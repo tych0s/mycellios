@@ -1,0 +1,24 @@
+node_modules/
+dist/
+coverage/
+runtime/
+.env
+*.log
+
+# Estado local y secretos de workers
+data/*.db
+data/*.db-*
+data/*.json
+!data/.gitkeep
+
+# Entornos de motores externos
+.venv/
+.python-version
+.DS_Store
+Thumbs.db
+
+# Artefactos de Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/

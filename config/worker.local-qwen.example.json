@@ -1,0 +1,31 @@
+{
+  "region": "es-mad",
+  "offeredVramMb": 4096,
+  "limits": {
+    "maxConcurrency": 1,
+    "maxPowerW": 80,
+    "maxTemperatureC": 82,
+    "pauseWhenForeground": true
+  },
+  "adapter": {
+    "kind": "externalggufruntime",
+    "model": "qwen3-0.6b-q8",
+    "baseUrl": "http://127.0.0.1:8080"
+  },
+  "deployment": {
+    "modelDigest": "sha256:9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031",
+    "peakVramMb": 1400,
+    "contextLimit": 8192,
+    "tokensPerSecond": 20,
+    "ttftMs": 2000
+  },
+  "llmfit": {
+    "enabled": true,
+    "required": false,
+    "executable": "llmfit",
+    "arguments": [],
+    "timeoutMs": 15000,
+    "model": "Qwen/Qwen3-0.6B",
+    "applyPerformanceEstimate": false
+  }
+}

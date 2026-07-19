@@ -1,0 +1,24 @@
+{
+  "region": "es-mad",
+  "offeredVramMb": 4096,
+  "limits": {
+    "maxConcurrency": 1,
+    "maxPowerW": 120,
+    "maxTemperatureC": 78,
+    "pauseWhenForeground": true
+  },
+  "adapter": {
+    "kind": "mock",
+    "model": "distributed-small",
+    "tokensPerSecond": 20,
+    "ttftMs": 150,
+    "failureRate": 0
+  },
+  "deployment": {
+    "modelDigest": "sha256:mock-distributed-small-v1",
+    "peakVramMb": 3000,
+    "contextLimit": 8192,
+    "tokensPerSecond": 20,
+    "ttftMs": 150
+  }
+}

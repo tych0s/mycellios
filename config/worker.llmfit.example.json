@@ -1,0 +1,30 @@
+{
+  "region": "es-mad",
+  "offeredVramMb": 4096,
+  "limits": {
+    "maxConcurrency": 1,
+    "maxPowerW": 80,
+    "maxTemperatureC": 82,
+    "pauseWhenForeground": true
+  },
+  "adapter": {
+    "kind": "externalggufruntime",
+    "model": "smollm2:135m",
+    "baseUrl": "http://127.0.0.1:8080"
+  },
+  "deployment": {
+    "modelDigest": "replace-with-the-sha256-of-the-gguf",
+    "peakVramMb": 1400,
+    "contextLimit": 8192,
+    "ttftMs": 2000
+  },
+  "llmfit": {
+    "enabled": true,
+    "required": false,
+    "executable": "llmfit",
+    "arguments": [],
+    "timeoutMs": 15000,
+    "model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+    "applyPerformanceEstimate": false
+  }
+}
