@@ -1,15 +1,15 @@
-# Landing de mycellios
+# mycellios landing page
 
-Sitio público independiente del cliente Electron, preparado para publicarse en
+Public website independent from the Electron client, ready to be published at
 `https://mycellios.com`.
 
-## Desarrollo
+## Development
 
 ```powershell
 npm run landing:dev
 ```
 
-## Validación y build de producción
+## Validation and production build
 
 ```powershell
 npm run landing:typecheck
@@ -17,23 +17,23 @@ npm run landing:build
 npm run landing:preview
 ```
 
-La salida estática se genera en `landing-dist/`. Ese directorio es el que debe
-publicar el proveedor de hosting. Las rutas públicas incluyen `robots.txt`,
-`sitemap.xml` y el favicon de la marca.
+Static output is generated in `landing-dist/`. This is the directory the hosting
+provider should publish. Public routes include `robots.txt`, `sitemap.xml`, and
+the brand favicon.
 
-La interfaz detecta el idioma del navegador, permite alternar entre español e
-inglés y conserva la preferencia localmente. Los metadatos principales también
-se actualizan con el idioma seleccionado.
+The interface and all SEO metadata are English-only so every visitor sees the
+same public message.
 
-## Activos visuales
+## Visual assets
 
-Las escenas originales de micelio generadas para la web están en:
+The original AI-generated mycelium scenes are stored in:
 
 - `src/assets/mycelium-hero.jpg`
 - `src/assets/mycelium-network.jpg`
+- `src/assets/efficiency-curve-ai.webp`
 
-Las imágenes se combinan con SVG y CSS animado; el movimiento y los paquetes de
-información no están horneados en el bitmap.
+The images are combined with animated SVG and CSS; movement and information
+packets are not baked into the bitmap.
 
-Antes de publicar, confirma que `hello@mycellios.com` recibe correo o cambia la
-constante `EMAIL` de `src/Landing.tsx` por la dirección definitiva.
+Before publishing, confirm that `hello@mycellios.com` can receive email or update
+the `EMAIL` constant in `src/Landing.tsx` with the final address.

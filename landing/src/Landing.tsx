@@ -8,7 +8,6 @@ import {
   CircleDot,
   Cpu,
   Gauge,
-  Languages,
   Layers3,
   Network,
   ShieldCheck,
@@ -17,58 +16,14 @@ import {
   Workflow,
   Zap,
 } from "lucide-react";
-import { useEffect, useRef, useState, type CSSProperties, type PointerEvent } from "react";
+import { useEffect, useRef, type CSSProperties, type PointerEvent } from "react";
 import brandIcon from "../../src/renderer/assets/mycellios-icon.png";
+import efficiencyCurve from "./assets/efficiency-curve-ai.webp";
 import myceliumHero from "./assets/mycelium-hero.jpg";
 import myceliumNetwork from "./assets/mycelium-network.jpg";
 
 const EMAIL = "hello@mycellios.com";
-type Language = "es" | "en";
-
-const translations = {
-  es: {
-    meta: { title: "mycellios — Un modelo. Muchos equipos.", description: "mycellios coordina equipos heterogéneos para ejecutar juntos modelos de IA que no caben en una sola máquina." },
-    home: "mycellios, inicio",
-    languageLabel: "Cambiar idioma",
-    nav: { aria: "Navegación principal", vision: "Visión", architecture: "Arquitectura", evidence: "Estado real", join: "Entrar en la red" },
-    hero: {
-      status: "Validación multi-equipo en curso",
-      line1: "Tu próximo", line2: "superordenador", line3: "ya está encendido.",
-      copy: "mycellios coordina ordenadores distintos para ejecutar juntos modelos de IA que no caben en una sola máquina.",
-      primary: "Quiero participar", secondary: "Ver cómo funciona",
-      footnote: "La contribución es voluntaria, medible y se puede pausar.",
-    },
-    visual: { aria: "Visualización de una red de equipos formando un único modelo", model: "MODELO", route: "ruta activa", nodes: "9 nodos", heterogeneous: "heterogéneos", capacity: "Capacidad", coordinated: "coordinada", caption: "Visualización conceptual · red en formación" },
-    signals: ["MODELOS GRANDES", "HARDWARE HETEROGÉNEO", "MEMORIA DISTRIBUIDA", "RUTAS ADAPTATIVAS", "MODO EXACTO", "MODELOS MoE"],
-    manifesto: { index: "01 / LA IDEA", kicker: "La capacidad ya existe. Está fragmentada.", title: "La IA más potente vive detrás de muros de silicio. Nosotros estamos construyendo otra puerta.", copy: "Millones de PCs, estaciones de trabajo y pequeños servidores pasan gran parte del día infrautilizados. Por separado no bastan. Coordinados, pueden formar una nueva clase de infraestructura.", link: "Descubrir GDLP/2" },
-    mycelium: {
-      eyebrow: "La inspiración", title: "La red ya aprendió a vivir antes que nosotros.",
-      copy: "Un micelio no tiene un centro que lo controle todo. Percibe localmente, transmite señales, redistribuye recursos y encuentra nuevas rutas cuando el entorno cambia. mycellios convierte esa lógica viva en infraestructura computacional.",
-      imageAlt: "Red micelial bioluminiscente transmitiendo señales entre sus ramificaciones",
-      live: "SEÑAL VIVA", packet: "paquete 0x7F", metrics: ["Sin centro único", "Señales locales", "Red adaptable"],
-    },
-    architecture: { eyebrow: "Arquitectura adaptativa", title: "No conectamos más equipos. Construimos la ruta correcta.", copy: "Añadir un nodo lento puede empeorar todo el sistema. GDLP/2 analiza cada modelo, agrupa recursos cercanos y selecciona solo las máquinas que aportan valor a esa ejecución." },
-    pipeline: {
-      target: "MODELO OBJETIVO", tooLarge1: "Demasiado grande", tooLarge2: "para un solo nodo", reserve: "reserva",
-      stages: [
-        { number: "01", name: "Analizar", detail: "memoria · topología" },
-        { number: "02", name: "Dividir", detail: "capas · expertos" },
-        { number: "03", name: "Asignar", detail: "el mejor equipo" },
-        { number: "04", name: "Coordinar", detail: "una única ruta" },
-      ],
-    },
-    principles: [
-      { title1: "Un modelo,", title2: "muchas memorias", copy: "Cada nodo almacena y procesa únicamente una parte. El modelo completo emerge de la colaboración.", label: "PARTITIONING" },
-      { title1: "Primero células,", title2: "después red", copy: "Los equipos cercanos forman células rápidas. La WAN conecta unas pocas etapas virtuales, no cientos de saltos.", label: "HIERARCHICAL MESH" },
-      { title1: "La ruta cambia.", title2: "El trabajo continúa.", copy: "El planificador mide capacidad, conexión y disponibilidad para preparar alternativas cuando cambia la red.", label: "ADAPTIVE ROUTING" },
-    ],
-    modes: { eyebrow: "Una red, dos garantías", title1: "Rápido cuando conviene.", title2: "Exacto cuando importa.", copy: "La arquitectura separa explícitamente la inferencia equivalente al modelo de referencia de cualquier optimización aproximada. Nunca se mezclan en silencio.", exactTitle: "Modo exacto", exactCopy: "La distribución cambia dónde se calcula el modelo, no el resultado que debe producir.", exactFooter: "Verificación y rollback", optTitle: "Aproximación voluntaria", optCopy: "Compresión y codecs alternativos solo cuando el usuario los elige y la degradación está medida.", optFooter: "Siempre opt-in" },
-    evidence: { eyebrow: "Evidencia antes que promesas", title: "Estamos construyendo en público.", copy: "No llamamos red global a una simulación. Cada afirmación importante atraviesa una prueba reproducible antes de convertirse en promesa de producto.", done: "Implementado", next: "Siguiente hito físico", gate: "PRÓXIMO GATE", rows: [["Runtime de modelo dividido", "Pipeline real y API compatible", "READY"], ["Planificador heterogéneo", "Memoria, topología y disponibilidad", "READY"], ["Recuperación de etapa", "Ruta alternativa y continuación greedy", "LAB"], ["Modelo mayor que cada equipo", "Prueba sobre 2–4 máquinas físicas", "TESTING"]] },
-    participate: { eyebrow: "Construye la red", title: "Hay más de una forma de formar parte.", copy: "Buscamos los primeros equipos, organizaciones y personas que quieran convertir una idea difícil en infraestructura real.", contributor: { label: "PARA QUIEN APORTA", title: "Convierte capacidad ociosa en capacidad útil.", copy: "Conecta un PC, workstation o servidor. Decide cuánto aportas y pausa cuando quieras.", bullets: ["Hardware distinto, una sola red", "Contribución voluntaria", "Trabajo verificable"] }, organization: { label: "PARA EQUIPOS Y ORGANIZACIONES", title: "Ejecuta modelos abiertos sobre infraestructura que controlas.", copy: "Crea redes privadas para laboratorios, empresas y comunidades con hardware distribuido.", bullets: ["Modelos mayores por memoria agregada", "API familiar para tus aplicaciones", "Topología adaptada a tu red"] } },
-    closing: { eyebrow: "Red fundadora", title1: "Muchos equipos.", title2: "Un solo modelo.", copy: "Únete a la primera red de pruebas de mycellios y ayúdanos a demostrar que la próxima gran máquina puede ser una comunidad.", button: "Solicitar acceso temprano", email: "Escríbenos a", subject: "Quiero participar en mycellios" },
-    footer: { tagline: "Inteligencia distribuida, construida juntos.", architecture: "Arquitectura", status: "Estado", contact: "Contacto" },
-  },
-  en: {
+const copy = {
     meta: { title: "mycellios — One model. Many machines.", description: "mycellios coordinates heterogeneous machines to run AI models that do not fit on any single computer." },
     home: "mycellios, home",
     languageLabel: "Change language",
@@ -89,6 +44,29 @@ const translations = {
       imageAlt: "Bioluminescent mycelium network transmitting signals through its branches",
       live: "LIVE SIGNAL", packet: "packet 0x7F", metrics: ["No single center", "Local signals", "Adaptive network"],
     },
+    acceleration: {
+      eyebrow: "The compounding curve",
+      title: "Intelligence gets cheaper. Distribution makes it go further.",
+      copy: "Model efficiency is already moving at extraordinary speed. mycellios is being built to compound that progress: pooling memory first, shortening routes next, and increasing effective tokens per second as the network matures.",
+      observed: "Observed benchmark shift",
+      from: { date: "DEC 2024", model: "o3-preview · high compute", cost: ">$3,000 / task", score: "87.5% ARC-AGI-1" },
+      to: { date: "DEC 2025", model: "Gemini 3 Flash · high", cost: "$0.231 / task", score: "84.7% ARC-AGI-1" },
+      multiplier: "≈13,000×",
+      multiplierLabel: "lower cost per task",
+      axis: "CAPABILITY PER DOLLAR",
+      note: "The same benchmark family, but different systems and evaluation configurations. This is a directional efficiency signal—not an apples-to-apples price comparison.",
+      source: "Inspect the ARC Prize data",
+      roadmapEyebrow: "The mycellios development curve",
+      roadmapTitle: "Fit. Route. Multiply.",
+      roadmapCopy: "Every layer removes a different bottleneck. The target is a compounding throughput curve, not a single benchmark trick.",
+      direction: "DIRECTION · NOT A PERFORMANCE FORECAST",
+      equation: "MODEL EFFICIENCY × NETWORK EFFICIENCY = COMPOUND SYSTEM SPEED",
+      phases: [
+        { step: "NOW · 01", title: "Fit the model", copy: "Pool heterogeneous memory so models can run beyond the limit of any single machine.", signal: "MEMORY" },
+        { step: "NEXT · 02", title: "Shorten the route", copy: "Keep experts resident and move each request through fewer, faster network boundaries.", signal: "LOCALITY" },
+        { step: "SCALE · 03", title: "Multiply the paths", copy: "Coordinate parallel cells so added capacity can become useful throughput instead of added latency.", signal: "TOKENS / S" },
+      ],
+    },
     architecture: { eyebrow: "Adaptive architecture", title: "We do not connect more machines. We build the right route.", copy: "Adding a slow node can make the entire system worse. GDLP/2 analyzes each model, groups nearby resources, and selects only the machines that add value to that run." },
     pipeline: {
       target: "TARGET MODEL", tooLarge1: "Too large", tooLarge2: "for a single node", reserve: "reserve",
@@ -108,8 +86,7 @@ const translations = {
     evidence: { eyebrow: "Evidence before promises", title: "We are building in public.", copy: "We do not call a simulation a global network. Every important claim passes a reproducible test before it becomes a product promise.", done: "Implemented", next: "Next physical milestone", gate: "NEXT GATE", rows: [["Partitioned-model runtime", "Real pipeline and compatible API", "READY"], ["Heterogeneous scheduler", "Memory, topology, and availability", "READY"], ["Stage recovery", "Alternate route and greedy continuation", "LAB"], ["Model larger than every node", "Test across 2–4 physical machines", "TESTING"]] },
     participate: { eyebrow: "Build the network", title: "There is more than one way to take part.", copy: "We are looking for the first machines, organizations, and people ready to turn a difficult idea into real infrastructure.", contributor: { label: "FOR CONTRIBUTORS", title: "Turn idle capacity into useful capacity.", copy: "Connect a PC, workstation, or server. Decide how much you contribute and pause whenever you want.", bullets: ["Different hardware, one network", "Voluntary contribution", "Verifiable work"] }, organization: { label: "FOR TEAMS AND ORGANIZATIONS", title: "Run open models on infrastructure you control.", copy: "Create private networks for labs, companies, and communities with distributed hardware.", bullets: ["Larger models through pooled memory", "A familiar API for your applications", "Topology adapted to your network"] } },
     closing: { eyebrow: "Founding network", title1: "Many machines.", title2: "One model.", copy: "Join the first mycellios test network and help us prove that the next great machine can be a community.", button: "Request early access", email: "Write to us at", subject: "I want to join mycellios" },
-    footer: { tagline: "Distributed intelligence, built together.", architecture: "Architecture", status: "Status", contact: "Contact" },
-  },
+  footer: { tagline: "Distributed intelligence, built together.", architecture: "Architecture", status: "Status", contact: "Contact" },
 } as const;
 
 const nodes = [
@@ -126,15 +103,6 @@ function Brand({ compact = false, homeLabel }: { compact?: boolean; homeLabel: s
   return <a className={`brand ${compact ? "brand-compact" : ""}`} href="#top" aria-label={homeLabel}><img src={brandIcon} alt="" /><span>mycellios</span></a>;
 }
 
-function LanguageSwitch({ language, label, onChange }: { language: Language; label: string; onChange: (language: Language) => void }) {
-  return (
-    <div className="language-switch" role="group" aria-label={label}>
-      <Languages size={13} />
-      {(["es", "en"] as const).map((code) => <button key={code} type="button" className={language === code ? "active" : ""} aria-pressed={language === code} onClick={() => onChange(code)}>{code.toUpperCase()}</button>)}
-    </div>
-  );
-}
-
 function LivingBackdrop() {
   const paths = ["M-60 190 C180 40 280 330 520 190 S850 55 1080 220 S1350 340 1540 110", "M-80 480 C190 600 280 310 520 450 S850 650 1090 430 S1370 280 1540 520", "M120 -50 C230 170 440 100 530 320 S690 650 900 480 S1160 180 1490 290", "M20 740 C270 610 430 760 620 560 S880 260 1120 470 S1330 710 1520 590"];
   return (
@@ -148,7 +116,7 @@ function LivingBackdrop() {
   );
 }
 
-function NetworkHero({ text }: { text: (typeof translations)[Language]["visual"] }) {
+function NetworkHero({ text }: { text: typeof copy.visual }) {
   return (
     <div className="network-stage" aria-label={text.aria}>
       <div className="stage-grid" /><div className="stage-glow" />
@@ -177,7 +145,7 @@ function SectionHeading({ eyebrow, title, copy }: { eyebrow: string; title: stri
   return <div className="section-heading reveal"><span className="eyebrow"><i />{eyebrow}</span><h2>{title}</h2><p>{copy}</p></div>;
 }
 
-function MyceliumStory({ text }: { text: (typeof translations)[Language]["mycelium"] }) {
+function MyceliumStory({ text }: { text: typeof copy.mycelium }) {
   return (
     <section className="mycelium-story" id="mycelium">
       <div className="mycelium-visual reveal">
@@ -195,7 +163,70 @@ function MyceliumStory({ text }: { text: (typeof translations)[Language]["myceli
   );
 }
 
-function PipelineVisual({ text }: { text: (typeof translations)[Language]["pipeline"] }) {
+function EfficiencyCurve({ text }: { text: typeof copy.acceleration }) {
+  return (
+    <section className="acceleration-section" id="acceleration">
+      <div className="container">
+        <div className="acceleration-heading reveal">
+          <span className="eyebrow"><i />{text.eyebrow}</span>
+          <h2>{text.title}</h2>
+          <p>{text.copy}</p>
+        </div>
+
+        <article className="efficiency-curve reveal">
+          <img src={efficiencyCurve} alt="An abstract luminous mycelium network accelerating into a dense flow of information" loading="lazy" />
+          <div className="efficiency-veil" />
+          <div className="curve-topline"><span>{text.observed}</span><span>ARC-AGI-1 · 12 MONTHS</span></div>
+          <span className="curve-axis">{text.axis}</span>
+          <svg className="curve-plot" viewBox="0 0 1000 470" preserveAspectRatio="none" aria-hidden="true">
+            <defs>
+              <linearGradient id="efficiencyLine" x1="0" x2="1"><stop offset="0" stopColor="#7085ff" /><stop offset=".55" stopColor="#65f6d1" /><stop offset="1" stopColor="#e8fffb" /></linearGradient>
+              <filter id="curveGlow" x="-30%" y="-50%" width="160%" height="200%"><feGaussianBlur stdDeviation="7" result="blur" /><feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge></filter>
+            </defs>
+            <g className="curve-grid">
+              {[90, 180, 270, 360].map((y) => <line key={`h-${y}`} x1="80" y1={y} x2="930" y2={y} />)}
+              {[160, 350, 540, 730, 920].map((x) => <line key={`v-${x}`} x1={x} y1="55" x2={x} y2="405" />)}
+            </g>
+            <path className="curve-shadow" d="M150 365 C330 360 475 315 590 240 S750 115 845 82" />
+            <path className="curve-line" d="M150 365 C330 360 475 315 590 240 S750 115 845 82" />
+            <path className="curve-signal" d="M150 365 C330 360 475 315 590 240 S750 115 845 82" />
+            <g className="curve-point point-start"><circle cx="150" cy="365" r="20" /><circle cx="150" cy="365" r="5" /></g>
+            <g className="curve-point point-end" filter="url(#curveGlow)"><circle cx="845" cy="82" r="24" /><circle cx="845" cy="82" r="6" /></g>
+          </svg>
+          <div className="benchmark-point benchmark-from"><span>{text.from.date}</span><strong>{text.from.model}</strong><b>{text.from.cost}</b><small>{text.from.score}</small></div>
+          <div className="benchmark-point benchmark-to"><span>{text.to.date}</span><strong>{text.to.model}</strong><b>{text.to.cost}</b><small>{text.to.score}</small></div>
+          <div className="curve-multiplier"><strong>{text.multiplier}</strong><span>{text.multiplierLabel}</span><ArrowUpRight size={17} /></div>
+        </article>
+
+        <div className="curve-evidence reveal">
+          <p>{text.note}</p>
+          <div>
+            <a href="https://arcprize.org/blog/oai-o3-pub-breakthrough" target="_blank" rel="noreferrer">o3 analysis <ArrowUpRight size={13} /></a>
+            <a href="https://arcprize.org/leaderboard?hl=en-US" target="_blank" rel="noreferrer">{text.source} <ArrowUpRight size={13} /></a>
+          </div>
+        </div>
+
+        <div className="roadmap-heading reveal">
+          <div><span>{text.roadmapEyebrow}</span><h3>{text.roadmapTitle}</h3></div>
+          <p>{text.roadmapCopy}</p>
+          <small>{text.direction}</small>
+        </div>
+        <div className="acceleration-roadmap">
+          {text.phases.map((phase, index) => (
+            <article className="roadmap-phase reveal" key={phase.step}>
+              <div className="phase-line"><i /><span>{phase.step}</span><b>0{index + 1}</b></div>
+              <h4>{phase.title}</h4><p>{phase.copy}</p><strong>{phase.signal}</strong>
+              {index < text.phases.length - 1 && <ArrowRight className="phase-arrow" size={18} />}
+            </article>
+          ))}
+        </div>
+        <div className="curve-equation reveal"><i /><span>{text.equation}</span><i /></div>
+      </div>
+    </section>
+  );
+}
+
+function PipelineVisual({ text }: { text: typeof copy.pipeline }) {
   return (
     <div className="pipeline-card reveal">
       <div className="pipeline-topline"><span>GDLP / 2</span><span>ROUTE COMPILER</span><span className="live-dot">LIVE</span></div>
@@ -208,26 +239,21 @@ function PipelineVisual({ text }: { text: (typeof translations)[Language]["pipel
 
 function Landing() {
   const page = useRef<HTMLDivElement>(null);
-  const [language, setLanguage] = useState<Language>(() => {
-    const saved = window.localStorage.getItem("mycellios-language");
-    return saved === "es" || saved === "en" ? saved : navigator.language.toLowerCase().startsWith("es") ? "es" : "en";
-  });
-  const t = translations[language];
+  const t = copy;
 
   useEffect(() => {
-    document.documentElement.lang = language;
+    document.documentElement.lang = "en";
     document.title = t.meta.title;
     document.querySelector('meta[name="description"]')?.setAttribute("content", t.meta.description);
     document.querySelector('meta[property="og:title"]')?.setAttribute("content", t.meta.title);
     document.querySelector('meta[property="og:description"]')?.setAttribute("content", t.meta.description);
-    window.localStorage.setItem("mycellios-language", language);
-  }, [language, t.meta.description, t.meta.title]);
+  }, [t.meta.description, t.meta.title]);
 
   useEffect(() => {
     const observer = new IntersectionObserver((entries) => entries.forEach((entry) => entry.isIntersecting && entry.target.classList.add("is-visible")), { threshold: 0.14 });
     page.current?.querySelectorAll(".reveal").forEach((element) => observer.observe(element));
     return () => observer.disconnect();
-  }, [language]);
+  }, []);
 
   function trackPointer(event: PointerEvent<HTMLDivElement>) {
     const bounds = event.currentTarget.getBoundingClientRect();
@@ -238,7 +264,7 @@ function Landing() {
   return (
     <div className="site" id="top" ref={page} onPointerMove={trackPointer}>
       <LivingBackdrop /><div className="ambient-pointer" />
-      <header className="nav-shell"><nav className="nav container" aria-label={t.nav.aria}><Brand homeLabel={t.home} /><div className="nav-links"><a href="#vision">{t.nav.vision}</a><a href="#architecture">{t.nav.architecture}</a><a href="#evidence">{t.nav.evidence}</a></div><div className="nav-actions"><LanguageSwitch language={language} label={t.languageLabel} onChange={setLanguage} /><a className="nav-cta" href="#join">{t.nav.join} <ArrowUpRight size={15} /></a></div></nav></header>
+      <header className="nav-shell"><nav className="nav container" aria-label={t.nav.aria}><Brand homeLabel={t.home} /><div className="nav-links"><a href="#vision">{t.nav.vision}</a><a href="#architecture">{t.nav.architecture}</a><a href="#evidence">{t.nav.evidence}</a></div><div className="nav-actions"><a className="nav-cta" href="#join">{t.nav.join} <ArrowUpRight size={15} /></a></div></nav></header>
 
       <main>
         <section className="hero container">
@@ -251,6 +277,8 @@ function Landing() {
         <section className="manifesto container" id="vision"><div className="manifesto-index reveal">{t.manifesto.index}</div><div className="manifesto-copy reveal"><span>{t.manifesto.kicker}</span><h2>{t.manifesto.title}</h2></div><div className="manifesto-side reveal"><p>{t.manifesto.copy}</p><a href="#architecture">{t.manifesto.link} <ArrowUpRight size={15} /></a></div></section>
 
         <MyceliumStory text={t.mycelium} />
+
+        <EfficiencyCurve text={t.acceleration} />
 
         <section className="architecture-section" id="architecture"><div className="container"><SectionHeading eyebrow={t.architecture.eyebrow} title={t.architecture.title} copy={t.architecture.copy} /><PipelineVisual text={t.pipeline} /><div className="principles-grid">{t.principles.map((principle, index) => { const Icon = [Layers3, Network, Workflow][index] ?? Network; return <article className="principle-card reveal" key={principle.label}><div className="card-number">0{index + 1}</div><Icon size={25} /><h3>{principle.title1}<br />{principle.title2}</h3><p>{principle.copy}</p><span>{principle.label} <ArrowUpRight size={13} /></span></article>; })}</div></div></section>
 
