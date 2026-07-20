@@ -31,14 +31,15 @@ landing uses `releases/latest/download` URLs.
 
 ## Visual assets
 
-The original AI-generated mycelium scenes are stored in:
+The two AI-generated editorial scenes are stored in:
 
-- `src/assets/mycelium-hero.jpg`
 - `src/assets/mycelium-network.jpg`
 - `src/assets/efficiency-curve-ai.webp`
 
-The images are combined with animated SVG and CSS; movement and information
-packets are not baked into the bitmap.
+The hero is fully generative SVG and CSS: organic cell membranes, filaments,
+light fields, and moving information packets are rendered without a background
+bitmap. The editorial images are combined with animated SVG and CSS; movement
+and information packets are not baked into those bitmaps.
 
 Before publishing, confirm that `hello@mycellios.com` can receive email or update
 the `EMAIL` constant in `src/Landing.tsx` with the final address.

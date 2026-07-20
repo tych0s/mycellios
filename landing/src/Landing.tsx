@@ -23,7 +23,6 @@ import {
 import { useEffect, useRef, useState, type CSSProperties, type PointerEvent } from "react";
 import brandIcon from "../../src/renderer/assets/mycellios-icon.png";
 import efficiencyCurve from "./assets/efficiency-curve-ai.webp";
-import myceliumHero from "./assets/mycelium-hero.jpg";
 import myceliumNetwork from "./assets/mycelium-network.jpg";
 
 const EMAIL = "hello@mycellios.com";
@@ -146,12 +145,31 @@ function Brand({ compact = false, homeLabel }: { compact?: boolean; homeLabel: s
 }
 
 function LivingBackdrop() {
-  const paths = ["M-60 190 C180 40 280 330 520 190 S850 55 1080 220 S1350 340 1540 110", "M-80 480 C190 600 280 310 520 450 S850 650 1090 430 S1370 280 1540 520", "M120 -50 C230 170 440 100 530 320 S690 650 900 480 S1160 180 1490 290", "M20 740 C270 610 430 760 620 560 S880 260 1120 470 S1330 710 1520 590"];
+  const paths = ["M-60 190 C180 40 280 330 520 190 S850 55 1080 220 S1350 340 1540 110", "M-80 480 C190 600 280 310 520 450 S850 650 1090 430 S1370 280 1540 520", "M120 -50 C230 170 440 100 530 320 S690 650 900 480 S1160 180 1490 290", "M20 740 C270 610 430 760 620 560 S880 260 1120 470 S1330 710 1520 590", "M-30 690 C190 470 380 600 580 380 S960 110 1190 310 S1420 610 1510 420"];
   return (
     <div className="living-background" aria-hidden="true">
-      <img src={myceliumHero} alt="" />
-      <svg viewBox="0 0 1440 800" preserveAspectRatio="xMidYMid slice">
+      <div className="cell-aurora" />
+      <svg viewBox="0 0 1440 900" preserveAspectRatio="xMidYMid slice">
+        <defs>
+          <linearGradient id="backdropSignal" x1="0" x2="1"><stop offset="0" stopColor="#62f6d0" /><stop offset=".52" stopColor="#768cff" /><stop offset="1" stopColor="#cf6dff" /></linearGradient>
+          <radialGradient id="backdropCell"><stop offset="0" stopColor="#62f6d0" stopOpacity=".22" /><stop offset=".45" stopColor="#7786ff" stopOpacity=".08" /><stop offset="1" stopColor="#090b10" stopOpacity="0" /></radialGradient>
+          <filter id="cellDistortion" x="-30%" y="-30%" width="160%" height="160%"><feTurbulence type="fractalNoise" baseFrequency=".008 .014" numOctaves="2" seed="8" result="noise"><animate attributeName="baseFrequency" dur="18s" values=".008 .014;.011 .009;.008 .014" repeatCount="indefinite" /></feTurbulence><feDisplacementMap in="SourceGraphic" in2="noise" scale="22" /></filter>
+          <filter id="backdropGlow" x="-100%" y="-100%" width="300%" height="300%"><feGaussianBlur stdDeviation="5" result="blur" /><feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge></filter>
+        </defs>
+        <g className="backdrop-cells" filter="url(#cellDistortion)">
+          <path d="M770 45 C920 -35 1110 15 1195 142 C1285 277 1215 410 1065 437 C901 467 755 395 706 265 C669 164 690 87 770 45Z" />
+          <path d="M1060 390 C1210 323 1403 407 1480 540 C1546 654 1454 794 1298 818 C1127 845 980 749 966 611 C956 510 989 427 1060 390Z" />
+          <path d="M292 412 C430 356 570 425 620 540 C665 642 594 740 465 759 C326 779 205 707 185 596 C168 500 213 445 292 412Z" />
+        </g>
+        <g className="backdrop-nuclei">
+          <circle cx="990" cy="223" r="172" fill="url(#backdropCell)" /><circle cx="990" cy="223" r="7" />
+          <circle cx="1247" cy="602" r="150" fill="url(#backdropCell)" /><circle cx="1247" cy="602" r="5" />
+          <circle cx="405" cy="580" r="133" fill="url(#backdropCell)" /><circle cx="405" cy="580" r="4" />
+        </g>
         {paths.map((path, index) => <g key={path}><path d={path} className="hypha-base" /><path d={path} className="hypha-pulse" style={{ "--path-delay": `${index * -1.7}s` } as CSSProperties} /></g>)}
+        <g className="backdrop-packets" filter="url(#backdropGlow)">
+          {paths.slice(0, 4).map((path, index) => <circle key={`packet-${path}`} r={index % 2 ? 2.5 : 3.5}><animateMotion dur={`${8 + index * 1.6}s`} begin={`${index * -2.1}s`} repeatCount="indefinite" path={path} /></circle>)}
+        </g>
       </svg>
       <div className="spore-field" />
     </div>
@@ -164,15 +182,35 @@ function NetworkHero({ text }: { text: typeof copy.visual }) {
       <div className="stage-grid" /><div className="stage-glow" />
       <svg viewBox="0 0 680 560" role="img" aria-hidden="true">
         <defs>
-          <linearGradient id="linkGradient" x1="0" x2="1"><stop offset="0" stopColor="#66f6d1" /><stop offset=".52" stopColor="#768cff" /><stop offset="1" stopColor="#cf6dff" /></linearGradient>
+          <linearGradient id="networkLinkGradient" x1="0" x2="1"><stop offset="0" stopColor="#66f6d1" /><stop offset=".52" stopColor="#768cff" /><stop offset="1" stopColor="#cf6dff" /></linearGradient>
           <radialGradient id="coreGradient"><stop offset="0" stopColor="#e8fffb" /><stop offset=".28" stopColor="#65f5d0" /><stop offset=".68" stopColor="#6576ef" /><stop offset="1" stopColor="#9d52d5" /></radialGradient>
           <filter id="softGlow" x="-100%" y="-100%" width="300%" height="300%"><feGaussianBlur stdDeviation="8" result="blur" /><feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge></filter>
+          <filter id="membraneDistortion" x="-20%" y="-20%" width="140%" height="140%"><feTurbulence type="fractalNoise" baseFrequency=".012" numOctaves="2" seed="14" result="noise"><animate attributeName="seed" dur="12s" values="14;19;14" repeatCount="indefinite" /></feTurbulence><feDisplacementMap in="SourceGraphic" in2="noise" scale="12" /></filter>
         </defs>
+        <g className="cell-regions" filter="url(#membraneDistortion)">
+          <path d="M37 102 C97 25 221 22 297 75 C351 113 348 187 292 220 C216 265 106 237 48 181 C22 155 19 126 37 102Z" />
+          <path d="M371 29 C462 -11 596 17 646 97 C688 165 642 248 566 271 C487 294 398 259 365 194 C333 132 325 49 371 29Z" />
+          <path d="M326 323 C391 274 504 290 574 351 C643 411 613 508 523 532 C431 557 322 515 293 437 C277 394 289 351 326 323Z" />
+          <path d="M31 316 C88 268 190 284 246 346 C298 404 270 501 187 531 C105 561 24 516 11 433 C4 386 8 336 31 316Z" />
+        </g>
+        <g className="bio-filaments">
+          <path d="M30 286 C126 226 180 314 263 261 S421 167 526 250 S632 363 681 306" />
+          <path d="M74 545 C143 430 257 467 319 370 S427 185 602 120" />
+          <path d="M0 175 C128 205 210 139 321 210 S490 381 680 407" />
+        </g>
         <g className="mesh-lines">
           {links.map(([from, to], index) => { const start = nodes[from]; const end = nodes[to]; return <line key={`${from}-${to}`} x1={start.x} y1={start.y} x2={end.x} y2={end.y} className={index % 3 === 0 ? "signal-line" : ""} />; })}
           {nodes.map((node) => <line key={`core-${node.label}`} x1={node.x} y1={node.y} x2="340" y2="286" className="core-link" />)}
         </g>
-        <g className="core" filter="url(#softGlow)"><circle cx="340" cy="286" r="93" className="core-orbit orbit-a" /><circle cx="340" cy="286" r="68" className="core-orbit orbit-b" /><circle cx="340" cy="286" r="49" fill="url(#coreGradient)" /><circle cx="340" cy="286" r="26" className="core-center" /></g>
+        <g className="data-packets" filter="url(#softGlow)">
+          <circle r="3"><animateMotion dur="5.8s" repeatCount="indefinite" path="M90 130 C190 192 254 221 340 286 S467 349 564 355" /></circle>
+          <circle r="2.5"><animateMotion dur="7.2s" begin="-2.4s" repeatCount="indefinite" path="M608 188 C510 195 444 239 340 286 S267 409 210 492" /></circle>
+          <circle r="2"><animateMotion dur="4.9s" begin="-1.6s" repeatCount="indefinite" path="M185 66 C235 136 275 218 340 286 S440 432 432 474" /></circle>
+        </g>
+        <g className="micro-cells">
+          <g transform="translate(145 300)"><circle r="11" /><circle r="2" /></g><g transform="translate(505 166)"><circle r="8" /><circle r="1.7" /></g><g transform="translate(525 438)"><circle r="12" /><circle r="2.2" /></g><g transform="translate(273 54)"><circle r="7" /><circle r="1.5" /></g>
+        </g>
+        <g className="core" filter="url(#softGlow)"><circle cx="340" cy="286" r="108" className="core-wave" /><circle cx="340" cy="286" r="93" className="core-orbit orbit-a" /><circle cx="340" cy="286" r="68" className="core-orbit orbit-b" /><circle cx="340" cy="286" r="56" className="core-membrane" /><circle cx="340" cy="286" r="49" fill="url(#coreGradient)" /><circle cx="340" cy="286" r="26" className="core-center" /></g>
         <g className="node-points">{nodes.map((node, index) => <g key={node.label} className={`mesh-node node-${node.tone}`} style={{ "--delay": `${index * -0.31}s` } as CSSProperties}><circle cx={node.x} cy={node.y} r="18" className="node-halo" /><circle cx={node.x} cy={node.y} r="7" className="node-dot" /></g>)}</g>
       </svg>
       <div className="core-label"><span>01</span><strong>{text.model}</strong><small>{text.route}</small></div>
