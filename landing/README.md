@@ -24,6 +24,11 @@ the brand favicon.
 The interface and all SEO metadata are English-only so every visitor sees the
 same public message.
 
+The install section detects the visitor's operating system and downloads the
+normalized assets from the latest public GitHub Release. Release filenames are
+defined in `.github/workflows/desktop-build.yml`; keep those stable because the
+landing uses `releases/latest/download` URLs.
+
 ## Visual assets
 
 The original AI-generated mycelium scenes are stored in:

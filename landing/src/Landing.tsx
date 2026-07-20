@@ -7,32 +7,53 @@ import {
   ChevronRight,
   CircleDot,
   Cpu,
+  Download,
   Gauge,
+  HardDriveDownload,
   Layers3,
+  MonitorDown,
   Network,
+  Radio,
   ShieldCheck,
   Sparkles,
   Users,
   Workflow,
   Zap,
 } from "lucide-react";
-import { useEffect, useRef, type CSSProperties, type PointerEvent } from "react";
+import { useEffect, useRef, useState, type CSSProperties, type PointerEvent } from "react";
 import brandIcon from "../../src/renderer/assets/mycellios-icon.png";
 import efficiencyCurve from "./assets/efficiency-curve-ai.webp";
 import myceliumHero from "./assets/mycelium-hero.jpg";
 import myceliumNetwork from "./assets/mycelium-network.jpg";
 
 const EMAIL = "hello@mycellios.com";
+const RELEASE_BASE = "https://github.com/tych0s/mycellios/download";
+const RELEASES_URL = "https://github.com/tych0s/mycellios";
+
+const downloads = {
+  windows: { label: "Windows", detail: "Windows 10/11 · x64", filename: "mycellios-windows-x64.exe" },
+  "mac-arm64": { label: "macOS", detail: "Apple Silicon", filename: "mycellios-macos-arm64.dmg" },
+  "mac-x64": { label: "macOS", detail: "Intel", filename: "mycellios-macos-x64.dmg" },
+  "linux-deb": { label: "Linux", detail: "Ubuntu / Debian · x64", filename: "mycellios-linux-x64.deb" },
+  "linux-rpm": { label: "Linux", detail: "Fedora / RHEL · x64", filename: "mycellios-linux-x64.rpm" },
+} as const;
+
+type DownloadKey = keyof typeof downloads;
+
+function downloadUrl(key: DownloadKey): string {
+  return `${RELEASE_BASE}/${downloads[key].filename}`;
+}
+
 const copy = {
     meta: { title: "mycellios — One model. Many machines.", description: "mycellios coordinates heterogeneous machines to run AI models that do not fit on any single computer." },
     home: "mycellios, home",
     languageLabel: "Change language",
-    nav: { aria: "Main navigation", vision: "Vision", architecture: "Architecture", evidence: "Real progress", join: "Join the network" },
+    nav: { aria: "Main navigation", vision: "Vision", architecture: "Architecture", evidence: "Real progress", join: "Download" },
     hero: {
       status: "Physical multi-node validation underway",
       line1: "Your next", line2: "supercomputer", line3: "is already on.",
       copy: "mycellios coordinates different computers to run AI models that do not fit on any single machine.",
-      primary: "I want to join", secondary: "See how it works",
+      primary: "Download mycellios", secondary: "See how it works",
       footnote: "Contribution is voluntary, measurable, and can be paused at any time.",
     },
     visual: { aria: "Visualization of a network of machines forming a single model", model: "MODEL", route: "active route", nodes: "9 nodes", heterogeneous: "heterogeneous", capacity: "Capacity", coordinated: "coordinated", caption: "Concept visualization · network forming" },
@@ -84,6 +105,27 @@ const copy = {
     ],
     modes: { eyebrow: "One network, two guarantees", title1: "Fast when it helps.", title2: "Exact when it matters.", copy: "The architecture explicitly separates reference-equivalent inference from every approximate optimization. They are never mixed silently.", exactTitle: "Exact mode", exactCopy: "Distribution changes where the model is computed, not the result it must produce.", exactFooter: "Verification and rollback", optTitle: "Voluntary approximation", optCopy: "Compression and alternative codecs are used only when chosen by the user and the degradation is measured.", optFooter: "Always opt-in" },
     evidence: { eyebrow: "Evidence before promises", title: "We are building in public.", copy: "We do not call a simulation a global network. Every important claim passes a reproducible test before it becomes a product promise.", done: "Implemented", next: "Next physical milestone", gate: "NEXT GATE", rows: [["Partitioned-model runtime", "Real pipeline and compatible API", "READY"], ["Heterogeneous scheduler", "Memory, topology, and availability", "READY"], ["Stage recovery", "Alternate route and greedy continuation", "LAB"], ["Model larger than every node", "Test across 2–4 physical machines", "TESTING"]] },
+    install: {
+      eyebrow: "From download to network",
+      title1: "One click.",
+      title2: "Your machine joins the organism.",
+      copy: "Install the desktop app, choose how you want to participate, and mycellios detects your hardware automatically. No terminal, Docker, or manual configuration required.",
+      detected: "Recommended for this device",
+      download: "Download for",
+      early: "Early access · automatic hardware detection",
+      alternatives: "Other downloads",
+      allReleases: "Release notes and checksums",
+      safety: "Every installer is built and package-verified in GitHub Actions. Code signing is being rolled out; early builds may still trigger an operating-system publisher warning.",
+      consoleLabel: "MYCELLIOS · FIRST RUN",
+      ready: "NETWORK READY",
+      node: "this machine",
+      steps: [
+        { label: "Install", detail: "Desktop agent added", status: "DONE" },
+        { label: "Detect", detail: "CPU · RAM · GPU mapped", status: "DONE" },
+        { label: "Choose", detail: "Join or create a network", status: "READY" },
+      ],
+      promise: "YOU DECIDE WHAT TO SHARE · PAUSE AT ANY TIME",
+    },
     participate: { eyebrow: "Build the network", title: "There is more than one way to take part.", copy: "We are looking for the first machines, organizations, and people ready to turn a difficult idea into real infrastructure.", contributor: { label: "FOR CONTRIBUTORS", title: "Turn idle capacity into useful capacity.", copy: "Connect a PC, workstation, or server. Decide how much you contribute and pause whenever you want.", bullets: ["Different hardware, one network", "Voluntary contribution", "Verifiable work"] }, organization: { label: "FOR TEAMS AND ORGANIZATIONS", title: "Run open models on infrastructure you control.", copy: "Create private networks for labs, companies, and communities with distributed hardware.", bullets: ["Larger models through pooled memory", "A familiar API for your applications", "Topology adapted to your network"] } },
     closing: { eyebrow: "Founding network", title1: "Many machines.", title2: "One model.", copy: "Join the first mycellios test network and help us prove that the next great machine can be a community.", button: "Request early access", email: "Write to us at", subject: "I want to join mycellios" },
   footer: { tagline: "Distributed intelligence, built together.", architecture: "Architecture", status: "Status", contact: "Contact" },
@@ -237,6 +279,62 @@ function PipelineVisual({ text }: { text: typeof copy.pipeline }) {
   );
 }
 
+function InstallSection({ text }: { text: typeof copy.install }) {
+  const [recommended, setRecommended] = useState<DownloadKey>("windows");
+
+  useEffect(() => {
+    const agent = navigator.userAgent.toLowerCase();
+    if (agent.includes("mac")) setRecommended("mac-arm64");
+    else if (agent.includes("linux")) setRecommended("linux-deb");
+    else setRecommended("windows");
+  }, []);
+
+  const selected = downloads[recommended];
+
+  return (
+    <section className="install-section" id="install">
+      <div className="install-field" aria-hidden="true"><i /><i /><i /><i /><i /></div>
+      <div className="container install-layout">
+        <div className="install-copy reveal">
+          <span className="eyebrow"><i />{text.eyebrow}</span>
+          <h2>{text.title1}<br /><em>{text.title2}</em></h2>
+          <p>{text.copy}</p>
+          <div className="recommended-platform"><span><MonitorDown size={14} />{text.detected}</span><strong>{selected.label} · {selected.detail}</strong></div>
+          <a className="install-primary" href={downloadUrl(recommended)}>
+            <span className="install-download-icon"><Download size={22} /></span>
+            <span><small>{text.download}</small><strong>{selected.label}</strong></span>
+            <ArrowDownRight size={20} />
+          </a>
+          <div className="install-meta"><ShieldCheck size={14} /><span>{text.early}</span></div>
+        </div>
+
+        <div className="install-console reveal">
+          <div className="install-console-top"><div><i /><i /><i /></div><span>{text.consoleLabel}</span><b>01:18</b></div>
+          <div className="install-console-body">
+            <div className="install-node-orb"><span /><Radio size={27} /><i /></div>
+            <div className="install-ready"><span><i />{text.ready}</span><strong>{text.node}</strong><small>NODE · 7FA3_C2E1</small></div>
+            <div className="install-steps">
+              {text.steps.map((step, index) => <div key={step.label} style={{ "--install-delay": `${index * .45}s` } as CSSProperties}><span>0{index + 1}</span><i><Check size={11} /></i><p><strong>{step.label}</strong><small>{step.detail}</small></p><b>{step.status}</b></div>)}
+            </div>
+            <div className="install-promise"><ShieldCheck size={13} />{text.promise}</div>
+          </div>
+        </div>
+      </div>
+
+      <div className="container download-shelf reveal">
+        <div className="download-shelf-head"><span>{text.alternatives}</span><a href={RELEASES_URL} target="_blank" rel="noreferrer">{text.allReleases} <ArrowUpRight size={13} /></a></div>
+        <div className="download-options">
+          {(Object.keys(downloads) as DownloadKey[]).map((key) => {
+            const option = downloads[key];
+            return <a className={key === recommended ? "recommended" : ""} href={downloadUrl(key)} key={key}><HardDriveDownload size={18} /><span><strong>{option.label}</strong><small>{option.detail}</small></span>{key === recommended ? <b>RECOMMENDED</b> : <ArrowDownRight size={14} />}</a>;
+          })}
+        </div>
+        <p className="install-safety"><ShieldCheck size={14} />{text.safety}</p>
+      </div>
+    </section>
+  );
+}
+
 function Landing() {
   const page = useRef<HTMLDivElement>(null);
   const t = copy;
@@ -264,11 +362,11 @@ function Landing() {
   return (
     <div className="site" id="top" ref={page} onPointerMove={trackPointer}>
       <LivingBackdrop /><div className="ambient-pointer" />
-      <header className="nav-shell"><nav className="nav container" aria-label={t.nav.aria}><Brand homeLabel={t.home} /><div className="nav-links"><a href="#vision">{t.nav.vision}</a><a href="#architecture">{t.nav.architecture}</a><a href="#evidence">{t.nav.evidence}</a></div><div className="nav-actions"><a className="nav-cta" href="#join">{t.nav.join} <ArrowUpRight size={15} /></a></div></nav></header>
+      <header className="nav-shell"><nav className="nav container" aria-label={t.nav.aria}><Brand homeLabel={t.home} /><div className="nav-links"><a href="#vision">{t.nav.vision}</a><a href="#architecture">{t.nav.architecture}</a><a href="#evidence">{t.nav.evidence}</a></div><div className="nav-actions"><a className="nav-cta" href="#install">{t.nav.join} <Download size={15} /></a></div></nav></header>
 
       <main>
         <section className="hero container">
-          <div className="hero-copy"><div className="availability"><span /><strong>EARLY NETWORK</strong><i /> {t.hero.status}</div><h1>{t.hero.line1}<br />{t.hero.line2}<br /><em>{t.hero.line3}</em></h1><p>{t.hero.copy}</p><div className="hero-actions"><a className="button button-primary" href="#join">{t.hero.primary} <ArrowRight size={17} /></a><a className="button button-secondary" href="#architecture">{t.hero.secondary} <ArrowDownRight size={17} /></a></div><div className="hero-footnote"><ShieldCheck size={15} /><span>{t.hero.footnote}</span></div></div>
+          <div className="hero-copy"><div className="availability"><span /><strong>EARLY NETWORK</strong><i /> {t.hero.status}</div><h1>{t.hero.line1}<br />{t.hero.line2}<br /><em>{t.hero.line3}</em></h1><p>{t.hero.copy}</p><div className="hero-actions"><a className="button button-primary" href="#install">{t.hero.primary} <Download size={17} /></a><a className="button button-secondary" href="#architecture">{t.hero.secondary} <ArrowDownRight size={17} /></a></div><div className="hero-footnote"><ShieldCheck size={15} /><span>{t.hero.footnote}</span></div></div>
           <NetworkHero text={t.visual} />
         </section>
 
@@ -285,6 +383,8 @@ function Landing() {
         <section className="difference container"><div className="difference-copy reveal"><span className="eyebrow"><i />{t.modes.eyebrow}</span><h2>{t.modes.title1}<br /><em>{t.modes.title2}</em></h2><p>{t.modes.copy}</p></div><div className="mode-stack"><article className="mode-card exact reveal"><div><ShieldCheck size={23} /><span>01</span></div><h3>{t.modes.exactTitle}</h3><p>{t.modes.exactCopy}</p><footer><Check size={14} /> {t.modes.exactFooter}</footer></article><article className="mode-card optin reveal"><div><Sparkles size={23} /><span>02</span></div><h3>{t.modes.optTitle}</h3><p>{t.modes.optCopy}</p><footer><Check size={14} /> {t.modes.optFooter}</footer></article></div></section>
 
         <section className="evidence-section" id="evidence"><div className="container evidence-grid"><div><SectionHeading eyebrow={t.evidence.eyebrow} title={t.evidence.title} copy={t.evidence.copy} /><div className="status-legend reveal"><span><i className="done" />{t.evidence.done}</span><span><i className="next" />{t.evidence.next}</span></div></div><div className="status-board reveal"><div className="board-head"><span>BUILD STATUS</span><span>20 · 07 · 2026</span></div>{t.evidence.rows.map((row, index) => <div className={`status-row ${index === 3 ? "active" : ""}`} key={row[0]}><i className={index === 3 ? "next" : "done"}>{index === 3 ? <CircleDot size={12} /> : <Check size={12} />}</i><div><strong>{row[0]}</strong><small>{row[1]}</small></div><span>{row[2]}</span></div>)}<div className="board-footer"><span>{t.evidence.gate}</span><strong>Multi-node · GPU · LAN</strong><Gauge size={19} /></div></div></div></section>
+
+        <InstallSection text={t.install} />
 
         <section className="participate container"><SectionHeading eyebrow={t.participate.eyebrow} title={t.participate.title} copy={t.participate.copy} /><div className="participate-grid">{([t.participate.contributor, t.participate.organization] as const).map((audience, index) => <article className={`participate-card ${index === 1 ? "featured" : ""} reveal`} key={audience.label}><div className="participate-icon">{index === 0 ? <Cpu size={28} /> : <Users size={28} />}</div><span>{audience.label}</span><h3>{audience.title}</h3><p>{audience.copy}</p><ul>{audience.bullets.map((bullet) => <li key={bullet}><Check size={14} />{bullet}</li>)}</ul></article>)}</div></section>
 

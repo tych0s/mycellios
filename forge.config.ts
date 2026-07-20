@@ -87,6 +87,7 @@ const config: ForgeConfig = {
         productName: "mycellios",
         genericName: "Distributed inference network",
         description: "Control and contribute compute to the mycellios distributed inference network.",
+        license: "UNLICENSED",
         categories: ["Network", "Utility"],
         icon: "build/icons/icon.png",
       },

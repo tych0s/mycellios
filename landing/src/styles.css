@@ -294,6 +294,86 @@ button { font: inherit; }
 .board-footer strong { font: 500 10px "DM Mono"; color: var(--cyan); }
 .board-footer svg { color: var(--cyan); }
 
+.install-section { position: relative; overflow: hidden; border-bottom: 1px solid var(--line); background: radial-gradient(circle at 74% 33%, rgba(55,255,183,.105), transparent 27%), radial-gradient(circle at 23% 55%, rgba(99,91,255,.09), transparent 30%), #070a0a; }
+.install-section::before { content: ""; position: absolute; inset: 0; pointer-events: none; background-image: linear-gradient(rgba(98,246,208,.035) 1px, transparent 1px), linear-gradient(90deg, rgba(98,246,208,.035) 1px, transparent 1px); background-size: 64px 64px; mask-image: linear-gradient(to bottom, black, transparent 78%); opacity: .38; }
+.install-field { position: absolute; inset: 0; pointer-events: none; opacity: .75; }
+.install-field::before, .install-field::after { content: ""; position: absolute; width: 620px; height: 260px; border: 1px solid rgba(98,246,208,.12); border-radius: 50%; filter: blur(.2px); transform: rotate(-14deg); }
+.install-field::before { right: -150px; top: 140px; box-shadow: 0 0 0 68px rgba(98,246,208,.018), 0 0 0 136px rgba(98,246,208,.012); }
+.install-field::after { left: -330px; bottom: 60px; border-color: rgba(116,111,255,.13); }
+.install-field i { position: absolute; width: 5px; height: 5px; border-radius: 50%; background: var(--cyan); box-shadow: 0 0 12px var(--cyan); animation: installSpore 5s ease-in-out infinite; }
+.install-field i:nth-child(1) { left: 9%; top: 19%; }
+.install-field i:nth-child(2) { left: 43%; top: 10%; animation-delay: -1.7s; }
+.install-field i:nth-child(3) { right: 11%; top: 23%; animation-delay: -3s; }
+.install-field i:nth-child(4) { right: 27%; bottom: 20%; animation-delay: -.8s; }
+.install-field i:nth-child(5) { left: 18%; bottom: 12%; animation-delay: -4.1s; }
+.install-layout { position: relative; display: grid; grid-template-columns: .86fr 1.14fr; gap: 105px; align-items: center; padding-top: 145px; padding-bottom: 82px; }
+.install-copy h2 { max-width: 620px; margin: 24px 0; font: 500 clamp(52px,6.2vw,82px)/.91 "Space Grotesk"; letter-spacing: -.073em; }
+.install-copy h2 em { color: var(--cyan); font-style: normal; text-shadow: 0 0 38px rgba(98,246,208,.16); }
+.install-copy > p { max-width: 560px; margin: 0; color: #8f9999; font-size: 13px; line-height: 1.75; }
+.recommended-platform { display: flex; justify-content: space-between; gap: 20px; margin-top: 37px; padding: 13px 15px; border: 1px solid rgba(98,246,208,.14); border-bottom: 0; border-radius: 13px 13px 0 0; background: rgba(98,246,208,.025); }
+.recommended-platform span { display: flex; align-items: center; gap: 8px; color: #75807f; font: 400 7px "DM Mono"; text-transform: uppercase; }
+.recommended-platform span svg { color: var(--cyan); }
+.recommended-platform strong { color: #aeb8b6; font: 500 8px "DM Mono"; }
+.install-primary { min-height: 84px; display: grid; grid-template-columns: 46px 1fr auto; gap: 15px; align-items: center; padding: 13px 21px 13px 14px; border: 1px solid rgba(98,246,208,.64); border-radius: 0 0 15px 15px; color: #06100d; background: linear-gradient(110deg, #b8ffe8, #5cf5ca 52%, #7ae9d0); box-shadow: 0 18px 48px rgba(72,241,192,.16), inset 0 1px rgba(255,255,255,.5); transition: transform .25s, box-shadow .25s, filter .25s; }
+.install-primary:hover { transform: translateY(-3px); filter: brightness(1.04); box-shadow: 0 24px 62px rgba(72,241,192,.25), inset 0 1px rgba(255,255,255,.6); }
+.install-download-icon { width: 46px; height: 46px; display: grid; place-items: center; border: 1px solid rgba(4,22,17,.13); border-radius: 12px; background: rgba(4,22,17,.065); }
+.install-primary > span:nth-child(2) small, .install-primary > span:nth-child(2) strong { display: block; }
+.install-primary > span:nth-child(2) small { font: 500 8px "DM Mono"; text-transform: uppercase; opacity: .62; }
+.install-primary > span:nth-child(2) strong { margin-top: 3px; font: 600 22px "Space Grotesk"; letter-spacing: -.035em; }
+.install-meta { display: flex; align-items: center; gap: 8px; margin-top: 13px; color: #66716f; font: 400 8px "DM Mono"; }
+.install-meta svg { color: #82908d; }
+
+.install-console { position: relative; min-height: 570px; border: 1px solid rgba(98,246,208,.22); border-radius: 24px; overflow: hidden; background: rgba(5,10,9,.87); box-shadow: 0 45px 120px rgba(0,0,0,.45), 0 0 70px rgba(98,246,208,.055); backdrop-filter: blur(20px); }
+.install-console::before { content: ""; position: absolute; inset: 0; pointer-events: none; background: linear-gradient(rgba(98,246,208,.045) 1px, transparent 1px), linear-gradient(90deg, rgba(98,246,208,.045) 1px, transparent 1px); background-size: 45px 45px; mask-image: radial-gradient(circle at 50% 30%, black, transparent 80%); }
+.install-console-top { height: 52px; display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; padding: 0 20px; border-bottom: 1px solid rgba(98,246,208,.13); color: #52615d; font: 400 7px "DM Mono"; letter-spacing: .12em; }
+.install-console-top > div { display: flex; gap: 6px; }
+.install-console-top i { width: 8px; height: 8px; border-radius: 50%; background: #234238; }
+.install-console-top i:first-child { background: #29b982; box-shadow: 0 0 9px rgba(41,185,130,.6); }
+.install-console-top b { justify-self: end; color: #40504b; font-weight: 400; }
+.install-console-body { position: relative; padding: 39px 35px 27px; }
+.install-node-orb { width: 112px; height: 112px; display: grid; place-items: center; position: relative; margin: 3px auto 22px; border: 1px solid rgba(98,246,208,.22); border-radius: 50%; color: var(--cyan); background: radial-gradient(circle, rgba(98,246,208,.16), rgba(98,246,208,.03) 45%, transparent 68%); box-shadow: 0 0 0 20px rgba(98,246,208,.025), 0 0 0 40px rgba(98,246,208,.013); }
+.install-node-orb::before, .install-node-orb::after { content: ""; position: absolute; inset: -13px; border: 1px dashed rgba(98,246,208,.17); border-radius: 50%; animation: orbit 18s linear infinite; }
+.install-node-orb::after { inset: 13px; border-style: solid; border-color: rgba(98,246,208,.08); animation-direction: reverse; animation-duration: 9s; }
+.install-node-orb > span { position: absolute; left: -17px; top: 44px; width: 8px; height: 8px; border-radius: 50%; background: var(--cyan); box-shadow: 0 0 14px var(--cyan); }
+.install-node-orb > i { position: absolute; right: -11px; bottom: 12px; width: 6px; height: 6px; border-radius: 50%; background: var(--violet); box-shadow: 0 0 12px var(--violet); }
+.install-ready { text-align: center; }
+.install-ready > span { display: inline-flex; align-items: center; gap: 8px; color: var(--cyan); font: 500 8px "DM Mono"; letter-spacing: .1em; }
+.install-ready > span i { width: 6px; height: 6px; border-radius: 50%; background: var(--cyan); box-shadow: 0 0 9px var(--cyan); animation: pulse 1.6s infinite; }
+.install-ready strong { display: block; margin-top: 7px; font: 500 24px "Space Grotesk"; }
+.install-ready small { display: block; margin-top: 4px; color: #4d5b57; font: 400 7px "DM Mono"; letter-spacing: .08em; }
+.install-steps { margin-top: 29px; border: 1px solid rgba(255,255,255,.075); border-radius: 13px; overflow: hidden; background: rgba(0,0,0,.13); }
+.install-steps > div { min-height: 61px; display: grid; grid-template-columns: 24px 22px 1fr auto; gap: 10px; align-items: center; padding: 10px 15px; border-bottom: 1px solid rgba(255,255,255,.065); animation: installStep .65s both; animation-delay: var(--install-delay); }
+.install-steps > div:last-child { border-bottom: 0; }
+.install-steps > div > span { color: #44524e; font: 400 7px "DM Mono"; }
+.install-steps > div > i { width: 19px; height: 19px; display: grid; place-items: center; border-radius: 50%; color: #07110e; background: var(--cyan); box-shadow: 0 0 12px rgba(98,246,208,.18); }
+.install-steps p { margin: 0; }
+.install-steps p strong, .install-steps p small { display: block; }
+.install-steps p strong { font: 500 11px "Space Grotesk"; }
+.install-steps p small { margin-top: 3px; color: #596762; font: 400 7px "DM Mono"; }
+.install-steps > div > b { color: #5e746d; font: 500 7px "DM Mono"; }
+.install-steps > div:last-child > b { color: var(--cyan); }
+.install-promise { display: flex; align-items: center; justify-content: center; gap: 8px; margin-top: 19px; color: #4e5d58; font: 400 7px "DM Mono"; letter-spacing: .04em; }
+.install-promise svg { color: #6f847d; }
+
+.download-shelf { position: relative; padding-bottom: 120px; }
+.download-shelf-head { display: flex; justify-content: space-between; align-items: center; padding: 19px 2px; border-bottom: 1px solid var(--line); }
+.download-shelf-head > span { color: #7b8784; font: 500 8px "DM Mono"; text-transform: uppercase; letter-spacing: .08em; }
+.download-shelf-head a { display: flex; align-items: center; gap: 7px; color: #687571; font: 400 8px "DM Mono"; }
+.download-shelf-head a:hover { color: var(--cyan); }
+.download-options { display: grid; grid-template-columns: repeat(5,1fr); }
+.download-options > a { min-height: 92px; display: grid; grid-template-columns: 26px 1fr auto; gap: 10px; align-items: center; padding: 16px; border-bottom: 1px solid var(--line); border-right: 1px solid var(--line); transition: background .25s, color .25s; }
+.download-options > a:first-child { border-left: 1px solid var(--line); }
+.download-options > a:hover, .download-options > a.recommended { background: rgba(98,246,208,.045); }
+.download-options > a > svg { color: #71807b; }
+.download-options > a.recommended > svg { color: var(--cyan); }
+.download-options > a span strong, .download-options > a span small { display: block; }
+.download-options > a span strong { font: 500 11px "Space Grotesk"; }
+.download-options > a span small { margin-top: 4px; color: #59645f; font: 400 6px "DM Mono"; }
+.download-options > a > b { color: var(--cyan); font: 500 6px "DM Mono"; }
+.download-options > a > svg:last-child { width: 14px; color: #59645f; }
+.install-safety { max-width: 860px; display: flex; align-items: flex-start; gap: 9px; margin: 19px 0 0; color: #586460; font-size: 9px; line-height: 1.65; }
+.install-safety svg { flex: 0 0 auto; margin-top: 1px; color: #72817c; }
+
 .participate { padding: 130px 0; }
 .participate-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
 .participate-card { min-height: 440px; padding: 38px; border: 1px solid var(--line); border-radius: 21px; background: rgba(255, 255, 255, .018); }
@@ -341,6 +421,8 @@ button { font: inherit; }
 @keyframes efficiencyBreath { 0% { transform: scale(1.025) translate3d(-.4%,0,0); } 100% { transform: scale(1.08) translate3d(1.3%,-.8%,0); } }
 @keyframes efficiencySignal { to { stroke-dashoffset: -360; } }
 @keyframes curvePoint { 0% { opacity: .95; transform: scale(.42); } 75%, 100% { opacity: 0; transform: scale(1.65); } }
+@keyframes installSpore { 0%, 100% { opacity: .25; transform: translate3d(0,8px,0) scale(.7); } 50% { opacity: 1; transform: translate3d(7px,-9px,0) scale(1.15); } }
+@keyframes installStep { from { opacity: 0; transform: translateX(-12px); } to { opacity: 1; transform: translateX(0); } }
 
 @media (max-width: 1050px) {
   .container { width: min(100% - 42px, 900px); }
@@ -362,6 +444,10 @@ button { font: inherit; }
   .curve-multiplier { left: 48%; }
   .roadmap-heading { grid-template-columns: 1fr .8fr; }
   .roadmap-heading small { grid-column: 2; writing-mode: initial; }
+  .install-layout { gap: 48px; }
+  .install-copy h2 { font-size: clamp(50px,6.8vw,72px); }
+  .download-options { grid-template-columns: repeat(3,1fr); }
+  .download-options > a:nth-child(4) { border-left: 1px solid var(--line); }
   .section-heading { grid-template-columns: .45fr 1.3fr; }
   .section-heading > p { grid-column: 2; max-width: 620px; }
   .difference { gap: 48px; }
@@ -461,6 +547,21 @@ button { font: inherit; }
   .status-row > span { display: none; }
   .board-footer { grid-template-columns: 1fr auto; }
   .board-footer svg { display: none; }
+  .install-layout { grid-template-columns: 1fr; padding-top: 95px; gap: 65px; }
+  .install-copy h2 { font-size: clamp(48px,14vw,68px); }
+  .install-copy > p { font-size: 12px; }
+  .recommended-platform { display: block; }
+  .recommended-platform strong { display: block; margin-top: 8px; }
+  .install-console { min-height: 545px; border-radius: 19px; }
+  .install-console-body { padding: 36px 17px 22px; }
+  .install-steps > div { grid-template-columns: 19px 20px 1fr auto; padding-inline: 10px; }
+  .install-promise { font-size: 6px; }
+  .download-shelf { padding-bottom: 95px; }
+  .download-shelf-head { align-items: flex-start; gap: 16px; }
+  .download-shelf-head a { max-width: 145px; justify-content: flex-end; text-align: right; }
+  .download-options { grid-template-columns: 1fr; }
+  .download-options > a, .download-options > a:nth-child(4) { border-left: 1px solid var(--line); }
+  .install-safety { font-size: 8px; }
   .participate-grid { grid-template-columns: 1fr; }
   .participate-card { min-height: auto; padding: 30px; }
   .participate-icon { margin-bottom: 42px; }
