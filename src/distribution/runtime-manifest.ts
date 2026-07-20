@@ -5,14 +5,21 @@ import {
   FleetTopologyPlanner,
   TopologyBeamPlanner,
 } from "./planners.js";
+import {
+  MacroWaveRamVramPlanner,
+  type MacroWavePlannerOptions,
+} from "./macro-wave.js";
 import type {
   ActivationCodecId,
+  ComputeNodeProfile,
   DirectedLinkProfile,
   DistributedModelProfile,
   DistributionMetrics,
   DistributionPlan,
   DistributionTopology,
   DistributionWorkload,
+  MacroWavePlanContractV1,
+  MacroWaveStageExecutionContractV1,
   SearchOptions,
 } from "./types.js";
 
@@ -22,6 +29,9 @@ export interface RuntimeEndpoint {
 }
 
 export type RuntimeActivationCodec = Exclude<ActivationCodecId, "q4">;
+export type RuntimePlanTransport =
+  | "persistent-tcp"
+  | "persistent-tcp-macro-wave-v1";
 export const MAX_WAN_VIRTUAL_STAGES = 8;
 
 /** Backend metadata is intentionally open-ended so new runtimes do not require a protocol bump. */
@@ -75,6 +85,8 @@ export interface RuntimeNodeProfile {
   endpoint: RuntimeEndpoint;
   backend?: RuntimeBackendInput;
   capabilities?: RuntimeMemberCapabilitiesInput;
+  /** Required only when the opt-in MacroWave planner is selected. */
+  ramVram?: ComputeNodeProfile["ramVram"];
 }
 
 export interface RuntimeTopology {
@@ -207,6 +219,8 @@ export interface RuntimeVirtualStageManifest {
   members: RuntimeStageMemberManifest[];
   /** Omitted means the ordinary one-member layer-range runner. */
   execution?: RuntimeVirtualStageExecutionManifest;
+  /** Versioned RAM/VRAM contract emitted only by the MacroWave planner. */
+  macroWave?: MacroWaveStageExecutionContractV1;
   memoryBytes: number;
   memoryLimitBytes: number;
 }
@@ -215,10 +229,12 @@ export interface RuntimePrefillPlanManifest {
   phase: "prefill";
   planId: string;
   activationCodec: RuntimeActivationCodec;
-  transport: "persistent-tcp";
+  transport: RuntimePlanTransport;
   chunkTokens: number;
   microBatchSize: number;
   stages: RuntimeVirtualStageManifest[];
+  /** Omitted for the unchanged standard planner/runtime path. */
+  macroWave?: MacroWavePlanContractV1;
   predicted: DistributionMetrics;
 }
 
@@ -253,10 +269,12 @@ export interface RuntimeDecodePlanManifest {
   phase: "decode";
   planId: string;
   activationCodec: RuntimeActivationCodec;
-  transport: "persistent-tcp";
+  transport: RuntimePlanTransport;
   microBatchSize: number;
   directTokenReturnStage: number;
   stages: RuntimeVirtualStageManifest[];
+  /** Omitted for the unchanged standard planner/runtime path. */
+  macroWave?: MacroWavePlanContractV1;
   speculation: RuntimeSpeculationPolicy;
   predicted: DistributionMetrics;
 }
@@ -317,6 +335,10 @@ export interface RuntimePlanRequest {
   workload: DistributionWorkload;
   /** Opt-in only: INT8 changed greedy tokens in the physical SmolLM2 gate. */
   allowLossyActivation?: boolean;
+  /** MacroWave is never selected implicitly; omitted/default preserves legacy planning. */
+  planner?:
+    | { kind: "default" }
+    | { kind: "macro-wave"; options?: MacroWavePlannerOptions };
   /** Optional phase-specific placements; both phases use the winning route by default. */
   phasePlans?: {
     prefill?: DistributionPlan;
@@ -421,6 +443,7 @@ export function buildRuntimePipelineManifest(
     decodePlan =
       request.phasePlans?.decode ?? planDefaultRoute(request, decodeTopology);
   }
+  validateSelectedPlanningMode(request, prefillPlan, decodePlan);
   const prefillPredicted = evaluateRuntimePlan(
     request,
     prefillTopology,
@@ -484,20 +507,30 @@ export function buildRuntimePipelineManifest(
         phase: "prefill",
         planId: "pending",
         activationCodec: runtimeCodec(prefillPlan.codec),
-        transport: "persistent-tcp",
+        transport: prefillPlan.macroWave
+          ? "persistent-tcp-macro-wave-v1"
+          : "persistent-tcp",
         chunkTokens: prefillPlan.prefillChunkTokens,
         microBatchSize: prefillPlan.microBatchSize,
         stages: prefillStages,
+        ...(prefillPlan.macroWave
+          ? { macroWave: structuredClone(prefillPlan.macroWave) }
+          : {}),
         predicted: prefillPredicted,
       },
       decode: {
         phase: "decode",
         planId: "pending",
         activationCodec: runtimeCodec(decodePlan.codec),
-        transport: "persistent-tcp",
+        transport: decodePlan.macroWave
+          ? "persistent-tcp-macro-wave-v1"
+          : "persistent-tcp",
         microBatchSize: decodePlan.microBatchSize,
         directTokenReturnStage: 0,
         stages: decodeStages,
+        ...(decodePlan.macroWave
+          ? { macroWave: structuredClone(decodePlan.macroWave) }
+          : {}),
         speculation,
         predicted: decodePredicted,
       },
@@ -547,6 +580,12 @@ export function materializeRuntimeTensorParallelCell(
   }
   const prefillStage = prefillStages[stageIndex]!;
   const decodeStage = decodeStages[stageIndex]!;
+  if (
+    prefillStage.macroWave !== undefined ||
+    decodeStage.macroWave !== undefined
+  ) {
+    throw new Error("runtime_macro_wave_and_tensor_parallel_cells_are_not_composable");
+  }
   if (
     prefillStage.layerStart !== decodeStage.layerStart ||
     prefillStage.layerEnd !== decodeStage.layerEnd ||
@@ -739,6 +778,24 @@ function planDefaultRoute(
   request: RuntimePlanRequest,
   topology: DistributionTopology,
 ): DistributionPlan {
+  if (request.planner?.kind === "macro-wave") {
+    const planner = new MacroWaveRamVramPlanner({
+      ...request.planner.options,
+      candidateCodecs:
+        request.planner.options?.candidateCodecs ??
+        (request.allowLossyActivation
+          ? ["fp16", "int8", "int8-grouped", "int8-hadamard"]
+          : ["fp16"]),
+    });
+    const result = planner.evaluate(request.model, topology, {
+      ...request.workload,
+      maxStages: Math.min(request.workload.maxStages, MAX_WAN_VIRTUAL_STAGES),
+    });
+    if (!result.plan) {
+      throw new Error(`no_feasible_macro_wave_pipeline:${result.reason}`);
+    }
+    return result.plan;
+  }
   const searchOptions: SearchOptions = {
     ...DEFAULT_SEARCH_OPTIONS,
     // INT8 is implemented but not silently eligible: the real correctness
@@ -763,6 +820,64 @@ function planDefaultRoute(
   return plan;
 }
 
+function validateSelectedPlanningMode(
+  request: RuntimePlanRequest,
+  prefill: DistributionPlan,
+  decode: DistributionPlan,
+): void {
+  const explicitlySelected = request.planner?.kind === "macro-wave";
+  const plans = [prefill, decode] as const;
+  const containsMacroWave = plans.some(
+    (plan) =>
+      plan.macroWave !== undefined ||
+      plan.stages.some((stage) => stage.macroWave !== undefined) ||
+      plan.algorithm.startsWith("macro-wave"),
+  );
+  if (containsMacroWave && !explicitlySelected) {
+    throw new Error("runtime_macro_wave_plan_requires_explicit_selection");
+  }
+  if (!explicitlySelected) return;
+  if (plans.some((plan) => plan.macroWave === undefined)) {
+    throw new Error("runtime_macro_wave_selection_requires_contract_plans");
+  }
+  if (
+    (request.tensorParallelCells?.length ?? 0) > 0 ||
+    (request.phaseTensorParallelCells?.prefill?.length ?? 0) > 0 ||
+    (request.phaseTensorParallelCells?.decode?.length ?? 0) > 0
+  ) {
+    throw new Error("runtime_macro_wave_and_tensor_parallel_cells_are_not_composable");
+  }
+  const nodes = new Map(request.topology.nodes.map((node) => [node.id, node]));
+  for (const plan of plans) {
+    for (const stage of plan.stages) {
+      const execution = stage.macroWave;
+      if (!execution || execution.mode !== "macro-wave-memory") {
+        throw new Error("runtime_macro_wave_stage_contract_is_missing");
+      }
+      validateMacroWaveStageExecution(
+        execution as unknown as Record<string, unknown>,
+      );
+      const node = nodes.get(stage.nodeId);
+      const hierarchy = node?.ramVram;
+      if (!hierarchy) {
+        throw new Error(`runtime_macro_wave_node_profile_is_missing:${stage.nodeId}`);
+      }
+      if (
+        execution.budgets.hostRamBytes !== hierarchy.usableRamBytes ||
+        execution.budgets.vramBytes !== hierarchy.usableVramBytes
+      ) {
+        throw new Error(`runtime_macro_wave_node_budget_mismatch:${stage.nodeId}`);
+      }
+      if (
+        execution.memoryMode === "resident" &&
+        execution.residentKind !== (hierarchy.residentKind ?? "layers")
+      ) {
+        throw new Error(`runtime_macro_wave_resident_kind_mismatch:${stage.nodeId}`);
+      }
+    }
+  }
+}
+
 function evaluateRuntimePlan(
   request: RuntimePlanRequest,
   topology: DistributionTopology,
@@ -778,7 +893,7 @@ function evaluateRuntimePlan(
   }
   const predicted = evaluateDistributionPlan(
     request.model,
-    topology,
+    plan.macroWave ? macroWaveEvaluationTopology(topology, plan) : topology,
     request.workload,
     plan,
   );
@@ -787,14 +902,68 @@ function evaluateRuntimePlan(
       `planned_${phase}_pipeline_is_infeasible:${predicted.infeasibleReason}`,
     );
   }
+  if (plan.macroWave) {
+    const projection = plan.macroWave.projection;
+    Object.assign(predicted, {
+      ttftMs: projection.ttftMs,
+      tpotMs: projection.tpotMs,
+      responseTimeMs: projection.responseTimeMs,
+      pathDecodeMs: projection.pathDecodeMs,
+      pipelineCycleMs: projection.pipelineCycleMs,
+      tokensPerSecondPerSequence: projection.tokensPerSecondPerSequence,
+      aggregateTokensPerSecond: projection.aggregateTokensPerSecond,
+      networkBytesPerOutputToken: projection.networkBytesPerOutputToken,
+      routeAvailability: projection.routeAvailability,
+      calibrationRequired: true,
+      calibrationReasons: [
+        ...new Set([
+          ...(predicted.calibrationReasons ?? []),
+          "macro_wave_projection_requires_physical_calibration",
+        ]),
+      ],
+    });
+  }
   return predicted;
+}
+
+function macroWaveEvaluationTopology(
+  topology: DistributionTopology,
+  plan: DistributionPlan,
+): DistributionTopology {
+  const capacities = new Map(
+    plan.stages.map((stage) => {
+      const execution = stage.macroWave;
+      if (!execution) throw new Error("runtime_macro_wave_stage_contract_is_missing");
+      const capacity = execution.budgets.hostRamBytes + execution.budgets.vramBytes;
+      if (!Number.isSafeInteger(capacity)) {
+        throw new Error("runtime_macro_wave_combined_budget_is_invalid");
+      }
+      return [stage.nodeId, capacity] as const;
+    }),
+  );
+  return {
+    nodes: topology.nodes.map((node) => ({
+      ...node,
+      memoryBytes: capacities.get(node.id) ?? node.memoryBytes,
+      reserveBytes: capacities.has(node.id) ? 0 : node.reserveBytes,
+    })),
+    links: topology.links,
+  };
 }
 
 function distributionTopology(topology: RuntimeTopology): DistributionTopology {
   return {
     nodes: topology.nodes.map(
-      ({ endpoint: _endpoint, backend: _backend, capabilities: _capabilities, ...node }) =>
-        node,
+      ({
+        endpoint: _endpoint,
+        backend: _backend,
+        capabilities: _capabilities,
+        ramVram,
+        ...node
+      }) => ({
+        ...node,
+        ...(ramVram ? { ramVram: structuredClone(ramVram) } : {}),
+      }),
     ),
     links: topology.links,
   };
@@ -1123,6 +1292,9 @@ function buildVirtualStages(
         endpoint: { ...member.endpoint },
       },
       members: [member],
+      ...(stage.macroWave
+        ? { macroWave: structuredClone(stage.macroWave) }
+        : {}),
       memoryBytes: metrics.memoryBytes,
       memoryLimitBytes: metrics.memoryLimitBytes,
     };
@@ -1166,6 +1338,9 @@ function runtimePhasePlanId(
       activationCodec: plan.activationCodec,
       transport: plan.transport,
       microBatchSize: plan.microBatchSize,
+      macroWave: plan.macroWave
+        ? runtimeMacroWavePlanIdentity(plan.macroWave)
+        : null,
       ...(plan.phase === "prefill"
         ? { chunkTokens: plan.chunkTokens }
         : {
@@ -1176,6 +1351,16 @@ function runtimePhasePlanId(
     }),
     20,
   );
+}
+
+function runtimeMacroWavePlanIdentity(contract: MacroWavePlanContractV1): object {
+  return {
+    schema: contract.schema,
+    routeKind: contract.routeKind,
+    waveTokens: contract.waveTokens,
+    expectedCommittedTokensPerWave: contract.expectedCommittedTokensPerWave,
+    projection: { ...contract.projection },
+  };
 }
 
 function runtimePipelineId(manifest: RuntimePipelineManifestV2): string {
@@ -1225,8 +1410,29 @@ function runtimeStageIdentity(stage: RuntimeVirtualStageManifest): object {
     ...(stage.execution
       ? { execution: runtimeCellExecutionIdentity(stage.execution) }
       : {}),
+    ...(stage.macroWave
+      ? { macroWave: runtimeMacroWaveStageIdentity(stage.macroWave) }
+      : {}),
     memoryBytes: stage.memoryBytes,
     memoryLimitBytes: stage.memoryLimitBytes,
+  };
+}
+
+function runtimeMacroWaveStageIdentity(
+  execution: MacroWaveStageExecutionContractV1,
+): object {
+  return {
+    mode: execution.mode,
+    schema: execution.schema,
+    memoryMode: execution.memoryMode,
+    residentKind: execution.residentKind,
+    budgets: { ...execution.budgets },
+    requirements: { ...execution.requirements },
+    workingSet: { ...execution.workingSet },
+    cachePolicy: { ...execution.cachePolicy },
+    ...(execution.ramArtifact
+      ? { ramArtifact: structuredClone(execution.ramArtifact) }
+      : {}),
   };
 }
 
@@ -1405,6 +1611,7 @@ function sameExecutionRoute(
       stage.anchor.memberId === other.anchor.memberId &&
       endpointEquals(stage.anchor.endpoint, other.anchor.endpoint) &&
       stageExecutionEquals(stage.execution, other.execution) &&
+      macroWaveStageEquals(stage.macroWave, other.macroWave) &&
       stage.members.length === other.members.length &&
       stage.members.every((member, memberIndex) => {
         const otherMember = other.members[memberIndex];
@@ -1502,6 +1709,17 @@ function stageExecutionEquals(
   );
 }
 
+function macroWaveStageEquals(
+  left: MacroWaveStageExecutionContractV1 | undefined,
+  right: MacroWaveStageExecutionContractV1 | undefined,
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return (
+    JSON.stringify(runtimeMacroWaveStageIdentity(left)) ===
+    JSON.stringify(runtimeMacroWaveStageIdentity(right))
+  );
+}
+
 function validateRuntimePipelineManifestV1(manifest: Record<string, unknown>): void {
   validateIdentity(manifest);
   if (manifest.activationCodec !== "fp16" && manifest.activationCodec !== "int8") {
@@ -1571,6 +1789,11 @@ function validateRuntimePipelineManifestV2(manifest: Record<string, unknown>): v
     throw new Error("runtime_direct_return_stage_is_invalid");
   }
   validateSpeculationPolicy(decode.speculation);
+  validateMacroWaveSpeculationBinding(
+    prefill.macroWave,
+    decode.macroWave,
+    decode.speculation as unknown as RuntimeSpeculationPolicy,
+  );
   validateKvTransition(manifest.kvTransition);
   const kvTransition = manifest.kvTransition as unknown as RuntimeKvTransitionManifest;
   if (kvTransition.gate.modelRevision !== manifest.modelRevision) {
@@ -1611,7 +1834,11 @@ function validatePhasePlan(
   if (!isRuntimeActivationCodec(plan.activationCodec)) {
     throw new Error("runtime_codec_not_implemented");
   }
-  if (plan.transport !== "persistent-tcp") {
+  const expectedTransport =
+    plan.macroWave === undefined
+      ? "persistent-tcp"
+      : "persistent-tcp-macro-wave-v1";
+  if (plan.transport !== expectedTransport) {
     throw new Error("runtime_transport_not_implemented");
   }
   assertPositiveInteger(plan.microBatchSize, "runtime_microbatch_is_invalid");
@@ -1622,6 +1849,7 @@ function validatePhasePlan(
     throw new Error(`runtime_${phase}_prediction_is_not_feasible`);
   }
   validatePredictedMetrics(plan.predicted, plan.stages.length, phase);
+  validateMacroWavePlanContract(plan.macroWave, plan.stages, plan.predicted);
   let nextLayer = 0;
   const memberIds = new Set<string>();
   const stageIds = new Set<string>();
@@ -1700,6 +1928,18 @@ function validatePhasePlan(
     if (stageMemory !== assignedMemory) throw new Error("runtime_stage_memory_sum_mismatch");
     if (stageLimit !== memoryLimit) throw new Error("runtime_stage_limit_sum_mismatch");
     if (stageMemory > stageLimit) throw new Error("runtime_stage_memory_exceeded");
+    const stageExecution = stage.macroWave as unknown;
+    if (isRecord(stageExecution) && stageExecution.mode === "macro-wave-memory") {
+      const macro = stageExecution as unknown as MacroWaveStageExecutionContractV1;
+      if (stageMemory !== macro.requirements.fullStageStateBytes) {
+        throw new Error("runtime_macro_wave_stage_memory_mismatch");
+      }
+      if (
+        stageLimit !== macro.budgets.hostRamBytes + macro.budgets.vramBytes
+      ) {
+        throw new Error("runtime_macro_wave_stage_budget_mismatch");
+      }
+    }
     const predictedStage = (plan.predicted.stageMetrics as unknown[])[index];
     if (
       !isRecord(predictedStage) ||
@@ -1716,12 +1956,447 @@ function validatePhasePlan(
   if (nextLayer !== totalLayers) throw new Error("runtime_layers_are_not_complete");
 }
 
+function validateMacroWavePlanContract(
+  value: unknown,
+  stageValues: unknown[],
+  predicted: Record<string, unknown>,
+): void {
+  const macroStages = stageValues.filter(
+    (stage) => isRecord(stage) && stage.macroWave !== undefined,
+  );
+  if (value === undefined) {
+    if (
+      macroStages.some(
+        (stage) =>
+          isRecord((stage as Record<string, unknown>).macroWave) &&
+          ((stage as Record<string, unknown>).macroWave as Record<string, unknown>).mode ===
+            "macro-wave-memory",
+      )
+    ) {
+      throw new Error("runtime_macro_wave_stage_requires_plan_contract");
+    }
+    return;
+  }
+  if (!isRecord(value)) throw new Error("runtime_macro_wave_plan_contract_is_invalid");
+  assertExactObjectKeys(
+    value,
+    [
+      "schema",
+      "routeKind",
+      "waveTokens",
+      "expectedCommittedTokensPerWave",
+      "projection",
+    ],
+    "runtime_macro_wave_plan_contract_is_invalid",
+  );
+  if (value.schema !== "gdlp-macro-wave-plan/1") {
+    throw new Error("runtime_macro_wave_plan_schema_is_not_supported");
+  }
+  if (value.routeKind !== "resident-baseline" && value.routeKind !== "macro-wave") {
+    throw new Error("runtime_macro_wave_route_kind_is_invalid");
+  }
+  assertPositiveInteger(value.waveTokens, "runtime_macro_wave_tokens_are_invalid");
+  assertPositiveFinite(
+    value.expectedCommittedTokensPerWave,
+    "runtime_macro_wave_committed_tokens_are_invalid",
+  );
+  if ((value.expectedCommittedTokensPerWave as number) < 1) {
+    throw new Error("runtime_macro_wave_committed_tokens_are_invalid");
+  }
+  if ((value.expectedCommittedTokensPerWave as number) > (value.waveTokens as number)) {
+    throw new Error("runtime_macro_wave_committed_tokens_exceed_wave");
+  }
+  if (!isRecord(value.projection)) {
+    throw new Error("runtime_macro_wave_projection_is_invalid");
+  }
+  const projectionFields = [
+    "ttftMs",
+    "tpotMs",
+    "responseTimeMs",
+    "pathDecodeMs",
+    "pipelineCycleMs",
+    "tokensPerSecondPerSequence",
+    "aggregateTokensPerSecond",
+    "networkBytesPerOutputToken",
+    "rawActiveWeightBytesPerOutputToken",
+    "expectedWeightCacheMissBytesPerOutputToken",
+    "routeAvailability",
+  ];
+  assertExactObjectKeys(
+    value.projection,
+    projectionFields,
+    "runtime_macro_wave_projection_is_invalid",
+  );
+  for (const field of projectionFields) {
+    if (field === "routeAvailability") {
+      assertProbability(
+        value.projection[field],
+        "runtime_macro_wave_projection_is_invalid",
+      );
+    } else {
+      assertNonNegativeFinite(
+        value.projection[field],
+        "runtime_macro_wave_projection_is_invalid",
+      );
+    }
+  }
+  for (const field of [
+    "ttftMs",
+    "tpotMs",
+    "responseTimeMs",
+    "pathDecodeMs",
+    "pipelineCycleMs",
+    "tokensPerSecondPerSequence",
+    "aggregateTokensPerSecond",
+    "networkBytesPerOutputToken",
+    "routeAvailability",
+  ]) {
+    if (predicted[field] !== value.projection[field]) {
+      throw new Error(`runtime_macro_wave_projection_mismatch:${field}`);
+    }
+  }
+  let ramBackedStages = 0;
+  for (const stage of stageValues) {
+    if (!isRecord(stage) || !isRecord(stage.macroWave)) {
+      throw new Error("runtime_macro_wave_stage_contract_is_missing");
+    }
+    if (
+      stage.execution !== undefined ||
+      !Array.isArray(stage.members) ||
+      stage.members.length !== 1
+    ) {
+      throw new Error("runtime_macro_wave_stage_requires_single_member");
+    }
+    validateMacroWaveStageExecution(stage.macroWave);
+    if (stage.macroWave.memoryMode === "ram-backed") {
+      ramBackedStages += 1;
+      validateMacroWaveRamBackedMember(stage.members[0]);
+    }
+  }
+  if (value.routeKind === "macro-wave" && ramBackedStages === 0) {
+    throw new Error("runtime_macro_wave_route_requires_ram_backed_stage");
+  }
+  if (value.routeKind === "resident-baseline" && ramBackedStages !== 0) {
+    throw new Error("runtime_macro_wave_resident_route_cannot_stream_weights");
+  }
+}
+
+function validateMacroWaveStageExecution(value: Record<string, unknown>): void {
+  const hasRamArtifact = Object.prototype.hasOwnProperty.call(value, "ramArtifact");
+  assertExactObjectKeys(
+    value,
+    [
+      "mode",
+      "schema",
+      "memoryMode",
+      "residentKind",
+      "budgets",
+      "requirements",
+      "workingSet",
+      "cachePolicy",
+      ...(hasRamArtifact ? ["ramArtifact"] : []),
+    ],
+    "runtime_macro_wave_stage_contract_is_invalid",
+  );
+  if (value.mode !== "macro-wave-memory") {
+    throw new Error("runtime_macro_wave_stage_mode_is_invalid");
+  }
+  if (value.schema !== "gdlp-macro-wave-stage/1") {
+    throw new Error("runtime_macro_wave_stage_schema_is_not_supported");
+  }
+  if (value.memoryMode !== "resident" && value.memoryMode !== "ram-backed") {
+    throw new Error("runtime_macro_wave_memory_mode_is_invalid");
+  }
+  if (value.residentKind !== "layers" && value.residentKind !== "expert-shard") {
+    throw new Error("runtime_macro_wave_resident_kind_is_invalid");
+  }
+  if (
+    !isRecord(value.budgets) ||
+    !isRecord(value.requirements) ||
+    !isRecord(value.workingSet) ||
+    !isRecord(value.cachePolicy)
+  ) {
+    throw new Error("runtime_macro_wave_stage_contract_is_invalid");
+  }
+  const budgets = value.budgets as unknown as MacroWaveStageExecutionContractV1["budgets"];
+  const requirements = value.requirements as unknown as MacroWaveStageExecutionContractV1["requirements"];
+  const workingSet = value.workingSet as unknown as MacroWaveStageExecutionContractV1["workingSet"];
+  const cachePolicy = value.cachePolicy as unknown as MacroWaveStageExecutionContractV1["cachePolicy"];
+  if (value.memoryMode === "ram-backed") {
+    if (!isRecord(value.ramArtifact)) {
+      throw new Error("runtime_macro_wave_ram_artifact_is_missing");
+    }
+    validateMacroWaveRamArtifact(value.ramArtifact);
+    if (
+      value.ramArtifact.largestExpertBytes !== workingSet.largestTransferUnitBytes ||
+      value.ramArtifact.largestExpertBytes !== workingSet.largestExpertBytes ||
+      value.ramArtifact.weightBufferCopies !== requirements.weightBufferCopies
+    ) {
+      throw new Error("runtime_macro_wave_ram_artifact_budget_mismatch");
+    }
+  } else if (hasRamArtifact) {
+    throw new Error("runtime_macro_wave_resident_stage_cannot_bind_ram_artifact");
+  }
+  assertExactObjectKeys(
+    budgets as unknown as Record<string, unknown>,
+    ["hostRamBytes", "vramBytes"],
+    "runtime_macro_wave_budgets_are_invalid",
+  );
+  assertPositiveInteger(budgets.hostRamBytes, "runtime_macro_wave_ram_budget_is_invalid");
+  assertPositiveInteger(budgets.vramBytes, "runtime_macro_wave_vram_budget_is_invalid");
+  const requirementFields = [
+    "fullStageStateBytes",
+    "hostRamBytes",
+    "vramBytes",
+    "fixedVramBytes",
+    "residentParameterBudgetBytes",
+    "residentStreamingTransientBytes",
+    "boundedPinnedStagingReserveBytes",
+    "hostRamPeakUpperBoundBytes",
+    "activationBufferBytes",
+    "weightBufferBytes",
+    "weightBufferCopies",
+  ];
+  assertExactObjectKeys(
+    requirements as unknown as Record<string, unknown>,
+    requirementFields,
+    "runtime_macro_wave_requirements_are_invalid",
+  );
+  for (const field of requirementFields) {
+    assertNonNegativeInteger(
+      requirements[field as keyof typeof requirements],
+      "runtime_macro_wave_requirements_are_invalid",
+    );
+  }
+  if (requirements.hostRamBytes > budgets.hostRamBytes) {
+    throw new Error("runtime_macro_wave_ram_budget_exceeded");
+  }
+  if (requirements.vramBytes > budgets.vramBytes) {
+    throw new Error("runtime_macro_wave_vram_budget_exceeded");
+  }
+  const workingSetFields = [
+    "totalWeightBytes",
+    "residentWeightBytes",
+    "totalRoutedExpertBytes",
+    "activeWeightBytesPerWave",
+    "largestTransferUnitBytes",
+    "largestExpertBytes",
+  ];
+  assertExactObjectKeys(
+    workingSet as unknown as Record<string, unknown>,
+    workingSetFields,
+    "runtime_macro_wave_working_set_is_invalid",
+  );
+  for (const field of workingSetFields) {
+    assertNonNegativeInteger(
+      workingSet[field as keyof typeof workingSet],
+      "runtime_macro_wave_working_set_is_invalid",
+    );
+  }
+  if (
+    workingSet.residentWeightBytes > workingSet.totalWeightBytes ||
+    workingSet.totalRoutedExpertBytes > workingSet.totalWeightBytes ||
+    workingSet.activeWeightBytesPerWave > workingSet.totalWeightBytes
+  ) {
+    throw new Error("runtime_macro_wave_working_set_exceeds_weights");
+  }
+  assertExactObjectKeys(
+    cachePolicy as unknown as Record<string, unknown>,
+    [
+      "kind",
+      "capacityBytes",
+      "expectedHitRate",
+      "expectedMissWeightBytesPerWave",
+    ],
+    "runtime_macro_wave_cache_policy_is_invalid",
+  );
+  if (
+    cachePolicy.kind !== "full-resident" &&
+    cachePolicy.kind !== "disabled" &&
+    cachePolicy.kind !== "bounded-lru"
+  ) {
+    throw new Error("runtime_macro_wave_cache_policy_is_invalid");
+  }
+  assertNonNegativeInteger(
+    cachePolicy.capacityBytes,
+    "runtime_macro_wave_cache_capacity_is_invalid",
+  );
+  assertProbability(
+    cachePolicy.expectedHitRate,
+    "runtime_macro_wave_cache_hit_rate_is_invalid",
+  );
+  assertNonNegativeInteger(
+    cachePolicy.expectedMissWeightBytesPerWave,
+    "runtime_macro_wave_cache_miss_bytes_are_invalid",
+  );
+  const requiredVram =
+    requirements.fixedVramBytes +
+    requirements.activationBufferBytes +
+    requirements.weightBufferBytes;
+  if (value.memoryMode === "ram-backed" && requirements.vramBytes !== requiredVram) {
+    throw new Error("runtime_macro_wave_vram_requirement_is_inconsistent");
+  }
+  if (value.memoryMode === "resident") {
+    if (
+      requirements.hostRamBytes !== 0 ||
+      requirements.residentStreamingTransientBytes !== 0 ||
+      requirements.boundedPinnedStagingReserveBytes !== 0 ||
+      requirements.hostRamPeakUpperBoundBytes !== 0 ||
+      requirements.weightBufferBytes !== 0 ||
+      requirements.weightBufferCopies !== 0 ||
+      workingSet.activeWeightBytesPerWave !== 0 ||
+      cachePolicy.kind !== "full-resident" ||
+      cachePolicy.capacityBytes !== workingSet.residentWeightBytes ||
+      cachePolicy.expectedHitRate !== 1 ||
+      cachePolicy.expectedMissWeightBytesPerWave !== 0
+    ) {
+      throw new Error("runtime_macro_wave_resident_contract_is_inconsistent");
+    }
+    if (
+      value.residentKind === "layers" &&
+      workingSet.residentWeightBytes !== workingSet.totalWeightBytes
+    ) {
+      throw new Error("runtime_macro_wave_layer_resident_weights_are_incomplete");
+    }
+    if (
+      requirements.residentParameterBudgetBytes !== workingSet.residentWeightBytes ||
+      requirements.vramBytes !==
+      requirements.fixedVramBytes +
+        requirements.activationBufferBytes +
+        workingSet.residentWeightBytes
+    ) {
+      throw new Error("runtime_macro_wave_resident_vram_is_inconsistent");
+    }
+    return;
+  }
+  if (
+    value.residentKind !== "layers" ||
+    requirements.hostRamBytes !== requirements.hostRamPeakUpperBoundBytes ||
+    requirements.hostRamPeakUpperBoundBytes !==
+      workingSet.totalRoutedExpertBytes +
+        requirements.boundedPinnedStagingReserveBytes +
+        requirements.residentStreamingTransientBytes ||
+    requirements.boundedPinnedStagingReserveBytes !==
+      workingSet.largestExpertBytes * 2 ||
+    requirements.weightBufferCopies !== 2 ||
+    requirements.residentParameterBudgetBytes !== workingSet.residentWeightBytes ||
+    workingSet.totalWeightBytes !==
+      workingSet.residentWeightBytes + workingSet.totalRoutedExpertBytes ||
+    workingSet.totalRoutedExpertBytes < 1 ||
+    workingSet.activeWeightBytesPerWave < 1 ||
+    workingSet.activeWeightBytesPerWave > workingSet.totalRoutedExpertBytes ||
+    workingSet.largestExpertBytes < 1 ||
+    workingSet.largestTransferUnitBytes !== workingSet.largestExpertBytes ||
+    workingSet.largestExpertBytes > workingSet.activeWeightBytesPerWave ||
+    requirements.weightBufferBytes !==
+      workingSet.largestExpertBytes * requirements.weightBufferCopies ||
+    requirements.fixedVramBytes !==
+      requirements.fullStageStateBytes -
+        workingSet.totalWeightBytes +
+        requirements.residentParameterBudgetBytes
+  ) {
+    throw new Error("runtime_macro_wave_ram_backed_contract_is_inconsistent");
+  }
+  const expectedMiss = Math.ceil(
+    workingSet.activeWeightBytesPerWave * (1 - cachePolicy.expectedHitRate),
+  );
+  if (cachePolicy.expectedMissWeightBytesPerWave !== expectedMiss) {
+    throw new Error("runtime_macro_wave_cache_expectation_is_inconsistent");
+  }
+  if (cachePolicy.kind === "disabled") {
+    if (
+      cachePolicy.capacityBytes !== 0 ||
+      cachePolicy.expectedHitRate !== 0
+    ) {
+      throw new Error("runtime_macro_wave_disabled_cache_is_inconsistent");
+    }
+  } else if (
+    cachePolicy.kind !== "bounded-lru" ||
+    cachePolicy.expectedHitRate <= 0 ||
+    cachePolicy.capacityBytes < workingSet.largestTransferUnitBytes ||
+    requirements.vramBytes + cachePolicy.capacityBytes > budgets.vramBytes
+  ) {
+    throw new Error("runtime_macro_wave_bounded_cache_is_inconsistent");
+  }
+}
+
+function validateMacroWaveRamArtifact(value: Record<string, unknown>): void {
+  assertExactObjectKeys(
+    value,
+    [
+      "schema",
+      "format",
+      "locality",
+      "loader",
+      "weightEncoding",
+      "sourceDtypes",
+      "adapterIds",
+      "expertExecutionMode",
+      "largestExpertBytes",
+      "weightBufferCopies",
+      "fullModelMaterialization",
+    ],
+    "runtime_macro_wave_ram_artifact_is_invalid",
+  );
+  if (
+    value.schema !== "gdlp-local-safetensors-moe-stage/1" ||
+    value.format !== "safetensors" ||
+    value.locality !== "host-local-only" ||
+    value.loader !== "selective-safetensors-ram-backed-moe" ||
+    value.weightEncoding !== "floating-safetensors" ||
+    !Array.isArray(value.sourceDtypes) ||
+    value.sourceDtypes.length !== 3 ||
+    value.sourceDtypes[0] !== "fp16" ||
+    value.sourceDtypes[1] !== "bf16" ||
+    value.sourceDtypes[2] !== "fp32" ||
+    value.expertExecutionMode !== "serial-exact" ||
+    value.weightBufferCopies !== 2 ||
+    !Number.isSafeInteger(value.largestExpertBytes) ||
+    (value.largestExpertBytes as number) <= 0 ||
+    value.fullModelMaterialization !== false ||
+    !Array.isArray(value.adapterIds) ||
+    value.adapterIds.length !== 2 ||
+    value.adapterIds[0] !== "transformers-qwen3-moe-v1" ||
+    value.adapterIds[1] !== "transformers-glm4-moe-v1"
+  ) {
+    throw new Error("runtime_macro_wave_ram_artifact_is_invalid");
+  }
+}
+
+function validateMacroWaveRamBackedMember(value: unknown): void {
+  if (!isRecord(value) || !isRecord(value.backend) || !isRecord(value.capabilities)) {
+    throw new Error("runtime_macro_wave_ram_backend_is_not_declared");
+  }
+  const backend = value.backend as unknown as RuntimeBackendProfile;
+  const capabilities = value.capabilities as unknown as RuntimeMemberCapabilities;
+  if (
+    !backend.modelFormats.includes("safetensors") ||
+    !backend.executionModes.includes("ram-backed-moe-stage") ||
+    !capabilities.deviceKinds.includes("gpu") ||
+    !capabilities.computeApis.includes("cuda") ||
+    !capabilities.weightDtypes.some((dtype) =>
+      ["fp16", "bf16", "fp32"].includes(dtype)
+    ) ||
+    !capabilities.features.includes("ram-authoritative-routed-experts") ||
+    !capabilities.features.includes("device-expert-cache") ||
+    !capabilities.features.includes("authoritative-router") ||
+    !capabilities.features.includes("predictive-prefetch-only") ||
+    !capabilities.features.includes("meta-model-construction") ||
+    !capabilities.features.includes("no-full-model-materialization")
+  ) {
+    throw new Error("runtime_macro_wave_ram_backend_is_not_declared");
+  }
+}
+
 function validateVirtualStageExecution(
   value: unknown,
   stage: RuntimeVirtualStageManifest,
 ): void {
   if (value === undefined) return;
-  if (!isRecord(value) || value.mode !== "tensor-parallel-cell") {
+  if (!isRecord(value)) {
+    throw new Error("runtime_stage_execution_is_invalid");
+  }
+  if (value.mode !== "tensor-parallel-cell") {
     throw new Error("runtime_stage_execution_is_invalid");
   }
   if (value.engine !== "python-torch") {
@@ -2171,6 +2846,64 @@ function validateSpeculationPolicy(value: unknown): void {
   }
 }
 
+function validateMacroWaveSpeculationBinding(
+  prefill: unknown,
+  decode: unknown,
+  speculation: RuntimeSpeculationPolicy,
+): void {
+  if (prefill === undefined && decode === undefined) return;
+  if (!isRecord(prefill) || !isRecord(decode)) {
+    throw new Error("runtime_macro_wave_requires_both_phase_contracts");
+  }
+  const prefillCore = {
+    schema: prefill.schema,
+    routeKind: prefill.routeKind,
+    waveTokens: prefill.waveTokens,
+    expectedCommittedTokensPerWave: prefill.expectedCommittedTokensPerWave,
+  };
+  const decodeCore = {
+    schema: decode.schema,
+    routeKind: decode.routeKind,
+    waveTokens: decode.waveTokens,
+    expectedCommittedTokensPerWave: decode.expectedCommittedTokensPerWave,
+  };
+  if (JSON.stringify(prefillCore) !== JSON.stringify(decodeCore)) {
+    throw new Error("runtime_macro_wave_phase_contracts_do_not_match");
+  }
+
+  const waveTokens = decode.waveTokens as number;
+  const expectedCommitted = decode.expectedCommittedTokensPerWave as number;
+  const selected = speculation.strategies.find(
+    (strategy) => strategy.id === speculation.defaultStrategyId,
+  );
+  if (!selected) {
+    // validateSpeculationPolicy normally catches this first; retain a closed
+    // boundary here if the helper is reused independently later.
+    throw new Error("runtime_speculation_default_is_unknown");
+  }
+  if (speculation.mode === "disabled" || selected.kind === "autoregressive") {
+    if (waveTokens !== 1 || expectedCommitted !== 1) {
+      throw new Error("runtime_macro_wave_autoregressive_contract_mismatch");
+    }
+    return;
+  }
+
+  for (const strategy of speculation.strategies) {
+    if (
+      strategy.kind !== "autoregressive" &&
+      strategy.maxDraftTokens + 1 > waveTokens
+    ) {
+      throw new Error("runtime_macro_wave_speculation_exceeds_wave");
+    }
+  }
+  const maximumCommittedPositions = selected.maxDraftTokens + 1;
+  if (expectedCommitted > maximumCommittedPositions) {
+    throw new Error(
+      "runtime_macro_wave_committed_projection_exceeds_strategy",
+    );
+  }
+}
+
 function validateKvTransition(value: unknown): void {
   if (!isRecord(value)) throw new Error("runtime_kv_transition_is_missing");
   if (value.mode !== "in-place" && value.mode !== "transfer" && value.mode !== "recompute") {
@@ -2198,6 +2931,21 @@ function validatePlanRequest(request: RuntimePlanRequest): void {
   if (typeof request.modelRevision !== "string" || !request.modelRevision.trim()) {
     throw new Error("model_revision_cannot_be_empty");
   }
+  if (request.planner !== undefined) {
+    if (
+      !isRecord(request.planner) ||
+      (request.planner.kind !== "default" && request.planner.kind !== "macro-wave")
+    ) {
+      throw new Error("runtime_planner_selection_is_invalid");
+    }
+    if (
+      request.planner.kind === "macro-wave" &&
+      request.planner.options !== undefined &&
+      !isRecord(request.planner.options)
+    ) {
+      throw new Error("runtime_macro_wave_options_are_invalid");
+    }
+  }
   if (
     request.tensorParallelCells !== undefined &&
     !Array.isArray(request.tensorParallelCells)
@@ -2220,6 +2968,12 @@ function validatePlanRequest(request: RuntimePlanRequest): void {
     request.phaseTensorParallelCells?.prefill ?? [],
     request.phaseTensorParallelCells?.decode ?? [],
   ];
+  if (
+    request.planner?.kind === "macro-wave" &&
+    cellPlanGroups.some((cells) => cells.length > 0)
+  ) {
+    throw new Error("runtime_macro_wave_and_tensor_parallel_cells_are_not_composable");
+  }
   for (const cells of cellPlanGroups) {
     for (const cell of cells) {
       if (!isRecord(cell)) throw new Error("runtime_cell_plan_is_invalid");
@@ -2254,6 +3008,17 @@ function validatePlanRequest(request: RuntimePlanRequest): void {
   ) {
     throw new Error("runtime_model_tied_weights_flag_is_invalid");
   }
+  for (const [name, value] of [
+    ["largest_embedding_tensor", request.model.largestEmbeddingTensorBytes],
+    ["largest_lm_head_tensor", request.model.largestLmHeadTensorBytes],
+  ] as const) {
+    if (value !== undefined) {
+      assertNonNegativeInteger(
+        value,
+        `runtime_model_${name}_bytes_are_invalid`,
+      );
+    }
+  }
   for (const [index, layer] of request.model.layers.entries()) {
     if (layer.index !== index) throw new Error("runtime_model_layer_index_is_invalid");
     assertNonNegativeInteger(layer.weightBytes, "runtime_model_layer_weight_is_invalid");
@@ -2273,6 +3038,12 @@ function validatePlanRequest(request: RuntimePlanRequest): void {
       layer.prefillMsPerTokenAtUnit,
       "runtime_model_layer_prefill_time_is_invalid",
     );
+    if (layer.largestResidentTensorBytes !== undefined) {
+      assertNonNegativeInteger(
+        layer.largestResidentTensorBytes,
+        "runtime_model_layer_largest_resident_tensor_is_invalid",
+      );
+    }
   }
   const hiddenSizes = new Set(request.model.layers.map((layer) => layer.activationElements));
   if (hiddenSizes.size !== 1) {
@@ -2385,6 +3156,22 @@ function validateStringList(value: unknown, error: string): asserts value is str
     value.length < 1 ||
     value.some((entry) => typeof entry !== "string" || !entry.trim()) ||
     new Set(value).size !== value.length
+  ) {
+    throw new Error(error);
+  }
+}
+
+function assertExactObjectKeys(
+  value: Record<string, unknown>,
+  required: readonly string[],
+  error: string,
+): void {
+  const keys = Object.keys(value);
+  const allowed = new Set(required);
+  if (
+    keys.length !== required.length ||
+    required.some((key) => !Object.prototype.hasOwnProperty.call(value, key)) ||
+    keys.some((key) => !allowed.has(key))
   ) {
     throw new Error(error);
   }

@@ -26,6 +26,7 @@ from distributed_runtime.protocol import (
     decode_token,
     decode_verify_result,
     encode_tensor,
+    encode_tensor_payload,
     recv_exact,
     recv_frame,
     send_frame,
@@ -74,6 +75,77 @@ class ProtocolFramingTests(unittest.TestCase):
         self.assertEqual(frame.hidden_size, 576)
         self.assertEqual(frame.flags, int(TensorCodec.FP16))
         self.assertEqual(frame.payload, b"")
+
+    def test_route_probe_frames_are_payload_free_control_frames(self) -> None:
+        self.assertEqual(
+            send_frame(self.sender, FrameType.PING, 1234, step=41),
+            HEADER_BYTES,
+        )
+        ping = recv_frame(self.receiver)
+        self.assertEqual(ping.frame_type, FrameType.PING)
+        self.assertEqual(ping.request_id, 1234)
+        self.assertEqual(ping.step, 41)
+        self.assertEqual((ping.flags, ping.token_count, ping.hidden_size), (0, 0, 0))
+        send_frame(self.sender, FrameType.PONG, ping.request_id, step=ping.step)
+        pong = recv_frame(self.receiver)
+        self.assertEqual(pong.frame_type, FrameType.PONG)
+        self.assertEqual((pong.request_id, pong.step), (1234, 41))
+        self.assertEqual((pong.flags, pong.token_count, pong.hidden_size), (0, 0, 0))
+        with self.assertRaisesRegex(ValueError, "cannot carry"):
+            send_frame(self.sender, FrameType.PING, 1234, payload=b"x")
+
+    def test_route_probe_send_rejects_noncanonical_metadata(self) -> None:
+        for frame_type in (FrameType.PING, FrameType.PONG):
+            for field, value in (
+                ("flags", 1),
+                ("token_count", 1),
+                ("hidden_size", 1),
+            ):
+                with self.subTest(frame_type=frame_type.name, field=field):
+                    with self.assertRaisesRegex(
+                        ValueError, "flags=token_count=hidden_size=0"
+                    ):
+                        send_frame(
+                            self.sender,
+                            frame_type,
+                            1234,
+                            step=41,
+                            **{field: value},
+                        )
+
+    def test_route_probe_recv_rejects_noncanonical_wire_metadata(self) -> None:
+        malformed_fields = (
+            ("flags", 1, 0, 0, 0),
+            ("token_count", 0, 1, 0, 0),
+            ("hidden_size", 0, 0, 1, 0),
+            ("payload", 0, 0, 0, 1),
+        )
+        for frame_type in (FrameType.PING, FrameType.PONG):
+            for field, flags, token_count, hidden_size, payload_size in malformed_fields:
+                with self.subTest(frame_type=frame_type.name, field=field):
+                    sender, receiver = socket.socketpair()
+                    try:
+                        sender.sendall(
+                            HEADER.pack(
+                                MAGIC,
+                                VERSION,
+                                int(frame_type),
+                                flags,
+                                1234,
+                                41,
+                                token_count,
+                                hidden_size,
+                                payload_size,
+                            )
+                            + (b"x" if payload_size else b"")
+                        )
+                        with self.assertRaisesRegex(
+                            ValueError, "flags=token_count=hidden_size=0"
+                        ):
+                            recv_frame(receiver)
+                    finally:
+                        sender.close()
+                        receiver.close()
 
     def test_activation_frame_survives_fragmented_transport(self) -> None:
         tensor = torch.arange(21, dtype=torch.float32).reshape(1, 3, 7) / 5
@@ -182,6 +254,57 @@ class TensorCodecTests(unittest.TestCase):
         source = torch.randn(1, 11, 23, dtype=torch.float32)
         decoded = self.round_trip(source, TensorCodec.FP16)
         self.assertTrue(torch.allclose(decoded, source, atol=0.002, rtol=0.001))
+
+    def test_owner_backed_fp16_payload_stages_directly_in_wire_dtype(self) -> None:
+        source = torch.randn(1, 3, 17, dtype=torch.float32)
+        encoded = encode_tensor_payload(source, TensorCodec.FP16)
+        self.assertEqual(encoded.staging_dtype, torch.float16)
+        self.assertEqual(encoded.source_device, "cpu")
+        self.assertEqual(encoded.nbytes, source.numel() * 2)
+        self.assertIsInstance(encoded.owner, torch.Tensor)
+        self.assertEqual(encoded.view.tobytes(), encode_tensor(source, TensorCodec.FP16))
+
+    def test_owner_backed_payload_can_be_sent_without_materialising_bytes(self) -> None:
+        source = torch.randn(1, 2, 9, dtype=torch.float32)
+        encoded = encode_tensor_payload(source, TensorCodec.FP32)
+        sender, receiver = socket.socketpair()
+        try:
+            sent = send_frame(
+                sender,
+                FrameType.ACTIVATION,
+                33,
+                token_count=2,
+                hidden_size=9,
+                flags=int(TensorCodec.FP32),
+                payload=encoded.view,
+            )
+            frame = recv_frame(receiver)
+            self.assertEqual(sent, HEADER_BYTES + encoded.nbytes)
+            self.assertTrue(torch.equal(decode_tensor(frame), source))
+        finally:
+            sender.close()
+            receiver.close()
+
+    def test_owner_backed_payload_is_an_immutable_snapshot(self) -> None:
+        for codec, dtype in (
+            (TensorCodec.FP32, torch.float32),
+            (TensorCodec.FP16, torch.float16),
+        ):
+            with self.subTest(codec=codec.name):
+                source = torch.tensor([[[1.0, 2.0]]], dtype=dtype)
+                encoded = encode_tensor_payload(source, codec)
+                snapshot = encoded.view.tobytes()
+                source.zero_()
+                self.assertEqual(encoded.view.tobytes(), snapshot)
+
+    def test_activation_encoder_rejects_non_floating_tensors(self) -> None:
+        source = torch.tensor([[[-(1 << 63)]]], dtype=torch.int64)
+        for codec in TensorCodec:
+            with self.subTest(codec=codec.name), self.assertRaisesRegex(
+                ValueError,
+                "floating dtype",
+            ):
+                encode_tensor_payload(source, codec)
 
     def test_int8_error_is_bounded_by_one_quantization_step(self) -> None:
         torch.manual_seed(11)
@@ -591,6 +714,112 @@ class DeflateCodecTests(unittest.TestCase):
 
 
 class PersistentStageDataPlaneTests(unittest.TestCase):
+    def test_stage_ingress_executes_compatible_requests_in_one_tensor_batch(self) -> None:
+        return_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        return_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return_listener.bind(("127.0.0.1", 0))
+        return_listener.listen(1)
+        return_port = int(return_listener.getsockname()[1])
+        stage_port = self.free_port()
+        while stage_port == return_port:
+            stage_port = self.free_port()
+        config = StageProcessConfig(
+            spec=StageModelSpec("fake", 15, 30, 30, 1),
+            pipeline_id=778,
+            listen_host="127.0.0.1",
+            listen_port=stage_port,
+            next_host=None,
+            next_port=None,
+            next_layer_end=None,
+            return_host="127.0.0.1",
+            return_port=return_port,
+            codec=TensorCodec.FP32,
+            one_way_delay_ms=0,
+            bandwidth_mbps=0,
+            connect_timeout_seconds=2,
+            max_physical_batch_size=4,
+            physical_batch_window_ms=50,
+        )
+        ready = threading.Event()
+        metrics: queue.Queue[dict[str, object]] = queue.Queue()
+        errors: list[BaseException] = []
+        _FakePhysicalBatchLastStageRunner.batch_calls = []
+
+        def run() -> None:
+            try:
+                run_stage_process(config, ready, metrics)
+            except BaseException as error:
+                errors.append(error)
+
+        with patch(
+            "distributed_runtime.stage.StageRunner",
+            _FakePhysicalBatchLastStageRunner,
+        ):
+            worker = threading.Thread(target=run, daemon=True)
+            worker.start()
+            self.assertTrue(ready.wait(2))
+            upstream = socket.create_connection(("127.0.0.1", stage_port), timeout=2)
+            upstream.settimeout(2)
+            send_frame(
+                upstream,
+                FrameType.HELLO,
+                778,
+                step=15,
+                token_count=30,
+                hidden_size=4,
+                flags=int(TensorCodec.FP32),
+            )
+            direct_return, _ = return_listener.accept()
+            direct_return.settimeout(2)
+            self.assertEqual(recv_frame(upstream).frame_type, FrameType.READY)
+
+            hidden = torch.arange(4, dtype=torch.float32).reshape(1, 1, 4)
+            payload = encode_tensor(hidden, TensorCodec.FP32)
+            for request_id in (11, 22):
+                send_frame(upstream, FrameType.BEGIN, request_id)
+                send_frame(
+                    upstream,
+                    FrameType.ACTIVATION,
+                    request_id,
+                    step=0,
+                    token_count=1,
+                    hidden_size=4,
+                    flags=int(TensorCodec.FP32),
+                    payload=payload,
+                )
+
+            returned = (recv_frame(direct_return), recv_frame(direct_return))
+            self.assertEqual([frame.request_id for frame in returned], [11, 22])
+            self.assertEqual(
+                [decode_token(frame) for frame in returned],
+                [111, 122],
+            )
+            self.assertEqual(
+                _FakePhysicalBatchLastStageRunner.batch_calls,
+                [(11, 22)],
+            )
+
+            for request_id in (11, 22):
+                send_frame(upstream, FrameType.END, request_id)
+            observations = {
+                int(observation["request_id"]): observation
+                for observation in (metrics.get(timeout=2), metrics.get(timeout=2))
+            }
+            for request_id in (11, 22):
+                observation = observations[request_id]
+                self.assertEqual(observation["model_forward_calls"], 1)
+                self.assertEqual(observation["physical_batch_calls"], 1)
+                self.assertEqual(observation["physical_batch_items"], 2)
+                self.assertEqual(observation["max_physical_batch_size"], 2)
+
+            send_frame(upstream, FrameType.SHUTDOWN, 778)
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+            direct_return.close()
+            upstream.close()
+        return_listener.close()
+
     def test_last_stage_handshake_cache_lifecycle_and_direct_token_return(self) -> None:
         return_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         return_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -645,6 +874,12 @@ class PersistentStageDataPlaneTests(unittest.TestCase):
             direct_return, _ = return_listener.accept()
             direct_return.settimeout(2)
             self.assertEqual(recv_frame(upstream).frame_type, FrameType.READY)
+
+            send_frame(upstream, FrameType.PING, 777, step=41)
+            pong = recv_frame(direct_return)
+            self.assertEqual(pong.frame_type, FrameType.PONG)
+            self.assertEqual(pong.request_id, 777)
+            self.assertEqual(pong.step, 41)
 
             request_id = 91
             send_frame(upstream, FrameType.BEGIN, request_id)
@@ -759,6 +994,25 @@ class PersistentStageDataPlaneTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "step mismatch"):
             validate_activation(frame, config, runner, metrics)
+
+        sealed = StageProcessConfig(
+            **{
+                **config.__dict__,
+                "sealed_wave_tokens": 4,
+                "max_prefill_chunk_tokens": 8,
+            }
+        )
+        oversized_verify = Frame(
+            FrameType.VERIFY,
+            int(TensorCodec.FP32),
+            5,
+            1,
+            5,
+            4,
+            b"",
+        )
+        with self.assertRaisesRegex(ValueError, "exceeds sealed_wave_tokens"):
+            validate_activation(oversized_verify, sealed, runner, metrics)
 
         hello = Frame(
             FrameType.HELLO,
@@ -1007,6 +1261,33 @@ class _FailingLastStageRunner(_FakeLastStageRunner):
         token_mode: str = "last",
     ) -> tuple[torch.Tensor, int | None]:
         raise RuntimeError("synthetic compute failure")
+
+
+class _FakePhysicalBatchLastStageRunner(_FakeLastStageRunner):
+    batch_calls: list[tuple[int, ...]] = []
+
+    def physical_batch_key(
+        self,
+        request_id: int,
+        *,
+        token_count: int,
+        token_mode: str,
+    ) -> tuple[int, int, str]:
+        return self.sequence_length(request_id), token_count, token_mode
+
+    def forward_hidden_batch(
+        self,
+        request_ids: tuple[int, ...],
+        hidden_states: tuple[torch.Tensor, ...],
+        *,
+        token_mode: str = "last",
+    ) -> tuple[tuple[torch.Tensor, int], ...]:
+        self.batch_calls.append(request_ids)
+        results = []
+        for request_id, hidden in zip(request_ids, hidden_states, strict=True):
+            self.active[request_id] += int(hidden.shape[1])
+            results.append((hidden, 100 + request_id))
+        return tuple(results)
 
 
 class _ExplodingMetricSink:

@@ -30,6 +30,7 @@ import type {
   DistributedModelProfile,
   DistributionPlan,
   DistributionWorkload,
+  MacroWaveStageExecutionContractV1,
 } from "../src/distribution/types.js";
 
 const MIB = 1024 * 1024;
@@ -85,6 +86,27 @@ describe("HTTP LaunchAgent RPC", () => {
     expect([...fakeAgents.values()].reduce((total, agent) => total + agent.stopCount, 0)).toBe(
       description.launchOrder.length,
     );
+  });
+
+  it("preserves an exact resident MacroWave stage contract and rejects extensions", async () => {
+    const request = fixtureRequest();
+    request.process.macroWave = residentMacroWaveStage();
+    const fake = new FakeAgent("fake:macro-wave", { autoReady: true });
+    const { address } = await serve(fake, request.nodeId);
+    const handle = await rpcClient(address).start(
+      request,
+      new AbortController().signal,
+    );
+
+    await handle.ready;
+    expect(fake.starts[0]!.process.macroWave).toEqual(request.process.macroWave);
+    await handle.stop("macro_wave_contract_checked");
+
+    const extended = structuredClone(request);
+    Object.assign(extended.process.macroWave!, { unsealedExtension: true });
+    await expect(
+      rpcClient(address).start(extended, new AbortController().signal),
+    ).rejects.toThrow("macroWave_keys_are_invalid");
   });
 
   it("deduplicates concurrent starts, latches ready across exit and bounds output", async () => {
@@ -238,6 +260,50 @@ describe("HTTP LaunchAgent RPC", () => {
     fake.handles.get(request.process.processId)!.markReady();
     await handle.ready;
     await handle.stop("weighted_complete");
+  });
+
+  it("preserves an explicit sealed NativeStage stage binding through RPC", async () => {
+    const request = fixtureRequest();
+    if (request.process.kind !== "remote-stage") {
+      throw new Error("fixture_first_process_is_not_remote_stage");
+    }
+    request.process.native_stage = {
+      packagePath: "D:/packages/stage-4-6",
+      packageId: "a".repeat(64),
+      manifestSha256: "b".repeat(64),
+      modelSource: "D:/models/local-snapshot",
+      modelRevision: null,
+      modelIdentity: `sha256:${"c".repeat(64)}`,
+      layerStart: request.process.layerStart,
+      layerEnd: request.process.layerEnd,
+      totalLayers: request.process.totalLayers,
+      daemonExecutable: "D:/bin/llama-native_stage-worker.exe",
+      pipelineId: "18446744073709551615",
+      contextTokens: 4_096,
+      gpuLayers: 0,
+      computeApi: "cpu",
+      startupTimeoutSeconds: 90,
+      callTimeoutSeconds: 30,
+      closeTimeoutSeconds: 5,
+    };
+    const fake = new FakeAgent("fake:native_stage");
+    const { address } = await serve(fake, request.nodeId);
+
+    const handle = await rpcClient(address).start(request, new AbortController().signal);
+    expect(fake.starts[0]!.process).toMatchObject({
+      kind: "remote-stage",
+      native_stage: {
+        packageId: "a".repeat(64),
+        modelSource: "D:/models/local-snapshot",
+        modelRevision: null,
+        modelIdentity: `sha256:${"c".repeat(64)}`,
+        pipelineId: "18446744073709551615",
+        computeApi: "cpu",
+      },
+    });
+    fake.handles.get(request.process.processId)!.markReady();
+    await handle.ready;
+    await handle.stop("native_stage_complete");
   });
 
   it("reads the worst-case JSON expansion of bounded UTF-8 output", async () => {
@@ -402,6 +468,7 @@ describe("HTTP LaunchAgent RPC", () => {
     const client = new HttpLaunchAgent({
       endpoint: address,
       requestTimeoutMs: 20,
+      cleanupRequestTimeoutMs: 1_000,
       pollRequestTimeoutMs: 20,
       pollIntervalMs: 2,
     });
@@ -575,6 +642,43 @@ function fixtureRequest(): LaunchAgentStartRequest {
     pipelineId: description.pipelineId,
     nodeId: process.anchor.memberId,
     process: structuredClone(process),
+  };
+}
+
+function residentMacroWaveStage(): MacroWaveStageExecutionContractV1 {
+  return {
+    mode: "macro-wave-memory",
+    schema: "gdlp-macro-wave-stage/1",
+    memoryMode: "resident",
+    residentKind: "layers",
+    budgets: { hostRamBytes: 256, vramBytes: 256 },
+    requirements: {
+      fullStageStateBytes: 130,
+      hostRamBytes: 0,
+      vramBytes: 130,
+      fixedVramBytes: 20,
+      residentParameterBudgetBytes: 100,
+      residentStreamingTransientBytes: 0,
+      boundedPinnedStagingReserveBytes: 0,
+      hostRamPeakUpperBoundBytes: 0,
+      activationBufferBytes: 10,
+      weightBufferBytes: 0,
+      weightBufferCopies: 0,
+    },
+    workingSet: {
+      totalWeightBytes: 100,
+      residentWeightBytes: 100,
+      totalRoutedExpertBytes: 0,
+      activeWeightBytesPerWave: 0,
+      largestTransferUnitBytes: 0,
+      largestExpertBytes: 0,
+    },
+    cachePolicy: {
+      kind: "full-resident",
+      capacityBytes: 100,
+      expectedHitRate: 1,
+      expectedMissWeightBytesPerWave: 0,
+    },
   };
 }
 

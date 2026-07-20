@@ -22,6 +22,10 @@ export async function probeHardware(): Promise<HardwareProbe> {
   if (nvidia.length > 0) return { ...base, gpus: nvidia };
   const windows = platform() === "win32" ? await probeWindowsGpu(base.ramMb) : [];
   if (windows.length > 0) return { ...base, gpus: windows };
+  const mac = platform() === "darwin" ? await probeMacGpu(base.ramMb) : [];
+  if (mac.length > 0) return { ...base, gpus: mac };
+  const linux = platform() === "linux" ? await probeLinuxGpu(base.ramMb) : [];
+  if (linux.length > 0) return { ...base, gpus: linux };
   return {
     ...base,
     gpus: [
@@ -33,6 +37,69 @@ export async function probeHardware(): Promise<HardwareProbe> {
       },
     ],
   };
+}
+
+async function probeMacGpu(systemRamMb: number): Promise<HardwareProbe["gpus"]> {
+  try {
+    const { stdout } = await execFileAsync("system_profiler", [
+      "-json",
+      "SPDisplaysDataType",
+    ]);
+    const payload = JSON.parse(stdout) as { SPDisplaysDataType?: Array<Record<string, unknown>> };
+    return (payload.SPDisplaysDataType ?? []).map((device, index) => {
+      const model = stringValue(device.sppci_model) ?? stringValue(device._name) ?? "Apple GPU";
+      const vendorName = stringValue(device.spdisplays_vendor) ?? model;
+      const vendor = classifyVendor(vendorName);
+      const unifiedMemory = vendor === "apple" || /apple\s+m\d|apple\s+silicon/i.test(model);
+      return {
+        id: `gpu-${index}`,
+        vendor,
+        model,
+        physicalVramMb: unifiedMemory ? 0 : parseMemoryMb(device.spdisplays_vram),
+        ...(unifiedMemory
+          ? {
+              unifiedMemory: true,
+              sharedMemoryMb: systemRamMb,
+            }
+          : {}),
+      };
+    });
+  } catch {
+    return [];
+  }
+}
+
+async function probeLinuxGpu(systemRamMb: number): Promise<HardwareProbe["gpus"]> {
+  try {
+    const { stdout } = await execFileAsync("lspci", ["-mm"]);
+    return stdout
+      .trim()
+      .split("\n")
+      .filter((line) => /"(?:VGA compatible controller|3D controller|Display controller)"/i.test(line))
+      .map((line, index) => {
+        const fields = [...line.matchAll(/"([^"]*)"/g)].map((match) => match[1] ?? "");
+        const vendorName = fields[1] ?? "unknown";
+        const model = fields[2] ?? "Linux GPU";
+        const vendor = classifyVendor(`${vendorName} ${model}`);
+        const unifiedMemory =
+          vendor === "intel" ||
+          (vendor === "amd" && /(integrated|apu|radeon\(tm\).*graphics)/i.test(model));
+        return {
+          id: `gpu-${index}`,
+          vendor,
+          model,
+          physicalVramMb: 0,
+          ...(unifiedMemory
+            ? {
+                unifiedMemory: true,
+                sharedMemoryMb: Math.floor(systemRamMb / 2),
+              }
+            : {}),
+        };
+      });
+  } catch {
+    return [];
+  }
 }
 
 async function probeNvidia(): Promise<HardwareProbe["gpus"]> {
@@ -119,4 +186,18 @@ function classifyVendor(model: string): string {
   if (normalized.includes("intel")) return "intel";
   if (normalized.includes("apple")) return "apple";
   return "unknown";
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function parseMemoryMb(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value)) return Math.max(0, Math.floor(value));
+  if (typeof value !== "string") return 0;
+  const match = value.match(/([\d.]+)\s*(GB|MB)/i);
+  if (!match) return 0;
+  const amount = Number(match[1]);
+  if (!Number.isFinite(amount)) return 0;
+  return Math.round(amount * (match[2]?.toUpperCase() === "GB" ? 1_024 : 1));
 }

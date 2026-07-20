@@ -32,7 +32,7 @@ from .protocol import (
     TensorCodec,
     configure_socket,
     decode_token,
-    encode_tensor,
+    encode_tensor_payload,
     recv_frame,
     send_frame,
 )
@@ -226,7 +226,7 @@ def send_activation(
     hidden: torch.Tensor,
 ) -> tuple[int, float]:
     encode_started = time.perf_counter()
-    payload = encode_tensor(hidden, codec)
+    encoded = encode_tensor_payload(hidden, codec)
     encode_ms = (time.perf_counter() - encode_started) * 1_000
     bytes_out = send_frame(
         sock,
@@ -236,7 +236,7 @@ def send_activation(
         token_count=int(hidden.shape[1]),
         hidden_size=int(hidden.shape[2]),
         flags=int(codec),
-        payload=payload,
+        payload=encoded.view,
         emulator=emulator,
     )
     return bytes_out, encode_ms

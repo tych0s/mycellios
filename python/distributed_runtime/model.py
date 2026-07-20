@@ -1,18 +1,37 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 import gc
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol
 
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 import torch
 from torch import nn
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, DynamicCache
+from transformers.cache_utils import DynamicLayer
+
+from .model_adapters import (
+    SelectiveStageAdapter,
+    resolve_selective_stage_adapter,
+)
+
+MAX_PHYSICAL_STAGE_BATCH_SIZE = 8
+
+
+@dataclass(frozen=True)
+class ModelArtifactReference:
+    """Path-independent coordinates for one immutable checkpoint snapshot."""
+
+    identity: str
+    canonical_source: str
+    canonical_revision: str | None
+    snapshot_identity: int
 
 
 STAGE_QUANTIZE_MODES = (None, "dynamic-int8")
@@ -27,6 +46,9 @@ class StageModelSpec:
     total_layers: int
     threads: int
     revision: str | None = None
+    artifact_identity: str | None = None
+    canonical_model_source: str | None = None
+    canonical_model_revision: str | None = None
     # Opt-in experimental execution variants. ``None`` keeps the reference
     # FP32 eager path byte-for-byte identical. ``quantize="dynamic-int8"`` is an
     # APPROXIMATE mode: it may change greedy tokens versus the FP32 reference.
@@ -50,6 +72,20 @@ class StageModelSpec:
             raise ValueError(f"quantize must be one of {STAGE_QUANTIZE_MODES}")
         if self.compile_mode not in STAGE_COMPILE_MODES:
             raise ValueError(f"compile_mode must be one of {STAGE_COMPILE_MODES}")
+        for name, value in (
+            ("artifact_identity", self.artifact_identity),
+            ("canonical_model_source", self.canonical_model_source),
+            ("canonical_model_revision", self.canonical_model_revision),
+        ):
+            if value is not None and not value.strip():
+                raise ValueError(f"{name} cannot be blank")
+        if self.artifact_identity is None and (
+            self.canonical_model_source is not None
+            or self.canonical_model_revision is not None
+        ):
+            raise ValueError(
+                "canonical model coordinates require an explicit artifact identity"
+            )
 
     @property
     def first(self) -> bool:
@@ -95,11 +131,46 @@ class StageRunnerContract(Protocol):
 
 
 class StageRunner:
+    MAX_PHYSICAL_BATCH_SIZE = MAX_PHYSICAL_STAGE_BATCH_SIZE
+
     def __init__(self, spec: StageModelSpec) -> None:
         torch.set_num_threads(spec.threads)
         model = _load_selective_stage_model(spec)
-        if not hasattr(model, "model") or not hasattr(model.model, "layers"):
-            raise TypeError("the distributed prototype requires a decoder model with model.layers")
+        self._initialize_from_loaded_model(
+            spec,
+            model,
+            loader="selective-safetensors",
+            device_kinds=("cpu",),
+        )
+
+    def _initialize_from_loaded_model(
+        self,
+        spec: StageModelSpec,
+        model: nn.Module,
+        *,
+        loader: str,
+        device_kinds: tuple[str, ...],
+        semantic_features: tuple[str, ...] | None = None,
+    ) -> None:
+        """Adopt one already-loaded, adapter-certified local model.
+
+        The RAM-backed MoE loader constructs its local Hugging Face model on
+        the meta device, removes routed expert parameters, and only then
+        materializes resident tensors.  Keeping the request/KV lifecycle in
+        this initializer lets that runner reuse the exact same StageRunner
+        implementation without first creating a forbidden full expert copy.
+        """
+
+        if not isinstance(loader, str) or not loader.strip():
+            raise ValueError("loader cannot be empty")
+        if not device_kinds or any(
+            not isinstance(kind, str) or not kind.strip() for kind in device_kinds
+        ):
+            raise ValueError("device_kinds must contain non-empty strings")
+        adapter = getattr(model, "_gdlp_selective_stage_adapter", None)
+        if not isinstance(adapter, SelectiveStageAdapter):
+            raise TypeError("selective model loader did not return a certified family adapter")
+        self.model_adapter = adapter
         selected = list(model.model.layers)
         # Every stage owns an independent DynamicCache. Local layer indexes keep
         # cache lookup and sequence-length accounting dense and O(number of local layers).
@@ -109,11 +180,23 @@ class StageRunner:
         self.head = model.lm_head if spec.last else None
         self.hidden_size = int(model.config.hidden_size)
         self.parameter_bytes = _unique_parameter_bytes(self.base, self.head)
-        self.loader = "selective-safetensors"
+        self.loader = loader
         self.spec = spec
-        from .executor_abi import (
-            build_stage_executor_manifest,
-            model_identity_for_source,
+        self._physical_batch_cache_supported = _supports_dynamic_tensor_batching(
+            self.base.config
+        )
+        self.model_forward_calls = 0
+        self.physical_batch_calls = 0
+        self.physical_batch_items = 0
+        self.max_observed_physical_batch_size = 1
+        from .executor_abi import build_stage_executor_manifest
+
+        artifact = model_artifact_reference(
+            getattr(model, "_gdlp_resolved_snapshot", spec.model_name),
+            None if hasattr(model, "_gdlp_resolved_snapshot") else spec.revision,
+            artifact_identity=spec.artifact_identity,
+            canonical_source=spec.canonical_model_source,
+            canonical_revision=spec.canonical_model_revision,
         )
 
         weight_dtypes = tuple(
@@ -129,10 +212,10 @@ class StageRunner:
         self.executor_manifest = build_stage_executor_manifest(
             engine="python-torch",
             engine_version=torch.__version__,
-            adapter="transformers-selective-safetensors",
-            model_identity=model_identity_for_source(spec.model_name, spec.revision),
-            model_source=spec.model_name,
-            model_revision=spec.revision,
+            adapter=adapter.adapter_id,
+            model_identity=artifact.identity,
+            model_source=artifact.canonical_source,
+            model_revision=artifact.canonical_revision,
             artifact_format="safetensors",
             layer_start=spec.layer_start,
             layer_end=spec.layer_end,
@@ -146,7 +229,12 @@ class StageRunner:
                 "int8-grouped",
                 "int8-hadamard",
             ),
-            device_kinds=("cpu",),
+            max_batch_size=(
+                self.MAX_PHYSICAL_BATCH_SIZE
+                if self._physical_batch_cache_supported
+                else 1
+            ),
+            device_kinds=device_kinds,
             compute_apis=("torch",),
             weight_dtypes=weight_dtypes,
             features=(
@@ -154,6 +242,12 @@ class StageRunner:
                 "rank-local-kv",
                 "rollback",
                 "selective-load",
+                *(adapter.semantic_features if semantic_features is None else semantic_features),
+                *(
+                    ("physical-tensor-batching",)
+                    if self._physical_batch_cache_supported
+                    else ()
+                ),
             ),
         )
         # Opt-in spike variants. Applied after the manifest so the default
@@ -235,9 +329,43 @@ class StageRunner:
             past_key_values=self.caches.get(request_id),
             use_cache=True,
         )
+        self.model_forward_calls += 1
         self.caches[request_id] = output.past_key_values
         self.tokens_seen[request_id] += int(input_ids.shape[1])
         return output.last_hidden_state
+
+    @torch.inference_mode()
+    def forward_ids_batch(
+        self,
+        request_ids: Sequence[int],
+        input_ids: Sequence[torch.Tensor],
+    ) -> tuple[torch.Tensor, ...]:
+        """Run compatible token inputs in one physical model forward.
+
+        Requests retain independent KV ownership.  Their caches are merged only
+        for the duration of the forward and are split into fresh rank-one cache
+        tensors before this method returns.
+        """
+
+        if not self.spec.first:
+            raise RuntimeError("only the first stage accepts token IDs")
+        ids, tensors, token_count = self._validate_physical_batch_inputs(
+            request_ids,
+            input_ids,
+            expected_hidden_size=None,
+            integer=True,
+        )
+        cache = self._merge_dynamic_caches(ids)
+        output = self.base(
+            input_ids=torch.cat(tensors, dim=0),
+            past_key_values=cache,
+            use_cache=True,
+        )
+        self._commit_physical_batch(ids, output.past_key_values, token_count)
+        return tuple(
+            output.last_hidden_state[index : index + 1].contiguous()
+            for index in range(len(ids))
+        )
 
     @torch.inference_mode()
     def forward_hidden(
@@ -266,6 +394,7 @@ class StageRunner:
             past_key_values=self.caches.get(request_id),
             use_cache=True,
         )
+        self.model_forward_calls += 1
         self.caches[request_id] = output.past_key_values
         self.tokens_seen[request_id] += int(hidden.shape[1])
         if self.head is None or token_mode == "none":
@@ -280,6 +409,266 @@ class StageRunner:
         if token_mode == "all":
             return output.last_hidden_state, tuple(int(token) for token in tokens)
         return output.last_hidden_state, int(tokens[-1])
+
+    def physical_batch_key(
+        self,
+        request_id: int,
+        *,
+        token_count: int,
+        token_mode: str,
+    ) -> tuple[int, int, str] | None:
+        """Return the exact cache/shape key accepted by ``forward_hidden_batch``.
+
+        ``None`` deliberately means sequential fallback.  In particular, the
+        pinned Transformers cache API cannot reconstruct hybrid/sliding cache
+        metadata from independent requests without touching backend internals,
+        so those layouts are never presented as physically batchable here.
+        """
+
+        self._require_active(request_id)
+        if not self._physical_batch_cache_supported:
+            return None
+        if (
+            not isinstance(token_count, int)
+            or isinstance(token_count, bool)
+            or token_count < 1
+        ):
+            raise ValueError("token_count must be a positive integer")
+        if token_mode not in ("none", "last", "all"):
+            raise ValueError("token_mode must be none, last or all")
+        current = self.tokens_seen[request_id]
+        cache = self.caches.get(request_id)
+        if cache is not None:
+            if not isinstance(cache, DynamicCache):
+                return None
+            if cache.get_seq_length() != current:
+                return None
+        elif current != 0:
+            return None
+        return current, token_count, token_mode
+
+    @torch.inference_mode()
+    def forward_hidden_batch(
+        self,
+        request_ids: Sequence[int],
+        hidden_states: Sequence[torch.Tensor],
+        *,
+        token_mode: str = "last",
+    ) -> tuple[
+        tuple[torch.Tensor, int | tuple[int, ...] | None],
+        ...,
+    ]:
+        """Execute one real tensor batch and split outputs/KV by request."""
+
+        if token_mode not in ("none", "last", "all"):
+            raise ValueError("token_mode must be none, last or all")
+        ids, tensors, token_count = self._validate_physical_batch_inputs(
+            request_ids,
+            hidden_states,
+            expected_hidden_size=self.hidden_size,
+            integer=False,
+        )
+        keys = {
+            self.physical_batch_key(
+                request_id,
+                token_count=token_count,
+                token_mode=token_mode,
+            )
+            for request_id in ids
+        }
+        if None in keys or len(keys) != 1:
+            raise ValueError(
+                "physical batching requires equal cache length, token count and cache layout"
+            )
+        cache = self._merge_dynamic_caches(ids)
+        output = self.base(
+            inputs_embeds=torch.cat(tensors, dim=0),
+            past_key_values=cache,
+            use_cache=True,
+        )
+        self._commit_physical_batch(ids, output.past_key_values, token_count)
+
+        token_rows: list[int | tuple[int, ...] | None]
+        if self.head is None or token_mode == "none":
+            token_rows = [None] * len(ids)
+        else:
+            selected = (
+                output.last_hidden_state
+                if token_mode == "all"
+                else output.last_hidden_state[:, -1:, :]
+            )
+            predicted = torch.argmax(self.head(selected), dim=-1)
+            if token_mode == "all":
+                token_rows = [
+                    tuple(int(token) for token in predicted[index].reshape(-1).tolist())
+                    for index in range(len(ids))
+                ]
+            else:
+                token_rows = [
+                    int(predicted[index].reshape(-1)[-1].item())
+                    for index in range(len(ids))
+                ]
+        return tuple(
+            (
+                output.last_hidden_state[index : index + 1].contiguous(),
+                token_rows[index],
+            )
+            for index in range(len(ids))
+        )
+
+    def _validate_physical_batch_inputs(
+        self,
+        request_ids: Sequence[int],
+        tensors: Sequence[torch.Tensor],
+        *,
+        expected_hidden_size: int | None,
+        integer: bool,
+    ) -> tuple[tuple[int, ...], tuple[torch.Tensor, ...], int]:
+        ids = tuple(request_ids)
+        values = tuple(tensors)
+        if not 2 <= len(ids) <= self.MAX_PHYSICAL_BATCH_SIZE:
+            raise ValueError(
+                "physical batch size must be between 2 and "
+                f"{self.MAX_PHYSICAL_BATCH_SIZE}"
+            )
+        if len(values) != len(ids):
+            raise ValueError("request_ids and tensors must have equal length")
+        if len(set(ids)) != len(ids):
+            raise ValueError("physical batch request IDs must be unique")
+        for request_id in ids:
+            self._require_active(request_id)
+
+        first = values[0]
+        if first.ndim != 2 + (expected_hidden_size is not None) or first.shape[0] != 1:
+            kind = "hidden state" if expected_hidden_size is not None else "input_ids"
+            raise ValueError(f"each {kind} must have batch size one")
+        token_count = int(first.shape[1])
+        if token_count < 1:
+            raise ValueError("physical batch inputs need at least one token")
+        expected_shape = tuple(first.shape)
+        for value in values:
+            if tuple(value.shape) != expected_shape:
+                raise ValueError("physical batch tensors must have identical shapes")
+            if value.dtype != first.dtype or value.device != first.device:
+                raise ValueError("physical batch tensors must share dtype and device")
+            if integer:
+                if value.dtype not in (torch.int32, torch.int64):
+                    raise TypeError("input_ids must contain integer token IDs")
+            elif not value.is_floating_point():
+                raise TypeError("hidden states must be floating point")
+        if expected_hidden_size is not None and int(first.shape[2]) != expected_hidden_size:
+            raise ValueError(
+                f"hidden state must have shape [1, tokens, {expected_hidden_size}]"
+            )
+        return ids, values, token_count
+
+    def _merge_dynamic_caches(self, request_ids: tuple[int, ...]) -> DynamicCache:
+        if not self._physical_batch_cache_supported:
+            raise ValueError("this model cache layout cannot be physically batched")
+        caches = tuple(self.caches.get(request_id) for request_id in request_ids)
+        current = self.tokens_seen[request_ids[0]]
+        if any(self.tokens_seen[request_id] != current for request_id in request_ids):
+            raise ValueError("physical batching requires equal cache lengths")
+
+        merged = DynamicCache(config=self.base.config)
+        if current == 0:
+            if any(
+                cache is not None
+                and (
+                    not isinstance(cache, DynamicCache)
+                    or cache.get_seq_length() != 0
+                )
+                for cache in caches
+            ):
+                raise ValueError("empty physical batch has inconsistent caches")
+            return merged
+        if any(not isinstance(cache, DynamicCache) for cache in caches):
+            raise ValueError("physical batching requires DynamicCache request state")
+        dynamic_caches = tuple(cache for cache in caches if isinstance(cache, DynamicCache))
+        if any(len(cache.layers) != len(merged.layers) for cache in dynamic_caches):
+            raise ValueError("physical batch caches have different layer counts")
+
+        for layer_index, target in enumerate(merged.layers):
+            sources = tuple(cache.layers[layer_index] for cache in dynamic_caches)
+            if type(target) is not DynamicLayer or any(
+                type(source) is not DynamicLayer for source in sources
+            ):
+                raise ValueError("physical batching only supports plain DynamicCache layers")
+            if any(
+                not source.is_initialized
+                or source.keys is None
+                or source.values is None
+                or int(source.keys.shape[0]) != 1
+                or int(source.values.shape[0]) != 1
+                or source.get_seq_length() != current
+                for source in sources
+            ):
+                raise ValueError("physical batch cache tensors are inconsistent")
+            key_shapes = {tuple(source.keys.shape[1:]) for source in sources}
+            value_shapes = {tuple(source.values.shape[1:]) for source in sources}
+            if len(key_shapes) != 1 or len(value_shapes) != 1:
+                raise ValueError("physical batch cache tensor shapes differ")
+            target.update(
+                torch.cat([source.keys for source in sources], dim=0),
+                torch.cat([source.values for source in sources], dim=0),
+            )
+        return merged
+
+    def _commit_physical_batch(
+        self,
+        request_ids: tuple[int, ...],
+        cache: Any,
+        token_count: int,
+    ) -> None:
+        if not isinstance(cache, DynamicCache):
+            raise TypeError("physical model forward did not return DynamicCache")
+        if len(cache.layers) == 0 or any(
+            type(layer) is not DynamicLayer
+            or not layer.is_initialized
+            or layer.keys is None
+            or layer.values is None
+            or int(layer.keys.shape[0]) != len(request_ids)
+            or int(layer.values.shape[0]) != len(request_ids)
+            for layer in cache.layers
+        ):
+            raise TypeError("physical model forward returned an unsupported cache layout")
+
+        split = [DynamicCache(config=self.base.config) for _ in request_ids]
+        for layer_index, source in enumerate(cache.layers):
+            for batch_index, target_cache in enumerate(split):
+                target = target_cache.layers[layer_index]
+                if type(target) is not DynamicLayer:
+                    raise TypeError("physical cache split changed the cache layout")
+                target.update(
+                    source.keys[batch_index : batch_index + 1].clone(),
+                    source.values[batch_index : batch_index + 1].clone(),
+                )
+        for request_id, request_cache in zip(request_ids, split, strict=True):
+            self.caches[request_id] = request_cache
+            self.tokens_seen[request_id] += token_count
+        self.model_forward_calls += 1
+        self.physical_batch_calls += 1
+        self.physical_batch_items += len(request_ids)
+        self.max_observed_physical_batch_size = max(
+            self.max_observed_physical_batch_size,
+            len(request_ids),
+        )
+
+
+def _supports_dynamic_tensor_batching(config: Any) -> bool:
+    """Whether the pinned Transformers cache can be losslessly split/merged.
+
+    Plain ``DynamicLayer`` stores all sequence positions and therefore has a
+    complete public tensor representation. Sliding, hybrid, static and offload
+    layers carry additional cursor/window state and intentionally remain on the
+    sequential path until their cache API exposes a lossless batch split.
+    """
+
+    try:
+        cache = DynamicCache(config=config)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return bool(cache.layers) and all(type(layer) is DynamicLayer for layer in cache.layers)
 
 
 def _apply_dynamic_int8(
@@ -350,35 +739,108 @@ def model_snapshot_identity(model_name: str, revision: str | None = None) -> int
     """
 
     snapshot = Path(resolve_model_snapshot(model_name, revision))
+    return int.from_bytes(_model_snapshot_digest(snapshot)[:8], "big", signed=False)
+
+
+def model_artifact_reference(
+    model_name: str,
+    revision: str | None = None,
+    *,
+    artifact_identity: str | None = None,
+    canonical_source: str | None = None,
+    canonical_revision: str | None = None,
+) -> ModelArtifactReference:
+    """Resolve stable executor coordinates without embedding a host cache path.
+
+    An orchestrator can calculate the identity once and pass the three explicit
+    fields to every process. Direct callers remain safe: Hub snapshots use the
+    commit in their cache path (constant time), while arbitrary local folders
+    are content-hashed because a path alone is not an immutable identity.
+    """
+
+    snapshot = Path(resolve_model_snapshot(model_name, revision))
+    commit = _hub_snapshot_commit(snapshot)
+    if artifact_identity is None:
+        digest = _model_snapshot_digest(snapshot)
+        identity = "sha256:" + digest.hex()
+    else:
+        identity = artifact_identity.strip()
+        if not identity:
+            raise ValueError("artifact_identity cannot be blank")
+        digest = _identity_digest(identity)
+
+    if canonical_source is None:
+        repository = _hub_snapshot_repository(snapshot)
+        if repository is not None:
+            source = f"hf://{repository}"
+        elif commit is not None:
+            source = f"hf-snapshot://{commit}"
+        else:
+            source = f"content-addressed://{identity}"
+    else:
+        source = canonical_source.strip()
+        if not source:
+            raise ValueError("canonical_source cannot be blank")
+
+    if canonical_revision is not None:
+        stable_revision = canonical_revision.strip()
+        if not stable_revision:
+            raise ValueError("canonical_revision cannot be blank")
+    elif commit is not None:
+        stable_revision = commit
+    elif artifact_identity is None:
+        stable_revision = identity
+    else:
+        stable_revision = None
+    return ModelArtifactReference(
+        identity=identity,
+        canonical_source=source,
+        canonical_revision=stable_revision,
+        snapshot_identity=int.from_bytes(digest[:8], "big", signed=False),
+    )
+
+
+def _model_snapshot_digest(snapshot: Path) -> bytes:
     commit = _hub_snapshot_commit(snapshot)
     digest = hashlib.sha256()
     if commit is not None:
         digest.update(b"gdlp-hub-snapshot-v1\0")
         digest.update(commit.encode("ascii"))
-    else:
-        digest.update(b"gdlp-local-model-v1\0")
-        files = sorted(
-            (
-                path
-                for path in snapshot.rglob("*")
-                if path.is_file()
-                and (path.name == "config.json" or path.name.endswith(".safetensors"))
-            ),
-            key=lambda path: path.relative_to(snapshot).as_posix(),
+        return digest.digest()
+
+    digest.update(b"gdlp-local-model-v1\0")
+    files = sorted(
+        (
+            path
+            for path in snapshot.rglob("*")
+            if path.is_file()
+            and (path.name == "config.json" or path.name.endswith(".safetensors"))
+        ),
+        key=lambda path: path.relative_to(snapshot).as_posix(),
+    )
+    if not files:
+        raise FileNotFoundError(
+            f"model snapshot {snapshot} contains no config.json or safetensors files"
         )
-        if not files:
-            raise FileNotFoundError(
-                f"model snapshot {snapshot} contains no config.json or safetensors files"
-            )
-        for path in files:
-            relative = path.relative_to(snapshot).as_posix().encode("utf-8")
-            digest.update(len(relative).to_bytes(4, "big"))
-            digest.update(relative)
-            digest.update(path.stat().st_size.to_bytes(8, "big"))
-            with path.open("rb") as handle:
-                while chunk := handle.read(8 * 1024 * 1024):
-                    digest.update(chunk)
-    return int.from_bytes(digest.digest()[:8], "big", signed=False)
+    for path in files:
+        relative = path.relative_to(snapshot).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        digest.update(path.stat().st_size.to_bytes(8, "big"))
+        with path.open("rb") as handle:
+            while chunk := handle.read(8 * 1024 * 1024):
+                digest.update(chunk)
+    return digest.digest()
+
+
+def _identity_digest(identity: str) -> bytes:
+    if identity.startswith("sha256:"):
+        candidate = identity.removeprefix("sha256:")
+        if len(candidate) == 64 and all(
+            character in "0123456789abcdef" for character in candidate
+        ):
+            return bytes.fromhex(candidate)
+    return hashlib.sha256(b"gdlp-explicit-model-identity-v1\0" + identity.encode()).digest()
 
 
 def _hub_snapshot_commit(snapshot: Path) -> str | None:
@@ -394,6 +856,18 @@ def _hub_snapshot_commit(snapshot: Path) -> str | None:
     return candidate
 
 
+def _hub_snapshot_repository(snapshot: Path) -> str | None:
+    if _hub_snapshot_commit(snapshot) is None:
+        return None
+    model_directory = snapshot.parent.parent.name
+    if not model_directory.startswith("models--"):
+        return None
+    coordinates = model_directory.removeprefix("models--").split("--")
+    if len(coordinates) != 2 or not all(coordinates):
+        return None
+    return "/".join(coordinates)
+
+
 def _load_selective_stage_model(spec: StageModelSpec):
     """Instantiate only this stage and stream only its tensors from safetensors.
 
@@ -407,16 +881,16 @@ def _load_selective_stage_model(spec: StageModelSpec):
     snapshot_name = resolve_model_snapshot(spec.model_name, spec.revision)
     resolved_spec = replace(spec, model_name=snapshot_name, revision=None)
     config = AutoConfig.from_pretrained(snapshot_name)
-    actual_layers = int(getattr(config, "num_hidden_layers", 0) or 0)
-    if actual_layers != spec.total_layers:
-        raise ValueError(
-            f"model has {actual_layers} layers, but the stage plan declares "
-            f"{spec.total_layers}"
-        )
+    adapter = resolve_selective_stage_adapter(config)
+    adapter.validate_source_config(config, spec.total_layers)
     local_config = copy.deepcopy(config)
     local_layers = spec.layer_end - spec.layer_start
-    _slice_layer_specific_config(local_config, spec)
-    local_config.num_hidden_layers = local_layers
+    adapter.slice_config(
+        local_config,
+        layer_start=spec.layer_start,
+        layer_end=spec.layer_end,
+        total_layers=spec.total_layers,
+    )
     original_vocab_size = int(local_config.vocab_size)
     original_pad_token_id = getattr(local_config, "pad_token_id", None)
     # Intermediate stages never look up token IDs or project logits. Avoid even
@@ -425,19 +899,7 @@ def _load_selective_stage_model(spec: StageModelSpec):
         local_config.vocab_size = 1
         local_config.pad_token_id = 0
     model = AutoModelForCausalLM.from_config(local_config, dtype=torch.float32)
-    if (
-        not hasattr(model, "model")
-        or not hasattr(model.model, "layers")
-        or not hasattr(model.model, "norm")
-        or not hasattr(model.model, "embed_tokens")
-        or not hasattr(model, "lm_head")
-    ):
-        raise TypeError(
-            "selective loading currently requires a decoder with model.layers, "
-            "model.norm, model.embed_tokens and lm_head"
-        )
-    if len(model.model.layers) != local_layers:
-        raise ValueError("local model constructor did not honor num_hidden_layers")
+    adapter.inspect_constructed_model(model, local_layers=local_layers)
     if not spec.last:
         model.model.norm = nn.Identity()
         # Drop an untied vocabulary projection before streaming checkpoint tensors;
@@ -452,9 +914,11 @@ def _load_selective_stage_model(spec: StageModelSpec):
         # Preserve the original semantic config for any forward code that reads it.
         model.config.vocab_size = original_vocab_size
         model.config.pad_token_id = original_pad_token_id
-    _load_stage_parameters_from_safetensors(model, resolved_spec)
+    _load_stage_parameters_from_safetensors(model, resolved_spec, adapter=adapter)
     model.model.config.num_hidden_layers = local_layers
     model.config.num_hidden_layers = local_layers
+    model._gdlp_selective_stage_adapter = adapter
+    model._gdlp_resolved_snapshot = snapshot_name
     return model.eval()
 
 
@@ -466,9 +930,38 @@ def _slice_layer_specific_config(config: Any, spec: StageModelSpec) -> None:
             setattr(config, name, value[spec.layer_start : spec.layer_end])
 
 
-def _load_stage_parameters_from_safetensors(model: Any, spec: StageModelSpec) -> None:
+def _load_stage_parameters_from_safetensors(
+    model: Any,
+    spec: StageModelSpec,
+    *,
+    adapter: SelectiveStageAdapter | None = None,
+    preloaded_checkpoint_tensors: Mapping[str, torch.Tensor] | None = None,
+    ignored_checkpoint_names: set[str] | frozenset[str] = frozenset(),
+) -> None:
+    """Load every required local tensor, with explicit RAM-MoE exceptions.
+
+    ``preloaded_checkpoint_tensors`` is used by the direct MoE loader for the
+    small router/shared artifacts it has already authenticated and read.
+    ``ignored_checkpoint_names`` is deliberately name-exact: it may account
+    only for routed expert tensors that another certified owner retains.  This
+    prevents a broad prefix filter from silently omitting attention or router
+    state.
+    """
+
     root = _checkpoint_root(spec)
     checkpoint_files = _checkpoint_key_map(root)
+    checkpoint_names = set(checkpoint_files)
+    preloaded = dict(preloaded_checkpoint_tensors or {})
+    ignored = set(ignored_checkpoint_names)
+    unknown_preloaded = set(preloaded) - checkpoint_names
+    unknown_ignored = ignored - checkpoint_names
+    if unknown_preloaded or unknown_ignored:
+        raise KeyError(
+            "external checkpoint accounting names are absent from the artifact: "
+            f"preloaded={sorted(unknown_preloaded)}, ignored={sorted(unknown_ignored)}"
+        )
+    if set(preloaded).intersection(ignored):
+        raise ValueError("a checkpoint tensor cannot be both preloaded and ignored")
     tied_embeddings = bool(getattr(model.config, "tie_word_embeddings", False))
     targets: list[tuple[str, torch.Tensor, str]] = []
     seen_tensors: set[int] = set()
@@ -480,6 +973,22 @@ def _load_stage_parameters_from_safetensors(model: Any, spec: StageModelSpec) ->
         if identity in seen_tensors:
             continue
         seen_tensors.add(identity)
+        assignments = (
+            adapter.checkpoint_assignments(
+                local_name,
+                target,
+                layer_start=spec.layer_start,
+                checkpoint_names=checkpoint_names,
+            )
+            if adapter is not None
+            else None
+        )
+        if assignments is not None:
+            targets.extend(
+                (local_name, assignment.destination, assignment.checkpoint_name)
+                for assignment in assignments
+            )
+            continue
         checkpoint_name = _checkpoint_name(
             local_name,
             spec,
@@ -496,10 +1005,35 @@ def _load_stage_parameters_from_safetensors(model: Any, spec: StageModelSpec) ->
         loaded_checkpoint_names,
         spec,
         tied_embeddings=tied_embeddings,
+        externally_accounted_checkpoint_names=ignored,
     )
+
+    target_checkpoint_names = {
+        checkpoint_name for _, _, checkpoint_name in targets
+    }
+    unused_preloaded = set(preloaded) - target_checkpoint_names
+    if unused_preloaded:
+        raise KeyError(
+            "preloaded checkpoint tensors have no resident destination: "
+            f"{sorted(unused_preloaded)}"
+        )
 
     by_file: dict[Path, list[tuple[str, torch.Tensor, str]]] = {}
     for local_name, target, checkpoint_name in targets:
+        preloaded_value = preloaded.get(checkpoint_name)
+        if preloaded_value is not None:
+            if not isinstance(preloaded_value, torch.Tensor):
+                raise TypeError(
+                    f"preloaded checkpoint tensor {checkpoint_name!r} must be torch.Tensor"
+                )
+            if tuple(preloaded_value.shape) != tuple(target.shape):
+                raise ValueError(
+                    f"shape mismatch for {local_name}: preloaded "
+                    f"{tuple(preloaded_value.shape)}, stage {tuple(target.shape)}"
+                )
+            with torch.no_grad():
+                target.copy_(preloaded_value)
+            continue
         relative_file = checkpoint_files.get(checkpoint_name)
         if relative_file is None:
             raise KeyError(
@@ -614,13 +1148,21 @@ def _validate_checkpoint_coverage(
     spec: StageModelSpec,
     *,
     tied_embeddings: bool,
+    externally_accounted_checkpoint_names: set[str] | frozenset[str] = frozenset(),
 ) -> None:
     relevant = {
         name
         for name in checkpoint_files
         if _checkpoint_tensor_belongs_to_stage(name, spec)
     }
-    accounted = set(loaded_checkpoint_names)
+    externally_accounted = set(externally_accounted_checkpoint_names)
+    outside_stage = externally_accounted - relevant
+    if outside_stage:
+        raise KeyError(
+            "externally accounted checkpoint tensors are outside this stage: "
+            f"{sorted(outside_stage)}"
+        )
+    accounted = set(loaded_checkpoint_names) | externally_accounted
     if tied_embeddings and accounted.intersection(
         {"model.embed_tokens.weight", "lm_head.weight"}
     ):

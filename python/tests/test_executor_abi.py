@@ -6,12 +6,28 @@ import unittest
 from distributed_runtime.executor_abi import (
     STAGE_EXECUTOR_SCHEMA,
     build_stage_executor_manifest,
+    model_identity_for_source,
     parse_stage_executor_manifest,
     validate_executor_chain,
 )
 
 
 class StageExecutorAbiTests(unittest.TestCase):
+    def test_hub_snapshot_identity_ignores_absolute_cache_root(self) -> None:
+        commit = "c1899de289a04d12100db370d81485cdf75e47ca"
+        first = model_identity_for_source(
+            f"C:/host-a/cache/models--Qwen--Qwen3-0.6B/snapshots/{commit}",
+            None,
+        )
+        second = model_identity_for_source(
+            f"D:\\host-b\\hf\\snapshots\\{commit}",
+            None,
+        )
+        by_revision = model_identity_for_source("Qwen/Qwen3-0.6B", commit)
+        self.assertEqual(first, second)
+        self.assertEqual(first, by_revision)
+        self.assertRegex(first, r"^sha256:[0-9a-f]{64}$")
+
     def test_manifest_round_trip_seals_every_execution_field(self) -> None:
         manifest = _manifest(
             engine="external GGUF runtime",

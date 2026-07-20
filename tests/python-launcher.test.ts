@@ -1,8 +1,10 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   compilePythonLaunchDescription,
   validatePythonLaunchDescription,
   type PythonLaunchCompilerOptions,
+  type PythonNativeStageStageInput,
   type PythonCellMemberLaunch,
   type PythonPipelineLaunchDescription,
   type PythonRemoteStageLaunch,
@@ -187,6 +189,62 @@ function argumentValues(args: string[], flag: string): string[] {
 
 function moduleName(args: string[]): string | undefined {
   return argumentValue(args, "-m");
+}
+
+const NATIVE_STAGE_TEST_COMMIT = "12fd25f77366fa6b3b4b768ec3050bf629380bac";
+
+function native_stagePipelineId(commit = NATIVE_STAGE_TEST_COMMIT): string {
+  const bytes = createHash("sha256")
+    .update("gdlp-hub-snapshot-v1\0")
+    .update(commit, "ascii")
+    .digest()
+    .subarray(0, 8);
+  let result = 0n;
+  for (const byte of bytes) result = (result << 8n) | BigInt(byte);
+  return result.toString();
+}
+
+function native_stageStage(
+  current: RuntimePipelineManifestV2,
+  stageIndex: number,
+  overrides: Partial<PythonNativeStageStageInput> = {},
+): PythonNativeStageStageInput {
+  const stage = current.plans.prefill.stages[stageIndex]!;
+  return {
+    packagePath: `D:\\packages\\${stage.stageId}`,
+    packageId: "a".repeat(64),
+    manifestSha256: "b".repeat(64),
+    modelSource: "hf://HuggingFaceTB/SmolLM2-135M-Instruct",
+    modelRevision: NATIVE_STAGE_TEST_COMMIT,
+    layerStart: stage.layerStart,
+    layerEnd: stage.layerEnd,
+    totalLayers: current.totalLayers,
+    daemonExecutable: "D:\\bin\\llama-native_stage-worker.exe",
+    pipelineId: native_stagePipelineId(),
+    contextTokens: 4_096,
+    gpuLayers: 99,
+    computeApi: "cuda",
+    startupTimeoutSeconds: 90,
+    callTimeoutSeconds: 30.5,
+    closeTimeoutSeconds: 5,
+    ...overrides,
+  };
+}
+
+function native_stageOptions(
+  current: RuntimePipelineManifestV2,
+  stageIndexes: number[] = [2],
+): Partial<PythonLaunchCompilerOptions> {
+  const snapshot = `C:\\cache\\models--HuggingFaceTB--SmolLM2-135M-Instruct\\snapshots\\${NATIVE_STAGE_TEST_COMMIT}`;
+  return {
+    runtimeModel: { source: snapshot, revision: null },
+    native_stageStages: Object.fromEntries(
+      stageIndexes.map((index) => {
+        const stage = current.plans.prefill.stages[index]!;
+        return [stage.stageId, native_stageStage(current, index)];
+      }),
+    ),
+  };
 }
 
 function addCooperativeMember(stage: RuntimeVirtualStageManifest): void {
@@ -429,6 +487,8 @@ describe("GDLP/2 Python launch compiler", () => {
   it("places prefill, batching and disabled speculation on the root server argv", () => {
     const args = root(compile()).command.args;
     expect(argumentValue(args, "--prefill-chunk-tokens")).toBe("8");
+    expect(argumentValue(args, "--sealed-wave-tokens")).toBe("1");
+    expect(argumentValue(args, "--max-prefill-chunk-tokens")).toBe("8");
     expect(argumentValue(args, "--max-batch-size")).toBe("2");
     expect(argumentValue(args, "--max-active-sequences")).toBe("2");
     expect(argumentValue(args, "--speculation")).toBe("off");
@@ -480,6 +540,233 @@ describe("GDLP/2 Python launch compiler", () => {
     }
   });
 
+  it("propagates one path-independent artifact identity to every Python model process", () => {
+    const description = compile(manifest(), {
+      runtimeModel: {
+        source: "D:\\different-host-cache\\Qwen3",
+        revision: null,
+        snapshotIdentity: "12345",
+      },
+    });
+    expect(description.runtimeModel).toEqual({
+      source: "D:\\different-host-cache\\Qwen3",
+      revision: null,
+      snapshotIdentity: "12345",
+      artifactIdentity: "snapshot:uint64:0000000000003039",
+      canonicalSource:
+        "content-addressed://snapshot:uint64:0000000000003039",
+      canonicalRevision: null,
+    });
+    for (const process of description.launchOrder) {
+      if (process.kind === "cell-member") continue;
+      expect(argumentValue(process.command.args, "--model-artifact-identity")).toBe(
+        "snapshot:uint64:0000000000003039",
+      );
+      expect(argumentValue(process.command.args, "--model-canonical-source")).toBe(
+        "content-addressed://snapshot:uint64:0000000000003039",
+      );
+      expect(argumentValue(process.command.args, "--pipeline-snapshot-identity")).toBe(
+        "12345",
+      );
+    }
+  });
+
+  it("canonicalizes a Hub cache snapshot to repository and commit coordinates", () => {
+    const commit = "c1899de289a04d12100db370d81485cdf75e47ca";
+    const description = compile(manifest(), {
+      runtimeModel: {
+        source: `C:\\cache\\models--Qwen--Qwen3-0.6B\\snapshots\\${commit}`,
+        revision: null,
+      },
+    });
+    expect(description.runtimeModel.canonicalSource).toBe("hf://Qwen/Qwen3-0.6B");
+    expect(description.runtimeModel.canonicalRevision).toBe(commit);
+    expect(description.runtimeModel.artifactIdentity).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(description.runtimeModel.snapshotIdentity).toMatch(/^\d+$/);
+  });
+
+  it("binds one sealed NativeStage package to an exact non-root stage and renders every flag", () => {
+    const current = manifest();
+    const target = current.plans.prefill.stages[2]!;
+    const description = compile(current, native_stageOptions(current));
+    const launch = remotes(description).find((stage) => stage.stageId === target.stageId)!;
+    const normalized = description.configuration.native_stageStages[target.stageId]!;
+
+    expect(launch.native_stage).toEqual(normalized);
+    expect(launch.cell).toBeNull();
+    expect(normalized.modelIdentity).toBe(description.runtimeModel.artifactIdentity);
+    expect(argumentValue(launch.command.args, "--model")).toBe(
+      "hf://HuggingFaceTB/SmolLM2-135M-Instruct",
+    );
+    expect(argumentValue(launch.command.args, "--revision")).toBe(NATIVE_STAGE_TEST_COMMIT);
+    expect(launch.command.args).not.toContain("--model-artifact-identity");
+    expect(launch.command.args).not.toContain("--pipeline-snapshot-identity");
+    expect(argumentValue(launch.command.args, "--native_stage-package")).toBe(
+      normalized.packagePath,
+    );
+    expect(argumentValue(launch.command.args, "--native_stage-package-id")).toBe(
+      normalized.packageId,
+    );
+    expect(argumentValue(launch.command.args, "--native_stage-manifest-sha256")).toBe(
+      normalized.manifestSha256,
+    );
+    expect(argumentValue(launch.command.args, "--native_stage-daemon-bin")).toBe(
+      normalized.daemonExecutable,
+    );
+    expect(argumentValue(launch.command.args, "--native_stage-pipeline-id")).toBe(
+      normalized.pipelineId,
+    );
+    expect(argumentValue(launch.command.args, "--native_stage-context-tokens")).toBe("4096");
+    expect(argumentValue(launch.command.args, "--native_stage-gpu-layers")).toBe("99");
+    expect(argumentValue(launch.command.args, "--native_stage-compute-api")).toBe("cuda");
+    expect(argumentValue(launch.command.args, "--native_stage-startup-timeout-seconds")).toBe(
+      "90",
+    );
+    expect(argumentValue(launch.command.args, "--native_stage-call-timeout-seconds")).toBe(
+      "30.5",
+    );
+    expect(argumentValue(launch.command.args, "--native_stage-close-timeout-seconds")).toBe(
+      "5",
+    );
+    expect(argumentValue(root(description).command.args, "--model")).toContain(
+      "models--HuggingFaceTB--SmolLM2-135M-Instruct",
+    );
+    expect(() =>
+      validatePythonLaunchDescription(JSON.parse(JSON.stringify(description))),
+    ).not.toThrow();
+  });
+
+  it("binds a local non-Hub snapshot through its content-derived pipeline identity", () => {
+    const current = manifest();
+    const target = current.plans.prefill.stages[2]!;
+    const localSource = "D:\\models\\SmolLM2-local-snapshot";
+    const snapshotIdentity = "12345";
+    const options = native_stageOptions(current);
+    options.runtimeModel = {
+      source: localSource,
+      revision: null,
+      snapshotIdentity,
+    };
+    options.native_stageStages![target.stageId] = native_stageStage(current, 2, {
+      modelSource: localSource,
+      modelRevision: null,
+      pipelineId: snapshotIdentity,
+    });
+
+    const description = compile(current, options);
+    const normalized = description.configuration.native_stageStages[target.stageId]!;
+    const launch = remotes(description).find((stage) => stage.stageId === target.stageId)!;
+
+    expect(description.runtimeModel.artifactIdentity).toBe(
+      "snapshot:uint64:0000000000003039",
+    );
+    expect(normalized.modelIdentity).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(normalized.modelIdentity).not.toBe(description.runtimeModel.artifactIdentity);
+    expect(normalized.pipelineId).toBe(snapshotIdentity);
+    expect(argumentValue(launch.command.args, "--model")).toBe(localSource);
+    expect(launch.command.args).not.toContain("--revision");
+    expect(() =>
+      validatePythonLaunchDescription(JSON.parse(JSON.stringify(description))),
+    ).not.toThrow();
+
+    const wrongContent = structuredClone(options);
+    wrongContent.native_stageStages![target.stageId]!.pipelineId = "12346";
+    expect(() => compile(current, wrongContent)).toThrow(
+      `python_native_stage_pipeline_identity_mismatch:${target.stageId}`,
+    );
+
+    const wrongCoordinates = structuredClone(options);
+    wrongCoordinates.native_stageStages![target.stageId]!.modelIdentity =
+      `sha256:${"f".repeat(64)}`;
+    expect(() => compile(current, wrongCoordinates)).toThrow(
+      `python_native_stage_model_identity_mismatch:${target.stageId}`,
+    );
+  });
+
+  it("sorts multiple NativeStage stage bindings before deriving route and launch identities", () => {
+    const current = manifest();
+    const forward = native_stageOptions(current, [1, 2]);
+    const reversedEntries = Object.entries(forward.native_stageStages!).reverse();
+    const reversed = {
+      ...forward,
+      native_stageStages: Object.fromEntries(reversedEntries),
+    };
+    expect(compile(current, reversed)).toEqual(compile(current, forward));
+  });
+
+  it("detects NativeStage configuration, process metadata and argv tampering", () => {
+    const current = manifest();
+    const stageId = current.plans.prefill.stages[2]!.stageId;
+
+    const configuration = compile(current, native_stageOptions(current));
+    configuration.configuration.native_stageStages[stageId]!.packagePath += "-tampered";
+    expect(() => validatePythonLaunchDescription(configuration)).toThrow(
+      "python_launch_description_mismatch",
+    );
+
+    const process = compile(current, native_stageOptions(current));
+    remotes(process).find((stage) => stage.stageId === stageId)!.native_stage!.packageId =
+      "c".repeat(64);
+    expect(() => validatePythonLaunchDescription(process)).toThrow(
+      "python_launch_description_mismatch",
+    );
+
+    const argv = compile(current, native_stageOptions(current));
+    const args = remotes(argv).find((stage) => stage.stageId === stageId)!.command.args;
+    args[args.indexOf("--native_stage-context-tokens") + 1] = "8192";
+    expect(() => validatePythonLaunchDescription(argv)).toThrow(
+      "python_launch_description_mismatch",
+    );
+  });
+
+  it("fails closed for invalid NativeStage stage bindings", () => {
+    const current = manifest();
+    const rootId = current.plans.prefill.stages[0]!.stageId;
+    expect(() => compile(current, native_stageOptions(current, [0]))).toThrow(
+      `python_native_stage_stage_cannot_be_root:${rootId}`,
+    );
+
+    const unknown = native_stageOptions(current);
+    unknown.native_stageStages = {
+      "stage-does-not-exist": native_stageStage(current, 2),
+    };
+    expect(() => compile(current, unknown)).toThrow(
+      "python_native_stage_stage_is_not_in_both_phases:stage-does-not-exist",
+    );
+
+    const stageId = current.plans.prefill.stages[2]!.stageId;
+    const range = native_stageOptions(current);
+    range.native_stageStages![stageId]!.layerStart -= 1;
+    expect(() => compile(current, range)).toThrow(
+      `python_native_stage_stage_range_mismatch:${stageId}`,
+    );
+
+    const pipeline = native_stageOptions(current);
+    pipeline.native_stageStages![stageId]!.pipelineId = "1";
+    expect(() => compile(current, pipeline)).toThrow(
+      `python_native_stage_pipeline_identity_mismatch:${stageId}`,
+    );
+
+    const compute = native_stageOptions(current);
+    compute.native_stageStages![stageId]!.computeApi = "cpu";
+    expect(() => compile(current, compute)).toThrow(
+      `python_native_stage_compute_api_gpu_layers_mismatch:${stageId}`,
+    );
+
+    const missingIdentity = native_stageOptions(current);
+    delete (missingIdentity.native_stageStages![stageId] as Partial<PythonNativeStageStageInput>)
+      .packageId;
+    expect(() => compile(current, missingIdentity)).toThrow(
+      `python_native_stage_stage_configuration_keys_are_invalid:${stageId}`,
+    );
+
+    const cell = materializeTensorParallelCell(manifest());
+    const cellStageId = cell.plans.prefill.stages[1]!.stageId;
+    expect(() => compile(cell, native_stageOptions(cell, [1]))).toThrow(
+      `python_native_stage_stage_cannot_use_cell_execution:${cellStageId}`,
+    );
+  });
+
   it("maps adaptive ngram speculation to the Python server", () => {
     const policy: RuntimeSpeculationPolicy = {
       mode: "adaptive",
@@ -512,6 +799,12 @@ describe("GDLP/2 Python launch compiler", () => {
     const args = root(compile(current)).command.args;
     expect(argumentValue(args, "--speculation")).toBe("ngram");
     expect(argumentValue(args, "--speculative-max-draft-tokens")).toBe("5");
+    expect(argumentValue(args, "--sealed-wave-tokens")).toBe("6");
+    expect(argumentValue(args, "--max-prefill-chunk-tokens")).toBe("8");
+    for (const stage of remotes(compile(current))) {
+      expect(argumentValue(stage.command.args, "--sealed-wave-tokens")).toBe("6");
+      expect(argumentValue(stage.command.args, "--max-prefill-chunk-tokens")).toBe("8");
+    }
   });
 
   it("rejects a speculative provider the Python server cannot execute", () => {

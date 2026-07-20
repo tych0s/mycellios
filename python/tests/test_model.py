@@ -11,6 +11,7 @@ from unittest.mock import patch
 from safetensors.torch import save_file
 import torch
 from torch import nn
+from transformers import LlamaConfig, LlamaModel
 
 from distributed_runtime.model import (
     StageModelSpec,
@@ -199,6 +200,117 @@ class ModelContractTests(unittest.TestCase):
         self.assertEqual(tokens, [1, 2, 0])
 
 
+class PhysicalTensorBatchTests(unittest.TestCase):
+    def test_token_batch_uses_one_forward_and_splits_independent_dynamic_caches(self) -> None:
+        runner = _tiny_stage_runner()
+        first = torch.tensor([[1, 2, 3]], dtype=torch.long)
+        second = torch.tensor([[1, 4, 5]], dtype=torch.long)
+        next_first = torch.tensor([[6]], dtype=torch.long)
+        next_second = torch.tensor([[7]], dtype=torch.long)
+
+        for request_id in (11, 22):
+            runner.begin(request_id)
+        sequential_first = (
+            runner.forward_ids(11, first),
+            runner.forward_ids(22, second),
+        )
+        sequential_next = (
+            runner.forward_ids(11, next_first),
+            runner.forward_ids(22, next_second),
+        )
+        sequential_caches = {
+            request_id: tuple(
+                (layer.keys.clone(), layer.values.clone())
+                for layer in runner.caches[request_id].layers
+            )
+            for request_id in (11, 22)
+        }
+        runner.end(11)
+        runner.end(22)
+
+        for request_id in (101, 202):
+            runner.begin(request_id)
+        calls_before = runner.model_forward_calls
+        batched_first = runner.forward_ids_batch((101, 202), (first, second))
+        self.assertEqual(runner.model_forward_calls - calls_before, 1)
+        batched_next = runner.forward_ids_batch(
+            (101, 202), (next_first, next_second)
+        )
+
+        for actual, expected in zip(batched_first, sequential_first, strict=True):
+            torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+        for actual, expected in zip(batched_next, sequential_next, strict=True):
+            torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+        for batched_id, sequential_id in ((101, 11), (202, 22)):
+            self.assertEqual(runner.sequence_length(batched_id), 4)
+            for layer, (expected_keys, expected_values) in zip(
+                runner.caches[batched_id].layers,
+                sequential_caches[sequential_id],
+                strict=True,
+            ):
+                torch.testing.assert_close(layer.keys, expected_keys, rtol=1e-5, atol=1e-6)
+                torch.testing.assert_close(
+                    layer.values, expected_values, rtol=1e-5, atol=1e-6
+                )
+        self.assertNotEqual(
+            runner.caches[101].layers[0].keys.data_ptr(),
+            runner.caches[202].layers[0].keys.data_ptr(),
+            "split request caches must not alias the shared batch allocation",
+        )
+        self.assertEqual(runner.physical_batch_calls, 2)
+        self.assertEqual(runner.physical_batch_items, 4)
+        self.assertEqual(runner.max_observed_physical_batch_size, 2)
+
+    def test_hidden_batch_is_token_exact_and_refuses_unequal_cache_lengths(self) -> None:
+        runner = _tiny_stage_runner()
+        torch.manual_seed(73)
+        first = torch.randn(1, 3, runner.hidden_size)
+        second = torch.randn(1, 3, runner.hidden_size)
+
+        for request_id in (1, 2):
+            runner.begin(request_id)
+        sequential = (
+            runner.forward_hidden(1, first, token_mode="all"),
+            runner.forward_hidden(2, second, token_mode="all"),
+        )
+        runner.end(1)
+        runner.end(2)
+
+        for request_id in (3, 4):
+            runner.begin(request_id)
+        calls_before = runner.model_forward_calls
+        batched = runner.forward_hidden_batch(
+            (3, 4), (first, second), token_mode="all"
+        )
+        self.assertEqual(runner.model_forward_calls - calls_before, 1)
+        for (actual_hidden, actual_tokens), (expected_hidden, expected_tokens) in zip(
+            batched, sequential, strict=True
+        ):
+            torch.testing.assert_close(
+                actual_hidden, expected_hidden, rtol=1e-5, atol=1e-6
+            )
+            self.assertEqual(actual_tokens, expected_tokens)
+
+        runner.forward_hidden(3, torch.randn(1, 1, runner.hidden_size))
+        self.assertNotEqual(
+            runner.physical_batch_key(3, token_count=1, token_mode="last"),
+            runner.physical_batch_key(4, token_count=1, token_mode="last"),
+        )
+        with self.assertRaisesRegex(ValueError, "equal cache length"):
+            runner.forward_hidden_batch(
+                (3, 4),
+                (
+                    torch.randn(1, 1, runner.hidden_size),
+                    torch.randn(1, 1, runner.hidden_size),
+                ),
+            )
+
+        runner._physical_batch_cache_supported = False
+        self.assertIsNone(
+            runner.physical_batch_key(3, token_count=1, token_mode="last")
+        )
+
+
 @unittest.skipUnless(
     os.environ.get("RUN_DISTRIBUTED_MODEL_TESTS") == "1",
     "set RUN_DISTRIBUTED_MODEL_TESTS=1 to run the cached SmolLM integration test",
@@ -207,6 +319,92 @@ class SmolLMPartitionIntegrationTests(unittest.TestCase):
     MODEL_NAME = os.environ.get(
         "DISTRIBUTED_TEST_MODEL", "HuggingFaceTB/SmolLM2-135M-Instruct"
     )
+
+    def test_real_stage_physically_batches_and_preserves_per_request_kv(self) -> None:
+        with patch(
+            "distributed_runtime.model.AutoModelForCausalLM.from_pretrained",
+            side_effect=AssertionError("stage loader must remain selective"),
+        ):
+            runner = StageRunner(StageModelSpec(self.MODEL_NAME, 15, 30, 30, 2))
+        self.assertIn("physical-tensor-batching", runner.executor_manifest.features)
+        self.assertEqual(runner.executor_manifest.max_batch_size, 8)
+        torch.manual_seed(79)
+        first_prefill = torch.randn(1, 3, runner.hidden_size)
+        second_prefill = torch.randn(1, 3, runner.hidden_size)
+        first_decode = torch.randn(1, 1, runner.hidden_size)
+        second_decode = torch.randn(1, 1, runner.hidden_size)
+
+        for request_id in (11, 22):
+            runner.begin(request_id)
+        sequential_prefill = (
+            runner.forward_hidden(11, first_prefill, token_mode="all"),
+            runner.forward_hidden(22, second_prefill, token_mode="all"),
+        )
+        sequential_decode = (
+            runner.forward_hidden(11, first_decode),
+            runner.forward_hidden(22, second_decode),
+        )
+        sequential_caches = {
+            request_id: tuple(
+                (layer.keys.clone(), layer.values.clone())
+                for layer in runner.caches[request_id].layers
+            )
+            for request_id in (11, 22)
+        }
+        runner.end(11)
+        runner.end(22)
+
+        for request_id in (101, 202):
+            runner.begin(request_id)
+        before = runner.model_forward_calls
+        batched_prefill = runner.forward_hidden_batch(
+            (101, 202),
+            (first_prefill, second_prefill),
+            token_mode="all",
+        )
+        self.assertEqual(runner.model_forward_calls - before, 1)
+        batched_decode = runner.forward_hidden_batch(
+            (101, 202),
+            (first_decode, second_decode),
+        )
+
+        for actual, expected in zip(
+            batched_prefill, sequential_prefill, strict=True
+        ):
+            torch.testing.assert_close(actual[0], expected[0], rtol=1e-3, atol=3e-5)
+            self.assertEqual(actual[1], expected[1])
+        for actual, expected in zip(batched_decode, sequential_decode, strict=True):
+            torch.testing.assert_close(actual[0], expected[0], rtol=1e-3, atol=3e-5)
+            self.assertEqual(actual[1], expected[1])
+        for batched_id, sequential_id in ((101, 11), (202, 22)):
+            self.assertEqual(runner.sequence_length(batched_id), 4)
+            for layer, (expected_keys, expected_values) in zip(
+                runner.caches[batched_id].layers,
+                sequential_caches[sequential_id],
+                strict=True,
+            ):
+                torch.testing.assert_close(
+                    layer.keys, expected_keys, rtol=1e-3, atol=3e-5
+                )
+                torch.testing.assert_close(
+                    layer.values, expected_values, rtol=1e-3, atol=3e-5
+                )
+        self.assertNotEqual(
+            runner.caches[101].layers[0].keys.data_ptr(),
+            runner.caches[202].layers[0].keys.data_ptr(),
+        )
+        runner.truncate(101, 3)
+        self.assertNotEqual(
+            runner.physical_batch_key(101, token_count=1, token_mode="last"),
+            runner.physical_batch_key(202, token_count=1, token_mode="last"),
+        )
+        runner.truncate(202, 3)
+        self.assertEqual(
+            runner.physical_batch_key(101, token_count=1, token_mode="last"),
+            runner.physical_batch_key(202, token_count=1, token_mode="last"),
+        )
+        runner.end(101)
+        runner.end(202)
 
     def test_two_stages_are_token_exact_for_interleaved_chats(self) -> None:
         tokenizer = load_tokenizer(self.MODEL_NAME)
@@ -359,6 +557,33 @@ class _CroppableCache:
 
     def crop(self, token_count: int) -> None:
         self.crops.append(token_count)
+
+
+def _tiny_stage_runner() -> StageRunner:
+    torch.manual_seed(67)
+    config = LlamaConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
+    )
+    runner = StageRunner.__new__(StageRunner)
+    runner.base = LlamaModel(config).eval()
+    runner.head = nn.Linear(config.hidden_size, config.vocab_size, bias=False).eval()
+    runner.hidden_size = config.hidden_size
+    runner.spec = StageModelSpec("tiny", 0, 2, 2, 1)
+    runner.caches = {}
+    runner.tokens_seen = {}
+    runner.active_requests = set()
+    runner._physical_batch_cache_supported = True
+    runner.model_forward_calls = 0
+    runner.physical_batch_calls = 0
+    runner.physical_batch_items = 0
+    runner.max_observed_physical_batch_size = 1
+    return runner
 
 
 class _FakeCausalModel:

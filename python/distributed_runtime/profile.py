@@ -17,6 +17,10 @@ from .model import (
     model_snapshot_identity,
     resolve_model_snapshot,
 )
+from .safetensors_moe_stage_loader import (
+    LocalSafetensorsMoeMetadata,
+    inspect_local_safetensors_moe_metadata,
+)
 
 
 PROFILE_SCHEMA = "gdlp-model-profile/1"
@@ -69,7 +73,11 @@ def compile_model_profile(
 
     options = options or ModelProfileOptions()
     snapshot = Path(resolve_model_snapshot(model_name, revision))
-    config = AutoConfig.from_pretrained(snapshot)
+    config = AutoConfig.from_pretrained(
+        snapshot,
+        local_files_only=True,
+        trust_remote_code=False,
+    )
     total_layers = _positive_int_config(
         config,
         "num_hidden_layers",
@@ -90,6 +98,28 @@ def compile_model_profile(
     if missing:
         raise ValueError(f"layer prefix {prefix!r} has no tensors for layers {missing}")
 
+    moe_metadata: LocalSafetensorsMoeMetadata | None = None
+    moe_workspace_bytes_per_position: int | None = None
+    if getattr(config, "model_type", None) in {"qwen3_moe", "glm4_moe"}:
+        # This certification path is deliberately stricter than generic layer
+        # profiling.  It reuses the executable loader's metadata-only layout
+        # validators and never interprets an unfamiliar MoE as streamable.
+        if prefix != "model.layers":
+            raise ValueError(
+                f"certified MoE profiling requires layer prefix 'model.layers', got {prefix!r}"
+            )
+        moe_metadata = inspect_local_safetensors_moe_metadata(snapshot)
+        if moe_metadata.total_layers != total_layers:
+            raise ValueError(
+                "certified MoE metadata layer count differs from the model profile"
+            )
+        moe_intermediate_size = _positive_int_config(config, "moe_intermediate_size")
+        moe_workspace_bytes_per_position = _serial_moe_workspace_bytes_per_position(
+            hidden_size=hidden_size,
+            intermediate_size=moe_intermediate_size,
+            source_dtype=moe_metadata.source_dtype,
+        )
+
     assigned = {tensor.name for values in layer_tensors for tensor in values}
     endpoints = [tensor for tensor in tensors if tensor.name not in assigned]
     embedding_tensors = [tensor for tensor in endpoints if _is_embedding_tensor(tensor.name)]
@@ -108,20 +138,92 @@ def compile_model_profile(
         # planner deliberately budgets that duplication even if storage has one tensor.
         duplicated_tied_head_bytes = embedding_bytes
         lm_head_bytes += duplicated_tied_head_bytes
+    largest_embedding_tensor_bytes = max(
+        (tensor.bytes for tensor in embedding_tensors),
+        default=0,
+    )
+    # A tied final projection is populated from the canonical embedding tensor
+    # even when the checkpoint omits a separate lm_head key. Residual endpoint
+    # tensors (for example model.norm) are also streamed by the final stage.
+    final_projection_sources = (
+        embedding_tensors if tied and embedding_tensors else head_tensors
+    )
+    largest_lm_head_tensor_bytes = max(
+        (tensor.bytes for tensor in (*final_projection_sources, *residual_tensors)),
+        default=0,
+    )
 
     kv_element_bytes = options.kv_element_bytes or _dtype_bytes(config)
     kv_bytes_per_token = 2 * kv_heads * head_dim * kv_element_bytes
-    profile_layers = [
-        {
+    profile_layers: list[dict[str, Any]] = []
+    for index, values in enumerate(layer_tensors):
+        layer_profile: dict[str, Any] = {
             "index": index,
             "weightBytes": sum(tensor.bytes for tensor in values),
+            "largestResidentTensorBytes": max(
+                (
+                    tensor.bytes
+                    for tensor in values
+                    if not (
+                        moe_metadata is not None
+                        and moe_metadata.layers[index].sparse
+                        and ".mlp.experts." in tensor.name
+                    )
+                ),
+                default=0,
+            ),
             "activationElements": hidden_size,
             "kvBytesPerToken": kv_bytes_per_token,
             "decodeMsAtUnit": options.decode_ms_per_layer_at_unit,
             "prefillMsPerTokenAtUnit": options.prefill_ms_per_token_at_unit,
         }
-        for index, values in enumerate(layer_tensors)
-    ]
+        if moe_metadata is not None:
+            moe_layer = moe_metadata.layers[index]
+            if moe_layer.sparse:
+                routed_bytes = moe_layer.routed_expert_bytes
+                excluded_routed_bytes = sum(
+                    tensor.bytes
+                    for tensor in values
+                    if ".mlp.experts." in tensor.name
+                )
+                if excluded_routed_bytes != routed_bytes:
+                    raise ValueError(
+                        f"layer {index} routed expert header accounting differs "
+                        "from certified MoE metadata"
+                    )
+                if routed_bytes > layer_profile["weightBytes"]:
+                    raise ValueError(
+                        f"layer {index} routed experts exceed complete layer weight bytes"
+                    )
+                active_bytes = sum(
+                    sorted(moe_layer.expert_sizes_bytes, reverse=True)[
+                        : moe_metadata.experts_per_token
+                    ]
+                )
+                layer_profile["expertParallel"] = {
+                    "expertWeightBytes": routed_bytes,
+                    "expertCount": moe_metadata.expert_count,
+                    "expertsPerToken": moe_metadata.experts_per_token,
+                }
+                layer_profile["macroWave"] = {
+                    # Legacy per-token telemetry retained by the planner.  The
+                    # exact serial execution unit is the largest expert below.
+                    "activeWeightBytesPerWave": active_bytes,
+                    "largestTransferUnitBytes": moe_layer.largest_expert_bytes,
+                    # Peak temporary storage for one serial routed expert and
+                    # one position. The planner multiplies this by the sealed
+                    # physical wave/batch width and only one layer at a time.
+                    "expertWorkspaceBytesPerPosition": (
+                        moe_workspace_bytes_per_position
+                    ),
+                }
+            else:
+                # GLM4-MoE can begin with ordinary dense MLP layers. Mark the
+                # zero routed allocation so a mixed stage remains fully
+                # accounted, but omit routing geometry and MacroWave transfer
+                # fields because there is no expert to page.
+                layer_profile["expertParallel"] = {"expertWeightBytes": 0}
+        profile_layers.append(layer_profile)
 
     architecture = _first_string(getattr(config, "architectures", None))
     selective_compatible = prefix.endswith("model.layers") or prefix == "model.layers"
@@ -141,6 +243,43 @@ def compile_model_profile(
         + embedding_bytes
         + lm_head_bytes
     )
+    inspection: dict[str, Any] = {
+        "architecture": architecture,
+        "layerPrefix": prefix,
+        "hiddenSize": hidden_size,
+        "attentionHeads": attention_heads,
+        "keyValueHeads": kv_heads,
+        "headDim": head_dim,
+        "kvElementBytes": kv_element_bytes,
+        "calibrationRequired": True,
+        "duplicatedTiedHeadBytes": duplicated_tied_head_bytes,
+    }
+    accounting: dict[str, Any] = {
+        "checkpointStorageBytes": storage_bytes,
+        "plannedResidentWeightBytesAcrossSplitEndpoints": planned_weight_bytes,
+    }
+    if moe_metadata is not None:
+        routed_bytes = moe_metadata.total_routed_expert_bytes
+        layer_weight_bytes = sum(layer["weightBytes"] for layer in profile_layers)
+        inspection["certifiedMoe"] = {
+            "adapterId": moe_metadata.adapter_id,
+            "storageLayout": moe_metadata.storage_layout,
+            "sourceDtype": moe_metadata.source_dtype,
+            "expertCount": moe_metadata.expert_count,
+            "expertsPerToken": moe_metadata.experts_per_token,
+            "expertWorkspace": {
+                "bytesPerPosition": moe_workspace_bytes_per_position,
+                "executionMode": "serial-exact-swiglu",
+                "includesCublasWorkspace": False,
+            },
+        }
+        accounting.update(
+            {
+                "moeRoutedExpertWeightBytes": routed_bytes,
+                "moeNonRoutedLayerWeightBytes": layer_weight_bytes - routed_bytes,
+            }
+        )
+
     return {
         "schema": PROFILE_SCHEMA,
         "source": {
@@ -152,17 +291,7 @@ def compile_model_profile(
             "storageBytes": storage_bytes,
             "tensorCount": len(tensors),
         },
-        "inspection": {
-            "architecture": architecture,
-            "layerPrefix": prefix,
-            "hiddenSize": hidden_size,
-            "attentionHeads": attention_heads,
-            "keyValueHeads": kv_heads,
-            "headDim": head_dim,
-            "kvElementBytes": kv_element_bytes,
-            "calibrationRequired": True,
-            "duplicatedTiedHeadBytes": duplicated_tied_head_bytes,
-        },
+        "inspection": inspection,
         "compatibility": {
             "selectiveSafetensors": selective_compatible and not compatibility_reasons,
             "requiresAdapter": not (selective_compatible and not compatibility_reasons),
@@ -173,6 +302,8 @@ def compile_model_profile(
             "layers": profile_layers,
             "embeddingBytes": embedding_bytes,
             "lmHeadBytes": lm_head_bytes,
+            "largestEmbeddingTensorBytes": largest_embedding_tensor_bytes,
+            "largestLmHeadTensorBytes": largest_lm_head_tensor_bytes,
             "tiedEmbeddingAndHead": tied,
             "runtimeOverheadBytesPerStage": options.runtime_overhead_bytes_per_stage,
             "embeddingDecodeMsAtUnit": 0.0,
@@ -180,10 +311,7 @@ def compile_model_profile(
             "embeddingPrefillMsPerTokenAtUnit": 0.0,
             "lmHeadPrefillMsPerTokenAtUnit": 0.0,
         },
-        "accounting": {
-            "checkpointStorageBytes": storage_bytes,
-            "plannedResidentWeightBytesAcrossSplitEndpoints": planned_weight_bytes,
-        },
+        "accounting": accounting,
     }
 
 
@@ -351,6 +479,37 @@ def _dtype_bytes(config: Any) -> int:
         return 1
     # Runtime KV is conservatively assumed FP16 when a checkpoint omits dtype.
     return 2
+
+
+def _serial_moe_workspace_bytes_per_position(
+    *,
+    hidden_size: int,
+    intermediate_size: int,
+    source_dtype: str,
+) -> int:
+    """Conservative tensor-temporary bound for the certified serial SwiGLU path.
+
+    The runner executes one routed expert at a time. At its widest point it can
+    retain selected hidden rows, packed gate/up output, activation/product
+    temporaries, down output, weighted output and two int64 index vectors.
+    CUDA library scratch remains part of the independent runtime reserve until
+    a physical ``max_memory_allocated`` gate replaces that assumption.
+    """
+
+    try:
+        element_bytes = {"F16": 2, "BF16": 2, "F32": 4}[source_dtype]
+    except KeyError as error:
+        raise ValueError(
+            f"unsupported certified MoE workspace dtype {source_dtype!r}"
+        ) from error
+    tensor_bytes = (
+        4 * intermediate_size + 3 * hidden_size
+    ) * element_bytes
+    index_and_gate_bytes = 2 * 8 + element_bytes
+    raw = tensor_bytes + index_and_gate_bytes
+    # Device allocators round small temporaries; sealing to 256 bytes avoids a
+    # systematically optimistic byte-exact sum.
+    return ((raw + 255) // 256) * 256
 
 
 def _first_string(value: Any) -> str | None:

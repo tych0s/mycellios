@@ -1,5 +1,9 @@
 node_modules/
 dist/
+out/
+.vite/
+landing-dist/
+mobile-dist/
 coverage/
 runtime/
 .env

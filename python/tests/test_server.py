@@ -19,10 +19,17 @@ from distributed_runtime.server import (
     DistributedOpenAIServer,
     IncrementalTokenDecoder,
     PendingGeneration,
+    build_server,
+    parse_args as parse_server_args,
 )
 
 
 class EngineConfigurationTests(unittest.TestCase):
+    def test_server_rejects_partial_wave_limits_before_model_loading(self) -> None:
+        args = parse_server_args(["--sealed-wave-tokens", "1"])
+        with self.assertRaisesRegex(ValueError, "must be supplied together"):
+            build_server(args)
+
     def test_balanced_and_explicit_boundaries(self) -> None:
         self.assertEqual(balanced_boundaries(30, 4), (0, 8, 15, 22, 30))
         self.assertEqual(parse_boundaries("0,9,30", 30), (0, 9, 30))
