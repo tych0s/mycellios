@@ -1,5 +1,8 @@
 import websocket from "@fastify/websocket";
+import staticFiles from "@fastify/static";
 import Fastify, { type FastifyInstance } from "fastify";
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
 import { z, ZodError } from "zod";
 import {
   chatCompletionRequestSchema,
@@ -11,6 +14,7 @@ import { Scheduler } from "../scheduler/scheduler.js";
 import { MeshDatabase } from "../storage/database.js";
 import { MeshStore } from "../storage/store.js";
 import { MeshService, MeshServiceError, type JobStreamEvent } from "./mesh-service.js";
+import { MobileComputeHub, type MobileWorkerSnapshot } from "./mobile-compute-hub.js";
 import { WorkerHub } from "./worker-hub.js";
 
 export interface CoordinatorRuntime {
@@ -19,6 +23,7 @@ export interface CoordinatorRuntime {
   store: MeshStore;
   scheduler: Scheduler;
   hub: WorkerHub;
+  mobileHub: MobileComputeHub;
   service: MeshService;
   close(): Promise<void>;
 }
@@ -32,8 +37,23 @@ export async function createCoordinator(
   const store = new MeshStore(database);
   const scheduler = new Scheduler(store);
   await app.register(websocket, { options: { maxPayload: 2 * 1024 * 1024 } });
+  const mobileAssetsPath = resolveMobileAssetsPath(config.mobileAssetsPath);
+  if (mobileAssetsPath) {
+    await app.register(staticFiles, {
+      root: mobileAssetsPath,
+      prefix: "/mobile/",
+      decorateReply: false,
+      index: "index.html",
+      cacheControl: true,
+      maxAge: "1h",
+      immutable: false,
+    });
+    app.get("/mobile", async (_request, reply) => reply.redirect("/mobile/"));
+  }
   const hub = new WorkerHub(store);
   hub.attach(app);
+  const mobileHub = new MobileComputeHub({ joinToken: config.mobileJoinToken });
+  mobileHub.attach(app);
   const service = new MeshService(store, scheduler, hub, config.requestTimeoutMs);
   const staleTimer = setInterval(() => {
     store.markStaleWorkers();
@@ -43,14 +63,19 @@ export async function createCoordinator(
 
   app.get("/health", async () => {
     const workers = store.listWorkers();
+    const mobileWorkers = mobileHub.listWorkers();
     return {
       status: "ok",
       version: "0.2.0",
       workers: {
-        registered: workers.length,
-        connected: hub.connectedWorkerIds().size,
-        online: workers.filter((worker) => worker.status === "online").length,
+        registered: workers.length + mobileWorkers.length,
+        connected: hub.connectedWorkerIds().size + mobileHub.connectedCount(),
+        online:
+          workers.filter((worker) => worker.status === "online").length +
+          mobileHub.onlineCount(),
+        mobile: mobileWorkers.length,
       },
+      mobilePwa: mobileAssetsPath ? "/mobile/" : null,
     };
   });
 
@@ -61,7 +86,8 @@ export async function createCoordinator(
   });
 
   app.get("/internal/v1/workers", async () => ({
-    data: store.listWorkers().map((worker) => ({
+    data: [
+      ...store.listWorkers().map((worker) => ({
       id: worker.id,
       status: worker.status,
       connected: hub.isConnected(worker.id),
@@ -70,12 +96,15 @@ export async function createCoordinator(
         (sum, gpu) => sum + gpu.offeredVramMb,
         0,
       ),
+      gpus: worker.capabilities.gpus,
       deployments: worker.capabilities.deployments,
       llmfit: worker.capabilities.llmfit,
       reliability: worker.reliability,
       jobsCompleted: worker.jobsCompleted,
       lastSeenAt: new Date(worker.lastSeenAt).toISOString(),
-    })),
+      })),
+      ...mobileHub.listWorkers().map(mobileDashboardWorker),
+    ],
   }));
 
   app.get("/v1/models", async () => {
@@ -86,7 +115,7 @@ export async function createCoordinator(
         id: model.id,
         object: "model",
         created: 0,
-        owned_by: "gpu-distribuida",
+        owned_by: "mycellios",
         x_replicas: model.replicas,
         x_pipelines: model.pipelines,
         ...(model.llmfit
@@ -227,12 +256,60 @@ export async function createCoordinator(
     store,
     scheduler,
     hub,
+    mobileHub,
     service,
     async close() {
       clearInterval(staleTimer);
       hub.close();
+      mobileHub.close();
       await app.close();
       database.close();
+    },
+  };
+}
+
+function resolveMobileAssetsPath(configured: string | undefined): string | null {
+  const candidates = [configured, resolve(process.cwd(), "mobile-dist")].filter(
+    (candidate): candidate is string => Boolean(candidate),
+  );
+  return candidates.find((candidate) => existsSync(resolve(candidate, "index.html"))) ?? null;
+}
+
+function mobileDashboardWorker(worker: MobileWorkerSnapshot) {
+  return {
+    id: worker.id,
+    status: worker.status,
+    connected: worker.connected,
+    region: worker.region,
+    offeredVramMb: 0,
+    reliability:
+      worker.completedTasks + worker.failedTasks === 0
+        ? 1
+        : worker.completedTasks / (worker.completedTasks + worker.failedTasks),
+    jobsCompleted: worker.completedTasks,
+    lastSeenAt: worker.lastSeenAt,
+    gpus: [
+      {
+        id: `mobile-${worker.id}`,
+        vendor: worker.backend === "webgpu" ? "WebGPU" : "Browser CPU",
+        model: `${worker.name} · ${worker.backend.toUpperCase()}`,
+        physicalVramMb: 0,
+        sharedMemoryMb: worker.capabilities.deviceMemoryGb
+          ? Math.round(worker.capabilities.deviceMemoryGb * 1_024)
+          : undefined,
+        offeredVramMb: 0,
+        freeOfferedVramMb: 0,
+        utilizationPct: worker.connected && worker.visible ? 100 : 0,
+      },
+    ],
+    deployments: [],
+    mobile: {
+      platform: worker.platform,
+      backend: worker.backend,
+      performanceLevel: worker.performanceLevel,
+      wakeLock: worker.wakeLock,
+      estimatedGflops: worker.estimatedGflops,
+      verifiedTasks: worker.verifiedTasks,
     },
   };
 }

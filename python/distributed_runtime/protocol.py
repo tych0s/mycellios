@@ -11,7 +11,10 @@ import zlib
 import torch
 
 MAGIC = b"GDLP"
-VERSION = 2
+# PING/PONG extends the v2 frame vocabulary. A version bump makes mixed old/new
+# stage deployments fail during HELLO instead of accepting READY and then
+# stalling on an unknown control frame.
+VERSION = 3
 HEADER = struct.Struct("<4sBBHQIIII")
 HEADER_BYTES = HEADER.size
 MAX_PAYLOAD_BYTES = 64 * 1024 * 1024
@@ -43,6 +46,11 @@ class FrameType(IntEnum):
     # greedy target token for every position so the root can accept a draft prefix.
     VERIFY = 13
     VERIFY_RESULT = 14
+    # PING follows the forward stage chain and the last stage returns PONG over
+    # the direct-return socket. The elapsed time measures the same no-compute
+    # route used by a decode wave, rather than one arbitrary peer-to-peer link.
+    PING = 15
+    PONG = 16
 
 
 class TensorCodec(IntEnum):
@@ -66,6 +74,7 @@ _DEFLATE_BASE = {
 TENSOR_FRAME_TYPES = frozenset(
     (FrameType.ACTIVATION, FrameType.PREFILL, FrameType.VERIFY)
 )
+ROUTE_PROBE_FRAME_TYPES = frozenset((FrameType.PING, FrameType.PONG))
 
 
 @dataclass(frozen=True)
@@ -77,6 +86,28 @@ class Frame:
     token_count: int
     hidden_size: int
     payload: bytes | bytearray
+
+
+@dataclass(frozen=True)
+class EncodedTensorPayload:
+    """A bytes view that keeps its tensor/bytes backing storage alive.
+
+    The original data plane always materialised a Python ``bytes`` object after
+    first converting every activation to CPU FP32.  That doubled host traffic
+    for the common FP16 wire codec and added another full payload copy before
+    ``sendall``.  This owner-backed view lets the synchronous socket write read
+    directly from a contiguous CPU tensor.  Quantized/deflated codecs retain
+    their existing byte-exact implementation until a certified GPU codec exists.
+    """
+
+    view: memoryview
+    owner: object
+    staging_dtype: torch.dtype | None
+    source_device: str
+
+    @property
+    def nbytes(self) -> int:
+        return self.view.nbytes
 
 
 @dataclass(frozen=True)
@@ -203,27 +234,43 @@ def recv_exact(sock: socket.socket, size: int) -> bytearray:
     return data
 
 
-def encode_tensor(tensor: torch.Tensor, codec: TensorCodec) -> bytes:
+def encode_tensor_payload(
+    tensor: torch.Tensor, codec: TensorCodec
+) -> EncodedTensorPayload:
     if tensor.numel() == 0:
         raise ValueError("cannot encode an empty tensor")
+    if not tensor.is_floating_point():
+        raise ValueError("activation tensors must use a real floating dtype")
     base_codec = _DEFLATE_BASE.get(codec)
     if base_codec is not None:
-        return zlib.compress(encode_tensor(tensor, base_codec), level=1)
-    contiguous = tensor.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        compressed = zlib.compress(encode_tensor(tensor, base_codec), level=1)
+        return _owned_bytes_payload(compressed, tensor)
     if codec == TensorCodec.FP32:
-        return contiguous.numpy().tobytes(order="C")
+        contiguous = _transport_staging_tensor(tensor, torch.float32)
+        return _owned_tensor_payload(contiguous, tensor)
     if codec == TensorCodec.FP16:
-        max_value = float(contiguous.abs().max().item())
+        detached = tensor.detach()
+        max_value = float(detached.abs().max().item())
         if not math.isfinite(max_value) or max_value > torch.finfo(torch.float16).max:
             raise ValueError("tensor contains values outside the finite FP16 range")
-        return contiguous.to(dtype=torch.float16).numpy().tobytes(order="C")
+        # Convert GPU/BF16/FP32 activations directly to the wire dtype.  Going
+        # through a CPU FP32 tensor first needlessly transfers twice as many
+        # bytes over PCIe on the most common production path.
+        contiguous = _transport_staging_tensor(detached, torch.float16)
+        return _owned_tensor_payload(contiguous, tensor)
+
+    # Keep the historical CPU/FP32 quantization reference bit-for-bit stable.
+    # A future accelerator codec must be advertised and parity-certified before
+    # it can replace this branch on heterogeneous hardware.
+    contiguous = _transport_staging_tensor(tensor, torch.float32)
     if codec == TensorCodec.INT8:
         if not bool(torch.isfinite(contiguous).all().item()):
             raise ValueError("cannot quantize a tensor containing non-finite values")
         max_value = float(contiguous.abs().max().item())
         scale = max_value / 127.0 if max_value > 0 else 1.0
         quantized = torch.clamp(torch.round(contiguous / scale), -127, 127).to(torch.int8)
-        return struct.pack("<f", scale) + quantized.numpy().tobytes(order="C")
+        encoded = struct.pack("<f", scale) + quantized.numpy().tobytes(order="C")
+        return _owned_bytes_payload(encoded, tensor)
     if codec in (TensorCodec.INT8_GROUPED, TensorCodec.INT8_HADAMARD):
         if not bool(torch.isfinite(contiguous).all().item()):
             raise ValueError("cannot quantize a tensor containing non-finite values")
@@ -258,10 +305,52 @@ def encode_tensor(tensor: torch.Tensor, codec: TensorCodec) -> bytes:
             data_columns.append(quantized.reshape(row_count, -1))
         scale_matrix = torch.cat(scale_columns, dim=1).contiguous()
         quantized = torch.cat(data_columns, dim=1).contiguous()
-        return scale_matrix.numpy().tobytes(order="C") + quantized.numpy().tobytes(
+        encoded = scale_matrix.numpy().tobytes(order="C") + quantized.numpy().tobytes(
             order="C"
         )
+        return _owned_bytes_payload(encoded, tensor)
     raise ValueError(f"unsupported tensor codec {codec}")
+
+
+def encode_tensor(tensor: torch.Tensor, codec: TensorCodec) -> bytes:
+    """Compatibility wrapper for callers that need an owned ``bytes`` value."""
+
+    return encode_tensor_payload(tensor, codec).view.tobytes()
+
+
+def _transport_staging_tensor(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    detached = tensor.detach()
+    if detached.device.type == "cpu" and detached.dtype == dtype:
+        # The returned memoryview must be a snapshot. A runner is allowed to
+        # reuse or mutate its scratch tensor as soon as encode returns, while a
+        # LinkEmulator or a slow socket can keep the payload alive much longer.
+        return detached.contiguous().clone()
+    return detached.to(device="cpu", dtype=dtype).contiguous()
+
+
+def _owned_tensor_payload(
+    staging: torch.Tensor, source: torch.Tensor
+) -> EncodedTensorPayload:
+    if staging.device.type != "cpu" or not staging.is_contiguous():
+        raise ValueError("transport staging tensor must be contiguous CPU memory")
+    view = memoryview(staging.numpy()).cast("B")
+    return EncodedTensorPayload(
+        view=view,
+        owner=staging,
+        staging_dtype=staging.dtype,
+        source_device=str(source.device),
+    )
+
+
+def _owned_bytes_payload(
+    encoded: bytes, source: torch.Tensor
+) -> EncodedTensorPayload:
+    return EncodedTensorPayload(
+        view=memoryview(encoded),
+        owner=encoded,
+        staging_dtype=None,
+        source_device=str(source.device),
+    )
 
 
 def decode_tensor(frame: Frame) -> torch.Tensor:
@@ -422,6 +511,17 @@ def _validate_frame_metadata(
 ) -> None:
     if payload_size > MAX_PAYLOAD_BYTES:
         raise ValueError(f"payload exceeds {MAX_PAYLOAD_BYTES} bytes")
+    if frame_type in ROUTE_PROBE_FRAME_TYPES:
+        # request_id and step deliberately remain available for correlating a
+        # PONG with its PING.  Every other header field has exactly one wire
+        # representation so probes cannot smuggle codec/shape metadata that
+        # different implementations might interpret inconsistently.
+        if flags != 0 or token_count != 0 or hidden_size != 0 or payload_size != 0:
+            raise ValueError(
+                f"{frame_type.name} frames require "
+                "flags=token_count=hidden_size=0 and cannot carry a payload"
+            )
+        return
     if frame_type in TENSOR_FRAME_TYPES:
         try:
             codec = TensorCodec(flags)

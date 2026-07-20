@@ -1,0 +1,355 @@
+{
+  "schema": "gdlp-macro-wave-input/1",
+  "model": {
+    "id": "domestic-moe-floating-safetensors-profile",
+    "layers": [
+      {
+        "index": 0,
+        "weightBytes": 2147483648,
+        "activationElements": 8192,
+        "kvBytesPerToken": 8192,
+        "decodeMsAtUnit": 6.4,
+        "prefillMsPerTokenAtUnit": 0.09,
+        "macroWave": {
+          "activeWeightBytesPerWave": 268435456,
+          "largestTransferUnitBytes": 134217728,
+          "expertWorkspaceBytesPerPosition": 73728
+        },
+        "expertParallel": {
+          "expertWeightBytes": 1610612736,
+          "expertCount": 12,
+          "expertsPerToken": 2
+        }
+      },
+      {
+        "index": 1,
+        "weightBytes": 2147483648,
+        "activationElements": 8192,
+        "kvBytesPerToken": 8192,
+        "decodeMsAtUnit": 6.1,
+        "prefillMsPerTokenAtUnit": 0.09,
+        "macroWave": {
+          "activeWeightBytesPerWave": 268435456,
+          "largestTransferUnitBytes": 134217728,
+          "expertWorkspaceBytesPerPosition": 73728
+        },
+        "expertParallel": {
+          "expertWeightBytes": 1610612736,
+          "expertCount": 12,
+          "expertsPerToken": 2
+        }
+      },
+      {
+        "index": 2,
+        "weightBytes": 2147483648,
+        "activationElements": 8192,
+        "kvBytesPerToken": 8192,
+        "decodeMsAtUnit": 6.2,
+        "prefillMsPerTokenAtUnit": 0.09,
+        "macroWave": {
+          "activeWeightBytesPerWave": 268435456,
+          "largestTransferUnitBytes": 134217728,
+          "expertWorkspaceBytesPerPosition": 73728
+        },
+        "expertParallel": {
+          "expertWeightBytes": 1610612736,
+          "expertCount": 12,
+          "expertsPerToken": 2
+        }
+      },
+      {
+        "index": 3,
+        "weightBytes": 2147483648,
+        "activationElements": 8192,
+        "kvBytesPerToken": 8192,
+        "decodeMsAtUnit": 6.5,
+        "prefillMsPerTokenAtUnit": 0.1,
+        "macroWave": {
+          "activeWeightBytesPerWave": 268435456,
+          "largestTransferUnitBytes": 134217728,
+          "expertWorkspaceBytesPerPosition": 73728
+        },
+        "expertParallel": {
+          "expertWeightBytes": 1610612736,
+          "expertCount": 12,
+          "expertsPerToken": 2
+        }
+      },
+      {
+        "index": 4,
+        "weightBytes": 2147483648,
+        "activationElements": 8192,
+        "kvBytesPerToken": 8192,
+        "decodeMsAtUnit": 6.3,
+        "prefillMsPerTokenAtUnit": 0.1,
+        "macroWave": {
+          "activeWeightBytesPerWave": 268435456,
+          "largestTransferUnitBytes": 134217728,
+          "expertWorkspaceBytesPerPosition": 73728
+        },
+        "expertParallel": {
+          "expertWeightBytes": 1610612736,
+          "expertCount": 12,
+          "expertsPerToken": 2
+        }
+      },
+      {
+        "index": 5,
+        "weightBytes": 2147483648,
+        "activationElements": 8192,
+        "kvBytesPerToken": 8192,
+        "decodeMsAtUnit": 6.6,
+        "prefillMsPerTokenAtUnit": 0.1,
+        "macroWave": {
+          "activeWeightBytesPerWave": 268435456,
+          "largestTransferUnitBytes": 134217728,
+          "expertWorkspaceBytesPerPosition": 73728
+        },
+        "expertParallel": {
+          "expertWeightBytes": 1610612736,
+          "expertCount": 12,
+          "expertsPerToken": 2
+        }
+      },
+      {
+        "index": 6,
+        "weightBytes": 2147483648,
+        "activationElements": 8192,
+        "kvBytesPerToken": 8192,
+        "decodeMsAtUnit": 6.7,
+        "prefillMsPerTokenAtUnit": 0.1,
+        "macroWave": {
+          "activeWeightBytesPerWave": 268435456,
+          "largestTransferUnitBytes": 134217728,
+          "expertWorkspaceBytesPerPosition": 73728
+        },
+        "expertParallel": {
+          "expertWeightBytes": 1610612736,
+          "expertCount": 12,
+          "expertsPerToken": 2
+        }
+      },
+      {
+        "index": 7,
+        "weightBytes": 2147483648,
+        "activationElements": 8192,
+        "kvBytesPerToken": 8192,
+        "decodeMsAtUnit": 6.5,
+        "prefillMsPerTokenAtUnit": 0.1,
+        "macroWave": {
+          "activeWeightBytesPerWave": 268435456,
+          "largestTransferUnitBytes": 134217728,
+          "expertWorkspaceBytesPerPosition": 73728
+        },
+        "expertParallel": {
+          "expertWeightBytes": 1610612736,
+          "expertCount": 12,
+          "expertsPerToken": 2
+        }
+      },
+      {
+        "index": 8,
+        "weightBytes": 2147483648,
+        "activationElements": 8192,
+        "kvBytesPerToken": 8192,
+        "decodeMsAtUnit": 6.8,
+        "prefillMsPerTokenAtUnit": 0.11,
+        "macroWave": {
+          "activeWeightBytesPerWave": 268435456,
+          "largestTransferUnitBytes": 134217728,
+          "expertWorkspaceBytesPerPosition": 73728
+        },
+        "expertParallel": {
+          "expertWeightBytes": 1610612736,
+          "expertCount": 12,
+          "expertsPerToken": 2
+        }
+      },
+      {
+        "index": 9,
+        "weightBytes": 2147483648,
+        "activationElements": 8192,
+        "kvBytesPerToken": 8192,
+        "decodeMsAtUnit": 6.9,
+        "prefillMsPerTokenAtUnit": 0.11,
+        "macroWave": {
+          "activeWeightBytesPerWave": 268435456,
+          "largestTransferUnitBytes": 134217728,
+          "expertWorkspaceBytesPerPosition": 73728
+        },
+        "expertParallel": {
+          "expertWeightBytes": 1610612736,
+          "expertCount": 12,
+          "expertsPerToken": 2
+        }
+      },
+      {
+        "index": 10,
+        "weightBytes": 2147483648,
+        "activationElements": 8192,
+        "kvBytesPerToken": 8192,
+        "decodeMsAtUnit": 7,
+        "prefillMsPerTokenAtUnit": 0.11,
+        "macroWave": {
+          "activeWeightBytesPerWave": 268435456,
+          "largestTransferUnitBytes": 134217728,
+          "expertWorkspaceBytesPerPosition": 73728
+        },
+        "expertParallel": {
+          "expertWeightBytes": 1610612736,
+          "expertCount": 12,
+          "expertsPerToken": 2
+        }
+      },
+      {
+        "index": 11,
+        "weightBytes": 2147483648,
+        "activationElements": 8192,
+        "kvBytesPerToken": 8192,
+        "decodeMsAtUnit": 7.1,
+        "prefillMsPerTokenAtUnit": 0.11,
+        "macroWave": {
+          "activeWeightBytesPerWave": 268435456,
+          "largestTransferUnitBytes": 134217728,
+          "expertWorkspaceBytesPerPosition": 73728
+        },
+        "expertParallel": {
+          "expertWeightBytes": 1610612736,
+          "expertCount": 12,
+          "expertsPerToken": 2
+        }
+      }
+    ],
+    "embeddingBytes": 536870912,
+    "lmHeadBytes": 536870912,
+    "tiedEmbeddingAndHead": true,
+    "runtimeOverheadBytesPerStage": 268435456,
+    "embeddingDecodeMsAtUnit": 1.2,
+    "lmHeadDecodeMsAtUnit": 1.8,
+    "embeddingPrefillMsPerTokenAtUnit": 0.02,
+    "lmHeadPrefillMsPerTokenAtUnit": 0.03
+  },
+  "topology": {
+    "nodes": [
+      {
+        "id": "home-a-4gb",
+        "region": "madrid",
+        "memoryBytes": 4294967296,
+        "reserveBytes": 536870912,
+        "decodeScale": 1,
+        "prefillScale": 1,
+        "codecScale": 1,
+        "batchGain": 0.4,
+        "maxBatchSpeedup": 2.2,
+        "powerWatts": 115,
+        "availability": 0.995,
+        "ramVram": {
+          "usableRamBytes": 17179869184,
+          "usableVramBytes": 3758096384,
+          "ramBandwidthGBps": 38,
+          "pcieBandwidthGBps": 8,
+          "residentKind": "layers"
+        }
+      },
+      {
+        "id": "home-b-4gb",
+        "region": "valencia",
+        "memoryBytes": 4294967296,
+        "reserveBytes": 536870912,
+        "decodeScale": 1.08,
+        "prefillScale": 1.06,
+        "codecScale": 1.02,
+        "batchGain": 0.36,
+        "maxBatchSpeedup": 2,
+        "powerWatts": 105,
+        "availability": 0.994,
+        "ramVram": {
+          "usableRamBytes": 17179869184,
+          "usableVramBytes": 3758096384,
+          "ramBandwidthGBps": 32,
+          "pcieBandwidthGBps": 8,
+          "residentKind": "layers"
+        }
+      },
+      {
+        "id": "home-c-4gb",
+        "region": "sevilla",
+        "memoryBytes": 4294967296,
+        "reserveBytes": 536870912,
+        "decodeScale": 1.13,
+        "prefillScale": 1.1,
+        "codecScale": 1.05,
+        "batchGain": 0.34,
+        "maxBatchSpeedup": 1.9,
+        "powerWatts": 95,
+        "availability": 0.993,
+        "ramVram": {
+          "usableRamBytes": 17179869184,
+          "usableVramBytes": 3758096384,
+          "ramBandwidthGBps": 28,
+          "pcieBandwidthGBps": 6,
+          "residentKind": "layers"
+        }
+      },
+      {
+        "id": "home-d-4gb",
+        "region": "bilbao",
+        "memoryBytes": 4294967296,
+        "reserveBytes": 536870912,
+        "decodeScale": 0.96,
+        "prefillScale": 0.98,
+        "codecScale": 1,
+        "batchGain": 0.42,
+        "maxBatchSpeedup": 2.25,
+        "powerWatts": 125,
+        "availability": 0.995,
+        "ramVram": {
+          "usableRamBytes": 17179869184,
+          "usableVramBytes": 3758096384,
+          "ramBandwidthGBps": 42,
+          "pcieBandwidthGBps": 12,
+          "residentKind": "layers"
+        }
+      }
+    ],
+    "links": [
+      { "from": "home-a-4gb", "to": "home-b-4gb", "oneWayLatencyMs": 6, "jitterP95Ms": 2, "bandwidthMbps": 600, "lossRate": 0.001, "availability": 0.997 },
+      { "from": "home-a-4gb", "to": "home-c-4gb", "oneWayLatencyMs": 9, "jitterP95Ms": 3, "bandwidthMbps": 450, "lossRate": 0.0015, "availability": 0.996 },
+      { "from": "home-a-4gb", "to": "home-d-4gb", "oneWayLatencyMs": 8, "jitterP95Ms": 2.5, "bandwidthMbps": 500, "lossRate": 0.001, "availability": 0.997 },
+      { "from": "home-b-4gb", "to": "home-a-4gb", "oneWayLatencyMs": 6, "jitterP95Ms": 2, "bandwidthMbps": 600, "lossRate": 0.001, "availability": 0.997 },
+      { "from": "home-b-4gb", "to": "home-c-4gb", "oneWayLatencyMs": 8, "jitterP95Ms": 2.5, "bandwidthMbps": 500, "lossRate": 0.0012, "availability": 0.996 },
+      { "from": "home-b-4gb", "to": "home-d-4gb", "oneWayLatencyMs": 11, "jitterP95Ms": 3, "bandwidthMbps": 400, "lossRate": 0.0015, "availability": 0.996 },
+      { "from": "home-c-4gb", "to": "home-a-4gb", "oneWayLatencyMs": 9, "jitterP95Ms": 3, "bandwidthMbps": 450, "lossRate": 0.0015, "availability": 0.996 },
+      { "from": "home-c-4gb", "to": "home-b-4gb", "oneWayLatencyMs": 8, "jitterP95Ms": 2.5, "bandwidthMbps": 500, "lossRate": 0.0012, "availability": 0.996 },
+      { "from": "home-c-4gb", "to": "home-d-4gb", "oneWayLatencyMs": 10, "jitterP95Ms": 3, "bandwidthMbps": 420, "lossRate": 0.0015, "availability": 0.996 },
+      { "from": "home-d-4gb", "to": "home-a-4gb", "oneWayLatencyMs": 8, "jitterP95Ms": 2.5, "bandwidthMbps": 500, "lossRate": 0.001, "availability": 0.997 },
+      { "from": "home-d-4gb", "to": "home-b-4gb", "oneWayLatencyMs": 11, "jitterP95Ms": 3, "bandwidthMbps": 400, "lossRate": 0.0015, "availability": 0.996 },
+      { "from": "home-d-4gb", "to": "home-c-4gb", "oneWayLatencyMs": 10, "jitterP95Ms": 3, "bandwidthMbps": 420, "lossRate": 0.0015, "availability": 0.996 }
+    ]
+  },
+  "workload": {
+    "promptTokens": 256,
+    "outputTokens": 64,
+    "contextTokens": 2048,
+    "concurrentSequences": 4,
+    "maxStages": 4,
+    "maxQualityLoss": 0,
+    "minRouteAvailability": 0.9,
+    "batchWindowMs": 2,
+    "p95": true
+  },
+  "plannerOptions": {
+    "beamWidth": 256,
+    "candidateCodecs": ["fp16"],
+    "candidateMicroBatchSizes": [1, 2, 4],
+    "candidatePrefillChunks": [32, 64, 128],
+    "waveTokens": 4,
+    "expectedCommittedTokensPerWave": 3,
+    "verificationScalePerExtraToken": 0.35,
+    "activationBufferCopies": 2,
+    "weightBufferCopies": 2,
+    "activationBytesPerElement": 2,
+    "transferSetupMsPerUnit": 0.02,
+    "expectedWeightCacheHitRate": 0
+  }
+}

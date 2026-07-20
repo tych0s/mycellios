@@ -37,6 +37,10 @@ if ($LASTEXITCODE -ne 0) {
 if ($LASTEXITCODE -ne 0) {
     throw "Could not install the distribution requirements (exit code $LASTEXITCODE)."
 }
+& $venvPython -c "import accelerate, torch, transformers; assert accelerate.__version__ == '1.14.0'; assert transformers.__version__ == '5.14.1'; assert torch.__version__ == '2.13.0+cpu'; assert torch.version.cuda is None; print('HF native TP/EP runtime:', 'accelerate=' + accelerate.__version__, 'transformers=' + transformers.__version__, 'torch=' + torch.__version__)"
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not validate the pinned HF native TP/EP runtime (exit code $LASTEXITCODE)."
+}
 
 New-Item -ItemType Directory -Force -Path $cachePath | Out-Null
 $env:HF_HOME = $cachePath

@@ -19,6 +19,16 @@ import type {
   StagePlacement,
 } from "./types.js";
 
+export { MacroWaveRamVramPlanner } from "./macro-wave.js";
+export type {
+  MacroWaveLinkCost,
+  MacroWaveModeCost,
+  MacroWavePlannerOptions,
+  MacroWavePlanningResult,
+  MacroWaveRouteCost,
+  MacroWaveStageCost,
+} from "./macro-wave.js";
+
 export const DEFAULT_SEARCH_OPTIONS: SearchOptions = {
   beamWidth: 512,
   candidateCodecs: ["fp16", "int8", "q4"],

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 import json
 import math
 import multiprocessing as mp
+from pathlib import Path
 import sys
 import time
 from typing import Any
@@ -27,6 +28,11 @@ from .engine import (
 )
 from .model import load_tokenizer, resolve_model_snapshot
 from .protocol import TensorCodec
+from .ram_backed_moe_runtime import (
+    add_ram_backed_moe_arguments,
+    ram_backed_moe_config_from_args,
+)
+from .recovery import RecoveringPipelineEngine
 
 
 DEFAULT_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
@@ -47,7 +53,7 @@ class ContinuousMicroBatcher:
 
     def __init__(
         self,
-        engine: DistributedPipelineEngine,
+        engine: DistributedPipelineEngine | RecoveringPipelineEngine,
         *,
         max_batch_size: int,
         batch_window_ms: float,
@@ -255,7 +261,7 @@ class IncrementalTokenDecoder:
 class DistributedOpenAIServer:
     def __init__(
         self,
-        engine: DistributedPipelineEngine,
+        engine: DistributedPipelineEngine | RecoveringPipelineEngine,
         tokenizer: Any,
         *,
         public_model_name: str,
@@ -300,16 +306,32 @@ class DistributedOpenAIServer:
 
     async def health(self, _: web.Request) -> web.Response:
         healthy = self.engine.healthy
+        recovery = getattr(
+            self.engine,
+            "recovery_stats",
+            {"configured": False, "state": "disabled"},
+        )
+        status = (
+            "recovering"
+            if recovery.get("state") == "recovering"
+            else ("ready" if healthy else "degraded")
+        )
         return web.json_response(
             {
-                "status": "ready" if healthy else "degraded",
+                "status": status,
                 "error": self.engine.fatal_error,
                 "model": self.public_model_name,
                 "stages": self.engine.stages,
                 "boundaries": list(self.engine.config.boundaries),
                 "codec": self.engine.config.codec.name.lower(),
                 "prefill_chunk_tokens": self.engine.config.prefill_chunk_tokens,
+                "sealed_wave_tokens": self.engine.config.sealed_wave_token_limit,
+                "max_prefill_chunk_tokens": (
+                    self.engine.config.prefill_token_limit or 0
+                ),
                 "speculation": self.engine.speculation_stats,
+                "root_batching": self.engine.root_batch_stats,
+                "recovery": recovery,
                 "root_parameter_bytes": self.engine.root_parameter_bytes,
                 "batcher": {
                     "queued": self.batcher.queue.qsize(),
@@ -631,6 +653,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--revision")
+    parser.add_argument("--model-artifact-identity")
+    parser.add_argument("--model-canonical-source")
+    parser.add_argument("--model-canonical-revision")
+    parser.add_argument("--pipeline-snapshot-identity", type=int)
+    add_ram_backed_moe_arguments(parser)
+    parser.add_argument(
+        "--stage-executor-id",
+        action="append",
+        default=[],
+        help=(
+            "Ordered sealed executor id for root and each child; repeat once per "
+            "stage when constructing a remote recovery contract."
+        ),
+    )
     parser.add_argument("--public-model-name", default="distributed-small")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8081)
@@ -655,11 +691,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-pending-requests", type=int, default=128)
     parser.add_argument("--batch-window-ms", type=float, default=2.0)
     parser.add_argument(
+        "--root-batch-window-ms",
+        type=float,
+        default=0.5,
+        help="Coalesce ready root continuations into physical tensor batches.",
+    )
+    parser.add_argument(
+        "--route-probe-interval-seconds",
+        type=float,
+        default=5.0,
+        help="Measure full-route latency periodically; zero disables probes.",
+    )
+    parser.add_argument(
+        "--route-probe-timeout-seconds",
+        type=float,
+        default=10.0,
+        help="Fail a route whose no-compute probe does not return in time.",
+    )
+    parser.add_argument(
         "--prefill-chunk-tokens",
         type=int,
         default=0,
         help="Split long prompts into bounded pipeline waves; zero disables chunking.",
     )
+    parser.add_argument("--sealed-wave-tokens", type=int)
+    parser.add_argument("--max-prefill-chunk-tokens", type=int)
     parser.add_argument(
         "--speculation",
         choices=("off", "ngram"),
@@ -670,6 +726,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--speculation-minimum-speedup", type=float, default=1.05)
     parser.add_argument("--no-speculation-probes", action="store_true")
     parser.add_argument("--max-output-tokens", type=int, default=512)
+    parser.add_argument(
+        "--recovery-max-retries",
+        type=int,
+        default=0,
+        help=(
+            "Recreate a failed local route and exactly replay the visible greedy "
+            "prefix; zero disables recovery. Remote routes require programmatic "
+            "standby factories."
+        ),
+    )
     parser.add_argument("--first-stage-host")
     parser.add_argument("--first-stage-port", type=int)
     parser.add_argument("--return-bind-host", default="127.0.0.1")
@@ -681,6 +747,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
+    if (args.sealed_wave_tokens is None) != (
+        args.max_prefill_chunk_tokens is None
+    ):
+        raise ValueError(
+            "sealed-wave-tokens and max-prefill-chunk-tokens must be supplied together"
+        )
+    ram_backed_moe = ram_backed_moe_config_from_args(args)
     if not 1 <= args.port <= 65_535:
         raise ValueError("port must be between 1 and 65535")
     if not args.public_model_name.strip():
@@ -697,10 +770,55 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
         raise ValueError("max-pending-requests must be at least max-active-sequences")
     if not math.isfinite(args.batch_window_ms) or args.batch_window_ms < 0:
         raise ValueError("batch-window-ms must be finite and non-negative")
+    if (
+        not math.isfinite(args.root_batch_window_ms)
+        or not 0 <= args.root_batch_window_ms <= 100
+    ):
+        raise ValueError("root-batch-window-ms must be between 0 and 100")
+    if (
+        not math.isfinite(args.route_probe_interval_seconds)
+        or args.route_probe_interval_seconds < 0
+    ):
+        raise ValueError(
+            "route-probe-interval-seconds must be finite and non-negative"
+        )
+    if (
+        not math.isfinite(args.route_probe_timeout_seconds)
+        or args.route_probe_timeout_seconds <= 0
+    ):
+        raise ValueError("route-probe-timeout-seconds must be finite and positive")
     if args.prefill_chunk_tokens < 0:
         raise ValueError("prefill-chunk-tokens must be non-negative")
+    if args.sealed_wave_tokens is not None and not 1 <= args.sealed_wave_tokens <= 17:
+        raise ValueError("sealed-wave-tokens must be between 1 and 17")
+    if (
+        args.max_prefill_chunk_tokens is not None
+        and args.max_prefill_chunk_tokens < 1
+    ):
+        raise ValueError("max-prefill-chunk-tokens must be positive")
+    if (
+        args.max_prefill_chunk_tokens is not None
+        and args.prefill_chunk_tokens > args.max_prefill_chunk_tokens
+    ):
+        raise ValueError(
+            "prefill-chunk-tokens cannot exceed max-prefill-chunk-tokens"
+        )
     if not 1 <= args.speculative_max_draft_tokens <= 16:
         raise ValueError("speculative-max-draft-tokens must be between 1 and 16")
+    if args.sealed_wave_tokens is not None:
+        required_wave_tokens = (
+            args.speculative_max_draft_tokens + 1
+            if args.speculation == "ngram"
+            else 1
+        )
+        if args.sealed_wave_tokens < required_wave_tokens:
+            raise ValueError(
+                "sealed-wave-tokens cannot be smaller than the VERIFY input"
+            )
+        if args.speculation == "off" and args.sealed_wave_tokens != 1:
+            raise ValueError(
+                "sealed-wave-tokens greater than one require speculation"
+            )
     if (
         not math.isfinite(args.speculation_minimum_speedup)
         or args.speculation_minimum_speedup < 1
@@ -708,8 +826,18 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
         raise ValueError("speculation-minimum-speedup must be finite and at least 1")
     if args.max_output_tokens < 1:
         raise ValueError("max-output-tokens must be positive")
-    snapshot = resolve_model_snapshot(args.model, args.revision)
-    model_config = AutoConfig.from_pretrained(snapshot)
+    if args.recovery_max_retries < 0:
+        raise ValueError("recovery-max-retries must be non-negative")
+    if ram_backed_moe is not None:
+        snapshot = str(Path(args.model).expanduser().resolve())
+        model_config = AutoConfig.from_pretrained(
+            snapshot,
+            local_files_only=True,
+            trust_remote_code=False,
+        )
+    else:
+        snapshot = resolve_model_snapshot(args.model, args.revision)
+        model_config = AutoConfig.from_pretrained(snapshot)
     total_layers = int(model_config.num_hidden_layers)
     boundaries = (
         parse_boundaries(args.boundaries, total_layers)
@@ -719,6 +847,15 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
     remote = args.first_stage_host is not None or args.first_stage_port is not None
     if remote and (args.first_stage_host is None or args.first_stage_port is None):
         raise ValueError("remote mode requires both first-stage-host and first-stage-port")
+    if remote and args.recovery_max_retries > 0:
+        raise ValueError(
+            "remote recovery requires programmatic immutable-compatible standby factories"
+        )
+    if ram_backed_moe is not None and not remote:
+        raise ValueError(
+            "server CLI RAM-backed MoE requires remote child stages with their "
+            "own sealed bindings"
+        )
     codec = {
         "fp32": TensorCodec.FP32,
         "fp16": TensorCodec.FP16,
@@ -728,8 +865,7 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
         "int8-grouped-deflate": TensorCodec.INT8_GROUPED_DEFLATE,
         "int8-hadamard-deflate": TensorCodec.INT8_HADAMARD_DEFLATE,
     }[args.codec]
-    engine = DistributedPipelineEngine(
-        PipelineEngineConfig(
+    engine_config = PipelineEngineConfig(
             model_name=snapshot,
             boundaries=boundaries,
             codec=codec,
@@ -742,9 +878,23 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
             return_bind_host=args.return_bind_host,
             return_advertise_host=args.return_advertise_host,
             return_port=args.return_port,
+            artifact_identity=args.model_artifact_identity,
+            canonical_model_source=args.model_canonical_source,
+            canonical_model_revision=args.model_canonical_revision,
+            pipeline_snapshot_identity=args.pipeline_snapshot_identity,
+            ram_backed_moe_stages=(
+                None
+                if ram_backed_moe is None
+                else (ram_backed_moe,) + (None,) * (len(boundaries) - 2)
+            ),
+            stage_executor_ids=(
+                tuple(args.stage_executor_id) if args.stage_executor_id else None
+            ),
             max_active_sequences=args.max_active_sequences,
             max_pending_requests=args.max_pending_requests,
             prefill_chunk_tokens=args.prefill_chunk_tokens,
+            sealed_wave_tokens=args.sealed_wave_tokens,
+            max_prefill_chunk_tokens=args.max_prefill_chunk_tokens,
             speculative_max_draft_tokens=(
                 args.speculative_max_draft_tokens
                 if args.speculation == "ngram"
@@ -752,8 +902,21 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
             ),
             speculation_minimum_speedup=args.speculation_minimum_speedup,
             speculation_probe=not args.no_speculation_probes,
-        )
+            root_batch_window_ms=args.root_batch_window_ms,
+            route_probe_interval_seconds=args.route_probe_interval_seconds,
+            route_probe_timeout_seconds=args.route_probe_timeout_seconds,
     )
+    engine_factory = lambda: DistributedPipelineEngine(engine_config)
+    initial_engine = engine_factory()
+    engine: DistributedPipelineEngine | RecoveringPipelineEngine
+    if args.recovery_max_retries > 0:
+        engine = RecoveringPipelineEngine(
+            engine_factory,
+            max_retries=args.recovery_max_retries,
+            initial_engine=initial_engine,
+        )
+    else:
+        engine = initial_engine
     try:
         tokenizer = load_tokenizer(engine.model_snapshot)
         return DistributedOpenAIServer(
@@ -792,6 +955,7 @@ def main(argv: list[str] | None = None) -> int:
                 "model": args.public_model_name,
                 "stages": server.engine.stages,
                 "boundaries": list(server.engine.config.boundaries),
+                "root_batch_window_ms": server.engine.config.root_batch_window_ms,
             },
             sort_keys=True,
         ),

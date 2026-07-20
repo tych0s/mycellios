@@ -1,0 +1,87 @@
+{
+  "schema": "gdlp-resident-expert-mesh-simulation/1",
+  "scenarioId": "domestic-4gb-resident-expert-mesh-synthetic",
+  "model": {
+    "sparseLayers": 12,
+    "expertsPerLayer": 12,
+    "expertBytes": 134217728,
+    "activationElements": 8192,
+    "activationDtypeBytes": 2,
+    "topK": 2
+  },
+  "wave": {
+    "positions": 16,
+    "positionsPerSequence": 4,
+    "concurrentSequences": 4,
+    "committedTokens": 3,
+    "routingUnionExpertsPerLayer": 12
+  },
+  "coordinator": {
+    "id": "mesh-root",
+    "usableVramBytes": 3758096384,
+    "reservedVramBytes": 536870912,
+    "weightBufferBytes": 268435456,
+    "ramToGpuGbytesPerSecond": 8,
+    "expertComputeMsPerToken": 1
+  },
+  "owners": [
+    {
+      "id": "home-owner-01",
+      "usableVramBytes": 3758096384,
+      "reservedVramBytes": 536870912,
+      "expertComputeMsPerToken": 0.8
+    },
+    {
+      "id": "home-owner-02",
+      "usableVramBytes": 3758096384,
+      "reservedVramBytes": 536870912,
+      "expertComputeMsPerToken": 0.8
+    },
+    {
+      "id": "home-owner-03",
+      "usableVramBytes": 3758096384,
+      "reservedVramBytes": 536870912,
+      "expertComputeMsPerToken": 0.8
+    },
+    {
+      "id": "home-owner-04",
+      "usableVramBytes": 3758096384,
+      "reservedVramBytes": 536870912,
+      "expertComputeMsPerToken": 0.8
+    },
+    {
+      "id": "home-owner-05",
+      "usableVramBytes": 3758096384,
+      "reservedVramBytes": 536870912,
+      "expertComputeMsPerToken": 0.8
+    },
+    {
+      "id": "home-owner-06",
+      "usableVramBytes": 3758096384,
+      "reservedVramBytes": 536870912,
+      "expertComputeMsPerToken": 0.8
+    },
+    {
+      "id": "home-owner-07",
+      "usableVramBytes": 3758096384,
+      "reservedVramBytes": 536870912,
+      "expertComputeMsPerToken": 0.8
+    },
+    {
+      "id": "home-owner-08",
+      "usableVramBytes": 3758096384,
+      "reservedVramBytes": 536870912,
+      "expertComputeMsPerToken": 0.8
+    }
+  ],
+  "network": {
+    "roundTripMs": 15,
+    "bandwidthMbps": 1000,
+    "egressBandwidthMbps": 1000,
+    "ingressBandwidthMbps": 1000
+  },
+  "sensitivityRttMs": [1, 5, 15, 30, 60],
+  "comparison": {
+    "macroWaveColdTokensPerSecond": 1.22
+  }
+}

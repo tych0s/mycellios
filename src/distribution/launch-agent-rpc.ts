@@ -38,6 +38,7 @@ export interface HttpLaunchAgentOptions {
   endpoint: string | URL;
   id?: string;
   requestTimeoutMs?: number;
+  cleanupRequestTimeoutMs?: number;
   pollRequestTimeoutMs?: number;
   pollIntervalMs?: number;
   maxConsecutivePollErrors?: number;
@@ -63,6 +64,7 @@ export class HttpLaunchAgent implements LaunchAgent {
   readonly id: string;
   private readonly baseUrl: string;
   private readonly requestTimeoutMs: number;
+  private readonly cleanupRequestTimeoutMs: number;
   private readonly pollRequestTimeoutMs: number;
   private readonly pollIntervalMs: number;
   private readonly maxConsecutivePollErrors: number;
@@ -81,6 +83,15 @@ export class HttpLaunchAgent implements LaunchAgent {
       1,
       300_000,
       "launch_agent_rpc_request_timeout_is_invalid",
+    );
+    // A cleanup starts after a failed/aborted fetch, when Undici may still be
+    // discarding the old connection. Reusing a very small operation timeout
+    // can abort the deterministic stop before it even reaches the daemon.
+    this.cleanupRequestTimeoutMs = boundedInteger(
+      options.cleanupRequestTimeoutMs ?? Math.max(this.requestTimeoutMs, 1_000),
+      1,
+      300_000,
+      "launch_agent_rpc_cleanup_timeout_is_invalid",
     );
     this.pollRequestTimeoutMs = boundedInteger(
       options.pollRequestTimeoutMs ?? 5_000,
@@ -174,6 +185,7 @@ export class HttpLaunchAgent implements LaunchAgent {
   async stopRemote(
     handleId: string,
     reason: string,
+    timeoutMs = this.requestTimeoutMs,
   ): Promise<LaunchAgentRpcProcessSnapshot> {
     assertHandleId(handleId);
     assertReason(reason);
@@ -182,7 +194,7 @@ export class HttpLaunchAgent implements LaunchAgent {
       "POST",
       { schema: STOP_SCHEMA, reason },
       undefined,
-      this.requestTimeoutMs,
+      timeoutMs,
       "stop",
     );
   }
@@ -197,10 +209,11 @@ export class HttpLaunchAgent implements LaunchAgent {
 
   private async bestEffortStop(handleId: string, reason: string): Promise<void> {
     try {
-      await this.stopRemote(handleId, reason);
+      await this.stopRemote(handleId, reason, this.cleanupRequestTimeoutMs);
     } catch {
       // 404 means the cancelled start never reached the daemon. Network
-      // failure is bounded by requestTimeoutMs and cannot hide the root error.
+      // failure is bounded by cleanupRequestTimeoutMs and cannot hide the root
+      // error.
     }
   }
 
@@ -829,8 +842,11 @@ function validatePythonLaunchProcess(value: unknown, nodeId: string): asserts va
     "layerEnd",
     "totalLayers",
     "codec",
+    "sealedWaveTokens",
+    "maxPrefillChunkTokens",
     "anchor",
     "members",
+    "macroWave",
     "command",
   ];
   const variant =
@@ -848,7 +864,7 @@ function validatePythonLaunchProcess(value: unknown, nodeId: string): asserts va
           "startupTimeoutSeconds",
         ]
       : value.kind === "remote-stage"
-        ? ["downstream", "returnEndpoint", "cell"]
+        ? ["downstream", "returnEndpoint", "cell", "native_stage"]
         : [
             "boundaries",
             "firstRemoteStage",
@@ -862,6 +878,13 @@ function validatePythonLaunchProcess(value: unknown, nodeId: string): asserts va
   for (const name of ["launchIndex", "stageIndex", "layerStart", "layerEnd", "totalLayers"] as const) {
     assertInteger(value[name], 0, Number.MAX_SAFE_INTEGER, `python_launch_${name}`);
   }
+  assertInteger(value.sealedWaveTokens, 1, 17, "python_launch_sealedWaveTokens");
+  assertInteger(
+    value.maxPrefillChunkTokens,
+    1,
+    2_147_483_647,
+    "python_launch_maxPrefillChunkTokens",
+  );
   if (
     (value.totalLayers as number) < 1 ||
     (value.layerStart as number) >= (value.layerEnd as number) ||
@@ -880,9 +903,15 @@ function validatePythonLaunchProcess(value: unknown, nodeId: string): asserts va
     throw new Error("python_launch_anchor_does_not_match_node");
   }
   validateMembers(value.members);
+  validateMacroWaveStage(value.macroWave);
   validateCommand(value.command);
 
-  if (value.kind === "cell-member") validateCellMember(value);
+  if (value.kind === "cell-member") {
+    if (value.macroWave !== null) {
+      throw new Error("cell_member_macro_wave_must_be_null");
+    }
+    validateCellMember(value);
+  }
   if (value.kind === "remote-stage") validateRemoteStage(value);
   if (value.kind === "root-engine") validateRootEngine(value);
 }
@@ -914,6 +943,79 @@ function validateRemoteStage(value: Record<string, unknown>): void {
   if (value.downstream !== null) validateDownstream(value.downstream, "downstream");
   validateEndpoint(value.returnEndpoint, "returnEndpoint");
   if (value.cell !== null) validateCell(value.cell);
+  if (value.native_stage !== null) validateNativeStageStage(value.native_stage, value);
+}
+
+function validateNativeStageStage(
+  value: unknown,
+  launch: Record<string, unknown>,
+): void {
+  assertRecord(value, "native_stage");
+  assertExactKeys(
+    value,
+    [
+      "packagePath",
+      "packageId",
+      "manifestSha256",
+      "modelSource",
+      "modelRevision",
+      "modelIdentity",
+      "layerStart",
+      "layerEnd",
+      "totalLayers",
+      "daemonExecutable",
+      "pipelineId",
+      "contextTokens",
+      "gpuLayers",
+      "computeApi",
+      "startupTimeoutSeconds",
+      "callTimeoutSeconds",
+      "closeTimeoutSeconds",
+    ],
+    [],
+    "native_stage",
+  );
+  assertPath(value.packagePath, "native_stage.packagePath");
+  assertSha256(value.packageId, "native_stage.packageId");
+  assertSha256(value.manifestSha256, "native_stage.manifestSha256");
+  assertPath(value.modelSource, "native_stage.modelSource");
+  if (value.modelRevision !== null) {
+    assertPath(value.modelRevision, "native_stage.modelRevision", 1_024);
+  }
+  if (
+    typeof value.modelIdentity !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/.test(value.modelIdentity)
+  ) {
+    throw new Error("native_stage.modelIdentity_is_invalid");
+  }
+  assertInteger(value.layerStart, 0, Number.MAX_SAFE_INTEGER, "native_stage.layerStart");
+  assertInteger(value.layerEnd, 1, Number.MAX_SAFE_INTEGER, "native_stage.layerEnd");
+  assertInteger(value.totalLayers, 1, Number.MAX_SAFE_INTEGER, "native_stage.totalLayers");
+  if (
+    value.layerStart !== launch.layerStart ||
+    value.layerEnd !== launch.layerEnd ||
+    value.totalLayers !== launch.totalLayers
+  ) {
+    throw new Error("native_stage_layer_range_does_not_match_launch");
+  }
+  if (launch.stageIndex === 0) throw new Error("native_stage_stage_cannot_be_root");
+  if (launch.cell !== null) throw new Error("native_stage_stage_cannot_use_cell_execution");
+  if (!Array.isArray(launch.members) || launch.members.length !== 1) {
+    throw new Error("native_stage_stage_requires_single_member");
+  }
+  assertPath(value.daemonExecutable, "native_stage.daemonExecutable");
+  assertUint64String(value.pipelineId, "native_stage.pipelineId");
+  assertInteger(value.contextTokens, 1, 2_147_483_647, "native_stage.contextTokens");
+  assertInteger(value.gpuLayers, 0, 1_000_000, "native_stage.gpuLayers");
+  if (!(value.computeApi === "cpu" || value.computeApi === "cuda" || value.computeApi === "rocm" || value.computeApi === "metal" || value.computeApi === "vulkan")) {
+    throw new Error("native_stage.computeApi_is_invalid");
+  }
+  if ((value.computeApi === "cpu") !== (value.gpuLayers === 0)) {
+    throw new Error("native_stage_compute_api_gpu_layers_mismatch");
+  }
+  assertPositiveFinite(value.startupTimeoutSeconds, "native_stage.startupTimeoutSeconds");
+  assertPositiveFinite(value.callTimeoutSeconds, "native_stage.callTimeoutSeconds");
+  assertPositiveFinite(value.closeTimeoutSeconds, "native_stage.closeTimeoutSeconds");
 }
 
 function validateRootEngine(value: Record<string, unknown>): void {
@@ -925,6 +1027,28 @@ function validateRootEngine(value: Record<string, unknown>): void {
   validateEndpoint(value.returnEndpoint, "returnEndpoint");
   validatePrefill(value.prefill);
   validateDecode(value.decode);
+  const prefill = value.prefill as Record<string, unknown>;
+  const decode = value.decode as Record<string, unknown>;
+  if (
+    macroWavePlanExecutionIdentity(prefill.macroWave) !==
+    macroWavePlanExecutionIdentity(decode.macroWave)
+  ) {
+    throw new Error("root_engine_macro_wave_phase_contracts_do_not_match");
+  }
+  if ((value.macroWave === null) !== (prefill.macroWave === null)) {
+    throw new Error("root_engine_macro_wave_stage_contract_is_inconsistent");
+  }
+}
+
+function macroWavePlanExecutionIdentity(value: unknown): string {
+  if (value === null) return "null";
+  const contract = value as Record<string, unknown>;
+  return stableJson({
+    schema: contract.schema,
+    routeKind: contract.routeKind,
+    waveTokens: contract.waveTokens,
+    expectedCommittedTokensPerWave: contract.expectedCommittedTokensPerWave,
+  });
 }
 
 function validateCommand(value: unknown): void {
@@ -1110,19 +1234,33 @@ function validateCellExternal(value: unknown, worldSize: number): void {
 
 function validatePrefill(value: unknown): void {
   assertRecord(value, "prefill");
-  assertExactKeys(value, ["phase", "planId", "activationCodec", "microBatchSize", "chunkTokens"], [], "prefill");
+  assertExactKeys(
+    value,
+    ["phase", "planId", "activationCodec", "microBatchSize", "chunkTokens", "macroWave"],
+    [],
+    "prefill",
+  );
   if (value.phase !== "prefill") throw new Error("prefill_phase_is_invalid");
   assertIdentifier(value.planId, "prefill.planId");
   assertIdentifier(value.activationCodec, "prefill.activationCodec");
   assertInteger(value.microBatchSize, 1, 1_000_000, "prefill.microBatchSize");
   assertInteger(value.chunkTokens, 1, 1_000_000, "prefill.chunkTokens");
+  validateMacroWavePlan(value.macroWave, "prefill.macroWave");
 }
 
 function validateDecode(value: unknown): void {
   assertRecord(value, "decode");
   assertExactKeys(
     value,
-    ["phase", "planId", "activationCodec", "microBatchSize", "directTokenReturnStage", "speculation"],
+    [
+      "phase",
+      "planId",
+      "activationCodec",
+      "microBatchSize",
+      "directTokenReturnStage",
+      "speculation",
+      "macroWave",
+    ],
     [],
     "decode",
   );
@@ -1132,6 +1270,362 @@ function validateDecode(value: unknown): void {
   assertInteger(value.microBatchSize, 1, 1_000_000, "decode.microBatchSize");
   assertInteger(value.directTokenReturnStage, 0, 1_000_000, "decode.directTokenReturnStage");
   validateSpeculation(value.speculation);
+  validateMacroWavePlan(value.macroWave, "decode.macroWave");
+}
+
+function validateMacroWavePlan(value: unknown, name: string): void {
+  if (value === null) return;
+  assertRecord(value, name);
+  assertExactKeys(
+    value,
+    [
+      "schema",
+      "routeKind",
+      "waveTokens",
+      "expectedCommittedTokensPerWave",
+      "projection",
+    ],
+    [],
+    name,
+  );
+  if (value.schema !== "gdlp-macro-wave-plan/1") {
+    throw new Error(`${name}_schema_is_invalid`);
+  }
+  if (value.routeKind !== "resident-baseline" && value.routeKind !== "macro-wave") {
+    throw new Error(`${name}_route_kind_is_invalid`);
+  }
+  assertInteger(value.waveTokens, 1, Number.MAX_SAFE_INTEGER, `${name}.waveTokens`);
+  assertPositiveFinite(
+    value.expectedCommittedTokensPerWave,
+    `${name}.expectedCommittedTokensPerWave`,
+  );
+  if ((value.expectedCommittedTokensPerWave as number) > (value.waveTokens as number)) {
+    throw new Error(`${name}_committed_tokens_exceed_wave`);
+  }
+  // The compiler currently emits only the exact one-position subset. Keep the
+  // RPC boundary aligned with that executable ABI rather than accepting a
+  // future contract that the Python process would silently ignore.
+  if (value.waveTokens !== 1 || value.expectedCommittedTokensPerWave !== 1) {
+    throw new Error(`${name}_is_not_executable_by_current_runtime`);
+  }
+  assertRecord(value.projection, `${name}.projection`);
+  const projectionFields = [
+    "ttftMs",
+    "tpotMs",
+    "responseTimeMs",
+    "pathDecodeMs",
+    "pipelineCycleMs",
+    "tokensPerSecondPerSequence",
+    "aggregateTokensPerSecond",
+    "networkBytesPerOutputToken",
+    "rawActiveWeightBytesPerOutputToken",
+    "expectedWeightCacheMissBytesPerOutputToken",
+    "routeAvailability",
+  ];
+  assertExactKeys(value.projection, projectionFields, [], `${name}.projection`);
+  for (const field of projectionFields) {
+    assertFiniteRange(
+      value.projection[field],
+      0,
+      Number.MAX_VALUE,
+      `${name}.projection.${field}`,
+    );
+  }
+  assertFiniteRange(
+    value.projection.routeAvailability,
+    0,
+    1,
+    `${name}.projection.routeAvailability`,
+  );
+}
+
+function validateMacroWaveStage(value: unknown): void {
+  if (value === null) return;
+  assertRecord(value, "macroWave");
+  assertExactKeys(
+    value,
+    [
+      "mode",
+      "schema",
+      "memoryMode",
+      "residentKind",
+      "budgets",
+      "requirements",
+      "workingSet",
+      "cachePolicy",
+    ],
+    ["ramArtifact"],
+    "macroWave",
+  );
+  if (value.mode !== "macro-wave-memory" || value.schema !== "gdlp-macro-wave-stage/1") {
+    throw new Error("macro_wave_stage_identity_is_invalid");
+  }
+  if (value.memoryMode !== "resident" && value.memoryMode !== "ram-backed") {
+    throw new Error("macro_wave_memory_mode_is_invalid");
+  }
+  if (value.residentKind !== "layers" && value.residentKind !== "expert-shard") {
+    throw new Error("macro_wave_resident_kind_is_invalid");
+  }
+  assertRecord(value.budgets, "macroWave.budgets");
+  assertExactKeys(
+    value.budgets,
+    ["hostRamBytes", "vramBytes"],
+    [],
+    "macroWave.budgets",
+  );
+  assertInteger(
+    value.budgets.hostRamBytes,
+    1,
+    Number.MAX_SAFE_INTEGER,
+    "macroWave.budgets.hostRamBytes",
+  );
+  assertInteger(
+    value.budgets.vramBytes,
+    1,
+    Number.MAX_SAFE_INTEGER,
+    "macroWave.budgets.vramBytes",
+  );
+
+  assertRecord(value.requirements, "macroWave.requirements");
+  const requirementFields = [
+    "fullStageStateBytes",
+    "hostRamBytes",
+    "vramBytes",
+    "fixedVramBytes",
+    "residentParameterBudgetBytes",
+    "residentStreamingTransientBytes",
+    "boundedPinnedStagingReserveBytes",
+    "hostRamPeakUpperBoundBytes",
+    "activationBufferBytes",
+    "weightBufferBytes",
+    "weightBufferCopies",
+  ];
+  assertExactKeys(
+    value.requirements,
+    requirementFields,
+    [],
+    "macroWave.requirements",
+  );
+  for (const field of requirementFields) {
+    assertInteger(
+      value.requirements[field],
+      0,
+      Number.MAX_SAFE_INTEGER,
+      `macroWave.requirements.${field}`,
+    );
+  }
+  if (
+    (value.requirements.hostRamBytes as number) >
+      (value.budgets.hostRamBytes as number) ||
+    (value.requirements.vramBytes as number) > (value.budgets.vramBytes as number)
+  ) {
+    throw new Error("macro_wave_stage_budget_is_exceeded");
+  }
+
+  assertRecord(value.workingSet, "macroWave.workingSet");
+  const workingSetFields = [
+    "totalWeightBytes",
+    "residentWeightBytes",
+    "totalRoutedExpertBytes",
+    "activeWeightBytesPerWave",
+    "largestTransferUnitBytes",
+    "largestExpertBytes",
+  ];
+  assertExactKeys(value.workingSet, workingSetFields, [], "macroWave.workingSet");
+  for (const field of workingSetFields) {
+    assertInteger(
+      value.workingSet[field],
+      0,
+      Number.MAX_SAFE_INTEGER,
+      `macroWave.workingSet.${field}`,
+    );
+  }
+  if (
+    (value.workingSet.residentWeightBytes as number) >
+      (value.workingSet.totalWeightBytes as number) ||
+    (value.workingSet.activeWeightBytesPerWave as number) >
+      (value.workingSet.totalWeightBytes as number)
+  ) {
+    throw new Error("macro_wave_working_set_exceeds_total_weights");
+  }
+
+  assertRecord(value.cachePolicy, "macroWave.cachePolicy");
+  assertExactKeys(
+    value.cachePolicy,
+    [
+      "kind",
+      "capacityBytes",
+      "expectedHitRate",
+      "expectedMissWeightBytesPerWave",
+    ],
+    [],
+    "macroWave.cachePolicy",
+  );
+  if (
+    value.cachePolicy.kind !== "full-resident" &&
+    value.cachePolicy.kind !== "disabled" &&
+    value.cachePolicy.kind !== "bounded-lru"
+  ) {
+    throw new Error("macro_wave_cache_kind_is_invalid");
+  }
+  assertInteger(
+    value.cachePolicy.capacityBytes,
+    0,
+    Number.MAX_SAFE_INTEGER,
+    "macroWave.cachePolicy.capacityBytes",
+  );
+  assertFiniteRange(
+    value.cachePolicy.expectedHitRate,
+    0,
+    1,
+    "macroWave.cachePolicy.expectedHitRate",
+  );
+  assertInteger(
+    value.cachePolicy.expectedMissWeightBytesPerWave,
+    0,
+    Number.MAX_SAFE_INTEGER,
+    "macroWave.cachePolicy.expectedMissWeightBytesPerWave",
+  );
+
+  const requirements = value.requirements;
+  const workingSet = value.workingSet;
+  const cachePolicy = value.cachePolicy;
+  const hostRamBytes = requirements.hostRamBytes as number;
+  const totalRoutedExpertBytes = workingSet.totalRoutedExpertBytes as number;
+  const activeWeightBytesPerWave = workingSet.activeWeightBytesPerWave as number;
+  const largestExpertBytes = workingSet.largestExpertBytes as number;
+  const cacheCapacityBytes = cachePolicy.capacityBytes as number;
+  const cacheExpectedHitRate = cachePolicy.expectedHitRate as number;
+  if (value.memoryMode === "resident") {
+    if (value.ramArtifact !== undefined) {
+      throw new Error("macro_wave_resident_stage_cannot_bind_ram_artifact");
+    }
+    if (
+      value.residentKind !== "layers" ||
+      requirements.hostRamBytes !== 0 ||
+      requirements.residentStreamingTransientBytes !== 0 ||
+      requirements.boundedPinnedStagingReserveBytes !== 0 ||
+      requirements.hostRamPeakUpperBoundBytes !== 0 ||
+      requirements.weightBufferBytes !== 0 ||
+      requirements.weightBufferCopies !== 0 ||
+      requirements.residentParameterBudgetBytes !== workingSet.residentWeightBytes ||
+      workingSet.totalRoutedExpertBytes !== 0 ||
+      workingSet.activeWeightBytesPerWave !== 0 ||
+      workingSet.largestTransferUnitBytes !== 0 ||
+      workingSet.largestExpertBytes !== 0 ||
+      workingSet.residentWeightBytes !== workingSet.totalWeightBytes ||
+      cachePolicy.kind !== "full-resident" ||
+      cachePolicy.capacityBytes !== workingSet.residentWeightBytes ||
+      cachePolicy.expectedHitRate !== 1 ||
+      cachePolicy.expectedMissWeightBytesPerWave !== 0 ||
+      requirements.vramBytes !==
+        (requirements.fixedVramBytes as number) +
+          (requirements.activationBufferBytes as number) +
+          (workingSet.residentWeightBytes as number)
+    ) {
+      throw new Error("macro_wave_resident_stage_contract_is_inconsistent");
+    }
+    return;
+  }
+
+  assertRecord(value.ramArtifact, "macroWave.ramArtifact");
+  validateMacroWaveRamArtifact(value.ramArtifact);
+  const artifact = value.ramArtifact;
+  const requiredVram =
+    (requirements.fixedVramBytes as number) +
+    (requirements.activationBufferBytes as number) +
+    (requirements.weightBufferBytes as number);
+  if (
+    value.residentKind !== "layers" ||
+    requirements.vramBytes !== requiredVram ||
+    hostRamBytes !== requirements.hostRamPeakUpperBoundBytes ||
+    requirements.hostRamPeakUpperBoundBytes !==
+      totalRoutedExpertBytes +
+        (requirements.boundedPinnedStagingReserveBytes as number) +
+        (requirements.residentStreamingTransientBytes as number) ||
+    requirements.boundedPinnedStagingReserveBytes !== largestExpertBytes * 2 ||
+    requirements.weightBufferCopies !== 2 ||
+    requirements.residentParameterBudgetBytes !== workingSet.residentWeightBytes ||
+    workingSet.totalWeightBytes !==
+      (workingSet.residentWeightBytes as number) +
+        (workingSet.totalRoutedExpertBytes as number) ||
+    totalRoutedExpertBytes < 1 ||
+    activeWeightBytesPerWave < 1 ||
+    activeWeightBytesPerWave > totalRoutedExpertBytes ||
+    largestExpertBytes < 1 ||
+    workingSet.largestTransferUnitBytes !== workingSet.largestExpertBytes ||
+    largestExpertBytes > activeWeightBytesPerWave ||
+    requirements.weightBufferBytes !==
+      (workingSet.largestExpertBytes as number) *
+        (requirements.weightBufferCopies as number) ||
+    artifact.largestExpertBytes !== workingSet.largestExpertBytes ||
+    artifact.weightBufferCopies !== requirements.weightBufferCopies
+  ) {
+    throw new Error("macro_wave_ram_backed_stage_contract_is_inconsistent");
+  }
+  const expectedMiss = Math.ceil(
+    activeWeightBytesPerWave * (1 - cacheExpectedHitRate),
+  );
+  if (cachePolicy.expectedMissWeightBytesPerWave !== expectedMiss) {
+    throw new Error("macro_wave_cache_expectation_is_inconsistent");
+  }
+  if (cachePolicy.kind === "disabled") {
+    if (cachePolicy.capacityBytes !== 0 || cachePolicy.expectedHitRate !== 0) {
+      throw new Error("macro_wave_disabled_cache_is_inconsistent");
+    }
+  } else if (
+    cachePolicy.kind !== "bounded-lru" ||
+    cacheExpectedHitRate <= 0 ||
+    cacheCapacityBytes < largestExpertBytes ||
+    (requirements.vramBytes as number) + cacheCapacityBytes >
+      (value.budgets.vramBytes as number)
+  ) {
+    throw new Error("macro_wave_bounded_cache_is_inconsistent");
+  }
+}
+
+function validateMacroWaveRamArtifact(value: Record<string, unknown>): void {
+  assertExactKeys(
+    value,
+    [
+      "schema",
+      "format",
+      "locality",
+      "loader",
+      "weightEncoding",
+      "sourceDtypes",
+      "adapterIds",
+      "expertExecutionMode",
+      "largestExpertBytes",
+      "weightBufferCopies",
+      "fullModelMaterialization",
+    ],
+    [],
+    "macroWave.ramArtifact",
+  );
+  if (
+    value.schema !== "gdlp-local-safetensors-moe-stage/1" ||
+    value.format !== "safetensors" ||
+    value.locality !== "host-local-only" ||
+    value.loader !== "selective-safetensors-ram-backed-moe" ||
+    value.weightEncoding !== "floating-safetensors" ||
+    value.expertExecutionMode !== "serial-exact" ||
+    value.weightBufferCopies !== 2 ||
+    value.fullModelMaterialization !== false ||
+    !Array.isArray(value.sourceDtypes) ||
+    value.sourceDtypes.join(",") !== "fp16,bf16,fp32" ||
+    !Array.isArray(value.adapterIds) ||
+    value.adapterIds.join(",") !==
+      "transformers-qwen3-moe-v1,transformers-glm4-moe-v1"
+  ) {
+    throw new Error("macro_wave_ram_artifact_is_invalid");
+  }
+  assertInteger(
+    value.largestExpertBytes,
+    1,
+    Number.MAX_SAFE_INTEGER,
+    "macroWave.ramArtifact.largestExpertBytes",
+  );
 }
 
 function validateSpeculation(value: unknown): void {
@@ -1440,6 +1934,15 @@ function assertExactKeys(
 
 function assertIdentifier(value: unknown, name: string): asserts value is string {
   if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$/.test(value)) {
+    throw new Error(`${name}_is_invalid`);
+  }
+}
+
+function assertUint64String(value: unknown, name: string): asserts value is string {
+  if (typeof value !== "string" || !/^(?:0|[1-9]\d*)$/.test(value)) {
+    throw new Error(`${name}_is_invalid`);
+  }
+  if (BigInt(value) > 18_446_744_073_709_551_615n) {
     throw new Error(`${name}_is_invalid`);
   }
 }

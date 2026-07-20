@@ -75,7 +75,7 @@ function positiveInteger(value: string, label: string): number {
 }
 
 function printSummary(results: SimulationResult[]): void {
-  console.log("Simulación de GPU Distribuida (modelo de planificación, no benchmark real)\n");
+  console.log("Simulación de mycellios (modelo de planificación, no benchmark real)\n");
   console.table(
     results.map((result) => ({
       escenario: result.options.scenario,

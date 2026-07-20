@@ -229,7 +229,10 @@ class ExternalTensorParallelCellTests(unittest.TestCase):
             ports = _ports(6)
             config = _external_stage_config(str(fixture), ports)
             config = StageProcessConfig(
-                **{**config.__dict__, "cell_startup_timeout_seconds": 10.0}
+                # A cold Windows spawn imports Torch independently in rank zero
+                # and in the external CLI. Ten seconds made this integrity test
+                # race process startup instead of exercising the digest HELLO.
+                **{**config.__dict__, "cell_startup_timeout_seconds": 30.0}
             )
             environment = os.environ.copy()
             environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
@@ -276,9 +279,12 @@ class ExternalTensorParallelCellTests(unittest.TestCase):
                 except subprocess.TimeoutExpired:
                     member.kill()
                     member.wait(timeout=5)
+                stderr = member.stderr.read() if member.stderr is not None else ""
                 if member.stderr is not None:
                     member.stderr.close()
             self.assertNotEqual(member.returncode, 0)
+            self.assertIn("external cell anchor rejected rank 1", stderr)
+            self.assertIn("shard digest", stderr)
 
 
 def _external_stage_config(fixture: str, ports: tuple[int, ...]) -> StageProcessConfig:

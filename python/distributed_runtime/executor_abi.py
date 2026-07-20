@@ -207,9 +207,28 @@ def model_identity_for_source(source: str, revision: str | None) -> str:
 
     _string(source, "model source")
     _nullable_string(revision, "model revision")
+    commit = _hub_commit_from_coordinates(source, revision)
+    if commit is not None:
+        return "sha256:" + hashlib.sha256(
+            b"gdlp-hub-snapshot-v1\0" + commit.encode("ascii")
+        ).hexdigest()
     return "sha256:" + hashlib.sha256(
         _canonical_json({"source": source, "revision": revision})
     ).hexdigest()
+
+
+def _hub_commit_from_coordinates(source: str, revision: str | None) -> str | None:
+    candidates = [revision.strip().lower()] if revision is not None else []
+    parts = [part for part in source.replace("\\", "/").split("/") if part]
+    for index, part in enumerate(parts[:-1]):
+        if part.lower() == "snapshots":
+            candidates.append(parts[index + 1].lower())
+    for candidate in candidates:
+        if len(candidate) >= 32 and all(
+            character in "0123456789abcdef" for character in candidate
+        ):
+            return candidate
+    return None
 
 
 def parse_stage_executor_manifest(value: object) -> StageExecutorManifest:

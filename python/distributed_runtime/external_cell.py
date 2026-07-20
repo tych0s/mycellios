@@ -238,13 +238,26 @@ class ExternalTensorParallelCellStageRunner:
         )
 
         unequal = len(set(manifest["rankWeights"])) > 1
+        model_identity = spec.artifact_identity or model_identity_for_source(
+            spec.model_name, spec.revision
+        )
+        model_source = spec.canonical_model_source or (
+            f"content-addressed://{spec.artifact_identity}"
+            if spec.artifact_identity is not None
+            else spec.model_name
+        )
+        model_revision = (
+            spec.canonical_model_revision
+            if spec.artifact_identity is not None
+            else spec.revision
+        )
         self.executor_manifest = build_stage_executor_manifest(
             engine="python-torch-cell",
             engine_version=torch.__version__,
             adapter="llama-tensor-parallel-safetensors-external",
-            model_identity=model_identity_for_source(spec.model_name, spec.revision),
-            model_source=spec.model_name,
-            model_revision=spec.revision,
+            model_identity=model_identity,
+            model_source=model_source,
+            model_revision=model_revision,
             artifact_format="safetensors-tp-cell",
             layer_start=spec.layer_start,
             layer_end=spec.layer_end,
