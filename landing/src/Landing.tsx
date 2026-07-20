@@ -145,30 +145,62 @@ function Brand({ compact = false, homeLabel }: { compact?: boolean; homeLabel: s
 }
 
 function LivingBackdrop() {
-  const paths = ["M-60 190 C180 40 280 330 520 190 S850 55 1080 220 S1350 340 1540 110", "M-80 480 C190 600 280 310 520 450 S850 650 1090 430 S1370 280 1540 520", "M120 -50 C230 170 440 100 530 320 S690 650 900 480 S1160 180 1490 290", "M20 740 C270 610 430 760 620 560 S880 260 1120 470 S1330 710 1520 590", "M-30 690 C190 470 380 600 580 380 S960 110 1190 310 S1420 610 1510 420"];
+  const hyphae = [
+    { d: "M1510 180 C1320 185 1195 250 1040 312 C850 388 702 380 552 470 C360 585 205 565 -70 720", depth: 0, delay: 0 },
+    { d: "M1245 232 C1210 145 1152 75 1048 -30", depth: 1, delay: .3 },
+    { d: "M1158 270 C1140 390 1198 475 1110 612", depth: 1, delay: .55 },
+    { d: "M1040 312 C946 211 885 126 748 38", depth: 1, delay: .75 },
+    { d: "M944 352 C910 468 843 575 724 690", depth: 1, delay: .95 },
+    { d: "M820 382 C742 301 664 224 526 177", depth: 1, delay: 1.1 },
+    { d: "M690 404 C635 522 556 630 423 758", depth: 1, delay: 1.25 },
+    { d: "M552 470 C438 405 318 342 132 371", depth: 1, delay: 1.45 },
+    { d: "M403 548 C300 502 190 478 32 523", depth: 2, delay: 1.75 },
+    { d: "M1210 146 C1310 96 1404 91 1510 112", depth: 2, delay: .95 },
+    { d: "M1168 444 C1274 428 1373 466 1490 546", depth: 2, delay: 1.2 },
+    { d: "M946 211 C1012 112 1017 40 995 -38", depth: 2, delay: 1.35 },
+    { d: "M885 126 C823 72 784 24 773 -35", depth: 2, delay: 1.65 },
+    { d: "M843 575 C913 652 1008 715 1146 770", depth: 2, delay: 1.65 },
+    { d: "M742 301 C668 327 605 322 526 284", depth: 2, delay: 1.85 },
+    { d: "M635 522 C701 602 744 698 748 805", depth: 2, delay: 1.95 },
+    { d: "M438 405 C420 303 371 225 278 154", depth: 2, delay: 2.05 },
+    { d: "M318 342 C244 277 159 242 36 259", depth: 2, delay: 2.2 },
+    { d: "M300 502 C252 623 169 712 36 802", depth: 2, delay: 2.35 },
+    { d: "M1110 612 C1195 683 1324 717 1494 700", depth: 2, delay: 1.7 },
+    { d: "M1318 190 C1370 270 1422 316 1506 340", depth: 3, delay: 1.55 },
+    { d: "M1164 444 C1244 506 1290 570 1304 655", depth: 3, delay: 2.05 },
+    { d: "M1040 312 C1082 230 1100 167 1082 94", depth: 3, delay: 1.75 },
+    { d: "M944 352 C877 280 820 242 748 232", depth: 3, delay: 2.05 },
+    { d: "M843 575 C802 510 781 455 792 392", depth: 3, delay: 2.3 },
+    { d: "M742 301 C704 229 651 177 578 143", depth: 3, delay: 2.15 },
+    { d: "M635 522 C570 556 521 602 488 666", depth: 3, delay: 2.4 },
+    { d: "M552 470 C494 500 450 554 430 622", depth: 3, delay: 2.55 },
+    { d: "M438 405 C352 390 286 404 224 454", depth: 3, delay: 2.6 },
+    { d: "M318 342 C269 204 198 124 82 81", depth: 3, delay: 2.75 },
+    { d: "M300 502 C202 540 112 606 22 702", depth: 3, delay: 2.85 },
+    { d: "M526 177 C473 106 394 62 294 42", depth: 3, delay: 2.55 },
+  ] as const;
   return (
     <div className="living-background" aria-hidden="true">
-      <div className="cell-aurora" />
       <svg viewBox="0 0 1440 900" preserveAspectRatio="xMidYMid slice">
         <defs>
-          <linearGradient id="backdropSignal" x1="0" x2="1"><stop offset="0" stopColor="#62f6d0" /><stop offset=".52" stopColor="#768cff" /><stop offset="1" stopColor="#cf6dff" /></linearGradient>
-          <radialGradient id="backdropCell"><stop offset="0" stopColor="#62f6d0" stopOpacity=".22" /><stop offset=".45" stopColor="#7786ff" stopOpacity=".08" /><stop offset="1" stopColor="#090b10" stopOpacity="0" /></radialGradient>
-          <filter id="cellDistortion" x="-30%" y="-30%" width="160%" height="160%"><feTurbulence type="fractalNoise" baseFrequency=".008 .014" numOctaves="2" seed="8" result="noise"><animate attributeName="baseFrequency" dur="18s" values=".008 .014;.011 .009;.008 .014" repeatCount="indefinite" /></feTurbulence><feDisplacementMap in="SourceGraphic" in2="noise" scale="22" /></filter>
-          <filter id="backdropGlow" x="-100%" y="-100%" width="300%" height="300%"><feGaussianBlur stdDeviation="5" result="blur" /><feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge></filter>
+          <linearGradient id="hyphaGradient" x1="1" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#d9fff5" /><stop offset=".42" stopColor="#72d9c6" /><stop offset=".75" stopColor="#7888bf" /><stop offset="1" stopColor="#8a5ca9" /></linearGradient>
+          <radialGradient id="colonyGlow"><stop offset="0" stopColor="#6ce5ca" stopOpacity=".12" /><stop offset="1" stopColor="#07080b" stopOpacity="0" /></radialGradient>
         </defs>
-        <g className="backdrop-cells" filter="url(#cellDistortion)">
-          <path d="M770 45 C920 -35 1110 15 1195 142 C1285 277 1215 410 1065 437 C901 467 755 395 706 265 C669 164 690 87 770 45Z" />
-          <path d="M1060 390 C1210 323 1403 407 1480 540 C1546 654 1454 794 1298 818 C1127 845 980 749 966 611 C956 510 989 427 1060 390Z" />
-          <path d="M292 412 C430 356 570 425 620 540 C665 642 594 740 465 759 C326 779 205 707 185 596 C168 500 213 445 292 412Z" />
+        <g className="colony-glow">
+          <ellipse cx="1040" cy="312" rx="330" ry="250" fill="url(#colonyGlow)" />
+          <ellipse cx="552" cy="470" rx="285" ry="230" fill="url(#colonyGlow)" />
         </g>
-        <g className="backdrop-nuclei">
-          <circle cx="990" cy="223" r="172" fill="url(#backdropCell)" /><circle cx="990" cy="223" r="7" />
-          <circle cx="1247" cy="602" r="150" fill="url(#backdropCell)" /><circle cx="1247" cy="602" r="5" />
-          <circle cx="405" cy="580" r="133" fill="url(#backdropCell)" /><circle cx="405" cy="580" r="4" />
+        <g className="mycelium-web">
+          {hyphae.map((hypha) => <path key={hypha.d} d={hypha.d} pathLength="1" className={`hypha-branch depth-${hypha.depth}`} style={{ "--grow-delay": `${hypha.delay}s` } as CSSProperties} />)}
         </g>
-        {paths.map((path, index) => <g key={path}><path d={path} className="hypha-base" /><path d={path} className="hypha-pulse" style={{ "--path-delay": `${index * -1.7}s` } as CSSProperties} /></g>)}
-        <g className="backdrop-packets" filter="url(#backdropGlow)">
-          {paths.slice(0, 4).map((path, index) => <circle key={`packet-${path}`} r={index % 2 ? 2.5 : 3.5}><animateMotion dur={`${8 + index * 1.6}s`} begin={`${index * -2.1}s`} repeatCount="indefinite" path={path} /></circle>)}
+        <g className="hypha-crosslinks">
+          <path d="M1210 146 C1112 181 1078 228 1040 312" /><path d="M944 352 C848 412 762 456 635 522" /><path d="M820 382 C702 365 628 397 552 470" /><path d="M438 405 C402 466 370 516 300 502" />
+          <path d="M1318 190 C1235 314 1190 384 1164 444" /><path d="M1082 94 C958 168 875 238 820 382" /><path d="M748 232 C692 363 634 431 552 470" /><path d="M792 392 C673 408 558 388 438 405" /><path d="M488 666 C350 616 260 554 224 454" />
+        </g>
+        <g className="fruiting-bodies">
+          <g transform="translate(1040 312)"><path d="M-8 5 C-7-10 7-10 8 5Z" /><path d="M0 5 L0 18" /></g>
+          <g transform="translate(552 470) scale(.8)"><path d="M-8 5 C-7-10 7-10 8 5Z" /><path d="M0 5 L0 18" /></g>
+          <g transform="translate(843 575) scale(.55)"><path d="M-8 5 C-7-10 7-10 8 5Z" /><path d="M0 5 L0 18" /></g>
         </g>
       </svg>
       <div className="spore-field" />
@@ -184,10 +216,8 @@ function NetworkHero({ text }: { text: typeof copy.visual }) {
         <defs>
           <linearGradient id="networkLinkGradient" x1="0" x2="1"><stop offset="0" stopColor="#66f6d1" /><stop offset=".52" stopColor="#768cff" /><stop offset="1" stopColor="#cf6dff" /></linearGradient>
           <radialGradient id="coreGradient"><stop offset="0" stopColor="#e8fffb" /><stop offset=".28" stopColor="#65f5d0" /><stop offset=".68" stopColor="#6576ef" /><stop offset="1" stopColor="#9d52d5" /></radialGradient>
-          <filter id="softGlow" x="-100%" y="-100%" width="300%" height="300%"><feGaussianBlur stdDeviation="8" result="blur" /><feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge></filter>
-          <filter id="membraneDistortion" x="-20%" y="-20%" width="140%" height="140%"><feTurbulence type="fractalNoise" baseFrequency=".012" numOctaves="2" seed="14" result="noise"><animate attributeName="seed" dur="12s" values="14;19;14" repeatCount="indefinite" /></feTurbulence><feDisplacementMap in="SourceGraphic" in2="noise" scale="12" /></filter>
         </defs>
-        <g className="cell-regions" filter="url(#membraneDistortion)">
+        <g className="cell-regions">
           <path d="M37 102 C97 25 221 22 297 75 C351 113 348 187 292 220 C216 265 106 237 48 181 C22 155 19 126 37 102Z" />
           <path d="M371 29 C462 -11 596 17 646 97 C688 165 642 248 566 271 C487 294 398 259 365 194 C333 132 325 49 371 29Z" />
           <path d="M326 323 C391 274 504 290 574 351 C643 411 613 508 523 532 C431 557 322 515 293 437 C277 394 289 351 326 323Z" />
@@ -200,17 +230,12 @@ function NetworkHero({ text }: { text: typeof copy.visual }) {
         </g>
         <g className="mesh-lines">
           {links.map(([from, to], index) => { const start = nodes[from]; const end = nodes[to]; return <line key={`${from}-${to}`} x1={start.x} y1={start.y} x2={end.x} y2={end.y} className={index % 3 === 0 ? "signal-line" : ""} />; })}
-          {nodes.map((node) => <line key={`core-${node.label}`} x1={node.x} y1={node.y} x2="340" y2="286" className="core-link" />)}
-        </g>
-        <g className="data-packets" filter="url(#softGlow)">
-          <circle r="3"><animateMotion dur="5.8s" repeatCount="indefinite" path="M90 130 C190 192 254 221 340 286 S467 349 564 355" /></circle>
-          <circle r="2.5"><animateMotion dur="7.2s" begin="-2.4s" repeatCount="indefinite" path="M608 188 C510 195 444 239 340 286 S267 409 210 492" /></circle>
-          <circle r="2"><animateMotion dur="4.9s" begin="-1.6s" repeatCount="indefinite" path="M185 66 C235 136 275 218 340 286 S440 432 432 474" /></circle>
+          {nodes.map((node, index) => <path key={`core-${node.label}`} d={`M${node.x} ${node.y} Q${(node.x + 340) / 2 + (index % 2 ? 18 : -18)} ${(node.y + 286) / 2 + (index % 3 - 1) * 16} 340 286`} className="core-link" />)}
         </g>
         <g className="micro-cells">
           <g transform="translate(145 300)"><circle r="11" /><circle r="2" /></g><g transform="translate(505 166)"><circle r="8" /><circle r="1.7" /></g><g transform="translate(525 438)"><circle r="12" /><circle r="2.2" /></g><g transform="translate(273 54)"><circle r="7" /><circle r="1.5" /></g>
         </g>
-        <g className="core" filter="url(#softGlow)"><circle cx="340" cy="286" r="108" className="core-wave" /><circle cx="340" cy="286" r="93" className="core-orbit orbit-a" /><circle cx="340" cy="286" r="68" className="core-orbit orbit-b" /><circle cx="340" cy="286" r="56" className="core-membrane" /><circle cx="340" cy="286" r="49" fill="url(#coreGradient)" /><circle cx="340" cy="286" r="26" className="core-center" /></g>
+        <g className="core"><circle cx="340" cy="286" r="93" className="core-orbit orbit-a" /><circle cx="340" cy="286" r="68" className="core-orbit orbit-b" /><circle cx="340" cy="286" r="56" className="core-membrane" /><circle cx="340" cy="286" r="49" fill="url(#coreGradient)" /><circle cx="340" cy="286" r="26" className="core-center" /></g>
         <g className="node-points">{nodes.map((node, index) => <g key={node.label} className={`mesh-node node-${node.tone}`} style={{ "--delay": `${index * -0.31}s` } as CSSProperties}><circle cx={node.x} cy={node.y} r="18" className="node-halo" /><circle cx={node.x} cy={node.y} r="7" className="node-dot" /></g>)}</g>
       </svg>
       <div className="core-label"><span>01</span><strong>{text.model}</strong><small>{text.route}</small></div>

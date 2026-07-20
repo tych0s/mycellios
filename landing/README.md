@@ -36,10 +36,10 @@ The two AI-generated editorial scenes are stored in:
 - `src/assets/mycelium-network.jpg`
 - `src/assets/efficiency-curve-ai.webp`
 
-The hero is fully generative SVG and CSS: organic cell membranes, filaments,
-light fields, and moving information packets are rendered without a background
-bitmap. The editorial images are combined with animated SVG and CSS; movement
-and information packets are not baked into those bitmaps.
+The hero is fully generative SVG and CSS. A branching mycelium colony grows once
+across the viewport, reveals its crosslinks and fruiting bodies, and then rests.
+It uses no animated raster, SVG turbulence, or perpetual background particles.
+The editorial images are combined with lightweight SVG and CSS overlays.
 
 Before publishing, confirm that `hello@mycellios.com` can receive email or update
 the `EMAIL` constant in `src/Landing.tsx` with the final address.
