@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import CancelledError as FutureCancelledError, Future
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 import math
 import multiprocessing as mp
@@ -72,6 +73,16 @@ class PipelineEngineConfig:
     speculative_max_draft_tokens: int = 0
     speculation_minimum_speedup: float = 1.05
     speculation_probe: bool = True
+    # Zero keeps today's behavior: every finished generation sends END and the
+    # per-request KV cache is dropped on every stage. A positive value keeps up
+    # to that many finished sessions alive (same wire_id, KV intact on every
+    # stage) so the next turn of the same chat only prefills the new suffix.
+    # Retained sessions hold KV memory on every stage but never occupy one of
+    # the max_active_sequences decode slots while idle.
+    max_retained_sessions: int = 0
+    # Total idle KV tokens allowed across retained sessions; zero is unbounded.
+    max_retained_session_tokens: int = 0
+    retained_session_ttl_seconds: float = 600.0
 
     def __post_init__(self) -> None:
         if not self.model_name.strip():
@@ -109,6 +120,17 @@ class PipelineEngineConfig:
             raise ValueError("speculation_minimum_speedup must be finite and at least 1")
         if not isinstance(self.speculation_probe, bool):
             raise TypeError("speculation_probe must be boolean")
+        for name, value in (
+            ("max_retained_sessions", self.max_retained_sessions),
+            ("max_retained_session_tokens", self.max_retained_session_tokens),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if (
+            not math.isfinite(self.retained_session_ttl_seconds)
+            or self.retained_session_ttl_seconds <= 0
+        ):
+            raise ValueError("retained_session_ttl_seconds must be finite and positive")
         for name, value in (
             ("startup_timeout_seconds", self.startup_timeout_seconds),
             ("socket_timeout_seconds", self.socket_timeout_seconds),
@@ -148,6 +170,10 @@ class GenerationInput:
     input_ids: torch.Tensor
     max_new_tokens: int
     eos_token_ids: frozenset[int] = frozenset()
+    # Opaque chat/session identity. With session retention enabled, input_ids
+    # must contain the COMPLETE tokenized conversation; the engine reuses the
+    # live KV prefix it already served for this key and prefills only the rest.
+    session_key: str | None = None
 
     def __post_init__(self) -> None:
         if self.client_id < 0:
@@ -161,6 +187,14 @@ class GenerationInput:
             or self.input_ids.dtype not in (torch.int32, torch.int64)
         ):
             raise ValueError("input_ids must be an integer tensor with shape [1, tokens]")
+        if self.session_key is not None and (
+            not isinstance(self.session_key, str)
+            or not self.session_key.strip()
+            or len(self.session_key) > 256
+        ):
+            raise ValueError(
+                "session_key must be a non-empty string of at most 256 characters"
+            )
 
 
 @dataclass(frozen=True)
@@ -171,6 +205,8 @@ class GenerationOutput:
     ttft_ms: float
     tpot_ms: float
     total_ms: float
+    # KV tokens served from a retained session instead of being re-prefilled.
+    reused_kv_tokens: int = 0
 
 
 class GenerationCancelledError(RuntimeError):
@@ -196,6 +232,33 @@ class _GenerationJob:
     verify_drafts: tuple[int, ...] = ()
     verify_base_tokens: int = 0
     speculation_profile: str = "load-1"
+    # Retained session this job checked out at admission (None for fresh wires).
+    session: "_RetainedSession | None" = None
+    reused_tokens: int = 0
+    # Number of leading KV positions on every stage that are known to equal the
+    # exact served sequence (prompt + emitted tokens). The physical KV may be
+    # longer when a turn ends right after a partially rejected VERIFY wave.
+    kv_valid: int = 0
+
+
+@dataclass
+class _RetainedSession:
+    """A finished chat whose wire and KV stay alive on every stage.
+
+    The wire was opened with BEGIN once and never received END. ``served_ids``
+    is the exact token sequence served for the last turn (full prompt plus the
+    emitted completion); ``kv_valid_tokens`` bounds the prefix of it that the
+    physical KV provably encodes. Only the scheduler thread touches instances.
+    """
+
+    key: str
+    wire_id: int
+    step: int
+    served_ids: tuple[int, ...]
+    kv_tokens: int
+    kv_valid_tokens: int
+    last_used: float
+    busy: bool = False
 
 
 class DistributedPipelineEngine:
@@ -241,6 +304,20 @@ class DistributedPipelineEngine:
         self._speculation_probe_waves = 0
         self._speculation_decision_reasons: dict[str, int] = {}
         self._speculation_selected_sizes: dict[int, int] = {}
+        # Session retention state. The map is owned by the scheduler thread;
+        # insertion order doubles as the LRU order because every retention
+        # refresh re-inserts the entry. The integer counters are read without a
+        # lock by observability endpoints, which is safe for CPython int reads.
+        self._retained_sessions: dict[str, _RetainedSession] = {}
+        self._session_retained_tokens = 0
+        self._session_reuse_hits = 0
+        self._session_reuse_misses = 0
+        self._session_busy_fallbacks = 0
+        self._session_divergence_fallbacks = 0
+        self._session_ttl_evictions = 0
+        self._session_budget_evictions = 0
+        self._session_cancel_releases = 0
+        self._session_reused_token_total = 0
         self.stage_metrics: list[dict[str, Any]] = []
         if config.speculative_max_draft_tokens > 0:
             self.draft_provider: DraftProvider | None = draft_provider or NgramDraftProvider(
@@ -300,6 +377,25 @@ class DistributedPipelineEngine:
     def fatal_error(self) -> str | None:
         with self._state_lock:
             return self._fatal_error
+
+    @property
+    def session_stats(self) -> dict[str, Any]:
+        return {
+            "configured": self.config.max_retained_sessions > 0,
+            "max_retained_sessions": self.config.max_retained_sessions,
+            "max_retained_session_tokens": self.config.max_retained_session_tokens,
+            "ttl_seconds": self.config.retained_session_ttl_seconds,
+            "retained_sessions": len(self._retained_sessions),
+            "retained_tokens": self._session_retained_tokens,
+            "reuse_hits": self._session_reuse_hits,
+            "reuse_misses": self._session_reuse_misses,
+            "busy_fallbacks": self._session_busy_fallbacks,
+            "divergence_fallbacks": self._session_divergence_fallbacks,
+            "ttl_evictions": self._session_ttl_evictions,
+            "budget_evictions": self._session_budget_evictions,
+            "cancel_releases": self._session_cancel_releases,
+            "reused_tokens_total": self._session_reused_token_total,
+        }
 
     @property
     def speculation_stats(self) -> dict[str, Any]:
@@ -602,6 +698,7 @@ class DistributedPipelineEngine:
         fatal: BaseException | None = None
         try:
             while not self._scheduler_stop.is_set():
+                self._expire_retained_sessions(runner, downstream)
                 if not active:
                     try:
                         idle_value = self._received_frames.get_nowait()
@@ -659,6 +756,16 @@ class DistributedPipelineEngine:
             )
             for job in list(active.values()):
                 self._retire_job(job, runner, exception=terminal_error)
+            # Retained sessions die with the pipeline: the SHUTDOWN below (or
+            # the stage processes exiting) frees their KV remotely; release the
+            # root's copies here. runner.end is a no-op for already-ended ids.
+            for session in list(self._retained_sessions.values()):
+                try:
+                    runner.end(session.wire_id)
+                except BaseException:
+                    pass
+            self._retained_sessions.clear()
+            self._session_retained_tokens = 0
             self._fail_pending_submissions(terminal_error)
             if downstream is not None and not self._shutdown_sent:
                 try:
@@ -704,14 +811,23 @@ class DistributedPipelineEngine:
                 )
                 continue
             try:
-                wire_id = self._next_request_id()
-                job.wire_id = wire_id
-                job.started_at = time.perf_counter()
-                active[wire_id] = job
-                with self._callback_lock:
-                    self._callback_routes[wire_id] = job
-                runner.begin(wire_id)
-                send_frame(downstream, FrameType.BEGIN, wire_id)
+                session = self._checkout_session(job, runner, downstream)
+                if session is not None:
+                    job.wire_id = session.wire_id
+                    job.step = session.step
+                    job.started_at = time.perf_counter()
+                    active[session.wire_id] = job
+                    with self._callback_lock:
+                        self._callback_routes[session.wire_id] = job
+                else:
+                    wire_id = self._next_request_id()
+                    job.wire_id = wire_id
+                    job.started_at = time.perf_counter()
+                    active[wire_id] = job
+                    with self._callback_lock:
+                        self._callback_routes[wire_id] = job
+                    runner.begin(wire_id)
+                    send_frame(downstream, FrameType.BEGIN, wire_id)
                 self._send_next_prefill_chunk(
                     job,
                     runner,
@@ -722,6 +838,216 @@ class DistributedPipelineEngine:
                 for remaining in selected[index + 1 :]:
                     self._retire_job(remaining, runner, exception=error, began=False)
                 raise
+
+    def _checkout_session(
+        self,
+        job: _GenerationJob,
+        runner: StageRunner,
+        downstream: socket.socket,
+    ) -> _RetainedSession | None:
+        """Reuse the retained KV of this chat if an exact prefix is still live.
+
+        Returns the checked-out session with the wire already truncated to the
+        reusable prefix, or None when the job must open a fresh wire. Runs on
+        the scheduler thread only.
+        """
+
+        key = job.request.session_key
+        if key is None or self.config.max_retained_sessions < 1:
+            return None
+        session = self._retained_sessions.get(key)
+        if session is None:
+            self._session_reuse_misses += 1
+            return None
+        if session.busy:
+            # A concurrent turn of the same chat still owns the wire. Serve
+            # this request exactly with a fresh full prefill instead.
+            self._session_busy_fallbacks += 1
+            return None
+        new_ids = [int(token) for token in job.request.input_ids.reshape(-1).tolist()]
+        # The longest common prefix between the retokenized history and the
+        # exactly-served sequence is a safe reuse bound even when BPE merges
+        # differ at turn boundaries. Keep at least one token to forward so the
+        # pipeline can produce the first token of this turn.
+        prefix = _longest_common_prefix(session.served_ids, new_ids)
+        reuse = min(prefix, session.kv_valid_tokens, len(new_ids) - 1)
+        if reuse <= 0:
+            # The histories diverge from the first token (for example an edited
+            # system prompt): a full prefill costs the same as rebuilding, so
+            # free the stale KV everywhere and start a fresh wire.
+            self._release_retained_session(session, runner, downstream)
+            self._session_divergence_fallbacks += 1
+            return None
+        if session.kv_tokens != reuse:
+            # TRUNCATE is ordered on the stage stream, so every stage crops its
+            # KV before the suffix prefill below can be processed.
+            runner.truncate(session.wire_id, reuse)
+            send_frame(
+                downstream,
+                FrameType.TRUNCATE,
+                session.wire_id,
+                token_count=reuse,
+            )
+            self._session_retained_tokens += reuse - session.kv_tokens
+            session.kv_tokens = reuse
+        session.kv_valid_tokens = reuse
+        session.busy = True
+        session.last_used = time.monotonic()
+        job.session = session
+        job.prefill_offset = reuse
+        job.kv_valid = reuse
+        job.reused_tokens = reuse
+        self._session_reuse_hits += 1
+        self._session_reused_token_total += reuse
+        return session
+
+    def _try_retain_session(
+        self,
+        job: _GenerationJob,
+        runner: StageRunner,
+        downstream: socket.socket,
+    ) -> bool:
+        """Keep this finished turn's wire and KV alive for the next turn.
+
+        Returns True when the session machinery now owns the wire lifecycle
+        (no END must be sent and the root cache must stay); False when the
+        caller should retire the wire normally.
+        """
+
+        key = job.request.session_key
+        if (
+            key is None
+            or self.config.max_retained_sessions < 1
+            or job.wire_id is None
+            or job.cancel_requested.is_set()
+        ):
+            return False
+        session = job.session
+        if session is None and key in self._retained_sessions:
+            # Another turn of the same chat owns the retained slot; this job
+            # ran on an independent fresh wire and retires normally.
+            return False
+        prompt_ids = tuple(
+            int(token) for token in job.request.input_ids.reshape(-1).tolist()
+        )
+        served = prompt_ids + tuple(job.token_ids)
+        kv_tokens = runner.sequence_length(job.wire_id)
+        now = time.monotonic()
+        if session is None:
+            session = _RetainedSession(
+                key=key,
+                wire_id=job.wire_id,
+                step=job.step + 1,
+                served_ids=served,
+                kv_tokens=kv_tokens,
+                kv_valid_tokens=job.kv_valid,
+                last_used=now,
+            )
+            self._session_retained_tokens += kv_tokens
+        else:
+            self._session_retained_tokens += kv_tokens - session.kv_tokens
+            session.step = job.step + 1
+            session.served_ids = served
+            session.kv_tokens = kv_tokens
+            session.kv_valid_tokens = job.kv_valid
+            session.busy = False
+            session.last_used = now
+            self._retained_sessions.pop(key, None)
+        # (Re-)insert last so dict order stays least-recently-used first.
+        self._retained_sessions[key] = session
+        self._enforce_session_budget(runner, downstream)
+        return True
+
+    def _release_retained_session(
+        self,
+        session: _RetainedSession,
+        runner: StageRunner,
+        downstream: socket.socket,
+    ) -> None:
+        """Retire an idle retained wire: END frees the KV on every stage."""
+
+        self._retained_sessions.pop(session.key, None)
+        self._session_retained_tokens -= session.kv_tokens
+        runner.end(session.wire_id)
+        send_frame(downstream, FrameType.END, session.wire_id)
+
+    def _expire_retained_sessions(
+        self,
+        runner: StageRunner,
+        downstream: socket.socket,
+    ) -> None:
+        if not self._retained_sessions:
+            return
+        now = time.monotonic()
+        ttl = self.config.retained_session_ttl_seconds
+        expired = [
+            session
+            for session in self._retained_sessions.values()
+            if not session.busy and now - session.last_used > ttl
+        ]
+        for session in expired:
+            self._release_retained_session(session, runner, downstream)
+            self._session_ttl_evictions += 1
+
+    def _enforce_session_budget(
+        self,
+        runner: StageRunner,
+        downstream: socket.socket,
+    ) -> None:
+        max_sessions = self.config.max_retained_sessions
+        max_tokens = self.config.max_retained_session_tokens
+        while (max_sessions and len(self._retained_sessions) > max_sessions) or (
+            max_tokens and self._session_retained_tokens > max_tokens
+        ):
+            victim = next(
+                (
+                    session
+                    for session in self._retained_sessions.values()
+                    if not session.busy
+                ),
+                None,
+            )
+            if victim is None:
+                # Only busy sessions remain; their turns retire them later.
+                return
+            self._release_retained_session(victim, runner, downstream)
+            self._session_budget_evictions += 1
+
+    def _drop_job_session(self, job: _GenerationJob) -> None:
+        """Forget the retained state of a cancelled turn.
+
+        The CANCEL frame already frees the KV on every stage and _retire_job
+        frees the root cache, so only the bookkeeping is removed here.
+        """
+
+        session = job.session
+        if session is None:
+            return
+        job.session = None
+        if self._retained_sessions.get(session.key) is session:
+            self._retained_sessions.pop(session.key, None)
+            self._session_retained_tokens -= session.kv_tokens
+            self._session_cancel_releases += 1
+
+    def _finish_turn(
+        self,
+        job: _GenerationJob,
+        active: dict[int, _GenerationJob],
+        runner: StageRunner,
+        downstream: socket.socket,
+        reason: str,
+    ) -> None:
+        if job.wire_id is not None:
+            active.pop(job.wire_id, None)
+        retained = self._try_retain_session(job, runner, downstream)
+        if not retained and job.wire_id is not None:
+            send_frame(downstream, FrameType.END, job.wire_id)
+        self._retire_job(
+            job,
+            runner,
+            result=self._generation_output(job, reason),
+            retained=retained,
+        )
 
     def _send_requested_cancellations(
         self,
@@ -781,6 +1107,9 @@ class DistributedPipelineEngine:
                 send_frame(downstream, FrameType.CANCEL, frame.request_id)
                 job.cancel_sent = True
             active.pop(frame.request_id)
+            # A cancelled turn never retains: CANCEL already freed the KV on
+            # every stage, so the session bookkeeping must forget this chat.
+            self._drop_job_session(job)
             self._retire_job(
                 job,
                 runner,
@@ -811,15 +1140,14 @@ class DistributedPipelineEngine:
                     ),
                 )
             job.verify_drafts = ()
+            appended_before = len(job.token_ids)
             reason = self._append_verified_tokens(job, emitted, arrived)
+            appended = len(job.token_ids) - appended_before
+            # Draft positions in the KV are valid only up to the accepted
+            # prefix AND only as far as tokens were actually emitted.
+            job.kv_valid += min(accepted, appended)
             if reason is not None:
-                send_frame(downstream, FrameType.END, frame.request_id)
-                active.pop(frame.request_id)
-                self._retire_job(
-                    job,
-                    runner,
-                    result=self._generation_output(job, reason),
-                )
+                self._finish_turn(job, active, runner, downstream, reason)
                 return
 
             if accepted < len(drafts):
@@ -864,12 +1192,12 @@ class DistributedPipelineEngine:
         reached_eos = token in job.request.eos_token_ids
         reached_limit = len(job.token_ids) >= job.request.max_new_tokens
         if reached_eos or reached_limit:
-            send_frame(downstream, FrameType.END, frame.request_id)
-            active.pop(frame.request_id)
-            self._retire_job(
+            self._finish_turn(
                 job,
+                active,
                 runner,
-                result=self._generation_output(job, "stop" if reached_eos else "length"),
+                downstream,
+                "stop" if reached_eos else "length",
             )
             return
 
@@ -983,6 +1311,9 @@ class DistributedPipelineEngine:
         # cheap and could enable speculation that slowed the actual conversation.
         job.wave_started_at = time.perf_counter()
         hidden = runner.forward_ids(job.wire_id, next_ids)
+        # The re-forwarded last emitted token always matches the served
+        # sequence; draft positions become valid only after verification.
+        job.kv_valid += 1
         job.last_outbound_bytes = self._send_activation(
             downstream,
             emulator,
@@ -1034,6 +1365,7 @@ class DistributedPipelineEngine:
             ttft_ms=(job.arrivals[0] - job.started_at) * 1_000,
             tpot_ms=sum(intervals) / len(intervals) if intervals else 0.0,
             total_ms=(job.arrivals[-1] - job.started_at) * 1_000,
+            reused_kv_tokens=job.reused_tokens,
         )
 
     def _retire_job(
@@ -1044,9 +1376,13 @@ class DistributedPipelineEngine:
         result: GenerationOutput | None = None,
         exception: BaseException | None = None,
         began: bool = True,
+        retained: bool = False,
     ) -> None:
         if began and job.wire_id is not None:
-            runner.end(job.wire_id)
+            if not retained:
+                # A retained wire keeps its root KV; the session machinery owns
+                # its lifecycle (TTL, budget eviction or the next turn).
+                runner.end(job.wire_id)
             with self._callback_lock:
                 self._callback_routes.pop(job.wire_id, None)
         with self._state_lock:
@@ -1141,6 +1477,8 @@ class DistributedPipelineEngine:
         )
         hidden = runner.forward_ids(job.wire_id, input_chunk)
         job.prefill_offset = end
+        # Prompt tokens are the served sequence by definition.
+        job.kv_valid += end - start
         job.wave_started_at = time.perf_counter()
         job.last_outbound_bytes = self._send_activation(
             downstream,
@@ -1258,6 +1596,21 @@ def _resolve_verified_tokens(
     if accepted == len(drafts):
         return accepted, (*drafts, target_tokens[-1])
     return accepted, (*drafts[:accepted], target_tokens[accepted])
+
+
+def _longest_common_prefix(left: Sequence[int], right: Sequence[int]) -> int:
+    """Length of the shared exact token prefix of two sequences.
+
+    Session reuse depends on this being a LOWER bound of KV equivalence:
+    tokenizing a conversation again may merge bytes differently exactly at the
+    first position where the sequences stop matching, never before it.
+    """
+
+    limit = min(len(left), len(right))
+    index = 0
+    while index < limit and left[index] == right[index]:
+        index += 1
+    return index
 
 
 def _finite_or_none(value: float | None) -> float | None:

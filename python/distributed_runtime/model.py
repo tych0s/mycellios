@@ -15,6 +15,10 @@ from torch import nn
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 
+STAGE_QUANTIZE_MODES = (None, "dynamic-int8")
+STAGE_COMPILE_MODES = (None, "default", "reduce-overhead")
+
+
 @dataclass(frozen=True)
 class StageModelSpec:
     model_name: str
@@ -23,6 +27,11 @@ class StageModelSpec:
     total_layers: int
     threads: int
     revision: str | None = None
+    # Opt-in experimental execution variants. ``None`` keeps the reference
+    # FP32 eager path byte-for-byte identical. ``quantize="dynamic-int8"`` is an
+    # APPROXIMATE mode: it may change greedy tokens versus the FP32 reference.
+    quantize: str | None = None
+    compile_mode: str | None = None
 
     def __post_init__(self) -> None:
         if not self.model_name.strip():
@@ -37,6 +46,10 @@ class StageModelSpec:
             raise ValueError("threads must be positive")
         if self.revision is not None and not self.revision.strip():
             raise ValueError("revision cannot be blank")
+        if self.quantize not in STAGE_QUANTIZE_MODES:
+            raise ValueError(f"quantize must be one of {STAGE_QUANTIZE_MODES}")
+        if self.compile_mode not in STAGE_COMPILE_MODES:
+            raise ValueError(f"compile_mode must be one of {STAGE_COMPILE_MODES}")
 
     @property
     def first(self) -> bool:
@@ -143,6 +156,19 @@ class StageRunner:
                 "selective-load",
             ),
         )
+        # Opt-in spike variants. Applied after the manifest so the default
+        # metadata path stays identical when both flags are absent.
+        if spec.quantize == "dynamic-int8":
+            self.base, self.head = _apply_dynamic_int8(self.base, self.head)
+            self.loader += "+dynamic-int8"
+        if spec.compile_mode is not None:
+            inductor_mode = None if spec.compile_mode == "default" else spec.compile_mode
+            self.base = torch.compile(self.base, backend="inductor", mode=inductor_mode)
+            if self.head is not None:
+                self.head = torch.compile(
+                    self.head, backend="inductor", mode=inductor_mode
+                )
+            self.loader += f"+compile-{spec.compile_mode}"
         self.caches: dict[int, Any] = {}
         self.tokens_seen: dict[int, int] = {}
         self.active_requests: set[int] = set()
@@ -254,6 +280,28 @@ class StageRunner:
         if token_mode == "all":
             return output.last_hidden_state, tuple(int(token) for token in tokens)
         return output.last_hidden_state, int(tokens[-1])
+
+
+def _apply_dynamic_int8(
+    base: nn.Module, head: nn.Module | None
+) -> tuple[nn.Module, nn.Module | None]:
+    """Replace every ``nn.Linear`` with a dynamically quantized INT8 kernel.
+
+    APPROXIMATE mode: activations stay FP32 on the wire and in the KV cache,
+    but matmul weights are stored INT8 and requantized per batch, so greedy
+    tokens may drift from the FP32 reference. ``inplace=True`` avoids a full
+    deepcopy of the resident stage. A bare ``nn.Linear`` head is wrapped in a
+    pass-through container because ``convert`` only swaps child modules.
+    """
+
+    from torch.ao.quantization import quantize_dynamic
+
+    base = quantize_dynamic(base, {nn.Linear}, dtype=torch.qint8, inplace=True)
+    if head is not None:
+        head = quantize_dynamic(
+            nn.Sequential(head), {nn.Linear}, dtype=torch.qint8, inplace=True
+        )
+    return base, head
 
 
 def load_tokenizer(model_name: str):

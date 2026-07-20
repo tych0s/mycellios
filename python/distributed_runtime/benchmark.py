@@ -76,6 +76,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--iterations", type=positive_int, default=3)
     parser.add_argument("--threads-per-stage", type=positive_int, default=1)
     parser.add_argument("--reference-threads", type=positive_int)
+    parser.add_argument(
+        "--stage-quantize",
+        choices=("none", "dynamic-int8"),
+        default="none",
+        help=(
+            "Opt-in APPROXIMATE mode: dynamically quantize every stage Linear "
+            "to INT8. Greedy tokens may drift from the FP32 reference; combine "
+            "with --allow-token-drift to report the drift without failing."
+        ),
+    )
+    parser.add_argument(
+        "--stage-compile",
+        choices=("none", "default", "reduce-overhead"),
+        default="none",
+        help=(
+            "Opt-in torch.compile (inductor CPU) of every stage forward. "
+            "Requires a working C++ toolchain on the host."
+        ),
+    )
     parser.add_argument("--one-way-delay-ms", type=nonnegative_float, default=0.0)
     parser.add_argument("--bandwidth-mbps", type=nonnegative_float, default=0.0)
     parser.add_argument("--startup-timeout-seconds", type=positive_float, default=180.0)
@@ -385,6 +404,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     boundaries = layer_boundaries(total_layers, args.stages, args.boundaries)
     codec = codec_from_name(args.codec)
     reference_threads = args.reference_threads or args.threads_per_stage
+    stage_quantize = None if args.stage_quantize == "none" else args.stage_quantize
+    stage_compile = None if args.stage_compile == "none" else args.stage_compile
 
     tokenizer = load_tokenizer(stage_model_name)
     tokenized = tokenizer(args.prompt, return_tensors="pt", add_special_tokens=True)
@@ -434,6 +455,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                         layer_end=boundaries[stage_index + 1],
                         total_layers=total_layers,
                         threads=args.threads_per_stage,
+                        quantize=stage_quantize,
+                        compile_mode=stage_compile,
                     ),
                     pipeline_id=pipeline_id,
                     listen_host=HOST,
@@ -479,6 +502,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 layer_end=boundaries[1],
                 total_layers=total_layers,
                 threads=args.threads_per_stage,
+                quantize=stage_quantize,
+                compile_mode=stage_compile,
             )
         )
         root_stage_info = {
@@ -621,6 +646,11 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "iterations": args.iterations,
             "threads_per_stage": args.threads_per_stage,
             "reference_threads": reference_threads,
+            "stage_quantize": args.stage_quantize,
+            "stage_compile": args.stage_compile,
+            "token_equivalence_mode": (
+                "approximate" if stage_quantize is not None else "exact-reference"
+            ),
             "one_way_delay_ms": args.one_way_delay_ms,
             "bandwidth_mbps": args.bandwidth_mbps,
             "persistent_tcp": True,
