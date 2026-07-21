@@ -37,6 +37,7 @@ from distributed_runtime.stage import (
     prepare_tree_capacity,
     project_tree_capacity,
     run_stage_process,
+    tree_reservation_defers_frame,
     validate_activation,
     validate_tree_reservation_frame_order,
 )
@@ -406,7 +407,7 @@ class TreeCapacityStageTests(unittest.TestCase):
             stage_sock.close()
             peer.close()
 
-    def test_quote_allows_unrelated_request_but_blocks_parent_and_live_leaf(self) -> None:
+    def test_quote_defers_every_runtime_kv_mutation_until_consumed(self) -> None:
         config = _last_stage_config(max_kv_bytes=10_000)
         runner = _QuoteRunner(config.spec)
         runner.begin(11)
@@ -434,9 +435,12 @@ class TreeCapacityStageTests(unittest.TestCase):
                 FrameType.END,
                 FrameType.CANCEL,
             ):
-                validate_tree_reservation_frame_order(
-                    Frame(frame_type, 0, 99, 0, 0, 0, b""), book, {}
+                candidate = Frame(frame_type, 0, 99, 0, 0, 0, b"")
+                self.assertTrue(
+                    tree_reservation_defers_frame(candidate, book, {})
                 )
+                with self.assertRaisesRegex(ValueError, "cannot overtake"):
+                    validate_tree_reservation_frame_order(candidate, book, {})
             with self.assertRaisesRegex(ValueError, "cannot overtake"):
                 validate_tree_reservation_frame_order(
                     Frame(FrameType.ACTIVATION, 0, 11, 3, 1, 4, b""),
@@ -779,9 +783,9 @@ class TreeCapacityStageTests(unittest.TestCase):
                 self.assertEqual(accepted.stage_count, 3)
                 self.assertEqual(accepted.total_projected_bytes, 456)
 
-                # The quote is single-flight only for this parent/tree. A
-                # separate chat must still cross all three stages during the
-                # quote RTT instead of creating a route-wide bubble.
+                # Every cache mutation is held behind the quote: allowing an
+                # unrelated chat to grow could consume the very allocator
+                # capacity that the route just promised to this tree.
                 other = 88
                 send_frame(upstream, FrameType.BEGIN, other)
                 send_frame(
@@ -794,19 +798,56 @@ class TreeCapacityStageTests(unittest.TestCase):
                     flags=int(TensorCodec.FP32),
                     payload=encode_tensor(hidden, TensorCodec.FP32),
                 )
+                direct_return.settimeout(0.05)
+                with self.assertRaises(socket.timeout):
+                    recv_frame(direct_return)
+                direct_return.settimeout(5)
+
+                # COMMIT alone still cannot expose a partial transaction. The
+                # last stage returns one ACK containing the number of stages
+                # that revalidated it, and no FORK has happened yet.
+                send_frame(
+                    upstream,
+                    FrameType.TREE_RESERVATION_COMMIT,
+                    parent,
+                    step=1,
+                    token_count=0,
+                    payload=tree_reservation_payload(1_002),
+                )
+                commit_result = recv_frame(direct_return)
+                self.assertEqual(
+                    (
+                        commit_result.frame_type,
+                        commit_result.request_id,
+                        commit_result.token_count,
+                    ),
+                    (FrameType.TREE_RESERVATION_COMMIT_RESULT, parent, 3),
+                )
+                self.assertEqual(
+                    sum(
+                        len(instance.fork_calls)
+                        for instance in _QuoteRunner.instances.values()
+                    ),
+                    0,
+                )
+
+                # Consuming the sole quoted FORK releases the route barrier;
+                # the unrelated chat then resumes in original TCP order.
+                child = 78
+                send_frame(
+                    upstream,
+                    FrameType.FORK,
+                    child,
+                    payload=branch_request_payload(parent),
+                )
                 other_result = recv_frame(direct_return)
                 self.assertEqual(
                     (other_result.frame_type, other_result.request_id),
                     (FrameType.TOKEN, other),
                 )
                 send_frame(upstream, FrameType.END, other)
-                send_frame(
-                    upstream,
-                    FrameType.TREE_RESERVATION_CANCEL,
-                    parent,
-                    step=1,
-                    payload=tree_reservation_payload(1_002),
-                )
+                send_frame(upstream, FrameType.END, child)
+                send_frame(upstream, FrameType.END, parent)
                 send_frame(upstream, FrameType.SHUTDOWN, 901)
                 for worker in workers:
                     worker.join(5)

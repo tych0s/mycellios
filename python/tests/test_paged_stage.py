@@ -149,6 +149,10 @@ class HFPagedStageRunnerTests(unittest.TestCase):
                     ),
                     3 * paged.paged_cache.bytes_per_block,
                 )
+                self.assertEqual(
+                    paged.project_request_incremental_physical_cache_bytes(1, 3),
+                    paged.paged_cache.bytes_per_block,
+                )
                 with self.assertRaisesRegex(ValueError, "physical preflight"):
                     paged.fork_request(
                         2,

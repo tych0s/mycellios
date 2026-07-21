@@ -1622,7 +1622,7 @@ class EngineUnitTests(unittest.TestCase):
             child.settimeout(None)
 
             ready = replace(quote, stage_count=engine.stages - 1)
-            committed = engine._handle_return_value(
+            awaiting_commit = engine._handle_return_value(
                 (
                     Frame(
                         FrameType.TREE_PREPARE_RESULT,
@@ -1639,7 +1639,7 @@ class EngineUnitTests(unittest.TestCase):
                 runner,
                 root,
             )
-            self.assertIsInstance(committed, _CommittedPhysicalTreeWave)
+            self.assertIsNone(awaiting_commit)
             commit = recv_frame(child)
             self.assertEqual(commit.frame_type, FrameType.TREE_RESERVATION_COMMIT)
             self.assertEqual(runner.active, root_state)
@@ -1650,6 +1650,24 @@ class EngineUnitTests(unittest.TestCase):
                 recv_frame(child)
             child.settimeout(None)
 
+            committed = engine._handle_return_value(
+                (
+                    Frame(
+                        FrameType.TREE_RESERVATION_COMMIT_RESULT,
+                        0,
+                        commit.request_id,
+                        commit.step,
+                        engine.stages - 1,
+                        0,
+                        commit.payload,
+                    ),
+                    time.perf_counter(),
+                ),
+                active,
+                runner,
+                root,
+            )
+            self.assertIsInstance(committed, _CommittedPhysicalTreeWave)
             assert isinstance(committed, _CommittedPhysicalTreeWave)
             engine._dispatch_root_waves([committed], runner, root, LinkEmulator())
             outbound = tuple(recv_frame(child) for _ in range(4))
@@ -2068,9 +2086,22 @@ class EngineUnitTests(unittest.TestCase):
                 all(isinstance(wave, _PreparedPhysicalTreeWave) for wave in prepared)
             )
             engine._dispatch_root_waves(prepared, runner, root, LinkEmulator())
-            first, second = recv_frame(child), recv_frame(child)
+            first = recv_frame(child)
             self.assertEqual(first.frame_type, FrameType.TREE_PREPARE)
             self.assertEqual(first.request_id, 1)
+            child.settimeout(0.02)
+            with self.assertRaises(socket.timeout):
+                recv_frame(child)
+            child.settimeout(None)
+
+            # The second request has already fallen back logically, but its
+            # root/remote KV mutation stays behind the global capacity barrier.
+            engine._cancel_pending_tree_reservation(
+                jobs[0], root, reason="unit test releases first quote"
+            )
+            engine._dispatch_root_waves([], runner, root, LinkEmulator())
+            cancel, second = recv_frame(child), recv_frame(child)
+            self.assertEqual(cancel.frame_type, FrameType.TREE_RESERVATION_CANCEL)
             self.assertEqual(second.frame_type, FrameType.ACTIVATION)
             self.assertEqual(second.request_id, 2)
             child.settimeout(0.02)
@@ -2385,6 +2416,8 @@ def _root_batch_test_engine(
     engine._pending_tree_reservation = None
     engine._tree_quote_nonce_counter = 0
     engine._queued_tree_prepare_results = deque()
+    engine._queued_tree_commit_results = deque()
+    engine._tree_barrier_deferred_waves = deque()
     engine._physical_tree_quote_requests = 0
     engine._physical_tree_quote_ready = 0
     engine._physical_tree_quote_rejected = 0
@@ -2463,7 +2496,7 @@ def _dispatch_and_ready_tree_quote(
         raise AssertionError(f"expected TREE_PREPARE, got {prepare.frame_type.name}")
     quote = decode_tree_prepare(prepare)
     result_quote = replace(quote, stage_count=engine.stages - 1)
-    committed = engine._handle_return_value(
+    awaiting_commit = engine._handle_return_value(
         (
             Frame(
                 FrameType.TREE_PREPARE_RESULT,
@@ -2480,14 +2513,33 @@ def _dispatch_and_ready_tree_quote(
         runner,
         root,
     )
-    if not isinstance(committed, _CommittedPhysicalTreeWave):
-        raise AssertionError("READY quote did not produce a committed physical tree")
-    engine._dispatch_root_waves([committed], runner, root, LinkEmulator())
+    if awaiting_commit is not None:
+        raise AssertionError("READY quote must wait for the route COMMIT result")
     commit = recv_frame(child)
     if commit.frame_type != FrameType.TREE_RESERVATION_COMMIT:
         raise AssertionError(
             f"expected TREE_RESERVATION_COMMIT, got {commit.frame_type.name}"
         )
+    committed = engine._handle_return_value(
+        (
+            Frame(
+                FrameType.TREE_RESERVATION_COMMIT_RESULT,
+                0,
+                commit.request_id,
+                commit.step,
+                engine.stages - 1,
+                0,
+                commit.payload,
+            ),
+            time.perf_counter(),
+        ),
+        active,
+        runner,
+        root,
+    )
+    if not isinstance(committed, _CommittedPhysicalTreeWave):
+        raise AssertionError("COMMIT result did not arm the physical tree")
+    engine._dispatch_root_waves([committed], runner, root, LinkEmulator())
     return prepare
 
 

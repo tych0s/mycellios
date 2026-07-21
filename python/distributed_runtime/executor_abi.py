@@ -99,6 +99,12 @@ class StageKVPhysicalAccounting(Protocol):
         delta_tokens_by_leaf: Sequence[int],
     ) -> int: ...
 
+    def project_request_incremental_physical_cache_bytes(
+        self,
+        request_id: int,
+        additional_tokens: int,
+    ) -> int: ...
+
 
 @dataclass(frozen=True)
 class StageExecutorManifest:

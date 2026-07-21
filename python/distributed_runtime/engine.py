@@ -40,6 +40,7 @@ from .protocol import (
     branch_request_payload,
     configure_socket,
     decode_tree_prepare,
+    decode_tree_reservation_nonce,
     decode_token,
     decode_verify_result,
     encode_tensor_payload,
@@ -1934,6 +1935,9 @@ class DistributedPipelineEngine:
         downstream: socket.socket,
         emulator: LinkEmulator,
     ) -> None:
+        if getattr(self, "_pending_tree_reservation", None) is not None:
+            self._deferred_batches.appendleft(batch)
+            return
         available = self.config.max_active_sequences - len(active)
         if available <= 0:
             self._deferred_batches.appendleft(batch)
@@ -1974,6 +1978,13 @@ class DistributedPipelineEngine:
         for wire_id, job in list(active.items()):
             if job.cancel_requested.is_set() and not job.cancel_sent:
                 pending_quote = getattr(self, "_pending_tree_reservation", None)
+                if (
+                    pending_quote is not None
+                    and pending_quote.prepared.job is not job
+                ):
+                    # Root and remote cache mutations remain frozen until the
+                    # quoted transaction is acknowledged or cancelled.
+                    continue
                 if (
                     pending_quote is not None
                     and pending_quote.prepared.job is job
@@ -2074,6 +2085,9 @@ class DistributedPipelineEngine:
         emulator: LinkEmulator,
     ) -> int:
         """Dispatch at most one ordered prefill chunk per active request."""
+
+        if getattr(self, "_pending_tree_reservation", None) is not None:
+            return 0
 
         prepared: list[_PreparedRootWave] = []
         for job in active.values():
@@ -3539,18 +3553,33 @@ class DistributedPipelineEngine:
         ):
             raise TypeError("root request_cache_bytes must return a positive integer")
         current_branch_bytes = self._physical_tree_live_kv_bytes(runner)
-        projected_branch_bytes = 0
-        for path in paths:
-            projected = project_cache_bytes(parent_request_id, 1 + len(path))
+        project_tree_physical = getattr(
+            runner, "project_tree_incremental_physical_cache_bytes", None
+        )
+        if callable(project_tree_physical):
+            projected_branch_bytes = project_tree_physical(
+                parent_request_id,
+                delta_tokens_by_leaf=tuple(1 + len(path) for path in paths),
+            )
             if (
-                not isinstance(projected, int)
-                or isinstance(projected, bool)
-                or projected < parent_bytes
+                not isinstance(projected_branch_bytes, int)
+                or isinstance(projected_branch_bytes, bool)
+                or projected_branch_bytes < 0
             ):
-                raise TypeError(
-                    "root project_request_cache_bytes returned an invalid projection"
-                )
-            projected_branch_bytes += projected
+                raise TypeError("root runner returned invalid physical tree projection")
+        else:
+            projected_branch_bytes = 0
+            for path in paths:
+                projected = project_cache_bytes(parent_request_id, 1 + len(path))
+                if (
+                    not isinstance(projected, int)
+                    or isinstance(projected, bool)
+                    or projected < parent_bytes
+                ):
+                    raise TypeError(
+                        "root project_request_cache_bytes returned an invalid projection"
+                    )
+                projected_branch_bytes += projected
         projected_total = current_branch_bytes + projected_branch_bytes
         if projected_total > self.config.max_speculative_kv_bytes:
             return None
@@ -3573,13 +3602,39 @@ class DistributedPipelineEngine:
         )
 
     def _physical_tree_live_kv_bytes(self, runner: StageRunnerContract) -> int:
+        live_children = tuple(
+            sorted(getattr(self, "_physical_tree_live_children", set()))
+        )
+        if not live_children:
+            return 0
+        unique_physical_bytes = getattr(runner, "unique_physical_cache_bytes", None)
+        if callable(unique_physical_bytes):
+            leaf_routes = getattr(self, "_leaf_routes", {})
+            try:
+                parent_ids = tuple(
+                    sorted({leaf_routes[request_id] for request_id in live_children})
+                )
+            except KeyError as error:
+                raise RuntimeError(
+                    "root physical KV accounting lost a live child's parent route"
+                ) from error
+            all_ids = tuple(sorted(set(live_children) | set(parent_ids)))
+            all_bytes = unique_physical_bytes(all_ids)
+            parent_bytes = unique_physical_bytes(parent_ids)
+            for name, value in (("all", all_bytes), ("parent", parent_bytes)):
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                    raise TypeError(
+                        f"root runner returned invalid {name} unique physical KV bytes"
+                    )
+            if all_bytes < parent_bytes:
+                raise RuntimeError("root physical KV accounting moved backwards")
+            return all_bytes - parent_bytes
+
         request_cache_bytes = getattr(runner, "request_cache_bytes", None)
         if not callable(request_cache_bytes):
             raise TypeError("root runner cannot measure physical leaf KV")
         total = 0
-        for request_id in sorted(
-            getattr(self, "_physical_tree_live_children", set())
-        ):
+        for request_id in live_children:
             measured = request_cache_bytes(request_id)
             if (
                 not isinstance(measured, int)
@@ -3879,11 +3934,28 @@ class DistributedPipelineEngine:
             parent_bytes = request_cache_bytes(parent_request_id)
             current_bytes = self._physical_tree_live_kv_bytes(runner)
             remaining_bytes = self.config.max_speculative_kv_bytes - current_bytes
+            project_tree_physical = getattr(
+                runner, "project_tree_incremental_physical_cache_bytes", None
+            )
+            projected_fork_bytes = (
+                project_tree_physical(
+                    parent_request_id,
+                    delta_tokens_by_leaf=(0,),
+                )
+                if callable(project_tree_physical)
+                else parent_bytes
+            )
             if (
                 not isinstance(parent_bytes, int)
                 or isinstance(parent_bytes, bool)
                 or parent_bytes < 1
-                or parent_bytes > remaining_bytes
+            ):
+                raise RuntimeError("root FORK parent has invalid logical KV bytes")
+            if (
+                not isinstance(projected_fork_bytes, int)
+                or isinstance(projected_fork_bytes, bool)
+                or projected_fork_bytes < 0
+                or projected_fork_bytes > remaining_bytes
             ):
                 raise RuntimeError("root FORK no longer fits its sealed KV budget")
             copied_bytes = fork_request(
@@ -3891,14 +3963,39 @@ class DistributedPipelineEngine:
                 command.parent_request_id,
                 max_cache_bytes=remaining_bytes,
             )
-            if copied_bytes != parent_bytes:
-                # The child may have been published locally by a broken runner;
-                # release it, but quarantine the route rather than falling back.
+            if (
+                not isinstance(copied_bytes, int)
+                or isinstance(copied_bytes, bool)
+                or copied_bytes < 0
+            ):
+                runner.end(command.child_request_id)
+                raise RuntimeError("root FORK returned invalid copied KV bytes")
+            self._physical_tree_live_children.add(command.child_request_id)
+            try:
+                observed_bytes = self._physical_tree_live_kv_bytes(runner)
+            except BaseException:
+                self._physical_tree_live_children.remove(command.child_request_id)
+                runner.end(command.child_request_id)
+                raise
+            observed_increment = observed_bytes - current_bytes
+            if observed_increment != projected_fork_bytes:
+                self._physical_tree_live_children.remove(command.child_request_id)
                 runner.end(command.child_request_id)
                 raise RuntimeError(
-                    "root FORK byte count changed after exact preflight"
+                    "root FORK physical allocation changed after preflight: "
+                    f"{observed_increment} != {projected_fork_bytes}"
                 )
-            self._physical_tree_live_children.add(command.child_request_id)
+            last_fork_report = getattr(runner, "last_fork_report", None)
+            if callable(last_fork_report):
+                report = last_fork_report()
+                if report is not None and (
+                    getattr(report, "copied_bytes", None) != copied_bytes
+                    or getattr(report, "newly_reserved_bytes", None)
+                    != observed_increment
+                ):
+                    self._physical_tree_live_children.remove(command.child_request_id)
+                    runner.end(command.child_request_id)
+                    raise RuntimeError("root FORK physical accounting report mismatch")
             send_frame(
                 downstream,
                 FrameType.FORK,
@@ -4192,6 +4289,29 @@ class DistributedPipelineEngine:
         advance backend-owned KV twice.
         """
 
+        pending_transaction = getattr(self, "_pending_tree_reservation", None)
+        deferred = getattr(self, "_tree_barrier_deferred_waves", None)
+        if deferred is None:
+            deferred = deque()
+            self._tree_barrier_deferred_waves = deferred
+        if pending_transaction is not None:
+            commit_waves = [
+                wave for wave in waves if isinstance(wave, _CommittedPhysicalTreeWave)
+            ]
+            if len(commit_waves) > 1:
+                raise RuntimeError("one tree transaction received duplicate COMMIT results")
+            for wave in waves:
+                if not isinstance(wave, _CommittedPhysicalTreeWave):
+                    deferred.append(wave)
+            if not commit_waves:
+                return
+            # COMMIT acknowledgement is a global memory barrier. It must be
+            # consumed before an earlier ordinary return can advance root KV.
+            waves = commit_waves
+        elif deferred:
+            waves = [*deferred, *waves]
+            deferred.clear()
+
         if not waves:
             return
         if any(
@@ -4231,6 +4351,13 @@ class DistributedPipelineEngine:
                     )
             if ordinary:
                 self._dispatch_root_waves(ordinary, runner, downstream, emulator)
+            if (
+                getattr(self, "_pending_tree_reservation", None) is None
+                and deferred
+            ):
+                resumed = list(deferred)
+                deferred.clear()
+                self._dispatch_root_waves(resumed, runner, downstream, emulator)
             return
         request_ids = [wave.job.wire_id for wave in waves]
         if any(request_id is None for request_id in request_ids):

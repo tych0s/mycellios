@@ -397,6 +397,19 @@ class StageRunner:
             for delta_tokens in deltas
         )
 
+    def project_request_incremental_physical_cache_bytes(
+        self,
+        request_id: int,
+        additional_tokens: int,
+    ) -> int:
+        """Return only the new unique storage needed to grow one safe-copy KV."""
+
+        current = self.request_cache_bytes(request_id)
+        projected = self.project_request_cache_bytes(request_id, additional_tokens)
+        if projected < current:
+            raise RuntimeError("safe-copy KV projection moved backwards")
+        return projected - current
+
     def last_fork_report(self):
         """Return the optional sealed accounting for the latest fork."""
 

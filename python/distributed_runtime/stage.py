@@ -62,6 +62,7 @@ class TreeCapacityProjection:
     parent_tokens: int
     parent_cache_bytes: int
     branch_ids: tuple[int, ...]
+    available_physical_bytes: int | None = None
     rejection: TreePrepareRejection = TreePrepareRejection.NONE
     required: int = 0
     limit: int = 0
@@ -732,6 +733,17 @@ def project_tree_capacity(
 
     branch_bytes = speculative_kv_bytes(runner, branch_parents)
 
+    available_physical = getattr(runner, "available_physical_cache_bytes", None)
+    available_physical_bytes: int | None = None
+    if callable(available_physical):
+        available_physical_bytes = available_physical()
+        if (
+            not isinstance(available_physical_bytes, int)
+            or isinstance(available_physical_bytes, bool)
+            or available_physical_bytes < 0
+        ):
+            raise TypeError("stage runner returned invalid available physical KV bytes")
+
     request_cache_bytes = getattr(runner, "request_cache_bytes", None)
     project_cache_bytes = getattr(runner, "project_request_cache_bytes", None)
     if not callable(request_cache_bytes) or not callable(project_cache_bytes):
@@ -744,18 +756,35 @@ def project_tree_capacity(
     ):
         raise TypeError("stage runner returned invalid parent cache bytes")
 
-    projected_total = branch_bytes
-    for path_length in path_lengths:
-        projected = project_cache_bytes(parent_request_id, 1 + path_length)
+    delta_tokens_by_leaf = tuple(1 + length for length in path_lengths)
+    project_tree_physical = getattr(
+        runner, "project_tree_incremental_physical_cache_bytes", None
+    )
+    if callable(project_tree_physical):
+        projected_new_bytes = project_tree_physical(
+            parent_request_id,
+            delta_tokens_by_leaf=delta_tokens_by_leaf,
+        )
         if (
-            not isinstance(projected, int)
-            or isinstance(projected, bool)
-            or projected < parent_cache_bytes
+            not isinstance(projected_new_bytes, int)
+            or isinstance(projected_new_bytes, bool)
+            or projected_new_bytes < 0
         ):
-            raise TypeError("stage runner returned invalid projected tree KV bytes")
-        projected_total += projected
-        if projected_total > (1 << 64) - 1:
-            raise ValueError("tree capacity projection exceeds uint64")
+            raise TypeError("stage runner returned invalid physical tree projection")
+    else:
+        projected_new_bytes = 0
+        for delta_tokens in delta_tokens_by_leaf:
+            projected = project_cache_bytes(parent_request_id, delta_tokens)
+            if (
+                not isinstance(projected, int)
+                or isinstance(projected, bool)
+                or projected < parent_cache_bytes
+            ):
+                raise TypeError("stage runner returned invalid projected tree KV bytes")
+            projected_new_bytes += projected
+    projected_total = branch_bytes + projected_new_bytes
+    if projected_total > (1 << 64) - 1:
+        raise ValueError("tree capacity projection exceeds uint64")
 
     # A projection is contractually read-only. Detect an executor that changed
     # any observable sequence/cache state while pricing the quote.
@@ -767,6 +796,11 @@ def project_tree_capacity(
         raise RuntimeError("tree capacity projection mutated speculative children")
     if speculative_kv_bytes(runner, branch_parents) != branch_bytes:
         raise RuntimeError("tree capacity projection mutated speculative KV bytes")
+    if (
+        callable(available_physical)
+        and available_physical() != available_physical_bytes
+    ):
+        raise RuntimeError("tree capacity projection mutated physical KV availability")
 
     required_count = branch_count + len(path_lengths)
     required_tokens = parent_tokens + 1 + max(path_lengths)
@@ -785,6 +819,13 @@ def project_tree_capacity(
         rejection = TreePrepareRejection.KV_BYTES
         required = projected_total
         limit = config.max_speculative_kv_bytes
+    elif (
+        available_physical_bytes is not None
+        and projected_new_bytes > available_physical_bytes
+    ):
+        rejection = TreePrepareRejection.KV_BYTES
+        required = projected_total
+        limit = branch_bytes + available_physical_bytes
     return TreeCapacityProjection(
         projected_kv_bytes=projected_total,
         current_branch_count=branch_count,
@@ -792,6 +833,7 @@ def project_tree_capacity(
         parent_tokens=parent_tokens,
         parent_cache_bytes=parent_cache_bytes,
         branch_ids=branch_ids,
+        available_physical_bytes=available_physical_bytes,
         rejection=rejection,
         required=required,
         limit=limit,
@@ -1087,12 +1129,37 @@ def fork_stage_request(
     remaining_bytes = config.max_speculative_kv_bytes - current_branch_bytes
     if parent_cache_bytes < 1:
         raise ValueError("FORK parent did not materialise a measurable KV cache")
-    if parent_cache_bytes > remaining_bytes:
+    project_tree_physical = getattr(
+        runner, "project_tree_incremental_physical_cache_bytes", None
+    )
+    if callable(project_tree_physical):
+        projected_fork_bytes = project_tree_physical(
+            parent_request_id,
+            delta_tokens_by_leaf=(0,),
+        )
+    else:
+        projected_fork_bytes = parent_cache_bytes
+    if (
+        not isinstance(projected_fork_bytes, int)
+        or isinstance(projected_fork_bytes, bool)
+        or projected_fork_bytes < 0
+    ):
+        raise TypeError("stage runner returned invalid physical FORK projection")
+    if projected_fork_bytes > remaining_bytes:
         raise ValueError(
             "FORK exceeds max_speculative_kv_bytes before cloning: "
-            f"{current_branch_bytes + parent_cache_bytes} > "
+            f"{current_branch_bytes + projected_fork_bytes} > "
             f"{config.max_speculative_kv_bytes}"
         )
+    available_physical = getattr(runner, "available_physical_cache_bytes", None)
+    if callable(available_physical):
+        available_bytes = available_physical()
+        if (
+            not isinstance(available_bytes, int)
+            or isinstance(available_bytes, bool)
+            or available_bytes < projected_fork_bytes
+        ):
+            raise ValueError("FORK exceeds available physical KV pool capacity")
     copied_kv_bytes = fork_request(
         child_request_id,
         parent_request_id,
@@ -1105,11 +1172,35 @@ def fork_stage_request(
     if copied_kv_bytes < 0:
         runner.end(child_request_id)
         raise ValueError("stage runner returned negative copied KV bytes")
-    if copied_kv_bytes != parent_cache_bytes:
+    branch_parents[child_request_id] = parent_request_id
+    try:
+        observed_branch_bytes = speculative_kv_bytes(runner, branch_parents)
+    except BaseException:
+        branch_parents.pop(child_request_id, None)
+        runner.end(child_request_id)
+        raise
+    observed_increment = observed_branch_bytes - current_branch_bytes
+    if observed_increment != projected_fork_bytes:
+        branch_parents.pop(child_request_id, None)
         runner.end(child_request_id)
         raise RuntimeError(
-            "stage runner fork byte count changed after the preflight estimate"
+            "stage runner physical FORK allocation changed after preflight: "
+            f"{observed_increment} != {projected_fork_bytes}"
         )
+    last_fork_report = getattr(runner, "last_fork_report", None)
+    if callable(last_fork_report):
+        report = last_fork_report()
+        if report is not None:
+            report_copied = getattr(report, "copied_bytes", None)
+            report_reserved = getattr(report, "newly_reserved_bytes", None)
+            if report_copied != copied_kv_bytes:
+                branch_parents.pop(child_request_id, None)
+                runner.end(child_request_id)
+                raise RuntimeError("stage runner FORK report copied-byte mismatch")
+            if report_reserved != observed_increment:
+                branch_parents.pop(child_request_id, None)
+                runner.end(child_request_id)
+                raise RuntimeError("stage runner FORK report physical-byte mismatch")
 
     parent_metrics = request_metrics[parent_request_id]
     child_metrics = dict(parent_metrics)
@@ -1126,9 +1217,9 @@ def fork_stage_request(
             "branch_inherited_frames": int(parent_metrics["frames"]),
             "branch_inherited_tokens": parent_tokens,
             "fork_copied_kv_bytes": copied_kv_bytes,
+            "fork_new_physical_kv_bytes": observed_increment,
         }
     )
-    branch_parents[child_request_id] = parent_request_id
     request_metrics[child_request_id] = child_metrics
     if downstream is not None:
         child_metrics["bytes_out"] += send_frame(
@@ -1216,6 +1307,23 @@ def speculative_kv_bytes(
 ) -> int:
     """Measure all live speculative leaf/subtree KV before another allocation."""
 
+    if not branch_parents:
+        return 0
+    unique_physical_bytes = getattr(runner, "unique_physical_cache_bytes", None)
+    if callable(unique_physical_bytes):
+        parent_ids = tuple(sorted(set(branch_parents.values())))
+        all_ids = tuple(sorted(set(branch_parents) | set(parent_ids)))
+        all_bytes = unique_physical_bytes(all_ids)
+        parent_bytes = unique_physical_bytes(parent_ids)
+        for name, value in (("all", all_bytes), ("parent", parent_bytes)):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise TypeError(
+                    f"stage runner returned invalid {name} unique physical KV bytes"
+                )
+        if all_bytes < parent_bytes:
+            raise RuntimeError("speculative physical KV accounting moved backwards")
+        return all_bytes - parent_bytes
+
     request_cache_bytes = getattr(runner, "request_cache_bytes", None)
     if not callable(request_cache_bytes):
         raise TypeError("stage runner cannot measure speculative KV bytes")
@@ -1245,19 +1353,50 @@ def validate_speculative_kv_preflight(
         raise ValueError("one speculative request cannot appear twice in a physical batch")
     request_cache_bytes = getattr(runner, "request_cache_bytes", None)
     project_cache_bytes = getattr(runner, "project_request_cache_bytes", None)
+    project_growth_physical = getattr(
+        runner, "project_request_incremental_physical_cache_bytes", None
+    )
     if not callable(request_cache_bytes) or not callable(project_cache_bytes):
         raise TypeError("stage runner cannot preflight speculative KV growth")
 
     projected_total_bytes = speculative_kv_bytes(runner, branch_parents)
+    total_incremental_bytes = 0
     for frame in branch_frames:
-        current = request_cache_bytes(frame.request_id)
-        projected = project_cache_bytes(frame.request_id, frame.token_count)
-        for name, value in (("current", current), ("projected", projected)):
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                raise TypeError(f"stage runner returned invalid {name} KV bytes")
-        if projected < current:
-            raise ValueError("stage runner projected speculative KV bytes backwards")
-        projected_total_bytes += projected - current
+        if callable(project_growth_physical):
+            incremental = project_growth_physical(
+                frame.request_id,
+                frame.token_count,
+            )
+            if (
+                not isinstance(incremental, int)
+                or isinstance(incremental, bool)
+                or incremental < 0
+            ):
+                raise TypeError(
+                    "stage runner returned invalid incremental physical KV bytes"
+                )
+        else:
+            current = request_cache_bytes(frame.request_id)
+            projected = project_cache_bytes(frame.request_id, frame.token_count)
+            for name, value in (("current", current), ("projected", projected)):
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                    raise TypeError(f"stage runner returned invalid {name} KV bytes")
+            if projected < current:
+                raise ValueError("stage runner projected speculative KV bytes backwards")
+            incremental = projected - current
+        projected_total_bytes += incremental
+        total_incremental_bytes += incremental
+    available_physical = getattr(runner, "available_physical_cache_bytes", None)
+    if callable(available_physical):
+        available_bytes = available_physical()
+        if (
+            not isinstance(available_bytes, int)
+            or isinstance(available_bytes, bool)
+            or available_bytes < total_incremental_bytes
+        ):
+            raise ValueError(
+                "speculative KV growth exceeds available physical cache pool"
+            )
     if projected_total_bytes > config.max_speculative_kv_bytes:
         raise ValueError(
             "speculative KV bytes exceed max_speculative_kv_bytes before "
