@@ -170,7 +170,7 @@ describe("python launcher CLI", () => {
     let reads = 0;
     await expect(
       executePythonLauncherCli(
-        ["--input", "request.json", "--out", ".\\request.json"],
+        ["--input", "request.json", "--out", join(".", "request.json")],
         {
           cwd: resolve("virtual-python-launch-cli"),
           readText: async () => {

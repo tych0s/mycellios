@@ -2,7 +2,7 @@ import type { AddressInfo } from "node:net";
 import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import WebSocket from "ws";
 import { afterEach, describe, expect, it } from "vitest";
 import type { CoordinatorRuntime } from "../src/coordinator/server.js";
@@ -202,6 +202,7 @@ describe("mobile compute hub", () => {
         databasePath: ":memory:",
         requestTimeoutMs: 10_000,
         mobileJoinToken: "invite-test",
+        mobileAssetsPath: resolve("tests/fixtures/mobile-assets"),
         mobileExpertArtifactsPath: newArtifactDirectory(),
       },
       { logger: false },
@@ -222,7 +223,7 @@ describe("mobile compute hub", () => {
 
     const page = await runtime.app.inject({ method: "GET", url: "/mobile/" });
     expect(page.statusCode).toBe(200);
-    expect(page.body).toContain("Aporta potencia a la red");
+    expect(page.body).toContain("Contribute power to the network");
     const manifest = await runtime.app.inject({ method: "GET", url: "/mobile/manifest.webmanifest" });
     expect(manifest.statusCode).toBe(200);
     expect(manifest.json<{ short_name: string }>().short_name).toBe("mycellios");
