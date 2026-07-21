@@ -90,6 +90,9 @@ export function buildConnectedExecutorActivationSnapshot(
     },
     runtime: {
       ...baseConfig.runtime,
+      // Remote desktop executors resolve this through their packaged runtime
+      // PATH. Never send the coordinator's absolute Linux interpreter path.
+      stagePythonExecutable: "python",
       apiAdvertiseHost: rootHost,
       returnEndpoint: { ...baseConfig.runtime.returnEndpoint, host: rootHost },
     },
