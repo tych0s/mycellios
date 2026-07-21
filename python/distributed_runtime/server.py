@@ -46,6 +46,7 @@ class PendingGeneration:
     prompt_tokens: int
     events: asyncio.Queue[tuple[str, Any]] = field(default_factory=asyncio.Queue)
     abandoned: bool = False
+    session_key: str | None = None
 
 
 class ContinuousMicroBatcher:
@@ -152,6 +153,7 @@ class ContinuousMicroBatcher:
                 input_ids=pending.input_ids,
                 max_new_tokens=pending.max_new_tokens,
                 eos_token_ids=self.eos_token_ids,
+                session_key=pending.session_key,
             )
             for pending in batch
         ]
@@ -330,6 +332,7 @@ class DistributedOpenAIServer:
                     self.engine.config.prefill_token_limit or 0
                 ),
                 "speculation": self.engine.speculation_stats,
+                "sessions": self.engine.session_stats,
                 "root_batching": self.engine.root_batch_stats,
                 "recovery": recovery,
                 "root_parameter_bytes": self.engine.root_parameter_bytes,
@@ -363,7 +366,10 @@ class DistributedOpenAIServer:
     async def chat_completions(self, request: web.Request) -> web.StreamResponse:
         try:
             body = await request.json()
-            pending, stream = self._prepare_request(body)
+            pending, stream = self._prepare_request(
+                body,
+                header_session_id=request.headers.get("X-Session-Id"),
+            )
         except (json.JSONDecodeError, TypeError, ValueError, KeyError) as error:
             return error_response(str(error), "invalid_request", 400)
         try:
@@ -374,7 +380,11 @@ class DistributedOpenAIServer:
             return await self._stream_response(request, pending)
         return await self._complete_response(pending)
 
-    def _prepare_request(self, body: Any) -> tuple[PendingGeneration, bool]:
+    def _prepare_request(
+        self,
+        body: Any,
+        header_session_id: str | None = None,
+    ) -> tuple[PendingGeneration, bool]:
         if not isinstance(body, dict):
             raise ValueError("request body must be a JSON object")
         supported_fields = {
@@ -423,6 +433,15 @@ class DistributedOpenAIServer:
             normalized.append(
                 {"role": "system" if role == "developer" else role, "content": content}
             )
+        if "user" in body and (
+            not isinstance(body["user"], str) or not body["user"].strip()
+        ):
+            raise ValueError("user must be a non-empty string")
+        # An explicit transport header wins; the OpenAI ``user`` field is the
+        # compatible fallback so unmodified clients can still pin their chat.
+        session_key = normalize_session_key(
+            header_session_id if header_session_id is not None else body.get("user")
+        )
         if "max_tokens" in body and "max_completion_tokens" in body:
             raise ValueError("use max_tokens or max_completion_tokens, not both")
         raw_max = body.get("max_tokens", body.get("max_completion_tokens", 64))
@@ -452,6 +471,7 @@ class DistributedOpenAIServer:
                 input_ids=input_ids,
                 max_new_tokens=max_new_tokens,
                 prompt_tokens=prompt_tokens,
+                session_key=session_key,
             ),
             body.get("stream", False),
         )
@@ -589,12 +609,26 @@ class DistributedOpenAIServer:
                                 "ttft_ms": output.ttft_ms,
                                 "tpot_ms": output.tpot_ms,
                                 "pipeline_ms": output.total_ms,
+                                "reused_kv_tokens": output.reused_kv_tokens,
                             },
                         }
                     )
         except asyncio.CancelledError:
             self.batcher.cancel(pending)
             raise
+
+
+def normalize_session_key(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("session identifier must be a string")
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if len(normalized) > 128:
+        raise ValueError("session identifier must be at most 128 characters")
+    return normalized
 
 
 def exact_integer(value: Any, name: str) -> int:
@@ -725,6 +759,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--speculative-max-draft-tokens", type=int, default=4)
     parser.add_argument("--speculation-minimum-speedup", type=float, default=1.05)
     parser.add_argument("--no-speculation-probes", action="store_true")
+    parser.add_argument(
+        "--max-retained-sessions",
+        type=int,
+        default=0,
+        help=(
+            "Keep the KV of up to this many finished chats alive on every stage "
+            "so the next turn (X-Session-Id header or OpenAI user field) only "
+            "prefills the new suffix; zero disables session retention."
+        ),
+    )
+    parser.add_argument(
+        "--max-retained-session-tokens",
+        type=int,
+        default=0,
+        help="Total idle KV tokens across retained sessions; zero is unbounded.",
+    )
+    parser.add_argument("--retained-session-ttl-seconds", type=float, default=600.0)
     parser.add_argument("--max-output-tokens", type=int, default=512)
     parser.add_argument(
         "--recovery-max-retries",
@@ -826,6 +877,13 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
         raise ValueError("speculation-minimum-speedup must be finite and at least 1")
     if args.max_output_tokens < 1:
         raise ValueError("max-output-tokens must be positive")
+    if args.max_retained_sessions < 0 or args.max_retained_session_tokens < 0:
+        raise ValueError("retained session limits must be non-negative")
+    if (
+        not math.isfinite(args.retained_session_ttl_seconds)
+        or args.retained_session_ttl_seconds <= 0
+    ):
+        raise ValueError("retained-session-ttl-seconds must be finite and positive")
     if args.recovery_max_retries < 0:
         raise ValueError("recovery-max-retries must be non-negative")
     if ram_backed_moe is not None:
@@ -905,6 +963,9 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
             root_batch_window_ms=args.root_batch_window_ms,
             route_probe_interval_seconds=args.route_probe_interval_seconds,
             route_probe_timeout_seconds=args.route_probe_timeout_seconds,
+            max_retained_sessions=args.max_retained_sessions,
+            max_retained_session_tokens=args.max_retained_session_tokens,
+            retained_session_ttl_seconds=args.retained_session_ttl_seconds,
     )
     engine_factory = lambda: DistributedPipelineEngine(engine_config)
     initial_engine = engine_factory()
