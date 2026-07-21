@@ -71,6 +71,7 @@ const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1_000;
 const LEGACY_PUBLIC_COORDINATOR_URLS = new Set([
   "https://www.mycellios.com",
   "https://mycellios.com",
+  "https://network.mycellios.app",
 ]);
 
 let mainWindow: BrowserWindow | null = null;
