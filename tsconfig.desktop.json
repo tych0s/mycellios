@@ -20,7 +20,8 @@
     "vite.*.config.ts",
     "src/desktop/**/*.ts",
     "src/renderer/**/*.ts",
-    "src/renderer/**/*.tsx"
+    "src/renderer/**/*.tsx",
+    "landing/src/Panel.tsx"
   ],
   "exclude": ["node_modules", "dist", "out", ".vite"]
 }

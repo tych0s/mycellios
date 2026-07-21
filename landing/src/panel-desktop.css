@@ -1,0 +1,56 @@
+.desktop-panel .panel-topbar {
+  -webkit-app-region: drag;
+}
+
+.desktop-panel .panel-topbar button,
+.desktop-panel .panel-topbar a,
+.desktop-panel .panel-menu-button {
+  -webkit-app-region: no-drag;
+}
+
+.panel-window-controls {
+  display: flex;
+  align-items: center;
+  border-left: 1px solid #183033;
+  margin-left: 2px;
+  padding-left: 8px;
+}
+
+.panel-window-controls button {
+  border-color: transparent;
+  background: transparent;
+}
+
+.panel-window-controls button.close:hover {
+  background: #ad2733;
+  color: #fff;
+}
+
+.panel-update-ready {
+  color: #77dec9 !important;
+  border-color: #28544e !important;
+}
+
+.desktop-panel.platform-darwin .panel-sidebar {
+  padding-top: 58px;
+}
+
+.public-panel .content-page {
+  height: auto;
+  overflow: visible;
+  padding: 0;
+}
+
+.public-panel .mode-grid.single-mode {
+  grid-template-columns: 1fr;
+}
+
+.public-panel .mode-grid.single-mode button {
+  cursor: default;
+}
+
+@media (max-width: 1180px) {
+  .desktop-panel .panel-top-actions > span {
+    display: none;
+  }
+}

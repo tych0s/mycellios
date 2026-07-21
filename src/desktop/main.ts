@@ -20,6 +20,7 @@ import { probeHardware, type HardwareProbe } from "../worker/hardware.js";
 import type {
   ChatRequest,
   ChatResponse,
+  DashboardJob,
   DashboardModel,
   DashboardSnapshot,
   DashboardWorker,
@@ -390,21 +391,20 @@ async function readSnapshot(): Promise<DashboardSnapshot> {
   let health: DashboardSnapshot["health"] = null;
   let workers: DashboardWorker[] = [];
   let models: DashboardModel[] = [];
+  let jobs: DashboardJob[] = [];
   try {
-    const [healthResult, workerResult, modelResult] = await Promise.all([
+    const [healthResult, publicResult] = await Promise.all([
       fetchJson<NonNullable<DashboardSnapshot["health"]>>("health"),
-      fetchJson<{ data: DashboardWorker[] }>("internal/v1/workers"),
-      fetchJson<{ data: Array<{ id: string; x_replicas: number; x_pipelines: number }> }>(
-        "v1/models",
-      ),
+      fetchJson<{
+        workers: DashboardWorker[];
+        models: DashboardModel[];
+        jobs: DashboardJob[];
+      }>("public/v1/snapshot"),
     ]);
     health = healthResult;
-    workers = workerResult.data;
-    models = modelResult.data.map((model) => ({
-      id: model.id,
-      replicas: model.x_replicas,
-      pipelines: model.x_pipelines,
-    }));
+    workers = publicResult.workers;
+    models = publicResult.models;
+    jobs = publicResult.jobs;
   } catch (error) {
     connectionError = errorText(error);
   }
@@ -418,6 +418,7 @@ async function readSnapshot(): Promise<DashboardSnapshot> {
     health,
     workers,
     models,
+    jobs,
     localHardware,
     settings,
     update: { ...updateStatus },
@@ -470,6 +471,14 @@ function registerIpc(): void {
     return readSnapshot();
   });
   ipcMain.handle("chat:send", (_event, request: ChatRequest) => sendChat(request));
+  ipcMain.handle("workers:remove", async (_event, workerId: string) => {
+    await fetchJson(`public/v1/workers/${encodeURIComponent(workerId)}`, { method: "DELETE" });
+    return readSnapshot();
+  });
+  ipcMain.handle("workers:clear-offline", async () => {
+    await fetchJson("public/v1/workers/clear-offline", { method: "POST" });
+    return readSnapshot();
+  });
   ipcMain.handle("updates:check", () => checkForUpdates());
   ipcMain.handle("updates:install", () => {
     if (updateStatus.state !== "ready") {

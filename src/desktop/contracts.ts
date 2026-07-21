@@ -45,6 +45,7 @@ export interface DashboardDeployment {
 
 export interface DashboardWorker {
   id: string;
+  kind: "desktop" | "browser";
   status: "online" | "suspect" | "offline" | "draining";
   connected: boolean;
   region: string;
@@ -77,6 +78,18 @@ export interface DashboardModel {
   id: string;
   replicas: number;
   pipelines: number;
+}
+
+export interface DashboardJob {
+  id: string;
+  model: string;
+  status: string;
+  workerId: string | null;
+  inputTokens: number;
+  outputTokens: number;
+  failureCode: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface LocalHardware {
@@ -127,6 +140,7 @@ export interface DashboardSnapshot {
   } | null;
   workers: DashboardWorker[];
   models: DashboardModel[];
+  jobs: DashboardJob[];
   localHardware: LocalHardware;
   settings: DesktopSettings;
   update: DesktopUpdateStatus;
@@ -151,6 +165,8 @@ export interface DesktopBridge {
   saveSettings(settings: DesktopSettings): Promise<DashboardSnapshot>;
   setContribution(enabled: boolean): Promise<DashboardSnapshot>;
   sendChat(request: ChatRequest): Promise<ChatResponse>;
+  removeWorker(workerId: string): Promise<DashboardSnapshot>;
+  clearOfflineWorkers(): Promise<DashboardSnapshot>;
   checkForUpdates(): Promise<DesktopUpdateStatus>;
   installUpdate(): Promise<void>;
   minimizeWindow(): Promise<void>;
