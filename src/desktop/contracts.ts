@@ -188,8 +188,13 @@ export interface ChatResponse {
   requestId: string;
   model: string;
   text: string;
+  promptTokens: number;
+  outputTokens: number;
   totalTokens: number;
   routeClass: string;
+  affinityHit: boolean;
+  ttftMs: number;
+  activeMs: number;
 }
 
 export interface DesktopBridge {

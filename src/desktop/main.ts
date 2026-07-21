@@ -436,8 +436,8 @@ async function sendChat(request: ChatRequest): Promise<ChatResponse> {
     id: string;
     model: string;
     choices: Array<{ message: { content: string } }>;
-    usage: { total_tokens: number };
-    x_network: { route_class: string };
+    usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+    x_network: { route_class: string; affinity_hit: boolean; ttft_ms: number; active_ms: number };
   }>("v1/chat/completions", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -452,8 +452,13 @@ async function sendChat(request: ChatRequest): Promise<ChatResponse> {
     requestId: response.id,
     model: response.model,
     text: response.choices[0]?.message.content ?? "",
+    promptTokens: response.usage.prompt_tokens,
+    outputTokens: response.usage.completion_tokens,
     totalTokens: response.usage.total_tokens,
     routeClass: response.x_network.route_class,
+    affinityHit: response.x_network.affinity_hit,
+    ttftMs: response.x_network.ttft_ms,
+    activeMs: response.x_network.active_ms,
   };
 }
 
