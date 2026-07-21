@@ -48,7 +48,7 @@ const config: ForgeConfig = {
       OriginalFilename: "mycellios.exe",
       "requested-execution-level": "asInvoker",
     },
-    icon: "build/icons/icon",
+    icon: "build/icons/app-icon-v2",
     extraResource: ["assets/mycellios-logo.png", "build/icons", "mobile-dist"],
     ...(windowsSign ? { windowsSign } : {}),
     ...(macSign ? { osxSign: macSign } : {}),
@@ -59,14 +59,14 @@ const config: ForgeConfig = {
     new MakerSquirrel({
       name: "mycellios",
       setupExe: "mycellios-setup.exe",
-      setupIcon: "build/icons/icon.ico",
+      setupIcon: "build/icons/app-icon-v2.ico",
       ...(windowsSign ? { windowsSign } : {}),
     }),
     new MakerZIP({}, ["darwin", "linux"]),
     new MakerDMG(
       {
         name: "mycellios",
-        icon: "build/icons/icon.icns",
+        icon: "build/icons/app-icon-v2.icns",
         format: "ULFO",
       },
       ["darwin"],
@@ -78,7 +78,7 @@ const config: ForgeConfig = {
         genericName: "Distributed inference network",
         description: "Control and contribute compute to the mycellios distributed inference network.",
         categories: ["Network", "Utility"],
-        icon: "build/icons/icon.png",
+        icon: "build/icons/app-icon-v2.png",
       },
     }),
     new MakerRpm({
@@ -89,7 +89,7 @@ const config: ForgeConfig = {
         description: "Control and contribute compute to the mycellios distributed inference network.",
         license: "UNLICENSED",
         categories: ["Network", "Utility"],
-        icon: "build/icons/icon.png",
+        icon: "build/icons/app-icon-v2.png",
       },
     }),
   ],

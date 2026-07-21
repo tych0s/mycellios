@@ -33,10 +33,13 @@ import { consumeChatCompletionStream } from "./chat-stream.js";
 if (started) app.quit();
 
 app.setName("mycellios");
+if (process.platform === "win32") app.setAppUserModelId("app.mycellios.desktop.v2");
+
+const PUBLIC_COORDINATOR_URL = "https://www.mycellios.com";
 
 const DEFAULT_SETTINGS: DesktopSettings = {
   coordinatorMode: "remote",
-  remoteCoordinatorUrl: "https://mycellios.com",
+  remoteCoordinatorUrl: PUBLIC_COORDINATOR_URL,
   remoteCoordinatorToken: "",
   contributionEnabled: false,
   launchAtLogin: false,
@@ -50,9 +53,12 @@ const DEFAULT_SETTINGS: DesktopSettings = {
   modelDigest: "",
 };
 
-const UPDATE_FEED_URL = "https://mycellios.com/updates/win32/x64/";
+const UPDATE_FEED_URL = "https://www.mycellios.com/updates/win32/x64/";
 const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1_000;
-const LEGACY_PUBLIC_COORDINATOR_URL = "https://www.mycellios.com";
+const LEGACY_PUBLIC_COORDINATOR_URLS = new Set([
+  "https://www.mycellios.com",
+  "https://mycellios.com",
+]);
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
@@ -178,7 +184,7 @@ function loadSettings(): DesktopSettings {
   try {
     const stored = JSON.parse(readFileSync(settingsPath(), "utf8")) as Partial<DesktopSettings>;
     const storedCoordinatorUrl = stored.remoteCoordinatorUrl?.trim().replace(/\/+$/, "");
-    const migrated = storedCoordinatorUrl === LEGACY_PUBLIC_COORDINATOR_URL
+    const migrated = storedCoordinatorUrl && LEGACY_PUBLIC_COORDINATOR_URLS.has(storedCoordinatorUrl)
       ? { ...stored, remoteCoordinatorUrl: DEFAULT_SETTINGS.remoteCoordinatorUrl }
       : stored;
     const loaded = sanitizeSettings({ ...DEFAULT_SETTINGS, ...migrated });
@@ -584,7 +590,7 @@ function registerIpc(): void {
 }
 
 function createWindow(): void {
-  const icon = resourcePath("build", "icons", "icon.png");
+  const icon = resourcePath("build", "icons", "app-icon-v2.png");
   mainWindow = new BrowserWindow({
     width: 1_520,
     height: 920,
@@ -658,7 +664,7 @@ function createTray(): void {
 }
 
 function createTrayUnsafe(): void {
-  const trayImage = nativeImage.createFromPath(resourcePath("build", "icons", "icon.png"));
+  const trayImage = nativeImage.createFromPath(resourcePath("build", "icons", "app-icon-v2.png"));
   tray?.destroy();
   tray = new Tray(trayImage.resize({ width: 22, height: 22 }));
   tray.setToolTip("mycellios");

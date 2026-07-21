@@ -54,8 +54,10 @@ import type {
 import { consumeChatCompletionStream } from "../../src/desktop/chat-stream";
 import type { BenchmarkMeasurement, BenchmarkRun } from "../../src/benchlab/types";
 import { Contribute } from "./Contribute";
-import brandIcon from "./assets/mycellios-mark-transparent.png";
+import brandIcon from "./assets/mycellios-app-icon-v2.png";
 import "./panel.css";
+
+const PUBLIC_COORDINATOR_URL = "https://www.mycellios.com";
 import "./panel-downloads.css";
 import "./panel-desktop.css";
 
@@ -311,7 +313,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
 
   const publicOrigin = desktopSnapshot?.settings.coordinatorMode === "remote"
     ? desktopSnapshot.coordinatorUrl.replace(/\/$/, "")
-    : "https://mycellios.com";
+    : PUBLIC_COORDINATOR_URL;
   const publicLink = (path: string) => desktop ? `${publicOrigin}${path}` : path;
   const externalProps = desktop ? { target: "_blank", rel: "noreferrer" } as const : {};
 
@@ -893,11 +895,11 @@ function DesktopOnboarding({ snapshot, bridge, onSnapshot }: { snapshot: Dashboa
   const [error, setError] = useState<string | null>(null);
   async function complete() {
     setSaving(true); setError(null);
-    try { onSnapshot(await bridge.saveSettings({ ...snapshot.settings, coordinatorMode: "remote", remoteCoordinatorUrl: "https://mycellios.com", remoteCoordinatorToken: "", contributionEnabled: contribute, onboardingComplete: true })); }
+    try { onSnapshot(await bridge.saveSettings({ ...snapshot.settings, coordinatorMode: "remote", remoteCoordinatorUrl: PUBLIC_COORDINATOR_URL, remoteCoordinatorToken: "", contributionEnabled: contribute, onboardingComplete: true })); }
     catch (caught) { setError(errorText(caught)); }
     finally { setSaving(false); }
   }
-  return <div className="modal-backdrop"><div className="onboarding-card"><div className="onboarding-brand"><img src={brandIcon} alt="" /><span>GET STARTED</span></div><h1>Connect this machine to mycellios</h1><p>The desktop agent and the web panel will show the same public network.</p><div className="mode-grid single-mode"><button className="selected"><Globe2 size={23} /><strong>Public mycellios network</strong><span>https://mycellios.com</span><Check size={16} className="mode-check" /></button></div><label className="contribute-choice"><input type="checkbox" checked={contribute} onChange={(event) => setContribute(event.target.checked)} /><span><strong>Contribute this machine's resources</strong><small>Start with a safe connectivity test; switch to local model runtime later.</small></span></label>{error && <div className="inline-error"><CircleAlert size={17} />{error}</div>}<button className="primary-button onboarding-submit" disabled={saving} onClick={() => void complete()}>{saving ? <LoaderCircle className="spin" size={18} /> : <Sparkles size={18} />}Enter mycellios <ChevronRight size={18} /></button><div className="onboarding-security"><ShieldCheck size={15} />Connected through HTTPS/WSS to the public coordinator.</div></div></div>;
+  return <div className="modal-backdrop"><div className="onboarding-card"><div className="onboarding-brand"><img src={brandIcon} alt="" /><span>GET STARTED</span></div><h1>Connect this machine to mycellios</h1><p>The desktop agent and the web panel will show the same public network.</p><div className="mode-grid single-mode"><button className="selected"><Globe2 size={23} /><strong>Public mycellios network</strong><span>{PUBLIC_COORDINATOR_URL}</span><Check size={16} className="mode-check" /></button></div><label className="contribute-choice"><input type="checkbox" checked={contribute} onChange={(event) => setContribute(event.target.checked)} /><span><strong>Contribute this machine's resources</strong><small>Start with a safe connectivity test; switch to local model runtime later.</small></span></label>{error && <div className="inline-error"><CircleAlert size={17} />{error}</div>}<button className="primary-button onboarding-submit" disabled={saving} onClick={() => void complete()}>{saving ? <LoaderCircle className="spin" size={18} /> : <Sparkles size={18} />}Enter mycellios <ChevronRight size={18} /></button><div className="onboarding-security"><ShieldCheck size={15} />Connected through HTTPS/WSS to the public coordinator.</div></div></div>;
 }
 
 function desktopToPublicSnapshot(snapshot: DashboardSnapshot): PublicSnapshot {
