@@ -468,12 +468,33 @@ class HFPagedStageCache:
             required_blocks += (
                 ceil(projected_length / self.block_size) - shared_complete_blocks
             )
-        free_blocks = self.cache.get_num_free_blocks()
-        if required_blocks > free_blocks:
-            raise MemoryError(
-                "paged cache has insufficient blocks for projected tree: "
-                f"{required_blocks} > {free_blocks}"
+        return required_blocks * self.bytes_per_block
+
+    def project_request_incremental_physical_bytes(
+        self,
+        request_id: int,
+        additional_tokens: int,
+    ) -> int:
+        """Project new pool blocks for an already materialised request."""
+
+        self._guard()
+        self._require_idle()
+        record = self._require_request(request_id)
+        if not isinstance(additional_tokens, int) or isinstance(additional_tokens, bool):
+            raise TypeError("additional_tokens must be an integer")
+        if additional_tokens < 0:
+            raise ValueError("additional_tokens cannot be negative")
+        current_length = len(record.cache_keys)
+        projected_length = current_length + additional_tokens
+        if projected_length > self.max_sequence_tokens:
+            raise ValueError(
+                f"projected request would reach {projected_length} tokens, "
+                f"limit is {self.max_sequence_tokens}"
             )
+        required_blocks = (
+            ceil(projected_length / self.block_size)
+            - ceil(current_length / self.block_size)
+        )
         return required_blocks * self.bytes_per_block
 
     def snapshot(self) -> PagedCacheSnapshot:
@@ -1185,6 +1206,24 @@ class HFPagedStageRunner:
         return self.paged_cache.project_tree_incremental_physical_bytes(
             parent_request_id,
             delta_tokens_by_leaf=delta_tokens_by_leaf,
+        )
+
+    def project_request_incremental_physical_cache_bytes(
+        self,
+        request_id: int,
+        additional_tokens: int,
+    ) -> int:
+        return self.paged_cache.project_request_incremental_physical_bytes(
+            request_id,
+            additional_tokens,
+        )
+
+    def available_physical_cache_bytes(self) -> int:
+        """Return allocatable bytes in the runner-owned preallocated KV pool."""
+
+        return (
+            self.paged_cache.cache.get_num_free_blocks()
+            * self.paged_cache.bytes_per_block
         )
 
     def last_fork_report(self) -> StageKVForkReport | None:

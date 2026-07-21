@@ -261,6 +261,10 @@ class ModelContractTests(unittest.TestCase):
             runner.project_request_cache_bytes(1, 0)
             + runner.project_request_cache_bytes(1, 2),
         )
+        self.assertEqual(
+            runner.project_request_incremental_physical_cache_bytes(1, 2),
+            runner.project_request_cache_bytes(1, 2) - parent_bytes,
+        )
         copied = runner.fork_request(2, 1, max_cache_bytes=parent_bytes)
         report = runner.last_fork_report()
         self.assertIsNotNone(report)
