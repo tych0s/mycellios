@@ -13,7 +13,7 @@ const random = Array.from({ length: randomTrials }, (_, index) =>
 );
 const planners = defaultDistributionPlanners();
 
-console.log("Laboratorio de distribución LLM: modelo analítico reproducible, no benchmark físico");
+console.log("LLM distribution lab: reproducible analytical model, not a physical benchmark");
 console.log(`Escenarios: ${fixed.length} fijos + ${random.length} Monte Carlo; seed=${seed}`);
 
 const fixedResult = runDistributionBenchmark(fixed, planners);
@@ -34,9 +34,9 @@ for (const scenario of fixed) {
       ttft_p95_ms: round(row.evaluated?.metrics.ttftMs),
       tok_s_agregados: round(row.evaluated?.metrics.aggregateTokensPerSecond),
       Wh_token: round(row.evaluated?.metrics.energyWhPerOutputToken, 6),
-      ruta: row.evaluated?.plan.stages
+      route: row.evaluated?.plan.stages
         .map((stage) => `${stage.nodeId}[${stage.layerStart}:${stage.layerEnd}]`)
-        .join(" -> ") ?? "sin ruta",
+        .join(" -> ") ?? "no route",
     })),
   );
 }

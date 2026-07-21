@@ -117,7 +117,7 @@ export function NetworkGraph({ snapshot, selectedId, onSelect }: NetworkGraphPro
 
     const localId = "device:local";
     const localAngle = Math.PI * 0.84;
-    const localLabel = snapshot.localHardware.hostname || "Este equipo";
+    const localLabel = snapshot.localHardware.hostname || "This machine";
     addNode(
       graph,
       metadata,
@@ -126,7 +126,7 @@ export function NetworkGraph({ snapshot, selectedId, onSelect }: NetworkGraphPro
         x: Math.cos(localAngle) * 5.2,
         y: Math.sin(localAngle) * 5.2,
         size: selectedId === localId ? 14 : 11,
-        label: `${localLabel} · este equipo`,
+        label: `${localLabel} · this machine`,
         color: COLORS.local,
         forceLabel: true,
         zIndex: 6,
@@ -171,7 +171,7 @@ export function NetworkGraph({ snapshot, selectedId, onSelect }: NetworkGraphPro
     return () => renderer.kill();
   }, [snapshot, selectedId, onSelect]);
 
-  return <div className="network-graph" ref={container} aria-label="Mapa de la red mycellios" />;
+  return <div className="network-graph" ref={container} aria-label="mycellios network map" />;
 }
 
 function addNode(

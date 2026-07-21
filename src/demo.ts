@@ -58,7 +58,7 @@ try {
     },
     body: JSON.stringify({
       model: "distributed-small",
-      messages: [{ role: "user", content: "¿Funciona la red distribuida?" }],
+      messages: [{ role: "user", content: "Does the distributed network work?" }],
       max_tokens: 80,
       stream: false,
       session_id: "demo-session",

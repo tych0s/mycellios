@@ -181,7 +181,7 @@ export const DEFAULT_WAN_ROUTES: WanRouteProfile[] = [
   },
   {
     id: "regional-fiber",
-    label: "Misma región, fibra doméstica",
+    label: "Same region, residential fiber",
     physicalNodes: 8,
     stages: 6,
     offeredMemoryGb: 88,
@@ -198,7 +198,7 @@ export const DEFAULT_WAN_ROUTES: WanRouteProfile[] = [
   },
   {
     id: "regional-mixed",
-    label: "Región mixta, enlaces residenciales",
+    label: "Mixed region, residential links",
     physicalNodes: 12,
     stages: 6,
     offeredMemoryGb: 84,
@@ -232,7 +232,7 @@ export const DEFAULT_WAN_ROUTES: WanRouteProfile[] = [
   },
   {
     id: "intercontinental",
-    label: "Ruta intercontinental",
+    label: "Intercontinental route",
     physicalNodes: 16,
     stages: 8,
     offeredMemoryGb: 90,

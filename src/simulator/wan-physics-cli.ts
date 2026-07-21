@@ -103,17 +103,17 @@ function parseArgs(args: readonly string[]): CliOptions {
 
 function usage(): string {
   return [
-    "Uso: npm run simulate:physics -- [opciones]",
+    "Usage: npm run simulate:physics -- [options]",
     "",
-    "  --nodes 10,100,1000  Tamaños de flota; comparten un único flujo RNG",
-    "  --trials 1000         Trials Monte Carlo por tamaño",
-    "  --seed 123456789      Semilla Mulberry32",
-    "  --prompt 2000         Tokens de prompt para TTFT",
-    "  --context 2000        Tokens de contexto para bytes KV",
-    "  --microchunk 128      Microchunk de prefill",
-    "  --curated-trials 10000 Trials del caso regional curado de 10 nodos",
-    "  --no-curated          Omite el caso curado",
-    "  --json                Salida JSON sin redondear",
+    "  --nodes 10,100,1000  Fleet sizes; they share a single RNG stream",
+    "  --trials 1000         Monte Carlo trials per size",
+    "  --seed 123456789      Mulberry32 seed",
+    "  --prompt 2000         Prompt tokens for TTFT",
+    "  --context 2000        Context tokens for KV bytes",
+    "  --microchunk 128      Prefill microchunk",
+    "  --curated-trials 10000 Trials for the curated regional 10-node case",
+    "  --no-curated          Omit the curated case",
+    "  --json                Unrounded JSON output",
   ].join("\n");
 }
 
@@ -125,13 +125,13 @@ function printSummary(summary: WanSummary): void {
   console.log(
     [
       `N=${summary.nodes}`,
-      `P(ruta)=${fixed(summary.probabilityAnyRoute * 100, 1)}%`,
-      `rutas p50/p95=${summary.routes.p50}/${summary.routes.p95}`,
-      `etapas p50/p95=${summary.stages.p50}/${summary.stages.p95}`,
-      `tok/s p50/lenta-P95=${fixed(summary.tokensPerSecond.p50)}/${fixed(summary.tokensPerSecond.slowPathP95)}`,
+      `P(route)=${fixed(summary.probabilityAnyRoute * 100, 1)}%`,
+      `routes p50/p95=${summary.routes.p50}/${summary.routes.p95}`,
+      `stages p50/p95=${summary.stages.p50}/${summary.stages.p95}`,
+      `tok/s p50/slow-P95=${fixed(summary.tokensPerSecond.p50)}/${fixed(summary.tokensPerSecond.slowPathP95)}`,
       `TTFT p50/p95=${fixed(summary.ttftMs.p50 / 1_000)}/${fixed(summary.ttftMs.p95 / 1_000)} s`,
-      `slots ideales p50/p95=${summary.concurrency.p50}/${summary.concurrency.p95}`,
-      `potencia p50/p95=${fixed(summary.incrementalPowerKw.p50)}/${fixed(summary.incrementalPowerKw.p95)} kW`,
+      `ideal slots p50/p95=${summary.concurrency.p50}/${summary.concurrency.p95}`,
+      `power p50/p95=${fixed(summary.incrementalPowerKw.p50)}/${fixed(summary.incrementalPowerKw.p95)} kW`,
     ].join(" | "),
   );
 }
@@ -205,34 +205,34 @@ function main(): void {
 
     console.log(`kind=${report.kind}`);
     console.log(
-      "AVISO: modelo físico teórico, no benchmark medido. Los slots son ideales de pipeline cíclico; no son usuarios garantizados.",
+      "WARNING: theoretical physical model, not a measured benchmark. Slots are ideal cyclic-pipeline slots, not guaranteed users.",
     );
     console.log(
-      `GLM-4.5-Air: 46 capas, H=4096, 73 GB Q4_K_M; activación INT8=${report.model.activationBytes.int8} B.`,
+      `GLM-4.5-Air: 46 layers, H=4096, 73 GB Q4_K_M; INT8 activation=${report.model.activationBytes.int8} B.`,
     );
     console.log(
-      `Monte Carlo: ${options.trials} trials/tamaño, seed=${options.seed}, RNG compartido en orden ${options.nodes.join(" -> ")}.`,
+      `Monte Carlo: ${options.trials} trials/size, seed=${options.seed}, RNG shared in ${options.nodes.join(" -> ")} order.`,
     );
     for (const summary of report.suite) printSummary(summary);
 
     if (report.curatedTenNodeRegionalRoute !== null) {
-      console.log("\nCaso curado: 10 nodos viables, online y en una misma región:");
+      console.log("\nCurated case: 10 feasible online nodes in the same region:");
       printSummary(report.curatedTenNodeRegionalRoute);
     }
 
-    console.log("\nKV por conversación BF16:");
+    console.log("\nBF16 KV per conversation:");
     console.log(
-      `2k=${fixed(report.model.kvExamples.bf16At2k / 1e9, 3)} GB | 20k=${fixed(report.model.kvExamples.bf16At20k / 1e9, 3)} GB | 128k=${fixed(report.model.kvExamples.bf16At128k / 1e9, 3)} GB (Q8: la mitad).`,
+      `2k=${fixed(report.model.kvExamples.bf16At2k / 1e9, 3)} GB | 20k=${fixed(report.model.kvExamples.bf16At20k / 1e9, 3)} GB | 128k=${fixed(report.model.kvExamples.bf16At128k / 1e9, 3)} GB (Q8: half).`,
     );
-    console.log("\nSensibilidad tok/s (BW=100 Mbps; RTT mostrado como latencia unidireccional por salto):");
+    console.log("\nTok/s sensitivity (BW=100 Mbps; RTT shown as one-way latency per hop):");
     for (const stages of [6, 10, 16]) {
       const row = report.sensitivity.filter((point) => point.stages === stages);
       console.log(
-        `${stages} etapas: ${row.map((point) => `${point.oneWayHopMs} ms=${fixed(point.tokensPerSecond, 4)}`).join(" | ")}`,
+        `${stages} stages: ${row.map((point) => `${point.oneWayHopMs} ms=${fixed(point.tokensPerSecond, 4)}`).join(" | ")}`,
       );
     }
     console.log(
-      `Éxito sin redundancia con fallo 2%/etapa: S6=${fixed(report.noRedundancyRouteSuccessAtTwoPercentStageFailure.stages6 * 100, 1)}% | S10=${fixed(report.noRedundancyRouteSuccessAtTwoPercentStageFailure.stages10 * 100, 1)}% | S16=${fixed(report.noRedundancyRouteSuccessAtTwoPercentStageFailure.stages16 * 100, 1)}%.`,
+      `Success without redundancy at 2% failure/stage: S6=${fixed(report.noRedundancyRouteSuccessAtTwoPercentStageFailure.stages6 * 100, 1)}% | S10=${fixed(report.noRedundancyRouteSuccessAtTwoPercentStageFailure.stages10 * 100, 1)}% | S16=${fixed(report.noRedundancyRouteSuccessAtTwoPercentStageFailure.stages16 * 100, 1)}%.`,
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -243,4 +243,3 @@ function main(): void {
 }
 
 main();
-

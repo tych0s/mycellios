@@ -18,6 +18,29 @@ interface ComputeResult {
   estimatedGflops: number;
 }
 
+interface ExpertManifest {
+  artifactId: string;
+  modelId: string;
+  modelDigest: string;
+  layer: number;
+  expert: number;
+  contentId: string;
+  weightsHash: string;
+  hiddenSize: number;
+  intermediateSize: number;
+  dtype: "float32";
+  activation: "silu";
+  canaryInputBase64: string;
+  canaryOutputBase64: string;
+}
+
+interface ResidentExpert {
+  manifest: ExpertManifest;
+  gate: Float32Array;
+  up: Float32Array;
+  down: Float32Array;
+}
+
 interface RuntimeState {
   running: boolean;
   starting: boolean;
@@ -33,6 +56,8 @@ interface RuntimeState {
   verifiedTasks: number;
   gpu: GPUAdapter | null;
   device: GPUDevice | null;
+  residentExperts: Map<string, ResidentExpert>;
+  cancelledMatrixTasks: Set<string>;
 }
 
 const state: RuntimeState = {
@@ -50,6 +75,8 @@ const state: RuntimeState = {
   verifiedTasks: 0,
   gpu: null,
   device: null,
+  residentExperts: new Map(),
+  cancelledMatrixTasks: new Set(),
 };
 
 const elements = {
@@ -84,7 +111,7 @@ document.addEventListener("visibilitychange", () => {
     requestWork();
   } else {
     sendHeartbeat();
-    setStatus("En pausa porque Mycellios no está visible.");
+    setStatus("Paused because mycellios is not visible.");
   }
 });
 
@@ -98,16 +125,16 @@ async function start(): Promise<void> {
   if (state.starting || state.running) return;
   state.starting = true;
   setBusy(true);
-  setConnection("connecting", "Preparando");
-  addLog("Comprobando el motor de cálculo del dispositivo.");
+  setConnection("connecting", "Preparing");
+  addLog("Checking the device compute engine.");
   try {
     await initializeComputeBackend();
-    setStatus(`Midiendo ${state.backend === "webgpu" ? "la GPU" : "la CPU"} con una tarea real…`);
+    setStatus(`Measuring the ${state.backend === "webgpu" ? "GPU" : "CPU"} with a real task…`);
     const benchmarkSize = state.backend === "webgpu" ? 96 : 48;
     const benchmark = await runMatrixTask(benchmarkSize, 73);
     state.estimatedGflops = benchmark.estimatedGflops;
     renderPerformance();
-    addLog(`Benchmark terminado: ${formatGflops(state.estimatedGflops)} GFLOPS.`);
+    addLog(`Benchmark complete: ${formatGflops(state.estimatedGflops)} GFLOPS.`);
     await acquireWakeLock();
     const credentials = await registerWorker(benchmarkSize, benchmark.durationMs);
     state.workerId = credentials.workerId;
@@ -115,13 +142,13 @@ async function start(): Promise<void> {
     state.running = true;
     document.body.classList.add("running");
     setBusy(false);
-    elements.toggle.innerHTML = '<span class="power-symbol">⏻</span><span>Dejar de aportar</span>';
+    elements.toggle.innerHTML = '<span class="power-symbol">⏻</span><span>Stop contributing</span>';
     elements.levels.forEach((button) => { button.disabled = true; });
     connect();
   } catch (error) {
-    addLog(`No se pudo iniciar: ${errorText(error)}`);
+    addLog(`Could not start: ${errorText(error)}`);
     setStatus(errorText(error));
-    setConnection("offline", "No disponible");
+    setConnection("offline", "Unavailable");
     await stop(false);
   } finally {
     state.starting = false;
@@ -144,36 +171,38 @@ async function stop(log = true): Promise<void> {
   state.device?.destroy();
   state.device = null;
   state.gpu = null;
+  state.residentExperts.clear();
+  state.cancelledMatrixTasks.clear();
   renderWakeLock();
   setBusy(false);
-  setConnection("offline", "Desconectado");
-  setStatus("Pulsa el botón y mantén esta pantalla abierta.");
-  elements.toggle.innerHTML = '<span class="power-symbol">⏻</span><span>Aportar potencia</span>';
+  setConnection("offline", "Disconnected");
+  setStatus("Press the button and keep this screen open.");
+  elements.toggle.innerHTML = '<span class="power-symbol">⏻</span><span>Contribute power</span>';
   elements.levels.forEach((button) => { button.disabled = false; });
-  if (log) addLog("Aportación detenida por el usuario.");
+  if (log) addLog("Contribution stopped by the user.");
 }
 
 async function detectBackendPreview(): Promise<void> {
   if (!navigator.gpu) {
     elements.backend.textContent = "CPU";
-    elements.gpu.textContent = "Fallback universal";
+    elements.gpu.textContent = "Universal fallback";
     return;
   }
   elements.backend.textContent = "WebGPU";
-  elements.gpu.textContent = "GPU disponible";
+  elements.gpu.textContent = "GPU available";
 }
 
 async function initializeComputeBackend(): Promise<void> {
   if (!window.isSecureContext) {
     state.backend = "cpu";
     elements.backend.textContent = "CPU";
-    elements.gpu.textContent = "WebGPU requiere HTTPS";
+    elements.gpu.textContent = "WebGPU requires HTTPS";
     return;
   }
   if (!navigator.gpu) {
     state.backend = "cpu";
     elements.backend.textContent = "CPU";
-    elements.gpu.textContent = "WebGPU no disponible";
+    elements.gpu.textContent = "WebGPU unavailable";
     return;
   }
   try {
@@ -181,11 +210,11 @@ async function initializeComputeBackend(): Promise<void> {
     const adapter =
       (await navigator.gpu.requestAdapter(compatibilityOptions)) ??
       (await navigator.gpu.requestAdapter({ powerPreference: "high-performance" }));
-    if (!adapter) throw new Error("No hay adaptador WebGPU");
+    if (!adapter) throw new Error("No WebGPU adapter found");
     const device = await adapter.requestDevice();
     device.lost.then((info) => {
       if (!state.running) return;
-      addLog(`La GPU dejó de estar disponible: ${info.message || info.reason}.`);
+      addLog(`The GPU became unavailable: ${info.message || info.reason}.`);
       void stop(false);
     });
     state.backend = "webgpu";
@@ -193,18 +222,19 @@ async function initializeComputeBackend(): Promise<void> {
     state.device = device;
     elements.backend.textContent = "WebGPU";
     const info = adapter.info as GPUAdapterInfo & { description?: string };
-    elements.gpu.textContent = info.description || info.device || info.architecture || "GPU del móvil";
+    elements.gpu.textContent = info.description || info.device || info.architecture || "Mobile GPU";
   } catch (error) {
     state.backend = "cpu";
     elements.backend.textContent = "CPU";
-    elements.gpu.textContent = "Fallback del navegador";
-    addLog(`WebGPU no disponible; se usará CPU: ${errorText(error)}`);
+    elements.gpu.textContent = "Browser fallback";
+    addLog(`WebGPU unavailable; using CPU: ${errorText(error)}`);
   }
 }
 
 async function registerWorker(matrixSize: number, durationMs: number): Promise<{ workerId: string; token: string }> {
   const query = new URLSearchParams(window.location.search);
-  const joinToken = query.get("join")?.trim();
+  const invitationFromUrl = query.get("join")?.trim();
+  const joinToken = persistentJoinToken(invitationFromUrl);
   const adapterInfo = state.gpu?.info as (GPUAdapterInfo & { description?: string }) | undefined;
   const body = {
     clientId: persistentClientId(),
@@ -234,28 +264,37 @@ async function registerWorker(matrixSize: number, durationMs: number): Promise<{
     body: JSON.stringify(body),
   });
   if (!response.ok) {
-    if (response.status === 401) throw new Error("El enlace de invitación no es válido.");
-    throw new Error(`El coordinador rechazó el registro (HTTP ${response.status}).`);
+    if (response.status === 401) throw new Error("The invitation link is invalid.");
+    throw new Error(`The coordinator rejected registration (HTTP ${response.status}).`);
   }
   return (await response.json()) as { workerId: string; token: string };
 }
 
+function persistentJoinToken(invitationFromUrl: string | undefined): string | undefined {
+  try {
+    if (invitationFromUrl) localStorage.setItem("mycellios.joinToken", invitationFromUrl);
+    return invitationFromUrl || localStorage.getItem("mycellios.joinToken")?.trim() || undefined;
+  } catch {
+    return invitationFromUrl;
+  }
+}
+
 function connect(): void {
   if (!state.running || !state.workerId || !state.token) return;
-  setConnection("connecting", "Conectando");
+  setConnection("connecting", "Connecting");
   const url = new URL("./v1/connect", window.location.href);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   url.searchParams.set("workerId", state.workerId);
   url.searchParams.set("token", state.token);
   const socket = new WebSocket(url);
   state.socket = socket;
-  socket.addEventListener("open", () => addLog("Canal seguro con el coordinador abierto."));
+  socket.addEventListener("open", () => addLog("Secure coordinator channel opened."));
   socket.addEventListener("message", (event) => void handleServerMessage(String(event.data)));
   socket.addEventListener("close", () => {
     if (state.socket === socket) state.socket = null;
     if (!state.running) return;
-    setConnection("connecting", "Reconectando");
-    setStatus("Se perdió la conexión; reintentando automáticamente…");
+    setConnection("connecting", "Reconnecting");
+    setStatus("Connection lost; retrying automatically…");
     state.reconnectTimer = window.setTimeout(connect, 2_000);
   });
   socket.addEventListener("error", () => socket.close());
@@ -269,9 +308,9 @@ async function handleServerMessage(raw: string): Promise<void> {
     return;
   }
   if (message.type === "server.ready") {
-    setConnection("online", "Conectado");
-    setStatus("Aportando potencia. Mantén Mycellios visible.");
-    addLog("Worker móvil registrado y listo para trabajar.");
+    setConnection("online", "Connected");
+    setStatus("Contributing power. Keep mycellios visible.");
+    addLog("Mobile worker registered and ready.");
     sendHeartbeat();
     if (state.heartbeatTimer !== null) window.clearInterval(state.heartbeatTimer);
     state.heartbeatTimer = window.setInterval(sendHeartbeat, 5_000);
@@ -283,16 +322,47 @@ async function handleServerMessage(raw: string): Promise<void> {
     await executeOffer(offer);
     return;
   }
+  if (message.type === "compute.cancel") {
+    const payload = message.payload as { taskId?: string };
+    if (payload.taskId) state.cancelledMatrixTasks.add(payload.taskId);
+    return;
+  }
+  if (message.type === "expert.load") {
+    await loadExpert(message.payload as {
+      taskId: string; leaseId: string; artifactId: string; manifestUrl: string; deadlineAt: number;
+    });
+    return;
+  }
+  if (message.type === "expert.execute") {
+    await executeExpert(message.payload as {
+      taskId: string; leaseId: string; artifactId: string; rows: number;
+      hiddenSize: number; activationsBase64: string; deadlineAt: number;
+    });
+    return;
+  }
+  if (message.type === "expert.verified") {
+    const payload = message.payload as { phase?: string; verifiedTasks?: number };
+    if (payload.phase === "executed") {
+      state.verifiedTasks = payload.verifiedTasks ?? state.verifiedTasks + 1;
+      elements.tasks.textContent = String(state.verifiedTasks);
+      setStatus("Expert output verified and used by the model network.");
+      addLog("Real MoE expert result accepted by the coordinator.");
+    }
+    return;
+  }
+  if (message.type === "expert.rejected") {
+    addLog("Expert weights failed the network canary and were removed.");
+  }
   if (message.type === "compute.verified") {
     const payload = message.payload as { verifiedTasks?: number };
     state.verifiedTasks = payload.verifiedTasks ?? state.verifiedTasks + 1;
     elements.tasks.textContent = String(state.verifiedTasks);
-    addLog(`Resultado verificado por la red · tarea ${state.verifiedTasks}.`);
+    addLog(`Result verified by the network · task ${state.verifiedTasks}.`);
     window.setTimeout(requestWork, coolDownMs());
     return;
   }
   if (message.type === "compute.rejected") {
-    addLog("El resultado no superó la verificación y fue descartado.");
+    addLog("The result failed verification and was discarded.");
     window.setTimeout(requestWork, coolDownMs());
   }
 }
@@ -301,10 +371,11 @@ async function executeOffer(offer: ComputeOffer): Promise<void> {
   if (!state.running || document.visibilityState !== "visible") return;
   if (offer.operation !== "matrix-multiply" || offer.deadlineAt <= Date.now()) return;
   send("compute.accept", { taskId: offer.taskId, leaseId: offer.leaseId });
-  setStatus(`Calculando una matriz ${offer.size}×${offer.size} con ${state.backend.toUpperCase()}…`);
-  addLog(`Trabajo recibido: multiplicación ${offer.size}×${offer.size}.`);
+  setStatus(`Computing a ${offer.size}×${offer.size} matrix with ${state.backend.toUpperCase()}…`);
+  addLog(`Job received: ${offer.size}×${offer.size} multiplication.`);
   try {
     const result = await runMatrixTask(offer.size, offer.seed);
+    if (state.cancelledMatrixTasks.delete(offer.taskId)) return;
     state.estimatedGflops = result.estimatedGflops;
     renderPerformance();
     send("compute.result", {
@@ -313,16 +384,301 @@ async function executeOffer(offer: ComputeOffer): Promise<void> {
       backend: state.backend,
       ...result,
     });
-    setStatus("Resultado enviado; esperando verificación del coordinador…");
+    setStatus("Result sent; waiting for coordinator verification…");
   } catch (error) {
     send("compute.fail", {
       taskId: offer.taskId,
       leaseId: offer.leaseId,
       message: errorText(error).slice(0, 300),
     });
-    addLog(`La tarea falló: ${errorText(error)}`);
+    addLog(`Task failed: ${errorText(error)}`);
     window.setTimeout(requestWork, coolDownMs());
   }
+}
+
+async function loadExpert(offer: {
+  taskId: string;
+  leaseId: string;
+  artifactId: string;
+  manifestUrl: string;
+  deadlineAt: number;
+}): Promise<void> {
+  if (!state.running || document.visibilityState !== "visible" || offer.deadlineAt <= Date.now()) return;
+  try {
+    setStatus("Downloading and verifying a real model expert…");
+    const manifestResponse = await fetch(new URL(offer.manifestUrl, window.location.origin));
+    if (!manifestResponse.ok) throw new Error(`expert manifest HTTP ${manifestResponse.status}`);
+    const manifest = (await manifestResponse.json()) as ExpertManifest;
+    if (manifest.artifactId !== offer.artifactId || manifest.dtype !== "float32"
+      || manifest.activation !== "silu") throw new Error("unsupported expert manifest");
+    const weightsResponse = await fetch(
+      new URL(`/mobile/v1/experts/weights/${manifest.weightsHash}`, window.location.origin),
+    );
+    if (!weightsResponse.ok) throw new Error(`expert weights HTTP ${weightsResponse.status}`);
+    const bytes = await weightsResponse.arrayBuffer();
+    const digest = hex(await crypto.subtle.digest("SHA-256", bytes));
+    if (digest !== manifest.weightsHash) throw new Error("expert weight hash mismatch");
+    const expectedValues = 3 * manifest.hiddenSize * manifest.intermediateSize;
+    if (bytes.byteLength !== expectedValues * Float32Array.BYTES_PER_ELEMENT) {
+      throw new Error("expert weight shape mismatch");
+    }
+    const allWeights = new Float32Array(bytes);
+    const projectionValues = manifest.hiddenSize * manifest.intermediateSize;
+    const expert: ResidentExpert = {
+      manifest,
+      gate: allWeights.slice(0, projectionValues),
+      up: allWeights.slice(projectionValues, 2 * projectionValues),
+      down: allWeights.slice(2 * projectionValues),
+    };
+    const canaryInput = float32FromBase64(manifest.canaryInputBase64);
+    if (canaryInput.length !== manifest.hiddenSize) throw new Error("invalid expert canary input");
+    const started = performance.now();
+    const computed = await computeSwiGlu(expert, canaryInput, 1);
+    state.residentExperts.set(offer.artifactId, expert);
+    send("expert.ready", {
+      taskId: offer.taskId,
+      leaseId: offer.leaseId,
+      artifactId: offer.artifactId,
+      canaryOutputBase64: float32ToBase64(computed.values),
+      backend: computed.backend,
+      durationMs: Math.max(0, performance.now() - started),
+    });
+    setStatus(`Resident MoE expert ready · layer ${manifest.layer}, expert ${manifest.expert}.`);
+    addLog(`Loaded ${manifest.modelId} L${manifest.layer}/E${manifest.expert}; SHA-256 verified.`);
+  } catch (error) {
+    state.residentExperts.delete(offer.artifactId);
+    send("expert.fail", {
+      taskId: offer.taskId,
+      leaseId: offer.leaseId,
+      artifactId: offer.artifactId,
+      message: errorText(error).slice(0, 500),
+    });
+    addLog(`Expert load failed: ${errorText(error)}`);
+  }
+}
+
+async function executeExpert(offer: {
+  taskId: string;
+  leaseId: string;
+  artifactId: string;
+  rows: number;
+  hiddenSize: number;
+  activationsBase64: string;
+  deadlineAt: number;
+}): Promise<void> {
+  if (!state.running || document.visibilityState !== "visible" || offer.deadlineAt <= Date.now()) return;
+  const expert = state.residentExperts.get(offer.artifactId);
+  try {
+    if (!expert) throw new Error("expert is not resident");
+    if (expert.manifest.hiddenSize !== offer.hiddenSize) throw new Error("activation shape mismatch");
+    const activations = float32FromBase64(offer.activationsBase64);
+    if (activations.length !== offer.rows * offer.hiddenSize) throw new Error("activation payload mismatch");
+    setStatus(`Running real model expert L${expert.manifest.layer}/E${expert.manifest.expert}…`);
+    const started = performance.now();
+    const computed = await computeSwiGlu(expert, activations, offer.rows);
+    send("expert.result", {
+      taskId: offer.taskId,
+      leaseId: offer.leaseId,
+      artifactId: offer.artifactId,
+      rows: offer.rows,
+      hiddenSize: offer.hiddenSize,
+      outputBase64: float32ToBase64(computed.values),
+      backend: computed.backend,
+      durationMs: Math.max(0, performance.now() - started),
+    });
+    setStatus("Expert activation returned; awaiting network verification…");
+  } catch (error) {
+    state.residentExperts.delete(offer.artifactId);
+    send("expert.fail", {
+      taskId: offer.taskId,
+      leaseId: offer.leaseId,
+      artifactId: offer.artifactId,
+      message: errorText(error).slice(0, 500),
+    });
+  }
+}
+
+async function computeSwiGlu(
+  expert: ResidentExpert,
+  activations: Float32Array,
+  rows: number,
+): Promise<{ values: Float32Array; backend: Backend }> {
+  if (state.device) {
+    try {
+      return { values: await swiGluWebGpu(state.device, expert, activations, rows), backend: "webgpu" };
+    } catch (error) {
+      addLog(`Expert WebGPU fallback to CPU: ${errorText(error)}`);
+    }
+  }
+  return { values: await swiGluCpu(expert, activations, rows), backend: "cpu" };
+}
+
+async function swiGluCpu(
+  expert: ResidentExpert,
+  activations: Float32Array,
+  rows: number,
+): Promise<Float32Array> {
+  const { hiddenSize, intermediateSize } = expert.manifest;
+  const activated = new Float32Array(rows * intermediateSize);
+  for (let row = 0; row < rows; row += 1) {
+    for (let intermediate = 0; intermediate < intermediateSize; intermediate += 1) {
+      let gate = 0;
+      let up = 0;
+      const weightOffset = intermediate * hiddenSize;
+      const inputOffset = row * hiddenSize;
+      for (let hidden = 0; hidden < hiddenSize; hidden += 1) {
+        const input = activations[inputOffset + hidden] ?? 0;
+        gate += input * (expert.gate[weightOffset + hidden] ?? 0);
+        up += input * (expert.up[weightOffset + hidden] ?? 0);
+      }
+      activated[row * intermediateSize + intermediate] = (gate / (1 + Math.exp(-gate))) * up;
+    }
+    if (row % 4 === 0) await new Promise<void>((resolvePromise) => window.setTimeout(resolvePromise, 0));
+  }
+  const output = new Float32Array(rows * hiddenSize);
+  for (let row = 0; row < rows; row += 1) {
+    for (let hidden = 0; hidden < hiddenSize; hidden += 1) {
+      let sum = 0;
+      const downOffset = hidden * intermediateSize;
+      for (let intermediate = 0; intermediate < intermediateSize; intermediate += 1) {
+        sum += (activated[row * intermediateSize + intermediate] ?? 0)
+          * (expert.down[downOffset + intermediate] ?? 0);
+      }
+      output[row * hiddenSize + hidden] = sum;
+    }
+  }
+  return output;
+}
+
+async function swiGluWebGpu(
+  device: GPUDevice,
+  expert: ResidentExpert,
+  activations: Float32Array,
+  rows: number,
+): Promise<Float32Array> {
+  const { hiddenSize, intermediateSize } = expert.manifest;
+  const byteSizes = [activations.byteLength, expert.gate.byteLength, expert.up.byteLength,
+    expert.down.byteLength, rows * intermediateSize * 4, rows * hiddenSize * 4];
+  if (byteSizes.some((size) => size > Number(device.limits.maxStorageBufferBindingSize))) {
+    throw new Error("expert tensor exceeds this GPU's storage binding limit");
+  }
+  const buffers: GPUBuffer[] = [];
+  const storage = (label: string, values: Float32Array): GPUBuffer => {
+    const buffer = device.createBuffer({
+      label,
+      size: Math.max(4, values.byteLength),
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(buffer, 0, values);
+    buffers.push(buffer);
+    return buffer;
+  };
+  const input = storage("expert-input", activations);
+  const gate = storage("expert-gate", expert.gate);
+  const up = storage("expert-up", expert.up);
+  const down = storage("expert-down", expert.down);
+  const activated = device.createBuffer({
+    label: "expert-activated",
+    size: rows * intermediateSize * 4,
+    usage: GPUBufferUsage.STORAGE,
+  });
+  const output = device.createBuffer({
+    label: "expert-output",
+    size: rows * hiddenSize * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
+  const readback = device.createBuffer({
+    label: "expert-readback",
+    size: rows * hiddenSize * 4,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
+  buffers.push(activated, output, readback);
+  try {
+    const firstModule = device.createShaderModule({ code: `
+      @group(0) @binding(0) var<storage, read> x: array<f32>;
+      @group(0) @binding(1) var<storage, read> gate: array<f32>;
+      @group(0) @binding(2) var<storage, read> up: array<f32>;
+      @group(0) @binding(3) var<storage, read_write> activated: array<f32>;
+      @compute @workgroup_size(64)
+      fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+        let index = id.x;
+        if (index >= ${rows * intermediateSize}u) { return; }
+        let row = index / ${intermediateSize}u;
+        let neuron = index % ${intermediateSize}u;
+        var gateValue = 0.0;
+        var upValue = 0.0;
+        for (var h = 0u; h < ${hiddenSize}u; h = h + 1u) {
+          let value = x[row * ${hiddenSize}u + h];
+          gateValue = gateValue + value * gate[neuron * ${hiddenSize}u + h];
+          upValue = upValue + value * up[neuron * ${hiddenSize}u + h];
+        }
+        activated[index] = (gateValue / (1.0 + exp(-gateValue))) * upValue;
+      }
+    ` });
+    const secondModule = device.createShaderModule({ code: `
+      @group(0) @binding(0) var<storage, read> activated: array<f32>;
+      @group(0) @binding(1) var<storage, read> down: array<f32>;
+      @group(0) @binding(2) var<storage, read_write> output: array<f32>;
+      @compute @workgroup_size(64)
+      fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+        let index = id.x;
+        if (index >= ${rows * hiddenSize}u) { return; }
+        let row = index / ${hiddenSize}u;
+        let hidden = index % ${hiddenSize}u;
+        var sum = 0.0;
+        for (var i = 0u; i < ${intermediateSize}u; i = i + 1u) {
+          sum = sum + activated[row * ${intermediateSize}u + i] * down[hidden * ${intermediateSize}u + i];
+        }
+        output[index] = sum;
+      }
+    ` });
+    const first = device.createComputePipeline({ layout: "auto", compute: { module: firstModule } });
+    const second = device.createComputePipeline({ layout: "auto", compute: { module: secondModule } });
+    const firstGroup = device.createBindGroup({ layout: first.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: input } }, { binding: 1, resource: { buffer: gate } },
+      { binding: 2, resource: { buffer: up } }, { binding: 3, resource: { buffer: activated } },
+    ] });
+    const secondGroup = device.createBindGroup({ layout: second.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: activated } }, { binding: 1, resource: { buffer: down } },
+      { binding: 2, resource: { buffer: output } },
+    ] });
+    const encoder = device.createCommandEncoder();
+    const firstPass = encoder.beginComputePass();
+    firstPass.setPipeline(first); firstPass.setBindGroup(0, firstGroup);
+    firstPass.dispatchWorkgroups(Math.ceil((rows * intermediateSize) / 64)); firstPass.end();
+    const secondPass = encoder.beginComputePass();
+    secondPass.setPipeline(second); secondPass.setBindGroup(0, secondGroup);
+    secondPass.dispatchWorkgroups(Math.ceil((rows * hiddenSize) / 64)); secondPass.end();
+    encoder.copyBufferToBuffer(output, 0, readback, 0, rows * hiddenSize * 4);
+    device.queue.submit([encoder.finish()]);
+    await readback.mapAsync(GPUMapMode.READ);
+    return new Float32Array(readback.getMappedRange().slice(0));
+  } finally {
+    if (readback.mapState === "mapped") readback.unmap();
+    buffers.forEach((buffer) => buffer.destroy());
+  }
+}
+
+function float32FromBase64(value: string): Float32Array {
+  const binary = atob(value);
+  if (binary.length % 4 !== 0) return new Float32Array();
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return new Float32Array(bytes.buffer);
+}
+
+function float32ToBase64(values: Float32Array): string {
+  const bytes = new Uint8Array(values.buffer, values.byteOffset, values.byteLength);
+  let binary = "";
+  const chunk = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunk));
+  }
+  return btoa(binary);
+}
+
+function hex(value: ArrayBuffer): string {
+  return [...new Uint8Array(value)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 async function runMatrixTask(size: number, seed: number): Promise<ComputeResult> {
@@ -338,7 +694,7 @@ async function runMatrixTask(size: number, seed: number): Promise<ComputeResult>
 async function multiplyWebGpu(device: GPUDevice, size: number, seed: number): Promise<number[]> {
   const elementCount = size * size;
   const byteLength = elementCount * Float32Array.BYTES_PER_ELEMENT;
-  if (byteLength > Number(device.limits.maxBufferSize)) throw new Error("La matriz no cabe en la GPU");
+  if (byteLength > Number(device.limits.maxBufferSize)) throw new Error("The matrix does not fit on the GPU");
   const matrixA = new Float32Array(elementCount);
   const matrixB = new Float32Array(elementCount);
   for (let row = 0; row < size; row += 1) {
@@ -492,7 +848,7 @@ function setConnection(kind: "online" | "offline" | "connecting", label: string)
 
 function setBusy(busy: boolean): void {
   elements.toggle.disabled = busy;
-  if (busy) elements.toggle.innerHTML = '<span class="power-symbol">◌</span><span>Preparando…</span>';
+  if (busy) elements.toggle.innerHTML = '<span class="power-symbol">◌</span><span>Preparing…</span>';
 }
 
 function setStatus(text: string): void {
@@ -523,7 +879,7 @@ function mobileName(): string {
   const platform =
     (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData?.platform ||
     navigator.platform ||
-    "Móvil";
+    "Mobile";
   return `${platform} mobile`;
 }
 
