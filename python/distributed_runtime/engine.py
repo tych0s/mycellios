@@ -762,6 +762,7 @@ class _RootTreeCapacitySnapshot:
     live_child_ids: tuple[int, ...]
     live_child_bytes: int
     projected_kv_bytes: int
+    available_physical_bytes: int | None = None
 
 
 @dataclass
@@ -3897,6 +3898,16 @@ class DistributedPipelineEngine:
         ):
             raise TypeError("root request_cache_bytes must return a positive integer")
         current_branch_bytes = self._physical_tree_live_kv_bytes(runner)
+        available_physical = getattr(runner, "available_physical_cache_bytes", None)
+        available_physical_bytes: int | None = None
+        if callable(available_physical):
+            available_physical_bytes = available_physical()
+            if (
+                not isinstance(available_physical_bytes, int)
+                or isinstance(available_physical_bytes, bool)
+                or available_physical_bytes < 0
+            ):
+                raise TypeError("root runner returned invalid physical KV availability")
         project_tree_physical = getattr(
             runner, "project_tree_incremental_physical_cache_bytes", None
         )
@@ -3927,6 +3938,11 @@ class DistributedPipelineEngine:
         projected_total = current_branch_bytes + projected_branch_bytes
         if projected_total > self.config.max_speculative_kv_bytes:
             return None
+        if (
+            available_physical_bytes is not None
+            and projected_branch_bytes > available_physical_bytes
+        ):
+            return None
         if runner.sequence_length(parent_request_id) != parent_tokens:
             raise RuntimeError("root tree projection mutated parent sequence length")
         if request_cache_bytes(parent_request_id) != parent_bytes:
@@ -3937,12 +3953,18 @@ class DistributedPipelineEngine:
             raise RuntimeError("root tree projection mutated live child identities")
         if self._physical_tree_live_kv_bytes(runner) != current_branch_bytes:
             raise RuntimeError("root tree projection mutated live child KV bytes")
+        if (
+            callable(available_physical)
+            and available_physical() != available_physical_bytes
+        ):
+            raise RuntimeError("root tree projection mutated physical KV availability")
         return _RootTreeCapacitySnapshot(
             parent_tokens=parent_tokens,
             parent_cache_bytes=parent_bytes,
             live_child_ids=live_child_ids,
             live_child_bytes=current_branch_bytes,
             projected_kv_bytes=projected_total,
+            available_physical_bytes=available_physical_bytes,
         )
 
     def _physical_tree_live_kv_bytes(self, runner: StageRunnerContract) -> int:
@@ -4302,6 +4324,17 @@ class DistributedPipelineEngine:
                 or projected_fork_bytes > remaining_bytes
             ):
                 raise RuntimeError("root FORK no longer fits its sealed KV budget")
+            available_physical = getattr(
+                runner, "available_physical_cache_bytes", None
+            )
+            if callable(available_physical):
+                available_bytes = available_physical()
+                if (
+                    not isinstance(available_bytes, int)
+                    or isinstance(available_bytes, bool)
+                    or available_bytes < projected_fork_bytes
+                ):
+                    raise RuntimeError("root FORK no longer fits physical KV pool")
             copied_bytes = fork_request(
                 command.child_request_id,
                 command.parent_request_id,

@@ -16,6 +16,12 @@ from distributed_runtime.paged_stage import (
 )
 from distributed_runtime.model import StageModelSpec, StageRunner
 from distributed_runtime.executor_abi import StageKVPhysicalAccounting
+from distributed_runtime.protocol import Frame, FrameType, TreePrepareRejection
+from distributed_runtime.stage import (
+    project_tree_capacity,
+    speculative_kv_bytes,
+    validate_speculative_kv_preflight,
+)
 
 
 def _tiny_llama(seed: int) -> LlamaModel:
@@ -153,6 +159,32 @@ class HFPagedStageRunnerTests(unittest.TestCase):
                     paged.project_request_incremental_physical_cache_bytes(1, 3),
                     paged.paged_cache.bytes_per_block,
                 )
+                capacity_config = type(
+                    "CapacityConfig",
+                    (),
+                    {
+                        "max_speculative_branches": 4,
+                        "max_speculative_branch_tokens": 32,
+                        "max_speculative_kv_bytes": (
+                            3 * paged.paged_cache.bytes_per_block
+                        ),
+                    },
+                )()
+                physical_projection = project_tree_capacity(
+                    (1, 3),
+                    parent_request_id=1,
+                    config=capacity_config,
+                    runner=paged,
+                    branch_parents={},
+                )
+                self.assertEqual(
+                    physical_projection.projected_kv_bytes,
+                    3 * paged.paged_cache.bytes_per_block,
+                )
+                self.assertEqual(
+                    physical_projection.rejection,
+                    TreePrepareRejection.NONE,
+                )
                 with self.assertRaisesRegex(ValueError, "physical preflight"):
                     paged.fork_request(
                         2,
@@ -182,6 +214,25 @@ class HFPagedStageRunnerTests(unittest.TestCase):
                 self.assertEqual(
                     paged.unique_physical_cache_bytes((1, 2)),
                     report.unique_physical_bytes,
+                )
+                self.assertEqual(
+                    speculative_kv_bytes(paged, {2: 1}),
+                    paged.paged_cache.bytes_per_block,
+                )
+                growth_config = type(
+                    "GrowthConfig",
+                    (),
+                    {
+                        "max_speculative_kv_bytes": (
+                            2 * paged.paged_cache.bytes_per_block
+                        ),
+                    },
+                )()
+                validate_speculative_kv_preflight(
+                    (Frame(FrameType.VERIFY, 0, 2, 0, 3, 0, b""),),
+                    growth_config,
+                    paged,
+                    {2: 1},
                 )
 
                 paged.end(2)
