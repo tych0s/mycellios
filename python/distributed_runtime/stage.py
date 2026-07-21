@@ -108,6 +108,64 @@ class TreeReservationBook:
     last_nonce: int | None = None
     last_parent_request_id: int | None = None
     last_step: int | None = None
+    last_mutated: bool = False
+
+
+@dataclass
+class StageBranchLedger:
+    """Separate logical request ownership from physical COW ancestry.
+
+    ``logical_owners`` is the live accounting/lifecycle relation: every
+    speculative request in one tree belongs directly to its ordinary root
+    request.  ``fork_sources`` records which *physical* request supplied the KV
+    snapshot for each fork.  The source may itself be speculative and may be
+    ended after its descendants exist; a correct COW backend keeps those
+    descendants alive through block refcounts (or independent safe copies).
+
+    Keeping these relations separate is what makes a carrier -> nested fork ->
+    carrier END -> descendant PROMOTE lifecycle possible without pretending
+    that the carrier owns the user request or subtracting it twice from the
+    speculative-KV budget.
+    """
+
+    logical_owners: dict[int, int] = field(default_factory=dict)
+    fork_sources: dict[int, int] = field(default_factory=dict)
+
+    def register(
+        self,
+        child_request_id: int,
+        *,
+        logical_owner_request_id: int,
+        fork_source_physical_request_id: int,
+    ) -> None:
+        if (
+            child_request_id in self.logical_owners
+            or child_request_id in self.fork_sources
+        ):
+            raise ValueError(
+                f"speculative request {child_request_id} is already registered"
+            )
+        if logical_owner_request_id in self.logical_owners:
+            raise ValueError("logical owner must be an ordinary root request")
+        if fork_source_physical_request_id != logical_owner_request_id:
+            source_owner = self.logical_owners.get(fork_source_physical_request_id)
+            if source_owner != logical_owner_request_id:
+                raise ValueError(
+                    "physical fork source does not belong to the logical owner"
+                )
+        self.logical_owners[child_request_id] = logical_owner_request_id
+        self.fork_sources[child_request_id] = fork_source_physical_request_id
+
+    def release(self, request_id: int) -> None:
+        self.logical_owners.pop(request_id, None)
+        self.fork_sources.pop(request_id, None)
+
+    def owned_requests(self, logical_owner_request_id: int) -> set[int]:
+        return {
+            request_id
+            for request_id, owner_request_id in self.logical_owners.items()
+            if owner_request_id == logical_owner_request_id
+        }
 
 
 @dataclass(frozen=True)
@@ -278,7 +336,10 @@ def run_stage_process(
     pending_frames: deque[Frame] = deque()
     reservation_deferred_frames: deque[Frame] = deque()
     request_admission: SingleRequestAdmission | None = None
-    branch_parents: dict[int, int] = {}
+    branch_lineage = StageBranchLedger()
+    # Kept as a local alias because the v6 capacity/validation helpers consume
+    # a Mapping. Its values are logical roots, never nested physical sources.
+    branch_parents = branch_lineage.logical_owners
     tree_reservations = TreeReservationBook()
     tree_leaf_shapes: dict[int, TreeLeafShape] = {}
     try:
@@ -419,6 +480,7 @@ def run_stage_process(
                     downstream,
                     tree_reservations,
                     tree_leaf_shapes,
+                    branch_lineage,
                 )
             elif frame.frame_type == FrameType.PROMOTE:
                 promote_stage_request(
@@ -429,6 +491,7 @@ def run_stage_process(
                     branch_parents,
                     downstream,
                     tree_leaf_shapes,
+                    branch_lineage,
                 )
             elif frame.frame_type in (
                 FrameType.ACTIVATION,
@@ -476,19 +539,19 @@ def run_stage_process(
                         token_count=frame.token_count,
                     )
             elif frame.frame_type in (FrameType.END, FrameType.CANCEL):
-                if frame.request_id in branch_parents.values():
-                    raise ValueError(
-                        f"cannot {frame.frame_type.name} request {frame.request_id} "
-                        "while it still owns speculative children"
-                    )
-                runner.end(frame.request_id)
+                metrics = end_physical_stage_request(
+                    frame.request_id,
+                    operation=frame.frame_type.name,
+                    runner=runner,
+                    request_metrics=request_metrics,
+                    branch_lineage=branch_lineage,
+                )
                 tree_leaf_shapes.pop(frame.request_id, None)
                 abandon_tree_reservation_for_request(
                     tree_reservations, frame.request_id
                 )
                 if downstream is not None:
                     send_frame(downstream, frame.frame_type, frame.request_id)
-                metrics = request_metrics.pop(frame.request_id, None)
                 if metrics is not None:
                     metrics["cell_rank_work"] = cell_rank_work_metric(runner)
                     put_metric_best_effort(
@@ -496,7 +559,6 @@ def run_stage_process(
                     )
                 if request_admission is not None:
                     request_admission.release(frame.request_id)
-                branch_parents.pop(frame.request_id, None)
             elif frame.frame_type == FrameType.PING:
                 if frame.request_id != config.pipeline_id:
                     raise ValueError("route PING belongs to another pipeline session")
@@ -524,6 +586,8 @@ def run_stage_process(
                 stopping.set()
                 tree_reservations.active = None
                 tree_leaf_shapes.clear()
+                branch_lineage.logical_owners.clear()
+                branch_lineage.fork_sources.clear()
                 if downstream is not None:
                     forward_shutdown_and_wait(
                         downstream,
@@ -907,6 +971,7 @@ def prepare_tree_capacity(
     reservations.last_nonce = quote.nonce
     reservations.last_parent_request_id = frame.request_id
     reservations.last_step = frame.step
+    reservations.last_mutated = False
     projection = project_tree_capacity(
         quote.path_lengths,
         parent_request_id=frame.request_id,
@@ -1078,6 +1143,8 @@ def cancel_tree_reservation(
         if active.consumed_forks:
             raise ValueError("cannot cancel a reservation after FORK consumption")
         reservations.active = None
+    elif reservations.last_mutated:
+        raise ValueError("cannot cancel a reservation after FORK consumption")
     if downstream is not None:
         send_frame(
             downstream,
@@ -1097,78 +1164,123 @@ def abandon_tree_reservation_for_request(
         reservations.active = None
 
 
-def fork_stage_request(
-    frame: Frame,
+def _resolve_branch_lineage(
+    branch_parents: dict[int, int],
+    branch_lineage: StageBranchLedger | None,
+) -> StageBranchLedger:
+    if branch_lineage is None:
+        # Compatibility for direct v6 helper callers. The live stage owns one
+        # persistent ledger, while legacy tests can continue passing the map.
+        return StageBranchLedger(logical_owners=branch_parents)
+    if branch_lineage.logical_owners is not branch_parents:
+        raise ValueError("branch lineage does not own the supplied branch map")
+    return branch_lineage
+
+
+def _discard_failed_physical_fork(
+    child_request_id: int,
+    runner: StageRunnerContract,
+    request_metrics: dict[int, dict[str, Any]],
+    branch_lineage: StageBranchLedger,
+) -> None:
+    request_metrics.pop(child_request_id, None)
+    branch_lineage.release(child_request_id)
+    runner.end(child_request_id)
+
+
+def fork_physical_stage_request(
+    *,
+    child_request_id: int,
+    fork_source_physical_request_id: int,
+    logical_owner_request_id: int,
     config: StageProcessConfig,
     runner: StageRunnerContract,
     request_metrics: dict[int, dict[str, Any]],
-    branch_parents: dict[int, int],
-    downstream: socket.socket | None,
-    tree_reservations: TreeReservationBook | None = None,
-    tree_leaf_shapes: dict[int, TreeLeafShape] | None = None,
-) -> None:
-    """Apply one ordered FORK(child,parent) to this stage's local KV state."""
+    branch_lineage: StageBranchLedger,
+) -> dict[str, Any]:
+    """Create one local KV lane while keeping ownership and COW source distinct.
+
+    This is deliberately wire-agnostic. Protocol v6 calls it with source ==
+    owner and therefore retains its flat-tree contract. PrefixWave can call the
+    same primitive with a speculative carrier as ``fork_source`` while every
+    created lane remains logically owned and budgeted by the ordinary root.
+    """
 
     if config.max_speculative_branches == 0:
         raise ValueError("FORK is disabled by the sealed stage contract")
-    child_request_id = frame.request_id
-    parent_request_id = decode_branch_request_id(frame)
-    reservation = None if tree_reservations is None else tree_reservations.active
-    quoted_path_length: int | None = None
-    if tree_reservations is not None and reservation is None:
-        raise ValueError("FORK requires an active committed tree reservation")
-    if reservation is not None:
-        if not reservation.committed:
-            raise ValueError("FORK cannot consume an uncommitted tree reservation")
-        if tree_leaf_shapes is None:
-            raise ValueError("committed tree FORK requires a leaf-shape ledger")
-        if parent_request_id != reservation.parent_request_id:
-            raise ValueError("FORK parent does not match committed tree reservation")
-        if reservation.consumed_forks >= len(reservation.path_lengths):
-            raise ValueError("FORK exceeds committed tree reservation count")
-        quoted_path_length = reservation.path_lengths[reservation.consumed_forks]
-    if child_request_id == parent_request_id:
-        raise ValueError("FORK child and parent request IDs must differ")
-    if parent_request_id not in request_metrics:
+    if child_request_id == fork_source_physical_request_id:
+        raise ValueError("FORK child and physical source request IDs must differ")
+    if child_request_id == logical_owner_request_id:
+        raise ValueError("FORK child and logical owner request IDs must differ")
+    if logical_owner_request_id in branch_lineage.logical_owners:
+        raise ValueError("FORK logical owner must be an ordinary root request")
+    if logical_owner_request_id not in request_metrics:
         raise ValueError(
-            f"FORK parent request {parent_request_id} is not active on this stage"
+            f"FORK logical owner request {logical_owner_request_id} is not active"
         )
-    if child_request_id in request_metrics or child_request_id in branch_parents:
+    if fork_source_physical_request_id not in request_metrics:
+        raise ValueError(
+            "FORK physical source request "
+            f"{fork_source_physical_request_id} is not active on this stage"
+        )
+    if fork_source_physical_request_id != logical_owner_request_id:
+        source_owner = branch_lineage.logical_owners.get(
+            fork_source_physical_request_id
+        )
+        if source_owner != logical_owner_request_id:
+            raise ValueError("FORK physical source is outside the logical tree")
+    source_metrics = request_metrics[fork_source_physical_request_id]
+    source_frames = source_metrics.get("frames")
+    if not isinstance(source_frames, int) or isinstance(source_frames, bool):
+        raise TypeError("FORK physical source has invalid frame metrics")
+    if (
+        child_request_id in request_metrics
+        or child_request_id in branch_lineage.logical_owners
+        or child_request_id in branch_lineage.fork_sources
+    ):
         raise ValueError(f"FORK child request {child_request_id} is already active")
-    if len(branch_parents) >= config.max_speculative_branches:
+    if len(branch_lineage.logical_owners) >= config.max_speculative_branches:
         raise ValueError(
             "FORK exceeds max_speculative_branches: "
-            f"{len(branch_parents) + 1} > {config.max_speculative_branches}"
+            f"{len(branch_lineage.logical_owners) + 1} > "
+            f"{config.max_speculative_branches}"
         )
-    parent_tokens = runner.sequence_length(parent_request_id)
-    if parent_tokens < 1:
-        raise ValueError("FORK requires a non-empty prefilled parent KV cache")
-    if parent_tokens > config.max_speculative_branch_tokens:
+
+    source_tokens = runner.sequence_length(fork_source_physical_request_id)
+    if source_tokens < 1:
         raise ValueError(
-            "FORK parent cache exceeds max_speculative_branch_tokens: "
-            f"{parent_tokens} > {config.max_speculative_branch_tokens}"
+            "FORK requires a non-empty prefilled physical source KV cache"
+        )
+    if source_tokens > config.max_speculative_branch_tokens:
+        raise ValueError(
+            "FORK physical source cache exceeds max_speculative_branch_tokens: "
+            f"{source_tokens} > {config.max_speculative_branch_tokens}"
         )
     request_cache_bytes = getattr(runner, "request_cache_bytes", None)
     fork_request = getattr(runner, "fork_request", None)
     if not callable(request_cache_bytes) or not callable(fork_request):
         raise TypeError("stage runner cannot preflight and fork request KV state")
-    current_branch_bytes = speculative_kv_bytes(runner, branch_parents)
-    parent_cache_bytes = request_cache_bytes(parent_request_id)
-    if not isinstance(parent_cache_bytes, int) or isinstance(parent_cache_bytes, bool):
+    current_branch_bytes = speculative_kv_bytes(
+        runner, branch_lineage.logical_owners
+    )
+    source_cache_bytes = request_cache_bytes(fork_source_physical_request_id)
+    if not isinstance(source_cache_bytes, int) or isinstance(
+        source_cache_bytes, bool
+    ):
         raise TypeError("stage runner request_cache_bytes must return an integer")
     remaining_bytes = config.max_speculative_kv_bytes - current_branch_bytes
-    if parent_cache_bytes < 1:
-        raise ValueError("FORK parent did not materialise a measurable KV cache")
+    if source_cache_bytes < 1:
+        raise ValueError("FORK physical source has no measurable KV cache")
     project_tree_physical = getattr(
         runner, "project_tree_incremental_physical_cache_bytes", None
     )
     if callable(project_tree_physical):
         projected_fork_bytes = project_tree_physical(
-            parent_request_id,
+            fork_source_physical_request_id,
             delta_tokens_by_leaf=(0,),
         )
     else:
-        projected_fork_bytes = parent_cache_bytes
+        projected_fork_bytes = source_cache_bytes
     if (
         not isinstance(projected_fork_bytes, int)
         or isinstance(projected_fork_bytes, bool)
@@ -1190,29 +1302,41 @@ def fork_stage_request(
             or available_bytes < projected_fork_bytes
         ):
             raise ValueError("FORK exceeds available physical KV pool capacity")
+
     copied_kv_bytes = fork_request(
         child_request_id,
-        parent_request_id,
+        fork_source_physical_request_id,
         max_cache_bytes=remaining_bytes,
     )
     if not isinstance(copied_kv_bytes, int) or isinstance(copied_kv_bytes, bool):
-        # Do not continue after an executor violates the sealed branch ABI.
         runner.end(child_request_id)
         raise TypeError("stage runner fork_request must return copied KV bytes")
     if copied_kv_bytes < 0:
         runner.end(child_request_id)
         raise ValueError("stage runner returned negative copied KV bytes")
-    branch_parents[child_request_id] = parent_request_id
     try:
-        observed_branch_bytes = speculative_kv_bytes(runner, branch_parents)
+        branch_lineage.register(
+            child_request_id,
+            logical_owner_request_id=logical_owner_request_id,
+            fork_source_physical_request_id=fork_source_physical_request_id,
+        )
     except BaseException:
-        branch_parents.pop(child_request_id, None)
         runner.end(child_request_id)
+        raise
+    try:
+        observed_branch_bytes = speculative_kv_bytes(
+            runner, branch_lineage.logical_owners
+        )
+    except BaseException:
+        _discard_failed_physical_fork(
+            child_request_id, runner, request_metrics, branch_lineage
+        )
         raise
     observed_increment = observed_branch_bytes - current_branch_bytes
     if observed_increment != projected_fork_bytes:
-        branch_parents.pop(child_request_id, None)
-        runner.end(child_request_id)
+        _discard_failed_physical_fork(
+            child_request_id, runner, request_metrics, branch_lineage
+        )
         raise RuntimeError(
             "stage runner physical FORK allocation changed after preflight: "
             f"{observed_increment} != {projected_fork_bytes}"
@@ -1224,33 +1348,86 @@ def fork_stage_request(
             report_copied = getattr(report, "copied_bytes", None)
             report_reserved = getattr(report, "newly_reserved_bytes", None)
             if report_copied != copied_kv_bytes:
-                branch_parents.pop(child_request_id, None)
-                runner.end(child_request_id)
+                _discard_failed_physical_fork(
+                    child_request_id, runner, request_metrics, branch_lineage
+                )
                 raise RuntimeError("stage runner FORK report copied-byte mismatch")
             if report_reserved != observed_increment:
-                branch_parents.pop(child_request_id, None)
-                runner.end(child_request_id)
+                _discard_failed_physical_fork(
+                    child_request_id, runner, request_metrics, branch_lineage
+                )
                 raise RuntimeError("stage runner FORK report physical-byte mismatch")
 
-    parent_metrics = request_metrics[parent_request_id]
-    child_metrics = dict(parent_metrics)
-    child_metrics.update(
-        {
-            "compute_ms": 0,
-            "bytes_out": 0,
-            "tokens": parent_tokens,
-            "model_forward_calls": 0,
-            "physical_batch_calls": 0,
-            "physical_batch_items": 0,
-            "max_physical_batch_size": 0,
-            "branch_parent_request_id": parent_request_id,
-            "branch_inherited_frames": int(parent_metrics["frames"]),
-            "branch_inherited_tokens": parent_tokens,
-            "fork_copied_kv_bytes": copied_kv_bytes,
-            "fork_new_physical_kv_bytes": observed_increment,
-        }
+    try:
+        child_metrics = dict(source_metrics)
+        child_metrics.update(
+            {
+                "compute_ms": 0,
+                "bytes_out": 0,
+                "tokens": source_tokens,
+                "model_forward_calls": 0,
+                "physical_batch_calls": 0,
+                "physical_batch_items": 0,
+                "max_physical_batch_size": 0,
+                # Legacy metric retained as logical ownership, not COW ancestry.
+                "branch_parent_request_id": logical_owner_request_id,
+                "branch_logical_owner_request_id": logical_owner_request_id,
+                "branch_fork_source_request_id": fork_source_physical_request_id,
+                "branch_inherited_frames": source_frames,
+                "branch_inherited_tokens": source_tokens,
+                "fork_copied_kv_bytes": copied_kv_bytes,
+                "fork_new_physical_kv_bytes": observed_increment,
+            }
+        )
+        request_metrics[child_request_id] = child_metrics
+    except BaseException:
+        _discard_failed_physical_fork(
+            child_request_id, runner, request_metrics, branch_lineage
+        )
+        raise
+    return child_metrics
+
+
+def fork_stage_request(
+    frame: Frame,
+    config: StageProcessConfig,
+    runner: StageRunnerContract,
+    request_metrics: dict[int, dict[str, Any]],
+    branch_parents: dict[int, int],
+    downstream: socket.socket | None,
+    tree_reservations: TreeReservationBook | None = None,
+    tree_leaf_shapes: dict[int, TreeLeafShape] | None = None,
+    branch_lineage: StageBranchLedger | None = None,
+) -> None:
+    """Apply one ordered protocol-v6 flat FORK(child,parent)."""
+
+    child_request_id = frame.request_id
+    parent_request_id = decode_branch_request_id(frame)
+    reservation = None if tree_reservations is None else tree_reservations.active
+    quoted_path_length: int | None = None
+    if tree_reservations is not None and reservation is None:
+        raise ValueError("FORK requires an active committed tree reservation")
+    if reservation is not None:
+        if not reservation.committed:
+            raise ValueError("FORK cannot consume an uncommitted tree reservation")
+        if tree_leaf_shapes is None:
+            raise ValueError("committed tree FORK requires a leaf-shape ledger")
+        if parent_request_id != reservation.parent_request_id:
+            raise ValueError("FORK parent does not match committed tree reservation")
+        if reservation.consumed_forks >= len(reservation.path_lengths):
+            raise ValueError("FORK exceeds committed tree reservation count")
+        quoted_path_length = reservation.path_lengths[reservation.consumed_forks]
+
+    lineage = _resolve_branch_lineage(branch_parents, branch_lineage)
+    child_metrics = fork_physical_stage_request(
+        child_request_id=child_request_id,
+        fork_source_physical_request_id=parent_request_id,
+        logical_owner_request_id=parent_request_id,
+        config=config,
+        runner=runner,
+        request_metrics=request_metrics,
+        branch_lineage=lineage,
     )
-    request_metrics[child_request_id] = child_metrics
     if downstream is not None:
         child_metrics["bytes_out"] += send_frame(
             downstream,
@@ -1269,6 +1446,7 @@ def fork_stage_request(
         reservation.consumed_forks += 1
         reservation.quoted_children[child_request_id] = 1 + quoted_path_length
         reservation.deadline_at = time.monotonic() + TREE_RESERVATION_TTL_SECONDS
+        tree_reservations.last_mutated = True
 
 
 def consume_tree_reservation_verifies(
@@ -1310,6 +1488,79 @@ def consume_tree_reservation_verifies(
     return False
 
 
+def end_physical_stage_request(
+    request_id: int,
+    *,
+    operation: str,
+    runner: StageRunnerContract,
+    request_metrics: dict[int, dict[str, Any]],
+    branch_lineage: StageBranchLedger,
+) -> dict[str, Any] | None:
+    """End one lane without treating historical physical ancestry as ownership."""
+
+    if request_id in branch_lineage.logical_owners.values():
+        raise ValueError(
+            f"cannot {operation} request {request_id} while it still logically "
+            "owns speculative branches"
+        )
+    runner.end(request_id)
+    metrics = request_metrics.pop(request_id, None)
+    branch_lineage.release(request_id)
+    return metrics
+
+
+def promote_physical_stage_descendant(
+    *,
+    logical_owner_request_id: int,
+    descendant_request_id: int,
+    config: StageProcessConfig,
+    runner: StageRunnerContract,
+    request_metrics: dict[int, dict[str, Any]],
+    branch_lineage: StageBranchLedger,
+) -> dict[str, Any]:
+    """Move the sole surviving descendant into its ordinary root in O(1)."""
+
+    if config.max_speculative_branches == 0:
+        raise ValueError("PROMOTE is disabled by the sealed stage contract")
+    if descendant_request_id == logical_owner_request_id:
+        raise ValueError("PROMOTE owner and descendant request IDs must differ")
+    if logical_owner_request_id in branch_lineage.logical_owners:
+        raise ValueError("PROMOTE logical owner must be an ordinary root request")
+    if logical_owner_request_id not in request_metrics:
+        raise ValueError(
+            f"PROMOTE owner request {logical_owner_request_id} is not active"
+        )
+    if descendant_request_id not in request_metrics:
+        raise ValueError(
+            f"PROMOTE descendant request {descendant_request_id} is not active"
+        )
+    if (
+        branch_lineage.logical_owners.get(descendant_request_id)
+        != logical_owner_request_id
+    ):
+        raise ValueError("PROMOTE descendant is outside the logical tree")
+    live_owned = branch_lineage.owned_requests(logical_owner_request_id)
+    if live_owned != {descendant_request_id}:
+        raise ValueError(
+            "PROMOTE requires the selected descendant to be the sole live branch"
+        )
+
+    promote_request = getattr(runner, "promote_request", None)
+    if not callable(promote_request):
+        raise TypeError("stage runner cannot promote request KV state")
+    promote_request(logical_owner_request_id, descendant_request_id)
+    selected_metrics = request_metrics.pop(descendant_request_id)
+    branch_lineage.release(descendant_request_id)
+    selected_metrics["branch_promotions"] = int(
+        selected_metrics.get("branch_promotions", 0)
+    ) + 1
+    selected_metrics.pop("branch_parent_request_id", None)
+    selected_metrics.pop("branch_logical_owner_request_id", None)
+    selected_metrics.pop("branch_fork_source_request_id", None)
+    request_metrics[logical_owner_request_id] = selected_metrics
+    return selected_metrics
+
+
 def promote_stage_request(
     frame: Frame,
     config: StageProcessConfig,
@@ -1318,47 +1569,23 @@ def promote_stage_request(
     branch_parents: dict[int, int],
     downstream: socket.socket | None,
     tree_leaf_shapes: dict[int, TreeLeafShape] | None = None,
+    branch_lineage: StageBranchLedger | None = None,
 ) -> None:
-    """Apply one ordered PROMOTE(parent,child) without copying selected KV."""
+    """Apply one ordered protocol-v6 PROMOTE(parent,child)."""
 
-    if config.max_speculative_branches == 0:
-        raise ValueError("PROMOTE is disabled by the sealed stage contract")
     parent_request_id = frame.request_id
     child_request_id = decode_branch_request_id(frame)
-    if child_request_id == parent_request_id:
-        raise ValueError("PROMOTE parent and child request IDs must differ")
-    if parent_request_id not in request_metrics:
-        raise ValueError(f"PROMOTE parent request {parent_request_id} is not active")
-    if child_request_id not in request_metrics:
-        raise ValueError(f"PROMOTE child request {child_request_id} is not active")
-    if branch_parents.get(child_request_id) != parent_request_id:
-        raise ValueError("PROMOTE child is not a direct child of the parent")
     if tree_leaf_shapes is not None and child_request_id not in tree_leaf_shapes:
         raise ValueError("PROMOTE child is not bound to a committed tree quote")
-    children = {
-        child
-        for child, parent in branch_parents.items()
-        if parent == parent_request_id
-    }
-    if children != {child_request_id}:
-        raise ValueError("PROMOTE requires the selected child to be the only sibling")
-    if child_request_id in branch_parents.values():
-        raise ValueError("PROMOTE requires a leaf child with no active descendants")
-
-    promote_request = getattr(runner, "promote_request", None)
-    if not callable(promote_request):
-        raise TypeError("stage runner cannot promote request KV state")
-    promote_request(parent_request_id, child_request_id)
-    selected_metrics = request_metrics.pop(child_request_id)
-    branch_parents.pop(child_request_id)
-    selected_metrics["branch_promotions"] = int(
-        selected_metrics.get("branch_promotions", 0)
-    ) + 1
-    if parent_request_id in branch_parents:
-        selected_metrics["branch_parent_request_id"] = branch_parents[parent_request_id]
-    else:
-        selected_metrics.pop("branch_parent_request_id", None)
-    request_metrics[parent_request_id] = selected_metrics
+    lineage = _resolve_branch_lineage(branch_parents, branch_lineage)
+    selected_metrics = promote_physical_stage_descendant(
+        logical_owner_request_id=parent_request_id,
+        descendant_request_id=child_request_id,
+        config=config,
+        runner=runner,
+        request_metrics=request_metrics,
+        branch_lineage=lineage,
+    )
     if tree_leaf_shapes is not None:
         tree_leaf_shapes.pop(child_request_id, None)
     if downstream is not None:
@@ -1374,7 +1601,13 @@ def speculative_kv_bytes(
     runner: StageRunnerContract,
     branch_parents: Mapping[int, int],
 ) -> int:
-    """Measure all live speculative leaf/subtree KV before another allocation."""
+    """Measure physical KV beyond the ordinary logical-owner roots.
+
+    Mapping values must be logical roots, not immediate fork sources. Thus a
+    nested tree is deduplicated as ``union(root + live lanes) - union(root)``;
+    ending an intermediate carrier cannot make its descendants disappear from
+    the budget.
+    """
 
     if not branch_parents:
         return 0
@@ -1552,6 +1785,13 @@ def collect_compatible_activation_frames(
         # or accepting a compatible tensor; otherwise a parent activation could
         # mutate the snapshot while TREE_PREPARE is awaiting its route result.
         if tree_reservations is not None:
+            if tree_reservation_defers_frame(
+                candidate,
+                tree_reservations,
+                {} if branch_parents is None else branch_parents,
+            ):
+                pending_frames.appendleft(candidate)
+                break
             validate_tree_reservation_frame_order(
                 candidate,
                 tree_reservations,
