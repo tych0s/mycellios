@@ -1,23 +1,60 @@
+import { readFile } from "node:fs/promises";
+import { isAbsolute, resolve } from "node:path";
 import { loadCoordinatorConfig } from "../core/config.js";
-import { AutomaticModelActivationManager } from "./model-activation-manager.js";
+import { parseAutoDistributionConfig } from "../distribution/auto-distribute.js";
+import {
+  buildConnectedExecutorActivationSnapshot,
+  resolveConnectedExecutorAgent,
+} from "./connected-executor-activation.js";
+import {
+  AutomaticModelActivationManager,
+  DynamicModelActivationManager,
+} from "./model-activation-manager.js";
 import { createCoordinator } from "./server.js";
 
 const config = loadCoordinatorConfig();
 const activationConfigPath = process.env.MYCELLIOS_AUTO_DISTRIBUTE_CONFIG?.trim();
-const activationManager = activationConfigPath
-  ? await AutomaticModelActivationManager.fromFile(activationConfigPath)
+const dynamicWorkerActivation = process.env.MYCELLIOS_DYNAMIC_WORKER_ACTIVATION?.trim() === "1";
+const absoluteActivationConfigPath = activationConfigPath
+  ? isAbsolute(activationConfigPath) ? activationConfigPath : resolve(process.cwd(), activationConfigPath)
+  : undefined;
+const baseActivationConfig = absoluteActivationConfigPath
+  ? parseAutoDistributionConfig(JSON.parse(await readFile(absoluteActivationConfigPath, "utf8")) as unknown)
+  : undefined;
+const activationManager = baseActivationConfig && !dynamicWorkerActivation
+  ? new AutomaticModelActivationManager(baseActivationConfig)
   : undefined;
 const runtime = await createCoordinator(config, {
   logger: true,
   ...(activationManager ? { activationManager } : {}),
+  ...(baseActivationConfig && dynamicWorkerActivation
+    ? {
+        activationManagerFactory: ({ store, hub }) => new DynamicModelActivationManager({
+          snapshot: () => buildConnectedExecutorActivationSnapshot(
+            baseActivationConfig,
+            store.listWorkers(),
+            hub.connectedWorkerIds(),
+          ),
+          resolveManagedAgent: (nodeId, launch) => resolveConnectedExecutorAgent(
+            store.listWorkers(),
+            hub.connectedWorkerIds(),
+            hub,
+            nodeId,
+            launch,
+          ),
+        }),
+      }
+    : {}),
 });
 
 await runtime.app.listen({ host: config.host, port: config.port });
 runtime.app.log.info(
   `mycellios coordinator listening on http://${config.host}:${config.port}`,
 );
-if (activationManager) {
-  runtime.app.log.info(`automatic model activation enabled with ${activationConfigPath}`);
+if (baseActivationConfig) {
+  runtime.app.log.info(
+    `${dynamicWorkerActivation ? "dynamic worker" : "static"} model activation enabled with ${activationConfigPath}`,
+  );
 }
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
