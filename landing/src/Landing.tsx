@@ -24,6 +24,7 @@ import { useEffect, useRef, useState, type CSSProperties, type PointerEvent } fr
 import brandIcon from "../../src/renderer/assets/mycellios-icon.png";
 import efficiencyCurve from "./assets/efficiency-curve-ai.webp";
 import myceliumNetwork from "./assets/mycelium-network.jpg";
+import { MyceliumHero } from "./MyceliumHero";
 
 const EMAIL = "hello@mycellios.com";
 const RELEASE_BASE = "https://github.com/tych0s/mycellios/download";
@@ -428,9 +429,11 @@ function Landing() {
       <header className="nav-shell"><nav className="nav container" aria-label={t.nav.aria}><Brand homeLabel={t.home} /><div className="nav-links"><a href="#vision">{t.nav.vision}</a><a href="#architecture">{t.nav.architecture}</a><a href="#evidence">{t.nav.evidence}</a></div><div className="nav-actions"><a className="nav-cta" href="#install">{t.nav.join} <Download size={15} /></a></div></nav></header>
 
       <main>
-        <section className="hero container">
-          <div className="hero-copy"><div className="availability"><span /><strong>EARLY NETWORK</strong><i /> {t.hero.status}</div><h1>{t.hero.line1}<br />{t.hero.line2}<br /><em>{t.hero.line3}</em></h1><p>{t.hero.copy}</p><div className="hero-actions"><a className="button button-primary" href="#install">{t.hero.primary} <Download size={17} /></a><a className="button button-secondary" href="#architecture">{t.hero.secondary} <ArrowDownRight size={17} /></a></div><div className="hero-footnote"><ShieldCheck size={15} /><span>{t.hero.footnote}</span></div></div>
-          <NetworkHero text={t.visual} />
+        <section className="hero">
+          <MyceliumHero />
+          <div className="hero-inner container">
+            <div className="hero-copy"><div className="availability"><span /><strong>EARLY NETWORK</strong><i /> {t.hero.status}</div><h1>{t.hero.line1}<br />{t.hero.line2}<br /><em>{t.hero.line3}</em></h1><p>{t.hero.copy}</p><div className="hero-actions"><a className="button button-primary" href="#install">{t.hero.primary} <Download size={17} /></a><a className="button button-secondary" href="#architecture">{t.hero.secondary} <ArrowDownRight size={17} /></a></div><div className="hero-footnote"><ShieldCheck size={15} /><span>{t.hero.footnote}</span></div></div>
+          </div>
         </section>
 
         <section className="signal-strip" aria-label={t.nav.vision}><div className="signal-track">{t.signals.map((item) => <span key={item}>{item}<i /></span>)}</div></section>
