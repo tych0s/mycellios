@@ -616,6 +616,7 @@ class DistributedOpenAIServer:
                                 "ttft_ms": output.ttft_ms,
                                 "tpot_ms": output.tpot_ms,
                                 "pipeline_ms": output.total_ms,
+                                "reused_kv_tokens": output.reused_kv_tokens,
                                 "output_token_ids_sha256": output_token_ids_sha256(
                                     output.token_ids
                                 ),
