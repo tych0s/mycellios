@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import hashlib
+from itertools import combinations
 import json
 import math
 from pathlib import Path
@@ -571,6 +572,21 @@ class _Placement:
     replicas: tuple[ResidentExpertReplica, ...]
     resident_bytes_by_owner: tuple[tuple[str, int], ...]
     capacity_lower_bound_owners: int
+    strategy: str
+    minimum_owner_count_proven: bool
+    search_states_evaluated: int
+    search_limit_reached: bool
+    owner_subset_strategy: str
+    owner_subsets_evaluated: int
+    owner_subset_total: int
+    owner_subset_enumeration_complete: bool
+
+
+@dataclass(frozen=True)
+class _OwnerSubsetPlacement:
+    owners: tuple[OwnerInput, ...]
+    records_by_owner: tuple[tuple[ExpertRecord, ...], ...]
+    strategy: str
 
 
 def _owner_link_values(
@@ -653,19 +669,11 @@ def _place_all_experts(
     # top-k on every owner would reject valid split routes, so each candidate is
     # charged only for its peak observed coactivation count. Operator workspace
     # remains explicitly uncalibrated in this synthetic input schema.
-    dynamic_bytes_per_expert = (
+    dynamic_bytes_per_assignment = (
         3
-        * scenario.wave.positions
         * scenario.model.activation_elements
         * scenario.model.activation_dtype_bytes
     )
-    static_capacity_after_one_route = {
-        owner.node_id: max(
-            0,
-            owner.expert_capacity_bytes - dynamic_bytes_per_expert,
-        )
-        for owner in scenario.owners
-    }
     # Capacity first preserves the minimum-owner packing bound. Among equal
     # domestic capacities, prefer the faster measured GPU/link instead of an
     # arbitrary lexical id.
@@ -673,7 +681,7 @@ def _place_all_experts(
         sorted(
             scenario.owners,
             key=lambda owner: (
-                -static_capacity_after_one_route[owner.node_id],
+                -owner.expert_capacity_bytes,
                 _owner_speed_score(scenario, owner),
                 owner.node_id,
             ),
@@ -683,7 +691,7 @@ def _place_all_experts(
     cumulative = 0
     lower_bound = 0
     for owner in ordered:
-        cumulative += static_capacity_after_one_route[owner.node_id]
+        cumulative += owner.expert_capacity_bytes
         lower_bound += 1
         if cumulative >= total_bytes:
             break
@@ -735,32 +743,218 @@ def _place_all_experts(
     ):
         raise RuntimeError("co-routing placement groups lost or repeated an expert")
 
-    observed_edges = tuple(
-        frozenset(
-            ExpertKey(
-                layer,
-                (
-                    layer + token * scenario.model.top_k + slot
+    observed_edges_by_layer = tuple(
+        tuple(
+            frozenset(
+                ExpertKey(
+                    layer,
+                    (
+                        layer + token * scenario.model.top_k + slot
+                    )
+                    % scenario.wave.routing_union_experts_per_layer,
                 )
-                % scenario.wave.routing_union_experts_per_layer,
+                for slot in range(scenario.model.top_k)
             )
-            for slot in range(scenario.model.top_k)
+            for token in range(scenario.wave.positions)
         )
         for layer in range(scenario.model.sparse_layers)
-        for token in range(scenario.wave.positions)
     )
 
-    def peak_coactivation(keys: set[ExpertKey]) -> int:
+    def peak_assignment_count(keys: set[ExpertKey]) -> int:
         return max(
-            (len(keys & edge) for edge in observed_edges),
+            (
+                sum(len(keys & edge) for edge in layer_edges)
+                for layer_edges in observed_edges_by_layer
+            ),
             default=0,
         )
 
-    for owner_count in range(lower_bound, len(ordered) + 1):
-        selected = ordered[:owner_count]
+    # The coactivation-first greedy is intentionally kept as the fast path: it
+    # produces the established placement for the reference scenario.  It can,
+    # however, paint itself into a corner on heterogeneous cards.  The bounded
+    # exact repair below assigns individual experts and proves feasibility (or
+    # infeasibility) for every state it fully explores.  A global bound keeps a
+    # pathological input from turning this closed-schema simulator into an
+    # unbounded bin-packing job.
+    exact_key_limit = 64
+    exact_state_limit = 200_000
+    owner_subset_exact_limit = 256
+    owner_subset_fallback_limit = 256
+    exact_states_total = 0
+    any_assignment_search_cut_off = False
+
+    assignment_count_by_key: dict[ExpertKey, int] = {
+        key: 0 for key in records_by_key
+    }
+    coactivation_by_pair: dict[tuple[ExpertKey, ExpertKey], int] = {}
+    for layer_edges in observed_edges_by_layer:
+        for edge in layer_edges:
+            ordered_edge = tuple(sorted(edge))
+            for key in ordered_edge:
+                assignment_count_by_key[key] += 1
+            for left_index, left in enumerate(ordered_edge):
+                for right in ordered_edge[left_index + 1 :]:
+                    pair = (left, right)
+                    coactivation_by_pair[pair] = (
+                        coactivation_by_pair.get(pair, 0) + 1
+                    )
+
+    exact_record_order = tuple(
+        record for group in placement_groups for record in group
+    )
+
+    def exact_repair(
+        selected: Sequence[OwnerInput],
+    ) -> tuple[str, tuple[tuple[ExpertRecord, ...], ...] | None, int]:
+        """Return ``feasible``, ``infeasible`` or ``cutoff`` plus assignments."""
+
+        nonlocal exact_states_total
+        # This necessary lower bound is cheap and works at any model size. At
+        # least one resident expert is active, so some owner must reserve the
+        # smallest observed per-expert route in addition to all static weights.
+        # It proves the reference six-owner attempt impossible (those six GPUs
+        # are already exactly full of weights) without invoking backtracking.
+        minimum_route_bytes = (
+            min(assignment_count_by_key.values(), default=0)
+            * dynamic_bytes_per_assignment
+        )
+        if sum(owner.expert_capacity_bytes for owner in selected) < (
+            total_bytes + minimum_route_bytes
+        ):
+            return "infeasible", None, 0
+        if len(exact_record_order) > exact_key_limit:
+            return "cutoff", None, 0
+        remaining_state_budget = exact_state_limit - exact_states_total
+        if remaining_state_budget <= 0:
+            return "cutoff", None, 0
+
+        owner_count = len(selected)
+        owner_static = [0] * owner_count
+        owner_layer_assignments = [
+            [0] * scenario.model.sparse_layers for _ in selected
+        ]
+        owner_keys: list[set[ExpertKey]] = [set() for _ in selected]
+        owner_records: list[list[ExpertRecord]] = [[] for _ in selected]
+        dead_states: set[tuple[int, tuple[int, ...]]] = set()
+        owner_masks = [0] * owner_count
+        states = 0
+        cut_off = False
+
+        def projected_bytes(owner_index: int, record: ExpertRecord) -> int:
+            layer = record.key.layer
+            projected_layer_peak = max(
+                max(owner_layer_assignments[owner_index], default=0),
+                owner_layer_assignments[owner_index][layer]
+                + assignment_count_by_key[record.key],
+            )
+            return (
+                owner_static[owner_index]
+                + record.byte_size
+                + projected_layer_peak * dynamic_bytes_per_assignment
+            )
+
+        def affinity(owner_index: int, key: ExpertKey) -> int:
+            score = 0
+            for resident_key in owner_keys[owner_index]:
+                pair = tuple(sorted((key, resident_key)))
+                score += coactivation_by_pair.get(pair, 0)
+            return score
+
+        def search(record_index: int) -> bool:
+            nonlocal states, cut_off
+            if states >= remaining_state_budget:
+                cut_off = True
+                return False
+            states += 1
+            if record_index == len(exact_record_order):
+                return True
+
+            state = (record_index, tuple(owner_masks))
+            if state in dead_states:
+                return False
+
+            record = exact_record_order[record_index]
+            candidates = [
+                owner_index
+                for owner_index, owner in enumerate(selected)
+                if projected_bytes(owner_index, record)
+                <= owner.expert_capacity_bytes
+            ]
+            candidates.sort(
+                key=lambda owner_index: (
+                    -affinity(owner_index, record.key),
+                    projected_bytes(owner_index, record)
+                    / selected[owner_index].expert_capacity_bytes,
+                    _owner_speed_score(scenario, selected[owner_index]),
+                    owner_static[owner_index],
+                    selected[owner_index].node_id,
+                )
+            )
+
+            # Owners with identical capacity/performance/current contents are
+            # symmetric for feasibility. Exploring only one avoids factorial
+            # duplication without changing the result.
+            seen_owner_states: set[tuple[object, ...]] = set()
+            for owner_index in candidates:
+                owner = selected[owner_index]
+                owner_signature = (
+                    owner.expert_capacity_bytes,
+                    _owner_speed_score(scenario, owner),
+                    owner_static[owner_index],
+                    tuple(owner_layer_assignments[owner_index]),
+                    owner_masks[owner_index],
+                )
+                if owner_signature in seen_owner_states:
+                    continue
+                seen_owner_states.add(owner_signature)
+
+                layer = record.key.layer
+                assignment_delta = assignment_count_by_key[record.key]
+                owner_static[owner_index] += record.byte_size
+                owner_layer_assignments[owner_index][layer] += assignment_delta
+                owner_keys[owner_index].add(record.key)
+                owner_records[owner_index].append(record)
+                owner_masks[owner_index] |= 1 << record_index
+
+                if search(record_index + 1):
+                    return True
+
+                owner_masks[owner_index] &= ~(1 << record_index)
+                owner_records[owner_index].pop()
+                owner_keys[owner_index].remove(record.key)
+                owner_layer_assignments[owner_index][layer] -= assignment_delta
+                owner_static[owner_index] -= record.byte_size
+                if cut_off:
+                    return False
+
+            dead_states.add(state)
+            return False
+
+        feasible = search(0)
+        exact_states_total += states
+        if feasible:
+            return (
+                "feasible",
+                tuple(tuple(items) for items in owner_records),
+                states,
+            )
+        return ("cutoff" if cut_off else "infeasible"), None, states
+
+    ordered_index = {
+        owner.node_id: index for index, owner in enumerate(ordered)
+    }
+
+    def normalize_subset(
+        selected: Sequence[OwnerInput],
+    ) -> tuple[OwnerInput, ...]:
+        return tuple(sorted(selected, key=lambda owner: ordered_index[owner.node_id]))
+
+    def greedy_placement(
+        selected: Sequence[OwnerInput],
+    ) -> _OwnerSubsetPlacement | None:
         used = {owner.node_id: 0 for owner in selected}
         placed_keys = {owner.node_id: set() for owner in selected}
-        placements: list[ResidentExpertReplica] = []
+        records_by_owner = {owner.node_id: [] for owner in selected}
         failed = False
 
         def can_place(owner: OwnerInput, chunk: Sequence[ExpertRecord]) -> bool:
@@ -771,7 +965,8 @@ def _place_all_experts(
                 record.byte_size for record in chunk
             )
             projected_dynamic = (
-                peak_coactivation(projected_keys) * dynamic_bytes_per_expert
+                peak_assignment_count(projected_keys)
+                * dynamic_bytes_per_assignment
             )
             return (
                 projected_static + projected_dynamic
@@ -805,12 +1000,7 @@ def _place_all_experts(
                 owner = min(
                     chunk_candidates,
                     key=lambda item: (
-                        (
-                            used[item.node_id]
-                            + peak_coactivation(placed_keys[item.node_id])
-                            * dynamic_bytes_per_expert
-                        )
-                        / item.expert_capacity_bytes,
+                        used[item.node_id] / item.expert_capacity_bytes,
                         _owner_speed_score(scenario, item),
                         used[item.node_id],
                         item.node_id,
@@ -820,31 +1010,331 @@ def _place_all_experts(
                 placed_keys[owner.node_id].update(
                     record.key for record in chunk
                 )
-                for record in chunk:
-                    placements.append(
-                        ResidentExpertReplica(
-                            record.key,
-                            owner.node_id,
-                            record.content_id,
-                        )
-                    )
+                records_by_owner[owner.node_id].extend(chunk)
             if failed:
                 break
-        if not failed:
-            resident = tuple(
-                (
-                    owner.node_id,
-                    used[owner.node_id],
+        if failed:
+            return None
+        return _OwnerSubsetPlacement(
+            owners=tuple(selected),
+            records_by_owner=tuple(
+                tuple(records_by_owner[owner.node_id]) for owner in selected
+            ),
+            strategy="trace-coactivation-disjoint-greedy/1",
+        )
+
+    attempt_cache: dict[
+        tuple[str, ...],
+        tuple[str, _OwnerSubsetPlacement | None],
+    ] = {}
+
+    def attempt_subset(
+        selected_value: Sequence[OwnerInput],
+    ) -> tuple[str, _OwnerSubsetPlacement | None]:
+        selected = normalize_subset(selected_value)
+        signature = tuple(owner.node_id for owner in selected)
+        cached = attempt_cache.get(signature)
+        if cached is not None:
+            return cached
+
+        greedy = greedy_placement(selected)
+        if greedy is not None:
+            result = ("feasible", greedy)
+            attempt_cache[signature] = result
+            return result
+
+        outcome, repaired, _states = exact_repair(selected)
+        if outcome != "feasible":
+            result = (outcome, None)
+            attempt_cache[signature] = result
+            return result
+        if repaired is None:
+            raise RuntimeError("exact placement repair returned no assignment")
+        result = (
+            "feasible",
+            _OwnerSubsetPlacement(
+                owners=selected,
+                records_by_owner=repaired,
+                strategy="trace-coactivation-bounded-exact-repair/1",
+            ),
+        )
+        attempt_cache[signature] = result
+        return result
+
+    def projected_subset_score(
+        placement: _OwnerSubsetPlacement,
+    ) -> tuple[object, ...]:
+        """Rank feasible subsets by the resident remote critical path.
+
+        This deliberately mirrors the simulator's one owner batch per layer:
+        owners advance in parallel, while layers remain sequential.  It is a
+        placement ranking, not a replacement for the full mesh projection.
+        """
+
+        activation_bytes = (
+            scenario.model.activation_elements
+            * scenario.model.activation_dtype_bytes
+        )
+        layer_times: list[float] = []
+        active_owner_ids: set[str] = set()
+        for layer, layer_edges in enumerate(observed_edges_by_layer):
+            owner_times: list[float] = []
+            for owner, owner_records in zip(
+                placement.owners,
+                placement.records_by_owner,
+            ):
+                layer_keys = {
+                    record.key for record in owner_records if record.key.layer == layer
+                }
+                assignment_total = sum(
+                    assignment_count_by_key[key] for key in layer_keys
                 )
-                for owner in sorted(selected, key=lambda item: item.node_id)
+                if assignment_total <= 0:
+                    continue
+                active_owner_ids.add(owner.node_id)
+                unique_positions = sum(
+                    1 for edge in layer_edges if layer_keys & edge
+                )
+                v1_request_bytes = assignment_total * activation_bytes
+                coalesced_request_bytes = unique_positions * activation_bytes
+                coalesced_metadata_bytes = (
+                    assignment_total * owner.row_index_bytes_per_assignment
+                )
+                use_coalesced = (
+                    owner.supports_exact_input_coalescing
+                    and coalesced_request_bytes + coalesced_metadata_bytes
+                    < v1_request_bytes
+                )
+                request_bytes = (
+                    coalesced_request_bytes + coalesced_metadata_bytes
+                    if use_coalesced
+                    else v1_request_bytes
+                )
+                response_bytes = assignment_total * activation_bytes
+                rtt, _base, egress, ingress = _owner_link_values(
+                    scenario,
+                    owner,
+                    scenario.network.round_trip_ms,
+                )
+                owner_times.append(
+                    rtt
+                    + assignment_total * owner.expert_compute_ms_per_token
+                    + request_bytes / (egress * 125.0)
+                    + response_bytes / (ingress * 125.0)
+                )
+            layer_times.append(max(owner_times, default=0.0))
+
+        owner_ids = tuple(sorted(owner.node_id for owner in placement.owners))
+        assignment_signature = tuple(
+            sorted(
+                (
+                    record.key.layer,
+                    record.key.expert,
+                    owner.node_id,
+                )
+                for owner, owner_records in zip(
+                    placement.owners,
+                    placement.records_by_owner,
+                )
+                for record in owner_records
             )
-            return _Placement(
-                owners=tuple(sorted(selected, key=lambda item: item.node_id)),
-                replicas=tuple(sorted(placements)),
-                resident_bytes_by_owner=resident,
-                capacity_lower_bound_owners=lower_bound,
+        )
+        return (
+            math.fsum(layer_times),
+            math.fsum(
+                _owner_speed_score(scenario, owner)
+                for owner in placement.owners
+                if owner.node_id in active_owner_ids
+            ),
+            owner_ids,
+            assignment_signature,
+        )
+
+    def owner_subsets(
+        owner_count: int,
+    ) -> tuple[tuple[tuple[OwnerInput, ...], ...], int, bool, str]:
+        subset_total = math.comb(len(ordered), owner_count)
+        prefix = tuple(ordered[:owner_count])
+        if subset_total <= owner_subset_exact_limit:
+            return (
+                tuple(combinations(ordered, owner_count)),
+                subset_total,
+                True,
+                "exact-enumeration/1",
             )
-    raise ValueError("deterministic expert placement cannot satisfy owner VRAM budgets")
+
+        candidates: list[tuple[OwnerInput, ...]] = []
+        signatures: set[tuple[str, ...]] = set()
+
+        def add(selected_value: Sequence[OwnerInput]) -> None:
+            if len(candidates) >= owner_subset_fallback_limit:
+                return
+            selected = normalize_subset(selected_value)
+            signature = tuple(owner.node_id for owner in selected)
+            if len(selected) != owner_count or signature in signatures:
+                return
+            signatures.add(signature)
+            candidates.append(selected)
+
+        add(prefix)
+        fastest = normalize_subset(
+            sorted(
+                ordered,
+                key=lambda owner: (
+                    _owner_speed_score(scenario, owner),
+                    -owner.expert_capacity_bytes,
+                    owner.node_id,
+                ),
+            )[:owner_count]
+        )
+        add(fastest)
+        for base in (prefix, fastest):
+            base_ids = {owner.node_id for owner in base}
+            incumbents = sorted(
+                base,
+                key=lambda owner: (
+                    -_owner_speed_score(scenario, owner),
+                    owner.expert_capacity_bytes,
+                    owner.node_id,
+                ),
+            )
+            outsiders = sorted(
+                (owner for owner in ordered if owner.node_id not in base_ids),
+                key=lambda owner: (
+                    _owner_speed_score(scenario, owner),
+                    -owner.expert_capacity_bytes,
+                    owner.node_id,
+                ),
+            )
+            for outsider in outsiders:
+                for incumbent in incumbents:
+                    add(
+                        tuple(
+                            owner
+                            for owner in base
+                            if owner.node_id != incumbent.node_id
+                        )
+                        + (outsider,)
+                    )
+                    if len(candidates) >= owner_subset_fallback_limit:
+                        break
+                if len(candidates) >= owner_subset_fallback_limit:
+                    break
+            if len(candidates) >= owner_subset_fallback_limit:
+                break
+        return (
+            tuple(candidates),
+            subset_total,
+            False,
+            "deterministic-capacity-speed-neighborhood/1",
+        )
+
+    unresolved_lower_count = False
+    any_subset_search_limited = False
+    for owner_count in range(lower_bound, len(ordered) + 1):
+        subsets, subset_total, enumeration_complete, subset_strategy = (
+            owner_subsets(owner_count)
+        )
+        prefix = tuple(ordered[:owner_count])
+        prefix_signature = tuple(owner.node_id for owner in prefix)
+        ordered_subsets = tuple(
+            sorted(
+                subsets,
+                key=lambda selected: (
+                    tuple(owner.node_id for owner in selected)
+                    != prefix_signature,
+                    math.fsum(
+                        _owner_speed_score(scenario, owner) for owner in selected
+                    ),
+                    tuple(owner.node_id for owner in selected),
+                ),
+            )
+        )
+        evaluated: list[tuple[str, _OwnerSubsetPlacement | None]] = []
+        prefix_outcome, prefix_placement = attempt_subset(prefix)
+        evaluated.append((prefix_outcome, prefix_placement))
+        if prefix_outcome == "infeasible":
+            # The k largest capacities component-wise dominate every other
+            # k-owner subset. Exact infeasibility of this prefix therefore
+            # proves that no alternate subset of the same size can fit.
+            continue
+
+        for selected in ordered_subsets:
+            if tuple(owner.node_id for owner in selected) == prefix_signature:
+                continue
+            evaluated.append(attempt_subset(selected))
+
+        if any(outcome == "cutoff" for outcome, _placement in evaluated):
+            any_assignment_search_cut_off = True
+        feasible = tuple(
+            placement
+            for outcome, placement in evaluated
+            if outcome == "feasible" and placement is not None
+        )
+        if not feasible:
+            unresolved_lower_count = True
+            if not enumeration_complete:
+                any_subset_search_limited = True
+            continue
+
+        chosen = min(feasible, key=projected_subset_score)
+        if not enumeration_complete:
+            any_subset_search_limited = True
+        by_owner_id = {
+            owner.node_id: owner_records
+            for owner, owner_records in zip(
+                chosen.owners,
+                chosen.records_by_owner,
+            )
+        }
+        output_owners = tuple(sorted(chosen.owners, key=lambda owner: owner.node_id))
+        replicas = tuple(
+            sorted(
+                ResidentExpertReplica(
+                    record.key,
+                    owner.node_id,
+                    record.content_id,
+                )
+                for owner in output_owners
+                for record in by_owner_id[owner.node_id]
+            )
+        )
+        resident = tuple(
+            (
+                owner.node_id,
+                sum(
+                    record.byte_size for record in by_owner_id[owner.node_id]
+                ),
+            )
+            for owner in output_owners
+        )
+        return _Placement(
+            owners=output_owners,
+            replicas=replicas,
+            resident_bytes_by_owner=resident,
+            capacity_lower_bound_owners=lower_bound,
+            strategy=chosen.strategy,
+            minimum_owner_count_proven=not unresolved_lower_count,
+            search_states_evaluated=exact_states_total,
+            search_limit_reached=(
+                any_assignment_search_cut_off or any_subset_search_limited
+            ),
+            owner_subset_strategy=subset_strategy,
+            owner_subsets_evaluated=len(evaluated),
+            owner_subset_total=subset_total,
+            owner_subset_enumeration_complete=enumeration_complete,
+        )
+
+    if any_assignment_search_cut_off or unresolved_lower_count:
+        raise ValueError(
+            "deterministic expert placement did not find a feasible assignment; "
+            "bounded exact repair was not completed "
+            f"(limits: {exact_key_limit} experts and {exact_state_limit} states)"
+        )
+    raise ValueError(
+        "deterministic expert placement proved that owner VRAM budgets cannot "
+        "hold the declared experts plus their observed activation routes"
+    )
 
 
 def _synthetic_routing(
@@ -976,6 +1466,26 @@ def _simulate_once(
                 peak_vram_bytes_by_node.get(node_id, 0),
                 byte_size,
             )
+    max_inflight_owner_rpcs = {
+        plan.max_inflight_owner_rpcs for plan in layer_plans
+    }
+    if len(max_inflight_owner_rpcs) != 1:
+        raise RuntimeError("layer plans disagree on max inflight owner RPCs")
+    scheduling_by_layer = [
+        {
+            "layer": plan.layer,
+            "perOwnerLowerBoundMs": plan.per_owner_lower_bound_ms,
+            "ownerScheduledMakespanMs": plan.owner_scheduled_makespan_ms,
+            "coordinatorNicLowerBoundMs": plan.coordinator_nic_lower_bound_ms,
+            "coordinatorOverheadMs": plan.coordinator_overhead_ms,
+            "exposedMs": plan.exposed_ms,
+            "maxInflightOwnerRpcs": plan.max_inflight_owner_rpcs,
+            "coordinationCalibrationRequired": (
+                plan.coordination_calibration_required
+            ),
+        }
+        for plan in layer_plans
+    ]
     return {
         "roundTripMs": round_trip_ms,
         "exposedMsPerWave": projection.exposed_ms_per_wave,
@@ -1047,9 +1557,20 @@ def _simulate_once(
         "workspaceCalibrationRequired": (
             projection.workspace_calibration_required
         ),
+        "maxInflightOwnerRpcs": next(iter(max_inflight_owner_rpcs)),
+        "ownerScheduledMakespanMsPerWave": math.fsum(
+            plan.owner_scheduled_makespan_ms for plan in layer_plans
+        ),
         "coordinatorNicLowerBoundMsPerWave": sum(
             plan.coordinator_nic_lower_bound_ms for plan in layer_plans
         ),
+        "coordinatorOverheadMsPerWave": math.fsum(
+            plan.coordinator_overhead_ms for plan in layer_plans
+        ),
+        "coordinationCalibrationRequired": any(
+            plan.coordination_calibration_required for plan in layer_plans
+        ),
+        "schedulingByLayer": scheduling_by_layer,
         "peakVramBytesByNode": dict(sorted(peak_vram_bytes_by_node.items())),
         "remoteResidentDispatches": len(remote_dispatches),
         "localRamDispatches": len(local_ram_dispatches),
@@ -1122,7 +1643,16 @@ def simulate_document(value: object) -> dict[str, Any]:
             "throughputNormalization": "per-sequence-committed-tokens",
         },
         "placement": {
-            "strategy": "trace-coactivation-disjoint-greedy/1",
+            "strategy": placement.strategy,
+            "minimumOwnerCountProven": placement.minimum_owner_count_proven,
+            "searchStatesEvaluated": placement.search_states_evaluated,
+            "searchLimitReached": placement.search_limit_reached,
+            "ownerSubsetStrategy": placement.owner_subset_strategy,
+            "ownerSubsetsEvaluated": placement.owner_subsets_evaluated,
+            "ownerSubsetTotal": placement.owner_subset_total,
+            "ownerSubsetEnumerationComplete": (
+                placement.owner_subset_enumeration_complete
+            ),
             "candidateOwnerCount": len(scenario.owners),
             "capacityLowerBoundOwners": placement.capacity_lower_bound_owners,
             "ownersRequired": len(placement.owners),
@@ -1173,35 +1703,45 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     lines = [
         f"# Resident Expert Mesh — {report['scenarioId']}",
         "",
-        "> Techo parcial sintético del tramo de expertos sparse. No es una "
-        "predicción de GLM: no suma atención, dense/shared MLP, KV, colas ni WAN "
-        "entre stages.",
+        "> Synthetic partial ceiling for the sparse-expert segment. This is not a "
+        "GLM prediction: it excludes attention, dense/shared MLP, KV, queues, and "
+        "inter-stage WAN.",
         "",
-        "## Configuración y colocación",
+        "## Configuration and placement",
         "",
-        f"- Capas sparse: **{model['sparseLayers']}**",
-        f"- Expertos totales residentes: **{model['totalExperts']}**",
-        f"- Owners candidatos/necesarios: **{placement['candidateOwnerCount']} / "
+        f"- Sparse layers: **{model['sparseLayers']}**",
+        f"- Total resident experts: **{model['totalExperts']}**",
+        f"- Candidate/required owners: **{placement['candidateOwnerCount']} / "
         f"{placement['ownersRequired']}**",
-        f"- Posiciones físicas/onda: **{wave['positions']}** = "
+        f"- Physical positions/wave: **{wave['positions']}** = "
         f"**{wave['positionsPerSequence']}** × **{wave['concurrentSequences']} chats**",
-        f"- Tokens comprometidos usados para tok/s por secuencia: "
+        f"- Committed tokens used for per-sequence tok/s: "
         f"**{wave['committedTokens']}**",
-        f"- Unión sintética cubierta por capa: **{wave['routingUnionExpertsPerLayer']}**",
+        f"- Synthetic union covered per layer: **{wave['routingUnionExpertsPerLayer']}**",
         "",
-        "## Resultado principal",
+        "## Primary result",
         "",
-        "| RTT | ms/ola | ms/token comprometido | tok/s parcial/secuencia | "
-        "request / response / row-map | pesos evitados | pesos cargados | "
-        "owners remotos activos |",
+        "| RTT | ms/wave | ms/committed token | partial tok/s/sequence | "
+        "request / response / row-map | avoided weights | loaded weights | "
+        "active remote owners |",
         "|---:|---:|---:|---:|---:|---:|---:|---:|",
         _markdown_result_row(primary),
         "",
-        "## Sensibilidad real del simulador",
+        "## Scheduling and coordination",
         "",
-        "| RTT | ms/ola | ms/token | tok/s parcial/secuencia | "
-        "× frente a MacroWave frío | "
-        "pesos evitados | pesos cargados |",
+        f"- Maximum concurrent owner RPCs: **{primary['maxInflightOwnerRpcs']}**",
+        "- Scheduled owner makespan/wave: **"
+        f"{_fmt(primary['ownerScheduledMakespanMsPerWave'])} ms**",
+        "- Modeled coordinator overhead/wave: **"
+        f"{_fmt(primary['coordinatorOverheadMsPerWave'])} ms**",
+        "- Coordination calibration required: **"
+        f"{'yes' if primary['coordinationCalibrationRequired'] else 'no'}**",
+        "",
+        "## Actual simulator sensitivity",
+        "",
+        "| RTT | ms/wave | ms/token | partial tok/s/sequence | "
+        "× versus cold MacroWave | "
+        "avoided weights | loaded weights |",
         "|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for result in report["sensitivity"]:
@@ -1218,31 +1758,29 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     lines.extend(
         [
             "",
-            "## Comparación honesta",
+            "## Honest comparison",
             "",
-            "El referente MacroWave frío del escenario es **"
-            f"{comparison['macroWaveColdTokensPerSecondPerSequence']} tok/s por "
-            "secuencia**. La razón "
-            "mostrada arriba compara ese resultado completo del modelo sintético "
-            "anterior con un techo que solo cronometra expertos sparse; por tanto "
-            "no debe interpretarse como speedup final ni como rendimiento esperado "
-            "de GLM.",
+            "The scenario's cold MacroWave reference is **"
+            f"{comparison['macroWaveColdTokensPerSecondPerSequence']} tok/s per "
+            "sequence**. The ratio shown above compares that complete synthetic-model "
+            "result with a ceiling that times only sparse experts; it must not be "
+            "interpreted as final speedup or expected GLM performance.",
             "",
-            "La malla evita copiar pesos cuando el RTT es pequeño. Al crecer el RTT, "
-            "el planificador vuelve de forma exacta a RAM local y los pesos cargados "
-            "aumentan. Las capas siguen siendo secuenciales, de modo que el coste WAN "
-            "por capa no desaparece.",
+            "The mesh avoids copying weights when RTT is low. As RTT grows, the "
+            "scheduler falls back exactly to local RAM and loaded weights increase. "
+            "Layers remain sequential, so per-layer WAN cost does not disappear.",
             "",
-            "La colocación agrupa primero los conjuntos top-k coactivados. Cuando "
-            "varios expertos del mismo owner reutilizan posiciones, el request envía "
-            "cada fila una sola vez y el row-map conserva la correspondencia; la "
-            "response sigue separada por experto para mantener la reducción canónica.",
+            "Placement groups co-activated top-k sets first. When multiple experts "
+            "owned by the same node reuse positions, the request sends each row once "
+            "and the row map preserves correspondence; the response remains separate "
+            "per expert to preserve canonical reduction.",
             "",
-            "Esta entrada no calibra staging host<->device, NIC agregada ni workspace "
-            "del operador. El JSON informa los bytes de staging y marca "
-            "`transportCalibrationRequired` / `workspaceCalibrationRequired`; "
-            "mientras sigan activos, los tok/s son un límite inferior de tiempo "
-            "(techo superior de rendimiento), no una proyección física completa.",
+            "This input does not calibrate host<->device staging, aggregate NIC, or "
+            "operator workspace. The JSON reports staging bytes and marks "
+            "`transportCalibrationRequired` / `coordinationCalibrationRequired` / "
+            "`workspaceCalibrationRequired`; "
+            "while those flags remain active, tok/s is derived from a lower bound on "
+            "time (an upper bound on performance), not a complete physical projection.",
             "",
         ]
     )

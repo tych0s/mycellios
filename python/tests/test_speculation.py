@@ -5,10 +5,13 @@ import unittest
 
 from distributed_runtime.speculation import (
     MAX_DRAFT_TOKENS,
+    MAX_TREE_DRAFT_BRANCHES,
     AdaptiveSpeculationConfig,
     AdaptiveSpeculationController,
     DraftProvider,
     NgramDraftProvider,
+    NgramTreeDraftProvider,
+    TreeDraftProvider,
 )
 
 
@@ -83,6 +86,114 @@ class NgramDraftProviderTests(unittest.TestCase):
             with self.subTest(limit=invalid_limit):
                 with self.assertRaises(ValueError):
                     provider.draft([1, 2, 1, 2], invalid_limit)  # type: ignore[arg-type]
+
+
+class NgramTreeDraftProviderTests(unittest.TestCase):
+    def test_satisfies_tree_runtime_protocol(self) -> None:
+        self.assertIsInstance(NgramTreeDraftProvider(), TreeDraftProvider)
+
+    def test_returns_several_ranked_historical_continuations(self) -> None:
+        provider = NgramTreeDraftProvider(
+            max_draft_tokens=3,
+            max_branches=3,
+            max_match_tokens=2,
+        )
+        history = [
+            1,
+            2,
+            10,
+            11,
+            1,
+            2,
+            20,
+            21,
+            1,
+            2,
+            30,
+            31,
+            1,
+            2,
+        ]
+        self.assertEqual(
+            provider.draft_paths(history),
+            ((30, 31, 1), (20, 21, 1), (10, 11, 1)),
+        )
+
+    def test_shared_prefixes_are_retained_as_distinct_leaf_paths(self) -> None:
+        provider = NgramTreeDraftProvider(
+            max_draft_tokens=3,
+            max_branches=2,
+            max_match_tokens=2,
+        )
+        history = [1, 2, 10, 11, 9, 1, 2, 10, 12, 8, 1, 2]
+        paths = provider.draft_paths(history)
+        self.assertEqual(paths, ((10, 12, 8), (10, 11, 9)))
+        self.assertEqual(paths[0][0], paths[1][0])
+
+    def test_removes_redundant_prefix_leaf(self) -> None:
+        provider = NgramTreeDraftProvider(
+            max_draft_tokens=2,
+            max_branches=4,
+            min_match_tokens=1,
+            max_match_tokens=1,
+        )
+        self.assertEqual(provider.draft_paths([1, 1, 1]), ((1, 1),))
+
+    def test_longer_replacement_inherits_removed_prefix_priority(self) -> None:
+        provider = NgramTreeDraftProvider(
+            max_draft_tokens=2,
+            max_branches=1,
+            min_match_tokens=1,
+            max_match_tokens=1,
+        )
+        # The most recent match proposes the short path (1,), while an older
+        # occurrence provides (1, 9).  The longer path covers the short one and
+        # must keep its priority over unrelated alternatives under width one.
+        history = [1, 1, 9, 2, 1, 2, 2, 1, 1]
+        self.assertEqual(provider.draft_paths(history), ((1, 9),))
+
+    def test_per_call_limits_are_closed_and_do_not_mutate_history(self) -> None:
+        provider = NgramTreeDraftProvider(
+            max_draft_tokens=4,
+            max_branches=4,
+            max_match_tokens=2,
+        )
+        history = [1, 2, 10, 11, 1, 2, 20, 21, 1, 2, 30, 31, 1, 2]
+        original = list(history)
+        self.assertEqual(provider.draft_paths(history, max_tokens=1, max_branches=2), ((30,), (20,)))
+        self.assertEqual(provider.draft_paths(history, max_tokens=0), ())
+        self.assertEqual(provider.draft_paths(history, max_branches=0), ())
+        self.assertEqual(history, original)
+
+    def test_rejects_invalid_configuration_and_inputs(self) -> None:
+        for invalid in (0, MAX_DRAFT_TOKENS + 1, True, 1.5):
+            with self.subTest(max_draft_tokens=invalid):
+                with self.assertRaises(ValueError):
+                    NgramTreeDraftProvider(max_draft_tokens=invalid)  # type: ignore[arg-type]
+        for invalid in (0, MAX_TREE_DRAFT_BRANCHES + 1, True, 1.5):
+            with self.subTest(max_branches=invalid):
+                with self.assertRaises(ValueError):
+                    NgramTreeDraftProvider(max_branches=invalid)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            NgramTreeDraftProvider(min_match_tokens=0)
+        with self.assertRaises(ValueError):
+            NgramTreeDraftProvider(min_match_tokens=3, max_match_tokens=2)
+        with self.assertRaises(ValueError):
+            NgramTreeDraftProvider(strategy="ngram")
+
+        provider = NgramTreeDraftProvider()
+        for invalid_history in ("123", [1, -1], [1, True], [1, 2.5]):
+            with self.subTest(history=invalid_history):
+                with self.assertRaises(ValueError):
+                    provider.draft_paths(invalid_history)  # type: ignore[arg-type]
+        for invalid_limit in (-1, True, 1.5):
+            with self.subTest(limit=invalid_limit):
+                with self.assertRaises(ValueError):
+                    provider.draft_paths([1, 2, 1, 2], invalid_limit)  # type: ignore[arg-type]
+                with self.assertRaises(ValueError):
+                    provider.draft_paths(
+                        [1, 2, 1, 2], max_branches=invalid_limit  # type: ignore[arg-type]
+                    )
 
 
 class AdaptiveSpeculationControllerTests(unittest.TestCase):

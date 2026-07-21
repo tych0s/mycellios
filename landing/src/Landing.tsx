@@ -21,7 +21,7 @@ import {
   Zap,
 } from "lucide-react";
 import { useEffect, useRef, useState, type CSSProperties, type PointerEvent } from "react";
-import brandIcon from "./assets/mycellios-mark.png";
+import brandIcon from "./assets/mycellios-mark-transparent.png";
 import efficiencyCurve from "./assets/efficiency-curve-ai.webp";
 import myceliumNetwork from "./assets/mycelium-network.jpg";
 import { MyceliumHero } from "./MyceliumHero";

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import json
 import math
 from pathlib import Path
+import re
 import statistics
 import time
 from typing import Any, Iterable
@@ -15,10 +16,19 @@ import aiohttp
 
 @dataclass(frozen=True)
 class RequestMeasurement:
-    ttft_ms: float
+    request_id: str
+    client_first_content_ms: float
     response_ms: float
     finish_reason: str | None
     text_nonempty: bool
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    server_token_ttft_ms: float
+    server_token_tpot_ms: float
+    server_pipeline_ms: float
+    output_token_ids_sha256: str
+    output_token_ids_hash_scheme: str
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -70,6 +80,7 @@ async def stream_request(
     model: str,
     prompt: str,
     output_tokens: int,
+    request_id: str,
 ) -> RequestMeasurement:
     body = {
         "model": model,
@@ -82,6 +93,7 @@ async def stream_request(
     first_content: float | None = None
     text_parts: list[str] = []
     finish_reason: str | None = None
+    final_evidence: dict[str, Any] | None = None
     async with session.post(url, json=body) as response:
         response.raise_for_status()
         buffer = b""
@@ -106,15 +118,97 @@ async def stream_request(
                         text_parts.append(delta)
                     if choice.get("finish_reason") is not None:
                         finish_reason = str(choice["finish_reason"])
+                        final_evidence = document
     finished = time.perf_counter()
     if first_content is None:
         first_content = finished
+    if final_evidence is None:
+        raise RuntimeError("stream ended without a final evidence chunk")
+    evidence = parse_final_stream_evidence(final_evidence)
+    if finish_reason != evidence["finish_reason"]:
+        raise RuntimeError("stream finish reason changed while parsing evidence")
     return RequestMeasurement(
-        ttft_ms=(first_content - started) * 1_000,
+        request_id=request_id,
+        client_first_content_ms=(first_content - started) * 1_000,
         response_ms=(finished - started) * 1_000,
         finish_reason=finish_reason,
         text_nonempty=bool(text_parts),
+        prompt_tokens=evidence["prompt_tokens"],
+        completion_tokens=evidence["completion_tokens"],
+        total_tokens=evidence["total_tokens"],
+        server_token_ttft_ms=evidence["server_token_ttft_ms"],
+        server_token_tpot_ms=evidence["server_token_tpot_ms"],
+        server_pipeline_ms=evidence["server_pipeline_ms"],
+        output_token_ids_sha256=evidence["output_token_ids_sha256"],
+        output_token_ids_hash_scheme=evidence["output_token_ids_hash_scheme"],
     )
+
+
+def parse_final_stream_evidence(document: Any) -> dict[str, Any]:
+    if not isinstance(document, dict):
+        raise RuntimeError("final stream evidence must be an object")
+    choices = document.get("choices")
+    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
+        raise RuntimeError("final stream evidence must contain one choice")
+    finish_reason = choices[0].get("finish_reason")
+    if not isinstance(finish_reason, str) or not finish_reason:
+        raise RuntimeError("final stream evidence is missing finish_reason")
+    usage = document.get("usage")
+    metrics = document.get("distribution_metrics")
+    if not isinstance(usage, dict) or not isinstance(metrics, dict):
+        raise RuntimeError("final stream evidence is missing usage or distribution_metrics")
+    prompt_tokens = strict_nonnegative_integer(usage.get("prompt_tokens"), "prompt_tokens")
+    completion_tokens = strict_positive_integer(
+        usage.get("completion_tokens"), "completion_tokens"
+    )
+    total_tokens = strict_positive_integer(usage.get("total_tokens"), "total_tokens")
+    if total_tokens != prompt_tokens + completion_tokens:
+        raise RuntimeError("usage total_tokens is inconsistent")
+    ttft_ms = finite_nonnegative_number(metrics.get("ttft_ms"), "ttft_ms")
+    tpot_ms = finite_nonnegative_number(metrics.get("tpot_ms"), "tpot_ms")
+    pipeline_ms = finite_nonnegative_number(metrics.get("pipeline_ms"), "pipeline_ms")
+    expected_pipeline_ms = ttft_ms + max(0, completion_tokens - 1) * tpot_ms
+    if not math.isclose(pipeline_ms, expected_pipeline_ms, rel_tol=1e-6, abs_tol=1e-3):
+        raise RuntimeError("pipeline metrics are internally inconsistent")
+    digest = metrics.get("output_token_ids_sha256")
+    if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+        raise RuntimeError("output token digest is invalid")
+    scheme = metrics.get("output_token_ids_hash_scheme")
+    if scheme != "gdlp-output-token-ids-v1":
+        raise RuntimeError("output token digest scheme is unsupported")
+    return {
+        "finish_reason": finish_reason,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "server_token_ttft_ms": ttft_ms,
+        "server_token_tpot_ms": tpot_ms,
+        "server_pipeline_ms": pipeline_ms,
+        "output_token_ids_sha256": digest,
+        "output_token_ids_hash_scheme": scheme,
+    }
+
+
+def strict_nonnegative_integer(value: Any, name: str) -> int:
+    if type(value) is not int or value < 0:
+        raise RuntimeError(f"{name} must be a non-negative integer")
+    return value
+
+
+def strict_positive_integer(value: Any, name: str) -> int:
+    parsed = strict_nonnegative_integer(value, name)
+    if parsed < 1:
+        raise RuntimeError(f"{name} must be positive")
+    return parsed
+
+
+def finite_nonnegative_number(value: Any, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeError(f"{name} must be a finite non-negative number")
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise RuntimeError(f"{name} must be a finite non-negative number")
+    return parsed
 
 
 async def run_batch(
@@ -133,6 +227,7 @@ async def run_batch(
                 args.model,
                 args.prompt.format(request=f"{label}-{index}"),
                 args.output_tokens,
+                f"{label}-{index}",
             )
             for index in range(concurrency)
         )
@@ -175,12 +270,30 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 requests.extend(values)
                 walls.append(wall)
             mean_wall = statistics.fmean(walls)
+            total_wall_seconds = sum(walls) / 1_000
+            actual_tokens = sum(value.completion_tokens for value in requests)
             rows.append(
                 {
                     "concurrency": concurrency,
                     "measured_requests": len(requests),
-                    "ttft_mean_ms": statistics.fmean(value.ttft_ms for value in requests),
-                    "ttft_p95_ms": percentile((value.ttft_ms for value in requests), 0.95),
+                    "client_first_content_mean_ms": statistics.fmean(
+                        value.client_first_content_ms for value in requests
+                    ),
+                    "client_first_content_p95_ms": percentile(
+                        (value.client_first_content_ms for value in requests), 0.95
+                    ),
+                    "server_token_ttft_mean_ms": statistics.fmean(
+                        value.server_token_ttft_ms for value in requests
+                    ),
+                    "server_token_ttft_p95_ms": percentile(
+                        (value.server_token_ttft_ms for value in requests), 0.95
+                    ),
+                    "server_token_tpot_mean_ms": statistics.fmean(
+                        value.server_token_tpot_ms for value in requests
+                    ),
+                    "server_token_tpot_p95_ms": percentile(
+                        (value.server_token_tpot_ms for value in requests), 0.95
+                    ),
                     "response_mean_ms": statistics.fmean(
                         value.response_ms for value in requests
                     ),
@@ -188,19 +301,24 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                         (value.response_ms for value in requests), 0.95
                     ),
                     "batch_wall_mean_ms": mean_wall,
-                    "aggregate_nominal_tok_s": (
-                        concurrency * args.output_tokens / (mean_wall / 1_000)
+                    "actual_completion_tokens": actual_tokens,
+                    "aggregate_actual_tok_s": actual_tokens / total_wall_seconds,
+                    "per_request_actual_tok_s_mean": statistics.fmean(
+                        value.completion_tokens / (value.response_ms / 1_000)
+                        for value in requests
                     ),
                     "length_finishes": sum(
                         value.finish_reason == "length" for value in requests
                     ),
                     "nonempty": sum(value.text_nonempty for value in requests),
+                    "batch_wall_samples_ms": walls,
+                    "request_samples": [asdict(value) for value in requests],
                 }
             )
         async with session.get(health_url) as response:
             health = await response.json()
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "openai_api_continuous_scheduler",
         "configuration": {
             "base_url": args.base_url,
@@ -210,6 +328,7 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "warm_batches_per_scenario": args.warmups,
             "measured_batches_per_scenario": args.iterations,
             "persistent_http_connections_prewarmed": True,
+            "throughput_uses_actual_completion_tokens": True,
         },
         "rows": rows,
         "server_after_measurement": health,

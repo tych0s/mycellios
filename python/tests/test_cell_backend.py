@@ -5,7 +5,11 @@ from unittest.mock import patch
 
 import torch
 
-from distributed_runtime.cell_backend import CellExecutorBackend, rank_backend
+from distributed_runtime.cell_backend import (
+    CellExecutorBackend,
+    MAX_CELL_ACTIVATION_BATCH_SIZE,
+    rank_backend,
+)
 
 
 class CellExecutorBackendTests(unittest.TestCase):
@@ -64,6 +68,21 @@ class CellExecutorBackendTests(unittest.TestCase):
         self.assertEqual(result.dtype, torch.float32)
         torch.testing.assert_close(result, source.float(), rtol=0, atol=0)
         broadcast.assert_called_once_with(result, src=0)
+
+    def test_collective_broadcast_accepts_one_bounded_physical_batch(self) -> None:
+        backend = CellExecutorBackend()
+        source = torch.arange(48, dtype=torch.float16).reshape(2, 3, 8)
+        with patch("torch.distributed.broadcast") as broadcast:
+            result = backend.broadcast_activation(source, [2, 3, 8])
+        self.assertEqual(result.shape, (2, 3, 8))
+        torch.testing.assert_close(result, source.float(), rtol=0, atol=0)
+        broadcast.assert_called_once_with(result, src=0)
+
+        with self.assertRaisesRegex(ValueError, "bounded physical batch"):
+            backend.broadcast_activation(
+                None,
+                [MAX_CELL_ACTIVATION_BATCH_SIZE + 1, 3, 8],
+            )
 
 
 if __name__ == "__main__":

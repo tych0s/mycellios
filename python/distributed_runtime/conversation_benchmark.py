@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import json
 import math
 from pathlib import Path
@@ -12,7 +12,7 @@ from typing import Any
 
 import aiohttp
 
-from .api_benchmark import percentile, positive_csv
+from .api_benchmark import parse_final_stream_evidence, percentile, positive_csv
 
 
 DEFAULT_TURNS = (
@@ -30,11 +30,20 @@ class TurnMeasurement:
     turn: int
     history_messages: int
     request_characters: int
-    ttft_ms: float
+    client_first_content_ms: float
     response_ms: float
     content_chunks: int
     response_characters: int
     assistant_text: str
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    server_token_ttft_ms: float
+    server_token_tpot_ms: float
+    server_pipeline_ms: float
+    output_token_ids_sha256: str
+    output_token_ids_hash_scheme: str
+    finish_reason: str
     batch_wall_ms: float = 0.0
 
 
@@ -82,6 +91,7 @@ async def stream_chat_turn(
     first_content: float | None = None
     text_parts: list[str] = []
     content_chunks = 0
+    final_document: dict[str, Any] | None = None
     async with session.post(
         url,
         json={
@@ -115,21 +125,35 @@ async def stream_chat_turn(
                             first_content = now
                         text_parts.append(text)
                         content_chunks += 1
+                    if choice.get("finish_reason") is not None:
+                        final_document = document
     finished = time.perf_counter()
     if first_content is None:
         first_content = finished
     assistant_text = "".join(text_parts)
+    if final_document is None:
+        raise RuntimeError("stream ended without a final evidence chunk")
+    evidence = parse_final_stream_evidence(final_document)
     return TurnMeasurement(
         iteration=iteration,
         conversation=conversation,
         turn=turn,
         history_messages=len(messages),
         request_characters=request_characters,
-        ttft_ms=(first_content - started) * 1_000,
+        client_first_content_ms=(first_content - started) * 1_000,
         response_ms=(finished - started) * 1_000,
         content_chunks=content_chunks,
         response_characters=len(assistant_text),
         assistant_text=assistant_text,
+        prompt_tokens=evidence["prompt_tokens"],
+        completion_tokens=evidence["completion_tokens"],
+        total_tokens=evidence["total_tokens"],
+        server_token_ttft_ms=evidence["server_token_ttft_ms"],
+        server_token_tpot_ms=evidence["server_token_tpot_ms"],
+        server_pipeline_ms=evidence["server_pipeline_ms"],
+        output_token_ids_sha256=evidence["output_token_ids_sha256"],
+        output_token_ids_hash_scheme=evidence["output_token_ids_hash_scheme"],
+        finish_reason=evidence["finish_reason"],
     )
 
 
@@ -214,31 +238,50 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     )
                     / 1_000
                 )
-                observed_chunks = sum(value.content_chunks for value in row)
+                actual_tokens = sum(value.completion_tokens for value in row)
                 turns.append(
                     {
                         "turn": turn,
                         "requests": len(row),
                         "historyMessages": row[0].history_messages,
-                        "requestCharactersMean": statistics.fmean(
+                        "requestCharactersMeanDiagnostic": statistics.fmean(
                             value.request_characters for value in row
                         ),
-                        "ttftMeanMs": statistics.fmean(value.ttft_ms for value in row),
-                        "ttftP95Ms": percentile((value.ttft_ms for value in row), 0.95),
+                        "promptTokensMean": statistics.fmean(
+                            value.prompt_tokens for value in row
+                        ),
+                        "clientFirstContentMeanMs": statistics.fmean(
+                            value.client_first_content_ms for value in row
+                        ),
+                        "clientFirstContentP95Ms": percentile(
+                            (value.client_first_content_ms for value in row), 0.95
+                        ),
+                        "serverTokenTtftMeanMs": statistics.fmean(
+                            value.server_token_ttft_ms for value in row
+                        ),
+                        "serverTokenTtftP95Ms": percentile(
+                            (value.server_token_ttft_ms for value in row), 0.95
+                        ),
+                        "serverTokenTpotMeanMs": statistics.fmean(
+                            value.server_token_tpot_ms for value in row
+                        ),
+                        "serverTokenTpotP95Ms": percentile(
+                            (value.server_token_tpot_ms for value in row), 0.95
+                        ),
                         "responseMeanMs": statistics.fmean(
                             value.response_ms for value in row
                         ),
                         "responseP95Ms": percentile(
                             (value.response_ms for value in row), 0.95
                         ),
-                        "observedContentChunks": observed_chunks,
-                        "perUserContentChunksPerSecond": (
-                            observed_chunks / total_response_seconds
+                        "actualCompletionTokens": actual_tokens,
+                        "perUserActualTokensPerSecond": (
+                            actual_tokens / total_response_seconds
                             if total_response_seconds > 0
                             else 0.0
                         ),
-                        "aggregateContentChunksPerSecond": (
-                            observed_chunks / total_batch_wall_seconds
+                        "aggregateActualTokensPerSecond": (
+                            actual_tokens / total_batch_wall_seconds
                             if total_batch_wall_seconds > 0
                             else 0.0
                         ),
@@ -257,14 +300,18 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     "concurrentConversations": concurrency,
                     "completedConversationRuns": concurrency * args.iterations,
                     "turns": turns,
+                    "requestSamples": [asdict(value) for value in values],
                 }
             )
         async with session.get(health_url) as response:
             final_health = await response.json()
     return {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "kind": "gdlp_physical_growing_chat_benchmark",
-        "provenance": "physical HTTP/SSE run; content chunks normally correspond to emitted tokenizer pieces",
+        "provenance": (
+            "physical HTTP/SSE run; throughput uses server-reported actual token counts, "
+            "never content chunks or requested maximums"
+        ),
         "configuration": {
             "baseUrl": args.base_url,
             "model": args.model,
@@ -273,6 +320,7 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "turns": args.turns,
             "maxOutputTokensPerTurn": args.output_tokens,
             "historyIsResentEachTurn": True,
+            "throughputUsesActualCompletionTokens": True,
         },
         "initialHealth": initial_health,
         "scenarios": scenarios,

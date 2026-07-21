@@ -54,6 +54,15 @@ class ExternalTensorParallelCellTests(unittest.TestCase):
         prompt = torch.randn((1, 3, hidden_size), generator=generator)
         next_hidden = torch.randn((1, 1, hidden_size), generator=generator)
         correction = torch.randn((1, 1, hidden_size), generator=generator)
+        batch_prompt_a = torch.randn((1, 2, hidden_size), generator=generator)
+        batch_prompt_b = torch.randn((1, 2, hidden_size), generator=generator)
+        batch_next_a = torch.randn((1, 1, hidden_size), generator=generator)
+        batch_next_b = torch.randn((1, 1, hidden_size), generator=generator)
+        fork_prompt = torch.randn((1, 2, hidden_size), generator=generator)
+        fork_parent_next = torch.randn((1, 1, hidden_size), generator=generator)
+        fork_child_next = torch.randn((1, 1, hidden_size), generator=generator)
+        fork_child_second = torch.randn((1, 1, hidden_size), generator=generator)
+        promoted_next = torch.randn((1, 1, hidden_size), generator=generator)
         expected_prompt, prompt_caches = _dense_stage_forward(
             prompt, layers, attention_heads, kv_heads, head_dim
         )
@@ -76,6 +85,63 @@ class ExternalTensorParallelCellTests(unittest.TestCase):
             kv_heads,
             head_dim,
             truncated,
+        )
+        expected_batch_prompt_a, batch_caches_a = _dense_stage_forward(
+            batch_prompt_a, layers, attention_heads, kv_heads, head_dim
+        )
+        expected_batch_prompt_b, batch_caches_b = _dense_stage_forward(
+            batch_prompt_b, layers, attention_heads, kv_heads, head_dim
+        )
+        expected_batch_next_a, _ = _dense_stage_forward(
+            batch_next_a,
+            layers,
+            attention_heads,
+            kv_heads,
+            head_dim,
+            batch_caches_a,
+        )
+        expected_batch_next_b, _ = _dense_stage_forward(
+            batch_next_b,
+            layers,
+            attention_heads,
+            kv_heads,
+            head_dim,
+            batch_caches_b,
+        )
+        expected_fork_prompt, fork_caches = _dense_stage_forward(
+            fork_prompt, layers, attention_heads, kv_heads, head_dim
+        )
+        expected_fork_parent_next, _ = _dense_stage_forward(
+            fork_parent_next,
+            layers,
+            attention_heads,
+            kv_heads,
+            head_dim,
+            fork_caches,
+        )
+        expected_fork_child_next, fork_child_caches = _dense_stage_forward(
+            fork_child_next,
+            layers,
+            attention_heads,
+            kv_heads,
+            head_dim,
+            fork_caches,
+        )
+        expected_fork_child_second, fork_child_caches = _dense_stage_forward(
+            fork_child_second,
+            layers,
+            attention_heads,
+            kv_heads,
+            head_dim,
+            fork_child_caches,
+        )
+        expected_promoted_next, _ = _dense_stage_forward(
+            promoted_next,
+            layers,
+            attention_heads,
+            kv_heads,
+            head_dim,
+            fork_child_caches,
         )
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -140,6 +206,12 @@ class ExternalTensorParallelCellTests(unittest.TestCase):
                 self.assertIn(
                     "unequal-tensor-parallel", runner.executor_manifest.features
                 )
+                self.assertIn(
+                    "multi-request-physical-batch", runner.executor_manifest.features
+                )
+                self.assertIn(
+                    "exact-request-fork-safe-copy", runner.executor_manifest.features
+                )
                 self.assertEqual(
                     [report.shard_file for report in runner.member_reports],
                     ["rank-000.safetensors", "rank-001.safetensors"],
@@ -151,7 +223,20 @@ class ExternalTensorParallelCellTests(unittest.TestCase):
                     runner.member_reports[0].parameter_bytes,
                     runner.member_reports[1].parameter_bytes,
                 )
+                self.assertEqual(
+                    runner.member_work_reports,
+                    {},
+                    "READY must not be treated as evidence of executed work",
+                )
+                self.assertEqual(runner.member_batch_work_reports, {})
                 self.assertIsNone(member.poll(), "external rank exited before BEGIN")
+                with self.assertRaisesRegex(ValueError, "outside the physical batch bound"):
+                    runner.forward_hidden_batch(
+                        tuple(range(9)),
+                        tuple(prompt[:, :1, :] for _ in range(9)),
+                    )
+                with self.assertRaisesRegex(ValueError, "outside the physical batch bound"):
+                    runner.forward_hidden_batch((707,), (prompt[:, :1, :],))
 
                 request_id = 707
                 runner.begin(request_id)
@@ -160,6 +245,14 @@ class ExternalTensorParallelCellTests(unittest.TestCase):
                 )
                 self.assertTrue(
                     torch.allclose(actual_prompt, expected_prompt, rtol=1e-5, atol=1e-5)
+                )
+                self.assertEqual(
+                    runner.member_work_reports,
+                    _expected_cpu_rank_work(1, 5, 3),
+                )
+                self.assertEqual(
+                    runner.member_batch_work_reports,
+                    _expected_cpu_rank_batch_work(1, 1, 1),
                 )
                 self.assertEqual(
                     runner.member_layer_cache_shapes[request_id],
@@ -173,7 +266,19 @@ class ExternalTensorParallelCellTests(unittest.TestCase):
                 self.assertTrue(
                     torch.allclose(actual_next, expected_next, rtol=1e-5, atol=1e-5)
                 )
+                self.assertEqual(
+                    runner.member_work_reports,
+                    _expected_cpu_rank_work(2, 10, 4),
+                )
+                self.assertEqual(
+                    runner.member_batch_work_reports,
+                    _expected_cpu_rank_batch_work(2, 2, 1),
+                )
                 runner.truncate(request_id, 2)
+                self.assertEqual(
+                    runner.member_work_reports,
+                    _expected_cpu_rank_work(2, 10, 4),
+                )
                 self.assertEqual(
                     runner.member_layer_cache_shapes[request_id],
                     (
@@ -190,8 +295,270 @@ class ExternalTensorParallelCellTests(unittest.TestCase):
                         atol=1e-5,
                     )
                 )
+                self.assertEqual(
+                    runner.member_work_reports,
+                    _expected_cpu_rank_work(3, 15, 5),
+                )
+                self.assertEqual(
+                    runner.member_batch_work_reports,
+                    _expected_cpu_rank_batch_work(3, 3, 1),
+                )
                 self.assertEqual(runner.sequence_length(request_id), 3)
                 runner.end(request_id)
+
+                request_ids = (801, 802)
+                for batched_request_id in request_ids:
+                    runner.begin(batched_request_id)
+                self.assertEqual(
+                    runner.physical_batch_key(
+                        request_ids[0], token_count=2, token_mode="none"
+                    ),
+                    runner.physical_batch_key(
+                        request_ids[1], token_count=2, token_mode="none"
+                    ),
+                )
+                with self.assertRaisesRegex(ValueError, "distinct requests"):
+                    runner.forward_hidden_batch(
+                        (request_ids[0], request_ids[0]),
+                        (batch_prompt_a, batch_prompt_a),
+                        token_mode="none",
+                    )
+                with self.assertRaisesRegex(ValueError, "equal rank-one"):
+                    runner.forward_hidden_batch(
+                        request_ids,
+                        (batch_prompt_a, batch_next_b),
+                        token_mode="none",
+                    )
+
+                batch_prompt_results = runner.forward_hidden_batch(
+                    request_ids,
+                    (batch_prompt_a, batch_prompt_b),
+                    token_mode="none",
+                )
+                torch.testing.assert_close(
+                    batch_prompt_results[0][0],
+                    expected_batch_prompt_a,
+                    rtol=1e-4,
+                    atol=5e-5,
+                )
+                torch.testing.assert_close(
+                    batch_prompt_results[1][0],
+                    expected_batch_prompt_b,
+                    rtol=1e-4,
+                    atol=5e-5,
+                )
+                self.assertEqual(
+                    tuple(result[1] for result in batch_prompt_results),
+                    (None, None),
+                )
+                self.assertEqual(
+                    runner.member_work_reports,
+                    _expected_cpu_rank_work(4, 20, 9),
+                )
+                self.assertEqual(
+                    runner.member_batch_work_reports,
+                    _expected_cpu_rank_batch_work(4, 5, 2),
+                )
+                for batched_request_id in request_ids:
+                    self.assertEqual(runner.sequence_length(batched_request_id), 2)
+                    self.assertEqual(
+                        runner.member_layer_cache_shapes[batched_request_id],
+                        (
+                            ((1, 3, 2, head_dim), (1, 3, 2, head_dim)),
+                            ((1, 1, 2, head_dim), (1, 1, 2, head_dim)),
+                        ),
+                    )
+
+                batch_next_results = runner.forward_hidden_batch(
+                    request_ids,
+                    (batch_next_a, batch_next_b),
+                )
+                torch.testing.assert_close(
+                    batch_next_results[0][0],
+                    expected_batch_next_a,
+                    rtol=1e-4,
+                    atol=5e-5,
+                )
+                torch.testing.assert_close(
+                    batch_next_results[1][0],
+                    expected_batch_next_b,
+                    rtol=1e-4,
+                    atol=5e-5,
+                )
+                self.assertEqual(
+                    runner.member_work_reports,
+                    _expected_cpu_rank_work(5, 25, 11),
+                )
+                self.assertEqual(
+                    runner.member_batch_work_reports,
+                    _expected_cpu_rank_batch_work(5, 7, 2),
+                )
+                for batched_request_id in request_ids:
+                    self.assertEqual(runner.sequence_length(batched_request_id), 3)
+                    self.assertEqual(
+                        runner.member_layer_cache_shapes[batched_request_id],
+                        (
+                            ((1, 3, 3, head_dim), (1, 3, 3, head_dim)),
+                            ((1, 1, 3, head_dim), (1, 1, 3, head_dim)),
+                        ),
+                    )
+                    runner.end(batched_request_id)
+
+                parent_request_id = 901
+                child_request_id = 902
+                runner.begin(parent_request_id)
+                actual_fork_prompt, _ = runner.forward_hidden(
+                    parent_request_id,
+                    fork_prompt,
+                    token_mode="none",
+                )
+                torch.testing.assert_close(
+                    actual_fork_prompt,
+                    expected_fork_prompt,
+                    rtol=1e-5,
+                    atol=1e-5,
+                )
+                parent_cache_bytes = runner.request_cache_bytes(parent_request_id)
+                self.assertEqual(parent_cache_bytes, 256)
+                self.assertEqual(
+                    runner.project_request_cache_bytes(parent_request_id, 1),
+                    384,
+                )
+                work_before_fork = runner.member_work_reports
+                batch_work_before_fork = runner.member_batch_work_reports
+                with self.assertRaisesRegex(ValueError, "must differ"):
+                    runner.fork_request(
+                        parent_request_id,
+                        parent_request_id,
+                        max_cache_bytes=parent_cache_bytes,
+                    )
+                with self.assertRaisesRegex(ValueError, "preflight byte budget"):
+                    runner.fork_request(
+                        child_request_id,
+                        parent_request_id,
+                        max_cache_bytes=parent_cache_bytes - 1,
+                    )
+                with self.assertRaisesRegex(ValueError, "has not received BEGIN"):
+                    runner.sequence_length(child_request_id)
+
+                copied_bytes = runner.fork_request(
+                    child_request_id,
+                    parent_request_id,
+                    max_cache_bytes=parent_cache_bytes,
+                )
+                self.assertEqual(copied_bytes, parent_cache_bytes)
+                self.assertEqual(runner.sequence_length(child_request_id), 2)
+                self.assertEqual(
+                    runner.member_request_cache_bytes[child_request_id],
+                    runner.member_request_cache_bytes[parent_request_id],
+                )
+                self.assertTrue(
+                    all(
+                        report["aliasFree"] is True
+                        and report["copiedCacheBytes"] > 0
+                        and report["childRequestId"] == child_request_id
+                        and report["parentRequestId"] == parent_request_id
+                        for report in runner.member_fork_reports.values()
+                    )
+                )
+                self.assertEqual(runner.member_work_reports, work_before_fork)
+                self.assertEqual(runner.member_batch_work_reports, batch_work_before_fork)
+                with self.assertRaisesRegex(ValueError, "already active"):
+                    runner.fork_request(
+                        child_request_id,
+                        parent_request_id,
+                        max_cache_bytes=parent_cache_bytes,
+                    )
+
+                actual_fork_parent_next, _ = runner.forward_hidden(
+                    parent_request_id,
+                    fork_parent_next,
+                )
+                torch.testing.assert_close(
+                    actual_fork_parent_next,
+                    expected_fork_parent_next,
+                    rtol=1e-5,
+                    atol=1e-5,
+                )
+                self.assertEqual(runner.sequence_length(child_request_id), 2)
+                self.assertEqual(runner.request_cache_bytes(child_request_id), 256)
+
+                actual_fork_child_next, _ = runner.forward_hidden(
+                    child_request_id,
+                    fork_child_next,
+                )
+                torch.testing.assert_close(
+                    actual_fork_child_next,
+                    expected_fork_child_next,
+                    rtol=1e-5,
+                    atol=1e-5,
+                )
+                actual_fork_child_second, _ = runner.forward_hidden(
+                    child_request_id,
+                    fork_child_second,
+                )
+                torch.testing.assert_close(
+                    actual_fork_child_second,
+                    expected_fork_child_second,
+                    rtol=1e-5,
+                    atol=1e-5,
+                )
+                self.assertEqual(runner.sequence_length(parent_request_id), 3)
+                self.assertEqual(runner.sequence_length(child_request_id), 4)
+                self.assertEqual(runner.request_cache_bytes(parent_request_id), 384)
+                self.assertEqual(runner.request_cache_bytes(child_request_id), 512)
+
+                selected_shapes = runner.member_layer_cache_shapes[child_request_id]
+                selected_rank_bytes = runner.member_request_cache_bytes[child_request_id]
+                work_before_promote = runner.member_work_reports
+                batch_work_before_promote = runner.member_batch_work_reports
+                with self.assertRaisesRegex(ValueError, "must differ"):
+                    runner.promote_request(parent_request_id, parent_request_id)
+                runner.promote_request(parent_request_id, child_request_id)
+                self.assertEqual(runner.sequence_length(parent_request_id), 4)
+                self.assertEqual(runner.request_cache_bytes(parent_request_id), 512)
+                self.assertEqual(
+                    runner.member_layer_cache_shapes[parent_request_id], selected_shapes
+                )
+                self.assertEqual(
+                    runner.member_request_cache_bytes[parent_request_id],
+                    selected_rank_bytes,
+                )
+                self.assertTrue(
+                    all(
+                        report["movedWithoutCopy"] is True
+                        and report["parentRequestId"] == parent_request_id
+                        and report["childRequestId"] == child_request_id
+                        for report in runner.member_promotion_reports.values()
+                    )
+                )
+                self.assertEqual(runner.member_work_reports, work_before_promote)
+                self.assertEqual(
+                    runner.member_batch_work_reports, batch_work_before_promote
+                )
+                with self.assertRaisesRegex(ValueError, "has not received BEGIN"):
+                    runner.sequence_length(child_request_id)
+
+                actual_promoted_next, _ = runner.forward_hidden(
+                    parent_request_id,
+                    promoted_next,
+                )
+                torch.testing.assert_close(
+                    actual_promoted_next,
+                    expected_promoted_next,
+                    rtol=1e-4,
+                    atol=3e-4,
+                )
+                self.assertEqual(runner.sequence_length(parent_request_id), 5)
+                self.assertEqual(
+                    runner.member_work_reports,
+                    _expected_cpu_rank_work(10, 50, 17),
+                )
+                self.assertEqual(
+                    runner.member_batch_work_reports,
+                    _expected_cpu_rank_batch_work(10, 12, 2),
+                )
+                runner.end(parent_request_id)
             finally:
                 if runner is not None:
                     runner.close()
@@ -314,6 +681,46 @@ def _external_stage_config(fixture: str, ports: tuple[int, ...]) -> StageProcess
         cell_distributed_port=distributed_port,
         cell_startup_timeout_seconds=30.0,
     )
+
+
+def _expected_cpu_rank_work(
+    forward_calls: int,
+    collective_calls: int,
+    tokens_processed: int,
+) -> dict[int, dict[str, object]]:
+    return {
+        rank: {
+            "rank": rank,
+            "device": "cpu",
+            "computeDtype": "float32",
+            "collectiveBackend": "gloo",
+            "forwardCalls": forward_calls,
+            "collectiveCalls": collective_calls,
+            "tokensProcessed": tokens_processed,
+            "memory": {
+                "allocatedBytes": 0,
+                "reservedBytes": 0,
+                "peakAllocatedBytes": 0,
+            },
+        }
+        for rank in range(2)
+    }
+
+
+def _expected_cpu_rank_batch_work(
+    physical_forward_calls: int,
+    logical_forward_items: int,
+    max_physical_batch_size: int,
+) -> dict[int, dict[str, int]]:
+    return {
+        rank: {
+            "rank": rank,
+            "physicalForwardCalls": physical_forward_calls,
+            "logicalForwardItems": logical_forward_items,
+            "maxPhysicalBatchSize": max_physical_batch_size,
+        }
+        for rank in range(2)
+    }
 
 
 def _ports(count: int) -> tuple[int, ...]:

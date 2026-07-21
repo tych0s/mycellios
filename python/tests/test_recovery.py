@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import CancelledError, Future
+from dataclasses import replace
 from types import SimpleNamespace
 import threading
 import unittest
@@ -21,6 +22,17 @@ from distributed_runtime.recovery import (
 
 
 class RecoveringPipelineEngineTests(unittest.TestCase):
+    def test_physical_tree_limits_are_part_of_recovery_identity_v4(self) -> None:
+        disabled = _identity()
+        enabled = replace(
+            disabled,
+            max_speculative_branches=2,
+            max_speculative_branch_tokens=128,
+            max_speculative_kv_bytes=4096,
+        )
+        self.assertEqual(disabled.schema_version, 4)
+        self.assertNotEqual(disabled, enabled)
+
     def test_executor_contract_requires_one_sealed_id_per_stage(self) -> None:
         common = {"model_name": "fixture", "boundaries": (0, 2, 4)}
         with self.assertRaisesRegex(ValueError, "one id per stage"):
@@ -426,7 +438,7 @@ def _identity(
     stage_executor_ids: tuple[str, ...] = ("1" * 32, "2" * 32),
 ) -> PipelineRecoveryIdentity:
     return PipelineRecoveryIdentity(
-        schema_version=2,
+        schema_version=4,
         artifact_identity=artifact_identity,
         canonical_model_source="hf://fixture/model",
         canonical_model_revision="a" * 40,
@@ -440,6 +452,11 @@ def _identity(
         stage_executor_ids=stage_executor_ids,
         threads_per_stage=1,
         prefill_chunk_tokens=0,
+        prefill_inflight_chunks=1,
+        prefill_inflight_bytes=0,
+        max_speculative_branches=0,
+        max_speculative_branch_tokens=0,
+        max_speculative_kv_bytes=0,
         sealed_wave_tokens=1,
         max_prefill_chunk_tokens=0,
         speculative_max_draft_tokens=0,

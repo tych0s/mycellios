@@ -1,42 +1,42 @@
-# Integraciones externas y licencias
+# External integrations and licences
 
-Este repositorio contiene una implementación propia del plano de control. No se ha copiado ni incorporado código fuente de los proyectos estudiados.
+This repository contains a proper implementation of the control planee. It has not been copied or incorporated source code of the projects studied.
 
-La licencia del núcleo de mycellios queda pendiente de decisión del propietario antes de publicarlo. Hasta que exista un archivo `LICENSE`, no debe asumirse una licencia open source.
+The mycellios kernel license is pending decision by the owner before publishing it. Until a `LICENSE` file exists, an open source license should not be assumed.
 
-| Proyecto | Licencia observada | Política de integración |
+| Proyecto | Licencia observada |Integration policy|
 |---|---|---|
-| distributed runtime | GPL-3.0 | Solo proceso/bridge externo o inspiración clean-room |
-| AI Horde | AGPL-3.0 | API externa o conceptos reimplementados; no vendoring |
-| [external runtime A](https://github.com/external runtime A/external-runtime-a) | Apache-2.0 | Sidecar experimental fijado por release/commit; célula privada como un único deployment mediante API OpenAI-compatible |
+| distributed runtime | GPL-3.0 |Only external process/bridge or clean-room inspiration|
+| AI Horde | AGPL-3.0 |External API or reimplemented concepts; not selling|
+| [external runtime A](https://github.com/external runtime A/external-runtime-a) | Apache-2.0 |Sidecar experimental fixed by release/committee; private cell as a single deployment using OpenAI-compatible API|
 | peer runtime | MIT | Sidecar Python opcional |
-| BloomBee | Apache-2.0 | Sidecar Python con entorno y commit fijados |
+| BloomBee | Apache-2.0 |Sidecar Python with fixed environment and commit|
 | parallel runtime | Apache-2.0 | Celda independiente mediante API OpenAI-compatible |
-| PRIMA.cpp | MIT en el repositorio observado | Binario/proceso LAN aislado |
+| PRIMA.cpp |MIT in the observed repository| Binario/proceso LAN aislado |
 | external runtime B | Apache-2.0 | Celda independiente mediante API |
-| external GGUF runtime | MIT | Runtime stock GGUF y celda RPC LAN; build local observado `b10068`/`571d0d540`. La base del backend parcial NativeStage queda fijada por separado en `c46583b86bed573c4ff30685dae59874f124e664` |
-| Hugging Face Transformers | Apache-2.0 | Dependencia Python fijada en `5.14.1`; loader selectivo propio y TP/EP nativo como executor de célula |
-| Hugging Face Accelerate | Apache-2.0 | Dependencia Python fijada en `1.14.0`, requerida por la carga TP/EP nativa; no sustituye PyTorch |
-| [llmfit](https://github.com/AlexsJones/llmfit) | MIT | Binario opcional invocado sin shell para perfil de hardware y recomendación; no se incorpora su código ni decide el reparto GDLP por capas |
-| Distributed Llama | MIT | Laboratorio LAN como proceso aislado |
-| Helix | Apache-2.0 | Se usan ideas de planificación; no se incluye Gurobi ni su runtime |
-| DeServe | Sin licencia declarada en el repositorio observado | Solo ideas descritas en el paper; no copiar código |
-| [NNTrainer](https://github.com/nntrainer/nntrainer) | Apache-2.0 | Posible sidecar futuro para dispositivos limitados; no integrado ni vendido dentro del repositorio |
-| [KVzip](https://github.com/snu-mllab/KVzip) | MIT | Experimento futuro de compresión de KV cache; sin código incorporado |
-| [LMCache](https://github.com/LMCache/LMCache) | Apache-2.0 | Experimento futuro para celdas de confianza y runtimes compatibles; no usar como caché WAN entre desconocidos |
-| [FlowSpec](https://github.com/Leosang-lx/FlowSpec) | Sin licencia declarada en el repositorio observado | Solo paper y conceptos de planificación; no copiar ni redistribuir código |
-| [MDI-LLM](https://github.com/davmacario/MDI-LLM) | MIT | Referencia de investigación para pipelines recurrentes; no integrado |
-| [NativeStage](https://github.com/fthrvi/native_stage) | MIT | Backend parcial Llama integrado mediante proceso aislado; fuente fijada en `0c16119713396ec6052400f3eb049c5e7a66cd94`, parches verificados y paquetes sub-GGUF sellados |
-| LunarG Vulkan SDK | Licencias por componente | Toolchain local `1.4.350.0` usado para compilar el gate Vulkan; no se versiona ni redistribuye dentro del repositorio |
-| w64devkit | Licencias por componente | Toolchain portátil local `2.6.0` usado para builds Windows; no se versiona ni redistribuye dentro del repositorio |
-| [Speculative Pipeline Decoding](https://github.com/yuyijiong/speculative_pipeline_decoding) | Sin licencia declarada en el repositorio observado | Solo paper, evaluación externa y conceptos; no copiar ni redistribuir código |
-| [Multi-Block Diffusion](https://github.com/SJTU-DENG-Lab/mbd-lms) | MIT | Línea WAN-native futura y aislada; no integrada en el runtime autoregresivo |
-| SpecPipe, Jupiter y HALO | Sin repositorio oficial enlazado localizado | Solo ideas y resultados del paper; no existe código que incorporar en este proyecto |
+| external GGUF runtime | MIT |Runtime stock GGUF and cell RPC LAN; local build observed `b10068`/`571d0d540`. The base of the partial NativeStage backend is fixed separately in `c46583b86bed573c4ff30685dae59874f124e664`|
+| Hugging Face Transformers | Apache-2.0 |Python unit fixed in `5.14.1`; own selective loader and native TP/EP as cell executor|
+| Hugging Face Accelerate | Apache-2.0 |Python unit set to `1.14.0`, required by native TP/EP load; does not replace PyTorch|
+| [llmfit](https://github.com/AlexsJones/llmfit) | MIT |Optional binary invoked without shell for hardware profile and recommendation; does not incorporate its code nor decides the layered GDLP distribution|
+| Distributed Llama | MIT |LAN laboratory as an isolated process|
+| Helix | Apache-2.0 |Planning ideas are used; Gurobi and his runtime are not included|
+| DeServe |No license declared in the observed repository|Only ideas described in paper; do not copy code|
+| [NNTrainer](https://github.com/nntrainer/nntrainer) | Apache-2.0 |Possible future sidecar for limited devices; not integrated or sold within the repository|
+| [KVzip](https://github.com/snu-mllab/KVzip) | MIT |Future compression experiment of KV cache; no built-in code|
+| [LMCache](https://github.com/LMCache/LMCache) | Apache-2.0 |Future experiment for trusted cells and compatible runtimes; do not use as a WAN cache among strangers|
+| [FlowSpec](https://github.com/Leosang-lx/FlowSpec) |No license declared in the observed repository|Paper only and planning concepts; do not copy or redistribute code|
+| [MDI-LLM](https://github.com/davmacario/MDI-LLM) | MIT |Research reference for recurring pipelines; not integrated|
+| [NativeStage](https://github.com/fthrvi/native_stage) | MIT |Partial Backend Integrated flame by isolated process; source fixed in `0c16119713396ec6052400f3eb049c5e7a66cd94`, verified patches and sealed sub-GGGUF packages|
+| LunarG Vulkan SDK |Licences by component|Local toolchain `1.4.350.0` used to compile the Vulkan gate; it is not edited or redistributed within the repository|
+| w64devkit |Licences by component|Local portable toolchain `2.6.0` used for Windows builds; no version or redistribution within the repository|
+| [Speculative Pipeline Decoding](https://github.com/yuyijiong/speculative_pipeline_decoding) |No license declared in the observed repository|Paper only, external evaluation and concepts; do not copy or redistribute code|
+| [Multi-Block Diffusion](https://github.com/SJTU-DENG-Lab/mbd-lms) | MIT |Future and isolated WAN-native line; not integrated into autoregressive runtime|
+|SpecPipe, Jupiter and Halo|No official localized linked repository|Only paper ideas and results; there is no code to incorporate into this project|
 
-Esta tabla es una guía de ingeniería, no asesoramiento jurídico. Las licencias y commits deben volver a verificarse antes de distribuir una imagen que incluya cualquier motor externo.
+This table is an engineering guide, not legal advice. Licenses and commits must be re-verified before distributing an image that includes any external engine.
 
-## Regla de seguridad
+## Security rule
 
-Los endpoints locales de inferencia se enlazan a loopback. El agente doméstico abre la conexión hacia el coordinador. No se deben publicar en WAN los puertos RPC de external GGUF runtime, PRIMA.cpp o Distributed Llama, ni los puertos HTTP o de gestión de external runtime A. Una célula external runtime A privada controla la admisión, pero no constituye ejecución confidencial ni atestación de los hosts.
+The local inference endpoints are linked to loopback. The domestic agent opens the connection to the coordinator. The RPC ports of external GGUF runtime, PRIMA.cpp or Distributed Call, nor the HTTP or external runtime A management ports, should not be published in WAN. A private external runtime A cell controls the admission, but does not constitute confidential execution or host attestation.
 
-Referencia crítica: [advisory de external GGUF runtime RPC](https://github.com/ggml-org/external GGUF runtime/security/advisories/GHSA-j8rj-fmpv-wcxw).
+Critical reference: [advisory of external GGUF runtime RPC](https://github.com/ggml-org/external GGUF runtime/security/advisories/GHSA-j8rj-fmpv-wcxw).

@@ -179,6 +179,7 @@ async function startNetwork(options: { llmfit?: boolean; networkToken?: string }
     port: 0,
     databasePath: ":memory:",
     requestTimeoutMs: 10_000,
+    mobileAssetsPath: resolve("tests/fixtures/mobile-assets"),
     landingAssetsPath: resolve("tests/fixtures/landing-assets"),
     ...(options.networkToken
       ? { networkToken: options.networkToken, mobileJoinToken: options.networkToken }
