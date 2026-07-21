@@ -42,6 +42,7 @@ from distributed_runtime.protocol import (
     decode_tensor,
     recv_frame,
     encode_tree_prepare_quote,
+    tree_reservation_payload,
     token_payload,
     verify_result_payload,
 )
@@ -1742,6 +1743,124 @@ class EngineUnitTests(unittest.TestCase):
             quote_stats = engine.speculation_stats["physical_tree"]["capacity_quote"]
             self.assertEqual(quote_stats["rejected"], 1)
             self.assertEqual(quote_stats["rejections"], {"kv_bytes": 1})
+        finally:
+            engine._retire_job(job, runner, exception=RuntimeError("test cleanup"))
+            root.close()
+            child.close()
+
+    def test_tree_commit_result_is_identity_bound_and_timeout_has_zero_forks(self) -> None:
+        engine, runner, job, active = _prepared_tree_test_case(
+            ((20,),), max_new_tokens=4
+        )
+        root, child = socket.socketpair()
+        try:
+            prepared = engine._prepare_decode_wave(job, runner, active_sequences=1)
+            assert isinstance(prepared, _PreparedPhysicalTreeWave)
+            engine._dispatch_root_waves([prepared], runner, root, LinkEmulator())
+            prepare = recv_frame(child)
+            quote = decode_tree_prepare(prepare)
+            ready = replace(quote, stage_count=engine.stages - 1)
+            self.assertIsNone(
+                engine._handle_return_value(
+                    (
+                        Frame(
+                            FrameType.TREE_PREPARE_RESULT,
+                            0,
+                            prepare.request_id,
+                            prepare.step,
+                            prepare.token_count,
+                            0,
+                            encode_tree_prepare_quote(ready),
+                        ),
+                        time.perf_counter(),
+                    ),
+                    active,
+                    runner,
+                    root,
+                )
+            )
+            commit = recv_frame(child)
+            with self.assertRaisesRegex(RuntimeError, "nonce mismatch"):
+                engine._handle_return_value(
+                    (
+                        Frame(
+                            FrameType.TREE_RESERVATION_COMMIT_RESULT,
+                            0,
+                            commit.request_id,
+                            commit.step,
+                            engine.stages - 1,
+                            0,
+                            tree_reservation_payload(quote.nonce + 1),
+                        ),
+                        time.perf_counter(),
+                    ),
+                    active,
+                    runner,
+                    root,
+                )
+            self.assertEqual(runner.forks, [])
+        finally:
+            engine._retire_job(job, runner, exception=RuntimeError("test cleanup"))
+            root.close()
+            child.close()
+
+        engine, runner, job, active = _prepared_tree_test_case(
+            ((20,),), max_new_tokens=4
+        )
+        root, child = socket.socketpair()
+        try:
+            prepared = engine._prepare_decode_wave(job, runner, active_sequences=1)
+            assert isinstance(prepared, _PreparedPhysicalTreeWave)
+            engine._dispatch_root_waves([prepared], runner, root, LinkEmulator())
+            prepare = recv_frame(child)
+            quote = decode_tree_prepare(prepare)
+            ready = replace(quote, stage_count=engine.stages - 1)
+            engine._handle_return_value(
+                (
+                    Frame(
+                        FrameType.TREE_PREPARE_RESULT,
+                        0,
+                        prepare.request_id,
+                        prepare.step,
+                        prepare.token_count,
+                        0,
+                        encode_tree_prepare_quote(ready),
+                    ),
+                    time.perf_counter(),
+                ),
+                active,
+                runner,
+                root,
+            )
+            commit = recv_frame(child)
+            assert engine._pending_tree_reservation is not None
+            engine._pending_tree_reservation.deadline_at = time.perf_counter() - 1
+            with self.assertRaisesRegex(
+                TimeoutError, "TREE_RESERVATION_COMMIT_RESULT timeout"
+            ):
+                engine._check_pipeline_timeouts(active)
+            cancel = recv_frame(child)
+            self.assertEqual(cancel.frame_type, FrameType.TREE_RESERVATION_CANCEL)
+            self.assertEqual(runner.forks, [])
+            with self.assertRaisesRegex(RuntimeError, "late or unsolicited"):
+                engine._handle_return_value(
+                    (
+                        Frame(
+                            FrameType.TREE_RESERVATION_COMMIT_RESULT,
+                            0,
+                            commit.request_id,
+                            commit.step,
+                            engine.stages - 1,
+                            0,
+                            commit.payload,
+                        ),
+                        time.perf_counter(),
+                    ),
+                    active,
+                    runner,
+                    root,
+                )
+            self.assertEqual(runner.forks, [])
         finally:
             engine._retire_job(job, runner, exception=RuntimeError("test cleanup"))
             root.close()
