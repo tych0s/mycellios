@@ -21,6 +21,7 @@ import { llmfitHardwareFallback, probeLlmfit } from "./llmfit.js";
 
 export interface WorkerAgentOptions {
   coordinatorUrl: string;
+  networkToken?: string;
   heartbeatIntervalMs?: number;
   reconnect?: boolean;
   logger?: Pick<Console, "info" | "warn" | "error">;
@@ -119,11 +120,55 @@ export class WorkerAgent {
     this.stopped = true;
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     await this.abortActiveJobs("Worker shutting down");
-    this.socket?.close(1000, "worker shutting down");
+    await this.sendGoodbye("user_requested");
+    await this.closeSocket();
   }
 
   get workerId(): string | undefined {
     return this.registeredWorkerId;
+  }
+
+  private async sendGoodbye(reason: "user_requested" | "shutdown"): Promise<void> {
+    const socket = this.socket;
+    const workerId = this.registeredWorkerId;
+    if (!socket || socket.readyState !== socket.OPEN || !workerId) return;
+    const envelope: WorkerEnvelope = {
+      v: 1,
+      type: "worker.goodbye",
+      workerId,
+      payload: { reason },
+    };
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, 500);
+      timer.unref();
+      socket.send(JSON.stringify(envelope), () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+  }
+
+  private async closeSocket(): Promise<void> {
+    const socket = this.socket;
+    if (!socket || socket.readyState === socket.CLOSED) return;
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        socket.off("close", finish);
+        resolve();
+      };
+      const timer = setTimeout(finish, 1_000);
+      timer.unref();
+      socket.once("close", finish);
+      try {
+        socket.close(1000, "worker shutting down");
+      } catch {
+        finish();
+      }
+    });
   }
 
   private async buildCapabilities(): Promise<WorkerCapabilities> {
@@ -188,6 +233,9 @@ export class WorkerAgent {
             this.config.deployment.tokensPerSecond ?? defaultTokensPerSecond,
           ttftMs: this.config.deployment.ttftMs ?? defaultTtft,
           dataLocality: adapterDataLocality(this.config),
+          ...(this.config.deployment.internalPipeline
+            ? { internalPipeline: structuredClone(this.config.deployment.internalPipeline) }
+            : {}),
         },
       ],
       network: {
@@ -237,7 +285,7 @@ export class WorkerAgent {
       coordinatorHttpUrl(this.coordinatorBaseUrl, "internal/v1/workers/register"),
       {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: this.requestHeaders({ "content-type": "application/json" }),
         body: JSON.stringify({
           capabilities: this.capabilities,
         }),
@@ -268,7 +316,12 @@ export class WorkerAgent {
 
     return new Promise((resolve, reject) => {
       let opened = false;
-      const socket = new WebSocket(url, { maxPayload: MAX_SERVER_MESSAGE_BYTES });
+      const socket = new WebSocket(url, {
+        maxPayload: MAX_SERVER_MESSAGE_BYTES,
+        ...(this.options.networkToken
+          ? { headers: { authorization: `Bearer ${this.options.networkToken}` } }
+          : {}),
+      });
       this.socket = socket;
       socket.on("open", () => {
         opened = true;
@@ -301,6 +354,11 @@ export class WorkerAgent {
         if (opened) resolve();
       });
     });
+  }
+
+  private requestHeaders(initial: Record<string, string> = {}): Record<string, string> {
+    if (!this.options.networkToken) return initial;
+    return { ...initial, authorization: `Bearer ${this.options.networkToken}` };
   }
 
   private async handleServerMessage(input: unknown): Promise<void> {

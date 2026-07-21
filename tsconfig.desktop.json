@@ -13,14 +13,15 @@
     "skipLibCheck": true,
     "resolveJsonModule": true,
     "jsx": "react-jsx",
-    "types": ["node", "vite/client"]
+    "types": ["node", "vite/client", "@webgpu/types"]
   },
   "include": [
     "forge.config.ts",
     "vite.*.config.ts",
     "src/desktop/**/*.ts",
     "src/renderer/**/*.ts",
-    "src/renderer/**/*.tsx"
+    "src/renderer/**/*.tsx",
+    "landing/src/Panel.tsx"
   ],
   "exclude": ["node_modules", "dist", "out", ".vite"]
 }

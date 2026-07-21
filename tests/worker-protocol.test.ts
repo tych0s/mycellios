@@ -3,6 +3,7 @@ import {
   parseWorkerEnvelope,
   taskCompleteEnvelopeSchema,
   taskTokenEnvelopeSchema,
+  workerGoodbyeEnvelopeSchema,
   workerEnvelopeSchema,
   workerHeartbeatEnvelopeSchema,
   workerHelloEnvelopeSchema,
@@ -49,6 +50,19 @@ describe("worker protocol schemas", () => {
         payload: {},
       }).success,
     ).toBe(false);
+  });
+
+  it("accepts only an explicit bounded worker goodbye", () => {
+    const goodbye = {
+      ...baseEnvelope,
+      type: "worker.goodbye" as const,
+      payload: { reason: "user_requested" as const },
+    };
+    expect(workerGoodbyeEnvelopeSchema.safeParse(goodbye).success).toBe(true);
+    expect(workerGoodbyeEnvelopeSchema.safeParse({
+      ...goodbye,
+      payload: { reason: "network_error" },
+    }).success).toBe(false);
   });
 
   it("enforces UTF-8 byte limits for token chunks and completion output", () => {

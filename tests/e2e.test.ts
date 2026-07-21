@@ -123,9 +123,52 @@ describe("inference-only coordinator and worker", () => {
       /^dep-/,
     );
   });
+
+  it("removes a worker from the visible inventory after a voluntary stop", async () => {
+    const { runtime, agent, run } = await startNetwork();
+    cleanup.push(async () => {
+      await agent.stop();
+      await run;
+      await runtime.close();
+    });
+    expect(runtime.store.listWorkers()).toHaveLength(1);
+
+    await agent.stop();
+    await run;
+    await waitUntil(() => runtime.store.listWorkers().length === 0, 2_000);
+
+    expect(runtime.store.listWorkers()).toHaveLength(0);
+    expect(runtime.hub.connectedWorkerIds().size).toBe(0);
+    const retained = runtime.database.raw
+      .prepare("SELECT status, deregistered FROM workers")
+      .get() as { status: string; deregistered: number };
+    expect(retained).toEqual({ status: "offline", deregistered: 1 });
+  });
+
+  it("protects network and worker routes when a network token is configured", async () => {
+    const networkToken = "test-network-token";
+    const { runtime, address, agent, run } = await startNetwork({ networkToken });
+    cleanup.push(async () => {
+      await agent.stop();
+      await run;
+      await runtime.close();
+    });
+
+    expect((await fetch(new URL("health", `${address}/`))).status).toBe(200);
+    expect((await fetch(new URL("public/v1/snapshot", `${address}/`))).status).toBe(200);
+    expect((await fetch(new URL("network", `${address}/`))).status).toBe(200);
+    expect((await fetch(new URL("v1/models", `${address}/`))).status).toBe(401);
+    expect(
+      (
+        await fetch(new URL("v1/models", `${address}/`), {
+          headers: { authorization: `Bearer ${networkToken}` },
+        })
+      ).status,
+    ).toBe(200);
+  });
 });
 
-async function startNetwork(options: { llmfit?: boolean } = {}): Promise<{
+async function startNetwork(options: { llmfit?: boolean; networkToken?: string } = {}): Promise<{
   runtime: CoordinatorRuntime;
   address: string;
   agent: WorkerAgent;
@@ -136,6 +179,9 @@ async function startNetwork(options: { llmfit?: boolean } = {}): Promise<{
     port: 0,
     databasePath: ":memory:",
     requestTimeoutMs: 10_000,
+    ...(options.networkToken
+      ? { networkToken: options.networkToken, mobileJoinToken: options.networkToken }
+      : {}),
   });
   const address = await runtime.app.listen({ host: "127.0.0.1", port: 0 });
   const agent = new WorkerAgent(
@@ -176,6 +222,7 @@ async function startNetwork(options: { llmfit?: boolean } = {}): Promise<{
       heartbeatIntervalMs: 100,
       reconnect: false,
       logger: { info() {}, warn() {}, error() {} },
+      ...(options.networkToken ? { networkToken: options.networkToken } : {}),
     },
   );
   const run = agent.start();

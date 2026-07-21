@@ -51,6 +51,10 @@ export interface ModelDeployment {
     layerStart: number;
     layerEnd: number;
   } | undefined;
+  internalPipeline?: {
+    stageCount: number;
+    boundaries: number[];
+  } | undefined;
 }
 
 export interface GpuCapability {

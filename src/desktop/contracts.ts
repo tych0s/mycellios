@@ -4,6 +4,7 @@ export type AdapterMode = "connectivity-test" | "local-model-runtime";
 export interface DesktopSettings {
   coordinatorMode: CoordinatorMode;
   remoteCoordinatorUrl: string;
+  remoteCoordinatorToken: string;
   contributionEnabled: boolean;
   launchAtLogin: boolean;
   closeToTray: boolean;
@@ -44,6 +45,7 @@ export interface DashboardDeployment {
 
 export interface DashboardWorker {
   id: string;
+  kind: "desktop" | "browser";
   status: "online" | "suspect" | "offline" | "draining";
   connected: boolean;
   region: string;
@@ -53,12 +55,72 @@ export interface DashboardWorker {
   lastSeenAt: string;
   gpus: DashboardGpu[];
   deployments: DashboardDeployment[];
+  mobile?: {
+    platform: string;
+    backend: "webgpu" | "cpu";
+    performanceLevel: "low" | "balanced" | "maximum";
+    wakeLock: boolean;
+    estimatedGflops: number;
+    verifiedTasks: number;
+    residentExperts: Array<{
+      artifactId: string;
+      modelId: string;
+      modelDigest: string;
+      layer: number;
+      expert: number;
+      contentId: string;
+      bytes: number;
+    }>;
+  };
 }
 
 export interface DashboardModel {
   id: string;
   replicas: number;
   pipelines: number;
+}
+
+export interface RequestedModelCapacity {
+  id: string;
+  source: string;
+  revision: string | null;
+  status: "profiling" | "waiting_capacity" | "ready" | "activating" | "active" | "incompatible" | "failed";
+  autoActivate: boolean;
+  adapterId: string | null;
+  compatible: boolean | null;
+  requiredVramMiB: number | null;
+  availableVramMiB: number;
+  missingVramMiB: number | null;
+  requiredNodes: number;
+  availableNodes: number;
+  missingNodes: number;
+  weightBytes: number | null;
+  contextTokens: number;
+  message: string;
+  activationRequestedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RequestModelInput {
+  id: string;
+  source: string;
+  revision: string | null;
+  contextTokens: number;
+  minimumNodes: number;
+  autoActivate: boolean;
+}
+
+export interface DashboardJob {
+  id: string;
+  model: string;
+  status: string;
+  workerId: string | null;
+  inputTokens: number;
+  outputTokens: number;
+  failureCode: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface LocalHardware {
@@ -77,6 +139,24 @@ export interface LocalHardware {
   }>;
 }
 
+export type DesktopUpdateState =
+  | "unsupported"
+  | "development"
+  | "idle"
+  | "checking"
+  | "downloading"
+  | "ready"
+  | "up-to-date"
+  | "error";
+
+export interface DesktopUpdateStatus {
+  state: DesktopUpdateState;
+  currentVersion: string;
+  availableVersion: string | null;
+  message: string;
+  checkedAt: string | null;
+}
+
 export interface DashboardSnapshot {
   capturedAt: string;
   coordinatorUrl: string;
@@ -91,8 +171,11 @@ export interface DashboardSnapshot {
   } | null;
   workers: DashboardWorker[];
   models: DashboardModel[];
+  requestedModels: RequestedModelCapacity[];
+  jobs: DashboardJob[];
   localHardware: LocalHardware;
   settings: DesktopSettings;
+  update: DesktopUpdateStatus;
 }
 
 export interface ChatRequest {
@@ -114,4 +197,16 @@ export interface DesktopBridge {
   saveSettings(settings: DesktopSettings): Promise<DashboardSnapshot>;
   setContribution(enabled: boolean): Promise<DashboardSnapshot>;
   sendChat(request: ChatRequest): Promise<ChatResponse>;
+  removeWorker(workerId: string): Promise<DashboardSnapshot>;
+  clearOfflineWorkers(): Promise<DashboardSnapshot>;
+  requestModel(input: RequestModelInput): Promise<DashboardSnapshot>;
+  removeRequestedModel(modelId: string): Promise<DashboardSnapshot>;
+  getBenchmarkRuns(): Promise<BenchmarkRun[]>;
+  runBenchmark(): Promise<BenchmarkRun>;
+  checkForUpdates(): Promise<DesktopUpdateStatus>;
+  installUpdate(): Promise<void>;
+  minimizeWindow(): Promise<void>;
+  toggleMaximizeWindow(): Promise<boolean>;
+  closeWindow(): Promise<void>;
 }
+import type { BenchmarkRun } from "../benchlab/types.js";
