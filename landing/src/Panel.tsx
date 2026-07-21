@@ -50,7 +50,7 @@ import type {
 } from "../../src/desktop/contracts";
 import type { BenchmarkMeasurement, BenchmarkRun } from "../../src/benchlab/types";
 import { Contribute } from "./Contribute";
-import brandIcon from "./assets/mycellios-mark-transparent.png";
+import brandIcon from "./assets/mycellios-app-icon-v2.png";
 import "./panel.css";
 
 const PUBLIC_COORDINATOR_URL = "https://www.mycellios.com";

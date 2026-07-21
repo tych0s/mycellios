@@ -1,5 +1,5 @@
-const CACHE = "mycellios-mobile-v0.2.5";
-const CORE = ["./", "./manifest.webmanifest", "./icon.png"];
+const CACHE = "mycellios-mobile-v0.2.8";
+const CORE = ["./", "./manifest.webmanifest", "./mycellios-app-icon-v2.png"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(CORE)));

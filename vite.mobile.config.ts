@@ -21,7 +21,12 @@ function mobileAssets(): Plugin {
             background_color: "#11172f",
             theme_color: "#11172f",
             icons: [
-              { src: "./icon.png", sizes: "512x512", type: "image/png", purpose: "any maskable" },
+              {
+                src: "./mycellios-app-icon-v2.png",
+                sizes: "1024x1024",
+                type: "image/png",
+                purpose: "any maskable",
+              },
             ],
           },
           null,
@@ -30,8 +35,8 @@ function mobileAssets(): Plugin {
       });
       this.emitFile({
         type: "asset",
-        fileName: "icon.png",
-        source: readFileSync("build/icons/icon.png"),
+        fileName: "mycellios-app-icon-v2.png",
+        source: readFileSync("build/icons/app-icon-v2.png"),
       });
       this.emitFile({
         type: "asset",

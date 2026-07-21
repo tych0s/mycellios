@@ -31,6 +31,7 @@ import type {
 if (started) app.quit();
 
 app.setName("mycellios");
+if (process.platform === "win32") app.setAppUserModelId("app.mycellios.desktop.v2");
 
 const PUBLIC_COORDINATOR_URL = "https://www.mycellios.com";
 
@@ -552,7 +553,7 @@ function registerIpc(): void {
 }
 
 function createWindow(): void {
-  const icon = resourcePath("build", "icons", "icon.png");
+  const icon = resourcePath("build", "icons", "app-icon-v2.png");
   mainWindow = new BrowserWindow({
     width: 1_520,
     height: 920,
@@ -626,7 +627,7 @@ function createTray(): void {
 }
 
 function createTrayUnsafe(): void {
-  const trayImage = nativeImage.createFromPath(resourcePath("build", "icons", "icon.png"));
+  const trayImage = nativeImage.createFromPath(resourcePath("build", "icons", "app-icon-v2.png"));
   tray?.destroy();
   tray = new Tray(trayImage.resize({ width: 22, height: 22 }));
   tray.setToolTip("mycellios");
