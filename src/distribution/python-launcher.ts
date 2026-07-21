@@ -16,7 +16,97 @@ import type {
   MacroWaveStageExecutionContractV1,
 } from "./types.js";
 
+const GDLP_FRAME_HEADER_BYTES = 32n;
+const DEFAULT_PREFILL_INFLIGHT_BYTES = 64 * 1024 * 1024;
+const MAX_PREFILL_INFLIGHT_BYTES = 1024 * 1024 * 1024;
+const MAX_SPECULATIVE_BRANCHES = 64;
+const MAX_SPECULATIVE_BRANCH_TOKENS = 1_048_576;
+const MAX_SPECULATIVE_KV_BYTES = 2 ** 40;
+
 export type PythonLaunchPhase = "prefill" | "decode";
+
+/** Every tensor codec currently understood by the Python GDLP/2 runtime. */
+export type PythonPrefillReservationCodec =
+  | RuntimeActivationCodec
+  | "fp32"
+  | "int8-grouped-deflate"
+  | "int8-hadamard-deflate";
+
+/**
+ * Data-independent upper bound for one encoded prefill frame on the wire.
+ *
+ * This deliberately mirrors Python `_prefill_frame_byte_reservation`: quantized
+ * scale bytes are included per row/block and DEFLATE uses zlib's worst-case
+ * bound. The return type is bigint so a hostile-but-valid safe-integer shape
+ * cannot make the static check optimistic through Number multiplication.
+ */
+export function pythonPrefillFrameByteReservation(
+  codec: PythonPrefillReservationCodec,
+  tokenCount: number,
+  hiddenSize: number,
+): bigint {
+  if (
+    !Number.isSafeInteger(tokenCount) ||
+    tokenCount < 1 ||
+    !Number.isSafeInteger(hiddenSize) ||
+    hiddenSize < 1
+  ) {
+    throw new Error("python_prefill_frame_shape_is_invalid");
+  }
+
+  const tokens = BigInt(tokenCount);
+  const hidden = BigInt(hiddenSize);
+  const elements = tokens * hidden;
+  const deflated =
+    codec === "int8-grouped-deflate" || codec === "int8-hadamard-deflate";
+  const baseCodec =
+    codec === "int8-grouped-deflate"
+      ? "int8-grouped"
+      : codec === "int8-hadamard-deflate"
+        ? "int8-hadamard"
+        : codec;
+
+  let payloadBytes: bigint;
+  if (baseCodec === "fp32") {
+    payloadBytes = elements * 4n;
+  } else if (baseCodec === "fp16") {
+    payloadBytes = elements * 2n;
+  } else if (baseCodec === "int8") {
+    payloadBytes = elements + 4n;
+  } else if (baseCodec === "int8-grouped") {
+    const blocks = (hidden + 63n) / 64n;
+    payloadBytes = elements + tokens * blocks * 4n;
+  } else if (baseCodec === "int8-hadamard") {
+    const blocks = hadamardQuantizationBlockCount(hidden);
+    payloadBytes = elements + tokens * blocks * 4n;
+  } else {
+    throw new Error("python_prefill_frame_codec_is_invalid");
+  }
+
+  if (deflated) {
+    // Same bound as Python protocol._deflate_bound: raw DEFLATE stored-block
+    // overhead (13) plus the zlib header and Adler-32 trailer (6).
+    payloadBytes =
+      payloadBytes +
+      (payloadBytes >> 12n) +
+      (payloadBytes >> 14n) +
+      (payloadBytes >> 25n) +
+      19n;
+  }
+  return GDLP_FRAME_HEADER_BYTES + payloadBytes;
+}
+
+function hadamardQuantizationBlockCount(hiddenSize: bigint): bigint {
+  // Python repeatedly consumes the largest power of two <= min(64, remaining).
+  // Full groups contribute one block; the sub-64 tail contributes its popcount.
+  let remainder = Number(hiddenSize % 64n);
+  let tailBlocks = 0n;
+  while (remainder > 0) {
+    tailBlocks += BigInt(remainder & 1);
+    remainder >>= 1;
+  }
+  return hiddenSize / 64n + tailBlocks;
+}
 
 export interface PythonRuntimeModelInput {
   /** Hugging Face id or local snapshot path consumed by the Python loaders. */
@@ -48,6 +138,16 @@ export interface PythonLaunchCompilerOptions {
   threadsPerStage?: number;
   connectTimeoutSeconds?: number;
   batchWindowMs?: number;
+  /** Maximum ordered prefill chunks allowed on the physical route at once. */
+  prefillInflightChunks?: number;
+  /** Per-request hard cap for encoded prefill wire bytes currently in flight. */
+  prefillInflightBytes?: number;
+  /** Concurrent physical KV children. Zero keeps the physical tree disabled. */
+  maxSpeculativeBranches?: number;
+  /** Absolute context-token ceiling for every physical KV child. */
+  maxSpeculativeBranchTokens?: number;
+  /** Aggregate stage-local byte ceiling for all physical child KV caches. */
+  maxSpeculativeKvBytes?: number;
   maxPendingRequests?: number;
   maxOutputTokens?: number;
   speculationMinimumSpeedup?: number;
@@ -173,6 +273,11 @@ export interface PythonLaunchConfiguration {
   threadsPerStage: number;
   connectTimeoutSeconds: number;
   batchWindowMs: number;
+  prefillInflightChunks: number;
+  prefillInflightBytes: number;
+  maxSpeculativeBranches: number;
+  maxSpeculativeBranchTokens: number;
+  maxSpeculativeKvBytes: number;
   maxPendingRequests: number;
   maxOutputTokens: number;
   speculationMinimumSpeedup: number;
@@ -859,6 +964,12 @@ function renderRemoteStageArguments(
     String(launch.sealedWaveTokens),
     "--max-prefill-chunk-tokens",
     String(launch.maxPrefillChunkTokens),
+    "--max-speculative-branches",
+    String(configuration.maxSpeculativeBranches),
+    "--max-speculative-branch-tokens",
+    String(configuration.maxSpeculativeBranchTokens),
+    "--max-speculative-kv-bytes",
+    String(configuration.maxSpeculativeKvBytes),
     "--connect-timeout-seconds",
     finiteNumber(configuration.connectTimeoutSeconds),
   );
@@ -949,6 +1060,16 @@ function renderRootEngineArguments(
     finiteNumber(configuration.batchWindowMs),
     "--prefill-chunk-tokens",
     String(launch.prefill.chunkTokens),
+    "--prefill-inflight-chunks",
+    String(configuration.prefillInflightChunks),
+    "--prefill-inflight-bytes",
+    String(configuration.prefillInflightBytes),
+    "--max-speculative-branches",
+    String(configuration.maxSpeculativeBranches),
+    "--max-speculative-branch-tokens",
+    String(configuration.maxSpeculativeBranchTokens),
+    "--max-speculative-kv-bytes",
+    String(configuration.maxSpeculativeKvBytes),
     "--sealed-wave-tokens",
     String(launch.sealedWaveTokens),
     "--max-prefill-chunk-tokens",
@@ -1063,6 +1184,58 @@ function normalizeConfiguration(
     value.native_stageStages,
     runtimeModel,
   );
+  const prefillInflightChunks = boundedInteger(
+    value.prefillInflightChunks ??
+      Math.min(64, manifest.plans.prefill.stages.length),
+    1,
+    64,
+    "python_prefill_inflight_chunks_is_invalid",
+  );
+  const prefillInflightBytes = boundedInteger(
+    value.prefillInflightBytes ?? DEFAULT_PREFILL_INFLIGHT_BYTES,
+    1,
+    MAX_PREFILL_INFLIGHT_BYTES,
+    "python_prefill_inflight_bytes_is_invalid",
+  );
+  const minimumPrefillFrameBytes = pythonPrefillFrameByteReservation(
+    manifest.plans.prefill.activationCodec,
+    manifest.plans.prefill.chunkTokens,
+    manifest.hiddenSize,
+  );
+  if (BigInt(prefillInflightBytes) < minimumPrefillFrameBytes) {
+    throw new Error(
+      `python_prefill_inflight_bytes_below_frame_reservation:${minimumPrefillFrameBytes}`,
+    );
+  }
+  const maxSpeculativeBranches = boundedInteger(
+    value.maxSpeculativeBranches ?? 0,
+    0,
+    MAX_SPECULATIVE_BRANCHES,
+    "python_max_speculative_branches_is_invalid",
+  );
+  const maxSpeculativeBranchTokens = boundedInteger(
+    value.maxSpeculativeBranchTokens ?? 0,
+    0,
+    MAX_SPECULATIVE_BRANCH_TOKENS,
+    "python_max_speculative_branch_tokens_is_invalid",
+  );
+  const maxSpeculativeKvBytes = boundedInteger(
+    value.maxSpeculativeKvBytes ?? 0,
+    0,
+    MAX_SPECULATIVE_KV_BYTES,
+    "python_max_speculative_kv_bytes_is_invalid",
+  );
+  const speculativeTreeLimitsEnabled = [
+    maxSpeculativeBranches,
+    maxSpeculativeBranchTokens,
+    maxSpeculativeKvBytes,
+  ].map((limit) => limit > 0);
+  if (
+    speculativeTreeLimitsEnabled.some(Boolean) &&
+    !speculativeTreeLimitsEnabled.every(Boolean)
+  ) {
+    throw new Error("python_speculative_tree_limits_must_be_disabled_or_complete");
+  }
   const normalized: PythonLaunchConfiguration = {
     apiEndpoint: { ...value.apiEndpoint },
     returnEndpoint: { ...value.returnEndpoint },
@@ -1098,6 +1271,11 @@ function normalizeConfiguration(
       value.batchWindowMs ?? 2,
       "python_batch_window_is_invalid",
     ),
+    prefillInflightChunks,
+    prefillInflightBytes,
+    maxSpeculativeBranches,
+    maxSpeculativeBranchTokens,
+    maxSpeculativeKvBytes,
     maxPendingRequests: boundedInteger(
       value.maxPendingRequests ?? 128,
       1,

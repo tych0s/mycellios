@@ -18,6 +18,7 @@ export function addWorker(
     modelDigest?: string;
     mode?: ExecutionMode;
     stage?: { index: number; total: number; layerStart: number; layerEnd: number };
+    internalPipeline?: { stageCount: number; boundaries: number[] };
     llmfit?: {
       fitLevel: string;
       bestQuant?: string;
@@ -58,6 +59,7 @@ export function addWorker(
           ttftMs: input.ttftMs ?? 1_000,
           dataLocality: "local",
           ...(input.stage ? { stage: input.stage } : {}),
+          ...(input.internalPipeline ? { internalPipeline: input.internalPipeline } : {}),
         },
       ],
       network: { coordinatorRttMs: 20, uplinkMbps: 100, downlinkMbps: 100 },

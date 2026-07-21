@@ -1,0 +1,6 @@
+{
+  "name": "mycellios mobile worker test",
+  "short_name": "mycellios",
+  "start_url": "./",
+  "display": "standalone"
+}

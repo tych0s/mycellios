@@ -1,10 +1,12 @@
 import websocket from "@fastify/websocket";
 import staticFiles from "@fastify/static";
-import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { z, ZodError } from "zod";
+import { runAndPersistRealSuite } from "../benchlab/run.js";
+import { loadBenchmarkRuns } from "../benchlab/history.js";
 import {
   chatCompletionRequestSchema,
   workerRegistrationSchema,
@@ -16,6 +18,12 @@ import { MeshDatabase } from "../storage/database.js";
 import { MeshStore } from "../storage/store.js";
 import { MeshService, MeshServiceError, type JobStreamEvent } from "./mesh-service.js";
 import { MobileComputeHub, type MobileWorkerSnapshot } from "./mobile-compute-hub.js";
+import type { ModelActivationManager } from "./model-activation-manager.js";
+import {
+  inspectHubModelCapacity,
+  requestedModelCapacityViews,
+  shouldQueueAutomaticActivation,
+} from "./model-catalog.js";
 import { WorkerHub } from "./worker-hub.js";
 
 export interface CoordinatorRuntime {
@@ -31,7 +39,7 @@ export interface CoordinatorRuntime {
 
 export async function createCoordinator(
   config: CoordinatorConfig,
-  options: { logger?: boolean } = {},
+  options: { logger?: boolean; activationManager?: ModelActivationManager } = {},
 ): Promise<CoordinatorRuntime> {
   const app = Fastify({ logger: options.logger ?? false, bodyLimit: 2 * 1024 * 1024 });
   if (config.networkToken) {
@@ -45,6 +53,23 @@ export async function createCoordinator(
       }
     });
   }
+  const authorizeModelMutation = (request: FastifyRequest, reply: FastifyReply): boolean => {
+    const expected = config.modelAdminToken;
+    if (!expected && isLoopbackAddress(request.ip)) return true;
+    if (!expected) {
+      void reply.code(503).send({
+        error: {
+          code: "model_administration_not_configured",
+          message: "Remote model administration requires MYCELLIOS_MODEL_ADMIN_TOKEN.",
+        },
+      });
+      return false;
+    }
+    const received = parseBearerToken(request.headers.authorization);
+    if (received && constantTimeEqual(received, expected)) return true;
+    void reply.code(401).send({ error: { code: "invalid_model_admin_token" } });
+    return false;
+  };
   app.addContentTypeParser(
     "application/octet-stream",
     { parseAs: "buffer", bodyLimit: 512 * 1024 * 1024 },
@@ -88,9 +113,64 @@ export async function createCoordinator(
   });
   mobileHub.attach(app);
   const service = new MeshService(store, scheduler, hub, config.requestTimeoutMs);
+  const activationManager = options.activationManager;
+  await activationManager?.initialize();
+  const launchRequestedModel = (model: import("../storage/store.js").StoredRequestedModel) => {
+    if (!activationManager || activationManager.isManaging(model.id) || activationManager.isBusy()) return;
+    void activationManager.activate(model).catch((error: unknown) => {
+      if (store.getRequestedModel(model.id)) {
+        store.setRequestedModelActivationError(
+          model.id,
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    });
+  };
+  const reconcileRequestedModels = () => {
+    const activeModelIds = new Set(
+      scheduler
+        .listAvailableModels({ connectedWorkerIds: hub.connectedWorkerIds() })
+        .map((model) => model.id),
+    );
+    const requests = store.listRequestedModels();
+    const views = requestedModelCapacityViews({
+      requests,
+      workers: store.listWorkers(),
+      connectedWorkerIds: hub.connectedWorkerIds(),
+      activeModelIds,
+      ...(activationManager
+        ? { executionNodesForModel: (modelId: string) => activationManager.capacityNodesForModel(modelId) }
+        : {}),
+      activationAvailable: activationManager !== undefined,
+    });
+    for (const view of views) {
+      const stored = requests.find((request) => request.id === view.id)!;
+      if (shouldQueueAutomaticActivation(view)) {
+        store.setRequestedModelActivation(view.id, true);
+        launchRequestedModel(store.getRequestedModel(view.id)!);
+      } else if (
+        view.status === "activating" &&
+        stored.activationRequestedAt !== null &&
+        activationManager &&
+        !activationManager.isManaging(view.id) &&
+        !activationManager.isBusy()
+      ) {
+        launchRequestedModel(stored);
+      } else if (
+        stored.activationRequestedAt !== null &&
+        (view.status === "waiting_capacity" || view.status === "incompatible" || view.status === "failed")
+      ) {
+        store.setRequestedModelActivation(view.id, false);
+      }
+    }
+  };
+  const benchmarkRoot = process.env.MYCELLIOS_BENCHMARK_ROOT?.trim() || process.cwd();
+  let benchmarkRunInFlight: ReturnType<typeof runAndPersistRealSuite> | null = null;
   const staleTimer = setInterval(() => {
     store.markStaleWorkers();
     hub.closeStaleConnections();
+    void activationManager?.refresh();
+    reconcileRequestedModels();
   }, 5_000);
   staleTimer.unref();
 
@@ -114,9 +194,112 @@ export async function createCoordinator(
     };
   });
 
-  app.get("/public/v1/snapshot", async () =>
-    publicSnapshot(store, scheduler, hub, mobileHub),
-  );
+  app.get("/public/v1/snapshot", async () => {
+    reconcileRequestedModels();
+    return publicSnapshot(store, scheduler, hub, mobileHub, activationManager);
+  });
+
+  app.post("/public/v1/requested-models", async (request, reply) => {
+    if (!authorizeModelMutation(request, reply)) return;
+    const body = requestedModelCreateSchema.parse(request.body);
+    const stored = store.upsertRequestedModel({
+      id: body.id,
+      source: body.source,
+      revision: body.revision,
+      contextTokens: body.contextTokens,
+      minimumNodes: body.minimumNodes,
+      autoActivate: body.autoActivate,
+    });
+    try {
+      const profile = await inspectHubModelCapacity({
+        source: stored.source,
+        revision: stored.revision,
+        contextTokens: stored.contextTokens,
+        minimumNodes: stored.minimumNodes,
+      });
+      store.setRequestedModelProfile(stored.id, profile as unknown as Record<string, unknown>, null);
+    } catch (error) {
+      store.setRequestedModelProfile(
+        stored.id,
+        null,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+    reconcileRequestedModels();
+    const snapshot = publicSnapshot(store, scheduler, hub, mobileHub, activationManager);
+    return reply.code(201).send({
+      model: snapshot.requestedModels.find((model) => model.id === stored.id),
+    });
+  });
+
+  app.delete("/public/v1/requested-models/:modelId", async (request, reply) => {
+    if (!authorizeModelMutation(request, reply)) return;
+    const { modelId } = requestedModelParamsSchema.parse(request.params);
+    await activationManager?.deactivate(modelId);
+    if (!store.removeRequestedModel(modelId)) {
+      return reply.code(404).send({ error: { code: "requested_model_not_found" } });
+    }
+    return { removed: true, modelId };
+  });
+
+  app.get("/internal/v1/model-activation-requests", async () => {
+    reconcileRequestedModels();
+    return {
+      data: store.listRequestedModels()
+        .filter((model) => model.activationRequestedAt !== null)
+        .map((model) => ({
+          id: model.id,
+          source: model.source,
+          revision: model.revision,
+          contextTokens: model.contextTokens,
+          minimumNodes: model.minimumNodes,
+          profile: model.profile,
+          requestedAt: new Date(model.activationRequestedAt!).toISOString(),
+        })),
+    };
+  });
+
+  app.get("/local/v1/benchmarks", async (request, reply) => {
+    if (!isLoopbackAddress(request.ip)) {
+      return reply.code(403).send({
+        error: { code: "local_access_required", message: "Benchmark history is available on the coordinator host only." },
+      });
+    }
+    return { runs: loadBenchmarkRuns(benchmarkRoot).toReversed() };
+  });
+
+  app.post("/local/v1/benchmarks/run", async (request, reply) => {
+    if (!isLoopbackAddress(request.ip)) {
+      return reply.code(403).send({
+        error: { code: "local_access_required", message: "Benchmarks can only be started on the coordinator host." },
+      });
+    }
+    if (benchmarkRunInFlight) {
+      return reply.code(409).send({
+        error: { code: "benchmark_in_progress", message: "A real benchmark is already running." },
+      });
+    }
+    const body = benchmarkRunRequestSchema.parse(request.body ?? {});
+    benchmarkRunInFlight = runAndPersistRealSuite({
+      cwd: benchmarkRoot,
+      coordinatorUrl: `http://127.0.0.1:${config.port}`,
+      ...(body.version ? { version: body.version } : {}),
+      ...(body.label ? { label: body.label } : {}),
+    });
+    try {
+      const result = await benchmarkRunInFlight;
+      return { run: result.run };
+    } catch (error) {
+      return reply.code(503).send({
+        error: {
+          code: "benchmark_unavailable",
+          message: error instanceof Error ? error.message : String(error),
+        },
+      });
+    } finally {
+      benchmarkRunInFlight = null;
+    }
+  });
 
   app.delete("/public/v1/workers/:workerId", async (request, reply) => {
     const { workerId } = workerIdParamsSchema.parse(request.params);
@@ -343,10 +526,30 @@ export async function createCoordinator(
       clearInterval(staleTimer);
       hub.close();
       mobileHub.close();
+      await activationManager?.close();
       await app.close();
       database.close();
     },
   };
+}
+
+const benchmarkRunRequestSchema = z.object({
+  version: z.string().trim().min(1).max(80).optional(),
+  label: z.string().trim().min(1).max(160).optional(),
+});
+
+const requestedModelCreateSchema = z.object({
+  id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
+  source: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,95}\/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
+  revision: z.string().min(1).max(512).nullable().default(null),
+  contextTokens: z.number().int().min(128).max(1_048_576).default(4_096),
+  minimumNodes: z.number().int().min(2).max(8).default(2),
+  autoActivate: z.boolean().default(true),
+}).strict();
+
+export function isLoopbackAddress(address: string): boolean {
+  const normalized = address.toLowerCase();
+  return normalized === "::1" || normalized === "127.0.0.1" || normalized.startsWith("127.") || normalized.startsWith("::ffff:127.");
 }
 
 function resolveMobileAssetsPath(configured: string | undefined): string | null {
@@ -428,9 +631,20 @@ function publicSnapshot(
   scheduler: Scheduler,
   hub: WorkerHub,
   mobileHub: MobileComputeHub,
+  activationManager?: ModelActivationManager,
 ) {
   const workers = dashboardWorkers(store, hub, mobileHub);
   const models = scheduler.listAvailableModels({ connectedWorkerIds: hub.connectedWorkerIds() });
+  const requestedModels = requestedModelCapacityViews({
+    requests: store.listRequestedModels(),
+    workers: store.listWorkers(),
+    connectedWorkerIds: hub.connectedWorkerIds(),
+    activeModelIds: new Set(models.map((model) => model.id)),
+    ...(activationManager
+      ? { executionNodesForModel: (modelId: string) => activationManager.capacityNodesForModel(modelId) }
+      : {}),
+    activationAvailable: activationManager !== undefined,
+  });
   const jobs = store.listJobs(100).map((job) => ({
     id: job.id,
     model: job.model,
@@ -459,6 +673,7 @@ function publicSnapshot(
       replicas: model.replicas,
       pipelines: model.pipelines,
     })),
+    requestedModels,
     jobs,
   };
 }
@@ -518,6 +733,9 @@ function parseIdempotencyKey(received: string | string[] | undefined): string | 
 
 const jobIdParamsSchema = z.object({ jobId: z.string().min(1).max(128) }).strict();
 const workerIdParamsSchema = z.object({ workerId: z.string().min(1).max(256) }).strict();
+const requestedModelParamsSchema = z.object({
+  modelId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
+}).strict();
 
 function parseBearerToken(header: string | undefined): string | undefined {
   const match = /^Bearer (.+)$/i.exec(header ?? "");

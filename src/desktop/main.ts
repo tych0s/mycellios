@@ -400,6 +400,7 @@ async function readSnapshot(): Promise<DashboardSnapshot> {
   let health: DashboardSnapshot["health"] = null;
   let workers: DashboardWorker[] = [];
   let models: DashboardModel[] = [];
+  let requestedModels: import("./contracts.js").RequestedModelCapacity[] = [];
   let jobs: DashboardJob[] = [];
   try {
     const [healthResult, publicResult] = await Promise.all([
@@ -407,12 +408,14 @@ async function readSnapshot(): Promise<DashboardSnapshot> {
       fetchJson<{
         workers: DashboardWorker[];
         models: DashboardModel[];
+        requestedModels: import("./contracts.js").RequestedModelCapacity[];
         jobs: DashboardJob[];
       }>("public/v1/snapshot"),
     ]);
     health = healthResult;
     workers = publicResult.workers;
     models = publicResult.models;
+    requestedModels = publicResult.requestedModels;
     jobs = publicResult.jobs;
   } catch (error) {
     connectionError = errorText(error);
@@ -427,6 +430,7 @@ async function readSnapshot(): Promise<DashboardSnapshot> {
     health,
     workers,
     models,
+    requestedModels,
     jobs,
     localHardware,
     settings,
@@ -487,6 +491,37 @@ function registerIpc(): void {
   ipcMain.handle("workers:clear-offline", async () => {
     await fetchJson("public/v1/workers/clear-offline", { method: "POST" });
     return readSnapshot();
+  });
+  ipcMain.handle("models:request", async (_event, input: import("./contracts.js").RequestModelInput) => {
+    await fetchJson("public/v1/requested-models", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(input),
+    });
+    return readSnapshot();
+  });
+  ipcMain.handle("models:remove-request", async (_event, modelId: string) => {
+    await fetchJson(`public/v1/requested-models/${encodeURIComponent(modelId)}`, { method: "DELETE" });
+    return readSnapshot();
+  });
+  ipcMain.handle("benchmarks:read", async () => {
+    const result = await fetchJson<{ runs: import("../benchlab/types.js").BenchmarkRun[] }>("local/v1/benchmarks");
+    return result.runs;
+  });
+  ipcMain.handle("benchmarks:run", async () => {
+    const response = await fetch(new URL("local/v1/benchmarks/run", `${coordinatorUrl}/`), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+      signal: AbortSignal.timeout(15 * 60_000),
+      redirect: "error",
+    });
+    const body = await response.json() as {
+      run?: import("../benchlab/types.js").BenchmarkRun;
+      error?: { message?: string };
+    };
+    if (!response.ok || !body.run) throw new Error(body.error?.message ?? `The coordinator returned HTTP ${response.status}.`);
+    return body.run;
   });
   ipcMain.handle("updates:check", () => checkForUpdates());
   ipcMain.handle("updates:install", () => {

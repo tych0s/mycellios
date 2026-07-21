@@ -233,6 +233,9 @@ export class WorkerAgent {
             this.config.deployment.tokensPerSecond ?? defaultTokensPerSecond,
           ttftMs: this.config.deployment.ttftMs ?? defaultTtft,
           dataLocality: adapterDataLocality(this.config),
+          ...(this.config.deployment.internalPipeline
+            ? { internalPipeline: structuredClone(this.config.deployment.internalPipeline) }
+            : {}),
         },
       ],
       network: {

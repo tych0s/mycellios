@@ -15,6 +15,7 @@ import {
   HardDrive,
   House,
   Laptop,
+  LayoutDashboard,
   LoaderCircle,
   Maximize2,
   MemoryStick,
@@ -37,22 +38,28 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useMemo, useState, type CSSProperties, type FormEvent } from "react";
+import "@fontsource-variable/manrope";
 import type {
   DashboardSnapshot,
   DesktopBridge,
   DesktopSettings,
   DesktopUpdateStatus,
+  RequestModelInput,
+  RequestedModelCapacity,
 } from "../../src/desktop/contracts";
-import brandIcon from "./assets/mycellios-mark.png";
+import type { BenchmarkMeasurement, BenchmarkRun } from "../../src/benchlab/types";
+import { Contribute } from "./Contribute";
+import brandIcon from "./assets/mycellios-mark-transparent.png";
 import "./panel.css";
 import "./panel-downloads.css";
 import "./panel-desktop.css";
 
-type PanelView = "overview" | "nodes" | "models" | "jobs" | "inference" | "join" | "downloads" | "machine" | "settings";
+type PanelView = "overview" | "nodes" | "models" | "jobs" | "tests" | "inference" | "contribute" | "join" | "downloads" | "machine" | "settings";
 
 interface PanelProps {
   desktopBridge?: DesktopBridge;
+  mobileEntry?: boolean;
 }
 
 interface PublicGpu {
@@ -122,6 +129,7 @@ interface PublicSnapshot {
   };
   workers: PublicWorker[];
   models: Array<{ id: string; replicas: number; pipelines: number }>;
+  requestedModels: RequestedModelCapacity[];
   jobs: PublicJob[];
 }
 
@@ -131,43 +139,53 @@ const EMPTY: PublicSnapshot = {
   summary: { registered: 0, connected: 0, online: 0, mobile: 0, offeredVramMb: 0, completedJobs: 0 },
   workers: [],
   models: [],
+  requestedModels: [],
   jobs: [],
 };
 
 const sharedNavItems: Array<{ id: PanelView; label: string; icon: typeof Network }> = [
-  { id: "overview", label: "Network", icon: Network },
+  { id: "overview", label: "Overview", icon: LayoutDashboard },
   { id: "nodes", label: "Nodes", icon: Server },
+  { id: "jobs", label: "Tasks", icon: Activity },
+  { id: "tests", label: "Tests", icon: Gauge },
   { id: "models", label: "Models", icon: Boxes },
-  { id: "jobs", label: "Jobs", icon: Activity },
   { id: "inference", label: "Inference", icon: MessageSquareText },
-  { id: "join", label: "Join network", icon: Zap },
+  { id: "contribute", label: "Contribute", icon: Zap },
   { id: "downloads", label: "Downloads", icon: Download },
 ];
 
-function initialView(desktop: boolean): PanelView {
+function initialView(desktop: boolean, mobileEntry: boolean): PanelView {
   if (desktop) return "overview";
+  const requested = new URLSearchParams(window.location.search).get("view");
+  if (sharedNavItems.some((item) => item.id === requested)) return requested as PanelView;
+  if (mobileEntry || window.location.pathname.startsWith("/mobile")) return "contribute";
   if (window.location.pathname === "/join") return "join";
   if (window.location.pathname === "/downloads") return "downloads";
-  const requested = new URLSearchParams(window.location.search).get("view");
-  return sharedNavItems.some((item) => item.id === requested) ? requested as PanelView : "overview";
+  return "overview";
 }
 
-function Panel({ desktopBridge }: PanelProps = {}) {
+function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   const desktop = desktopBridge !== undefined;
-  const navItems = useMemo(() => desktop
-    ? [
-        ...sharedNavItems.slice(0, 1),
+  const localBrowser = !desktop && ["localhost", "127.0.0.1", "::1", "[::1]"].includes(window.location.hostname);
+  const navItems = useMemo(() => {
+    if (!desktop) return sharedNavItems;
+    const desktopItems = sharedNavItems.filter((item) => item.id !== "contribute");
+    return [
+        ...desktopItems.slice(0, 1),
         { id: "machine" as const, label: "This machine", icon: Cpu },
-        ...sharedNavItems.slice(1),
+        ...desktopItems.slice(1),
         { id: "settings" as const, label: "Settings", icon: Settings },
-      ]
-    : sharedNavItems, [desktop]);
-  const [view, setView] = useState<PanelView>(() => initialView(desktop));
+      ];
+  }, [desktop]);
+  const [view, setView] = useState<PanelView>(() => initialView(desktop, mobileEntry));
   const [snapshot, setSnapshot] = useState<PublicSnapshot>(EMPTY);
   const [desktopSnapshot, setDesktopSnapshot] = useState<DashboardSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [modelAdminToken, setModelAdminToken] = useState(() =>
+    desktop ? "" : window.sessionStorage.getItem("mycellios-model-admin-token") ?? "",
+  );
   const applyDesktopSnapshot = useCallback((next: DashboardSnapshot) => {
     setDesktopSnapshot(next);
     setSnapshot(desktopToPublicSnapshot(next));
@@ -202,8 +220,10 @@ function Panel({ desktopBridge }: PanelProps = {}) {
     setView(next);
     setMenuOpen(false);
     if (!desktop) {
-      const path = next === "join" ? "/join" : next === "downloads" ? "/downloads" : "/network";
-      const query = next === "overview" || next === "join" || next === "downloads" ? "" : `?view=${next}`;
+      const path = mobileEntry ? "/mobile/" : next === "join" ? "/join" : next === "downloads" ? "/downloads" : "/network";
+      const query = mobileEntry
+        ? next === "contribute" ? "" : `?view=${next}`
+        : next === "overview" || next === "join" || next === "downloads" ? "" : `?view=${next}`;
       window.history.replaceState({}, "", `${path}${query}`);
     }
   }
@@ -230,6 +250,47 @@ function Panel({ desktopBridge }: PanelProps = {}) {
     await refresh();
   }
 
+  async function requestModel(input: RequestModelInput, adminToken: string) {
+    if (desktopBridge) {
+      applyDesktopSnapshot(await desktopBridge.requestModel(input));
+      return;
+    }
+    const token = adminToken.trim();
+    if (!token && !localBrowser) throw new Error("Enter the network administration token.");
+    if (token) {
+      window.sessionStorage.setItem("mycellios-model-admin-token", token);
+      setModelAdminToken(token);
+    }
+    const response = await fetch("/public/v1/requested-models", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify(input),
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => null) as { error?: { message?: string } } | null;
+      throw new Error(body?.error?.message ?? `HTTP ${response.status}`);
+    }
+    await refresh();
+  }
+
+  async function removeRequestedModel(modelId: string, adminToken: string) {
+    if (desktopBridge) {
+      applyDesktopSnapshot(await desktopBridge.removeRequestedModel(modelId));
+      return;
+    }
+    const token = adminToken.trim();
+    if (!token && !localBrowser) throw new Error("Enter the network administration token.");
+    const response = await fetch(`/public/v1/requested-models/${encodeURIComponent(modelId)}`, {
+      method: "DELETE",
+      ...(token ? { headers: { authorization: `Bearer ${token}` } } : {}),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    await refresh();
+  }
+
   async function sendPrompt(model: string, prompt: string) {
     if (desktopBridge) return (await desktopBridge.sendChat({ model, prompt })).text;
     const response = await fetch("/v1/chat/completions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }], max_tokens: 256 }) });
@@ -247,6 +308,7 @@ function Panel({ desktopBridge }: PanelProps = {}) {
   return (
     <div className={`public-panel ${desktop ? `desktop-panel platform-${desktopSnapshot?.platform ?? "loading"}` : ""}`}>
       <aside className={menuOpen ? "panel-sidebar open" : "panel-sidebar"}>
+        <button className="panel-sidebar-close" aria-label="Close navigation" onClick={() => setMenuOpen(false)}><X size={18} /></button>
         <a className="panel-brand" href={publicLink("/")} {...externalProps}><img src={brandIcon} alt="" /><div><strong>mycellios</strong><span>network control</span></div></a>
         <nav>
           <span className="panel-nav-label">CONTROL CENTER</span>
@@ -257,40 +319,50 @@ function Panel({ desktopBridge }: PanelProps = {}) {
           ))}
         </nav>
         <div className="panel-sidebar-links">
-          <a href={publicLink("/mobile/")} {...externalProps}><Smartphone size={17} /><span>Mobile worker</span><ExternalLink size={13} /></a>
+          <a href={publicLink("/mobile/")} {...externalProps}><Smartphone size={17} /><span>Mobile app</span><ExternalLink size={13} /></a>
           <a href={publicLink("/")} {...externalProps}><House size={17} /><span>Landing</span><ExternalLink size={13} /></a>
         </div>
-        <div className="panel-sidebar-status"><i /><div><strong>Public test network</strong><span>No login required</span></div></div>
+        <div className={`panel-sidebar-status ${error ? "degraded" : "healthy"}`}>
+          <i />
+          <div>
+            <span>Network Status</span>
+            <strong>{error ? "Degraded" : "Healthy"}</strong>
+            <small>{error ? "Coordinator unavailable" : "All systems operational"}</small>
+          </div>
+        </div>
       </aside>
+      {menuOpen && <button className="panel-menu-backdrop" aria-label="Close navigation overlay" onClick={() => setMenuOpen(false)} />}
 
       <div className="panel-main">
         <header className="panel-topbar">
           <button
             className="panel-menu-button"
-            aria-label={menuOpen ? "Close menu" : "Open menu"}
+            aria-label="Open menu"
             aria-expanded={menuOpen}
             onClick={() => setMenuOpen((current) => !current)}
-          >{menuOpen ? <X /> : <Menu />}</button>
-          <div><span className="panel-live-dot" /><strong>mycellios network</strong><small>{error ? "Coordinator unavailable" : "Live coordinator"}</small></div>
+          ><Menu /></button>
+          <div className="panel-topbar-status"><span className={`panel-live-dot ${error ? "degraded" : ""}`} /><div><strong>{error ? "Network degraded" : "Network healthy"}</strong><small>{snapshot.capturedAt === EMPTY.capturedAt ? "Waiting for snapshot" : `Updated ${relativeTime(snapshot.capturedAt)}`}</small></div></div>
           <div className="panel-top-actions">
             {desktopSnapshot?.update.state === "ready" && <button className="panel-update-ready" onClick={() => void desktopBridge?.installUpdate()} title="Restart and install update"><Download size={15} /></button>}
             {desktopSnapshot && <span>v{desktopSnapshot.appVersion}</span>}
             <span>API {snapshot.version}</span>
             <button onClick={() => void refresh()} aria-label="Refresh"><RefreshCw className={loading ? "spin" : ""} size={17} /></button>
-            {!desktop && <a href="/mobile/">Contribute <Zap size={15} /></a>}
+            {!desktop && <a href={mobileEntry ? "/mobile/" : "/network?view=contribute"}>Contribute <Zap size={15} /></a>}
             {desktopBridge && <div className="panel-window-controls"><button onClick={() => void desktopBridge.minimizeWindow()} aria-label="Minimize"><Minus size={16} /></button><button onClick={() => void desktopBridge.toggleMaximizeWindow()} aria-label="Maximize"><Maximize2 size={15} /></button><button className="close" onClick={() => void desktopBridge.closeWindow()} aria-label="Close"><X size={16} /></button></div>}
           </div>
         </header>
 
-        {error && <div className="panel-error"><CircleAlert size={17} /> Could not refresh the coordinator: {error}</div>}
+        {error && <div className="panel-error" title={error}><CircleAlert size={17} /> Coordinator unavailable. Retrying automatically.</div>}
         <main className="panel-content">
           {loading && snapshot.capturedAt === EMPTY.capturedAt ? <PanelLoading /> : (
             <>
               {view === "overview" && <Overview snapshot={snapshot} onNavigate={navigate} publicLink={publicLink} external={desktop} />}
               {view === "nodes" && <Nodes snapshot={snapshot} onRemove={removeWorker} onClearOffline={clearOfflineWorkers} />}
-              {view === "models" && <Models snapshot={snapshot} />}
+              {view === "models" && <Models snapshot={snapshot} onRequest={requestModel} onRemove={removeRequestedModel} adminToken={modelAdminToken} requiresAdminToken={!desktop && !localBrowser} />}
               {view === "jobs" && <Jobs snapshot={snapshot} />}
+              {view === "tests" && <Tests bridge={desktopBridge} />}
               {view === "inference" && <Inference snapshot={snapshot} onSend={sendPrompt} />}
+              {view === "contribute" && <Contribute />}
               {view === "join" && <JoinNetwork publicLink={publicLink} external={desktop} />}
               {view === "downloads" && <Downloads publicLink={publicLink} external={desktop} />}
               {view === "machine" && desktopSnapshot && desktopBridge && <Machine snapshot={desktopSnapshot} bridge={desktopBridge} onSnapshot={applyDesktopSnapshot} />}
@@ -307,17 +379,24 @@ function Panel({ desktopBridge }: PanelProps = {}) {
 function Overview({ snapshot, onNavigate, publicLink, external }: { snapshot: PublicSnapshot; onNavigate: (view: PanelView) => void; publicLink: (path: string) => string; external: boolean }) {
   const active = snapshot.workers.filter((worker) => worker.connected);
   return (
-    <section>
-      <PageTitle eyebrow="LIVE FABRIC" title="Distributed network" copy="Every active browser and desktop node connected to the public mycellios coordinator." actions={<><button onClick={() => onNavigate("nodes")}>Manage nodes</button><a href={publicLink("/mobile/")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}>Add this device <ArrowRight size={16} /></a></>} />
+    <section className="overview-page">
+      <PageTitle eyebrow="NETWORK CONTROL" title="Overview" copy="A live view of the capacity, models and tasks connected to your mycellios network." actions={<><button onClick={() => onNavigate("nodes")}>Manage nodes</button><a href={publicLink("/mobile/")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}>Add this device <ArrowRight size={16} /></a></>} />
       <div className="panel-stat-grid">
-        <Stat icon={Radio} label="Connected" value={String(snapshot.summary.connected)} detail={`${snapshot.summary.registered} registered`} />
-        <Stat icon={HardDrive} label="Offered memory" value={formatMemory(snapshot.summary.offeredVramMb)} detail="Across desktop nodes" />
-        <Stat icon={Boxes} label="Models" value={String(snapshot.models.length)} detail="Available now" />
-        <Stat icon={CheckCircle2} label="Completed" value={String(snapshot.summary.completedJobs)} detail="Recent jobs" />
+        <Stat icon={Radio} label="Active nodes" value={String(snapshot.summary.connected)} detail={`${snapshot.summary.registered} registered`} />
+        <Stat icon={HardDrive} label="Shared VRAM" value={formatMemory(snapshot.summary.offeredVramMb)} detail="Verified offered capacity" tone="orange" />
+        <Stat icon={Boxes} label="Available models" value={String(snapshot.models.length)} detail="Announced by live nodes" />
+        <Stat icon={CheckCircle2} label="Tasks completed" value={String(snapshot.summary.completedJobs)} detail="Current coordinator history" />
       </div>
       <div className="overview-grid">
+        <article className="activity-card">
+          <div className="card-heading"><div><span>RECENT ACTIVITY</span><h2>Network tasks</h2></div><button onClick={() => onNavigate("jobs")}>View all</button></div>
+          <div className="activity-list">
+            {snapshot.jobs.slice(0, 5).map((job) => <div key={job.id}><i className={job.status} /><div><strong>{job.model}</strong><span>{shortId(job.id)} · {relativeTime(job.updatedAt)}</span></div><b>{job.status}</b></div>)}
+            {snapshot.jobs.length === 0 && <Empty icon={Activity} title="No tasks yet" copy="Tasks will appear here when you test a connected model." />}
+          </div>
+        </article>
         <article className="network-canvas">
-          <div className="canvas-head"><div><span>PHYSICAL NETWORK</span><strong>{active.length} live nodes</strong></div><span className="canvas-live"><i /> LIVE</span></div>
+          <div className="canvas-head"><div><span>LIVE TOPOLOGY</span><strong>Network</strong></div><button className="canvas-link" onClick={() => onNavigate("nodes")}>View nodes</button></div>
           <div className="network-orbit">
             <div className="orbit-grid" />
             <div className="network-core"><img src={brandIcon} alt="" /><span>mycellios</span><small>coordinator</small></div>
@@ -329,14 +408,16 @@ function Overview({ snapshot, onNavigate, publicLink, external }: { snapshot: Pu
             })}
             {active.length === 0 && <div className="network-empty"><Wifi size={28} /><strong>Waiting for the first node</strong><a href={publicLink("/mobile/")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}>Connect this device</a></div>}
           </div>
-        </article>
-        <article className="activity-card">
-          <div className="card-heading"><div><span>RECENT ACTIVITY</span><h2>Network jobs</h2></div><button onClick={() => onNavigate("jobs")}>View all</button></div>
-          <div className="activity-list">
-            {snapshot.jobs.slice(0, 7).map((job) => <div key={job.id}><i className={job.status} /><div><strong>{job.model}</strong><span>{shortId(job.id)} · {relativeTime(job.updatedAt)}</span></div><b>{job.status}</b></div>)}
-            {snapshot.jobs.length === 0 && <Empty icon={Activity} title="No jobs yet" copy="Jobs will appear here when you test a connected model." />}
+          <div className="network-summary">
+            <div><span>Nodes online</span><strong>{snapshot.summary.connected} / {snapshot.summary.registered}</strong></div>
+            <div><span>Shared VRAM</span><strong>{formatMemory(snapshot.summary.offeredVramMb)}</strong></div>
           </div>
         </article>
+      </div>
+      <div className="overview-announcement">
+        <div className="announcement-icon"><Sparkles size={21} /></div>
+        <div><strong>Public network validation</strong><span>Connect a device to help validate physical multi-node inference with real hardware.</span></div>
+        <button onClick={() => onNavigate("join")}>Join network <ArrowRight size={16} /></button>
       </div>
     </section>
   );
@@ -375,12 +456,106 @@ function Nodes({ snapshot, onRemove, onClearOffline }: { snapshot: PublicSnapsho
   );
 }
 
-function Models({ snapshot }: { snapshot: PublicSnapshot }) {
-  return <section><PageTitle eyebrow="MODEL FABRIC" title="Available models" copy="Replicas and distributed pipelines announced by connected desktop nodes." />
-    <div className="panel-table"><div className="panel-table-head"><span>Model</span><span>Replicas</span><span>Pipelines</span><span>Status</span></div>
+function Models({ snapshot, onRequest, onRemove, adminToken: initialAdminToken, requiresAdminToken }: {
+  snapshot: PublicSnapshot;
+  onRequest: (input: RequestModelInput, adminToken: string) => Promise<void>;
+  onRemove: (modelId: string, adminToken: string) => Promise<void>;
+  adminToken: string;
+  requiresAdminToken: boolean;
+}) {
+  const [source, setSource] = useState("Qwen/Qwen3-0.6B");
+  const [modelId, setModelId] = useState("qwen3-0.6b");
+  const [revision, setRevision] = useState("");
+  const [contextTokens, setContextTokens] = useState(4096);
+  const [minimumNodes, setMinimumNodes] = useState(2);
+  const [autoActivate, setAutoActivate] = useState(true);
+  const [adminToken, setAdminToken] = useState(initialAdminToken);
+  const [busy, setBusy] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    setFormError(null);
+    try {
+      await onRequest({
+        id: modelId.trim(),
+        source: source.trim(),
+        revision: revision.trim() || null,
+        contextTokens,
+        minimumNodes,
+        autoActivate,
+      }, adminToken);
+    } catch (error) {
+      setFormError(errorText(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <section className="models-page">
+    <PageTitle eyebrow="MODEL FABRIC" title="Models" copy="Add a normal compatible model. mycellios calculates what the network is missing and watches capacity automatically." />
+    <form className="model-request-form" onSubmit={(event) => void submit(event)}>
+      <div className="model-form-heading"><div><span>ADD MODEL</span><h2>Prepare automatic distribution</h2><p>No pre-split files or terminal commands required.</p></div><Boxes size={24} /></div>
+      <div className="model-form-grid">
+        <label>HUGGING FACE MODEL<input value={source} onChange={(event) => setSource(event.target.value)} placeholder="Qwen/Qwen3-0.6B" required /></label>
+        <label>NETWORK NAME<input value={modelId} onChange={(event) => setModelId(event.target.value)} placeholder="qwen3-0.6b" required pattern="[A-Za-z0-9][A-Za-z0-9._-]*" /></label>
+        <label>REVISION <small>optional</small><input value={revision} onChange={(event) => setRevision(event.target.value)} placeholder="main or commit" /></label>
+        <label>CONTEXT TOKENS<input type="number" min={128} max={1048576} value={contextTokens} onChange={(event) => setContextTokens(Number(event.target.value))} /></label>
+        <label>MINIMUM NODES<select value={minimumNodes} onChange={(event) => setMinimumNodes(Number(event.target.value))}>{[2, 3, 4, 5, 6, 7, 8].map((count) => <option key={count}>{count}</option>)}</select></label>
+        {requiresAdminToken && <label>NETWORK ADMIN TOKEN<input type="password" autoComplete="current-password" value={adminToken} onChange={(event) => setAdminToken(event.target.value)} placeholder="Required to deploy models" required /></label>}
+        <label className="model-auto-toggle"><input type="checkbox" checked={autoActivate} onChange={(event) => setAutoActivate(event.target.checked)} /><span><strong>Activate automatically</strong><small>Start as soon as compatible capacity reaches the requirement.</small></span></label>
+      </div>
+      {formError && <div className="model-form-error"><CircleAlert size={16} />{formError}</div>}
+      <button className="model-submit" disabled={busy}>{busy ? <LoaderCircle className="spin" /> : <Play size={16} />}{busy ? "Inspecting model…" : "Add and calculate"}</button>
+    </form>
+
+    <div className="model-request-list">
+      {snapshot.requestedModels.map((model) => <RequestedModelCard key={model.id} model={model} onRemove={(modelId) => onRemove(modelId, adminToken)} />)}
+    </div>
+
+    <div className="panel-table model-active-table"><div className="panel-table-head"><span>Active model</span><span>Replicas</span><span>Pipelines</span><span>Status</span></div>
       {snapshot.models.map((model) => <div className="panel-table-row" key={model.id}><strong><Boxes size={17} />{model.id}</strong><span>{model.replicas}</span><span>{model.pipelines}</span><b><i />Available</b></div>)}
-      {snapshot.models.length === 0 && <Empty icon={Boxes} title="No models announced" copy="Connect a desktop node with local model runtime to publish the first model." />}
-    </div></section>;
+      {snapshot.models.length === 0 && <Empty icon={Boxes} title="No active models" copy="Add a model above. It will remain queued with an exact capacity shortfall until the network can run it." />}
+    </div>
+  </section>;
+}
+
+function RequestedModelCard({ model, onRemove }: { model: RequestedModelCapacity; onRemove: (modelId: string) => Promise<void> }) {
+  const [removing, setRemoving] = useState(false);
+  const required = model.requiredVramMiB ?? 0;
+  const vramProgress = required > 0 ? model.availableVramMiB / required : 0;
+  const nodeProgress = model.requiredNodes > 0 ? model.availableNodes / model.requiredNodes : 0;
+  const progress = Math.min(100, Math.round(Math.min(vramProgress, nodeProgress) * 100));
+  async function remove() {
+    setRemoving(true);
+    try { await onRemove(model.id); } finally { setRemoving(false); }
+  }
+  return <article className={`model-request-card ${model.status}`}>
+    <div className="model-request-head"><div className="model-request-icon"><Boxes /></div><div><span>{model.source}</span><h2>{model.id}</h2><small>{model.adapterId ?? "Checking architecture"}</small></div><ModelStatus status={model.status} /></div>
+    <p className="model-request-message">{model.message}</p>
+    <div className="model-capacity-bar"><i style={{ width: `${progress}%` }} /></div>
+    <div className="model-capacity-grid">
+      <Metric label="Estimated need" value={model.requiredVramMiB === null ? "Calculating" : formatMemory(model.requiredVramMiB)} />
+      <Metric label="Available" value={formatMemory(model.availableVramMiB)} />
+      <Metric label="Estimated shortfall" value={model.missingVramMiB === null ? "—" : formatMemory(model.missingVramMiB)} />
+      <Metric label="Nodes" value={`${model.availableNodes} / ${model.requiredNodes}`} />
+    </div>
+    <div className="model-request-foot"><span>{model.autoActivate ? <><Zap size={14} /> Auto-activation armed</> : "Manual activation"}</span><button disabled={removing} onClick={() => void remove()}>{removing ? <LoaderCircle className="spin" /> : <Trash2 />} Remove</button></div>
+  </article>;
+}
+
+function ModelStatus({ status }: { status: RequestedModelCapacity["status"] }) {
+  const labels: Record<RequestedModelCapacity["status"], string> = {
+    profiling: "Profiling",
+    waiting_capacity: "Waiting for capacity",
+    ready: "Ready",
+    activating: "Activation queued",
+    active: "Active",
+    incompatible: "Incompatible",
+    failed: "Needs attention",
+  };
+  return <b className={`model-request-status ${status}`}>{status === "profiling" || status === "activating" ? <LoaderCircle className="spin" /> : status === "active" || status === "ready" ? <CheckCircle2 /> : <CircleAlert />}{labels[status]}</b>;
 }
 
 function Jobs({ snapshot }: { snapshot: PublicSnapshot }) {
@@ -389,6 +564,126 @@ function Jobs({ snapshot }: { snapshot: PublicSnapshot }) {
       {snapshot.jobs.map((job) => <div className="panel-table-row" key={job.id}><strong><Activity size={16} />{shortId(job.id)}<small>{relativeTime(job.createdAt)}</small></strong><span>{job.model}</span><span>{job.inputTokens + job.outputTokens}</span><b className={job.status}><i />{job.status}</b></div>)}
       {snapshot.jobs.length === 0 && <Empty icon={Activity} title="No jobs yet" copy="Use the inference console when a model becomes available." />}
     </div></section>;
+}
+
+function Tests({ bridge }: { bridge: DesktopBridge | undefined }) {
+  const [runs, setRuns] = useState<BenchmarkRun[]>([]);
+  const [selectedRunId, setSelectedRunId] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [running, setRunning] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const loadRuns = useCallback(async () => {
+    setLoading(true);
+    try {
+      const next = bridge ? await bridge.getBenchmarkRuns() : await fetchBenchmarkRuns();
+      setRuns(next);
+      setSelectedRunId((current) => next.some((run) => run.runId === current) ? current : next[0]?.runId ?? "");
+      setError(null);
+    } catch (caught) {
+      setError(errorText(caught));
+    } finally {
+      setLoading(false);
+    }
+  }, [bridge]);
+
+  useEffect(() => { void loadRuns(); }, [loadRuns]);
+
+  async function runNow() {
+    setRunning(true);
+    setError(null);
+    try {
+      const run = bridge ? await bridge.runBenchmark() : await requestBenchmarkRun();
+      setRuns((current) => [run, ...current.filter((item) => item.runId !== run.runId)]);
+      setSelectedRunId(run.runId);
+    } catch (caught) {
+      setError(errorText(caught));
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  const selected = runs.find((run) => run.runId === selectedRunId) ?? runs[0] ?? null;
+  const measurements = runs.flatMap((run) => run.measurements);
+  const bestThroughput = measurements.reduce<number | null>((best, item) => {
+    const value = item.metrics.tokensPerSecond;
+    return value === null ? best : best === null ? value : Math.max(best, value);
+  }, null);
+  const latestDevices = selected?.measurements.reduce((best, item) => Math.max(best, item.inventory.connectedDevices), 0) ?? 0;
+
+  return <section className="tests-page">
+    <PageTitle eyebrow="REAL BENCHMARKS" title="Performance tests" copy="Real measurements from the active runtime, saved by version so improvements and regressions stay visible." actions={<button disabled={running} onClick={() => void runNow()}>{running ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}{running ? "Running real test…" : "Run real test"}</button>} />
+    {error && <div className="benchmark-error"><CircleAlert size={17} /><span><strong>Benchmark unavailable</strong>{error}</span></div>}
+    <div className="panel-stat-grid benchmark-stats">
+      <Stat icon={Activity} label="Recorded runs" value={String(runs.length)} detail="No simulated records" />
+      <Stat icon={Gauge} label="Best throughput" value={formatBenchmark(bestThroughput, " tok/s")} detail="Measured per request" tone="orange" />
+      <Stat icon={Server} label="Connected devices" value={String(latestDevices)} detail="In the selected run" />
+      <Stat icon={Boxes} label="Selected version" value={selected ? `v${selected.version}` : "—"} detail={selected ? formatBenchmarkDate(selected.finishedAt) : "No measurements yet"} />
+    </div>
+    {loading && runs.length === 0 ? <div className="benchmark-loading"><LoaderCircle className="spin" /><span>Loading real benchmark history…</span></div> : runs.length === 0 ? <Empty icon={Gauge} title="No real tests recorded" copy="Start the active runtime and run the first measurement. Nothing is generated if the runtime is not ready." /> : <>
+      <div className="benchmark-toolbar">
+        <label>RUN<select value={selected?.runId ?? ""} onChange={(event) => setSelectedRunId(event.target.value)}>{runs.map((run) => <option key={run.runId} value={run.runId}>{`v${run.version} · ${formatBenchmarkDate(run.finishedAt)} · ${benchmarkStatusLabel(run.status)}`}</option>)}</select></label>
+        {selected && <div className={`benchmark-run-state ${selected.status}`}><i />{benchmarkStatusLabel(selected.status)}<span>{selected.suite === "physical-import" ? "physical campaign" : "active runtime"}</span></div>}
+      </div>
+      <div className="benchmark-chart-grid">
+        <BenchmarkTrend runs={runs} metric="tokensPerSecond" label="Throughput by version" unit="tok/s" />
+        <BenchmarkTrend runs={runs} metric="ttftMsP95" label="TTFT P95 by version" unit="ms" />
+      </div>
+      {selected && <BenchmarkRunDetails run={selected} />}
+    </>}
+  </section>;
+}
+
+function BenchmarkTrend({ runs, metric, label, unit }: { runs: BenchmarkRun[]; metric: "tokensPerSecond" | "ttftMsP95"; label: string; unit: string }) {
+  const chronological = [...runs].reverse();
+  const ids = Array.from(new Set(chronological.flatMap((run) => run.measurements.map((item) => item.id))));
+  const values = chronological.flatMap((run) => run.measurements.map((item) => item.metrics[metric])).filter((value): value is number => value !== null);
+  const width = 720; const height = 240; const left = 52; const right = 30; const top = 28; const bottom = 42;
+  const ceiling = Math.max(...values, 1);
+  const x = (index: number) => chronological.length === 1 ? (left + width - right) / 2 : left + (index / (chronological.length - 1)) * (width - left - right);
+  const y = (value: number) => top + (1 - value / ceiling) * (height - top - bottom);
+  return <article className="benchmark-chart">
+    <div><span>VERSION TREND</span><h2>{label}</h2></div>
+    <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${label}. ${ids.length} measured test series.`}>
+      <line className="benchmark-axis" x1={left} y1={height - bottom} x2={width - right} y2={height - bottom} />
+      {[0, 0.5, 1].map((ratio) => <g key={ratio}><line className="benchmark-grid-line" x1={left} y1={top + ratio * (height - top - bottom)} x2={width - right} y2={top + ratio * (height - top - bottom)} /><text x={left - 8} y={top + ratio * (height - top - bottom) + 4} textAnchor="end">{formatBenchmark(ceiling * (1 - ratio), "")}</text></g>)}
+      {ids.map((id, seriesIndex) => {
+        const points = chronological.map((run, runIndex) => {
+          const measurement = run.measurements.find((item) => item.id === id);
+          const value = measurement?.metrics[metric] ?? null;
+          return value === null ? null : { run, value, x: x(runIndex), y: y(value) };
+        }).filter((point): point is NonNullable<typeof point> => point !== null);
+        return <g className={`benchmark-series series-${seriesIndex % 4}`} key={id}>
+          {points.length > 1 && <polyline points={points.map((point) => `${point.x},${point.y}`).join(" ")} />}
+          {points.map((point) => <circle key={point.run.runId} cx={point.x} cy={point.y} r="5"><title>{`${id} · v${point.run.version}: ${formatBenchmark(point.value, ` ${unit}`)}`}</title></circle>)}
+        </g>;
+      })}
+      {chronological.map((run, index) => <text className="benchmark-x-label" key={run.runId} x={x(index)} y={height - 14} textAnchor="middle">v{run.version}</text>)}
+    </svg>
+    <div className="benchmark-legend">{ids.map((id, index) => <span key={id}><i className={`series-${index % 4}`} />{id}</span>)}</div>
+  </article>;
+}
+
+function BenchmarkRunDetails({ run }: { run: BenchmarkRun }) {
+  return <div className="benchmark-results panel-table">
+    <div className="card-heading"><div><span>SELECTED REAL RUN</span><h2>{run.label}</h2></div><small>{run.gitCommit ? run.gitCommit.slice(0, 8) : "uncommitted"}{run.gitDirty ? " · working tree changed" : ""}</small></div>
+    <div className="benchmark-table-head"><span>Test / model</span><span>Devices</span><span>Evidence</span><span>Tokens/s</span><span>TTFT P95</span><span>Change</span><span>Status</span></div>
+    {run.measurements.map((measurement) => <BenchmarkResultRow measurement={measurement} key={measurement.id} />)}
+  </div>;
+}
+
+function BenchmarkResultRow({ measurement }: { measurement: BenchmarkMeasurement }) {
+  const devices = measurement.inventory.profiles.map((profile) => `${profile.count}× ${profile.label}`).join(" · ");
+  const delta = measurement.comparison.tokensPerSecondPct;
+  return <div className="benchmark-table-row">
+    <strong><Gauge size={16} /><span>{measurement.title}<small>{measurement.model.label} · {measurement.model.precision} · rev {measurement.model.revision?.slice(0, 8) ?? "—"}</small></span></strong>
+    <span>{measurement.inventory.connectedDevices}/{measurement.inventory.totalDevices}<small>{devices || "No device profile"}</small></span>
+    <span>{measurement.evidence}<small>{measurement.environment}</small></span>
+    <span className="metric-value">{formatBenchmark(measurement.metrics.tokensPerSecond, " tok/s")}</span>
+    <span className="metric-value">{formatBenchmark(measurement.metrics.ttftMsP95, " ms")}</span>
+    <span className={delta !== null && delta < 0 ? "negative" : "positive"}>{delta === null ? "baseline" : `${delta >= 0 ? "+" : ""}${delta.toFixed(2)}%`}</span>
+    <b className={measurement.status}><i />{benchmarkStatusLabel(measurement.status)}</b>
+  </div>;
 }
 
 function Inference({ snapshot, onSend }: { snapshot: PublicSnapshot; onSend: (model: string, prompt: string) => Promise<string> }) {
@@ -506,6 +801,7 @@ function desktopToPublicSnapshot(snapshot: DashboardSnapshot): PublicSnapshot {
     },
     workers: snapshot.workers,
     models: snapshot.models,
+    requestedModels: snapshot.requestedModels,
     jobs: snapshot.jobs,
   };
 }
@@ -531,7 +827,7 @@ function PageTitle({ eyebrow, title, copy, actions }: { eyebrow: string; title: 
   return <div className="panel-page-title"><div><span>{eyebrow}</span><h1>{title}</h1><p>{copy}</p></div>{actions && <div className="page-actions">{actions}</div>}</div>;
 }
 
-function Stat({ icon: Icon, label, value, detail }: { icon: typeof Radio; label: string; value: string; detail: string }) { return <article className="panel-stat"><div><Icon /></div><span>{label}</span><strong>{value}</strong><small>{detail}</small></article>; }
+function Stat({ icon: Icon, label, value, detail, tone = "blue" }: { icon: typeof Radio; label: string; value: string; detail: string; tone?: "blue" | "orange" }) { return <article className={`panel-stat ${tone}`}><div><Icon /></div><span>{label}</span><strong>{value}</strong><small>{detail}</small><i className="stat-accent" /></article>; }
 function Metric({ label, value }: { label: string; value: string }) { return <div><span>{label}</span><strong>{value}</strong></div>; }
 function Empty({ icon: Icon, title, copy }: { icon: typeof Activity; title: string; copy: string }) { return <div className="panel-empty"><Icon /><strong>{title}</strong><p>{copy}</p></div>; }
 function PanelLoading() { return <div className="panel-loading"><LoaderCircle className="spin" /><strong>Connecting to mycellios</strong><span>Loading the public network snapshot…</span></div>; }
@@ -539,5 +835,39 @@ function workerLabel(worker: PublicWorker) { return worker.kind === "browser" ? 
 function shortId(value: string) { return value.length <= 10 ? value : `${value.slice(0, 6)}…${value.slice(-4)}`; }
 function formatMemory(value: number) { return value >= 1_024 ? `${(value / 1_024).toFixed(value >= 10_240 ? 0 : 1)} GB` : `${Math.round(value)} MB`; }
 function relativeTime(value: string) { const seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1_000)); if (seconds < 5) return "now"; if (seconds < 60) return `${seconds}s ago`; const minutes = Math.floor(seconds / 60); if (minutes < 60) return `${minutes}m ago`; return `${Math.floor(minutes / 60)}h ago`; }
+
+async function fetchBenchmarkRuns(): Promise<BenchmarkRun[]> {
+  const response = await fetch("/local/v1/benchmarks", { cache: "no-store" });
+  const body = await response.json() as { runs?: BenchmarkRun[]; error?: { message?: string } };
+  if (!response.ok) throw new Error(body.error?.message ?? `HTTP ${response.status}`);
+  return body.runs ?? [];
+}
+
+async function requestBenchmarkRun(): Promise<BenchmarkRun> {
+  const response = await fetch("/local/v1/benchmarks/run", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  });
+  const body = await response.json() as { run?: BenchmarkRun; error?: { message?: string } };
+  if (!response.ok || !body.run) throw new Error(body.error?.message ?? `HTTP ${response.status}`);
+  return body.run;
+}
+
+function formatBenchmark(value: number | null, suffix: string): string {
+  if (value === null || !Number.isFinite(value)) return "—";
+  return `${value.toLocaleString("en-US", { maximumFractionDigits: 2 })}${suffix}`;
+}
+
+function formatBenchmarkDate(value: string): string {
+  return new Date(value).toLocaleString("es-ES", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+}
+
+function benchmarkStatusLabel(status: BenchmarkRun["status"]): string {
+  if (status === "baseline") return "Baseline";
+  if (status === "passed") return "Improved / stable";
+  if (status === "regression") return "Regression";
+  return "Failed";
+}
 
 export { Panel };

@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 5;
 
 export class MeshDatabase {
   readonly raw: DatabaseSync;
@@ -110,6 +110,21 @@ export class MeshDatabase {
       CREATE INDEX IF NOT EXISTS sessions_expiry
       ON sessions(expires_at);
 
+      CREATE TABLE IF NOT EXISTS requested_models (
+        id TEXT PRIMARY KEY,
+        source TEXT NOT NULL,
+        revision TEXT,
+        context_tokens INTEGER NOT NULL,
+        minimum_nodes INTEGER NOT NULL,
+        auto_activate INTEGER NOT NULL DEFAULT 1,
+        profile_json TEXT,
+        profile_error TEXT,
+        activation_requested_at INTEGER,
+        activation_error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
     `);
     if (currentVersion >= 2 && currentVersion < 3) {
       const columns = this.raw.prepare("PRAGMA table_info(workers)").all() as Array<{
@@ -119,6 +134,14 @@ export class MeshDatabase {
         this.raw.exec("ALTER TABLE workers ADD COLUMN deregistered INTEGER NOT NULL DEFAULT 0");
       }
       this.raw.exec("UPDATE workers SET deregistered = 1");
+    }
+    if (currentVersion >= 4 && currentVersion < 5) {
+      const columns = this.raw.prepare("PRAGMA table_info(requested_models)").all() as Array<{
+        name: string;
+      }>;
+      if (!columns.some((column) => column.name === "activation_error")) {
+        this.raw.exec("ALTER TABLE requested_models ADD COLUMN activation_error TEXT");
+      }
     }
     this.raw.prepare("UPDATE schema_meta SET version = ?").run(SCHEMA_VERSION);
   }

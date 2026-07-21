@@ -63,6 +63,36 @@ interface JobRow {
   updated_at: number;
 }
 
+export interface StoredRequestedModel {
+  id: string;
+  source: string;
+  revision: string | null;
+  contextTokens: number;
+  minimumNodes: number;
+  autoActivate: boolean;
+  profile: Record<string, unknown> | null;
+  profileError: string | null;
+  activationRequestedAt: number | null;
+  activationError: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+interface RequestedModelRow {
+  id: string;
+  source: string;
+  revision: string | null;
+  context_tokens: number;
+  minimum_nodes: number;
+  auto_activate: number;
+  profile_json: string | null;
+  profile_error: string | null;
+  activation_requested_at: number | null;
+  activation_error: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
 export class MeshStore {
   constructor(readonly database: MeshDatabase) {}
 
@@ -145,6 +175,102 @@ export class MeshStore {
       )
       .run(Date.now());
     return Number(result.changes);
+  }
+
+  upsertRequestedModel(input: {
+    id: string;
+    source: string;
+    revision: string | null;
+    contextTokens: number;
+    minimumNodes: number;
+    autoActivate: boolean;
+  }): StoredRequestedModel {
+    const now = Date.now();
+    this.database.raw.prepare(
+      `INSERT INTO requested_models(
+         id, source, revision, context_tokens, minimum_nodes, auto_activate,
+         created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         source = excluded.source,
+         revision = excluded.revision,
+         context_tokens = excluded.context_tokens,
+         minimum_nodes = excluded.minimum_nodes,
+         auto_activate = excluded.auto_activate,
+         profile_json = NULL,
+         profile_error = NULL,
+         activation_requested_at = NULL,
+         activation_error = NULL,
+         updated_at = excluded.updated_at`,
+    ).run(
+      input.id,
+      input.source,
+      input.revision,
+      input.contextTokens,
+      input.minimumNodes,
+      input.autoActivate ? 1 : 0,
+      now,
+      now,
+    );
+    return this.getRequestedModel(input.id)!;
+  }
+
+  getRequestedModel(id: string): StoredRequestedModel | null {
+    const row = this.database.raw.prepare("SELECT * FROM requested_models WHERE id = ?").get(id) as
+      | RequestedModelRow
+      | undefined;
+    return row ? this.mapRequestedModel(row) : null;
+  }
+
+  listRequestedModels(): StoredRequestedModel[] {
+    const rows = this.database.raw
+      .prepare("SELECT * FROM requested_models ORDER BY created_at DESC")
+      .all() as unknown as RequestedModelRow[];
+    return rows.map((row) => this.mapRequestedModel(row));
+  }
+
+  setRequestedModelProfile(
+    id: string,
+    profile: Record<string, unknown> | null,
+    error: string | null,
+  ): void {
+    this.database.raw.prepare(
+      `UPDATE requested_models
+       SET profile_json = ?, profile_error = ?, activation_requested_at = NULL,
+           activation_error = NULL, updated_at = ?
+       WHERE id = ?`,
+    ).run(profile ? JSON.stringify(profile) : null, error, Date.now(), id);
+  }
+
+  setRequestedModelActivation(id: string, requested: boolean): void {
+    const now = Date.now();
+    if (requested) {
+      this.database.raw.prepare(
+        `UPDATE requested_models
+         SET activation_requested_at = ?, activation_error = NULL, updated_at = ?
+         WHERE id = ?`,
+      ).run(now, now, id);
+      return;
+    }
+    this.database.raw.prepare(
+      `UPDATE requested_models
+       SET activation_requested_at = NULL, updated_at = ?
+       WHERE id = ?`,
+    ).run(now, id);
+  }
+
+  setRequestedModelActivationError(id: string, error: string): void {
+    this.database.raw.prepare(
+      `UPDATE requested_models
+       SET activation_requested_at = NULL, activation_error = ?, updated_at = ?
+       WHERE id = ?`,
+    ).run(error, Date.now(), id);
+  }
+
+  removeRequestedModel(id: string): boolean {
+    return Number(
+      this.database.raw.prepare("DELETE FROM requested_models WHERE id = ?").run(id).changes,
+    ) === 1;
   }
 
   markStaleWorkers(now = Date.now()): { suspect: number; offline: number } {
@@ -338,6 +464,23 @@ export class MeshStore {
       reliability: Number(row.reliability),
       jobsCompleted: Number(row.jobs_completed),
       lastSeenAt: Number(row.last_seen_at),
+    };
+  }
+
+  private mapRequestedModel(row: RequestedModelRow): StoredRequestedModel {
+    return {
+      id: row.id,
+      source: row.source,
+      revision: row.revision,
+      contextTokens: row.context_tokens,
+      minimumNodes: row.minimum_nodes,
+      autoActivate: row.auto_activate === 1,
+      profile: row.profile_json ? JSON.parse(row.profile_json) as Record<string, unknown> : null,
+      profileError: row.profile_error,
+      activationRequestedAt: row.activation_requested_at,
+      activationError: row.activation_error,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
     };
   }
 

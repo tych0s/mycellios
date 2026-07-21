@@ -80,6 +80,37 @@ export interface DashboardModel {
   pipelines: number;
 }
 
+export interface RequestedModelCapacity {
+  id: string;
+  source: string;
+  revision: string | null;
+  status: "profiling" | "waiting_capacity" | "ready" | "activating" | "active" | "incompatible" | "failed";
+  autoActivate: boolean;
+  adapterId: string | null;
+  compatible: boolean | null;
+  requiredVramMiB: number | null;
+  availableVramMiB: number;
+  missingVramMiB: number | null;
+  requiredNodes: number;
+  availableNodes: number;
+  missingNodes: number;
+  weightBytes: number | null;
+  contextTokens: number;
+  message: string;
+  activationRequestedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RequestModelInput {
+  id: string;
+  source: string;
+  revision: string | null;
+  contextTokens: number;
+  minimumNodes: number;
+  autoActivate: boolean;
+}
+
 export interface DashboardJob {
   id: string;
   model: string;
@@ -140,6 +171,7 @@ export interface DashboardSnapshot {
   } | null;
   workers: DashboardWorker[];
   models: DashboardModel[];
+  requestedModels: RequestedModelCapacity[];
   jobs: DashboardJob[];
   localHardware: LocalHardware;
   settings: DesktopSettings;
@@ -167,9 +199,14 @@ export interface DesktopBridge {
   sendChat(request: ChatRequest): Promise<ChatResponse>;
   removeWorker(workerId: string): Promise<DashboardSnapshot>;
   clearOfflineWorkers(): Promise<DashboardSnapshot>;
+  requestModel(input: RequestModelInput): Promise<DashboardSnapshot>;
+  removeRequestedModel(modelId: string): Promise<DashboardSnapshot>;
+  getBenchmarkRuns(): Promise<BenchmarkRun[]>;
+  runBenchmark(): Promise<BenchmarkRun>;
   checkForUpdates(): Promise<DesktopUpdateStatus>;
   installUpdate(): Promise<void>;
   minimizeWindow(): Promise<void>;
   toggleMaximizeWindow(): Promise<boolean>;
   closeWindow(): Promise<void>;
 }
+import type { BenchmarkRun } from "../benchlab/types.js";

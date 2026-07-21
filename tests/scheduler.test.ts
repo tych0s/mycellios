@@ -126,6 +126,16 @@ describe("multi-objective scheduler", () => {
     });
   });
 
+  it("reports a distributed cell as a pipeline instead of a whole-model replica", () => {
+    const cell = addWorker(store, {
+      id: "distributed-cell",
+      internalPipeline: { stageCount: 2, boundaries: [0, 14, 28] },
+    });
+    const models = scheduler.listAvailableModels({ connectedWorkerIds: new Set([cell.id]) });
+    expect(models).toEqual([{ id: "distributed-small", replicas: 0, pipelines: 1 }]);
+    expect(scheduler.selectRoute(request, "cell-route")?.routeClass).toBe("replica");
+  });
+
   it("preplans disjoint standbys with the exact primary model revision", () => {
     const primary = addWorker(store, {
       id: "primary",

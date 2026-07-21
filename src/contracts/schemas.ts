@@ -44,6 +44,13 @@ export const deploymentSchema = z
         layerEnd: z.number().int().nonnegative(),
       })
       .optional(),
+    internalPipeline: z
+      .object({
+        stageCount: z.number().int().min(2).max(64),
+        boundaries: z.array(z.number().int().nonnegative()).min(3).max(65),
+      })
+      .strict()
+      .optional(),
   })
   .superRefine((deployment, context) => {
     if (deployment.mode === "pipeline" && deployment.stage === undefined) {
@@ -59,6 +66,20 @@ export const deploymentSchema = z
         message: "stage.index must be lower than stage.total",
         path: ["stage", "index"],
       });
+    }
+    if (deployment.internalPipeline) {
+      const { stageCount, boundaries } = deployment.internalPipeline;
+      if (
+        boundaries.length !== stageCount + 1 ||
+        boundaries[0] !== 0 ||
+        boundaries.some((boundary, index) => index > 0 && boundary <= boundaries[index - 1]!)
+      ) {
+        context.addIssue({
+          code: "custom",
+          message: "internalPipeline boundaries must be strictly increasing and match stageCount",
+          path: ["internalPipeline", "boundaries"],
+        });
+      }
     }
   });
 
@@ -187,6 +208,7 @@ export const workerConfigSchema = z.object({
       kind: z.literal("openai-compatible"),
       model: z.string().min(1),
       baseUrl: z.string().url(),
+      requestTemperature: z.number().min(0).max(2).optional(),
       apiPathPrefix: z
         .string()
         .max(128)
@@ -203,6 +225,13 @@ export const workerConfigSchema = z.object({
       contextLimit: z.number().int().positive().default(8_192),
       tokensPerSecond: z.number().positive().optional(),
       ttftMs: z.number().nonnegative().optional(),
+      internalPipeline: z
+        .object({
+          stageCount: z.number().int().min(2).max(64),
+          boundaries: z.array(z.number().int().nonnegative()).min(3).max(65),
+        })
+        .strict()
+        .optional(),
     })
     .default({ contextLimit: 8_192 }),
   llmfit: z

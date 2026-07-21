@@ -30,7 +30,7 @@ import {
 const START_SCHEMA = "gdlp-launch-agent-start/1";
 const STOP_SCHEMA = "gdlp-launch-agent-stop/1";
 const SNAPSHOT_SCHEMA = "gdlp-launch-agent-process/1";
-const HEALTH_SCHEMA = "gdlp-launch-agent-health/1";
+const HEALTH_SCHEMA = "gdlp-launch-agent-health/2";
 const ERROR_SCHEMA = "gdlp-launch-agent-error/1";
 
 type RpcProcessState = "starting" | "ready" | "exited";
@@ -50,7 +50,10 @@ export interface LaunchAgentRpcHealth {
   schema: typeof HEALTH_SCHEMA;
   agentId: string;
   nodeId: string | null;
-  processes: number;
+  /** Processes that are still starting or running. */
+  activeProcesses: number;
+  /** Completed idempotency records retained to prevent duplicate launches. */
+  retainedTombstones: number;
 }
 
 export interface HttpLaunchAgentOptions {
@@ -59,6 +62,10 @@ export interface HttpLaunchAgentOptions {
   /** Optional bearer credential for the launch-agent control plane. */
   authToken?: string;
   requestTimeoutMs?: number;
+  /** Defaults to requestTimeoutMs, or 10 seconds when neither is provided. */
+  healthTimeoutMs?: number;
+  /** Defaults to requestTimeoutMs when explicitly set, otherwise 60 seconds. */
+  physicalEvidenceTimeoutMs?: number;
   cleanupRequestTimeoutMs?: number;
   pollRequestTimeoutMs?: number;
   pollIntervalMs?: number;
@@ -86,6 +93,8 @@ export class HttpLaunchAgent implements LaunchAgent {
   private readonly baseUrl: string;
   private readonly authToken: string | undefined;
   private readonly requestTimeoutMs: number;
+  private readonly healthTimeoutMs: number;
+  private readonly physicalEvidenceTimeoutMs: number;
   private readonly cleanupRequestTimeoutMs: number;
   private readonly pollRequestTimeoutMs: number;
   private readonly pollIntervalMs: number;
@@ -106,6 +115,18 @@ export class HttpLaunchAgent implements LaunchAgent {
       1,
       300_000,
       "launch_agent_rpc_request_timeout_is_invalid",
+    );
+    this.healthTimeoutMs = boundedInteger(
+      options.healthTimeoutMs ?? options.requestTimeoutMs ?? 10_000,
+      1,
+      300_000,
+      "launch_agent_rpc_health_timeout_is_invalid",
+    );
+    this.physicalEvidenceTimeoutMs = boundedInteger(
+      options.physicalEvidenceTimeoutMs ?? options.requestTimeoutMs ?? 60_000,
+      1,
+      300_000,
+      "launch_agent_rpc_physical_evidence_timeout_is_invalid",
     );
     // A cleanup starts after a failed/aborted fetch, when Undici may still be
     // discarding the old connection. Reusing a very small operation timeout
@@ -211,7 +232,7 @@ export class HttpLaunchAgent implements LaunchAgent {
       "GET",
       undefined,
       signal,
-      this.requestTimeoutMs,
+      this.healthTimeoutMs,
       "health",
     );
     return validateHealth(value);
@@ -227,7 +248,7 @@ export class HttpLaunchAgent implements LaunchAgent {
       "POST",
       { schema: PHYSICAL_PROBE_REQUEST_SCHEMA, nonce },
       signal,
-      this.requestTimeoutMs,
+      this.physicalEvidenceTimeoutMs,
       "physical_evidence",
     );
     validatePhysicalProbe(value, nonce);
@@ -689,11 +710,15 @@ export class LaunchAgentRpcServer {
       const url = new URL(request.url ?? "/", "http://launch-agent.invalid");
       if (url.search || url.hash) throw new RpcRouteError(400, "query_is_not_supported");
       if (request.method === "GET" && url.pathname === "/healthz") {
+        const activeProcesses = [...this.entries.values()].filter(
+          (entry) => entry.exit === null,
+        ).length;
         sendJson(response, 200, {
           schema: HEALTH_SCHEMA,
           agentId: this.agent.id,
           nodeId: this.nodeId ?? null,
-          processes: this.entries.size,
+          activeProcesses,
+          retainedTombstones: this.entries.size - activeProcesses,
         });
         return;
       }
@@ -763,13 +788,21 @@ export class LaunchAgentRpcServer {
     } catch {
       throw new RpcRouteError(400, "physical_probe_nonce_is_invalid");
     }
-    const probe = await operationWithTimeout(
-      this.physicalProbe.collect(value.nonce),
-      undefined,
-      this.physicalProbeTimeoutMs,
-      "physical_probe",
-    );
-    validatePhysicalProbe(probe, value.nonce);
+    const nonce = value.nonce as string;
+    const controller = new AbortController();
+    let probe: PhysicalProbeV1;
+    try {
+      probe = await operationWithTimeout(
+        Promise.resolve().then(() => this.physicalProbe!.collect(nonce, controller.signal)),
+        undefined,
+        this.physicalProbeTimeoutMs,
+        "physical_probe",
+      );
+    } catch (error) {
+      if (!controller.signal.aborted) controller.abort(error);
+      throw error;
+    }
+    validatePhysicalProbe(probe, nonce);
     sendJson(response, 200, probe);
   }
 
@@ -1090,6 +1123,10 @@ function validatePythonLaunchProcess(value: unknown, nodeId: string): asserts va
   validateMembers(value.members);
   validateMacroWaveStage(value.macroWave);
   validateCommand(value.command);
+  if (value.kind === "root-engine") validateRootEngineCommand(value.command);
+  if (value.kind === "remote-stage") {
+    validateSpeculativeTreeCommand(value.command, "remote_stage");
+  }
 
   if (value.kind === "cell-member") {
     if (value.macroWave !== null) {
@@ -1244,6 +1281,74 @@ function validateCommand(value: unknown): void {
     throw new Error("command_args_are_invalid");
   }
   for (const argument of value.args) assertArgument(argument);
+}
+
+function validateRootEngineCommand(value: unknown): void {
+  assertRecord(value, "root_engine_command");
+  if (!Array.isArray(value.args)) throw new Error("root_engine_command_args_are_invalid");
+  assertCommandIntegerFlag(
+    value.args,
+    "--prefill-inflight-chunks",
+    1,
+    64,
+    "root_engine_prefill_inflight_chunks",
+  );
+  assertCommandIntegerFlag(
+    value.args,
+    "--prefill-inflight-bytes",
+    1,
+    1024 * 1024 * 1024,
+    "root_engine_prefill_inflight_bytes",
+  );
+  validateSpeculativeTreeCommand(value, "root_engine");
+}
+
+function validateSpeculativeTreeCommand(value: unknown, prefix: string): void {
+  assertRecord(value, `${prefix}_command`);
+  if (!Array.isArray(value.args)) throw new Error(`${prefix}_command_args_are_invalid`);
+  const branches = assertCommandIntegerFlag(
+    value.args,
+    "--max-speculative-branches",
+    0,
+    64,
+    `${prefix}_max_speculative_branches`,
+  );
+  const branchTokens = assertCommandIntegerFlag(
+    value.args,
+    "--max-speculative-branch-tokens",
+    0,
+    1_048_576,
+    `${prefix}_max_speculative_branch_tokens`,
+  );
+  const kvBytes = assertCommandIntegerFlag(
+    value.args,
+    "--max-speculative-kv-bytes",
+    0,
+    2 ** 40,
+    `${prefix}_max_speculative_kv_bytes`,
+  );
+  const enabled = [branches, branchTokens, kvBytes].map((limit) => limit > 0);
+  if (enabled.some(Boolean) && !enabled.every(Boolean)) {
+    throw new Error(`${prefix}_speculative_tree_limits_are_incomplete`);
+  }
+}
+
+function assertCommandIntegerFlag(
+  args: unknown[],
+  flag: string,
+  minimum: number,
+  maximum: number,
+  name: string,
+): number {
+  const positions = args.flatMap((argument, index) => argument === flag ? [index] : []);
+  if (positions.length !== 1) throw new Error(`${name}_flag_is_invalid`);
+  const raw = args[positions[0]! + 1];
+  if (typeof raw !== "string" || !/^(?:0|[1-9][0-9]*)$/.test(raw)) {
+    throw new Error(`${name}_is_invalid`);
+  }
+  const parsed = Number(raw);
+  assertInteger(parsed, minimum, maximum, name);
+  return parsed;
 }
 
 function validateAnchor(value: unknown, name: string): void {
@@ -1882,7 +1987,7 @@ function validateHealth(value: unknown): LaunchAgentRpcHealth {
   assertRecord(value, "launch_agent_rpc_health");
   assertExactKeys(
     value,
-    ["schema", "agentId", "nodeId", "processes"],
+    ["schema", "agentId", "nodeId", "activeProcesses", "retainedTombstones"],
     [],
     "launch_agent_rpc_health",
   );
@@ -1893,8 +1998,17 @@ function validateHealth(value: unknown): LaunchAgentRpcHealth {
   if (value.nodeId !== null) {
     assertIdentifier(value.nodeId, "launch_agent_rpc_health_node_id");
   }
-  if (!Number.isSafeInteger(value.processes) || (value.processes as number) < 0) {
-    throw new Error("launch_agent_rpc_health_process_count_is_invalid");
+  if (
+    !Number.isSafeInteger(value.activeProcesses) ||
+    (value.activeProcesses as number) < 0
+  ) {
+    throw new Error("launch_agent_rpc_health_active_process_count_is_invalid");
+  }
+  if (
+    !Number.isSafeInteger(value.retainedTombstones) ||
+    (value.retainedTombstones as number) < 0
+  ) {
+    throw new Error("launch_agent_rpc_health_tombstone_count_is_invalid");
   }
   return value as unknown as LaunchAgentRpcHealth;
 }
