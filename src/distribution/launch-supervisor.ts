@@ -138,7 +138,8 @@ export class LaunchReadinessTimeoutError extends Error {
 export class LaunchProcessExitedError extends Error {
   constructor(readonly processId: string, readonly exit: LaunchProcessExit) {
     super(
-      `launch_process_exited:${processId}:code=${exit.code ?? "null"}:signal=${exit.signal ?? "null"}`,
+      `launch_process_exited:${processId}:code=${exit.code ?? "null"}:signal=${exit.signal ?? "null"}`
+        + (exit.error ? `:error=${exit.error}` : ""),
     );
     this.name = "LaunchProcessExitedError";
   }
