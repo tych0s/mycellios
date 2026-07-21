@@ -618,3 +618,9 @@ button { font: inherit; }
   *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
   .reveal { opacity: 1; transform: none; }
 }
+
+/* The shared web/Electron dashboard uses one typeface across every view. */
+.public-panel,
+.public-panel * {
+  font-family: "Manrope Variable", Manrope, "SF Pro Display", "Segoe UI Variable", sans-serif;
+}

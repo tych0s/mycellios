@@ -1248,9 +1248,9 @@
 .public-panel .model-form-heading h2,
 .public-panel .model-request-head h2 {
   margin: 5px 0 0;
-  font-family: "DM Serif Display", Georgia, serif;
+  font-family: inherit;
   font-size: 22px;
-  font-weight: 400;
+  font-weight: 500;
 }
 
 .public-panel .model-form-heading p {
