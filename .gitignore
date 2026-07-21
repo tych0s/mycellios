@@ -26,3 +26,11 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+
+# Estado local de Codex y artefactos de publicación generados
+.codex-runtime/
+updates/
+
+# Configuración específica de pilotos locales (las plantillas sí se versionan)
+config/*.local.json
+config/worker.public-*.json

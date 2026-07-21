@@ -53,6 +53,16 @@ for (const dependency of forbiddenRuntimeImports) {
   }
 }
 
+const expectedUpdateFeed = "https://www.mycellios.com/updates/win32/x64/";
+if (platform === "win32") {
+  if (!mainBundle.includes(expectedUpdateFeed)) {
+    throw new Error(`El paquete no contiene el canal de actualización: ${expectedUpdateFeed}`);
+  }
+  if (!mainBundle.includes("quitAndInstall")) {
+    throw new Error("El paquete no contiene la instalación de la actualización descargada.");
+  }
+}
+
 const rendererHtml = extractFile(
   asarPath,
   join(".vite", "renderer", "main_window", "index.html"),

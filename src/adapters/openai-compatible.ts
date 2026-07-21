@@ -14,6 +14,7 @@ export interface OpenAICompatibleOptions {
   apiPathPrefix?: string;
   apiKey?: string;
   allowedHosts?: string[];
+  requestTemperature?: number | undefined;
 }
 
 export class OpenAICompatibleAdapter implements InferenceAdapter {
@@ -69,7 +70,7 @@ export class OpenAICompatibleAdapter implements InferenceAdapter {
           model: this.options.model,
           messages: request.request.messages,
           max_tokens: request.request.max_tokens,
-          temperature: request.request.temperature,
+          temperature: this.options.requestTemperature ?? request.request.temperature,
           top_p: request.request.top_p,
           seed: request.request.seed,
           stream: true,

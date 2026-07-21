@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
+import heapq
+from itertools import product
 import math
 import threading
 from typing import Callable, Iterable, Mapping, Protocol, Sequence
@@ -27,6 +29,75 @@ RESIDENT_EXPERT_MESH_SCHEMA = "gdlp-resident-expert-mesh/1"
 # full tensor-route evaluations made the offline sensitivity simulator itself
 # a bottleneck without improving its chosen assignment.
 _EXACT_ASSIGNMENT_COMBINATION_LIMIT = 1_024
+# Heuristic planning must stay off the inference critical path even for long
+# prefills.  The repair budget counts attempted row routes (not expensive full
+# tensor-plan evaluations), while the local pass is deliberately single-sweep.
+_HEURISTIC_FEASIBILITY_REPAIR_STATE_LIMIT = 65_536
+_HEURISTIC_LOCAL_MOVE_PROBE_LIMIT = 4_096
+# A public mesh may know thousands of identity-equivalent replicas for one
+# expert.  Scoring every replica for every routed row is itself slower than an
+# inference wave.  Keep a deterministic performance frontier on the critical
+# path; capacity-driven extensions below retain enough owners for the rows of
+# that expert, while the plan truthfully loses its global-optimality claim.
+_HEURISTIC_REMOTE_CANDIDATE_LIMIT_PER_KEY = 64
+
+
+def _list_scheduled_makespan_ms(
+    owner_times: Mapping[str, float],
+    max_inflight: int,
+) -> float:
+    """Deterministic LPT schedule for the bounded owner worker pool."""
+
+    if not owner_times:
+        return 0.0
+    # The overwhelmingly common search state fits in one wave.  Its exact LPT
+    # result is simply the slowest owner; avoid sorting/heap work for every
+    # speculative add/remove probe.
+    if len(owner_times) <= max_inflight:
+        return max(owner_times.values())
+    lane_count = min(max_inflight, len(owner_times))
+    lanes = [(0.0, lane) for lane in range(lane_count)]
+    heapq.heapify(lanes)
+    for _owner_id, duration_ms in sorted(
+        owner_times.items(),
+        key=lambda item: (-item[1], item[0]),
+    ):
+        available_ms, lane = heapq.heappop(lanes)
+        heapq.heappush(lanes, (available_ms + duration_ms, lane))
+    return max(available_ms for available_ms, _lane in lanes)
+
+
+def _modeled_coordinator_overhead_ms(
+    *,
+    remote_owner_count: int,
+    transport_payload_bytes: int,
+    assignment_count: int,
+    rpc_dispatch_ms_per_owner: float | None,
+    serialization_bytes_per_ms: float | None,
+    reduction_ms_per_assignment: float | None,
+) -> float:
+    """Return only calibrated serial coordinator work; missing terms stay 0."""
+
+    return math.fsum(
+        (
+            (
+                remote_owner_count * rpc_dispatch_ms_per_owner
+                if rpc_dispatch_ms_per_owner is not None
+                else 0.0
+            ),
+            (
+                transport_payload_bytes / serialization_bytes_per_ms
+                if serialization_bytes_per_ms is not None
+                and transport_payload_bytes
+                else 0.0
+            ),
+            (
+                assignment_count * reduction_ms_per_assignment
+                if reduction_ms_per_assignment is not None
+                else 0.0
+            ),
+        )
+    )
 
 
 class ResidentExpertMeshError(RuntimeError):
@@ -425,7 +496,9 @@ class LayerMeshPlan:
     owner_exposed_ms: tuple[tuple[str, float], ...]
     owner_peak_vram_bytes: tuple[tuple[str, int], ...]
     per_owner_lower_bound_ms: float
+    owner_scheduled_makespan_ms: float
     coordinator_nic_lower_bound_ms: float
+    coordinator_overhead_ms: float
     exposed_ms: float
     activation_round_trip_bytes: int
     activation_request_bytes: int
@@ -437,7 +510,9 @@ class LayerMeshPlan:
     weight_loaded_bytes: int
     weight_avoided_bytes: int
     transport_calibration_required: bool
+    coordination_calibration_required: bool
     workspace_calibration_required: bool
+    max_inflight_owner_rpcs: int
     assignment_strategy: str
     assignment_optimality_proven: bool
     assignment_states_evaluated: int
@@ -485,14 +560,25 @@ class _Candidate:
     workspace_calibration_required: bool
 
 
+@dataclass(frozen=True, order=True)
+class _AssignmentUnit:
+    """One authoritative router row/slot that may choose any exact replica."""
+
+    key: ExpertKey
+    ordinal: int
+    assignment: ExpertAssignment
+
+
 @dataclass(frozen=True)
 class _AssignmentEvaluation:
-    selected: tuple[tuple[ExpertKey, _Candidate], ...]
+    selected: tuple[tuple[_AssignmentUnit, _Candidate], ...]
     dispatches: tuple[ExpertDispatch, ...]
     owner_exposed_ms: tuple[tuple[str, float], ...]
     owner_peak_vram_bytes: tuple[tuple[str, int], ...]
     per_owner_lower_bound_ms: float
+    owner_scheduled_makespan_ms: float
     coordinator_nic_lower_bound_ms: float
+    coordinator_overhead_ms: float
     exposed_ms: float
     activation_round_trip_bytes: int
     activation_request_bytes: int
@@ -504,8 +590,284 @@ class _AssignmentEvaluation:
     weight_loaded_bytes: int
     weight_avoided_bytes: int
     transport_calibration_required: bool
+    coordination_calibration_required: bool
     workspace_calibration_required: bool
-    signature: tuple[tuple[int, int, int, str], ...]
+    signature: tuple[tuple[int, int, int, int, int, str], ...]
+
+
+class _IncrementalAssignmentState:
+    """Reversible exact-cost state for bounded row-level search.
+
+    Dynamic VRAM is linear in routed rows. Remote transport is grouped once per
+    owner and local RAM weight cost once per owner/key/path, so all quantities
+    needed by the heuristic can be updated without rebuilding and sorting the
+    complete selection for every candidate row.
+    """
+
+    def __init__(
+        self,
+        *,
+        coordinator_id: str,
+        nodes: Mapping[str, MeshNodeProfile],
+        links: Mapping[tuple[str, str], MeshLinkProfile],
+        activation_bytes_per_token: int,
+        static_vram_bytes: Mapping[str, int],
+        v1_only_nodes: frozenset[str],
+        row_index_bytes_by_node: Mapping[str, int],
+        max_inflight_owner_rpcs: int,
+        coordinator_rpc_dispatch_ms_per_owner: float | None,
+        coordinator_serialization_bytes_per_ms: float | None,
+        coordinator_reduction_ms_per_assignment: float | None,
+    ) -> None:
+        self.coordinator_id = coordinator_id
+        self.nodes = nodes
+        self.links = links
+        self.activation_bytes_per_token = activation_bytes_per_token
+        self.static_vram_bytes = static_vram_bytes
+        self.v1_only_nodes = v1_only_nodes
+        self.row_index_bytes_by_node = row_index_bytes_by_node
+        self.max_inflight_owner_rpcs = max_inflight_owner_rpcs
+        self.coordinator_rpc_dispatch_ms_per_owner = (
+            coordinator_rpc_dispatch_ms_per_owner
+        )
+        self.coordinator_serialization_bytes_per_ms = (
+            coordinator_serialization_bytes_per_ms
+        )
+        self.coordinator_reduction_ms_per_assignment = (
+            coordinator_reduction_ms_per_assignment
+        )
+        self.selection: dict[_AssignmentUnit, _Candidate] = {}
+        self.dynamic_vram_bytes = {node_id: 0 for node_id in nodes}
+        self.route_counts: dict[tuple[ExpertKey, str, str], int] = {}
+        self.remote_assignment_counts: dict[str, int] = {}
+        self.remote_position_refcounts: dict[str, dict[int, int]] = {}
+        self.remote_owner_metrics: dict[
+            str,
+            tuple[float, int, int, int],
+        ] = {}
+        self.total_request_bytes = 0
+        self.total_response_bytes = 0
+        self.total_metadata_bytes = 0
+        self.local_owner_time_ms = 0.0
+        self.weight_loaded_bytes = 0
+
+    def _refresh_remote_owner_metrics(self, owner_id: str) -> None:
+        previous = self.remote_owner_metrics.pop(owner_id, None)
+        if previous is not None:
+            _duration, request, response, metadata = previous
+            self.total_request_bytes -= request
+            self.total_response_bytes -= response
+            self.total_metadata_bytes -= metadata
+
+        assignment_total = self.remote_assignment_counts.get(owner_id, 0)
+        if not assignment_total:
+            return
+        unique_position_total = len(self.remote_position_refcounts[owner_id])
+        activation = self.activation_bytes_per_token
+        v1_request_bytes = activation * assignment_total
+        response_bytes = activation * assignment_total
+        metadata_per_assignment = self.row_index_bytes_by_node.get(owner_id, 4)
+        coalesced_request_bytes = activation * unique_position_total
+        coalesced_metadata_bytes = metadata_per_assignment * assignment_total
+        use_coalesced = (
+            owner_id not in self.v1_only_nodes
+            and coalesced_request_bytes + coalesced_metadata_bytes
+            < v1_request_bytes
+        )
+        request_bytes = (
+            coalesced_request_bytes if use_coalesced else v1_request_bytes
+        )
+        metadata_bytes = coalesced_metadata_bytes if use_coalesced else 0
+        staging_bytes = (
+            2 * activation * (unique_position_total + assignment_total)
+            if use_coalesced
+            else 4 * activation * assignment_total
+        )
+        link = self.links[(self.coordinator_id, owner_id)]
+        duration_ms = (
+            link.round_trip_ms
+            + link.rpc_setup_ms
+            + (request_bytes + metadata_bytes) / link.egress_bytes_per_ms
+            + response_bytes / link.ingress_bytes_per_ms
+            + (
+                staging_bytes / link.host_device_staging_bytes_per_ms
+                if link.host_device_staging_bytes_per_ms > 0
+                else 0.0
+            )
+            + assignment_total
+            * self.nodes[owner_id].expert_compute_ms_per_token
+        )
+        self.remote_owner_metrics[owner_id] = (
+            duration_ms,
+            request_bytes,
+            response_bytes,
+            metadata_bytes,
+        )
+        self.total_request_bytes += request_bytes
+        self.total_response_bytes += response_bytes
+        self.total_metadata_bytes += metadata_bytes
+
+    def can_add(self, unit: _AssignmentUnit, candidate: _Candidate) -> bool:
+        if unit in self.selection or candidate.key != unit.key:
+            return False
+        coordinator_added = candidate.coordinator_dynamic_vram_bytes
+        if (
+            self.static_vram_bytes[self.coordinator_id]
+            + self.dynamic_vram_bytes[self.coordinator_id]
+            + coordinator_added
+            > self.nodes[self.coordinator_id].resident_vram_budget_bytes
+        ):
+            return False
+        if candidate.owner_id == self.coordinator_id:
+            return True
+        return (
+            self.static_vram_bytes[candidate.owner_id]
+            + self.dynamic_vram_bytes[candidate.owner_id]
+            + candidate.owner_dynamic_vram_bytes
+            <= self.nodes[candidate.owner_id].resident_vram_budget_bytes
+        )
+
+    def add(self, unit: _AssignmentUnit, candidate: _Candidate) -> None:
+        if not self.can_add(unit, candidate):
+            raise ValueError("cannot add an infeasible incremental assignment")
+        route_key = (unit.key, candidate.owner_id, candidate.path)
+        previous_route_count = self.route_counts.get(route_key, 0)
+        self.selection[unit] = candidate
+        self.route_counts[route_key] = previous_route_count + 1
+        self.dynamic_vram_bytes[self.coordinator_id] += (
+            candidate.coordinator_dynamic_vram_bytes
+        )
+        if candidate.owner_id == self.coordinator_id:
+            if previous_route_count == 0:
+                self.local_owner_time_ms += candidate.duration_ms
+                self.weight_loaded_bytes += candidate.weight_loaded_bytes
+            else:
+                self.local_owner_time_ms += self.nodes[
+                    self.coordinator_id
+                ].expert_compute_ms_per_token
+            return
+
+        self.dynamic_vram_bytes[candidate.owner_id] += (
+            candidate.owner_dynamic_vram_bytes
+        )
+        self.remote_assignment_counts[candidate.owner_id] = (
+            self.remote_assignment_counts.get(candidate.owner_id, 0) + 1
+        )
+        position_counts = self.remote_position_refcounts.setdefault(
+            candidate.owner_id,
+            {},
+        )
+        position_counts[unit.assignment.token_index] = (
+            position_counts.get(unit.assignment.token_index, 0) + 1
+        )
+        self._refresh_remote_owner_metrics(candidate.owner_id)
+        if previous_route_count == 0:
+            self.weight_loaded_bytes += candidate.weight_loaded_bytes
+
+    def remove(self, unit: _AssignmentUnit) -> _Candidate:
+        try:
+            candidate = self.selection.pop(unit)
+        except KeyError as error:
+            raise ValueError("incremental assignment is absent") from error
+        route_key = (unit.key, candidate.owner_id, candidate.path)
+        previous_route_count = self.route_counts[route_key]
+        if previous_route_count == 1:
+            del self.route_counts[route_key]
+            self.weight_loaded_bytes -= candidate.weight_loaded_bytes
+        else:
+            self.route_counts[route_key] = previous_route_count - 1
+
+        self.dynamic_vram_bytes[self.coordinator_id] -= (
+            candidate.coordinator_dynamic_vram_bytes
+        )
+        if candidate.owner_id == self.coordinator_id:
+            if previous_route_count == 1:
+                self.local_owner_time_ms -= candidate.duration_ms
+            else:
+                self.local_owner_time_ms -= self.nodes[
+                    self.coordinator_id
+                ].expert_compute_ms_per_token
+            if abs(self.local_owner_time_ms) <= 1e-12:
+                self.local_owner_time_ms = 0.0
+            return candidate
+
+        self.dynamic_vram_bytes[candidate.owner_id] -= (
+            candidate.owner_dynamic_vram_bytes
+        )
+        remaining_assignments = self.remote_assignment_counts[candidate.owner_id] - 1
+        if remaining_assignments:
+            self.remote_assignment_counts[candidate.owner_id] = remaining_assignments
+        else:
+            del self.remote_assignment_counts[candidate.owner_id]
+        position_counts = self.remote_position_refcounts[candidate.owner_id]
+        token_index = unit.assignment.token_index
+        remaining_references = position_counts[token_index] - 1
+        if remaining_references:
+            position_counts[token_index] = remaining_references
+        else:
+            del position_counts[token_index]
+        if not position_counts:
+            del self.remote_position_refcounts[candidate.owner_id]
+        self._refresh_remote_owner_metrics(candidate.owner_id)
+        return candidate
+
+    def objective(self) -> tuple[float, int, int]:
+        """Return the heuristic objective matching the full cost model."""
+
+        owner_times = {
+            owner_id: metrics[0]
+            for owner_id, metrics in self.remote_owner_metrics.items()
+        }
+        if self.local_owner_time_ms > 0:
+            owner_times[self.coordinator_id] = self.local_owner_time_ms
+
+        coordinator = self.nodes[self.coordinator_id]
+        nic_bounds = []
+        if self.total_request_bytes or self.total_metadata_bytes:
+            if coordinator.aggregate_egress_bytes_per_ms > 0:
+                nic_bounds.append(
+                    (self.total_request_bytes + self.total_metadata_bytes)
+                    / coordinator.aggregate_egress_bytes_per_ms
+                )
+        if (
+            self.total_response_bytes
+            and coordinator.aggregate_ingress_bytes_per_ms > 0
+        ):
+            nic_bounds.append(
+                self.total_response_bytes
+                / coordinator.aggregate_ingress_bytes_per_ms
+            )
+        exposed_ms = max(
+            _list_scheduled_makespan_ms(
+                owner_times,
+                self.max_inflight_owner_rpcs,
+            ),
+            max(nic_bounds, default=0.0),
+        ) + _modeled_coordinator_overhead_ms(
+            remote_owner_count=len(self.remote_assignment_counts),
+            transport_payload_bytes=(
+                self.total_request_bytes
+                + self.total_response_bytes
+                + self.total_metadata_bytes
+            ),
+            assignment_count=len(self.selection),
+            rpc_dispatch_ms_per_owner=(
+                self.coordinator_rpc_dispatch_ms_per_owner
+            ),
+            serialization_bytes_per_ms=(
+                self.coordinator_serialization_bytes_per_ms
+            ),
+            reduction_ms_per_assignment=(
+                self.coordinator_reduction_ms_per_assignment
+            ),
+        )
+        return (
+            exposed_ms,
+            self.total_request_bytes
+            + self.total_response_bytes
+            + self.total_metadata_bytes,
+            self.weight_loaded_bytes,
+        )
 
 
 class ResidentExpertMesh:
@@ -524,6 +886,10 @@ class ResidentExpertMesh:
         local_weight_buffer_bytes: int,
         activation_bytes_per_token: int,
         require_local_ram_fallback: bool = True,
+        max_inflight_owner_rpcs: int = 32,
+        coordinator_rpc_dispatch_ms_per_owner: float | None = None,
+        coordinator_serialization_gbytes_per_second: float | None = None,
+        coordinator_reduction_ms_per_assignment: float | None = None,
     ) -> None:
         self.coordinator_id = _name("coordinator_id", coordinator_id)
         self.local_weight_buffer_bytes = _integer(
@@ -538,6 +904,41 @@ class ResidentExpertMesh:
         if not isinstance(require_local_ram_fallback, bool):
             raise TypeError("require_local_ram_fallback must be boolean")
         self.require_local_ram_fallback = require_local_ram_fallback
+        self.max_inflight_owner_rpcs = _integer(
+            "max_inflight_owner_rpcs",
+            max_inflight_owner_rpcs,
+            minimum=1,
+        )
+        self.coordinator_rpc_dispatch_ms_per_owner = (
+            None
+            if coordinator_rpc_dispatch_ms_per_owner is None
+            else _finite(
+                "coordinator_rpc_dispatch_ms_per_owner",
+                coordinator_rpc_dispatch_ms_per_owner,
+            )
+        )
+        if coordinator_serialization_gbytes_per_second is None:
+            self.coordinator_serialization_bytes_per_ms = None
+        else:
+            serialization_gbytes_per_second = _finite(
+                "coordinator_serialization_gbytes_per_second",
+                coordinator_serialization_gbytes_per_second,
+            )
+            if serialization_gbytes_per_second <= 0:
+                raise ValueError(
+                    "coordinator_serialization_gbytes_per_second must be positive"
+                )
+            self.coordinator_serialization_bytes_per_ms = (
+                serialization_gbytes_per_second * 1_000_000.0
+            )
+        self.coordinator_reduction_ms_per_assignment = (
+            None
+            if coordinator_reduction_ms_per_assignment is None
+            else _finite(
+                "coordinator_reduction_ms_per_assignment",
+                coordinator_reduction_ms_per_assignment,
+            )
+        )
 
         self._experts = self._index_experts(experts)
         self._nodes = self._index_nodes(nodes)
@@ -594,7 +995,7 @@ class ResidentExpertMesh:
         # path, especially on LAN links with sub-millisecond RTT.
         self._executor_lock = threading.Lock()
         self._executor = ThreadPoolExecutor(
-            max_workers=max(1, len(self._nodes)),
+            max_workers=self.max_inflight_owner_rpcs,
             thread_name_prefix=f"resident-mesh-{self.coordinator_id}",
         )
         self._closed = False
@@ -711,37 +1112,150 @@ class ResidentExpertMesh:
             return probe() is True
         return False
 
+    def _candidate_for_assignment_count(
+        self,
+        candidate: _Candidate,
+        assignment_count: int,
+    ) -> _Candidate:
+        """Resize a one-row route while keeping fixed path costs single-shot."""
+
+        _integer("assignment_count", assignment_count, minimum=1)
+        record = self._experts[candidate.key]
+        owner = self._nodes[candidate.owner_id]
+        if candidate.path == "local-gpu":
+            duration_ms = assignment_count * owner.expert_compute_ms_per_token
+        elif candidate.path == "local-ram":
+            duration_ms = (
+                record.byte_size / owner.ram_to_device_bytes_per_ms
+                + assignment_count * owner.expert_compute_ms_per_token
+            )
+        else:
+            link = self._links[(self.coordinator_id, candidate.owner_id)]
+            staging_bytes = (
+                candidate.host_device_staging_bytes * assignment_count
+            )
+            duration_ms = (
+                link.round_trip_ms
+                + link.rpc_setup_ms
+                + (
+                    self.activation_bytes_per_token
+                    * assignment_count
+                    / link.egress_bytes_per_ms
+                )
+                + (
+                    self.activation_bytes_per_token
+                    * assignment_count
+                    / link.ingress_bytes_per_ms
+                )
+                + (
+                    staging_bytes / link.host_device_staging_bytes_per_ms
+                    if link.host_device_staging_bytes_per_ms > 0
+                    else 0.0
+                )
+                + assignment_count * owner.expert_compute_ms_per_token
+            )
+        return _Candidate(
+            key=candidate.key,
+            owner_id=candidate.owner_id,
+            path=candidate.path,
+            duration_ms=duration_ms,
+            activation_bytes=candidate.activation_bytes * assignment_count,
+            host_device_staging_bytes=(
+                candidate.host_device_staging_bytes * assignment_count
+            ),
+            coordinator_dynamic_vram_bytes=(
+                candidate.coordinator_dynamic_vram_bytes * assignment_count
+            ),
+            owner_dynamic_vram_bytes=(
+                candidate.owner_dynamic_vram_bytes * assignment_count
+            ),
+            # A grouped owner/key/path executes one physical expert copy, no
+            # matter how many routed rows are sent to it.
+            weight_loaded_bytes=candidate.weight_loaded_bytes,
+            weight_avoided_bytes=candidate.weight_avoided_bytes,
+            transport_calibration_required=(
+                candidate.transport_calibration_required
+            ),
+            workspace_calibration_required=(
+                candidate.workspace_calibration_required
+            ),
+        )
+
     def _evaluate_assignment_selection(
         self,
         *,
-        assignments: Mapping[ExpertKey, Sequence[ExpertAssignment]],
-        selection: Mapping[ExpertKey, _Candidate],
+        selection: Mapping[_AssignmentUnit, _Candidate],
         static_vram_bytes: Mapping[str, int],
         v1_only_nodes: frozenset[str],
         row_index_bytes_by_node: Mapping[str, int],
     ) -> _AssignmentEvaluation | None:
         """Evaluate one whole-layer assignment from grouped physical costs."""
 
-        dynamic_vram_bytes = {node_id: 0 for node_id in self._nodes}
         selected_items = tuple(sorted(selection.items()))
-        for _key, candidate in selected_items:
-            dynamic_vram_bytes[self.coordinator_id] += (
+        route_units: dict[
+            tuple[ExpertKey, str, str],
+            list[_AssignmentUnit],
+        ] = {}
+        path_by_key_owner: dict[tuple[ExpertKey, str], str] = {}
+        route_candidates: dict[tuple[ExpertKey, str, str], _Candidate] = {}
+        for unit, candidate in selected_items:
+            key_owner = (unit.key, candidate.owner_id)
+            previous_path = path_by_key_owner.setdefault(
+                key_owner,
+                candidate.path,
+            )
+            # One owner cannot execute the same expert twice in one batch.
+            # Local GPU always dominates local RAM when both are available,
+            # so rejecting a mixed local path cannot remove an optimum.
+            if previous_path != candidate.path:
+                return None
+            route_key = (unit.key, candidate.owner_id, candidate.path)
+            route_units.setdefault(route_key, []).append(unit)
+            route_candidates.setdefault(route_key, candidate)
+
+        grouped_items: tuple[
+            tuple[ExpertKey, _Candidate, tuple[ExpertAssignment, ...]],
+            ...,
+        ] = tuple(
+            (
+                route_key[0],
+                self._candidate_for_assignment_count(
+                    route_candidates[route_key],
+                    len(units),
+                ),
+                tuple(unit.assignment for unit in sorted(units)),
+            )
+            for route_key, units in sorted(route_units.items())
+        )
+
+        dynamic_vram_bytes: dict[str, int] = {}
+        for _key, candidate, _route_assignments in grouped_items:
+            dynamic_vram_bytes[self.coordinator_id] = (
+                dynamic_vram_bytes.get(self.coordinator_id, 0)
+                +
                 candidate.coordinator_dynamic_vram_bytes
             )
             if candidate.owner_id != self.coordinator_id:
-                dynamic_vram_bytes[candidate.owner_id] += (
+                dynamic_vram_bytes[candidate.owner_id] = (
+                    dynamic_vram_bytes.get(candidate.owner_id, 0)
+                    +
                     candidate.owner_dynamic_vram_bytes
                 )
         if any(
             static_vram_bytes[node_id] + dynamic_vram_bytes[node_id]
-            > node.resident_vram_budget_bytes
-            for node_id, node in self._nodes.items()
+            > self._nodes[node_id].resident_vram_budget_bytes
+            for node_id in dynamic_vram_bytes
         ):
             return None
 
-        by_owner: dict[str, list[tuple[ExpertKey, _Candidate]]] = {}
-        for key, candidate in selected_items:
-            by_owner.setdefault(candidate.owner_id, []).append((key, candidate))
+        by_owner: dict[
+            str,
+            list[tuple[ExpertKey, _Candidate, tuple[ExpertAssignment, ...]]],
+        ] = {}
+        for key, candidate, route_assignments in grouped_items:
+            by_owner.setdefault(candidate.owner_id, []).append(
+                (key, candidate, route_assignments)
+            )
 
         owner_times: dict[str, float] = {}
         grouped_transport: dict[str, tuple[int, int, int, int, bool]] = {}
@@ -753,17 +1267,19 @@ class ResidentExpertMesh:
         for owner_id, owner_items in sorted(by_owner.items()):
             if owner_id == self.coordinator_id:
                 owner_times[owner_id] = math.fsum(
-                    candidate.duration_ms for _key, candidate in owner_items
+                    candidate.duration_ms
+                    for _key, candidate, _assignments in owner_items
                 )
                 continue
             assignment_total = sum(
-                len(assignments[key]) for key, _candidate in owner_items
+                len(route_assignments)
+                for _key, _candidate, route_assignments in owner_items
             )
             unique_position_total = len(
                 {
                     assignment.token_index
-                    for key, _candidate in owner_items
-                    for assignment in assignments[key]
+                    for _key, _candidate, route_assignments in owner_items
+                    for assignment in route_assignments
                 }
             )
             activation = self.activation_bytes_per_token
@@ -822,6 +1338,10 @@ class ResidentExpertMesh:
             if duration > 0
         )
         per_owner_lower_bound_ms = max(owner_times.values(), default=0.0)
+        owner_scheduled_makespan_ms = _list_scheduled_makespan_ms(
+            owner_times,
+            self.max_inflight_owner_rpcs,
+        )
         coordinator = self._nodes[self.coordinator_id]
         has_remote = bool(grouped_transport)
         nic_is_calibrated = (
@@ -840,14 +1360,48 @@ class ResidentExpertMesh:
                 / coordinator.aggregate_ingress_bytes_per_ms
             )
         coordinator_nic_lower_bound_ms = max(known_nic_bounds, default=0.0)
+        coordination_calibration_required = (
+            (
+                has_remote
+                and self.coordinator_rpc_dispatch_ms_per_owner is None
+            )
+            or (
+                has_remote
+                and self.coordinator_serialization_bytes_per_ms is None
+            )
+            or (
+                bool(selected_items)
+                and self.coordinator_reduction_ms_per_assignment is None
+            )
+        )
+        coordinator_overhead_ms = _modeled_coordinator_overhead_ms(
+            remote_owner_count=len(grouped_transport),
+            transport_payload_bytes=(
+                total_request_bytes
+                + total_response_bytes
+                + total_metadata_bytes
+            ),
+            assignment_count=len(selected_items),
+            rpc_dispatch_ms_per_owner=(
+                self.coordinator_rpc_dispatch_ms_per_owner
+            ),
+            serialization_bytes_per_ms=(
+                self.coordinator_serialization_bytes_per_ms
+            ),
+            reduction_ms_per_assignment=(
+                self.coordinator_reduction_ms_per_assignment
+            ),
+        )
 
         dispatches: list[ExpertDispatch] = []
         first_remote_key = {
-            owner_id: min(key for key, _candidate in owner_items)
+            owner_id: min(
+                key for key, _candidate, _assignments in owner_items
+            )
             for owner_id, owner_items in by_owner.items()
             if owner_id != self.coordinator_id
         }
-        for key, candidate in selected_items:
+        for key, candidate, route_assignments in grouped_items:
             remote_group_head = (
                 candidate.owner_id != self.coordinator_id
                 and first_remote_key[candidate.owner_id] == key
@@ -871,7 +1425,7 @@ class ResidentExpertMesh:
                     key=key,
                     owner_id=candidate.owner_id,
                     path=candidate.path,
-                    assignments=tuple(assignments[key]),
+                    assignments=route_assignments,
                     exposed_ms=exposed_ms,
                     activation_round_trip_bytes=activation_bytes,
                     host_device_staging_bytes=staging_bytes,
@@ -895,13 +1449,20 @@ class ResidentExpertMesh:
                 node_id,
                 static_vram_bytes[node_id] + dynamic_vram_bytes[node_id],
             )
-            for node_id in sorted(self._nodes)
+            for node_id in sorted(dynamic_vram_bytes)
             if dynamic_vram_bytes[node_id] > 0
         )
         path_rank = {"local-gpu": 0, "remote-resident": 1, "local-ram": 2}
         signature = tuple(
-            (key.layer, key.expert, path_rank[candidate.path], candidate.owner_id)
-            for key, candidate in selected_items
+            (
+                unit.key.layer,
+                unit.key.expert,
+                unit.assignment.token_index,
+                unit.assignment.slot_index,
+                path_rank[candidate.path],
+                candidate.owner_id,
+            )
+            for unit, candidate in selected_items
         )
         activation_round_trip_bytes = total_request_bytes + total_response_bytes
         return _AssignmentEvaluation(
@@ -910,11 +1471,13 @@ class ResidentExpertMesh:
             owner_exposed_ms=active_owner_times,
             owner_peak_vram_bytes=owner_peak_vram_bytes,
             per_owner_lower_bound_ms=per_owner_lower_bound_ms,
+            owner_scheduled_makespan_ms=owner_scheduled_makespan_ms,
             coordinator_nic_lower_bound_ms=coordinator_nic_lower_bound_ms,
+            coordinator_overhead_ms=coordinator_overhead_ms,
             exposed_ms=max(
-                per_owner_lower_bound_ms,
+                owner_scheduled_makespan_ms,
                 coordinator_nic_lower_bound_ms,
-            ),
+            ) + coordinator_overhead_ms,
             activation_round_trip_bytes=activation_round_trip_bytes,
             activation_request_bytes=total_request_bytes,
             activation_response_bytes=total_response_bytes,
@@ -925,18 +1488,25 @@ class ResidentExpertMesh:
             coalesced_owner_ids=tuple(coalesced_owner_ids),
             host_device_staging_bytes=total_staging_bytes,
             weight_loaded_bytes=sum(
-                candidate.weight_loaded_bytes for _key, candidate in selected_items
+                candidate.weight_loaded_bytes
+                for _key, candidate, _assignments in grouped_items
             ),
             weight_avoided_bytes=sum(
-                candidate.weight_avoided_bytes for _key, candidate in selected_items
+                candidate.weight_avoided_bytes
+                for _key, candidate, _assignments in grouped_items
             ),
             transport_calibration_required=any(
                 candidate.transport_calibration_required
-                for _key, candidate in selected_items
-            ) or (has_remote and not nic_is_calibrated),
+                for _key, candidate, _assignments in grouped_items
+            ) or (has_remote and not nic_is_calibrated) or (
+                has_remote and coordination_calibration_required
+            ),
+            coordination_calibration_required=(
+                coordination_calibration_required
+            ),
             workspace_calibration_required=any(
                 candidate.workspace_calibration_required
-                for _key, candidate in selected_items
+                for _key, candidate, _assignments in grouped_items
             ),
             signature=signature,
         )
@@ -966,6 +1536,281 @@ class ResidentExpertMesh:
             current.weight_loaded_bytes,
             current.signature,
         )
+
+    @staticmethod
+    def _heuristic_objective_is_better(
+        candidate: tuple[float, int, int],
+        current: tuple[float, int, int] | None,
+    ) -> bool:
+        if current is None:
+            return True
+        if candidate[0] < current[0] - 1e-12:
+            return True
+        if not math.isclose(
+            candidate[0],
+            current[0],
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            return False
+        return candidate[1:] < current[1:]
+
+    def _incremental_state(
+        self,
+        *,
+        static_vram_bytes: Mapping[str, int],
+        v1_only_nodes: frozenset[str],
+        row_index_bytes_by_node: Mapping[str, int],
+    ) -> _IncrementalAssignmentState:
+        return _IncrementalAssignmentState(
+            coordinator_id=self.coordinator_id,
+            nodes=self._nodes,
+            links=self._links,
+            activation_bytes_per_token=self.activation_bytes_per_token,
+            static_vram_bytes=static_vram_bytes,
+            v1_only_nodes=v1_only_nodes,
+            row_index_bytes_by_node=row_index_bytes_by_node,
+            max_inflight_owner_rpcs=self.max_inflight_owner_rpcs,
+            coordinator_rpc_dispatch_ms_per_owner=(
+                self.coordinator_rpc_dispatch_ms_per_owner
+            ),
+            coordinator_serialization_bytes_per_ms=(
+                self.coordinator_serialization_bytes_per_ms
+            ),
+            coordinator_reduction_ms_per_assignment=(
+                self.coordinator_reduction_ms_per_assignment
+            ),
+        )
+
+    def _bounded_candidate_frontier(
+        self,
+        *,
+        candidates: Sequence[_Candidate],
+        assignment_count: int,
+        static_vram_bytes: Mapping[str, int],
+    ) -> tuple[tuple[_Candidate, ...], bool]:
+        """Bound a huge replica set without making an exactness claim.
+
+        Coordinator-local routes are always retained.  Remote routes are
+        ranked by their sealed one-row cost and identity; after the normal
+        frontier limit, more are retained until their individual dynamic-VRAM
+        capacities can cover this expert's routed rows.  Cross-expert capacity
+        interactions can still require a discarded route, which is why the
+        caller labels every genuinely pruned plan heuristic and never turns a
+        pruned exhaustive failure into an infeasibility proof.
+        """
+
+        local = tuple(
+            candidate
+            for candidate in candidates
+            if candidate.owner_id == self.coordinator_id
+        )
+        remote = tuple(
+            sorted(
+                (
+                    candidate
+                    for candidate in candidates
+                    if candidate.owner_id != self.coordinator_id
+                ),
+                key=lambda candidate: (
+                    candidate.duration_ms,
+                    candidate.transport_calibration_required,
+                    candidate.workspace_calibration_required,
+                    candidate.activation_bytes,
+                    candidate.owner_dynamic_vram_bytes,
+                    candidate.owner_id,
+                ),
+            )
+        )
+        frontier_limit = min(
+            _HEURISTIC_REMOTE_CANDIDATE_LIMIT_PER_KEY,
+            self.max_inflight_owner_rpcs,
+        )
+        if len(remote) <= frontier_limit:
+            return tuple(local + remote), False
+
+        retained_remote = list(remote[:frontier_limit])
+
+        def row_capacity(candidate: _Candidate) -> int:
+            coordinator_headroom = (
+                self._nodes[self.coordinator_id].resident_vram_budget_bytes
+                - static_vram_bytes[self.coordinator_id]
+            )
+            if candidate.coordinator_dynamic_vram_bytes:
+                capacity = (
+                    coordinator_headroom
+                    // candidate.coordinator_dynamic_vram_bytes
+                )
+            else:
+                capacity = assignment_count
+            if candidate.owner_id != self.coordinator_id:
+                owner_headroom = (
+                    self._nodes[candidate.owner_id].resident_vram_budget_bytes
+                    - static_vram_bytes[candidate.owner_id]
+                )
+                if candidate.owner_dynamic_vram_bytes:
+                    capacity = min(
+                        capacity,
+                        owner_headroom // candidate.owner_dynamic_vram_bytes,
+                    )
+            return max(0, min(capacity, assignment_count))
+
+        retained_capacity = sum(
+            row_capacity(candidate)
+            for candidate in (*local, *retained_remote)
+        )
+        next_index = len(retained_remote)
+        while (
+            retained_capacity < assignment_count
+            and next_index < len(remote)
+        ):
+            candidate = remote[next_index]
+            retained_remote.append(candidate)
+            retained_capacity += row_capacity(candidate)
+            next_index += 1
+
+        retained = tuple(local + tuple(retained_remote))
+        return retained, len(retained) < len(candidates)
+
+    def _incremental_greedy_selection(
+        self,
+        *,
+        ordered_units: Sequence[_AssignmentUnit],
+        candidates_by_key: Mapping[ExpertKey, Sequence[_Candidate]],
+        static_vram_bytes: Mapping[str, int],
+        v1_only_nodes: frozenset[str],
+        row_index_bytes_by_node: Mapping[str, int],
+    ) -> tuple[_IncrementalAssignmentState | None, int]:
+        state = self._incremental_state(
+            static_vram_bytes=static_vram_bytes,
+            v1_only_nodes=v1_only_nodes,
+            row_index_bytes_by_node=row_index_bytes_by_node,
+        )
+        states_evaluated = 0
+        for unit in ordered_units:
+            best_candidate: _Candidate | None = None
+            best_objective: tuple[float, int, int] | None = None
+            for candidate in candidates_by_key[unit.key]:
+                states_evaluated += 1
+                if not state.can_add(unit, candidate):
+                    continue
+                state.add(unit, candidate)
+                objective = state.objective()
+                state.remove(unit)
+                if self._heuristic_objective_is_better(
+                    objective,
+                    best_objective,
+                ):
+                    best_candidate = candidate
+                    best_objective = objective
+            if best_candidate is None:
+                return None, states_evaluated
+            state.add(unit, best_candidate)
+        return state, states_evaluated
+
+    def _bounded_feasible_selection(
+        self,
+        *,
+        ordered_units: Sequence[_AssignmentUnit],
+        candidates_by_key: Mapping[ExpertKey, Sequence[_Candidate]],
+        static_vram_bytes: Mapping[str, int],
+        v1_only_nodes: frozenset[str],
+        row_index_bytes_by_node: Mapping[str, int],
+    ) -> tuple[_IncrementalAssignmentState | None, int, bool]:
+        """Iteratively search for feasibility within a truthful fixed budget.
+
+        The final boolean is true only when every candidate branch was
+        exhausted. A budget stop therefore remains an unresolved search limit,
+        never a false proof that the sealed mesh is infeasible.
+        """
+
+        state = self._incremental_state(
+            static_vram_bytes=static_vram_bytes,
+            v1_only_nodes=v1_only_nodes,
+            row_index_bytes_by_node=row_index_bytes_by_node,
+        )
+        unit_count = len(ordered_units)
+        next_candidate_indexes = [0] * unit_count
+        chosen: list[_Candidate | None] = [None] * unit_count
+        depth = 0
+        states_evaluated = 0
+        while depth >= 0:
+            if depth == unit_count:
+                return state, states_evaluated, False
+            unit = ordered_units[depth]
+            pool = candidates_by_key[unit.key]
+            advanced = False
+            while next_candidate_indexes[depth] < len(pool):
+                if (
+                    states_evaluated
+                    >= _HEURISTIC_FEASIBILITY_REPAIR_STATE_LIMIT
+                ):
+                    return None, states_evaluated, False
+                candidate = pool[next_candidate_indexes[depth]]
+                next_candidate_indexes[depth] += 1
+                states_evaluated += 1
+                if not state.can_add(unit, candidate):
+                    continue
+                state.add(unit, candidate)
+                chosen[depth] = candidate
+                depth += 1
+                if depth < unit_count:
+                    next_candidate_indexes[depth] = 0
+                    chosen[depth] = None
+                advanced = True
+                break
+            if advanced:
+                continue
+
+            next_candidate_indexes[depth] = 0
+            if depth == 0:
+                return None, states_evaluated, True
+            depth -= 1
+            previous = chosen[depth]
+            if previous is None:
+                raise AssertionError("bounded repair lost its parent assignment")
+            state.remove(ordered_units[depth])
+            chosen[depth] = None
+        raise AssertionError("bounded repair escaped its iterative search")
+
+    def _bounded_incremental_local_search(
+        self,
+        *,
+        state: _IncrementalAssignmentState,
+        ordered_units: Sequence[_AssignmentUnit],
+        candidates_by_key: Mapping[ExpertKey, Sequence[_Candidate]],
+        probe_limit: int = _HEURISTIC_LOCAL_MOVE_PROBE_LIMIT,
+    ) -> int:
+        """Apply at most one deterministic improving move per routed row."""
+
+        probes = 0
+        objective = state.objective()
+        for unit in ordered_units:
+            original = state.selection[unit]
+            for candidate in candidates_by_key[unit.key]:
+                if candidate == original:
+                    continue
+                if probes >= probe_limit:
+                    return probes
+                state.remove(unit)
+                probes += 1
+                accepted = False
+                if state.can_add(unit, candidate):
+                    state.add(unit, candidate)
+                    candidate_objective = state.objective()
+                    if self._heuristic_objective_is_better(
+                        candidate_objective,
+                        objective,
+                    ):
+                        objective = candidate_objective
+                        accepted = True
+                    else:
+                        state.remove(unit)
+                if not accepted:
+                    state.add(unit, original)
+                else:
+                    break
+        return probes
 
     def plan_layer(
         self,
@@ -1028,11 +1873,12 @@ class ResidentExpertMesh:
 
         static_vram_bytes = self._resident_vram_usage()
         candidates_by_key: dict[ExpertKey, tuple[_Candidate, ...]] = {}
+        candidate_frontier_pruned = False
         path_rank = {"local-gpu": 0, "remote-resident": 1, "local-ram": 2}
         for key in sorted(assignments):
             raw_candidates = self._candidates(
                 key,
-                len(assignments[key]),
+                1,
                 unavailable_nodes,
                 unavailable_link_set,
                 unavailable_resident_set,
@@ -1045,6 +1891,15 @@ class ResidentExpertMesh:
                     value.owner_id,
                 ),
             ):
+                if any(
+                    existing.owner_id == candidate.owner_id
+                    for existing in candidates
+                ):
+                    # A resident local-GPU path is strictly faster than the
+                    # same owner's RAM-load fallback and has the same dynamic
+                    # VRAM shape. Keep one executable path per key/owner; RAM
+                    # reappears automatically if residency is unavailable.
+                    continue
                 additions = {
                     self.coordinator_id: candidate.coordinator_dynamic_vram_bytes
                 }
@@ -1064,44 +1919,51 @@ class ResidentExpertMesh:
                     f"no exact resident or RAM fallback path within sealed "
                     f"VRAM for {key}"
                 )
-            candidates_by_key[key] = tuple(candidates)
+            frontier, pruned = self._bounded_candidate_frontier(
+                candidates=candidates,
+                assignment_count=len(assignments[key]),
+                static_vram_bytes=static_vram_bytes,
+            )
+            candidates_by_key[key] = frontier
+            candidate_frontier_pruned = candidate_frontier_pruned or pruned
 
-        ordered_keys = tuple(sorted(assignments))
+        ordered_units = tuple(
+            _AssignmentUnit(key, ordinal, assignment)
+            for key in sorted(assignments)
+            for ordinal, assignment in enumerate(assignments[key])
+        )
         combination_count = 1
-        for key in ordered_keys:
-            combination_count *= len(candidates_by_key[key])
+        for unit in ordered_units:
+            combination_count *= len(candidates_by_key[unit.key])
             if combination_count > _EXACT_ASSIGNMENT_COMBINATION_LIMIT:
                 break
 
         best: _AssignmentEvaluation | None = None
         states_evaluated = 0
-        if combination_count <= _EXACT_ASSIGNMENT_COMBINATION_LIMIT:
-            selection: dict[ExpertKey, _Candidate] = {}
-
-            def visit(index: int) -> None:
-                nonlocal best, states_evaluated
-                if index == len(ordered_keys):
-                    states_evaluated += 1
-                    evaluated = self._evaluate_assignment_selection(
-                        assignments=assignments,
-                        selection=selection,
-                        static_vram_bytes=static_vram_bytes,
-                        v1_only_nodes=v1_only_nodes,
-                        row_index_bytes_by_node=row_index_bytes_by_node,
-                    )
-                    if evaluated is not None and self._assignment_is_better(
-                        evaluated,
-                        best,
-                    ):
-                        best = evaluated
-                    return
-                key = ordered_keys[index]
-                for candidate in candidates_by_key[key]:
-                    selection[key] = candidate
-                    visit(index + 1)
-                selection.pop(key, None)
-
-            visit(0)
+        if (
+            combination_count <= _EXACT_ASSIGNMENT_COMBINATION_LIMIT
+            and not candidate_frontier_pruned
+        ):
+            # ``itertools.product`` keeps exact enumeration iterative.  A
+            # layer with thousands of one-choice experts is one state, not a
+            # reason to recurse once per expert and overflow Python's stack.
+            candidate_pools = tuple(
+                candidates_by_key[unit.key] for unit in ordered_units
+            )
+            for chosen in product(*candidate_pools):
+                states_evaluated += 1
+                selection = dict(zip(ordered_units, chosen))
+                evaluated = self._evaluate_assignment_selection(
+                    selection=selection,
+                    static_vram_bytes=static_vram_bytes,
+                    v1_only_nodes=v1_only_nodes,
+                    row_index_bytes_by_node=row_index_bytes_by_node,
+                )
+                if evaluated is not None and self._assignment_is_better(
+                    evaluated,
+                    best,
+                ):
+                    best = evaluated
             strategy = "exact-enumeration"
             optimality_proven = True
             if best is None:
@@ -1109,80 +1971,88 @@ class ResidentExpertMesh:
                     "no complete exact assignment fits the sealed dynamic VRAM"
                 )
         else:
-            selection = {}
             constrained_order = tuple(
                 sorted(
-                    ordered_keys,
-                    key=lambda key: (len(candidates_by_key[key]), key),
+                    ordered_units,
+                    key=lambda unit: (
+                        len(candidates_by_key[unit.key]),
+                        unit,
+                    ),
                 )
             )
-            for key in constrained_order:
-                step_best: _AssignmentEvaluation | None = None
-                step_candidate: _Candidate | None = None
-                for candidate in candidates_by_key[key]:
-                    simulated = dict(selection)
-                    simulated[key] = candidate
-                    states_evaluated += 1
-                    evaluated = self._evaluate_assignment_selection(
-                        assignments=assignments,
-                        selection=simulated,
+            state, greedy_states = self._incremental_greedy_selection(
+                ordered_units=constrained_order,
+                candidates_by_key=candidates_by_key,
+                static_vram_bytes=static_vram_bytes,
+                v1_only_nodes=v1_only_nodes,
+                row_index_bytes_by_node=row_index_bytes_by_node,
+            )
+            states_evaluated += greedy_states
+            repaired = False
+            if state is None:
+                state, repair_states, repair_exhaustive = (
+                    self._bounded_feasible_selection(
+                        ordered_units=constrained_order,
+                        candidates_by_key=candidates_by_key,
                         static_vram_bytes=static_vram_bytes,
                         v1_only_nodes=v1_only_nodes,
                         row_index_bytes_by_node=row_index_bytes_by_node,
                     )
-                    if evaluated is not None and self._assignment_is_better(
-                        evaluated,
-                        step_best,
-                    ):
-                        step_best = evaluated
-                        step_candidate = candidate
-                if step_candidate is None:
+                )
+                states_evaluated += repair_states
+                if state is None:
+                    if repair_exhaustive:
+                        if candidate_frontier_pruned:
+                            raise ExpertAssignmentSearchLimitError(
+                                "the bounded replica frontier was exhausted; "
+                                "full route feasibility remains unresolved"
+                            )
+                        raise ExpertRouteUnavailableError(
+                            "bounded assignment repair exhaustively proved that "
+                            "no complete route fits the sealed dynamic VRAM"
+                        )
                     raise ExpertAssignmentSearchLimitError(
-                        "bounded assignment search could not prove a feasible "
-                        f"route for {key}"
+                        "bounded assignment repair exhausted "
+                        f"{_HEURISTIC_FEASIBILITY_REPAIR_STATE_LIMIT} states; "
+                        "route feasibility remains unresolved"
                     )
-                selection[key] = step_candidate
+                repaired = True
+
+            states_evaluated += self._bounded_incremental_local_search(
+                state=state,
+                ordered_units=ordered_units,
+                candidates_by_key=candidates_by_key,
+                probe_limit=(
+                    min(
+                        _HEURISTIC_LOCAL_MOVE_PROBE_LIMIT,
+                        self.max_inflight_owner_rpcs**2,
+                    )
+                    if candidate_frontier_pruned
+                    else _HEURISTIC_LOCAL_MOVE_PROBE_LIMIT
+                ),
+            )
             best = self._evaluate_assignment_selection(
-                assignments=assignments,
-                selection=selection,
+                selection=state.selection,
                 static_vram_bytes=static_vram_bytes,
                 v1_only_nodes=v1_only_nodes,
                 row_index_bytes_by_node=row_index_bytes_by_node,
             )
             if best is None:
-                raise ExpertAssignmentSearchLimitError(
-                    "bounded assignment search produced no feasible complete route"
+                raise ResidentExpertMeshError(
+                    "incremental assignment state disagrees with full validation"
                 )
-            improved = True
-            while improved:
-                improved = False
-                replacement: tuple[ExpertKey, _Candidate] | None = None
-                replacement_evaluation = best
-                for key in ordered_keys:
-                    for candidate in candidates_by_key[key]:
-                        if candidate == selection[key]:
-                            continue
-                        simulated = dict(selection)
-                        simulated[key] = candidate
-                        states_evaluated += 1
-                        evaluated = self._evaluate_assignment_selection(
-                            assignments=assignments,
-                            selection=simulated,
-                            static_vram_bytes=static_vram_bytes,
-                            v1_only_nodes=v1_only_nodes,
-                            row_index_bytes_by_node=row_index_bytes_by_node,
-                        )
-                        if evaluated is not None and self._assignment_is_better(
-                            evaluated,
-                            replacement_evaluation,
-                        ):
-                            replacement = (key, candidate)
-                            replacement_evaluation = evaluated
-                if replacement is not None:
-                    selection[replacement[0]] = replacement[1]
-                    best = replacement_evaluation
-                    improved = True
-            strategy = "heuristic-local-search"
+            if candidate_frontier_pruned:
+                strategy = (
+                    "heuristic-candidate-pruned-bounded-repair"
+                    if repaired
+                    else "heuristic-candidate-pruned-local-search"
+                )
+            else:
+                strategy = (
+                    "heuristic-bounded-repair"
+                    if repaired
+                    else "heuristic-incremental-local-search"
+                )
             optimality_proven = False
 
         assert best is not None
@@ -1195,7 +2065,11 @@ class ResidentExpertMesh:
             owner_exposed_ms=best.owner_exposed_ms,
             owner_peak_vram_bytes=best.owner_peak_vram_bytes,
             per_owner_lower_bound_ms=best.per_owner_lower_bound_ms,
+            owner_scheduled_makespan_ms=(
+                best.owner_scheduled_makespan_ms
+            ),
             coordinator_nic_lower_bound_ms=best.coordinator_nic_lower_bound_ms,
+            coordinator_overhead_ms=best.coordinator_overhead_ms,
             exposed_ms=best.exposed_ms,
             activation_round_trip_bytes=best.activation_round_trip_bytes,
             activation_request_bytes=best.activation_request_bytes,
@@ -1207,7 +2081,11 @@ class ResidentExpertMesh:
             weight_loaded_bytes=best.weight_loaded_bytes,
             weight_avoided_bytes=best.weight_avoided_bytes,
             transport_calibration_required=best.transport_calibration_required,
+            coordination_calibration_required=(
+                best.coordination_calibration_required
+            ),
             workspace_calibration_required=best.workspace_calibration_required,
+            max_inflight_owner_rpcs=self.max_inflight_owner_rpcs,
             assignment_strategy=strategy,
             assignment_optimality_proven=optimality_proven,
             assignment_states_evaluated=states_evaluated,
@@ -1435,13 +2313,18 @@ class ResidentExpertMesh:
         for dispatch in plan.dispatches:
             by_owner.setdefault(dispatch.owner_id, []).append(dispatch)
 
-        # Build assignment tensors once per expert.  These vectors are reused
-        # for activation selection and weighted reduction; router gates are
-        # gathered in one operation instead of extracting scalar tensors in a
-        # Python loop.
-        assignment_indexes: dict[ExpertKey, tuple[torch.Tensor, torch.Tensor]] = {}
+        # Build assignment tensors once per dispatch.  One expert may be split
+        # across multiple replica owners, so the physical dispatch (not just
+        # the logical key) identifies the exact row/slot subset used for both
+        # activation selection and weighted reduction. Router gates are
+        # gathered in one operation instead of extracting scalar tensors in
+        # a Python loop.
+        assignment_indexes: dict[
+            ExpertDispatch,
+            tuple[torch.Tensor, torch.Tensor],
+        ] = {}
         for dispatch in plan.dispatches:
-            assignment_indexes[dispatch.key] = (
+            assignment_indexes[dispatch] = (
                 torch.tensor(
                     [assignment.token_index for assignment in dispatch.assignments],
                     dtype=torch.long,
@@ -1541,7 +2424,7 @@ class ResidentExpertMesh:
             else:
                 batch_items: list[OwnerExpertBatchItem] = []
                 for dispatch in ordered_dispatches:
-                    indices, _ = assignment_indexes[dispatch.key]
+                    indices, _ = assignment_indexes[dispatch]
                     selected_hidden = hidden.index_select(0, indices)
                     record = self._experts[dispatch.key]
                     batch_items.append(
@@ -1598,13 +2481,23 @@ class ResidentExpertMesh:
         with self._executor_lock:
             if self._closed:
                 raise ResidentExpertMeshError("resident expert mesh is closed")
+            predicted_owner_ms = dict(plan.owner_exposed_ms)
+            execution_owner_ids = tuple(
+                sorted(
+                    by_owner,
+                    key=lambda owner_id: (
+                        -predicted_owner_ms.get(owner_id, 0.0),
+                        owner_id,
+                    ),
+                )
+            )
             futures = {
                 owner_id: self._executor.submit(
                     guarded_run_owner,
                     owner_id,
-                    dispatches,
+                    by_owner[owner_id],
                 )
-                for owner_id, dispatches in sorted(by_owner.items())
+                for owner_id in execution_owner_ids
             }
         wait(tuple(futures.values()), return_when=FIRST_EXCEPTION)
         if primary_failure:
@@ -1660,7 +2553,12 @@ class ResidentExpertMesh:
 
         canonical_completed = sorted(
             completed,
-            key=lambda value: value[0].key,
+            key=lambda value: (
+                value[0].key,
+                value[0].owner_id,
+                value[0].path,
+                value[0].assignments,
+            ),
         )
         normalized: list[tuple[ExpertDispatch, torch.Tensor]] = []
         # Validate every result before allocating or mutating the reduction
@@ -1697,7 +2595,7 @@ class ResidentExpertMesh:
 
         output = torch.zeros_like(hidden)
         for dispatch, expert_output in normalized:
-            indices, slots = assignment_indexes[dispatch.key]
+            indices, slots = assignment_indexes[dispatch]
             gates = routing.expert_weights[indices, slots]
             weighted = expert_output * gates.unsqueeze(-1)
             output.index_add_(0, indices, weighted.to(dtype=output.dtype))

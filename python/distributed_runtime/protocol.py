@@ -11,10 +11,12 @@ import zlib
 import torch
 
 MAGIC = b"GDLP"
-# PING/PONG extends the v2 frame vocabulary. A version bump makes mixed old/new
-# stage deployments fail during HELLO instead of accepting READY and then
-# stalling on an unknown control frame.
-VERSION = 3
+# Transactional sparse-tree capacity quotes extend the v4 frame vocabulary.
+# v6 adds an end-to-end COMMIT result: the root cannot emit FORK until the last
+# stage proves that every preceding stage consumed and revalidated COMMIT.
+# Mixed deployments therefore fail during HELLO instead of silently weakening
+# the all-stage mutation barrier.
+VERSION = 6
 HEADER = struct.Struct("<4sBBHQIIII")
 HEADER_BYTES = HEADER.size
 MAX_PAYLOAD_BYTES = 64 * 1024 * 1024
@@ -22,6 +24,8 @@ QUANT_GROUP_SIZE = 64
 UINT16_MAX = (1 << 16) - 1
 UINT32_MAX = (1 << 32) - 1
 UINT64_MAX = (1 << 64) - 1
+MAX_TREE_PREPARE_PATHS = 64
+MAX_TREE_PREPARE_PATH_TOKENS = 1_048_575
 
 
 class FrameType(IntEnum):
@@ -51,6 +55,35 @@ class FrameType(IntEnum):
     # route used by a decode wave, rather than one arbitrary peer-to-peer link.
     PING = 15
     PONG = 16
+    # Exact speculative trees use independent request IDs as virtual leaves.
+    # FORK(child,parent) clones the parent's stage-local KV state into `child`;
+    # PROMOTE(parent,child) atomically moves the selected child's state back to
+    # `parent`. The second uint64 request ID is the only payload field.
+    FORK = 17
+    PROMOTE = 18
+    # TREE_PREPARE is a mutation-free capacity quote. Every stage appends its
+    # result to the bounded binary aggregate and the final stage returns
+    # TREE_PREPARE_RESULT on the direct-return socket. COMMIT revalidates and
+    # arms the quote; CANCEL releases it without allocating KV.
+    TREE_PREPARE = 19
+    TREE_PREPARE_RESULT = 20
+    TREE_RESERVATION_COMMIT = 21
+    TREE_RESERVATION_CANCEL = 22
+    TREE_RESERVATION_COMMIT_RESULT = 23
+
+
+class TreePrepareStatus(IntEnum):
+    READY = 0
+    REJECT = 1
+
+
+class TreePrepareRejection(IntEnum):
+    NONE = 0
+    TREE_DISABLED = 1
+    RESERVATION_BUSY = 2
+    BRANCH_COUNT = 3
+    BRANCH_TOKENS = 4
+    KV_BYTES = 5
 
 
 class TensorCodec(IntEnum):
@@ -75,6 +108,30 @@ TENSOR_FRAME_TYPES = frozenset(
     (FrameType.ACTIVATION, FrameType.PREFILL, FrameType.VERIFY)
 )
 ROUTE_PROBE_FRAME_TYPES = frozenset((FrameType.PING, FrameType.PONG))
+BRANCH_CONTROL_FRAME_TYPES = frozenset((FrameType.FORK, FrameType.PROMOTE))
+BRANCH_REQUEST_ID = struct.Struct("<Q")
+TREE_PREPARE_FRAME_TYPES = frozenset(
+    (FrameType.TREE_PREPARE, FrameType.TREE_PREPARE_RESULT)
+)
+TREE_RESERVATION_COMMIT_FRAME_TYPES = frozenset(
+    (FrameType.TREE_RESERVATION_COMMIT,)
+)
+TREE_RESERVATION_CANCEL_FRAME_TYPES = frozenset(
+    (FrameType.TREE_RESERVATION_CANCEL,)
+)
+TREE_RESERVATION_RESULT_FRAME_TYPES = frozenset(
+    (FrameType.TREE_RESERVATION_COMMIT_RESULT,)
+)
+TREE_RESERVATION_FRAME_TYPES = (
+    TREE_RESERVATION_COMMIT_FRAME_TYPES
+    | TREE_RESERVATION_CANCEL_FRAME_TYPES
+    | TREE_RESERVATION_RESULT_FRAME_TYPES
+)
+# nonce, status, rejection, visited stage count, rejecting layer start,
+# required capacity, configured limit and sum of all visited-stage projections.
+TREE_PREPARE_PREFIX = struct.Struct("<QBBHIQQQ")
+TREE_PATH_LENGTH = struct.Struct("<I")
+TREE_RESERVATION_NONCE = struct.Struct("<Q")
 
 
 @dataclass(frozen=True)
@@ -86,6 +143,21 @@ class Frame:
     token_count: int
     hidden_size: int
     payload: bytes | bytearray
+
+
+@dataclass(frozen=True)
+class TreePrepareQuote:
+    """Closed, bounded sparse-tree capacity quote carried across the route."""
+
+    nonce: int
+    path_lengths: tuple[int, ...]
+    status: TreePrepareStatus = TreePrepareStatus.READY
+    rejection: TreePrepareRejection = TreePrepareRejection.NONE
+    stage_count: int = 0
+    rejecting_layer_start: int = 0
+    required: int = 0
+    limit: int = 0
+    total_projected_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -163,6 +235,7 @@ def send_frame(
     _validate_frame_metadata(
         normalized_type,
         flags=flags,
+        step=step,
         token_count=token_count,
         hidden_size=hidden_size,
         payload_size=payload_size,
@@ -204,6 +277,7 @@ def recv_frame(sock: socket.socket) -> Frame:
     _validate_frame_metadata(
         frame_type,
         flags=flags,
+        step=step,
         token_count=token_count,
         hidden_size=hidden_size,
         payload_size=size,
@@ -440,6 +514,169 @@ def token_payload(token_id: int) -> bytes:
     return struct.pack("<I", token_id)
 
 
+def branch_request_payload(request_id: int) -> bytes:
+    """Encode the second request ID in a FORK/PROMOTE control frame."""
+
+    _require_unsigned("branch_request_id", request_id, UINT64_MAX)
+    return BRANCH_REQUEST_ID.pack(request_id)
+
+
+def decode_branch_request_id(frame: Frame) -> int:
+    """Decode the parent/child ID carried by an exact branch control frame.
+
+    FORK uses ``frame.request_id`` as the child and returns the parent. PROMOTE
+    uses ``frame.request_id`` as the parent and returns the selected child.
+    Keeping both wire forms canonical avoids ambiguous retries or hidden branch
+    metadata in the otherwise unused header fields.
+    """
+
+    if frame.frame_type not in BRANCH_CONTROL_FRAME_TYPES:
+        raise ValueError("frame is not a branch lifecycle control")
+    if len(frame.payload) != BRANCH_REQUEST_ID.size:
+        raise ValueError("branch control payload must contain exactly one uint64")
+    return BRANCH_REQUEST_ID.unpack(frame.payload)[0]
+
+
+def tree_prepare_payload(
+    nonce: int,
+    path_lengths: list[int] | tuple[int, ...],
+) -> bytes:
+    """Create the canonical root-originated TREE_PREPARE payload.
+
+    The ordered lengths bind the later FORKs to the proposed leaf shape without
+    putting candidate token IDs on the control plane. A nonce is unique for the
+    pipeline session and is never accepted as an implicit retry token.
+    """
+
+    return encode_tree_prepare_quote(
+        TreePrepareQuote(nonce=nonce, path_lengths=tuple(path_lengths))
+    )
+
+
+def encode_tree_prepare_quote(quote: TreePrepareQuote) -> bytes:
+    if not isinstance(quote, TreePrepareQuote):
+        raise TypeError("quote must be a TreePrepareQuote")
+    _require_unsigned("tree reservation nonce", quote.nonce, UINT64_MAX)
+    path_lengths = tuple(quote.path_lengths)
+    if not 1 <= len(path_lengths) <= MAX_TREE_PREPARE_PATHS:
+        raise ValueError(
+            "tree prepare path count must be between 1 and "
+            f"{MAX_TREE_PREPARE_PATHS}"
+        )
+    for path_length in path_lengths:
+        _require_unsigned(
+            "tree path length", path_length, MAX_TREE_PREPARE_PATH_TOKENS
+        )
+        if path_length < 1:
+            raise ValueError("tree path lengths must be positive")
+    try:
+        status = TreePrepareStatus(quote.status)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"unknown tree prepare status {quote.status}") from error
+    try:
+        rejection = TreePrepareRejection(quote.rejection)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"unknown tree prepare rejection {quote.rejection}"
+        ) from error
+    _require_unsigned("tree quote stage_count", quote.stage_count, UINT16_MAX)
+    _require_unsigned(
+        "tree quote rejecting_layer_start", quote.rejecting_layer_start, UINT32_MAX
+    )
+    _require_unsigned("tree quote required", quote.required, UINT64_MAX)
+    _require_unsigned("tree quote limit", quote.limit, UINT64_MAX)
+    _require_unsigned(
+        "tree quote total_projected_bytes",
+        quote.total_projected_bytes,
+        UINT64_MAX,
+    )
+    if status is TreePrepareStatus.READY:
+        if rejection is not TreePrepareRejection.NONE:
+            raise ValueError("READY tree quote cannot carry a rejection reason")
+        if quote.rejecting_layer_start or quote.required or quote.limit:
+            raise ValueError("READY tree quote must use zero rejection fields")
+    elif rejection is TreePrepareRejection.NONE:
+        raise ValueError("REJECT tree quote requires a structured rejection reason")
+
+    prefix = TREE_PREPARE_PREFIX.pack(
+        quote.nonce,
+        int(status),
+        int(rejection),
+        quote.stage_count,
+        quote.rejecting_layer_start,
+        quote.required,
+        quote.limit,
+        quote.total_projected_bytes,
+    )
+    lengths = struct.pack(f"<{len(path_lengths)}I", *path_lengths)
+    return prefix + lengths
+
+
+def decode_tree_prepare(frame: Frame) -> TreePrepareQuote:
+    if frame.frame_type not in TREE_PREPARE_FRAME_TYPES:
+        raise ValueError("frame is not a tree capacity quote")
+    if not 1 <= frame.token_count <= MAX_TREE_PREPARE_PATHS:
+        raise ValueError("tree prepare frame has an invalid path count")
+    expected = TREE_PREPARE_PREFIX.size + frame.token_count * TREE_PATH_LENGTH.size
+    if len(frame.payload) != expected:
+        raise ValueError(
+            f"tree prepare payload has {len(frame.payload)} bytes, expected {expected}"
+        )
+    (
+        nonce,
+        status_value,
+        rejection_value,
+        stage_count,
+        rejecting_layer_start,
+        required,
+        limit,
+        total_projected_bytes,
+    ) = TREE_PREPARE_PREFIX.unpack_from(frame.payload)
+    try:
+        status = TreePrepareStatus(status_value)
+    except ValueError as error:
+        raise ValueError(f"unknown tree prepare status {status_value}") from error
+    try:
+        rejection = TreePrepareRejection(rejection_value)
+    except ValueError as error:
+        raise ValueError(
+            f"unknown tree prepare rejection {rejection_value}"
+        ) from error
+    path_lengths = struct.unpack_from(
+        f"<{frame.token_count}I", frame.payload, TREE_PREPARE_PREFIX.size
+    )
+    quote = TreePrepareQuote(
+        nonce=nonce,
+        path_lengths=tuple(path_lengths),
+        status=status,
+        rejection=rejection,
+        stage_count=stage_count,
+        rejecting_layer_start=rejecting_layer_start,
+        required=required,
+        limit=limit,
+        total_projected_bytes=total_projected_bytes,
+    )
+    # Re-encoding is both a semantic validator and a canonical representation
+    # check. It rejects zero paths, inconsistent status/reason combinations and
+    # every value outside the sealed control-plane bounds.
+    if encode_tree_prepare_quote(quote) != bytes(frame.payload):
+        raise ValueError("tree prepare payload is not canonical")
+    return quote
+
+
+def tree_reservation_payload(nonce: int) -> bytes:
+    _require_unsigned("tree reservation nonce", nonce, UINT64_MAX)
+    return TREE_RESERVATION_NONCE.pack(nonce)
+
+
+def decode_tree_reservation_nonce(frame: Frame) -> int:
+    if frame.frame_type not in TREE_RESERVATION_FRAME_TYPES:
+        raise ValueError("frame is not a tree reservation control")
+    if len(frame.payload) != TREE_RESERVATION_NONCE.size:
+        raise ValueError("tree reservation payload must contain exactly one uint64")
+    return TREE_RESERVATION_NONCE.unpack(frame.payload)[0]
+
+
 def decode_token(frame: Frame) -> int:
     if frame.frame_type != FrameType.TOKEN or len(frame.payload) != 4:
         raise ValueError("invalid token frame")
@@ -505,6 +742,7 @@ def _validate_frame_metadata(
     frame_type: FrameType,
     *,
     flags: int,
+    step: int,
     token_count: int,
     hidden_size: int,
     payload_size: int,
@@ -520,6 +758,74 @@ def _validate_frame_metadata(
             raise ValueError(
                 f"{frame_type.name} frames require "
                 "flags=token_count=hidden_size=0 and cannot carry a payload"
+            )
+        return
+    if frame_type in BRANCH_CONTROL_FRAME_TYPES:
+        if flags != 0 or step != 0 or token_count != 0 or hidden_size != 0:
+            raise ValueError(
+                f"{frame_type.name} frames require "
+                "flags=step=token_count=hidden_size=0"
+            )
+        if payload_size != BRANCH_REQUEST_ID.size:
+            raise ValueError(
+                f"{frame_type.name} payload must contain exactly one uint64"
+            )
+        return
+    if frame_type in TREE_PREPARE_FRAME_TYPES:
+        if flags != 0 or hidden_size != 0:
+            raise ValueError(
+                f"{frame_type.name} frames require flags=hidden_size=0"
+            )
+        if not 1 <= token_count <= MAX_TREE_PREPARE_PATHS:
+            raise ValueError(
+                f"{frame_type.name} token_count must be between 1 and "
+                f"{MAX_TREE_PREPARE_PATHS}"
+            )
+        expected = TREE_PREPARE_PREFIX.size + token_count * TREE_PATH_LENGTH.size
+        if payload_size != expected:
+            raise ValueError(
+                f"{frame_type.name} payload has {payload_size} bytes, expected {expected}"
+            )
+        return
+    if frame_type in TREE_RESERVATION_COMMIT_FRAME_TYPES:
+        if flags != 0 or hidden_size != 0:
+            raise ValueError(
+                f"{frame_type.name} frames require flags=hidden_size=0"
+            )
+        if token_count > UINT16_MAX - 1:
+            raise ValueError(
+                f"{frame_type.name} token_count must contain a uint16 "
+                "predecessor count"
+            )
+        if payload_size != TREE_RESERVATION_NONCE.size:
+            raise ValueError(
+                f"{frame_type.name} payload must contain exactly one uint64"
+            )
+        return
+    if frame_type in TREE_RESERVATION_CANCEL_FRAME_TYPES:
+        if flags != 0 or token_count != 0 or hidden_size != 0:
+            raise ValueError(
+                f"{frame_type.name} frames require "
+                "flags=token_count=hidden_size=0"
+            )
+        if payload_size != TREE_RESERVATION_NONCE.size:
+            raise ValueError(
+                f"{frame_type.name} payload must contain exactly one uint64"
+            )
+        return
+    if frame_type in TREE_RESERVATION_RESULT_FRAME_TYPES:
+        if flags != 0 or hidden_size != 0:
+            raise ValueError(
+                f"{frame_type.name} frames require flags=hidden_size=0"
+            )
+        if not 1 <= token_count <= UINT16_MAX:
+            raise ValueError(
+                f"{frame_type.name} token_count must contain a positive "
+                "uint16 stage count"
+            )
+        if payload_size != TREE_RESERVATION_NONCE.size:
+            raise ValueError(
+                f"{frame_type.name} payload must contain exactly one uint64"
             )
         return
     if frame_type in TENSOR_FRAME_TYPES:

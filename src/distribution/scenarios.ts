@@ -76,7 +76,7 @@ export function fixedDistributionScenarios(): DistributionScenario[] {
   return [
     {
       id: "lan-small-4",
-      description: "Modelo pequeño forzado a repartirse en cuatro equipos LAN heterogéneos",
+      description: "Small model forced across four heterogeneous LAN machines",
       model: smallModel,
       topology: completeTopology(lanNodes, (left, right) => ({
         oneWayLatencyMs: 0.35 + Math.abs(hashNumber(left.id) - hashNumber(right.id)) % 0.6,
@@ -103,7 +103,7 @@ export function fixedDistributionScenarios(): DistributionScenario[] {
     },
     {
       id: "regional-medium-12",
-      description: "Modelo de 1.5B repartido regionalmente con enlaces asimétricos",
+      description: "Regionally distributed 1.5B model with asymmetric links",
       model: mediumProxy,
       topology: completeTopology(regionalNodes, (left, right) => {
         const sameRegion = left.region === right.region;
@@ -118,7 +118,7 @@ export function fixedDistributionScenarios(): DistributionScenario[] {
     },
     {
       id: "many-machines-select-few",
-      description: "Treinta y dos nodos; el planificador debe ignorar los que empeoran la ruta",
+      description: "Thirty-two nodes; the scheduler must ignore nodes that worsen the route",
       model: mediumProxy,
       topology: completeTopology(manyNodes, (left, right) => {
         const sameCell = left.region === right.region;
@@ -133,7 +133,7 @@ export function fixedDistributionScenarios(): DistributionScenario[] {
     },
     {
       id: "concurrent-recurrent-pipeline",
-      description: "Ocho conversaciones intercaladas para medir batching y ciclo de pipeline",
+      description: "Eight interleaved conversations to measure batching and the pipeline cycle",
       model: qwenProxy,
       topology: completeTopology(wifiNodes, (left, right) => ({
         oneWayLatencyMs: left.region === right.region ? 1.5 : 9,
@@ -189,7 +189,7 @@ export function randomDistributionScenario(seed: number, index: number): Distrib
   const concurrentSequences = [1, 2, 4, 8][Math.floor(random() * 4)]!;
   return {
     id: `random-${index}`,
-    description: "Escenario Monte Carlo heterogéneo",
+    description: "Heterogeneous Monte Carlo scenario",
     model,
     topology,
     workload: {

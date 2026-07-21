@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   compilePythonLaunchDescription,
+  pythonPrefillFrameByteReservation,
   validatePythonLaunchDescription,
   type PythonLaunchCompilerOptions,
   type PythonNativeStageStageInput,
@@ -149,6 +150,11 @@ function options(overrides: Partial<PythonLaunchCompilerOptions> = {}): PythonLa
     connectTimeoutSeconds: 45.5,
     ...overrides,
   };
+}
+
+function strongArtifactIdentity(snapshotIdentity: string): string {
+  const prefix = BigInt(snapshotIdentity).toString(16).padStart(16, "0");
+  return `sha256:${prefix}${"a".repeat(48)}`;
 }
 
 function compile(
@@ -487,12 +493,197 @@ describe("GDLP/2 Python launch compiler", () => {
   it("places prefill, batching and disabled speculation on the root server argv", () => {
     const args = root(compile()).command.args;
     expect(argumentValue(args, "--prefill-chunk-tokens")).toBe("8");
+    expect(argumentValue(args, "--prefill-inflight-chunks")).toBe("3");
+    expect(argumentValue(args, "--prefill-inflight-bytes")).toBe(
+      String(64 * 1024 * 1024),
+    );
     expect(argumentValue(args, "--sealed-wave-tokens")).toBe("1");
     expect(argumentValue(args, "--max-prefill-chunk-tokens")).toBe("8");
     expect(argumentValue(args, "--max-batch-size")).toBe("2");
     expect(argumentValue(args, "--max-active-sequences")).toBe("2");
     expect(argumentValue(args, "--speculation")).toBe("off");
     expect(argumentValue(args, "--speculative-max-draft-tokens")).toBe("1");
+  });
+
+  it("seals explicit bounded prefill pipeline credits into configuration and argv", () => {
+    const description = compile(manifest(), {
+      prefillInflightChunks: 5,
+      prefillInflightBytes: 96 * 1024 * 1024,
+    });
+    const args = root(description).command.args;
+    expect(description.configuration.prefillInflightChunks).toBe(5);
+    expect(description.configuration.prefillInflightBytes).toBe(96 * 1024 * 1024);
+    expect(argumentValue(args, "--prefill-inflight-chunks")).toBe("5");
+    expect(argumentValue(args, "--prefill-inflight-bytes")).toBe(
+      String(96 * 1024 * 1024),
+    );
+    expect(() => validatePythonLaunchDescription(description)).not.toThrow();
+  });
+
+  it("seals disabled or complete physical tree limits into every pipeline process", () => {
+    const disabled = compile();
+    expect(disabled.configuration.maxSpeculativeBranches).toBe(0);
+    expect(disabled.configuration.maxSpeculativeBranchTokens).toBe(0);
+    expect(disabled.configuration.maxSpeculativeKvBytes).toBe(0);
+    for (const process of [root(disabled), ...remotes(disabled)]) {
+      expect(argumentValue(process.command.args, "--max-speculative-branches")).toBe("0");
+      expect(
+        argumentValue(process.command.args, "--max-speculative-branch-tokens"),
+      ).toBe("0");
+      expect(argumentValue(process.command.args, "--max-speculative-kv-bytes")).toBe("0");
+    }
+
+    const enabled = compile(manifest(), {
+      maxSpeculativeBranches: 8,
+      maxSpeculativeBranchTokens: 32_768,
+      maxSpeculativeKvBytes: 512 * 1024 * 1024,
+    });
+    expect(enabled.configuration.maxSpeculativeBranches).toBe(8);
+    expect(enabled.configuration.maxSpeculativeBranchTokens).toBe(32_768);
+    expect(enabled.configuration.maxSpeculativeKvBytes).toBe(512 * 1024 * 1024);
+    for (const process of [root(enabled), ...remotes(enabled)]) {
+      expect(argumentValue(process.command.args, "--max-speculative-branches")).toBe("8");
+      expect(
+        argumentValue(process.command.args, "--max-speculative-branch-tokens"),
+      ).toBe("32768");
+      expect(argumentValue(process.command.args, "--max-speculative-kv-bytes")).toBe(
+        String(512 * 1024 * 1024),
+      );
+    }
+    expect(() => validatePythonLaunchDescription(enabled)).not.toThrow();
+  });
+
+  it("rejects partial or unsafe physical tree limits", () => {
+    expect(() => compile(manifest(), { maxSpeculativeBranches: 1 })).toThrow(
+      "python_speculative_tree_limits_must_be_disabled_or_complete",
+    );
+    expect(() =>
+      compile(manifest(), {
+        maxSpeculativeBranches: 65,
+        maxSpeculativeBranchTokens: 1,
+        maxSpeculativeKvBytes: 1,
+      }),
+    ).toThrow("python_max_speculative_branches_is_invalid");
+    expect(() =>
+      compile(manifest(), {
+        maxSpeculativeBranches: 1,
+        maxSpeculativeBranchTokens: 1_048_577,
+        maxSpeculativeKvBytes: 1,
+      }),
+    ).toThrow("python_max_speculative_branch_tokens_is_invalid");
+    expect(() =>
+      compile(manifest(), {
+        maxSpeculativeBranches: 1,
+        maxSpeculativeBranchTokens: 1,
+        maxSpeculativeKvBytes: 2 ** 40 + 1,
+      }),
+    ).toThrow("python_max_speculative_kv_bytes_is_invalid");
+  });
+
+  it("rejects unsafe prefill pipeline credit bounds", () => {
+    expect(() => compile(manifest(), { prefillInflightChunks: 0 })).toThrow(
+      "python_prefill_inflight_chunks_is_invalid",
+    );
+    expect(() => compile(manifest(), { prefillInflightChunks: 65 })).toThrow(
+      "python_prefill_inflight_chunks_is_invalid",
+    );
+    expect(() => compile(manifest(), { prefillInflightBytes: 0 })).toThrow(
+      "python_prefill_inflight_bytes_is_invalid",
+    );
+    expect(() =>
+      compile(manifest(), { prefillInflightBytes: 1024 * 1024 * 1024 + 1 }),
+    ).toThrow("python_prefill_inflight_bytes_is_invalid");
+  });
+
+  it("fails closed unless one maximum prefill frame fits the byte credit", () => {
+    const required = 32 + 8 * 512 * 2;
+    expect(
+      compile(manifest(), {
+        prefillInflightChunks: 4,
+        prefillInflightBytes: required,
+      }).configuration.prefillInflightBytes,
+    ).toBe(required);
+    expect(() =>
+      compile(manifest(), {
+        prefillInflightChunks: 4,
+        prefillInflightBytes: required - 1,
+      }),
+    ).toThrow(`python_prefill_inflight_bytes_below_frame_reservation:${required}`);
+  });
+
+  it("uses the sealed manifest codec and shape for the launch-time capacity check", () => {
+    for (const codec of [
+      "fp16",
+      "int8",
+      "int8-grouped",
+      "int8-hadamard",
+    ] as const) {
+      const input = request();
+      input.model.layers = input.model.layers.map((layer) => ({
+        ...layer,
+        activationElements: 511,
+      }));
+      input.allowLossyActivation = codec !== "fp16";
+      input.phasePlans = {
+        prefill: route(0, codec),
+        decode: route(0, codec),
+      };
+      const current = buildRuntimePipelineManifest(input);
+      const required = Number(
+        pythonPrefillFrameByteReservation(
+          codec,
+          current.plans.prefill.chunkTokens,
+          current.hiddenSize,
+        ),
+      );
+
+      expect(
+        compile(current, { prefillInflightBytes: required }).configuration
+          .prefillInflightBytes,
+      ).toBe(required);
+      expect(() =>
+        compile(current, { prefillInflightBytes: required - 1 }),
+      ).toThrow(`python_prefill_inflight_bytes_below_frame_reservation:${required}`);
+    }
+  });
+
+  it("matches the Python reservation formula for every runtime tensor codec", () => {
+    const tokens = 8;
+    const hidden = 511;
+    const header = 32n;
+    const elements = BigInt(tokens * hidden);
+    const groupedBlocks = 8n;
+    const hadamardBlocks = 13n;
+    const groupedPayload = elements + BigInt(tokens) * groupedBlocks * 4n;
+    const hadamardPayload = elements + BigInt(tokens) * hadamardBlocks * 4n;
+    const deflateBound = (bytes: bigint): bigint =>
+      bytes +
+      (bytes >> 12n) +
+      (bytes >> 14n) +
+      (bytes >> 25n) +
+      19n;
+
+    expect(pythonPrefillFrameByteReservation("fp32", tokens, hidden)).toBe(
+      header + elements * 4n,
+    );
+    expect(pythonPrefillFrameByteReservation("fp16", tokens, hidden)).toBe(
+      header + elements * 2n,
+    );
+    expect(pythonPrefillFrameByteReservation("int8", tokens, hidden)).toBe(
+      header + elements + 4n,
+    );
+    expect(
+      pythonPrefillFrameByteReservation("int8-grouped", tokens, hidden),
+    ).toBe(header + groupedPayload);
+    expect(
+      pythonPrefillFrameByteReservation("int8-hadamard", tokens, hidden),
+    ).toBe(header + hadamardPayload);
+    expect(
+      pythonPrefillFrameByteReservation("int8-grouped-deflate", tokens, hidden),
+    ).toBe(header + deflateBound(groupedPayload));
+    expect(
+      pythonPrefillFrameByteReservation("int8-hadamard-deflate", tokens, hidden),
+    ).toBe(header + deflateBound(hadamardPayload));
   });
 
   it("connects remote stages only to their next remote anchor", () => {
@@ -571,6 +762,89 @@ describe("GDLP/2 Python launch compiler", () => {
     }
   });
 
+  it("accepts and propagates a full content identity for a local snapshot", () => {
+    const snapshotIdentity = "12345";
+    const artifactIdentity = strongArtifactIdentity(snapshotIdentity);
+    const canonicalSource = `content-addressed://${artifactIdentity}`;
+    const description = compile(manifest(), {
+      runtimeModel: {
+        source: "D:\\different-host-cache\\Qwen3",
+        revision: null,
+        snapshotIdentity,
+        artifactIdentity,
+        canonicalSource,
+        canonicalRevision: artifactIdentity,
+      },
+    });
+
+    expect(description.runtimeModel).toEqual({
+      source: "D:\\different-host-cache\\Qwen3",
+      revision: null,
+      snapshotIdentity,
+      artifactIdentity,
+      canonicalSource,
+      canonicalRevision: artifactIdentity,
+    });
+    for (const process of description.launchOrder) {
+      if (process.kind === "cell-member") continue;
+      expect(argumentValue(process.command.args, "--model-artifact-identity")).toBe(
+        artifactIdentity,
+      );
+      expect(argumentValue(process.command.args, "--model-canonical-source")).toBe(
+        canonicalSource,
+      );
+      expect(argumentValue(process.command.args, "--model-canonical-revision")).toBe(
+        artifactIdentity,
+      );
+      expect(argumentValue(process.command.args, "--pipeline-snapshot-identity")).toBe(
+        snapshotIdentity,
+      );
+    }
+    expect(() =>
+      validatePythonLaunchDescription(JSON.parse(JSON.stringify(description))),
+    ).not.toThrow();
+  });
+
+  it("requires a complete strong coordinate set bound to its snapshot uint64", () => {
+    const snapshotIdentity = "12345";
+    const artifactIdentity = strongArtifactIdentity(snapshotIdentity);
+    const base = {
+      source: "D:\\models\\Qwen3",
+      revision: null,
+      snapshotIdentity,
+      artifactIdentity,
+      canonicalSource: `content-addressed://${artifactIdentity}`,
+      canonicalRevision: artifactIdentity,
+    };
+
+    const missingRevision = { ...base };
+    delete (missingRevision as Partial<typeof base>).canonicalRevision;
+    expect(() => compile(manifest(), { runtimeModel: missingRevision })).toThrow(
+      "python_runtime_model_artifact_coordinates_are_incomplete",
+    );
+
+    const missingSnapshot = { ...base };
+    delete (missingSnapshot as Partial<typeof base>).snapshotIdentity;
+    expect(() => compile(manifest(), { runtimeModel: missingSnapshot })).toThrow(
+      "python_runtime_model_artifact_coordinates_are_incomplete",
+    );
+
+    expect(() =>
+      compile(manifest(), {
+        runtimeModel: { ...base, artifactIdentity: "snapshot:uint64:0000000000003039" },
+      }),
+    ).toThrow("python_runtime_model_artifact_identity_is_invalid");
+
+    expect(() =>
+      compile(manifest(), {
+        runtimeModel: {
+          ...base,
+          artifactIdentity: strongArtifactIdentity("12346"),
+        },
+      }),
+    ).toThrow("python_runtime_model_artifact_snapshot_identity_mismatch");
+  });
+
   it("canonicalizes a Hub cache snapshot to repository and commit coordinates", () => {
     const commit = "c1899de289a04d12100db370d81485cdf75e47ca";
     const description = compile(manifest(), {
@@ -583,6 +857,55 @@ describe("GDLP/2 Python launch compiler", () => {
     expect(description.runtimeModel.canonicalRevision).toBe(commit);
     expect(description.runtimeModel.artifactIdentity).toMatch(/^sha256:[0-9a-f]{64}$/);
     expect(description.runtimeModel.snapshotIdentity).toMatch(/^\d+$/);
+  });
+
+  it("accepts matching explicit Hub coordinates and rejects every contradiction", () => {
+    const commit = "c1899de289a04d12100db370d81485cdf75e47ca";
+    const source = `C:\\cache\\models--Qwen--Qwen3-0.6B\\snapshots\\${commit}`;
+    const implicit = compile(manifest(), {
+      runtimeModel: { source, revision: null },
+    });
+    const expected = implicit.runtimeModel;
+    const explicitRuntimeModel = {
+      source,
+      revision: null,
+      snapshotIdentity: expected.snapshotIdentity!,
+      artifactIdentity: expected.artifactIdentity!,
+      canonicalSource: expected.canonicalSource!,
+      canonicalRevision: expected.canonicalRevision!,
+    };
+
+    expect(
+      compile(manifest(), { runtimeModel: explicitRuntimeModel }),
+    ).toEqual(implicit);
+
+    const wrongArtifactIdentity = `${expected.artifactIdentity!.slice(0, -1)}${
+      expected.artifactIdentity!.endsWith("0") ? "1" : "0"
+    }`;
+    expect(() =>
+      compile(manifest(), {
+        runtimeModel: {
+          ...explicitRuntimeModel,
+          artifactIdentity: wrongArtifactIdentity,
+        },
+      }),
+    ).toThrow("python_runtime_model_artifact_identity_mismatch");
+    expect(() =>
+      compile(manifest(), {
+        runtimeModel: {
+          ...explicitRuntimeModel,
+          canonicalSource: "hf://another/model",
+        },
+      }),
+    ).toThrow("python_runtime_model_canonical_source_mismatch");
+    expect(() =>
+      compile(manifest(), {
+        runtimeModel: {
+          ...explicitRuntimeModel,
+          canonicalRevision: "f".repeat(40),
+        },
+      }),
+    ).toThrow("python_runtime_model_canonical_revision_mismatch");
   });
 
   it("binds one sealed NativeStage package to an exact non-root stage and renders every flag", () => {
@@ -668,6 +991,18 @@ describe("GDLP/2 Python launch compiler", () => {
     expect(() =>
       validatePythonLaunchDescription(JSON.parse(JSON.stringify(description))),
     ).not.toThrow();
+
+    const strongArtifact = strongArtifactIdentity(snapshotIdentity);
+    const strongOptions = structuredClone(options);
+    strongOptions.runtimeModel = {
+      ...strongOptions.runtimeModel!,
+      artifactIdentity: strongArtifact,
+      canonicalSource: `content-addressed://${strongArtifact}`,
+      canonicalRevision: strongArtifact,
+    };
+    const strongDescription = compile(current, strongOptions);
+    expect(strongDescription.runtimeModel.artifactIdentity).toBe(strongArtifact);
+    expect(() => validatePythonLaunchDescription(strongDescription)).not.toThrow();
 
     const wrongContent = structuredClone(options);
     wrongContent.native_stageStages![target.stageId]!.pipelineId = "12346";

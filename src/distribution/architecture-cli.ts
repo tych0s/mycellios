@@ -2,7 +2,7 @@ import { compareParallelismArchitectures } from "./parallelism.js";
 import { evaluatePlanner, TopologyBeamPlanner } from "./planners.js";
 import { fixedDistributionScenarios } from "./scenarios.js";
 
-console.log("Comparación de arquitecturas (modelo analítico reproducible)");
+console.log("Architecture comparison (reproducible analytical model)");
 for (const scenario of fixedDistributionScenarios()) {
   const planned = evaluatePlanner(
     new TopologyBeamPlanner(),

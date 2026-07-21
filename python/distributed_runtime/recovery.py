@@ -175,6 +175,11 @@ class RecoveringPipelineEngine:
             return self._engine.root_batch_stats
 
     @property
+    def prefill_window_stats(self) -> dict[str, int]:
+        with self._condition:
+            return self._engine.prefill_window_stats
+
+    @property
     def stage_metrics(self) -> list[dict[str, Any]]:
         with self._condition:
             return [*self._retired_stage_metrics, *self._engine.stage_metrics]

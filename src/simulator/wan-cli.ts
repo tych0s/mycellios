@@ -35,13 +35,13 @@ if (args.output) {
 if (args.json) {
   console.log(JSON.stringify(result, null, 2));
 } else {
-  console.log("Modelo teórico WAN para GLM-4.5-Air Q4 (no es un benchmark real)\n");
+  console.log("Theoretical WAN model for GLM-4.5-Air Q4 (not a real benchmark)\n");
   console.table(
     routes.map((route) => ({
-      ruta: route.label,
+      route: route.label,
       nodos_fisicos: route.physicalNodes,
       etapas_virtuales: route.virtualStages,
-      especulacion: route.speculation.appliedP50 ? "sí" : "fallback AR",
+      speculation: route.speculation.appliedP50 ? "yes" : "AR fallback",
       ttft_p50_s: route.ttftMs.p50 / 1_000,
       ttft_p95_s: route.ttftMs.p95 / 1_000,
       tok_s_p50: route.decodeTokensPerSecond.p50,
@@ -54,7 +54,7 @@ if (args.json) {
       electricidad_eur_M: route.economics.electricityEuroPerMillionOutputTokensAtSaturation,
     })),
   );
-  console.log("\nCota de memoria de la mezcla doméstica si todas las rutas fueran fuertes\n");
+  console.log("\nMemory bound for the residential mix if every route were strong\n");
   console.table(
     fleet.map((entry) => ({
       nodos: entry.nodes,

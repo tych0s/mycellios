@@ -74,6 +74,15 @@ class ModelProfileTests(unittest.TestCase):
             self.assertNotIn("macroWave", result["model"]["layers"][0])
             self.assertNotIn("certifiedMoe", result["inspection"])
             self.assertTrue(result["compatibility"]["selectiveSafetensors"])
+            self.assertEqual(
+                result["compatibility"]["adapterId"],
+                "transformers-llama-v1",
+            )
+            self.assertRegex(result["source"]["artifactIdentity"], r"^sha256:[0-9a-f]{64}$")
+            self.assertEqual(
+                result["source"]["canonicalSource"],
+                f"content-addressed://{result['source']['artifactIdentity']}",
+            )
             self.assertTrue(result["inspection"]["calibrationRequired"])
             self.assertEqual(
                 result["accounting"]["checkpointStorageBytes"],
@@ -126,7 +135,38 @@ class ModelProfileTests(unittest.TestCase):
             self.assertEqual(result["inspection"]["layerPrefix"], "transformer.h")
             self.assertFalse(result["compatibility"]["selectiveSafetensors"])
             self.assertTrue(result["compatibility"]["requiresAdapter"])
+            self.assertEqual(result["compatibility"]["adapterId"], "transformers-llama-v1")
             self.assertIn("transformer.h", result["compatibility"]["reasons"][0])
+
+    def test_rejects_model_layers_without_a_certified_architecture(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_config(root, tied=False)
+            config = json.loads((root / "config.json").read_text(encoding="utf-8"))
+            config["model_type"] = "mistral"
+            config["architectures"] = ["MistralForCausalLM"]
+            (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
+            save_file(
+                {
+                    "model.embed_tokens.weight": torch.zeros((16, 8), dtype=torch.float16),
+                    "model.layers.0.weight": torch.zeros((8, 8), dtype=torch.float16),
+                    "model.layers.1.weight": torch.zeros((8, 8), dtype=torch.float16),
+                    "model.norm.weight": torch.zeros(8, dtype=torch.float16),
+                    "lm_head.weight": torch.zeros((16, 8), dtype=torch.float16),
+                },
+                root / "model.safetensors",
+            )
+
+            result = compile_model_profile(str(root))
+
+            self.assertFalse(result["compatibility"]["selectiveSafetensors"])
+            self.assertIsNone(result["compatibility"]["adapterId"])
+            self.assertTrue(
+                any(
+                    "no certified selective-stage adapter" in reason
+                    for reason in result["compatibility"]["reasons"]
+                )
+            )
 
     def test_rejects_an_incomplete_layer_layout(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

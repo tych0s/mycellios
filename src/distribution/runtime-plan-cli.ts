@@ -7,7 +7,7 @@ import {
 
 const inputPath = process.argv[2];
 if (!inputPath) {
-  console.error("Uso: npm run plan:distribution -- <runtime-plan.json>");
+  console.error("Usage: npm run plan:distribution -- <runtime-plan.json>");
   process.exitCode = 2;
 } else {
   const source = await readFile(resolve(inputPath), "utf8");

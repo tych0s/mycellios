@@ -44,9 +44,9 @@ export class MockAdapter implements InferenceAdapter {
         .reverse()
         .find((message) => message.role === "user")?.content;
       const response =
-        `Respuesta de ${this.options.model} ejecutada por la red distribuida. ` +
-        `He recibido: ${lastUser ?? "una petición sin mensaje de usuario"}. ` +
-        "Este resultado procede del adaptador de prueba determinista.";
+        `Response from ${this.options.model}, executed by the distributed network. ` +
+        `I received: ${lastUser ?? "a request without a user message"}. ` +
+        "This result comes from the deterministic test adapter.";
       const pieces = response.match(/\S+\s*/g) ?? [response];
       const maxPieces = Math.min(pieces.length, request.request.max_tokens ?? pieces.length);
       const delayMs = Math.max(0, Math.round(1_000 / this.options.tokensPerSecond));

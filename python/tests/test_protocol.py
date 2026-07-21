@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import math
 import socket
 import struct
@@ -8,6 +9,7 @@ import threading
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 import zlib
 
@@ -22,6 +24,8 @@ from distributed_runtime.protocol import (
     Frame,
     FrameType,
     TensorCodec,
+    branch_request_payload,
+    decode_branch_request_id,
     decode_tensor,
     decode_token,
     decode_verify_result,
@@ -37,10 +41,16 @@ from distributed_runtime.model import StageModelSpec
 from distributed_runtime.stage_cli import JsonMetricSink
 from distributed_runtime.stage import (
     StageProcessConfig,
+    collect_compatible_activation_frames,
+    fork_stage_request,
+    forward_shutdown_and_wait,
     monitor_downstream_control,
+    promote_stage_request,
     run_stage_process,
     validate_activation,
     validate_hello,
+    validate_speculative_kv_preflight,
+    validate_speculative_runner,
     validate_stage_config,
 )
 
@@ -112,6 +122,49 @@ class ProtocolFramingTests(unittest.TestCase):
                             step=41,
                             **{field: value},
                         )
+
+    def test_exact_branch_control_frames_are_canonical_and_round_trip_uint64_ids(self) -> None:
+        parent = 2**63 + 19
+        child = 2**63 + 23
+        send_frame(
+            self.sender,
+            FrameType.FORK,
+            child,
+            payload=branch_request_payload(parent),
+        )
+        fork = recv_frame(self.receiver)
+        self.assertEqual((fork.frame_type, fork.request_id), (FrameType.FORK, child))
+        self.assertEqual(decode_branch_request_id(fork), parent)
+
+        send_frame(
+            self.sender,
+            FrameType.PROMOTE,
+            parent,
+            payload=branch_request_payload(child),
+        )
+        promote = recv_frame(self.receiver)
+        self.assertEqual(
+            (promote.frame_type, promote.request_id),
+            (FrameType.PROMOTE, parent),
+        )
+        self.assertEqual(decode_branch_request_id(promote), child)
+
+        for frame_type in (FrameType.FORK, FrameType.PROMOTE):
+            with self.subTest(frame_type=frame_type.name):
+                with self.assertRaisesRegex(ValueError, "exactly one uint64"):
+                    send_frame(self.sender, frame_type, child, payload=b"short")
+                with self.assertRaisesRegex(ValueError, "flags=step=token_count"):
+                    send_frame(
+                        self.sender,
+                        frame_type,
+                        child,
+                        step=1,
+                        payload=branch_request_payload(parent),
+                    )
+        with self.assertRaisesRegex(ValueError, "branch lifecycle"):
+            decode_branch_request_id(
+                Frame(FrameType.BEGIN, 0, child, 0, 0, 0, b"")
+            )
 
     def test_route_probe_recv_rejects_noncanonical_wire_metadata(self) -> None:
         malformed_fields = (
@@ -714,6 +767,413 @@ class DeflateCodecTests(unittest.TestCase):
 
 
 class PersistentStageDataPlaneTests(unittest.TestCase):
+    def test_stage_fork_and_promote_enforce_sealed_exact_leaf_lifecycle(self) -> None:
+        config = StageProcessConfig(
+            spec=StageModelSpec("fake", 15, 30, 30, 1),
+            pipeline_id=779,
+            listen_host="127.0.0.1",
+            listen_port=20_101,
+            next_host=None,
+            next_port=None,
+            next_layer_end=None,
+            return_host="127.0.0.1",
+            return_port=20_102,
+            codec=TensorCodec.FP32,
+            one_way_delay_ms=0,
+            bandwidth_mbps=0,
+            max_speculative_branches=2,
+            max_speculative_branch_tokens=4,
+            max_speculative_kv_bytes=31,
+        )
+        validate_stage_config(config)
+        runner = _FakeLastStageRunner(config.spec)
+        validate_speculative_runner(config, runner)
+        runner.begin(11)
+        runner.active[11] = 3
+        request_metrics: dict[int, dict[str, object]] = {
+            11: {
+                "frames": 1,
+                "compute_ms": 7,
+                "bytes_out": 99,
+                "tokens": 3,
+                "model_forward_calls": 1,
+                "physical_batch_calls": 0,
+                "physical_batch_items": 1,
+                "max_physical_batch_size": 1,
+            }
+        }
+        branches: dict[int, int] = {}
+        stage_downstream, child_downstream = socket.socketpair()
+        try:
+            fork = Frame(
+                FrameType.FORK,
+                0,
+                22,
+                0,
+                0,
+                0,
+                branch_request_payload(11),
+            )
+            fork_stage_request(
+                fork,
+                config,
+                runner,
+                request_metrics,
+                branches,
+                stage_downstream,
+            )
+            relayed = recv_frame(child_downstream)
+            self.assertEqual((relayed.frame_type, relayed.request_id), (FrameType.FORK, 22))
+            self.assertEqual(decode_branch_request_id(relayed), 11)
+            self.assertEqual(branches, {22: 11})
+            self.assertEqual(runner.sequence_length(22), 3)
+            self.assertEqual(request_metrics[22]["frames"], 1)
+            self.assertEqual(request_metrics[22]["branch_inherited_tokens"], 3)
+
+            oversized = Frame(
+                FrameType.ACTIVATION,
+                int(TensorCodec.FP32),
+                22,
+                1,
+                2,
+                4,
+                b"\x00" * 32,
+            )
+            with self.assertRaisesRegex(ValueError, "branch_tokens"):
+                validate_activation(
+                    oversized,
+                    config,
+                    runner,
+                    request_metrics,
+                    branches,
+                )
+
+            byte_oversized = Frame(
+                FrameType.ACTIVATION,
+                int(TensorCodec.FP32),
+                22,
+                1,
+                1,
+                4,
+                b"\x00" * 16,
+            )
+            with self.assertRaisesRegex(ValueError, "KV bytes"):
+                validate_activation(
+                    byte_oversized,
+                    config,
+                    runner,
+                    request_metrics,
+                    branches,
+                )
+
+            runner.active[22] = 4
+            promote = Frame(
+                FrameType.PROMOTE,
+                0,
+                11,
+                0,
+                0,
+                0,
+                branch_request_payload(22),
+            )
+            promote_stage_request(
+                promote,
+                config,
+                runner,
+                request_metrics,
+                branches,
+                stage_downstream,
+            )
+            relayed = recv_frame(child_downstream)
+            self.assertEqual(
+                (relayed.frame_type, relayed.request_id),
+                (FrameType.PROMOTE, 11),
+            )
+            self.assertEqual(decode_branch_request_id(relayed), 22)
+            self.assertEqual(branches, {})
+            self.assertEqual(runner.sequence_length(11), 4)
+            self.assertNotIn(22, runner.active)
+
+            with self.assertRaisesRegex(ValueError, "before cloning"):
+                fork_stage_request(
+                    Frame(
+                        FrameType.FORK,
+                        0,
+                        33,
+                        0,
+                        0,
+                        0,
+                        branch_request_payload(11),
+                    ),
+                    config,
+                    runner,
+                    request_metrics,
+                    branches,
+                    None,
+                )
+            self.assertNotIn(33, runner.active)
+
+            with self.assertRaisesRegex(ValueError, "not active"):
+                promote_stage_request(
+                    promote,
+                    config,
+                    runner,
+                    request_metrics,
+                    branches,
+                    None,
+                )
+        finally:
+            stage_downstream.close()
+            child_downstream.close()
+
+    def test_stage_tree_contract_is_disabled_by_default_and_pair_sealed(self) -> None:
+        base = StageProcessConfig(
+            spec=StageModelSpec("fake", 15, 30, 30, 1),
+            pipeline_id=780,
+            listen_host="127.0.0.1",
+            listen_port=20_103,
+            next_host=None,
+            next_port=None,
+            next_layer_end=None,
+            return_host="127.0.0.1",
+            return_port=20_104,
+            codec=TensorCodec.FP32,
+            one_way_delay_ms=0,
+            bandwidth_mbps=0,
+        )
+        validate_stage_config(base)
+        for updates in (
+            {"max_speculative_branches": 1},
+            {"max_speculative_branch_tokens": 8},
+            {"max_speculative_kv_bytes": 1024},
+            {
+                "max_speculative_branches": 65,
+                "max_speculative_branch_tokens": 8,
+                "max_speculative_kv_bytes": 1024,
+            },
+        ):
+            with self.subTest(updates=updates), self.assertRaises(ValueError):
+                validate_stage_config(
+                    StageProcessConfig(**{**base.__dict__, **updates})
+                )
+
+        runner = _FakeLastStageRunner(base.spec)
+        runner.begin(1)
+        with self.assertRaisesRegex(ValueError, "disabled"):
+            fork_stage_request(
+                Frame(
+                    FrameType.FORK,
+                    0,
+                    2,
+                    0,
+                    0,
+                    0,
+                    branch_request_payload(1),
+                ),
+                base,
+                runner,
+                {1: {"frames": 0}},
+                {},
+                None,
+            )
+
+    def test_speculative_physical_batch_preflights_combined_kv_growth(self) -> None:
+        config = StageProcessConfig(
+            spec=StageModelSpec("fake", 15, 30, 30, 1),
+            pipeline_id=781,
+            listen_host="127.0.0.1",
+            listen_port=20_105,
+            next_host=None,
+            next_port=None,
+            next_layer_end=None,
+            return_host="127.0.0.1",
+            return_port=20_106,
+            codec=TensorCodec.FP32,
+            one_way_delay_ms=0,
+            bandwidth_mbps=0,
+            max_speculative_branches=2,
+            max_speculative_branch_tokens=4,
+            max_speculative_kv_bytes=60,
+        )
+        runner = _FakeLastStageRunner(config.spec)
+        runner.begin(1)
+        runner.active[1] = 3
+        metrics: dict[int, dict[str, object]] = {
+            1: {
+                "frames": 1,
+                "compute_ms": 0,
+                "bytes_out": 0,
+                "tokens": 3,
+                "model_forward_calls": 1,
+                "physical_batch_calls": 0,
+                "physical_batch_items": 1,
+                "max_physical_batch_size": 1,
+            }
+        }
+        branches: dict[int, int] = {}
+        for child in (2, 3):
+            fork_stage_request(
+                Frame(
+                    FrameType.FORK,
+                    0,
+                    child,
+                    0,
+                    0,
+                    0,
+                    branch_request_payload(1),
+                ),
+                config,
+                runner,
+                metrics,
+                branches,
+                None,
+            )
+        frames = tuple(
+            Frame(
+                FrameType.ACTIVATION,
+                int(TensorCodec.FP32),
+                child,
+                1,
+                1,
+                4,
+                b"\x00" * 16,
+            )
+            for child in (2, 3)
+        )
+        for frame in frames:
+            validate_speculative_kv_preflight(
+                (frame,), config, runner, branches
+            )
+        with self.assertRaisesRegex(ValueError, "KV bytes"):
+            validate_speculative_kv_preflight(frames, config, runner, branches)
+
+    def test_same_request_prefill_chunks_are_deferred_before_next_step_validation(self) -> None:
+        sender, upstream = socket.socketpair()
+        runner = _FakePhysicalBatchLastStageRunner(
+            StageModelSpec("fake", 15, 30, 30, 1)
+        )
+        runner.begin(11)
+        config = SimpleNamespace(
+            max_physical_batch_size=4,
+            physical_batch_window_ms=50,
+            codec=TensorCodec.FP32,
+            sealed_wave_tokens=None,
+            max_prefill_chunk_tokens=2,
+        )
+        request_metrics: dict[int, dict[str, object]] = {11: {"frames": 0}}
+        pending: deque[Frame] = deque()
+        hidden = torch.arange(8, dtype=torch.float32).reshape(1, 2, 4)
+        payload = encode_tensor(hidden, TensorCodec.FP32)
+        try:
+            for step in (0, 1):
+                send_frame(
+                    sender,
+                    FrameType.PREFILL,
+                    11,
+                    step=step,
+                    token_count=2,
+                    hidden_size=4,
+                    flags=int(TensorCodec.FP32),
+                    payload=payload,
+                )
+            first = recv_frame(upstream)
+            collected = collect_compatible_activation_frames(
+                first,
+                upstream=upstream,
+                pending_frames=pending,
+                config=config,
+                runner=runner,
+                request_metrics=request_metrics,
+                downstream=None,
+            )
+            self.assertEqual([frame.step for frame in collected], [0])
+            self.assertEqual([frame.step for frame in pending], [1])
+
+            # Once step zero commits, the deferred frame validates normally.
+            request_metrics[11]["frames"] = 1
+            runner.active[11] = 2
+            validate_activation(pending[0], config, runner, request_metrics)
+        finally:
+            sender.close()
+            upstream.close()
+
+    def test_only_tree_verify_batches_require_exact_and_workspace_certification(self) -> None:
+        feature_cases = (
+            (False, (), 2),
+            (True, (), 1),
+            (True, ("exact-tree-verify-batching",), 1),
+            (True, ("bounded-tree-verify-workspace",), 1),
+            (
+                True,
+                (
+                    "exact-tree-verify-batching",
+                    "bounded-tree-verify-workspace",
+                ),
+                2,
+            ),
+        )
+        for tree_leaves, features, expected_count in feature_cases:
+            with self.subTest(tree_leaves=tree_leaves, features=features):
+                sender, upstream = socket.socketpair()
+                try:
+                    runner = _FakePhysicalBatchLastStageRunner(
+                        StageModelSpec("fake", 15, 30, 30, 1)
+                    )
+                    runner.executor_manifest = SimpleNamespace(features=features)
+                    for request_id in (11, 22):
+                        runner.begin(request_id)
+                    config = SimpleNamespace(
+                        max_physical_batch_size=4,
+                        physical_batch_window_ms=50,
+                        codec=TensorCodec.FP32,
+                        sealed_wave_tokens=4,
+                        max_prefill_chunk_tokens=4,
+                        max_speculative_branch_tokens=16,
+                        max_speculative_kv_bytes=1_024,
+                    )
+                    request_metrics: dict[int, dict[str, object]] = {
+                        11: {"frames": 0},
+                        22: {"frames": 0},
+                    }
+                    payload = encode_tensor(
+                        torch.arange(8, dtype=torch.float32).reshape(1, 2, 4),
+                        TensorCodec.FP32,
+                    )
+                    for request_id in (11, 22):
+                        send_frame(
+                            sender,
+                            FrameType.VERIFY,
+                            request_id,
+                            step=0,
+                            token_count=2,
+                            hidden_size=4,
+                            flags=int(TensorCodec.FP32),
+                            payload=payload,
+                        )
+                    first = recv_frame(upstream)
+                    branch_parents = {11: 1, 22: 1} if tree_leaves else {}
+                    collected = collect_compatible_activation_frames(
+                        first,
+                        upstream=upstream,
+                        pending_frames=deque(),
+                        config=config,
+                        runner=runner,
+                        request_metrics=request_metrics,
+                        branch_parents=branch_parents,
+                        downstream=None,
+                    )
+                    self.assertEqual(len(collected), expected_count)
+                    if expected_count == 1:
+                        self.assertEqual(recv_frame(upstream).request_id, 22)
+                    else:
+                        self.assertEqual(
+                            tuple(frame.request_id for frame in collected),
+                            (11, 22),
+                        )
+                finally:
+                    sender.close()
+                    upstream.close()
+
     def test_stage_ingress_executes_compatible_requests_in_one_tensor_batch(self) -> None:
         return_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         return_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -855,7 +1315,9 @@ class PersistentStageDataPlaneTests(unittest.TestCase):
             except BaseException as error:
                 errors.append(error)
 
-        with patch("distributed_runtime.stage.StageRunner", _FakeLastStageRunner):
+        with patch(
+            "distributed_runtime.stage.StageRunner", _FakeCellWorkLastStageRunner
+        ):
             worker = threading.Thread(target=run, daemon=True)
             worker.start()
             self.assertTrue(ready.wait(2), "stage did not bind its persistent listener")
@@ -946,6 +1408,24 @@ class PersistentStageDataPlaneTests(unittest.TestCase):
             self.assertEqual(result["bytes_out"], HEADER_BYTES * 3 + 16)
             self.assertEqual(result["loader"], "fake-selective")
             self.assertEqual(result["parameter_bytes"], 16)
+            self.assertEqual(
+                result["cell_rank_work"],
+                [
+                    {
+                        "rank": rank,
+                        "device": "cpu",
+                        "forwardCalls": 3,
+                        "collectiveCalls": 15,
+                        "tokensProcessed": 6,
+                        "memory": {
+                            "allocatedBytes": 0,
+                            "reservedBytes": 0,
+                            "peakAllocatedBytes": 0,
+                        },
+                    }
+                    for rank in range(2)
+                ],
+            )
 
             send_frame(upstream, FrameType.SHUTDOWN, 777)
             worker.join(2)
@@ -1122,6 +1602,86 @@ class PersistentStageDataPlaneTests(unittest.TestCase):
         stage_upstream.close()
         root.close()
 
+    def test_forward_shutdown_half_closes_then_waits_for_downstream_eof(self) -> None:
+        stage_upstream, root = socket.socketpair()
+        stage_downstream, child = socket.socketpair()
+        stopping = threading.Event()
+        stopping.set()
+        monitor = threading.Thread(
+            target=monitor_downstream_control,
+            args=(
+                stage_downstream,
+                stage_upstream,
+                444,
+                stopping,
+                threading.Event(),
+                [],
+                threading.Lock(),
+            ),
+            daemon=True,
+        )
+        events: list[str] = []
+
+        def consume_shutdown() -> None:
+            frame = recv_frame(child)
+            self.assertEqual(frame.frame_type, FrameType.SHUTDOWN)
+            self.assertEqual(frame.request_id, 444)
+            events.append("shutdown-received")
+            self.assertEqual(child.recv(1), b"")
+            events.append("write-eof-received")
+            child.close()
+
+        consumer = threading.Thread(target=consume_shutdown, daemon=True)
+        monitor.start()
+        consumer.start()
+        try:
+            forward_shutdown_and_wait(
+                stage_downstream,
+                444,
+                monitor,
+                timeout_seconds=1.0,
+            )
+            events.append("forward-returned")
+            consumer.join(1)
+            self.assertFalse(consumer.is_alive())
+            self.assertFalse(monitor.is_alive())
+            self.assertEqual(
+                events,
+                [
+                    "shutdown-received",
+                    "write-eof-received",
+                    "forward-returned",
+                ],
+            )
+            root.settimeout(0.05)
+            with self.assertRaises(TimeoutError):
+                root.recv(1)
+        finally:
+            child.close()
+            stage_downstream.close()
+            stage_upstream.close()
+            root.close()
+
+    def test_forward_shutdown_timeout_is_bounded_and_fail_closed(self) -> None:
+        stage_downstream, child = socket.socketpair()
+        control = _StubbornControlThread()
+        try:
+            with self.assertRaisesRegex(TimeoutError, "acknowledge SHUTDOWN"):
+                forward_shutdown_and_wait(
+                    stage_downstream,
+                    555,
+                    control,
+                    timeout_seconds=0.0,
+                )
+            self.assertEqual(control.join_timeouts, [0.0])
+            frame = recv_frame(child)
+            self.assertEqual(frame.frame_type, FrameType.SHUTDOWN)
+            self.assertEqual(frame.request_id, 555)
+            self.assertEqual(child.recv(1), b"")
+        finally:
+            child.close()
+            stage_downstream.close()
+
     def test_metrics_failure_cannot_suppress_stage_error(self) -> None:
         return_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         return_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1237,6 +1797,36 @@ class _FakeLastStageRunner:
             raise ValueError("invalid truncate")
         self.active[request_id] = token_count
 
+    def request_cache_bytes(self, request_id: int) -> int:
+        return self.sequence_length(request_id) * 8
+
+    def project_request_cache_bytes(
+        self, request_id: int, additional_tokens: int
+    ) -> int:
+        return (self.sequence_length(request_id) + additional_tokens) * 8
+
+    def fork_request(
+        self,
+        child_request_id: int,
+        parent_request_id: int,
+        *,
+        max_cache_bytes: int,
+    ) -> int:
+        if parent_request_id not in self.active:
+            raise ValueError("inactive parent request")
+        if child_request_id in self.active:
+            raise ValueError("active child request")
+        copied_bytes = self.active[parent_request_id] * 8
+        if copied_bytes > max_cache_bytes:
+            raise ValueError("preflight byte budget")
+        self.active[child_request_id] = self.active[parent_request_id]
+        return copied_bytes
+
+    def promote_request(self, parent_request_id: int, child_request_id: int) -> None:
+        if parent_request_id not in self.active or child_request_id not in self.active:
+            raise ValueError("inactive request")
+        self.active[parent_request_id] = self.active.pop(child_request_id)
+
     def forward_hidden(
         self,
         request_id: int,
@@ -1250,6 +1840,50 @@ class _FakeLastStageRunner:
         if token_mode == "all":
             return hidden, tuple(42 for _ in range(int(hidden.shape[1])))
         return hidden, 42
+
+
+class _FakeCellWorkLastStageRunner(_FakeLastStageRunner):
+    def __init__(self, spec: StageModelSpec) -> None:
+        super().__init__(spec)
+        self.member_work_reports: dict[int, dict[str, object]] = {}
+
+    def forward_hidden(
+        self,
+        request_id: int,
+        hidden: torch.Tensor,
+        *,
+        token_mode: str = "last",
+    ) -> tuple[torch.Tensor, int | tuple[int, ...] | None]:
+        result = super().forward_hidden(request_id, hidden, token_mode=token_mode)
+        input_tokens = int(hidden.shape[1])
+        previous = self.member_work_reports.get(0)
+        forward_calls = 1 if previous is None else int(previous["forwardCalls"]) + 1
+        collective_calls = (
+            5 if previous is None else int(previous["collectiveCalls"]) + 5
+        )
+        tokens_processed = (
+            input_tokens
+            if previous is None
+            else int(previous["tokensProcessed"]) + input_tokens
+        )
+        self.member_work_reports = {
+            rank: {
+                "rank": rank,
+                "device": "cpu",
+                "computeDtype": "float32",
+                "collectiveBackend": "gloo",
+                "forwardCalls": forward_calls,
+                "collectiveCalls": collective_calls,
+                "tokensProcessed": tokens_processed,
+                "memory": {
+                    "allocatedBytes": 0,
+                    "reservedBytes": 0,
+                    "peakAllocatedBytes": 0,
+                },
+            }
+            for rank in range(2)
+        }
+        return result
 
 
 class _FailingLastStageRunner(_FakeLastStageRunner):
@@ -1293,6 +1927,17 @@ class _FakePhysicalBatchLastStageRunner(_FakeLastStageRunner):
 class _ExplodingMetricSink:
     def put(self, value: dict[str, object]) -> None:
         raise OSError("synthetic metrics failure")
+
+
+class _StubbornControlThread:
+    def __init__(self) -> None:
+        self.join_timeouts: list[float | None] = []
+
+    def join(self, timeout: float | None = None) -> None:
+        self.join_timeouts.append(timeout)
+
+    def is_alive(self) -> bool:
+        return True
 
 
 if __name__ == "__main__":

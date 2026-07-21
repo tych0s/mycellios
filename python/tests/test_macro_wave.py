@@ -228,6 +228,45 @@ class MacroWaveCostControllerTests(unittest.TestCase):
         self.assertTrue(plan.enabled)
         self.assertEqual((plan.depth, plan.width), (2, 2))
 
+    def test_measured_prefix_survival_avoids_an_optimistic_deep_wave(self) -> None:
+        controller = MacroWaveCostController(
+            MacroWaveCostConfig(
+                candidate_depths=(2, 4),
+                candidate_widths=(1,),
+                minimum_speedup=1.0,
+            )
+        )
+        observation = _observation(
+            acceptance_by_width=((1, 0.90),),
+            prefix_survival_by_width=((1, (0.90, 0.80, 0.05, 0.01)),),
+            target_ms_per_node=8.0,
+        )
+
+        plan = controller.choose(observation)
+
+        self.assertTrue(plan.enabled)
+        self.assertEqual((plan.depth, plan.width), (2, 1))
+        assert plan.estimate is not None
+        self.assertEqual(plan.estimate.prefix_survival_probabilities, (0.90, 0.80))
+        self.assertAlmostEqual(plan.estimate.expected_accepted_tokens, 1.70)
+
+    def test_measured_survival_is_not_extrapolated_past_observed_depth(self) -> None:
+        controller = MacroWaveCostController(
+            MacroWaveCostConfig(
+                candidate_depths=(2, 4),
+                candidate_widths=(1,),
+                minimum_speedup=1.0,
+            )
+        )
+        estimates = controller.estimates(
+            _observation(
+                acceptance_by_width=((1, 0.9),),
+                prefix_survival_by_width=((1, (0.9, 0.7)),),
+            )
+        )
+
+        self.assertEqual(tuple(estimate.depth for estimate in estimates), (2,))
+
     def test_vram_budget_prunes_deeper_candidates(self) -> None:
         controller = MacroWaveCostController(
             MacroWaveCostConfig(
@@ -347,6 +386,16 @@ class MacroWaveCostControllerTests(unittest.TestCase):
             _observation(bandwidth_bytes_per_second=0.0)
         with self.assertRaises(ValueError):
             _observation(vram_reserved_bytes=101, vram_budget_bytes=100)
+        with self.assertRaises(ValueError):
+            _observation(
+                acceptance_by_width=((1, 0.9),),
+                prefix_survival_by_width=((1, (0.9, 0.95)),),
+            )
+        with self.assertRaises(ValueError):
+            _observation(
+                acceptance_by_width=((1, 0.9),),
+                prefix_survival_by_width=((1, (0.8,)),),
+            )
 
 
 if __name__ == "__main__":

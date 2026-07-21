@@ -1,0 +1,130 @@
+{
+  "schema": "gdlp-physical-gpu-campaign-config/1",
+  "networkScope": "lan",
+  "apiBaseUrl": "http://100.64.0.10:8081",
+  "agents": [
+    {
+      "nodeId": "pc-a-root",
+      "endpoint": "http://100.64.0.10:9750",
+      "authTokenEnv": "GDLP_AGENT_PC_A_ROOT_TOKEN"
+    },
+    {
+      "nodeId": "pc-a-cell",
+      "endpoint": "http://100.64.0.10:9751",
+      "authTokenEnv": "GDLP_AGENT_PC_A_CELL_TOKEN"
+    },
+    {
+      "nodeId": "pc-b-cell",
+      "endpoint": "http://100.64.0.11:9750",
+      "authTokenEnv": "GDLP_AGENT_PC_B_CELL_TOKEN"
+    }
+  ],
+  "hosts": [
+    {
+      "hostId": "physical-pc-a",
+      "rankNodeId": "pc-a-cell",
+      "agentNodeId": "pc-a-cell",
+      "device": "cuda:0",
+      "offeredVramBytes": 4026531840,
+      "vendor": "NVIDIA",
+      "nonce": "campaign-pc-a-20260721-0001"
+    },
+    {
+      "hostId": "physical-pc-b",
+      "rankNodeId": "pc-b-cell",
+      "agentNodeId": "pc-b-cell",
+      "device": "cuda:0",
+      "offeredVramBytes": 4026531840,
+      "vendor": "NVIDIA",
+      "nonce": "campaign-pc-b-20260721-0002"
+    }
+  ],
+  "canaries": [
+    {
+      "id": "reference-canary",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Responde de forma determinista y breve."
+        },
+        {
+          "role": "user",
+          "content": "Explica en una frase qué es una red neuronal."
+        }
+      ],
+      "maxTokens": 16,
+      "expectedOutputTokenIdsSha256": "sha256:d651d3fc9953304dc73e87d88581680df8ce2f32cad3c6da552dca9021ce83b8",
+      "expectedCompletionTokens": 16,
+      "expectedFinishReason": "length"
+    },
+    {
+      "id": "format-canary",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Devuelve tres colores separados por comas."
+        }
+      ],
+      "maxTokens": 16,
+      "expectedOutputTokenIdsSha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "expectedCompletionTokens": 16,
+      "expectedFinishReason": "length"
+    },
+    {
+      "id": "reasoning-canary",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Continúa la serie 2, 4, 8, 16 con un solo número."
+        }
+      ],
+      "maxTokens": 16,
+      "expectedOutputTokenIdsSha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "expectedCompletionTokens": 16,
+      "expectedFinishReason": "length"
+    }
+  ],
+  "warmups": 1,
+  "iterations": 5,
+  "concurrencies": [1, 2, 4],
+  "networkLinks": [
+    {
+      "fromHostId": "physical-pc-a",
+      "toHostId": "physical-pc-b",
+      "rttMs": [1.1, 1.2, 1.15],
+      "goodputMbps": [900, 910, 905]
+    },
+    {
+      "fromHostId": "physical-pc-b",
+      "toHostId": "physical-pc-a",
+      "rttMs": [1.2, 1.25, 1.18],
+      "goodputMbps": [880, 890, 885]
+    }
+  ],
+  "reference": {
+    "referenceCanaryId": "reference-canary",
+    "artifactIdentity": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "canonicalSource": "content-addressed://sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "canonicalRevision": null,
+    "tokenizerId": "REPLACE_WITH_TOKENIZER_ID",
+    "promptTokenIdsSha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "outputTokenIds": [
+      200,
+      201,
+      202,
+      203,
+      204,
+      205,
+      206,
+      207,
+      208,
+      209,
+      210,
+      211,
+      212,
+      213,
+      214,
+      215
+    ]
+  }
+}

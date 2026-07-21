@@ -121,12 +121,12 @@ describe("MacroWave CLI contract", () => {
     const output = await executeMacroWaveCli([EXAMPLE, "--format", "markdown"], ROOT);
 
     expect(output).toContain("# MacroWave RAM+VRAM");
-    expect(output).toContain("## Métricas");
-    expect(output).toContain("| TTFT | TPOT | tok/s usuario");
-    expect(output).toContain("## Etapas");
-    expect(output).toContain("RAM requerida/útil");
-    expect(output).toContain("VRAM requerida/útil");
-    expect(output).toContain("## Razones de descarte");
+    expect(output).toContain("## Metrics");
+    expect(output).toContain("| TTFT | TPOT | user tok/s");
+    expect(output).toContain("## Stages");
+    expect(output).toContain("Required/usable RAM");
+    expect(output).toContain("Required/usable VRAM");
+    expect(output).toContain("## Rejection reasons");
     expect(output).not.toContain("Infinity");
   });
 
