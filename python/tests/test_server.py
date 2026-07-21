@@ -276,6 +276,7 @@ class HttpInferenceEvidenceTests(unittest.IsolatedAsyncioTestCase):
                 "ttft_ms": 4.0,
                 "tpot_ms": 2.0,
                 "pipeline_ms": 6.0,
+                "reused_kv_tokens": 0,
                 "output_token_ids_sha256": output_token_ids_sha256([10, 11]),
                 "output_token_ids_hash_scheme": OUTPUT_TOKEN_HASH_SCHEME,
             },
