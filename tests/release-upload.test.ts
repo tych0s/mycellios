@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -60,6 +60,8 @@ describe("release uploads", () => {
     const root = temporaryDirectory();
     const updates = join(root, "updates");
     const landing = join(root, "landing");
+    const downloads = join(root, "downloads");
+    mkdirSync(downloads);
     const content = Buffer.from('{"version":"0.2.12"}\n');
     const digest = sha256(content);
     const runtime = await createCoordinator(
@@ -71,6 +73,7 @@ describe("release uploads", () => {
         networkToken: "mesh-token",
         desktopUpdatesPath: updates,
         landingAssetsPath: landing,
+        releaseDownloadsPath: downloads,
       },
       {
         logger: false,
@@ -99,6 +102,31 @@ describe("release uploads", () => {
     expect(response.statusCode).toBe(201);
     expect(response.json()).toMatchObject({ complete: true, fileSha256: digest });
     expect(readFileSync(join(updates, "latest.json"))).toEqual(content);
+
+    const installer = Buffer.from("verified installer");
+    const installerDigest = sha256(installer);
+    const downloadResponse = await runtime.app.inject({
+      method: "PUT",
+      url: "/internal/v1/releases/downloads/mycellios-linux-x64.deb",
+      headers: {
+        authorization: "Bearer actions-token",
+        "content-type": "application/octet-stream",
+        "x-chunk-index": "0",
+        "x-chunk-count": "1",
+        "x-chunk-sha256": installerDigest,
+        "x-file-sha256": installerDigest,
+        "x-file-size": String(installer.length),
+      },
+      payload: installer,
+    });
+    expect(downloadResponse.statusCode).toBe(201);
+    expect(readFileSync(join(downloads, "mycellios-linux-x64.deb"))).toEqual(installer);
+    const publicDownload = await runtime.app.inject({
+      method: "GET",
+      url: "/downloads/mycellios-linux-x64.deb",
+    });
+    expect(publicDownload.statusCode).toBe(200);
+    expect(publicDownload.rawPayload).toEqual(installer);
   });
 
   it("restricts OIDC claims to this repository, workflow and release refs", () => {
@@ -117,6 +145,15 @@ describe("release uploads", () => {
       workflow_ref: "attacker/fork/.github/workflows/desktop-build.yml@refs/heads/main",
       event_name: "push",
     })).toThrow("release_repository_not_allowed");
+
+    expect(validateGitHubReleaseClaims({
+      repository: "tych0s/mycellios",
+      ref: "refs/heads/main",
+      sha: "b".repeat(40),
+      workflow_ref:
+        "tych0s/mycellios/.github/workflows/publish-existing-release.yml@refs/heads/main",
+      event_name: "workflow_dispatch",
+    })).toMatchObject({ ref: "refs/heads/main", sha: "b".repeat(40) });
   });
 });
 

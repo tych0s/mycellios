@@ -110,6 +110,10 @@ export async function createCoordinator(
     app.get("/mobile", async (_request, reply) => reply.redirect("/mobile/"));
   }
   const desktopUpdatesPath = resolveDesktopUpdatesPath(config.desktopUpdatesPath);
+  const releaseDownloadsPath = resolveReleaseDownloadsPath(
+    config.releaseDownloadsPath,
+    config.landingAssetsPath,
+  );
   const publicAssetVersion = readPackageVersion();
   if (desktopUpdatesPath) {
     await app.register(staticFiles, {
@@ -122,6 +126,15 @@ export async function createCoordinator(
     app.get("/downloads/windows", async (_request, reply) => {
       reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
       return reply.redirect(`/updates/win32/x64/mycellios-setup.exe?v=${publicAssetVersion}`);
+    });
+  }
+  if (releaseDownloadsPath) {
+    await app.register(staticFiles, {
+      root: releaseDownloadsPath,
+      prefix: "/downloads/",
+      decorateReply: false,
+      cacheControl: false,
+      setHeaders: setPublicAssetCacheHeaders,
     });
   }
   const hub = new WorkerHub(store);
@@ -198,7 +211,8 @@ export async function createCoordinator(
     const mobileWorkers = mobileHub.listWorkers();
     return {
       status: "ok",
-      version: "0.2.0",
+      version: readPackageVersion(),
+      revision: readBuildRevision(),
       workers: {
         registered: workers.length + mobileWorkers.length,
         connected: hub.connectedWorkerIds().size + mobileHub.connectedCount(),
@@ -210,6 +224,7 @@ export async function createCoordinator(
       mobilePwa: mobileAssetsPath ? "/mobile/" : null,
       landing: config.landingAssetsPath ? "/" : null,
       desktopUpdates: desktopUpdatesPath ? "/updates/win32/x64/" : null,
+      downloads: releaseDownloadsPath ? "/downloads/" : null,
       features: { distributedActivation: activationManager !== undefined },
     };
   });
@@ -526,6 +541,7 @@ export async function createCoordinator(
       const root = releaseAssetRoot(
         params.channel,
         config.desktopUpdatesPath,
+        config.releaseDownloadsPath,
         config.landingAssetsPath,
       );
       const result = await storeReleaseChunk({
@@ -545,7 +561,7 @@ export async function createCoordinator(
       });
     }
   });
-  if (landingAssetsPath) {
+  if (releaseDownloadsPath) {
     app.get("/downloads/macos-arm64", async (_request, reply) => {
       reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
       return reply.redirect(`/downloads/mycellios-macos-arm64.dmg?v=${publicAssetVersion}`);
@@ -562,6 +578,8 @@ export async function createCoordinator(
       reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
       return reply.redirect(`/downloads/mycellios-linux-x64.rpm?v=${publicAssetVersion}`);
     });
+  }
+  if (landingAssetsPath) {
     await app.register(staticFiles, {
       root: landingAssetsPath,
       prefix: "/",
@@ -677,15 +695,29 @@ function resolveDesktopUpdatesPath(configured: string | undefined): string | nul
 function releaseAssetRoot(
   channel: ReleaseAssetChannel,
   configuredUpdates: string | undefined,
+  configuredDownloads: string | undefined,
   configuredLanding: string | undefined,
 ): string {
   if (channel === "updates") {
     return resolve(configuredUpdates ?? resolve(process.cwd(), "updates", "win32", "x64"));
   }
+  if (configuredDownloads) return resolve(configuredDownloads);
   return resolve(
     configuredLanding ?? resolve(process.cwd(), "landing-dist"),
     "downloads",
   );
+}
+
+function resolveReleaseDownloadsPath(
+  configuredDownloads: string | undefined,
+  configuredLanding: string | undefined,
+): string | null {
+  const candidates = [
+    configuredDownloads,
+    configuredLanding ? resolve(configuredLanding, "downloads") : undefined,
+    resolve(process.cwd(), "landing-dist", "downloads"),
+  ].filter((candidate): candidate is string => Boolean(candidate));
+  return candidates.find((candidate) => existsSync(candidate)) ?? null;
 }
 
 function readPackageVersion(): string {
@@ -704,6 +736,19 @@ function readPackageVersion(): string {
     // Packaged clients do not need public download redirects.
   }
   return "0";
+}
+
+function readBuildRevision(): string | null {
+  const environmentRevision = process.env.MYCELLIOS_REVISION?.trim();
+  if (environmentRevision && /^[0-9a-f]{7,40}$/i.test(environmentRevision)) {
+    return environmentRevision.toLowerCase();
+  }
+  try {
+    const revision = readFileSync(resolve(process.cwd(), "REVISION"), "utf8").trim();
+    return /^[0-9a-f]{7,40}$/i.test(revision) ? revision.toLowerCase() : null;
+  } catch {
+    return null;
+  }
 }
 
 function resolveLandingAssetsPath(configured: string | undefined): string | null {
@@ -770,7 +815,7 @@ function publicSnapshot(
   }));
   return {
     capturedAt: new Date().toISOString(),
-    version: "0.2.0",
+    version: readPackageVersion(),
     summary: {
       registered: workers.length,
       connected: workers.filter((worker) => worker.connected).length,
