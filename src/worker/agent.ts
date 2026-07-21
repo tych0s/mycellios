@@ -18,7 +18,12 @@ import { estimateInputTokens } from "../core/request.js";
 import { safeVramBudget } from "../core/tiers.js";
 import { probeHardware } from "./hardware.js";
 import { llmfitHardwareFallback, probeLlmfit } from "./llmfit.js";
-import type { LaunchAgent, LaunchAgentStartRequest, LaunchProcessHandle } from "../distribution/launch-supervisor.js";
+import {
+  LaunchProcessExitedError,
+  type LaunchAgent,
+  type LaunchAgentStartRequest,
+  type LaunchProcessHandle,
+} from "../distribution/launch-supervisor.js";
 import {
   validatePythonLaunchDescription,
   type PythonPipelineLaunchDescription,
@@ -29,6 +34,10 @@ export interface WorkerAgentOptions {
   networkToken?: string;
   heartbeatIntervalMs?: number;
   reconnect?: boolean;
+  identity?: {
+    kind: "device" | "cell";
+    id: string;
+  };
   /** Register the physical node without claiming that a model runtime exists. */
   advertiseDeployment?: boolean;
   distributedExecutor?: {
@@ -36,6 +45,7 @@ export interface WorkerAgentOptions {
     stageHost: string;
     stagePort: number;
     launchAgent: LaunchAgent;
+    pythonExecutable?: string;
   };
   logger?: Pick<Console, "info" | "warn" | "error">;
 }
@@ -327,12 +337,14 @@ export class WorkerAgent {
   }
 
   private async register(): Promise<void> {
+    const identity = this.options.identity ?? this.defaultIdentity();
     const response = await fetch(
       coordinatorHttpUrl(this.coordinatorBaseUrl, "internal/v1/workers/register"),
       {
         method: "POST",
         headers: this.requestHeaders({ "content-type": "application/json" }),
         body: JSON.stringify({
+          ...(identity ? { identity } : {}),
           capabilities: this.capabilities,
         }),
         signal: AbortSignal.timeout(10_000),
@@ -351,6 +363,19 @@ export class WorkerAgent {
     }
     const body = registrationResponseSchema.parse(decoded);
     this.registeredWorkerId = body.workerId;
+  }
+
+  private defaultIdentity(): WorkerAgentOptions["identity"] {
+    if (this.options.distributedExecutor) {
+      return { kind: "device", id: this.options.distributedExecutor.nodeId };
+    }
+    if (this.config.instanceId) {
+      return {
+        kind: this.config.capacityScope === "cell" ? "cell" : "device",
+        id: this.config.instanceId,
+      };
+    }
+    return undefined;
   }
 
   private connectOnce(): Promise<void> {
@@ -475,11 +500,26 @@ export class WorkerAgent {
       }
       if (this.runtimeProcesses.has(requestId)) throw new Error("distributed_launch_request_is_duplicate");
       const controller = new AbortController();
-      const handle = await executor.launchAgent.start(input, controller.signal);
+      const localRequest: LaunchAgentStartRequest = executor.pythonExecutable
+        ? {
+            ...input,
+            process: {
+              ...input.process,
+              command: { ...input.process.command, executable: executor.pythonExecutable },
+            },
+          }
+        : input;
+      const handle = await executor.launchAgent.start(localRequest, controller.signal);
       this.runtimeProcesses.set(requestId, handle);
       void handle.ready.then(
         () => this.sendMessage("runtime.ready", { requestId }),
-        (error: unknown) => this.sendRuntimeExit(requestId, handle, { code: null, signal: null, error: errorText(error) }),
+        (error: unknown) => {
+          // The exited promise carries the original spawn/runtime error and
+          // captured output. Avoid racing it with a lossy wrapper error.
+          if (!(error instanceof LaunchProcessExitedError)) {
+            this.sendRuntimeExit(requestId, handle, { code: null, signal: null, error: errorText(error) });
+          }
+        },
       );
       void handle.exited.then(
         (exit) => this.sendRuntimeExit(requestId, handle, exit),

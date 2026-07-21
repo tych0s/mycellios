@@ -388,6 +388,10 @@ export async function runAutoDistribution(
       worker = new WorkerAgent(workerConfig, {
         coordinatorUrl: config.coordinator.url,
         ...(token ? { networkToken: token } : {}),
+        identity: {
+          kind: "cell",
+          id: automaticCellIdentity(config, compilation),
+        },
       });
       workerPromise = worker.start();
       await waitForWorkerRegistration(worker, workerPromise, 30_000);
@@ -409,6 +413,18 @@ export async function runAutoDistribution(
     if (worker) await worker.stop().catch(() => undefined);
     await supervisor.stop("auto_distribute_shutdown").catch(() => undefined);
   }
+}
+
+function automaticCellIdentity(
+  config: AutoDistributionConfig,
+  compilation: AutoDistributionCompilation,
+): string {
+  const topology = config.nodes.map((node) => node.id).sort().join(",");
+  const digest = createHash("sha256")
+    .update(`${config.model.publicName}\n${compilation.profile.source.artifactIdentity}\n${topology}`)
+    .digest("hex")
+    .slice(0, 32);
+  return `cell-${digest}`;
 }
 
 function validateCompiledProfile(value: unknown): CompiledModelProfile {

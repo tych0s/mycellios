@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 
 export class MeshDatabase {
   readonly raw: DatabaseSync;
@@ -62,6 +62,8 @@ export class MeshDatabase {
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
         ,deregistered INTEGER NOT NULL DEFAULT 0
+        ,identity_kind TEXT
+        ,identity_id TEXT
       );
 
       CREATE INDEX IF NOT EXISTS workers_status_seen
@@ -143,7 +145,88 @@ export class MeshDatabase {
         this.raw.exec("ALTER TABLE requested_models ADD COLUMN activation_error TEXT");
       }
     }
+    if (currentVersion < 6) this.migrateWorkerIdentities();
+    this.raw.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS workers_identity_unique
+      ON workers(identity_kind, identity_id)
+      WHERE identity_kind IS NOT NULL AND identity_id IS NOT NULL;
+    `);
     this.raw.prepare("UPDATE schema_meta SET version = ?").run(SCHEMA_VERSION);
+  }
+
+  private migrateWorkerIdentities(): void {
+    const columns = this.raw.prepare("PRAGMA table_info(workers)").all() as Array<{
+      name: string;
+    }>;
+    if (!columns.some((column) => column.name === "identity_kind")) {
+      this.raw.exec("ALTER TABLE workers ADD COLUMN identity_kind TEXT");
+    }
+    if (!columns.some((column) => column.name === "identity_id")) {
+      this.raw.exec("ALTER TABLE workers ADD COLUMN identity_id TEXT");
+    }
+
+    const rows = this.raw.prepare(
+      `SELECT id, status, capabilities_json, deregistered, last_seen_at,
+              identity_kind, identity_id
+       FROM workers`,
+    ).all() as Array<{
+      id: string;
+      status: string;
+      capabilities_json: string;
+      deregistered: number;
+      last_seen_at: number;
+      identity_kind: string | null;
+      identity_id: string | null;
+    }>;
+    const grouped = new Map<string, Array<{
+      row: (typeof rows)[number];
+      kind: "device" | "cell";
+      identityId: string;
+    }>>();
+    for (const row of rows) {
+      let kind: "device" | "cell" = row.identity_kind === "cell" ? "cell" : "device";
+      let identityId = row.identity_id;
+      if (!identityId) {
+        try {
+          const capabilities = JSON.parse(row.capabilities_json) as {
+            distributedExecutor?: { nodeId?: unknown };
+          };
+          const nodeId = capabilities.distributedExecutor?.nodeId;
+          if (typeof nodeId === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(nodeId)) {
+            identityId = nodeId;
+            kind = "device";
+          }
+        } catch {
+          // Invalid legacy capability JSON stays anonymous instead of blocking startup.
+        }
+      }
+      if (!identityId || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(identityId)) continue;
+      const key = `${kind}:${identityId}`;
+      const entries = grouped.get(key) ?? [];
+      entries.push({ row, kind, identityId });
+      grouped.set(key, entries);
+    }
+
+    for (const entries of grouped.values()) {
+      entries.sort((left, right) => {
+        const activeDifference = workerMigrationPriority(right.row) - workerMigrationPriority(left.row);
+        return activeDifference || right.row.last_seen_at - left.row.last_seen_at;
+      });
+      const keeper = entries[0]!;
+      for (const duplicate of entries.slice(1)) {
+        this.raw.prepare(
+          `UPDATE workers
+           SET deregistered = 1, status = 'offline', identity_kind = NULL, identity_id = NULL,
+               updated_at = ?
+           WHERE id = ?`,
+        ).run(Date.now(), duplicate.row.id);
+      }
+      this.raw.prepare(
+        `UPDATE workers
+         SET identity_kind = ?, identity_id = ?
+         WHERE id = ?`,
+      ).run(keeper.kind, keeper.identityId, keeper.row.id);
+    }
   }
 
   private removeLegacyProductSchema(): void {
@@ -165,4 +248,11 @@ export class MeshDatabase {
     `);
     this.raw.exec("PRAGMA foreign_keys = ON");
   }
+}
+
+function workerMigrationPriority(row: { status: string; deregistered: number }): number {
+  if (row.deregistered) return 0;
+  if (row.status === "online") return 3;
+  if (row.status === "suspect" || row.status === "draining") return 2;
+  return 1;
 }

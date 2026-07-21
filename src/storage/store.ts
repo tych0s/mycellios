@@ -16,6 +16,8 @@ export interface StoredWorker {
   reliability: number;
   jobsCompleted: number;
   lastSeenAt: number;
+  identityKind: "device" | "cell" | null;
+  identityId: string | null;
 }
 
 export interface StoredJob {
@@ -43,6 +45,8 @@ interface WorkerRow {
   reliability: number;
   jobs_completed: number;
   last_seen_at: number;
+  identity_kind: "device" | "cell" | null;
+  identity_id: string | null;
 }
 
 interface JobRow {
@@ -97,16 +101,43 @@ export class MeshStore {
   constructor(readonly database: MeshDatabase) {}
 
   registerWorker(registration: WorkerRegistration): StoredWorker {
-    const workerId = newId("wrk");
-    const now = Date.now();
-    this.database.raw
-      .prepare(
-        `INSERT INTO workers(
-           id, status, capabilities_json, last_seen_at, created_at, updated_at
-         ) VALUES (?, 'offline', ?, ?, ?, ?)`,
-      )
-      .run(workerId, JSON.stringify(registration.capabilities), now, now, now);
-    return this.getWorker(workerId)!;
+    return this.database.transaction(() => {
+      const now = Date.now();
+      const identity = registration.identity;
+      const existing = identity
+        ? this.database.raw
+            .prepare("SELECT id FROM workers WHERE identity_kind = ? AND identity_id = ?")
+            .get(identity.kind, identity.id) as { id: string } | undefined
+        : undefined;
+      if (existing) {
+        this.database.raw.prepare(
+          `UPDATE workers
+           SET status = 'offline', capabilities_json = ?, last_seen_at = ?, updated_at = ?,
+               deregistered = 0
+           WHERE id = ?`,
+        ).run(JSON.stringify(registration.capabilities), now, now, existing.id);
+        return this.getWorker(existing.id)!;
+      }
+
+      const workerId = newId("wrk");
+      this.database.raw
+        .prepare(
+          `INSERT INTO workers(
+             id, status, capabilities_json, last_seen_at, created_at, updated_at,
+             identity_kind, identity_id
+           ) VALUES (?, 'offline', ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          workerId,
+          JSON.stringify(registration.capabilities),
+          now,
+          now,
+          now,
+          identity?.kind ?? null,
+          identity?.id ?? null,
+        );
+      return this.getWorker(workerId)!;
+    });
   }
 
   getWorker(workerId: string): StoredWorker | null {
@@ -464,6 +495,8 @@ export class MeshStore {
       reliability: Number(row.reliability),
       jobsCompleted: Number(row.jobs_completed),
       lastSeenAt: Number(row.last_seen_at),
+      identityKind: row.identity_kind,
+      identityId: row.identity_id,
     };
   }
 

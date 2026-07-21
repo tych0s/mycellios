@@ -14,7 +14,8 @@ describe("requested model capacity catalog", () => {
       const url = new URL(String(input));
       expect(url.searchParams.get("search")).toBe("qwen");
       expect(url.searchParams.get("pipeline_tag")).toBe("text-generation");
-      expect(url.searchParams.get("config")).toBe("true");
+      expect(url.searchParams.getAll("expand")).toContain("safetensors");
+      expect(url.searchParams.getAll("expand")).toContain("config");
       return Response.json([
         {
           id: "org/unsupported-popular",
@@ -36,6 +37,7 @@ describe("requested model capacity catalog", () => {
           private: false,
           pipeline_tag: "text-generation",
           tags: ["transformers", "safetensors"],
+          safetensors: { parameters: { BF16: 751_632_384 }, total: 751_632_384 },
           config: { model_type: "qwen3", architectures: ["Qwen3ForCausalLM"] },
         },
       ]);
@@ -44,6 +46,8 @@ describe("requested model capacity catalog", () => {
     expect(results.map((model) => model.id)).toEqual(["Qwen/Qwen3-0.6B", "org/unsupported-popular"]);
     expect(results[0]?.compatible).toBe(true);
     expect(results[0]?.adapterId).toBe("transformers-qwen3-v1");
+    expect(results[0]?.parameterCount).toBe(751_632_384);
+    expect(results[0]?.estimatedMemoryMiB).toBeGreaterThan(1_500);
     expect(results[1]?.compatible).toBe(false);
     expect(results[1]?.compatibilityReason).toContain("certified");
   });
@@ -228,5 +232,7 @@ function worker(id: string, offeredVramMb: number, reservedVramMb: number): Stor
     reliability: 1,
     jobsCompleted: 0,
     lastSeenAt: Date.now(),
+    identityKind: "device",
+    identityId: id,
   };
 }

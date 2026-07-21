@@ -47,7 +47,7 @@ export interface DashboardDeployment {
 
 export interface DashboardWorker {
   id: string;
-  kind: "desktop" | "browser";
+  kind: "desktop" | "browser" | "cell";
   status: "online" | "suspect" | "offline" | "draining";
   connected: boolean;
   region: string;
@@ -180,6 +180,10 @@ export interface DashboardSnapshot {
     state: "paused" | "connecting" | "connected" | "error";
     workerId: string | null;
   };
+  modelAdminAuthorization: {
+    configured: boolean;
+    encrypted: boolean;
+  };
   settings: DesktopSettings;
   update: DesktopUpdateStatus;
 }
@@ -224,8 +228,8 @@ export interface DesktopBridge {
   removeWorker(workerId: string): Promise<DashboardSnapshot>;
   clearOfflineWorkers(): Promise<DashboardSnapshot>;
   searchHubModels(query: string): Promise<HubCatalogModel[]>;
-  requestModel(input: RequestModelInput): Promise<DashboardSnapshot>;
-  removeRequestedModel(modelId: string): Promise<DashboardSnapshot>;
+  requestModel(input: RequestModelInput, adminToken?: string): Promise<DashboardSnapshot>;
+  removeRequestedModel(modelId: string, adminToken?: string): Promise<DashboardSnapshot>;
   getBenchmarkRuns(): Promise<BenchmarkRun[]>;
   runBenchmark(): Promise<BenchmarkRun>;
   checkForUpdates(): Promise<DesktopUpdateStatus>;

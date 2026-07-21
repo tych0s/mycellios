@@ -194,6 +194,51 @@ describe("mobile compute hub", () => {
     socket.close();
   });
 
+  it("shows only active browser leases and expires disconnected sessions", async () => {
+    const runtime = await createCoordinator(
+      {
+        host: "127.0.0.1",
+        port: 0,
+        databasePath: ":memory:",
+        requestTimeoutMs: 10_000,
+        mobileExpertArtifactsPath: newArtifactDirectory(),
+      },
+      { logger: false, mobileDisconnectedRetentionMs: 60_000 },
+    );
+    runtimes.push(runtime);
+    await runtime.app.listen({ host: "127.0.0.1", port: 0 });
+    const address = runtime.app.server.address() as AddressInfo;
+
+    const firstRegistration = await runtime.app.inject({
+      method: "POST",
+      url: "/mobile/v1/register",
+      payload: { ...registrationPayload(), clientId: "browser-installation-old" },
+    });
+    const first = firstRegistration.json<{ workerId: string; token: string }>();
+    const firstSocket = new WebSocket(
+      `ws://127.0.0.1:${address.port}/mobile/v1/connect?workerId=${first.workerId}&token=${first.token}`,
+    );
+    await nextMessage(firstSocket);
+    firstSocket.terminate();
+    await waitUntil(() => runtime.mobileHub.connectedCount() === 0);
+
+    const secondRegistration = await runtime.app.inject({
+      method: "POST",
+      url: "/mobile/v1/register",
+      payload: { ...registrationPayload(), clientId: "browser-installation-new" },
+    });
+    const second = secondRegistration.json<{ workerId: string; token: string }>();
+    const secondSocket = new WebSocket(
+      `ws://127.0.0.1:${address.port}/mobile/v1/connect?workerId=${second.workerId}&token=${second.token}`,
+    );
+    await nextMessage(secondSocket);
+
+    expect(runtime.mobileHub.listWorkers().map((worker) => worker.id)).toEqual([second.workerId]);
+    expect(runtime.mobileHub.expireDisconnectedWorkers(Date.now() + 60_001)).toBe(1);
+    expect(runtime.mobileHub.listWorkers().map((worker) => worker.id)).toEqual([second.workerId]);
+    secondSocket.close(1000, "user stopped contribution");
+  });
+
   it("requires the optional invitation token and serves the built PWA", async () => {
     const runtime = await createCoordinator(
       {

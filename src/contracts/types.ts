@@ -2,6 +2,7 @@ export type WorkloadClass = "interactive" | "batch" | "benchmark";
 export type AdapterKind = "mock" | "local-model-runtime" | "externalggufruntime" | "openai-compatible";
 export type ExecutionMode = "replica" | "pipeline";
 export type WorkerStatus = "online" | "suspect" | "offline" | "draining";
+export type WorkerIdentityKind = "device" | "cell";
 export type JobStatus =
   | "queued"
   | "leasing"
@@ -25,6 +26,9 @@ export interface HubCatalogModel {
   compatible: boolean;
   gated: boolean;
   compatibilityReason: string | null;
+  parameterCount?: number | null;
+  estimatedMemoryMiB?: number | null;
+  memoryEstimateSource?: "hub_metadata" | "model_name" | null;
 }
 
 export interface ChatMessage {
@@ -155,6 +159,10 @@ export interface WorkerCapabilities {
 }
 
 export interface WorkerRegistration {
+  identity?: {
+    kind: WorkerIdentityKind;
+    id: string;
+  } | undefined;
   capabilities: WorkerCapabilities;
 }
 

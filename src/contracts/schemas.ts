@@ -184,11 +184,19 @@ export const workerCapabilitiesSchema = z.object({
 }).strict();
 
 export const workerRegistrationSchema = z.object({
+  identity: z
+    .object({
+      kind: z.enum(["device", "cell"]),
+      id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
+    })
+    .strict()
+    .optional(),
   capabilities: workerCapabilitiesSchema,
 }).strict();
 
 export const workerConfigSchema = z.object({
   region: z.string().min(1),
+  instanceId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/).optional(),
   // `cell` means that offeredVramMb is the aggregate capacity of a sidecar
   // cell represented by this gateway, not the gateway host's physical GPU.
   capacityScope: z.enum(["host", "cell"]).default("host"),

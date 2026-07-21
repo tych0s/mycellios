@@ -59,6 +59,37 @@ describe("requested model API activation flow", () => {
     expect(stored.activationRequestedAt).not.toBeNull();
     expect(stored.activationError).toBeNull();
   });
+
+  it("returns an actionable authorization error for protected model changes", async () => {
+    runtime = await createCoordinator({
+      host: "127.0.0.1",
+      port: 8_787,
+      databasePath: ":memory:",
+      requestTimeoutMs: 30_000,
+      modelAdminToken: "model-admin-secret",
+    });
+
+    const response = await runtime.app.inject({
+      method: "POST",
+      url: "/public/v1/requested-models",
+      payload: {
+        id: "qwen-ui",
+        source: "Qwen/Qwen3-0.6B",
+        revision: null,
+        contextTokens: 4_096,
+        minimumNodes: 2,
+        autoActivate: true,
+      },
+    });
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json()).toEqual({
+      error: {
+        code: "invalid_model_admin_token",
+        message: "The network administrator token is missing or invalid.",
+      },
+    });
+  });
 });
 
 class FakeActivationManager implements ModelActivationManager {

@@ -271,12 +271,11 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .settings-fields label, .onboarding-input { display: flex; flex-direction: column; gap: 6px; color: #728784; font-size: 9px; }
 .settings-fields input, .settings-fields select, .onboarding-input input { border: 1px solid var(--line); border-radius: 9px; background: #0b191c; color: #dbe7e5; padding: 10px 11px; font-size: 10px; }
 .toggle-list { display: flex; flex-direction: column; }
-.toggle-row { min-height: 42px; display: flex; align-items: center; justify-content: space-between; color: #9cafac; font-size: 10px; border-bottom: 1px solid rgba(142,183,180,.07); }
-.toggle-row input { position: absolute; opacity: 0; }
-.toggle-row i { width: 34px; height: 18px; border-radius: 99px; background: #223235; position: relative; transition: .2s; }
+.toggle-row { width: 100%; min-height: 42px; padding: 0; display: flex; align-items: center; justify-content: space-between; color: #9cafac; background: transparent; font-size: 10px; text-align: left; border: 0; border-bottom: 1px solid rgba(142,183,180,.07); cursor: pointer; }
+.toggle-row i { width: 34px; height: 18px; border-radius: 99px; background: #223235; position: relative; transition: .2s; pointer-events: none; }
 .toggle-row i::after { content: ""; position: absolute; width: 12px; height: 12px; top: 3px; left: 3px; border-radius: 50%; background: #82908f; transition: .2s; }
-.toggle-row input:checked + i { background: rgba(58, 174, 168, .45); }
-.toggle-row input:checked + i::after { left: 19px; background: var(--cyan); box-shadow: 0 0 8px var(--cyan); }
+.toggle-row[aria-checked="true"] i { background: rgba(58, 174, 168, .45); }
+.toggle-row[aria-checked="true"] i::after { left: 19px; background: var(--cyan); box-shadow: 0 0 8px var(--cyan); }
 .settings-footer { display: flex; justify-content: flex-end; padding-top: 20px; border-top: 1px solid var(--line); }
 .primary-button { border-radius: 10px; min-height: 39px; padding: 0 16px; font-size: 10px; }
 .primary-button:disabled { opacity: .5; cursor: wait; }

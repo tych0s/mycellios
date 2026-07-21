@@ -74,7 +74,7 @@ describe("coordinator crash recovery", () => {
     const row = migrated.raw
       .prepare("SELECT id, deregistered FROM workers WHERE id = 'wrk-existing'")
       .get() as { id: string; deregistered: number };
-    expect(version.version).toBe(5);
+    expect(version.version).toBe(6);
     expect(row).toEqual({ id: "wrk-existing", deregistered: 1 });
     migrated.close();
   });
@@ -111,7 +111,7 @@ describe("coordinator crash recovery", () => {
     const row = migrated.raw
       .prepare("SELECT id, deregistered FROM workers WHERE id = 'wrk-partially-migrated'")
       .get() as { id: string; deregistered: number };
-    expect(version.version).toBe(5);
+    expect(version.version).toBe(6);
     expect(row).toEqual({ id: "wrk-partially-migrated", deregistered: 1 });
     migrated.close();
 
@@ -119,7 +119,7 @@ describe("coordinator crash recovery", () => {
     expect(
       (reopened.raw.prepare("SELECT version FROM schema_meta").get() as { version: number })
         .version,
-    ).toBe(5);
+    ).toBe(6);
     reopened.close();
   });
 
@@ -155,7 +155,66 @@ describe("coordinator crash recovery", () => {
     expect(columns.some((column) => column.name === "activation_error")).toBe(true);
     expect(
       (migrated.raw.prepare("SELECT version FROM schema_meta").get() as { version: number }).version,
-    ).toBe(5);
+    ).toBe(6);
+    migrated.close();
+  });
+
+  it("backfills desktop identities and retires duplicate legacy rows", () => {
+    const directory = mkdtempSync(join(tmpdir(), "gpu-mesh-v5-identity-migration-"));
+    directories.push(directory);
+    const path = join(directory, "mesh.db");
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`
+      CREATE TABLE schema_meta (version INTEGER NOT NULL);
+      INSERT INTO schema_meta(version) VALUES (5);
+      CREATE TABLE workers (
+        id TEXT PRIMARY KEY,
+        status TEXT NOT NULL,
+        capabilities_json TEXT NOT NULL,
+        reliability REAL NOT NULL DEFAULT 0.95,
+        jobs_completed INTEGER NOT NULL DEFAULT 0,
+        last_seen_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        deregistered INTEGER NOT NULL DEFAULT 0
+      );
+    `);
+    const capabilities = JSON.stringify({
+      distributedExecutor: { nodeId: "desktop-migrated", protocol: "gdlp-worker-tunnel/1" },
+    });
+    const insert = legacy.prepare(`
+      INSERT INTO workers(
+        id, status, capabilities_json, last_seen_at, created_at, updated_at, deregistered
+      ) VALUES (?, ?, ?, ?, 1, ?, 0)
+    `);
+    insert.run("wrk-old", "offline", capabilities, 10, 10);
+    insert.run("wrk-current", "online", capabilities, 20, 20);
+    legacy.close();
+
+    const migrated = new MeshDatabase(path);
+    const rows = migrated.raw.prepare(`
+      SELECT id, deregistered, identity_kind, identity_id
+      FROM workers ORDER BY id
+    `).all() as Array<{
+      id: string;
+      deregistered: number;
+      identity_kind: string | null;
+      identity_id: string | null;
+    }>;
+    expect(rows).toEqual([
+      {
+        id: "wrk-current",
+        deregistered: 0,
+        identity_kind: "device",
+        identity_id: "desktop-migrated",
+      },
+      {
+        id: "wrk-old",
+        deregistered: 1,
+        identity_kind: null,
+        identity_id: null,
+      },
+    ]);
     migrated.close();
   });
 });

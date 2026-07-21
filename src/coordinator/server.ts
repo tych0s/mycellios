@@ -15,7 +15,7 @@ import type { ChatCompletionRequest } from "../contracts/types.js";
 import type { CoordinatorConfig } from "../core/config.js";
 import { Scheduler } from "../scheduler/scheduler.js";
 import { MeshDatabase } from "../storage/database.js";
-import { MeshStore } from "../storage/store.js";
+import { MeshStore, type StoredWorker } from "../storage/store.js";
 import { MeshService, MeshServiceError, type JobStreamEvent } from "./mesh-service.js";
 import { MobileComputeHub, type MobileWorkerSnapshot } from "./mobile-compute-hub.js";
 import { verifyGitHubReleaseUploadToken } from "./github-oidc.js";
@@ -56,6 +56,7 @@ export async function createCoordinator(
     activationManager?: ModelActivationManager;
     activationManagerFactory?: (context: CoordinatorActivationContext) => ModelActivationManager;
     releaseTokenVerifier?: (token: string) => Promise<unknown>;
+    mobileDisconnectedRetentionMs?: number;
   } = {},
 ): Promise<CoordinatorRuntime> {
   const app = Fastify({ logger: options.logger ?? false, bodyLimit: 2 * 1024 * 1024 });
@@ -85,7 +86,12 @@ export async function createCoordinator(
     }
     const received = parseBearerToken(request.headers.authorization);
     if (received && constantTimeEqual(received, expected)) return true;
-    void reply.code(401).send({ error: { code: "invalid_model_admin_token" } });
+    void reply.code(401).send({
+      error: {
+        code: "invalid_model_admin_token",
+        message: "The network administrator token is missing or invalid.",
+      },
+    });
     return false;
   };
   app.addContentTypeParser(
@@ -142,6 +148,7 @@ export async function createCoordinator(
   const mobileHub = new MobileComputeHub({
     joinToken: config.mobileJoinToken,
     expertArtifactsPath: config.mobileExpertArtifactsPath,
+    disconnectedRetentionMs: options.mobileDisconnectedRetentionMs,
   });
   mobileHub.attach(app);
   const service = new MeshService(store, scheduler, hub, config.requestTimeoutMs);
@@ -201,6 +208,7 @@ export async function createCoordinator(
   const staleTimer = setInterval(() => {
     store.markStaleWorkers();
     hub.closeStaleConnections();
+    mobileHub.expireDisconnectedWorkers();
     void activationManager?.refresh();
     reconcileRequestedModels();
   }, 5_000);
@@ -369,7 +377,7 @@ export async function createCoordinator(
 
   app.get("/internal/v1/workers", async () => ({
     data: [
-      ...store.listWorkers().map((worker) => ({
+      ...store.listWorkers().filter((worker) => storedWorkerIsVisible(worker, hub)).map((worker) => ({
       id: worker.id,
       status: worker.status,
       connected: hub.isConnected(worker.id),
@@ -384,8 +392,12 @@ export async function createCoordinator(
       reliability: worker.reliability,
       jobsCompleted: worker.jobsCompleted,
       lastSeenAt: new Date(worker.lastSeenAt).toISOString(),
+      kind: storedWorkerKind(worker),
       })),
-      ...mobileHub.listWorkers().map(mobileDashboardWorker),
+      ...mobileHub.listWorkers().map((worker) => ({
+        ...mobileDashboardWorker(worker),
+        kind: "browser" as const,
+      })),
     ],
   }));
 
@@ -760,7 +772,7 @@ function resolveLandingAssetsPath(configured: string | undefined): string | null
 
 function dashboardWorkers(store: MeshStore, hub: WorkerHub, mobileHub: MobileComputeHub) {
   return [
-    ...store.listWorkers().map((worker) => ({
+    ...store.listWorkers().filter((worker) => storedWorkerIsVisible(worker, hub)).map((worker) => ({
       id: worker.id,
       status: worker.status,
       connected: hub.isConnected(worker.id),
@@ -774,13 +786,27 @@ function dashboardWorkers(store: MeshStore, hub: WorkerHub, mobileHub: MobileCom
       reliability: worker.reliability,
       jobsCompleted: worker.jobsCompleted,
       lastSeenAt: new Date(worker.lastSeenAt).toISOString(),
-      kind: "desktop" as const,
+      kind: storedWorkerKind(worker),
     })),
     ...mobileHub.listWorkers().map((worker) => ({
       ...mobileDashboardWorker(worker),
       kind: "browser" as const,
     })),
   ];
+}
+
+function storedWorkerKind(worker: StoredWorker): "desktop" | "cell" {
+  if (
+    worker.identityKind === "cell" ||
+    worker.capabilities.gpus.some((gpu) => gpu.vendor === "sidecar-cell")
+  ) {
+    return "cell";
+  }
+  return "desktop";
+}
+
+function storedWorkerIsVisible(worker: StoredWorker, hub: WorkerHub): boolean {
+  return storedWorkerKind(worker) !== "cell" || hub.isConnected(worker.id);
 }
 
 function publicSnapshot(

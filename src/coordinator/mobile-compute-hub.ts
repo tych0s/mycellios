@@ -8,6 +8,7 @@ import { z } from "zod";
 const LEVELS = ["low", "balanced", "maximum"] as const;
 const BACKENDS = ["webgpu", "cpu"] as const;
 const SHA256 = /^[a-f0-9]{64}$/;
+const DEFAULT_DISCONNECTED_RETENTION_MS = 60_000;
 
 const expertManifestSchema = z
   .object({
@@ -216,6 +217,7 @@ interface MobileWorkerState {
   token: string;
   socket: WebSocket | null;
   connected: boolean;
+  disconnectedAt: number | null;
   visible: boolean;
   wakeLock: boolean;
   lastSeenAt: number;
@@ -234,6 +236,7 @@ export interface MobileComputeHubOptions {
   joinToken?: string | undefined;
   taskTimeoutMs?: number | undefined;
   expertArtifactsPath?: string | undefined;
+  disconnectedRetentionMs?: number | undefined;
 }
 
 type ExpertManifest = z.infer<typeof expertManifestSchema> & { artifactId: string };
@@ -264,11 +267,13 @@ export class MobileComputeHub {
   private readonly workers = new Map<string, MobileWorkerState>();
   private readonly workerByClient = new Map<string, string>();
   private readonly taskTimeoutMs: number;
+  private readonly disconnectedRetentionMs: number;
   private readonly expertArtifactsPath: string;
   private readonly expertManifests = new Map<string, ExpertManifest>();
 
   constructor(private readonly options: MobileComputeHubOptions = {}) {
     this.taskTimeoutMs = options.taskTimeoutMs ?? 45_000;
+    this.disconnectedRetentionMs = options.disconnectedRetentionMs ?? DEFAULT_DISCONNECTED_RETENTION_MS;
     this.expertArtifactsPath = resolve(options.expertArtifactsPath ?? "runtime/mobile-experts");
     mkdirSync(this.expertArtifactsPath, { recursive: true });
   }
@@ -367,6 +372,7 @@ export class MobileComputeHub {
         socket.close(4400, "invalid connection parameters");
         return;
       }
+      this.expireDisconnectedWorkers();
       const worker = this.workers.get(parsed.data.workerId);
       if (!worker || !constantTimeEqual(worker.token, parsed.data.token)) {
         socket.close(4401, "invalid worker credentials");
@@ -377,6 +383,7 @@ export class MobileComputeHub {
       }
       worker.socket = socket;
       worker.connected = true;
+      worker.disconnectedAt = null;
       worker.visible = true;
       worker.lastSeenAt = Date.now();
       this.send(socket, "server.ready", { workerId: worker.id });
@@ -393,6 +400,7 @@ export class MobileComputeHub {
   }
 
   register(registration: MobileRegistration): MobileWorkerState {
+    this.expireDisconnectedWorkers();
     const previousId = this.workerByClient.get(registration.clientId);
     const previous = previousId ? this.workers.get(previousId) : undefined;
     if (previous?.socket) previous.socket.close(4409, "worker registered again");
@@ -404,6 +412,7 @@ export class MobileComputeHub {
       token: randomBytes(32).toString("base64url"),
       socket: null,
       connected: false,
+      disconnectedAt: Date.now(),
       visible: true,
       wakeLock: false,
       lastSeenAt: Date.now(),
@@ -423,8 +432,9 @@ export class MobileComputeHub {
   }
 
   listWorkers(): MobileWorkerSnapshot[] {
+    this.expireDisconnectedWorkers();
     const now = Date.now();
-    return [...this.workers.values()].map((worker) => {
+    return [...this.workers.values()].filter((worker) => worker.connected).map((worker) => {
       const age = now - worker.lastSeenAt;
       const status = !worker.connected || age > 30_000
         ? "offline"
@@ -487,9 +497,19 @@ export class MobileComputeHub {
   }
 
   removeOfflineWorkers(): number {
-    const offline = this.listWorkers().filter((worker) => !worker.connected);
+    const offline = [...this.workers.values()].filter((worker) => !worker.connected);
     for (const worker of offline) this.removeWorker(worker.id);
     return offline.length;
+  }
+
+  expireDisconnectedWorkers(now = Date.now()): number {
+    const expired = [...this.workers.values()].filter((worker) =>
+      !worker.connected &&
+      worker.disconnectedAt !== null &&
+      now - worker.disconnectedAt >= this.disconnectedRetentionMs
+    );
+    for (const worker of expired) this.removeWorker(worker.id);
+    return expired.length;
   }
 
   close(): void {
@@ -832,6 +852,7 @@ export class MobileComputeHub {
     if (worker.socket !== socket) return;
     worker.socket = null;
     worker.connected = false;
+    worker.disconnectedAt = Date.now();
     worker.visible = false;
     worker.wakeLock = false;
     worker.pendingTask = null;
@@ -841,7 +862,7 @@ export class MobileComputeHub {
       worker.pendingExpertTask.reject(new Error("mobile worker disconnected"));
       worker.pendingExpertTask = null;
     }
-    worker.lastSeenAt = Date.now();
+    worker.lastSeenAt = worker.disconnectedAt;
     if (voluntary) {
       this.workers.delete(worker.id);
       if (this.workerByClient.get(worker.registration.clientId) === worker.id) {

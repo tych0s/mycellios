@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { networkInterfaces } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { spawn } from "node:child_process";
@@ -11,6 +11,7 @@ import {
   ipcMain,
   Menu,
   nativeImage,
+  safeStorage,
   shell,
   Tray,
 } from "electron";
@@ -83,6 +84,7 @@ let distributedExecutor: Awaited<ReturnType<typeof createDesktopDistributedExecu
 let distributionRuntimePromise: Promise<string> | null = null;
 let hardwarePromise: Promise<HardwareProbe> | null = null;
 let settings: DesktopSettings = DEFAULT_SETTINGS;
+let modelAdminToken = "";
 let isQuitting = false;
 let runtimeError: string | null = null;
 let updateCheckTimer: NodeJS.Timeout | null = null;
@@ -104,6 +106,33 @@ function resourcePath(...segments: string[]): string {
 
 function settingsPath(): string {
   return join(app.getPath("userData"), "desktop-settings.json");
+}
+
+function modelAdminTokenPath(): string {
+  return join(app.getPath("userData"), "model-admin-token.enc");
+}
+
+function loadModelAdminToken(): string {
+  if (!safeStorage.isEncryptionAvailable() || !existsSync(modelAdminTokenPath())) return "";
+  try {
+    return safeStorage.decryptString(readFileSync(modelAdminTokenPath())).trim();
+  } catch (error) {
+    writeDesktopLog("model-admin-token-load-failed", { error: errorText(error) });
+    return "";
+  }
+}
+
+function persistModelAdminToken(token: string): void {
+  const next = token.trim();
+  if (!next) return;
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error("Secure operating-system storage is unavailable. The administrator token was not saved.");
+  }
+  const target = modelAdminTokenPath();
+  const temporary = `${target}.tmp`;
+  writeFileSync(temporary, safeStorage.encryptString(next));
+  renameSync(temporary, target);
+  modelAdminToken = next;
 }
 
 function writeDesktopLog(event: string, details: unknown): void {
@@ -477,7 +506,7 @@ function getHardware(): Promise<HardwareProbe> {
 
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
-  if (settings.coordinatorMode === "remote" && settings.remoteCoordinatorToken) {
+  if (settings.coordinatorMode === "remote" && settings.remoteCoordinatorToken && !headers.has("authorization")) {
     headers.set("authorization", `Bearer ${settings.remoteCoordinatorToken}`);
   }
   const response = await fetch(new URL(path, `${coordinatorUrl}/`), {
@@ -486,7 +515,14 @@ async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
     signal: AbortSignal.timeout(8_000),
     redirect: "error",
   });
-  if (!response.ok) throw new Error(`The coordinator returned HTTP ${response.status}.`);
+  if (!response.ok) {
+    const body = await response.json().catch(() => null) as { error?: { code?: string; message?: string } } | null;
+    const message = body?.error?.message
+      ?? (response.status === 401
+        ? "The network administrator token is missing or invalid."
+        : `The coordinator returned HTTP ${response.status}.`);
+    throw new Error(message);
+  }
   return (await response.json()) as T;
 }
 
@@ -541,6 +577,10 @@ async function readSnapshot(): Promise<DashboardSnapshot> {
     jobs,
     localHardware,
     contribution: { state: contributionState, workerId: localWorkerId },
+    modelAdminAuthorization: {
+      configured: Boolean(modelAdminToken),
+      encrypted: Boolean(modelAdminToken) && safeStorage.isEncryptionAvailable(),
+    },
     settings,
     update: { ...updateStatus },
   };
@@ -639,16 +679,28 @@ function registerIpc(): void {
     const result = await fetchJson<{ data: HubCatalogModel[] }>(`public/v1/huggingface-models?q=${encodeURIComponent(query)}`);
     return result.data;
   });
-  ipcMain.handle("models:request", async (_event, input: import("./contracts.js").RequestModelInput) => {
+  ipcMain.handle("models:request", async (_event, input: import("./contracts.js").RequestModelInput, adminToken?: string) => {
+    const providedToken = adminToken?.trim() ?? "";
+    const token = providedToken || modelAdminToken;
     await fetchJson("public/v1/requested-models", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+      },
       body: JSON.stringify(input),
     });
+    if (providedToken && providedToken !== modelAdminToken) persistModelAdminToken(providedToken);
     return readSnapshot();
   });
-  ipcMain.handle("models:remove-request", async (_event, modelId: string) => {
-    await fetchJson(`public/v1/requested-models/${encodeURIComponent(modelId)}`, { method: "DELETE" });
+  ipcMain.handle("models:remove-request", async (_event, modelId: string, adminToken?: string) => {
+    const providedToken = adminToken?.trim() ?? "";
+    const token = providedToken || modelAdminToken;
+    await fetchJson(`public/v1/requested-models/${encodeURIComponent(modelId)}`, {
+      method: "DELETE",
+      ...(token ? { headers: { authorization: `Bearer ${token}` } } : {}),
+    });
+    if (providedToken && providedToken !== modelAdminToken) persistModelAdminToken(providedToken);
     return readSnapshot();
   });
   ipcMain.handle("benchmarks:read", async () => {
@@ -816,6 +868,7 @@ async function createDesktopDistributedExecutor() {
     nodeId,
     stageHost: preferredLanAddress(),
     stagePort: 9_850,
+    pythonExecutable,
     launchAgent: new LocalProcessAgent({
       id: `desktop-shard-executor:${nodeId}`,
       cwd: app.getAppPath(),
@@ -989,6 +1042,7 @@ else {
 
 app.whenReady().then(async () => {
   settings = loadSettings();
+  modelAdminToken = loadModelAdminToken();
   registerIpc();
   await restartRuntime().catch((error: unknown) => {
     runtimeError = errorText(error);

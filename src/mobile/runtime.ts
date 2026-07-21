@@ -149,6 +149,8 @@ function handleVisibilityChange(): void {
 async function start(): Promise<void> {
   if (state.starting || state.running) return;
   state.starting = true;
+  const clientIdPromise = persistentClientId();
+  const persistentStoragePromise = requestPersistentBrowserStorage();
   setBusy(true);
   setConnection("connecting", "Preparing");
   addLog("Checking the device compute engine.");
@@ -161,7 +163,12 @@ async function start(): Promise<void> {
     renderPerformance();
     addLog(`Benchmark complete: ${formatGflops(state.estimatedGflops)} GFLOPS.`);
     await acquireWakeLock();
-    const credentials = await registerWorker(benchmarkSize, benchmark.durationMs);
+    const clientId = await clientIdPromise;
+    const persistentStorage = await persistentStoragePromise;
+    addLog(persistentStorage
+      ? "Browser identity protected from automatic storage eviction."
+      : "Browser identity will be retained while site storage remains available.");
+    const credentials = await registerWorker(benchmarkSize, benchmark.durationMs, clientId);
     state.workerId = credentials.workerId;
     state.token = credentials.token;
     state.running = true;
@@ -252,13 +259,17 @@ async function initializeComputeBackend(): Promise<void> {
   }
 }
 
-async function registerWorker(matrixSize: number, durationMs: number): Promise<{ workerId: string; token: string }> {
+async function registerWorker(
+  matrixSize: number,
+  durationMs: number,
+  clientId: string,
+): Promise<{ workerId: string; token: string }> {
   const query = new URLSearchParams(window.location.search);
   const invitationFromUrl = query.get("join")?.trim();
   const joinToken = persistentJoinToken(invitationFromUrl);
   const adapterInfo = state.gpu?.info as (GPUAdapterInfo & { description?: string }) | undefined;
   const body = {
-    clientId: persistentClientId(),
+    clientId,
     name: mobileName(),
     region: query.get("region")?.trim() || "auto",
     platform: navigator.userAgent.slice(0, 120),
@@ -886,13 +897,83 @@ function coolDownMs(): number {
   return state.level === "low" ? 1_500 : state.level === "balanced" ? 600 : 150;
 }
 
-function persistentClientId(): string {
+async function persistentClientId(): Promise<string> {
   const key = "mycellios.mobile.client-id";
-  const stored = localStorage.getItem(key);
-  if (stored) return stored;
-  const created = crypto.randomUUID();
-  localStorage.setItem(key, created);
-  return created;
+  const legacy = safeLocalStorageGet(key);
+  try {
+    const database = await openIdentityDatabase();
+    const stored = await readIdentityValue(database, key);
+    const identity = stored || legacy || crypto.randomUUID();
+    await writeIdentityValue(database, key, identity);
+    database.close();
+    safeLocalStorageSet(key, identity);
+    return identity;
+  } catch {
+    const identity = legacy || crypto.randomUUID();
+    safeLocalStorageSet(key, identity);
+    return identity;
+  }
+}
+
+async function requestPersistentBrowserStorage(): Promise<boolean> {
+  try {
+    if (!navigator.storage?.persist) return false;
+    if (await navigator.storage.persisted()) return true;
+    return await navigator.storage.persist();
+  } catch {
+    return false;
+  }
+}
+
+function openIdentityDatabase(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    if (!globalThis.indexedDB) {
+      reject(new Error("IndexedDB is unavailable"));
+      return;
+    }
+    const request = indexedDB.open("mycellios-mobile-identity", 1);
+    request.addEventListener("upgradeneeded", () => {
+      if (!request.result.objectStoreNames.contains("identity")) {
+        request.result.createObjectStore("identity");
+      }
+    });
+    request.addEventListener("success", () => resolve(request.result));
+    request.addEventListener("error", () => reject(request.error ?? new Error("Could not open identity storage")));
+  });
+}
+
+function readIdentityValue(database: IDBDatabase, key: string): Promise<string | null> {
+  return new Promise((resolve, reject) => {
+    const request = database.transaction("identity", "readonly").objectStore("identity").get(key);
+    request.addEventListener("success", () => resolve(typeof request.result === "string" ? request.result : null));
+    request.addEventListener("error", () => reject(request.error ?? new Error("Could not read browser identity")));
+  });
+}
+
+function writeIdentityValue(database: IDBDatabase, key: string, value: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction("identity", "readwrite");
+    transaction.objectStore("identity").put(value, key);
+    transaction.addEventListener("complete", () => resolve());
+    transaction.addEventListener("abort", () => reject(transaction.error ?? new Error("Could not save browser identity")));
+    transaction.addEventListener("error", () => reject(transaction.error ?? new Error("Could not save browser identity")));
+  });
+}
+
+function safeLocalStorageGet(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function safeLocalStorageSet(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // IndexedDB remains the primary identity store.
+  }
 }
 
 function mobileName(): string {

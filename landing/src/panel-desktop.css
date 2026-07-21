@@ -200,23 +200,24 @@
 
 .public-panel .toggle-row {
   position: relative;
+  width: 100%;
   min-height: 46px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
+  padding: 0;
   color: var(--text-secondary);
+  background: transparent;
+  border: 0;
   border-bottom: 1px solid rgba(255, 255, 255, 0.055);
   font-size: 11px;
+  text-align: left;
+  cursor: pointer;
 }
 
 .public-panel .toggle-row:last-child {
   border-bottom: 0;
-}
-
-.public-panel .toggle-row input {
-  position: absolute;
-  opacity: 0;
 }
 
 .public-panel .toggle-row i {
@@ -227,6 +228,7 @@
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.1);
   transition: background 180ms ease;
+  pointer-events: none;
 }
 
 .public-panel .toggle-row i::after {
@@ -241,11 +243,11 @@
   transition: left 180ms ease, background 180ms ease, box-shadow 180ms ease;
 }
 
-.public-panel .toggle-row input:checked + i {
+.public-panel .toggle-row[aria-checked="true"] i {
   background: rgba(63, 124, 255, 0.45);
 }
 
-.public-panel .toggle-row input:checked + i::after {
+.public-panel .toggle-row[aria-checked="true"] i::after {
   left: 20px;
   background: #dce8ff;
   box-shadow: 0 0 10px var(--blue-glow);

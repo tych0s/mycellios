@@ -19,6 +19,7 @@ export function addWorker(
     mode?: ExecutionMode;
     stage?: { index: number; total: number; layerStart: number; layerEnd: number };
     internalPipeline?: { stageCount: number; boundaries: number[] };
+    identity?: WorkerRegistration["identity"];
     llmfit?: {
       fitLevel: string;
       bestQuant?: string;
@@ -30,6 +31,7 @@ export function addWorker(
 ): StoredWorker {
   const mode = input.mode ?? "replica";
   const registration: WorkerRegistration = {
+    ...(input.identity ? { identity: input.identity } : {}),
     capabilities: {
       region: input.region ?? "es-mad",
       agentVersion: "test",

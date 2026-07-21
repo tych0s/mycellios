@@ -15,9 +15,18 @@ export async function searchHubModelCatalog(
     sort: "downloads",
     direction: "-1",
     limit: normalizedQuery ? "30" : "80",
-    full: "true",
-    config: "true",
   });
+  for (const property of [
+    "author",
+    "config",
+    "downloads",
+    "gated",
+    "lastModified",
+    "likes",
+    "pipeline_tag",
+    "safetensors",
+    "tags",
+  ]) parameters.append("expand", property);
   if (normalizedQuery) parameters.set("search", normalizedQuery);
 
   const response = await fetcher(`https://huggingface.co/api/models?${parameters.toString()}`, {
@@ -41,6 +50,7 @@ export async function searchHubModelCatalog(
     const gated = entry.gated !== false && entry.gated !== undefined && entry.gated !== null;
     const tags = Array.isArray(entry.tags) ? entry.tags.filter((tag): tag is string => typeof tag === "string") : [];
     const hasSafetensors = tags.includes("safetensors");
+    const parameterCount = hubSafetensorsParameterCount(entry.safetensors);
     const compatible = adapterId !== null && !gated && hasSafetensors;
     const compatibilityReason = gated
       ? "Access approval is required on Hugging Face."
@@ -62,6 +72,9 @@ export async function searchHubModelCatalog(
       compatible,
       gated,
       compatibilityReason,
+      parameterCount,
+      estimatedMemoryMiB: estimateCatalogMemoryMiB(parameterCount),
+      memoryEstimateSource: parameterCount === null ? null : "hub_metadata",
     }];
   });
 
@@ -70,6 +83,20 @@ export async function searchHubModelCatalog(
     ? sorted
     : sorted.filter((model) => model.compatible && model.likes >= 20);
   return visible.slice(0, normalizedQuery ? 12 : 6);
+}
+
+function hubSafetensorsParameterCount(value: unknown): number | null {
+  if (!isRecord(value)) return null;
+  const total = value.total;
+  return typeof total === "number" && Number.isSafeInteger(total) && total > 0 ? total : null;
+}
+
+function estimateCatalogMemoryMiB(parameterCount: number | null): number | null {
+  if (parameterCount === null) return null;
+  const weightBytes = parameterCount * 2;
+  const runtimeBytes = 2 * 256 * MIB;
+  const loaderAndActivationReserve = Math.ceil(weightBytes * 0.1) + 2 * 64 * MIB;
+  return Math.ceil((weightBytes + runtimeBytes + loaderAndActivationReserve) / MIB);
 }
 
 export type RequestedModelStatus =
