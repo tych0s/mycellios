@@ -23,7 +23,7 @@ const strictCapabilitiesSchema = workerCapabilitiesSchema
         pauseWhenForeground: z.boolean(),
       })
       .strict(),
-    deployments: z.array(strictDeploymentSchema).min(1).max(256),
+    deployments: z.array(strictDeploymentSchema).max(256),
     network: z
       .object({
         coordinatorRttMs: z.number().nonnegative().max(3_600_000),
@@ -179,6 +179,24 @@ export const taskFailEnvelopeSchema = envelopeSchema(
     .strict(),
 );
 
+const runtimeRequestIdSchema = z.string().min(1).max(MAX_IDENTIFIER_LENGTH);
+export const runtimePreparedEnvelopeSchema = envelopeSchema(
+  "runtime.prepared",
+  z.object({ requestId: runtimeRequestIdSchema, ok: z.boolean(), error: z.string().max(2_048).optional() }).strict(),
+);
+export const runtimeReadyEnvelopeSchema = envelopeSchema(
+  "runtime.ready",
+  z.object({ requestId: runtimeRequestIdSchema }).strict(),
+);
+export const runtimeExitedEnvelopeSchema = envelopeSchema(
+  "runtime.exited",
+  z.object({
+    requestId: runtimeRequestIdSchema,
+    exit: z.object({ code: z.number().int().nullable(), signal: z.string().nullable(), error: z.string().max(2_048).optional() }).strict(),
+    output: z.object({ stdout: boundedText(256 * 1024), stderr: boundedText(256 * 1024), stdoutTruncated: z.boolean(), stderrTruncated: z.boolean() }).strict(),
+  }).strict(),
+);
+
 export const workerEnvelopeSchema = z.discriminatedUnion("type", [
   workerHelloEnvelopeSchema,
   workerHeartbeatEnvelopeSchema,
@@ -188,6 +206,9 @@ export const workerEnvelopeSchema = z.discriminatedUnion("type", [
   taskTokenEnvelopeSchema,
   taskCompleteEnvelopeSchema,
   taskFailEnvelopeSchema,
+  runtimePreparedEnvelopeSchema,
+  runtimeReadyEnvelopeSchema,
+  runtimeExitedEnvelopeSchema,
 ]);
 
 export type ValidatedWorkerEnvelope = z.infer<typeof workerEnvelopeSchema>;

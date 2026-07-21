@@ -3,6 +3,7 @@ import react from "@vitejs/plugin-react";
 import { defineConfig, type Plugin } from "vite";
 
 function mobileAssets(): Plugin {
+  const packageVersion = JSON.parse(readFileSync("package.json", "utf8")) as { version: string };
   return {
     name: "mycellios-mobile-assets",
     generateBundle() {
@@ -41,7 +42,7 @@ function mobileAssets(): Plugin {
       this.emitFile({
         type: "asset",
         fileName: "sw.js",
-        source: readFileSync("src/mobile/sw.js", "utf8"),
+        source: readFileSync("src/mobile/sw.js", "utf8").replace("__MYCELLIOS_VERSION__", packageVersion.version),
       });
     },
   };

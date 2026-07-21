@@ -12,6 +12,21 @@ export type JobStatus =
   | "cancelled"
   | "expired";
 
+export interface HubCatalogModel {
+  id: string;
+  author: string;
+  downloads: number;
+  likes: number;
+  lastModified: string | null;
+  pipelineTag: string | null;
+  modelType: string | null;
+  architecture: string | null;
+  adapterId: string | null;
+  compatible: boolean;
+  gated: boolean;
+  compatibilityReason: string | null;
+}
+
 export interface ChatMessage {
   role: "system" | "developer" | "user" | "assistant" | "tool";
   content: string;
@@ -129,6 +144,14 @@ export interface WorkerCapabilities {
     downlinkMbps: number;
   };
   llmfit?: LlmfitAdvisory | undefined;
+  /** A node-local shard executor controlled through the existing worker tunnel. */
+  distributedExecutor?: {
+    protocol: "gdlp-worker-tunnel/1";
+    nodeId: string;
+    stageHost: string;
+    stagePort: number;
+    runtime: "python-safetensors";
+  } | undefined;
 }
 
 export interface WorkerRegistration {

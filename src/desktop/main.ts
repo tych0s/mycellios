@@ -1,5 +1,8 @@
-import { appendFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { networkInterfaces } from "node:os";
+import { delimiter, dirname, join } from "node:path";
+import { spawn } from "node:child_process";
 import type { AddressInfo } from "node:net";
 import {
   app,
@@ -15,6 +18,13 @@ import started from "electron-squirrel-startup";
 import { workerConfigSchema, type WorkerConfig } from "../contracts/schemas.js";
 import type { CoordinatorRuntime } from "../coordinator/server.js";
 import { createCoordinator } from "../coordinator/server.js";
+import { DynamicModelActivationManager } from "../coordinator/model-activation-manager.js";
+import { parseAutoDistributionConfig } from "../distribution/auto-distribute.js";
+import { LocalProcessAgent, type LaunchAgent } from "../distribution/launch-supervisor.js";
+import type { PythonPipelineLaunchDescription } from "../distribution/python-launcher.js";
+import { WorkerTunnelLaunchAgent } from "../distribution/worker-tunnel-launch-agent.js";
+import type { StoredWorker } from "../storage/store.js";
+import type { WorkerHub } from "../coordinator/worker-hub.js";
 import { WorkerAgent, validateCoordinatorUrl } from "../worker/agent.js";
 import { probeHardware, type HardwareProbe } from "../worker/hardware.js";
 import type {
@@ -28,6 +38,7 @@ import type {
   DesktopSettings,
   DesktopUpdateStatus,
 } from "./contracts.js";
+import type { HubCatalogModel } from "../contracts/types.js";
 import { consumeChatCompletionStream } from "./chat-stream.js";
 
 if (started) app.quit();
@@ -36,6 +47,8 @@ app.setName("mycellios");
 if (process.platform === "win32") app.setAppUserModelId("app.mycellios.desktop.v2");
 
 const PUBLIC_COORDINATOR_URL = "https://www.mycellios.com";
+const LOCAL_DASHBOARD_COORDINATOR_URL = "http://127.0.0.1:4180";
+const LOCAL_DASHBOARD_COORDINATOR_PORT = 4_180;
 
 const DEFAULT_SETTINGS: DesktopSettings = {
   coordinatorMode: "remote",
@@ -65,6 +78,8 @@ let tray: Tray | null = null;
 let coordinator: CoordinatorRuntime | null = null;
 let coordinatorUrl = "";
 let worker: WorkerAgent | null = null;
+let distributedExecutor: Awaited<ReturnType<typeof createDesktopDistributedExecutor>> | null = null;
+let distributionRuntimePromise: Promise<string> | null = null;
 let hardwarePromise: Promise<HardwareProbe> | null = null;
 let settings: DesktopSettings = DEFAULT_SETTINGS;
 let isQuitting = false;
@@ -276,21 +291,51 @@ async function startCoordinatorIfNeeded(): Promise<void> {
     coordinatorUrl = normalizeHttpUrl(validateCoordinatorUrl(settings.remoteCoordinatorUrl));
     return;
   }
+  if (await coordinatorIsReachable(LOCAL_DASHBOARD_COORDINATOR_URL)) {
+    coordinatorUrl = LOCAL_DASHBOARD_COORDINATOR_URL;
+    writeDesktopLog("local-coordinator-selected", { coordinatorUrl });
+    return;
+  }
   coordinator = await createCoordinator(
     {
       host: "127.0.0.1",
-      port: 0,
+      port: LOCAL_DASHBOARD_COORDINATOR_PORT,
       databasePath: join(app.getPath("userData"), "mycellios.db"),
       requestTimeoutMs: 120_000,
       mobileAssetsPath: app.isPackaged
         ? join(process.resourcesPath, "mobile-dist")
         : join(app.getAppPath(), "mobile-dist"),
     },
-    { logger: false },
+    {
+      logger: false,
+      activationManagerFactory: ({ store, hub }) => new DynamicModelActivationManager({
+        cwd: app.getAppPath(),
+        snapshot: () => buildDesktopActivationSnapshot(store.listWorkers(), hub.connectedWorkerIds()),
+        resolveManagedAgent: (nodeId, launch) => resolveDesktopTunnelAgent(store.listWorkers(), hub, nodeId, launch),
+      }),
+    },
   );
-  await coordinator.app.listen({ host: "127.0.0.1", port: 0 });
+  await coordinator.app.listen({
+    host: "127.0.0.1",
+    port: LOCAL_DASHBOARD_COORDINATOR_PORT,
+  });
   const address = coordinator.app.server.address() as AddressInfo;
   coordinatorUrl = `http://127.0.0.1:${address.port}`;
+  writeDesktopLog("embedded-coordinator-started", { coordinatorUrl });
+}
+
+async function coordinatorIsReachable(baseUrl: string): Promise<boolean> {
+  try {
+    const response = await fetch(new URL("health", `${baseUrl}/`), {
+      signal: AbortSignal.timeout(1_500),
+      redirect: "error",
+    });
+    if (!response.ok) return false;
+    const body = await response.json() as { status?: unknown };
+    return body.status === "ok";
+  } catch {
+    return false;
+  }
 }
 
 function normalizeHttpUrl(url: URL): string {
@@ -345,6 +390,7 @@ async function buildWorkerConfig(): Promise<WorkerConfig> {
 
 async function startWorkerIfEnabled(): Promise<void> {
   if (!settings.contributionEnabled || worker) return;
+  distributedExecutor ??= await createDesktopDistributedExecutor();
   const config = await buildWorkerConfig();
   const nextWorker = new WorkerAgent(config, {
     coordinatorUrl,
@@ -352,23 +398,41 @@ async function startWorkerIfEnabled(): Promise<void> {
       ? { networkToken: settings.remoteCoordinatorToken }
       : {}),
     reconnect: true,
+    // The legacy connectivity option now means hardware-only standby. It
+    // registers this physical PC but never advertises a fake model.
+    advertiseDeployment: settings.adapterMode !== "connectivity-test",
+    distributedExecutor,
     logger: {
-      info: (message) => console.info(`[agent] ${message}`),
-      warn: (message) => console.warn(`[agent] ${message}`),
-      error: (message) => console.error(`[agent] ${message}`),
+      info: (message) => {
+        console.info(`[agent] ${message}`);
+        writeDesktopLog("worker-info", { message });
+      },
+      warn: (message) => {
+        console.warn(`[agent] ${message}`);
+        writeDesktopLog("worker-warning", { message });
+      },
+      error: (message) => {
+        console.error(`[agent] ${message}`);
+        writeDesktopLog("worker-error", { message });
+      },
     },
   });
   worker = nextWorker;
   void nextWorker.start().catch((error: unknown) => {
     runtimeError = errorText(error);
+    writeDesktopLog("worker-start-failed", { error: runtimeError });
     if (worker === nextWorker) worker = null;
   });
 }
 
-async function stopRuntime(): Promise<void> {
+async function stopWorker(): Promise<void> {
   const activeWorker = worker;
   worker = null;
   if (activeWorker) await activeWorker.stop();
+}
+
+async function stopRuntime(): Promise<void> {
+  await stopWorker();
   const activeCoordinator = coordinator;
   coordinator = null;
   if (activeCoordinator) await activeCoordinator.close();
@@ -428,6 +492,17 @@ async function readSnapshot(): Promise<DashboardSnapshot> {
   } catch (error) {
     connectionError = errorText(error);
   }
+  const localWorkerId = worker?.workerId ?? null;
+  const localWorkerConnected = localWorkerId !== null
+    && workers.some((candidate) => candidate.id === localWorkerId && candidate.connected);
+  const contributionState: DashboardSnapshot["contribution"]["state"] =
+    !settings.contributionEnabled
+      ? "paused"
+      : runtimeError
+        ? "error"
+        : localWorkerConnected
+          ? "connected"
+          : "connecting";
   return {
     capturedAt: new Date().toISOString(),
     coordinatorUrl,
@@ -441,6 +516,7 @@ async function readSnapshot(): Promise<DashboardSnapshot> {
     requestedModels,
     jobs,
     localHardware,
+    contribution: { state: contributionState, workerId: localWorkerId },
     settings,
     update: { ...updateStatus },
   };
@@ -534,6 +610,10 @@ function registerIpc(): void {
   ipcMain.handle("workers:clear-offline", async () => {
     await fetchJson("public/v1/workers/clear-offline", { method: "POST" });
     return readSnapshot();
+  });
+  ipcMain.handle("models:search-hub", async (_event, query: string) => {
+    const result = await fetchJson<{ data: HubCatalogModel[] }>(`public/v1/huggingface-models?q=${encodeURIComponent(query)}`);
+    return result.data;
   });
   ipcMain.handle("models:request", async (_event, input: import("./contracts.js").RequestModelInput) => {
     await fetchJson("public/v1/requested-models", {
@@ -696,6 +776,174 @@ function createTrayUnsafe(): void {
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+async function createDesktopDistributedExecutor() {
+  const runtimeRoot = await ensureDistributionRuntime();
+  const pythonExecutable = distributionPythonExecutable(runtimeRoot);
+  if (!existsSync(pythonExecutable)) {
+    throw new Error("The packaged shard runtime is missing. Reinstall mycellios to contribute this device.");
+  }
+  const pythonPath = resourcePath("python");
+  const hfHome = join(app.getPath("userData"), "model-shards");
+  mkdirSync(hfHome, { recursive: true });
+  const nodeId = persistentDistributedNodeId();
+  return {
+    nodeId,
+    stageHost: preferredLanAddress(),
+    stagePort: 9_850,
+    launchAgent: new LocalProcessAgent({
+      id: `desktop-shard-executor:${nodeId}`,
+      cwd: app.getAppPath(),
+      env: {
+        PYTHONPATH: pythonPath,
+        HF_HOME: hfHome,
+        TOKENIZERS_PARALLELISM: "false",
+        PATH: [dirname(pythonExecutable), process.env.PATH].filter(Boolean).join(delimiter),
+      },
+      maxOutputBytesPerStream: 256 * 1024,
+    }),
+  };
+}
+
+function distributionPythonExecutable(root = app.isPackaged
+  ? join(app.getPath("userData"), "distribution-runtime-v1")
+  : join(app.getAppPath(), "runtime", "distribution-venv")): string {
+  return process.platform === "win32"
+    ? join(root, "Scripts", "python.exe")
+    : join(root, "bin", "python3");
+}
+
+function ensureDistributionRuntime(): Promise<string> {
+  distributionRuntimePromise ??= ensureDistributionRuntimeOnce();
+  return distributionRuntimePromise;
+}
+
+async function ensureDistributionRuntimeOnce(): Promise<string> {
+  if (!app.isPackaged) return join(app.getAppPath(), "runtime", "distribution-venv");
+  const root = join(app.getPath("userData"), "distribution-runtime-v1");
+  if (existsSync(distributionPythonExecutable(root))) return root;
+  const archive = resourcePath("distribution-runtime.tar.gz");
+  if (!existsSync(archive)) throw new Error("The packaged shard runtime archive is missing. Reinstall mycellios.");
+  mkdirSync(root, { recursive: true });
+  await runProcess("tar", ["-xzf", archive, "-C", root]);
+  if (!existsSync(distributionPythonExecutable(root))) {
+    throw new Error("The shard runtime could not be extracted. Reinstall mycellios.");
+  }
+  return root;
+}
+
+function runProcess(executable: string, args: readonly string[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(executable, [...args], { shell: false, windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
+    child.once("error", reject);
+    child.once("close", (code) => code === 0 ? resolve() : reject(new Error(stderr.trim() || `${executable} exited with ${code}`)));
+  });
+}
+
+function persistentDistributedNodeId(): string {
+  const path = join(app.getPath("userData"), "distributed-node-id.txt");
+  try {
+    const existing = readFileSync(path, "utf8").trim();
+    if (/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(existing)) return existing;
+  } catch {
+    // First launch creates a stable executor identity below.
+  }
+  const nodeId = `desktop-${randomUUID()}`;
+  writeFileSync(path, `${nodeId}\n`, "utf8");
+  return nodeId;
+}
+
+function preferredLanAddress(): string {
+  for (const addresses of Object.values(networkInterfaces())) {
+    for (const address of addresses ?? []) {
+      if (address.family === "IPv4" && !address.internal && !address.address.startsWith("169.254.")) {
+        return address.address;
+      }
+    }
+  }
+  return "127.0.0.1";
+}
+
+function buildDesktopActivationSnapshot(
+  workers: readonly StoredWorker[],
+  connectedWorkerIds: ReadonlySet<string>,
+): import("../coordinator/model-activation-manager.js").DynamicActivationSnapshot {
+  const executors = workers
+    .filter((worker) => connectedWorkerIds.has(worker.id) && worker.capabilities.distributedExecutor)
+    .map((worker) => ({ worker, executor: worker.capabilities.distributedExecutor! }))
+    .filter((entry, index, all) => all.findIndex((candidate) => candidate.executor.nodeId === entry.executor.nodeId) === index);
+  const capacityNodes = executors.map(({ worker, executor }) => ({
+    id: executor.nodeId,
+    availableVramMiB: worker.capabilities.gpus.reduce((sum, gpu) => sum + gpu.freeOfferedVramMb, 0),
+  }));
+  if (executors.length < 2) return { capacityNodes, config: null };
+  const nodes = executors.map(({ worker, executor }) => {
+    const memoryMiB = worker.capabilities.gpus.reduce((sum, gpu) => sum + gpu.offeredVramMb, 0);
+    const measuredPower = worker.capabilities.gpus.reduce((sum, gpu) => sum + (gpu.powerW ?? 0), 0);
+    return {
+      id: executor.nodeId,
+      region: worker.capabilities.region,
+      endpoint: { host: executor.stageHost, port: executor.stagePort },
+      memoryMiB,
+      reserveMiB: Math.min(256, Math.max(0, memoryMiB - 1)),
+      decodeScale: 1,
+      prefillScale: 1,
+      codecScale: 1,
+      powerWatts: measuredPower > 0 ? measuredPower : 1,
+      availability: Math.max(0.01, Math.min(1, worker.reliability)),
+      agent: { kind: "managed" as const },
+    };
+  });
+  const links = executors.flatMap((from) => executors
+    .filter((to) => to.executor.nodeId !== from.executor.nodeId)
+    .map((to) => ({
+      from: from.executor.nodeId,
+      to: to.executor.nodeId,
+      oneWayLatencyMs: Math.max(0.1, (from.worker.capabilities.network.coordinatorRttMs + to.worker.capabilities.network.coordinatorRttMs) / 2),
+      jitterP95Ms: 0,
+      bandwidthMbps: Math.max(1, Math.min(from.worker.capabilities.network.uplinkMbps, to.worker.capabilities.network.downlinkMbps)),
+      lossRate: 0,
+      availability: Math.max(0.01, Math.min(from.worker.reliability, to.worker.reliability)),
+    })));
+  const rootHost = nodes[0]!.endpoint.host;
+  const config = parseAutoDistributionConfig({
+    schema: "gdlp-auto-distribute/1",
+    model: { source: "HuggingFaceTB/SmolLM2-135M-Instruct", revision: null, publicName: "pending-model" },
+    nodes,
+    links,
+    distribution: { minimumStages: 2, maximumStages: Math.min(8, nodes.length), allowLossyActivation: false },
+    workload: { promptTokens: 128, outputTokens: 128, contextTokens: 4_096, concurrentSequences: 1, minRouteAvailability: 0.9, batchWindowMs: 2, p95: true },
+    runtime: {
+      pythonExecutable: distributionPythonExecutable(),
+      stagePythonExecutable: "python",
+      pythonPath: resourcePath("python"),
+      hfHome: join(app.getPath("userData"), "coordinator-model-cache"),
+      apiEndpoint: { host: "0.0.0.0", port: 9_860 },
+      apiAdvertiseHost: rootHost,
+      returnEndpoint: { host: rootHost, port: 9_861 },
+      returnBindHost: "0.0.0.0",
+      threadsPerStage: 1,
+      connectTimeoutSeconds: 300,
+      readinessTimeoutMs: 600_000,
+      maxOutputTokens: 2_048,
+    },
+    canary: { prompt: "Reply with only OK. /no_think", maxTokens: 16, timeoutMs: 300_000 },
+    coordinator: { url: LOCAL_DASHBOARD_COORDINATOR_URL, region: settings.region, maxConcurrency: 1 },
+  });
+  return { capacityNodes, config };
+}
+
+function resolveDesktopTunnelAgent(
+  workers: readonly StoredWorker[],
+  hub: WorkerHub,
+  nodeId: string,
+  launch: PythonPipelineLaunchDescription,
+): LaunchAgent | undefined {
+  const worker = workers.find((candidate) => candidate.capabilities.distributedExecutor?.nodeId === nodeId);
+  return worker ? new WorkerTunnelLaunchAgent(hub, worker.id, nodeId, launch) : undefined;
 }
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock();

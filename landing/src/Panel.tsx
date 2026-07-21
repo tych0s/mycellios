@@ -27,6 +27,7 @@ import {
   Play,
   Radio,
   RefreshCw,
+  Search,
   Send,
   Server,
   Settings,
@@ -48,6 +49,7 @@ import type {
   DesktopBridge,
   DesktopSettings,
   DesktopUpdateStatus,
+  HubCatalogModel,
   RequestModelInput,
   RequestedModelCapacity,
 } from "../../src/desktop/contracts";
@@ -78,6 +80,7 @@ interface PublicGpu {
   freeOfferedVramMb: number;
   utilizationPct?: number;
   temperatureC?: number;
+  powerW?: number;
 }
 
 interface PublicDeployment {
@@ -158,7 +161,7 @@ const sharedNavItems: Array<{ id: PanelView; label: string; icon: typeof Network
   { id: "tests", label: "Tests", icon: Gauge },
   { id: "models", label: "Models", icon: Boxes },
   { id: "inference", label: "Chat", icon: MessageSquareText },
-  { id: "contribute", label: "Contribute", icon: Zap },
+  { id: "contribute", label: "This device", icon: Zap },
   { id: "downloads", label: "Downloads", icon: Download },
 ];
 
@@ -180,7 +183,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     const desktopItems = sharedNavItems.filter((item) => item.id !== "contribute");
     return [
         ...desktopItems.slice(0, 1),
-        { id: "machine" as const, label: "This machine", icon: Cpu },
+        { id: "machine" as const, label: "This device", icon: Cpu },
         ...desktopItems.slice(1),
         { id: "settings" as const, label: "Settings", icon: Settings },
       ];
@@ -284,6 +287,17 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     await refresh();
   }
 
+  const searchHubModels = useCallback(async (query: string): Promise<HubCatalogModel[]> => {
+    if (desktopBridge) return desktopBridge.searchHubModels(query);
+    const response = await fetch(`/public/v1/huggingface-models?q=${encodeURIComponent(query)}`, { cache: "no-store" });
+    if (!response.ok) {
+      const body = await response.json().catch(() => null) as { error?: { message?: string } } | null;
+      throw new Error(body?.error?.message ?? `HTTP ${response.status}`);
+    }
+    const body = await response.json() as { data: HubCatalogModel[] };
+    return body.data;
+  }, [desktopBridge]);
+
   async function removeRequestedModel(modelId: string, adminToken: string) {
     if (desktopBridge) {
       applyDesktopSnapshot(await desktopBridge.removeRequestedModel(modelId));
@@ -359,7 +373,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
             {desktopSnapshot && <span>v{desktopSnapshot.appVersion}</span>}
             <span>API {snapshot.version}</span>
             <button onClick={() => void refresh()} aria-label="Refresh"><RefreshCw className={loading ? "spin" : ""} size={17} /></button>
-            {!desktop && <a href={mobileEntry ? "/mobile/" : "/network?view=contribute"}>Contribute <Zap size={15} /></a>}
+            {!desktop && <a href={mobileEntry ? "/mobile/" : "/network?view=contribute"}>This device <Zap size={15} /></a>}
             {desktopBridge && <div className="panel-window-controls"><button onClick={() => void desktopBridge.minimizeWindow()} aria-label="Minimize"><Minus size={16} /></button><button onClick={() => void desktopBridge.toggleMaximizeWindow()} aria-label="Maximize"><Maximize2 size={15} /></button><button className="close" onClick={() => void desktopBridge.closeWindow()} aria-label="Close"><X size={16} /></button></div>}
           </div>
         </header>
@@ -370,7 +384,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
             <>
               {view === "overview" && <Overview snapshot={snapshot} onNavigate={navigate} publicLink={publicLink} external={desktop} />}
               {view === "nodes" && <Nodes snapshot={snapshot} onRemove={removeWorker} onClearOffline={clearOfflineWorkers} />}
-              {view === "models" && <Models snapshot={snapshot} onRequest={requestModel} onRemove={removeRequestedModel} adminToken={modelAdminToken} requiresAdminToken={!desktop && !localBrowser} />}
+              {view === "models" && <Models snapshot={snapshot} onSearch={searchHubModels} onRequest={requestModel} onRemove={removeRequestedModel} adminToken={modelAdminToken} requiresAdminToken={!desktop && !localBrowser} />}
               {view === "jobs" && <Jobs snapshot={snapshot} />}
               {view === "tests" && <Tests bridge={desktopBridge} />}
               {view === "inference" && <Inference snapshot={snapshot} onSend={sendPrompt} onNavigate={navigate} />}
@@ -395,7 +409,7 @@ function Overview({ snapshot, onNavigate, publicLink, external }: { snapshot: Pu
       <PageTitle eyebrow="NETWORK CONTROL" title="Overview" copy="A live view of the capacity, models and tasks connected to your mycellios network." actions={<><button onClick={() => onNavigate("nodes")}>Manage nodes</button><a href={publicLink("/mobile/")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}>Add this device <ArrowRight size={16} /></a></>} />
       <div className="panel-stat-grid">
         <Stat icon={Radio} label="Active nodes" value={String(snapshot.summary.connected)} detail={`${snapshot.summary.registered} registered`} />
-        <Stat icon={HardDrive} label="Shared VRAM" value={formatMemory(snapshot.summary.offeredVramMb)} detail="Verified offered capacity" tone="orange" />
+        <Stat icon={HardDrive} label="Shared VRAM" value={formatMemory(snapshot.summary.offeredVramMb)} detail="Verified offered capacity" tone="purple" />
         <Stat icon={Boxes} label="Available models" value={String(snapshot.models.length)} detail="Announced by live nodes" />
         <Stat icon={CheckCircle2} label="Tasks completed" value={String(snapshot.summary.completedJobs)} detail="Current coordinator history" />
       </div>
@@ -437,6 +451,20 @@ function Overview({ snapshot, onNavigate, publicLink, external }: { snapshot: Pu
 
 function Nodes({ snapshot, onRemove, onClearOffline }: { snapshot: PublicSnapshot; onRemove: (workerId: string) => Promise<void>; onClearOffline: () => Promise<void> }) {
   const [busy, setBusy] = useState<string | null>(null);
+  const [selectedWorkerId, setSelectedWorkerId] = useState("");
+  const connectedWorkers = snapshot.workers.filter((worker) => worker.connected);
+  const activeWorkers = snapshot.workers.filter((worker) => worker.connected && worker.status === "online");
+  const activeGpus = activeWorkers.flatMap((worker) => worker.gpus);
+  const activeDeployments = activeWorkers.flatMap((worker) => worker.deployments);
+  const telemetryGpus = activeGpus.filter((gpu) => gpu.utilizationPct !== undefined);
+  const poweredGpus = activeGpus.filter((gpu) => (gpu.powerW ?? 0) > 0);
+  const activeOfferedVramMb = activeGpus.reduce((total, gpu) => total + gpu.offeredVramMb, 0);
+  const freeVramMb = activeGpus.reduce((total, gpu) => total + gpu.freeOfferedVramMb, 0);
+  const averageUtilization = telemetryGpus.length > 0 ? telemetryGpus.reduce((total, gpu) => total + (gpu.utilizationPct ?? 0), 0) / telemetryGpus.length : null;
+  const observedPowerW = poweredGpus.reduce((total, gpu) => total + (gpu.powerW ?? 0), 0);
+  const activeThroughput = activeDeployments.reduce((total, deployment) => total + deployment.tokensPerSecond, 0);
+  const sortedWorkers = [...snapshot.workers].sort((left, right) => nodeStateOrder(left) - nodeStateOrder(right));
+  const selectedWorker = snapshot.workers.find((worker) => worker.id === selectedWorkerId) ?? activeWorkers[0] ?? snapshot.workers[0] ?? null;
   async function remove(workerId: string) {
     setBusy(workerId);
     try {
@@ -454,29 +482,88 @@ function Nodes({ snapshot, onRemove, onClearOffline }: { snapshot: PublicSnapsho
     }
   }
   return (
-    <section>
-      <PageTitle eyebrow="NODE REGISTRY" title="Connected machines" copy="Inspect hardware, contribution status and recent activity for every registered device." actions={<button disabled={busy !== null} onClick={() => void clearOffline()}><Trash2 size={15} /> Clear offline</button>} />
+    <section className="nodes-page">
+      <PageTitle eyebrow="RED DISTRIBUIDA" title="Red de nodos" copy="Estado, capacidad y conexiones reales de todas las máquinas registradas en mycellios." actions={<button disabled={busy !== null} onClick={() => void clearOffline()}><Trash2 size={15} /> Limpiar inactivos</button>} />
+
+      <div className="node-overview-grid">
+        <NodeOverviewStat icon={Server} label="Nodos activos" value={`${activeWorkers.length} / ${snapshot.workers.length}`} detail={`${connectedWorkers.length} conectados ahora`} progress={snapshot.workers.length > 0 ? activeWorkers.length / snapshot.workers.length : 0} tone="green" />
+        <NodeOverviewStat icon={MemoryStick} label="Capacidad activa" value={formatMemory(activeOfferedVramMb)} detail={`${formatMemory(freeVramMb)} libres`} progress={activeOfferedVramMb > 0 ? freeVramMb / activeOfferedVramMb : 0} tone="blue" />
+        <NodeOverviewStat icon={Gauge} label="Carga GPU media" value={averageUtilization === null ? "Sin datos" : `${averageUtilization.toFixed(0)}%`} detail={`${telemetryGpus.length} GPU${telemetryGpus.length === 1 ? "" : "s"} con telemetría`} progress={averageUtilization === null ? 0 : averageUtilization / 100} tone="purple" />
+        <NodeOverviewStat icon={Zap} label="Rendimiento anunciado" value={activeThroughput > 0 ? `${formatCompactNumber(activeThroughput)} tok/s` : "—"} detail={`${activeDeployments.length} despliegue${activeDeployments.length === 1 ? "" : "s"} activo${activeDeployments.length === 1 ? "" : "s"}`} tone="violet" />
+        <NodeOverviewStat icon={Activity} label="Potencia observada" value={poweredGpus.length > 0 ? formatPower(observedPowerW) : "Sin datos"} detail={poweredGpus.length > 0 ? `${poweredGpus.length} lectura${poweredGpus.length === 1 ? "" : "s"} física${poweredGpus.length === 1 ? "" : "s"}` : "No se estima ni se inventa"} tone="cyan" />
+      </div>
+
+      <section className="node-topology-card">
+        <header className="node-topology-head">
+          <div><span>TOPOLOGÍA EN VIVO</span><h2>Conexiones con el coordinador</h2><p>Cada línea representa una sesión real con mycellios.</p></div>
+          <div className="node-topology-legend"><span><i className="active" />Activo</span><span><i className="warning" />Atención</span><span><i className="offline" />Inactivo</span></div>
+        </header>
+        <div className={`node-topology-map${snapshot.workers.length === 0 ? " empty" : ""}`}>
+          <div className="node-topology-grid" />
+          <svg className="node-topology-links" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+            {sortedWorkers.map((worker, index) => {
+              const position = topologyPosition(index, sortedWorkers.length);
+              return <line key={worker.id} className={`${nodeVisualState(worker)}${selectedWorker?.id === worker.id ? " selected" : ""}`} x1="50" y1="52" x2={position.x} y2={position.y} vectorEffect="non-scaling-stroke" />;
+            })}
+          </svg>
+          <div className="node-network-hub"><div><Network /></div><strong>mycellios</strong><span>{activeWorkers.length} activo{activeWorkers.length === 1 ? "" : "s"}</span><i /></div>
+          {sortedWorkers.map((worker, index) => {
+            const position = topologyPosition(index, sortedWorkers.length);
+            const label = workerLabel(worker);
+            return <button
+              type="button"
+              key={worker.id}
+              aria-label={`Ver nodo ${label}`}
+              aria-pressed={selectedWorker?.id === worker.id}
+              className={`topology-node ${nodeVisualState(worker)}${selectedWorker?.id === worker.id ? " selected" : ""}`}
+              style={{ "--node-x": `${position.x}%`, "--node-y": `${position.y}%` } as CSSProperties}
+              onClick={() => setSelectedWorkerId(worker.id)}
+            ><div>{worker.kind === "browser" ? <Smartphone /> : <Laptop />}<i /></div><span><strong>{label}</strong><small>{worker.region} · {nodeStatusLabel(worker)}</small></span></button>;
+          })}
+          {snapshot.workers.length === 0 && <div className="node-topology-empty"><Server /><strong>Aún no hay nodos</strong><span>Conecta una máquina para verla aparecer en la red.</span></div>}
+        </div>
+        {selectedWorker && <NodeTopologyInspector worker={selectedWorker} />}
+      </section>
+
+      <div className="node-list-heading"><div><span>INVENTARIO COMPLETO</span><h2>Detalle de nodos</h2></div><strong>{snapshot.workers.length} registrado{snapshot.workers.length === 1 ? "" : "s"}</strong></div>
       <div className="node-card-grid">
         {snapshot.workers.map((worker) => <article className="node-card" key={worker.id}>
-          <div className="node-card-head"><div className={`node-device ${worker.kind}`}>{worker.kind === "browser" ? <Smartphone /> : <Laptop />}</div><div><span>{worker.kind === "browser" ? "BROWSER WORKER" : "DESKTOP AGENT"}</span><h2>{workerLabel(worker)}</h2><small>{shortId(worker.id)}</small></div><span className={`node-status ${worker.status}`}><i />{worker.connected ? "connected" : worker.status}</span></div>
-          <div className="node-card-metrics"><Metric label="Hardware" value={worker.gpus[0]?.model ?? "Unknown"} /><Metric label="Offered" value={formatMemory(worker.offeredVramMb)} /><Metric label="Region" value={worker.region} /><Metric label="Completed" value={String(worker.jobsCompleted)} /></div>
-          <div className="node-card-foot"><span>Last seen {relativeTime(worker.lastSeenAt)}</span><button disabled={busy === worker.id} onClick={() => void remove(worker.id)}>{busy === worker.id ? <LoaderCircle className="spin" /> : <Trash2 />} Remove</button></div>
+          <div className="node-card-head"><div className={`node-device ${worker.kind}`}>{worker.kind === "browser" ? <Smartphone /> : <Laptop />}</div><div><span>{worker.kind === "browser" ? "NODO DE NAVEGADOR" : "AGENTE DE ESCRITORIO"}</span><h2>{workerLabel(worker)}</h2><small>{shortId(worker.id)}</small></div><span className={`node-status ${worker.status}`}><i />{nodeStatusLabel(worker)}</span></div>
+          <div className="node-card-metrics"><Metric label="Hardware" value={worker.gpus[0]?.model ?? "Desconocido"} /><Metric label="Ofrecido" value={formatMemory(worker.offeredVramMb)} /><Metric label="Región" value={worker.region} /><Metric label="Completadas" value={String(worker.jobsCompleted)} /></div>
+          <div className="node-card-foot"><span>Visto {relativeTimeEs(worker.lastSeenAt)}</span><button disabled={busy === worker.id} onClick={() => void remove(worker.id)}>{busy === worker.id ? <LoaderCircle className="spin" /> : <Trash2 />} Eliminar</button></div>
         </article>)}
-        {snapshot.workers.length === 0 && <div className="wide-empty"><Empty icon={Server} title="No registered nodes" copy="Open the mobile worker or install mycellios to add the first machine." /><a href="/mobile/">Connect a device <ArrowRight size={15} /></a></div>}
+        {snapshot.workers.length === 0 && <div className="wide-empty"><Empty icon={Server} title="No hay nodos registrados" copy="Abre el worker móvil o instala mycellios para añadir la primera máquina." /><a href="/mobile/">Conectar un dispositivo <ArrowRight size={15} /></a></div>}
       </div>
     </section>
   );
 }
 
-function Models({ snapshot, onRequest, onRemove, adminToken: initialAdminToken, requiresAdminToken }: {
+function NodeOverviewStat({ icon: Icon, label, value, detail, progress, tone }: { icon: typeof Server; label: string; value: string; detail: string; progress?: number; tone: "green" | "blue" | "purple" | "violet" | "cyan" }) {
+  return <article className={`node-overview-stat ${tone}`}><div className="node-overview-icon"><Icon /></div><span>{label}</span><strong>{value}</strong><small>{detail}</small>{progress !== undefined && <div className="node-overview-progress"><i style={{ width: `${Math.max(0, Math.min(1, progress)) * 100}%` }} /></div>}</article>;
+}
+
+function NodeTopologyInspector({ worker }: { worker: PublicWorker }) {
+  const gpus = worker.gpus;
+  const free = gpus.reduce((total, gpu) => total + gpu.freeOfferedVramMb, 0);
+  const utilizations = gpus.filter((gpu) => gpu.utilizationPct !== undefined);
+  const utilization = utilizations.length > 0 ? utilizations.reduce((total, gpu) => total + (gpu.utilizationPct ?? 0), 0) / utilizations.length : null;
+  const throughput = worker.deployments.reduce((total, deployment) => total + deployment.tokensPerSecond, 0);
+  return <div className="node-topology-inspector">
+    <div className={`node-inspector-identity ${nodeVisualState(worker)}`}><div>{worker.kind === "browser" ? <Smartphone /> : <Laptop />}</div><span><small>NODO SELECCIONADO</small><strong>{workerLabel(worker)}</strong><em>{worker.region} · {shortId(worker.id)}</em></span></div>
+    <div className="node-inspector-metrics"><Metric label="Estado" value={nodeStatusLabel(worker)} /><Metric label="GPU libre" value={formatMemory(free)} /><Metric label="Carga" value={utilization === null ? "Sin datos" : `${utilization.toFixed(0)}%`} /><Metric label="Rend. anunciado" value={throughput > 0 ? `${formatCompactNumber(throughput)} tok/s` : "—"} /><Metric label="Fiabilidad" value={`${Math.round(worker.reliability * 100)}%`} /><Metric label="Modelos" value={String(worker.deployments.length)} /></div>
+  </div>;
+}
+
+function Models({ snapshot, onSearch, onRequest, onRemove, adminToken: initialAdminToken, requiresAdminToken }: {
   snapshot: PublicSnapshot;
+  onSearch: (query: string) => Promise<HubCatalogModel[]>;
   onRequest: (input: RequestModelInput, adminToken: string) => Promise<void>;
   onRemove: (modelId: string, adminToken: string) => Promise<void>;
   adminToken: string;
   requiresAdminToken: boolean;
 }) {
-  const [source, setSource] = useState("Qwen/Qwen3-0.6B");
-  const [modelId, setModelId] = useState("qwen3-0.6b");
+  const [source, setSource] = useState("");
+  const [modelId, setModelId] = useState("");
   const [revision, setRevision] = useState("");
   const [contextTokens, setContextTokens] = useState(4096);
   const [minimumNodes, setMinimumNodes] = useState(2);
@@ -484,6 +571,50 @@ function Models({ snapshot, onRequest, onRemove, adminToken: initialAdminToken, 
   const [adminToken, setAdminToken] = useState(initialAdminToken);
   const [busy, setBusy] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  const [catalogQuery, setCatalogQuery] = useState("");
+  const [catalogModels, setCatalogModels] = useState<HubCatalogModel[]>([]);
+  const [catalogBusy, setCatalogBusy] = useState(true);
+  const [catalogError, setCatalogError] = useState<string | null>(null);
+  const [catalogOpen, setCatalogOpen] = useState(true);
+  const searchSequence = useRef(0);
+
+  useEffect(() => {
+    const query = catalogQuery.trim();
+    if (query.length === 1) {
+      setCatalogModels([]);
+      setCatalogBusy(false);
+      setCatalogError(null);
+      return;
+    }
+    const sequence = ++searchSequence.current;
+    setCatalogBusy(true);
+    setCatalogError(null);
+    const timer = window.setTimeout(() => {
+      void onSearch(query).then(
+        (models) => {
+          if (searchSequence.current !== sequence) return;
+          setCatalogModels(models);
+          setCatalogBusy(false);
+        },
+        (error: unknown) => {
+          if (searchSequence.current !== sequence) return;
+          setCatalogModels([]);
+          setCatalogError(errorText(error));
+          setCatalogBusy(false);
+        },
+      );
+    }, query ? 320 : 0);
+    return () => window.clearTimeout(timer);
+  }, [catalogQuery, onSearch]);
+
+  function selectCatalogModel(model: HubCatalogModel) {
+    if (!model.compatible) return;
+    setSource(model.id);
+    setModelId(networkNameForHubModel(model.id));
+    setRevision("");
+    setFormError(null);
+    setCatalogOpen(false);
+  }
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -506,20 +637,40 @@ function Models({ snapshot, onRequest, onRemove, adminToken: initialAdminToken, 
   }
 
   return <section className="models-page">
-    <PageTitle eyebrow="MODEL FABRIC" title="Models" copy="Add a normal compatible model. mycellios calculates what the network is missing and watches capacity automatically." />
+    <PageTitle eyebrow="MODEL FABRIC" title="Models" copy="Choose a compatible Hugging Face model. mycellios prepares its name, calculates capacity and distributes it automatically." />
     <form className="model-request-form" onSubmit={(event) => void submit(event)}>
-      <div className="model-form-heading"><div><span>ADD MODEL</span><h2>Prepare automatic distribution</h2><p>No pre-split files or terminal commands required.</p></div><Boxes size={24} /></div>
-      <div className="model-form-grid">
-        <label>HUGGING FACE MODEL<input value={source} onChange={(event) => setSource(event.target.value)} placeholder="Qwen/Qwen3-0.6B" required /></label>
-        <label>NETWORK NAME<input value={modelId} onChange={(event) => setModelId(event.target.value)} placeholder="qwen3-0.6b" required pattern="[A-Za-z0-9][A-Za-z0-9._-]*" /></label>
-        <label>REVISION <small>optional</small><input value={revision} onChange={(event) => setRevision(event.target.value)} placeholder="main or commit" /></label>
-        <label>CONTEXT TOKENS<input type="number" min={128} max={1048576} value={contextTokens} onChange={(event) => setContextTokens(Number(event.target.value))} /></label>
-        <label>MINIMUM NODES<AppSelect ariaLabel="Minimum nodes" value={String(minimumNodes)} onChange={(value) => setMinimumNodes(Number(value))} options={[2, 3, 4, 5, 6, 7, 8].map((count) => ({ value: String(count), label: String(count) }))} /></label>
-        {requiresAdminToken && <label>NETWORK ADMIN TOKEN<input type="password" autoComplete="current-password" value={adminToken} onChange={(event) => setAdminToken(event.target.value)} placeholder="Required to deploy models" required /></label>}
+      <div className="model-form-heading"><div><span>HUGGING FACE CATALOG</span><h2>Choose a model for the network</h2><p>Only certified architectures can be selected. No terminal commands or pre-split files.</p></div><Boxes size={24} /></div>
+
+      {(!source || catalogOpen) && <>
+        <div className="hub-model-search"><Search size={17} /><input value={catalogQuery} onChange={(event) => setCatalogQuery(event.target.value)} placeholder="Search Qwen, Llama, GLM…" aria-label="Search Hugging Face models" />{catalogBusy && <LoaderCircle className="spin" />}</div>
+        <div className="hub-catalog-heading"><span>{catalogQuery.trim() ? "SEARCH RESULTS" : "POPULAR COMPATIBLE MODELS"}</span><a href="https://huggingface.co/models?pipeline_tag=text-generation" target="_blank" rel="noreferrer">Explore Hugging Face <ExternalLink size={12} /></a></div>
+        {catalogError && <div className="hub-catalog-state error"><CircleAlert size={15} />Catalog unavailable. You can still enter a model manually below.</div>}
+        {!catalogError && !catalogBusy && catalogModels.length === 0 && <div className="hub-catalog-state">{catalogQuery.trim().length === 1 ? "Type at least two characters to search." : "No matching models found."}</div>}
+        {catalogModels.length > 0 && <div className="hub-model-grid">{catalogModels.map((model) => <button type="button" key={model.id} className={`hub-model-card ${source === model.id ? "selected" : ""} ${model.compatible ? "compatible" : "unsupported"}`} aria-disabled={!model.compatible} onClick={() => selectCatalogModel(model)} title={model.compatibilityReason ?? `Select ${model.id}`}>
+          <span className="hub-model-card-head"><i><Boxes /></i><strong>{model.id}</strong>{source === model.id && <CheckCircle2 />}</span>
+          <small>{model.architecture ?? model.modelType ?? "Architecture unavailable"}</small>
+          <span className="hub-model-card-meta"><b>{model.compatible ? "CERTIFIED" : model.gated ? "GATED" : "NOT SUPPORTED"}</b><em>{formatHubCount(model.downloads)} downloads</em></span>
+        </button>)}</div>}
+      </>}
+
+      {source && <div className="hub-selected-model"><CheckCircle2 /><span><small>SELECTED MODEL</small><strong>{source}</strong><em>It will be published as {modelId}</em></span><button type="button" onClick={() => setCatalogOpen(true)}>Change model</button></div>}
+
+      <details className="model-advanced">
+        <summary><SlidersHorizontal size={15} /> Advanced settings or manual model ID <ChevronDown size={15} /></summary>
+        <div className="model-form-grid">
+          <label>HUGGING FACE MODEL<input value={source} onChange={(event) => { setSource(event.target.value); setModelId(networkNameForHubModel(event.target.value)); }} placeholder="Qwen/Qwen3-0.6B" required /></label>
+          <label>NETWORK NAME <small>automatic</small><input value={modelId} onChange={(event) => setModelId(event.target.value)} placeholder="qwen3-0.6b" required pattern="[A-Za-z0-9][A-Za-z0-9._-]*" /></label>
+          <label>REVISION <small>optional</small><input value={revision} onChange={(event) => setRevision(event.target.value)} placeholder="main or commit" /></label>
+          <label>CONTEXT TOKENS<input type="number" min={128} max={1048576} value={contextTokens} onChange={(event) => setContextTokens(Number(event.target.value))} /></label>
+          <label>MINIMUM NODES<AppSelect ariaLabel="Minimum nodes" value={String(minimumNodes)} onChange={(value) => setMinimumNodes(Number(value))} options={[2, 3, 4, 5, 6, 7, 8].map((count) => ({ value: String(count), label: String(count) }))} /></label>
+          {requiresAdminToken && <label>NETWORK ADMIN TOKEN<input type="password" autoComplete="current-password" value={adminToken} onChange={(event) => setAdminToken(event.target.value)} placeholder="Required to deploy models" required /></label>}
+        </div>
+      </details>
+      <div className="model-submit-row">
         <label className="model-auto-toggle"><input type="checkbox" checked={autoActivate} onChange={(event) => setAutoActivate(event.target.checked)} /><span><strong>Activate automatically</strong><small>Start as soon as compatible capacity reaches the requirement.</small></span></label>
+        <button className="model-submit" disabled={busy || !source.trim() || !modelId.trim()}>{busy ? <LoaderCircle className="spin" /> : <Play size={16} />}{busy ? "Inspecting model…" : "Calculate and prepare"}</button>
       </div>
       {formError && <div className="model-form-error"><CircleAlert size={16} />{formError}</div>}
-      <button className="model-submit" disabled={busy}>{busy ? <LoaderCircle className="spin" /> : <Play size={16} />}{busy ? "Inspecting model…" : "Add and calculate"}</button>
     </form>
 
     <div className="model-request-list">
@@ -528,7 +679,7 @@ function Models({ snapshot, onRequest, onRemove, adminToken: initialAdminToken, 
 
     <div className="panel-table model-active-table"><div className="panel-table-head"><span>Active model</span><span>Replicas</span><span>Pipelines</span><span>Status</span></div>
       {snapshot.models.map((model) => <div className="panel-table-row" key={model.id}><strong><Boxes size={17} />{model.id}</strong><span>{model.replicas}</span><span>{model.pipelines}</span><b><i />Available</b></div>)}
-      {snapshot.models.length === 0 && <Empty icon={Boxes} title="No active models" copy="Add a model above. It will remain queued with an exact capacity shortfall until the network can run it." />}
+      {snapshot.models.length === 0 && <Empty icon={Boxes} title="No active models" copy="Choose a model above. It will remain queued with an exact capacity shortfall until the network can run it." />}
     </div>
   </section>;
 }
@@ -628,7 +779,7 @@ function Tests({ bridge }: { bridge: DesktopBridge | undefined }) {
     {error && <div className="benchmark-error"><CircleAlert size={17} /><span><strong>Benchmark unavailable</strong>{error}</span></div>}
     <div className="panel-stat-grid benchmark-stats">
       <Stat icon={Activity} label="Recorded runs" value={String(runs.length)} detail="No simulated records" />
-      <Stat icon={Gauge} label="Best throughput" value={formatBenchmark(bestThroughput, " tok/s")} detail="Measured per request" tone="orange" />
+      <Stat icon={Gauge} label="Best throughput" value={formatBenchmark(bestThroughput, " tok/s")} detail="Measured per request" tone="purple" />
       <Stat icon={Server} label="Connected devices" value={String(latestDevices)} detail="In the selected run" />
       <Stat icon={Boxes} label="Selected version" value={selected ? `v${selected.version}` : "—"} detail={selected ? formatBenchmarkDate(selected.finishedAt) : "No measurements yet"} />
     </div>
@@ -778,7 +929,7 @@ function Inference({ snapshot, onSend, onNavigate }: {
     <PageTitle eyebrow="INFERENCIA REAL" title="Probar un modelo" copy="Habla con un modelo conectado y comprueba la ruta, la latencia y los tokens de cada respuesta." />
     {realModels.length === 0 ? <div className="inference-unavailable">
       <div className="inference-unavailable-icon"><MessageSquareText /></div>
-      <div className="inference-unavailable-copy"><span>NO HAY MODELOS DE IA DISPONIBLES</span><h2>Ahora mismo no se puede hacer una inferencia real</h2><p>La red no tiene ningún modelo real conectado. La prueba <code>mycellios-connectivity-check</code> solo verifica la comunicación y nunca genera respuestas de IA.</p>
+      <div className="inference-unavailable-copy"><span>NO HAY MODELOS DE IA DISPONIBLES</span><h2>Ahora mismo no se puede hacer una inferencia real</h2><p>La red no tiene ningún runtime de IA real conectado. Un PC puede aparecer como nodo disponible sin inventar un modelo ni respuestas.</p>
         {snapshot.requestedModels[0] && <div className="inference-request-state"><LoaderCircle className={snapshot.requestedModels[0].status === "active" ? "" : "spin"} /><span><strong>{snapshot.requestedModels[0].id}</strong>{snapshot.requestedModels[0].message}</span></div>}
         <div className="inference-unavailable-actions"><button className="primary-button" onClick={() => onNavigate("models")}><Boxes size={16} />Ver y activar modelos</button>{connectivityModel && <button className="secondary-button" disabled={diagnostic === "running"} onClick={() => void checkConnection()}>{diagnostic === "running" ? <LoaderCircle className="spin" size={16} /> : diagnostic === "ok" ? <CheckCircle2 size={16} /> : <Wifi size={16} />}{diagnostic === "idle" ? "Comprobar conexión" : diagnostic === "running" ? "Comprobando…" : diagnostic === "ok" ? "Conexión correcta" : "Reintentar conexión"}</button>}</div>
         {diagnostic === "failed" && <div className="inference-diagnostic-error"><CircleAlert size={15} />El coordinador no ha completado la prueba de conexión.</div>}
@@ -838,21 +989,28 @@ function Downloads({ publicLink, external }: { publicLink: (path: string) => str
 
 function Machine({ snapshot, bridge, onSnapshot }: { snapshot: DashboardSnapshot; bridge: DesktopBridge; onSnapshot: (snapshot: DashboardSnapshot) => void }) {
   const [busy, setBusy] = useState(false);
+  const contributionLabel = snapshot.contribution.state === "connected"
+    ? "Connected"
+    : snapshot.contribution.state === "connecting"
+      ? "Connecting…"
+      : snapshot.contribution.state === "error"
+        ? "Connection error"
+        : "Paused";
   async function toggleContribution() {
     setBusy(true);
     try { onSnapshot(await bridge.setContribution(!snapshot.settings.contributionEnabled)); }
     finally { setBusy(false); }
   }
   return <section className="content-page">
-    <PageTitle eyebrow="LOCAL NODE" title="This machine" copy="Hardware detected on this computer and the resources offered to mycellios." actions={<button disabled={busy} onClick={() => void toggleContribution()}><CirclePower size={16} />{snapshot.settings.contributionEnabled ? "Pause contribution" : "Start contributing"}</button>} />
+    <PageTitle eyebrow="NATIVE NODE" title="This device" copy="Hardware detected on this computer and the resources offered to mycellios." actions={<button disabled={busy} onClick={() => void toggleContribution()}><CirclePower size={16} />{snapshot.settings.contributionEnabled ? "Pause contribution" : "Start contributing"}</button>} />
     <div className="hardware-hero">
       <div className="device-orb"><Cpu size={42} /></div>
       <div><span className="eyebrow">{snapshot.platform.toUpperCase()}</span><h2>{snapshot.localHardware.hostname}</h2><p>{snapshot.localHardware.gpus.length} accelerator(s) · {formatMemory(snapshot.localHardware.ramMb)} RAM</p></div>
-      <span className={`state-badge ${snapshot.settings.contributionEnabled ? "online" : "paused"}`}>{snapshot.settings.contributionEnabled ? "Contributing" : "Paused"}</span>
+      <span className={`state-badge ${snapshot.contribution.state === "connected" ? "online" : "paused"}`}>{contributionLabel}</span>
     </div>
     <div className="cards-grid">
       {snapshot.localHardware.gpus.map((gpu) => <article className="hardware-card" key={gpu.id}><div className="hardware-card-icon"><Gauge size={23} /></div><span className="card-kicker">{gpu.vendor}</span><h3>{gpu.model}</h3><div className="capacity-line"><span style={{ width: `${Math.min(100, snapshot.settings.offeredVramMb / Math.max(1, gpu.physicalVramMb + (gpu.sharedMemoryMb ?? 0)) * 100)}%` }} /></div><div className="hardware-metrics"><DesktopMetric label="Physical VRAM" value={formatMemory(gpu.physicalVramMb)} /><DesktopMetric label="Shared" value={formatMemory(gpu.sharedMemoryMb ?? 0)} /><DesktopMetric label="Utilization" value={`${gpu.utilizationPct ?? 0}%`} /><DesktopMetric label="Temperature" value={gpu.temperatureC === undefined ? "—" : `${gpu.temperatureC} °C`} /></div></article>)}
-      {snapshot.localHardware.gpus.length === 0 && <div className="wide-empty"><Empty icon={Cpu} title="No GPU detected" copy="This machine can still run the connectivity test and CPU-compatible workloads." /></div>}
+      {snapshot.localHardware.gpus.length === 0 && <div className="wide-empty"><Empty icon={Cpu} title="No GPU detected" copy="This machine can register its real hardware, but it will not advertise a model until a compatible runtime is active." /></div>}
     </div>
   </section>;
 }
@@ -882,7 +1040,7 @@ function DesktopSettingsView({ snapshot, bridge, onSnapshot }: { snapshot: Dashb
     <PageTitle eyebrow="DESKTOP PREFERENCES" title="Settings" copy="Native connection, contribution, background behavior and updates for this computer." />
     {error && <div className="inline-error"><CircleAlert size={17} />{error}</div>}
     <div className="settings-section"><div><Globe2 size={20} /><div><h3>Coordinator</h3><p>Use the public network or host an isolated local coordinator.</p></div></div><div className="settings-fields"><label>Mode<AppSelect ariaLabel="Coordinator mode" value={draft.coordinatorMode} onChange={(value) => update("coordinatorMode", value as DesktopSettings["coordinatorMode"])} options={[{ value: "remote", label: "Public mycellios network" }, { value: "local", label: "Local network on this machine" }]} /></label>{draft.coordinatorMode === "remote" && <label>Coordinator URL<input value={draft.remoteCoordinatorUrl} onChange={(event) => update("remoteCoordinatorUrl", event.target.value)} /></label>}<label>Region<input value={draft.region} onChange={(event) => update("region", event.target.value)} placeholder="auto" /></label></div></div>
-    <div className="settings-section"><div><Gauge size={20} /><div><h3>Contribution</h3><p>Select the runtime and memory offered by this node.</p></div></div><div className="settings-fields"><label>Runtime<AppSelect ariaLabel="Contribution runtime" value={draft.adapterMode} onChange={(value) => update("adapterMode", value as DesktopSettings["adapterMode"])} options={[{ value: "connectivity-test", label: "Connectivity test" }, { value: "local-model-runtime", label: "Local local model runtime" }]} /></label><label>Offered VRAM (MB)<input type="number" min="512" step="256" value={draft.offeredVramMb} onChange={(event) => update("offeredVramMb", Number(event.target.value))} /></label>{draft.adapterMode === "local-model-runtime" && <><label>local model runtime model<input value={draft.modelName} onChange={(event) => update("modelName", event.target.value)} /></label><label>local model runtime URL<input value={draft.adapterBaseUrl} onChange={(event) => update("adapterBaseUrl", event.target.value)} /></label><label>Pinned digest<input value={draft.modelDigest} onChange={(event) => update("modelDigest", event.target.value)} placeholder="sha256:…" /></label></>}</div></div>
+    <div className="settings-section"><div><Gauge size={20} /><div><h3>Contribution</h3><p>Register real hardware only, or expose a model through a verified local runtime.</p></div></div><div className="settings-fields"><label>Runtime<AppSelect ariaLabel="Contribution runtime" value={draft.adapterMode} onChange={(value) => update("adapterMode", value as DesktopSettings["adapterMode"])} options={[{ value: "connectivity-test", label: "Hardware only (no model)" }, { value: "local-model-runtime", label: "Local local model runtime" }]} /></label><label>Offered VRAM (MB)<input type="number" min="512" step="256" value={draft.offeredVramMb} onChange={(event) => update("offeredVramMb", Number(event.target.value))} /></label>{draft.adapterMode === "local-model-runtime" && <><label>local model runtime model<input value={draft.modelName} onChange={(event) => update("modelName", event.target.value)} /></label><label>local model runtime URL<input value={draft.adapterBaseUrl} onChange={(event) => update("adapterBaseUrl", event.target.value)} /></label><label>Pinned digest<input value={draft.modelDigest} onChange={(event) => update("modelDigest", event.target.value)} placeholder="sha256:…" /></label></>}</div></div>
     <div className="settings-section compact-settings"><div><SlidersHorizontal size={20} /><div><h3>Application</h3><p>Startup and background contribution.</p></div></div><div className="toggle-list"><Toggle label="Start with the system" checked={draft.launchAtLogin} onChange={(value) => update("launchAtLogin", value)} /><Toggle label="Keep running in the tray" checked={draft.closeToTray} onChange={(value) => update("closeToTray", value)} /><Toggle label="Contribute resources" checked={draft.contributionEnabled} onChange={(value) => update("contributionEnabled", value)} /></div></div>
     <div className="settings-section"><div><Download size={20} /><div><h3>Automatic updates</h3><p>Desktop releases are checked and downloaded in the background when supported.</p></div></div><div className="update-settings"><div><span className={`update-state ${snapshot.update.state}`}>{updateStateLabel(snapshot.update.state)}</span><strong>Version {snapshot.appVersion}</strong><p>{snapshot.update.message}</p></div><div className="update-actions"><button className="secondary-button" disabled={checkingUpdate || snapshot.update.state === "checking" || snapshot.update.state === "downloading"} onClick={() => void checkUpdate()}><RefreshCw className={checkingUpdate ? "spin" : ""} size={15} />Check now</button>{snapshot.update.state === "ready" && <button className="primary-button" onClick={() => void bridge.installUpdate()}><Download size={15} />Restart and update</button>}</div></div></div>
     <div className="settings-footer"><button className="primary-button" disabled={saving} onClick={() => void save()}>{saving ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}Save and reconnect</button></div>
@@ -899,7 +1057,7 @@ function DesktopOnboarding({ snapshot, bridge, onSnapshot }: { snapshot: Dashboa
     catch (caught) { setError(errorText(caught)); }
     finally { setSaving(false); }
   }
-  return <div className="modal-backdrop"><div className="onboarding-card"><div className="onboarding-brand"><img src={brandIcon} alt="" /><span>GET STARTED</span></div><h1>Connect this machine to mycellios</h1><p>The desktop agent and the web panel will show the same public network.</p><div className="mode-grid single-mode"><button className="selected"><Globe2 size={23} /><strong>Public mycellios network</strong><span>{PUBLIC_COORDINATOR_URL}</span><Check size={16} className="mode-check" /></button></div><label className="contribute-choice"><input type="checkbox" checked={contribute} onChange={(event) => setContribute(event.target.checked)} /><span><strong>Contribute this machine's resources</strong><small>Start with a safe connectivity test; switch to local model runtime later.</small></span></label>{error && <div className="inline-error"><CircleAlert size={17} />{error}</div>}<button className="primary-button onboarding-submit" disabled={saving} onClick={() => void complete()}>{saving ? <LoaderCircle className="spin" size={18} /> : <Sparkles size={18} />}Enter mycellios <ChevronRight size={18} /></button><div className="onboarding-security"><ShieldCheck size={15} />Connected through HTTPS/WSS to the public coordinator.</div></div></div>;
+  return <div className="modal-backdrop"><div className="onboarding-card"><div className="onboarding-brand"><img src={brandIcon} alt="" /><span>GET STARTED</span></div><h1>Connect this machine to mycellios</h1><p>The desktop agent and the web panel will show the same public network.</p><div className="mode-grid single-mode"><button className="selected"><Globe2 size={23} /><strong>Public mycellios network</strong><span>{PUBLIC_COORDINATOR_URL}</span><Check size={16} className="mode-check" /></button></div><label className="contribute-choice"><input type="checkbox" checked={contribute} onChange={(event) => setContribute(event.target.checked)} /><span><strong>Contribute this machine's resources</strong><small>Register real hardware only; models appear only when a verified runtime is active.</small></span></label>{error && <div className="inline-error"><CircleAlert size={17} />{error}</div>}<button className="primary-button onboarding-submit" disabled={saving} onClick={() => void complete()}>{saving ? <LoaderCircle className="spin" size={18} /> : <Sparkles size={18} />}Enter mycellios <ChevronRight size={18} /></button><div className="onboarding-security"><ShieldCheck size={15} />Connected through HTTPS/WSS to the public coordinator.</div></div></div>;
 }
 
 function desktopToPublicSnapshot(snapshot: DashboardSnapshot): PublicSnapshot {
@@ -989,19 +1147,53 @@ function AppSelect({ ariaLabel, value, options, onChange }: { ariaLabel: string;
 
 function Toggle({ label, checked, onChange }: { label: string; checked: boolean; onChange: (checked: boolean) => void }) { return <label className="toggle-row"><span>{label}</span><input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} /><i /></label>; }
 function errorText(error: unknown) { return error instanceof Error ? error.message : String(error); }
+function networkNameForHubModel(source: string): string {
+  return (source.split("/").at(-1) ?? source)
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "")
+    .slice(0, 128);
+}
+function formatHubCount(value: number): string {
+  return new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 }).format(value);
+}
 
 function PageTitle({ eyebrow, title, copy, actions }: { eyebrow: string; title: string; copy: string; actions?: React.ReactNode }) {
   return <div className="panel-page-title"><div><span>{eyebrow}</span><h1>{title}</h1><p>{copy}</p></div>{actions && <div className="page-actions">{actions}</div>}</div>;
 }
 
-function Stat({ icon: Icon, label, value, detail, tone = "blue" }: { icon: typeof Radio; label: string; value: string; detail: string; tone?: "blue" | "orange" }) { return <article className={`panel-stat ${tone}`}><div><Icon /></div><span>{label}</span><strong>{value}</strong><small>{detail}</small><i className="stat-accent" /></article>; }
+function Stat({ icon: Icon, label, value, detail, tone = "blue" }: { icon: typeof Radio; label: string; value: string; detail: string; tone?: "blue" | "purple" }) { return <article className={`panel-stat ${tone}`}><div><Icon /></div><span>{label}</span><strong>{value}</strong><small>{detail}</small><i className="stat-accent" /></article>; }
 function Metric({ label, value }: { label: string; value: string }) { return <div><span>{label}</span><strong>{value}</strong></div>; }
 function Empty({ icon: Icon, title, copy }: { icon: typeof Activity; title: string; copy: string }) { return <div className="panel-empty"><Icon /><strong>{title}</strong><p>{copy}</p></div>; }
 function PanelLoading() { return <div className="panel-loading"><LoaderCircle className="spin" /><strong>Connecting to mycellios</strong><span>Loading the public network snapshot…</span></div>; }
 function workerLabel(worker: PublicWorker) { return worker.kind === "browser" ? `Browser ${shortId(worker.id)}` : worker.gpus[0]?.model || `Desktop ${shortId(worker.id)}`; }
+function nodeVisualState(worker: PublicWorker): "active" | "warning" | "offline" { return worker.connected && worker.status === "online" ? "active" : worker.connected || worker.status === "suspect" || worker.status === "draining" ? "warning" : "offline"; }
+function nodeStateOrder(worker: PublicWorker): number { return nodeVisualState(worker) === "active" ? 0 : nodeVisualState(worker) === "warning" ? 1 : 2; }
+function nodeStatusLabel(worker: PublicWorker): string {
+  if (worker.connected && worker.status === "online") return "Activo";
+  if (worker.status === "suspect") return "Inestable";
+  if (worker.status === "draining") return "Finalizando";
+  if (worker.connected) return "Conectado";
+  return "Inactivo";
+}
+function topologyPosition(index: number, total: number): { x: number; y: number } {
+  if (total <= 1) return { x: 50, y: 17 };
+  if (total <= 10) {
+    const angle = -Math.PI / 2 + (index / total) * Math.PI * 2;
+    return { x: 50 + Math.cos(angle) * 41, y: 52 + Math.sin(angle) * 36 };
+  }
+  const inner = index % 2 === 0;
+  const slot = Math.floor(index / 2);
+  const count = inner ? Math.ceil(total / 2) : Math.floor(total / 2);
+  const angle = -Math.PI / 2 + (slot / count) * Math.PI * 2;
+  return { x: 50 + Math.cos(angle) * (inner ? 28 : 43), y: 52 + Math.sin(angle) * (inner ? 25 : 38) };
+}
+function formatCompactNumber(value: number): string { return new Intl.NumberFormat("es-ES", { maximumFractionDigits: value < 10 ? 1 : 0 }).format(value); }
+function formatPower(watts: number): string { return watts >= 1_000 ? `${(watts / 1_000).toFixed(1)} kW` : `${Math.round(watts)} W`; }
 function shortId(value: string) { return value.length <= 10 ? value : `${value.slice(0, 6)}…${value.slice(-4)}`; }
 function formatMemory(value: number) { return value >= 1_024 ? `${(value / 1_024).toFixed(value >= 10_240 ? 0 : 1)} GB` : `${Math.round(value)} MB`; }
 function relativeTime(value: string) { const seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1_000)); if (seconds < 5) return "now"; if (seconds < 60) return `${seconds}s ago`; const minutes = Math.floor(seconds / 60); if (minutes < 60) return `${minutes}m ago`; return `${Math.floor(minutes / 60)}h ago`; }
+function relativeTimeEs(value: string) { const seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1_000)); if (seconds < 5) return "ahora"; if (seconds < 60) return `hace ${seconds} s`; const minutes = Math.floor(seconds / 60); if (minutes < 60) return `hace ${minutes} min`; return `hace ${Math.floor(minutes / 60)} h`; }
 
 function inferenceModelOption(snapshot: PublicSnapshot, model: PublicSnapshot["models"][number]) {
   const deployments = snapshot.workers.flatMap((worker) => worker.deployments).filter((deployment) => deployment.model === model.id);

@@ -2,12 +2,52 @@ import { describe, expect, it } from "vitest";
 import {
   inspectHubModelCapacity,
   requestedModelCapacityViews,
+  searchHubModelCatalog,
   shouldQueueAutomaticActivation,
   type HubModelCapacityProfile,
 } from "../src/coordinator/model-catalog.js";
 import type { StoredRequestedModel, StoredWorker } from "../src/storage/store.js";
 
 describe("requested model capacity catalog", () => {
+  it("searches the public Hub catalog and prioritizes selectable certified models", async () => {
+    const results = await searchHubModelCatalog("qwen", async (input) => {
+      const url = new URL(String(input));
+      expect(url.searchParams.get("search")).toBe("qwen");
+      expect(url.searchParams.get("pipeline_tag")).toBe("text-generation");
+      expect(url.searchParams.get("config")).toBe("true");
+      return Response.json([
+        {
+          id: "org/unsupported-popular",
+          author: "org",
+          downloads: 9_000_000,
+          likes: 10,
+          gated: false,
+          private: false,
+          pipeline_tag: "text-generation",
+          tags: ["safetensors"],
+          config: { model_type: "mistral", architectures: ["MistralForCausalLM"] },
+        },
+        {
+          id: "Qwen/Qwen3-0.6B",
+          author: "Qwen",
+          downloads: 1_000_000,
+          likes: 100,
+          gated: false,
+          private: false,
+          pipeline_tag: "text-generation",
+          tags: ["transformers", "safetensors"],
+          config: { model_type: "qwen3", architectures: ["Qwen3ForCausalLM"] },
+        },
+      ]);
+    });
+
+    expect(results.map((model) => model.id)).toEqual(["Qwen/Qwen3-0.6B", "org/unsupported-popular"]);
+    expect(results[0]?.compatible).toBe(true);
+    expect(results[0]?.adapterId).toBe("transformers-qwen3-v1");
+    expect(results[1]?.compatible).toBe(false);
+    expect(results[1]?.compatibilityReason).toContain("certified");
+  });
+
   it("profiles a compatible Hub checkpoint from metadata without downloading weights", async () => {
     const requests: string[] = [];
     const profile = await inspectHubModelCapacity(
@@ -92,6 +132,19 @@ describe("requested model capacity catalog", () => {
     expect(ready.missingNodes).toBe(0);
     expect(ready.missingVramMiB).toBe(0);
     expect(shouldQueueAutomaticActivation(ready)).toBe(true);
+
+    const oneRealExecutor = requestedModelCapacityViews({
+      requests: [request],
+      workers: [],
+      connectedWorkerIds: new Set(),
+      activeModelIds: new Set(),
+      executionNodesForModel: () => [{ id: "desktop-only", availableVramMiB: 16_384 }],
+      activationAvailable: true,
+    })[0]!;
+    expect(oneRealExecutor.status).toBe("waiting_capacity");
+    expect(oneRealExecutor.availableNodes).toBe(1);
+    expect(oneRealExecutor.missingNodes).toBe(1);
+    expect(shouldQueueAutomaticActivation(oneRealExecutor)).toBe(false);
 
     const active = requestedModelCapacityViews({
       requests: [{ ...request, activationRequestedAt: Date.now() }],

@@ -22,6 +22,7 @@ import type { ModelActivationManager } from "./model-activation-manager.js";
 import {
   inspectHubModelCapacity,
   requestedModelCapacityViews,
+  searchHubModelCatalog,
   shouldQueueAutomaticActivation,
 } from "./model-catalog.js";
 import { WorkerHub } from "./worker-hub.js";
@@ -37,9 +38,18 @@ export interface CoordinatorRuntime {
   close(): Promise<void>;
 }
 
+export interface CoordinatorActivationContext {
+  store: MeshStore;
+  hub: WorkerHub;
+}
+
 export async function createCoordinator(
   config: CoordinatorConfig,
-  options: { logger?: boolean; activationManager?: ModelActivationManager } = {},
+  options: {
+    logger?: boolean;
+    activationManager?: ModelActivationManager;
+    activationManagerFactory?: (context: CoordinatorActivationContext) => ModelActivationManager;
+  } = {},
 ): Promise<CoordinatorRuntime> {
   const app = Fastify({ logger: options.logger ?? false, bodyLimit: 2 * 1024 * 1024 });
   if (config.networkToken) {
@@ -113,7 +123,7 @@ export async function createCoordinator(
   });
   mobileHub.attach(app);
   const service = new MeshService(store, scheduler, hub, config.requestTimeoutMs);
-  const activationManager = options.activationManager;
+  const activationManager = options.activationManager ?? options.activationManagerFactory?.({ store, hub });
   await activationManager?.initialize();
   const launchRequestedModel = (model: import("../storage/store.js").StoredRequestedModel) => {
     if (!activationManager || activationManager.isManaging(model.id) || activationManager.isBusy()) return;
@@ -197,6 +207,20 @@ export async function createCoordinator(
   app.get("/public/v1/snapshot", async () => {
     reconcileRequestedModels();
     return publicSnapshot(store, scheduler, hub, mobileHub, activationManager);
+  });
+
+  app.get("/public/v1/huggingface-models", async (request, reply) => {
+    const { q } = huggingFaceModelSearchSchema.parse(request.query);
+    try {
+      return { data: await searchHubModelCatalog(q) };
+    } catch (error) {
+      return reply.code(502).send({
+        error: {
+          code: "huggingface_catalog_unavailable",
+          message: error instanceof Error ? error.message : String(error),
+        },
+      });
+    }
   });
 
   app.post("/public/v1/requested-models", async (request, reply) => {
@@ -537,6 +561,10 @@ export async function createCoordinator(
 const benchmarkRunRequestSchema = z.object({
   version: z.string().trim().min(1).max(80).optional(),
   label: z.string().trim().min(1).max(160).optional(),
+});
+
+const huggingFaceModelSearchSchema = z.object({
+  q: z.string().trim().max(80).default(""),
 });
 
 const requestedModelCreateSchema = z.object({

@@ -125,7 +125,10 @@ export const workerCapabilitiesSchema = z.object({
     maxTemperatureC: z.number().optional(),
     pauseWhenForeground: z.boolean(),
   }),
-  deployments: z.array(deploymentSchema).min(1),
+  // A contributor may register real hardware before it has a real inference
+  // runtime available. The scheduler only considers workers that advertise a
+  // matching deployment, so an empty list is safe and avoids inventing one.
+  deployments: z.array(deploymentSchema).max(256),
   network: z.object({
     coordinatorRttMs: z.number().nonnegative(),
     uplinkMbps: z.number().nonnegative(),
@@ -165,6 +168,16 @@ export const workerCapabilitiesSchema = z.object({
         })
         .strict()
         .optional(),
+    })
+    .strict()
+    .optional(),
+  distributedExecutor: z
+    .object({
+      protocol: z.literal("gdlp-worker-tunnel/1"),
+      nodeId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
+      stageHost: z.string().min(1).max(253),
+      stagePort: z.number().int().min(1).max(65_535),
+      runtime: z.literal("python-safetensors"),
     })
     .strict()
     .optional(),

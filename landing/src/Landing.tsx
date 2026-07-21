@@ -440,7 +440,15 @@ function Landing() {
           </div>
         </section>
 
-        <section className="signal-strip" aria-label={t.nav.vision}><div className="signal-track">{[...t.signals, ...t.signals].map((item, index) => <span key={`${item}-${index}`}>{item}<i /></span>)}</div></section>
+        <section className="signal-strip" aria-label={t.nav.vision}>
+          <div className="signal-track">
+            {[0, 1].map((copy) => (
+              <div className="signal-sequence" key={copy} aria-hidden={copy === 1}>
+                {t.signals.map((item) => <span key={`${copy}-${item}`}>{item}<i /></span>)}
+              </div>
+            ))}
+          </div>
+        </section>
 
         <section className="manifesto container" id="vision"><div className="manifesto-index reveal">{t.manifesto.index}</div><div className="manifesto-copy reveal"><span>{t.manifesto.kicker}</span><h2>{t.manifesto.title}</h2></div><div className="manifesto-side reveal"><p>{t.manifesto.copy}</p><a href="#architecture">{t.manifesto.link} <ArrowUpRight size={15} /></a></div></section>
 

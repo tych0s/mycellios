@@ -996,6 +996,89 @@ def resolve_model_snapshot(model_name: str, revision: str | None = None) -> str:
     )
 
 
+def resolve_stage_model_snapshot(
+    model_name: str,
+    *,
+    revision: str | None,
+    layer_start: int,
+    layer_end: int,
+    total_layers: int,
+) -> str:
+    """Download only checkpoint files referenced by this stage when indexed.
+
+    Hugging Face sharding is file-granular, so one file may contain adjacent
+    layers, but an indexed model no longer causes every contributor to fetch
+    every safetensors shard. Unsharded checkpoints necessarily remain one file.
+    """
+    local = Path(model_name)
+    if local.is_dir():
+        return str(local.resolve())
+    if local.is_absolute():
+        raise FileNotFoundError(f"local model directory does not exist: {local}")
+    metadata_patterns = [
+        "*.safetensors.index.json",
+        "config.json",
+        "generation_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "added_tokens.json",
+        "*.model",
+        "*.tiktoken",
+        "chat_template*",
+        "merges.txt",
+        "vocab.json",
+        "vocab.txt",
+    ]
+    snapshot = Path(
+        snapshot_download(
+            repo_id=model_name,
+            revision=revision,
+            allow_patterns=metadata_patterns,
+        )
+    )
+    indexes = sorted(snapshot.glob("*.safetensors.index.json"))
+    if not indexes:
+        return resolve_model_snapshot(model_name, revision)
+    if len(indexes) > 1:
+        raise ValueError(f"multiple safetensors indexes found under {snapshot}")
+    document = json.loads(indexes[0].read_text(encoding="utf-8"))
+    weight_map = document.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError("safetensors index has no weight_map")
+    spec = StageModelSpec(
+        model_name=model_name,
+        revision=revision,
+        layer_start=layer_start,
+        layer_end=layer_end,
+        total_layers=total_layers,
+        threads=1,
+    )
+    files: set[str] = set()
+    for name, relative_file in weight_map.items():
+        if not isinstance(name, str) or not isinstance(relative_file, str):
+            raise ValueError("safetensors index weight_map must contain string keys and files")
+        belongs = _checkpoint_tensor_belongs_to_stage(name, spec)
+        # A tied final projection may be sourced from the embedding key even
+        # when the checkpoint omits lm_head.weight.
+        if spec.last and name.startswith("model.embed_tokens."):
+            belongs = True
+        if belongs:
+            relative = Path(relative_file)
+            if relative.is_absolute() or ".." in relative.parts or relative.suffix != ".safetensors":
+                raise ValueError(f"invalid safetensors shard path: {relative_file!r}")
+            files.add(relative_file)
+    if not files:
+        raise ValueError("stage has no checkpoint shards in the safetensors index")
+    return str(
+        snapshot_download(
+            repo_id=model_name,
+            revision=revision,
+            allow_patterns=[*metadata_patterns, *sorted(files)],
+        )
+    )
+
+
 def model_snapshot_identity(model_name: str, revision: str | None = None) -> int:
     """Return a deterministic uint64 identity for an immutable model snapshot.
 
@@ -1146,7 +1229,13 @@ def _load_selective_stage_model(spec: StageModelSpec):
     are then copied one at a time from memory-mapped safetensors files.
     """
 
-    snapshot_name = resolve_model_snapshot(spec.model_name, spec.revision)
+    snapshot_name = resolve_stage_model_snapshot(
+        spec.model_name,
+        revision=spec.revision,
+        layer_start=spec.layer_start,
+        layer_end=spec.layer_end,
+        total_layers=spec.total_layers,
+    )
     resolved_spec = replace(spec, model_name=snapshot_name, revision=None)
     config = AutoConfig.from_pretrained(snapshot_name)
     adapter = resolve_selective_stage_adapter(config)

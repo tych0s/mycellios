@@ -1,6 +1,8 @@
 node_modules/
 dist/
 out/
+build/distribution-runtime/
+build/distribution-runtime.tar.gz
 .vite/
 landing-dist/
 mobile-dist/

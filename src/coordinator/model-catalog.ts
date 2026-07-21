@@ -1,8 +1,76 @@
 import type { StoredRequestedModel, StoredWorker } from "../storage/store.js";
+import type { HubCatalogModel } from "../contracts/types.js";
 
 const MIB = 1024 * 1024;
 const MAX_SAFETENSORS_HEADER_BYTES = 64 * MIB;
 const HUB_MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}\/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+export async function searchHubModelCatalog(
+  query: string,
+  fetcher: typeof fetch = fetch,
+): Promise<HubCatalogModel[]> {
+  const normalizedQuery = query.trim().slice(0, 80);
+  const parameters = new URLSearchParams({
+    pipeline_tag: "text-generation",
+    sort: "downloads",
+    direction: "-1",
+    limit: normalizedQuery ? "30" : "80",
+    full: "true",
+    config: "true",
+  });
+  if (normalizedQuery) parameters.set("search", normalizedQuery);
+
+  const response = await fetcher(`https://huggingface.co/api/models?${parameters.toString()}`, {
+    headers: { accept: "application/json" },
+    redirect: "follow",
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!response.ok) throw new Error(`huggingface_catalog_http_${response.status}`);
+  const value = await response.json() as unknown;
+  if (!Array.isArray(value)) throw new Error("huggingface_catalog_is_invalid");
+
+  const models = value.flatMap((entry): HubCatalogModel[] => {
+    if (!isRecord(entry) || typeof entry.id !== "string" || !HUB_MODEL_ID.test(entry.id)) return [];
+    if (entry.private === true) return [];
+    const config = isRecord(entry.config) ? entry.config : {};
+    const modelType = typeof config.model_type === "string" ? config.model_type : null;
+    const architecture = Array.isArray(config.architectures) && typeof config.architectures[0] === "string"
+      ? config.architectures[0]
+      : null;
+    const adapterId = certifiedAdapter(modelType, architecture);
+    const gated = entry.gated !== false && entry.gated !== undefined && entry.gated !== null;
+    const tags = Array.isArray(entry.tags) ? entry.tags.filter((tag): tag is string => typeof tag === "string") : [];
+    const hasSafetensors = tags.includes("safetensors");
+    const compatible = adapterId !== null && !gated && hasSafetensors;
+    const compatibilityReason = gated
+      ? "Access approval is required on Hugging Face."
+      : !hasSafetensors
+        ? "No public Safetensors checkpoint was advertised."
+        : adapterId === null
+          ? "This architecture does not have a certified mycellios adapter yet."
+          : null;
+    return [{
+      id: entry.id,
+      author: typeof entry.author === "string" ? entry.author : entry.id.split("/")[0]!,
+      downloads: nonNegativeNumber(entry.downloads),
+      likes: nonNegativeNumber(entry.likes),
+      lastModified: typeof entry.lastModified === "string" ? entry.lastModified : null,
+      pipelineTag: typeof entry.pipeline_tag === "string" ? entry.pipeline_tag : null,
+      modelType,
+      architecture,
+      adapterId,
+      compatible,
+      gated,
+      compatibilityReason,
+    }];
+  });
+
+  const sorted = models.toSorted((left, right) => Number(right.compatible) - Number(left.compatible) || right.downloads - left.downloads);
+  const visible = normalizedQuery
+    ? sorted
+    : sorted.filter((model) => model.compatible && model.likes >= 20);
+  return visible.slice(0, normalizedQuery ? 12 : 6);
+}
 
 export type RequestedModelStatus =
   | "profiling"
@@ -305,6 +373,10 @@ function positiveConfigInteger(config: Record<string, unknown>, ...names: string
 
 function optionalPositiveInteger(value: unknown): number | null {
   return Number.isSafeInteger(value) && (value as number) > 0 ? value as number : null;
+}
+
+function nonNegativeNumber(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
 }
 
 function parseProfile(value: Record<string, unknown> | null): HubModelCapacityProfile | null {

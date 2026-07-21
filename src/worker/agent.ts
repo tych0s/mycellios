@@ -18,12 +18,25 @@ import { estimateInputTokens } from "../core/request.js";
 import { safeVramBudget } from "../core/tiers.js";
 import { probeHardware } from "./hardware.js";
 import { llmfitHardwareFallback, probeLlmfit } from "./llmfit.js";
+import type { LaunchAgent, LaunchAgentStartRequest, LaunchProcessHandle } from "../distribution/launch-supervisor.js";
+import {
+  validatePythonLaunchDescription,
+  type PythonPipelineLaunchDescription,
+} from "../distribution/python-launcher.js";
 
 export interface WorkerAgentOptions {
   coordinatorUrl: string;
   networkToken?: string;
   heartbeatIntervalMs?: number;
   reconnect?: boolean;
+  /** Register the physical node without claiming that a model runtime exists. */
+  advertiseDeployment?: boolean;
+  distributedExecutor?: {
+    nodeId: string;
+    stageHost: string;
+    stagePort: number;
+    launchAgent: LaunchAgent;
+  };
   logger?: Pick<Console, "info" | "warn" | "error">;
 }
 
@@ -67,6 +80,21 @@ const serverMessageSchema = z.discriminatedUnion("type", [
       payload: z.object({ jobId: z.string().min(1).max(256) }).strict(),
     })
     .strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.prepare"),
+    payload: z.object({ requestId: z.string().min(1).max(256), description: z.unknown() }).strict(),
+  }).strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.start"),
+    payload: z.object({ requestId: z.string().min(1).max(256), request: z.unknown() }).strict(),
+  }).strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.stop"),
+    payload: z.object({ requestId: z.string().min(1).max(256), reason: z.string().min(1).max(300) }).strict(),
+  }).strict(),
 ]);
 
 const registrationResponseSchema = z
@@ -88,6 +116,8 @@ export class WorkerAgent {
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private readonly activeJobs = new Map<string, AbortController>();
   private readonly recentJobs = new Map<string, number>();
+  private readonly authorizedRuntimeProcesses = new Map<string, string>();
+  private readonly runtimeProcesses = new Map<string, LaunchProcessHandle>();
   private readonly logger: Pick<Console, "info" | "warn" | "error">;
 
   constructor(
@@ -120,6 +150,11 @@ export class WorkerAgent {
     this.stopped = true;
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     await this.abortActiveJobs("Worker shutting down");
+    await Promise.all(
+      [...this.runtimeProcesses.values()].map((handle) => handle.stop("worker_shutting_down").catch(() => undefined)),
+    );
+    this.runtimeProcesses.clear();
+    this.authorizedRuntimeProcesses.clear();
     await this.sendGoodbye("user_requested");
     await this.closeSocket();
   }
@@ -216,8 +251,9 @@ export class WorkerAgent {
         },
       ],
       limits: this.config.limits,
-      deployments: [
-        {
+      deployments: this.options.advertiseDeployment === false
+        ? []
+        : [{
           deploymentId,
           model,
           modelDigest:
@@ -236,14 +272,24 @@ export class WorkerAgent {
           ...(this.config.deployment.internalPipeline
             ? { internalPipeline: structuredClone(this.config.deployment.internalPipeline) }
             : {}),
-        },
-      ],
+        }],
       network: {
         coordinatorRttMs: 0,
         uplinkMbps: 100,
         downlinkMbps: 100,
       },
       ...(llmfit ? { llmfit } : {}),
+      ...(this.options.distributedExecutor
+        ? {
+            distributedExecutor: {
+              protocol: "gdlp-worker-tunnel/1" as const,
+              nodeId: this.options.distributedExecutor.nodeId,
+              stageHost: this.options.distributedExecutor.stageHost,
+              stagePort: this.options.distributedExecutor.stagePort,
+              runtime: "python-safetensors" as const,
+            },
+          }
+        : {}),
     };
   }
 
@@ -388,7 +434,76 @@ export class WorkerAgent {
         await this.adapter.cancel(jobId);
         break;
       }
+      case "runtime.prepare":
+        await this.prepareDistributedRuntime(message.payload.requestId, message.payload.description);
+        break;
+      case "runtime.start":
+        await this.startDistributedRuntime(message.payload.requestId, message.payload.request);
+        break;
+      case "runtime.stop":
+        await this.stopDistributedRuntime(message.payload.requestId, message.payload.reason);
+        break;
     }
+  }
+
+  private async prepareDistributedRuntime(requestId: string, input: unknown): Promise<void> {
+    try {
+      const executor = this.options.distributedExecutor;
+      if (!executor) throw new Error("distributed_executor_is_not_enabled");
+      validatePythonLaunchDescription(input);
+      const description = input as PythonPipelineLaunchDescription;
+      const local = description.launchOrder.filter((process) => process.anchor.memberId === executor.nodeId);
+      if (local.length === 0) throw new Error("distributed_plan_has_no_process_for_this_node");
+      this.authorizedRuntimeProcesses.clear();
+      for (const process of local) {
+        this.authorizedRuntimeProcesses.set(process.processId, JSON.stringify(process));
+      }
+      this.sendMessage("runtime.prepared", { requestId, ok: true });
+    } catch (error) {
+      this.sendMessage("runtime.prepared", { requestId, ok: false, error: errorText(error) });
+    }
+  }
+
+  private async startDistributedRuntime(requestId: string, input: unknown): Promise<void> {
+    const executor = this.options.distributedExecutor;
+    try {
+      if (!executor) throw new Error("distributed_executor_is_not_enabled");
+      if (!isLaunchAgentStartRequest(input)) throw new Error("distributed_launch_request_is_invalid");
+      if (input.nodeId !== executor.nodeId) throw new Error("distributed_launch_node_mismatch");
+      if (this.authorizedRuntimeProcesses.get(input.process.processId) !== JSON.stringify(input.process)) {
+        throw new Error("distributed_launch_process_was_not_prepared");
+      }
+      if (this.runtimeProcesses.has(requestId)) throw new Error("distributed_launch_request_is_duplicate");
+      const controller = new AbortController();
+      const handle = await executor.launchAgent.start(input, controller.signal);
+      this.runtimeProcesses.set(requestId, handle);
+      void handle.ready.then(
+        () => this.sendMessage("runtime.ready", { requestId }),
+        (error: unknown) => this.sendRuntimeExit(requestId, handle, { code: null, signal: null, error: errorText(error) }),
+      );
+      void handle.exited.then(
+        (exit) => this.sendRuntimeExit(requestId, handle, exit),
+        (error: unknown) => this.sendRuntimeExit(requestId, handle, { code: null, signal: null, error: errorText(error) }),
+      );
+    } catch (error) {
+      this.sendRuntimeExit(requestId, undefined, { code: null, signal: null, error: errorText(error) });
+    }
+  }
+
+  private async stopDistributedRuntime(requestId: string, reason: string): Promise<void> {
+    const handle = this.runtimeProcesses.get(requestId);
+    if (handle) await handle.stop(reason).catch(() => undefined);
+  }
+
+  private sendRuntimeExit(
+    requestId: string,
+    handle: LaunchProcessHandle | undefined,
+    exit: { code: number | null; signal: NodeJS.Signals | null; error?: string },
+  ): void {
+    if (!this.runtimeProcesses.has(requestId) && handle) return;
+    this.runtimeProcesses.delete(requestId);
+    const output = handle?.output?.() ?? { stdout: "", stderr: "", stdoutTruncated: false, stderrTruncated: false };
+    this.sendMessage("runtime.exited", { requestId, exit, output });
   }
 
   private async execute(payload: JobPayload): Promise<void> {
@@ -671,6 +786,23 @@ function delay(milliseconds: number): Promise<void> {
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isLaunchAgentStartRequest(value: unknown): value is LaunchAgentStartRequest {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const request = value as Record<string, unknown>;
+  if (
+    typeof request.launchId !== "string" ||
+    typeof request.pipelineId !== "string" ||
+    typeof request.nodeId !== "string" ||
+    !request.process ||
+    typeof request.process !== "object" ||
+    Array.isArray(request.process)
+  ) return false;
+  const process = request.process as Record<string, unknown>;
+  const anchor = process.anchor;
+  return typeof process.processId === "string" && !!anchor && typeof anchor === "object" &&
+    !Array.isArray(anchor) && (anchor as Record<string, unknown>).memberId === request.nodeId;
 }
 
 function adapterDataLocality(config: WorkerConfig): "local" | "external" {

@@ -134,8 +134,8 @@ export function NetworkGraph({ snapshot, selectedId, onSelect }: NetworkGraphPro
       { kind: "device", label: localLabel },
     );
     graph.addEdge("network", localId, {
-      size: snapshot.settings.contributionEnabled ? 2.5 : 1,
-      color: snapshot.settings.contributionEnabled ? "#51ded3" : "#315c62",
+      size: snapshot.contribution.state === "connected" ? 2.5 : 1,
+      color: snapshot.contribution.state === "connected" ? "#51ded3" : "#315c62",
       zIndex: 3,
     });
 

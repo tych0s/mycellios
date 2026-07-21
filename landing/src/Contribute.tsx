@@ -7,7 +7,6 @@ import {
   Power,
   Radio,
   ShieldCheck,
-  Zap,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import {
@@ -19,7 +18,6 @@ import {
   type MobileWorkerLevel,
   type MobileWorkerSnapshot,
 } from "../../src/mobile/runtime";
-import brandIcon from "./assets/mycellios-app-icon-v2.png";
 
 export function Contribute() {
   const [worker, setWorker] = useState<MobileWorkerSnapshot>(() => getMobileWorkerSnapshot());
@@ -29,43 +27,48 @@ export function Contribute() {
     return subscribeMobileWorker(setWorker);
   }, []);
 
+  const contributionLabel = worker.starting
+    ? "Connecting…"
+    : worker.running
+      ? "Connected"
+      : "Paused";
+  const actionLabel = worker.starting
+    ? "Connecting…"
+    : worker.running
+      ? "Pause contribution"
+      : "Start contributing";
+
   return (
     <section className={`contribute-page ${worker.running ? "is-running" : ""}`}>
       <div className="panel-page-title">
         <div>
-          <span>THIS DEVICE · ONE CELL</span>
-          <h1>Contribute power</h1>
-          <p>Turn this device into a verified compute cell while you keep mycellios open.</p>
+          <span>BROWSER NODE</span>
+          <h1>This device</h1>
+          <p>Hardware available to mycellios from this browser.</p>
         </div>
-        <div className={`contribute-connection ${worker.connection}`}>
-          <i />
-          <span>{worker.connectionLabel}</span>
+        <div className="page-actions">
+          <button disabled={worker.starting} onClick={() => void toggleMobileWorker()}>
+            {worker.starting ? <Radio className="spin" size={16} /> : <Power size={16} />}
+            {actionLabel}
+          </button>
         </div>
       </div>
 
-      <article className="contribute-hero">
-        <div className="contribute-cell" aria-hidden="true">
-          <i className="cell-ring ring-one" />
-          <i className="cell-ring ring-two" />
-          <img src={brandIcon} alt="" />
-          <span className="cell-pulse pulse-one" />
-          <span className="cell-pulse pulse-two" />
+      <div className="hardware-hero browser-hardware-hero">
+        <div className="device-orb"><MonitorSmartphone size={36} /></div>
+        <div>
+          <span className="eyebrow">BROWSER</span>
+          <h2>Browser worker</h2>
+          <p>{worker.backend === "webgpu" ? "WebGPU" : "CPU"} · {worker.gpuLabel}</p>
         </div>
-        <div className="contribute-hero-copy">
-          <span className="card-kicker">VOLUNTARY COMPUTE</span>
-          <h2>{worker.running ? "Your cell is live." : "Add this device to the network."}</h2>
-          <p>{worker.statusText}</p>
-          <button
-            className={`contribute-toggle ${worker.running ? "stop" : "start"}`}
-            disabled={worker.starting}
-            onClick={() => void toggleMobileWorker()}
-          >
-            {worker.starting ? <Radio className="spin" size={19} /> : worker.running ? <Power size={19} /> : <Zap size={19} />}
-            {worker.starting ? "Preparing device…" : worker.running ? "Stop contributing" : "Contribute power"}
-          </button>
-          <small><ShieldCheck size={14} /> You stay in control. Contribution can be stopped at any time.</small>
-        </div>
-      </article>
+        <span className={`state-badge ${worker.running ? "online" : "paused"}`}>{contributionLabel}</span>
+      </div>
+
+      <div className="browser-contribution-status">
+        <Activity size={16} />
+        <div><strong>{worker.running ? "Browser contribution active" : "Browser contribution paused"}</strong><span>{worker.statusText}</span></div>
+        <small>This browser worker only remains available while this tab stays open and visible.</small>
+      </div>
 
       <div className="contribute-metrics" aria-label="Device contribution metrics">
         <WorkerMetric icon={Cpu} label="Engine" value={worker.backend === "webgpu" ? "WebGPU" : "CPU"} detail={worker.gpuLabel} />

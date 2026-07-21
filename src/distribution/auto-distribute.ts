@@ -46,6 +46,7 @@ const endpointSchema = z
 
 const agentSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("local") }).strict(),
+  z.object({ kind: z.literal("managed") }).strict(),
   z
     .object({
       kind: z.literal("http"),
@@ -131,6 +132,7 @@ export const autoDistributionConfigSchema = z
     runtime: z
       .object({
         pythonExecutable: z.string().min(1).max(4_096),
+        stagePythonExecutable: z.string().min(1).max(4_096).optional(),
         pythonPath: z.string().min(1).max(4_096).default("python"),
         hfHome: z.string().min(1).max(4_096).default("runtime/hf-cache"),
         apiEndpoint: endpointSchema,
@@ -254,6 +256,13 @@ export interface AutoDistributionCanaryMetrics {
   measuredTokensPerSecond: number;
 }
 
+export interface AutoDistributionRunOptions {
+  resolveManagedAgent?: (
+    nodeId: string,
+    launch: PythonPipelineLaunchDescription,
+  ) => LaunchAgent | undefined;
+}
+
 export function parseAutoDistributionConfig(value: unknown): AutoDistributionConfig {
   return autoDistributionConfigSchema.parse(value);
 }
@@ -319,7 +328,7 @@ export function compileAutoDistribution(
       canonicalRevision: profile.source.canonicalRevision,
     },
     publicModelName: config.model.publicName,
-    pythonExecutable: absoluteFrom(cwd, config.runtime.pythonExecutable),
+      pythonExecutable: config.runtime.stagePythonExecutable ?? absoluteFrom(cwd, config.runtime.pythonExecutable),
     threadsPerStage: config.runtime.threadsPerStage,
     connectTimeoutSeconds: config.runtime.connectTimeoutSeconds,
     batchWindowMs: config.workload.batchWindowMs,
@@ -358,9 +367,10 @@ export async function runAutoDistribution(
   cwd = process.cwd(),
   environment: NodeJS.ProcessEnv = process.env,
   shutdownSignal?: AbortSignal,
+  options: AutoDistributionRunOptions = {},
 ): Promise<AutoDistributionRunResult> {
   const config = parseAutoDistributionConfig(configValue);
-  const agents = await createLaunchAgents(config, cwd, environment);
+  const agents = await createLaunchAgents(config, cwd, environment, compilation.launch, options);
   const supervisor = new PythonLaunchSupervisor(compilation.launch, {
     resolveAgent: (nodeId) => agents.get(nodeId),
     readinessTimeoutMs: config.runtime.readinessTimeoutMs,
@@ -632,6 +642,8 @@ async function createLaunchAgents(
   config: AutoDistributionConfig,
   cwd: string,
   environment: NodeJS.ProcessEnv,
+  launch: PythonPipelineLaunchDescription,
+  options: AutoDistributionRunOptions,
 ): Promise<Map<string, LaunchAgent>> {
   const agents = new Map<string, LaunchAgent>();
   const local = new LocalProcessAgent({
@@ -646,6 +658,12 @@ async function createLaunchAgents(
   for (const node of config.nodes) {
     if (node.agent.kind === "local") {
       agents.set(node.id, local);
+      continue;
+    }
+    if (node.agent.kind === "managed") {
+      const agent = options.resolveManagedAgent?.(node.id, launch);
+      if (!agent) throw new Error(`managed_launch_agent_is_unavailable:${node.id}`);
+      agents.set(node.id, agent);
       continue;
     }
     const token = optionalSecret(environment, node.agent.authTokenEnv);

@@ -29,6 +29,7 @@ const bridge: DesktopBridge = Object.freeze({
   },
   removeWorker: (workerId: string) => ipcRenderer.invoke("workers:remove", workerId),
   clearOfflineWorkers: () => ipcRenderer.invoke("workers:clear-offline"),
+  searchHubModels: (query: string) => ipcRenderer.invoke("models:search-hub", query),
   requestModel: (input: RequestModelInput) => ipcRenderer.invoke("models:request", input),
   removeRequestedModel: (modelId: string) => ipcRenderer.invoke("models:remove-request", modelId),
   getBenchmarkRuns: () => ipcRenderer.invoke("benchmarks:read"),

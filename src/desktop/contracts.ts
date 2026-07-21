@@ -1,5 +1,7 @@
 export type CoordinatorMode = "local" | "remote";
 export type AdapterMode = "connectivity-test" | "local-model-runtime";
+import type { HubCatalogModel } from "../contracts/types.js";
+export type { HubCatalogModel } from "../contracts/types.js";
 
 export interface DesktopSettings {
   coordinatorMode: CoordinatorMode;
@@ -174,6 +176,10 @@ export interface DashboardSnapshot {
   requestedModels: RequestedModelCapacity[];
   jobs: DashboardJob[];
   localHardware: LocalHardware;
+  contribution: {
+    state: "paused" | "connecting" | "connected" | "error";
+    workerId: string | null;
+  };
   settings: DesktopSettings;
   update: DesktopUpdateStatus;
 }
@@ -217,6 +223,7 @@ export interface DesktopBridge {
   streamChat?(request: ChatRequest, onUpdate: (update: ChatStreamUpdate) => void): Promise<ChatResponse>;
   removeWorker(workerId: string): Promise<DashboardSnapshot>;
   clearOfflineWorkers(): Promise<DashboardSnapshot>;
+  searchHubModels(query: string): Promise<HubCatalogModel[]>;
   requestModel(input: RequestModelInput): Promise<DashboardSnapshot>;
   removeRequestedModel(modelId: string): Promise<DashboardSnapshot>;
   getBenchmarkRuns(): Promise<BenchmarkRun[]>;

@@ -1,5 +1,5 @@
 :root {
-  font-family: "DM Sans", Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: "Manrope Variable", Manrope, "SF Pro Display", "Segoe UI Variable", sans-serif;
   color: #e9f2f1;
   background: #05090b;
   font-synthesis: none;
@@ -67,7 +67,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .brand-lockup { display: flex; align-items: center; gap: 10px; }
 .brand-lockup img { width: 34px; height: 34px; object-fit: contain; filter: drop-shadow(0 0 12px rgba(83, 212, 220, 0.2)); }
 .brand-lockup div { display: flex; flex-direction: column; line-height: 1.04; }
-.brand-lockup strong { font: 600 16px "Space Grotesk", sans-serif; letter-spacing: -0.2px; }
+.brand-lockup strong { font: 600 16px "Manrope Variable", Manrope, sans-serif; letter-spacing: -0.2px; }
 .brand-lockup span { margin-top: 4px; font-size: 9px; color: #7d9291; letter-spacing: 1.3px; text-transform: uppercase; }
 
 .network-pill {
@@ -154,7 +154,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .view-heading { display: flex; align-items: flex-start; justify-content: space-between; }
 .floating-heading { position: absolute; z-index: 8; top: 24px; left: 28px; right: 28px; }
 .eyebrow { font-size: 9px; font-weight: 700; letter-spacing: 1.55px; color: #73908e; }
-.view-heading h1, .page-heading h1 { font: 600 24px "Space Grotesk", sans-serif; letter-spacing: -.65px; margin: 4px 0 0; }
+.view-heading h1, .page-heading h1 { font: 600 24px "Manrope Variable", Manrope, sans-serif; letter-spacing: -.65px; margin: 4px 0 0; }
 .graph-controls { display: flex; gap: 5px; padding: 4px; border: 1px solid var(--line); border-radius: 11px; background: rgba(6, 14, 16, .66); }
 .segmented { border: 0; border-radius: 8px; background: transparent; padding: 7px 10px; color: #718685; font-size: 10px; display: flex; align-items: center; gap: 6px; }
 .segmented.active { color: var(--gold); background: rgba(216, 191, 136, .1); }
@@ -175,12 +175,12 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .mini-stat { display: flex; align-items: center; justify-content: center; gap: 9px; color: #6f8886; border-right: 1px solid var(--line); }
 .mini-stat:last-child { border-right: 0; }
 .mini-stat div { display: flex; flex-direction: column; }
-.mini-stat strong { color: #d8e6e4; font: 600 14px "Space Grotesk"; }
+.mini-stat strong { color: #d8e6e4; font: 600 14px "Manrope Variable", Manrope, sans-serif; }
 .mini-stat span { color: #6d817f; font-size: 8px; text-transform: uppercase; letter-spacing: .45px; }
 
 .inspector { border-left: 1px solid var(--line); background: linear-gradient(180deg, rgba(13, 29, 32, .9), rgba(7, 17, 19, .96)); padding: 24px 22px; overflow: auto; z-index: 10; }
 .inspector-header { display: flex; gap: 12px; align-items: center; margin-bottom: 22px; }
-.inspector-header h2 { margin: 4px 0 0; font: 600 18px "Space Grotesk"; max-width: 235px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.inspector-header h2 { margin: 4px 0 0; font: 600 18px "Manrope Variable", Manrope, sans-serif; max-width: 235px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .inspector-icon { width: 38px; height: 38px; border: 1px solid rgba(79, 205, 200, .2); background: var(--cyan-soft); color: var(--cyan); border-radius: 12px; display: grid; place-items: center; }
 .status-card { padding: 13px 14px; border: 1px solid var(--line); border-radius: 11px; background: rgba(25, 48, 49, .4); margin-bottom: 12px; }
 .status-card > div { display: flex; align-items: center; gap: 7px; }
@@ -190,7 +190,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .metric-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 12px 0; }
 .metric { min-width: 0; padding: 11px 12px; border: 1px solid var(--line); border-radius: 10px; background: rgba(6, 16, 18, .46); display: flex; flex-direction: column; gap: 4px; }
 .metric span { color: #718482; font-size: 9px; }
-.metric strong { color: #dce9e7; font: 600 13px "Space Grotesk"; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.metric strong { color: #dce9e7; font: 600 13px "Manrope Variable", Manrope, sans-serif; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .detail-card { margin-top: 10px; padding: 14px; border: 1px solid var(--line); border-radius: 11px; background: rgba(8, 18, 20, .56); }
 .card-kicker { display: block; color: #687e7c; font-size: 8px; font-weight: 700; letter-spacing: 1.15px; margin-bottom: 8px; }
 .detail-card h3 { font-size: 12px; margin: 0 0 12px; line-height: 1.4; }
@@ -203,7 +203,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .hero-metric-card { margin: 3px 0 12px; padding: 18px; border-radius: 13px; background: radial-gradient(circle at 86% 12%, rgba(82, 224, 221, .18), transparent 46%), #101f22; border: 1px solid rgba(84, 200, 197, .18); display: flex; flex-direction: column; }
 .hero-metric-card.purple-card { background: radial-gradient(circle at 86% 12%, rgba(152, 104, 244, .24), transparent 46%), #181526; border-color: rgba(152, 104, 244, .22); }
 .hero-metric-card span { color: #89a09e; font-size: 10px; }
-.hero-metric-card strong { margin: 3px 0; font: 600 36px "Space Grotesk"; }
+.hero-metric-card strong { margin: 3px 0; font: 600 36px "Manrope Variable", Manrope, sans-serif; }
 .hero-metric-card small { color: #6d8280; font-size: 9px; }
 .security-card { display: flex; gap: 10px; align-items: center; color: var(--green); }
 .security-card h3 { margin: 0 0 3px; color: #cfe1de; }
@@ -214,7 +214,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .contribution-card { border: 1px solid var(--line); background: rgba(8, 18, 20, .6); border-radius: 12px; padding: 13px 14px; display: flex; justify-content: space-between; align-items: center; }
 .contribution-card.active { border-color: rgba(84, 223, 182, .24); background: rgba(37, 109, 91, .12); }
 .contribution-card > div { display: flex; flex-direction: column; }
-.contribution-card strong { font: 600 16px "Space Grotesk"; }
+.contribution-card strong { font: 600 16px "Manrope Variable", Manrope, sans-serif; }
 .power-button { width: 38px; height: 38px; border-radius: 50%; border: 1px solid rgba(84, 223, 182, .27); background: rgba(84, 223, 182, .09); color: var(--green); display: grid; place-items: center; cursor: pointer; }
 
 .content-page { height: 100%; overflow: auto; padding: 34px 42px 60px; }
@@ -223,7 +223,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .page-heading p { margin: 7px 0 0; color: var(--muted); font-size: 12px; }
 .hardware-hero { display: flex; align-items: center; gap: 18px; padding: 20px; border: 1px solid var(--line); border-radius: 15px; background: linear-gradient(125deg, rgba(26, 64, 65, .35), rgba(14, 23, 28, .75)); margin-bottom: 15px; }
 .device-orb { width: 58px; height: 58px; border-radius: 50%; display: grid; place-items: center; color: var(--cyan); background: radial-gradient(circle, rgba(76, 225, 220, .18), rgba(25, 72, 76, .12)); border: 1px solid rgba(82, 224, 221, .2); box-shadow: 0 0 28px rgba(54, 191, 188, .08); }
-.hardware-hero h2 { margin: 3px 0; font: 600 20px "Space Grotesk"; }
+.hardware-hero h2 { margin: 3px 0; font: 600 20px "Manrope Variable", Manrope, sans-serif; }
 .hardware-hero p { margin: 0; color: var(--muted); font-size: 10px; }
 .hardware-hero > .state-badge { margin-left: auto; }
 .state-badge { width: fit-content; display: inline-flex; align-items: center; gap: 5px; padding: 5px 8px; border-radius: 7px; font-size: 9px; border: 1px solid var(--line); }
@@ -300,7 +300,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .onboarding-card { width: min(620px, calc(100vw - 40px)); max-height: calc(100vh - 40px); overflow: auto; padding: 28px; border: 1px solid rgba(104, 183, 180, .2); border-radius: 19px; background: radial-gradient(circle at 90% 0%, rgba(61, 147, 143, .15), transparent 33%), #0a1518; box-shadow: 0 30px 100px rgba(0,0,0,.55); }
 .onboarding-brand { display: flex; align-items: center; gap: 9px; color: #718b88; font-size: 8px; letter-spacing: 1.4px; font-weight: 700; }
 .onboarding-brand img { width: 34px; height: 34px; }
-.onboarding-card h1 { margin: 17px 0 7px; font: 600 27px "Space Grotesk"; letter-spacing: -.7px; }
+.onboarding-card h1 { margin: 17px 0 7px; font: 600 27px "Manrope Variable", Manrope, sans-serif; letter-spacing: -.7px; }
 .onboarding-card > p { color: #859997; margin: 0 0 20px; font-size: 11px; }
 .mode-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .mode-grid button { position: relative; min-height: 115px; text-align: left; border: 1px solid var(--line); border-radius: 13px; padding: 16px; background: rgba(7,16,18,.6); color: #79908e; display: flex; flex-direction: column; gap: 7px; cursor: pointer; }
@@ -323,11 +323,11 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .fatal-state, .launch-screen { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
 .fatal-state { color: #b8c8c6; }
 .fatal-state svg { color: var(--danger); }
-.fatal-state h1 { font: 600 20px "Space Grotesk"; margin: 14px 0 5px; }
+.fatal-state h1 { font: 600 20px "Manrope Variable", Manrope, sans-serif; margin: 14px 0 5px; }
 .fatal-state p { color: var(--muted); font-size: 11px; }
 .launch-screen { position: relative; background: radial-gradient(circle, rgba(53, 135, 132, .14), transparent 38%); }
 .launch-screen img { width: 112px; height: 112px; position: relative; z-index: 2; filter: drop-shadow(0 0 25px rgba(65,204,207,.16)); }
-.launch-screen h1 { font: 600 25px "Space Grotesk"; margin: 16px 0 2px; }
+.launch-screen h1 { font: 600 25px "Manrope Variable", Manrope, sans-serif; margin: 16px 0 2px; }
 .launch-screen p { color: #6c8380; font-size: 10px; margin: 0 0 14px; }
 .launch-screen > svg { color: var(--cyan); }
 .launch-orbit { position: absolute; width: 220px; height: 220px; border-radius: 50%; border: 1px solid rgba(82,224,221,.12); animation: orbit 4s linear infinite; }

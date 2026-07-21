@@ -3,6 +3,8 @@ import {
   parseWorkerEnvelope,
   taskCompleteEnvelopeSchema,
   taskTokenEnvelopeSchema,
+  runtimeExitedEnvelopeSchema,
+  runtimePreparedEnvelopeSchema,
   workerGoodbyeEnvelopeSchema,
   workerEnvelopeSchema,
   workerHeartbeatEnvelopeSchema,
@@ -148,12 +150,28 @@ describe("worker protocol schemas", () => {
             },
           ],
           network: { coordinatorRttMs: 10, uplinkMbps: 100, downlinkMbps: 100 },
+          distributedExecutor: {
+            protocol: "gdlp-worker-tunnel/1" as const,
+            nodeId: "desktop-test",
+            stageHost: "192.168.1.20",
+            stagePort: 9_850,
+            runtime: "python-safetensors" as const,
+          },
         },
         metrics: { ready: true, activeJobs: 0, loadedModels: ["distributed-small"] },
       },
     };
 
     expect(workerHeartbeatEnvelopeSchema.safeParse(heartbeat).success).toBe(true);
+    expect(workerHeartbeatEnvelopeSchema.safeParse({
+      ...heartbeat,
+      payload: {
+        ...heartbeat.payload,
+        heartbeat: { ...heartbeat.payload.heartbeat, deployments: [] },
+        capabilities: { ...heartbeat.payload.capabilities, deployments: [] },
+        metrics: { ...heartbeat.payload.metrics, loadedModels: [] },
+      },
+    }).success).toBe(true);
     expect(
       workerHeartbeatEnvelopeSchema.safeParse({
         ...heartbeat,
@@ -163,5 +181,22 @@ describe("worker protocol schemas", () => {
         },
       }).success,
     ).toBe(false);
+  });
+
+  it("accepts bounded shard-runtime lifecycle responses", () => {
+    expect(runtimePreparedEnvelopeSchema.safeParse({
+      ...baseEnvelope,
+      type: "runtime.prepared",
+      payload: { requestId: "prepare-1", ok: true },
+    }).success).toBe(true);
+    expect(runtimeExitedEnvelopeSchema.safeParse({
+      ...baseEnvelope,
+      type: "runtime.exited",
+      payload: {
+        requestId: "run-1",
+        exit: { code: 0, signal: null },
+        output: { stdout: "ready", stderr: "", stdoutTruncated: false, stderrTruncated: false },
+      },
+    }).success).toBe(true);
   });
 });
