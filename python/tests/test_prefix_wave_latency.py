@@ -6,6 +6,7 @@ from distributed_runtime.prefix_wave_latency import (
     PrefixWaveCostModel,
     PrefixWaveStrategy,
     compare_prefix_wave_strategies,
+    optimize_stream_chunking,
     simulate_prefix_wave,
 )
 
@@ -49,7 +50,7 @@ class PrefixWaveWorkTests(unittest.TestCase):
         self.assertEqual(comparison.monolithic_packed.executed_token_steps, 9)
         self.assertEqual(comparison.streaming_segmented.executed_token_steps, 9)
         self.assertEqual(len(comparison.monolithic_packed.work_units), 1)
-        self.assertEqual(len(comparison.streaming_segmented.work_units), 3)
+        self.assertEqual(len(comparison.streaming_segmented.work_units), 5)
         self.assertAlmostEqual(
             comparison.streaming_segmented.shared_compute_reduction_ratio,
             0.55,
@@ -194,6 +195,51 @@ class PrefixWaveCausalityTests(unittest.TestCase):
 
 
 class PrefixWaveTradeoffTests(unittest.TestCase):
+    def test_chunk_optimizer_selects_pipeline_or_amortization_from_costs(self) -> None:
+        long_chains = tuple(
+            (10, 11, 12, 13, 100 + leaf, 200 + leaf, 300 + leaf, 400 + leaf)
+            for leaf in range(8)
+        )
+        pipeline_bound = PrefixWaveCostModel(
+            stage_compute_ms_per_token=(2.0,) * 4,
+            stage_kernel_launch_ms=(0.1,) * 4,
+            hop_one_way_propagation_ms=(0.1,) * 3,
+            hop_bandwidth_mbps=(10_000.0,) * 3,
+            activation_bytes_per_token=100,
+            pack_fixed_ms_per_record=0.01,
+            unpack_fixed_ms_per_record=0.01,
+            pack_bytes_per_ms=1_000_000_000.0,
+            hash_bytes_per_ms=1_000_000_000.0,
+        )
+        overhead_bound = PrefixWaveCostModel(
+            stage_compute_ms_per_token=(0.001,) * 4,
+            stage_kernel_launch_ms=(1.0,) * 4,
+            hop_one_way_propagation_ms=(0.0,) * 3,
+            hop_bandwidth_mbps=(10_000.0,) * 3,
+            activation_bytes_per_token=100,
+            pack_fixed_ms_per_record=1.0,
+            unpack_fixed_ms_per_record=1.0,
+            pack_bytes_per_ms=1_000_000_000.0,
+            hash_bytes_per_ms=1_000_000_000.0,
+        )
+
+        fine = optimize_stream_chunking(long_chains, pipeline_bound)
+        coarse = optimize_stream_chunking(long_chains, overhead_bound)
+        self.assertEqual(fine.selected_chain_tokens_per_record, 1)
+        self.assertEqual(coarse.selected_chain_tokens_per_record, 5)
+        self.assertEqual(
+            {item.simulation.executed_token_steps for item in fine.candidates},
+            {37},
+        )
+        self.assertLess(
+            fine.simulation.makespan_ms,
+            fine.candidates[-1].simulation.makespan_ms,
+        )
+        self.assertLess(
+            coarse.simulation.makespan_ms,
+            coarse.candidates[0].simulation.makespan_ms,
+        )
+
     def test_streaming_wins_when_stage_pipeline_is_material(self) -> None:
         comparison = compare_prefix_wave_strategies(PATHS, _cost_model())
         self.assertLess(
@@ -277,6 +323,13 @@ class PrefixWaveValidationTests(unittest.TestCase):
                 model,
                 strategy=PrefixWaveStrategy.STREAMING_SEGMENTED,
                 stream_groups_per_record=0,
+            )
+        with self.assertRaisesRegex(ValueError, "shared_root_tokens"):
+            simulate_prefix_wave(
+                PATHS,
+                model,
+                strategy=PrefixWaveStrategy.STREAMING_SEGMENTED,
+                shared_root_tokens=10**9,
             )
         with self.assertRaisesRegex(ValueError, "prefix"):
             simulate_prefix_wave(
