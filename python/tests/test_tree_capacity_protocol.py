@@ -11,6 +11,9 @@ import torch
 
 from distributed_runtime.model import StageModelSpec
 from distributed_runtime.protocol import (
+    HEADER,
+    MAGIC,
+    VERSION,
     Frame,
     FrameType,
     TensorCodec,
@@ -18,6 +21,7 @@ from distributed_runtime.protocol import (
     TreePrepareRejection,
     TreePrepareStatus,
     branch_request_payload,
+    decode_tree_reservation_nonce,
     decode_tree_prepare,
     encode_tensor,
     encode_tree_prepare_quote,
@@ -161,6 +165,156 @@ def _prepare_frame(
 
 
 class TreeCapacityPayloadTests(unittest.TestCase):
+    def test_commit_and_route_ack_metadata_are_canonical(self) -> None:
+        sender, receiver = socket.socketpair()
+        try:
+            nonce = 2**63 + 11
+            payload = tree_reservation_payload(nonce)
+            for predecessor_count in (0, (2**16) - 2):
+                send_frame(
+                    sender,
+                    FrameType.TREE_RESERVATION_COMMIT,
+                    41,
+                    step=5,
+                    token_count=predecessor_count,
+                    payload=payload,
+                )
+                commit = recv_frame(receiver)
+                self.assertEqual(commit.token_count, predecessor_count)
+                self.assertEqual(decode_tree_reservation_nonce(commit), nonce)
+
+            for stage_count in (1, (2**16) - 1):
+                send_frame(
+                    sender,
+                    FrameType.TREE_RESERVATION_COMMIT_RESULT,
+                    41,
+                    step=5,
+                    token_count=stage_count,
+                    payload=payload,
+                )
+                result = recv_frame(receiver)
+                self.assertEqual(result.token_count, stage_count)
+                self.assertEqual(decode_tree_reservation_nonce(result), nonce)
+
+            with self.assertRaisesRegex(ValueError, "predecessor count"):
+                send_frame(
+                    sender,
+                    FrameType.TREE_RESERVATION_COMMIT,
+                    41,
+                    token_count=(2**16) - 1,
+                    payload=payload,
+                )
+            for stage_count in (0, 2**16):
+                with self.subTest(stage_count=stage_count):
+                    with self.assertRaisesRegex(ValueError, "positive uint16"):
+                        send_frame(
+                            sender,
+                            FrameType.TREE_RESERVATION_COMMIT_RESULT,
+                            41,
+                            token_count=stage_count,
+                            payload=payload,
+                        )
+
+            for frame_type, token_count in (
+                (FrameType.TREE_RESERVATION_COMMIT, 0),
+                (FrameType.TREE_RESERVATION_COMMIT_RESULT, 1),
+            ):
+                with self.subTest(frame_type=frame_type.name, field="flags"):
+                    with self.assertRaisesRegex(ValueError, "flags=hidden_size=0"):
+                        send_frame(
+                            sender,
+                            frame_type,
+                            41,
+                            token_count=token_count,
+                            flags=1,
+                            payload=payload,
+                        )
+                with self.subTest(frame_type=frame_type.name, field="hidden_size"):
+                    with self.assertRaisesRegex(ValueError, "flags=hidden_size=0"):
+                        send_frame(
+                            sender,
+                            frame_type,
+                            41,
+                            token_count=token_count,
+                            hidden_size=1,
+                            payload=payload,
+                        )
+                with self.subTest(frame_type=frame_type.name, field="payload"):
+                    with self.assertRaisesRegex(ValueError, "exactly one uint64"):
+                        send_frame(
+                            sender,
+                            frame_type,
+                            41,
+                            token_count=token_count,
+                            payload=b"short",
+                        )
+        finally:
+            sender.close()
+            receiver.close()
+
+    def test_commit_and_route_ack_reject_noncanonical_wire_headers(self) -> None:
+        payload = tree_reservation_payload(99)
+        cases = (
+            (FrameType.TREE_RESERVATION_COMMIT, 1, 0, 0, 8, "flags"),
+            (FrameType.TREE_RESERVATION_COMMIT, 0, 0, 1, 8, "hidden_size"),
+            (
+                FrameType.TREE_RESERVATION_COMMIT,
+                0,
+                (2**16) - 1,
+                0,
+                8,
+                "predecessor count",
+            ),
+            (FrameType.TREE_RESERVATION_COMMIT, 0, 0, 0, 7, "one uint64"),
+            (
+                FrameType.TREE_RESERVATION_COMMIT_RESULT,
+                0,
+                0,
+                0,
+                8,
+                "positive uint16",
+            ),
+            (
+                FrameType.TREE_RESERVATION_COMMIT_RESULT,
+                0,
+                2**16,
+                0,
+                8,
+                "positive uint16",
+            ),
+            (
+                FrameType.TREE_RESERVATION_COMMIT_RESULT,
+                0,
+                1,
+                0,
+                9,
+                "one uint64",
+            ),
+        )
+        for frame_type, flags, token_count, hidden_size, size, pattern in cases:
+            with self.subTest(frame_type=frame_type.name, pattern=pattern):
+                sender, receiver = socket.socketpair()
+                try:
+                    sender.sendall(
+                        HEADER.pack(
+                            MAGIC,
+                            VERSION,
+                            int(frame_type),
+                            flags,
+                            41,
+                            5,
+                            token_count,
+                            hidden_size,
+                            size,
+                        )
+                        + payload[:size]
+                    )
+                    with self.assertRaisesRegex(ValueError, pattern):
+                        recv_frame(receiver)
+                finally:
+                    sender.close()
+                    receiver.close()
+
     def test_quote_and_structured_result_are_canonical_and_bounded(self) -> None:
         sender, receiver = socket.socketpair()
         try:
@@ -337,7 +491,7 @@ class TreeCapacityStageTests(unittest.TestCase):
             stage_sock.close()
             peer.close()
 
-    def test_unquoted_fork_is_rejected_on_the_v5_stage_path(self) -> None:
+    def test_unquoted_fork_is_rejected_on_the_v6_stage_path(self) -> None:
         config = _last_stage_config(max_kv_bytes=10_000)
         runner = _QuoteRunner(config.spec)
         runner.begin(11)

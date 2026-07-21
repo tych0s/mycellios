@@ -90,15 +90,16 @@ class TreeLeafShape:
 
 @dataclass
 class TreeReservationBook:
-    """One globally serialized logical quote for a physical stage.
+    """One globally serialized capacity quote for a physical stage.
 
     The quote allocates no KV. Its count/byte guarantee is made transactional by
     deferring every unrelated frame that can mutate runtime-visible KV, blocking
     another PREPARE/FORK, and revalidating the exact snapshot at COMMIT. This
-    seals the runtime KV budget; it is deliberately not advertised as a physical
-    CUDA/allocator reservation because no such runner ABI exists yet. The engine
-    must serialize one global tree wave from PREPARE until RESULT+CANCEL or the
-    end-to-end COMMIT result plus all quoted FORKs are consumed.
+    seals both the configured budget and, when the runner exposes it, its
+    runner-owned physical KV pool.  It is not a reservation of arbitrary CUDA
+    workspace or process-wide VRAM outside that pool.  The engine must serialize
+    one global tree wave from PREPARE until RESULT+CANCEL or the end-to-end
+    COMMIT result plus all quoted FORKs are consumed.
     """
 
     active: TreeCapacityReservation | None = None

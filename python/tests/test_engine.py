@@ -412,6 +412,96 @@ class EngineUnitTests(unittest.TestCase):
             root.close()
             child.close()
 
+    def test_pending_tree_reservation_blocks_every_live_admission_point(self) -> None:
+        def run_case(
+            *, incomplete_prefill: bool
+        ) -> tuple[list[object], int, list[BaseException]]:
+            engine = DistributedPipelineEngine.__new__(DistributedPipelineEngine)
+            engine.config = SimpleNamespace(
+                one_way_delay_ms=0.0,
+                bandwidth_mbps=0.0,
+                max_active_sequences=2,
+                root_batch_window_ms=0.0,
+            )
+            engine._scheduler_stop = threading.Event()
+            engine._shutdown_sent = True
+            engine._downstream = object()
+            engine._pending_tree_reservation = None
+            received = mock.Mock()
+            received.get_nowait.side_effect = queue.Empty
+            received.get.return_value = None
+            engine._received_frames = received
+
+            runner = object()
+            engine._require_runner = mock.Mock(return_value=runner)
+            engine._require_socket = mock.Mock(return_value=engine._downstream)
+            engine._check_route_probe_timeout = mock.Mock()
+            engine._send_requested_cancellations = mock.Mock()
+            engine._send_route_probe_if_due = mock.Mock()
+            engine._retire_job = mock.Mock()
+            engine._fail_pending_submissions = mock.Mock()
+
+            prompt_tokens = 2
+            job = SimpleNamespace(
+                cancel_requested=threading.Event(),
+                prefill_offset=prompt_tokens - int(incomplete_prefill),
+                request=SimpleNamespace(input_ids=torch.tensor([[1, 2]])),
+            )
+            initial, deferred = object(), object()
+            admission_calls: list[object] = []
+            fatal_errors: list[BaseException] = []
+            timeout_checks = 0
+
+            def next_submission(timeout: float) -> list[object]:
+                del timeout
+                return [initial] if not admission_calls else [deferred]
+
+            def admit_batch(
+                batch: list[object],
+                active: dict[int, object],
+                _runner: object,
+                _downstream: object,
+                _emulator: LinkEmulator,
+            ) -> None:
+                admission_calls.append(batch[0])
+                if len(admission_calls) == 1:
+                    active[1] = job
+                    engine._pending_tree_reservation = object()
+                else:
+                    # Bounds a regression: without the scheduler-level gate this
+                    # is the same deferred batch being popped and requeued.
+                    engine._scheduler_stop.set()
+
+            def check_timeouts(active: dict[int, object]) -> None:
+                nonlocal timeout_checks
+                del active
+                timeout_checks += 1
+                if incomplete_prefill:
+                    engine._scheduler_stop.set()
+
+            def dispatch_prefill(*_args: object) -> bool:
+                if not incomplete_prefill:
+                    engine._scheduler_stop.set()
+                return False
+
+            engine._next_submission = next_submission
+            engine._admit_batch = admit_batch
+            engine._check_pipeline_timeouts = check_timeouts
+            engine._dispatch_prefill_credit_round = dispatch_prefill
+            engine._set_fatal = fatal_errors.append
+
+            engine._scheduler_loop()
+            return admission_calls, timeout_checks, fatal_errors
+
+        for incomplete_prefill in (True, False):
+            with self.subTest(incomplete_prefill=incomplete_prefill):
+                admissions, timeout_checks, fatal_errors = run_case(
+                    incomplete_prefill=incomplete_prefill
+                )
+                self.assertEqual(len(admissions), 1)
+                self.assertEqual(timeout_checks, 1)
+                self.assertEqual(fatal_errors, [])
+
     def test_close_orders_protocol_shutdown_before_child_wait_and_hard_socket_close(self) -> None:
         events: list[str] = []
         process = _LifecycleProcess(events, exit_code=0)
