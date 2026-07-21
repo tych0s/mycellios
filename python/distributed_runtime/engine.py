@@ -3317,11 +3317,20 @@ class DistributedPipelineEngine:
                 self._cancel_pending_tree_reservation(
                     pending_quote.prepared.job,
                     pending_quote.downstream,
-                    reason="TREE_PREPARE_RESULT timeout",
+                    reason=(
+                        "TREE_RESERVATION_COMMIT_RESULT timeout"
+                        if waiting_for_commit
+                        else "TREE_PREPARE_RESULT timeout"
+                    ),
                     count_metric=False,
                 )
                 raise TimeoutError(
-                    "TREE_PREPARE_RESULT timeout for parent request "
+                    (
+                        "TREE_RESERVATION_COMMIT_RESULT"
+                        if waiting_for_commit
+                        else "TREE_PREPARE_RESULT"
+                    )
+                    + " timeout for parent request "
                     f"{pending_quote.prepared.job.wire_id}"
                 )
         coordinator = getattr(self, "_physical_tree", None)
