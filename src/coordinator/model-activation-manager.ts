@@ -156,7 +156,7 @@ export class AutomaticModelActivationManager implements ModelActivationManager {
         ...this.baseConfig.workload,
         contextTokens: model.contextTokens,
       },
-      artifactsDirectory: `runtime/auto-distribute/${model.id}`,
+      artifactsDirectory: modelArtifactsDirectory(this.baseConfig, model.id),
     });
   }
 
@@ -228,7 +228,7 @@ export class DynamicModelActivationManager implements ModelActivationManager {
         maximumStages: Math.max(model.minimumNodes, Math.min(base.distribution.maximumStages, base.nodes.length)),
       },
       workload: { ...base.workload, contextTokens: model.contextTokens },
-      artifactsDirectory: `runtime/auto-distribute/${model.id}`,
+      artifactsDirectory: modelArtifactsDirectory(base, model.id),
     });
     const controller = new AbortController();
     this.activeModelId = model.id;
@@ -264,6 +264,13 @@ export class DynamicModelActivationManager implements ModelActivationManager {
   async close(): Promise<void> {
     if (this.activeModelId) await this.deactivate(this.activeModelId);
   }
+}
+
+function modelArtifactsDirectory(base: AutoDistributionConfig, modelId: string): string {
+  const configuredRoot = base.artifactsDirectory?.trim();
+  return configuredRoot
+    ? resolve(configuredRoot, modelId)
+    : `runtime/auto-distribute/${modelId}`;
 }
 
 async function defaultAutomaticModelRunner(
