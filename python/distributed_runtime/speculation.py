@@ -16,6 +16,7 @@ from typing import Protocol, runtime_checkable
 
 
 MAX_DRAFT_TOKENS = 16
+MAX_TREE_DRAFT_BRANCHES = 64
 
 
 def _is_int(value: object) -> bool:
@@ -52,6 +53,28 @@ class DraftProvider(Protocol):
         max_tokens: int | None = None,
     ) -> tuple[int, ...]:
         """Return up to ``max_tokens`` deterministic candidate tokens."""
+
+
+@runtime_checkable
+class TreeDraftProvider(Protocol):
+    """Candidate source for one exact sparse speculative tree.
+
+    Providers return leaf paths only.  Paths may share prefixes, but a path
+    may not be a prefix of another path because verifying the longer leaf
+    already computes every target argmax needed by the shorter one.
+    """
+
+    strategy: str
+    max_draft_tokens: int
+    max_branches: int
+
+    def draft_paths(
+        self,
+        token_history: Sequence[int],
+        max_tokens: int | None = None,
+        max_branches: int | None = None,
+    ) -> tuple[tuple[int, ...], ...]:
+        """Return deterministic, distinct candidate leaf paths."""
 
 
 @dataclass(frozen=True)
@@ -129,6 +152,158 @@ class NgramDraftProvider:
                 if continuation:
                     return tuple(continuation)
         return ()
+
+
+@dataclass(frozen=True)
+class NgramTreeDraftProvider:
+    """Build several deterministic continuations from repeated suffixes.
+
+    A linear n-gram drafter uses only the most recent occurrence of the
+    longest suffix.  This provider retains several historical occurrences,
+    ranked first by match width and then by recency.  The target model can
+    verify those alternatives concurrently in one physical sparse-tree wave,
+    exchanging additional local compute for fewer sequential WAN round trips.
+
+    Candidate prefixes that are already covered by a longer candidate are
+    removed.  Therefore every returned path is a leaf and can be passed
+    directly to ``branched_candidates_to_macro_wave``.
+    """
+
+    max_draft_tokens: int = 8
+    max_branches: int = 4
+    min_match_tokens: int = 2
+    max_match_tokens: int | None = 8
+    strategy: str = "ngram-tree"
+
+    def __post_init__(self) -> None:
+        if (
+            not _is_int(self.max_draft_tokens)
+            or not 1 <= int(self.max_draft_tokens) <= MAX_DRAFT_TOKENS
+        ):
+            raise ValueError(
+                f"max_draft_tokens must be an integer between 1 and {MAX_DRAFT_TOKENS}"
+            )
+        if (
+            not _is_int(self.max_branches)
+            or not 1 <= int(self.max_branches) <= MAX_TREE_DRAFT_BRANCHES
+        ):
+            raise ValueError(
+                "max_branches must be an integer between 1 and "
+                f"{MAX_TREE_DRAFT_BRANCHES}"
+            )
+        if not _is_int(self.min_match_tokens) or int(self.min_match_tokens) < 1:
+            raise ValueError("min_match_tokens must be a positive integer")
+        if self.max_match_tokens is not None:
+            if not _is_int(self.max_match_tokens) or int(self.max_match_tokens) < int(
+                self.min_match_tokens
+            ):
+                raise ValueError(
+                    "max_match_tokens must be None or an integer >= min_match_tokens"
+                )
+        if self.strategy != "ngram-tree":
+            raise ValueError("NgramTreeDraftProvider strategy must be 'ngram-tree'")
+
+    def draft_paths(
+        self,
+        token_history: Sequence[int],
+        max_tokens: int | None = None,
+        max_branches: int | None = None,
+    ) -> tuple[tuple[int, ...], ...]:
+        if isinstance(token_history, (str, bytes, bytearray)):
+            raise ValueError("token_history must be a sequence of integer token ids")
+        observed: list[int] = []
+        for token in token_history:
+            if not _is_int(token) or int(token) < 0:
+                raise ValueError(
+                    "token_history must contain non-negative integer token ids"
+                )
+            observed.append(int(token))
+
+        if max_tokens is None:
+            token_limit = int(self.max_draft_tokens)
+        else:
+            token_limit = min(
+                _validate_count("max_tokens", max_tokens),
+                int(self.max_draft_tokens),
+            )
+        if max_branches is None:
+            branch_limit = int(self.max_branches)
+        else:
+            branch_limit = min(
+                _validate_count("max_branches", max_branches),
+                int(self.max_branches),
+            )
+        if (
+            token_limit == 0
+            or branch_limit == 0
+            or len(observed) <= int(self.min_match_tokens)
+        ):
+            return ()
+
+        largest_width = len(observed) - 1
+        if self.max_match_tokens is not None:
+            largest_width = min(largest_width, int(self.max_match_tokens))
+
+        # Each matching occurrence is identified by the point where its
+        # continuation begins.  Searching wider suffixes first means a given
+        # occurrence is recorded under its most specific match only.
+        occurrence_ends: set[int] = set()
+        ranked: list[tuple[int, int, tuple[int, ...]]] = []
+        history_size = len(observed)
+        for width in range(largest_width, int(self.min_match_tokens) - 1, -1):
+            suffix_start = history_size - width
+            suffix = observed[suffix_start:]
+            for start in range(suffix_start - 1, -1, -1):
+                continuation_start = start + width
+                if continuation_start in occurrence_ends:
+                    continue
+                if observed[start:continuation_start] != suffix:
+                    continue
+                occurrence_ends.add(continuation_start)
+                continuation_end = min(
+                    history_size,
+                    continuation_start + token_limit,
+                )
+                continuation = tuple(observed[continuation_start:continuation_end])
+                if continuation:
+                    ranked.append((width, start, continuation))
+
+        if not ranked:
+            return ()
+
+        # Exact duplicates add no coverage.  A shorter path that prefixes a
+        # longer path is also redundant: the longer leaf computes all targets
+        # along that prefix plus one or more additional targets.
+        distinct: list[tuple[int, ...]] = []
+        for _width, _start, candidate in ranked:
+            if candidate not in distinct:
+                distinct.append(candidate)
+        leaves = [
+            candidate
+            for candidate in distinct
+            if not any(
+                len(candidate) < len(other)
+                and other[: len(candidate)] == candidate
+                for other in distinct
+            )
+        ]
+        # A long leaf inherits the priority of every shorter candidate it
+        # covers.  Without this rule, removing a highly ranked short prefix
+        # could let unrelated leaves consume the branch budget before its
+        # longer replacement is considered.
+        candidate_rank = {candidate: index for index, candidate in enumerate(distinct)}
+
+        def coverage_rank(leaf: tuple[int, ...]) -> tuple[int, int, tuple[int, ...]]:
+            covered = min(
+                rank
+                for candidate, rank in candidate_rank.items()
+                if len(candidate) <= len(leaf)
+                and leaf[: len(candidate)] == candidate
+            )
+            return covered, candidate_rank[leaf], leaf
+
+        leaves.sort(key=coverage_rank)
+        return tuple(leaves[:branch_limit])
 
 
 def _automatic_candidate_sizes(max_draft_tokens: int) -> tuple[int, ...]:

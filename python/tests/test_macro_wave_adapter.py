@@ -10,6 +10,7 @@ from distributed_runtime.macro_wave_adapter import (
     branched_candidates_to_macro_wave,
     linear_draft_to_macro_wave,
     prepare_linear_macro_wave,
+    prepare_tree_macro_wave,
     record_linear_resolution,
     resolve_linear_macro_wave,
     resolve_macro_wave,
@@ -17,6 +18,7 @@ from distributed_runtime.macro_wave_adapter import (
 from distributed_runtime.speculation import (
     AdaptiveSpeculationConfig,
     AdaptiveSpeculationController,
+    NgramTreeDraftProvider,
 )
 
 
@@ -34,6 +36,23 @@ class _FixedDraftProvider:
         del token_history
         limit = self.max_draft_tokens if max_tokens is None else max_tokens
         return self.tokens[:limit]
+
+
+@dataclass
+class _FixedTreeDraftProvider:
+    paths: tuple[tuple[int, ...], ...]
+    max_draft_tokens: int = 8
+    max_branches: int = 4
+    strategy: str = "fixed-tree-test"
+
+    def draft_paths(
+        self,
+        token_history: object,
+        max_tokens: int | None = None,
+        max_branches: int | None = None,
+    ) -> tuple[tuple[int, ...], ...]:
+        del token_history, max_tokens, max_branches
+        return self.paths
 
 
 def _controller(*, verification_ready: bool) -> AdaptiveSpeculationController:
@@ -225,6 +244,54 @@ class LinearMacroWaveAdapterTests(unittest.TestCase):
 
 
 class BranchedMacroWaveAdapterTests(unittest.TestCase):
+    def test_ngram_tree_provider_builds_a_shared_prefix_exact_proposal(self) -> None:
+        provider = NgramTreeDraftProvider(
+            max_draft_tokens=3,
+            max_branches=2,
+            max_match_tokens=2,
+        )
+        history = (1, 2, 10, 11, 9, 1, 2, 10, 12, 8, 1, 2)
+        proposal = prepare_tree_macro_wave(
+            provider,
+            history,
+            request_id="ngram-tree",
+            ordinal=3,
+            parent_kv_version=KVVersion(7),
+        )
+        self.assertIsNotNone(proposal)
+        assert proposal is not None
+        self.assertEqual(proposal.candidate_paths, ((10, 12, 8), (10, 11, 9)))
+        self.assertEqual(proposal.width, 2)
+        self.assertEqual(proposal.strategy, "ngram-tree")
+
+    def test_tree_provider_output_is_revalidated_fail_closed(self) -> None:
+        common = {
+            "token_history": (1, 2),
+            "request_id": "bounded-tree",
+            "ordinal": 0,
+        }
+        with self.assertRaisesRegex(ValueError, "more paths"):
+            prepare_tree_macro_wave(
+                _FixedTreeDraftProvider(((1,), (2,)), max_branches=1),
+                **common,
+            )
+        with self.assertRaisesRegex(ValueError, "longer"):
+            prepare_tree_macro_wave(
+                _FixedTreeDraftProvider(((1, 2, 3),), max_draft_tokens=2),
+                **common,
+            )
+        with self.assertRaisesRegex(ValueError, "cannot prefix"):
+            prepare_tree_macro_wave(
+                _FixedTreeDraftProvider(((1,), (1, 2))),
+                **common,
+            )
+        self.assertIsNone(
+            prepare_tree_macro_wave(
+                _FixedTreeDraftProvider(()),
+                **common,
+            )
+        )
+
     def test_branched_candidates_share_prefix_and_commit_only_exact_path(self) -> None:
         proposal = branched_candidates_to_macro_wave(
             ((10, 11), (10, 12), (20, 21)),

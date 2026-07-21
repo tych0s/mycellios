@@ -5,14 +5,46 @@ import unittest
 
 from distributed_runtime.executor_abi import (
     STAGE_EXECUTOR_SCHEMA,
+    STAGE_KV_FORK_REPORT_SCHEMA,
+    StageKVForkReport,
     build_stage_executor_manifest,
     model_identity_for_source,
     parse_stage_executor_manifest,
+    parse_stage_kv_fork_report,
     validate_executor_chain,
 )
 
 
 class StageExecutorAbiTests(unittest.TestCase):
+    def test_physical_kv_fork_report_round_trip_is_strict(self) -> None:
+        report = StageKVForkReport(
+            logical_bytes=12_288,
+            unique_physical_bytes=5_120,
+            copied_bytes=1_024,
+            newly_reserved_bytes=1_024,
+            peak_workspace_bytes=None,
+        )
+        document = report.to_document()
+        self.assertEqual(document["schema"], STAGE_KV_FORK_REPORT_SCHEMA)
+        self.assertEqual(parse_stage_kv_fork_report(document), report)
+
+        unknown = copy.deepcopy(document)
+        unknown["backendGuess"] = 1
+        with self.assertRaisesRegex(ValueError, "unknown or missing"):
+            parse_stage_kv_fork_report(unknown)
+        negative = copy.deepcopy(document)
+        negative["copiedBytes"] = -1
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            parse_stage_kv_fork_report(negative)
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            StageKVForkReport(
+                logical_bytes=0,
+                unique_physical_bytes=0,
+                copied_bytes=0,
+                newly_reserved_bytes=-1,
+                peak_workspace_bytes=0,
+            )
+
     def test_hub_snapshot_identity_ignores_absolute_cache_root(self) -> None:
         commit = "c1899de289a04d12100db370d81485cdf75e47ca"
         first = model_identity_for_source(

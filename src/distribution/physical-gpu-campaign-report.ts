@@ -626,14 +626,22 @@ function validateAgentCleanup(
     for (const value of observations) {
       const observation = record(value, "physical_gpu_campaign_report_agent_health_item");
       const health = record(observation.health, "physical_gpu_campaign_report_agent_health_value");
+      exactKeys(
+        health,
+        ["schema", "agentId", "nodeId", "activeProcesses", "retainedTombstones"],
+        "physical_gpu_campaign_report_agent_health_value",
+      );
       if (
         observation.passed !== true ||
         observation.error !== null ||
         typeof observation.expectedNodeId !== "string" ||
         typeof observation.expectedAgentId !== "string" ||
+        health.schema !== "gdlp-launch-agent-health/2" ||
         health.agentId !== observation.expectedAgentId ||
         health.nodeId !== observation.expectedNodeId ||
-        health.processes !== 0 ||
+        health.activeProcesses !== 0 ||
+        !Number.isSafeInteger(health.retainedTombstones) ||
+        health.retainedTombstones < 0 ||
         !expectedNodes.has(observation.expectedNodeId)
       ) {
         throw new Error("physical_gpu_campaign_report_agent_health_mismatch");

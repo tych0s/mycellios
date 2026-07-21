@@ -666,7 +666,11 @@ class RamBackedMoeMeshIntegrationTests(unittest.TestCase):
             {dispatch.key.expert: dispatch.owner_id for dispatch in plan.dispatches},
             {0: "root", 1: "remote"},
         )
-        self.assertFalse(plan.transport_calibration_required)
+        # The link and workspace are sealed, but this integration fixture does
+        # not claim measured coordinator dispatch/serialization/reduction
+        # costs.  The projection must therefore remain explicitly partial.
+        self.assertTrue(plan.transport_calibration_required)
+        self.assertTrue(plan.coordination_calibration_required)
         self.assertFalse(plan.workspace_calibration_required)
         self.assertEqual(remote.delegate.batch_calls, 1)
         self.assertEqual(meshed.resident_expert_local_owner.batch_calls, 1)

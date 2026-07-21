@@ -37,6 +37,7 @@ from .speculation import (
     AdaptiveSpeculationController,
     DraftProvider,
     SpeculationDecision,
+    TreeDraftProvider,
 )
 
 
@@ -283,6 +284,65 @@ def linear_draft_to_macro_wave(
     return proposal
 
 
+def prepare_tree_macro_wave(
+    provider: TreeDraftProvider,
+    token_history: Sequence[int],
+    *,
+    request_id: str | int,
+    ordinal: int,
+    parent_kv_version: KVVersion = KVVersion(0),
+    max_tokens: int | None = None,
+    max_branches: int | None = None,
+) -> MacroWaveProposal | None:
+    """Ask a tree drafter for bounded leaves and build an exact proposal.
+
+    This function is intentionally policy-free: a runtime controller may
+    lower ``max_tokens`` or ``max_branches`` from latency, load and KV budget
+    measurements before calling it.  Every provider limit is checked again so
+    an untrusted or buggy drafter cannot silently exceed the sealed wave.
+    """
+
+    if not isinstance(provider, TreeDraftProvider):
+        raise ValueError("provider must implement TreeDraftProvider")
+    history = _tokens(token_history, "token_history")
+    token_limit = (
+        int(provider.max_draft_tokens)
+        if max_tokens is None
+        else min(_count("max_tokens", max_tokens), int(provider.max_draft_tokens))
+    )
+    branch_limit = (
+        int(provider.max_branches)
+        if max_branches is None
+        else min(_count("max_branches", max_branches), int(provider.max_branches))
+    )
+    if token_limit == 0 or branch_limit == 0:
+        return None
+
+    raw_paths = provider.draft_paths(
+        history,
+        max_tokens=token_limit,
+        max_branches=branch_limit,
+    )
+    if isinstance(raw_paths, (str, bytes, bytearray)):
+        raise ValueError("provider paths must be a sequence of token paths")
+    paths = tuple(_tokens(path, "provider candidate path") for path in raw_paths)
+    if not paths:
+        return None
+    if len(paths) > branch_limit:
+        raise ValueError("provider returned more paths than max_branches")
+    if any(len(path) > token_limit for path in paths):
+        raise ValueError("provider returned a path longer than max_tokens")
+
+    return branched_candidates_to_macro_wave(
+        paths,
+        request_id=request_id,
+        ordinal=ordinal,
+        base_prefix_tokens=history,
+        parent_kv_version=parent_kv_version,
+        strategy=provider.strategy,
+    )
+
+
 def prepare_linear_macro_wave(
     provider: DraftProvider,
     controller: AdaptiveSpeculationController,
@@ -447,6 +507,7 @@ __all__ = [
     "MacroWaveResolution",
     "branched_candidates_to_macro_wave",
     "linear_draft_to_macro_wave",
+    "prepare_tree_macro_wave",
     "prepare_linear_macro_wave",
     "record_linear_resolution",
     "resolve_linear_macro_wave",

@@ -41,6 +41,7 @@ from distributed_runtime.stage import (
     StageProcessConfig,
     build_stage_runner,
     run_stage_process,
+    validate_speculative_runner,
     validate_stage_config,
 )
 
@@ -378,6 +379,207 @@ class TensorParallelCellStageTests(unittest.TestCase):
             finally:
                 runner.close()
             self.assertTrue(all(not process.is_alive() for process in runner._processes))
+
+    def test_local_cell_fork_has_exact_bytes_independent_kv_and_reference_promotion(self) -> None:
+        generator = torch.Generator().manual_seed(239)
+        hidden_size = 16
+        attention_heads = 4
+        kv_heads = 2
+        head_dim = 4
+        dense_layers = (
+            _dense_layer(generator, hidden_size, kv_heads, head_dim, 9),
+            _dense_layer(generator, hidden_size, kv_heads, head_dim, 11),
+        )
+        prompt = torch.randn((1, 2, hidden_size), generator=generator)
+        parent_next = torch.randn((1, 1, hidden_size), generator=generator)
+        child_next = torch.randn((1, 1, hidden_size), generator=generator)
+        child_second = torch.randn((1, 1, hidden_size), generator=generator)
+        promoted_next = torch.randn((1, 1, hidden_size), generator=generator)
+
+        expected_prompt, prompt_caches = _dense_stage_forward(
+            prompt,
+            dense_layers,
+            attention_heads=attention_heads,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+        )
+        expected_parent_next, _ = _dense_stage_forward(
+            parent_next,
+            dense_layers,
+            attention_heads=attention_heads,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+            caches=prompt_caches,
+        )
+        expected_child_next, child_caches = _dense_stage_forward(
+            child_next,
+            dense_layers,
+            attention_heads=attention_heads,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+            caches=prompt_caches,
+        )
+        expected_child_second, child_second_caches = _dense_stage_forward(
+            child_second,
+            dense_layers,
+            attention_heads=attention_heads,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+            caches=child_caches,
+        )
+        expected_promoted_next, _ = _dense_stage_forward(
+            promoted_next,
+            dense_layers,
+            attention_heads=attention_heads,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+            caches=child_second_caches,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = write_llama_stage_cell_fixture(
+                temporary,
+                dense_layers,
+                world_size=2,
+                num_attention_heads=attention_heads,
+                num_key_value_heads=kv_heads,
+                head_dim=head_dim,
+            )
+            config = StageProcessConfig(
+                **{
+                    **_stage_config(layer_end=3, total_layers=4).__dict__,
+                    "cell_fixture": str(fixture),
+                    "cell_world_size": 2,
+                }
+            )
+            runner = build_stage_runner(config)
+            self.assertIsInstance(runner, TensorParallelCellStageRunner)
+            parent_request_id = 901
+            child_request_id = 902
+            try:
+                self.assertIn(
+                    "exact-request-fork-safe-copy",
+                    runner.executor_manifest.features,
+                )
+                validate_speculative_runner(
+                    StageProcessConfig(
+                        **{
+                            **config.__dict__,
+                            "max_speculative_branches": 2,
+                            "max_speculative_branch_tokens": 128,
+                            "max_speculative_kv_bytes": 1024,
+                        }
+                    ),
+                    runner,
+                )
+                runner.begin(parent_request_id)
+                actual_prompt, _ = runner.forward_hidden(
+                    parent_request_id,
+                    prompt,
+                    token_mode="none",
+                )
+                torch.testing.assert_close(
+                    actual_prompt, expected_prompt, rtol=1e-5, atol=1e-5
+                )
+                parent_bytes = runner.request_cache_bytes(parent_request_id)
+                self.assertEqual(parent_bytes, 256)
+                self.assertEqual(
+                    runner.project_request_cache_bytes(parent_request_id, 1),
+                    384,
+                )
+
+                operation_before_preflight = runner._operation
+                with self.assertRaisesRegex(ValueError, "preflight byte budget"):
+                    runner.fork_request(
+                        child_request_id,
+                        parent_request_id,
+                        max_cache_bytes=parent_bytes - 1,
+                    )
+                self.assertEqual(runner._operation, operation_before_preflight)
+                with self.assertRaisesRegex(ValueError, "has not received BEGIN"):
+                    runner.sequence_length(child_request_id)
+
+                copied_bytes = runner.fork_request(
+                    child_request_id,
+                    parent_request_id,
+                    max_cache_bytes=parent_bytes,
+                )
+                self.assertEqual(copied_bytes, parent_bytes)
+                self.assertEqual(runner.request_cache_bytes(child_request_id), parent_bytes)
+                self.assertTrue(
+                    all(
+                        report["aliasFree"] is True
+                        and report["copiedCacheBytes"] > 0
+                        for report in runner.member_fork_reports.values()
+                    )
+                )
+
+                actual_parent_next, _ = runner.forward_hidden(
+                    parent_request_id, parent_next
+                )
+                torch.testing.assert_close(
+                    actual_parent_next,
+                    expected_parent_next,
+                    rtol=1e-5,
+                    atol=1e-5,
+                )
+                self.assertEqual(runner.sequence_length(child_request_id), 2)
+                self.assertEqual(runner.request_cache_bytes(child_request_id), 256)
+
+                actual_child_next, _ = runner.forward_hidden(
+                    child_request_id, child_next
+                )
+                torch.testing.assert_close(
+                    actual_child_next,
+                    expected_child_next,
+                    rtol=1e-5,
+                    atol=1e-5,
+                )
+                actual_child_second, _ = runner.forward_hidden(
+                    child_request_id, child_second
+                )
+                torch.testing.assert_close(
+                    actual_child_second,
+                    expected_child_second,
+                    rtol=1e-5,
+                    atol=1e-5,
+                )
+                self.assertEqual(runner.sequence_length(parent_request_id), 3)
+                self.assertEqual(runner.sequence_length(child_request_id), 4)
+                self.assertEqual(runner.request_cache_bytes(parent_request_id), 384)
+                self.assertEqual(runner.request_cache_bytes(child_request_id), 512)
+
+                selected_shapes = runner.member_layer_cache_shapes[child_request_id]
+                with self.assertRaisesRegex(ValueError, "must differ"):
+                    runner.promote_request(parent_request_id, parent_request_id)
+                runner.promote_request(parent_request_id, child_request_id)
+                self.assertEqual(runner.sequence_length(parent_request_id), 4)
+                self.assertEqual(runner.request_cache_bytes(parent_request_id), 512)
+                self.assertEqual(
+                    runner.member_layer_cache_shapes[parent_request_id],
+                    selected_shapes,
+                )
+                self.assertTrue(
+                    all(
+                        report["movedWithoutCopy"] is True
+                        for report in runner.member_promotion_reports.values()
+                    )
+                )
+                with self.assertRaisesRegex(ValueError, "has not received BEGIN"):
+                    runner.sequence_length(child_request_id)
+
+                actual_promoted_next, _ = runner.forward_hidden(
+                    parent_request_id, promoted_next
+                )
+                torch.testing.assert_close(
+                    actual_promoted_next,
+                    expected_promoted_next,
+                    rtol=1e-5,
+                    atol=1e-5,
+                )
+            finally:
+                runner.end(parent_request_id)
+                runner.close()
 
     def test_weighted_three_to_one_cell_executes_exact_unequal_shards(self) -> None:
         generator = torch.Generator().manual_seed(271)

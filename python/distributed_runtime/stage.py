@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import asdict, dataclass
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import math
 from pathlib import Path
@@ -25,8 +26,15 @@ from .protocol import (
     FrameType,
     LinkEmulator,
     TensorCodec,
+    TreePrepareQuote,
+    TreePrepareRejection,
+    TreePrepareStatus,
     configure_socket,
+    decode_branch_request_id,
+    decode_tree_prepare,
+    decode_tree_reservation_nonce,
     decode_tensor,
+    encode_tree_prepare_quote,
     encode_tensor_payload,
     recv_frame,
     send_frame,
@@ -38,6 +46,65 @@ from .ram_backed_moe_runtime import (
     build_ram_backed_moe_stage_runner,
     validate_ram_backed_moe_binding,
 )
+
+MAX_SPECULATIVE_BRANCHES = 64
+MAX_SPECULATIVE_BRANCH_TOKENS = 1_048_576
+STAGE_SHUTDOWN_GRACE_SECONDS = 5.0
+MAX_SPECULATIVE_KV_BYTES = 1 << 40
+TREE_RESERVATION_TTL_SECONDS = 120.0
+
+
+@dataclass(frozen=True)
+class TreeCapacityProjection:
+    projected_kv_bytes: int
+    current_branch_count: int
+    current_branch_bytes: int
+    parent_tokens: int
+    parent_cache_bytes: int
+    branch_ids: tuple[int, ...]
+    available_physical_bytes: int | None = None
+    rejection: TreePrepareRejection = TreePrepareRejection.NONE
+    required: int = 0
+    limit: int = 0
+
+
+@dataclass
+class TreeCapacityReservation:
+    nonce: int
+    parent_request_id: int
+    step: int
+    path_lengths: tuple[int, ...]
+    projection: TreeCapacityProjection
+    expected_commit_predecessors: int
+    deadline_at: float
+    committed: bool = False
+    consumed_forks: int = 0
+
+
+@dataclass(frozen=True)
+class TreeLeafShape:
+    parent_request_id: int
+    nonce: int
+    expected_tokens: int
+
+
+@dataclass
+class TreeReservationBook:
+    """One globally serialized logical quote for a physical stage.
+
+    The quote allocates no KV. Its count/byte guarantee is made transactional by
+    deferring every unrelated frame that can mutate runtime-visible KV, blocking
+    another PREPARE/FORK, and revalidating the exact snapshot at COMMIT. This
+    seals the runtime KV budget; it is deliberately not advertised as a physical
+    CUDA/allocator reservation because no such runner ABI exists yet. The engine
+    must serialize one global tree wave from PREPARE until RESULT+CANCEL or the
+    end-to-end COMMIT result plus all quoted FORKs are consumed.
+    """
+
+    active: TreeCapacityReservation | None = None
+    last_nonce: int | None = None
+    last_parent_request_id: int | None = None
+    last_step: int | None = None
 
 
 @dataclass(frozen=True)
@@ -73,6 +140,12 @@ class StageProcessConfig:
     cell_startup_timeout_seconds: float = 120.0
     max_physical_batch_size: int = 8
     physical_batch_window_ms: float = 0.5
+    # Exact tree controls are disabled unless all three sealed limits are
+    # non-zero. Count, tokens and preflight KV bytes bound concurrent leaves
+    # before any clone/forward allocation is attempted.
+    max_speculative_branches: int = 0
+    max_speculative_branch_tokens: int = 0
+    max_speculative_kv_bytes: int = 0
     ram_backed_moe: RamBackedMoeRuntimeConfig | None = None
     native_stage_package: str | None = None
     native_stage_package_id: str | None = None
@@ -161,6 +234,28 @@ def request_admission_for_runner(
     return SingleRequestAdmission()
 
 
+def validate_speculative_runner(
+    config: StageProcessConfig,
+    runner: StageRunnerContract,
+) -> None:
+    """Fail before READY when sealed tree controls exceed backend capability."""
+
+    if config.max_speculative_branches == 0:
+        return
+    if getattr(runner, "max_active_requests", None) == 1:
+        raise ValueError("speculative branches require a multi-request stage runner")
+    for method_name in (
+        "request_cache_bytes",
+        "project_request_cache_bytes",
+        "fork_request",
+        "promote_request",
+    ):
+        if not callable(getattr(runner, method_name, None)):
+            raise ValueError(
+                f"stage runner does not support exact speculative {method_name}"
+            )
+
+
 def run_stage_process(
     config: StageProcessConfig,
     ready_event: Any,
@@ -178,10 +273,15 @@ def run_stage_process(
     upstream_send_lock = threading.Lock()
     control_thread: threading.Thread | None = None
     pending_frames: deque[Frame] = deque()
+    reservation_deferred_frames: deque[Frame] = deque()
     request_admission: SingleRequestAdmission | None = None
+    branch_parents: dict[int, int] = {}
+    tree_reservations = TreeReservationBook()
+    tree_leaf_shapes: dict[int, TreeLeafShape] = {}
     try:
         validate_stage_config(config)
         runner = build_stage_runner(config)
+        validate_speculative_runner(config, runner)
         request_admission = request_admission_for_runner(runner)
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -248,11 +348,27 @@ def run_stage_process(
         with upstream_send_lock:
             send_frame(upstream, FrameType.READY, config.pipeline_id)
         while True:
-            frame = pending_frames.popleft() if pending_frames else None
+            expire_tree_reservation(tree_reservations)
+            frame = (
+                reservation_deferred_frames.popleft()
+                if tree_reservations.active is None
+                and reservation_deferred_frames
+                else None
+            )
+            if frame is None:
+                frame = pending_frames.popleft() if pending_frames else None
             if frame is None and request_admission is not None:
                 frame = request_admission.next_deferred()
             if frame is None:
                 frame = recv_frame(upstream)
+            if tree_reservation_defers_frame(
+                frame, tree_reservations, branch_parents
+            ):
+                reservation_deferred_frames.append(frame)
+                continue
+            validate_tree_reservation_frame_order(
+                frame, tree_reservations, branch_parents
+            )
             if (
                 request_admission is not None
                 and not request_admission.admit_or_defer(frame)
@@ -260,12 +376,70 @@ def run_stage_process(
                 continue
             if frame.frame_type == FrameType.BEGIN:
                 begin_stage_request(frame, config, runner, request_metrics, downstream)
+            elif frame.frame_type == FrameType.TREE_PREPARE:
+                prepare_tree_capacity(
+                    frame,
+                    config=config,
+                    runner=runner,
+                    request_metrics=request_metrics,
+                    branch_parents=branch_parents,
+                    reservations=tree_reservations,
+                    downstream=downstream,
+                    return_socket=return_socket,
+                    emulator=emulator,
+                )
+            elif frame.frame_type == FrameType.TREE_RESERVATION_COMMIT:
+                commit_tree_reservation(
+                    frame,
+                    config=config,
+                    runner=runner,
+                    request_metrics=request_metrics,
+                    branch_parents=branch_parents,
+                    reservations=tree_reservations,
+                    downstream=downstream,
+                    return_socket=return_socket,
+                    emulator=emulator,
+                )
+            elif frame.frame_type == FrameType.TREE_RESERVATION_CANCEL:
+                cancel_tree_reservation(
+                    frame,
+                    reservations=tree_reservations,
+                    downstream=downstream,
+                )
+            elif frame.frame_type == FrameType.FORK:
+                fork_stage_request(
+                    frame,
+                    config,
+                    runner,
+                    request_metrics,
+                    branch_parents,
+                    downstream,
+                    tree_reservations,
+                    tree_leaf_shapes,
+                )
+            elif frame.frame_type == FrameType.PROMOTE:
+                promote_stage_request(
+                    frame,
+                    config,
+                    runner,
+                    request_metrics,
+                    branch_parents,
+                    downstream,
+                    tree_leaf_shapes,
+                )
             elif frame.frame_type in (
                 FrameType.ACTIVATION,
                 FrameType.PREFILL,
                 FrameType.VERIFY,
             ):
-                validate_activation(frame, config, runner, request_metrics)
+                validate_activation(
+                    frame,
+                    config,
+                    runner,
+                    request_metrics,
+                    branch_parents,
+                    tree_leaf_shapes,
+                )
                 frames = collect_compatible_activation_frames(
                     frame,
                     upstream=upstream,
@@ -273,6 +447,9 @@ def run_stage_process(
                     config=config,
                     runner=runner,
                     request_metrics=request_metrics,
+                    branch_parents=branch_parents,
+                    tree_leaf_shapes=tree_leaf_shapes,
+                    tree_reservations=tree_reservations,
                     downstream=downstream,
                 )
                 process_activation_frames(
@@ -280,6 +457,7 @@ def run_stage_process(
                     config=config,
                     runner=runner,
                     request_metrics=request_metrics,
+                    branch_parents=branch_parents,
                     downstream=downstream,
                     return_socket=return_socket,
                     emulator=emulator,
@@ -294,16 +472,27 @@ def run_stage_process(
                         token_count=frame.token_count,
                     )
             elif frame.frame_type in (FrameType.END, FrameType.CANCEL):
+                if frame.request_id in branch_parents.values():
+                    raise ValueError(
+                        f"cannot {frame.frame_type.name} request {frame.request_id} "
+                        "while it still owns speculative children"
+                    )
                 runner.end(frame.request_id)
+                tree_leaf_shapes.pop(frame.request_id, None)
+                abandon_tree_reservation_for_request(
+                    tree_reservations, frame.request_id
+                )
                 if downstream is not None:
                     send_frame(downstream, frame.frame_type, frame.request_id)
                 metrics = request_metrics.pop(frame.request_id, None)
                 if metrics is not None:
+                    metrics["cell_rank_work"] = cell_rank_work_metric(runner)
                     put_metric_best_effort(
                         metrics_queue, {"request_id": frame.request_id, **metrics}
                     )
                 if request_admission is not None:
                     request_admission.release(frame.request_id)
+                branch_parents.pop(frame.request_id, None)
             elif frame.frame_type == FrameType.PING:
                 if frame.request_id != config.pipeline_id:
                     raise ValueError("route PING belongs to another pipeline session")
@@ -329,8 +518,14 @@ def run_stage_process(
                 # Mark the lifecycle transition before forwarding SHUTDOWN. The
                 # downstream monitor may observe the peer's ensuing EOF first.
                 stopping.set()
+                tree_reservations.active = None
+                tree_leaf_shapes.clear()
                 if downstream is not None:
-                    send_frame(downstream, FrameType.SHUTDOWN, frame.request_id)
+                    forward_shutdown_and_wait(
+                        downstream,
+                        frame.request_id,
+                        control_thread,
+                    )
                 break
             elif frame.frame_type == FrameType.ERROR:
                 message = frame.payload.decode("utf-8", errors="replace")
@@ -421,6 +616,814 @@ def begin_stage_request(
         )
 
 
+def expire_tree_reservation(
+    reservations: TreeReservationBook,
+    *,
+    now: float | None = None,
+) -> bool:
+    """Drop an abandoned logical quote without touching model/KV state."""
+
+    active = reservations.active
+    if active is None:
+        return False
+    observed = time.monotonic() if now is None else now
+    if observed < active.deadline_at:
+        return False
+    reservations.active = None
+    return True
+
+
+def tree_reservation_defers_frame(
+    frame: Frame,
+    reservations: TreeReservationBook,
+    branch_parents: Mapping[int, int],
+) -> bool:
+    """Hold every unrelated KV mutation behind one active tree transaction.
+
+    The stage cannot reserve arbitrary CUDA allocator state through the legacy
+    runner ABI.  Serializing runtime-visible cache mutations from PREPARE until
+    the final quoted FORK is therefore the only truthful fail-closed guarantee.
+    Control frames are never hidden here: malformed/replayed tree controls must
+    reach the validator and fail the route immediately.
+    """
+
+    del branch_parents  # all ordinary KV owners share the same allocator budget
+    if reservations.active is None:
+        return False
+    return frame.frame_type in {
+        FrameType.BEGIN,
+        FrameType.ACTIVATION,
+        FrameType.PREFILL,
+        FrameType.VERIFY,
+        FrameType.TRUNCATE,
+        FrameType.PROMOTE,
+        FrameType.END,
+        FrameType.CANCEL,
+    }
+
+
+def validate_tree_reservation_frame_order(
+    frame: Frame,
+    reservations: TreeReservationBook,
+    branch_parents: Mapping[int, int],
+) -> None:
+    """Protect the quoted tree while unrelated real requests keep progressing."""
+
+    active = reservations.active
+    if active is None:
+        return
+    always_safe = {
+        FrameType.PING,
+        FrameType.SHUTDOWN,
+        FrameType.ERROR,
+        FrameType.TREE_RESERVATION_CANCEL,
+    }
+    if frame.frame_type in always_safe:
+        return
+    if frame.frame_type == FrameType.TREE_RESERVATION_COMMIT:
+        if active.committed:
+            raise ValueError("tree reservation COMMIT cannot be replayed")
+        return
+    if frame.frame_type == FrameType.FORK and active.committed:
+        return
+    del branch_parents
+    phase = "committed" if active.committed else "prepared"
+    raise ValueError(
+        f"{frame.frame_type.name} cannot overtake a {phase} tree reservation"
+    )
+
+
+def project_tree_capacity(
+    path_lengths: tuple[int, ...],
+    *,
+    parent_request_id: int,
+    config: StageProcessConfig,
+    runner: StageRunnerContract,
+    branch_parents: Mapping[int, int],
+) -> TreeCapacityProjection:
+    """Compute the exact local quote without cloning or extending any KV cache."""
+
+    if not path_lengths or len(path_lengths) > MAX_SPECULATIVE_BRANCHES:
+        raise ValueError("tree capacity quote has an invalid path count")
+    if any(
+        not isinstance(length, int) or isinstance(length, bool) or length < 1
+        for length in path_lengths
+    ):
+        raise ValueError("tree capacity path lengths must be positive integers")
+    parent_tokens = runner.sequence_length(parent_request_id)
+    if not isinstance(parent_tokens, int) or isinstance(parent_tokens, bool):
+        raise TypeError("stage runner sequence_length must return an integer")
+    if parent_tokens < 1:
+        raise ValueError("TREE_PREPARE requires a non-empty parent KV cache")
+
+    branch_ids = tuple(sorted(branch_parents))
+    branch_count = len(branch_ids)
+    if config.max_speculative_branches == 0:
+        return TreeCapacityProjection(
+            projected_kv_bytes=0,
+            current_branch_count=branch_count,
+            current_branch_bytes=0,
+            parent_tokens=parent_tokens,
+            parent_cache_bytes=0,
+            branch_ids=branch_ids,
+            rejection=TreePrepareRejection.TREE_DISABLED,
+            required=branch_count + len(path_lengths),
+            limit=0,
+        )
+
+    branch_bytes = speculative_kv_bytes(runner, branch_parents)
+
+    available_physical = getattr(runner, "available_physical_cache_bytes", None)
+    available_physical_bytes: int | None = None
+    if callable(available_physical):
+        available_physical_bytes = available_physical()
+        if (
+            not isinstance(available_physical_bytes, int)
+            or isinstance(available_physical_bytes, bool)
+            or available_physical_bytes < 0
+        ):
+            raise TypeError("stage runner returned invalid available physical KV bytes")
+
+    request_cache_bytes = getattr(runner, "request_cache_bytes", None)
+    project_cache_bytes = getattr(runner, "project_request_cache_bytes", None)
+    if not callable(request_cache_bytes) or not callable(project_cache_bytes):
+        raise TypeError("stage runner cannot quote speculative KV capacity")
+    parent_cache_bytes = request_cache_bytes(parent_request_id)
+    if (
+        not isinstance(parent_cache_bytes, int)
+        or isinstance(parent_cache_bytes, bool)
+        or parent_cache_bytes < 1
+    ):
+        raise TypeError("stage runner returned invalid parent cache bytes")
+
+    delta_tokens_by_leaf = tuple(1 + length for length in path_lengths)
+    project_tree_physical = getattr(
+        runner, "project_tree_incremental_physical_cache_bytes", None
+    )
+    if callable(project_tree_physical):
+        projected_new_bytes = project_tree_physical(
+            parent_request_id,
+            delta_tokens_by_leaf=delta_tokens_by_leaf,
+        )
+        if (
+            not isinstance(projected_new_bytes, int)
+            or isinstance(projected_new_bytes, bool)
+            or projected_new_bytes < 0
+        ):
+            raise TypeError("stage runner returned invalid physical tree projection")
+    else:
+        projected_new_bytes = 0
+        for delta_tokens in delta_tokens_by_leaf:
+            projected = project_cache_bytes(parent_request_id, delta_tokens)
+            if (
+                not isinstance(projected, int)
+                or isinstance(projected, bool)
+                or projected < parent_cache_bytes
+            ):
+                raise TypeError("stage runner returned invalid projected tree KV bytes")
+            projected_new_bytes += projected
+    projected_total = branch_bytes + projected_new_bytes
+    if projected_total > (1 << 64) - 1:
+        raise ValueError("tree capacity projection exceeds uint64")
+
+    # A projection is contractually read-only. Detect an executor that changed
+    # any observable sequence/cache state while pricing the quote.
+    if runner.sequence_length(parent_request_id) != parent_tokens:
+        raise RuntimeError("tree capacity projection mutated parent sequence length")
+    if request_cache_bytes(parent_request_id) != parent_cache_bytes:
+        raise RuntimeError("tree capacity projection mutated parent cache bytes")
+    if tuple(sorted(branch_parents)) != branch_ids:
+        raise RuntimeError("tree capacity projection mutated speculative children")
+    if speculative_kv_bytes(runner, branch_parents) != branch_bytes:
+        raise RuntimeError("tree capacity projection mutated speculative KV bytes")
+    if (
+        callable(available_physical)
+        and available_physical() != available_physical_bytes
+    ):
+        raise RuntimeError("tree capacity projection mutated physical KV availability")
+
+    required_count = branch_count + len(path_lengths)
+    required_tokens = parent_tokens + 1 + max(path_lengths)
+    rejection = TreePrepareRejection.NONE
+    required = 0
+    limit = 0
+    if required_count > config.max_speculative_branches:
+        rejection = TreePrepareRejection.BRANCH_COUNT
+        required = required_count
+        limit = config.max_speculative_branches
+    elif required_tokens > config.max_speculative_branch_tokens:
+        rejection = TreePrepareRejection.BRANCH_TOKENS
+        required = required_tokens
+        limit = config.max_speculative_branch_tokens
+    elif projected_total > config.max_speculative_kv_bytes:
+        rejection = TreePrepareRejection.KV_BYTES
+        required = projected_total
+        limit = config.max_speculative_kv_bytes
+    elif (
+        available_physical_bytes is not None
+        and projected_new_bytes > available_physical_bytes
+    ):
+        rejection = TreePrepareRejection.KV_BYTES
+        required = projected_total
+        limit = branch_bytes + available_physical_bytes
+    return TreeCapacityProjection(
+        projected_kv_bytes=projected_total,
+        current_branch_count=branch_count,
+        current_branch_bytes=branch_bytes,
+        parent_tokens=parent_tokens,
+        parent_cache_bytes=parent_cache_bytes,
+        branch_ids=branch_ids,
+        available_physical_bytes=available_physical_bytes,
+        rejection=rejection,
+        required=required,
+        limit=limit,
+    )
+
+
+def prepare_tree_capacity(
+    frame: Frame,
+    *,
+    config: StageProcessConfig,
+    runner: StageRunnerContract,
+    request_metrics: Mapping[int, Mapping[str, Any]],
+    branch_parents: Mapping[int, int],
+    reservations: TreeReservationBook,
+    downstream: socket.socket | None,
+    return_socket: socket.socket | None,
+    emulator: LinkEmulator | None = None,
+) -> TreePrepareQuote:
+    """Accumulate one mutation-free local quote and forward or return it."""
+
+    if frame.frame_type != FrameType.TREE_PREPARE:
+        raise ValueError("expected TREE_PREPARE")
+    if reservations.active is not None:
+        raise ValueError("another tree reservation is already active")
+    quote = decode_tree_prepare(frame)
+    if quote.nonce == reservations.last_nonce:
+        raise ValueError("tree reservation nonce cannot be replayed")
+    if frame.request_id not in request_metrics:
+        raise ValueError(
+            f"TREE_PREPARE parent request {frame.request_id} is not active"
+        )
+    expected_step = int(request_metrics[frame.request_id]["frames"])
+    if frame.step != expected_step:
+        raise ValueError(
+            f"TREE_PREPARE step mismatch for request {frame.request_id}: "
+            f"got {frame.step}, expected {expected_step}"
+        )
+    if quote.stage_count >= (1 << 16) - 1:
+        raise ValueError("tree prepare stage count overflow")
+
+    reservations.last_nonce = quote.nonce
+    reservations.last_parent_request_id = frame.request_id
+    reservations.last_step = frame.step
+    projection = project_tree_capacity(
+        quote.path_lengths,
+        parent_request_id=frame.request_id,
+        config=config,
+        runner=runner,
+        branch_parents=branch_parents,
+    )
+    aggregate_total = quote.total_projected_bytes + projection.projected_kv_bytes
+    if aggregate_total > (1 << 64) - 1:
+        raise ValueError("tree prepare aggregate projection exceeds uint64")
+
+    status = quote.status
+    rejection = quote.rejection
+    rejecting_layer_start = quote.rejecting_layer_start
+    required = quote.required
+    limit = quote.limit
+    local_ready = projection.rejection is TreePrepareRejection.NONE
+    if status is TreePrepareStatus.READY and not local_ready:
+        status = TreePrepareStatus.REJECT
+        rejection = projection.rejection
+        rejecting_layer_start = config.spec.layer_start
+        required = projection.required
+        limit = projection.limit
+    accumulated = replace(
+        quote,
+        status=status,
+        rejection=rejection,
+        stage_count=quote.stage_count + 1,
+        rejecting_layer_start=rejecting_layer_start,
+        required=required,
+        limit=limit,
+        total_projected_bytes=aggregate_total,
+    )
+    payload = encode_tree_prepare_quote(accumulated)
+
+    # READY means this stage has logically reserved the exact count/byte quote.
+    # The reservation allocates no KV; serialization plus COMMIT revalidation
+    # makes another PREPARE/FORK unable to consume its quoted capacity.
+    if quote.status is TreePrepareStatus.READY and local_ready:
+        reservations.active = TreeCapacityReservation(
+            nonce=quote.nonce,
+            parent_request_id=frame.request_id,
+            step=frame.step,
+            path_lengths=quote.path_lengths,
+            projection=projection,
+            expected_commit_predecessors=quote.stage_count,
+            deadline_at=time.monotonic() + TREE_RESERVATION_TTL_SECONDS,
+        )
+
+    if downstream is not None:
+        send_frame(
+            downstream,
+            FrameType.TREE_PREPARE,
+            frame.request_id,
+            step=frame.step,
+            token_count=len(quote.path_lengths),
+            payload=payload,
+            emulator=emulator,
+        )
+    else:
+        if return_socket is None:
+            raise RuntimeError("last stage has no tree-quote return socket")
+        send_frame(
+            return_socket,
+            FrameType.TREE_PREPARE_RESULT,
+            frame.request_id,
+            step=frame.step,
+            token_count=len(quote.path_lengths),
+            payload=payload,
+            emulator=emulator,
+        )
+    return accumulated
+
+
+def commit_tree_reservation(
+    frame: Frame,
+    *,
+    config: StageProcessConfig,
+    runner: StageRunnerContract,
+    request_metrics: Mapping[int, Mapping[str, Any]],
+    branch_parents: Mapping[int, int],
+    reservations: TreeReservationBook,
+    downstream: socket.socket | None,
+    return_socket: socket.socket | None = None,
+    emulator: LinkEmulator | None = None,
+) -> None:
+    """Revalidate and propagate COMMIT, returning a route-wide ACK at the end."""
+
+    nonce = decode_tree_reservation_nonce(frame)
+    active = reservations.active
+    if active is None:
+        raise ValueError("TREE_RESERVATION_COMMIT has no active quote")
+    if (
+        nonce != active.nonce
+        or frame.request_id != active.parent_request_id
+        or frame.step != active.step
+    ):
+        raise ValueError("TREE_RESERVATION_COMMIT identity mismatch")
+    if active.committed:
+        raise ValueError("TREE_RESERVATION_COMMIT cannot be replayed")
+    if frame.token_count != active.expected_commit_predecessors:
+        raise ValueError(
+            "TREE_RESERVATION_COMMIT predecessor count mismatch: "
+            f"got {frame.token_count}, expected {active.expected_commit_predecessors}"
+        )
+    if frame.request_id not in request_metrics:
+        raise ValueError("tree reservation parent is no longer active")
+    if int(request_metrics[frame.request_id]["frames"]) != active.step:
+        raise RuntimeError("tree reservation parent step changed before COMMIT")
+    observed = project_tree_capacity(
+        active.path_lengths,
+        parent_request_id=active.parent_request_id,
+        config=config,
+        runner=runner,
+        branch_parents=branch_parents,
+    )
+    if observed.rejection is not TreePrepareRejection.NONE:
+        raise RuntimeError("reserved tree capacity disappeared before COMMIT")
+    if observed != active.projection:
+        raise RuntimeError("tree reservation snapshot changed before COMMIT")
+    active.committed = True
+    active.deadline_at = time.monotonic() + TREE_RESERVATION_TTL_SECONDS
+    committed_stage_count = frame.token_count + 1
+    if downstream is not None:
+        send_frame(
+            downstream,
+            FrameType.TREE_RESERVATION_COMMIT,
+            frame.request_id,
+            step=frame.step,
+            token_count=committed_stage_count,
+            payload=frame.payload,
+            emulator=emulator,
+        )
+    else:
+        if return_socket is None:
+            raise RuntimeError("last stage has no tree-commit return socket")
+        send_frame(
+            return_socket,
+            FrameType.TREE_RESERVATION_COMMIT_RESULT,
+            frame.request_id,
+            step=frame.step,
+            token_count=committed_stage_count,
+            payload=frame.payload,
+            emulator=emulator,
+        )
+
+
+def cancel_tree_reservation(
+    frame: Frame,
+    *,
+    reservations: TreeReservationBook,
+    downstream: socket.socket | None,
+) -> None:
+    """Idempotently release this quote, never a different outstanding nonce."""
+
+    nonce = decode_tree_reservation_nonce(frame)
+    identity = (nonce, frame.request_id, frame.step)
+    expected = (
+        reservations.last_nonce,
+        reservations.last_parent_request_id,
+        reservations.last_step,
+    )
+    if identity != expected:
+        raise ValueError("TREE_RESERVATION_CANCEL identity mismatch")
+    active = reservations.active
+    if active is not None:
+        if identity != (active.nonce, active.parent_request_id, active.step):
+            raise ValueError("TREE_RESERVATION_CANCEL targets another nonce")
+        if active.consumed_forks:
+            raise ValueError("cannot cancel a reservation after FORK consumption")
+        reservations.active = None
+    if downstream is not None:
+        send_frame(
+            downstream,
+            FrameType.TREE_RESERVATION_CANCEL,
+            frame.request_id,
+            step=frame.step,
+            payload=frame.payload,
+        )
+
+
+def abandon_tree_reservation_for_request(
+    reservations: TreeReservationBook,
+    request_id: int,
+) -> None:
+    active = reservations.active
+    if active is not None and active.parent_request_id == request_id:
+        reservations.active = None
+
+
+def fork_stage_request(
+    frame: Frame,
+    config: StageProcessConfig,
+    runner: StageRunnerContract,
+    request_metrics: dict[int, dict[str, Any]],
+    branch_parents: dict[int, int],
+    downstream: socket.socket | None,
+    tree_reservations: TreeReservationBook | None = None,
+    tree_leaf_shapes: dict[int, TreeLeafShape] | None = None,
+) -> None:
+    """Apply one ordered FORK(child,parent) to this stage's local KV state."""
+
+    if config.max_speculative_branches == 0:
+        raise ValueError("FORK is disabled by the sealed stage contract")
+    child_request_id = frame.request_id
+    parent_request_id = decode_branch_request_id(frame)
+    reservation = None if tree_reservations is None else tree_reservations.active
+    quoted_path_length: int | None = None
+    if tree_reservations is not None and reservation is None:
+        raise ValueError("FORK requires an active committed tree reservation")
+    if reservation is not None:
+        if not reservation.committed:
+            raise ValueError("FORK cannot consume an uncommitted tree reservation")
+        if tree_leaf_shapes is None:
+            raise ValueError("committed tree FORK requires a leaf-shape ledger")
+        if parent_request_id != reservation.parent_request_id:
+            raise ValueError("FORK parent does not match committed tree reservation")
+        if reservation.consumed_forks >= len(reservation.path_lengths):
+            raise ValueError("FORK exceeds committed tree reservation count")
+        quoted_path_length = reservation.path_lengths[reservation.consumed_forks]
+    if child_request_id == parent_request_id:
+        raise ValueError("FORK child and parent request IDs must differ")
+    if parent_request_id not in request_metrics:
+        raise ValueError(
+            f"FORK parent request {parent_request_id} is not active on this stage"
+        )
+    if child_request_id in request_metrics or child_request_id in branch_parents:
+        raise ValueError(f"FORK child request {child_request_id} is already active")
+    if len(branch_parents) >= config.max_speculative_branches:
+        raise ValueError(
+            "FORK exceeds max_speculative_branches: "
+            f"{len(branch_parents) + 1} > {config.max_speculative_branches}"
+        )
+    parent_tokens = runner.sequence_length(parent_request_id)
+    if parent_tokens < 1:
+        raise ValueError("FORK requires a non-empty prefilled parent KV cache")
+    if parent_tokens > config.max_speculative_branch_tokens:
+        raise ValueError(
+            "FORK parent cache exceeds max_speculative_branch_tokens: "
+            f"{parent_tokens} > {config.max_speculative_branch_tokens}"
+        )
+    request_cache_bytes = getattr(runner, "request_cache_bytes", None)
+    fork_request = getattr(runner, "fork_request", None)
+    if not callable(request_cache_bytes) or not callable(fork_request):
+        raise TypeError("stage runner cannot preflight and fork request KV state")
+    current_branch_bytes = speculative_kv_bytes(runner, branch_parents)
+    parent_cache_bytes = request_cache_bytes(parent_request_id)
+    if not isinstance(parent_cache_bytes, int) or isinstance(parent_cache_bytes, bool):
+        raise TypeError("stage runner request_cache_bytes must return an integer")
+    remaining_bytes = config.max_speculative_kv_bytes - current_branch_bytes
+    if parent_cache_bytes < 1:
+        raise ValueError("FORK parent did not materialise a measurable KV cache")
+    project_tree_physical = getattr(
+        runner, "project_tree_incremental_physical_cache_bytes", None
+    )
+    if callable(project_tree_physical):
+        projected_fork_bytes = project_tree_physical(
+            parent_request_id,
+            delta_tokens_by_leaf=(0,),
+        )
+    else:
+        projected_fork_bytes = parent_cache_bytes
+    if (
+        not isinstance(projected_fork_bytes, int)
+        or isinstance(projected_fork_bytes, bool)
+        or projected_fork_bytes < 0
+    ):
+        raise TypeError("stage runner returned invalid physical FORK projection")
+    if projected_fork_bytes > remaining_bytes:
+        raise ValueError(
+            "FORK exceeds max_speculative_kv_bytes before cloning: "
+            f"{current_branch_bytes + projected_fork_bytes} > "
+            f"{config.max_speculative_kv_bytes}"
+        )
+    available_physical = getattr(runner, "available_physical_cache_bytes", None)
+    if callable(available_physical):
+        available_bytes = available_physical()
+        if (
+            not isinstance(available_bytes, int)
+            or isinstance(available_bytes, bool)
+            or available_bytes < projected_fork_bytes
+        ):
+            raise ValueError("FORK exceeds available physical KV pool capacity")
+    copied_kv_bytes = fork_request(
+        child_request_id,
+        parent_request_id,
+        max_cache_bytes=remaining_bytes,
+    )
+    if not isinstance(copied_kv_bytes, int) or isinstance(copied_kv_bytes, bool):
+        # Do not continue after an executor violates the sealed branch ABI.
+        runner.end(child_request_id)
+        raise TypeError("stage runner fork_request must return copied KV bytes")
+    if copied_kv_bytes < 0:
+        runner.end(child_request_id)
+        raise ValueError("stage runner returned negative copied KV bytes")
+    branch_parents[child_request_id] = parent_request_id
+    try:
+        observed_branch_bytes = speculative_kv_bytes(runner, branch_parents)
+    except BaseException:
+        branch_parents.pop(child_request_id, None)
+        runner.end(child_request_id)
+        raise
+    observed_increment = observed_branch_bytes - current_branch_bytes
+    if observed_increment != projected_fork_bytes:
+        branch_parents.pop(child_request_id, None)
+        runner.end(child_request_id)
+        raise RuntimeError(
+            "stage runner physical FORK allocation changed after preflight: "
+            f"{observed_increment} != {projected_fork_bytes}"
+        )
+    last_fork_report = getattr(runner, "last_fork_report", None)
+    if callable(last_fork_report):
+        report = last_fork_report()
+        if report is not None:
+            report_copied = getattr(report, "copied_bytes", None)
+            report_reserved = getattr(report, "newly_reserved_bytes", None)
+            if report_copied != copied_kv_bytes:
+                branch_parents.pop(child_request_id, None)
+                runner.end(child_request_id)
+                raise RuntimeError("stage runner FORK report copied-byte mismatch")
+            if report_reserved != observed_increment:
+                branch_parents.pop(child_request_id, None)
+                runner.end(child_request_id)
+                raise RuntimeError("stage runner FORK report physical-byte mismatch")
+
+    parent_metrics = request_metrics[parent_request_id]
+    child_metrics = dict(parent_metrics)
+    child_metrics.update(
+        {
+            "compute_ms": 0,
+            "bytes_out": 0,
+            "tokens": parent_tokens,
+            "model_forward_calls": 0,
+            "physical_batch_calls": 0,
+            "physical_batch_items": 0,
+            "max_physical_batch_size": 0,
+            "branch_parent_request_id": parent_request_id,
+            "branch_inherited_frames": int(parent_metrics["frames"]),
+            "branch_inherited_tokens": parent_tokens,
+            "fork_copied_kv_bytes": copied_kv_bytes,
+            "fork_new_physical_kv_bytes": observed_increment,
+        }
+    )
+    request_metrics[child_request_id] = child_metrics
+    if downstream is not None:
+        child_metrics["bytes_out"] += send_frame(
+            downstream,
+            FrameType.FORK,
+            child_request_id,
+            payload=frame.payload,
+        )
+    if reservation is not None:
+        if quoted_path_length is None:
+            raise RuntimeError("committed tree reservation has no leaf-shape ledger")
+        tree_leaf_shapes[child_request_id] = TreeLeafShape(
+            parent_request_id=parent_request_id,
+            nonce=reservation.nonce,
+            expected_tokens=1 + quoted_path_length,
+        )
+        reservation.consumed_forks += 1
+        if reservation.consumed_forks == len(reservation.path_lengths):
+            tree_reservations.active = None
+
+
+def promote_stage_request(
+    frame: Frame,
+    config: StageProcessConfig,
+    runner: StageRunnerContract,
+    request_metrics: dict[int, dict[str, Any]],
+    branch_parents: dict[int, int],
+    downstream: socket.socket | None,
+    tree_leaf_shapes: dict[int, TreeLeafShape] | None = None,
+) -> None:
+    """Apply one ordered PROMOTE(parent,child) without copying selected KV."""
+
+    if config.max_speculative_branches == 0:
+        raise ValueError("PROMOTE is disabled by the sealed stage contract")
+    parent_request_id = frame.request_id
+    child_request_id = decode_branch_request_id(frame)
+    if child_request_id == parent_request_id:
+        raise ValueError("PROMOTE parent and child request IDs must differ")
+    if parent_request_id not in request_metrics:
+        raise ValueError(f"PROMOTE parent request {parent_request_id} is not active")
+    if child_request_id not in request_metrics:
+        raise ValueError(f"PROMOTE child request {child_request_id} is not active")
+    if branch_parents.get(child_request_id) != parent_request_id:
+        raise ValueError("PROMOTE child is not a direct child of the parent")
+    if tree_leaf_shapes is not None and child_request_id not in tree_leaf_shapes:
+        raise ValueError("PROMOTE child is not bound to a committed tree quote")
+    children = {
+        child
+        for child, parent in branch_parents.items()
+        if parent == parent_request_id
+    }
+    if children != {child_request_id}:
+        raise ValueError("PROMOTE requires the selected child to be the only sibling")
+    if child_request_id in branch_parents.values():
+        raise ValueError("PROMOTE requires a leaf child with no active descendants")
+
+    promote_request = getattr(runner, "promote_request", None)
+    if not callable(promote_request):
+        raise TypeError("stage runner cannot promote request KV state")
+    promote_request(parent_request_id, child_request_id)
+    selected_metrics = request_metrics.pop(child_request_id)
+    branch_parents.pop(child_request_id)
+    selected_metrics["branch_promotions"] = int(
+        selected_metrics.get("branch_promotions", 0)
+    ) + 1
+    if parent_request_id in branch_parents:
+        selected_metrics["branch_parent_request_id"] = branch_parents[parent_request_id]
+    else:
+        selected_metrics.pop("branch_parent_request_id", None)
+    request_metrics[parent_request_id] = selected_metrics
+    if tree_leaf_shapes is not None:
+        tree_leaf_shapes.pop(child_request_id, None)
+    if downstream is not None:
+        selected_metrics["bytes_out"] += send_frame(
+            downstream,
+            FrameType.PROMOTE,
+            parent_request_id,
+            payload=frame.payload,
+        )
+
+
+def speculative_kv_bytes(
+    runner: StageRunnerContract,
+    branch_parents: Mapping[int, int],
+) -> int:
+    """Measure all live speculative leaf/subtree KV before another allocation."""
+
+    if not branch_parents:
+        return 0
+    unique_physical_bytes = getattr(runner, "unique_physical_cache_bytes", None)
+    if callable(unique_physical_bytes):
+        parent_ids = tuple(sorted(set(branch_parents.values())))
+        all_ids = tuple(sorted(set(branch_parents) | set(parent_ids)))
+        all_bytes = unique_physical_bytes(all_ids)
+        parent_bytes = unique_physical_bytes(parent_ids)
+        for name, value in (("all", all_bytes), ("parent", parent_bytes)):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise TypeError(
+                    f"stage runner returned invalid {name} unique physical KV bytes"
+                )
+        if all_bytes < parent_bytes:
+            raise RuntimeError("speculative physical KV accounting moved backwards")
+        return all_bytes - parent_bytes
+
+    request_cache_bytes = getattr(runner, "request_cache_bytes", None)
+    if not callable(request_cache_bytes):
+        raise TypeError("stage runner cannot measure speculative KV bytes")
+    total = 0
+    for request_id in branch_parents:
+        value = request_cache_bytes(request_id)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise TypeError("stage runner returned invalid request cache bytes")
+        total += value
+    return total
+
+
+def validate_speculative_kv_preflight(
+    frames: tuple[Frame, ...],
+    config: StageProcessConfig,
+    runner: StageRunnerContract,
+    branch_parents: Mapping[int, int],
+) -> None:
+    """Seal the combined KV growth of one sequential or physical batch."""
+
+    branch_frames = tuple(
+        frame for frame in frames if frame.request_id in branch_parents
+    )
+    if not branch_frames:
+        return
+    if len({frame.request_id for frame in branch_frames}) != len(branch_frames):
+        raise ValueError("one speculative request cannot appear twice in a physical batch")
+    request_cache_bytes = getattr(runner, "request_cache_bytes", None)
+    project_cache_bytes = getattr(runner, "project_request_cache_bytes", None)
+    project_growth_physical = getattr(
+        runner, "project_request_incremental_physical_cache_bytes", None
+    )
+    if not callable(request_cache_bytes) or not callable(project_cache_bytes):
+        raise TypeError("stage runner cannot preflight speculative KV growth")
+
+    projected_total_bytes = speculative_kv_bytes(runner, branch_parents)
+    total_incremental_bytes = 0
+    for frame in branch_frames:
+        if callable(project_growth_physical):
+            incremental = project_growth_physical(
+                frame.request_id,
+                frame.token_count,
+            )
+            if (
+                not isinstance(incremental, int)
+                or isinstance(incremental, bool)
+                or incremental < 0
+            ):
+                raise TypeError(
+                    "stage runner returned invalid incremental physical KV bytes"
+                )
+        else:
+            current = request_cache_bytes(frame.request_id)
+            projected = project_cache_bytes(frame.request_id, frame.token_count)
+            for name, value in (("current", current), ("projected", projected)):
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                    raise TypeError(f"stage runner returned invalid {name} KV bytes")
+            if projected < current:
+                raise ValueError("stage runner projected speculative KV bytes backwards")
+            incremental = projected - current
+        projected_total_bytes += incremental
+        total_incremental_bytes += incremental
+    available_physical = getattr(runner, "available_physical_cache_bytes", None)
+    if callable(available_physical):
+        available_bytes = available_physical()
+        if (
+            not isinstance(available_bytes, int)
+            or isinstance(available_bytes, bool)
+            or available_bytes < total_incremental_bytes
+        ):
+            raise ValueError(
+                "speculative KV growth exceeds available physical cache pool"
+            )
+    if projected_total_bytes > config.max_speculative_kv_bytes:
+        raise ValueError(
+            "speculative KV bytes exceed max_speculative_kv_bytes before "
+            "child forward: "
+            f"{projected_total_bytes} > {config.max_speculative_kv_bytes}"
+        )
+
+
+def tree_verify_batch_is_certified(runner: StageRunnerContract) -> bool:
+    """Require both numerical and peak-memory evidence for tree batching.
+
+    Equal tensor shapes and cache lengths do not prove that batch=K chooses the
+    same greedy tokens as K independent forwards on every device/dtype/kernel.
+    Some cache implementations also retain the original rows while building
+    and splitting a temporary batch, so persistent KV accounting alone can
+    understate the real peak by several times.  Executors must explicitly seal
+    both properties before VERIFY leaves may share one physical forward.
+    """
+
+    manifest = getattr(runner, "executor_manifest", None)
+    features = frozenset(getattr(manifest, "features", ()))
+    return {
+        "exact-tree-verify-batching",
+        "bounded-tree-verify-workspace",
+    }.issubset(features)
+
+
 def collect_compatible_activation_frames(
     first: Frame,
     *,
@@ -429,6 +1432,9 @@ def collect_compatible_activation_frames(
     config: StageProcessConfig,
     runner: StageRunnerContract,
     request_metrics: dict[int, dict[str, Any]],
+    branch_parents: Mapping[int, int] | None = None,
+    tree_leaf_shapes: Mapping[int, TreeLeafShape] | None = None,
+    tree_reservations: TreeReservationBook | None = None,
     downstream: socket.socket | None,
 ) -> tuple[Frame, ...]:
     """Read a bounded run of activations that can share one model forward.
@@ -440,11 +1446,18 @@ def collect_compatible_activation_frames(
 
     batch_forward = getattr(runner, "forward_hidden_batch", None)
     batch_key = getattr(runner, "physical_batch_key", None)
+    first_is_tree_leaf = (
+        branch_parents is not None and first.request_id in branch_parents
+    )
     if (
         getattr(runner, "max_active_requests", None) == 1
         or config.max_physical_batch_size < 2
         or not callable(batch_forward)
         or not callable(batch_key)
+        or (
+            first_is_tree_leaf
+            and not tree_verify_batch_is_certified(runner)
+        )
     ):
         return (first,)
     token_mode = activation_token_mode(first.frame_type)
@@ -465,6 +1478,16 @@ def collect_compatible_activation_frames(
         if not readable:
             break
         candidate = recv_frame(upstream)
+        # The batch collector reads ahead of the main stage loop.  It must
+        # enforce the same reservation barrier before applying an inline BEGIN
+        # or accepting a compatible tensor; otherwise a parent activation could
+        # mutate the snapshot while TREE_PREPARE is awaiting its route result.
+        if tree_reservations is not None:
+            validate_tree_reservation_frame_order(
+                candidate,
+                tree_reservations,
+                {} if branch_parents is None else branch_parents,
+            )
         if candidate.frame_type == FrameType.BEGIN:
             begin_stage_request(
                 candidate,
@@ -481,7 +1504,35 @@ def collect_compatible_activation_frames(
         ):
             pending_frames.appendleft(candidate)
             break
-        validate_activation(candidate, config, runner, request_metrics)
+        # Consecutive credit-window chunks from one request are deliberately
+        # not one physical tensor batch: chunk N+1 depends on chunk N's KV.
+        # Defer it before step validation, because the first frame's forward
+        # has not yet incremented request_metrics["frames"]. The main loop will
+        # validate it immediately after the predecessor commits.
+        if candidate.request_id in request_ids:
+            pending_frames.appendleft(candidate)
+            break
+        candidate_is_tree_leaf = (
+            branch_parents is not None
+            and candidate.request_id in branch_parents
+        )
+        # Never merge a real request with a virtual tree leaf.  Apart from
+        # making peak-memory accounting harder to certify, their lifecycle and
+        # cancellation semantics are deliberately different.
+        if candidate_is_tree_leaf != first_is_tree_leaf:
+            pending_frames.appendleft(candidate)
+            break
+        if candidate_is_tree_leaf and not tree_verify_batch_is_certified(runner):
+            pending_frames.appendleft(candidate)
+            break
+        validate_activation(
+            candidate,
+            config,
+            runner,
+            request_metrics,
+            branch_parents,
+            tree_leaf_shapes,
+        )
         candidate_mode = activation_token_mode(candidate.frame_type)
         candidate_key = batch_key(
             candidate.request_id,
@@ -489,8 +1540,7 @@ def collect_compatible_activation_frames(
             token_mode=candidate_mode,
         )
         compatible = (
-            candidate.request_id not in request_ids
-            and candidate.frame_type == first.frame_type
+            candidate.frame_type == first.frame_type
             and candidate.flags == first.flags
             and candidate.token_count == first.token_count
             and candidate.hidden_size == first.hidden_size
@@ -510,6 +1560,7 @@ def process_activation_frames(
     config: StageProcessConfig,
     runner: StageRunnerContract,
     request_metrics: dict[int, dict[str, Any]],
+    branch_parents: Mapping[int, int],
     downstream: socket.socket | None,
     return_socket: socket.socket | None,
     emulator: LinkEmulator,
@@ -518,6 +1569,20 @@ def process_activation_frames(
 
     if not frames:
         raise ValueError("activation frame batch cannot be empty")
+    if len(frames) > 1:
+        tree_membership = tuple(
+            frame.request_id in branch_parents for frame in frames
+        )
+        if any(tree_membership) and not all(tree_membership):
+            raise ValueError("physical batches cannot mix real requests and tree leaves")
+        if any(tree_membership) and not tree_verify_batch_is_certified(runner):
+            raise ValueError(
+                "physical tree VERIFY batching requires exact-token and "
+                "bounded-workspace executor certification"
+            )
+    # Individual ingress validation is insufficient for a physical batch: two
+    # children may each fit alone but exceed the total KV budget together.
+    validate_speculative_kv_preflight(frames, config, runner, branch_parents)
     token_mode = activation_token_mode(frames[0].frame_type)
     hidden_states = tuple(decode_tensor(frame) for frame in frames)
     timings_ms: tuple[float, ...]
@@ -838,6 +1903,45 @@ def validate_stage_config(config: StageProcessConfig) -> None:
         or config.physical_batch_window_ms > 100
     ):
         raise ValueError("physical_batch_window_ms must be between 0 and 100")
+    if (
+        not isinstance(config.max_speculative_branches, int)
+        or isinstance(config.max_speculative_branches, bool)
+        or not 0 <= config.max_speculative_branches <= MAX_SPECULATIVE_BRANCHES
+    ):
+        raise ValueError(
+            "max_speculative_branches must be between 0 and "
+            f"{MAX_SPECULATIVE_BRANCHES}"
+        )
+    if (
+        not isinstance(config.max_speculative_branch_tokens, int)
+        or isinstance(config.max_speculative_branch_tokens, bool)
+        or not 0
+        <= config.max_speculative_branch_tokens
+        <= MAX_SPECULATIVE_BRANCH_TOKENS
+    ):
+        raise ValueError(
+            "max_speculative_branch_tokens must be between 0 and "
+            f"{MAX_SPECULATIVE_BRANCH_TOKENS}"
+        )
+    if (
+        not isinstance(config.max_speculative_kv_bytes, int)
+        or isinstance(config.max_speculative_kv_bytes, bool)
+        or not 0 <= config.max_speculative_kv_bytes <= MAX_SPECULATIVE_KV_BYTES
+    ):
+        raise ValueError(
+            "max_speculative_kv_bytes must be between 0 and "
+            f"{MAX_SPECULATIVE_KV_BYTES}"
+        )
+    enabled_limits = (
+        config.max_speculative_branches > 0,
+        config.max_speculative_branch_tokens > 0,
+        config.max_speculative_kv_bytes > 0,
+    )
+    if any(enabled_limits) and not all(enabled_limits):
+        raise ValueError(
+            "speculative branch count, tokens and KV bytes must all be zero "
+            "or all be positive"
+        )
     has_native_stage = config.native_stage_package is not None
     has_ram_backed_moe = config.ram_backed_moe is not None
     if has_ram_backed_moe:
@@ -1037,9 +2141,27 @@ def validate_activation(
     config: StageProcessConfig,
     runner: StageRunnerContract,
     request_metrics: dict[int, dict[str, Any]],
+    branch_parents: Mapping[int, int] | None = None,
+    tree_leaf_shapes: Mapping[int, TreeLeafShape] | None = None,
 ) -> None:
     if frame.request_id not in request_metrics:
         raise ValueError(f"activation for request {frame.request_id} arrived before BEGIN")
+    leaf_shape = (
+        None if tree_leaf_shapes is None else tree_leaf_shapes.get(frame.request_id)
+    )
+    if leaf_shape is not None:
+        if frame.frame_type != FrameType.VERIFY:
+            raise ValueError("quoted physical tree leaves require a VERIFY frame")
+        if frame.token_count != leaf_shape.expected_tokens:
+            raise ValueError(
+                "quoted physical tree leaf shape mismatch: "
+                f"got {frame.token_count}, expected {leaf_shape.expected_tokens}"
+            )
+        if (
+            branch_parents is None
+            or branch_parents.get(frame.request_id) != leaf_shape.parent_request_id
+        ):
+            raise RuntimeError("quoted physical tree leaf lost its parent binding")
     if (
         frame.frame_type == FrameType.VERIFY
         and config.sealed_wave_tokens is not None
@@ -1087,7 +2209,21 @@ def validate_activation(
             f"expected {runner.hidden_size}"
         )
     # This also proves that BEGIN reached the model runner and its local cache is active.
-    runner.sequence_length(frame.request_id)
+    current_tokens = runner.sequence_length(frame.request_id)
+    if branch_parents is not None and frame.request_id in branch_parents:
+        next_tokens = current_tokens + frame.token_count
+        if next_tokens > config.max_speculative_branch_tokens:
+            raise ValueError(
+                "speculative child activation exceeds "
+                "max_speculative_branch_tokens: "
+                f"{next_tokens} > {config.max_speculative_branch_tokens}"
+            )
+        validate_speculative_kv_preflight(
+            (frame,),
+            config,
+            runner,
+            branch_parents,
+        )
 
 
 def connect_with_retry(host: str, port: int, timeout_seconds: float) -> socket.socket:
@@ -1156,6 +2292,39 @@ def monitor_downstream_control(
         pass
 
 
+def forward_shutdown_and_wait(
+    downstream: socket.socket,
+    request_id: int,
+    control_thread: threading.Thread | None,
+    *,
+    timeout_seconds: float = STAGE_SHUTDOWN_GRACE_SECONDS,
+) -> None:
+    """Forward planned shutdown and wait for downstream EOF as its ACK.
+
+    The control reader is already blocked on this socket. With ``stopping`` set
+    by the caller, a downstream EOF is quiet and proves that the next stage
+    consumed SHUTDOWN and closed. Closing this socket before that observation
+    can turn the ordered frame into a Windows TCP reset at the next hop.
+    """
+
+    if not math.isfinite(timeout_seconds) or timeout_seconds < 0:
+        raise ValueError("shutdown timeout must be finite and non-negative")
+    send_frame(downstream, FrameType.SHUTDOWN, request_id)
+    try:
+        downstream.shutdown(socket.SHUT_WR)
+    except OSError:
+        # sendall completed; an immediate peer close also proves consumption.
+        pass
+    if control_thread is None:
+        raise RuntimeError("intermediate stage has no downstream control reader")
+    control_thread.join(timeout=timeout_seconds)
+    if control_thread.is_alive():
+        raise TimeoutError(
+            "downstream stage did not acknowledge SHUTDOWN with EOF within "
+            f"{timeout_seconds}s"
+        )
+
+
 def send_error_best_effort(
     sock: socket.socket | None,
     request_id: int,
@@ -1201,6 +2370,93 @@ def executor_metric_fields(runner: StageRunnerContract) -> dict[str, str]:
         "executor_engine": str(manifest.engine),
         "executor_adapter": str(manifest.adapter),
     }
+
+
+def cell_rank_work_metric(runner: StageRunnerContract) -> list[dict[str, Any]]:
+    """Return the closed, JSON-safe physical work evidence for one stage.
+
+    This is intentionally best-effort like the metric sink itself. A runner
+    without physical-rank evidence, or one exposing a malformed snapshot,
+    produces an empty list and cannot fail an otherwise valid request.
+    """
+
+    try:
+        reports = getattr(runner, "member_work_reports", None)
+        if not isinstance(reports, Mapping):
+            return []
+        ranks = list(reports)
+        if any(
+            not isinstance(rank, int) or isinstance(rank, bool) or rank < 0
+            for rank in ranks
+        ) or sorted(ranks) != list(range(len(ranks))):
+            return []
+
+        result: list[dict[str, Any]] = []
+        expected_report_keys = {
+            "rank",
+            "device",
+            "computeDtype",
+            "collectiveBackend",
+            "forwardCalls",
+            "collectiveCalls",
+            "tokensProcessed",
+            "memory",
+        }
+        expected_memory_keys = {
+            "allocatedBytes",
+            "reservedBytes",
+            "peakAllocatedBytes",
+        }
+        for rank in sorted(ranks):
+            report = reports[rank]
+            if not isinstance(report, Mapping) or set(report) != expected_report_keys:
+                return []
+            if report.get("rank") != rank:
+                return []
+            device = report.get("device")
+            if not isinstance(device, str) or not device:
+                return []
+            if not isinstance(report.get("computeDtype"), str) or not isinstance(
+                report.get("collectiveBackend"), str
+            ):
+                return []
+            counters: dict[str, int] = {}
+            for name in ("forwardCalls", "collectiveCalls", "tokensProcessed"):
+                value = report.get(name)
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                    return []
+                counters[name] = value
+
+            memory = report.get("memory")
+            if not isinstance(memory, Mapping) or set(memory) != expected_memory_keys:
+                return []
+            memory_values: dict[str, int] = {}
+            for name in (
+                "allocatedBytes",
+                "reservedBytes",
+                "peakAllocatedBytes",
+            ):
+                value = memory.get(name)
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                    return []
+                memory_values[name] = value
+            if (
+                memory_values["allocatedBytes"] > memory_values["reservedBytes"]
+                or memory_values["allocatedBytes"]
+                > memory_values["peakAllocatedBytes"]
+            ):
+                return []
+            result.append(
+                {
+                    "rank": rank,
+                    "device": device,
+                    **counters,
+                    "memory": memory_values,
+                }
+            )
+        return result
+    except BaseException:
+        return []
 
 
 def drain_metrics(metrics_queue: Any) -> list[dict[str, Any]]:

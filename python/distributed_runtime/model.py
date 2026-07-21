@@ -34,6 +34,10 @@ class ModelArtifactReference:
     snapshot_identity: int
 
 
+STAGE_QUANTIZE_MODES = (None, "dynamic-int8")
+STAGE_COMPILE_MODES = (None, "default", "reduce-overhead")
+
+
 @dataclass(frozen=True)
 class StageModelSpec:
     model_name: str
@@ -45,6 +49,11 @@ class StageModelSpec:
     artifact_identity: str | None = None
     canonical_model_source: str | None = None
     canonical_model_revision: str | None = None
+    # Opt-in experimental execution variants. ``None`` keeps the reference
+    # FP32 eager path byte-for-byte identical. ``quantize="dynamic-int8"`` is an
+    # APPROXIMATE mode: it may change greedy tokens versus the FP32 reference.
+    quantize: str | None = None
+    compile_mode: str | None = None
 
     def __post_init__(self) -> None:
         if not self.model_name.strip():
@@ -59,6 +68,10 @@ class StageModelSpec:
             raise ValueError("threads must be positive")
         if self.revision is not None and not self.revision.strip():
             raise ValueError("revision cannot be blank")
+        if self.quantize not in STAGE_QUANTIZE_MODES:
+            raise ValueError(f"quantize must be one of {STAGE_QUANTIZE_MODES}")
+        if self.compile_mode not in STAGE_COMPILE_MODES:
+            raise ValueError(f"compile_mode must be one of {STAGE_COMPILE_MODES}")
         for name, value in (
             ("artifact_identity", self.artifact_identity),
             ("canonical_model_source", self.canonical_model_source),
@@ -105,6 +118,22 @@ class StageRunnerContract(Protocol):
     def truncate(self, request_id: int, token_count: int) -> None: ...
 
     def sequence_length(self, request_id: int) -> int: ...
+
+    def request_cache_bytes(self, request_id: int) -> int: ...
+
+    def project_request_cache_bytes(
+        self, request_id: int, additional_tokens: int
+    ) -> int: ...
+
+    def fork_request(
+        self,
+        child_request_id: int,
+        parent_request_id: int,
+        *,
+        max_cache_bytes: int,
+    ) -> int: ...
+
+    def promote_request(self, parent_request_id: int, child_request_id: int) -> None: ...
 
     def forward_hidden(
         self,
@@ -228,6 +257,7 @@ class StageRunner:
                 "layer-range",
                 "rank-local-kv",
                 "rollback",
+                "exact-request-fork-safe-copy",
                 "selective-load",
                 *(adapter.semantic_features if semantic_features is None else semantic_features),
                 *(
@@ -237,9 +267,23 @@ class StageRunner:
                 ),
             ),
         )
+        # Opt-in spike variants. Applied after the manifest so the default
+        # metadata path stays identical when both flags are absent.
+        if spec.quantize == "dynamic-int8":
+            self.base, self.head = _apply_dynamic_int8(self.base, self.head)
+            self.loader += "+dynamic-int8"
+        if spec.compile_mode is not None:
+            inductor_mode = None if spec.compile_mode == "default" else spec.compile_mode
+            self.base = torch.compile(self.base, backend="inductor", mode=inductor_mode)
+            if self.head is not None:
+                self.head = torch.compile(
+                    self.head, backend="inductor", mode=inductor_mode
+                )
+            self.loader += f"+compile-{spec.compile_mode}"
         self.caches: dict[int, Any] = {}
         self.tokens_seen: dict[int, int] = {}
         self.active_requests: set[int] = set()
+        self._last_fork_report = None
         del model
         gc.collect()
 
@@ -280,6 +324,206 @@ class StageRunner:
                 raise TypeError("model cache does not support speculative rollback")
             crop(token_count)
         self.tokens_seen[request_id] = token_count
+
+    def request_cache_bytes(self, request_id: int) -> int:
+        """Return unique tensor-storage bytes currently owned by one KV state."""
+
+        self._require_active(request_id)
+        return _cache_storage_bytes(self.caches.get(request_id))
+
+    def project_request_cache_bytes(
+        self,
+        request_id: int,
+        additional_tokens: int,
+    ) -> int:
+        """Conservatively project KV storage before allocating another wave.
+
+        A non-empty DynamicCache has already materialised every local layer, so
+        total unique storage divided by the logical token count is a safe upper
+        bound per future token (cropped/sliding caches only make it larger).
+        Empty-cache projection is refused: exact trees are expected to fork an
+        already-prefilled parent, and guessing model-specific KV geometry would
+        not be a fail-closed memory seal.
+        """
+
+        self._require_active(request_id)
+        if not isinstance(additional_tokens, int) or isinstance(additional_tokens, bool):
+            raise TypeError("additional_tokens must be an integer")
+        if additional_tokens < 0:
+            raise ValueError("additional_tokens cannot be negative")
+        current_tokens = self.tokens_seen[request_id]
+        current_bytes = self.request_cache_bytes(request_id)
+        if additional_tokens == 0:
+            return current_bytes
+        if current_tokens < 1 or current_bytes < 1:
+            raise ValueError("cannot project speculative KV bytes from an empty cache")
+        bytes_per_token = (current_bytes + current_tokens - 1) // current_tokens
+        return bytes_per_token * (current_tokens + additional_tokens)
+
+    def unique_physical_cache_bytes(self, request_ids: Sequence[int]) -> int:
+        """Deduplicate tensor storages across a selected request set.
+
+        DynamicCache requests never intentionally alias, but using storage
+        identities here keeps the optional physical ABI truthful and detects a
+        future backend change instead of assuming safe-copy forever.
+        """
+
+        ids = tuple(request_ids)
+        if len(set(ids)) != len(ids):
+            raise ValueError("request_ids must be unique")
+        storage_keys: set[tuple[str, int | None, int, int]] = set()
+        for request_id in ids:
+            self._require_active(request_id)
+            storage_keys.update(_cache_storage_keys(self.caches.get(request_id)))
+        return sum(key[3] for key in storage_keys)
+
+    def project_incremental_physical_cache_bytes(
+        self,
+        parent_request_id: int,
+        *,
+        new_leaf_count: int,
+        delta_tokens: int,
+    ) -> int:
+        """Conservatively project new unique storage for safe-copy leaves."""
+
+        self._require_active(parent_request_id)
+        for name, value in (
+            ("new_leaf_count", new_leaf_count),
+            ("delta_tokens", delta_tokens),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{name} must be an integer")
+            if value < 0:
+                raise ValueError(f"{name} cannot be negative")
+        if new_leaf_count == 0:
+            return 0
+        projected_leaf_bytes = self.project_request_cache_bytes(
+            parent_request_id,
+            delta_tokens,
+        )
+        return new_leaf_count * projected_leaf_bytes
+
+    def project_tree_incremental_physical_cache_bytes(
+        self,
+        parent_request_id: int,
+        *,
+        delta_tokens_by_leaf: Sequence[int],
+    ) -> int:
+        """Project an exact heterogeneous safe-copy tree without a max-depth pad."""
+
+        self._require_active(parent_request_id)
+        deltas = tuple(delta_tokens_by_leaf)
+        for delta_tokens in deltas:
+            if not isinstance(delta_tokens, int) or isinstance(delta_tokens, bool):
+                raise TypeError("delta_tokens_by_leaf must contain integers")
+            if delta_tokens < 0:
+                raise ValueError("delta_tokens_by_leaf cannot contain negatives")
+        return sum(
+            self.project_request_cache_bytes(parent_request_id, delta_tokens)
+            for delta_tokens in deltas
+        )
+
+    def project_request_incremental_physical_cache_bytes(
+        self,
+        request_id: int,
+        additional_tokens: int,
+    ) -> int:
+        """Return only the new unique storage needed to grow one safe-copy KV."""
+
+        current = self.request_cache_bytes(request_id)
+        projected = self.project_request_cache_bytes(request_id, additional_tokens)
+        if projected < current:
+            raise RuntimeError("safe-copy KV projection moved backwards")
+        return projected - current
+
+    def last_fork_report(self):
+        """Return the optional sealed accounting for the latest fork."""
+
+        return getattr(self, "_last_fork_report", None)
+
+    def fork_request(
+        self,
+        child_request_id: int,
+        parent_request_id: int,
+        *,
+        max_cache_bytes: int,
+    ) -> int:
+        """Create an exact, independently mutable KV leaf from ``parent``.
+
+        Transformers' DynamicCache mutates its key/value tensors during the
+        next forward. Sharing those tensors without a cache-aware COW layer
+        would corrupt sibling leaves, so this first physical implementation
+        deliberately takes the safe path: clone before publishing the child
+        and prove that no tensor storage aliases the parent. The returned byte
+        count is the unique parent cache storage copied by this operation.
+        """
+
+        if child_request_id == parent_request_id:
+            raise ValueError("fork child and parent request IDs must differ")
+        self._require_active(parent_request_id)
+        if child_request_id in self.active_requests:
+            raise ValueError(f"fork child request {child_request_id} is already active")
+        if not isinstance(max_cache_bytes, int) or isinstance(max_cache_bytes, bool):
+            raise TypeError("max_cache_bytes must be an integer")
+        if max_cache_bytes < 0:
+            raise ValueError("max_cache_bytes cannot be negative")
+
+        parent_cache = self.caches.get(parent_request_id)
+        copied_bytes = _cache_storage_bytes(parent_cache)
+        if copied_bytes > max_cache_bytes:
+            raise ValueError(
+                "fork cache exceeds the preflight byte budget: "
+                f"{copied_bytes} > {max_cache_bytes}"
+            )
+        try:
+            child_cache = copy.deepcopy(parent_cache)
+        except BaseException as error:
+            raise TypeError("model cache cannot be cloned safely for an exact fork") from error
+        if _cache_storage_keys(parent_cache) & _cache_storage_keys(child_cache):
+            raise RuntimeError("forked model cache aliases parent tensor storage")
+
+        # Publish only after the complete clone and alias check succeed.
+        if parent_request_id in self.caches:
+            self.caches[child_request_id] = child_cache
+        else:
+            self.caches.pop(child_request_id, None)
+        self.tokens_seen[child_request_id] = self.tokens_seen[parent_request_id]
+        self.active_requests.add(child_request_id)
+        from .executor_abi import StageKVForkReport
+
+        self._last_fork_report = StageKVForkReport(
+            logical_bytes=sum(
+                self.request_cache_bytes(request_id)
+                for request_id in self.active_requests
+            ),
+            unique_physical_bytes=self.unique_physical_cache_bytes(
+                tuple(self.active_requests)
+            ),
+            copied_bytes=copied_bytes,
+            newly_reserved_bytes=copied_bytes,
+            peak_workspace_bytes=None,
+        )
+        return copied_bytes
+
+    def promote_request(self, parent_request_id: int, child_request_id: int) -> None:
+        """Move the selected child's exact KV state back to the parent in O(1)."""
+
+        if child_request_id == parent_request_id:
+            raise ValueError("promote parent and child request IDs must differ")
+        self._require_active(parent_request_id)
+        self._require_active(child_request_id)
+
+        child_has_cache = child_request_id in self.caches
+        child_cache = self.caches.get(child_request_id)
+        child_tokens = self.tokens_seen[child_request_id]
+        if child_has_cache:
+            self.caches[parent_request_id] = child_cache
+        else:
+            self.caches.pop(parent_request_id, None)
+        self.tokens_seen[parent_request_id] = child_tokens
+        self.caches.pop(child_request_id, None)
+        self.tokens_seen.pop(child_request_id, None)
+        self.active_requests.remove(child_request_id)
 
     def sequence_length(self, request_id: int) -> int:
         self._require_active(request_id)
@@ -629,6 +873,56 @@ class StageRunner:
         )
 
 
+def _cache_tensors(value: Any, seen: set[int] | None = None) -> tuple[torch.Tensor, ...]:
+    """Walk one cache object without following cycles or model/module state."""
+
+    if value is None:
+        return ()
+    if isinstance(value, torch.Tensor):
+        return (value,)
+    if isinstance(value, nn.Module):
+        raise TypeError("request cache unexpectedly contains a torch module")
+    visited = set() if seen is None else seen
+    identity = id(value)
+    if identity in visited:
+        return ()
+    visited.add(identity)
+    if isinstance(value, Mapping):
+        children = tuple(value.values())
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        children = tuple(value)
+    else:
+        fields = getattr(value, "__dict__", None)
+        if not isinstance(fields, dict):
+            return ()
+        children = tuple(fields.values())
+    return tuple(
+        tensor
+        for child in children
+        for tensor in _cache_tensors(child, visited)
+    )
+
+
+def _tensor_storage_key(tensor: torch.Tensor) -> tuple[str, int | None, int, int] | None:
+    storage = tensor.untyped_storage()
+    size = int(storage.nbytes())
+    if size == 0:
+        return None
+    return (tensor.device.type, tensor.device.index, int(storage.data_ptr()), size)
+
+
+def _cache_storage_keys(value: Any) -> frozenset[tuple[str, int | None, int, int]]:
+    return frozenset(
+        key
+        for tensor in _cache_tensors(value)
+        if (key := _tensor_storage_key(tensor)) is not None
+    )
+
+
+def _cache_storage_bytes(value: Any) -> int:
+    return sum(key[3] for key in _cache_storage_keys(value))
+
+
 def _supports_dynamic_tensor_batching(config: Any) -> bool:
     """Whether the pinned Transformers cache can be losslessly split/merged.
 
@@ -643,6 +937,28 @@ def _supports_dynamic_tensor_batching(config: Any) -> bool:
     except (AttributeError, TypeError, ValueError):
         return False
     return bool(cache.layers) and all(type(layer) is DynamicLayer for layer in cache.layers)
+
+
+def _apply_dynamic_int8(
+    base: nn.Module, head: nn.Module | None
+) -> tuple[nn.Module, nn.Module | None]:
+    """Replace every ``nn.Linear`` with a dynamically quantized INT8 kernel.
+
+    APPROXIMATE mode: activations stay FP32 on the wire and in the KV cache,
+    but matmul weights are stored INT8 and requantized per batch, so greedy
+    tokens may drift from the FP32 reference. ``inplace=True`` avoids a full
+    deepcopy of the resident stage. A bare ``nn.Linear`` head is wrapped in a
+    pass-through container because ``convert`` only swaps child modules.
+    """
+
+    from torch.ao.quantization import quantize_dynamic
+
+    base = quantize_dynamic(base, {nn.Linear}, dtype=torch.qint8, inplace=True)
+    if head is not None:
+        head = quantize_dynamic(
+            nn.Sequential(head), {nn.Linear}, dtype=torch.qint8, inplace=True
+        )
+    return base, head
 
 
 def load_tokenizer(model_name: str):

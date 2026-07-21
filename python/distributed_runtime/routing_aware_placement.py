@@ -12,6 +12,7 @@ and it is not a runtime or WAN benchmark.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from functools import lru_cache
 import math
@@ -29,6 +30,16 @@ ROUTING_AWARE_PLACEMENT_SCHEMA = "gdlp-routing-aware-placement/1"
 _FLOAT_TOLERANCE = 1e-12
 _COVERAGE_REPAIR_MAX_KEYS = 36
 _COVERAGE_REPAIR_MAX_STATES = 200_000
+_TRACE_OWNER_EXACT_MAX_TRANSITIONS = 100_000
+_TRACE_OWNER_EXACT_MAX_RESIDENT_STATES = 4_096
+_TRACE_OWNER_EXACT_MAX_RESIDENT_STATE_CELLS = 1_000_000
+_TRACE_OWNER_EXACT_MAX_COPIED_STATE_CELLS = 1_000_000
+_TRACE_OWNER_BEAM_WIDTH = 64
+_TRACE_OWNER_BEAM_MAX_TRANSITIONS = 100_000
+_TRACE_OWNER_BEAM_MAX_RESIDENT_STATES = 1_024
+_TRACE_OWNER_BEAM_MAX_RESIDENT_STATE_CELLS = 1_000_000
+_TRACE_OWNER_BEAM_MAX_COPIED_STATE_CELLS = 1_000_000
+_TRACE_OWNER_LOCAL_SEARCH_MAX_STATES = 20_000
 
 
 class RoutingAwarePlacementError(RuntimeError):
@@ -123,6 +134,14 @@ class TraceOwnerProjection:
     coalesced_exact_row_index_bytes_per_position: int
     owner_partial_activation_byte_floor_per_position: int
     projected_link_ms_per_position: float
+    # Exact search is used whenever its bounded count-state DP completes.
+    # Larger routes remain semantically exact (every expert has one resident
+    # owner within dynamic VRAM), but their performance assignment is a bounded
+    # deterministic heuristic and is therefore reported as non-optimal.
+    owner_selection_strategy: str = "unknown"
+    owner_selection_optimal: bool = False
+    owner_selection_states_evaluated: int = 0
+    transport_mode_by_owner: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -203,6 +222,15 @@ class _TraceRouteState:
     response_bytes: int
     owners: tuple[str, ...]
     assignments: tuple[tuple[int, str], ...]
+    coalesced_owners: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _TraceOwnerSelection:
+    state: _TraceRouteState
+    strategy: str
+    optimal: bool
+    states_evaluated: int
 
 
 @dataclass(frozen=True)
@@ -407,9 +435,14 @@ def _build_context(
 
     edges = _canonical_edges(traces, records)
     peak_experts_per_position = max(len(edge.keys) for edge in edges)
-    coordinator_dynamic_bytes = positions_per_wave * peak_experts_per_position * (
-        3 * activation_bytes
-        + node_map[coordinator].expert_workspace_bytes_per_token
+    # The offline candidates are remote owners. The coordinator materializes
+    # selected inputs, returned outputs and canonical reduction buffers, but it
+    # does not execute the remote expert's gate/up/SwiGLU workspace.
+    coordinator_dynamic_bytes = (
+        positions_per_wave
+        * peak_experts_per_position
+        * 3
+        * activation_bytes
     )
     if (
         node_map[coordinator].reserved_vram_bytes + coordinator_dynamic_bytes
@@ -523,15 +556,27 @@ def _static_remaining(
     context: _PlanningContext,
     placements: Mapping[ExpertKey, set[str]],
 ) -> dict[str, int]:
+    resident_bytes_by_owner = {
+        node_id: 0 for node_id in context.candidate_node_ids
+    }
+    # Traverse each physical replica once.  The previous owner-major sum
+    # rescanned every placement for every candidate owner, making construction
+    # of a wide trace problem quadratic when owners and experts grew together.
+    # Unknown non-candidate owners remain ignored, while an unknown expert that
+    # claims a candidate owner still fails closed through the records lookup.
+    for key, owner_ids in placements.items():
+        byte_size: int | None = None
+        for node_id in owner_ids:
+            if node_id not in resident_bytes_by_owner:
+                continue
+            if byte_size is None:
+                byte_size = context.records[key].byte_size
+            resident_bytes_by_owner[node_id] += byte_size
     return {
         node_id: (
             context.nodes[node_id].resident_vram_budget_bytes
             - context.nodes[node_id].reserved_vram_bytes
-            - sum(
-                context.records[key].byte_size
-                for key, owners in placements.items()
-                if node_id in owners
-            )
+            - resident_bytes_by_owner[node_id]
         )
         for node_id in context.candidate_node_ids
     }
@@ -1018,11 +1063,17 @@ def _project(
     peak_load = {node_id: 0 for node_id in context.candidate_node_ids}
     routes: list[TraceOwnerProjection] = []
     for edge in context.edges:
-        owners, owner_for_key, link_ms = _select_trace_owners(
+        selection = _select_trace_owner_route(
             context,
             placements,
             edge,
         )
+        owners = selection.state.owners
+        owner_for_key = {
+            edge.keys[index]: owner
+            for index, owner in selection.state.assignments
+        }
+        link_ms = _route_state_projected_ms(context, selection.state)
         per_owner_count = {owner: 0 for owner in owners}
         for owner in owner_for_key.values():
             per_owner_count[owner] += 1
@@ -1038,13 +1089,14 @@ def _project(
         # gate multiplication and canonical floating-point reduction intact.
         coalesced_exact_activation_bytes = 0
         coalesced_exact_row_index_bytes = 0
-        for count in per_owner_count.values():
+        coalesced_owners = set(selection.state.coalesced_owners)
+        for owner, count in per_owner_count.items():
             v1_owner_bytes = 2 * context.activation_bytes_per_position * count
             exact_owner_bytes = (
                 context.activation_bytes_per_position * (count + 1)
             )
             row_bytes = 4 * count
-            if exact_owner_bytes + row_bytes < v1_owner_bytes:
+            if owner in coalesced_owners:
                 coalesced_exact_activation_bytes += exact_owner_bytes
                 coalesced_exact_row_index_bytes += row_bytes
             else:
@@ -1090,6 +1142,20 @@ def _project(
                     owner_partial_activation_byte_floor
                 ),
                 projected_link_ms_per_position=link_ms,
+                owner_selection_strategy=selection.strategy,
+                owner_selection_optimal=selection.optimal,
+                owner_selection_states_evaluated=selection.states_evaluated,
+                transport_mode_by_owner=tuple(
+                    (
+                        owner,
+                        (
+                            "coalesced-exact"
+                            if owner in coalesced_owners
+                            else "rpc-v1"
+                        ),
+                    )
+                    for owner in owners
+                ),
             )
         )
 
@@ -1163,120 +1229,732 @@ def _select_trace_owners(
     placements: Mapping[ExpertKey, set[str]],
     edge: _TraceEdge,
 ) -> tuple[tuple[str, ...], dict[ExpertKey, str], float]:
-    full_mask = (1 << len(edge.keys)) - 1
-    static_remaining = _static_remaining(context, placements)
-    node_masks: list[tuple[str, int, int]] = []
-    for node_id in context.candidate_node_ids:
-        mask = 0
-        for index, key in enumerate(edge.keys):
-            if node_id in placements.get(key, set()):
-                mask |= 1 << index
-        if mask:
-            max_dynamic_experts = max(
-                0,
-                static_remaining[node_id]
-                // _dynamic_bytes_per_expert(context, node_id),
-            )
-            if max_dynamic_experts:
-                node_masks.append((node_id, mask, max_dynamic_experts))
+    """Compatibility wrapper around the bounded owner-assignment solver."""
 
-    states: dict[int, list[_TraceRouteState]] = {
-        0: [_TraceRouteState(0.0, 0, 0, (), ())]
-    }
-    for node_id, node_mask, max_dynamic_experts in node_masks:
-        updated = {mask: list(values) for mask, values in states.items()}
-        for mask, route_states in states.items():
-            for state in route_states:
-                available = node_mask & ~mask
-                subset = available
-                while subset:
-                    combined = mask | subset
-                    count = subset.bit_count()
-                    if count > max_dynamic_experts:
-                        subset = (subset - 1) & available
-                        continue
-                    v1_transfer_ms = count * context.per_expert_transfer_ms[node_id]
-                    coalesced_transfer_ms = (
-                        context.shared_input_transfer_ms[node_id]
-                        + count * context.per_expert_output_transfer_ms[node_id]
-                        + count * context.row_index_transfer_ms[node_id]
-                    )
-                    use_coalesced = (
-                        coalesced_transfer_ms
-                        < v1_transfer_ms - _FLOAT_TOLERANCE
-                    )
-                    request_bytes = (
-                        context.activation_bytes_per_position + 4 * count
-                        if use_coalesced
-                        else context.activation_bytes_per_position * count
-                    )
-                    response_bytes = context.activation_bytes_per_position * count
-                    owner_ms = (
-                        context.fixed_contact_cost_ms[node_id]
-                        + (
-                            coalesced_transfer_ms
-                            if use_coalesced
-                            else v1_transfer_ms
-                        )
-                        + count
-                        * context.nodes[node_id].expert_compute_ms_per_token
-                    )
-                    candidate = _TraceRouteState(
-                        max_owner_ms=max(state.max_owner_ms, owner_ms),
-                        request_bytes=state.request_bytes + request_bytes,
-                        response_bytes=state.response_bytes + response_bytes,
-                        owners=state.owners + (node_id,),
-                        assignments=tuple(
-                            sorted(
-                                (
-                                    *state.assignments,
-                                    *(
-                                        (index, node_id)
-                                        for index in range(len(edge.keys))
-                                        if subset & (1 << index)
-                                    ),
-                                )
-                            )
-                        ),
-                    )
-                    _insert_route_state(updated.setdefault(combined, []), candidate)
-                    subset = (subset - 1) & available
-        states = updated
-    complete = states.get(full_mask)
-    if not complete:
-        raise RoutingAwarePlacementUnavailableError(
-            f"required trace at layer {edge.layer} has no complete exact route"
-        )
-    selected = min(complete, key=lambda state: _route_state_rank(context, state))
-    link_ms = _route_state_projected_ms(context, selected)
-    owners = selected.owners
-    assignments = selected.assignments
+    selection = _select_trace_owner_route(context, placements, edge)
     owner_for_key = {
-        edge.keys[index]: owner for index, owner in assignments
+        edge.keys[index]: owner for index, owner in selection.state.assignments
     }
     if set(owner_for_key) != set(edge.keys):
         raise RoutingAwarePlacementUnavailableError(
             f"required trace at layer {edge.layer} has an incomplete owner route"
         )
-    return owners, owner_for_key, link_ms
+    return (
+        selection.state.owners,
+        owner_for_key,
+        _route_state_projected_ms(context, selection.state),
+    )
+
+
+def _select_trace_owner_route(
+    context: _PlanningContext,
+    placements: Mapping[ExpertKey, set[str]],
+    edge: _TraceEdge,
+) -> _TraceOwnerSelection:
+    """Select one exact resident owner per expert without a 2**top-k walk.
+
+    A single owner is handled in linear time.  General small routes use an
+    exact dynamic program whose states are owner load-count vectors; routes
+    that exceed its explicit transition bound use a deterministic feasible
+    matching followed by bounded beam and local search.  The latter preserves
+    routing and VRAM semantics but does not claim performance optimality.
+    """
+
+    owner_ids, candidate_owners, capacities = _trace_owner_problem(
+        context,
+        placements,
+        edge,
+    )
+    if len(owner_ids) == 1:
+        owner_id = owner_ids[0]
+        if capacities[owner_id] < len(edge.keys):
+            raise RoutingAwarePlacementUnavailableError(
+                f"required trace at layer {edge.layer} has no complete exact route"
+            )
+        state = _build_trace_route_state(
+            context,
+            tuple(owner_id for _key in edge.keys),
+        )
+        return _TraceOwnerSelection(
+            state=state,
+            strategy="single-owner-linear",
+            optimal=True,
+            states_evaluated=1,
+        )
+
+    exact_state, exact_states, exact_completed = _solve_trace_owners_exact(
+        context,
+        candidate_owners,
+        capacities,
+    )
+    if exact_completed:
+        if exact_state is None:
+            raise RoutingAwarePlacementUnavailableError(
+                f"required trace at layer {edge.layer} has no complete exact route"
+            )
+        return _TraceOwnerSelection(
+            state=exact_state,
+            strategy="exact-count-dp",
+            optimal=True,
+            states_evaluated=exact_states,
+        )
+
+    heuristic_state, heuristic_states = _solve_trace_owners_heuristic(
+        context,
+        candidate_owners,
+        capacities,
+    )
+    if heuristic_state is None:
+        # The feasibility seed is a complete capacitated bipartite matching,
+        # so this is a proof of absence rather than heuristic exhaustion.
+        raise RoutingAwarePlacementUnavailableError(
+            f"required trace at layer {edge.layer} has no complete exact route"
+        )
+    return _TraceOwnerSelection(
+        state=heuristic_state,
+        strategy="bounded-beam-local-search",
+        optimal=False,
+        states_evaluated=exact_states + heuristic_states,
+    )
+
+
+def _trace_owner_problem(
+    context: _PlanningContext,
+    placements: Mapping[ExpertKey, set[str]],
+    edge: _TraceEdge,
+) -> tuple[tuple[str, ...], tuple[tuple[str, ...], ...], dict[str, int]]:
+    """Build deterministic owner domains and dynamic expert capacities."""
+
+    static_remaining = _static_remaining(context, placements)
+    capacities: dict[str, int] = {}
+    for node_id in context.candidate_node_ids:
+        dynamic_bytes = _dynamic_bytes_per_expert(context, node_id)
+        capacities[node_id] = max(0, static_remaining[node_id] // dynamic_bytes)
+
+    candidate_order = {
+        node_id: index
+        for index, node_id in enumerate(context.candidate_node_ids)
+    }
+    candidate_owners = tuple(
+        tuple(
+            sorted(
+                (
+                    node_id
+                    for node_id in placements.get(key, ())
+                    if node_id in candidate_order and capacities[node_id] > 0
+                ),
+                key=candidate_order.__getitem__,
+            )
+        )
+        for key in edge.keys
+    )
+    if any(not values for values in candidate_owners):
+        raise RoutingAwarePlacementUnavailableError(
+            f"required trace at layer {edge.layer} has no complete exact route"
+        )
+    used_owner_ids = {
+        owner for values in candidate_owners for owner in values
+    }
+    owner_ids = tuple(
+        node_id
+        for node_id in context.candidate_node_ids
+        if node_id in used_owner_ids
+    )
+    if sum(min(capacities[node_id], len(edge.keys)) for node_id in owner_ids) < len(
+        edge.keys
+    ):
+        raise RoutingAwarePlacementUnavailableError(
+            f"required trace at layer {edge.layer} has no complete exact route"
+        )
+    return owner_ids, candidate_owners, capacities
+
+
+def _trace_owner_resident_state_limit(
+    *,
+    expert_count: int,
+    owner_count: int,
+    max_states: int,
+    max_state_cells: int,
+    dense_copies_per_state: int,
+) -> int:
+    """Bound live dense DP states by both count and pointer-sized cells."""
+
+    dense_width = (expert_count + owner_count) * dense_copies_per_state
+    if dense_width <= 0 or max_states <= 0 or max_state_cells <= 0:
+        return 0
+    return min(max_states, max_state_cells // dense_width)
+
+
+def _trace_owner_transition_limit(
+    *,
+    expert_count: int,
+    owner_count: int,
+    max_transitions: int,
+    max_copied_state_cells: int,
+) -> int:
+    """Bound cumulative dense-vector copying, not only live state count.
+
+    Every DP transition copies one owner-count vector and one expert-assignment
+    vector into mutable lists and then into immutable tuples.  The factor of
+    two accounts for both representations.  Without this independent work
+    budget, a wide route can remain inside the resident-memory cap while still
+    copying billions of pointer cells before reaching ``max_transitions``.
+    """
+
+    copied_cells_per_transition = 2 * (expert_count + owner_count)
+    if (
+        copied_cells_per_transition <= 0
+        or max_transitions <= 0
+        or max_copied_state_cells <= 0
+    ):
+        return 0
+    return min(
+        max_transitions,
+        max_copied_state_cells // copied_cells_per_transition,
+    )
+
+
+def _solve_trace_owners_exact(
+    context: _PlanningContext,
+    candidate_owners: tuple[tuple[str, ...], ...],
+    capacities: Mapping[str, int],
+) -> tuple[_TraceRouteState | None, int, bool]:
+    """Run an exact count-state DP up to an explicit transition bound."""
+
+    owner_ids = tuple(
+        sorted({owner for values in candidate_owners for owner in values})
+    )
+    owner_slot = {owner: index for index, owner in enumerate(owner_ids)}
+    transition_limit = _trace_owner_transition_limit(
+        expert_count=len(candidate_owners),
+        owner_count=len(owner_ids),
+        max_transitions=_TRACE_OWNER_EXACT_MAX_TRANSITIONS,
+        max_copied_state_cells=_TRACE_OWNER_EXACT_MAX_COPIED_STATE_CELLS,
+    )
+    # A complete assignment needs at least one successful transition per
+    # expert.  If that lower bound already exceeds the cumulative copy budget,
+    # skip before allocating the dense initial state; the feasible matching
+    # solver will preserve semantics and report non-optimal performance.
+    if transition_limit < len(candidate_owners):
+        return None, 0, False
+    resident_state_limit = _trace_owner_resident_state_limit(
+        expert_count=len(candidate_owners),
+        owner_count=len(owner_ids),
+        max_states=_TRACE_OWNER_EXACT_MAX_RESIDENT_STATES,
+        max_state_cells=_TRACE_OWNER_EXACT_MAX_RESIDENT_STATE_CELLS,
+        # Account conservatively for the temporary mutable child vectors that
+        # coexist with the resident immutable state during construction.
+        dense_copies_per_state=2,
+    )
+    # Expanding the initial state requires the frontier and at least one child
+    # to coexist.  Skip the DP before constructing either dense tuple when the
+    # configured memory budget cannot hold both; the feasible bounded solver
+    # remains available and will report the route as non-optimal.
+    if resident_state_limit < 2:
+        return None, 0, False
+    order = tuple(
+        sorted(
+            range(len(candidate_owners)),
+            key=lambda index: (len(candidate_owners[index]), index),
+        )
+    )
+    empty_assignment = tuple("" for _values in candidate_owners)
+    frontier: dict[tuple[int, ...], tuple[str, ...]] = {
+        tuple(0 for _owner in owner_ids): empty_assignment
+    }
+    transitions = 0
+    for expert_index in order:
+        updated: dict[tuple[int, ...], tuple[str, ...]] = {}
+        # Insertion order is deterministic because both the frontier and every
+        # owner domain are built canonically.  Avoid a second O(states) list.
+        for counts, assignment in frontier.items():
+            for owner in candidate_owners[expert_index]:
+                if transitions >= transition_limit:
+                    return None, transitions, False
+                transitions += 1
+                slot = owner_slot[owner]
+                if counts[slot] >= capacities[owner]:
+                    continue
+                # Each child owns dense owner-count and expert-assignment
+                # tuples.  Refuse the transition before materializing them if
+                # frontier + next frontier would exceed the resident budget.
+                if len(frontier) + len(updated) + 1 > resident_state_limit:
+                    return None, transitions, False
+                next_counts = list(counts)
+                next_counts[slot] += 1
+                next_assignment = list(assignment)
+                next_assignment[expert_index] = owner
+                canonical_counts = tuple(next_counts)
+                canonical_assignment = tuple(next_assignment)
+                current = updated.get(canonical_counts)
+                if current is None or canonical_assignment < current:
+                    updated[canonical_counts] = canonical_assignment
+        if not updated:
+            return None, transitions, True
+        frontier = updated
+
+    selected = min(
+        (
+            _build_trace_route_state(context, assignment)
+            for assignment in frontier.values()
+        ),
+        key=lambda state: _route_state_rank(context, state),
+    )
+    return selected, transitions, True
+
+
+def _solve_trace_owners_heuristic(
+    context: _PlanningContext,
+    candidate_owners: tuple[tuple[str, ...], ...],
+    capacities: Mapping[str, int],
+) -> tuple[_TraceRouteState | None, int]:
+    """Find a feasible exact route, then optimize it within fixed bounds."""
+
+    seed = _find_feasible_trace_assignment(context, candidate_owners, capacities)
+    if seed is None:
+        return None, 1
+    selected = _build_trace_route_state(context, seed)
+    states_evaluated = 1
+
+    beam_state, beam_states = _solve_trace_owners_beam(
+        context,
+        candidate_owners,
+        capacities,
+    )
+    states_evaluated += beam_states
+    if beam_state is not None and _route_state_rank(
+        context, beam_state
+    ) < _route_state_rank(context, selected):
+        selected = beam_state
+
+    improved, local_states = _improve_trace_owner_assignment(
+        context,
+        candidate_owners,
+        capacities,
+        tuple(owner for _index, owner in selected.assignments),
+    )
+    states_evaluated += local_states
+    return improved, states_evaluated
+
+
+def _find_feasible_trace_assignment(
+    context: _PlanningContext,
+    candidate_owners: tuple[tuple[str, ...], ...],
+    capacities: Mapping[str, int],
+) -> tuple[str, ...] | None:
+    """Solve capacitated matching with iterative augmenting paths.
+
+    Owners are represented directly with their capacities rather than expanded
+    into one slot object per unit of capacity.  The alternating-path search is
+    breadth-first and reconstructed iteratively, so valid large top-k routes do
+    not depend on Python's recursion limit and memory remains O(edges + route).
+    """
+
+    owner_ids = tuple(
+        sorted({owner for values in candidate_owners for owner in values})
+    )
+    owner_capacity = {
+        owner: max(0, min(capacities[owner], len(candidate_owners)))
+        for owner in owner_ids
+    }
+    owner_assignments: dict[str, list[int]] = {
+        owner: [] for owner in owner_ids
+    }
+    expert_to_owner: list[str | None] = [None] * len(candidate_owners)
+    option_order = tuple(
+        tuple(
+            sorted(
+                values,
+                key=lambda owner: (context.contact_cost_ms[owner], owner),
+            )
+        )
+        for values in candidate_owners
+    )
+
+    def augment(start_expert: int) -> bool:
+        pending = deque((start_expert,))
+        visited_experts = {start_expert}
+        # Records which expert first reached each owner.  Once a free owner is
+        # found, current assignments provide the reverse alternating edges.
+        parent_expert_for_owner: dict[str, int] = {}
+        while pending:
+            expert_index = pending.popleft()
+            for owner in option_order[expert_index]:
+                if owner in parent_expert_for_owner:
+                    continue
+                parent_expert_for_owner[owner] = expert_index
+                assigned = owner_assignments[owner]
+                if len(assigned) < owner_capacity[owner]:
+                    # Flip the alternating path without recursion.  Moving an
+                    # incumbent frees its previous owner for its predecessor.
+                    available_owner = owner
+                    while True:
+                        moving_expert = parent_expert_for_owner[available_owner]
+                        previous_owner = expert_to_owner[moving_expert]
+                        if previous_owner is not None:
+                            owner_assignments[previous_owner].remove(moving_expert)
+                        owner_assignments[available_owner].append(moving_expert)
+                        expert_to_owner[moving_expert] = available_owner
+                        if previous_owner is None:
+                            return True
+                        available_owner = previous_owner
+                for incumbent in sorted(assigned):
+                    if incumbent in visited_experts:
+                        continue
+                    visited_experts.add(incumbent)
+                    pending.append(incumbent)
+        return False
+
+    for expert_index in sorted(
+        range(len(candidate_owners)),
+        key=lambda index: (len(candidate_owners[index]), index),
+    ):
+        if not augment(expert_index):
+            return None
+
+    result: list[str] = []
+    for owner in expert_to_owner:
+        if owner is None:
+            return None
+        result.append(owner)
+    return tuple(result)
+
+
+def _solve_trace_owners_beam(
+    context: _PlanningContext,
+    candidate_owners: tuple[tuple[str, ...], ...],
+    capacities: Mapping[str, int],
+) -> tuple[_TraceRouteState | None, int]:
+    """Run a deterministic, transition-bounded beam over count states."""
+
+    owner_ids = tuple(
+        sorted({owner for values in candidate_owners for owner in values})
+    )
+    owner_slot = {owner: index for index, owner in enumerate(owner_ids)}
+    transition_limit = _trace_owner_transition_limit(
+        expert_count=len(candidate_owners),
+        owner_count=len(owner_ids),
+        max_transitions=_TRACE_OWNER_BEAM_MAX_TRANSITIONS,
+        max_copied_state_cells=_TRACE_OWNER_BEAM_MAX_COPIED_STATE_CELLS,
+    )
+    if transition_limit < len(candidate_owners):
+        return None, 0
+    resident_state_limit = _trace_owner_resident_state_limit(
+        expert_count=len(candidate_owners),
+        owner_count=len(owner_ids),
+        max_states=_TRACE_OWNER_BEAM_MAX_RESIDENT_STATES,
+        max_state_cells=_TRACE_OWNER_BEAM_MAX_RESIDENT_STATE_CELLS,
+        # Account conservatively for child-construction vectors plus the
+        # route/rank tuple retained while sorting the next beam frontier.
+        dense_copies_per_state=3,
+    )
+    if resident_state_limit < 2:
+        return None, 0
+    order = tuple(
+        sorted(
+            range(len(candidate_owners)),
+            key=lambda index: (len(candidate_owners[index]), index),
+        )
+    )
+    frontier: dict[tuple[int, ...], tuple[str, ...]] = {
+        tuple(0 for _owner in owner_ids): tuple("" for _value in candidate_owners)
+    }
+    transitions = 0
+    for expert_index in order:
+        updated: dict[tuple[int, ...], tuple[str, ...]] = {}
+        for counts, assignment in frontier.items():
+            for owner in candidate_owners[expert_index]:
+                if transitions >= transition_limit:
+                    return None, transitions
+                transitions += 1
+                slot = owner_slot[owner]
+                if counts[slot] >= capacities[owner]:
+                    continue
+                if len(frontier) + len(updated) + 1 > resident_state_limit:
+                    return None, transitions
+                next_counts = list(counts)
+                next_counts[slot] += 1
+                next_assignment = list(assignment)
+                next_assignment[expert_index] = owner
+                canonical_counts = tuple(next_counts)
+                canonical_assignment = tuple(next_assignment)
+                current = updated.get(canonical_counts)
+                if current is None or canonical_assignment < current:
+                    updated[canonical_counts] = canonical_assignment
+        if not updated:
+            return None, transitions
+        ranked = sorted(
+            updated.items(),
+            key=lambda item: (
+                _route_state_rank(
+                    context,
+                    _build_trace_route_state(context, item[1]),
+                ),
+                item[0],
+                item[1],
+            ),
+        )
+        frontier = dict(ranked[:_TRACE_OWNER_BEAM_WIDTH])
+
+    return (
+        min(
+            (
+                _build_trace_route_state(context, assignment)
+                for assignment in frontier.values()
+            ),
+            key=lambda state: _route_state_rank(context, state),
+        ),
+        transitions,
+    )
+
+
+def _improve_trace_owner_assignment(
+    context: _PlanningContext,
+    candidate_owners: tuple[tuple[str, ...], ...],
+    capacities: Mapping[str, int],
+    seed: tuple[str, ...],
+) -> tuple[_TraceRouteState, int]:
+    """Apply bounded strict one-move descent to a feasible assignment."""
+
+    current_assignment = seed
+    current_state = _build_trace_route_state(context, current_assignment)
+    states_evaluated = 0
+    while states_evaluated < _TRACE_OWNER_LOCAL_SEARCH_MAX_STATES:
+        counts = {
+            owner: current_assignment.count(owner)
+            for owner in {value for values in candidate_owners for value in values}
+        }
+        best_assignment = current_assignment
+        best_state = current_state
+        limit_reached = False
+        for expert_index, current_owner in enumerate(current_assignment):
+            for owner in candidate_owners[expert_index]:
+                if owner == current_owner or counts.get(owner, 0) >= capacities[owner]:
+                    continue
+                candidate = list(current_assignment)
+                candidate[expert_index] = owner
+                candidate_assignment = tuple(candidate)
+                candidate_state = _build_trace_route_state(
+                    context,
+                    candidate_assignment,
+                )
+                states_evaluated += 1
+                if _route_state_rank(context, candidate_state) < _route_state_rank(
+                    context, best_state
+                ):
+                    best_assignment = candidate_assignment
+                    best_state = candidate_state
+                if states_evaluated >= _TRACE_OWNER_LOCAL_SEARCH_MAX_STATES:
+                    limit_reached = True
+                    break
+            if limit_reached:
+                break
+        if best_assignment == current_assignment:
+            return current_state, states_evaluated
+        current_assignment = best_assignment
+        current_state = best_state
+        if limit_reached:
+            break
+    return current_state, states_evaluated
+
+
+def _build_trace_route_state(
+    context: _PlanningContext,
+    assignment: tuple[str, ...],
+) -> _TraceRouteState:
+    """Materialize the exact joint owner, transport and shared-NIC objective."""
+
+    assignments = tuple(
+        (index, owner) for index, owner in enumerate(assignment) if owner
+    )
+    counts: dict[str, int] = {}
+    for _index, owner in assignments:
+        counts[owner] = counts.get(owner, 0) + 1
+
+    # Each contacted owner has two exact transports.  Choosing the locally
+    # faster one is insufficient: its request can be larger and make the
+    # coordinator's shared egress NIC the true critical path.  Build both
+    # alternatives and solve that two-choice min-max problem jointly below.
+    owner_options: list[
+        tuple[str, tuple[float, int, bool], tuple[float, int, bool]]
+    ] = []
+    response_bytes = 0
+    for node_id in sorted(counts):
+        count = counts[node_id]
+        v1_transfer_ms = count * context.per_expert_transfer_ms[node_id]
+        coalesced_transfer_ms = (
+            context.shared_input_transfer_ms[node_id]
+            + count * context.per_expert_output_transfer_ms[node_id]
+            + count * context.row_index_transfer_ms[node_id]
+        )
+        fixed_and_compute_ms = (
+            context.fixed_contact_cost_ms[node_id]
+            + count * context.nodes[node_id].expert_compute_ms_per_token
+        )
+        owner_options.append(
+            (
+                node_id,
+                (
+                    fixed_and_compute_ms + v1_transfer_ms,
+                    context.activation_bytes_per_position * count,
+                    False,
+                ),
+                (
+                    fixed_and_compute_ms + coalesced_transfer_ms,
+                    context.activation_bytes_per_position + 4 * count,
+                    True,
+                ),
+            )
+        )
+        response_bytes += context.activation_bytes_per_position * count
+    max_owner_ms, request_bytes, coalesced_owners = (
+        _select_trace_transport_modes(
+            context,
+            tuple(owner_options),
+            response_bytes=response_bytes,
+        )
+    )
+    return _TraceRouteState(
+        max_owner_ms=max_owner_ms,
+        request_bytes=request_bytes,
+        response_bytes=response_bytes,
+        owners=tuple(sorted(counts)),
+        assignments=assignments,
+        coalesced_owners=coalesced_owners,
+    )
+
+
+def _select_trace_transport_modes(
+    context: _PlanningContext,
+    owner_options: tuple[
+        tuple[str, tuple[float, int, bool], tuple[float, int, bool]], ...
+    ],
+    *,
+    response_bytes: int,
+) -> tuple[float, int, tuple[str, ...]]:
+    """Exactly minimize owner makespan and shared-NIC time over two modes.
+
+    For a fixed upper bound on owner time, every owner independently chooses
+    the feasible mode with the smallest request.  Therefore an optimum occurs
+    at the time of one of the two modes.  Starting with every owner's fastest
+    mode and scanning the slower/lower-request alternatives in time order
+    visits that complete Pareto frontier in O(owners log owners), without a
+    2**owners mode walk.
+    """
+
+    if not owner_options:
+        return 0.0, 0, ()
+
+    selected: dict[str, tuple[float, int, bool]] = {}
+    events: list[tuple[float, str, tuple[float, int, bool]]] = []
+    request_bytes = 0
+    max_owner_ms = 0.0
+    for node_id, v1, coalesced in owner_options:
+        v1_ms, v1_request, _v1_mode = v1
+        coalesced_ms, coalesced_request, _coalesced_mode = coalesced
+        if v1_ms <= coalesced_ms and v1_request <= coalesced_request:
+            initial = v1
+        elif coalesced_ms <= v1_ms and coalesced_request <= v1_request:
+            initial = coalesced
+        else:
+            # The non-dominated pair is a strict time/request tradeoff.
+            if (v1_ms, False) < (coalesced_ms, True):
+                initial, slower = v1, coalesced
+            else:
+                initial, slower = coalesced, v1
+            events.append((slower[0], node_id, slower))
+        selected[node_id] = initial
+        request_bytes += initial[1]
+        max_owner_ms = max(max_owner_ms, initial[0])
+
+    def objective(owner_ms: float, request: int) -> tuple[float, int]:
+        projected_ms = _projected_trace_ms(
+            context,
+            max_owner_ms=owner_ms,
+            request_bytes=request,
+            response_bytes=response_bytes,
+        )
+        return projected_ms, request + response_bytes
+
+    best_rank = objective(max_owner_ms, request_bytes)
+    best_event_count = 0
+    events.sort(key=lambda item: (item[0], item[1], item[2][2]))
+    event_index = 0
+    while event_index < len(events):
+        event_ms = events[event_index][0]
+        group_end = event_index
+        while group_end < len(events) and events[group_end][0] == event_ms:
+            _time, node_id, slower = events[group_end]
+            previous = selected[node_id]
+            request_bytes += slower[1] - previous[1]
+            selected[node_id] = slower
+            group_end += 1
+        max_owner_ms = max(max_owner_ms, event_ms)
+        rank = objective(max_owner_ms, request_bytes)
+        if rank < best_rank:
+            best_rank = rank
+            best_event_count = group_end
+        event_index = group_end
+
+    # Reconstruct only the winning frontier point.  This keeps the scan linear
+    # in memory even for unusually wide synthetic routes such as K=1200.
+    selected.clear()
+    request_bytes = 0
+    max_owner_ms = 0.0
+    for node_id, v1, coalesced in owner_options:
+        v1_ms, v1_request, _v1_mode = v1
+        coalesced_ms, coalesced_request, _coalesced_mode = coalesced
+        if v1_ms <= coalesced_ms and v1_request <= coalesced_request:
+            initial = v1
+        elif coalesced_ms <= v1_ms and coalesced_request <= v1_request:
+            initial = coalesced
+        elif (v1_ms, False) < (coalesced_ms, True):
+            initial = v1
+        else:
+            initial = coalesced
+        selected[node_id] = initial
+    for _time, node_id, slower in events[:best_event_count]:
+        selected[node_id] = slower
+    for value in selected.values():
+        max_owner_ms = max(max_owner_ms, value[0])
+        request_bytes += value[1]
+    return (
+        max_owner_ms,
+        request_bytes,
+        tuple(sorted(node_id for node_id, value in selected.items() if value[2])),
+    )
+
+
+def _projected_trace_ms(
+    context: _PlanningContext,
+    *,
+    max_owner_ms: float,
+    request_bytes: int,
+    response_bytes: int,
+) -> float:
+    coordinator = context.nodes[context.coordinator_id]
+    directional_bounds = [max_owner_ms]
+    if request_bytes > 0 and coordinator.aggregate_egress_bytes_per_ms > 0:
+        directional_bounds.append(
+            request_bytes / coordinator.aggregate_egress_bytes_per_ms
+        )
+    if response_bytes > 0 and coordinator.aggregate_ingress_bytes_per_ms > 0:
+        directional_bounds.append(
+            response_bytes / coordinator.aggregate_ingress_bytes_per_ms
+        )
+    return max(directional_bounds)
 
 
 def _route_state_projected_ms(
     context: _PlanningContext,
     state: _TraceRouteState,
 ) -> float:
-    coordinator = context.nodes[context.coordinator_id]
-    directional_nic_ms = [0.0]
-    if state.request_bytes > 0 and coordinator.aggregate_egress_bytes_per_ms > 0:
-        directional_nic_ms.append(
-            state.request_bytes / coordinator.aggregate_egress_bytes_per_ms
-        )
-    if state.response_bytes > 0 and coordinator.aggregate_ingress_bytes_per_ms > 0:
-        directional_nic_ms.append(
-            state.response_bytes / coordinator.aggregate_ingress_bytes_per_ms
-        )
-    nic_ms = max(directional_nic_ms)
-    return max(state.max_owner_ms, nic_ms)
+    return _projected_trace_ms(
+        context,
+        max_owner_ms=state.max_owner_ms,
+        request_bytes=state.request_bytes,
+        response_bytes=state.response_bytes,
+    )
 
 
 def _route_state_rank(

@@ -181,12 +181,12 @@ try {
     if (-not $connectedWorker) { throw 'The real Qwen worker did not connect in time.' }
 
     $questions = @(
-        'Responde en español y en una frase: ¿qué demuestra esta prueba? /no_think',
-        'En una frase: ¿qué ventaja ofrece dividir un modelo por capas? /no_think',
-        'En una frase: ¿por qué ayuda mantener afinidad de sesión? /no_think',
-        'En una frase: ¿qué puede aportar un portátil que ofrece solo 4 GB? /no_think',
-        'En una frase: ¿por qué conviene usar pocos saltos para un chat? /no_think',
-        'En una frase: ¿qué benchmark deberíamos ejecutar después? /no_think'
+        'Answer in one sentence: what does this test demonstrate? /no_think',
+        'In one sentence: what is the benefit of splitting a model by layers? /no_think',
+        'In one sentence: why does session affinity help? /no_think',
+        'In one sentence: what can a laptop contribute if it offers only 4 GB? /no_think',
+        'In one sentence: why are fewer hops better for chat? /no_think',
+        'In one sentence: which benchmark should we run next? /no_think'
     )
     $conversation = [System.Collections.ArrayList]::new()
     $measurements = @()

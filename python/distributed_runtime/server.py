@@ -4,10 +4,12 @@ import argparse
 import asyncio
 import codecs
 from dataclasses import dataclass, field
+import hashlib
 import json
 import math
 import multiprocessing as mp
 from pathlib import Path
+import struct
 import sys
 import time
 from typing import Any
@@ -33,9 +35,29 @@ from .ram_backed_moe_runtime import (
     ram_backed_moe_config_from_args,
 )
 from .recovery import RecoveringPipelineEngine
+from .stage import (
+    MAX_SPECULATIVE_BRANCHES,
+    MAX_SPECULATIVE_BRANCH_TOKENS,
+    MAX_SPECULATIVE_KV_BYTES,
+)
 
 
 DEFAULT_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
+OUTPUT_TOKEN_HASH_SCHEME = "gdlp-output-token-ids-v1"
+OUTPUT_TOKEN_DIGEST_DOMAIN = OUTPUT_TOKEN_HASH_SCHEME.encode("ascii") + b"\0"
+
+
+def output_token_ids_sha256(token_ids: list[int] | tuple[int, ...]) -> str:
+    """Seal an exact token sequence without publishing the token ids themselves."""
+
+    digest = hashlib.sha256()
+    digest.update(OUTPUT_TOKEN_DIGEST_DOMAIN)
+    digest.update(struct.pack(">Q", len(token_ids)))
+    for token_id in token_ids:
+        if type(token_id) is not int or token_id < 0 or token_id > 0xFFFFFFFF:
+            raise ValueError("output token id must be a uint32")
+        digest.update(struct.pack(">I", token_id))
+    return f"sha256:{digest.hexdigest()}"
 
 
 @dataclass
@@ -46,6 +68,7 @@ class PendingGeneration:
     prompt_tokens: int
     events: asyncio.Queue[tuple[str, Any]] = field(default_factory=asyncio.Queue)
     abandoned: bool = False
+    session_key: str | None = None
 
 
 class ContinuousMicroBatcher:
@@ -152,6 +175,7 @@ class ContinuousMicroBatcher:
                 input_ids=pending.input_ids,
                 max_new_tokens=pending.max_new_tokens,
                 eos_token_ids=self.eos_token_ids,
+                session_key=pending.session_key,
             )
             for pending in batch
         ]
@@ -306,6 +330,7 @@ class DistributedOpenAIServer:
 
     async def health(self, _: web.Request) -> web.Response:
         healthy = self.engine.healthy
+        artifact = self.engine.model_artifact
         recovery = getattr(
             self.engine,
             "recovery_stats",
@@ -321,15 +346,38 @@ class DistributedOpenAIServer:
                 "status": status,
                 "error": self.engine.fatal_error,
                 "model": self.public_model_name,
+                "artifact_identity": artifact.identity,
+                "canonical_model_source": artifact.canonical_source,
+                "canonical_model_revision": artifact.canonical_revision,
+                # JSON numbers cannot represent every uint64 exactly.  Keep the
+                # pipeline identity lossless across Python and JS consumers.
+                "pipeline_snapshot_identity": str(self.engine.pipeline_id),
                 "stages": self.engine.stages,
                 "boundaries": list(self.engine.config.boundaries),
                 "codec": self.engine.config.codec.name.lower(),
                 "prefill_chunk_tokens": self.engine.config.prefill_chunk_tokens,
+                "prefill_inflight_chunks": (
+                    self.engine.config.prefill_inflight_chunks
+                ),
+                "prefill_inflight_bytes": self.engine.config.prefill_inflight_bytes,
+                "max_speculative_branches": (
+                    self.engine.config.max_speculative_branches
+                ),
+                "max_speculative_branch_tokens": (
+                    self.engine.config.max_speculative_branch_tokens
+                ),
+                "max_speculative_kv_bytes": self.engine.config.max_speculative_kv_bytes,
                 "sealed_wave_tokens": self.engine.config.sealed_wave_token_limit,
                 "max_prefill_chunk_tokens": (
                     self.engine.config.prefill_token_limit or 0
                 ),
                 "speculation": self.engine.speculation_stats,
+                "sessions": getattr(
+                    self.engine,
+                    "session_stats",
+                    {"configured": False, "retained_sessions": 0},
+                ),
+                "prefill_window": self.engine.prefill_window_stats,
                 "root_batching": self.engine.root_batch_stats,
                 "recovery": recovery,
                 "root_parameter_bytes": self.engine.root_parameter_bytes,
@@ -363,7 +411,10 @@ class DistributedOpenAIServer:
     async def chat_completions(self, request: web.Request) -> web.StreamResponse:
         try:
             body = await request.json()
-            pending, stream = self._prepare_request(body)
+            pending, stream = self._prepare_request(
+                body,
+                header_session_id=request.headers.get("X-Session-Id"),
+            )
         except (json.JSONDecodeError, TypeError, ValueError, KeyError) as error:
             return error_response(str(error), "invalid_request", 400)
         try:
@@ -374,7 +425,11 @@ class DistributedOpenAIServer:
             return await self._stream_response(request, pending)
         return await self._complete_response(pending)
 
-    def _prepare_request(self, body: Any) -> tuple[PendingGeneration, bool]:
+    def _prepare_request(
+        self,
+        body: Any,
+        header_session_id: str | None = None,
+    ) -> tuple[PendingGeneration, bool]:
         if not isinstance(body, dict):
             raise ValueError("request body must be a JSON object")
         supported_fields = {
@@ -423,6 +478,15 @@ class DistributedOpenAIServer:
             normalized.append(
                 {"role": "system" if role == "developer" else role, "content": content}
             )
+        if "user" in body and (
+            not isinstance(body["user"], str) or not body["user"].strip()
+        ):
+            raise ValueError("user must be a non-empty string")
+        # An explicit transport header wins; the OpenAI ``user`` field is the
+        # compatible fallback so unmodified clients can still pin their chat.
+        session_key = normalize_session_key(
+            header_session_id if header_session_id is not None else body.get("user")
+        )
         if "max_tokens" in body and "max_completion_tokens" in body:
             raise ValueError("use max_tokens or max_completion_tokens, not both")
         raw_max = body.get("max_tokens", body.get("max_completion_tokens", 64))
@@ -452,6 +516,7 @@ class DistributedOpenAIServer:
                 input_ids=input_ids,
                 max_new_tokens=max_new_tokens,
                 prompt_tokens=prompt_tokens,
+                session_key=session_key,
             ),
             body.get("stream", False),
         )
@@ -495,6 +560,19 @@ class DistributedOpenAIServer:
                         sent_role = True
                 elif kind == "done":
                     output: GenerationOutput = payload
+                    if tuple(decoder.token_ids) != output.token_ids:
+                        await write_sse(
+                            response,
+                            {
+                                "error": {
+                                    "message": "token event stream does not match engine output",
+                                    "type": "pipeline_evidence_error",
+                                }
+                            },
+                        )
+                        await response.write(b"data: [DONE]\n\n")
+                        completed = True
+                        break
                     tail = decoder.finish()
                     if tail:
                         await write_sse(
@@ -528,6 +606,22 @@ class DistributedOpenAIServer:
                             self.public_model_name,
                             "",
                             finish_reason=output.finish_reason,
+                            usage={
+                                "prompt_tokens": pending.prompt_tokens,
+                                "completion_tokens": len(decoder.token_ids),
+                                "total_tokens": pending.prompt_tokens
+                                + len(decoder.token_ids),
+                            },
+                            distribution_metrics={
+                                "ttft_ms": output.ttft_ms,
+                                "tpot_ms": output.tpot_ms,
+                                "pipeline_ms": output.total_ms,
+                                "reused_kv_tokens": output.reused_kv_tokens,
+                                "output_token_ids_sha256": output_token_ids_sha256(
+                                    output.token_ids
+                                ),
+                                "output_token_ids_hash_scheme": OUTPUT_TOKEN_HASH_SCHEME,
+                            },
                         ),
                     )
                     await response.write(b"data: [DONE]\n\n")
@@ -562,8 +656,14 @@ class DistributedOpenAIServer:
                     return error_response(str(payload), "pipeline_error", 500)
                 elif kind == "done":
                     output: GenerationOutput = payload
+                    if tuple(token_ids) != output.token_ids:
+                        return error_response(
+                            "token event stream does not match engine output",
+                            "pipeline_evidence_error",
+                            500,
+                        )
                     text = self.tokenizer.decode(
-                        token_ids,
+                        output.token_ids,
                         skip_special_tokens=True,
                         clean_up_tokenization_spaces=False,
                     )
@@ -582,19 +682,38 @@ class DistributedOpenAIServer:
                             ],
                             "usage": {
                                 "prompt_tokens": pending.prompt_tokens,
-                                "completion_tokens": len(token_ids),
-                                "total_tokens": pending.prompt_tokens + len(token_ids),
+                                "completion_tokens": len(output.token_ids),
+                                "total_tokens": pending.prompt_tokens
+                                + len(output.token_ids),
                             },
                             "distribution_metrics": {
                                 "ttft_ms": output.ttft_ms,
                                 "tpot_ms": output.tpot_ms,
                                 "pipeline_ms": output.total_ms,
+                                "reused_kv_tokens": output.reused_kv_tokens,
+                                "output_token_ids_sha256": output_token_ids_sha256(
+                                    output.token_ids
+                                ),
+                                "output_token_ids_hash_scheme": OUTPUT_TOKEN_HASH_SCHEME,
                             },
                         }
                     )
         except asyncio.CancelledError:
             self.batcher.cancel(pending)
             raise
+
+
+def normalize_session_key(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("session identifier must be a string")
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if len(normalized) > 128:
+        raise ValueError("session identifier must be at most 128 characters")
+    return normalized
 
 
 def exact_integer(value: Any, name: str) -> int:
@@ -620,19 +739,26 @@ def chunk_payload(
     *,
     role: str | None = None,
     finish_reason: str | None = None,
+    usage: dict[str, int] | None = None,
+    distribution_metrics: dict[str, float | str] | None = None,
 ) -> dict[str, Any]:
     delta: dict[str, str] = {}
     if role is not None:
         delta["role"] = role
     if text:
         delta["content"] = text
-    return {
+    payload: dict[str, Any] = {
         "id": completion_id,
         "object": "chat.completion.chunk",
         "created": created,
         "model": model,
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
     }
+    if usage is not None:
+        payload["usage"] = usage
+    if distribution_metrics is not None:
+        payload["distribution_metrics"] = distribution_metrics
+    return payload
 
 
 async def write_sse(response: web.StreamResponse, payload: dict[str, Any]) -> None:
@@ -714,8 +840,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0,
         help="Split long prompts into bounded pipeline waves; zero disables chunking.",
     )
+    parser.add_argument(
+        "--prefill-inflight-chunks",
+        type=int,
+        default=1,
+        help="Maximum ordered prefill chunks allowed on the route at once.",
+    )
+    parser.add_argument(
+        "--prefill-inflight-bytes",
+        type=int,
+        default=0,
+        help=(
+            "Per-request maximum encoded prefill wire bytes in flight; "
+            "zero disables the byte cap."
+        ),
+    )
     parser.add_argument("--sealed-wave-tokens", type=int)
     parser.add_argument("--max-prefill-chunk-tokens", type=int)
+    parser.add_argument(
+        "--max-speculative-branches",
+        type=int,
+        default=0,
+        help="Sealed concurrent exact KV children; zero disables physical trees.",
+    )
+    parser.add_argument(
+        "--max-speculative-branch-tokens",
+        type=int,
+        default=0,
+        help="Sealed absolute context-token ceiling for every physical KV child.",
+    )
+    parser.add_argument(
+        "--max-speculative-kv-bytes",
+        type=int,
+        default=0,
+        help="Sealed aggregate stage-local byte ceiling for child KV caches.",
+    )
     parser.add_argument(
         "--speculation",
         choices=("off", "ngram"),
@@ -725,6 +884,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--speculative-max-draft-tokens", type=int, default=4)
     parser.add_argument("--speculation-minimum-speedup", type=float, default=1.05)
     parser.add_argument("--no-speculation-probes", action="store_true")
+    parser.add_argument(
+        "--max-retained-sessions",
+        type=int,
+        default=0,
+        help=(
+            "Keep the KV of up to this many finished chats alive on every stage "
+            "so the next turn (X-Session-Id header or OpenAI user field) only "
+            "prefills the new suffix; zero disables session retention."
+        ),
+    )
+    parser.add_argument(
+        "--max-retained-session-tokens",
+        type=int,
+        default=0,
+        help="Total idle KV tokens across retained sessions; zero is unbounded.",
+    )
+    parser.add_argument("--retained-session-ttl-seconds", type=float, default=600.0)
     parser.add_argument("--max-output-tokens", type=int, default=512)
     parser.add_argument(
         "--recovery-max-retries",
@@ -789,6 +965,41 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
         raise ValueError("route-probe-timeout-seconds must be finite and positive")
     if args.prefill_chunk_tokens < 0:
         raise ValueError("prefill-chunk-tokens must be non-negative")
+    if not 1 <= args.prefill_inflight_chunks <= 64:
+        raise ValueError("prefill-inflight-chunks must be between 1 and 64")
+    if not 0 <= args.prefill_inflight_bytes <= 1024 * 1024 * 1024:
+        raise ValueError("prefill-inflight-bytes must be between 0 and 1 GiB")
+    for name, value, maximum in (
+        (
+            "max-speculative-branches",
+            args.max_speculative_branches,
+            MAX_SPECULATIVE_BRANCHES,
+        ),
+        (
+            "max-speculative-branch-tokens",
+            args.max_speculative_branch_tokens,
+            MAX_SPECULATIVE_BRANCH_TOKENS,
+        ),
+        (
+            "max-speculative-kv-bytes",
+            args.max_speculative_kv_bytes,
+            MAX_SPECULATIVE_KV_BYTES,
+        ),
+    ):
+        if not 0 <= value <= maximum:
+            raise ValueError(f"{name} must be between 0 and {maximum}")
+    speculative_tree_limits_enabled = (
+        args.max_speculative_branches > 0,
+        args.max_speculative_branch_tokens > 0,
+        args.max_speculative_kv_bytes > 0,
+    )
+    if any(speculative_tree_limits_enabled) and not all(
+        speculative_tree_limits_enabled
+    ):
+        raise ValueError(
+            "speculative branch count, tokens and KV bytes must all be zero "
+            "or all be positive"
+        )
     if args.sealed_wave_tokens is not None and not 1 <= args.sealed_wave_tokens <= 17:
         raise ValueError("sealed-wave-tokens must be between 1 and 17")
     if (
@@ -826,6 +1037,13 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
         raise ValueError("speculation-minimum-speedup must be finite and at least 1")
     if args.max_output_tokens < 1:
         raise ValueError("max-output-tokens must be positive")
+    if args.max_retained_sessions < 0 or args.max_retained_session_tokens < 0:
+        raise ValueError("retained session limits must be non-negative")
+    if (
+        not math.isfinite(args.retained_session_ttl_seconds)
+        or args.retained_session_ttl_seconds <= 0
+    ):
+        raise ValueError("retained-session-ttl-seconds must be finite and positive")
     if args.recovery_max_retries < 0:
         raise ValueError("recovery-max-retries must be non-negative")
     if ram_backed_moe is not None:
@@ -893,6 +1111,11 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
             max_active_sequences=args.max_active_sequences,
             max_pending_requests=args.max_pending_requests,
             prefill_chunk_tokens=args.prefill_chunk_tokens,
+            prefill_inflight_chunks=args.prefill_inflight_chunks,
+            prefill_inflight_bytes=args.prefill_inflight_bytes,
+            max_speculative_branches=args.max_speculative_branches,
+            max_speculative_branch_tokens=args.max_speculative_branch_tokens,
+            max_speculative_kv_bytes=args.max_speculative_kv_bytes,
             sealed_wave_tokens=args.sealed_wave_tokens,
             max_prefill_chunk_tokens=args.max_prefill_chunk_tokens,
             speculative_max_draft_tokens=(
@@ -905,6 +1128,9 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
             root_batch_window_ms=args.root_batch_window_ms,
             route_probe_interval_seconds=args.route_probe_interval_seconds,
             route_probe_timeout_seconds=args.route_probe_timeout_seconds,
+            max_retained_sessions=args.max_retained_sessions,
+            max_retained_session_tokens=args.max_retained_session_tokens,
+            retained_session_ttl_seconds=args.retained_session_ttl_seconds,
     )
     engine_factory = lambda: DistributedPipelineEngine(engine_config)
     initial_engine = engine_factory()

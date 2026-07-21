@@ -187,6 +187,120 @@ class ModelContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot truncate"):
             runner.truncate(77, 9)
 
+    def test_exact_request_fork_has_independent_kv_and_promote_moves_selected_state(self) -> None:
+        runner = _tiny_stage_runner()
+        parent = 71
+        child = 72
+        runner.begin(parent)
+        runner.forward_ids(parent, torch.tensor([[1, 2, 3]], dtype=torch.long))
+
+        cache_bytes = runner.request_cache_bytes(parent)
+        self.assertGreater(cache_bytes, 0)
+        self.assertGreater(
+            runner.project_request_cache_bytes(parent, 1),
+            cache_bytes,
+        )
+        copied_bytes = runner.fork_request(
+            child,
+            parent,
+            max_cache_bytes=cache_bytes,
+        )
+        self.assertGreater(copied_bytes, 0)
+        self.assertEqual(runner.sequence_length(child), 3)
+        self.assertNotEqual(
+            runner.caches[parent].layers[0].keys.data_ptr(),
+            runner.caches[child].layers[0].keys.data_ptr(),
+        )
+
+        parent_output = runner.forward_ids(
+            parent, torch.tensor([[4]], dtype=torch.long)
+        )
+        child_projected_bytes = runner.project_request_cache_bytes(child, 1)
+        child_output = runner.forward_ids(
+            child, torch.tensor([[4]], dtype=torch.long)
+        )
+        self.assertLessEqual(
+            runner.request_cache_bytes(child),
+            child_projected_bytes,
+        )
+        torch.testing.assert_close(parent_output, child_output, rtol=1e-5, atol=1e-6)
+        selected_cache = runner.caches[child]
+        runner.forward_ids(child, torch.tensor([[5]], dtype=torch.long))
+        self.assertEqual(runner.sequence_length(parent), 4)
+        self.assertEqual(runner.sequence_length(child), 5)
+
+        runner.promote_request(parent, child)
+        self.assertEqual(runner.sequence_length(parent), 5)
+        self.assertIs(runner.caches[parent], selected_cache)
+        self.assertNotIn(child, runner.active_requests)
+        with self.assertRaisesRegex(ValueError, "has not received BEGIN"):
+            runner.sequence_length(child)
+        runner.forward_ids(parent, torch.tensor([[6]], dtype=torch.long))
+        self.assertEqual(runner.sequence_length(parent), 6)
+
+    def test_safe_copy_runner_exposes_optional_physical_accounting(self) -> None:
+        runner = _tiny_stage_runner()
+        runner.begin(1)
+        runner.forward_ids(1, torch.tensor([[1, 2, 3]], dtype=torch.long))
+        parent_bytes = runner.request_cache_bytes(1)
+
+        self.assertEqual(runner.unique_physical_cache_bytes((1,)), parent_bytes)
+        self.assertEqual(
+            runner.project_incremental_physical_cache_bytes(
+                1,
+                new_leaf_count=2,
+                delta_tokens=1,
+            ),
+            2 * runner.project_request_cache_bytes(1, 1),
+        )
+        self.assertEqual(
+            runner.project_tree_incremental_physical_cache_bytes(
+                1,
+                delta_tokens_by_leaf=(0, 2),
+            ),
+            runner.project_request_cache_bytes(1, 0)
+            + runner.project_request_cache_bytes(1, 2),
+        )
+        self.assertEqual(
+            runner.project_request_incremental_physical_cache_bytes(1, 2),
+            runner.project_request_cache_bytes(1, 2) - parent_bytes,
+        )
+        copied = runner.fork_request(2, 1, max_cache_bytes=parent_bytes)
+        report = runner.last_fork_report()
+        self.assertIsNotNone(report)
+        assert report is not None
+        self.assertEqual(copied, parent_bytes)
+        self.assertEqual(report.copied_bytes, parent_bytes)
+        self.assertEqual(report.newly_reserved_bytes, parent_bytes)
+        self.assertEqual(report.logical_bytes, 2 * parent_bytes)
+        self.assertEqual(report.unique_physical_bytes, 2 * parent_bytes)
+        self.assertEqual(
+            runner.unique_physical_cache_bytes((1, 2)),
+            2 * parent_bytes,
+        )
+        with self.assertRaisesRegex(ValueError, "unique"):
+            runner.unique_physical_cache_bytes((1, 1))
+
+    def test_exact_request_fork_and_promote_fail_closed_on_invalid_lifecycle(self) -> None:
+        runner = _tiny_stage_runner()
+        runner.begin(1)
+        with self.assertRaisesRegex(ValueError, "must differ"):
+            runner.fork_request(1, 1, max_cache_bytes=0)
+        with self.assertRaisesRegex(ValueError, "has not received BEGIN"):
+            runner.fork_request(2, 999, max_cache_bytes=0)
+        runner.forward_ids(1, torch.tensor([[1]], dtype=torch.long))
+        cache_bytes = runner.request_cache_bytes(1)
+        with self.assertRaisesRegex(ValueError, "preflight byte budget"):
+            runner.fork_request(2, 1, max_cache_bytes=cache_bytes - 1)
+        self.assertNotIn(2, runner.active_requests)
+        runner.fork_request(2, 1, max_cache_bytes=cache_bytes)
+        with self.assertRaisesRegex(ValueError, "already active"):
+            runner.fork_request(2, 1, max_cache_bytes=cache_bytes)
+        with self.assertRaisesRegex(ValueError, "must differ"):
+            runner.promote_request(1, 1)
+        with self.assertRaisesRegex(ValueError, "has not received BEGIN"):
+            runner.promote_request(1, 999)
+
     def test_reference_does_not_compute_after_the_last_requested_token(self) -> None:
         fake = _FakeCausalModel()
         with patch(

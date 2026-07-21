@@ -14,8 +14,13 @@ from transformers import AutoConfig
 from .model import (
     _checkpoint_key_map,
     _hub_snapshot_commit,
+    model_artifact_reference,
     model_snapshot_identity,
     resolve_model_snapshot,
+)
+from .model_adapters import (
+    UnsupportedSelectiveStageArchitectureError,
+    resolve_selective_stage_adapter,
 )
 from .safetensors_moe_stage_loader import (
     LocalSafetensorsMoeMetadata,
@@ -236,6 +241,14 @@ def compile_model_profile(
         compatibility_reasons.append("embedding tensor was not recognized")
     if not head_tensors and not tied:
         compatibility_reasons.append("untied language-model head was not recognized")
+    certified_adapter = None
+    try:
+        certified_adapter = resolve_selective_stage_adapter(config)
+        certified_adapter.validate_source_config(config, total_layers)
+    except (UnsupportedSelectiveStageArchitectureError, ValueError, TypeError) as error:
+        compatibility_reasons.append(str(error))
+
+    artifact = model_artifact_reference(str(snapshot))
 
     storage_bytes = sum(tensor.bytes for tensor in tensors)
     planned_weight_bytes = (
@@ -287,6 +300,9 @@ def compile_model_profile(
             "revision": revision,
             "snapshotCommit": _hub_snapshot_commit(snapshot),
             "snapshotIdentityUint64Hex": f"{model_snapshot_identity(str(snapshot)):016x}",
+            "artifactIdentity": artifact.identity,
+            "canonicalSource": artifact.canonical_source,
+            "canonicalRevision": artifact.canonical_revision,
             "format": "safetensors",
             "storageBytes": storage_bytes,
             "tensorCount": len(tensors),
@@ -295,6 +311,9 @@ def compile_model_profile(
         "compatibility": {
             "selectiveSafetensors": selective_compatible and not compatibility_reasons,
             "requiresAdapter": not (selective_compatible and not compatibility_reasons),
+            "adapterId": (
+                certified_adapter.adapter_id if certified_adapter is not None else None
+            ),
             "reasons": compatibility_reasons,
         },
         "model": {
