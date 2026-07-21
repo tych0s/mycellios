@@ -77,7 +77,7 @@ export async function createCoordinator(
     });
     app.get("/downloads/windows", async (_request, reply) => {
       reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
-      return reply.redirect("/updates/win32/x64/mycellios-setup.exe?v=0.2.2");
+      return reply.redirect("/updates/win32/x64/mycellios-setup.exe?v=0.2.3");
     });
   }
   const hub = new WorkerHub(store);
@@ -287,6 +287,22 @@ export async function createCoordinator(
 
   const landingAssetsPath = resolveLandingAssetsPath(config.landingAssetsPath);
   if (landingAssetsPath) {
+    app.get("/downloads/macos-arm64", async (_request, reply) => {
+      reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
+      return reply.redirect("/downloads/mycellios-macos-arm64.dmg?v=0.2.2");
+    });
+    app.get("/downloads/macos-x64", async (_request, reply) => {
+      reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
+      return reply.redirect("/downloads/mycellios-macos-x64.dmg?v=0.2.2");
+    });
+    app.get("/downloads/linux-deb", async (_request, reply) => {
+      reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
+      return reply.redirect("/downloads/mycellios-linux-x64.deb?v=0.2.2");
+    });
+    app.get("/downloads/linux-rpm", async (_request, reply) => {
+      reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
+      return reply.redirect("/downloads/mycellios-linux-x64.rpm?v=0.2.2");
+    });
     await app.register(staticFiles, {
       root: landingAssetsPath,
       prefix: "/",

@@ -111,7 +111,7 @@ describe("mobile compute hub", () => {
 
     const page = await runtime.app.inject({ method: "GET", url: "/mobile/" });
     expect(page.statusCode).toBe(200);
-    expect(page.body).toContain("Aporta potencia a la red");
+    expect(page.body).toContain("Contribute power to the network");
     const manifest = await runtime.app.inject({ method: "GET", url: "/mobile/manifest.webmanifest" });
     expect(manifest.statusCode).toBe(200);
     expect(manifest.json<{ short_name: string }>().short_name).toBe("mycellios");

@@ -27,7 +27,6 @@ import myceliumNetwork from "./assets/mycelium-network.jpg";
 import { MyceliumHero } from "./MyceliumHero";
 
 const EMAIL = "hello@mycellios.com";
-const RELEASE_BASE = "https://github.com/tych0s/mycellios/download";
 const RELEASES_URL = "https://github.com/tych0s/mycellios";
 
 const downloads = {
@@ -41,7 +40,12 @@ const downloads = {
 type DownloadKey = keyof typeof downloads;
 
 function downloadUrl(key: DownloadKey): string {
-  return `${RELEASE_BASE}/${downloads[key].filename}`;
+  if (key === "windows") return "/downloads/windows";
+  if (key === "mac-arm64") return "/downloads/macos-arm64";
+  if (key === "mac-x64") return "/downloads/macos-x64";
+  if (key === "linux-deb") return "/downloads/linux-deb";
+  if (key === "linux-rpm") return "/downloads/linux-rpm";
+  throw new Error(`Unsupported download target: ${String(key)}`);
 }
 
 const copy = {
@@ -426,13 +430,13 @@ function Landing() {
   return (
     <div className="site" id="top" ref={page} onPointerMove={trackPointer}>
       <LivingBackdrop /><div className="ambient-pointer" />
-      <header className="nav-shell"><nav className="nav container" aria-label={t.nav.aria}><Brand homeLabel={t.home} /><div className="nav-links"><a href="#vision">{t.nav.vision}</a><a href="#architecture">{t.nav.architecture}</a><a href="#evidence">{t.nav.evidence}</a></div><div className="nav-actions"><a className="nav-cta" href="#install">{t.nav.join} <Download size={15} /></a></div></nav></header>
+      <header className="nav-shell"><nav className="nav container" aria-label={t.nav.aria}><Brand homeLabel={t.home} /><div className="nav-links"><a href="/network">Live network</a><a href="/network?view=nodes">Nodes</a><a href="/mobile/">Contribute</a><a href="#architecture">{t.nav.architecture}</a></div><div className="nav-actions"><a className="nav-cta" href="/join">Join now <Zap size={15} /></a></div></nav></header>
 
       <main>
         <section className="hero">
           <MyceliumHero />
           <div className="hero-inner container">
-            <div className="hero-copy"><div className="availability"><span /><strong>EARLY NETWORK</strong><i /> {t.hero.status}</div><h1>{t.hero.line1}<br />{t.hero.line2}<br /><em>{t.hero.line3}</em></h1><p>{t.hero.copy}</p><div className="hero-actions"><a className="button button-primary" href="#install">{t.hero.primary} <Download size={17} /></a><a className="button button-secondary" href="#architecture">{t.hero.secondary} <ArrowDownRight size={17} /></a></div><div className="hero-footnote"><ShieldCheck size={15} /><span>{t.hero.footnote}</span></div></div>
+            <div className="hero-copy"><div className="availability"><span /><strong>EARLY NETWORK</strong><i /> {t.hero.status}</div><h1>{t.hero.line1}<br />{t.hero.line2}<br /><em>{t.hero.line3}</em></h1><p>{t.hero.copy}</p><div className="hero-actions"><a className="button button-primary" href="/join">Join the network <Zap size={17} /></a><a className="button button-secondary" href="/network">Open live panel <Network size={17} /></a></div><div className="hero-footnote"><ShieldCheck size={15} /><span>No account or invitation required during public testing.</span></div></div>
           </div>
         </section>
 
@@ -454,10 +458,10 @@ function Landing() {
 
         <section className="participate container"><SectionHeading eyebrow={t.participate.eyebrow} title={t.participate.title} copy={t.participate.copy} /><div className="participate-grid">{([t.participate.contributor, t.participate.organization] as const).map((audience, index) => <article className={`participate-card ${index === 1 ? "featured" : ""} reveal`} key={audience.label}><div className="participate-icon">{index === 0 ? <Cpu size={28} /> : <Users size={28} />}</div><span>{audience.label}</span><h3>{audience.title}</h3><p>{audience.copy}</p><ul>{audience.bullets.map((bullet) => <li key={bullet}><Check size={14} />{bullet}</li>)}</ul></article>)}</div></section>
 
-        <section className="closing" id="join"><div className="closing-grid" /><div className="container closing-inner reveal"><Brand compact homeLabel={t.home} /><span className="eyebrow"><i />{t.closing.eyebrow}</span><h2>{t.closing.title1}<br /><em>{t.closing.title2}</em></h2><p>{t.closing.copy}</p><a className="button button-primary button-large" href={`mailto:${EMAIL}?subject=${encodeURIComponent(t.closing.subject)}`}>{t.closing.button} <ArrowUpRight size={18} /></a><small>{t.closing.email} <a href={`mailto:${EMAIL}`}>{EMAIL}</a></small></div></section>
+        <section className="closing" id="join"><div className="closing-grid" /><div className="container closing-inner reveal"><Brand compact homeLabel={t.home} /><span className="eyebrow"><i />{t.closing.eyebrow}</span><h2>{t.closing.title1}<br /><em>{t.closing.title2}</em></h2><p>{t.closing.copy}</p><a className="button button-primary button-large" href="/join">Connect this device <Zap size={18} /></a><small>Public test network · no login required</small></div></section>
       </main>
 
-      <footer className="footer container"><Brand homeLabel={t.home} /><p>{t.footer.tagline}</p><div><a href="#architecture">{t.footer.architecture}</a><a href="#evidence">{t.footer.status}</a><a href={`mailto:${EMAIL}`}>{t.footer.contact}</a></div><span>© 2026 mycellios</span></footer>
+      <footer className="footer container"><Brand homeLabel={t.home} /><p>{t.footer.tagline}</p><div><a href="/network">Network panel</a><a href="/mobile/">Mobile worker</a><a href="/downloads">Downloads</a><a href={`mailto:${EMAIL}`}>{t.footer.contact}</a></div><span>© 2026 mycellios</span></footer>
     </div>
   );
 }
