@@ -1,4 +1,5 @@
 import type { AddressInfo } from "node:net";
+import { resolve } from "node:path";
 import WebSocket from "ws";
 import { afterEach, describe, expect, it } from "vitest";
 import type { CoordinatorRuntime } from "../src/coordinator/server.js";
@@ -92,6 +93,7 @@ describe("mobile compute hub", () => {
         databasePath: ":memory:",
         requestTimeoutMs: 10_000,
         mobileJoinToken: "invite-test",
+        mobileAssetsPath: resolve("tests/fixtures/mobile-assets"),
       },
       { logger: false },
     );

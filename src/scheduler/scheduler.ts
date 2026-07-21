@@ -124,17 +124,19 @@ export class Scheduler {
       .filter((worker) => !options.connectedWorkerIds || options.connectedWorkerIds.has(worker.id));
     const models = new Map<
       string,
-      { replicas: number; stages: Set<string>; llmfit: LlmfitModelAdvisory[] }
+      { replicas: number; internalPipelines: number; stages: Set<string>; llmfit: LlmfitModelAdvisory[] }
     >();
     for (const worker of workers) {
       for (const deployment of worker.capabilities.deployments) {
         const entry = models.get(deployment.model) ?? {
           replicas: 0,
+          internalPipelines: 0,
           stages: new Set<string>(),
           llmfit: [],
         };
         if (deployment.mode === "replica") {
-          entry.replicas += 1;
+          if (deployment.internalPipeline) entry.internalPipelines += 1;
+          else entry.replicas += 1;
           const advisory = worker.capabilities.llmfit?.model;
           if (advisory?.deploymentId === deployment.deploymentId) {
             entry.llmfit.push(advisory);
@@ -151,7 +153,7 @@ export class Scheduler {
       return {
         id,
         replicas: value.replicas,
-        pipelines: this.countCompletePipelines(value.stages),
+        pipelines: value.internalPipelines + this.countCompletePipelines(value.stages),
         ...(llmfit ? { llmfit } : {}),
       };
     });

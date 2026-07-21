@@ -1,10 +1,22 @@
+import { readFile } from "node:fs/promises";
+import { delimiter, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { LocalProcessAgent } from "./launch-supervisor.js";
 import { LaunchAgentRpcServer } from "./launch-agent-rpc.js";
+import { PythonPhysicalProbe } from "./physical-probe.js";
+import {
+  validatePythonLaunchDescription,
+  type PythonPipelineLaunchDescription,
+} from "./python-launcher.js";
 
-interface CliOptions {
+export interface LaunchAgentDaemonCliOptions {
   host: string;
   port: number;
   nodeId: string;
+  authTokenEnv: string;
+  allowLaunchFile?: string;
+  physicalProbePython: string;
+  physicalProbeTimeoutMs: number;
   cwd?: string;
   maxOutputBytes: number;
   startTimeoutMs: number;
@@ -14,7 +26,28 @@ interface CliOptions {
 }
 
 async function main(): Promise<void> {
-  const options = parseArguments(process.argv.slice(2));
+  const options = parseLaunchAgentDaemonArguments(process.argv.slice(2));
+  const authToken = readLaunchAgentDaemonAuthToken(
+    options.authTokenEnv,
+    process.env,
+  );
+  const allowedLaunch =
+    options.allowLaunchFile === undefined
+      ? undefined
+      : await loadAllowedPythonLaunchDescription(options.allowLaunchFile);
+  const physicalProbe = new PythonPhysicalProbe({
+    pythonExecutable: options.physicalProbePython,
+    ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+    env: {
+      PYTHONPATH: [
+        resolve(options.cwd ?? process.cwd(), "python"),
+        process.env.PYTHONPATH,
+      ]
+        .filter((value): value is string => value !== undefined && value.length > 0)
+        .join(delimiter),
+    },
+    timeoutMs: options.physicalProbeTimeoutMs,
+  });
   const local = new LocalProcessAgent({
     id: `local-process:${options.nodeId}`,
     ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
@@ -24,6 +57,12 @@ async function main(): Promise<void> {
   const daemon = new LaunchAgentRpcServer({
     agent: local,
     nodeId: options.nodeId,
+    ...(authToken === undefined ? {} : { authToken }),
+    ...(allowedLaunch === undefined
+      ? {}
+      : { allowedLaunchDescriptions: [allowedLaunch] }),
+    physicalProbe,
+    physicalProbeTimeoutMs: options.physicalProbeTimeoutMs,
     maxOutputBytesPerStream: options.maxOutputBytes,
     startTimeoutMs: options.startTimeoutMs,
     stopTimeoutMs: options.stopTimeoutMs,
@@ -57,12 +96,18 @@ async function main(): Promise<void> {
   process.once("SIGTERM", close);
 }
 
-function parseArguments(argumentsValue: string[]): CliOptions {
+export function parseLaunchAgentDaemonArguments(
+  argumentsValue: string[],
+): LaunchAgentDaemonCliOptions {
   const values = new Map<string, string>();
   const allowed = new Set([
     "--host",
     "--port",
     "--node-id",
+    "--auth-token-env",
+    "--allow-launch-file",
+    "--physical-probe-python",
+    "--physical-probe-timeout-ms",
     "--cwd",
     "--max-output-bytes",
     "--start-timeout-ms",
@@ -80,7 +125,7 @@ function parseArguments(argumentsValue: string[]): CliOptions {
   }
   const nodeId = values.get("--node-id");
   if (!nodeId) throw new Error("launch_agent_daemon_node_id_is_required");
-  const host = values.get("--host") ?? "0.0.0.0";
+  const host = values.get("--host") ?? "127.0.0.1";
   if (!host.trim() || /[\0\r\n]/.test(host)) {
     throw new Error("launch_agent_daemon_host_is_invalid");
   }
@@ -88,10 +133,37 @@ function parseArguments(argumentsValue: string[]): CliOptions {
   if (cwd !== undefined && (!cwd.trim() || /[\0\r\n]/.test(cwd))) {
     throw new Error("launch_agent_daemon_cwd_is_invalid");
   }
+  const authTokenEnv =
+    values.get("--auth-token-env") ?? "GDLP_LAUNCH_AGENT_TOKEN";
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(authTokenEnv)) {
+    throw new Error("launch_agent_daemon_auth_token_env_is_invalid");
+  }
+  const allowLaunchFile = values.get("--allow-launch-file");
+  if (
+    allowLaunchFile !== undefined &&
+    (!allowLaunchFile.trim() || /[\0\r\n]/.test(allowLaunchFile))
+  ) {
+    throw new Error("launch_agent_daemon_allow_launch_file_is_invalid");
+  }
+  const physicalProbePython =
+    values.get("--physical-probe-python") ?? "python";
+  if (!physicalProbePython.trim() || /[\0\r\n]/.test(physicalProbePython)) {
+    throw new Error("launch_agent_daemon_physical_probe_python_is_invalid");
+  }
   return {
     host,
     port: integerOption(values, "--port", 9_750, 0, 65_535),
     nodeId,
+    authTokenEnv,
+    ...(allowLaunchFile === undefined ? {} : { allowLaunchFile }),
+    physicalProbePython,
+    physicalProbeTimeoutMs: integerOption(
+      values,
+      "--physical-probe-timeout-ms",
+      30_000,
+      1,
+      300_000,
+    ),
     ...(cwd === undefined ? {} : { cwd }),
     maxOutputBytes: integerOption(
       values,
@@ -131,6 +203,31 @@ function parseArguments(argumentsValue: string[]): CliOptions {
   };
 }
 
+export function readLaunchAgentDaemonAuthToken(
+  name: string,
+  environment: NodeJS.ProcessEnv,
+): string | undefined {
+  const value = environment[name];
+  return value === undefined || value.length === 0 ? undefined : value;
+}
+
+export async function loadAllowedPythonLaunchDescription(
+  pathValue: string,
+): Promise<PythonPipelineLaunchDescription> {
+  if (typeof pathValue !== "string" || !pathValue.trim() || /[\0\r\n]/.test(pathValue)) {
+    throw new Error("launch_agent_daemon_allow_launch_file_is_invalid");
+  }
+  const source = await readFile(resolve(pathValue), "utf8");
+  let value: unknown;
+  try {
+    value = JSON.parse(source);
+  } catch {
+    throw new Error("launch_agent_daemon_allow_launch_file_is_not_json");
+  }
+  validatePythonLaunchDescription(value);
+  return structuredClone(value);
+}
+
 function integerOption(
   values: Map<string, string>,
   name: string,
@@ -159,8 +256,13 @@ function renderError(value: unknown): string {
   });
 }
 
-void main().catch((error) => {
-  process.stderr.write(`${renderError(error)}\n`);
-  process.exitCode = 1;
-});
-
+const entryPath = process.argv[1];
+if (
+  entryPath !== undefined &&
+  resolve(fileURLToPath(import.meta.url)) === resolve(entryPath)
+) {
+  void main().catch((error) => {
+    process.stderr.write(`${renderError(error)}\n`);
+    process.exitCode = 1;
+  });
+}
