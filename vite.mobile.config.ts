@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import react from "@vitejs/plugin-react";
 import { defineConfig, type Plugin } from "vite";
 
 function mobileAssets(): Plugin {
@@ -12,13 +13,13 @@ function mobileAssets(): Plugin {
           {
             name: "mycellios mobile worker",
             short_name: "mycellios",
-            description: "Aporta potencia de cálculo a la red mycellios desde el navegador.",
+            description: "Contribute verified compute power to the mycellios network from this device.",
             start_url: "./",
             scope: "./",
             display: "standalone",
             orientation: "portrait",
-            background_color: "#061011",
-            theme_color: "#081617",
+            background_color: "#11172f",
+            theme_color: "#11172f",
             icons: [
               { src: "./icon.png", sizes: "512x512", type: "image/png", purpose: "any maskable" },
             ],
@@ -45,7 +46,7 @@ export default defineConfig({
   root: "src/mobile",
   base: "./",
   publicDir: false,
-  plugins: [mobileAssets()],
+  plugins: [react(), mobileAssets()],
   build: {
     outDir: "../../mobile-dist",
     emptyOutDir: true,

@@ -14,6 +14,7 @@ describe("inference adapters", () => {
   });
 
   it("normalizes an OpenAI-compatible SSE stream", async () => {
+    let receivedTemperature: number | undefined;
     const baseUrl = await listen((request, response) => {
       if (request.url === "/v1/models") {
         response.setHeader("content-type", "application/json");
@@ -21,16 +22,23 @@ describe("inference adapters", () => {
         return;
       }
       if (request.url === "/v1/chat/completions") {
-        response.setHeader("content-type", "text/event-stream");
-        response.write('data: {"choices":[{"delta":{"content":"hola "}}]}\n\n');
-        response.write('data: {"choices":[{"delta":{"content":"mundo"}}]}\n\n');
-        response.end("data: [DONE]\n\n");
+        const chunks: Buffer[] = [];
+        request.on("data", (chunk: Buffer) => chunks.push(chunk));
+        request.on("end", () => {
+          const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { temperature?: number };
+          receivedTemperature = body.temperature;
+          response.setHeader("content-type", "text/event-stream");
+          response.write('data: {"choices":[{"delta":{"content":"hola "}}]}\n\n');
+          response.write('data: {"choices":[{"delta":{"content":"mundo"}}]}\n\n');
+          response.end("data: [DONE]\n\n");
+        });
       }
     });
     const adapter = new OpenAICompatibleAdapter({
       baseUrl,
       model: "test-model",
       kind: "externalggufruntime",
+      requestTemperature: 0,
     });
     expect((await adapter.probe()).models).toContain("test-model");
     const chunks = [];
@@ -44,6 +52,7 @@ describe("inference adapters", () => {
       chunks.push(chunk.text);
     }
     expect(chunks.join("")).toBe("hola mundo");
+    expect(receivedTemperature).toBe(0);
   });
 
   it("normalizes local model runtime NDJSON", async () => {

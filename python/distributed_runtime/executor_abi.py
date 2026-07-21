@@ -3,10 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 
 STAGE_EXECUTOR_SCHEMA = "gdlp-stage-executor/1"
+STAGE_KV_FORK_REPORT_SCHEMA = "gdlp-stage-kv-fork-report/1"
 STAGE_TENSOR_LAYOUT = "batch-token-hidden-row-major"
 STAGE_ENDIANNESS = "little"
 _PHASES = ("prefill", "decode", "verify")
@@ -31,6 +32,72 @@ _CODECS = (
     "int8-grouped-deflate",
     "int8-hadamard-deflate",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class StageKVForkReport:
+    """Sealed physical accounting captured immediately after one KV fork.
+
+    ``logical_bytes`` is the sum of logical KV represented by every active
+    request after the fork. ``unique_physical_bytes`` deduplicates shared
+    storage across those requests. The remaining fields are operation deltas;
+    workspace is optional because several backends cannot observe allocator
+    peaks without perturbing global device statistics.
+    """
+
+    logical_bytes: int
+    unique_physical_bytes: int
+    copied_bytes: int
+    newly_reserved_bytes: int
+    peak_workspace_bytes: int | None
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("logical_bytes", self.logical_bytes),
+            ("unique_physical_bytes", self.unique_physical_bytes),
+            ("copied_bytes", self.copied_bytes),
+            ("newly_reserved_bytes", self.newly_reserved_bytes),
+        ):
+            _nonnegative_integer(value, name)
+        if self.peak_workspace_bytes is not None:
+            _nonnegative_integer(
+                self.peak_workspace_bytes,
+                "peak_workspace_bytes",
+            )
+
+    def to_document(self) -> dict[str, int | str | None]:
+        return {
+            "schema": STAGE_KV_FORK_REPORT_SCHEMA,
+            "logicalBytes": self.logical_bytes,
+            "uniquePhysicalBytes": self.unique_physical_bytes,
+            "copiedBytes": self.copied_bytes,
+            "newlyReservedBytes": self.newly_reserved_bytes,
+            "peakWorkspaceBytes": self.peak_workspace_bytes,
+        }
+
+
+@runtime_checkable
+class StageKVPhysicalAccounting(Protocol):
+    """Optional COW-aware extension to the legacy stage runner contract."""
+
+    def last_fork_report(self) -> StageKVForkReport | None: ...
+
+    def unique_physical_cache_bytes(self, request_ids: Sequence[int]) -> int: ...
+
+    def project_incremental_physical_cache_bytes(
+        self,
+        parent_request_id: int,
+        *,
+        new_leaf_count: int,
+        delta_tokens: int,
+    ) -> int: ...
+
+    def project_tree_incremental_physical_cache_bytes(
+        self,
+        parent_request_id: int,
+        *,
+        delta_tokens_by_leaf: Sequence[int],
+    ) -> int: ...
 
 
 @dataclass(frozen=True)
@@ -229,6 +296,43 @@ def _hub_commit_from_coordinates(source: str, revision: str | None) -> str | Non
         ):
             return candidate
     return None
+
+
+def parse_stage_kv_fork_report(value: object) -> StageKVForkReport:
+    """Parse the exact language-neutral COW accounting document."""
+
+    document = _exact_mapping(
+        value,
+        (
+            "schema",
+            "logicalBytes",
+            "uniquePhysicalBytes",
+            "copiedBytes",
+            "newlyReservedBytes",
+            "peakWorkspaceBytes",
+        ),
+        "stage KV fork report",
+    )
+    if document.get("schema") != STAGE_KV_FORK_REPORT_SCHEMA:
+        raise ValueError("unsupported stage KV fork report schema")
+    workspace = document.get("peakWorkspaceBytes")
+    if workspace is not None:
+        workspace = _nonnegative_integer(workspace, "peakWorkspaceBytes")
+    return StageKVForkReport(
+        logical_bytes=_nonnegative_integer(
+            document.get("logicalBytes"), "logicalBytes"
+        ),
+        unique_physical_bytes=_nonnegative_integer(
+            document.get("uniquePhysicalBytes"), "uniquePhysicalBytes"
+        ),
+        copied_bytes=_nonnegative_integer(
+            document.get("copiedBytes"), "copiedBytes"
+        ),
+        newly_reserved_bytes=_nonnegative_integer(
+            document.get("newlyReservedBytes"), "newlyReservedBytes"
+        ),
+        peak_workspace_bytes=workspace,
+    )
 
 
 def parse_stage_executor_manifest(value: object) -> StageExecutorManifest:
@@ -479,10 +583,14 @@ def _hex_string(value: object, size: int, name: str) -> str:
 __all__ = [
     "STAGE_EXECUTOR_SCHEMA",
     "STAGE_ENDIANNESS",
+    "STAGE_KV_FORK_REPORT_SCHEMA",
     "STAGE_TENSOR_LAYOUT",
     "StageExecutorManifest",
+    "StageKVForkReport",
+    "StageKVPhysicalAccounting",
     "build_stage_executor_manifest",
     "model_identity_for_source",
     "parse_stage_executor_manifest",
+    "parse_stage_kv_fork_report",
     "validate_executor_chain",
 ]

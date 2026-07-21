@@ -14,7 +14,7 @@ import {
 export const PHYSICAL_GPU_CAMPAIGN_SCHEMA = "gdlp-physical-gpu-campaign-observation/1" as const;
 export const OUTPUT_TOKEN_HASH_SCHEME = "gdlp-output-token-ids-v1" as const;
 
-const AGENT_HEALTH_SCHEMA = "gdlp-launch-agent-health/1";
+const AGENT_HEALTH_SCHEMA = "gdlp-launch-agent-health/2";
 const SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/;
 const DECIMAL_UINT64_PATTERN = /^(?:0|[1-9][0-9]{0,19})$/;
 const MAX_UINT64 = (1n << 64n) - 1n;
@@ -25,6 +25,15 @@ const MAX_CONCURRENCIES = 32;
 const MAX_CONCURRENCY = 1_024;
 const MAX_ITERATIONS = 10_000;
 const MAX_WARMUPS = 1_000;
+const MAX_TIMEOUT_MS = 86_400_000;
+
+const DEFAULT_TIMEOUTS: Readonly<PhysicalGpuCampaignTimeouts> = Object.freeze({
+  agentHealthMs: 10_000,
+  apiHealthMs: 10_000,
+  apiRequestMs: 300_000,
+  sseIdleMs: 30_000,
+  cleanupStopMs: 60_000,
+});
 
 export type PhysicalGpuCampaignMessageRole = "system" | "developer" | "user" | "assistant";
 export type PhysicalGpuCampaignFinishReason = "length" | "stop";
@@ -65,7 +74,16 @@ export interface PhysicalGpuCampaignAgentHealth {
   schema: typeof AGENT_HEALTH_SCHEMA;
   agentId: string;
   nodeId: string | null;
-  processes: number;
+  activeProcesses: number;
+  retainedTombstones: number;
+}
+
+export interface PhysicalGpuCampaignTimeouts {
+  agentHealthMs: number;
+  apiHealthMs: number;
+  apiRequestMs: number;
+  sseIdleMs: number;
+  cleanupStopMs: number;
 }
 
 export interface PhysicalGpuCampaignSupervisor {
@@ -86,6 +104,7 @@ export type PhysicalGpuCampaignSupervisorFactory = (
 
 export type PhysicalGpuCampaignHealthReader = (
   binding: PhysicalGpuCampaignAgentBinding,
+  signal?: AbortSignal,
 ) => Promise<unknown>;
 
 export interface PhysicalGpuCampaignDependencies {
@@ -93,6 +112,7 @@ export interface PhysicalGpuCampaignDependencies {
   now?: () => number;
   supervisor?: PhysicalGpuCampaignSupervisorFactory;
   health?: PhysicalGpuCampaignHealthReader;
+  timeouts?: Partial<PhysicalGpuCampaignTimeouts>;
 }
 
 export interface PhysicalGpuCampaignLifecycleEvent {
@@ -280,6 +300,7 @@ export async function runPhysicalGpuCampaign(
     dependencies.supervisor ??
     ((launch, options) => new PythonLaunchSupervisor(launch, options));
   const healthReader = dependencies.health ?? defaultAgentHealthReader;
+  const timeouts = normalizeTimeouts(dependencies.timeouts);
   assertDependencies(fetchImpl, supervisorFactory, healthReader);
 
   const lifecycle: PhysicalGpuCampaignLifecycleObservation = {
@@ -326,12 +347,13 @@ export async function runPhysicalGpuCampaign(
       input.agents,
       "before",
       healthReader,
+      timeouts.agentHealthMs,
     );
     const preflightPassed = lifecycle.agentHealthBefore.every((item) => item.passed);
     recordEvent(
       "agent_preflight",
       preflightPassed,
-      preflightPassed ? "all_launch_agents_empty" : "launch_agent_preflight_failed",
+      preflightPassed ? "all_launch_agents_inactive" : "launch_agent_preflight_failed",
     );
     if (!preflightPassed) throw new Error("physical_gpu_campaign_agent_preflight_failed");
 
@@ -344,7 +366,12 @@ export async function runPhysicalGpuCampaign(
     lifecycle.supervisorStarted = structuredClone(started);
     recordEvent("supervisor_start", true, "all_launch_processes_ready");
 
-    observation.apiHealth = await observeApiHealth(fetchImpl, input.apiBaseUrl, input.expectedHealth);
+    observation.apiHealth = await observeApiHealth(
+      fetchImpl,
+      input.apiBaseUrl,
+      input.expectedHealth,
+      timeouts.apiHealthMs,
+    );
     recordEvent("api_health", true, "root_api_identity_exact");
 
     observation.canaries.pre = await runCanaryCorpus(
@@ -352,6 +379,7 @@ export async function runPhysicalGpuCampaign(
       input,
       fetchImpl,
       now,
+      timeouts.apiRequestMs,
     );
     const preCanariesPassed = observation.canaries.pre.every((item) => item.passed);
     recordEvent(
@@ -366,7 +394,14 @@ export async function runPhysicalGpuCampaign(
       throw new Error("physical_gpu_campaign_pre_canary_failed");
     }
 
-    const benchmarkPassed = await runBenchmark(input, fetchImpl, now, observation);
+    const benchmarkPassed = await runBenchmark(
+      input,
+      fetchImpl,
+      now,
+      observation,
+      timeouts.apiRequestMs,
+      timeouts.sseIdleMs,
+    );
     recordEvent(
       "benchmark",
       benchmarkPassed,
@@ -383,6 +418,7 @@ export async function runPhysicalGpuCampaign(
       input,
       fetchImpl,
       now,
+      timeouts.apiRequestMs,
     );
     const postCanariesPassed = observation.canaries.post.every((item) => item.passed);
     recordEvent(
@@ -414,7 +450,11 @@ export async function runPhysicalGpuCampaign(
       lifecycle.cleanupAttempted = true;
       try {
         lifecycle.supervisorBeforeStop ??= structuredClone(supervisor.snapshot());
-        const stopped = await supervisor.stop("physical_gpu_campaign_complete");
+        const stopped = await withCampaignDeadline(
+          "cleanup_stop",
+          timeouts.cleanupStopMs,
+          () => supervisor!.stop("physical_gpu_campaign_complete"),
+        );
         lifecycle.supervisorStopped = structuredClone(stopped);
         stopPassed = isCleanStoppedSupervisor(stopped, input.launch);
         recordEvent(
@@ -433,12 +473,13 @@ export async function runPhysicalGpuCampaign(
       input.agents,
       "after",
       healthReader,
+      timeouts.agentHealthMs,
     );
     const agentsClean = lifecycle.agentHealthAfter.every((item) => item.passed);
     recordEvent(
       "agent_cleanup",
       agentsClean,
-      agentsClean ? "all_launch_agents_empty" : "residual_agent_processes_detected",
+      agentsClean ? "all_launch_agents_inactive" : "residual_agent_processes_detected",
     );
     if (!agentsClean) recordFailure("agent_cleanup", "residual_agent_processes_detected");
     lifecycle.cleanupPassed = stopPassed && agentsClean;
@@ -623,50 +664,60 @@ async function collectAgentHealth(
   bindings: PhysicalGpuCampaignAgentBinding[],
   phase: PhysicalGpuCampaignAgentHealthPhase,
   reader: PhysicalGpuCampaignHealthReader,
+  timeoutMs: number,
 ): Promise<PhysicalGpuCampaignAgentHealthObservation[]> {
-  const observations: PhysicalGpuCampaignAgentHealthObservation[] = [];
-  for (const binding of bindings) {
+  return Promise.all(bindings.map(async (binding) => {
     try {
-      const health = validateAgentHealth(await reader(binding));
+      const health = validateAgentHealth(
+        await withCampaignDeadline(
+          `agent_health:${phase}:${binding.nodeId}`,
+          timeoutMs,
+          (signal) => reader(binding, signal),
+        ),
+      );
       const passed =
-        health.agentId === binding.agent.id && health.nodeId === binding.nodeId && health.processes === 0;
-      observations.push({
+        health.agentId === binding.agent.id &&
+        health.nodeId === binding.nodeId &&
+        health.activeProcesses === 0;
+      return {
         phase,
         expectedAgentId: binding.agent.id,
         expectedNodeId: binding.nodeId,
         health,
         passed,
         error: passed ? null : "launch_agent_health_identity_or_process_mismatch",
-      });
+      };
     } catch (error) {
-      observations.push({
+      return {
         phase,
         expectedAgentId: binding.agent.id,
         expectedNodeId: binding.nodeId,
         health: null,
         passed: false,
         error: normalizeError(error).message,
-      });
+      };
     }
-  }
-  return observations;
+  }));
 }
 
 async function defaultAgentHealthReader(
   binding: PhysicalGpuCampaignAgentBinding,
+  signal?: AbortSignal,
 ): Promise<unknown> {
-  const candidate = binding.agent as LaunchAgent & { health?: () => Promise<unknown> };
+  const candidate = binding.agent as LaunchAgent & {
+    health?: (signal?: AbortSignal) => Promise<unknown>;
+  };
   if (typeof candidate.health !== "function") {
     throw new Error(`physical_gpu_campaign_agent_health_not_available:${binding.nodeId}`);
   }
-  return candidate.health.call(binding.agent);
+  return candidate.health.call(binding.agent, signal);
 }
 
 function validateAgentHealth(value: unknown): PhysicalGpuCampaignAgentHealth {
   const health = object(value, "physical_gpu_campaign_agent_health");
   exactKeys(
     health,
-    ["schema", "agentId", "nodeId", "processes"],
+    ["schema", "agentId", "nodeId", "activeProcesses", "retainedTombstones"],
     "physical_gpu_campaign_agent_health",
   );
   if (health.schema !== AGENT_HEALTH_SCHEMA) {
@@ -677,81 +728,97 @@ function validateAgentHealth(value: unknown): PhysicalGpuCampaignAgentHealth {
     health.nodeId === null
       ? null
       : identifier(health.nodeId, "physical_gpu_campaign_agent_health_node_id");
-  const processes = integer(
-    health.processes,
+  const activeProcesses = integer(
+    health.activeProcesses,
     0,
     Number.MAX_SAFE_INTEGER,
-    "physical_gpu_campaign_agent_health_processes",
+    "physical_gpu_campaign_agent_health_active_processes",
   );
-  return { schema: AGENT_HEALTH_SCHEMA, agentId, nodeId, processes };
+  const retainedTombstones = integer(
+    health.retainedTombstones,
+    0,
+    Number.MAX_SAFE_INTEGER,
+    "physical_gpu_campaign_agent_health_retained_tombstones",
+  );
+  return {
+    schema: AGENT_HEALTH_SCHEMA,
+    agentId,
+    nodeId,
+    activeProcesses,
+    retainedTombstones,
+  };
 }
 
 async function observeApiHealth(
   fetchImpl: PhysicalGpuCampaignFetch,
   apiBaseUrl: string,
   expected: ValidatedCampaignInput["expectedHealth"],
+  timeoutMs: number,
 ): Promise<PhysicalGpuCampaignApiHealthObservation> {
-  const response = await fetchImpl(`${apiBaseUrl}/health`, {
-    method: "GET",
-    headers: { accept: "application/json" },
+  return withCampaignDeadline("api_health", timeoutMs, async (signal) => {
+    const response = await fetchImpl(`${apiBaseUrl}/health`, {
+      method: "GET",
+      headers: { accept: "application/json" },
+      signal,
+    });
+    if (response.status !== 200) {
+      throw new Error(`physical_gpu_campaign_api_health_http_status:${response.status}`);
+    }
+    const health = await responseJsonObject(response, "physical_gpu_campaign_api_health");
+    if (health.status !== "ready" || health.error !== null) {
+      throw new Error("physical_gpu_campaign_api_is_not_ready");
+    }
+    const observed: PhysicalGpuCampaignApiHealthObservation = {
+      status: "ready",
+      error: null,
+      model: requiredText(health.model, "physical_gpu_campaign_api_health_model"),
+      artifactIdentity: requiredText(
+        health.artifact_identity,
+        "physical_gpu_campaign_api_health_artifact_identity",
+      ),
+      canonicalModelSource: requiredText(
+        health.canonical_model_source,
+        "physical_gpu_campaign_api_health_canonical_source",
+      ),
+      canonicalModelRevision:
+        health.canonical_model_revision === null
+          ? null
+          : requiredText(
+              health.canonical_model_revision,
+              "physical_gpu_campaign_api_health_canonical_revision",
+            ),
+      pipelineSnapshotIdentity: decimalUint64(
+        health.pipeline_snapshot_identity,
+        "physical_gpu_campaign_api_health_pipeline_identity",
+      ),
+      stages: integer(
+        health.stages,
+        1,
+        1_024,
+        "physical_gpu_campaign_api_health_stages",
+      ),
+      boundaries: integerArray(
+        health.boundaries,
+        2,
+        1_025,
+        "physical_gpu_campaign_api_health_boundaries",
+      ),
+      codec: requiredText(health.codec, "physical_gpu_campaign_api_health_codec"),
+    };
+    if (
+      observed.model !== expected.model ||
+      observed.artifactIdentity !== expected.artifactIdentity ||
+      observed.canonicalModelSource !== expected.canonicalModelSource ||
+      observed.canonicalModelRevision !== expected.canonicalModelRevision ||
+      observed.pipelineSnapshotIdentity !== expected.pipelineSnapshotIdentity ||
+      observed.stages !== expected.stages ||
+      !sameNumberArray(observed.boundaries, expected.boundaries) ||
+      observed.codec !== expected.codec
+    ) {
+      throw new Error("physical_gpu_campaign_api_health_identity_mismatch");
+    }
+    return observed;
   });
-  if (response.status !== 200) {
-    throw new Error(`physical_gpu_campaign_api_health_http_status:${response.status}`);
-  }
-  const health = await responseJsonObject(response, "physical_gpu_campaign_api_health");
-  if (health.status !== "ready" || health.error !== null) {
-    throw new Error("physical_gpu_campaign_api_is_not_ready");
-  }
-  const observed: PhysicalGpuCampaignApiHealthObservation = {
-    status: "ready",
-    error: null,
-    model: requiredText(health.model, "physical_gpu_campaign_api_health_model"),
-    artifactIdentity: requiredText(
-      health.artifact_identity,
-      "physical_gpu_campaign_api_health_artifact_identity",
-    ),
-    canonicalModelSource: requiredText(
-      health.canonical_model_source,
-      "physical_gpu_campaign_api_health_canonical_source",
-    ),
-    canonicalModelRevision:
-      health.canonical_model_revision === null
-        ? null
-        : requiredText(
-            health.canonical_model_revision,
-            "physical_gpu_campaign_api_health_canonical_revision",
-          ),
-    pipelineSnapshotIdentity: decimalUint64(
-      health.pipeline_snapshot_identity,
-      "physical_gpu_campaign_api_health_pipeline_identity",
-    ),
-    stages: integer(
-      health.stages,
-      1,
-      1_024,
-      "physical_gpu_campaign_api_health_stages",
-    ),
-    boundaries: integerArray(
-      health.boundaries,
-      2,
-      1_025,
-      "physical_gpu_campaign_api_health_boundaries",
-    ),
-    codec: requiredText(health.codec, "physical_gpu_campaign_api_health_codec"),
-  };
-  if (
-    observed.model !== expected.model ||
-    observed.artifactIdentity !== expected.artifactIdentity ||
-    observed.canonicalModelSource !== expected.canonicalModelSource ||
-    observed.canonicalModelRevision !== expected.canonicalModelRevision ||
-    observed.pipelineSnapshotIdentity !== expected.pipelineSnapshotIdentity ||
-    observed.stages !== expected.stages ||
-    !sameNumberArray(observed.boundaries, expected.boundaries) ||
-    observed.codec !== expected.codec
-  ) {
-    throw new Error("physical_gpu_campaign_api_health_identity_mismatch");
-  }
-  return observed;
 }
 
 async function runCanaryCorpus(
@@ -759,22 +826,39 @@ async function runCanaryCorpus(
   input: ValidatedCampaignInput,
   fetchImpl: PhysicalGpuCampaignFetch,
   now: () => number,
+  timeoutMs: number,
 ): Promise<PhysicalGpuCampaignCanaryObservation[]> {
   const observations: PhysicalGpuCampaignCanaryObservation[] = [];
   for (const canary of input.canaries) {
     const startedAt = now();
     try {
-      const response = await fetchImpl(`${input.apiBaseUrl}/v1/chat/completions`, {
-        method: "POST",
-        headers: { accept: "application/json", "content-type": "application/json" },
-        body: JSON.stringify(requestBody(input.expectedHealth.model, canary, false)),
-      });
-      if (response.status !== 200) {
-        throw new Error(`physical_gpu_campaign_canary_http_status:${response.status}`);
-      }
-      const document = await responseJsonObject(response, "physical_gpu_campaign_canary_response");
-      const evidence = completionEvidence(document, input.expectedHealth.model, canary);
-      const clientResponseMs = duration(startedAt, now(), "physical_gpu_campaign_canary_response");
+      const { evidence, clientResponseMs } = await withCampaignDeadline(
+        `canary:${phase}:${canary.id}`,
+        timeoutMs,
+        async (signal) => {
+          const response = await fetchImpl(`${input.apiBaseUrl}/v1/chat/completions`, {
+            method: "POST",
+            headers: { accept: "application/json", "content-type": "application/json" },
+            body: JSON.stringify(requestBody(input.expectedHealth.model, canary, false)),
+            signal,
+          });
+          if (response.status !== 200) {
+            throw new Error(`physical_gpu_campaign_canary_http_status:${response.status}`);
+          }
+          const document = await responseJsonObject(
+            response,
+            "physical_gpu_campaign_canary_response",
+          );
+          return {
+            evidence: completionEvidence(document, input.expectedHealth.model, canary),
+            clientResponseMs: duration(
+              startedAt,
+              now(),
+              "physical_gpu_campaign_canary_response",
+            ),
+          };
+        },
+      );
       observations.push({
         phase,
         canaryId: canary.id,
@@ -802,6 +886,8 @@ async function runBenchmark(
   fetchImpl: PhysicalGpuCampaignFetch,
   now: () => number,
   observation: PhysicalGpuCampaignObservation,
+  requestTimeoutMs: number,
+  sseIdleTimeoutMs: number,
 ): Promise<boolean> {
   for (const concurrency of input.concurrencies) {
     for (const phase of ["warmup", "measure"] as const) {
@@ -823,6 +909,8 @@ async function runBenchmark(
               batchId,
               fetchImpl,
               now,
+              requestTimeoutMs,
+              sseIdleTimeoutMs,
             );
           }),
         );
@@ -865,34 +953,46 @@ async function runSseSample(
   batchId: string,
   fetchImpl: PhysicalGpuCampaignFetch,
   now: () => number,
+  requestTimeoutMs: number,
+  sseIdleTimeoutMs: number,
 ): Promise<PhysicalGpuCampaignRequestSample> {
   const sampleId = `${batchId}-r${requestIndex}`;
   const startedAt = now();
   try {
-    const response = await fetchImpl(`${input.apiBaseUrl}/v1/chat/completions`, {
-      method: "POST",
-      headers: { accept: "text/event-stream", "content-type": "application/json" },
-      body: JSON.stringify(requestBody(input.expectedHealth.model, canary, true)),
-    });
-    if (response.status !== 200) {
-      throw new Error(`physical_gpu_campaign_sse_http_status:${response.status}`);
-    }
-    const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
-    if (!contentType.includes("text/event-stream")) {
-      throw new Error("physical_gpu_campaign_sse_content_type_mismatch");
-    }
-    const streamed = await readSse(response, now);
-    const evidence = completionEvidence(streamed.document, input.expectedHealth.model, canary);
-    const clientFirstContentMs = duration(
-      startedAt,
-      streamed.firstContentAtMs,
-      "physical_gpu_campaign_first_content",
-    );
-    const clientResponseMs = duration(
-      startedAt,
-      streamed.doneAtMs,
-      "physical_gpu_campaign_response",
-    );
+    const { evidence, clientFirstContentMs, clientResponseMs } =
+      await withCampaignDeadline(
+        `sse_request:${sampleId}`,
+        requestTimeoutMs,
+        async (signal) => {
+          const response = await fetchImpl(`${input.apiBaseUrl}/v1/chat/completions`, {
+            method: "POST",
+            headers: { accept: "text/event-stream", "content-type": "application/json" },
+            body: JSON.stringify(requestBody(input.expectedHealth.model, canary, true)),
+            signal,
+          });
+          if (response.status !== 200) {
+            throw new Error(`physical_gpu_campaign_sse_http_status:${response.status}`);
+          }
+          const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+          if (!contentType.includes("text/event-stream")) {
+            throw new Error("physical_gpu_campaign_sse_content_type_mismatch");
+          }
+          const streamed = await readSse(response, now, signal, sseIdleTimeoutMs);
+          return {
+            evidence: completionEvidence(streamed.document, input.expectedHealth.model, canary),
+            clientFirstContentMs: duration(
+              startedAt,
+              streamed.firstContentAtMs,
+              "physical_gpu_campaign_first_content",
+            ),
+            clientResponseMs: duration(
+              startedAt,
+              streamed.doneAtMs,
+              "physical_gpu_campaign_response",
+            ),
+          };
+        },
+      );
     if (clientResponseMs <= 0) throw new Error("physical_gpu_campaign_response_duration_is_zero");
     return {
       sampleId,
@@ -939,7 +1039,12 @@ async function runSseSample(
   }
 }
 
-async function readSse(response: Response, now: () => number): Promise<SseResult> {
+async function readSse(
+  response: Response,
+  now: () => number,
+  signal: AbortSignal,
+  idleTimeoutMs: number,
+): Promise<SseResult> {
   if (response.body === null) throw new Error("physical_gpu_campaign_sse_body_missing");
   const reader = response.body.getReader();
   const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -948,49 +1053,94 @@ async function readSse(response: Response, now: () => number): Promise<SseResult
   let doneAtMs: number | null = null;
   let finalDocument: Record<string, unknown> | null = null;
   let doneSeen = false;
-  while (true) {
-    const { done, value } = await reader.read();
-    buffer += decoder.decode(value, { stream: !done });
-    buffer = buffer.replaceAll("\r\n", "\n");
-    let boundary = buffer.indexOf("\n\n");
-    while (boundary >= 0) {
-      const event = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      const data = event
-        .split("\n")
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).replace(/^ /, ""))
-        .join("\n");
-      if (data !== "") {
-        if (doneSeen) throw new Error("physical_gpu_campaign_sse_event_after_done");
-        if (data === "[DONE]") {
-          doneSeen = true;
-          doneAtMs = now();
-        } else {
-          const document = jsonObject(data, "physical_gpu_campaign_sse_event");
-          if ("error" in document) throw new Error("physical_gpu_campaign_sse_error_event");
-          const choice = firstChoice(document, "physical_gpu_campaign_sse_choice");
-          const delta = object(choice.delta, "physical_gpu_campaign_sse_delta");
-          if (typeof delta.content === "string" && delta.content.length > 0 && firstContentAtMs === null) {
-            firstContentAtMs = now();
-          }
-          if (choice.finish_reason !== null && choice.finish_reason !== undefined) {
-            if (finalDocument !== null) {
-              throw new Error("physical_gpu_campaign_sse_multiple_final_chunks");
+  try {
+    while (true) {
+      const { done, value } = await readSseChunk(reader, signal, idleTimeoutMs);
+      buffer += decoder.decode(value, { stream: !done });
+      buffer = buffer.replaceAll("\r\n", "\n");
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        const event = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        const data = event
+          .split("\n")
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice(5).replace(/^ /, ""))
+          .join("\n");
+        if (data !== "") {
+          if (doneSeen) throw new Error("physical_gpu_campaign_sse_event_after_done");
+          if (data === "[DONE]") {
+            doneSeen = true;
+            doneAtMs = now();
+          } else {
+            const document = jsonObject(data, "physical_gpu_campaign_sse_event");
+            if ("error" in document) throw new Error("physical_gpu_campaign_sse_error_event");
+            const choice = firstChoice(document, "physical_gpu_campaign_sse_choice");
+            const delta = object(choice.delta, "physical_gpu_campaign_sse_delta");
+            if (
+              typeof delta.content === "string" &&
+              delta.content.length > 0 &&
+              firstContentAtMs === null
+            ) {
+              firstContentAtMs = now();
             }
-            finalDocument = document;
+            if (choice.finish_reason !== null && choice.finish_reason !== undefined) {
+              if (finalDocument !== null) {
+                throw new Error("physical_gpu_campaign_sse_multiple_final_chunks");
+              }
+              finalDocument = document;
+            }
           }
         }
+        boundary = buffer.indexOf("\n\n");
       }
-      boundary = buffer.indexOf("\n\n");
+      if (done) break;
     }
-    if (done) break;
+    if (buffer.trim() !== "") throw new Error("physical_gpu_campaign_sse_trailing_partial_event");
+    if (!doneSeen || doneAtMs === null) throw new Error("physical_gpu_campaign_sse_done_missing");
+    if (finalDocument === null) throw new Error("physical_gpu_campaign_sse_final_chunk_missing");
+    if (firstContentAtMs === null) throw new Error("physical_gpu_campaign_sse_first_content_missing");
+    return { document: finalDocument, firstContentAtMs, doneAtMs };
+  } catch (error) {
+    try {
+      await reader.cancel(error);
+    } catch {
+      // Cancellation is best-effort; preserve the deadline/protocol error.
+    }
+    throw error;
+  } finally {
+    reader.releaseLock();
   }
-  if (buffer.trim() !== "") throw new Error("physical_gpu_campaign_sse_trailing_partial_event");
-  if (!doneSeen || doneAtMs === null) throw new Error("physical_gpu_campaign_sse_done_missing");
-  if (finalDocument === null) throw new Error("physical_gpu_campaign_sse_final_chunk_missing");
-  if (firstContentAtMs === null) throw new Error("physical_gpu_campaign_sse_first_content_missing");
-  return { document: finalDocument, firstContentAtMs, doneAtMs };
+}
+
+async function readSseChunk(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal: AbortSignal,
+  idleTimeoutMs: number,
+): Promise<{ done: boolean; value: Uint8Array | undefined }> {
+  if (signal.aborted) throw campaignCancellation(signal);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
+      callback();
+    };
+    const timeoutError = new Error(`physical_gpu_campaign_timeout:sse_idle:${idleTimeoutMs}`);
+    const abort = () => finish(() => reject(campaignCancellation(signal)));
+    const timer = setTimeout(() => finish(() => reject(timeoutError)), idleTimeoutMs);
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) {
+      abort();
+      return;
+    }
+    reader.read().then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(normalizeError(error))),
+    );
+  });
 }
 
 function completionEvidence(
@@ -1203,6 +1353,88 @@ function assertDependencies(
     throw new Error("physical_gpu_campaign_supervisor_factory_is_invalid");
   }
   if (typeof health !== "function") throw new Error("physical_gpu_campaign_health_reader_is_invalid");
+}
+
+function normalizeTimeouts(
+  value: Partial<PhysicalGpuCampaignTimeouts> | undefined,
+): PhysicalGpuCampaignTimeouts {
+  if (value !== undefined && (typeof value !== "object" || value === null || Array.isArray(value))) {
+    throw new Error("physical_gpu_campaign_timeouts_must_be_an_object");
+  }
+  const candidate = (value ?? {}) as Record<string, unknown>;
+  const allowed = new Set([
+    "agentHealthMs",
+    "apiHealthMs",
+    "apiRequestMs",
+    "sseIdleMs",
+    "cleanupStopMs",
+  ]);
+  if (Object.keys(candidate).some((key) => !allowed.has(key))) {
+    throw new Error("physical_gpu_campaign_timeouts_has_invalid_keys");
+  }
+  return {
+    agentHealthMs: integer(
+      candidate.agentHealthMs ?? DEFAULT_TIMEOUTS.agentHealthMs,
+      1,
+      MAX_TIMEOUT_MS,
+      "physical_gpu_campaign_agent_health_timeout",
+    ),
+    apiHealthMs: integer(
+      candidate.apiHealthMs ?? DEFAULT_TIMEOUTS.apiHealthMs,
+      1,
+      MAX_TIMEOUT_MS,
+      "physical_gpu_campaign_api_health_timeout",
+    ),
+    apiRequestMs: integer(
+      candidate.apiRequestMs ?? DEFAULT_TIMEOUTS.apiRequestMs,
+      1,
+      MAX_TIMEOUT_MS,
+      "physical_gpu_campaign_api_request_timeout",
+    ),
+    sseIdleMs: integer(
+      candidate.sseIdleMs ?? DEFAULT_TIMEOUTS.sseIdleMs,
+      1,
+      MAX_TIMEOUT_MS,
+      "physical_gpu_campaign_sse_idle_timeout",
+    ),
+    cleanupStopMs: integer(
+      candidate.cleanupStopMs ?? DEFAULT_TIMEOUTS.cleanupStopMs,
+      1,
+      MAX_TIMEOUT_MS,
+      "physical_gpu_campaign_cleanup_stop_timeout",
+    ),
+  };
+}
+
+async function withCampaignDeadline<T>(
+  operation: string,
+  timeoutMs: number,
+  task: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const controller = new AbortController();
+  const timeoutError = new Error(`physical_gpu_campaign_timeout:${operation}:${timeoutMs}`);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      if (!controller.signal.aborted) controller.abort(timeoutError);
+      reject(timeoutError);
+    }, timeoutMs);
+  });
+  const pending = Promise.resolve().then(() => task(controller.signal));
+  try {
+    return await Promise.race([pending, deadline]);
+  } catch (error) {
+    if (!controller.signal.aborted) controller.abort(error);
+    throw normalizeError(error);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function campaignCancellation(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new Error("physical_gpu_campaign_cancelled");
 }
 
 function checkedClock(clock: () => number): () => number {

@@ -2,54 +2,17 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <meta name="theme-color" content="#081617" />
-    <meta name="description" content="Contribute compute power to the mycellios network from your phone." />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#11172f" />
+    <meta name="description" content="Contribute power to the network with the Mycellios mobile compute cell." />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="icon" href="./icon.png" />
-    <link rel="apple-touch-icon" href="./icon.png" />
-    <title>mycellios mobile worker</title>
+    <title>mycellios — Contribute</title>
   </head>
   <body>
-    <main class="shell">
-      <header class="brand">
-        <img src="./icon.png" alt="" />
-        <div><strong>mycellios</strong><span>mobile compute</span></div>
-        <span id="connectionBadge" class="badge offline">Disconnected</span>
-      </header>
-
-      <section class="hero panel">
-        <div class="orb" aria-hidden="true"><div class="orb-core"></div></div>
-        <p class="eyebrow">YOUR PHONE · ONE CELL</p>
-        <h1>Contribute power to the network</h1>
-        <p id="statusText" class="status-text">Press the button and keep this screen open.</p>
-        <button id="toggleButton" class="power-button"><span class="power-symbol">⏻</span><span>Contribute power</span></button>
-        <p class="privacy">You stay in control. Stop at any time.</p>
-      </section>
-
-      <section class="stats-grid">
-        <article class="panel stat"><span>Engine</span><strong id="backendValue">Detecting</strong><small id="gpuValue">WebGPU or CPU</small></article>
-        <article class="panel stat"><span>Performance</span><strong id="gflopsValue">—</strong><small>estimated GFLOPS</small></article>
-        <article class="panel stat"><span>Verified</span><strong id="tasksValue">0</strong><small>real tasks</small></article>
-        <article class="panel stat"><span>Display</span><strong id="wakeValue">Normal</strong><small>Wake Lock</small></article>
-      </section>
-
-      <section class="panel controls">
-        <div><span class="eyebrow">POWER LEVEL</span><p>Higher power increases energy use and temperature.</p></div>
-        <div class="level-control" role="group" aria-label="Power level">
-          <button data-level="low">Low</button>
-          <button data-level="balanced" class="active">Balanced</button>
-          <button data-level="maximum">Maximum</button>
-        </div>
-      </section>
-
-      <section class="panel activity-panel">
-        <div class="activity-heading"><span class="eyebrow">ACTIVITY</span><span id="activityPulse" class="pulse"></span></div>
-        <ol id="activityLog" class="activity-log"><li>Worker ready to start.</li></ol>
-      </section>
-
-      <footer>Experimental prototype · work stops if you close or suspend the app</footer>
-    </main>
-    <script type="module" src="/main.ts"></script>
+    <div id="root"><noscript>Contribute power to the network by enabling JavaScript.</noscript></div>
+    <script type="module" src="/main.tsx"></script>
   </body>
 </html>

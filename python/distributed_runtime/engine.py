@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import CancelledError as FutureCancelledError, Future
 from collections import deque
 from collections.abc import Sequence
+import copy
 from dataclasses import dataclass, field
 import math
 import multiprocessing as mp
@@ -20,6 +21,7 @@ from .macro_wave import KVVersion, MacroWaveState
 from .macro_wave_adapter import (
     MacroWaveProposal,
     prepare_linear_macro_wave,
+    prepare_tree_macro_wave,
     record_linear_resolution,
     resolve_linear_macro_wave,
 )
@@ -35,12 +37,30 @@ from .protocol import (
     FrameType,
     LinkEmulator,
     TensorCodec,
+    TreePrepareStatus,
+    branch_request_payload,
     configure_socket,
+    decode_tree_prepare,
     decode_token,
     decode_verify_result,
     encode_tensor_payload,
     recv_frame,
     send_frame,
+    tree_prepare_payload,
+    tree_reservation_payload,
+)
+from .physical_tree import (
+    CancelCommand,
+    EndCommand,
+    PhysicalTreeCoordinator,
+    PhysicalTreeError,
+    PromoteCommand,
+    TombstoneDrain,
+    TreeAbortPlan,
+    TreeCommitPlan,
+    TreePhase,
+    TruncateCommand,
+    VerifyCommand,
 )
 from .ram_backed_moe_runtime import (
     RamBackedMoeRuntimeConfig,
@@ -53,11 +73,29 @@ from .speculation import (
     AdaptiveSpeculationController,
     DraftProvider,
     NgramDraftProvider,
+    NgramTreeDraftProvider,
+    TreeDraftProvider,
 )
-from .stage import StageProcessConfig, connect_with_retry, drain_metrics, run_stage_process
+from .stage import (
+    MAX_SPECULATIVE_BRANCHES,
+    MAX_SPECULATIVE_BRANCH_TOKENS,
+    MAX_SPECULATIVE_KV_BYTES,
+    StageProcessConfig,
+    connect_with_retry,
+    drain_metrics,
+    run_stage_process,
+    validate_speculative_runner,
+)
 
 
 TokenCallback = Callable[[int, int, int, float], None]
+
+MAX_PREFILL_INFLIGHT_CHUNKS = 64
+MAX_PREFILL_INFLIGHT_BYTES = 1 << 30
+SCHEDULER_SHUTDOWN_GRACE_SECONDS = 2.0
+CHILD_SHUTDOWN_GRACE_SECONDS = 5.0
+IO_THREAD_SHUTDOWN_GRACE_SECONDS = 2.0
+HARD_SHUTDOWN_GRACE_SECONDS = 5.0
 
 
 def _sealed_wave_token_limit(config: Any) -> int:
@@ -74,6 +112,66 @@ def _prefill_token_limit(config: Any) -> int | None:
         return int(explicit)
     configured = int(getattr(config, "prefill_chunk_tokens", 0))
     return configured if configured > 0 else None
+
+
+def _prefill_inflight_chunk_limit(config: Any) -> int:
+    return int(getattr(config, "prefill_inflight_chunks", 1))
+
+
+def _prefill_inflight_byte_limit(config: Any) -> int:
+    return int(getattr(config, "prefill_inflight_bytes", 0))
+
+
+def _hadamard_quantization_block_count(hidden_size: int) -> int:
+    remaining = hidden_size
+    blocks = 0
+    while remaining > 0:
+        size = 1 << int(math.floor(math.log2(min(64, remaining))))
+        remaining -= size
+        blocks += 1
+    return blocks
+
+
+def _prefill_frame_byte_reservation(
+    codec: TensorCodec,
+    token_count: int,
+    hidden_size: int,
+) -> int:
+    """Conservative, data-independent bytes reserved by one prefill frame."""
+
+    if token_count < 1 or hidden_size < 1:
+        raise ValueError("prefill frame shape must be positive")
+    elements = token_count * hidden_size
+    base_codec = {
+        TensorCodec.INT8_GROUPED_DEFLATE: TensorCodec.INT8_GROUPED,
+        TensorCodec.INT8_HADAMARD_DEFLATE: TensorCodec.INT8_HADAMARD,
+    }.get(codec, codec)
+    if base_codec == TensorCodec.FP32:
+        payload_bytes = elements * 4
+    elif base_codec == TensorCodec.FP16:
+        payload_bytes = elements * 2
+    elif base_codec == TensorCodec.INT8:
+        payload_bytes = elements + 4
+    elif base_codec == TensorCodec.INT8_GROUPED:
+        blocks = (hidden_size + 63) // 64
+        payload_bytes = elements + token_count * blocks * 4
+    elif base_codec == TensorCodec.INT8_HADAMARD:
+        blocks = _hadamard_quantization_block_count(hidden_size)
+        payload_bytes = elements + token_count * blocks * 4
+    else:
+        raise ValueError(f"unsupported tensor codec {codec}")
+    if base_codec != codec:
+        # Same zlib worst-case bound used by protocol._deflate_bound. Reserving
+        # the bound, rather than an observed compression ratio, keeps credit
+        # admission deterministic before root KV is advanced.
+        payload_bytes = (
+            payload_bytes
+            + (payload_bytes >> 12)
+            + (payload_bytes >> 14)
+            + (payload_bytes >> 25)
+            + 19
+        )
+    return HEADER_BYTES + payload_bytes
 
 
 @dataclass(frozen=True)
@@ -110,6 +208,19 @@ class PipelineEngineConfig:
     # Zero keeps the whole prompt in one physical prefill wave.  A positive
     # value sends bounded chunks and lets decode work enter between their ACKs.
     prefill_chunk_tokens: int = 0
+    # Exact prefill may pipeline several ordered chunks from one request. Both
+    # ceilings are per request; the global maximum is therefore bounded by
+    # max_active_sequences times each value. One chunk preserves historical
+    # stop-and-wait. The byte ceiling reserves a conservative payload bound
+    # before advancing root KV; zero disables only this secondary ceiling.
+    prefill_inflight_chunks: int = 1
+    prefill_inflight_bytes: int = 0
+    # Physical sparse-tree execution remains off unless all three limits are
+    # positive. They are part of the immutable execution/recovery contract even
+    # before a branch scheduler is enabled at the root.
+    max_speculative_branches: int = 0
+    max_speculative_branch_tokens: int = 0
+    max_speculative_kv_bytes: int = 0
     # Hard frame limits sealed by the launcher/planner. None preserves direct
     # programmatic compatibility while deriving the smallest safe decode wave.
     sealed_wave_tokens: int | None = None
@@ -229,6 +340,61 @@ class PipelineEngineConfig:
             or self.prefill_chunk_tokens < 0
         ):
             raise ValueError("prefill_chunk_tokens must be a non-negative integer")
+        if (
+            not isinstance(self.prefill_inflight_chunks, int)
+            or isinstance(self.prefill_inflight_chunks, bool)
+            or not 1
+            <= self.prefill_inflight_chunks
+            <= MAX_PREFILL_INFLIGHT_CHUNKS
+        ):
+            raise ValueError(
+                "prefill_inflight_chunks must be between 1 and "
+                f"{MAX_PREFILL_INFLIGHT_CHUNKS}"
+            )
+        if (
+            not isinstance(self.prefill_inflight_bytes, int)
+            or isinstance(self.prefill_inflight_bytes, bool)
+            or not 0 <= self.prefill_inflight_bytes <= MAX_PREFILL_INFLIGHT_BYTES
+        ):
+            raise ValueError(
+                "prefill_inflight_bytes must be zero or between 1 and "
+                f"{MAX_PREFILL_INFLIGHT_BYTES}"
+            )
+        for name, value, maximum in (
+            (
+                "max_speculative_branches",
+                self.max_speculative_branches,
+                MAX_SPECULATIVE_BRANCHES,
+            ),
+            (
+                "max_speculative_branch_tokens",
+                self.max_speculative_branch_tokens,
+                MAX_SPECULATIVE_BRANCH_TOKENS,
+            ),
+            (
+                "max_speculative_kv_bytes",
+                self.max_speculative_kv_bytes,
+                MAX_SPECULATIVE_KV_BYTES,
+            ),
+        ):
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or not 0 <= value <= maximum
+            ):
+                raise ValueError(f"{name} must be between 0 and {maximum}")
+        speculative_tree_limits_enabled = (
+            self.max_speculative_branches > 0,
+            self.max_speculative_branch_tokens > 0,
+            self.max_speculative_kv_bytes > 0,
+        )
+        if any(speculative_tree_limits_enabled) and not all(
+            speculative_tree_limits_enabled
+        ):
+            raise ValueError(
+                "speculative branch count, tokens and KV bytes must all be zero "
+                "or all be positive"
+            )
         if (self.sealed_wave_tokens is None) != (
             self.max_prefill_chunk_tokens is None
         ):
@@ -427,6 +593,11 @@ class PipelineRecoveryIdentity:
     stage_executor_ids: tuple[str, ...]
     threads_per_stage: int
     prefill_chunk_tokens: int
+    prefill_inflight_chunks: int
+    prefill_inflight_bytes: int
+    max_speculative_branches: int
+    max_speculative_branch_tokens: int
+    max_speculative_kv_bytes: int
     sealed_wave_tokens: int
     max_prefill_chunk_tokens: int
     speculative_max_draft_tokens: int
@@ -438,6 +609,61 @@ class GenerationCancelledError(RuntimeError):
     pass
 
 
+class PipelineShutdownError(RuntimeError):
+    """The bounded shutdown finished without a clean local lifecycle."""
+
+    def __init__(self, report: dict[str, Any]) -> None:
+        self.report = copy.deepcopy(report)
+        failed_children = [
+            child
+            for child in report.get("child_processes", ())
+            if child.get("alive") or child.get("exit_code") != 0
+        ]
+        alive_threads = [
+            name
+            for name, alive in report.get("threads_alive", {}).items()
+            if alive
+        ]
+        fatal_count = len(report.get("fatal_stage_metrics", ()))
+        reasons: list[str] = []
+        if not report.get("shutdown_sent", False):
+            reasons.append("SHUTDOWN was not sent")
+        if report.get("hard_fallback_used", False):
+            reasons.append("hard fallback was required")
+        if failed_children:
+            rendered = ", ".join(
+                f"{child.get('name')}={child.get('exit_code')}"
+                + ("(alive)" if child.get("alive") else "")
+                for child in failed_children
+            )
+            reasons.append(f"child exit failure: {rendered}")
+        if alive_threads:
+            reasons.append(f"threads still alive: {', '.join(alive_threads)}")
+        if fatal_count:
+            reasons.append(f"fatal stage metrics: {fatal_count}")
+        for error in report.get("cleanup_errors", ()):
+            reasons.append(str(error))
+        super().__init__(
+            "pipeline shutdown was not clean"
+            + (f": {'; '.join(reasons)}" if reasons else "")
+        )
+
+
+@dataclass(frozen=True)
+class _InflightWave:
+    step: int
+    frame_type: FrameType
+    prefill_end: int | None
+    started_at: float
+    sent_at: float
+    outbound_bytes: int
+    reserved_bytes: int
+
+    @property
+    def is_prefill(self) -> bool:
+        return self.prefill_end is not None
+
+
 @dataclass
 class _GenerationJob:
     request: GenerationInput
@@ -445,13 +671,21 @@ class _GenerationJob:
     future: Future[GenerationOutput] = field(default_factory=Future)
     cancel_requested: threading.Event = field(default_factory=threading.Event)
     wire_id: int | None = None
+    # ``step`` is the oldest return expected from the route. ``next_step`` is
+    # assigned to the next immutable outbound wave. They differ only while a
+    # credit-window prefill has more than one chunk in flight.
     step: int = 0
+    next_step: int | None = None
     started_at: float = 0.0
     last_sent_at: float = 0.0
     token_ids: list[int] = field(default_factory=list)
     arrivals: list[float] = field(default_factory=list)
     cancel_sent: bool = False
     prefill_offset: int = 0
+    prefill_acked_offset: int = 0
+    prefill_inflight_bytes: int = 0
+    prefill_reserved_bytes: int = 0
+    inflight_waves: deque[_InflightWave] = field(default_factory=deque)
     wave_started_at: float = 0.0
     last_outbound_bytes: int = 0
     verify_proposal: MacroWaveProposal | None = None
@@ -464,6 +698,16 @@ class _GenerationJob:
     # exact served sequence (prompt + emitted tokens). The physical KV may be
     # longer when a turn ends right after a partially rejected VERIFY wave.
     kv_valid: int = 0
+    # Physical leaves are never jobs and never receive a future/callback.  The
+    # parent can nevertheless be closed before a cancelled leaf return has
+    # drained, so retirement of its user future must be deferred explicitly.
+    physical_tree_parent_closed: bool = False
+    physical_tree_pending_result: GenerationOutput | None = None
+    physical_tree_pending_exception: BaseException | None = None
+
+    def __post_init__(self) -> None:
+        if self.next_step is None:
+            self.next_step = self.step
 
 
 @dataclass
@@ -493,7 +737,48 @@ class _PreparedRootWave:
     job: _GenerationJob
     input_ids: torch.Tensor
     frame_type: FrameType
+    step: int
     prefill_end: int | None = None
+    reserved_bytes: int = 0
+
+
+@dataclass(frozen=True)
+class _PreparedPhysicalTreeWave:
+    """One validated logical tree which has not mutated root or wire KV yet."""
+
+    job: _GenerationJob
+    proposal: MacroWaveProposal
+    base_kv_tokens: int
+    pending_token: int
+    step: int
+    active_sequences: int
+
+
+@dataclass(frozen=True)
+class _RootTreeCapacitySnapshot:
+    parent_tokens: int
+    parent_cache_bytes: int
+    live_child_ids: tuple[int, ...]
+    live_child_bytes: int
+    projected_kv_bytes: int
+
+
+@dataclass
+class _PendingTreeReservation:
+    prepared: _PreparedPhysicalTreeWave
+    nonce: int
+    path_lengths: tuple[int, ...]
+    root_snapshot: _RootTreeCapacitySnapshot
+    sent_at: float
+    deadline_at: float
+    downstream: socket.socket
+    commit_sent: bool = False
+    committed: bool = False
+
+
+@dataclass(frozen=True)
+class _CommittedPhysicalTreeWave:
+    pending: _PendingTreeReservation
 
 
 class DistributedPipelineEngine:
@@ -510,10 +795,13 @@ class DistributedPipelineEngine:
         *,
         draft_provider: DraftProvider | None = None,
         speculation_controller: AdaptiveSpeculationController | None = None,
+        tree_draft_provider: NgramTreeDraftProvider | TreeDraftProvider | None = None,
     ) -> None:
         self.config = config
         self._state_lock = threading.Lock()
         self._closed = False
+        self._close_error: PipelineShutdownError | None = None
+        self._shutdown_report: dict[str, Any] | None = None
         self._fatal_error: str | None = None
         self._request_counter = 0
         self._processes: list[Any] = []
@@ -529,6 +817,35 @@ class DistributedPipelineEngine:
         # timely PONG from racing the scheduler's deadline check.
         self._route_probe_returns: queue.Queue[tuple[Any, float]] = queue.Queue()
         self._callback_routes: dict[int, _GenerationJob] = {}
+        # Virtual physical leaves deliberately live outside callback/chat
+        # routing. Values are their real parent request IDs, never user IDs.
+        self._leaf_routes: dict[int, int] = {}
+        self._tree_return_lock = threading.Lock()
+        self._queued_tree_returns: dict[int, deque[float]] = {}
+        self._physical_tree_live_children: set[int] = set()
+        self._physical_tree = PhysicalTreeCoordinator()
+        self._physical_tree_prepared_waves = 0
+        self._physical_tree_prepared_leaves = 0
+        self._physical_tree_committed_waves = 0
+        self._physical_tree_aborted_waves = 0
+        self._physical_tree_batch_calls = 0
+        self._physical_tree_batch_items = 0
+        self._pending_tree_reservation: _PendingTreeReservation | None = None
+        self._tree_quote_nonce_counter = 0
+        self._queued_tree_prepare_results: deque[tuple[int, int, float]] = deque()
+        self._queued_tree_commit_results: deque[tuple[int, int, float]] = deque()
+        self._tree_barrier_deferred_waves: deque[
+            _PreparedRootWave | _PreparedPhysicalTreeWave
+        ] = deque()
+        self._physical_tree_quote_requests = 0
+        self._physical_tree_quote_ready = 0
+        self._physical_tree_quote_rejected = 0
+        self._physical_tree_quote_cancelled = 0
+        self._physical_tree_quote_timeouts = 0
+        self._physical_tree_quote_singleflight_fallbacks = 0
+        self._physical_tree_quote_protocol_failures = 0
+        self._physical_tree_quote_rtt_seconds = 0.0
+        self._physical_tree_quote_rejections: dict[str, int] = {}
         self._callback_lock = threading.Lock()
         self._receiver_thread: threading.Thread | None = None
         self._control_thread: threading.Thread | None = None
@@ -563,6 +880,18 @@ class DistributedPipelineEngine:
         self._root_physical_batch_items = 0
         self._root_sequential_items = 0
         self._root_max_physical_batch_size = 1
+        self._prefill_current_chunks = 0
+        self._prefill_current_bytes = 0
+        self._prefill_current_reserved_bytes = 0
+        self._prefill_high_water_chunks = 0
+        self._prefill_high_water_bytes = 0
+        self._prefill_high_water_reserved_bytes = 0
+        self._prefill_max_request_chunks = 0
+        self._prefill_max_request_bytes = 0
+        self._prefill_max_request_reserved_bytes = 0
+        self._prefill_dispatched_chunks = 0
+        self._prefill_completed_chunks = 0
+        self._prefill_acknowledged_chunks = 0
         self._route_probe_lock = threading.Lock()
         self._route_probe_sent_at: float | None = None
         self._route_probe_deadline_at: float | None = None
@@ -596,6 +925,27 @@ class DistributedPipelineEngine:
             self.draft_provider = None
             self.speculation_controller = None
             self._speculation_controllers = {}
+
+        tree_limits_enabled = all(
+            value > 0
+            for value in (
+                config.max_speculative_branches,
+                config.max_speculative_branch_tokens,
+                config.max_speculative_kv_bytes,
+            )
+        )
+        if tree_draft_provider is not None:
+            if not isinstance(tree_draft_provider, TreeDraftProvider):
+                raise ValueError("tree_draft_provider must implement TreeDraftProvider")
+            if not tree_limits_enabled:
+                raise ValueError(
+                    "tree_draft_provider requires all three sealed speculative limits"
+                )
+            if config.speculative_max_draft_tokens < 1:
+                raise ValueError(
+                    "tree_draft_provider requires speculative_max_draft_tokens > 0"
+                )
+        self.tree_draft_provider: TreeDraftProvider | None = tree_draft_provider
 
         ram_stage_configs = config.ram_backed_moe_stages or tuple(
             None for _ in range(len(config.boundaries) - 1)
@@ -653,8 +1003,8 @@ class DistributedPipelineEngine:
         )
         try:
             self._start()
-        except BaseException:
-            self.close()
+        except BaseException as error:
+            self._close_preserving_exception(error)
             raise
 
     @property
@@ -669,6 +1019,13 @@ class DistributedPipelineEngine:
     def healthy(self) -> bool:
         with self._state_lock:
             return not self._closed and self._fatal_error is None
+
+    @property
+    def shutdown_status(self) -> dict[str, Any] | None:
+        """Return immutable evidence from the last completed close attempt."""
+
+        report = getattr(self, "_shutdown_report", None)
+        return copy.deepcopy(report) if report is not None else None
 
     @property
     def fatal_error(self) -> str | None:
@@ -696,9 +1053,14 @@ class DistributedPipelineEngine:
 
     @property
     def recovery_identity(self) -> PipelineRecoveryIdentity:
+        if getattr(self, "tree_draft_provider", None) is not None:
+            raise RuntimeError(
+                "physical sparse-tree execution is not replay-recovery eligible: "
+                "the injected tree draft policy is not sealed in PipelineEngineConfig"
+            )
         stage_executor_ids = self._recovery_stage_executor_ids()
         return PipelineRecoveryIdentity(
-            schema_version=2,
+            schema_version=4,
             artifact_identity=self.model_artifact.identity,
             canonical_model_source=self.model_artifact.canonical_source,
             canonical_model_revision=self.model_artifact.canonical_revision,
@@ -712,6 +1074,11 @@ class DistributedPipelineEngine:
             stage_executor_ids=stage_executor_ids,
             threads_per_stage=self.config.threads_per_stage,
             prefill_chunk_tokens=self.config.prefill_chunk_tokens,
+            prefill_inflight_chunks=self.config.prefill_inflight_chunks,
+            prefill_inflight_bytes=self.config.prefill_inflight_bytes,
+            max_speculative_branches=self.config.max_speculative_branches,
+            max_speculative_branch_tokens=self.config.max_speculative_branch_tokens,
+            max_speculative_kv_bytes=self.config.max_speculative_kv_bytes,
             sealed_wave_tokens=self.config.sealed_wave_token_limit,
             max_prefill_chunk_tokens=self.config.prefill_token_limit or 0,
             speculative_max_draft_tokens=self.config.speculative_max_draft_tokens,
@@ -781,12 +1148,14 @@ class DistributedPipelineEngine:
     def speculation_stats(self) -> dict[str, Any]:
         controller = self.speculation_controller
         route_rtt_ms, route_probe_count = self._route_probe_snapshot()
+        tree_stats = self._physical_tree_stats()
         if controller is None:
             return {
                 "configured": False,
                 "enabled": False,
                 "route_rtt_ms": route_rtt_ms,
                 "route_probe_count": route_probe_count,
+                "physical_tree": tree_stats,
             }
         with self._speculation_lock:
             controllers = (
@@ -826,6 +1195,7 @@ class DistributedPipelineEngine:
                 "acceptance_rate": acceptance_rate,
                 "route_rtt_ms": route_rtt_ms,
                 "route_probe_count": route_probe_count,
+                "physical_tree": tree_stats,
                 "verification_bytes": sum(
                     value.verification_bytes for value in observations
                 ),
@@ -857,6 +1227,74 @@ class DistributedPipelineEngine:
                 },
             }
 
+    def _physical_tree_stats(self) -> dict[str, Any]:
+        provider = getattr(self, "tree_draft_provider", None)
+        return {
+            "configured": provider is not None,
+            "strategy": getattr(provider, "strategy", None),
+            "provider_max_draft_tokens": int(
+                getattr(provider, "max_draft_tokens", 0)
+            ),
+            "provider_max_branches": int(getattr(provider, "max_branches", 0)),
+            "prepared_waves": int(
+                getattr(self, "_physical_tree_prepared_waves", 0)
+            ),
+            "prepared_leaves": int(
+                getattr(self, "_physical_tree_prepared_leaves", 0)
+            ),
+            "committed_waves": int(
+                getattr(self, "_physical_tree_committed_waves", 0)
+            ),
+            "aborted_waves": int(
+                getattr(self, "_physical_tree_aborted_waves", 0)
+            ),
+            "batch_calls": int(getattr(self, "_physical_tree_batch_calls", 0)),
+            "batch_items": int(getattr(self, "_physical_tree_batch_items", 0)),
+            "live_leaves": len(
+                getattr(self, "_physical_tree_live_children", ())
+            ),
+            "virtual_routes": len(getattr(self, "_leaf_routes", {})),
+            "capacity_quote": {
+                "pending": getattr(self, "_pending_tree_reservation", None)
+                is not None,
+                "requests": int(
+                    getattr(self, "_physical_tree_quote_requests", 0)
+                ),
+                "ready": int(getattr(self, "_physical_tree_quote_ready", 0)),
+                "rejected": int(
+                    getattr(self, "_physical_tree_quote_rejected", 0)
+                ),
+                "cancelled": int(
+                    getattr(self, "_physical_tree_quote_cancelled", 0)
+                ),
+                "timeouts": int(
+                    getattr(self, "_physical_tree_quote_timeouts", 0)
+                ),
+                "singleflight_fallbacks": int(
+                    getattr(
+                        self,
+                        "_physical_tree_quote_singleflight_fallbacks",
+                        0,
+                    )
+                ),
+                "protocol_failures": int(
+                    getattr(self, "_physical_tree_quote_protocol_failures", 0)
+                ),
+                "average_rtt_ms": (
+                    1_000
+                    * float(getattr(self, "_physical_tree_quote_rtt_seconds", 0.0))
+                    / int(getattr(self, "_physical_tree_quote_ready", 0)
+                          + getattr(self, "_physical_tree_quote_rejected", 0))
+                    if int(getattr(self, "_physical_tree_quote_ready", 0)
+                           + getattr(self, "_physical_tree_quote_rejected", 0))
+                    else None
+                ),
+                "rejections": dict(
+                    getattr(self, "_physical_tree_quote_rejections", {})
+                ),
+            },
+        }
+
     @property
     def root_batch_stats(self) -> dict[str, int | float]:
         return {
@@ -867,6 +1305,51 @@ class DistributedPipelineEngine:
             "physical_batch_items": self._root_physical_batch_items,
             "sequential_items": self._root_sequential_items,
             "max_physical_batch_size": self._root_max_physical_batch_size,
+        }
+
+    @property
+    def prefill_window_stats(self) -> dict[str, int]:
+        configured_chunks = _prefill_inflight_chunk_limit(self.config)
+        configured_bytes = _prefill_inflight_byte_limit(self.config)
+        return {
+            "configured_chunks_per_request": configured_chunks,
+            "configured_bytes_per_request": configured_bytes,
+            "global_chunk_ceiling": configured_chunks
+            * int(self.config.max_active_sequences),
+            "global_byte_ceiling": configured_bytes
+            * int(self.config.max_active_sequences),
+            "current_chunks": int(getattr(self, "_prefill_current_chunks", 0)),
+            "current_bytes": int(getattr(self, "_prefill_current_bytes", 0)),
+            "current_reserved_bytes": int(
+                getattr(self, "_prefill_current_reserved_bytes", 0)
+            ),
+            "high_water_chunks": int(
+                getattr(self, "_prefill_high_water_chunks", 0)
+            ),
+            "high_water_bytes": int(
+                getattr(self, "_prefill_high_water_bytes", 0)
+            ),
+            "high_water_reserved_bytes": int(
+                getattr(self, "_prefill_high_water_reserved_bytes", 0)
+            ),
+            "max_request_chunks": int(
+                getattr(self, "_prefill_max_request_chunks", 0)
+            ),
+            "max_request_bytes": int(
+                getattr(self, "_prefill_max_request_bytes", 0)
+            ),
+            "max_request_reserved_bytes": int(
+                getattr(self, "_prefill_max_request_reserved_bytes", 0)
+            ),
+            "dispatched_chunks": int(
+                getattr(self, "_prefill_dispatched_chunks", 0)
+            ),
+            "completed_chunks": int(
+                getattr(self, "_prefill_completed_chunks", 0)
+            ),
+            "acknowledged_chunks": int(
+                getattr(self, "_prefill_acknowledged_chunks", 0)
+            ),
         }
 
     def generate(
@@ -902,6 +1385,7 @@ class DistributedPipelineEngine:
                 raise ValueError(
                     f"request {request.client_id} exceeds model context {self.maximum_context}"
                 )
+            self._validate_prefill_credit_capacity(request)
         jobs = [_GenerationJob(request=request, callback=on_token) for request in requests]
         with self._state_lock:
             if self._closed:
@@ -922,6 +1406,27 @@ class DistributedPipelineEngine:
         self._submission_queue.put(jobs)
         return [job.future for job in jobs]
 
+    def _validate_prefill_credit_capacity(self, request: GenerationInput) -> None:
+        byte_limit = _prefill_inflight_byte_limit(self.config)
+        if byte_limit == 0:
+            return
+        total = int(request.input_ids.shape[1])
+        configured = self.config.prefill_chunk_tokens
+        token_count = total if configured == 0 else min(total, configured)
+        prefill_limit = _prefill_token_limit(self.config)
+        if prefill_limit is not None:
+            token_count = min(token_count, prefill_limit)
+        reservation = _prefill_frame_byte_reservation(
+            TensorCodec(self.config.codec),
+            token_count,
+            self.hidden_size,
+        )
+        if reservation > byte_limit:
+            raise ValueError(
+                f"request {request.client_id} prefill chunk reserves {reservation} bytes, "
+                f"exceeding prefill_inflight_bytes={byte_limit}"
+            )
+
     def cancel(self, client_id: int) -> bool:
         with self._state_lock:
             job = self._jobs_by_client.get(client_id)
@@ -933,43 +1438,210 @@ class DistributedPipelineEngine:
     def close(self) -> None:
         with self._state_lock:
             if self._closed:
+                prior_error = getattr(self, "_close_error", None)
+                if prior_error is not None:
+                    raise prior_error
                 return
             self._closed = True
+
+        cleanup_errors: list[str] = []
+        hard_fallback_used = False
+        downstream_was_present = self._downstream is not None
         self._scheduler_stop.set()
         self._submission_queue.put(None)
-        if self._scheduler_thread is not None:
-            self._scheduler_thread.join(timeout=1.0)
-        if self._scheduler_thread is not None and self._scheduler_thread.is_alive():
-            # Network shutdown is deliberately outside the state lock so it can
-            # interrupt a scheduler waiting on a failed stage.
+
+        scheduler = self._scheduler_thread
+        cleanup_errors.extend(
+            self._join_components(
+                (scheduler,),
+                SCHEDULER_SHUTDOWN_GRACE_SECONDS,
+            )
+        )
+        scheduler_alive = self._component_is_alive(scheduler)
+        if not scheduler_alive and downstream_was_present and not self._shutdown_sent:
+            # A partially constructed engine may own a connected route without
+            # ever starting the scheduler. Preserve the same protocol ordering.
+            try:
+                send_frame(
+                    self._require_socket(self._downstream, "downstream"),
+                    FrameType.SHUTDOWN,
+                    0,
+                )
+                self._shutdown_sent = True
+            except BaseException as error:
+                cleanup_errors.append(
+                    f"SHUTDOWN send failed: {type(error).__name__}: {error}"
+                )
+
+        protocol_shutdown_ready = (
+            not downstream_was_present or self._shutdown_sent
+        )
+        if not scheduler_alive and protocol_shutdown_ready:
+            # sendall(SHUTDOWN) completed. A write half-close preserves TCP
+            # ordering while making it impossible for later cleanup to overtake
+            # the protocol frame with a reset.
+            self._half_close_downstream_write()
+            cleanup_errors.extend(
+                self._join_components(
+                    tuple(self._processes),
+                    CHILD_SHUTDOWN_GRACE_SECONDS,
+                )
+            )
+            cleanup_errors.extend(
+                self._join_components(
+                    (self._receiver_thread, self._control_thread),
+                    IO_THREAD_SHUTDOWN_GRACE_SECONDS,
+                )
+            )
+
+        live_processes = [
+            process for process in self._processes if self._component_is_alive(process)
+        ]
+        live_threads = [
+            thread
+            for thread in (
+                self._scheduler_thread,
+                self._receiver_thread,
+                self._control_thread,
+            )
+            if self._component_is_alive(thread)
+        ]
+        if live_processes or live_threads or not protocol_shutdown_ready:
+            hard_fallback_used = True
+            # Only the bounded fallback may issue SHUT_RDWR. It interrupts a
+            # scheduler or reader that did not honor the graceful deadline.
             self._interrupt_transports()
-            self._received_frames.put(RuntimeError("pipeline closed"))
-            self._scheduler_thread.join(timeout=5.0)
-        self._close_transports()
-        for thread in (self._receiver_thread, self._control_thread):
-            if thread is not None:
-                thread.join(timeout=5.0)
-        for process in self._processes:
-            if process.is_alive():
-                process.join(timeout=2.0)
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=5.0)
+            self._received_frames.put(RuntimeError("pipeline hard shutdown"))
+            cleanup_errors.extend(
+                self._join_components(
+                    tuple(live_threads),
+                    HARD_SHUTDOWN_GRACE_SECONDS,
+                )
+            )
+            for process in live_processes:
+                if not self._component_is_alive(process):
+                    continue
+                try:
+                    process.terminate()
+                except BaseException as error:
+                    cleanup_errors.append(
+                        f"terminate {getattr(process, 'name', 'child')} failed: "
+                        f"{type(error).__name__}: {error}"
+                    )
+            cleanup_errors.extend(
+                self._join_components(
+                    tuple(live_processes),
+                    HARD_SHUTDOWN_GRACE_SECONDS,
+                )
+            )
+
+        self._close_transport_handles(cleanup_errors)
+        # Closing handles is the final bounded unblock for readers. It is safe
+        # here because the graceful child deadline has already elapsed.
+        cleanup_errors.extend(
+            self._join_components(
+                (
+                    self._scheduler_thread,
+                    self._receiver_thread,
+                    self._control_thread,
+                ),
+                HARD_SHUTDOWN_GRACE_SECONDS,
+            )
+        )
         if self._metrics_queue is not None:
-            self.stage_metrics.extend(drain_metrics(self._metrics_queue))
-        if self._scheduler_thread is None or not self._scheduler_thread.is_alive():
+            try:
+                self.stage_metrics.extend(drain_metrics(self._metrics_queue))
+            except BaseException as error:
+                cleanup_errors.append(
+                    f"metric drain failed: {type(error).__name__}: {error}"
+                )
+        if not self._component_is_alive(self._scheduler_thread):
             runner = self._runner
             self._runner = None
             if runner is not None:
                 close = getattr(runner, "close", None)
                 if callable(close):
-                    close()
+                    try:
+                        close()
+                    except BaseException as error:
+                        cleanup_errors.append(
+                            f"root runner close failed: {type(error).__name__}: {error}"
+                        )
+
+        child_processes = [
+            {
+                "name": str(getattr(process, "name", "unknown")),
+                "pid": getattr(process, "pid", None),
+                "exit_code": getattr(process, "exitcode", None),
+                "alive": self._component_is_alive(process),
+            }
+            for process in self._processes
+        ]
+        threads_alive = {
+            "scheduler": self._component_is_alive(self._scheduler_thread),
+            "token_return": self._component_is_alive(self._receiver_thread),
+            "upstream_control": self._component_is_alive(self._control_thread),
+        }
+        fatal_stage_metrics = [
+            copy.deepcopy(metric)
+            for metric in self.stage_metrics
+            if isinstance(metric, dict) and "fatal_error" in metric
+        ]
+        children_clean = all(
+            not child["alive"] and child["exit_code"] == 0
+            for child in child_processes
+        )
+        clean = (
+            protocol_shutdown_ready
+            and not hard_fallback_used
+            and children_clean
+            and not any(threads_alive.values())
+            and not fatal_stage_metrics
+            and not cleanup_errors
+        )
+        report = {
+            "schema": "gdlp-pipeline-shutdown/1",
+            "clean": clean,
+            "shutdown_required": downstream_was_present,
+            "shutdown_sent": bool(self._shutdown_sent) or not downstream_was_present,
+            "hard_fallback_used": hard_fallback_used,
+            "child_processes": child_processes,
+            "threads_alive": threads_alive,
+            "fatal_stage_metrics": fatal_stage_metrics,
+            "cleanup_errors": cleanup_errors,
+        }
+        self._shutdown_report = report
+        if not clean:
+            error = PipelineShutdownError(report)
+            self._close_error = error
+            raise error
 
     def __enter__(self) -> "DistributedPipelineEngine":
         return self
 
-    def __exit__(self, *_: object) -> None:
-        self.close()
+    def __exit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        _traceback: object,
+    ) -> None:
+        if exc_value is None:
+            self.close()
+        else:
+            self._close_preserving_exception(exc_value)
+
+    def _close_preserving_exception(self, original: BaseException) -> None:
+        """Run cleanup without replacing an exception already in flight."""
+
+        try:
+            self.close()
+        except BaseException as cleanup_error:
+            add_note = getattr(original, "add_note", None)
+            if callable(add_note):
+                add_note(
+                    "Secondary pipeline cleanup failure: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
 
     def _start(self) -> None:
         config = self.config
@@ -1038,6 +1710,11 @@ class DistributedPipelineEngine:
                         connect_timeout_seconds=config.startup_timeout_seconds,
                         sealed_wave_tokens=config.sealed_wave_tokens,
                         max_prefill_chunk_tokens=config.max_prefill_chunk_tokens,
+                        max_speculative_branches=config.max_speculative_branches,
+                        max_speculative_branch_tokens=(
+                            config.max_speculative_branch_tokens
+                        ),
+                        max_speculative_kv_bytes=config.max_speculative_kv_bytes,
                         ram_backed_moe=ram_stage_config,
                     )
                 )
@@ -1076,6 +1753,7 @@ class DistributedPipelineEngine:
         )
         if self._runner.hidden_size != self.hidden_size:
             raise RuntimeError("root stage hidden size differs from the model configuration")
+        validate_speculative_runner(config, self._runner)
 
         downstream = connect_with_retry(
             first_stage_host,
@@ -1218,10 +1896,20 @@ class DistributedPipelineEngine:
                     decode_since_admission = 0
                     continue
 
-                self._send_requested_cancellations(active, downstream)
+                self._send_requested_cancellations(active, runner, downstream)
+                if not active:
+                    continue
                 if (
                     len(active) < self.config.max_active_sequences
-                    and decode_since_admission >= max(1, len(active))
+                    and (
+                        decode_since_admission >= max(1, len(active))
+                        or any(
+                            not job.cancel_requested.is_set()
+                            and job.prefill_offset
+                            < int(job.request.input_ids.shape[1])
+                            for job in active.values()
+                        )
+                    )
                 ):
                     batch = self._next_submission(timeout=0.0)
                     if batch is not None:
@@ -1231,8 +1919,24 @@ class DistributedPipelineEngine:
 
                 self._check_pipeline_timeouts(active)
                 try:
-                    value = self._received_frames.get(timeout=0.05)
+                    value = self._received_frames.get_nowait()
                 except queue.Empty:
+                    # Fill at most one credit per request and scheduler turn.
+                    # Re-entering the loop between rounds lets returns,
+                    # cancellation and newly admissible work win over a long
+                    # prompt before its entire window is filled.
+                    if self._dispatch_prefill_credit_round(
+                        active,
+                        runner,
+                        downstream,
+                        emulator,
+                    ):
+                        continue
+                    try:
+                        value = self._received_frames.get(timeout=0.05)
+                    except queue.Empty:
+                        value = None
+                if value is None:
                     # An idle return channel is also an admission point. This lets a
                     # new chat enter while another request is between network hops.
                     batch = (
@@ -1245,7 +1949,11 @@ class DistributedPipelineEngine:
                         decode_since_admission = 0
                     continue
                 ready_values = self._collect_ready_return_values(value)
-                prepared: list[_PreparedRootWave] = []
+                prepared: list[
+                    _PreparedRootWave
+                    | _PreparedPhysicalTreeWave
+                    | _CommittedPhysicalTreeWave
+                ] = []
                 for ready_value in ready_values:
                     wave = self._handle_return_value(
                         ready_value,
@@ -1345,7 +2053,6 @@ class DistributedPipelineEngine:
         selected = batch[:available]
         if len(selected) < len(batch):
             self._deferred_batches.appendleft(batch[available:])
-        prepared: list[_PreparedRootWave] = []
         for index, job in enumerate(selected):
             if job.cancel_requested.is_set():
                 self._retire_job(
@@ -1376,12 +2083,11 @@ class DistributedPipelineEngine:
                         self._callback_routes[wire_id] = job
                     runner.begin(wire_id)
                     send_frame(downstream, FrameType.BEGIN, wire_id)
-                prepared.append(self._prepare_next_prefill_chunk(job))
             except BaseException as error:
                 for remaining in selected[index + 1 :]:
                     self._retire_job(remaining, runner, exception=error, began=False)
                 raise
-        self._dispatch_root_waves(prepared, runner, downstream, emulator)
+        self._dispatch_prefill_credit_round(active, runner, downstream, emulator)
 
     def _checkout_session(
         self,
@@ -1598,15 +2304,201 @@ class DistributedPipelineEngine:
     def _send_requested_cancellations(
         self,
         active: dict[int, _GenerationJob],
+        runner: StageRunner,
         downstream: socket.socket,
     ) -> None:
-        for wire_id, job in active.items():
+        for wire_id, job in list(active.items()):
             if job.cancel_requested.is_set() and not job.cancel_sent:
-                # The cancellation follows the already-sent activation on the same
-                # TCP stream. Its token may still return and is consumed as a
-                # tombstone before the job is retired.
+                pending_quote = getattr(self, "_pending_tree_reservation", None)
+                if (
+                    pending_quote is not None
+                    and pending_quote.prepared.job is job
+                ):
+                    self._cancel_pending_tree_reservation(
+                        job,
+                        downstream,
+                        reason="generation cancelled while tree capacity quote was pending",
+                    )
+                coordinator = getattr(self, "_physical_tree", None)
+                if (
+                    coordinator is not None
+                    and wire_id in coordinator.tree_by_parent
+                ):
+                    cancellation = coordinator.request_cancel(wire_id)
+                    if cancellation.deferred_until_commit:
+                        # The return handler owns the already-started ordered
+                        # transition and will emit the parent CANCEL last.
+                        job.cancel_sent = True
+                        job.physical_tree_pending_exception = (
+                            GenerationCancelledError("generation cancelled")
+                        )
+                        continue
+                    self._apply_physical_tree_cancel_commands(
+                        job,
+                        cancellation.commands,
+                        runner,
+                        downstream,
+                    )
+                    job.physical_tree_pending_exception = (
+                        GenerationCancelledError("generation cancelled")
+                    )
+                    self._sync_physical_leaf_routes()
+                    if not cancellation.draining_virtual_request_ids:
+                        self._retire_terminal_physical_tree(wire_id)
+                        active.pop(wire_id, None)
+                        pending = job.physical_tree_pending_exception
+                        job.physical_tree_pending_exception = None
+                        self._retire_job(
+                            job,
+                            runner,
+                            exception=pending,
+                            began=not job.physical_tree_parent_closed,
+                        )
+                    continue
+                # CANCEL follows every already-sent activation on the same TCP
+                # stream. Each outstanding return remains an authenticated FIFO
+                # tombstone and must be drained before retiring local request state.
                 send_frame(downstream, FrameType.CANCEL, wire_id)
                 job.cancel_sent = True
+                if not job.inflight_waves:
+                    active.pop(wire_id)
+                    self._retire_job(
+                        job,
+                        runner,
+                        exception=GenerationCancelledError("generation cancelled"),
+                    )
+
+    def _cancel_pending_tree_reservation(
+        self,
+        job: _GenerationJob,
+        downstream: socket.socket,
+        *,
+        reason: str,
+        count_metric: bool = True,
+    ) -> _PreparedPhysicalTreeWave | None:
+        """Release a quote before parent CANCEL; no root/wire KV has forked yet."""
+
+        pending = getattr(self, "_pending_tree_reservation", None)
+        if pending is None or pending.prepared.job is not job:
+            return None
+        parent_request_id = pending.prepared.job.wire_id
+        if parent_request_id is None:
+            raise RuntimeError("pending tree reservation lost its parent identity")
+        send_frame(
+            downstream,
+            FrameType.TREE_RESERVATION_CANCEL,
+            parent_request_id,
+            step=pending.prepared.step,
+            payload=tree_reservation_payload(pending.nonce),
+        )
+        proposal = pending.prepared.proposal
+        if proposal.tree.state is MacroWaveState.OPEN:
+            proposal.tree.rollback()
+        self._pending_tree_reservation = None
+        if count_metric:
+            self._physical_tree_quote_cancelled = int(
+                getattr(self, "_physical_tree_quote_cancelled", 0)
+            ) + 1
+        del reason  # retained at call sites for audit-readable cancellation intent
+        return pending.prepared
+
+    def _dispatch_prefill_credit_round(
+        self,
+        active: dict[int, _GenerationJob],
+        runner: StageRunner,
+        downstream: socket.socket,
+        emulator: LinkEmulator,
+    ) -> int:
+        """Dispatch at most one ordered prefill chunk per active request."""
+
+        prepared: list[_PreparedRootWave] = []
+        for job in active.values():
+            if job.cancel_requested.is_set():
+                continue
+            total = int(job.request.input_ids.shape[1])
+            if job.prefill_offset >= total:
+                continue
+            inflight_prefill = sum(
+                1 for wave in job.inflight_waves if wave.is_prefill
+            )
+            if inflight_prefill >= _prefill_inflight_chunk_limit(self.config):
+                continue
+            wave = self._prepare_next_prefill_chunk(job)
+            byte_limit = _prefill_inflight_byte_limit(self.config)
+            if (
+                byte_limit > 0
+                and job.prefill_reserved_bytes + wave.reserved_bytes > byte_limit
+            ):
+                continue
+            prepared.append(wave)
+        self._dispatch_root_waves(prepared, runner, downstream, emulator)
+        return len(prepared)
+
+    def _consume_inflight_return(
+        self,
+        job: _GenerationJob,
+        frame: Any,
+    ) -> _InflightWave:
+        if not job.inflight_waves:
+            raise RuntimeError(
+                f"request {frame.request_id} returned step {frame.step} with no wave in flight"
+            )
+        flight = job.inflight_waves[0]
+        if frame.step != flight.step:
+            raise RuntimeError(
+                f"request {frame.request_id} returned step {frame.step}, "
+                f"expected FIFO step {flight.step}"
+            )
+        expected_type = {
+            FrameType.PREFILL: FrameType.PREFILL_ACK,
+            FrameType.ACTIVATION: FrameType.TOKEN,
+            FrameType.VERIFY: FrameType.VERIFY_RESULT,
+        }.get(flight.frame_type)
+        if frame.frame_type != expected_type:
+            expected_name = expected_type.name if expected_type is not None else "none"
+            raise RuntimeError(
+                f"request {frame.request_id} returned {frame.frame_type.name} for "
+                f"{flight.frame_type.name}, expected {expected_name}"
+            )
+        job.inflight_waves.popleft()
+        next_step = job.next_step
+        if next_step is None:
+            raise RuntimeError("request lost its next outbound step")
+        job.step = (
+            job.inflight_waves[0].step if job.inflight_waves else next_step
+        )
+        if flight.is_prefill:
+            if flight.prefill_end is None or flight.prefill_end <= job.prefill_acked_offset:
+                raise RuntimeError("prefill completion offsets are not strictly increasing")
+            job.prefill_acked_offset = flight.prefill_end
+            current_chunks = int(getattr(self, "_prefill_current_chunks", 0))
+            current_bytes = int(getattr(self, "_prefill_current_bytes", 0))
+            current_reserved = int(
+                getattr(self, "_prefill_current_reserved_bytes", 0)
+            )
+            if (
+                job.prefill_inflight_bytes < flight.outbound_bytes
+                or job.prefill_reserved_bytes < flight.reserved_bytes
+                or current_chunks < 1
+                or current_bytes < flight.outbound_bytes
+                or current_reserved < flight.reserved_bytes
+            ):
+                raise RuntimeError("prefill in-flight telemetry underflow")
+            job.prefill_inflight_bytes -= flight.outbound_bytes
+            job.prefill_reserved_bytes -= flight.reserved_bytes
+            self._prefill_current_chunks = current_chunks - 1
+            self._prefill_current_bytes = current_bytes - flight.outbound_bytes
+            self._prefill_current_reserved_bytes = (
+                current_reserved - flight.reserved_bytes
+            )
+            self._prefill_completed_chunks = int(
+                getattr(self, "_prefill_completed_chunks", 0)
+            ) + 1
+            if frame.frame_type == FrameType.PREFILL_ACK:
+                self._prefill_acknowledged_chunks = int(
+                    getattr(self, "_prefill_acknowledged_chunks", 0)
+                ) + 1
+        return flight
 
     def _handle_return_value(
         self,
@@ -1614,7 +2506,12 @@ class DistributedPipelineEngine:
         active: dict[int, _GenerationJob],
         runner: StageRunner,
         downstream: socket.socket,
-    ) -> _PreparedRootWave | None:
+    ) -> (
+        _PreparedRootWave
+        | _PreparedPhysicalTreeWave
+        | _CommittedPhysicalTreeWave
+        | None
+    ):
         if isinstance(value, BaseException):
             raise RuntimeError(f"pipeline connection failed: {value}") from value
         frame, arrived = value
@@ -1624,37 +2521,67 @@ class DistributedPipelineEngine:
             FrameType.PREFILL_ACK,
             FrameType.TOKEN,
             FrameType.VERIFY_RESULT,
+            FrameType.TREE_PREPARE_RESULT,
+            FrameType.TREE_RESERVATION_COMMIT_RESULT,
         ):
             raise RuntimeError(f"unexpected return frame {frame.frame_type.name}")
+        if frame.frame_type == FrameType.TREE_PREPARE_RESULT:
+            return self._handle_tree_prepare_result(
+                frame,
+                arrived,
+                active,
+                runner,
+                downstream,
+            )
+        if frame.frame_type == FrameType.TREE_RESERVATION_COMMIT_RESULT:
+            return self._handle_tree_commit_result(
+                frame,
+                arrived,
+                active,
+                runner,
+                downstream,
+            )
+        if frame.request_id in getattr(self, "_leaf_routes", {}):
+            if frame.frame_type != FrameType.VERIFY_RESULT:
+                raise RuntimeError(
+                    f"virtual leaf {frame.request_id} returned {frame.frame_type.name}"
+                )
+            return self._handle_physical_tree_return(
+                frame,
+                arrived,
+                active,
+                runner,
+                downstream,
+            )
         job = active.get(frame.request_id)
         if job is None:
             raise RuntimeError(f"token for unknown request {frame.request_id}")
-        if frame.step != job.step:
-            raise RuntimeError(
-                f"request {frame.request_id} returned step {frame.step}, expected {job.step}"
-            )
+        flight = self._consume_inflight_return(job, frame)
         if job.cancel_requested.is_set():
             if not job.cancel_sent:
                 send_frame(downstream, FrameType.CANCEL, frame.request_id)
                 job.cancel_sent = True
-            active.pop(frame.request_id)
-            # A cancelled turn never retains: CANCEL already freed the KV on
-            # every stage, so the session bookkeeping must forget this chat.
-            self._drop_job_session(job)
-            self._retire_job(
-                job,
-                runner,
-                exception=GenerationCancelledError("generation cancelled"),
-            )
+            if not job.inflight_waves:
+                active.pop(frame.request_id)
+                # A cancelled turn never retains: CANCEL already freed the KV on
+                # every stage, so the session bookkeeping must forget this chat.
+                self._drop_job_session(job)
+                self._retire_job(
+                    job,
+                    runner,
+                    exception=GenerationCancelledError("generation cancelled"),
+                )
             return None
 
         if frame.frame_type == FrameType.PREFILL_ACK:
-            if job.prefill_offset >= int(job.request.input_ids.shape[1]):
+            if (
+                flight.prefill_end is None
+                or flight.prefill_end >= int(job.request.input_ids.shape[1])
+            ):
                 raise RuntimeError(
                     f"request {frame.request_id} returned an unexpected prefill ACK"
                 )
-            job.step += 1
-            return self._prepare_next_prefill_chunk(job)
+            return None
 
         if frame.frame_type == FrameType.VERIFY_RESULT:
             proposal = job.verify_proposal
@@ -1674,9 +2601,9 @@ class DistributedPipelineEngine:
                     controller,
                     proposal,
                     resolution,
-                    latency_seconds=max(1e-9, arrived - job.wave_started_at),
+                    latency_seconds=max(1e-9, arrived - flight.started_at),
                     transferred_bytes=(
-                        job.last_outbound_bytes + HEADER_BYTES + len(frame.payload)
+                        flight.outbound_bytes + HEADER_BYTES + len(frame.payload)
                     ),
                 )
             verify_base_tokens = job.verify_base_tokens
@@ -1710,7 +2637,6 @@ class DistributedPipelineEngine:
                     frame.request_id,
                     token_count=keep_tokens,
                 )
-            job.step += 1
             return self._prepare_decode_wave(
                 job,
                 runner,
@@ -1725,15 +2651,27 @@ class DistributedPipelineEngine:
         token = decode_token(frame)
         job.token_ids.append(token)
         job.arrivals.append(arrived)
+        if job.callback is not None:
+            try:
+                job.callback(
+                    job.request.client_id,
+                    token,
+                    prior_output_tokens,
+                    arrived,
+                )
+            except BaseException:
+                # Streaming is observational; a disconnected client must not
+                # poison the shared model pipeline for other users.
+                pass
         if self.speculation_controller is not None and prior_output_tokens > 0:
             with self._speculation_lock:
                 controller = self._speculation_controller_for_profile_locked(
                     job.speculation_profile
                 )
                 controller.record_classic(
-                    latency_seconds=max(1e-9, arrived - job.wave_started_at),
+                    latency_seconds=max(1e-9, arrived - flight.started_at),
                     transferred_bytes=(
-                        job.last_outbound_bytes + HEADER_BYTES + len(frame.payload)
+                        flight.outbound_bytes + HEADER_BYTES + len(frame.payload)
                     ),
                 )
 
@@ -1749,11 +2687,436 @@ class DistributedPipelineEngine:
             )
             return None
 
-        job.step += 1
         return self._prepare_decode_wave(
             job,
             runner,
             active_sequences=len(active),
+        )
+
+    def _handle_tree_prepare_result(
+        self,
+        frame: Any,
+        arrived: float,
+        active: dict[int, _GenerationJob],
+        runner: StageRunnerContract,
+        downstream: socket.socket,
+    ) -> _PreparedRootWave | _CommittedPhysicalTreeWave | None:
+        pending = getattr(self, "_pending_tree_reservation", None)
+        try:
+            if pending is None:
+                raise RuntimeError("late or unsolicited TREE_PREPARE_RESULT")
+            prepared = pending.prepared
+            job = prepared.job
+            parent_request_id = job.wire_id
+            if parent_request_id is None:
+                raise RuntimeError("pending tree quote lost its parent identity")
+            if pending.commit_sent:
+                raise RuntimeError("duplicate TREE_PREPARE_RESULT after COMMIT send")
+            if arrived > pending.deadline_at:
+                raise TimeoutError("TREE_PREPARE_RESULT arrived after its deadline")
+            quote = decode_tree_prepare(frame)
+            if frame.request_id != parent_request_id:
+                raise RuntimeError("TREE_PREPARE_RESULT parent identity mismatch")
+            if frame.step != prepared.step:
+                raise RuntimeError("TREE_PREPARE_RESULT step mismatch")
+            if quote.nonce != pending.nonce:
+                raise RuntimeError("TREE_PREPARE_RESULT nonce mismatch")
+            if quote.path_lengths != pending.path_lengths:
+                raise RuntimeError("TREE_PREPARE_RESULT path shape mismatch")
+            expected_remote_stages = self.stages - 1
+            if quote.stage_count != expected_remote_stages:
+                raise RuntimeError(
+                    "TREE_PREPARE_RESULT stage count mismatch: "
+                    f"got {quote.stage_count}, expected {expected_remote_stages}"
+                )
+            self._consume_queued_tree_prepare_result(frame, arrived)
+        except BaseException:
+            self._physical_tree_quote_protocol_failures = int(
+                getattr(self, "_physical_tree_quote_protocol_failures", 0)
+            ) + 1
+            raise
+
+        self._physical_tree_quote_rtt_seconds = float(
+            getattr(self, "_physical_tree_quote_rtt_seconds", 0.0)
+        ) + max(0.0, arrived - pending.sent_at)
+        if job.cancel_requested.is_set():
+            self._cancel_pending_tree_reservation(
+                job,
+                downstream,
+                reason="generation cancelled before tree quote consumption",
+            )
+            send_frame(downstream, FrameType.CANCEL, parent_request_id)
+            job.cancel_sent = True
+            active.pop(parent_request_id, None)
+            self._retire_job(
+                job,
+                runner,
+                exception=GenerationCancelledError("generation cancelled"),
+            )
+            return None
+
+        if quote.status is TreePrepareStatus.REJECT:
+            self._physical_tree_quote_rejected = int(
+                getattr(self, "_physical_tree_quote_rejected", 0)
+            ) + 1
+            reason_name = quote.rejection.name.lower()
+            reasons = getattr(self, "_physical_tree_quote_rejections", {})
+            reasons[reason_name] = int(reasons.get(reason_name, 0)) + 1
+            self._cancel_pending_tree_reservation(
+                job,
+                downstream,
+                reason=f"remote tree capacity rejected: {reason_name}",
+                count_metric=False,
+            )
+            return self._prepare_linear_or_classic_decode_wave(
+                job,
+                runner,
+                active_sequences=len(active),
+            )
+        if quote.status is not TreePrepareStatus.READY:
+            self._physical_tree_quote_protocol_failures = int(
+                getattr(self, "_physical_tree_quote_protocol_failures", 0)
+            ) + 1
+            raise RuntimeError("TREE_PREPARE_RESULT has an unknown status")
+
+        observed = self._root_tree_capacity_snapshot(
+            job,
+            prepared.proposal,
+            runner,
+            base_kv_tokens=prepared.base_kv_tokens,
+        )
+        if observed is None or observed != pending.root_snapshot:
+            self._physical_tree_quote_protocol_failures = int(
+                getattr(self, "_physical_tree_quote_protocol_failures", 0)
+            ) + 1
+            raise RuntimeError("root tree capacity changed before remote COMMIT")
+        send_frame(
+            downstream,
+            FrameType.TREE_RESERVATION_COMMIT,
+            parent_request_id,
+            step=prepared.step,
+            token_count=0,
+            payload=tree_reservation_payload(pending.nonce),
+        )
+        pending.commit_sent = True
+        pending.deadline_at = time.perf_counter() + self.config.socket_timeout_seconds
+        return None
+
+    def _handle_tree_commit_result(
+        self,
+        frame: Any,
+        arrived: float,
+        active: dict[int, _GenerationJob],
+        runner: StageRunnerContract,
+        downstream: socket.socket,
+    ) -> _CommittedPhysicalTreeWave | None:
+        """Arm root FORKs only after the final stage acknowledges COMMIT."""
+
+        del active, runner, downstream
+        pending = getattr(self, "_pending_tree_reservation", None)
+        try:
+            if pending is None:
+                raise RuntimeError(
+                    "late or unsolicited TREE_RESERVATION_COMMIT_RESULT"
+                )
+            if not pending.commit_sent:
+                raise RuntimeError("tree COMMIT result arrived before COMMIT send")
+            if pending.committed:
+                raise RuntimeError("duplicate TREE_RESERVATION_COMMIT_RESULT")
+            if arrived > pending.deadline_at:
+                raise TimeoutError(
+                    "TREE_RESERVATION_COMMIT_RESULT arrived after its deadline"
+                )
+            prepared = pending.prepared
+            parent_request_id = prepared.job.wire_id
+            if parent_request_id is None:
+                raise RuntimeError("pending tree commit lost its parent identity")
+            if frame.request_id != parent_request_id:
+                raise RuntimeError("tree COMMIT result parent identity mismatch")
+            if frame.step != prepared.step:
+                raise RuntimeError("tree COMMIT result step mismatch")
+            if decode_tree_reservation_nonce(frame) != pending.nonce:
+                raise RuntimeError("tree COMMIT result nonce mismatch")
+            expected_remote_stages = self.stages - 1
+            if frame.token_count != expected_remote_stages:
+                raise RuntimeError(
+                    "tree COMMIT result stage count mismatch: "
+                    f"got {frame.token_count}, expected {expected_remote_stages}"
+                )
+            self._consume_queued_tree_commit_result(frame, arrived)
+        except BaseException:
+            self._physical_tree_quote_protocol_failures = int(
+                getattr(self, "_physical_tree_quote_protocol_failures", 0)
+            ) + 1
+            raise
+
+        pending.committed = True
+        self._physical_tree_quote_ready = int(
+            getattr(self, "_physical_tree_quote_ready", 0)
+        ) + 1
+        return _CommittedPhysicalTreeWave(pending)
+
+    def _handle_physical_tree_return(
+        self,
+        frame: Any,
+        arrived: float,
+        active: dict[int, _GenerationJob],
+        runner: StageRunnerContract,
+        downstream: socket.socket,
+    ) -> _PreparedRootWave | _PreparedPhysicalTreeWave | None:
+        self._consume_queued_tree_return(frame.request_id, arrived)
+        parent_request_id = self._leaf_routes.get(frame.request_id)
+        if parent_request_id is None:
+            raise RuntimeError(f"return for unknown virtual leaf {frame.request_id}")
+        job = active.get(parent_request_id)
+        if job is None:
+            raise RuntimeError(
+                f"virtual leaf {frame.request_id} lost parent {parent_request_id}"
+            )
+        targets = decode_verify_result(frame)
+        outcome = self._physical_tree.accept_verify_result(
+            frame.request_id,
+            step=frame.step,
+            target_tokens=targets,
+            now=arrived,
+        )
+        self._sync_physical_leaf_routes()
+        if outcome is None:
+            return None
+        if isinstance(outcome, TombstoneDrain):
+            if outcome.wave_drained:
+                self._retire_terminal_physical_tree(outcome.parent_request_id)
+                self._finish_deferred_tree_retirement(
+                    job,
+                    active,
+                    runner,
+                )
+            return None
+        if isinstance(outcome, TreeAbortPlan):
+            self._physical_tree_aborted_waves = int(
+                getattr(self, "_physical_tree_aborted_waves", 0)
+            ) + 1
+            if outcome.route_fatal:
+                raise RuntimeError(
+                    "physical tree route is inconsistent and must be replayed: "
+                    f"{outcome.reason}"
+                )
+            for command in outcome.commands:
+                deferred_cancel = self._apply_physical_tree_cleanup_command(
+                    outcome.parent_request_id,
+                    command,
+                    runner,
+                    downstream,
+                )
+                if deferred_cancel is not None:
+                    self._apply_physical_tree_cancel_commands(
+                        job,
+                        (deferred_cancel,),
+                        runner,
+                        downstream,
+                    )
+            self._retire_terminal_physical_tree(outcome.parent_request_id)
+            return self._prepare_classic_decode_wave(job)
+        if not isinstance(outcome, TreeCommitPlan):
+            raise TypeError("physical tree coordinator returned an unknown plan")
+
+        if outcome.parent_request_id != parent_request_id:
+            raise RuntimeError("physical tree commit belongs to another parent")
+        if job.inflight_waves:
+            raise RuntimeError("physical tree parent unexpectedly has a wave in flight")
+
+        # Cancellation during an ordered commit is deferred by the state
+        # machine until END losers -> PROMOTE -> TRUNCATE is fully enqueued.
+        if job.cancel_requested.is_set():
+            self._physical_tree.request_cancel(parent_request_id)
+        deferred_parent_cancel: CancelCommand | None = None
+        for command in outcome.commands:
+            if job.cancel_requested.is_set():
+                self._physical_tree.request_cancel(parent_request_id)
+            planned_cancel = self._apply_physical_tree_cleanup_command(
+                parent_request_id,
+                command,
+                runner,
+                downstream,
+            )
+            if planned_cancel is not None:
+                if deferred_parent_cancel is not None:
+                    raise RuntimeError("physical tree emitted duplicate parent cancellation")
+                deferred_parent_cancel = planned_cancel
+
+        job.step = outcome.next_step
+        job.next_step = outcome.next_step
+        expected_parent_tokens = (
+            self._physical_tree.wave(parent_request_id).base_kv_tokens
+            + 1
+            + outcome.resolution.accepted_draft_tokens
+        )
+        if runner.sequence_length(parent_request_id) != expected_parent_tokens:
+            raise RuntimeError("physical tree commit produced the wrong parent KV length")
+
+        if job.cancel_requested.is_set() and deferred_parent_cancel is None:
+            cancellation = self._physical_tree.request_cancel(parent_request_id)
+            if cancellation.commands:
+                if len(cancellation.commands) != 1:
+                    raise RuntimeError("committed tree cancellation must target only parent")
+                deferred_parent_cancel = cancellation.commands[0]
+        if deferred_parent_cancel is not None:
+            self._apply_physical_tree_cancel_commands(
+                job,
+                (deferred_parent_cancel,),
+                runner,
+                downstream,
+            )
+
+        self._sync_physical_leaf_routes()
+        self._physical_tree_committed_waves = int(
+            getattr(self, "_physical_tree_committed_waves", 0)
+        ) + 1
+        self._retire_terminal_physical_tree(parent_request_id)
+        if job.cancel_requested.is_set():
+            active.pop(parent_request_id, None)
+            self._retire_job(
+                job,
+                runner,
+                exception=GenerationCancelledError("generation cancelled"),
+                began=not job.physical_tree_parent_closed,
+            )
+            return None
+
+        # Publishing happens strictly after every physical mutation above.
+        reason = self._append_verified_tokens(
+            job,
+            outcome.resolution.emitted_tokens,
+            arrived,
+        )
+        if reason is not None:
+            send_frame(downstream, FrameType.END, parent_request_id)
+            active.pop(parent_request_id)
+            self._retire_job(
+                job,
+                runner,
+                result=self._generation_output(job, reason),
+            )
+            return None
+        return self._prepare_decode_wave(
+            job,
+            runner,
+            active_sequences=len(active),
+        )
+
+    def _apply_physical_tree_cleanup_command(
+        self,
+        parent_request_id: int,
+        command: EndCommand | PromoteCommand | TruncateCommand,
+        runner: StageRunnerContract,
+        downstream: socket.socket,
+    ) -> CancelCommand | None:
+        if isinstance(command, EndCommand):
+            if command.request_id not in self._physical_tree_live_children:
+                raise RuntimeError("physical tree END targets a non-live leaf")
+            runner.end(command.request_id)
+            self._physical_tree_live_children.remove(command.request_id)
+            send_frame(downstream, FrameType.END, command.request_id)
+        elif isinstance(command, PromoteCommand):
+            if command.parent_request_id != parent_request_id:
+                raise RuntimeError("physical tree PROMOTE targets another parent")
+            if command.child_request_id not in self._physical_tree_live_children:
+                raise RuntimeError("physical tree PROMOTE targets a non-live carrier")
+            promote_request = getattr(runner, "promote_request", None)
+            if not callable(promote_request):
+                raise TypeError("root runner lost its exact PROMOTE capability")
+            promote_request(command.parent_request_id, command.child_request_id)
+            self._physical_tree_live_children.remove(command.child_request_id)
+            send_frame(
+                downstream,
+                FrameType.PROMOTE,
+                command.parent_request_id,
+                payload=branch_request_payload(command.child_request_id),
+            )
+        elif isinstance(command, TruncateCommand):
+            if command.request_id != parent_request_id:
+                raise RuntimeError("physical tree TRUNCATE targets another parent")
+            runner.truncate(command.request_id, command.keep_tokens)
+            send_frame(
+                downstream,
+                FrameType.TRUNCATE,
+                command.request_id,
+                token_count=command.keep_tokens,
+            )
+        else:
+            raise TypeError("unknown physical tree cleanup command")
+        deferred = self._physical_tree.confirm_cleanup_command(
+            parent_request_id,
+            command,
+        )
+        self._sync_physical_leaf_routes()
+        return deferred
+
+    def _apply_physical_tree_cancel_commands(
+        self,
+        job: _GenerationJob,
+        commands: tuple[CancelCommand, ...],
+        runner: StageRunnerContract,
+        downstream: socket.socket,
+    ) -> None:
+        parent_request_id = job.wire_id
+        if parent_request_id is None:
+            raise RuntimeError("physical tree cancellation lost its parent")
+        for command in commands:
+            request_id = command.request_id
+            if request_id in self._physical_tree_live_children:
+                runner.end(request_id)
+                self._physical_tree_live_children.remove(request_id)
+            elif request_id == parent_request_id:
+                if not job.physical_tree_parent_closed:
+                    runner.end(parent_request_id)
+                    job.physical_tree_parent_closed = True
+                    with self._callback_lock:
+                        self._callback_routes.pop(parent_request_id, None)
+                job.cancel_sent = True
+            else:
+                raise RuntimeError(
+                    f"physical tree CANCEL targets inactive request {request_id}"
+                )
+            send_frame(downstream, FrameType.CANCEL, request_id)
+        self._sync_physical_leaf_routes()
+
+    def _retire_terminal_physical_tree(self, parent_request_id: int) -> bool:
+        coordinator = getattr(self, "_physical_tree", None)
+        if coordinator is None or parent_request_id not in coordinator.tree_by_parent:
+            return False
+        wave = coordinator.wave(parent_request_id)
+        self._sync_physical_leaf_routes()
+        if wave.phase not in (TreePhase.COMMITTED, TreePhase.ABORTED):
+            return False
+        if any(
+            virtual_id in self._leaf_routes
+            for virtual_id in wave.virtual_routes
+        ):
+            return False
+        coordinator.retire_wave(parent_request_id)
+        return True
+
+    def _finish_deferred_tree_retirement(
+        self,
+        job: _GenerationJob,
+        active: dict[int, _GenerationJob],
+        runner: StageRunnerContract,
+    ) -> None:
+        result = job.physical_tree_pending_result
+        exception = job.physical_tree_pending_exception
+        if result is None and exception is None:
+            return
+        if job.wire_id is not None:
+            active.pop(job.wire_id, None)
+        job.physical_tree_pending_result = None
+        job.physical_tree_pending_exception = None
+        self._retire_job(
+            job,
+            runner,
+            result=result,
+            exception=exception,
+            began=not job.physical_tree_parent_closed,
         )
 
     def _append_verified_tokens(
@@ -1790,7 +3153,98 @@ class DistributedPipelineEngine:
         runner: StageRunner,
         *,
         active_sequences: int,
+    ) -> _PreparedRootWave | _PreparedPhysicalTreeWave:
+        if job.wire_id is None or not job.token_ids:
+            raise RuntimeError("decode job has no active token history")
+        remaining = job.request.max_new_tokens - len(job.token_ids)
+        tree_provider = getattr(self, "tree_draft_provider", None)
+        coordinator = getattr(self, "_physical_tree", None)
+        if (
+            tree_provider is not None
+            and remaining > 1
+            and (
+                getattr(self, "_pending_tree_reservation", None) is not None
+                or bool(getattr(coordinator, "tree_by_parent", {}))
+                or bool(getattr(self, "_physical_tree_live_children", set()))
+            )
+        ):
+            self._physical_tree_quote_singleflight_fallbacks = int(
+                getattr(self, "_physical_tree_quote_singleflight_fallbacks", 0)
+            ) + 1
+            return self._prepare_linear_or_classic_decode_wave(
+                job,
+                runner,
+                active_sequences=active_sequences,
+            )
+        if (
+            tree_provider is not None
+            and coordinator is not None
+            and remaining > 1
+            and job.wire_id not in coordinator.tree_by_parent
+        ):
+            prompt_history = tuple(
+                int(token) for token in job.request.input_ids.reshape(-1).tolist()
+            )
+            history = (*prompt_history, *job.token_ids)
+            base_kv_tokens = runner.sequence_length(job.wire_id)
+            if base_kv_tokens != len(history) - 1:
+                raise RuntimeError(
+                    "physical tree parent KV does not match its visible pending token"
+                )
+            maximum_context = int(getattr(self, "maximum_context", 0))
+            maximum_depth = min(
+                remaining - 1,
+                self.config.speculative_max_draft_tokens,
+                _sealed_wave_token_limit(self.config) - 1,
+                self.config.max_speculative_branch_tokens - base_kv_tokens - 1,
+                maximum_context - base_kv_tokens - 1,
+            )
+            available_branches = (
+                self.config.max_speculative_branches
+                - len(getattr(self, "_physical_tree_live_children", ()))
+            )
+            if maximum_depth > 0 and available_branches > 0:
+                proposal = prepare_tree_macro_wave(
+                    tree_provider,
+                    history,
+                    request_id=job.wire_id,
+                    ordinal=job.step,
+                    parent_kv_version=KVVersion(base_kv_tokens),
+                    max_tokens=maximum_depth,
+                    max_branches=available_branches,
+                )
+                if proposal is not None:
+                    if self._physical_tree_preflight(
+                        job,
+                        proposal,
+                        runner,
+                        base_kv_tokens=base_kv_tokens,
+                    ):
+                        return _PreparedPhysicalTreeWave(
+                            job=job,
+                            proposal=proposal,
+                            base_kv_tokens=base_kv_tokens,
+                            pending_token=job.token_ids[-1],
+                            step=job.next_step if job.next_step is not None else job.step,
+                            active_sequences=active_sequences,
+                        )
+                    if proposal.tree.state is MacroWaveState.OPEN:
+                        proposal.tree.rollback()
+        return self._prepare_linear_or_classic_decode_wave(
+            job,
+            runner,
+            active_sequences=active_sequences,
+        )
+
+    def _prepare_linear_or_classic_decode_wave(
+        self,
+        job: _GenerationJob,
+        runner: StageRunner,
+        *,
+        active_sequences: int,
     ) -> _PreparedRootWave:
+        """Preserve the production linear controller as the exact fallback."""
+
         if job.wire_id is None or not job.token_ids:
             raise RuntimeError("decode job has no active token history")
         remaining = job.request.max_new_tokens - len(job.token_ids)
@@ -1856,10 +3310,35 @@ class DistributedPipelineEngine:
                 f"{len(input_tokens)} > {sealed_wave_token_limit}"
             )
         next_ids = torch.tensor([input_tokens], dtype=torch.long)
+        next_step = job.next_step
+        if next_step is None:
+            raise RuntimeError("decode job lost its next outbound step")
+        if job.inflight_waves:
+            raise RuntimeError("decode cannot prepare while another wave is in flight")
         return _PreparedRootWave(
             job=job,
             input_ids=next_ids,
             frame_type=frame_type,
+            step=next_step,
+        )
+
+    def _prepare_classic_decode_wave(self, job: _GenerationJob) -> _PreparedRootWave:
+        """Prepare one greedy token without re-entering a rejected tree."""
+
+        if job.wire_id is None or not job.token_ids:
+            raise RuntimeError("decode job has no active token history")
+        if job.inflight_waves:
+            raise RuntimeError("decode cannot prepare while another wave is in flight")
+        next_step = job.next_step
+        if next_step is None:
+            raise RuntimeError("decode job lost its next outbound step")
+        job.verify_proposal = None
+        job.verify_base_tokens = 0
+        return _PreparedRootWave(
+            job=job,
+            input_ids=torch.tensor([[job.token_ids[-1]]], dtype=torch.long),
+            frame_type=FrameType.ACTIVATION,
+            step=next_step,
         )
 
     def _speculation_controller_for_profile_locked(
@@ -2058,12 +3537,15 @@ class DistributedPipelineEngine:
         began: bool = True,
         retained: bool = False,
     ) -> None:
+        self._discard_pending_tree_reservation(job)
+        self._discard_physical_tree_state(job, runner)
         proposal = job.verify_proposal
         if proposal is not None:
             if proposal.tree.state is MacroWaveState.OPEN:
                 proposal.tree.rollback()
             job.verify_proposal = None
             job.verify_base_tokens = 0
+        self._discard_inflight_waves(job)
         if began and job.wire_id is not None:
             if not retained:
                 # A retained wire keeps its root KV; the session machinery owns
@@ -2082,12 +3564,193 @@ class DistributedPipelineEngine:
         else:
             job.future.set_exception(exception or RuntimeError("generation failed"))
 
+    def _discard_pending_tree_reservation(self, job: _GenerationJob) -> None:
+        pending = getattr(self, "_pending_tree_reservation", None)
+        if pending is None or pending.prepared.job is not job:
+            return
+        proposal = pending.prepared.proposal
+        if proposal.tree.state is MacroWaveState.OPEN:
+            proposal.tree.rollback()
+        self._pending_tree_reservation = None
+
+    def _discard_physical_tree_state(
+        self,
+        job: _GenerationJob,
+        runner: StageRunnerContract,
+    ) -> None:
+        """Release root-only leaf state while a fatal route is being torn down."""
+
+        parent_request_id = job.wire_id
+        coordinator = getattr(self, "_physical_tree", None)
+        if (
+            parent_request_id is None
+            or coordinator is None
+            or parent_request_id not in coordinator.tree_by_parent
+        ):
+            return
+        wave = coordinator.tree_by_parent.pop(parent_request_id)
+        if wave.proposal.tree.state is MacroWaveState.OPEN:
+            wave.proposal.tree.rollback()
+        live_children = getattr(self, "_physical_tree_live_children", set())
+        virtual_ids = tuple(wave.virtual_routes)
+        lock = getattr(self, "_tree_return_lock", None)
+        if lock is None:
+            for virtual_id in virtual_ids:
+                self._leaf_routes.pop(virtual_id, None)
+                getattr(self, "_queued_tree_returns", {}).pop(virtual_id, None)
+        else:
+            with lock:
+                for virtual_id in virtual_ids:
+                    self._leaf_routes.pop(virtual_id, None)
+                    self._queued_tree_returns.pop(virtual_id, None)
+        for virtual_id in virtual_ids:
+            coordinator.leaf_route.pop(virtual_id, None)
+            if virtual_id in live_children:
+                runner.end(virtual_id)
+                live_children.remove(virtual_id)
+
+    def _discard_inflight_waves(self, job: _GenerationJob) -> None:
+        prefill = tuple(wave for wave in job.inflight_waves if wave.is_prefill)
+        if prefill:
+            released_bytes = sum(wave.outbound_bytes for wave in prefill)
+            released_reserved = sum(wave.reserved_bytes for wave in prefill)
+            current_chunks = int(getattr(self, "_prefill_current_chunks", 0))
+            current_bytes = int(getattr(self, "_prefill_current_bytes", 0))
+            current_reserved = int(
+                getattr(self, "_prefill_current_reserved_bytes", 0)
+            )
+            if (
+                current_chunks < len(prefill)
+                or current_bytes < released_bytes
+                or current_reserved < released_reserved
+            ):
+                raise RuntimeError("prefill retirement telemetry underflow")
+            self._prefill_current_chunks = current_chunks - len(prefill)
+            self._prefill_current_bytes = current_bytes - released_bytes
+            self._prefill_current_reserved_bytes = current_reserved - released_reserved
+        job.inflight_waves.clear()
+        job.prefill_inflight_bytes = 0
+        job.prefill_reserved_bytes = 0
+
     def _check_pipeline_timeouts(self, active: dict[int, _GenerationJob]) -> None:
+        pending_quote = getattr(self, "_pending_tree_reservation", None)
+        if pending_quote is not None:
+            observed_at = time.perf_counter()
+            waiting_for_commit = pending_quote.commit_sent
+            queue_name = (
+                "_queued_tree_commit_results"
+                if waiting_for_commit
+                else "_queued_tree_prepare_results"
+            )
+            lock = getattr(self, "_tree_return_lock", None)
+            if lock is None:
+                queued_quote_result = False
+            else:
+                with lock:
+                    queued_quote_result = any(
+                        request_id == pending_quote.prepared.job.wire_id
+                        and step == pending_quote.prepared.step
+                        for request_id, step, _arrived in getattr(
+                            self, queue_name, ()
+                        )
+                    )
+            if observed_at > pending_quote.deadline_at and not queued_quote_result:
+                self._physical_tree_quote_timeouts = int(
+                    getattr(self, "_physical_tree_quote_timeouts", 0)
+                ) + 1
+                self._cancel_pending_tree_reservation(
+                    pending_quote.prepared.job,
+                    pending_quote.downstream,
+                    reason=(
+                        "TREE_RESERVATION_COMMIT_RESULT timeout"
+                        if waiting_for_commit
+                        else "TREE_PREPARE_RESULT timeout"
+                    ),
+                    count_metric=False,
+                )
+                raise TimeoutError(
+                    (
+                        "TREE_RESERVATION_COMMIT_RESULT"
+                        if waiting_for_commit
+                        else "TREE_PREPARE_RESULT"
+                    )
+                    + " timeout for parent request "
+                    f"{pending_quote.prepared.job.wire_id}"
+                )
+        coordinator = getattr(self, "_physical_tree", None)
+        if coordinator is not None:
+            lock = getattr(self, "_tree_return_lock", None)
+            if lock is None:
+                queued_request_ids: set[int] = set()
+            else:
+                with lock:
+                    queued_request_ids = {
+                        request_id
+                        for request_id, arrivals in self._queued_tree_returns.items()
+                        if arrivals
+                    }
+            observed_at = time.perf_counter()
+            protected_wave = False
+            expired_unprotected: list[tuple[int, int]] = []
+            for wave in tuple(coordinator.tree_by_parent.values()):
+                outstanding = tuple(
+                    leaf
+                    for leaf in wave.ordered_leaves
+                    if leaf.verify_sent
+                    and leaf.result is None
+                    and not leaf.return_drained
+                )
+                if not outstanding or observed_at < wave.deadline_at:
+                    continue
+                # A timestamped return already owned by the scheduler must be
+                # accepted (and judged by arrival time) before expiring this
+                # wave. It does not shield an unrelated expired wave.
+                if any(
+                    leaf.virtual_request_id in queued_request_ids
+                    for leaf in outstanding
+                ):
+                    protected_wave = True
+                    continue
+                oldest = min(
+                    outstanding,
+                    key=lambda leaf: (
+                        float("inf")
+                        if leaf.verify_sent_at is None
+                        else leaf.verify_sent_at,
+                        leaf.ordinal,
+                    ),
+                )
+                expired_unprotected.append(
+                    (wave.parent_request_id, oldest.virtual_request_id)
+                )
+            if expired_unprotected and protected_wave:
+                parent_request_id, oldest_virtual_id = expired_unprotected[0]
+                self._physical_tree_aborted_waves = int(
+                    getattr(self, "_physical_tree_aborted_waves", 0)
+                ) + 1
+                raise TimeoutError(
+                    "physical tree VERIFY_RESULT timeout for oldest virtual request "
+                    f"{oldest_virtual_id} (parent {parent_request_id})"
+                )
+            expired_trees = (
+                coordinator.check_timeouts(observed_at)
+                if expired_unprotected and not protected_wave
+                else ()
+            )
+            if expired_trees:
+                self._sync_physical_leaf_routes()
+                self._physical_tree_aborted_waves = int(
+                    getattr(self, "_physical_tree_aborted_waves", 0)
+                ) + len(expired_trees)
+                oldest = expired_trees[0]
+                raise TimeoutError(oldest.reason)
         now = time.monotonic()
         expired = [
             job.request.client_id
             for job in active.values()
-            if job.last_sent_at and now - job.last_sent_at > self.config.socket_timeout_seconds
+            if job.inflight_waves
+            and now - job.inflight_waves[0].sent_at
+            > self.config.socket_timeout_seconds
         ]
         if expired:
             raise TimeoutError(f"timed out waiting for request {expired[0]}")
@@ -2116,6 +3779,161 @@ class DistributedPipelineEngine:
             for job in batch:
                 self._retire_job(job, self._require_runner(), exception=error, began=False)
 
+    def _physical_tree_preflight(
+        self,
+        job: _GenerationJob,
+        proposal: MacroWaveProposal,
+        runner: StageRunnerContract,
+        *,
+        base_kv_tokens: int,
+    ) -> bool:
+        """Atomically price a flat leaf set before the first physical FORK.
+
+        A capacity miss is a clean opt-out because neither root nor wire state
+        has changed. Contract/type mismatches raise: treating an unverifiable
+        byte estimate as spare capacity would defeat the sealed limits.
+        """
+
+        return self._root_tree_capacity_snapshot(
+            job,
+            proposal,
+            runner,
+            base_kv_tokens=base_kv_tokens,
+        ) is not None
+
+    def _root_tree_capacity_snapshot(
+        self,
+        job: _GenerationJob,
+        proposal: MacroWaveProposal,
+        runner: StageRunnerContract,
+        *,
+        base_kv_tokens: int,
+    ) -> _RootTreeCapacitySnapshot | None:
+        """Price and seal root state without mutating any request KV."""
+
+        parent_request_id = job.wire_id
+        if parent_request_id is None:
+            raise RuntimeError("physical tree parent has no wire identity")
+        limits = (
+            self.config.max_speculative_branches,
+            self.config.max_speculative_branch_tokens,
+            self.config.max_speculative_kv_bytes,
+        )
+        if not all(value > 0 for value in limits):
+            return None
+        if job.inflight_waves:
+            return None
+        if job.next_step is None or job.next_step != job.step:
+            return None
+        prompt_tokens = int(job.request.input_ids.shape[1])
+        if (
+            job.prefill_offset != prompt_tokens
+            or job.prefill_acked_offset != prompt_tokens
+        ):
+            return None
+        parent_tokens = runner.sequence_length(parent_request_id)
+        if base_kv_tokens < 1 or parent_tokens != base_kv_tokens:
+            return None
+        if proposal.tree.ledger.base_version != KVVersion(base_kv_tokens):
+            raise RuntimeError("physical tree proposal is bound to another KV version")
+
+        paths = proposal.candidate_paths
+        live_child_ids = tuple(
+            sorted(getattr(self, "_physical_tree_live_children", set()))
+        )
+        if len(live_child_ids) + len(paths) > self.config.max_speculative_branches:
+            return None
+        maximum_depth = proposal.max_depth
+        if 1 + maximum_depth > _sealed_wave_token_limit(self.config):
+            return None
+        if (
+            base_kv_tokens + 1 + maximum_depth
+            > self.config.max_speculative_branch_tokens
+        ):
+            return None
+        maximum_context = int(getattr(self, "maximum_context", 0))
+        if (
+            maximum_context < 1
+            or base_kv_tokens + 1 + maximum_depth > maximum_context
+        ):
+            return None
+
+        request_cache_bytes = getattr(runner, "request_cache_bytes", None)
+        project_cache_bytes = getattr(runner, "project_request_cache_bytes", None)
+        fork_request = getattr(runner, "fork_request", None)
+        promote_request = getattr(runner, "promote_request", None)
+        if not all(
+            callable(method)
+            for method in (
+                request_cache_bytes,
+                project_cache_bytes,
+                fork_request,
+                promote_request,
+            )
+        ):
+            return None
+        if getattr(runner, "max_active_requests", None) == 1:
+            return None
+
+        parent_bytes = request_cache_bytes(parent_request_id)
+        if (
+            not isinstance(parent_bytes, int)
+            or isinstance(parent_bytes, bool)
+            or parent_bytes < 1
+        ):
+            raise TypeError("root request_cache_bytes must return a positive integer")
+        current_branch_bytes = self._physical_tree_live_kv_bytes(runner)
+        projected_branch_bytes = 0
+        for path in paths:
+            projected = project_cache_bytes(parent_request_id, 1 + len(path))
+            if (
+                not isinstance(projected, int)
+                or isinstance(projected, bool)
+                or projected < parent_bytes
+            ):
+                raise TypeError(
+                    "root project_request_cache_bytes returned an invalid projection"
+                )
+            projected_branch_bytes += projected
+        projected_total = current_branch_bytes + projected_branch_bytes
+        if projected_total > self.config.max_speculative_kv_bytes:
+            return None
+        if runner.sequence_length(parent_request_id) != parent_tokens:
+            raise RuntimeError("root tree projection mutated parent sequence length")
+        if request_cache_bytes(parent_request_id) != parent_bytes:
+            raise RuntimeError("root tree projection mutated parent cache bytes")
+        if tuple(
+            sorted(getattr(self, "_physical_tree_live_children", set()))
+        ) != live_child_ids:
+            raise RuntimeError("root tree projection mutated live child identities")
+        if self._physical_tree_live_kv_bytes(runner) != current_branch_bytes:
+            raise RuntimeError("root tree projection mutated live child KV bytes")
+        return _RootTreeCapacitySnapshot(
+            parent_tokens=parent_tokens,
+            parent_cache_bytes=parent_bytes,
+            live_child_ids=live_child_ids,
+            live_child_bytes=current_branch_bytes,
+            projected_kv_bytes=projected_total,
+        )
+
+    def _physical_tree_live_kv_bytes(self, runner: StageRunnerContract) -> int:
+        request_cache_bytes = getattr(runner, "request_cache_bytes", None)
+        if not callable(request_cache_bytes):
+            raise TypeError("root runner cannot measure physical leaf KV")
+        total = 0
+        for request_id in sorted(
+            getattr(self, "_physical_tree_live_children", set())
+        ):
+            measured = request_cache_bytes(request_id)
+            if (
+                not isinstance(measured, int)
+                or isinstance(measured, bool)
+                or measured < 0
+            ):
+                raise TypeError("root request_cache_bytes returned invalid leaf KV bytes")
+            total += measured
+        return total
+
     def _send_activation(
         self,
         downstream: socket.socket,
@@ -2139,9 +3957,573 @@ class DistributedPipelineEngine:
             emulator=emulator,
         )
 
+    def _record_dispatched_wave(
+        self,
+        wave: _PreparedRootWave,
+        *,
+        started_at: float,
+        sent_at: float,
+        outbound_bytes: int,
+    ) -> None:
+        job = wave.job
+        next_step = job.next_step
+        if next_step is None or wave.step != next_step:
+            raise RuntimeError(
+                f"request {job.wire_id} dispatched step {wave.step}, "
+                f"expected immutable step {next_step}"
+            )
+        if job.inflight_waves and wave.step != job.inflight_waves[-1].step + 1:
+            raise RuntimeError("request outbound steps are not contiguous")
+        if not job.inflight_waves and job.step != wave.step:
+            raise RuntimeError(
+                f"request {job.wire_id} dispatched step {wave.step}, "
+                f"but expects return step {job.step}"
+            )
+        flight = _InflightWave(
+            step=wave.step,
+            frame_type=wave.frame_type,
+            prefill_end=wave.prefill_end,
+            started_at=started_at,
+            sent_at=sent_at,
+            outbound_bytes=outbound_bytes,
+            reserved_bytes=wave.reserved_bytes,
+        )
+        job.inflight_waves.append(flight)
+        job.next_step = wave.step + 1
+        job.last_sent_at = sent_at
+        job.last_outbound_bytes = outbound_bytes
+        if not flight.is_prefill:
+            return
+        if flight.prefill_end is None or flight.prefill_end <= job.prefill_offset:
+            raise RuntimeError("prefill dispatch offsets are not strictly increasing")
+        job.prefill_offset = flight.prefill_end
+        job.prefill_inflight_bytes += outbound_bytes
+        job.prefill_reserved_bytes += wave.reserved_bytes
+        self._prefill_current_chunks = int(
+            getattr(self, "_prefill_current_chunks", 0)
+        ) + 1
+        self._prefill_current_bytes = int(
+            getattr(self, "_prefill_current_bytes", 0)
+        ) + outbound_bytes
+        self._prefill_current_reserved_bytes = int(
+            getattr(self, "_prefill_current_reserved_bytes", 0)
+        ) + wave.reserved_bytes
+        self._prefill_high_water_chunks = max(
+            int(getattr(self, "_prefill_high_water_chunks", 0)),
+            self._prefill_current_chunks,
+        )
+        self._prefill_high_water_bytes = max(
+            int(getattr(self, "_prefill_high_water_bytes", 0)),
+            self._prefill_current_bytes,
+        )
+        self._prefill_high_water_reserved_bytes = max(
+            int(getattr(self, "_prefill_high_water_reserved_bytes", 0)),
+            self._prefill_current_reserved_bytes,
+        )
+        request_chunks = sum(1 for current in job.inflight_waves if current.is_prefill)
+        self._prefill_max_request_chunks = max(
+            int(getattr(self, "_prefill_max_request_chunks", 0)),
+            request_chunks,
+        )
+        self._prefill_max_request_bytes = max(
+            int(getattr(self, "_prefill_max_request_bytes", 0)),
+            job.prefill_inflight_bytes,
+        )
+        self._prefill_max_request_reserved_bytes = max(
+            int(getattr(self, "_prefill_max_request_reserved_bytes", 0)),
+            job.prefill_reserved_bytes,
+        )
+        self._prefill_dispatched_chunks = int(
+            getattr(self, "_prefill_dispatched_chunks", 0)
+        ) + 1
+
+    def _dispatch_physical_tree_wave(
+        self,
+        prepared: _PreparedPhysicalTreeWave,
+        runner: StageRunnerContract,
+        downstream: socket.socket,
+        emulator: LinkEmulator,
+    ) -> _PreparedRootWave | None:
+        """Request a route-wide quote without mutating root or remote KV."""
+
+        job = prepared.job
+        parent_request_id = job.wire_id
+        if parent_request_id is None:
+            raise RuntimeError("physical tree parent has no wire identity")
+        if prepared.step != job.next_step or prepared.step != job.step:
+            raise RuntimeError("prepared physical tree has a stale inherited step")
+        if job.cancel_requested.is_set():
+            if prepared.proposal.tree.state is MacroWaveState.OPEN:
+                prepared.proposal.tree.rollback()
+            return None
+        coordinator = getattr(self, "_physical_tree", None)
+        if (
+            getattr(self, "_pending_tree_reservation", None) is not None
+            or bool(getattr(coordinator, "tree_by_parent", {}))
+            or bool(getattr(self, "_physical_tree_live_children", set()))
+        ):
+            if prepared.proposal.tree.state is MacroWaveState.OPEN:
+                prepared.proposal.tree.rollback()
+            self._physical_tree_quote_singleflight_fallbacks = int(
+                getattr(self, "_physical_tree_quote_singleflight_fallbacks", 0)
+            ) + 1
+            return self._prepare_linear_or_classic_decode_wave(
+                job,
+                runner,
+                active_sequences=prepared.active_sequences,
+            )
+        root_snapshot = self._root_tree_capacity_snapshot(
+            job,
+            prepared.proposal,
+            runner,
+            base_kv_tokens=prepared.base_kv_tokens,
+        )
+        if root_snapshot is None:
+            if prepared.proposal.tree.state is MacroWaveState.OPEN:
+                prepared.proposal.tree.rollback()
+            return self._prepare_linear_or_classic_decode_wave(
+                job,
+                runner,
+                active_sequences=prepared.active_sequences,
+            )
+
+        ordered_paths = tuple(
+            sorted(
+                prepared.proposal.candidate_paths,
+                key=lambda path: (len(path), path),
+            )
+        )
+        path_lengths = tuple(len(path) for path in ordered_paths)
+        nonce = self._next_tree_quote_nonce()
+        sent_at = time.perf_counter()
+        pending = _PendingTreeReservation(
+            prepared=prepared,
+            nonce=nonce,
+            path_lengths=path_lengths,
+            root_snapshot=root_snapshot,
+            sent_at=sent_at,
+            deadline_at=sent_at + self.config.socket_timeout_seconds,
+            downstream=downstream,
+        )
+        self._pending_tree_reservation = pending
+        self._physical_tree_quote_requests = int(
+            getattr(self, "_physical_tree_quote_requests", 0)
+        ) + 1
+        send_frame(
+            downstream,
+            FrameType.TREE_PREPARE,
+            parent_request_id,
+            step=prepared.step,
+            token_count=len(path_lengths),
+            payload=tree_prepare_payload(nonce, path_lengths),
+            emulator=emulator,
+        )
+        return None
+
+    def _next_tree_quote_nonce(self) -> int:
+        nonce = int(getattr(self, "_tree_quote_nonce_counter", 0)) + 1
+        if nonce > (1 << 64) - 1:
+            raise RuntimeError("tree capacity quote nonce space is exhausted")
+        self._tree_quote_nonce_counter = nonce
+        return nonce
+
+    def _dispatch_committed_physical_tree_wave(
+        self,
+        committed: _CommittedPhysicalTreeWave,
+        runner: StageRunnerContract,
+        downstream: socket.socket,
+        emulator: LinkEmulator,
+    ) -> _PreparedRootWave | None:
+        """Consume a committed route quote exactly once, then issue FORK*/VERIFY*."""
+
+        pending = committed.pending
+        if getattr(self, "_pending_tree_reservation", None) is not pending:
+            raise RuntimeError("committed physical tree lost its pending reservation")
+        if not pending.committed:
+            raise RuntimeError(
+                "physical tree cannot FORK before route-wide reservation COMMIT result"
+            )
+        prepared = pending.prepared
+        job = prepared.job
+        parent_request_id = job.wire_id
+        if parent_request_id is None:
+            raise RuntimeError("physical tree parent has no wire identity")
+        if job.cancel_requested.is_set():
+            self._cancel_pending_tree_reservation(
+                job,
+                downstream,
+                reason="generation cancelled after tree COMMIT and before FORK",
+            )
+            return None
+        observed = self._root_tree_capacity_snapshot(
+            job,
+            prepared.proposal,
+            runner,
+            base_kv_tokens=prepared.base_kv_tokens,
+        )
+        if observed is None or observed != pending.root_snapshot:
+            self._cancel_pending_tree_reservation(
+                job,
+                downstream,
+                reason="root capacity changed after tree COMMIT",
+                count_metric=False,
+            )
+            self._physical_tree_quote_protocol_failures = int(
+                getattr(self, "_physical_tree_quote_protocol_failures", 0)
+            ) + 1
+            raise RuntimeError("root tree capacity changed after remote COMMIT")
+
+        virtual_ids = tuple(
+            self._next_request_id()
+            for _path in prepared.proposal.candidate_paths
+        )
+        coordinator = self._physical_tree
+        wave = coordinator.prepare_wave(
+            parent_request_id=parent_request_id,
+            proposal=prepared.proposal,
+            base_kv_tokens=prepared.base_kv_tokens,
+            pending_token=prepared.pending_token,
+            inherited_step=prepared.step,
+            virtual_request_ids=virtual_ids,
+            deadline_at=(
+                time.perf_counter() + self.config.socket_timeout_seconds
+            ),
+        )
+        self._sync_physical_leaf_routes()
+        self._physical_tree_prepared_waves = int(
+            getattr(self, "_physical_tree_prepared_waves", 0)
+        ) + 1
+        self._physical_tree_prepared_leaves = int(
+            getattr(self, "_physical_tree_prepared_leaves", 0)
+        ) + len(wave.leaves)
+        if job.cancel_requested.is_set():
+            self._cancel_pending_tree_reservation(
+                job,
+                downstream,
+                reason="generation cancelled immediately before first physical FORK",
+            )
+            coordinator.abort_before_wire(
+                parent_request_id,
+                "generation cancelled before first physical FORK",
+            )
+            self._sync_physical_leaf_routes()
+            coordinator.retire_wave(parent_request_id)
+            return None
+
+        # Every command is consumed once by the coordinator. A failure after
+        # this point is fatal to the route; no KV mutation is retried.
+        while True:
+            command = coordinator.next_fork_command(parent_request_id)
+            if command is None:
+                break
+            request_cache_bytes = getattr(runner, "request_cache_bytes", None)
+            fork_request = getattr(runner, "fork_request", None)
+            if not callable(request_cache_bytes) or not callable(fork_request):
+                raise TypeError("root runner lost its exact FORK capability")
+            parent_bytes = request_cache_bytes(parent_request_id)
+            current_bytes = self._physical_tree_live_kv_bytes(runner)
+            remaining_bytes = self.config.max_speculative_kv_bytes - current_bytes
+            if (
+                not isinstance(parent_bytes, int)
+                or isinstance(parent_bytes, bool)
+                or parent_bytes < 1
+                or parent_bytes > remaining_bytes
+            ):
+                raise RuntimeError("root FORK no longer fits its sealed KV budget")
+            copied_bytes = fork_request(
+                command.child_request_id,
+                command.parent_request_id,
+                max_cache_bytes=remaining_bytes,
+            )
+            if copied_bytes != parent_bytes:
+                # The child may have been published locally by a broken runner;
+                # release it, but quarantine the route rather than falling back.
+                runner.end(command.child_request_id)
+                raise RuntimeError(
+                    "root FORK byte count changed after exact preflight"
+                )
+            self._physical_tree_live_children.add(command.child_request_id)
+            send_frame(
+                downstream,
+                FrameType.FORK,
+                command.child_request_id,
+                payload=branch_request_payload(command.parent_request_id),
+            )
+
+        # Every remote stage consumes its logical reservation on the final
+        # ordered FORK. Clearing root state here admits the next global quote;
+        # no quote is considered consumed merely because COMMIT was written.
+        self._pending_tree_reservation = None
+
+        verify_commands: list[VerifyCommand] = []
+        while True:
+            command = coordinator.next_verify_command(
+                parent_request_id,
+                now=time.perf_counter(),
+            )
+            if command is None:
+                break
+            verify_commands.append(command)
+        job.wave_started_at = time.perf_counter()
+        self._dispatch_physical_tree_verifies(
+            verify_commands,
+            runner,
+            downstream,
+            emulator,
+        )
+        return None
+
+    def _dispatch_physical_tree_verifies(
+        self,
+        commands: list[VerifyCommand],
+        runner: StageRunnerContract,
+        downstream: socket.socket,
+        emulator: LinkEmulator,
+    ) -> None:
+        """Batch virtual leaves only when their exact physical key matches."""
+
+        if not commands:
+            raise RuntimeError("physical tree has no VERIFY commands")
+        self._root_ready_items += len(commands)
+        manifest = getattr(runner, "executor_manifest", None)
+        features = tuple(getattr(manifest, "features", ()))
+        # Equal shapes and cache lengths are necessary, but not sufficient, for
+        # token-exact batch=K vs K*batch=1 parity on every GPU/dtype/kernel.
+        # The capability must therefore be sealed into the executor manifest;
+        # current production runners do not advertise it and remain sequential.
+        batch_exact = all(
+            feature in features
+            for feature in (
+                "exact-tree-verify-batching",
+                "bounded-tree-verify-workspace",
+            )
+        )
+        batch_forward = (
+            getattr(runner, "forward_ids_batch", None) if batch_exact else None
+        )
+        batch_key = getattr(runner, "physical_batch_key", None) if batch_exact else None
+        maximum = getattr(runner, "MAX_PHYSICAL_BATCH_SIZE", 1)
+        if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 2:
+            maximum = 1
+
+        prepared_inputs = {
+            command.request_id: torch.tensor(
+                [command.input_tokens], dtype=torch.long
+            )
+            for command in commands
+        }
+        groups: dict[object, list[VerifyCommand]] = {}
+        for index, command in enumerate(commands):
+            key: object | None = None
+            value = prepared_inputs[command.request_id]
+            if callable(batch_forward) and callable(batch_key) and maximum >= 2:
+                runner_key = batch_key(
+                    command.request_id,
+                    token_count=command.token_count,
+                    token_mode=_root_token_mode(FrameType.VERIFY),
+                )
+                if runner_key is not None:
+                    candidate = (
+                        FrameType.VERIFY,
+                        tuple(value.shape),
+                        value.dtype,
+                        value.device,
+                        runner_key,
+                    )
+                    try:
+                        hash(candidate)
+                    except TypeError:
+                        candidate = None
+                    key = candidate
+            groups.setdefault(
+                key if key is not None else ("tree-sequential", index), []
+            ).append(command)
+
+        last_verify_sent_at: float | None = None
+        for group in groups.values():
+            for offset in range(0, len(group), max(1, maximum)):
+                chunk = group[offset : offset + max(1, maximum)]
+                if len(chunk) > 1:
+                    if not callable(batch_forward):
+                        raise TypeError("root tree batch key exists without batch forward")
+                    outputs = tuple(
+                        batch_forward(
+                            tuple(command.request_id for command in chunk),
+                            tuple(
+                                prepared_inputs[command.request_id]
+                                for command in chunk
+                            ),
+                        )
+                    )
+                    if len(outputs) != len(chunk):
+                        raise RuntimeError(
+                            "root physical tree batch returned the wrong output count"
+                        )
+                    self._root_physical_batch_calls += 1
+                    self._root_physical_batch_items += len(chunk)
+                    self._root_max_physical_batch_size = max(
+                        self._root_max_physical_batch_size, len(chunk)
+                    )
+                    self._root_model_forward_calls += 1
+                    self._physical_tree_batch_calls = int(
+                        getattr(self, "_physical_tree_batch_calls", 0)
+                    ) + 1
+                    self._physical_tree_batch_items = int(
+                        getattr(self, "_physical_tree_batch_items", 0)
+                    ) + len(chunk)
+                else:
+                    command = chunk[0]
+                    outputs = (
+                        runner.forward_ids(
+                            command.request_id,
+                            prepared_inputs[command.request_id],
+                        ),
+                    )
+                    self._root_sequential_items += 1
+                    self._root_model_forward_calls += 1
+
+                for command, hidden in zip(chunk, outputs, strict=True):
+                    if not isinstance(hidden, torch.Tensor):
+                        raise TypeError("root physical tree output must be a tensor")
+                    if tuple(hidden.shape) != (
+                        1,
+                        command.token_count,
+                        self.hidden_size,
+                    ):
+                        raise RuntimeError(
+                            "root physical tree output has an incompatible shape"
+                        )
+                    self._send_activation(
+                        downstream,
+                        emulator,
+                        command.request_id,
+                        command.step,
+                        hidden,
+                        frame_type=FrameType.VERIFY,
+                    )
+                    sent_at = time.perf_counter()
+                    try:
+                        _parent, leaf = self._physical_tree.leaf_route[
+                            command.request_id
+                        ]
+                    except KeyError as exc:
+                        raise RuntimeError(
+                            "physical tree VERIFY lost its virtual route"
+                        ) from exc
+                    leaf.verify_sent_at = sent_at
+                    last_verify_sent_at = sent_at
+
+        if last_verify_sent_at is None:
+            raise RuntimeError("physical tree sent no VERIFY frame")
+        parent_request_id = self._leaf_routes.get(commands[0].request_id)
+        if parent_request_id is None:
+            raise RuntimeError("physical tree VERIFY lost its parent route")
+        # FORK cloning and root compute have their own fatal execution path;
+        # they must not consume a leaf's return budget. Protocol v4 exposes one
+        # wave deadline, so arm it after the last VERIFY is physically written.
+        self._physical_tree.wave(parent_request_id).deadline_at = (
+            last_verify_sent_at + self.config.socket_timeout_seconds
+        )
+
+    def _sync_physical_leaf_routes(self) -> None:
+        coordinator = getattr(self, "_physical_tree", None)
+        routes = (
+            {}
+            if coordinator is None
+            else {
+                virtual_id: parent_request_id
+                for virtual_id, (parent_request_id, _leaf) in coordinator.leaf_route.items()
+            }
+        )
+        lock = getattr(self, "_tree_return_lock", None)
+        if lock is None:
+            self._leaf_routes = routes
+            return
+        with lock:
+            self._leaf_routes = routes
+
+    def _record_queued_tree_return(self, request_id: int, arrived: float) -> None:
+        lock = getattr(self, "_tree_return_lock", None)
+        if lock is None:
+            return
+        with lock:
+            if request_id not in self._leaf_routes:
+                return
+            self._queued_tree_returns.setdefault(request_id, deque()).append(arrived)
+
+    def _consume_queued_tree_return(self, request_id: int, arrived: float) -> None:
+        lock = getattr(self, "_tree_return_lock", None)
+        if lock is None:
+            return
+        with lock:
+            arrivals = self._queued_tree_returns.get(request_id)
+            if not arrivals:
+                return
+            observed = arrivals.popleft()
+            if observed != arrived:
+                raise RuntimeError("physical tree return queue lost arrival FIFO")
+            if not arrivals:
+                self._queued_tree_returns.pop(request_id, None)
+
+    def _record_queued_tree_prepare_result(
+        self, request_id: int, step: int, arrived: float
+    ) -> None:
+        lock = getattr(self, "_tree_return_lock", None)
+        if lock is None:
+            return
+        with lock:
+            queued = getattr(self, "_queued_tree_prepare_results", None)
+            if queued is None:
+                queued = deque()
+                self._queued_tree_prepare_results = queued
+            queued.append((request_id, step, arrived))
+
+    def _consume_queued_tree_prepare_result(self, frame: Any, arrived: float) -> None:
+        lock = getattr(self, "_tree_return_lock", None)
+        if lock is None:
+            return
+        with lock:
+            queued = getattr(self, "_queued_tree_prepare_results", None)
+            if not queued:
+                # Direct unit callers do not pass through the socket reader.
+                return
+            observed = queued.popleft()
+        if observed != (frame.request_id, frame.step, arrived):
+            raise RuntimeError("tree prepare result queue lost arrival FIFO")
+
+    def _record_queued_tree_commit_result(
+        self, request_id: int, step: int, arrived: float
+    ) -> None:
+        lock = getattr(self, "_tree_return_lock", None)
+        if lock is None:
+            return
+        with lock:
+            queued = getattr(self, "_queued_tree_commit_results", None)
+            if queued is None:
+                queued = deque()
+                self._queued_tree_commit_results = queued
+            queued.append((request_id, step, arrived))
+
+    def _consume_queued_tree_commit_result(self, frame: Any, arrived: float) -> None:
+        lock = getattr(self, "_tree_return_lock", None)
+        if lock is None:
+            return
+        with lock:
+            queued = getattr(self, "_queued_tree_commit_results", None)
+            if not queued:
+                # Direct unit callers do not pass through the socket reader.
+                return
+            observed = queued.popleft()
+        if observed != (frame.request_id, frame.step, arrived):
+            raise RuntimeError("tree commit result queue lost arrival FIFO")
+
     def _dispatch_root_waves(
         self,
-        waves: list[_PreparedRootWave],
+        waves: list[
+            _PreparedRootWave
+            | _PreparedPhysicalTreeWave
+            | _CommittedPhysicalTreeWave
+        ],
         runner: StageRunner,
         downstream: socket.socket,
         emulator: LinkEmulator,
@@ -2155,6 +4537,44 @@ class DistributedPipelineEngine:
         """
 
         if not waves:
+            return
+        if any(
+            isinstance(
+                wave, (_PreparedPhysicalTreeWave, _CommittedPhysicalTreeWave)
+            )
+            for wave in waves
+        ):
+            # A tree is an ordered control transaction. Flush ordinary work on
+            # either side as its original physical batches, but never let a
+            # BEGIN/activation split FORK* -> VERIFY* or cleanup controls.
+            ordinary: list[_PreparedRootWave] = []
+            for wave in waves:
+                if isinstance(wave, _PreparedRootWave):
+                    ordinary.append(wave)
+                    continue
+                if ordinary:
+                    self._dispatch_root_waves(ordinary, runner, downstream, emulator)
+                    ordinary = []
+                if isinstance(wave, _CommittedPhysicalTreeWave):
+                    fallback = self._dispatch_committed_physical_tree_wave(
+                        wave,
+                        runner,
+                        downstream,
+                        emulator,
+                    )
+                else:
+                    fallback = self._dispatch_physical_tree_wave(
+                        wave,
+                        runner,
+                        downstream,
+                        emulator,
+                    )
+                if fallback is not None:
+                    self._dispatch_root_waves(
+                        [fallback], runner, downstream, emulator
+                    )
+            if ordinary:
+                self._dispatch_root_waves(ordinary, runner, downstream, emulator)
             return
         request_ids = [wave.job.wire_id for wave in waves]
         if any(request_id is None for request_id in request_ids):
@@ -2205,6 +4625,9 @@ class DistributedPipelineEngine:
                     # Speculation pricing includes root compute and all network
                     # work, matching the former sequential timing boundary.
                     wave.job.wave_started_at = started
+                    next_step = wave.job.next_step
+                    if next_step is None or wave.step != next_step:
+                        raise RuntimeError("prepared root wave has a stale outbound step")
                 if len(chunk) > 1:
                     if not callable(batch_forward):
                         raise TypeError("root batch key exists without forward_ids_batch")
@@ -2241,21 +4664,27 @@ class DistributedPipelineEngine:
                     if wave.prefill_end is not None:
                         # Prompt tokens are the served sequence by definition.
                         job.kv_valid += wave.prefill_end - job.prefill_offset
-                        job.prefill_offset = wave.prefill_end
                     else:
                         # A decode wave re-forwards the last emitted token, which
                         # always matches the served sequence; any draft position
                         # after it becomes valid only once verification accepts it.
                         job.kv_valid += 1
-                    job.last_outbound_bytes = self._send_activation(
+                    outbound_bytes = self._send_activation(
                         downstream,
                         emulator,
                         job.wire_id,
-                        job.step,
+                        wave.step,
                         hidden,
                         frame_type=wave.frame_type,
                     )
-                    job.last_sent_at = time.monotonic()
+                    job.last_outbound_bytes = outbound_bytes
+                    sent_at = time.monotonic()
+                    self._record_dispatched_wave(
+                        wave,
+                        started_at=started,
+                        sent_at=sent_at,
+                        outbound_bytes=outbound_bytes,
+                    )
 
     def _prepare_next_prefill_chunk(
         self,
@@ -2284,13 +4713,29 @@ class DistributedPipelineEngine:
                 "prepared prefill chunk exceeds max_prefill_chunk_tokens: "
                 f"{input_chunk.shape[1]} > {prefill_limit}"
             )
+        next_step = job.next_step
+        if next_step is None:
+            raise RuntimeError("prefill job lost its next outbound step")
+        reservation = _prefill_frame_byte_reservation(
+            TensorCodec(self.config.codec),
+            int(input_chunk.shape[1]),
+            self.hidden_size,
+        )
+        byte_limit = _prefill_inflight_byte_limit(self.config)
+        if byte_limit > 0 and reservation > byte_limit:
+            raise RuntimeError(
+                f"request {job.wire_id} prefill chunk reserves {reservation} bytes, "
+                f"exceeding prefill_inflight_bytes={byte_limit}"
+            )
         return _PreparedRootWave(
             job=job,
             input_ids=input_chunk,
             frame_type=(
                 FrameType.ACTIVATION if end == total else FrameType.PREFILL
             ),
+            step=next_step,
             prefill_end=end,
+            reserved_bytes=reservation,
         )
 
     def _receive_loop(self) -> None:
@@ -2308,26 +4753,21 @@ class DistributedPipelineEngine:
                     with self._route_probe_lock:
                         self._route_probe_returns.put((frame, arrived))
                     continue
-                if frame.frame_type == FrameType.TOKEN:
-                    with self._callback_lock:
-                        job = self._callback_routes.get(frame.request_id)
-                    if (
-                        job is not None
-                        and job.callback is not None
-                        and frame.step == job.step
-                        and not job.cancel_requested.is_set()
-                    ):
-                        try:
-                            job.callback(
-                                job.request.client_id,
-                                decode_token(frame),
-                                len(job.token_ids),
-                                arrived,
-                            )
-                        except BaseException:
-                            # Streaming is observational; a disconnected client must
-                            # not poison the shared model pipeline for other users.
-                            pass
+                if frame.frame_type == FrameType.VERIFY_RESULT:
+                    self._record_queued_tree_return(frame.request_id, arrived)
+                elif frame.frame_type == FrameType.TREE_PREPARE_RESULT:
+                    self._record_queued_tree_prepare_result(
+                        frame.request_id, frame.step, arrived
+                    )
+                elif frame.frame_type == FrameType.TREE_RESERVATION_COMMIT_RESULT:
+                    self._record_queued_tree_commit_result(
+                        frame.request_id, frame.step, arrived
+                    )
+                # TOKEN callbacks run in the scheduler after the immutable FIFO
+                # flight record is consumed. With multiple prefill chunks in
+                # flight the reader can observe the final TOKEN before the
+                # scheduler has advanced through preceding ACKs; invoking here
+                # would either drop or mis-order that first streamed token.
                 self._received_frames.put((frame, arrived))
         except (EOFError, OSError) as error:
             if not self._closed:
@@ -2361,16 +4801,63 @@ class DistributedPipelineEngine:
                 except OSError:
                     pass
 
-    def _close_transports(self) -> None:
-        self._interrupt_transports()
+    def _half_close_downstream_write(self) -> None:
+        downstream = self._downstream
+        if downstream is None:
+            return
+        try:
+            downstream.shutdown(socket.SHUT_WR)
+        except OSError:
+            # A peer that consumed SHUTDOWN and closed immediately has already
+            # satisfied the ordering guarantee.
+            pass
+
+    def _close_transport_handles(self, cleanup_errors: list[str]) -> None:
         for sock in (self._return_socket, self._downstream, self._return_listener):
             if sock is not None:
                 try:
                     sock.close()
-                except OSError:
-                    pass
+                except OSError as error:
+                    cleanup_errors.append(
+                        f"socket close failed: {type(error).__name__}: {error}"
+                    )
+
+    @staticmethod
+    def _component_is_alive(component: Any | None) -> bool:
+        if component is None:
+            return False
+        try:
+            return bool(component.is_alive())
+        except BaseException:
+            # If lifecycle state cannot be certified, fail closed.
+            return True
+
+    @classmethod
+    def _join_components(
+        cls,
+        components: tuple[Any | None, ...],
+        timeout_seconds: float,
+    ) -> list[str]:
+        errors: list[str] = []
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        for component in components:
+            if component is None or not cls._component_is_alive(component):
+                continue
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                component.join(timeout=remaining)
+            except BaseException as error:
+                # The final report calls is_alive/exitcode and converts an
+                # uncertifiable lifecycle into PipelineShutdownError.
+                errors.append(
+                    f"join {getattr(component, 'name', 'component')} failed: "
+                    f"{type(error).__name__}: {error}"
+                )
+        return errors
 
     def _next_request_id(self) -> int:
+        if self._request_counter >= (1 << 64) - 1:
+            raise OverflowError("pipeline request ID space is exhausted")
         self._request_counter += 1
         return self._request_counter
 

@@ -21,7 +21,7 @@ from .cell_parallel import (
     llama_decoder_layer_tensor_parallel,
     shard_sizes,
 )
-from .cell_backend import CellExecutorBackend
+from .cell_backend import CellExecutorBackend, MAX_CELL_ACTIVATION_BATCH_SIZE
 from .cell_stage import (
     CellMemberReport,
     _TENSOR_NAMES,
@@ -35,10 +35,44 @@ from .cell_stage import (
 from .model import StageModelSpec
 
 
-_CONTROL_SCHEMA = "gdlp-cell-control/1"
+_CONTROL_SCHEMA = "gdlp-cell-control/2"
 _CONTROL_HEADER = struct.Struct("!IQ")
 _MAX_DOCUMENT_BYTES = 64 * 1024
 _MAX_TENSOR_BYTES = 512 * 1024 * 1024
+_DTYPE_ELEMENT_BYTES = {"float32": 4, "float16": 2, "bfloat16": 2}
+_WORK_REPORT_KEYS = frozenset(
+    (
+        "rank",
+        "device",
+        "computeDtype",
+        "collectiveBackend",
+        "forwardCalls",
+        "collectiveCalls",
+        "tokensProcessed",
+        "memory",
+    )
+)
+_WORK_MEMORY_KEYS = frozenset(
+    ("allocatedBytes", "reservedBytes", "peakAllocatedBytes")
+)
+_MEMORY_REPORT_KEYS = frozenset(
+    (
+        "device",
+        "computeDtype",
+        "collectiveBackend",
+        "allocatedBytes",
+        "reservedBytes",
+        "peakAllocatedBytes",
+    )
+)
+_BATCH_WORK_REPORT_KEYS = frozenset(
+    (
+        "rank",
+        "physicalForwardCalls",
+        "logicalForwardItems",
+        "maxPhysicalBatchSize",
+    )
+)
 
 
 @dataclass(frozen=True)
@@ -201,6 +235,8 @@ class ExternalTensorParallelCellStageRunner:
     shard; external members open only their own rank-specific file.
     """
 
+    MAX_PHYSICAL_BATCH_SIZE = MAX_CELL_ACTIVATION_BATCH_SIZE
+
     def __init__(self, spec: StageModelSpec, cell: ExternalTensorParallelCellSpec) -> None:
         if spec.first or spec.last:
             raise ValueError("external cells currently support intermediate stages only")
@@ -278,19 +314,32 @@ class ExternalTensorParallelCellStageRunner:
                 "layer-range",
                 "rank-local-kv",
                 "rollback",
+                "exact-request-fork-safe-copy",
                 "tensor-parallel-cell",
                 "external-ranks",
+                "multi-request-physical-batch",
                 "unequal-tensor-parallel" if unequal else "equal-tensor-parallel",
             ),
         )
         self.member_reports: tuple[CellMemberReport, ...] = ()
         self.member_memory_reports: dict[int, dict[str, int | str]] = {}
+        # READY proves only that a rank loaded its shard. Physical work appears
+        # here exclusively after a complete, validated FORWARD response from
+        # every member in the process group.
+        self.member_work_reports: dict[int, dict[str, Any]] = {}
+        # Additional counters keep the legacy rank-work evidence shape stable
+        # while making one physical collective operation distinguishable from
+        # the number of logical request rows completed by that operation.
+        self.member_batch_work_reports: dict[int, dict[str, int]] = {}
         self.active_requests: set[int] = set()
         self.tokens_seen: dict[int, int] = {}
         self.member_cache_shapes: dict[int, tuple[tuple[int, ...], ...]] = {}
         self.member_layer_cache_shapes: dict[
             int, tuple[tuple[tuple[int, ...], ...], ...]
         ] = {}
+        self.member_request_cache_bytes: dict[int, tuple[int, ...]] = {}
+        self.member_fork_reports: dict[int, dict[str, Any]] = {}
+        self.member_promotion_reports: dict[int, dict[str, Any]] = {}
         self._closed = False
         self._ready = False
         self._failed = False
@@ -380,6 +429,9 @@ class ExternalTensorParallelCellStageRunner:
         self._request("begin", {"requestId": _request_id(request_id)})
         self.active_requests.add(request_id)
         self.tokens_seen[request_id] = 0
+        self.member_cache_shapes.pop(request_id, None)
+        self.member_layer_cache_shapes.pop(request_id, None)
+        self.member_request_cache_bytes[request_id] = (0,) * self.cell.world_size
 
     def end(self, request_id: int) -> None:
         self._require_open()
@@ -390,6 +442,7 @@ class ExternalTensorParallelCellStageRunner:
         self.tokens_seen.pop(request_id, None)
         self.member_cache_shapes.pop(request_id, None)
         self.member_layer_cache_shapes.pop(request_id, None)
+        self.member_request_cache_bytes.pop(request_id, None)
 
     def truncate(self, request_id: int, token_count: int) -> None:
         self._require_active(request_id)
@@ -409,6 +462,277 @@ class ExternalTensorParallelCellStageRunner:
     def sequence_length(self, request_id: int) -> int:
         self._require_active(request_id)
         return self.tokens_seen[request_id]
+
+    def request_cache_bytes(self, request_id: int) -> int:
+        """Return exact unique KV storage bytes summed across cell ranks."""
+
+        self._require_active(request_id)
+        return sum(self._request_rank_cache_bytes(request_id))
+
+    def project_request_cache_bytes(
+        self,
+        request_id: int,
+        additional_tokens: int,
+    ) -> int:
+        """Conservatively project rank-local KV storage before another wave."""
+
+        self._require_active(request_id)
+        if not isinstance(additional_tokens, int) or isinstance(additional_tokens, bool):
+            raise TypeError("additional_tokens must be an integer")
+        if additional_tokens < 0:
+            raise ValueError("additional_tokens cannot be negative")
+        current_tokens = self.tokens_seen[request_id]
+        current_bytes = self.request_cache_bytes(request_id)
+        if additional_tokens == 0:
+            return current_bytes
+        if current_tokens < 1 or current_bytes < 1:
+            raise ValueError("cannot project speculative KV bytes from an empty cache")
+        bytes_per_token = (current_bytes + current_tokens - 1) // current_tokens
+        return bytes_per_token * (current_tokens + additional_tokens)
+
+    def fork_request(
+        self,
+        child_request_id: int,
+        parent_request_id: int,
+        *,
+        max_cache_bytes: int,
+    ) -> int:
+        """Clone every rank's parent KV before publishing an independent child."""
+
+        child_request_id = _request_id(child_request_id)
+        parent_request_id = _request_id(parent_request_id)
+        if child_request_id == parent_request_id:
+            raise ValueError("fork child and parent request IDs must differ")
+        self._require_active(parent_request_id)
+        if child_request_id in self.active_requests:
+            raise ValueError(f"fork child request {child_request_id} is already active")
+        if not isinstance(max_cache_bytes, int) or isinstance(max_cache_bytes, bool):
+            raise TypeError("max_cache_bytes must be an integer")
+        if max_cache_bytes < 0:
+            raise ValueError("max_cache_bytes cannot be negative")
+
+        expected_rank_bytes = self._request_rank_cache_bytes(parent_request_id)
+        copied_bytes = sum(expected_rank_bytes)
+        if copied_bytes > max_cache_bytes:
+            raise ValueError(
+                "fork cache exceeds the preflight byte budget: "
+                f"{copied_bytes} > {max_cache_bytes}"
+            )
+        parent_tokens = self.tokens_seen[parent_request_id]
+        responses = self._request(
+            "fork",
+            {
+                "childRequestId": child_request_id,
+                "parentRequestId": parent_request_id,
+                "expectedTokens": parent_tokens,
+                "expectedCacheBytes": copied_bytes,
+                "expectedRankCacheBytes": list(expected_rank_bytes),
+                "maxCacheBytes": max_cache_bytes,
+            },
+        )
+        try:
+            member_layers, reports = self._validated_fork_responses(
+                responses,
+                child_request_id=child_request_id,
+                parent_request_id=parent_request_id,
+                expected_tokens=parent_tokens,
+                expected_rank_bytes=expected_rank_bytes,
+            )
+        except BaseException:
+            # Some ranks may already have published the clone. Never continue
+            # with a cell whose cross-rank request identity is unproven.
+            self._failed = True
+            raise
+
+        self.active_requests.add(child_request_id)
+        self.tokens_seen[child_request_id] = parent_tokens
+        self.member_layer_cache_shapes[child_request_id] = member_layers
+        self.member_cache_shapes[child_request_id] = tuple(
+            layers[-1] for layers in member_layers
+        )
+        self.member_request_cache_bytes[child_request_id] = expected_rank_bytes
+        self.member_fork_reports = reports
+        return copied_bytes
+
+    def promote_request(self, parent_request_id: int, child_request_id: int) -> None:
+        """Move a selected child's rank-local KV back to its parent without copying."""
+
+        parent_request_id = _request_id(parent_request_id)
+        child_request_id = _request_id(child_request_id)
+        if child_request_id == parent_request_id:
+            raise ValueError("promote parent and child request IDs must differ")
+        self._require_active(parent_request_id)
+        self._require_active(child_request_id)
+        parent_tokens = self.tokens_seen[parent_request_id]
+        child_tokens = self.tokens_seen[child_request_id]
+        parent_rank_bytes = self._request_rank_cache_bytes(parent_request_id)
+        child_rank_bytes = self._request_rank_cache_bytes(child_request_id)
+        responses = self._request(
+            "promote",
+            {
+                "parentRequestId": parent_request_id,
+                "childRequestId": child_request_id,
+                "expectedParentTokens": parent_tokens,
+                "expectedChildTokens": child_tokens,
+                "expectedParentRankCacheBytes": list(parent_rank_bytes),
+                "expectedChildRankCacheBytes": list(child_rank_bytes),
+            },
+        )
+        try:
+            member_layers, reports = self._validated_promotion_responses(
+                responses,
+                parent_request_id=parent_request_id,
+                child_request_id=child_request_id,
+                expected_tokens=child_tokens,
+                expected_rank_bytes=child_rank_bytes,
+            )
+        except BaseException:
+            self._failed = True
+            raise
+
+        self.tokens_seen[parent_request_id] = child_tokens
+        self.member_layer_cache_shapes[parent_request_id] = member_layers
+        self.member_cache_shapes[parent_request_id] = tuple(
+            layers[-1] for layers in member_layers
+        )
+        self.member_request_cache_bytes[parent_request_id] = child_rank_bytes
+        self.active_requests.remove(child_request_id)
+        self.tokens_seen.pop(child_request_id, None)
+        self.member_layer_cache_shapes.pop(child_request_id, None)
+        self.member_cache_shapes.pop(child_request_id, None)
+        self.member_request_cache_bytes.pop(child_request_id, None)
+        self.member_promotion_reports = reports
+
+    def physical_batch_key(
+        self,
+        request_id: int,
+        *,
+        token_count: int,
+        token_mode: str,
+    ) -> tuple[int, int, str]:
+        """Return the exact compatibility key for a physical cell batch.
+
+        External cell members own simple rank-local Llama KV tensors, so unlike
+        a generic Transformers cache there is no unsupported hybrid layout.
+        Equal cache length, token count and token mode are sufficient.  The
+        stage collector compares this key before it sends a batched operation.
+        """
+
+        self._require_active(request_id)
+        if (
+            not isinstance(token_count, int)
+            or isinstance(token_count, bool)
+            or token_count < 1
+        ):
+            raise ValueError("token_count must be a positive integer")
+        if token_mode not in ("none", "last", "all"):
+            raise ValueError("token_mode must be none, last or all")
+        return self.tokens_seen[request_id], token_count, token_mode
+
+    @torch.inference_mode()
+    def forward_hidden_batch(
+        self,
+        request_ids: Sequence[int],
+        hidden_states: Sequence[torch.Tensor],
+        *,
+        token_mode: str = "last",
+    ) -> tuple[tuple[torch.Tensor, int | tuple[int, ...] | None], ...]:
+        """Execute independent requests in one broadcast and TP operation.
+
+        KV remains request-owned.  Every rank merges equal-length cache rows for
+        the physical forward and splits the returned KV back into rank-one
+        tensors before acknowledging the operation.
+        """
+
+        ids = _request_ids(request_ids, minimum=2)
+        if len(ids) > self.MAX_PHYSICAL_BATCH_SIZE:
+            raise ValueError("external cell physical batch exceeds its bounded maximum")
+        if isinstance(hidden_states, (str, bytes, bytearray)):
+            raise ValueError("hidden_states must be an ordered tensor sequence")
+        values = tuple(hidden_states)
+        if len(values) != len(ids):
+            raise ValueError("request_ids and hidden_states must have equal length")
+        if token_mode not in ("none", "last", "all"):
+            raise ValueError("token_mode must be none, last or all")
+
+        for request_id in ids:
+            self._require_active(request_id)
+        if len({self.tokens_seen[request_id] for request_id in ids}) != 1:
+            raise ValueError("physical batching requires equal request cache lengths")
+
+        first = values[0]
+        if (
+            not isinstance(first, torch.Tensor)
+            or first.ndim != 3
+            or first.shape[0] != 1
+            or first.shape[1] < 1
+            or first.shape[2] != self.hidden_size
+        ):
+            raise ValueError(
+                f"hidden state must have shape [1, tokens, {self.hidden_size}]"
+            )
+        if not first.is_floating_point() or first.device.type != "cpu":
+            raise ValueError("external cells accept CPU floating-point ingress activations")
+        expected_shape = tuple(first.shape)
+        for value in values[1:]:
+            if not isinstance(value, torch.Tensor) or tuple(value.shape) != expected_shape:
+                raise ValueError(
+                    "physical batching requires equal rank-one hidden-state shapes"
+                )
+            if not value.is_floating_point() or value.device.type != "cpu":
+                raise ValueError(
+                    "external cells accept CPU floating-point ingress activations"
+                )
+
+        physical = torch.cat(
+            tuple(value.detach().to(dtype=torch.float32) for value in values),
+            dim=0,
+        ).contiguous()
+        responses = self._request(
+            "forward-batch",
+            {"requestIds": list(ids), "activationShape": list(physical.shape)},
+            physical,
+        )
+        input_tokens = int(first.shape[1])
+        try:
+            self._record_member_work(
+                responses,
+                input_tokens=len(ids) * input_tokens,
+                logical_items=len(ids),
+            )
+            self._record_batch_cache_shapes(
+                ids,
+                responses,
+                input_tokens=input_tokens,
+            )
+            rank_zero = next(
+                (
+                    (document, tensor)
+                    for rank, document, tensor in responses
+                    if rank == 0
+                ),
+                None,
+            )
+            if (
+                rank_zero is None
+                or rank_zero[1] is None
+                or tuple(rank_zero[1].shape) != tuple(physical.shape)
+                or not rank_zero[1].is_floating_point()
+            ):
+                raise RuntimeError("external rank zero returned an invalid batched output")
+        except BaseException:
+            # Every rank has already advanced its KV.  A malformed response can
+            # no longer be retried without risking a double forward.
+            self._failed = True
+            raise
+
+        for request_id in ids:
+            self.tokens_seen[request_id] += input_tokens
+        output = rank_zero[1]
+        return tuple(
+            (output[index : index + 1].contiguous(), None)
+            for index in range(len(ids))
+        )
 
     @torch.inference_mode()
     def forward_hidden(
@@ -438,7 +762,19 @@ class ExternalTensorParallelCellStageRunner:
             {"requestId": request_id, "activationShape": list(hidden.shape)},
             hidden.detach().to(dtype=torch.float32).contiguous(),
         )
-        self.tokens_seen[request_id] += int(hidden.shape[1])
+        input_tokens = int(hidden.shape[1])
+        try:
+            self._record_member_work(
+                responses,
+                input_tokens=input_tokens,
+                logical_items=1,
+            )
+        except BaseException:
+            # Rank execution has advanced but its evidence is untrustworthy;
+            # continuing would make later cumulative reports ambiguous.
+            self._failed = True
+            raise
+        self.tokens_seen[request_id] += input_tokens
         self._record_cache_shapes(request_id, responses)
         rank_zero = next(
             ((document, tensor) for rank, document, tensor in responses if rank == 0),
@@ -462,6 +798,7 @@ class ExternalTensorParallelCellStageRunner:
             self.tokens_seen.clear()
             self.member_cache_shapes.clear()
             self.member_layer_cache_shapes.clear()
+            self.member_request_cache_bytes.clear()
             self._closed = True
 
     def _accept_members(self) -> None:
@@ -631,9 +968,11 @@ class ExternalTensorParallelCellStageRunner:
                     raise RuntimeError(
                         f"external rank {rank} failed {kind}: {document.get('message')}"
                     )
-                if kind == "forward":
+                if kind in ("forward", "forward-batch"):
                     if (rank == 0) != (tensor is not None):
-                        raise RuntimeError("external FORWARD tensor ownership is invalid")
+                        raise RuntimeError(
+                            "external forward tensor ownership is invalid"
+                        )
                 elif tensor is not None:
                     raise RuntimeError(f"external {kind} response cannot contain a tensor")
             responses.append((rank, dict(document), tensor))
@@ -641,24 +980,437 @@ class ExternalTensorParallelCellStageRunner:
             thread.join(timeout=0.1)
         return sorted(responses, key=lambda value: value[0])
 
+    def _request_rank_cache_bytes(self, request_id: int) -> tuple[int, ...]:
+        values = self.member_request_cache_bytes.get(request_id)
+        if (
+            not isinstance(values, tuple)
+            or len(values) != self.cell.world_size
+            or any(
+                not isinstance(value, int) or isinstance(value, bool) or value < 0
+                for value in values
+            )
+        ):
+            raise RuntimeError(
+                f"external request {request_id} has no sealed rank-cache byte inventory"
+            )
+        if self.tokens_seen[request_id] > 0 and sum(values) < 1:
+            raise RuntimeError(
+                f"external request {request_id} has tokens without measurable KV storage"
+            )
+        return values
+
+    def _validated_fork_responses(
+        self,
+        responses: Sequence[tuple[int, Mapping[str, Any], torch.Tensor | None]],
+        *,
+        child_request_id: int,
+        parent_request_id: int,
+        expected_tokens: int,
+        expected_rank_bytes: tuple[int, ...],
+    ) -> tuple[
+        tuple[tuple[tuple[int, ...], ...], ...],
+        dict[int, dict[str, Any]],
+    ]:
+        member_layers: list[tuple[tuple[int, ...], ...]] = []
+        reports: dict[int, dict[str, Any]] = {}
+        pending_memory: dict[int, dict[str, int | str]] = {}
+        for rank, document, _ in responses:
+            copied_bytes = _nonnegative_int(
+                document.get("copiedCacheBytes"), "fork copiedCacheBytes"
+            )
+            cache_bytes = _nonnegative_int(
+                document.get("cacheBytes"), "fork cacheBytes"
+            )
+            if (
+                document.get("childRequestId") != child_request_id
+                or document.get("parentRequestId") != parent_request_id
+                or document.get("tokensSeen") != expected_tokens
+                or document.get("aliasFree") is not True
+                or copied_bytes != expected_rank_bytes[rank]
+                or cache_bytes != expected_rank_bytes[rank]
+            ):
+                raise RuntimeError("external fork response identity is inconsistent")
+            shapes = _validated_cache_shapes(
+                document.get("cacheShapes"),
+                layer_count=self.layer_count,
+                expected_sequence_length=expected_tokens,
+            )
+            if cache_bytes != _cache_shapes_storage_bytes(
+                shapes,
+                element_bytes=_DTYPE_ELEMENT_BYTES[self.cell.compute_dtype],
+            ):
+                raise RuntimeError("external fork cache bytes disagree with its shapes")
+            memory = _validated_memory_report(document.get("memory"), rank=rank, cell=self.cell)
+            pending_memory[rank] = memory
+            member_layers.append(shapes)
+            reports[rank] = {
+                "rank": rank,
+                "childRequestId": child_request_id,
+                "parentRequestId": parent_request_id,
+                "tokensSeen": expected_tokens,
+                "copiedCacheBytes": copied_bytes,
+                "aliasFree": True,
+            }
+        if set(reports) != set(range(self.cell.world_size)):
+            raise RuntimeError("external fork responses do not cover every rank")
+        sealed_layers = tuple(member_layers)
+        parent_layers = self.member_layer_cache_shapes.get(parent_request_id)
+        if parent_layers is not None and sealed_layers != parent_layers:
+            raise RuntimeError("external fork changed parent cache tensor shapes")
+        self.member_memory_reports.update(pending_memory)
+        return sealed_layers, dict(sorted(reports.items()))
+
+    def _validated_promotion_responses(
+        self,
+        responses: Sequence[tuple[int, Mapping[str, Any], torch.Tensor | None]],
+        *,
+        parent_request_id: int,
+        child_request_id: int,
+        expected_tokens: int,
+        expected_rank_bytes: tuple[int, ...],
+    ) -> tuple[
+        tuple[tuple[tuple[int, ...], ...], ...],
+        dict[int, dict[str, Any]],
+    ]:
+        member_layers: list[tuple[tuple[int, ...], ...]] = []
+        reports: dict[int, dict[str, Any]] = {}
+        pending_memory: dict[int, dict[str, int | str]] = {}
+        for rank, document, _ in responses:
+            cache_bytes = _nonnegative_int(
+                document.get("cacheBytes"), "promote cacheBytes"
+            )
+            if (
+                document.get("parentRequestId") != parent_request_id
+                or document.get("childRequestId") != child_request_id
+                or document.get("tokensSeen") != expected_tokens
+                or document.get("movedWithoutCopy") is not True
+                or cache_bytes != expected_rank_bytes[rank]
+            ):
+                raise RuntimeError("external promotion response identity is inconsistent")
+            shapes = _validated_cache_shapes(
+                document.get("cacheShapes"),
+                layer_count=self.layer_count,
+                expected_sequence_length=expected_tokens,
+            )
+            if cache_bytes != _cache_shapes_storage_bytes(
+                shapes,
+                element_bytes=_DTYPE_ELEMENT_BYTES[self.cell.compute_dtype],
+            ):
+                raise RuntimeError(
+                    "external promotion cache bytes disagree with its shapes"
+                )
+            memory = _validated_memory_report(document.get("memory"), rank=rank, cell=self.cell)
+            pending_memory[rank] = memory
+            member_layers.append(shapes)
+            reports[rank] = {
+                "rank": rank,
+                "parentRequestId": parent_request_id,
+                "childRequestId": child_request_id,
+                "tokensSeen": expected_tokens,
+                "cacheBytes": cache_bytes,
+                "movedWithoutCopy": True,
+            }
+        if set(reports) != set(range(self.cell.world_size)):
+            raise RuntimeError("external promotion responses do not cover every rank")
+        sealed_layers = tuple(member_layers)
+        child_layers = self.member_layer_cache_shapes.get(child_request_id)
+        if child_layers is not None and sealed_layers != child_layers:
+            raise RuntimeError("external promotion changed selected cache tensor shapes")
+        self.member_memory_reports.update(pending_memory)
+        return sealed_layers, dict(sorted(reports.items()))
+
     def _record_cache_shapes(
         self,
         request_id: int,
         responses: Sequence[tuple[int, Mapping[str, Any], torch.Tensor | None]],
     ) -> None:
-        member_layers = tuple(
-            tuple(
-                tuple(int(value) for value in shape)
-                for shape in document["cacheShapes"]
+        member_layers_list: list[tuple[tuple[int, ...], ...]] = []
+        rank_cache_bytes: list[int] = []
+        for rank, document, _ in responses:
+            shapes = _validated_cache_shapes(
+                document.get("cacheShapes"),
+                layer_count=self.layer_count,
+                expected_sequence_length=self.tokens_seen[request_id],
             )
-            for _, document, _ in responses
-        )
+            cache_bytes = _nonnegative_int(
+                document.get("cacheBytes"), "cacheBytes"
+            )
+            if cache_bytes != _cache_shapes_storage_bytes(
+                shapes,
+                element_bytes=_DTYPE_ELEMENT_BYTES[self.cell.compute_dtype],
+            ):
+                raise RuntimeError(
+                    f"external rank {rank} cache bytes disagree with its shapes"
+                )
+            member_layers_list.append(shapes)
+            rank_cache_bytes.append(cache_bytes)
+        member_layers = tuple(member_layers_list)
         self.member_layer_cache_shapes[request_id] = member_layers
         self.member_cache_shapes[request_id] = tuple(layers[-1] for layers in member_layers)
+        self.member_request_cache_bytes[request_id] = tuple(rank_cache_bytes)
         for rank, document, _ in responses:
             memory = document.get("memory")
             if isinstance(memory, dict):
                 self.member_memory_reports[rank] = dict(memory)
+
+    def _record_batch_cache_shapes(
+        self,
+        request_ids: tuple[int, ...],
+        responses: Sequence[tuple[int, Mapping[str, Any], torch.Tensor | None]],
+        *,
+        input_tokens: int,
+    ) -> None:
+        expected_ids = list(request_ids)
+        shapes_by_rank: list[tuple[tuple[tuple[int, ...], ...], ...]] = []
+        bytes_by_rank: list[tuple[int, ...]] = []
+        for rank, document, _ in responses:
+            if document.get("requestIds") != expected_ids:
+                raise RuntimeError("external batch response request order is invalid")
+            entries = document.get("cacheShapesByRequest")
+            if not isinstance(entries, list) or len(entries) != len(request_ids):
+                raise RuntimeError("external batch response cache inventory is invalid")
+            rank_shapes: list[tuple[tuple[int, ...], ...]] = []
+            rank_cache_bytes: list[int] = []
+            for index, entry in enumerate(entries):
+                if (
+                    not isinstance(entry, dict)
+                    or set(entry) != {"requestId", "cacheShapes", "cacheBytes"}
+                    or entry.get("requestId") != request_ids[index]
+                ):
+                    raise RuntimeError("external batch response cache identity is invalid")
+                shapes = _validated_cache_shapes(
+                    entry.get("cacheShapes"),
+                    layer_count=self.layer_count,
+                    expected_sequence_length=(
+                        self.tokens_seen[request_ids[index]] + input_tokens
+                    ),
+                )
+                cache_bytes = _nonnegative_int(
+                    entry.get("cacheBytes"), "batch cacheBytes"
+                )
+                if cache_bytes != _cache_shapes_storage_bytes(
+                    shapes,
+                    element_bytes=_DTYPE_ELEMENT_BYTES[self.cell.compute_dtype],
+                ):
+                    raise RuntimeError(
+                        f"external rank {rank} batch cache bytes disagree with its shapes"
+                    )
+                rank_shapes.append(shapes)
+                rank_cache_bytes.append(cache_bytes)
+            shapes_by_rank.append(tuple(rank_shapes))
+            bytes_by_rank.append(tuple(rank_cache_bytes))
+            memory = document.get("memory")
+            if isinstance(memory, dict):
+                self.member_memory_reports[rank] = dict(memory)
+
+        if len(shapes_by_rank) != self.cell.world_size:
+            raise RuntimeError("external batch cache reports do not cover every rank")
+        for request_index, request_id in enumerate(request_ids):
+            member_layers = tuple(
+                rank_shapes[request_index] for rank_shapes in shapes_by_rank
+            )
+            self.member_layer_cache_shapes[request_id] = member_layers
+            self.member_cache_shapes[request_id] = tuple(
+                layers[-1] for layers in member_layers
+            )
+            self.member_request_cache_bytes[request_id] = tuple(
+                rank_bytes[request_index] for rank_bytes in bytes_by_rank
+            )
+
+    def _record_member_work(
+        self,
+        responses: Sequence[tuple[int, Mapping[str, Any], torch.Tensor | None]],
+        *,
+        input_tokens: int,
+        logical_items: int,
+    ) -> None:
+        if (
+            not isinstance(input_tokens, int)
+            or isinstance(input_tokens, bool)
+            or input_tokens < 1
+            or not isinstance(logical_items, int)
+            or isinstance(logical_items, bool)
+            or not 1 <= logical_items <= self.MAX_PHYSICAL_BATCH_SIZE
+            or input_tokens % logical_items != 0
+        ):
+            raise RuntimeError("external cell work increment is invalid")
+        collectives_per_forward = 1 + 2 * self.layer_count
+        validated: dict[int, dict[str, Any]] = {}
+        validated_batch: dict[int, dict[str, int]] = {}
+        for response_rank, document, _ in responses:
+            work = document.get("work")
+            if not isinstance(work, dict) or set(work) != _WORK_REPORT_KEYS:
+                raise RuntimeError(
+                    f"external rank {response_rank} returned an invalid work report"
+                )
+            rank = _nonnegative_int(work.get("rank"), "work rank")
+            if rank != response_rank or rank >= self.cell.world_size:
+                raise RuntimeError("external cell work report rank mismatch")
+            device = work.get("device")
+            compute_dtype = work.get("computeDtype")
+            collective_backend = work.get("collectiveBackend")
+            if device != (self.cell.rank_devices or ())[rank]:
+                raise RuntimeError("external cell work report device mismatch")
+            if compute_dtype != self.cell.compute_dtype:
+                raise RuntimeError("external cell work report dtype mismatch")
+            if collective_backend != self.cell.collective_backend:
+                raise RuntimeError("external cell work report backend mismatch")
+
+            forward_calls = _nonnegative_int(
+                work.get("forwardCalls"), "forwardCalls"
+            )
+            collective_calls = _nonnegative_int(
+                work.get("collectiveCalls"), "collectiveCalls"
+            )
+            tokens_processed = _nonnegative_int(
+                work.get("tokensProcessed"), "tokensProcessed"
+            )
+            if collective_calls != forward_calls * collectives_per_forward:
+                raise RuntimeError("external cell collective work count is invalid")
+
+            batch_work = document.get("batchWork")
+            if (
+                not isinstance(batch_work, dict)
+                or set(batch_work) != _BATCH_WORK_REPORT_KEYS
+            ):
+                raise RuntimeError(
+                    f"external rank {response_rank} returned invalid batch work"
+                )
+            batch_rank = _nonnegative_int(batch_work.get("rank"), "batch work rank")
+            physical_forward_calls = _nonnegative_int(
+                batch_work.get("physicalForwardCalls"), "physicalForwardCalls"
+            )
+            logical_forward_items = _nonnegative_int(
+                batch_work.get("logicalForwardItems"), "logicalForwardItems"
+            )
+            max_physical_batch_size = _nonnegative_int(
+                batch_work.get("maxPhysicalBatchSize"), "maxPhysicalBatchSize"
+            )
+            if (
+                batch_rank != rank
+                or physical_forward_calls != forward_calls
+                or not 1 <= max_physical_batch_size <= self.MAX_PHYSICAL_BATCH_SIZE
+            ):
+                raise RuntimeError("external cell batch work counters are inconsistent")
+
+            previous_batch = self.member_batch_work_reports.get(rank)
+            expected_logical_items = logical_items
+            expected_maximum = logical_items
+            if previous_batch is not None:
+                expected_logical_items += int(previous_batch["logicalForwardItems"])
+                expected_maximum = max(
+                    int(previous_batch["maxPhysicalBatchSize"]), logical_items
+                )
+            if (
+                logical_forward_items != expected_logical_items
+                or max_physical_batch_size != expected_maximum
+            ):
+                raise RuntimeError("external cell cumulative batch work is invalid")
+
+            memory = work.get("memory")
+            if not isinstance(memory, dict) or set(memory) != _WORK_MEMORY_KEYS:
+                raise RuntimeError("external cell work memory report is invalid")
+            allocated_bytes = _nonnegative_int(
+                memory.get("allocatedBytes"), "allocatedBytes"
+            )
+            reserved_bytes = _nonnegative_int(
+                memory.get("reservedBytes"), "reservedBytes"
+            )
+            peak_allocated_bytes = _nonnegative_int(
+                memory.get("peakAllocatedBytes"), "peakAllocatedBytes"
+            )
+            if (
+                allocated_bytes > reserved_bytes
+                or allocated_bytes > peak_allocated_bytes
+            ):
+                raise RuntimeError("external cell work memory counters are inconsistent")
+
+            previous = self.member_work_reports.get(rank)
+            if previous is None:
+                expected_forward_calls = 1
+                expected_collective_calls = collectives_per_forward
+                expected_tokens_processed = input_tokens
+            else:
+                expected_forward_calls = int(previous["forwardCalls"]) + 1
+                expected_collective_calls = (
+                    int(previous["collectiveCalls"]) + collectives_per_forward
+                )
+                expected_tokens_processed = (
+                    int(previous["tokensProcessed"]) + input_tokens
+                )
+                previous_memory = previous["memory"]
+                if peak_allocated_bytes < int(previous_memory["peakAllocatedBytes"]):
+                    raise RuntimeError("external cell peak allocation moved backwards")
+            if (
+                forward_calls != expected_forward_calls
+                or collective_calls != expected_collective_calls
+                or tokens_processed != expected_tokens_processed
+            ):
+                raise RuntimeError("external cell cumulative work counters are invalid")
+
+            reported_memory = document.get("memory")
+            expected_memory = {
+                "device": device,
+                "computeDtype": compute_dtype,
+                "collectiveBackend": collective_backend,
+                "allocatedBytes": allocated_bytes,
+                "reservedBytes": reserved_bytes,
+                "peakAllocatedBytes": peak_allocated_bytes,
+            }
+            if (
+                not isinstance(reported_memory, dict)
+                or set(reported_memory) != _MEMORY_REPORT_KEYS
+                or reported_memory != expected_memory
+            ):
+                raise RuntimeError("external cell forward memory reports disagree")
+
+            validated[rank] = {
+                "rank": rank,
+                "device": device,
+                "computeDtype": compute_dtype,
+                "collectiveBackend": collective_backend,
+                "forwardCalls": forward_calls,
+                "collectiveCalls": collective_calls,
+                "tokensProcessed": tokens_processed,
+                "memory": {
+                    "allocatedBytes": allocated_bytes,
+                    "reservedBytes": reserved_bytes,
+                    "peakAllocatedBytes": peak_allocated_bytes,
+                },
+            }
+            validated_batch[rank] = {
+                "rank": rank,
+                "physicalForwardCalls": physical_forward_calls,
+                "logicalForwardItems": logical_forward_items,
+                "maxPhysicalBatchSize": max_physical_batch_size,
+            }
+
+        if set(validated) != set(range(self.cell.world_size)):
+            raise RuntimeError("external cell work reports do not cover every rank")
+        counter_sets = {
+            (
+                report["forwardCalls"],
+                report["collectiveCalls"],
+                report["tokensProcessed"],
+            )
+            for report in validated.values()
+        }
+        if len(counter_sets) != 1:
+            raise RuntimeError("external cell ranks disagree about completed work")
+        batch_counter_sets = {
+            (
+                report["physicalForwardCalls"],
+                report["logicalForwardItems"],
+                report["maxPhysicalBatchSize"],
+            )
+            for report in validated_batch.values()
+        }
+        if set(validated_batch) != set(range(self.cell.world_size)) or len(
+            batch_counter_sets
+        ) != 1:
+            raise RuntimeError("external cell ranks disagree about batched work")
+        self.member_work_reports = dict(sorted(validated.items()))
+        self.member_batch_work_reports = dict(sorted(validated_batch.items()))
 
     def _require_active(self, request_id: int) -> None:
         self._require_open()
@@ -757,9 +1509,16 @@ class _MemberExecutor:
             tensor.nelement() * tensor.element_size() for tensor in weights.values()
         )
         self.tensor_count = len(weights)
+        self.rank = rank
         self.backend = backend
         self.caches: dict[int, list[tuple[torch.Tensor, torch.Tensor] | None]] = {}
         self.tokens_seen: dict[int, int] = {}
+        self.forward_calls = 0
+        self.logical_forward_items = 0
+        self.max_physical_batch_size = 0
+        self.collective_calls = 0
+        self.tokens_processed = 0
+        self.peak_allocated_bytes = 0
 
     def execute(
         self,
@@ -769,6 +1528,8 @@ class _MemberExecutor:
         *,
         rank: int,
     ) -> tuple[dict[str, Any], torch.Tensor | None, bool]:
+        if rank != self.rank:
+            raise ValueError("member executor rank is inconsistent")
         request_id = document.get("requestId")
         result: dict[str, Any] = {}
         if kind == "begin":
@@ -795,25 +1556,163 @@ class _MemberExecutor:
                 or not 0 <= token_count <= self.tokens_seen[request_id]
             ):
                 raise ValueError("invalid TRUNCATE token count")
-            for index, cache in enumerate(self.caches[request_id]):
-                if cache is not None:
-                    key, value = cache
-                    self.caches[request_id][index] = (
-                        key[:, :, :token_count, :].contiguous(),
-                        value[:, :, :token_count, :].contiguous(),
-                    )
+            if token_count < self.tokens_seen[request_id]:
+                for index, cache in enumerate(self.caches[request_id]):
+                    if cache is not None:
+                        key, value = cache
+                        # clone() compacts a slice that may report contiguous
+                        # while still retaining the pre-truncate storage.
+                        self.caches[request_id][index] = (
+                            key[:, :, :token_count, :].contiguous().clone(),
+                            value[:, :, :token_count, :].contiguous().clone(),
+                        )
             self.tokens_seen[request_id] = token_count
             result["cacheShapes"] = _cache_shapes(
                 self.caches[request_id], self.plans
             )
-        elif kind == "forward":
-            request_id = _request_id(request_id)
-            self._require_request(request_id)
+            result["cacheBytes"] = _request_cache_storage_bytes(
+                self.caches[request_id]
+            )
+        elif kind == "fork":
+            if tensor is not None:
+                raise ValueError("FORK cannot contain a tensor")
+            child_request_id = _request_id(document.get("childRequestId"))
+            parent_request_id = _request_id(document.get("parentRequestId"))
+            if child_request_id == parent_request_id:
+                raise ValueError("fork child and parent request IDs must differ")
+            self._require_request(parent_request_id)
+            if (
+                child_request_id in self.tokens_seen
+                or child_request_id in self.caches
+            ):
+                raise ValueError("fork child request is already active")
+            expected_tokens = _protocol_nonnegative_int(
+                document.get("expectedTokens"), "expectedTokens"
+            )
+            expected_cache_bytes = _protocol_nonnegative_int(
+                document.get("expectedCacheBytes"), "expectedCacheBytes"
+            )
+            max_cache_bytes = _protocol_nonnegative_int(
+                document.get("maxCacheBytes"), "maxCacheBytes"
+            )
+            expected_rank_bytes = _protocol_rank_cache_bytes(
+                document.get("expectedRankCacheBytes"),
+                world_size=int(self.manifest["worldSize"]),
+            )
+            if (
+                self.tokens_seen[parent_request_id] != expected_tokens
+                or sum(expected_rank_bytes) != expected_cache_bytes
+                or expected_cache_bytes > max_cache_bytes
+            ):
+                raise ValueError("fork preflight identity or byte budget is inconsistent")
+            parent_cache = self.caches[parent_request_id]
+            parent_cache_bytes = _request_cache_storage_bytes(parent_cache)
+            if parent_cache_bytes != expected_rank_bytes[self.rank]:
+                raise ValueError("fork rank cache bytes changed before cloning")
+
+            # Do not publish the child until every rank-local tensor has been
+            # copied and the storage identity sets prove there is no alias.
+            child_cache = _clone_request_cache(parent_cache)
+            parent_storage = _request_cache_storage_keys(parent_cache)
+            child_storage = _request_cache_storage_keys(child_cache)
+            if parent_storage & child_storage:
+                raise RuntimeError("forked external cache aliases parent tensor storage")
+            child_cache_bytes = _request_cache_storage_bytes(child_cache)
+            if child_cache_bytes != parent_cache_bytes:
+                raise RuntimeError("forked external cache changed storage byte size")
+            self.caches[child_request_id] = child_cache
+            self.tokens_seen[child_request_id] = expected_tokens
+            result.update(
+                {
+                    "childRequestId": child_request_id,
+                    "parentRequestId": parent_request_id,
+                    "tokensSeen": expected_tokens,
+                    "copiedCacheBytes": parent_cache_bytes,
+                    "cacheBytes": child_cache_bytes,
+                    "cacheShapes": _cache_shapes(child_cache, self.plans),
+                    "aliasFree": True,
+                    "memory": self._memory_report(),
+                }
+            )
+        elif kind == "promote":
+            if tensor is not None:
+                raise ValueError("PROMOTE cannot contain a tensor")
+            parent_request_id = _request_id(document.get("parentRequestId"))
+            child_request_id = _request_id(document.get("childRequestId"))
+            if child_request_id == parent_request_id:
+                raise ValueError("promote parent and child request IDs must differ")
+            self._require_request(parent_request_id)
+            self._require_request(child_request_id)
+            expected_parent_tokens = _protocol_nonnegative_int(
+                document.get("expectedParentTokens"), "expectedParentTokens"
+            )
+            expected_child_tokens = _protocol_nonnegative_int(
+                document.get("expectedChildTokens"), "expectedChildTokens"
+            )
+            expected_parent_rank_bytes = _protocol_rank_cache_bytes(
+                document.get("expectedParentRankCacheBytes"),
+                world_size=int(self.manifest["worldSize"]),
+            )
+            expected_rank_bytes = _protocol_rank_cache_bytes(
+                document.get("expectedChildRankCacheBytes"),
+                world_size=int(self.manifest["worldSize"]),
+            )
+            parent_cache_bytes = _request_cache_storage_bytes(
+                self.caches[parent_request_id]
+            )
+            child_cache = self.caches[child_request_id]
+            child_cache_bytes = _request_cache_storage_bytes(child_cache)
+            if (
+                self.tokens_seen[parent_request_id] != expected_parent_tokens
+                or self.tokens_seen[child_request_id] != expected_child_tokens
+                or parent_cache_bytes != expected_parent_rank_bytes[self.rank]
+                or child_cache_bytes != expected_rank_bytes[self.rank]
+            ):
+                raise ValueError("promotion preflight identity is inconsistent")
+
+            child_storage = _request_cache_storage_keys(child_cache)
+            moved_cache = self.caches.pop(child_request_id)
+            self.caches[parent_request_id] = moved_cache
+            self.tokens_seen[parent_request_id] = self.tokens_seen.pop(child_request_id)
+            if _request_cache_storage_keys(self.caches[parent_request_id]) != child_storage:
+                raise RuntimeError("promotion copied or changed selected KV storage")
+            result.update(
+                {
+                    "parentRequestId": parent_request_id,
+                    "childRequestId": child_request_id,
+                    "tokensSeen": expected_child_tokens,
+                    "cacheBytes": child_cache_bytes,
+                    "cacheShapes": _cache_shapes(
+                        self.caches[parent_request_id], self.plans
+                    ),
+                    "movedWithoutCopy": True,
+                    "memory": self._memory_report(),
+                }
+            )
+        elif kind in ("forward", "forward-batch"):
+            request_ids = (
+                (_request_id(request_id),)
+                if kind == "forward"
+                else _request_ids(document.get("requestIds"), minimum=2)
+            )
+            if len(request_ids) > MAX_CELL_ACTIVATION_BATCH_SIZE:
+                raise ValueError("external cell physical batch exceeds its maximum")
+            for current_request_id in request_ids:
+                self._require_request(current_request_id)
+            current_lengths = {
+                self.tokens_seen[current_request_id]
+                for current_request_id in request_ids
+            }
+            if len(current_lengths) != 1:
+                raise ValueError("physical batch request cache lengths differ")
+            current_length = next(iter(current_lengths))
+
             output = self.backend.broadcast_activation(
                 tensor, document.get("activationShape")
             )
+            if int(output.shape[0]) != len(request_ids):
+                raise ValueError("activation batch does not match requestIds")
             input_tokens = int(output.shape[1])
-            request_caches = self.caches[request_id]
             for index, (weights, plan, sizes, layer) in enumerate(
                 zip(
                     self.layer_weights,
@@ -822,6 +1721,11 @@ class _MemberExecutor:
                     self.manifest["layers"],
                 )
             ):
+                merged_cache = self._merge_request_layer_caches(
+                    request_ids,
+                    layer_index=index,
+                    current_length=current_length,
+                )
                 output, present = llama_decoder_layer_tensor_parallel(
                     output,
                     weights["input_norm"],
@@ -835,14 +1739,71 @@ class _MemberExecutor:
                     weights["up"],
                     weights["down"],
                     sizes,
-                    past_key_value=request_caches[index],
+                    past_key_value=merged_cache,
                     rms_norm_epsilon=float(layer["rmsNormEpsilon"]),
                     rope_theta=float(layer["ropeTheta"]),
                 )
-                request_caches[index] = present
-            self.tokens_seen[request_id] += input_tokens
-            result["cacheShapes"] = _cache_shapes(request_caches, self.plans)
-            result["memory"] = self.backend.memory_report()
+                self._split_request_layer_cache(
+                    request_ids,
+                    layer_index=index,
+                    present=present,
+                    expected_length=current_length + input_tokens,
+                )
+
+            for current_request_id in request_ids:
+                self.tokens_seen[current_request_id] += input_tokens
+            physical_batch_size = len(request_ids)
+            memory = self._memory_report()
+            self.forward_calls += 1
+            self.logical_forward_items += physical_batch_size
+            self.max_physical_batch_size = max(
+                self.max_physical_batch_size, physical_batch_size
+            )
+            self.collective_calls += 1 + 2 * len(self.layer_weights)
+            self.tokens_processed += physical_batch_size * input_tokens
+            if kind == "forward":
+                result["cacheShapes"] = _cache_shapes(
+                    self.caches[request_ids[0]], self.plans
+                )
+                result["cacheBytes"] = _request_cache_storage_bytes(
+                    self.caches[request_ids[0]]
+                )
+            else:
+                result["requestIds"] = list(request_ids)
+                result["cacheShapesByRequest"] = [
+                    {
+                        "requestId": current_request_id,
+                        "cacheShapes": _cache_shapes(
+                            self.caches[current_request_id], self.plans
+                        ),
+                        "cacheBytes": _request_cache_storage_bytes(
+                            self.caches[current_request_id]
+                        ),
+                    }
+                    for current_request_id in request_ids
+                ]
+            result["memory"] = memory
+            result["work"] = {
+                "rank": self.rank,
+                "device": memory["device"],
+                "computeDtype": memory["computeDtype"],
+                "collectiveBackend": memory["collectiveBackend"],
+                # Legacy evidence keeps this physical-call counter and shape.
+                "forwardCalls": self.forward_calls,
+                "collectiveCalls": self.collective_calls,
+                "tokensProcessed": self.tokens_processed,
+                "memory": {
+                    "allocatedBytes": int(memory["allocatedBytes"]),
+                    "reservedBytes": int(memory["reservedBytes"]),
+                    "peakAllocatedBytes": self.peak_allocated_bytes,
+                },
+            }
+            result["batchWork"] = {
+                "rank": self.rank,
+                "physicalForwardCalls": self.forward_calls,
+                "logicalForwardItems": self.logical_forward_items,
+                "maxPhysicalBatchSize": self.max_physical_batch_size,
+            }
             return (
                 result,
                 output.to(device="cpu", dtype=torch.float32) if rank == 0 else None,
@@ -860,6 +1821,91 @@ class _MemberExecutor:
     def _require_request(self, request_id: int) -> None:
         if request_id not in self.tokens_seen:
             raise ValueError(f"request {request_id} has not received BEGIN")
+
+    def _memory_report(self) -> dict[str, int | str]:
+        memory = dict(self.backend.memory_report())
+        self.peak_allocated_bytes = max(
+            self.peak_allocated_bytes,
+            int(memory["peakAllocatedBytes"]),
+        )
+        memory["peakAllocatedBytes"] = self.peak_allocated_bytes
+        return memory
+
+    def _merge_request_layer_caches(
+        self,
+        request_ids: tuple[int, ...],
+        *,
+        layer_index: int,
+        current_length: int,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        caches = tuple(self.caches[request_id][layer_index] for request_id in request_ids)
+        if current_length == 0:
+            if any(cache is not None for cache in caches):
+                raise RuntimeError("empty physical batch has unexpected KV state")
+            return None
+        if any(cache is None for cache in caches):
+            raise RuntimeError("physical batch has incomplete KV state")
+        concrete = tuple(cache for cache in caches if cache is not None)
+        for key, value in concrete:
+            if (
+                key.ndim != 4
+                or value.ndim != 4
+                or key.shape[0] != 1
+                or value.shape[0] != 1
+                or key.shape[2] != current_length
+                or value.shape[2] != current_length
+                or key.shape != value.shape
+                or key.dtype != self.backend.torch_dtype
+                or value.dtype != self.backend.torch_dtype
+                or key.device != self.backend.torch_device
+                or value.device != self.backend.torch_device
+            ):
+                raise RuntimeError("physical batch KV tensors are incompatible")
+        key_shapes = {tuple(key.shape[1:]) for key, _ in concrete}
+        value_shapes = {tuple(value.shape[1:]) for _, value in concrete}
+        if len(key_shapes) != 1 or len(value_shapes) != 1:
+            raise RuntimeError("physical batch KV tensor shapes differ")
+        return (
+            torch.cat(tuple(key for key, _ in concrete), dim=0).contiguous(),
+            torch.cat(tuple(value for _, value in concrete), dim=0).contiguous(),
+        )
+
+    def _split_request_layer_cache(
+        self,
+        request_ids: tuple[int, ...],
+        *,
+        layer_index: int,
+        present: tuple[torch.Tensor, torch.Tensor],
+        expected_length: int,
+    ) -> None:
+        if not isinstance(present, tuple) or len(present) != 2:
+            raise RuntimeError("physical batch returned invalid KV state")
+        key, value = present
+        plan = self.plans[layer_index]
+        expected_shape = (
+            len(request_ids),
+            int(plan.local_key_value_heads),
+            expected_length,
+            int(plan.head_dim),
+        )
+        if (
+            key.ndim != 4
+            or value.ndim != 4
+            or key.shape != value.shape
+            or tuple(key.shape) != expected_shape
+            or key.dtype != self.backend.torch_dtype
+            or value.dtype != self.backend.torch_dtype
+            or key.device != self.backend.torch_device
+            or value.device != self.backend.torch_device
+        ):
+            raise RuntimeError("physical batch returned an invalid KV shape")
+        for batch_index, current_request_id in enumerate(request_ids):
+            # clone() prevents one small request cache from retaining storage for
+            # every other row in the physical batch.
+            self.caches[current_request_id][layer_index] = (
+                key[batch_index : batch_index + 1].contiguous().clone(),
+                value[batch_index : batch_index + 1].contiguous().clone(),
+            )
 
 
 def run_external_cell_member(config: ExternalCellMemberConfig) -> None:
@@ -1017,6 +2063,159 @@ def _request_id(value: Any) -> int:
     return value
 
 
+def _request_ids(value: Any, *, minimum: int) -> tuple[int, ...]:
+    if (
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes, bytearray))
+    ):
+        raise ValueError("requestIds must be an ordered sequence")
+    request_ids = tuple(_request_id(item) for item in value)
+    if not minimum <= len(request_ids) <= MAX_CELL_ACTIVATION_BATCH_SIZE:
+        raise ValueError("requestIds count is outside the physical batch bound")
+    if len(set(request_ids)) != len(request_ids):
+        raise ValueError("requestIds must identify distinct requests")
+    return request_ids
+
+
+def _protocol_nonnegative_int(value: Any, name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"{name} must be a nonnegative integer")
+    return value
+
+
+def _protocol_rank_cache_bytes(value: Any, *, world_size: int) -> tuple[int, ...]:
+    if not isinstance(value, list) or len(value) != world_size:
+        raise ValueError("rank cache byte inventory does not cover the process group")
+    return tuple(
+        _protocol_nonnegative_int(item, "rank cache bytes") for item in value
+    )
+
+
+def _request_cache_storage_keys(
+    caches: Sequence[tuple[torch.Tensor, torch.Tensor] | None],
+) -> frozenset[tuple[str, int | None, int, int]]:
+    keys: set[tuple[str, int | None, int, int]] = set()
+    for cache in caches:
+        if cache is None:
+            continue
+        if not isinstance(cache, tuple) or len(cache) != 2:
+            raise RuntimeError("external request cache entry is invalid")
+        for tensor in cache:
+            if not isinstance(tensor, torch.Tensor):
+                raise RuntimeError("external request cache contains a non-tensor")
+            storage = tensor.untyped_storage()
+            storage_bytes = int(storage.nbytes())
+            if storage_bytes == 0:
+                continue
+            keys.add(
+                (
+                    tensor.device.type,
+                    tensor.device.index,
+                    int(storage.data_ptr()),
+                    storage_bytes,
+                )
+            )
+    return frozenset(keys)
+
+
+def _request_cache_storage_bytes(
+    caches: Sequence[tuple[torch.Tensor, torch.Tensor] | None],
+) -> int:
+    return sum(key[3] for key in _request_cache_storage_keys(caches))
+
+
+def _clone_request_cache(
+    caches: Sequence[tuple[torch.Tensor, torch.Tensor] | None],
+) -> list[tuple[torch.Tensor, torch.Tensor] | None]:
+    cloned: list[tuple[torch.Tensor, torch.Tensor] | None] = []
+    for cache in caches:
+        if cache is None:
+            cloned.append(None)
+            continue
+        if not isinstance(cache, tuple) or len(cache) != 2:
+            raise RuntimeError("external request cache entry cannot be cloned safely")
+        key, value = cache
+        if not isinstance(key, torch.Tensor) or not isinstance(value, torch.Tensor):
+            raise RuntimeError("external request cache tensors cannot be cloned safely")
+        cloned.append(
+            (
+                key.clone(memory_format=torch.contiguous_format),
+                value.clone(memory_format=torch.contiguous_format),
+            )
+        )
+    return cloned
+
+
+def _cache_shapes_storage_bytes(
+    shapes: Sequence[Sequence[int]],
+    *,
+    element_bytes: int,
+) -> int:
+    return sum(math.prod(shape) * element_bytes * 2 for shape in shapes)
+
+
+def _validated_cache_shapes(
+    value: Any,
+    *,
+    layer_count: int,
+    expected_sequence_length: int,
+) -> tuple[tuple[int, ...], ...]:
+    if not isinstance(value, list) or len(value) != layer_count:
+        raise RuntimeError("external batch cache layer count is invalid")
+    result: list[tuple[int, ...]] = []
+    for shape in value:
+        if (
+            not isinstance(shape, list)
+            or len(shape) != 4
+            or any(
+                not isinstance(item, int) or isinstance(item, bool) or item < 0
+                for item in shape
+            )
+            or shape[0] != 1
+            or shape[1] < 1
+            or shape[2] != expected_sequence_length
+            or shape[3] < 1
+        ):
+            raise RuntimeError("external batch cache shape is invalid")
+        result.append(tuple(shape))
+    return tuple(result)
+
+
+def _validated_memory_report(
+    value: Any,
+    *,
+    rank: int,
+    cell: ExternalTensorParallelCellSpec,
+) -> dict[str, int | str]:
+    if not isinstance(value, dict) or set(value) != _MEMORY_REPORT_KEYS:
+        raise RuntimeError("external control memory report is invalid")
+    if (
+        value.get("device") != (cell.rank_devices or ())[rank]
+        or value.get("computeDtype") != cell.compute_dtype
+        or value.get("collectiveBackend") != cell.collective_backend
+    ):
+        raise RuntimeError("external control memory identity is inconsistent")
+    allocated = _nonnegative_int(value.get("allocatedBytes"), "allocatedBytes")
+    reserved = _nonnegative_int(value.get("reservedBytes"), "reservedBytes")
+    peak = _nonnegative_int(value.get("peakAllocatedBytes"), "peakAllocatedBytes")
+    if allocated > reserved or allocated > peak:
+        raise RuntimeError("external control memory counters are inconsistent")
+    return {
+        "device": str(value["device"]),
+        "computeDtype": str(value["computeDtype"]),
+        "collectiveBackend": str(value["collectiveBackend"]),
+        "allocatedBytes": allocated,
+        "reservedBytes": reserved,
+        "peakAllocatedBytes": peak,
+    }
+
+
+def _nonnegative_int(value: Any, name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise RuntimeError(f"external cell {name} must be a nonnegative integer")
+    return value
+
+
 def _send_packet(
     connection: socket.socket,
     document: Mapping[str, Any],
@@ -1029,11 +2228,13 @@ def _send_packet(
     if tensor is not None:
         if (
             tensor.ndim != 3
-            or tensor.shape[0] != 1
+            or not 1 <= tensor.shape[0] <= MAX_CELL_ACTIVATION_BATCH_SIZE
             or tensor.shape[1] < 1
             or tensor.shape[2] < 1
         ):
-            raise ValueError("cell control tensors must have shape [1,tokens,hidden]")
+            raise ValueError(
+                "cell control tensors must have bounded shape [batch,tokens,hidden]"
+            )
         contiguous = tensor.detach().to(device="cpu", dtype=torch.float32).contiguous()
         tensor_payload = contiguous.numpy().tobytes(order="C")
         if len(tensor_payload) > _MAX_TENSOR_BYTES:
@@ -1071,7 +2272,7 @@ def _recv_packet(
                 not isinstance(value, int) or isinstance(value, bool) or value < 1
                 for value in shape
             )
-            or shape[0] != 1
+            or shape[0] > MAX_CELL_ACTIVATION_BATCH_SIZE
             or math.prod(shape) * 4 != tensor_size
         ):
             raise ValueError("cell control tensor shape does not match its payload")

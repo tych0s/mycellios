@@ -759,7 +759,10 @@ class MacroWaveCostObservation:
     per verification wave.  Per-node byte values should already include all
     WAN boundaries traversed by one candidate.  ``acceptance_by_width`` is
     measured probability that a tree of the given width contains the exact
-    target token at one depth level.
+    target token at the first depth level.  When available,
+    ``prefix_survival_by_width`` stores the measured survival curve
+    ``P(accepted_prefix >= level)``.  It avoids the optimistic assumption that
+    acceptance is independent and stationary at every speculative position.
     """
 
     route_rtt_ms: float
@@ -775,6 +778,7 @@ class MacroWaveCostObservation:
     vram_budget_bytes: int
     vram_reserved_bytes: int = 0
     fixed_wire_bytes: int = 0
+    prefix_survival_by_width: tuple[tuple[int, tuple[float, ...]], ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -807,6 +811,47 @@ class MacroWaveCostObservation:
         normalized_acceptance.sort()
         object.__setattr__(self, "acceptance_by_width", tuple(normalized_acceptance))
 
+        normalized_survival: list[tuple[int, tuple[float, ...]]] = []
+        observed_survival_widths: set[int] = set()
+        acceptance_lookup = dict(normalized_acceptance)
+        for raw_width, raw_probabilities in self.prefix_survival_by_width:
+            width = _integer("survival width", raw_width, minimum=1)
+            if width in observed_survival_widths:
+                raise ValueError("prefix_survival_by_width contains a duplicate width")
+            if width not in acceptance_lookup:
+                raise ValueError(
+                    "prefix_survival_by_width width is missing from acceptance_by_width"
+                )
+            if isinstance(raw_probabilities, (str, bytes, bytearray)):
+                raise ValueError("prefix survival probabilities must be a sequence")
+            probabilities = tuple(
+                _finite("prefix survival probability", probability)
+                for probability in raw_probabilities
+            )
+            if not probabilities:
+                raise ValueError("prefix survival probabilities must not be empty")
+            if any(probability > 1.0 for probability in probabilities):
+                raise ValueError("prefix survival probability must be <= 1")
+            if any(
+                current > previous
+                for previous, current in zip(probabilities, probabilities[1:])
+            ):
+                raise ValueError("prefix survival probabilities must be non-increasing")
+            if not math.isclose(
+                probabilities[0], acceptance_lookup[width], rel_tol=0.0, abs_tol=1e-12
+            ):
+                raise ValueError(
+                    "first prefix survival probability must match acceptance_by_width"
+                )
+            observed_survival_widths.add(width)
+            normalized_survival.append((width, probabilities))
+        normalized_survival.sort()
+        object.__setattr__(
+            self,
+            "prefix_survival_by_width",
+            tuple(normalized_survival),
+        )
+
         for name in (
             "activation_bytes_per_node",
             "metadata_bytes_per_node",
@@ -826,6 +871,30 @@ class MacroWaveCostObservation:
         normalized = _integer("width", width, minimum=1)
         return dict(self.acceptance_by_width).get(normalized)
 
+    def prefix_survival_for_width(
+        self,
+        width: int,
+        depth: int,
+    ) -> tuple[float, ...] | None:
+        """Return measured prefix survival or the legacy stationary estimate.
+
+        A measured curve is never extrapolated.  A candidate deeper than the
+        available evidence is skipped rather than silently reviving the old
+        independence assumption for its tail.
+        """
+
+        normalized_width = _integer("width", width, minimum=1)
+        normalized_depth = _integer("depth", depth, minimum=1)
+        curve = dict(self.prefix_survival_by_width).get(normalized_width)
+        if curve is not None:
+            if len(curve) < normalized_depth:
+                return None
+            return curve[:normalized_depth]
+        acceptance = self.acceptance_for_width(normalized_width)
+        if acceptance is None:
+            return None
+        return tuple(acceptance**level for level in range(1, normalized_depth + 1))
+
 
 @dataclass(frozen=True)
 class MacroWaveCostEstimate:
@@ -833,6 +902,7 @@ class MacroWaveCostEstimate:
     width: int
     candidate_nodes: int
     level_acceptance: float
+    prefix_survival_probabilities: tuple[float, ...]
     expected_accepted_tokens: float
     expected_emitted_tokens: float
     expected_rollback_nodes: float
@@ -896,6 +966,9 @@ class MacroWaveCostController:
             if acceptance is None:
                 continue
             for depth in self.config.candidate_depths:
+                survival = observation.prefix_survival_for_width(width, depth)
+                if survival is None:
+                    continue
                 nodes = _candidate_nodes(
                     width,
                     depth,
@@ -903,9 +976,7 @@ class MacroWaveCostController:
                 )
                 if nodes is None:
                     continue
-                expected_accepted = sum(
-                    acceptance**level for level in range(1, depth + 1)
-                )
+                expected_accepted = sum(survival)
                 expected_emitted = 1.0 + expected_accepted
                 expected_rollback = max(0.0, nodes - expected_accepted)
                 wire_bytes = (
@@ -940,6 +1011,7 @@ class MacroWaveCostController:
                         width=width,
                         candidate_nodes=nodes,
                         level_acceptance=acceptance,
+                        prefix_survival_probabilities=survival,
                         expected_accepted_tokens=expected_accepted,
                         expected_emitted_tokens=expected_emitted,
                         expected_rollback_nodes=expected_rollback,

@@ -123,6 +123,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cell-startup-timeout-seconds", type=float, default=120.0)
     parser.add_argument("--max-physical-batch-size", type=int, default=8)
     parser.add_argument("--physical-batch-window-ms", type=float, default=0.5)
+    parser.add_argument(
+        "--max-speculative-branches",
+        type=int,
+        default=0,
+        help="Sealed concurrent exact KV children; zero disables FORK/PROMOTE.",
+    )
+    parser.add_argument(
+        "--max-speculative-branch-tokens",
+        type=int,
+        default=0,
+        help="Sealed context-token ceiling for every speculative KV child.",
+    )
+    parser.add_argument(
+        "--max-speculative-kv-bytes",
+        type=int,
+        default=0,
+        help="Sealed total live speculative KV bytes, checked before allocation.",
+    )
     parser.add_argument("--native_stage-package")
     parser.add_argument("--native_stage-package-id")
     parser.add_argument("--native_stage-manifest-sha256")
@@ -298,6 +316,9 @@ def build_config(args: argparse.Namespace) -> StageProcessConfig:
         cell_startup_timeout_seconds=args.cell_startup_timeout_seconds,
         max_physical_batch_size=args.max_physical_batch_size,
         physical_batch_window_ms=args.physical_batch_window_ms,
+        max_speculative_branches=args.max_speculative_branches,
+        max_speculative_branch_tokens=args.max_speculative_branch_tokens,
+        max_speculative_kv_bytes=args.max_speculative_kv_bytes,
         ram_backed_moe=ram_backed_moe,
         native_stage_package=args.native_stage_package,
         native_stage_package_id=args.native_stage_package_id,

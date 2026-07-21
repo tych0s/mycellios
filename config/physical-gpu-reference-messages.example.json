@@ -1,0 +1,10 @@
+[
+  {
+    "role": "system",
+    "content": "Responde de forma determinista y breve."
+  },
+  {
+    "role": "user",
+    "content": "Explica en una frase qué es una red neuronal."
+  }
+]

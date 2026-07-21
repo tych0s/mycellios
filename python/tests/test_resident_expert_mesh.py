@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest import mock
 
 import torch
 
@@ -488,6 +489,615 @@ class ResidentExpertMeshTests(unittest.TestCase):
         self.assertTrue(plan.assignment_optimality_proven)
         self.assertEqual(plan.assignment_states_evaluated, 2)
         self.assertLess(plan.exposed_ms, 2.0)
+
+    def test_one_expert_rows_split_across_replicas_with_exact_reduction(self) -> None:
+        inventory = records(experts=1, byte_size=10)
+        key = inventory[0].key
+        mesh = ResidentExpertMesh(
+            coordinator_id="root",
+            experts=inventory,
+            nodes=(
+                node("root", budget=48, workspace_bytes_per_token=1),
+                node("owner-a", budget=35, workspace_bytes_per_token=1),
+                node("owner-b", budget=35, workspace_bytes_per_token=1),
+            ),
+            links=(
+                MeshLinkProfile("root", "owner-a", 0.0, 1_000_000.0),
+                MeshLinkProfile("root", "owner-b", 0.0, 1_000_000.0),
+            ),
+            local_ram_keys=(),
+            local_gpu_keys=(),
+            replicas=(
+                ResidentExpertReplica(key, "owner-a", inventory[0].content_id),
+                ResidentExpertReplica(key, "owner-b", inventory[0].content_id),
+            ),
+            local_weight_buffer_bytes=0,
+            activation_bytes_per_token=8,
+            require_local_ram_fallback=False,
+        )
+        weight = 2 * torch.eye(2)
+        owners = {
+            owner_id: InMemoryExpertOwner(
+                owner_id,
+                {key: (inventory[0].content_id, weight)},
+            )
+            for owner_id in ("owner-a", "owner-b")
+        }
+        hidden = torch.tensor([[1.0, -2.0], [3.0, 0.5]])
+        routing = AuthoritativeRouting(
+            torch.tensor([[0], [0]], dtype=torch.long),
+            torch.tensor([[0.25], [0.75]], dtype=torch.float32),
+        )
+
+        actual, plan = mesh.execute_layer(hidden, 0, routing, owners)
+
+        expected = hidden * (2 * routing.expert_weights[:, 0]).unsqueeze(-1)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        self.assertEqual(len(plan.dispatches), 2)
+        self.assertEqual(
+            {dispatch.owner_id for dispatch in plan.dispatches},
+            {"owner-a", "owner-b"},
+        )
+        self.assertTrue(
+            all(len(dispatch.assignments) == 1 for dispatch in plan.dispatches)
+        )
+        self.assertEqual(plan.assignment_states_evaluated, 4)
+        self.assertTrue(plan.assignment_optimality_proven)
+        self.assertEqual(plan.weight_loaded_bytes, 0)
+        # One resident physical copy is exercised on each owner; row count
+        # must not multiply the fixed weight metric within either dispatch.
+        self.assertEqual(plan.weight_avoided_bytes, 20)
+        self.assertEqual(
+            dict(plan.owner_peak_vram_bytes),
+            {"owner-a": 35, "owner-b": 35, "root": 48},
+        )
+        self.assertEqual(owners["owner-a"].batch_calls, 1)
+        self.assertEqual(owners["owner-b"].batch_calls, 1)
+
+    def test_rows_split_across_replicas_when_parallelism_reduces_makespan(self) -> None:
+        inventory = records(experts=1, byte_size=10)
+        key = inventory[0].key
+        mesh = ResidentExpertMesh(
+            coordinator_id="root",
+            experts=inventory,
+            nodes=(
+                node("root", budget=200, workspace_bytes_per_token=1),
+                node(
+                    "owner-a",
+                    budget=200,
+                    compute_ms=10.0,
+                    workspace_bytes_per_token=1,
+                ),
+                node(
+                    "owner-b",
+                    budget=200,
+                    compute_ms=10.0,
+                    workspace_bytes_per_token=1,
+                ),
+            ),
+            links=(
+                MeshLinkProfile("root", "owner-a", 0.0, 1_000_000_000.0),
+                MeshLinkProfile("root", "owner-b", 0.0, 1_000_000_000.0),
+            ),
+            local_ram_keys=(),
+            local_gpu_keys=(),
+            replicas=(
+                ResidentExpertReplica(key, "owner-a", inventory[0].content_id),
+                ResidentExpertReplica(key, "owner-b", inventory[0].content_id),
+            ),
+            local_weight_buffer_bytes=0,
+            activation_bytes_per_token=8,
+            require_local_ram_fallback=False,
+        )
+        routing = AuthoritativeRouting(
+            torch.zeros((4, 1), dtype=torch.long),
+            torch.ones((4, 1), dtype=torch.float32),
+        )
+
+        plan = mesh.plan_layer(0, routing)
+
+        self.assertEqual(
+            sorted(len(dispatch.assignments) for dispatch in plan.dispatches),
+            [2, 2],
+        )
+        self.assertLess(plan.exposed_ms, 30.0)
+        self.assertEqual(plan.assignment_states_evaluated, 16)
+        self.assertTrue(plan.assignment_optimality_proven)
+        # Two rows land on each replica, but each resident physical weight is
+        # still accounted once rather than once per row.
+        self.assertEqual(plan.weight_avoided_bytes, 20)
+
+    def test_grouped_rows_charge_local_ram_weight_once(self) -> None:
+        inventory = records(experts=1, byte_size=10)
+        key = inventory[0].key
+        mesh = ResidentExpertMesh(
+            coordinator_id="root",
+            experts=inventory,
+            nodes=(
+                node("root", budget=85, workspace_bytes_per_token=1),
+            ),
+            links=(),
+            local_ram_keys=(key,),
+            local_gpu_keys=(),
+            replicas=(),
+            local_weight_buffer_bytes=10,
+            activation_bytes_per_token=8,
+        )
+        routing = AuthoritativeRouting(
+            torch.zeros((3, 1), dtype=torch.long),
+            torch.ones((3, 1), dtype=torch.float32),
+        )
+
+        plan = mesh.plan_layer(0, routing)
+
+        self.assertEqual(len(plan.dispatches), 1)
+        self.assertEqual(len(plan.dispatches[0].assignments), 3)
+        self.assertEqual(plan.weight_loaded_bytes, 10)
+        self.assertEqual(plan.weight_avoided_bytes, 0)
+        self.assertEqual(dict(plan.owner_peak_vram_bytes), {"root": 85})
+
+    def test_exact_single_choice_over_many_experts_is_iterative(self) -> None:
+        expert_count = 1_101
+        inventory = records(experts=expert_count, byte_size=1)
+        all_keys = tuple(record.key for record in inventory)
+        mesh = ResidentExpertMesh(
+            coordinator_id="root",
+            experts=inventory,
+            nodes=(
+                node("root", budget=6_000, workspace_bytes_per_token=1),
+            ),
+            links=(),
+            local_ram_keys=(),
+            local_gpu_keys=all_keys,
+            replicas=(),
+            local_weight_buffer_bytes=0,
+            activation_bytes_per_token=1,
+            require_local_ram_fallback=False,
+        )
+        routing = AuthoritativeRouting(
+            torch.arange(expert_count, dtype=torch.long).reshape(-1, 1),
+            torch.ones((expert_count, 1), dtype=torch.float32),
+        )
+
+        plan = mesh.plan_layer(0, routing)
+
+        self.assertEqual(plan.assignment_strategy, "exact-enumeration")
+        self.assertTrue(plan.assignment_optimality_proven)
+        self.assertEqual(plan.assignment_states_evaluated, 1)
+        self.assertEqual(len(plan.dispatches), expert_count)
+
+    def test_bounded_repair_escapes_incremental_greedy_dead_end(self) -> None:
+        inventory = records(experts=11, byte_size=1)
+        profiles = (
+            node("root", budget=100, compute_ms=100.0, workspace_bytes_per_token=1),
+            # These three owners each have dynamic room for exactly one row.
+            node("a", budget=7, compute_ms=0.0, workspace_bytes_per_token=1),
+            node("b", budget=5, compute_ms=100.0, workspace_bytes_per_token=1),
+            node("c", budget=6, compute_ms=1.0, workspace_bytes_per_token=1),
+            node("d", budget=100, compute_ms=2.0, workspace_bytes_per_token=1),
+            node("e", budget=100, compute_ms=3.0, workspace_bytes_per_token=1),
+        )
+        links = tuple(
+            MeshLinkProfile(
+                "root",
+                owner_id,
+                0.0,
+                1_000_000_000.0,
+                rpc_setup_ms_per_batch=0.0,
+                host_device_staging_gbytes_per_second=1.0,
+            )
+            for owner_id in ("a", "b", "c", "d", "e")
+        )
+        placements = []
+        owner_sets = {
+            0: ("a", "b"),
+            1: ("a", "c"),
+            2: ("a", "c"),
+            **{expert: ("d", "e") for expert in range(3, 11)},
+        }
+        for record in inventory:
+            for owner_id in owner_sets[record.key.expert]:
+                placements.append(
+                    ResidentExpertReplica(record.key, owner_id, record.content_id)
+                )
+        mesh = ResidentExpertMesh(
+            coordinator_id="root",
+            experts=inventory,
+            nodes=profiles,
+            links=links,
+            local_ram_keys=(),
+            local_gpu_keys=(),
+            replicas=tuple(placements),
+            local_weight_buffer_bytes=0,
+            activation_bytes_per_token=1,
+            require_local_ram_fallback=False,
+        )
+        routing = AuthoritativeRouting(
+            torch.arange(11, dtype=torch.long).reshape(-1, 1),
+            torch.ones((11, 1), dtype=torch.float32),
+        )
+
+        plan = mesh.plan_layer(0, routing)
+
+        owners = {dispatch.key.expert: dispatch.owner_id for dispatch in plan.dispatches}
+        # Greedy chooses fast owner a for expert 0, then c for expert 1 and
+        # reaches a dead end on expert 2. The bounded repair must backtrack to
+        # the only feasible matching instead of reporting a false failure.
+        self.assertEqual(owners[0], "b")
+        self.assertEqual({owners[1], owners[2]}, {"a", "c"})
+        self.assertEqual(plan.assignment_strategy, "heuristic-bounded-repair")
+        self.assertFalse(plan.assignment_optimality_proven)
+        self.assertGreater(plan.assignment_states_evaluated, 0)
+
+    def test_large_prefill_uses_one_full_plan_evaluation(self) -> None:
+        row_count = 800
+        inventory = records(experts=1, byte_size=1)
+        key = inventory[0].key
+        mesh = ResidentExpertMesh(
+            coordinator_id="root",
+            experts=inventory,
+            nodes=(
+                node("root", budget=100_000, workspace_bytes_per_token=1),
+                node("owner-a", budget=100_000, workspace_bytes_per_token=1),
+                node("owner-b", budget=100_000, workspace_bytes_per_token=1),
+            ),
+            links=(
+                MeshLinkProfile("root", "owner-a", 0.0, 1_000_000_000.0),
+                MeshLinkProfile("root", "owner-b", 0.0, 1_000_000_000.0),
+            ),
+            local_ram_keys=(),
+            local_gpu_keys=(),
+            replicas=(
+                ResidentExpertReplica(key, "owner-a", inventory[0].content_id),
+                ResidentExpertReplica(key, "owner-b", inventory[0].content_id),
+            ),
+            local_weight_buffer_bytes=0,
+            activation_bytes_per_token=1,
+            require_local_ram_fallback=False,
+        )
+        routing = AuthoritativeRouting(
+            torch.zeros((row_count, 1), dtype=torch.long),
+            torch.ones((row_count, 1), dtype=torch.float32),
+        )
+
+        with mock.patch.object(
+            mesh,
+            "_evaluate_assignment_selection",
+            wraps=mesh._evaluate_assignment_selection,
+        ) as full_evaluation:
+            plan = mesh.plan_layer(0, routing)
+
+        self.assertEqual(full_evaluation.call_count, 1)
+        self.assertEqual(
+            plan.assignment_strategy,
+            "heuristic-incremental-local-search",
+        )
+        self.assertFalse(plan.assignment_optimality_proven)
+        self.assertLessEqual(plan.assignment_states_evaluated, 4 * row_count)
+        self.assertEqual(
+            sorted(len(dispatch.assignments) for dispatch in plan.dispatches),
+            [row_count // 2, row_count // 2],
+        )
+
+    def test_thousand_replicas_use_bounded_truthful_candidate_frontier(self) -> None:
+        replica_count = 1_000
+        row_count = 128
+        inventory = records(experts=1, byte_size=1)
+        key = inventory[0].key
+        owner_ids = tuple(f"owner-{index:04d}" for index in range(replica_count))
+        profiles = (
+            node(
+                "root",
+                budget=10_000,
+                compute_ms=100.0,
+                workspace_bytes_per_token=1,
+            ),
+            *(
+                node(
+                    owner_id,
+                    budget=1_000,
+                    compute_ms=0.0,
+                    workspace_bytes_per_token=1,
+                )
+                for owner_id in owner_ids
+            ),
+        )
+        links = tuple(
+            MeshLinkProfile(
+                "root",
+                owner_id,
+                0.0,
+                1_000_000_000.0,
+                rpc_setup_ms_per_batch=0.0,
+                host_device_staging_gbytes_per_second=10.0,
+            )
+            for owner_id in owner_ids
+        )
+        replicas = tuple(
+            ResidentExpertReplica(key, owner_id, inventory[0].content_id)
+            for owner_id in owner_ids
+        )
+        mesh = ResidentExpertMesh(
+            coordinator_id="root",
+            experts=inventory,
+            nodes=profiles,
+            links=links,
+            local_ram_keys=(),
+            local_gpu_keys=(),
+            replicas=replicas,
+            local_weight_buffer_bytes=0,
+            activation_bytes_per_token=1,
+            require_local_ram_fallback=False,
+            max_inflight_owner_rpcs=32,
+        )
+        routing = AuthoritativeRouting(
+            torch.zeros((row_count, 1), dtype=torch.long),
+            torch.ones((row_count, 1), dtype=torch.float32),
+        )
+
+        try:
+            plan = mesh.plan_layer(0, routing)
+        finally:
+            mesh.close()
+
+        self.assertEqual(
+            plan.assignment_strategy,
+            "heuristic-candidate-pruned-local-search",
+        )
+        self.assertFalse(plan.assignment_optimality_proven)
+        # Structural bound: 32 candidates per greedy row plus at most 32^2
+        # local probes. This rejects the old 128 x 1,000 scoring surface
+        # without relying on host timing.
+        self.assertLessEqual(
+            plan.assignment_states_evaluated,
+            row_count * 32 + 32**2,
+        )
+        self.assertEqual(plan.max_inflight_owner_rpcs, 32)
+
+    def test_pruned_frontier_extends_until_row_capacity_is_represented(self) -> None:
+        owner_count = 100
+        row_count = 80
+        inventory = records(experts=1, byte_size=1)
+        key = inventory[0].key
+        owner_ids = tuple(f"owner-{index:03d}" for index in range(owner_count))
+        mesh = ResidentExpertMesh(
+            coordinator_id="root",
+            experts=inventory,
+            nodes=(
+                node("root", budget=1_000, workspace_bytes_per_token=1),
+                *(
+                    # One resident byte plus exactly one four-byte routed row.
+                    node(
+                        owner_id,
+                        budget=5,
+                        compute_ms=0.0,
+                        workspace_bytes_per_token=1,
+                    )
+                    for owner_id in owner_ids
+                ),
+            ),
+            links=tuple(
+                MeshLinkProfile(
+                    "root",
+                    owner_id,
+                    0.0,
+                    1_000_000_000.0,
+                    rpc_setup_ms_per_batch=0.0,
+                    host_device_staging_gbytes_per_second=10.0,
+                )
+                for owner_id in owner_ids
+            ),
+            local_ram_keys=(),
+            local_gpu_keys=(),
+            replicas=tuple(
+                ResidentExpertReplica(key, owner_id, inventory[0].content_id)
+                for owner_id in owner_ids
+            ),
+            local_weight_buffer_bytes=0,
+            activation_bytes_per_token=1,
+            require_local_ram_fallback=False,
+            max_inflight_owner_rpcs=8,
+        )
+        routing = AuthoritativeRouting(
+            torch.zeros((row_count, 1), dtype=torch.long),
+            torch.ones((row_count, 1), dtype=torch.float32),
+        )
+
+        try:
+            plan = mesh.plan_layer(0, routing)
+        finally:
+            mesh.close()
+
+        self.assertEqual(len(plan.dispatches), row_count)
+        self.assertEqual(len(plan.owner_exposed_ms), row_count)
+        self.assertTrue(plan.assignment_strategy.startswith("heuristic-candidate-pruned"))
+        self.assertFalse(plan.assignment_optimality_proven)
+
+    def test_bounded_owner_waves_match_execution_and_calibrated_overhead(self) -> None:
+        tracker_lock = threading.Lock()
+        active = 0
+        peak = 0
+
+        class TrackingOwner:
+            supports_exact_input_coalescing = False
+
+            def __init__(self, node_id: str, record: ExpertRecord) -> None:
+                self.node_id = node_id
+                self.record = record
+
+            def has_expert(self, key: ExpertKey, content_id: str) -> bool:
+                return key == self.record.key and content_id == self.record.content_id
+
+            def is_expert_resident(self, key: ExpertKey, content_id: str) -> bool:
+                return self.has_expert(key, content_id)
+
+            def execute_batch(self, items):
+                nonlocal active, peak
+                with tracker_lock:
+                    active += 1
+                    peak = max(peak, active)
+                try:
+                    time.sleep(0.02)
+                    return tuple(
+                        OwnerExpertBatchResult(item.key, item.activations)
+                        for item in items
+                    )
+                finally:
+                    with tracker_lock:
+                        active -= 1
+
+        owner_count = 6
+        inventory = records(experts=owner_count, byte_size=1)
+        owner_ids = tuple(f"owner-{index}" for index in range(owner_count))
+        profiles = (
+            node(
+                "root",
+                budget=1_000,
+                workspace_bytes_per_token=1,
+                ingress_mbps=1_000_000_000.0,
+                egress_mbps=1_000_000_000.0,
+            ),
+            *(
+                node(
+                    owner_id,
+                    budget=100,
+                    compute_ms=0.0,
+                    workspace_bytes_per_token=1,
+                )
+                for owner_id in owner_ids
+            ),
+        )
+        links = tuple(
+            MeshLinkProfile(
+                "root",
+                owner_id,
+                10.0,
+                1_000_000_000.0,
+                rpc_setup_ms_per_batch=0.0,
+                host_device_staging_gbytes_per_second=10.0,
+            )
+            for owner_id in owner_ids
+        )
+        replicas = tuple(
+            ResidentExpertReplica(record.key, owner_id, record.content_id)
+            for record, owner_id in zip(inventory, owner_ids)
+        )
+        owners = {
+            owner_id: TrackingOwner(owner_id, record)
+            for record, owner_id in zip(inventory, owner_ids)
+        }
+        mesh = ResidentExpertMesh(
+            coordinator_id="root",
+            experts=inventory,
+            nodes=profiles,
+            links=links,
+            local_ram_keys=(),
+            local_gpu_keys=(),
+            replicas=replicas,
+            local_weight_buffer_bytes=0,
+            activation_bytes_per_token=4,
+            require_local_ram_fallback=False,
+            max_inflight_owner_rpcs=2,
+            coordinator_rpc_dispatch_ms_per_owner=0.2,
+            coordinator_serialization_gbytes_per_second=1.0,
+            coordinator_reduction_ms_per_assignment=0.1,
+        )
+        hidden = torch.arange(owner_count, dtype=torch.float32).reshape(-1, 1)
+        routing = AuthoritativeRouting(
+            torch.arange(owner_count, dtype=torch.long).reshape(-1, 1),
+            torch.ones((owner_count, 1), dtype=torch.float32),
+        )
+
+        try:
+            actual, plan = mesh.execute_layer(hidden, 0, routing, owners)
+        finally:
+            mesh.close()
+
+        torch.testing.assert_close(actual, hidden, rtol=0, atol=0)
+        self.assertEqual(peak, 2)
+        self.assertEqual(plan.max_inflight_owner_rpcs, 2)
+        self.assertAlmostEqual(
+            plan.owner_scheduled_makespan_ms,
+            3 * plan.per_owner_lower_bound_ms,
+            places=9,
+        )
+        expected_overhead = (
+            owner_count * 0.2
+            + plan.transport_payload_bytes / 1_000_000.0
+            + owner_count * 0.1
+        )
+        self.assertAlmostEqual(
+            plan.coordinator_overhead_ms,
+            expected_overhead,
+            places=12,
+        )
+        self.assertAlmostEqual(
+            plan.exposed_ms,
+            max(
+                plan.owner_scheduled_makespan_ms,
+                plan.coordinator_nic_lower_bound_ms,
+            )
+            + expected_overhead,
+            places=12,
+        )
+        self.assertFalse(plan.coordination_calibration_required)
+        self.assertFalse(plan.transport_calibration_required)
+
+    def test_missing_coordinator_cost_profile_is_marked_uncalibrated(self) -> None:
+        inventory = records(experts=1, byte_size=1)
+        record = inventory[0]
+        mesh = ResidentExpertMesh(
+            coordinator_id="root",
+            experts=inventory,
+            nodes=(
+                node(
+                    "root",
+                    budget=100,
+                    workspace_bytes_per_token=1,
+                    ingress_mbps=1_000_000.0,
+                    egress_mbps=1_000_000.0,
+                ),
+                node(
+                    "owner-1",
+                    budget=100,
+                    workspace_bytes_per_token=1,
+                ),
+            ),
+            links=(
+                MeshLinkProfile(
+                    "root",
+                    "owner-1",
+                    1.0,
+                    1_000_000.0,
+                    rpc_setup_ms_per_batch=0.0,
+                    host_device_staging_gbytes_per_second=1.0,
+                ),
+            ),
+            local_ram_keys=(),
+            local_gpu_keys=(),
+            replicas=(
+                ResidentExpertReplica(
+                    record.key,
+                    "owner-1",
+                    record.content_id,
+                ),
+            ),
+            local_weight_buffer_bytes=0,
+            activation_bytes_per_token=4,
+            require_local_ram_fallback=False,
+        )
+        routing = AuthoritativeRouting(
+            torch.zeros((1, 1), dtype=torch.long),
+            torch.ones((1, 1), dtype=torch.float32),
+        )
+
+        try:
+            plan = mesh.plan_layer(0, routing)
+        finally:
+            mesh.close()
+
+        self.assertTrue(plan.coordination_calibration_required)
+        self.assertTrue(plan.transport_calibration_required)
 
     def test_owner_row_map_cost_controls_planning_and_execution_choice(self) -> None:
         inventory = records(experts=2)

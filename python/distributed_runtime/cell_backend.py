@@ -15,6 +15,7 @@ _DTYPES: dict[str, torch.dtype] = {
     "bfloat16": torch.bfloat16,
 }
 _CUDA_DEVICE = re.compile(r"cuda:(0|[1-9][0-9]*)\Z")
+MAX_CELL_ACTIVATION_BATCH_SIZE = 8
 
 
 @dataclass(frozen=True)
@@ -115,12 +116,14 @@ class CellExecutorBackend:
         *,
         source_rank: int = 0,
     ) -> torch.Tensor:
-        """Move one ingress activation to rank zero and broadcast collectively.
+        """Move one bounded ingress batch to rank zero and broadcast collectively.
 
-        Only rank zero receives the activation from the GDLP/control plane.
+        Only rank zero receives the activation batch from the GDLP/control plane.
         Other members allocate the sealed shape locally.  This removes the
         previous N-way TCP replication and also gives NCCL/RCCL a device-local
-        tensor for the collective.
+        tensor for the collective.  Batch size one remains the exact legacy
+        path; larger first dimensions represent independent requests with an
+        equal token count and cache length, validated by the stage runner.
         """
 
         shape = _activation_shape(shape_value)
@@ -187,9 +190,15 @@ def _activation_shape(value: object) -> tuple[int, int, int]:
     ):
         raise ValueError("cell activation shape must contain three positive integers")
     shape = tuple(int(item) for item in value)
-    if shape[0] != 1:
-        raise ValueError("the current cell ABI requires activation batch size one")
+    if shape[0] > MAX_CELL_ACTIVATION_BATCH_SIZE:
+        raise ValueError(
+            "cell activation batch exceeds the bounded physical batch size"
+        )
     return shape
 
 
-__all__ = ["CellExecutorBackend", "rank_backend"]
+__all__ = [
+    "CellExecutorBackend",
+    "MAX_CELL_ACTIVATION_BATCH_SIZE",
+    "rank_backend",
+]

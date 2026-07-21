@@ -15,6 +15,7 @@ import {
   LaunchAgentRpcServer,
   LaunchAgentRpcTimeoutError,
   launchAgentRpcHandleId,
+  validateLaunchAgentRpcStartRequest,
   type LaunchAgentRpcServerAddress,
 } from "../src/distribution/launch-agent-rpc.js";
 import {
@@ -48,6 +49,286 @@ describe("HTTP LaunchAgent RPC", () => {
     const second = new HttpLaunchAgent({ endpoint: "http://[::1]:9750" });
     expect(first.id).toMatch(/^http-launch-agent:[a-f0-9]{24}$/);
     expect(second.id).toBe(first.id);
+  });
+
+  it("requires the configured bearer token on health, start, poll and stop", async () => {
+    const request = fixtureRequest();
+    const token = "rpc-control-secret-0123456789012345";
+    const fake = new FakeAgent("fake:authenticated");
+    const { address } = await serve(fake, request.nodeId, { authToken: token });
+
+    const unauthenticatedHealth = await fetch(`${address.url}/healthz`);
+    expect(unauthenticatedHealth.status).toBe(401);
+    expect(unauthenticatedHealth.headers.get("www-authenticate")).toBe(
+      'Bearer realm="gdlp-launch-agent"',
+    );
+    expect(await unauthenticatedHealth.text()).not.toContain(token);
+
+    let wrongTokenError: unknown;
+    try {
+      await rpcClient(address, {
+        authToken: "wrong-control-secret-012345678901",
+      }).start(
+        request,
+        new AbortController().signal,
+      );
+    } catch (error) {
+      wrongTokenError = error;
+    }
+    expect(wrongTokenError).toMatchObject({ status: 401 });
+    expect(String(wrongTokenError)).not.toContain(token);
+    expect(fake.starts).toHaveLength(0);
+
+    const authenticatedHealth = await fetch(`${address.url}/healthz`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(authenticatedHealth.status).toBe(200);
+
+    await expect(rpcClient(address, { authToken: token }).health()).resolves.toEqual({
+      schema: "gdlp-launch-agent-health/2",
+      agentId: fake.id,
+      nodeId: request.nodeId,
+      activeProcesses: 0,
+      retainedTombstones: 0,
+    });
+
+    const handle = await rpcClient(address, { authToken: token }).start(
+      request,
+      new AbortController().signal,
+    );
+    fake.handles.get(request.process.processId)!.markReady();
+    await handle.ready;
+    await handle.stop("authenticated_stop");
+    await expect(handle.exited).resolves.toEqual({ code: 0, signal: "SIGTERM" });
+    await expect(rpcClient(address, { authToken: token }).health()).resolves.toMatchObject({
+      activeProcesses: 0,
+      retainedTombstones: 1,
+    });
+    expect(fake.starts).toHaveLength(1);
+    expect(fake.stopCount).toBe(1);
+  });
+
+  it("reports completed entries as tombstones without losing start idempotency", async () => {
+    const request = fixtureRequest();
+    const fake = new FakeAgent("fake:health-tombstone", { autoReady: true });
+    const { address } = await serve(fake, request.nodeId);
+    const client = rpcClient(address);
+
+    const first = await client.start(request, new AbortController().signal);
+    await first.ready;
+    await expect(client.health()).resolves.toMatchObject({
+      activeProcesses: 1,
+      retainedTombstones: 0,
+    });
+    await first.stop("health_tombstone_complete");
+    await first.exited;
+    await expect(client.health()).resolves.toMatchObject({
+      activeProcesses: 0,
+      retainedTombstones: 1,
+    });
+
+    const replay = await client.start(structuredClone(request), new AbortController().signal);
+    await expect(replay.exited).resolves.toEqual({ code: 0, signal: "SIGTERM" });
+    expect(fake.starts).toHaveLength(1);
+    await expect(client.health()).resolves.toMatchObject({
+      activeProcesses: 0,
+      retainedTombstones: 1,
+    });
+  });
+
+  it("rejects legacy health/1 because its process count mixes active entries and tombstones", async () => {
+    const server = createServer((_request, response) => {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        schema: "gdlp-launch-agent-health/1",
+        agentId: "fake:legacy-health",
+        nodeId: "legacy-node",
+        processes: 0,
+      }));
+    });
+    rawServers.push(server);
+    const endpoint = await listenRawServer(server);
+
+    await expect(new HttpLaunchAgent({ endpoint }).health()).rejects.toThrow(
+      "launch_agent_rpc_health_keys_are_invalid",
+    );
+  });
+
+  it("collects a nonce-bound fixed physical probe through the authenticated RPC", async () => {
+    const request = fixtureRequest();
+    const token = "rpc-control-secret-physical-probe-012345";
+    const nonce = "physical-campaign-rpc-0001";
+    const { address } = await serve(new FakeAgent("fake:probe"), request.nodeId, {
+      authToken: token,
+      physicalProbe: {
+        async collect(observedNonce) {
+          return physicalProbeFixture(observedNonce);
+        },
+      },
+    });
+
+    const unauthenticated = await fetch(`${address.url}/v1/physical-evidence`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        schema: "gdlp-physical-probe-request/1",
+        nonce,
+      }),
+    });
+    expect(unauthenticated.status).toBe(401);
+
+    await expect(
+      rpcClient(address, { authToken: token }).physicalEvidence(nonce),
+    ).resolves.toEqual(physicalProbeFixture(nonce));
+  });
+
+  it("uses a dedicated physical-evidence deadline and aborts a timed-out collector", async () => {
+    const request = fixtureRequest();
+    const nonce = "physical-campaign-timeout-0001";
+    let observedSignal: AbortSignal | undefined;
+    const { address } = await serve(new FakeAgent("fake:probe-timeout"), request.nodeId, {
+      physicalProbeTimeoutMs: 20,
+      physicalProbe: {
+        collect(_nonce, signal) {
+          observedSignal = signal;
+          return new Promise(() => undefined);
+        },
+      },
+    });
+
+    await expect(
+      rpcClient(address, {
+        requestTimeoutMs: 5_000,
+        physicalEvidenceTimeoutMs: 5_000,
+      }).physicalEvidence(nonce),
+    ).rejects.toThrow("launch_agent_rpc_timeout:physical_probe:20");
+    expect(observedSignal?.aborted).toBe(true);
+  });
+
+  it("rejects a non-loopback bind when the server has no bearer credential", async () => {
+    const fake = new FakeAgent("fake:unsafe-bind");
+    const server = new LaunchAgentRpcServer({ agent: fake, nodeId: "unsafe-node" });
+    servers.push(server);
+
+    await expect(server.listen(0, "0.0.0.0")).rejects.toThrow(
+      "launch_agent_rpc_non_loopback_requires_authentication",
+    );
+    expect(fake.starts).toHaveLength(0);
+  });
+
+  it("rejects weak bearer credentials before opening the control plane", () => {
+    const fake = new FakeAgent("fake:weak-auth");
+    expect(
+      () => new LaunchAgentRpcServer({ agent: fake, authToken: "too-short" }),
+    ).toThrow("launch_agent_rpc_auth_token_is_invalid");
+    expect(
+      () =>
+        new HttpLaunchAgent({
+          endpoint: "http://127.0.0.1:9750",
+          authToken: "too-short",
+        }),
+    ).toThrow("launch_agent_rpc_auth_token_is_invalid");
+  });
+
+  it("requires both authentication and a sealed launch allowlist outside loopback", async () => {
+    const token = "rpc-control-secret-0123456789012345";
+    const description = fixtureDescription();
+    const nodeId = description.launchOrder[0]!.anchor.memberId;
+    const withoutAllowlist = new LaunchAgentRpcServer({
+      agent: new FakeAgent("fake:auth-only"),
+      nodeId,
+      authToken: token,
+    });
+    servers.push(withoutAllowlist);
+    await expect(withoutAllowlist.listen(0, "0.0.0.0")).rejects.toThrow(
+      "launch_agent_rpc_non_loopback_requires_launch_allowlist",
+    );
+
+    const sealed = new LaunchAgentRpcServer({
+      agent: new FakeAgent("fake:auth-and-allowlist"),
+      nodeId,
+      authToken: token,
+      allowedLaunchDescriptions: [description],
+    });
+    servers.push(sealed);
+    const address = await sealed.listen(0, "0.0.0.0");
+    expect(address.host).toBe("0.0.0.0");
+    await expect(
+      new HttpLaunchAgent({ endpoint: address.url, authToken: token }).health(),
+    ).resolves.toMatchObject({ nodeId });
+  });
+
+  it("starts an exact process from a compiler-validated launch allowlist", async () => {
+    const description = fixtureDescription();
+    const request = fixtureRequest(description);
+    const fake = new FakeAgent("fake:sealed-exact", { autoReady: true });
+    const { address } = await serve(fake, request.nodeId, {
+      allowedLaunchDescriptions: [description],
+    });
+
+    const handle = await rpcClient(address).start(
+      request,
+      new AbortController().signal,
+    );
+    await handle.ready;
+    expect(fake.starts).toEqual([request]);
+    await handle.stop("sealed_exact_complete");
+  });
+
+  it("rejects a mutated command even when its launch and process ids are allowed", async () => {
+    const description = fixtureDescription();
+    const request = fixtureRequest(description);
+    request.process.command.args.push("--unsealed-command-mutation");
+    const fake = new FakeAgent("fake:sealed-command-mutation");
+    const { address } = await serve(fake, request.nodeId, {
+      allowedLaunchDescriptions: [description],
+    });
+
+    await expect(
+      rpcClient(address).start(request, new AbortController().signal),
+    ).rejects.toMatchObject({
+      status: 403,
+      message: expect.stringContaining("launch_agent_rpc_start_is_not_allowed"),
+    });
+    expect(fake.starts).toHaveLength(0);
+  });
+
+  it("rejects an exact allowed process when it is sent to the wrong node daemon", async () => {
+    const description = fixtureDescription();
+    const request = fixtureRequest(description);
+    const otherNodeId = description.launchOrder.find(
+      (process) => process.anchor.memberId !== request.nodeId,
+    )!.anchor.memberId;
+    const fake = new FakeAgent("fake:sealed-wrong-node");
+    const { address } = await serve(fake, otherNodeId, {
+      allowedLaunchDescriptions: [description],
+    });
+
+    await expect(
+      rpcClient(address).start(request, new AbortController().signal),
+    ).rejects.toMatchObject({
+      status: 422,
+      message: expect.stringContaining("launch_node_does_not_match_daemon"),
+    });
+    expect(fake.starts).toHaveLength(0);
+  });
+
+  it("rejects a valid process from a launch that was not allowlisted", async () => {
+    const allowed = fixtureDescription("sha256:rpc-r1");
+    const denied = fixtureDescription("sha256:rpc-r2");
+    const request = fixtureRequest(denied);
+    const fake = new FakeAgent("fake:sealed-wrong-launch");
+    const { address } = await serve(fake, request.nodeId, {
+      allowedLaunchDescriptions: [allowed],
+    });
+
+    await expect(
+      rpcClient(address).start(request, new AbortController().signal),
+    ).rejects.toMatchObject({
+      status: 403,
+      message: expect.stringContaining("launch_agent_rpc_start_is_not_allowed"),
+    });
+    expect(fake.starts).toHaveLength(0);
   });
 
   it("materializes an entire gdlp-python-launch/2 route through loopback agents", async () => {
@@ -85,6 +366,77 @@ describe("HTTP LaunchAgent RPC", () => {
     expect(stopped.state).toBe("stopped");
     expect([...fakeAgents.values()].reduce((total, agent) => total + agent.stopCount, 0)).toBe(
       description.launchOrder.length,
+    );
+  });
+
+  it("requires sealed root prefill window flags within their compiled bounds", () => {
+    const description = fixtureDescription();
+    const root = description.launchOrder.find((process) => process.kind === "root-engine")!;
+    const request: LaunchAgentStartRequest = {
+      launchId: description.launchId,
+      pipelineId: description.pipelineId,
+      nodeId: root.anchor.memberId,
+      process: structuredClone(root),
+    };
+    expect(description.configuration.prefillInflightChunks).toBeGreaterThanOrEqual(1);
+    expect(description.configuration.prefillInflightBytes).toBeGreaterThanOrEqual(1);
+    expect(root.command.args).toContain("--prefill-inflight-chunks");
+    expect(root.command.args).toContain("--prefill-inflight-bytes");
+    expect(() => validateLaunchAgentRpcStartRequest(request)).not.toThrow();
+
+    const invalidChunks = structuredClone(request);
+    const chunksIndex = invalidChunks.process.command.args.indexOf("--prefill-inflight-chunks");
+    invalidChunks.process.command.args[chunksIndex + 1] = "0";
+    expect(() => validateLaunchAgentRpcStartRequest(invalidChunks)).toThrow(
+      "root_engine_prefill_inflight_chunks_is_invalid",
+    );
+
+    const invalidBytes = structuredClone(request);
+    const bytesIndex = invalidBytes.process.command.args.indexOf("--prefill-inflight-bytes");
+    invalidBytes.process.command.args[bytesIndex + 1] = String(1024 * 1024 * 1024 + 1);
+    expect(() => validateLaunchAgentRpcStartRequest(invalidBytes)).toThrow(
+      "root_engine_prefill_inflight_bytes_is_invalid",
+    );
+  });
+
+  it("validates complete bounded physical tree flags on root and remote stages", () => {
+    const description = fixtureDescription();
+    const processes = description.launchOrder.filter(
+      (process) => process.kind === "root-engine" || process.kind === "remote-stage",
+    );
+    const requestFor = (process: (typeof processes)[number]): LaunchAgentStartRequest => ({
+      launchId: description.launchId,
+      pipelineId: description.pipelineId,
+      nodeId: process.anchor.memberId,
+      process: structuredClone(process),
+    });
+    const setFlag = (request: LaunchAgentStartRequest, flag: string, value: string): void => {
+      const index = request.process.command.args.indexOf(flag);
+      expect(index).toBeGreaterThanOrEqual(0);
+      request.process.command.args[index + 1] = value;
+    };
+
+    for (const process of processes) {
+      const disabled = requestFor(process);
+      expect(() => validateLaunchAgentRpcStartRequest(disabled)).not.toThrow();
+
+      const enabled = requestFor(process);
+      setFlag(enabled, "--max-speculative-branches", "8");
+      setFlag(enabled, "--max-speculative-branch-tokens", "32768");
+      setFlag(enabled, "--max-speculative-kv-bytes", String(512 * 1024 * 1024));
+      expect(() => validateLaunchAgentRpcStartRequest(enabled)).not.toThrow();
+
+      const incomplete = requestFor(process);
+      setFlag(incomplete, "--max-speculative-branches", "1");
+      expect(() => validateLaunchAgentRpcStartRequest(incomplete)).toThrow(
+        `${process.kind === "root-engine" ? "root_engine" : "remote_stage"}_speculative_tree_limits_are_incomplete`,
+      );
+    }
+
+    const root = requestFor(processes.find((process) => process.kind === "root-engine")!);
+    setFlag(root, "--max-speculative-kv-bytes", String(2 ** 40 + 1));
+    expect(() => validateLaunchAgentRpcStartRequest(root)).toThrow(
+      "root_engine_max_speculative_kv_bytes_is_invalid",
     );
   });
 
@@ -634,8 +986,45 @@ function rpcClient(
   });
 }
 
-function fixtureRequest(): LaunchAgentStartRequest {
-  const description = fixtureDescription();
+function physicalProbeFixture(nonce: string) {
+  return {
+    schema: "gdlp-physical-probe/1" as const,
+    nonce,
+    host: {
+      fingerprintSha256: `sha256:${"1".repeat(64)}`,
+      fingerprintSource: "test",
+      platform: "linux",
+      architecture: "x86_64",
+      kernelRelease: "6.8",
+      pythonVersion: "3.12.0",
+    },
+    runtime: {
+      torchVersion: "2.13.0",
+      cudaVersion: "13.0",
+      rocmVersion: null,
+      cudaApiAvailable: true,
+      distributedAvailable: true,
+      ncclAvailable: true,
+      ncclVersion: "2.25.1",
+    },
+    devices: [
+      {
+        index: 0,
+        name: "Test GPU",
+        totalMemoryBytes: 4 * 1024 ** 3,
+        freeMemoryBytes: 3 * 1024 ** 3,
+        runtimeTotalMemoryBytes: 4 * 1024 ** 3,
+        capability: [8, 6] as [number, number],
+        uuidSha256: `sha256:${"2".repeat(64)}`,
+        fingerprintSha256: `sha256:${"3".repeat(64)}`,
+      },
+    ],
+  };
+}
+
+function fixtureRequest(
+  description: PythonPipelineLaunchDescription = fixtureDescription(),
+): LaunchAgentStartRequest {
   const process = description.launchOrder[0]!;
   return {
     launchId: description.launchId,
@@ -682,7 +1071,9 @@ function residentMacroWaveStage(): MacroWaveStageExecutionContractV1 {
   };
 }
 
-function fixtureDescription(): PythonPipelineLaunchDescription {
+function fixtureDescription(
+  modelRevision = "sha256:rpc-r1",
+): PythonPipelineLaunchDescription {
   const model: DistributedModelProfile = {
     id: "rpc-model",
     layers: Array.from({ length: 6 }, (_, index) => ({
@@ -754,7 +1145,7 @@ function fixtureDescription(): PythonPipelineLaunchDescription {
   }
   const request: RuntimePlanRequest = {
     model,
-    modelRevision: "sha256:rpc-r1",
+    modelRevision,
     topology: { nodes, links },
     workload,
     phasePlans: { prefill: plan, decode: plan },
