@@ -73,10 +73,10 @@ export function buildConnectedExecutorActivationSnapshot(
         ),
       ),
       lossRate: 0,
-      availability: Math.max(
-        0.01,
-        Math.min(from.worker.reliability, to.worker.reliability),
-      ),
+      // Worker reliability is already represented on both endpoint nodes.
+      // Reusing it here would count the same failures again for the forward
+      // and return links, making two 95% reliable workers look <90% reliable.
+      availability: 1,
     })));
   const rootHost = nodes[0]!.endpoint.host;
   const config = parseAutoDistributionConfig({

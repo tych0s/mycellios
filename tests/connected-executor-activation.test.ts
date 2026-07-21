@@ -43,6 +43,7 @@ describe("connected executor activation", () => {
     expect(snapshot.config?.runtime.apiAdvertiseHost).toBe("192.168.1.10");
     expect(snapshot.config?.runtime.returnEndpoint.host).toBe("192.168.1.10");
     expect(snapshot.config?.links).toHaveLength(2);
+    expect(snapshot.config?.links.every((link) => link.availability === 1)).toBe(true);
   });
 
   it("reports capacity but withholds a launch topology until two executors connect", () => {
