@@ -382,6 +382,7 @@ export async function createCoordinator(
         "content-type": "text/event-stream; charset=utf-8",
         "cache-control": "no-cache, no-transform",
         connection: "keep-alive",
+        "x-accel-buffering": "no",
         "x-network-request-id": handle.jobId,
         "x-network-session-id": handle.sessionId,
       });
@@ -777,6 +778,7 @@ function writeOpenAiEvent(
         created: Math.floor(Date.now() / 1_000),
         model,
         choices: [{ index: 0, delta: { content: event.token.text }, finish_reason: null }],
+        x_network: { token_index: event.token.index },
       })}\n\n`,
     );
   } else if (event.type === "completed") {

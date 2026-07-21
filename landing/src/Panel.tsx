@@ -4,6 +4,7 @@ import {
   Boxes,
   Check,
   CheckCircle2,
+  ChevronDown,
   ChevronRight,
   CircleAlert,
   CirclePower,
@@ -38,17 +39,19 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState, type CSSProperties, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent } from "react";
 import "@fontsource-variable/manrope";
 import type {
   DashboardSnapshot,
   ChatResponse,
+  ChatStreamUpdate,
   DesktopBridge,
   DesktopSettings,
   DesktopUpdateStatus,
   RequestModelInput,
   RequestedModelCapacity,
 } from "../../src/desktop/contracts";
+import { consumeChatCompletionStream } from "../../src/desktop/chat-stream";
 import type { BenchmarkMeasurement, BenchmarkRun } from "../../src/benchlab/types";
 import { Contribute } from "./Contribute";
 import brandIcon from "./assets/mycellios-mark-transparent.png";
@@ -294,30 +297,16 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     await refresh();
   }
 
-  async function sendPrompt(model: string, prompt: string): Promise<ChatResponse> {
+  async function sendPrompt(model: string, prompt: string, onUpdate?: (update: ChatStreamUpdate) => void): Promise<ChatResponse> {
+    if (desktopBridge?.streamChat) return desktopBridge.streamChat({ model, prompt }, onUpdate ?? (() => undefined));
     if (desktopBridge) return desktopBridge.sendChat({ model, prompt });
-    const response = await fetch("/v1/chat/completions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }], max_tokens: 256 }) });
-    const body = await response.json() as {
-      id?: string;
-      model?: string;
-      choices?: Array<{ message?: { content?: string } }>;
-      usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
-      x_network?: { route_class?: string; affinity_hit?: boolean; ttft_ms?: number; active_ms?: number };
-      error?: { message?: string };
-    };
-    if (!response.ok) throw new Error(body.error?.message ?? `HTTP ${response.status}`);
-    return {
-      requestId: body.id ?? "unknown",
-      model: body.model ?? model,
-      text: body.choices?.[0]?.message?.content ?? "",
-      promptTokens: body.usage?.prompt_tokens ?? 0,
-      outputTokens: body.usage?.completion_tokens ?? 0,
-      totalTokens: body.usage?.total_tokens ?? 0,
-      routeClass: body.x_network?.route_class ?? "unknown",
-      affinityHit: body.x_network?.affinity_hit ?? false,
-      ttftMs: body.x_network?.ttft_ms ?? 0,
-      activeMs: body.x_network?.active_ms ?? 0,
-    };
+    const startedAt = Date.now();
+    const response = await fetch("/v1/chat/completions", {
+      method: "POST",
+      headers: { accept: "text/event-stream", "content-type": "application/json" },
+      body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }], stream: true, max_tokens: 128, temperature: 0, top_p: 1 }),
+    });
+    return consumeChatCompletionStream(response, model, onUpdate ?? (() => undefined), startedAt);
   }
 
   const publicOrigin = desktopSnapshot?.settings.coordinatorMode === "remote"
@@ -523,7 +512,7 @@ function Models({ snapshot, onRequest, onRemove, adminToken: initialAdminToken, 
         <label>NETWORK NAME<input value={modelId} onChange={(event) => setModelId(event.target.value)} placeholder="qwen3-0.6b" required pattern="[A-Za-z0-9][A-Za-z0-9._-]*" /></label>
         <label>REVISION <small>optional</small><input value={revision} onChange={(event) => setRevision(event.target.value)} placeholder="main or commit" /></label>
         <label>CONTEXT TOKENS<input type="number" min={128} max={1048576} value={contextTokens} onChange={(event) => setContextTokens(Number(event.target.value))} /></label>
-        <label>MINIMUM NODES<select value={minimumNodes} onChange={(event) => setMinimumNodes(Number(event.target.value))}>{[2, 3, 4, 5, 6, 7, 8].map((count) => <option key={count}>{count}</option>)}</select></label>
+        <label>MINIMUM NODES<AppSelect ariaLabel="Minimum nodes" value={String(minimumNodes)} onChange={(value) => setMinimumNodes(Number(value))} options={[2, 3, 4, 5, 6, 7, 8].map((count) => ({ value: String(count), label: String(count) }))} /></label>
         {requiresAdminToken && <label>NETWORK ADMIN TOKEN<input type="password" autoComplete="current-password" value={adminToken} onChange={(event) => setAdminToken(event.target.value)} placeholder="Required to deploy models" required /></label>}
         <label className="model-auto-toggle"><input type="checkbox" checked={autoActivate} onChange={(event) => setAutoActivate(event.target.checked)} /><span><strong>Activate automatically</strong><small>Start as soon as compatible capacity reaches the requirement.</small></span></label>
       </div>
@@ -643,7 +632,7 @@ function Tests({ bridge }: { bridge: DesktopBridge | undefined }) {
     </div>
     {loading && runs.length === 0 ? <div className="benchmark-loading"><LoaderCircle className="spin" /><span>Loading real benchmark history…</span></div> : runs.length === 0 ? <Empty icon={Gauge} title="No real tests recorded" copy="Start the active runtime and run the first measurement. Nothing is generated if the runtime is not ready." /> : <>
       <div className="benchmark-toolbar">
-        <label>RUN<select value={selected?.runId ?? ""} onChange={(event) => setSelectedRunId(event.target.value)}>{runs.map((run) => <option key={run.runId} value={run.runId}>{`v${run.version} · ${formatBenchmarkDate(run.finishedAt)} · ${benchmarkStatusLabel(run.status)}`}</option>)}</select></label>
+        <label>RUN<AppSelect ariaLabel="Benchmark run" value={selected?.runId ?? ""} onChange={setSelectedRunId} options={runs.map((run) => ({ value: run.runId, label: `v${run.version} · ${formatBenchmarkDate(run.finishedAt)} · ${benchmarkStatusLabel(run.status)}` }))} /></label>
         {selected && <div className={`benchmark-run-state ${selected.status}`}><i />{benchmarkStatusLabel(selected.status)}<span>{selected.suite === "physical-import" ? "physical campaign" : "active runtime"}</span></div>}
       </div>
       <div className="benchmark-chart-grid">
@@ -713,9 +702,13 @@ interface InferenceTurn {
   response: ChatResponse;
 }
 
+interface InferencePendingTurn extends ChatStreamUpdate {
+  prompt: string;
+}
+
 function Inference({ snapshot, onSend, onNavigate }: {
   snapshot: PublicSnapshot;
-  onSend: (model: string, prompt: string) => Promise<ChatResponse>;
+  onSend: (model: string, prompt: string, onUpdate?: (update: ChatStreamUpdate) => void) => Promise<ChatResponse>;
   onNavigate: (view: PanelView) => void;
 }) {
   const options = useMemo(() => snapshot.models.map((item) => inferenceModelOption(snapshot, item)), [snapshot]);
@@ -725,26 +718,46 @@ function Inference({ snapshot, onSend, onNavigate }: {
   const [prompt, setPrompt] = useState("");
   const [turns, setTurns] = useState<InferenceTurn[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [pendingPrompt, setPendingPrompt] = useState<string | null>(null);
+  const [pendingTurn, setPendingTurn] = useState<InferencePendingTurn | null>(null);
   const [diagnostic, setDiagnostic] = useState<"idle" | "running" | "ok" | "failed">("idle");
+  const outputRef = useRef<HTMLDivElement>(null);
   const selectedModel = realModels.some((item) => item.id === model) ? model : realModels[0]?.id ?? "";
   const selectedOption = realModels.find((item) => item.id === selectedModel) ?? null;
 
+  useEffect(() => {
+    if (!pendingTurn) return;
+    const output = outputRef.current;
+    if (output) output.scrollTop = output.scrollHeight;
+  }, [pendingTurn?.text, pendingTurn?.outputTokens]);
+
   async function send() {
     const cleanPrompt = prompt.trim();
-    if (!selectedModel || !cleanPrompt || pendingPrompt) return;
-    setPendingPrompt(cleanPrompt);
+    if (!selectedModel || !cleanPrompt || pendingTurn) return;
+    setPendingTurn({
+      prompt: cleanPrompt,
+      requestId: "pending",
+      model: selectedModel,
+      delta: "",
+      text: "",
+      outputTokens: 0,
+      routeClass: "waiting",
+      affinityHit: false,
+      ttftMs: 0,
+      elapsedMs: 0,
+    });
     setPrompt("");
     setError(null);
     try {
-      const response = await onSend(selectedModel, cleanPrompt);
+      const response = await onSend(selectedModel, cleanPrompt, (update) => {
+        setPendingTurn((current) => current ? { ...current, ...update } : current);
+      });
       if (!response.text.trim()) throw new Error("El modelo terminó sin devolver texto.");
       setTurns((current) => [...current, { id: response.requestId, prompt: cleanPrompt, response }]);
     } catch (caught) {
       setPrompt(cleanPrompt);
       setError(errorText(caught));
     } finally {
-      setPendingPrompt(null);
+      setPendingTurn(null);
     }
   }
 
@@ -770,24 +783,42 @@ function Inference({ snapshot, onSend, onNavigate }: {
       </div>
     </div> : <div className="inference-console">
       <div className="inference-toolbar">
-        <label><span>MODELO REAL</span><select value={selectedModel} onChange={(event) => setModel(event.target.value)}>{realModels.map((item) => <option key={item.id} value={item.id}>{item.id}</option>)}</select></label>
+        <label><span>MODELO REAL</span><AppSelect ariaLabel="Modelo real" value={selectedModel} onChange={setModel} options={realModels.map((item) => ({ value: item.id, label: item.id }))} /></label>
         <div className="inference-model-summary"><span className="inference-live"><i />DISPONIBLE</span><span>{selectedOption?.routeLabel}</span><span>{selectedOption?.freeSlots ?? 0} hueco{selectedOption?.freeSlots === 1 ? "" : "s"} libre{selectedOption?.freeSlots === 1 ? "" : "s"}</span></div>
       </div>
-      <div className="inference-output" aria-live="polite">
-        {turns.length === 0 && !pendingPrompt && !error && <div className="inference-welcome"><Sparkles /><h2>Escribe una pregunta</h2><p>La respuesta vendrá del modelo seleccionado, no del adaptador de conectividad.</p><div className="inference-suggestions">{["Resume cómo funciona esta red", "Explica una idea en tres frases", "Responde con una prueba corta"].map((suggestion) => <button key={suggestion} onClick={() => setPrompt(suggestion)}>{suggestion}</button>)}</div></div>}
-        {turns.map((turn) => <div className="inference-turn" key={turn.id}>
-          <div className="inference-user-message"><span>TÚ</span><p>{turn.prompt}</p></div>
-          <div className="inference-message"><img src={brandIcon} alt="" /><div><span>{turn.response.model}</span><p>{turn.response.text}</p><div className="inference-response-metrics"><span><b>{formatDuration(turn.response.ttftMs)}</b>primer token</span><span><b>{formatDuration(turn.response.activeMs)}</b>tiempo total</span><span><b>{turn.response.outputTokens}</b>tokens salida</span><span><b>{formatResponseThroughput(turn.response)}</b>tokens/s</span><span><b>{turn.response.routeClass}</b>ruta</span></div></div></div>
-        </div>)}
-        {pendingPrompt && <div className="inference-turn pending"><div className="inference-user-message"><span>TÚ</span><p>{pendingPrompt}</p></div><div className="inference-thinking"><LoaderCircle className="spin" /><span>El modelo está procesando la petición…</span></div></div>}
+      <div className="inference-output" aria-live="polite" ref={outputRef}>
+        {turns.length === 0 && !pendingTurn && !error && <div className="inference-welcome"><Sparkles /><h2>Escribe una pregunta</h2><p>La respuesta vendrá del modelo seleccionado, no del adaptador de conectividad.</p><div className="inference-suggestions">{["Resume cómo funciona esta red", "Explica una idea en tres frases", "Responde con una prueba corta"].map((suggestion) => <button key={suggestion} onClick={() => setPrompt(suggestion)}>{suggestion}</button>)}</div></div>}
+        {turns.map((turn) => <InferenceCompletedTurn turn={turn} key={turn.id} />)}
+        {pendingTurn && <InferenceStreamingTurn turn={pendingTurn} />}
         {error && <div className="inference-error"><CircleAlert /><div><strong>No se pudo completar la inferencia</strong><span>{friendlyInferenceError(error)}</span></div></div>}
       </div>
       <div className="inference-input">
         <textarea aria-label="Mensaje" value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder={`Escribe a ${selectedModel}…`} />
-        <div className="inference-input-foot"><span><kbd>Enter</kbd> enviar · <kbd>Shift</kbd> + <kbd>Enter</kbd> nueva línea</span><div>{turns.length > 0 && <button className="inference-clear" onClick={() => { setTurns([]); setError(null); }}><Trash2 size={14} />Limpiar</button>}<button className="inference-send" disabled={!prompt.trim() || pendingPrompt !== null} onClick={() => void send()}>{pendingPrompt ? <LoaderCircle className="spin" /> : <Send />}<span>Enviar</span></button></div></div>
+        <div className="inference-input-foot"><span><kbd>Enter</kbd> enviar · <kbd>Shift</kbd> + <kbd>Enter</kbd> nueva línea</span><div>{turns.length > 0 && <button className="inference-clear" onClick={() => { setTurns([]); setError(null); }}><Trash2 size={14} />Limpiar</button>}<button className="inference-send" disabled={!prompt.trim() || pendingTurn !== null} onClick={() => void send()}>{pendingTurn ? <LoaderCircle className="spin" /> : <Send />}<span>Enviar</span></button></div></div>
       </div>
     </div>}
   </section>;
+}
+
+function InferenceStreamingTurn({ turn }: { turn: InferencePendingTurn }) {
+  const content = splitStreamingContent(turn.text);
+  return <div className="inference-turn pending">
+    <div className="inference-user-message"><span>TÚ</span><p>{turn.prompt}</p></div>
+    {turn.text ? <div className="inference-message streaming"><img src={brandIcon} alt="" /><div>
+      <div className="inference-stream-head"><span>{turn.model}</span><b><i />GENERANDO EN VIVO</b></div>
+      {content.reasoning !== null && <div className="inference-live-reasoning"><span>RAZONAMIENTO</span><p>{content.reasoning}{content.answer === "" && <i className="stream-cursor" />}</p></div>}
+      {content.answer && <p>{content.answer}<i className="stream-cursor" /></p>}
+      <div className="inference-response-metrics live"><span><b>{formatDuration(turn.ttftMs)}</b>primer token</span><span><b>{formatDuration(turn.elapsedMs)}</b>tiempo actual</span><span><b>{turn.outputTokens}</b>tokens recibidos</span><span><b>{formatLiveThroughput(turn)}</b>tokens/s ahora</span><span><b>{turn.routeClass}</b>ruta</span></div>
+    </div></div> : <div className="inference-thinking"><LoaderCircle className="spin" /><span>Esperando el primer token del modelo…</span></div>}
+  </div>;
+}
+
+function InferenceCompletedTurn({ turn }: { turn: InferenceTurn }) {
+  const content = splitThinkingContent(turn.response.text);
+  return <div className="inference-turn">
+    <div className="inference-user-message"><span>TÚ</span><p>{turn.prompt}</p></div>
+    <div className="inference-message"><img src={brandIcon} alt="" /><div><span>{turn.response.model}</span>{content.reasoning && <details className="inference-reasoning"><summary>Ver razonamiento del modelo</summary><p>{content.reasoning}</p></details>}<p>{content.answer}</p><div className="inference-response-metrics"><span><b>{formatDuration(turn.response.ttftMs)}</b>primer token</span><span><b>{formatDuration(turn.response.activeMs)}</b>tiempo total</span><span><b>{turn.response.outputTokens}</b>tokens salida</span><span><b>{formatResponseThroughput(turn.response)}</b>tokens/s</span><span><b>{turn.response.routeClass}</b>ruta</span></div></div></div>
+  </div>;
 }
 
 function JoinNetwork({ publicLink, external }: { publicLink: (path: string) => string; external: boolean }) {
@@ -848,8 +879,8 @@ function DesktopSettingsView({ snapshot, bridge, onSnapshot }: { snapshot: Dashb
   return <section className="content-page settings-page">
     <PageTitle eyebrow="DESKTOP PREFERENCES" title="Settings" copy="Native connection, contribution, background behavior and updates for this computer." />
     {error && <div className="inline-error"><CircleAlert size={17} />{error}</div>}
-    <div className="settings-section"><div><Globe2 size={20} /><div><h3>Coordinator</h3><p>Use the public network or host an isolated local coordinator.</p></div></div><div className="settings-fields"><label>Mode<select value={draft.coordinatorMode} onChange={(event) => update("coordinatorMode", event.target.value as DesktopSettings["coordinatorMode"])}><option value="remote">Public mycellios network</option><option value="local">Local network on this machine</option></select></label>{draft.coordinatorMode === "remote" && <label>Coordinator URL<input value={draft.remoteCoordinatorUrl} onChange={(event) => update("remoteCoordinatorUrl", event.target.value)} /></label>}<label>Region<input value={draft.region} onChange={(event) => update("region", event.target.value)} placeholder="auto" /></label></div></div>
-    <div className="settings-section"><div><Gauge size={20} /><div><h3>Contribution</h3><p>Select the runtime and memory offered by this node.</p></div></div><div className="settings-fields"><label>Runtime<select value={draft.adapterMode} onChange={(event) => update("adapterMode", event.target.value as DesktopSettings["adapterMode"])}><option value="connectivity-test">Connectivity test</option><option value="local-model-runtime">Local local model runtime</option></select></label><label>Offered VRAM (MB)<input type="number" min="512" step="256" value={draft.offeredVramMb} onChange={(event) => update("offeredVramMb", Number(event.target.value))} /></label>{draft.adapterMode === "local-model-runtime" && <><label>local model runtime model<input value={draft.modelName} onChange={(event) => update("modelName", event.target.value)} /></label><label>local model runtime URL<input value={draft.adapterBaseUrl} onChange={(event) => update("adapterBaseUrl", event.target.value)} /></label><label>Pinned digest<input value={draft.modelDigest} onChange={(event) => update("modelDigest", event.target.value)} placeholder="sha256:…" /></label></>}</div></div>
+    <div className="settings-section"><div><Globe2 size={20} /><div><h3>Coordinator</h3><p>Use the public network or host an isolated local coordinator.</p></div></div><div className="settings-fields"><label>Mode<AppSelect ariaLabel="Coordinator mode" value={draft.coordinatorMode} onChange={(value) => update("coordinatorMode", value as DesktopSettings["coordinatorMode"])} options={[{ value: "remote", label: "Public mycellios network" }, { value: "local", label: "Local network on this machine" }]} /></label>{draft.coordinatorMode === "remote" && <label>Coordinator URL<input value={draft.remoteCoordinatorUrl} onChange={(event) => update("remoteCoordinatorUrl", event.target.value)} /></label>}<label>Region<input value={draft.region} onChange={(event) => update("region", event.target.value)} placeholder="auto" /></label></div></div>
+    <div className="settings-section"><div><Gauge size={20} /><div><h3>Contribution</h3><p>Select the runtime and memory offered by this node.</p></div></div><div className="settings-fields"><label>Runtime<AppSelect ariaLabel="Contribution runtime" value={draft.adapterMode} onChange={(value) => update("adapterMode", value as DesktopSettings["adapterMode"])} options={[{ value: "connectivity-test", label: "Connectivity test" }, { value: "local-model-runtime", label: "Local local model runtime" }]} /></label><label>Offered VRAM (MB)<input type="number" min="512" step="256" value={draft.offeredVramMb} onChange={(event) => update("offeredVramMb", Number(event.target.value))} /></label>{draft.adapterMode === "local-model-runtime" && <><label>local model runtime model<input value={draft.modelName} onChange={(event) => update("modelName", event.target.value)} /></label><label>local model runtime URL<input value={draft.adapterBaseUrl} onChange={(event) => update("adapterBaseUrl", event.target.value)} /></label><label>Pinned digest<input value={draft.modelDigest} onChange={(event) => update("modelDigest", event.target.value)} placeholder="sha256:…" /></label></>}</div></div>
     <div className="settings-section compact-settings"><div><SlidersHorizontal size={20} /><div><h3>Application</h3><p>Startup and background contribution.</p></div></div><div className="toggle-list"><Toggle label="Start with the system" checked={draft.launchAtLogin} onChange={(value) => update("launchAtLogin", value)} /><Toggle label="Keep running in the tray" checked={draft.closeToTray} onChange={(value) => update("closeToTray", value)} /><Toggle label="Contribute resources" checked={draft.contributionEnabled} onChange={(value) => update("contributionEnabled", value)} /></div></div>
     <div className="settings-section"><div><Download size={20} /><div><h3>Automatic updates</h3><p>Desktop releases are checked and downloaded in the background when supported.</p></div></div><div className="update-settings"><div><span className={`update-state ${snapshot.update.state}`}>{updateStateLabel(snapshot.update.state)}</span><strong>Version {snapshot.appVersion}</strong><p>{snapshot.update.message}</p></div><div className="update-actions"><button className="secondary-button" disabled={checkingUpdate || snapshot.update.state === "checking" || snapshot.update.state === "downloading"} onClick={() => void checkUpdate()}><RefreshCw className={checkingUpdate ? "spin" : ""} size={15} />Check now</button>{snapshot.update.state === "ready" && <button className="primary-button" onClick={() => void bridge.installUpdate()}><Download size={15} />Restart and update</button>}</div></div></div>
     <div className="settings-footer"><button className="primary-button" disabled={saving} onClick={() => void save()}>{saving ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}Save and reconnect</button></div>
@@ -902,6 +933,58 @@ function updateStateLabel(state: DesktopUpdateStatus["state"]): string {
 }
 
 function DesktopMetric({ label, value }: { label: string; value: string }) { return <div className="metric"><span>{label}</span><strong>{value}</strong></div>; }
+
+interface AppSelectOption {
+  value: string;
+  label: string;
+}
+
+function AppSelect({ ariaLabel, value, options, onChange }: { ariaLabel: string; value: string; options: AppSelectOption[]; onChange: (value: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const selectedIndex = Math.max(0, options.findIndex((option) => option.value === value));
+  const selected = options[selectedIndex];
+
+  function moveSelection(direction: -1 | 1) {
+    if (options.length === 0) return;
+    const nextIndex = (selectedIndex + direction + options.length) % options.length;
+    const next = options[nextIndex];
+    if (next) onChange(next.value);
+  }
+
+  return <div className={`app-select${open ? " open" : ""}`} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false); }}>
+    <button
+      ref={triggerRef}
+      type="button"
+      className="app-select-trigger"
+      aria-label={ariaLabel}
+      aria-haspopup="listbox"
+      aria-expanded={open}
+      disabled={options.length === 0}
+      onClick={() => setOpen((current) => !current)}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") { event.preventDefault(); setOpen(false); }
+        if (event.key === "ArrowDown") { event.preventDefault(); setOpen(true); moveSelection(1); }
+        if (event.key === "ArrowUp") { event.preventDefault(); setOpen(true); moveSelection(-1); }
+      }}
+    >
+      <span>{selected?.label ?? "Selecciona una opción"}</span><ChevronDown size={16} />
+    </button>
+    {open && <div className="app-select-menu" role="listbox" aria-label={ariaLabel}>
+      {options.map((option) => <button
+        key={option.value}
+        type="button"
+        role="option"
+        aria-selected={option.value === value}
+        className={option.value === value ? "selected" : ""}
+        tabIndex={-1}
+        onMouseDown={(event) => event.preventDefault()}
+        onClick={() => { onChange(option.value); setOpen(false); triggerRef.current?.focus(); }}
+      ><span>{option.label}</span>{option.value === value && <Check size={15} />}</button>)}
+    </div>}
+  </div>;
+}
+
 function Toggle({ label, checked, onChange }: { label: string; checked: boolean; onChange: (checked: boolean) => void }) { return <label className="toggle-row"><span>{label}</span><input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} /><i /></label>; }
 function errorText(error: unknown) { return error instanceof Error ? error.message : String(error); }
 
@@ -937,6 +1020,31 @@ function formatDuration(milliseconds: number): string {
 function formatResponseThroughput(response: ChatResponse): string {
   if (response.activeMs <= 0 || response.outputTokens <= 0) return "—";
   return (response.outputTokens / (response.activeMs / 1_000)).toFixed(2);
+}
+
+function formatLiveThroughput(update: ChatStreamUpdate): string {
+  if (update.elapsedMs <= 0 || update.outputTokens <= 0) return "—";
+  return (update.outputTokens / (update.elapsedMs / 1_000)).toFixed(2);
+}
+
+function splitStreamingContent(text: string): { reasoning: string | null; answer: string } {
+  const opening = /^\s*<think>/i.exec(text);
+  if (!opening) return { reasoning: null, answer: text };
+  const content = text.slice(opening[0].length);
+  const closingIndex = content.toLowerCase().indexOf("</think>");
+  if (closingIndex < 0) return { reasoning: content, answer: "" };
+  return {
+    reasoning: content.slice(0, closingIndex),
+    answer: content.slice(closingIndex + "</think>".length).replace(/^\s+/, ""),
+  };
+}
+
+function splitThinkingContent(text: string): { reasoning: string | null; answer: string } {
+  const match = /^\s*<think>([\s\S]*?)<\/think>\s*/i.exec(text);
+  if (!match) return { reasoning: null, answer: text.trim() };
+  const reasoning = match[1]?.trim() || null;
+  const answer = text.slice(match[0].length).trim();
+  return { reasoning, answer: answer || "El modelo no devolvió contenido final." };
 }
 
 function friendlyInferenceError(message: string): string {

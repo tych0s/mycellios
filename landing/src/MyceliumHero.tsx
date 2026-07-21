@@ -470,6 +470,10 @@ function MyceliumHero() {
       <canvas ref={canvasRef} aria-hidden="true" />
       <div className="mycelium-core-overlay" aria-hidden="true" />
       <div className="mycelium-growth-status" aria-hidden="true"><i /><span>GPU LIGHTS · LIVE</span><b>EACH LIGHT = ONE GPU</b></div>
+      <div className="gpu-coordinate gpu-coordinate-a" aria-hidden="true"><i /><span>RTX 4090</span><b>24 GB</b></div>
+      <div className="gpu-coordinate gpu-coordinate-b" aria-hidden="true"><i /><span>APPLE M3</span><b>36 GB</b></div>
+      <div className="gpu-coordinate gpu-coordinate-c" aria-hidden="true"><i /><span>RTX 3060</span><b>12 GB</b></div>
+      <div className="network-whisper" aria-hidden="true"><span>ROUTE 7FA3</span><i /><b>MODEL SHARD MOVING</b></div>
     </div>
   );
 }

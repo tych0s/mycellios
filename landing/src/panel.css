@@ -41,6 +41,7 @@
   font-size: 14px;
   font-synthesis: none;
   text-rendering: geometricPrecision;
+  color-scheme: dark;
 }
 
 .public-panel *,
@@ -56,6 +57,28 @@
   font: inherit;
 }
 
+.public-panel input,
+.public-panel textarea {
+  caret-color: var(--blue-300);
+}
+
+.public-panel input::placeholder,
+.public-panel textarea::placeholder {
+  color: var(--text-disabled);
+  opacity: 1;
+}
+
+.public-panel input:disabled,
+.public-panel textarea:disabled,
+.public-panel button:disabled {
+  cursor: not-allowed;
+}
+
+.public-panel input[type="checkbox"],
+.public-panel input[type="radio"] {
+  accent-color: var(--blue-500);
+}
+
 .public-panel button:focus-visible,
 .public-panel a:focus-visible,
 .public-panel input:focus-visible,
@@ -63,6 +86,135 @@
 .public-panel textarea:focus-visible {
   outline: 2px solid var(--blue-400);
   outline-offset: 2px;
+}
+
+.public-panel .app-select {
+  position: relative;
+  width: 100%;
+  min-width: 0;
+  color: var(--text-primary);
+  font-size: 11px;
+  font-weight: 450;
+  letter-spacing: 0;
+}
+
+.public-panel .app-select.open {
+  z-index: 300;
+}
+
+.public-panel .app-select-trigger {
+  width: 100%;
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 12px 0 14px;
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+  border-radius: 11px;
+  color: var(--text-primary);
+  background: var(--bg-input);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.018);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 160ms ease, background 160ms ease, box-shadow 160ms ease;
+}
+
+.public-panel .app-select-trigger > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.public-panel .app-select-trigger > svg {
+  flex: 0 0 auto;
+  color: var(--blue-300);
+  transition: transform 160ms ease;
+}
+
+.public-panel .app-select-trigger:hover {
+  border-color: var(--border-strong);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.public-panel .app-select.open .app-select-trigger {
+  border-color: rgba(92, 150, 255, 0.72);
+  background: rgba(63, 124, 255, 0.075);
+  box-shadow: 0 0 0 3px rgba(63, 124, 255, 0.11), inset 0 1px 0 rgba(255, 255, 255, 0.025);
+}
+
+.public-panel .app-select.open .app-select-trigger > svg {
+  transform: rotate(180deg);
+}
+
+.public-panel .app-select-menu {
+  position: absolute;
+  top: calc(100% + 7px);
+  left: 0;
+  right: 0;
+  max-height: 260px;
+  display: grid;
+  gap: 3px;
+  padding: 6px;
+  overflow-y: auto;
+  border: 1px solid rgba(125, 151, 230, 0.2);
+  border-radius: 12px;
+  background: #121a36;
+  box-shadow: 0 18px 42px rgba(1, 5, 18, 0.48), inset 0 1px 0 rgba(255, 255, 255, 0.035);
+  scrollbar-color: var(--text-disabled) transparent;
+  animation: app-select-enter 130ms ease-out;
+}
+
+.public-panel .app-select-menu button {
+  width: 100%;
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 8px;
+  color: var(--text-secondary);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.public-panel .app-select-menu button > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.public-panel .app-select-menu button:hover,
+.public-panel .app-select-menu button:focus-visible {
+  outline: 0;
+  color: var(--text-primary);
+  background: rgba(92, 150, 255, 0.1);
+}
+
+.public-panel .app-select-menu button.selected {
+  color: #fff;
+  background: linear-gradient(135deg, var(--blue-600), var(--blue-500));
+  box-shadow: 0 5px 14px rgba(45, 98, 232, 0.2);
+}
+
+.public-panel .app-select-menu button svg {
+  flex: 0 0 auto;
+}
+
+.public-panel .toggle-row input:focus-visible + i {
+  outline: 2px solid var(--blue-400);
+  outline-offset: 3px;
+}
+
+@keyframes app-select-enter {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 .public-panel .panel-sidebar {
@@ -1693,6 +1845,89 @@
   line-height: 1.7;
 }
 
+.public-panel .inference-message.streaming > div {
+  min-width: 0;
+  flex: 1;
+}
+
+.public-panel .inference-stream-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 9px;
+}
+
+.public-panel .inference-stream-head b {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--success);
+  font-size: 8px;
+  font-weight: 550;
+  letter-spacing: 0.08em;
+}
+
+.public-panel .inference-stream-head b i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--success);
+  box-shadow: 0 0 10px rgba(99, 230, 176, 0.5);
+  animation: inference-live-pulse 1.25s ease-in-out infinite;
+}
+
+.public-panel .inference-live-reasoning {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-left: 2px solid rgba(92, 150, 255, 0.28);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.public-panel .inference-live-reasoning > span {
+  color: var(--blue-300);
+  font-size: 8px;
+  letter-spacing: 0.1em;
+}
+
+.public-panel .inference-live-reasoning p {
+  margin-top: 6px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.65;
+}
+
+.public-panel .stream-cursor {
+  width: 2px;
+  height: 1.05em;
+  display: inline-block;
+  margin-left: 3px;
+  border-radius: 2px;
+  vertical-align: -0.12em;
+  background: var(--blue-300);
+  box-shadow: 0 0 8px rgba(131, 181, 255, 0.42);
+  animation: inference-cursor 780ms steps(1) infinite;
+}
+
+.public-panel .inference-reasoning {
+  margin-top: 10px;
+  color: var(--text-secondary);
+  font-size: 10px;
+}
+
+.public-panel .inference-reasoning summary {
+  color: var(--blue-300);
+  cursor: pointer;
+}
+
+.public-panel .inference-reasoning p {
+  margin-top: 9px;
+  padding: 10px 12px;
+  border-left: 2px solid var(--border-strong);
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.02);
+  font-size: 11px;
+}
+
 .public-panel .inference-response-metrics {
   display: flex;
   flex-wrap: wrap;
@@ -1717,12 +1952,26 @@
   text-transform: none;
 }
 
+.public-panel .inference-response-metrics.live b {
+  color: var(--success);
+}
+
 .public-panel .inference-thinking {
   display: flex;
   align-items: center;
   gap: 10px;
   color: var(--text-secondary);
   font-size: 11px;
+}
+
+@keyframes inference-live-pulse {
+  0%, 100% { opacity: 0.45; transform: scale(0.88); }
+  50% { opacity: 1; transform: scale(1.12); }
+}
+
+@keyframes inference-cursor {
+  0%, 48% { opacity: 1; }
+  49%, 100% { opacity: 0; }
 }
 
 .public-panel .inference-error {

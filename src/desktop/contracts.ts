@@ -197,11 +197,24 @@ export interface ChatResponse {
   activeMs: number;
 }
 
+export interface ChatStreamUpdate {
+  requestId: string;
+  model: string;
+  delta: string;
+  text: string;
+  outputTokens: number;
+  routeClass: string;
+  affinityHit: boolean;
+  ttftMs: number;
+  elapsedMs: number;
+}
+
 export interface DesktopBridge {
   getSnapshot(): Promise<DashboardSnapshot>;
   saveSettings(settings: DesktopSettings): Promise<DashboardSnapshot>;
   setContribution(enabled: boolean): Promise<DashboardSnapshot>;
   sendChat(request: ChatRequest): Promise<ChatResponse>;
+  streamChat?(request: ChatRequest, onUpdate: (update: ChatStreamUpdate) => void): Promise<ChatResponse>;
   removeWorker(workerId: string): Promise<DashboardSnapshot>;
   clearOfflineWorkers(): Promise<DashboardSnapshot>;
   requestModel(input: RequestModelInput): Promise<DashboardSnapshot>;
