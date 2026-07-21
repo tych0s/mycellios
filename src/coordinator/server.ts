@@ -77,7 +77,7 @@ export async function createCoordinator(
     });
     app.get("/downloads/windows", async (_request, reply) => {
       reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
-      return reply.redirect("/updates/win32/x64/mycellios-setup.exe?v=0.2.3");
+      return reply.redirect("/updates/win32/x64/mycellios-setup.exe?v=0.2.4");
     });
   }
   const hub = new WorkerHub(store);

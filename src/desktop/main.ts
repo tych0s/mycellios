@@ -34,7 +34,7 @@ app.setName("mycellios");
 
 const DEFAULT_SETTINGS: DesktopSettings = {
   coordinatorMode: "remote",
-  remoteCoordinatorUrl: "https://www.mycellios.com",
+  remoteCoordinatorUrl: "https://mycellios.com",
   remoteCoordinatorToken: "",
   contributionEnabled: false,
   launchAtLogin: false,
@@ -48,8 +48,9 @@ const DEFAULT_SETTINGS: DesktopSettings = {
   modelDigest: "",
 };
 
-const UPDATE_FEED_URL = "https://www.mycellios.com/updates/win32/x64/";
+const UPDATE_FEED_URL = "https://mycellios.com/updates/win32/x64/";
 const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1_000;
+const LEGACY_PUBLIC_COORDINATOR_URL = "https://www.mycellios.com";
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
@@ -174,7 +175,15 @@ async function checkForUpdates(): Promise<DesktopUpdateStatus> {
 function loadSettings(): DesktopSettings {
   try {
     const stored = JSON.parse(readFileSync(settingsPath(), "utf8")) as Partial<DesktopSettings>;
-    return sanitizeSettings({ ...DEFAULT_SETTINGS, ...stored });
+    const storedCoordinatorUrl = stored.remoteCoordinatorUrl?.trim().replace(/\/+$/, "");
+    const migrated = storedCoordinatorUrl === LEGACY_PUBLIC_COORDINATOR_URL
+      ? { ...stored, remoteCoordinatorUrl: DEFAULT_SETTINGS.remoteCoordinatorUrl }
+      : stored;
+    const loaded = sanitizeSettings({ ...DEFAULT_SETTINGS, ...migrated });
+    if (migrated !== stored) {
+      writeFileSync(settingsPath(), `${JSON.stringify(loaded, null, 2)}\n`, "utf8");
+    }
+    return loaded;
   } catch {
     return { ...DEFAULT_SETTINGS };
   }
