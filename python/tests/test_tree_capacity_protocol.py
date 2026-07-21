@@ -36,6 +36,7 @@ from distributed_runtime.stage import (
     cancel_tree_reservation,
     collect_compatible_activation_frames,
     commit_tree_reservation,
+    consume_tree_reservation_verifies,
     expire_tree_reservation,
     fork_stage_request,
     prepare_tree_capacity,
@@ -471,10 +472,20 @@ class TreeCapacityStageTests(unittest.TestCase):
                 book,
                 shapes,
             )
-            self.assertIsNone(book.active)
+            self.assertIsNotNone(book.active)
+            self.assertTrue(book.active and book.active.committed)
             self.assertEqual(shapes[12].expected_tokens, 3)
             self.assertEqual(recv_frame(peer).frame_type, FrameType.FORK)
             valid = Frame(FrameType.VERIFY, 0, 12, 3, 3, 4, b"")
+            self.assertFalse(tree_reservation_defers_frame(valid, book, branches))
+            validate_tree_reservation_frame_order(valid, book, branches)
+            self.assertTrue(
+                tree_reservation_defers_frame(
+                    Frame(FrameType.ACTIVATION, 0, 99, 0, 1, 4, b""),
+                    book,
+                    branches,
+                )
+            )
             # Payload decoding belongs to process_activation_frames; this helper
             # proves the committed quote is bound to the VERIFY shape first.
             validate_activation(valid, config, runner, metrics, branches, shapes)
@@ -487,6 +498,8 @@ class TreeCapacityStageTests(unittest.TestCase):
                     branches,
                     shapes,
                 )
+            self.assertTrue(consume_tree_reservation_verifies((valid,), book))
+            self.assertIsNone(book.active)
         finally:
             stage_sock.close()
             peer.close()
@@ -724,6 +737,79 @@ class TreeCapacityStageTests(unittest.TestCase):
                     reservations=book,
                     downstream=None,
                 )
+        finally:
+            stage_sock.close()
+            peer.close()
+
+    def test_expired_reservation_after_fork_is_route_fatal_and_stays_barred(self) -> None:
+        config = _last_stage_config(max_kv_bytes=10_000)
+        runner = _QuoteRunner(config.spec)
+        runner.begin(11)
+        runner.active[11] = 2
+        metrics = {
+            11: {
+                "frames": 3,
+                "compute_ms": 0,
+                "bytes_out": 0,
+                "tokens": 2,
+            }
+        }
+        book = TreeReservationBook()
+        stage_sock, peer = socket.socketpair()
+        try:
+            prepare_tree_capacity(
+                _prepare_frame(11, 3, 710, (1,)),
+                config=config,
+                runner=runner,
+                request_metrics=metrics,
+                branch_parents={},
+                reservations=book,
+                downstream=stage_sock,
+                return_socket=None,
+            )
+            recv_frame(peer)
+            commit_tree_reservation(
+                Frame(
+                    FrameType.TREE_RESERVATION_COMMIT,
+                    0,
+                    11,
+                    3,
+                    0,
+                    0,
+                    tree_reservation_payload(710),
+                ),
+                config=config,
+                runner=runner,
+                request_metrics=metrics,
+                branch_parents={},
+                reservations=book,
+                downstream=stage_sock,
+            )
+            recv_frame(peer)
+            branches: dict[int, int] = {}
+            fork_stage_request(
+                Frame(
+                    FrameType.FORK,
+                    0,
+                    12,
+                    0,
+                    0,
+                    0,
+                    branch_request_payload(11),
+                ),
+                config,
+                runner,
+                metrics,
+                branches,
+                stage_sock,
+                book,
+                {},
+            )
+            recv_frame(peer)
+            assert book.active is not None
+            with self.assertRaisesRegex(TimeoutError, "after speculative KV mutation"):
+                expire_tree_reservation(book, now=book.active.deadline_at + 0.001)
+            self.assertIsNotNone(book.active)
         finally:
             stage_sock.close()
             peer.close()
@@ -985,14 +1071,39 @@ class TreeCapacityStageTests(unittest.TestCase):
                     0,
                 )
 
-                # Consuming the sole quoted FORK releases the route barrier;
-                # the unrelated chat then resumes in original TCP order.
+                # FORK alone cannot release the physical capacity guarantee:
+                # the unrelated chat remains held until the quoted VERIFY has
+                # materialised all of its promised KV growth on every stage.
                 child = 78
                 send_frame(
                     upstream,
                     FrameType.FORK,
                     child,
                     payload=branch_request_payload(parent),
+                )
+                direct_return.settimeout(0.05)
+                with self.assertRaises(socket.timeout):
+                    recv_frame(direct_return)
+                direct_return.settimeout(5)
+                tree_hidden = torch.arange(8, dtype=torch.float32).reshape(1, 2, 4)
+                send_frame(
+                    upstream,
+                    FrameType.VERIFY,
+                    child,
+                    step=1,
+                    token_count=2,
+                    hidden_size=4,
+                    flags=int(TensorCodec.FP32),
+                    payload=encode_tensor(tree_hidden, TensorCodec.FP32),
+                )
+                tree_result = recv_frame(direct_return)
+                self.assertEqual(
+                    (
+                        tree_result.frame_type,
+                        tree_result.request_id,
+                        tree_result.token_count,
+                    ),
+                    (FrameType.VERIFY_RESULT, child, 2),
                 )
                 other_result = recv_frame(direct_return)
                 self.assertEqual(
