@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 export class MeshDatabase {
   readonly raw: DatabaseSync;
@@ -48,7 +48,8 @@ export class MeshDatabase {
     const row = this.raw.prepare("SELECT version FROM schema_meta LIMIT 1").get() as {
       version: number;
     };
-    if (Number(row.version) < SCHEMA_VERSION) this.removeLegacyProductSchema();
+    const currentVersion = Number(row.version);
+    if (currentVersion < 2) this.removeLegacyProductSchema();
 
     this.raw.exec(`
       CREATE TABLE IF NOT EXISTS workers (
@@ -60,6 +61,7 @@ export class MeshDatabase {
         last_seen_at INTEGER NOT NULL,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
+        ,deregistered INTEGER NOT NULL DEFAULT 0
       );
 
       CREATE INDEX IF NOT EXISTS workers_status_seen
@@ -108,8 +110,17 @@ export class MeshDatabase {
       CREATE INDEX IF NOT EXISTS sessions_expiry
       ON sessions(expires_at);
 
-      UPDATE schema_meta SET version = ${SCHEMA_VERSION};
     `);
+    if (currentVersion >= 2 && currentVersion < 3) {
+      const columns = this.raw.prepare("PRAGMA table_info(workers)").all() as Array<{
+        name: string;
+      }>;
+      if (!columns.some((column) => column.name === "deregistered")) {
+        this.raw.exec("ALTER TABLE workers ADD COLUMN deregistered INTEGER NOT NULL DEFAULT 0");
+      }
+      this.raw.exec("UPDATE workers SET deregistered = 1");
+    }
+    this.raw.prepare("UPDATE schema_meta SET version = ?").run(SCHEMA_VERSION);
   }
 
   private removeLegacyProductSchema(): void {

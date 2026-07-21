@@ -1,4 +1,4 @@
-const CACHE = "mycellios-mobile-v1";
+const CACHE = "mycellios-mobile-v2";
 const CORE = ["./", "./manifest.webmanifest", "./icon.png"];
 
 self.addEventListener("install", (event) => {

@@ -67,6 +67,22 @@ export class WorkerHub extends EventEmitter<HubEvents> {
     return this.connections.get(workerId)?.ready === true;
   }
 
+  removeWorker(workerId: string): boolean {
+    const existed = Boolean(this.store.getWorker(workerId));
+    const state = this.connections.get(workerId);
+    if (state) {
+      this.connections.delete(workerId);
+      state.ready = false;
+      state.workerId = null;
+      try {
+        state.socket.close(4000, "removed from mycellios panel");
+      } catch {
+        this.handleClose(state);
+      }
+    }
+    return this.store.deregisterWorker(workerId) || existed;
+  }
+
   send(workerId: string, type: string, payload: unknown): boolean {
     const state = this.connections.get(workerId);
     if (!state?.ready || state.socket.readyState !== state.socket.OPEN) return false;
@@ -145,6 +161,17 @@ export class WorkerHub extends EventEmitter<HubEvents> {
       if (envelope.type === "worker.heartbeat") {
         this.applyHeartbeat(envelope.workerId, envelope.payload);
         state.ready = true;
+      }
+      if (envelope.type === "worker.goodbye") {
+        this.store.deregisterWorker(envelope.workerId);
+        if (this.connections.get(envelope.workerId) === state) {
+          this.connections.delete(envelope.workerId);
+          state.ready = false;
+          state.workerId = null;
+          this.emit("disconnect", envelope.workerId);
+        }
+        state.socket.close(1000, envelope.payload.reason);
+        return;
       }
       this.emit("envelope", envelope);
     } catch {

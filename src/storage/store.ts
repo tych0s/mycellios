@@ -80,20 +80,26 @@ export class MeshStore {
   }
 
   getWorker(workerId: string): StoredWorker | null {
-    const row = this.database.raw.prepare("SELECT * FROM workers WHERE id = ?").get(workerId) as
+    const row = this.database.raw
+      .prepare("SELECT * FROM workers WHERE id = ? AND deregistered = 0")
+      .get(workerId) as
       | WorkerRow
       | undefined;
     return row ? this.mapWorker(row) : null;
   }
 
   listWorkers(): StoredWorker[] {
-    const rows = this.database.raw.prepare("SELECT * FROM workers").all() as unknown as WorkerRow[];
+    const rows = this.database.raw
+      .prepare("SELECT * FROM workers WHERE deregistered = 0")
+      .all() as unknown as WorkerRow[];
     return rows.map((row) => this.mapWorker(row));
   }
 
   listSchedulableWorkers(now = Date.now(), staleAfterMs = 15_000): StoredWorker[] {
     const rows = this.database.raw
-      .prepare("SELECT * FROM workers WHERE status = 'online' AND last_seen_at >= ?")
+      .prepare(
+        "SELECT * FROM workers WHERE deregistered = 0 AND status = 'online' AND last_seen_at >= ?",
+      )
       .all(now - staleAfterMs) as unknown as WorkerRow[];
     return rows.map((row) => this.mapWorker(row));
   }
@@ -117,6 +123,28 @@ export class MeshStore {
     this.database.raw
       .prepare("UPDATE workers SET status = ?, updated_at = ? WHERE id = ?")
       .run(status, Date.now(), workerId);
+  }
+
+  deregisterWorker(workerId: string): boolean {
+    const result = this.database.raw
+      .prepare(
+        `UPDATE workers
+         SET deregistered = 1, status = 'offline', updated_at = ?
+         WHERE id = ? AND deregistered = 0`,
+      )
+      .run(Date.now(), workerId);
+    return Number(result.changes) === 1;
+  }
+
+  deregisterOfflineWorkers(): number {
+    const result = this.database.raw
+      .prepare(
+        `UPDATE workers
+         SET deregistered = 1, updated_at = ?
+         WHERE deregistered = 0 AND status IN ('offline', 'suspect')`,
+      )
+      .run(Date.now());
+    return Number(result.changes);
   }
 
   markStaleWorkers(now = Date.now()): { suspect: number; offline: number } {

@@ -10,6 +10,11 @@ const bridge: DesktopBridge = Object.freeze({
   saveSettings: (settings: DesktopSettings) => ipcRenderer.invoke("settings:save", settings),
   setContribution: (enabled: boolean) => ipcRenderer.invoke("contribution:set", enabled),
   sendChat: (request: ChatRequest) => ipcRenderer.invoke("chat:send", request),
+  checkForUpdates: () => ipcRenderer.invoke("updates:check"),
+  installUpdate: () => ipcRenderer.invoke("updates:install"),
+  minimizeWindow: () => ipcRenderer.invoke("window:minimize"),
+  toggleMaximizeWindow: () => ipcRenderer.invoke("window:toggle-maximize"),
+  closeWindow: () => ipcRenderer.invoke("window:close"),
 });
 
 contextBridge.exposeInMainWorld("mycellios", bridge);

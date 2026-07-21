@@ -121,6 +121,11 @@ export const workerHeartbeatEnvelopeSchema = envelopeSchema(
     .strict(),
 );
 
+export const workerGoodbyeEnvelopeSchema = envelopeSchema(
+  "worker.goodbye",
+  z.object({ reason: z.enum(["user_requested", "shutdown"]) }).strict(),
+);
+
 export const leaseAcceptEnvelopeSchema = envelopeSchema(
   "lease.accept",
   z.object({ jobId: identifierSchema, leaseId: identifierSchema }).strict(),
@@ -177,6 +182,7 @@ export const taskFailEnvelopeSchema = envelopeSchema(
 export const workerEnvelopeSchema = z.discriminatedUnion("type", [
   workerHelloEnvelopeSchema,
   workerHeartbeatEnvelopeSchema,
+  workerGoodbyeEnvelopeSchema,
   leaseAcceptEnvelopeSchema,
   leaseRejectEnvelopeSchema,
   taskTokenEnvelopeSchema,

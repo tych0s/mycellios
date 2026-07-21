@@ -1,6 +1,7 @@
 import websocket from "@fastify/websocket";
 import staticFiles from "@fastify/static";
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
+import { timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { z, ZodError } from "zod";
@@ -33,10 +34,26 @@ export async function createCoordinator(
   options: { logger?: boolean } = {},
 ): Promise<CoordinatorRuntime> {
   const app = Fastify({ logger: options.logger ?? false, bodyLimit: 2 * 1024 * 1024 });
+  if (config.networkToken) {
+    const expectedToken = config.networkToken;
+    app.addHook("onRequest", async (request, reply) => {
+      const path = request.url.split("?", 1)[0] ?? request.url;
+      if (!path.startsWith("/internal/v1/") && !path.startsWith("/v1/")) return;
+      const received = parseBearerToken(request.headers.authorization);
+      if (!received || !constantTimeEqual(received, expectedToken)) {
+        return reply.code(401).send({ error: { code: "invalid_network_token" } });
+      }
+    });
+  }
+  app.addContentTypeParser(
+    "application/octet-stream",
+    { parseAs: "buffer", bodyLimit: 512 * 1024 * 1024 },
+    (_request, body, done) => done(null, body),
+  );
   const database = new MeshDatabase(config.databasePath);
   const store = new MeshStore(database);
   const scheduler = new Scheduler(store);
-  await app.register(websocket, { options: { maxPayload: 2 * 1024 * 1024 } });
+  await app.register(websocket, { options: { maxPayload: 10 * 1024 * 1024 } });
   const mobileAssetsPath = resolveMobileAssetsPath(config.mobileAssetsPath);
   if (mobileAssetsPath) {
     await app.register(staticFiles, {
@@ -44,15 +61,31 @@ export async function createCoordinator(
       prefix: "/mobile/",
       decorateReply: false,
       index: "index.html",
-      cacheControl: true,
-      maxAge: "1h",
-      immutable: false,
+      cacheControl: false,
+      setHeaders: setPublicAssetCacheHeaders,
     });
     app.get("/mobile", async (_request, reply) => reply.redirect("/mobile/"));
   }
+  const desktopUpdatesPath = resolveDesktopUpdatesPath(config.desktopUpdatesPath);
+  if (desktopUpdatesPath) {
+    await app.register(staticFiles, {
+      root: desktopUpdatesPath,
+      prefix: "/updates/win32/x64/",
+      decorateReply: false,
+      cacheControl: false,
+      setHeaders: setPublicAssetCacheHeaders,
+    });
+    app.get("/downloads/windows", async (_request, reply) => {
+      reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
+      return reply.redirect("/updates/win32/x64/mycellios-setup.exe?v=0.2.1");
+    });
+  }
   const hub = new WorkerHub(store);
   hub.attach(app);
-  const mobileHub = new MobileComputeHub({ joinToken: config.mobileJoinToken });
+  const mobileHub = new MobileComputeHub({
+    joinToken: config.mobileJoinToken,
+    expertArtifactsPath: config.mobileExpertArtifactsPath,
+  });
   mobileHub.attach(app);
   const service = new MeshService(store, scheduler, hub, config.requestTimeoutMs);
   const staleTimer = setInterval(() => {
@@ -76,8 +109,25 @@ export async function createCoordinator(
         mobile: mobileWorkers.length,
       },
       mobilePwa: mobileAssetsPath ? "/mobile/" : null,
+      landing: config.landingAssetsPath ? "/" : null,
+      desktopUpdates: desktopUpdatesPath ? "/updates/win32/x64/" : null,
     };
   });
+
+  app.get("/public/v1/snapshot", async () =>
+    publicSnapshot(store, scheduler, hub, mobileHub),
+  );
+
+  app.delete("/public/v1/workers/:workerId", async (request, reply) => {
+    const { workerId } = workerIdParamsSchema.parse(request.params);
+    const removed = hub.removeWorker(workerId) || mobileHub.removeWorker(workerId);
+    if (!removed) return reply.code(404).send({ error: { code: "worker_not_found" } });
+    return { removed: true, workerId };
+  });
+
+  app.post("/public/v1/workers/clear-offline", async () => ({
+    removed: store.deregisterOfflineWorkers() + mobileHub.removeOfflineWorkers(),
+  }));
 
   app.post("/internal/v1/workers/register", async (request, reply) => {
     const registration = workerRegistrationSchema.parse(request.body);
@@ -235,6 +285,21 @@ export async function createCoordinator(
     return reply.code(202).send({ id: jobId, status: "cancelled" });
   });
 
+  const landingAssetsPath = resolveLandingAssetsPath(config.landingAssetsPath);
+  if (landingAssetsPath) {
+    await app.register(staticFiles, {
+      root: landingAssetsPath,
+      prefix: "/",
+      decorateReply: true,
+      index: "index.html",
+      cacheControl: false,
+      setHeaders: setPublicAssetCacheHeaders,
+    });
+    for (const path of ["/network", "/admin", "/join", "/downloads"] as const) {
+      app.get(path, async (_request, reply) => reply.sendFile("index.html"));
+    }
+  }
+
   app.setErrorHandler((error, _request, reply) => {
     if (error instanceof ZodError) {
       return reply.code(400).send({
@@ -275,6 +340,113 @@ function resolveMobileAssetsPath(configured: string | undefined): string | null 
   return candidates.find((candidate) => existsSync(resolve(candidate, "index.html"))) ?? null;
 }
 
+function setPublicAssetCacheHeaders(
+  reply: FastifyReply,
+  filePath: string,
+): void {
+  const normalized = filePath.replaceAll("\\", "/");
+  if (
+    normalized.endsWith("/index.html") ||
+    normalized.endsWith("/sw.js") ||
+    normalized.endsWith("/manifest.webmanifest") ||
+    normalized.includes("/downloads/") ||
+    normalized.endsWith("/RELEASES") ||
+    normalized.endsWith("-setup.exe") ||
+    normalized.endsWith("/latest.json")
+  ) {
+    reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
+    return;
+  }
+  if (normalized.includes("/assets/")) {
+    reply.header("Cache-Control", "public, max-age=31536000, immutable");
+    return;
+  }
+  if (normalized.endsWith(".nupkg")) {
+    reply.header("Cache-Control", "public, max-age=31536000, immutable");
+    return;
+  }
+  reply.header("Cache-Control", "public, max-age=3600");
+}
+
+function resolveDesktopUpdatesPath(configured: string | undefined): string | null {
+  const candidates = [configured, resolve(process.cwd(), "updates", "win32", "x64")].filter(
+    (candidate): candidate is string => Boolean(candidate),
+  );
+  return candidates.find((candidate) => existsSync(resolve(candidate, "RELEASES"))) ?? null;
+}
+
+function resolveLandingAssetsPath(configured: string | undefined): string | null {
+  const candidates = [configured, resolve(process.cwd(), "landing-dist")].filter(
+    (candidate): candidate is string => Boolean(candidate),
+  );
+  return candidates.find((candidate) => existsSync(resolve(candidate, "index.html"))) ?? null;
+}
+
+function dashboardWorkers(store: MeshStore, hub: WorkerHub, mobileHub: MobileComputeHub) {
+  return [
+    ...store.listWorkers().map((worker) => ({
+      id: worker.id,
+      status: worker.status,
+      connected: hub.isConnected(worker.id),
+      region: worker.capabilities.region,
+      offeredVramMb: worker.capabilities.gpus.reduce(
+        (sum, gpu) => sum + gpu.offeredVramMb,
+        0,
+      ),
+      gpus: worker.capabilities.gpus,
+      deployments: worker.capabilities.deployments,
+      reliability: worker.reliability,
+      jobsCompleted: worker.jobsCompleted,
+      lastSeenAt: new Date(worker.lastSeenAt).toISOString(),
+      kind: "desktop" as const,
+    })),
+    ...mobileHub.listWorkers().map((worker) => ({
+      ...mobileDashboardWorker(worker),
+      kind: "browser" as const,
+    })),
+  ];
+}
+
+function publicSnapshot(
+  store: MeshStore,
+  scheduler: Scheduler,
+  hub: WorkerHub,
+  mobileHub: MobileComputeHub,
+) {
+  const workers = dashboardWorkers(store, hub, mobileHub);
+  const models = scheduler.listAvailableModels({ connectedWorkerIds: hub.connectedWorkerIds() });
+  const jobs = store.listJobs(100).map((job) => ({
+    id: job.id,
+    model: job.model,
+    status: job.status,
+    workerId: job.workerId,
+    inputTokens: job.inputTokens,
+    outputTokens: job.outputTokens,
+    failureCode: job.failureCode,
+    createdAt: new Date(job.createdAt).toISOString(),
+    updatedAt: new Date(job.updatedAt).toISOString(),
+  }));
+  return {
+    capturedAt: new Date().toISOString(),
+    version: "0.2.0",
+    summary: {
+      registered: workers.length,
+      connected: workers.filter((worker) => worker.connected).length,
+      online: workers.filter((worker) => worker.status === "online").length,
+      mobile: workers.filter((worker) => worker.kind === "browser").length,
+      offeredVramMb: workers.reduce((sum, worker) => sum + worker.offeredVramMb, 0),
+      completedJobs: jobs.filter((job) => job.status === "completed").length,
+    },
+    workers,
+    models: models.map((model) => ({
+      id: model.id,
+      replicas: model.replicas,
+      pipelines: model.pipelines,
+    })),
+    jobs,
+  };
+}
+
 function mobileDashboardWorker(worker: MobileWorkerSnapshot) {
   return {
     id: worker.id,
@@ -310,6 +482,7 @@ function mobileDashboardWorker(worker: MobileWorkerSnapshot) {
       wakeLock: worker.wakeLock,
       estimatedGflops: worker.estimatedGflops,
       verifiedTasks: worker.verifiedTasks,
+      residentExperts: worker.residentExperts,
     },
   };
 }
@@ -328,6 +501,18 @@ function parseIdempotencyKey(received: string | string[] | undefined): string | 
 }
 
 const jobIdParamsSchema = z.object({ jobId: z.string().min(1).max(128) }).strict();
+const workerIdParamsSchema = z.object({ workerId: z.string().min(1).max(256) }).strict();
+
+function parseBearerToken(header: string | undefined): string | undefined {
+  const match = /^Bearer (.+)$/i.exec(header ?? "");
+  return match?.[1]?.trim() || undefined;
+}
+
+function constantTimeEqual(received: string, expected: string): boolean {
+  const left = Buffer.from(received);
+  const right = Buffer.from(expected);
+  return left.length === right.length && timingSafeEqual(left, right);
+}
 
 function writeOpenAiEvent(
   stream: NodeJS.WritableStream,

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import {
   createServer,
   type IncomingMessage,
@@ -14,11 +14,23 @@ import {
   type LaunchProcessExit,
   type LaunchProcessHandle,
 } from "./launch-supervisor.js";
-import type { PythonLaunchProcess } from "./python-launcher.js";
+import {
+  validatePythonLaunchDescription,
+  type PythonLaunchProcess,
+  type PythonPipelineLaunchDescription,
+} from "./python-launcher.js";
+import {
+  PHYSICAL_PROBE_REQUEST_SCHEMA,
+  assertPhysicalProbeNonce,
+  validatePhysicalProbe,
+  type PhysicalProbeCollector,
+  type PhysicalProbeV1,
+} from "./physical-probe.js";
 
 const START_SCHEMA = "gdlp-launch-agent-start/1";
 const STOP_SCHEMA = "gdlp-launch-agent-stop/1";
 const SNAPSHOT_SCHEMA = "gdlp-launch-agent-process/1";
+const HEALTH_SCHEMA = "gdlp-launch-agent-health/1";
 const ERROR_SCHEMA = "gdlp-launch-agent-error/1";
 
 type RpcProcessState = "starting" | "ready" | "exited";
@@ -34,9 +46,18 @@ export interface LaunchAgentRpcProcessSnapshot {
   output: LaunchCapturedOutput;
 }
 
+export interface LaunchAgentRpcHealth {
+  schema: typeof HEALTH_SCHEMA;
+  agentId: string;
+  nodeId: string | null;
+  processes: number;
+}
+
 export interface HttpLaunchAgentOptions {
   endpoint: string | URL;
   id?: string;
+  /** Optional bearer credential for the launch-agent control plane. */
+  authToken?: string;
   requestTimeoutMs?: number;
   cleanupRequestTimeoutMs?: number;
   pollRequestTimeoutMs?: number;
@@ -63,6 +84,7 @@ export class LaunchAgentRpcHttpError extends Error {
 export class HttpLaunchAgent implements LaunchAgent {
   readonly id: string;
   private readonly baseUrl: string;
+  private readonly authToken: string | undefined;
   private readonly requestTimeoutMs: number;
   private readonly cleanupRequestTimeoutMs: number;
   private readonly pollRequestTimeoutMs: number;
@@ -78,6 +100,7 @@ export class HttpLaunchAgent implements LaunchAgent {
     this.baseUrl = endpoint.href.replace(/\/$/, "");
     this.id = options.id ?? defaultHttpAgentId(endpoint);
     assertIdentifier(this.id, "launch_agent_rpc_id");
+    this.authToken = normalizeOptionalAuthToken(options.authToken);
     this.requestTimeoutMs = boundedInteger(
       options.requestTimeoutMs ?? 10_000,
       1,
@@ -182,6 +205,35 @@ export class HttpLaunchAgent implements LaunchAgent {
     );
   }
 
+  async health(signal?: AbortSignal): Promise<LaunchAgentRpcHealth> {
+    const value = await this.requestJson(
+      "/healthz",
+      "GET",
+      undefined,
+      signal,
+      this.requestTimeoutMs,
+      "health",
+    );
+    return validateHealth(value);
+  }
+
+  async physicalEvidence(
+    nonce: string,
+    signal?: AbortSignal,
+  ): Promise<PhysicalProbeV1> {
+    assertPhysicalProbeNonce(nonce);
+    const value = await this.requestJson(
+      "/v1/physical-evidence",
+      "POST",
+      { schema: PHYSICAL_PROBE_REQUEST_SCHEMA, nonce },
+      signal,
+      this.requestTimeoutMs,
+      "physical_evidence",
+    );
+    validatePhysicalProbe(value, nonce);
+    return structuredClone(value);
+  }
+
   async stopRemote(
     handleId: string,
     reason: string,
@@ -225,6 +277,25 @@ export class HttpLaunchAgent implements LaunchAgent {
     timeoutMs: number,
     operation: string,
   ): Promise<LaunchAgentRpcProcessSnapshot> {
+    const value = await this.requestJson(
+      path,
+      method,
+      body,
+      externalSignal,
+      timeoutMs,
+      operation,
+    );
+    return validateSnapshot(value, this.maxOutputBytes);
+  }
+
+  private async requestJson(
+    path: string,
+    method: "GET" | "POST",
+    body: unknown,
+    externalSignal: AbortSignal | undefined,
+    timeoutMs: number,
+    operation: string,
+  ): Promise<unknown> {
     const controller = new AbortController();
     const removeAbort = linkAbortSignal(externalSignal, controller);
     const timer = setTimeout(
@@ -238,6 +309,9 @@ export class HttpLaunchAgent implements LaunchAgent {
           method,
           headers: {
             accept: "application/json",
+            ...(this.authToken === undefined
+              ? {}
+              : { authorization: `Bearer ${this.authToken}` }),
             ...(body === undefined ? {} : { "content-type": "application/json" }),
           },
           ...(body === undefined ? {} : { body: JSON.stringify(body) }),
@@ -274,7 +348,7 @@ export class HttpLaunchAgent implements LaunchAgent {
       if (!response.ok) {
         throw new LaunchAgentRpcHttpError(response.status, rpcErrorMessage(value));
       }
-      return validateSnapshot(value, this.maxOutputBytes);
+      return value;
     } finally {
       clearTimeout(timer);
       removeAbort();
@@ -407,6 +481,17 @@ class HttpLaunchProcessHandle implements LaunchProcessHandle {
 export interface LaunchAgentRpcServerOptions {
   agent: LaunchAgent;
   nodeId?: string;
+  /** Optional bearer credential required on every HTTP route. */
+  authToken?: string;
+  /**
+   * Complete, compiler-sealed launches whose exact node-local processes may
+   * be started. An empty or malformed list is rejected rather than treated as
+   * an open control plane.
+   */
+  allowedLaunchDescriptions?: readonly unknown[];
+  /** Fixed read-only host/GPU probe; never receives argv or a command string. */
+  physicalProbe?: PhysicalProbeCollector;
+  physicalProbeTimeoutMs?: number;
   maxBodyBytes?: number;
   maxOutputBytesPerStream?: number;
   startTimeoutMs?: number;
@@ -443,6 +528,10 @@ interface ServerEntry {
 export class LaunchAgentRpcServer {
   private readonly agent: LaunchAgent;
   private readonly nodeId: string | undefined;
+  private readonly authTokenDigest: Buffer | undefined;
+  private readonly allowedStartFingerprints: ReadonlyMap<string, string> | undefined;
+  private readonly physicalProbe: PhysicalProbeCollector | undefined;
+  private readonly physicalProbeTimeoutMs: number;
   private readonly maxBodyBytes: number;
   private readonly maxOutputBytes: number;
   private readonly startTimeoutMs: number;
@@ -458,6 +547,26 @@ export class LaunchAgentRpcServer {
     this.agent = options.agent;
     if (options.nodeId !== undefined) assertIdentifier(options.nodeId, "nodeId");
     this.nodeId = options.nodeId;
+    const authToken = normalizeOptionalAuthToken(options.authToken);
+    this.authTokenDigest =
+      authToken === undefined ? undefined : launchAgentAuthTokenDigest(authToken);
+    this.allowedStartFingerprints = normalizeAllowedStartFingerprints(
+      options.allowedLaunchDescriptions,
+      this.nodeId,
+    );
+    if (
+      options.physicalProbe !== undefined &&
+      typeof options.physicalProbe.collect !== "function"
+    ) {
+      throw new Error("launch_agent_rpc_physical_probe_is_invalid");
+    }
+    this.physicalProbe = options.physicalProbe;
+    this.physicalProbeTimeoutMs = boundedInteger(
+      options.physicalProbeTimeoutMs ?? 30_000,
+      1,
+      300_000,
+      "launch_agent_rpc_physical_probe_timeout_is_invalid",
+    );
     this.maxBodyBytes = boundedInteger(
       options.maxBodyBytes ?? 2 * 1024 * 1024,
       1_024,
@@ -503,10 +612,21 @@ export class LaunchAgentRpcServer {
     if (typeof host !== "string" || !host.trim()) {
       return Promise.reject(new Error("launch_agent_rpc_listen_host_is_invalid"));
     }
+    const bindHost = host.trim();
+    if (!isLoopbackBindHost(bindHost) && this.authTokenDigest === undefined) {
+      return Promise.reject(
+        new Error("launch_agent_rpc_non_loopback_requires_authentication"),
+      );
+    }
+    if (!isLoopbackBindHost(bindHost) && this.allowedStartFingerprints === undefined) {
+      return Promise.reject(
+        new Error("launch_agent_rpc_non_loopback_requires_launch_allowlist"),
+      );
+    }
     return new Promise((resolve, reject) => {
       const onError = (error: Error) => reject(error);
       this.server.once("error", onError);
-      this.server.listen(port, host, () => {
+      this.server.listen(port, bindHost, () => {
         this.server.removeListener("error", onError);
         const address = this.server.address();
         if (!address || typeof address === "string") {
@@ -514,9 +634,13 @@ export class LaunchAgentRpcServer {
           return;
         }
         const advertisedHost =
-          host === "0.0.0.0" ? "127.0.0.1" : host === "::" ? "::1" : host;
+          bindHost === "0.0.0.0"
+            ? "127.0.0.1"
+            : bindHost === "::"
+              ? "::1"
+              : bindHost;
         resolve({
-          host,
+          host: bindHost,
           port: address.port,
           url: `http://${formatUrlHost(advertisedHost)}:${address.port}`,
         });
@@ -559,15 +683,22 @@ export class LaunchAgentRpcServer {
 
   private async route(request: IncomingMessage, response: ServerResponse): Promise<void> {
     try {
+      if (!this.isAuthorized(request)) {
+        throw new RpcRouteError(401, "launch_agent_rpc_unauthorized");
+      }
       const url = new URL(request.url ?? "/", "http://launch-agent.invalid");
       if (url.search || url.hash) throw new RpcRouteError(400, "query_is_not_supported");
       if (request.method === "GET" && url.pathname === "/healthz") {
         sendJson(response, 200, {
-          schema: "gdlp-launch-agent-health/1",
+          schema: HEALTH_SCHEMA,
           agentId: this.agent.id,
           nodeId: this.nodeId ?? null,
           processes: this.entries.size,
         });
+        return;
+      }
+      if (request.method === "POST" && url.pathname === "/v1/physical-evidence") {
+        await this.physicalEvidenceRoute(request, response);
         return;
       }
       if (request.method === "POST" && url.pathname === "/v1/processes") {
@@ -590,11 +721,56 @@ export class LaunchAgentRpcServer {
       throw new RpcRouteError(404, "route_not_found");
     } catch (error) {
       const normalized = normalizeRouteError(error);
+      if (normalized.status === 401) {
+        response.setHeader("www-authenticate", 'Bearer realm="gdlp-launch-agent"');
+      }
       sendJson(response, normalized.status, {
         schema: ERROR_SCHEMA,
         error: normalized.message,
       });
     }
+  }
+
+  private isAuthorized(request: IncomingMessage): boolean {
+    if (this.authTokenDigest === undefined) return true;
+    const header = request.headers.authorization;
+    const match = /^Bearer ([\x21-\x7e]+)$/i.exec(header ?? "");
+    const candidateDigest = launchAgentAuthTokenDigest(match?.[1] ?? "");
+    return timingSafeEqual(candidateDigest, this.authTokenDigest);
+  }
+
+  private async physicalEvidenceRoute(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    if (this.physicalProbe === undefined) {
+      throw new RpcRouteError(404, "physical_probe_is_not_configured");
+    }
+    requireJson(request);
+    const value = await readJsonBody(request, Math.min(this.maxBodyBytes, 4_096));
+    assertRecord(value, "physical_probe_request");
+    assertExactKeys(
+      value,
+      ["schema", "nonce"],
+      [],
+      "physical_probe_request",
+    );
+    if (value.schema !== PHYSICAL_PROBE_REQUEST_SCHEMA) {
+      throw new RpcRouteError(400, "physical_probe_request_schema_is_invalid");
+    }
+    try {
+      assertPhysicalProbeNonce(value.nonce);
+    } catch {
+      throw new RpcRouteError(400, "physical_probe_nonce_is_invalid");
+    }
+    const probe = await operationWithTimeout(
+      this.physicalProbe.collect(value.nonce),
+      undefined,
+      this.physicalProbeTimeoutMs,
+      "physical_probe",
+    );
+    validatePhysicalProbe(probe, value.nonce);
+    sendJson(response, 200, probe);
   }
 
   private async startRoute(
@@ -610,6 +786,9 @@ export class LaunchAgentRpcServer {
     const startRequest = structuredClone(value.request);
     if (this.nodeId !== undefined && startRequest.nodeId !== this.nodeId) {
       throw new RpcRouteError(422, "launch_node_does_not_match_daemon");
+    }
+    if (!this.isAllowedStart(startRequest)) {
+      throw new RpcRouteError(403, "launch_agent_rpc_start_is_not_allowed");
     }
     const handleId = launchAgentRpcHandleId(startRequest);
     const fingerprint = stableJson(startRequest);
@@ -651,6 +830,12 @@ export class LaunchAgentRpcServer {
       );
     }
     sendJson(response, created ? 201 : 200, this.snapshot(entry));
+  }
+
+  private isAllowedStart(request: LaunchAgentStartRequest): boolean {
+    if (this.allowedStartFingerprints === undefined) return true;
+    const expected = this.allowedStartFingerprints.get(allowedStartKey(request));
+    return expected !== undefined && expected === stableJson(request);
   }
 
   private async startEntry(entry: ServerEntry): Promise<void> {
@@ -1693,6 +1878,27 @@ function validateSnapshot(value: unknown, maxOutputBytes: number): LaunchAgentRp
   };
 }
 
+function validateHealth(value: unknown): LaunchAgentRpcHealth {
+  assertRecord(value, "launch_agent_rpc_health");
+  assertExactKeys(
+    value,
+    ["schema", "agentId", "nodeId", "processes"],
+    [],
+    "launch_agent_rpc_health",
+  );
+  if (value.schema !== HEALTH_SCHEMA) {
+    throw new Error("launch_agent_rpc_health_schema_is_invalid");
+  }
+  assertIdentifier(value.agentId, "launch_agent_rpc_health_agent_id");
+  if (value.nodeId !== null) {
+    assertIdentifier(value.nodeId, "launch_agent_rpc_health_node_id");
+  }
+  if (!Number.isSafeInteger(value.processes) || (value.processes as number) < 0) {
+    throw new Error("launch_agent_rpc_health_process_count_is_invalid");
+  }
+  return value as unknown as LaunchAgentRpcHealth;
+}
+
 function validateOutput(value: unknown, maxBytes: number): LaunchCapturedOutput {
   assertRecord(value, "launch_agent_rpc_output");
   assertExactKeys(value, ["stdout", "stderr", "stdoutTruncated", "stderrTruncated"], [], "launch_agent_rpc_output");
@@ -1902,6 +2108,79 @@ function defaultHttpAgentId(endpoint: URL): string {
     .update(endpoint.href)
     .digest("hex")
     .slice(0, 24)}`;
+}
+
+function normalizeOptionalAuthToken(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (
+    typeof value !== "string" ||
+    value.length < 32 ||
+    value.length > 8_192 ||
+    !/^[\x21-\x7e]+$/.test(value)
+  ) {
+    // Never include credential material in diagnostics.
+    throw new Error("launch_agent_rpc_auth_token_is_invalid");
+  }
+  return value;
+}
+
+function launchAgentAuthTokenDigest(value: string): Buffer {
+  return createHash("sha256")
+    .update("gdlp-launch-agent-auth/1\0")
+    .update(value, "utf8")
+    .digest();
+}
+
+function isLoopbackBindHost(host: string): boolean {
+  const normalized = host.toLowerCase();
+  return (
+    normalized === "::1" ||
+    normalized.startsWith("127.") ||
+    normalized.startsWith("::ffff:127.")
+  );
+}
+
+function normalizeAllowedStartFingerprints(
+  value: readonly unknown[] | undefined,
+  nodeId: string | undefined,
+): ReadonlyMap<string, string> | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length < 1 || value.length > 1_024) {
+    throw new Error("launch_agent_rpc_launch_allowlist_is_invalid");
+  }
+  if (nodeId === undefined) {
+    throw new Error("launch_agent_rpc_launch_allowlist_requires_node_id");
+  }
+
+  const fingerprints = new Map<string, string>();
+  for (const candidate of value) {
+    validatePythonLaunchDescription(candidate);
+    const description: PythonPipelineLaunchDescription = candidate;
+    for (const process of description.launchOrder) {
+      if (process.anchor.memberId !== nodeId) continue;
+      const expected: LaunchAgentStartRequest = {
+        launchId: description.launchId,
+        pipelineId: description.pipelineId,
+        nodeId,
+        process: structuredClone(process),
+      };
+      const key = allowedStartKey(expected);
+      const fingerprint = stableJson(expected);
+      const previous = fingerprints.get(key);
+      if (previous !== undefined && previous !== fingerprint) {
+        throw new Error("launch_agent_rpc_launch_allowlist_conflicts");
+      }
+      fingerprints.set(key, fingerprint);
+    }
+  }
+  if (fingerprints.size === 0) {
+    throw new Error("launch_agent_rpc_launch_allowlist_has_no_process_for_node");
+  }
+  return fingerprints;
+}
+
+function allowedStartKey(request: LaunchAgentStartRequest): string {
+  return `${request.launchId}\0${request.process.processId}`;
 }
 
 function stableJson(value: unknown): string {

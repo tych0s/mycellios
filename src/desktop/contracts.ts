@@ -4,6 +4,7 @@ export type AdapterMode = "connectivity-test" | "local-model-runtime";
 export interface DesktopSettings {
   coordinatorMode: CoordinatorMode;
   remoteCoordinatorUrl: string;
+  remoteCoordinatorToken: string;
   contributionEnabled: boolean;
   launchAtLogin: boolean;
   closeToTray: boolean;
@@ -53,6 +54,23 @@ export interface DashboardWorker {
   lastSeenAt: string;
   gpus: DashboardGpu[];
   deployments: DashboardDeployment[];
+  mobile?: {
+    platform: string;
+    backend: "webgpu" | "cpu";
+    performanceLevel: "low" | "balanced" | "maximum";
+    wakeLock: boolean;
+    estimatedGflops: number;
+    verifiedTasks: number;
+    residentExperts: Array<{
+      artifactId: string;
+      modelId: string;
+      modelDigest: string;
+      layer: number;
+      expert: number;
+      contentId: string;
+      bytes: number;
+    }>;
+  };
 }
 
 export interface DashboardModel {
@@ -77,6 +95,24 @@ export interface LocalHardware {
   }>;
 }
 
+export type DesktopUpdateState =
+  | "unsupported"
+  | "development"
+  | "idle"
+  | "checking"
+  | "downloading"
+  | "ready"
+  | "up-to-date"
+  | "error";
+
+export interface DesktopUpdateStatus {
+  state: DesktopUpdateState;
+  currentVersion: string;
+  availableVersion: string | null;
+  message: string;
+  checkedAt: string | null;
+}
+
 export interface DashboardSnapshot {
   capturedAt: string;
   coordinatorUrl: string;
@@ -93,6 +129,7 @@ export interface DashboardSnapshot {
   models: DashboardModel[];
   localHardware: LocalHardware;
   settings: DesktopSettings;
+  update: DesktopUpdateStatus;
 }
 
 export interface ChatRequest {
@@ -114,4 +151,9 @@ export interface DesktopBridge {
   saveSettings(settings: DesktopSettings): Promise<DashboardSnapshot>;
   setContribution(enabled: boolean): Promise<DashboardSnapshot>;
   sendChat(request: ChatRequest): Promise<ChatResponse>;
+  checkForUpdates(): Promise<DesktopUpdateStatus>;
+  installUpdate(): Promise<void>;
+  minimizeWindow(): Promise<void>;
+  toggleMaximizeWindow(): Promise<boolean>;
+  closeWindow(): Promise<void>;
 }

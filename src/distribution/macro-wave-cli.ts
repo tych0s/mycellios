@@ -364,21 +364,21 @@ export function renderMacroWaveMarkdown(document: MacroWaveCliDocument): string 
   const lines = [
     `# MacroWave RAM+VRAM — ${escapeMarkdown(document.modelId)}`,
     "",
-    `- Viable: **${document.feasible ? "sí" : "no"}**`,
-    `- Alternativa elegida: **${document.selectedAlternative ?? "ninguna"}**`,
-    `- Motivo: ${escapeMarkdown(document.reason ?? "ok")}`,
-    `- Hit esperado de caché de pesos (entrada, no garantía): **${formatPercent(document.traffic.expectedWeightCacheHitRate)}**`,
+    `- Feasible: **${document.feasible ? "yes" : "no"}**`,
+    `- Selected alternative: **${document.selectedAlternative ?? "none"}**`,
+    `- Reason: ${escapeMarkdown(document.reason ?? "ok")}`,
+    `- Expected weight-cache hit rate (input, not a guarantee): **${formatPercent(document.traffic.expectedWeightCacheHitRate)}**`,
     `- Entrada: \`${document.inputSha256}\``,
     "",
-    "## Métricas",
+    "## Metrics",
     "",
-    "| TTFT | TPOT | tok/s usuario | tok/s total | Pesos activos/token | Miss RAM/PCIe/token | Red/token |",
+    "| TTFT | TPOT | user tok/s | total tok/s | Active weights/token | RAM/PCIe miss/token | Network/token |",
     "|---:|---:|---:|---:|---:|---:|---:|",
     `| ${formatMs(document.metrics.ttftMs)} | ${formatMs(document.metrics.tpotMs)} | ${formatNumber(document.metrics.tokensPerSecondPerSequence)} | ${formatNumber(document.metrics.aggregateTokensPerSecond)} | ${formatBytes(document.traffic.rawActiveWeightBytesPerOutputToken)} | ${formatBytes(document.traffic.expectedWeightCacheMissBytesPerOutputToken)} | ${formatBytes(document.traffic.networkBytesPerOutputToken)} |`,
     "",
-    "## Etapas",
+    "## Stages",
     "",
-    "| # | Nodo | Capas | Modo | RAM requerida/útil | VRAM requerida/útil | Buffer pesos | Activos/miss por onda | Cómputo/onda | Carga/onda | Red/onda | RTT | Servicio/token |",
+    "| # | Node | Layers | Mode | Required/usable RAM | Required/usable VRAM | Weight buffer | Active/miss per wave | Compute/wave | Load/wave | Network/wave | RTT | Service/token |",
     "|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
   ];
   if (document.stages.length === 0) {
@@ -392,21 +392,21 @@ export function renderMacroWaveMarkdown(document: MacroWaveCliDocument): string 
   }
   lines.push(
     "",
-    "## Comparación",
+    "## Comparison",
     "",
-    "| Alternativa | Viable | Etapas | TTFT | TPOT | tok/s usuario | Razón |",
+    "| Alternative | Feasible | Stages | TTFT | TPOT | user tok/s | Reason |",
     "|---|---|---:|---:|---:|---:|---|",
   );
   for (const alternative of document.alternatives) {
     lines.push(
-      `| ${alternative.kind} | ${alternative.feasible ? "sí" : "no"} | ${alternative.stages} | ${formatMs(alternative.metrics.ttftMs)} | ${formatMs(alternative.metrics.tpotMs)} | ${formatNumber(alternative.metrics.tokensPerSecondPerSequence)} | ${escapeMarkdown(alternative.reason ?? "ok")} |`,
+      `| ${alternative.kind} | ${alternative.feasible ? "yes" : "no"} | ${alternative.stages} | ${formatMs(alternative.metrics.ttftMs)} | ${formatMs(alternative.metrics.tpotMs)} | ${formatNumber(alternative.metrics.tokensPerSecondPerSequence)} | ${escapeMarkdown(alternative.reason ?? "ok")} |`,
     );
   }
   lines.push(
     "",
-    "## Razones de descarte",
+    "## Rejection reasons",
     "",
-    "| Alternativa | Razón | Ocurrencias |",
+    "| Alternative | Reason | Occurrences |",
     "|---|---|---:|",
   );
   if (document.discardReasons.length === 0) {

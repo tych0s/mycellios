@@ -6,14 +6,17 @@ import {
   CircleAlert,
   CirclePower,
   Cpu,
+  Download,
   Gauge,
   Globe2,
   HardDrive,
   Info,
   Laptop,
   LoaderCircle,
+  Maximize2,
   MemoryStick,
   MessageSquareText,
+  Minus,
   Network,
   RefreshCw,
   Send,
@@ -32,13 +35,14 @@ import type {
   ChatResponse,
   DashboardSnapshot,
   DesktopSettings,
+  DesktopUpdateStatus,
 } from "../../desktop/contracts";
 import brandIcon from "../assets/mycellios-icon.png";
 import { NetworkGraph, type GraphSelection } from "./NetworkGraph";
 
 type View = "network" | "hardware" | "models" | "chat" | "settings";
 
-const EMPTY_MESSAGE = "No se pudo cargar el estado de mycellios.";
+const EMPTY_MESSAGE = "Could not load mycellios status.";
 
 export function App() {
   const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null);
@@ -130,7 +134,13 @@ export function App() {
         {view === "models" && <ModelsView snapshot={snapshot} />}
         {view === "chat" && <ChatView snapshot={snapshot} />}
         {view === "settings" && (
-          <SettingsView snapshot={snapshot} onSaved={setSnapshot} />
+          <SettingsView
+            snapshot={snapshot}
+            onSaved={setSnapshot}
+            onUpdate={(update) =>
+              setSnapshot((current) => (current ? { ...current, update } : current))
+            }
+          />
         )}
       </main>
       {!snapshot.settings.onboardingComplete && (
@@ -146,7 +156,7 @@ function LaunchScreen() {
       <div className="launch-orbit" />
       <img src={brandIcon} alt="" />
       <h1>mycellios</h1>
-      <p>Preparando la red distribuida</p>
+      <p>Preparing the distributed network</p>
       <LoaderCircle className="spin" size={22} />
     </div>
   );
@@ -166,7 +176,7 @@ function TitleBar({
     <header className="titlebar">
       <div className="window-drag-region" />
       <div className="brand-lockup">
-        <img src={brandIcon} alt="Logotipo de mycellios" />
+        <img src={brandIcon} alt="mycellios logo" />
         <div>
           <strong>mycellios</strong>
           <span>distributed intelligence</span>
@@ -174,15 +184,47 @@ function TitleBar({
       </div>
       <div className="network-pill">
         <span className={`status-dot ${connected ? "online" : "offline"}`} />
-        <span>{connected ? "Red conectada" : "Sin conexión"}</span>
+        <span>{connected ? "Network connected" : "Disconnected"}</span>
         <span className="network-pill-divider" />
         <span>{snapshot.coordinatorUrl.replace(/^https?:\/\//, "")}</span>
       </div>
       <div className="titlebar-actions">
+        {snapshot.update.state === "ready" && (
+          <button
+            className="update-ready-button"
+            onClick={() => void window.mycellios.installUpdate()}
+            title="Restart and install the downloaded update"
+          >
+            <Download size={14} /> Restart to update
+          </button>
+        )}
         <span className="version-label">v{snapshot.appVersion}</span>
-        <button className="icon-button" onClick={onRefresh} aria-label="Actualizar estado">
+        <button className="icon-button" onClick={onRefresh} aria-label="Refresh status">
           <RefreshCw className={loading ? "spin" : ""} size={17} />
         </button>
+        <span className="window-controls" aria-label="Window controls">
+          <button
+            className="window-control"
+            onClick={() => void window.mycellios.minimizeWindow()}
+            aria-label="Minimize window"
+          >
+            <Minus size={16} />
+          </button>
+          <button
+            className="window-control"
+            onClick={() => void window.mycellios.toggleMaximizeWindow()}
+            aria-label="Maximize or restore window"
+          >
+            <Maximize2 size={14} />
+          </button>
+          <button
+            className="window-control close"
+            onClick={() => void window.mycellios.closeWindow()}
+            aria-label="Close window"
+          >
+            <X size={16} />
+          </button>
+        </span>
       </div>
     </header>
   );
@@ -190,9 +232,9 @@ function TitleBar({
 
 function Sidebar({ view, setView }: { view: View; setView: (view: View) => void }) {
   const items: Array<{ id: View; label: string; icon: typeof Network }> = [
-    { id: "network", label: "Red", icon: Network },
-    { id: "hardware", label: "Equipo", icon: Cpu },
-    { id: "models", label: "Modelos", icon: Boxes },
+    { id: "network", label: "Network", icon: Network },
+    { id: "hardware", label: "Machine", icon: Cpu },
+    { id: "models", label: "Models", icon: Boxes },
     { id: "chat", label: "Chat", icon: MessageSquareText },
   ];
   return (
@@ -216,10 +258,10 @@ function Sidebar({ view, setView }: { view: View; setView: (view: View) => void 
       <button
         className={`sidebar-settings ${view === "settings" ? "active" : ""}`}
         onClick={() => setView("settings")}
-        title="Configuración"
+        title="Settings"
       >
         <Settings size={20} />
-        <span>Ajustes</span>
+        <span>Settings</span>
       </button>
     </aside>
   );
@@ -246,11 +288,11 @@ function NetworkView({
         <div className="view-heading floating-heading">
           <div>
             <span className="eyebrow">LIVE TOPOLOGY</span>
-            <h1>Mapa de conexiones</h1>
+            <h1>Connection map</h1>
           </div>
           <div className="graph-controls">
-            <button className="segmented active"><Network size={15} /> Red física</button>
-            <button className="segmented"><Activity size={15} /> Ruta activa</button>
+            <button className="segmented active"><Network size={15} /> Physical network</button>
+            <button className="segmented"><Activity size={15} /> Active route</button>
           </div>
         </div>
         <div className="graph-glow graph-glow-one" />
@@ -261,19 +303,19 @@ function NetworkView({
           onSelect={onSelect}
         />
         <div className="graph-legend">
-          <span><i className="legend-dot cyan" /> Este equipo</span>
+          <span><i className="legend-dot cyan" /> This machine</span>
           <span><i className="legend-dot green" /> Online</span>
-          <span><i className="legend-dot purple" /> Modelo</span>
+          <span><i className="legend-dot purple" /> Model</span>
           <span><i className="legend-dot grey" /> Offline</span>
         </div>
         <div className="network-stats-strip">
-          <MiniStat icon={Server} value={String(online)} label="nodos online" />
-          <MiniStat icon={MemoryStick} value={formatMemory(totalVram)} label="VRAM compartida" />
-          <MiniStat icon={Boxes} value={String(snapshot.models.length)} label="modelos" />
+          <MiniStat icon={Server} value={String(online)} label="online nodes" />
+          <MiniStat icon={MemoryStick} value={formatMemory(totalVram)} label="shared VRAM" />
+          <MiniStat icon={Boxes} value={String(snapshot.models.length)} label="models" />
           <MiniStat
             icon={Wifi}
             value={snapshot.health ? `${snapshot.health.workers.connected}` : "0"}
-            label="conexiones WSS"
+            label="WSS connections"
           />
         </div>
       </div>
@@ -300,25 +342,34 @@ function Inspector({
     const gpu = worker.gpus[0];
     return (
       <aside className="inspector">
-        <InspectorHeader icon={Server} eyebrow="NODO DE RED" title={selection.label} />
+        <InspectorHeader icon={Server} eyebrow="NETWORK NODE" title={selection.label} />
         <StatusCard status={worker.status} connected={worker.connected} />
         <div className="metric-grid">
-          <Metric label="VRAM ofrecida" value={formatMemory(worker.offeredVramMb)} />
-          <Metric label="Fiabilidad" value={`${Math.round(worker.reliability * 100)}%`} />
-          <Metric label="Trabajos" value={String(worker.jobsCompleted)} />
-          <Metric label="Región" value={worker.region} />
+          <Metric label="Offered VRAM" value={formatMemory(worker.offeredVramMb)} />
+          <Metric label="Reliability" value={`${Math.round(worker.reliability * 100)}%`} />
+          <Metric label="Jobs" value={String(worker.jobsCompleted)} />
+          <Metric label="Region" value={worker.region} />
         </div>
         {gpu && (
           <div className="detail-card">
-            <span className="card-kicker">ACELERADOR</span>
+            <span className="card-kicker">ACCELERATOR</span>
             <h3>{gpu.model}</h3>
-            <div className="detail-row"><Gauge size={15} /> {gpu.utilizationPct ?? 0}% utilización</div>
+            <div className="detail-row"><Gauge size={15} /> {gpu.utilizationPct ?? 0}% utilization</div>
             <div className="detail-row"><Thermometer size={15} /> {gpu.temperatureC ?? "—"} °C</div>
             <div className="detail-row"><Zap size={15} /> {gpu.powerW ?? "—"} W</div>
           </div>
         )}
         <div className="detail-card">
-          <span className="card-kicker">DESPLIEGUES</span>
+          <span className="card-kicker">{worker.mobile ? "MOBILE EXPERTS" : "DEPLOYMENTS"}</span>
+          {worker.mobile?.residentExperts.map((expert) => (
+            <div className="deployment-row" key={expert.artifactId}>
+              <div><span className="status-dot online" /><strong>{expert.modelId}</strong></div>
+              <span>L{expert.layer} · E{expert.expert}</span>
+            </div>
+          ))}
+          {worker.mobile && worker.mobile.residentExperts.length === 0 && (
+            <div className="deployment-row"><span>Benchmark only · awaiting an MoE expert</span></div>
+          )}
           {worker.deployments.map((deployment) => (
             <div className="deployment-row" key={deployment.deploymentId}>
               <div><span className="status-dot online" /><strong>{deployment.model}</strong></div>
@@ -333,14 +384,14 @@ function Inspector({
   if (selection.kind === "model") {
     return (
       <aside className="inspector">
-        <InspectorHeader icon={Boxes} eyebrow="MODELO DISTRIBUIDO" title={selection.model.id} />
+        <InspectorHeader icon={Boxes} eyebrow="DISTRIBUTED MODEL" title={selection.model.id} />
         <div className="hero-metric-card purple-card">
-          <span>Disponibilidad</span>
+          <span>Availability</span>
           <strong>{selection.model.replicas + selection.model.pipelines}</strong>
-          <small>rutas utilizables</small>
+          <small>usable routes</small>
         </div>
         <div className="metric-grid">
-          <Metric label="Réplicas" value={String(selection.model.replicas)} />
+          <Metric label="Replicas" value={String(selection.model.replicas)} />
           <Metric label="Pipelines" value={String(selection.model.pipelines)} />
         </div>
       </aside>
@@ -351,11 +402,11 @@ function Inspector({
     const gpu = snapshot.localHardware.gpus[0];
     return (
       <aside className="inspector">
-        <InspectorHeader icon={Laptop} eyebrow="ESTE EQUIPO" title={snapshot.localHardware.hostname} />
+        <InspectorHeader icon={Laptop} eyebrow="THIS MACHINE" title={snapshot.localHardware.hostname} />
         <div className={`contribution-card ${snapshot.settings.contributionEnabled ? "active" : ""}`}>
           <div>
-            <span className="card-kicker">CONTRIBUCIÓN</span>
-            <strong>{snapshot.settings.contributionEnabled ? "Activa" : "Pausada"}</strong>
+            <span className="card-kicker">CONTRIBUTION</span>
+            <strong>{snapshot.settings.contributionEnabled ? "Active" : "Paused"}</strong>
           </div>
           <button className="power-button" onClick={onToggleContribution}>
             <CirclePower size={21} />
@@ -363,11 +414,11 @@ function Inspector({
         </div>
         <div className="metric-grid">
           <Metric label="RAM" value={formatMemory(snapshot.localHardware.ramMb)} />
-          <Metric label="Cuota VRAM" value={formatMemory(snapshot.settings.offeredVramMb)} />
+          <Metric label="VRAM allocation" value={formatMemory(snapshot.settings.offeredVramMb)} />
         </div>
         <div className="detail-card">
-          <span className="card-kicker">HARDWARE DETECTADO</span>
-          <h3>{gpu?.model ?? "GPU no identificada"}</h3>
+          <span className="card-kicker">DETECTED HARDWARE</span>
+          <h3>{gpu?.model ?? "Unidentified GPU"}</h3>
           <div className="detail-row"><Cpu size={15} /> {snapshot.platform}</div>
           <div className="detail-row"><MemoryStick size={15} /> {formatMemory(gpu?.physicalVramMb ?? 0)} VRAM</div>
         </div>
@@ -379,26 +430,26 @@ function Inspector({
     <aside className="inspector">
       <InspectorHeader icon={Globe2} eyebrow="CONTROL PLANE" title="mycellios network" />
       <div className="hero-metric-card">
-        <span>Estado global</span>
+        <span>Global status</span>
         <strong>{snapshot.health?.workers.online ?? 0}</strong>
-        <small>nodos preparados</small>
+        <small>ready nodes</small>
       </div>
       <div className="metric-grid">
-        <Metric label="Registrados" value={String(snapshot.health?.workers.registered ?? 0)} />
-        <Metric label="Conectados" value={String(snapshot.health?.workers.connected ?? 0)} />
-        <Metric label="Modelos" value={String(snapshot.models.length)} />
-        <Metric label="Versión API" value={snapshot.health?.version ?? "—"} />
+        <Metric label="Registered" value={String(snapshot.health?.workers.registered ?? 0)} />
+        <Metric label="Connected" value={String(snapshot.health?.workers.connected ?? 0)} />
+        <Metric label="Models" value={String(snapshot.models.length)} />
+        <Metric label="API version" value={snapshot.health?.version ?? "—"} />
       </div>
       <div className="detail-card security-card">
         <ShieldCheck size={22} />
         <div>
-          <h3>Canal protegido</h3>
-          <p>{snapshot.settings.coordinatorMode === "remote" ? "HTTPS/WSS obligatorio" : "Loopback local aislado"}</p>
+          <h3>Protected channel</h3>
+          <p>{snapshot.settings.coordinatorMode === "remote" ? "HTTPS/WSS required" : "Isolated local loopback"}</p>
         </div>
       </div>
       <button className="wide-button" onClick={onToggleContribution}>
         <CirclePower size={17} />
-        {snapshot.settings.contributionEnabled ? "Pausar este nodo" : "Aportar este equipo"}
+        {snapshot.settings.contributionEnabled ? "Pause this node" : "Contribute this machine"}
       </button>
     </aside>
   );
@@ -407,16 +458,16 @@ function Inspector({
 function HardwareView({ snapshot }: { snapshot: DashboardSnapshot }) {
   return (
     <section className="content-page">
-      <PageHeading eyebrow="LOCAL NODE" title="Este equipo" description="Hardware detectado y cuota que mycellios puede utilizar." />
+      <PageHeading eyebrow="LOCAL NODE" title="This machine" description="Detected hardware and the allocation mycellios may use." />
       <div className="hardware-hero">
         <div className="device-orb"><Cpu size={42} /></div>
         <div>
           <span className="eyebrow">{snapshot.platform.toUpperCase()}</span>
           <h2>{snapshot.localHardware.hostname}</h2>
-          <p>{snapshot.localHardware.gpus.length} acelerador(es) · {formatMemory(snapshot.localHardware.ramMb)} RAM</p>
+          <p>{snapshot.localHardware.gpus.length} accelerator(s) · {formatMemory(snapshot.localHardware.ramMb)} RAM</p>
         </div>
         <span className={`state-badge ${snapshot.settings.contributionEnabled ? "online" : "paused"}`}>
-          {snapshot.settings.contributionEnabled ? "Contribuyendo" : "Pausado"}
+          {snapshot.settings.contributionEnabled ? "Contributing" : "Paused"}
         </span>
       </div>
       <div className="cards-grid">
@@ -427,10 +478,10 @@ function HardwareView({ snapshot }: { snapshot: DashboardSnapshot }) {
             <h3>{gpu.model}</h3>
             <div className="capacity-line"><span style={{ width: `${Math.min(100, snapshot.settings.offeredVramMb / Math.max(1, gpu.physicalVramMb + (gpu.sharedMemoryMb ?? 0)) * 100)}%` }} /></div>
             <div className="hardware-metrics">
-              <Metric label="VRAM física" value={formatMemory(gpu.physicalVramMb)} />
-              <Metric label="Compartida" value={formatMemory(gpu.sharedMemoryMb ?? 0)} />
-              <Metric label="Utilización" value={`${gpu.utilizationPct ?? 0}%`} />
-              <Metric label="Temperatura" value={gpu.temperatureC === undefined ? "—" : `${gpu.temperatureC} °C`} />
+              <Metric label="Physical VRAM" value={formatMemory(gpu.physicalVramMb)} />
+              <Metric label="Shared" value={formatMemory(gpu.sharedMemoryMb ?? 0)} />
+              <Metric label="Utilization" value={`${gpu.utilizationPct ?? 0}%`} />
+              <Metric label="Temperature" value={gpu.temperatureC === undefined ? "—" : `${gpu.temperatureC} °C`} />
             </div>
           </article>
         ))}
@@ -442,17 +493,17 @@ function HardwareView({ snapshot }: { snapshot: DashboardSnapshot }) {
 function ModelsView({ snapshot }: { snapshot: DashboardSnapshot }) {
   return (
     <section className="content-page">
-      <PageHeading eyebrow="MODEL FABRIC" title="Modelos disponibles" description="Réplicas y pipelines anunciados por los nodos conectados." />
+      <PageHeading eyebrow="MODEL FABRIC" title="Available models" description="Replicas and pipelines announced by connected nodes." />
       <div className="data-table">
-        <div className="table-head"><span>Modelo</span><span>Réplicas</span><span>Pipelines</span><span>Estado</span></div>
+        <div className="table-head"><span>Model</span><span>Replicas</span><span>Pipelines</span><span>Status</span></div>
         {snapshot.models.length === 0 ? (
-          <EmptyState icon={Boxes} title="Todavía no hay modelos" text="Conecta un nodo con local model runtime o un runtime compatible para anunciar su primer modelo." />
+          <EmptyState icon={Boxes} title="No models yet" text="Connect a node with local model runtime or a compatible runtime to announce its first model." />
         ) : snapshot.models.map((model) => (
           <div className="table-row" key={model.id}>
             <span className="model-name"><span className="model-glyph"><Sparkles size={16} /></span>{model.id}</span>
             <span>{model.replicas}</span>
             <span>{model.pipelines}</span>
-            <span className="state-badge online"><Check size={13} /> Disponible</span>
+            <span className="state-badge online"><Check size={13} /> Available</span>
           </div>
         ))}
       </div>
@@ -482,27 +533,27 @@ function ChatView({ snapshot }: { snapshot: DashboardSnapshot }) {
 
   return (
     <section className="content-page chat-page">
-      <PageHeading eyebrow="INFERENCE CONSOLE" title="Probar la red" description="Envía una petición real a un modelo disponible." />
+      <PageHeading eyebrow="INFERENCE CONSOLE" title="Test the network" description="Send a real request to an available model." />
       <div className="chat-console">
         <div className="chat-toolbar">
-          <label>Modelo</label>
+          <label>Model</label>
           <select value={model} onChange={(event) => setModel(event.target.value)}>
-            <option value="">Selecciona un modelo</option>
+            <option value="">Select a model</option>
             {snapshot.models.map((item) => <option key={item.id} value={item.id}>{item.id}</option>)}
           </select>
         </div>
         <div className="chat-transcript">
-          {!result && !error && <EmptyState icon={MessageSquareText} title="Consola preparada" text="Elige un modelo y pregunta algo para verificar la ruta completa." />}
+          {!result && !error && <EmptyState icon={MessageSquareText} title="Console ready" text="Choose a model and ask something to verify the complete route." />}
           {error && <div className="chat-error"><CircleAlert size={18} /> {error}</div>}
           {result && (
             <div className="assistant-message">
               <div className="assistant-avatar"><Sparkles size={17} /></div>
-              <div><span>mycellios · {result.model}</span><p>{result.text}</p><small>{result.totalTokens} tokens · ruta {result.routeClass}</small></div>
+              <div><span>mycellios · {result.model}</span><p>{result.text}</p><small>{result.totalTokens} tokens · route {result.routeClass}</small></div>
             </div>
           )}
         </div>
         <div className="chat-composer">
-          <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="Pregunta a la red mycellios…" />
+          <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="Ask the mycellios network…" />
           <button className="send-button" disabled={sending || !model || !prompt.trim()} onClick={() => void submit()}>
             {sending ? <LoaderCircle className="spin" size={19} /> : <Send size={19} />}
           </button>
@@ -512,9 +563,18 @@ function ChatView({ snapshot }: { snapshot: DashboardSnapshot }) {
   );
 }
 
-function SettingsView({ snapshot, onSaved }: { snapshot: DashboardSnapshot; onSaved: (snapshot: DashboardSnapshot) => void }) {
+function SettingsView({
+  snapshot,
+  onSaved,
+  onUpdate,
+}: {
+  snapshot: DashboardSnapshot;
+  onSaved: (snapshot: DashboardSnapshot) => void;
+  onUpdate: (update: DesktopUpdateStatus) => void;
+}) {
   const [draft, setDraft] = useState(snapshot.settings);
   const [saving, setSaving] = useState(false);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => setDraft(snapshot.settings), [snapshot.settings]);
@@ -535,41 +595,86 @@ function SettingsView({ snapshot, onSaved }: { snapshot: DashboardSnapshot; onSa
     }
   }
 
+  async function checkUpdate() {
+    setCheckingUpdate(true);
+    setError(null);
+    try {
+      onUpdate(await window.mycellios.checkForUpdates());
+    } catch (caught) {
+      setError(errorText(caught));
+    } finally {
+      setCheckingUpdate(false);
+    }
+  }
+
   return (
     <section className="content-page settings-page">
-      <PageHeading eyebrow="PREFERENCES" title="Configuración" description="Conexión, contribución y comportamiento de la aplicación." />
+      <PageHeading eyebrow="PREFERENCES" title="Settings" description="Connection, contribution, and application behavior." />
       {error && <div className="inline-error"><CircleAlert size={17} /> {error}</div>}
       <div className="settings-section">
-        <div><Globe2 size={20} /><div><h3>Coordinador</h3><p>Crea una red local o conecta este equipo a una red remota.</p></div></div>
+        <div><Globe2 size={20} /><div><h3>Coordinator</h3><p>Create a local network or connect this machine to a remote network.</p></div></div>
         <div className="settings-fields">
-          <label>Modo<select value={draft.coordinatorMode} onChange={(event) => update("coordinatorMode", event.target.value as DesktopSettings["coordinatorMode"])}><option value="local">Red local en este equipo</option><option value="remote">Unirse a coordinador remoto</option></select></label>
-          {draft.coordinatorMode === "remote" && <label>URL segura<input value={draft.remoteCoordinatorUrl} onChange={(event) => update("remoteCoordinatorUrl", event.target.value)} placeholder="https://network.mycellios.app" /></label>}
-          <label>Región<input value={draft.region} onChange={(event) => update("region", event.target.value)} placeholder="auto" /></label>
+          <label>Mode<select value={draft.coordinatorMode} onChange={(event) => update("coordinatorMode", event.target.value as DesktopSettings["coordinatorMode"])}><option value="local">Local network on this machine</option><option value="remote">Join a remote coordinator</option></select></label>
+          {draft.coordinatorMode === "remote" && <label>Public coordinator URL<input value={draft.remoteCoordinatorUrl} onChange={(event) => update("remoteCoordinatorUrl", event.target.value)} placeholder="https://www.mycellios.com" /></label>}
+          <label>Region<input value={draft.region} onChange={(event) => update("region", event.target.value)} placeholder="auto" /></label>
         </div>
       </div>
       <div className="settings-section">
-        <div><Gauge size={20} /><div><h3>Contribución</h3><p>Define el runtime y el límite de memoria que se ofrece.</p></div></div>
+        <div><Gauge size={20} /><div><h3>Contribution</h3><p>Choose the runtime and the memory limit being offered.</p></div></div>
         <div className="settings-fields">
-          <label>Runtime<select value={draft.adapterMode} onChange={(event) => update("adapterMode", event.target.value as DesktopSettings["adapterMode"])}><option value="connectivity-test">Prueba de conectividad</option><option value="local-model-runtime">local model runtime local</option></select></label>
-          <label>VRAM ofrecida (MB)<input type="number" min="512" step="256" value={draft.offeredVramMb} onChange={(event) => update("offeredVramMb", Number(event.target.value))} /></label>
-          {draft.adapterMode === "local-model-runtime" && <><label>Modelo local model runtime<input value={draft.modelName} onChange={(event) => update("modelName", event.target.value)} placeholder="qwen3:4b" /></label><label>URL de local model runtime<input value={draft.adapterBaseUrl} onChange={(event) => update("adapterBaseUrl", event.target.value)} /></label><label>Digest fijado<input value={draft.modelDigest} onChange={(event) => update("modelDigest", event.target.value)} placeholder="sha256:…" /></label></>}
+          <label>Runtime<select value={draft.adapterMode} onChange={(event) => update("adapterMode", event.target.value as DesktopSettings["adapterMode"])}><option value="connectivity-test">Connectivity test</option><option value="local-model-runtime">Local local model runtime</option></select></label>
+          <label>Offered VRAM (MB)<input type="number" min="512" step="256" value={draft.offeredVramMb} onChange={(event) => update("offeredVramMb", Number(event.target.value))} /></label>
+          {draft.adapterMode === "local-model-runtime" && <><label>local model runtime model<input value={draft.modelName} onChange={(event) => update("modelName", event.target.value)} placeholder="qwen3:4b" /></label><label>local model runtime URL<input value={draft.adapterBaseUrl} onChange={(event) => update("adapterBaseUrl", event.target.value)} /></label><label>Pinned digest<input value={draft.modelDigest} onChange={(event) => update("modelDigest", event.target.value)} placeholder="sha256:…" /></label></>}
         </div>
       </div>
       <div className="settings-section compact-settings">
-        <div><SlidersHorizontal size={20} /><div><h3>Aplicación</h3><p>Inicio automático y ejecución en segundo plano.</p></div></div>
+        <div><SlidersHorizontal size={20} /><div><h3>Application</h3><p>Automatic startup and background operation.</p></div></div>
         <div className="toggle-list">
-          <Toggle label="Iniciar con el sistema" checked={draft.launchAtLogin} onChange={(value) => update("launchAtLogin", value)} />
-          <Toggle label="Seguir en la bandeja al cerrar" checked={draft.closeToTray} onChange={(value) => update("closeToTray", value)} />
-          <Toggle label="Aportar recursos" checked={draft.contributionEnabled} onChange={(value) => update("contributionEnabled", value)} />
+          <Toggle label="Start with the system" checked={draft.launchAtLogin} onChange={(value) => update("launchAtLogin", value)} />
+          <Toggle label="Keep running in the tray when closed" checked={draft.closeToTray} onChange={(value) => update("closeToTray", value)} />
+          <Toggle label="Contribute resources" checked={draft.contributionEnabled} onChange={(value) => update("contributionEnabled", value)} />
         </div>
       </div>
-      <div className="settings-footer"><button className="primary-button" disabled={saving} onClick={() => void save()}>{saving ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />} Guardar y reconectar</button></div>
+      <div className="settings-section">
+        <div><Download size={20} /><div><h3>Automatic updates</h3><p>New Windows versions download in the background and install on restart.</p></div></div>
+        <div className="update-settings">
+          <div>
+            <span className={`update-state ${snapshot.update.state}`}>{updateStateLabel(snapshot.update.state)}</span>
+            <strong>Version {snapshot.appVersion}</strong>
+            <p>{snapshot.update.message}</p>
+          </div>
+          <div className="update-actions">
+            <button className="secondary-button" disabled={checkingUpdate || snapshot.update.state === "checking" || snapshot.update.state === "downloading"} onClick={() => void checkUpdate()}>
+              <RefreshCw className={checkingUpdate ? "spin" : ""} size={15} /> Check now
+            </button>
+            {snapshot.update.state === "ready" && (
+              <button className="primary-button" onClick={() => void window.mycellios.installUpdate()}>
+                <Download size={15} /> Restart and update
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+      <div className="settings-footer"><button className="primary-button" disabled={saving} onClick={() => void save()}>{saving ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />} Save and reconnect</button></div>
     </section>
   );
 }
 
+function updateStateLabel(state: DesktopUpdateStatus["state"]): string {
+  switch (state) {
+    case "checking": return "Checking";
+    case "downloading": return "Downloading";
+    case "ready": return "Ready to install";
+    case "up-to-date": return "Up to date";
+    case "error": return "Check failed";
+    case "unsupported": return "Managed externally";
+    case "development": return "Development mode";
+    default: return "Automatic";
+  }
+}
+
 function Onboarding({ snapshot, onComplete }: { snapshot: DashboardSnapshot; onComplete: (snapshot: DashboardSnapshot) => void }) {
-  const [mode, setMode] = useState<"local" | "remote">("local");
+  const [mode, setMode] = useState<"local" | "remote">(snapshot.settings.coordinatorMode);
   const [remoteUrl, setRemoteUrl] = useState(snapshot.settings.remoteCoordinatorUrl);
   const [contribute, setContribute] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -583,6 +688,7 @@ function Onboarding({ snapshot, onComplete }: { snapshot: DashboardSnapshot; onC
         ...snapshot.settings,
         coordinatorMode: mode,
         remoteCoordinatorUrl: remoteUrl,
+        remoteCoordinatorToken: "",
         contributionEnabled: contribute,
         onboardingComplete: true,
       }));
@@ -596,18 +702,18 @@ function Onboarding({ snapshot, onComplete }: { snapshot: DashboardSnapshot; onC
   return (
     <div className="modal-backdrop">
       <div className="onboarding-card">
-        <div className="onboarding-brand"><img src={brandIcon} alt="" /><span>PUESTA EN MARCHA</span></div>
-        <h1>Conecta este equipo a mycellios</h1>
-        <p>La aplicación configurará el coordinador y detectará el hardware automáticamente.</p>
+        <div className="onboarding-brand"><img src={brandIcon} alt="" /><span>GET STARTED</span></div>
+        <h1>Connect this machine to mycellios</h1>
+        <p>The application will configure the coordinator and detect the hardware automatically.</p>
         <div className="mode-grid">
-          <button className={mode === "local" ? "selected" : ""} onClick={() => setMode("local")}><Server size={23} /><strong>Crear red local</strong><span>Este equipo aloja el coordinador.</span>{mode === "local" && <Check size={16} className="mode-check" />}</button>
-          <button className={mode === "remote" ? "selected" : ""} onClick={() => setMode("remote")}><Globe2 size={23} /><strong>Unirse a una red</strong><span>Conecta mediante HTTPS/WSS.</span>{mode === "remote" && <Check size={16} className="mode-check" />}</button>
+          <button className={mode === "local" ? "selected" : ""} onClick={() => setMode("local")}><Server size={23} /><strong>Create a local network</strong><span>This machine hosts the coordinator.</span>{mode === "local" && <Check size={16} className="mode-check" />}</button>
+          <button className={mode === "remote" ? "selected" : ""} onClick={() => setMode("remote")}><Globe2 size={23} /><strong>Join a network</strong><span>Connect over HTTPS/WSS.</span>{mode === "remote" && <Check size={16} className="mode-check" />}</button>
         </div>
-        {mode === "remote" && <label className="onboarding-input">URL del coordinador<input value={remoteUrl} onChange={(event) => setRemoteUrl(event.target.value)} /></label>}
-        <label className="contribute-choice"><input type="checkbox" checked={contribute} onChange={(event) => setContribute(event.target.checked)} /><span><strong>Aportar recursos de este equipo</strong><small>Empieza con una prueba segura de conectividad; podrás cambiar a local model runtime después.</small></span></label>
+        {mode === "remote" && <label className="onboarding-input">Public coordinator URL<input value={remoteUrl} onChange={(event) => setRemoteUrl(event.target.value)} /></label>}
+        <label className="contribute-choice"><input type="checkbox" checked={contribute} onChange={(event) => setContribute(event.target.checked)} /><span><strong>Contribute this machine's resources</strong><small>Start with a safe connectivity test; you can switch to local model runtime later.</small></span></label>
         {error && <div className="inline-error"><CircleAlert size={17} /> {error}</div>}
-        <button className="primary-button onboarding-submit" disabled={saving} onClick={() => void complete()}>{saving ? <LoaderCircle className="spin" size={18} /> : <Sparkles size={18} />} Entrar en mycellios <ChevronRight size={18} /></button>
-        <div className="onboarding-security"><ShieldCheck size={15} /> Las conexiones remotas sin TLS se rechazan automáticamente.</div>
+        <button className="primary-button onboarding-submit" disabled={saving} onClick={() => void complete()}>{saving ? <LoaderCircle className="spin" size={18} /> : <Sparkles size={18} />} Enter mycellios <ChevronRight size={18} /></button>
+        <div className="onboarding-security"><ShieldCheck size={15} /> Remote connections without TLS are rejected automatically.</div>
       </div>
     </div>
   );
@@ -618,7 +724,7 @@ function InspectorHeader({ icon: Icon, eyebrow, title }: { icon: typeof Server; 
 }
 
 function StatusCard({ status, connected }: { status: string; connected: boolean }) {
-  return <div className={`status-card ${status}`}><div><span className={`status-dot ${connected ? "online" : "offline"}`} /><strong>{status === "online" ? "Nodo operativo" : status}</strong></div><span>{connected ? "WebSocket activo" : "Sin canal activo"}</span></div>;
+  return <div className={`status-card ${status}`}><div><span className={`status-dot ${connected ? "online" : "offline"}`} /><strong>{status === "online" ? "Node operational" : status}</strong></div><span>{connected ? "WebSocket active" : "No active channel"}</span></div>;
 }
 
 function Metric({ label, value }: { label: string; value: string }) {

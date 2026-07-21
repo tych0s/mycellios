@@ -25,6 +25,12 @@ export interface PythonRuntimeModelInput {
   revision?: string | null;
   /** Decimal uint64 returned by Python model_snapshot_identity(). */
   snapshotIdentity?: string;
+  /** Full content identity returned by Python model_artifact_reference(). */
+  artifactIdentity?: string;
+  /** Stable, host-independent source returned with artifactIdentity. */
+  canonicalSource?: string;
+  /** Must be supplied with the other strong coordinates; null is meaningful. */
+  canonicalRevision?: string | null;
 }
 
 export interface PythonLaunchCompilerOptions {
@@ -1034,11 +1040,18 @@ function normalizeConfiguration(
   ) {
     throw new Error("python_runtime_model_snapshot_identity_mismatch");
   }
+  const artifactCoordinates = normalizeModelArtifactCoordinates(
+    runtimeModelValue,
+    source,
+    revision,
+    snapshotIdentity,
+    requireNormalized,
+  );
   const runtimeModel: PythonRuntimeModelSource = {
     source,
     revision,
     ...(snapshotIdentity ? { snapshotIdentity } : {}),
-    ...deriveModelArtifactCoordinates(source, revision, snapshotIdentity),
+    ...artifactCoordinates,
   };
   const ramBackedMoeStages = normalizeRamBackedMoeStages(
     manifest,
@@ -1554,13 +1567,15 @@ function validateNativeStageStageBinding(
       throw new Error(`python_native_stage_runtime_model_identity_mismatch:${stageId}`);
     }
   } else if (
-    runtimeArtifactIdentity !== snapshotArtifactIdentity(runtimeModel.snapshotIdentity)
+    runtimeArtifactIdentity !== snapshotArtifactIdentity(runtimeModel.snapshotIdentity) &&
+    (!/^sha256:[0-9a-f]{64}$/.test(runtimeArtifactIdentity) ||
+      sha256Uint64Identity(runtimeArtifactIdentity) !== runtimeModel.snapshotIdentity)
   ) {
     // A local snapshot has two deliberately separate namespaces: Python's
-    // content-derived uint64 identifies the pipeline, while NativeStage's
-    // SHA-256 identifies the sealed package coordinates. The pipeline id
-    // equality above is the cross-backend content binding; comparing those
-    // two differently encoded identities would reject every local package.
+    // content-derived uint64 identifies the pipeline, while the full SHA-256
+    // can now be supplied explicitly as its strong parent identity. NativeStage
+    // still has separate package coordinates; the pipeline id equality above
+    // is the cross-backend content binding.
     throw new Error(`python_native_stage_runtime_model_identity_mismatch:${stageId}`);
   }
 }
@@ -1772,6 +1787,90 @@ function appendRamBackedMoeArguments(
     "--ram-moe-min-prefetch-confidence",
     finiteNumber(stage.cache.minPrefetchConfidence),
   );
+}
+
+type PythonModelArtifactCoordinates = Pick<
+  PythonRuntimeModelSource,
+  "artifactIdentity" | "canonicalSource" | "canonicalRevision"
+>;
+
+function normalizeModelArtifactCoordinates(
+  value: unknown,
+  source: string,
+  revision: string | null,
+  snapshotIdentity: string | undefined,
+  requireNormalized: boolean,
+): PythonModelArtifactCoordinates | Record<string, never> {
+  const derived = deriveModelArtifactCoordinates(source, revision, snapshotIdentity);
+  if (!isRecord(value)) return derived;
+
+  const hasArtifactIdentity = Object.prototype.hasOwnProperty.call(
+    value,
+    "artifactIdentity",
+  );
+  const hasCanonicalSource = Object.prototype.hasOwnProperty.call(
+    value,
+    "canonicalSource",
+  );
+  const hasCanonicalRevision = Object.prototype.hasOwnProperty.call(
+    value,
+    "canonicalRevision",
+  );
+  const hasAnyCoordinates =
+    hasArtifactIdentity || hasCanonicalSource || hasCanonicalRevision;
+  if (!hasAnyCoordinates) return derived;
+
+  const hasAllCoordinates =
+    hasArtifactIdentity && hasCanonicalSource && hasCanonicalRevision;
+  if (
+    requireNormalized &&
+    hasAllCoordinates &&
+    canonicalJson({
+      artifactIdentity: value.artifactIdentity,
+      canonicalSource: value.canonicalSource,
+      canonicalRevision: value.canonicalRevision,
+    }) === canonicalJson(derived)
+  ) {
+    // Revalidation sees the coordinates emitted by the compiler itself. This
+    // preserves the legacy snapshot:uint64 representation for local models.
+    return derived;
+  }
+  if (
+    !hasAllCoordinates ||
+    !Object.prototype.hasOwnProperty.call(value, "snapshotIdentity") ||
+    snapshotIdentity === undefined
+  ) {
+    throw new Error("python_runtime_model_artifact_coordinates_are_incomplete");
+  }
+
+  const artifactIdentity = sha256Identity(
+    value.artifactIdentity,
+    "python_runtime_model_artifact_identity_is_invalid",
+  );
+  const canonicalSource = safeString(
+    value.canonicalSource,
+    "python_runtime_model_canonical_source_is_invalid",
+  );
+  const canonicalRevision = nullableSafeString(
+    value.canonicalRevision,
+    "python_runtime_model_canonical_revision_is_invalid",
+  );
+  if (sha256Uint64Identity(artifactIdentity) !== snapshotIdentity) {
+    throw new Error("python_runtime_model_artifact_snapshot_identity_mismatch");
+  }
+
+  if (hubSnapshotCommit(source, revision) !== undefined) {
+    if (artifactIdentity !== derived.artifactIdentity) {
+      throw new Error("python_runtime_model_artifact_identity_mismatch");
+    }
+    if (canonicalSource !== derived.canonicalSource) {
+      throw new Error("python_runtime_model_canonical_source_mismatch");
+    }
+    if (canonicalRevision !== derived.canonicalRevision) {
+      throw new Error("python_runtime_model_canonical_revision_mismatch");
+    }
+  }
+  return { artifactIdentity, canonicalSource, canonicalRevision };
 }
 
 function deriveModelArtifactCoordinates(

@@ -3,6 +3,7 @@ import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import {
   app,
+  autoUpdater,
   BrowserWindow,
   ipcMain,
   Menu,
@@ -23,6 +24,7 @@ import type {
   DashboardSnapshot,
   DashboardWorker,
   DesktopSettings,
+  DesktopUpdateStatus,
 } from "./contracts.js";
 
 if (started) app.quit();
@@ -30,8 +32,9 @@ if (started) app.quit();
 app.setName("mycellios");
 
 const DEFAULT_SETTINGS: DesktopSettings = {
-  coordinatorMode: "local",
-  remoteCoordinatorUrl: "https://network.mycellios.app",
+  coordinatorMode: "remote",
+  remoteCoordinatorUrl: "https://www.mycellios.com",
+  remoteCoordinatorToken: "",
   contributionEnabled: false,
   launchAtLogin: false,
   closeToTray: true,
@@ -44,6 +47,9 @@ const DEFAULT_SETTINGS: DesktopSettings = {
   modelDigest: "",
 };
 
+const UPDATE_FEED_URL = "https://www.mycellios.com/updates/win32/x64/";
+const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1_000;
+
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let coordinator: CoordinatorRuntime | null = null;
@@ -53,6 +59,17 @@ let hardwarePromise: Promise<HardwareProbe> | null = null;
 let settings: DesktopSettings = DEFAULT_SETTINGS;
 let isQuitting = false;
 let runtimeError: string | null = null;
+let updateCheckTimer: NodeJS.Timeout | null = null;
+let updateCheckInFlight = false;
+let updateStatus: DesktopUpdateStatus = {
+  state: app.isPackaged ? "idle" : "development",
+  currentVersion: app.getVersion(),
+  availableVersion: null,
+  message: app.isPackaged
+    ? "Automatic updates are ready."
+    : "Updates are disabled in development mode.",
+  checkedAt: null,
+};
 
 function resourcePath(...segments: string[]): string {
   if (app.isPackaged) return join(process.resourcesPath, ...segments);
@@ -75,6 +92,84 @@ function writeDesktopLog(event: string, details: unknown): void {
   }
 }
 
+function setUpdateStatus(next: Partial<DesktopUpdateStatus>): void {
+  updateStatus = { ...updateStatus, ...next };
+  writeDesktopLog("update-status", updateStatus);
+}
+
+function configureAutomaticUpdates(): void {
+  if (!app.isPackaged) return;
+  if (process.platform !== "win32") {
+    setUpdateStatus({
+      state: "unsupported",
+      message:
+        process.platform === "darwin"
+          ? "Automatic updates require a signed macOS release."
+          : "Updates are delivered by your Linux package manager.",
+    });
+    return;
+  }
+
+  autoUpdater.setFeedURL({ url: UPDATE_FEED_URL });
+  autoUpdater.on("checking-for-update", () => {
+    setUpdateStatus({ state: "checking", message: "Checking for a new version…" });
+  });
+  autoUpdater.on("update-available", () => {
+    setUpdateStatus({
+      state: "downloading",
+      message: "A new version is downloading in the background…",
+    });
+  });
+  autoUpdater.on("update-not-available", () => {
+    setUpdateStatus({
+      state: "up-to-date",
+      availableVersion: null,
+      message: "mycellios is up to date.",
+      checkedAt: new Date().toISOString(),
+    });
+  });
+  autoUpdater.on("update-downloaded", (_event, _releaseNotes, releaseName) => {
+    setUpdateStatus({
+      state: "ready",
+      availableVersion: releaseName || null,
+      message: "Update ready. It will be installed automatically on the next restart.",
+      checkedAt: new Date().toISOString(),
+    });
+  });
+  autoUpdater.on("error", (error) => {
+    setUpdateStatus({
+      state: "error",
+      message: `Could not check for updates: ${error.message}`,
+      checkedAt: new Date().toISOString(),
+    });
+  });
+
+  // Squirrel holds a file lock for a few seconds after first install.
+  const initialDelayMs = process.argv.includes("--squirrel-firstrun") ? 15_000 : 10_000;
+  setTimeout(() => void checkForUpdates(), initialDelayMs).unref();
+  updateCheckTimer = setInterval(() => void checkForUpdates(), UPDATE_CHECK_INTERVAL_MS);
+  updateCheckTimer.unref();
+}
+
+async function checkForUpdates(): Promise<DesktopUpdateStatus> {
+  if (!app.isPackaged || process.platform !== "win32" || updateCheckInFlight) {
+    return updateStatus;
+  }
+  updateCheckInFlight = true;
+  try {
+    await autoUpdater.checkForUpdates();
+  } catch (error) {
+    setUpdateStatus({
+      state: "error",
+      message: `Could not check for updates: ${errorText(error)}`,
+      checkedAt: new Date().toISOString(),
+    });
+  } finally {
+    updateCheckInFlight = false;
+  }
+  return updateStatus;
+}
+
 function loadSettings(): DesktopSettings {
   try {
     const stored = JSON.parse(readFileSync(settingsPath(), "utf8")) as Partial<DesktopSettings>;
@@ -89,13 +184,15 @@ function sanitizeSettings(input: DesktopSettings): DesktopSettings {
     ? Math.max(512, Math.min(262_144, Math.round(input.offeredVramMb)))
     : DEFAULT_SETTINGS.offeredVramMb;
   const remoteCoordinatorUrl = input.remoteCoordinatorUrl.trim();
+  const remoteCoordinatorToken = input.remoteCoordinatorToken.trim();
   if (input.coordinatorMode === "remote") validateCoordinatorUrl(remoteCoordinatorUrl);
   if (input.adapterMode === "local-model-runtime" && !input.modelDigest.trim()) {
-    throw new Error("local model runtime necesita un digest de modelo fijado antes de aportar recursos.");
+    throw new Error("local model runtime requires a pinned model digest before contributing resources.");
   }
   return {
     coordinatorMode: input.coordinatorMode === "remote" ? "remote" : "local",
     remoteCoordinatorUrl,
+    remoteCoordinatorToken,
     contributionEnabled: Boolean(input.contributionEnabled),
     launchAtLogin: Boolean(input.launchAtLogin),
     closeToTray: Boolean(input.closeToTray),
@@ -233,6 +330,9 @@ async function startWorkerIfEnabled(): Promise<void> {
   const config = await buildWorkerConfig();
   const nextWorker = new WorkerAgent(config, {
     coordinatorUrl,
+    ...(settings.coordinatorMode === "remote" && settings.remoteCoordinatorToken
+      ? { networkToken: settings.remoteCoordinatorToken }
+      : {}),
     reconnect: true,
     logger: {
       info: (message) => console.info(`[agent] ${message}`),
@@ -270,12 +370,17 @@ function getHardware(): Promise<HardwareProbe> {
 }
 
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers);
+  if (settings.coordinatorMode === "remote" && settings.remoteCoordinatorToken) {
+    headers.set("authorization", `Bearer ${settings.remoteCoordinatorToken}`);
+  }
   const response = await fetch(new URL(path, `${coordinatorUrl}/`), {
     ...init,
+    headers,
     signal: AbortSignal.timeout(8_000),
     redirect: "error",
   });
-  if (!response.ok) throw new Error(`El coordinador respondió HTTP ${response.status}.`);
+  if (!response.ok) throw new Error(`The coordinator returned HTTP ${response.status}.`);
   return (await response.json()) as T;
 }
 
@@ -315,6 +420,7 @@ async function readSnapshot(): Promise<DashboardSnapshot> {
     models,
     localHardware,
     settings,
+    update: { ...updateStatus },
   };
 }
 
@@ -364,6 +470,27 @@ function registerIpc(): void {
     return readSnapshot();
   });
   ipcMain.handle("chat:send", (_event, request: ChatRequest) => sendChat(request));
+  ipcMain.handle("updates:check", () => checkForUpdates());
+  ipcMain.handle("updates:install", () => {
+    if (updateStatus.state !== "ready") {
+      throw new Error("There is no downloaded update ready to install.");
+    }
+    isQuitting = true;
+    autoUpdater.quitAndInstall();
+  });
+  ipcMain.handle("window:minimize", (event) => {
+    BrowserWindow.fromWebContents(event.sender)?.minimize();
+  });
+  ipcMain.handle("window:toggle-maximize", (event) => {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    if (!window) return false;
+    if (window.isMaximized()) window.unmaximize();
+    else window.maximize();
+    return window.isMaximized();
+  });
+  ipcMain.handle("window:close", (event) => {
+    BrowserWindow.fromWebContents(event.sender)?.close();
+  });
 }
 
 function createWindow(): void {
@@ -447,9 +574,9 @@ function createTrayUnsafe(): void {
   tray.setToolTip("mycellios");
   tray.setContextMenu(
     Menu.buildFromTemplate([
-      { label: "Abrir mycellios", click: () => mainWindow?.show() },
+      { label: "Open mycellios", click: () => mainWindow?.show() },
       {
-        label: settings.contributionEnabled ? "Pausar contribución" : "Activar contribución",
+        label: settings.contributionEnabled ? "Pause contribution" : "Enable contribution",
         click: () => {
           void (async () => {
             persistSettings({ ...settings, contributionEnabled: !settings.contributionEnabled });
@@ -494,6 +621,7 @@ app.whenReady().then(async () => {
   });
   createWindow();
   createTray();
+  configureAutomaticUpdates();
 });
 
 app.on("activate", () => {
@@ -511,5 +639,6 @@ app.on("window-all-closed", () => {
 });
 
 app.on("will-quit", () => {
+  if (updateCheckTimer) clearInterval(updateCheckTimer);
   void stopRuntime();
 });
