@@ -1,10 +1,39 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
 import type WebSocket from "ws";
 import { z } from "zod";
 
 const LEVELS = ["low", "balanced", "maximum"] as const;
 const BACKENDS = ["webgpu", "cpu"] as const;
+const SHA256 = /^[a-f0-9]{64}$/;
+
+const expertManifestSchema = z
+  .object({
+    modelId: z.string().min(1).max(200),
+    modelDigest: z.string().min(1).max(200),
+    layer: z.number().int().nonnegative().max(100_000),
+    expert: z.number().int().nonnegative().max(100_000),
+    contentId: z.string().min(1).max(300),
+    weightsHash: z.string().regex(SHA256),
+    hiddenSize: z.number().int().positive().max(16_384),
+    intermediateSize: z.number().int().positive().max(65_536),
+    dtype: z.literal("float32"),
+    activation: z.literal("silu"),
+    canaryInputBase64: z.string().min(4).max(512 * 1024),
+    canaryOutputBase64: z.string().min(4).max(512 * 1024),
+  })
+  .strict();
+
+const artifactParamsSchema = z.object({ artifactId: z.string().regex(SHA256) }).strict();
+const weightsParamsSchema = z.object({ weightsHash: z.string().regex(SHA256) }).strict();
+const expertActionSchema = z.object({ artifactId: z.string().regex(SHA256) }).strict();
+const expertExecuteSchema = expertActionSchema.extend({
+  rows: z.number().int().positive().max(4_096),
+  hiddenSize: z.number().int().positive().max(16_384),
+  activationsBase64: z.string().min(4).max(8 * 1024 * 1024),
+}).strict();
 
 export const mobileRegistrationSchema = z
   .object({
@@ -100,6 +129,42 @@ const mobileMessageSchema = z.discriminatedUnion("type", [
         .strict(),
     })
     .strict(),
+  z.object({
+    v: z.literal(1),
+    type: z.literal("expert.ready"),
+    payload: z.object({
+      taskId: z.string().uuid(),
+      leaseId: z.string().uuid(),
+      artifactId: z.string().regex(SHA256),
+      canaryOutputBase64: z.string().min(4).max(512 * 1024),
+      backend: z.enum(BACKENDS),
+      durationMs: z.number().nonnegative().max(600_000),
+    }).strict(),
+  }).strict(),
+  z.object({
+    v: z.literal(1),
+    type: z.literal("expert.result"),
+    payload: z.object({
+      taskId: z.string().uuid(),
+      leaseId: z.string().uuid(),
+      artifactId: z.string().regex(SHA256),
+      rows: z.number().int().positive().max(4_096),
+      hiddenSize: z.number().int().positive().max(16_384),
+      outputBase64: z.string().min(4).max(8 * 1024 * 1024),
+      backend: z.enum(BACKENDS),
+      durationMs: z.number().nonnegative().max(600_000),
+    }).strict(),
+  }).strict(),
+  z.object({
+    v: z.literal(1),
+    type: z.literal("expert.fail"),
+    payload: z.object({
+      taskId: z.string().uuid(),
+      leaseId: z.string().uuid(),
+      artifactId: z.string().regex(SHA256),
+      message: z.string().min(1).max(500),
+    }).strict(),
+  }).strict(),
 ]);
 
 export type MobileRegistration = z.infer<typeof mobileRegistrationSchema>;
@@ -124,6 +189,15 @@ export interface MobileWorkerSnapshot {
   verifiedTasks: number;
   lastSeenAt: string;
   capabilities: MobileRegistration["capabilities"];
+  residentExperts: Array<{
+    artifactId: string;
+    modelId: string;
+    modelDigest: string;
+    layer: number;
+    expert: number;
+    contentId: string;
+    bytes: number;
+  }>;
 }
 
 interface MatrixTask {
@@ -150,6 +224,8 @@ interface MobileWorkerState {
   failedTasks: number;
   verifiedTasks: number;
   pendingTask: MatrixTask | null;
+  pendingExpertTask: PendingExpertTask | null;
+  residentExperts: Set<string>;
   messageWindowAt: number;
   messagesInWindow: number;
 }
@@ -157,15 +233,44 @@ interface MobileWorkerState {
 export interface MobileComputeHubOptions {
   joinToken?: string | undefined;
   taskTimeoutMs?: number | undefined;
+  expertArtifactsPath?: string | undefined;
+}
+
+type ExpertManifest = z.infer<typeof expertManifestSchema> & { artifactId: string };
+
+interface PendingExpertTask {
+  kind: "load" | "execute";
+  taskId: string;
+  leaseId: string;
+  artifactId: string;
+  issuedAt: number;
+  rows?: number;
+  hiddenSize?: number;
+  resolve: (value: ExpertExecutionResult | MobileWorkerState) => void;
+  reject: (error: Error) => void;
+  timer: NodeJS.Timeout;
+}
+
+export interface ExpertExecutionResult {
+  workerId: string;
+  outputBase64: string;
+  rows: number;
+  hiddenSize: number;
+  backend: MobileBackend;
+  durationMs: number;
 }
 
 export class MobileComputeHub {
   private readonly workers = new Map<string, MobileWorkerState>();
   private readonly workerByClient = new Map<string, string>();
   private readonly taskTimeoutMs: number;
+  private readonly expertArtifactsPath: string;
+  private readonly expertManifests = new Map<string, ExpertManifest>();
 
   constructor(private readonly options: MobileComputeHubOptions = {}) {
     this.taskTimeoutMs = options.taskTimeoutMs ?? 45_000;
+    this.expertArtifactsPath = resolve(options.expertArtifactsPath ?? "runtime/mobile-experts");
+    mkdirSync(this.expertArtifactsPath, { recursive: true });
   }
 
   attach(app: FastifyInstance): void {
@@ -184,6 +289,77 @@ export class MobileComputeHub {
     });
 
     app.get("/mobile/v1/workers", async () => ({ data: this.listWorkers() }));
+
+    app.put("/internal/v1/mobile/experts/weights/:weightsHash", async (request, reply) => {
+      const { weightsHash } = weightsParamsSchema.parse(request.params);
+      if (!Buffer.isBuffer(request.body)) {
+        return reply.code(415).send({ error: { code: "binary_body_required" } });
+      }
+      const body = request.body;
+      if (body.length < 12 || body.length > 512 * 1024 * 1024) {
+        return reply.code(413).send({ error: { code: "invalid_weight_size" } });
+      }
+      if (createHash("sha256").update(body).digest("hex") !== weightsHash) {
+        return reply.code(400).send({ error: { code: "weight_hash_mismatch" } });
+      }
+      writeFileSync(this.weightPath(weightsHash), body);
+      return reply.code(201).send({ weightsHash, bytes: body.length });
+    });
+
+    app.post("/internal/v1/mobile/experts/register", async (request, reply) => {
+      const manifest = expertManifestSchema.parse(request.body);
+      const weights = readFileSync(this.weightPath(manifest.weightsHash));
+      const expectedBytes = (2 * manifest.intermediateSize * manifest.hiddenSize
+        + manifest.hiddenSize * manifest.intermediateSize) * Float32Array.BYTES_PER_ELEMENT;
+      if (weights.length !== expectedBytes) {
+        return reply.code(400).send({ error: { code: "weight_shape_mismatch", expectedBytes } });
+      }
+      const artifactId = createHash("sha256")
+        .update(JSON.stringify(manifest))
+        .digest("hex");
+      const stored = { ...manifest, artifactId };
+      this.expertManifests.set(artifactId, stored);
+      writeFileSync(this.manifestPath(artifactId), JSON.stringify(stored, null, 2));
+      this.cancelSyntheticWork();
+      return reply.code(201).send({ artifactId });
+    });
+
+    app.get("/mobile/v1/experts/:artifactId/manifest", async (request, reply) => {
+      const { artifactId } = artifactParamsSchema.parse(request.params);
+      const manifest = this.expertManifests.get(artifactId) ?? this.loadManifest(artifactId);
+      if (!manifest) return reply.code(404).send({ error: { code: "artifact_not_found" } });
+      return manifest;
+    });
+
+    app.get("/mobile/v1/experts/weights/:weightsHash", async (request, reply) => {
+      const { weightsHash } = weightsParamsSchema.parse(request.params);
+      try {
+        const body = readFileSync(this.weightPath(weightsHash));
+        reply.type("application/octet-stream");
+        return reply.send(body);
+      } catch {
+        return reply.code(404).send({ error: { code: "weights_not_found" } });
+      }
+    });
+
+    app.post("/internal/v1/mobile/experts/prepare", async (request, reply) => {
+      const { artifactId } = expertActionSchema.parse(request.body);
+      try {
+        const worker = await this.prepareExpert(artifactId);
+        return { artifactId, workerId: worker.id, resident: true };
+      } catch (error) {
+        return reply.code(503).send({ error: { code: "mobile_expert_unavailable", message: errorText(error) } });
+      }
+    });
+
+    app.post("/internal/v1/mobile/experts/execute", { bodyLimit: 10 * 1024 * 1024 }, async (request, reply) => {
+      const input = expertExecuteSchema.parse(request.body);
+      try {
+        return await this.executeExpert(input);
+      } catch (error) {
+        return reply.code(503).send({ error: { code: "mobile_expert_failed", message: errorText(error) } });
+      }
+    });
 
     app.get("/mobile/v1/connect", { websocket: true }, (socket, request) => {
       const parsed = connectionQuerySchema.safeParse(request.query);
@@ -205,7 +381,13 @@ export class MobileComputeHub {
       worker.lastSeenAt = Date.now();
       this.send(socket, "server.ready", { workerId: worker.id });
       socket.on("message", (raw) => this.handleMessage(worker, raw.toString()));
-      socket.on("close", () => this.disconnect(worker, socket));
+      socket.on("close", (code, reason) => {
+        this.disconnect(
+          worker,
+          socket,
+          code === 1000 && reason.toString() === "user stopped contribution",
+        );
+      });
       socket.on("error", () => this.disconnect(worker, socket));
     });
   }
@@ -230,6 +412,8 @@ export class MobileComputeHub {
       failedTasks: previous?.failedTasks ?? 0,
       verifiedTasks: previous?.verifiedTasks ?? 0,
       pendingTask: null,
+      pendingExpertTask: null,
+      residentExperts: new Set<string>(),
       messageWindowAt: Date.now(),
       messagesInWindow: 0,
     };
@@ -265,6 +449,18 @@ export class MobileComputeHub {
         verifiedTasks: worker.verifiedTasks,
         lastSeenAt: new Date(worker.lastSeenAt).toISOString(),
         capabilities: worker.registration.capabilities,
+        residentExperts: [...worker.residentExperts].flatMap((artifactId) => {
+          const manifest = this.expertManifests.get(artifactId) ?? this.loadManifest(artifactId);
+          return manifest ? [{
+            artifactId,
+            modelId: manifest.modelId,
+            modelDigest: manifest.modelDigest,
+            layer: manifest.layer,
+            expert: manifest.expert,
+            contentId: manifest.contentId,
+            bytes: 3 * manifest.hiddenSize * manifest.intermediateSize * 4,
+          }] : [];
+        }),
       };
     });
   }
@@ -275,6 +471,25 @@ export class MobileComputeHub {
 
   onlineCount(): number {
     return this.listWorkers().filter((worker) => worker.status === "online").length;
+  }
+
+  removeWorker(workerId: string): boolean {
+    const worker = this.workers.get(workerId);
+    if (!worker) return false;
+    this.workers.delete(workerId);
+    if (this.workerByClient.get(worker.registration.clientId) === workerId) {
+      this.workerByClient.delete(worker.registration.clientId);
+    }
+    worker.socket?.close(4000, "removed from mycellios panel");
+    worker.socket = null;
+    worker.connected = false;
+    return true;
+  }
+
+  removeOfflineWorkers(): number {
+    const offline = this.listWorkers().filter((worker) => !worker.connected);
+    for (const worker of offline) this.removeWorker(worker.id);
+    return offline.length;
   }
 
   close(): void {
@@ -292,7 +507,7 @@ export class MobileComputeHub {
       worker.messagesInWindow = 0;
     }
     worker.messagesInWindow += 1;
-    if (worker.messagesInWindow > 64 || Buffer.byteLength(raw, "utf8") > 64 * 1024) {
+    if (worker.messagesInWindow > 64 || Buffer.byteLength(raw, "utf8") > 10 * 1024 * 1024) {
       worker.socket?.close(4429, "message limit exceeded");
       return;
     }
@@ -332,11 +547,21 @@ export class MobileComputeHub {
           worker.pendingTask = null;
         }
         break;
+      case "expert.ready":
+        this.completeExpertLoad(worker, message.payload);
+        break;
+      case "expert.result":
+        this.completeExpertExecution(worker, message.payload);
+        break;
+      case "expert.fail":
+        this.failExpertTask(worker, message.payload);
+        break;
     }
   }
 
   private offerWork(worker: MobileWorkerState): void {
     if (!worker.socket || worker.socket.readyState !== worker.socket.OPEN || !worker.visible) return;
+    if (this.expertManifests.size > 0 || worker.pendingExpertTask) return;
     if (worker.pendingTask) {
       if (Date.now() - worker.pendingTask.issuedAt <= this.taskTimeoutMs) return;
       worker.failedTasks += 1;
@@ -394,6 +619,208 @@ export class MobileComputeHub {
     });
   }
 
+  private async prepareExpert(artifactId: string): Promise<MobileWorkerState> {
+    const manifest = this.expertManifests.get(artifactId) ?? this.loadManifest(artifactId);
+    if (!manifest) throw new Error(`expert artifact ${artifactId} is not registered`);
+    const resident = [...this.workers.values()].find(
+      (worker) => this.usableForExpert(worker) && worker.residentExperts.has(artifactId),
+    );
+    if (resident) return resident;
+    const worker = [...this.workers.values()].find((candidate) => this.usableForExpert(candidate));
+    if (!worker) throw new Error("no visible mobile worker is available");
+    this.cancelMatrixWork(worker);
+    return await new Promise<MobileWorkerState>((resolvePromise, rejectPromise) => {
+      const taskId = randomUUID();
+      const leaseId = randomUUID();
+      const timer = setTimeout(() => {
+        if (worker.pendingExpertTask?.taskId !== taskId) return;
+        worker.pendingExpertTask = null;
+        worker.failedTasks += 1;
+        rejectPromise(new Error("mobile expert load timed out"));
+      }, this.taskTimeoutMs);
+      timer.unref();
+      worker.pendingExpertTask = {
+        kind: "load",
+        taskId,
+        leaseId,
+        artifactId,
+        issuedAt: Date.now(),
+        resolve: (value) => resolvePromise(value as MobileWorkerState),
+        reject: rejectPromise,
+        timer,
+      };
+      this.send(worker.socket, "expert.load", {
+        taskId,
+        leaseId,
+        artifactId,
+        manifestUrl: `/mobile/v1/experts/${artifactId}/manifest`,
+        deadlineAt: Date.now() + this.taskTimeoutMs,
+      });
+    });
+  }
+
+  private async executeExpert(input: z.infer<typeof expertExecuteSchema>): Promise<ExpertExecutionResult> {
+    const manifest = this.expertManifests.get(input.artifactId) ?? this.loadManifest(input.artifactId);
+    if (!manifest) throw new Error(`expert artifact ${input.artifactId} is not registered`);
+    if (input.hiddenSize !== manifest.hiddenSize) throw new Error("activation hidden size mismatch");
+    const activations = decodeFloat32(input.activationsBase64);
+    if (activations.length !== input.rows * input.hiddenSize || !allFinite(activations)) {
+      throw new Error("activation payload does not match its declared shape");
+    }
+    const worker = await this.prepareExpert(input.artifactId);
+    return await new Promise<ExpertExecutionResult>((resolvePromise, rejectPromise) => {
+      const taskId = randomUUID();
+      const leaseId = randomUUID();
+      const timer = setTimeout(() => {
+        if (worker.pendingExpertTask?.taskId !== taskId) return;
+        worker.pendingExpertTask = null;
+        worker.residentExperts.delete(input.artifactId);
+        worker.failedTasks += 1;
+        rejectPromise(new Error("mobile expert execution timed out"));
+      }, this.taskTimeoutMs);
+      timer.unref();
+      worker.pendingExpertTask = {
+        kind: "execute",
+        taskId,
+        leaseId,
+        artifactId: input.artifactId,
+        issuedAt: Date.now(),
+        rows: input.rows,
+        hiddenSize: input.hiddenSize,
+        resolve: (value) => resolvePromise(value as ExpertExecutionResult),
+        reject: rejectPromise,
+        timer,
+      };
+      this.send(worker.socket, "expert.execute", {
+        taskId,
+        leaseId,
+        artifactId: input.artifactId,
+        rows: input.rows,
+        hiddenSize: input.hiddenSize,
+        activationsBase64: input.activationsBase64,
+        deadlineAt: Date.now() + this.taskTimeoutMs,
+      });
+    });
+  }
+
+  private completeExpertLoad(
+    worker: MobileWorkerState,
+    payload: Extract<z.infer<typeof mobileMessageSchema>, { type: "expert.ready" }>["payload"],
+  ): void {
+    const pending = worker.pendingExpertTask;
+    if (!this.matchesExpert(pending, payload) || pending.kind !== "load") return;
+    const manifest = this.expertManifests.get(pending.artifactId) ?? this.loadManifest(pending.artifactId);
+    const expected = manifest ? decodeFloat32(manifest.canaryOutputBase64) : new Float32Array();
+    const actual = decodeFloat32(payload.canaryOutputBase64);
+    const verified = expected.length > 0 && actual.length === expected.length
+      && [...actual].every((value, index) => Number.isFinite(value)
+        && Math.abs(value - (expected[index] ?? Number.POSITIVE_INFINITY)) <= 2e-4);
+    clearTimeout(pending.timer);
+    worker.pendingExpertTask = null;
+    if (!verified) {
+      worker.failedTasks += 1;
+      pending.reject(new Error("mobile expert canary verification failed"));
+      this.send(worker.socket, "expert.rejected", { artifactId: pending.artifactId, reason: "canary_failed" });
+      return;
+    }
+    worker.residentExperts.add(pending.artifactId);
+    worker.registration.backend = payload.backend;
+    pending.resolve(worker);
+    this.send(worker.socket, "expert.verified", { artifactId: pending.artifactId, phase: "loaded" });
+  }
+
+  private completeExpertExecution(
+    worker: MobileWorkerState,
+    payload: Extract<z.infer<typeof mobileMessageSchema>, { type: "expert.result" }>["payload"],
+  ): void {
+    const pending = worker.pendingExpertTask;
+    if (!this.matchesExpert(pending, payload) || pending.kind !== "execute") return;
+    const output = decodeFloat32(payload.outputBase64);
+    const valid = payload.rows === pending.rows && payload.hiddenSize === pending.hiddenSize
+      && output.length === payload.rows * payload.hiddenSize && allFinite(output);
+    clearTimeout(pending.timer);
+    worker.pendingExpertTask = null;
+    if (!valid) {
+      worker.residentExperts.delete(pending.artifactId);
+      worker.failedTasks += 1;
+      pending.reject(new Error("mobile expert returned an invalid tensor"));
+      return;
+    }
+    worker.completedTasks += 1;
+    worker.verifiedTasks += 1;
+    worker.registration.backend = payload.backend;
+    pending.resolve({
+      workerId: worker.id,
+      outputBase64: payload.outputBase64,
+      rows: payload.rows,
+      hiddenSize: payload.hiddenSize,
+      backend: payload.backend,
+      durationMs: payload.durationMs,
+    });
+    this.send(worker.socket, "expert.verified", {
+      artifactId: pending.artifactId,
+      phase: "executed",
+      verifiedTasks: worker.verifiedTasks,
+    });
+  }
+
+  private failExpertTask(
+    worker: MobileWorkerState,
+    payload: Extract<z.infer<typeof mobileMessageSchema>, { type: "expert.fail" }>["payload"],
+  ): void {
+    const pending = worker.pendingExpertTask;
+    if (!this.matchesExpert(pending, payload)) return;
+    clearTimeout(pending.timer);
+    worker.pendingExpertTask = null;
+    worker.residentExperts.delete(pending.artifactId);
+    worker.failedTasks += 1;
+    pending.reject(new Error(payload.message));
+  }
+
+  private usableForExpert(worker: MobileWorkerState): boolean {
+    return Boolean(
+      worker.connected && worker.visible && worker.socket
+      && worker.socket.readyState === worker.socket.OPEN && !worker.pendingExpertTask,
+    );
+  }
+
+  private cancelSyntheticWork(): void {
+    for (const worker of this.workers.values()) this.cancelMatrixWork(worker);
+  }
+
+  private cancelMatrixWork(worker: MobileWorkerState): void {
+    if (!worker.pendingTask) return;
+    this.send(worker.socket, "compute.cancel", { taskId: worker.pendingTask.taskId });
+    worker.pendingTask = null;
+  }
+
+  private matchesExpert(
+    task: PendingExpertTask | null,
+    payload: { taskId: string; leaseId: string; artifactId: string },
+  ): task is PendingExpertTask {
+    return Boolean(task && task.taskId === payload.taskId && task.leaseId === payload.leaseId
+      && task.artifactId === payload.artifactId);
+  }
+
+  private weightPath(weightsHash: string): string {
+    return resolve(this.expertArtifactsPath, `${weightsHash}.bin`);
+  }
+
+  private manifestPath(artifactId: string): string {
+    return resolve(this.expertArtifactsPath, `${artifactId}.json`);
+  }
+
+  private loadManifest(artifactId: string): ExpertManifest | null {
+    try {
+      const parsed = expertManifestSchema.extend({ artifactId: z.literal(artifactId) })
+        .parse(JSON.parse(readFileSync(this.manifestPath(artifactId), "utf8")));
+      this.expertManifests.set(artifactId, parsed);
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+
   private matches(
     task: MatrixTask | null,
     payload: { taskId: string; leaseId: string },
@@ -401,14 +828,26 @@ export class MobileComputeHub {
     return Boolean(task && task.taskId === payload.taskId && task.leaseId === payload.leaseId);
   }
 
-  private disconnect(worker: MobileWorkerState, socket: WebSocket): void {
+  private disconnect(worker: MobileWorkerState, socket: WebSocket, voluntary = false): void {
     if (worker.socket !== socket) return;
     worker.socket = null;
     worker.connected = false;
     worker.visible = false;
     worker.wakeLock = false;
     worker.pendingTask = null;
+    worker.residentExperts.clear();
+    if (worker.pendingExpertTask) {
+      clearTimeout(worker.pendingExpertTask.timer);
+      worker.pendingExpertTask.reject(new Error("mobile worker disconnected"));
+      worker.pendingExpertTask = null;
+    }
     worker.lastSeenAt = Date.now();
+    if (voluntary) {
+      this.workers.delete(worker.id);
+      if (this.workerByClient.get(worker.registration.clientId) === worker.id) {
+        this.workerByClient.delete(worker.registration.clientId);
+      }
+    }
   }
 
   private send(socket: WebSocket | null, type: string, payload: unknown): void {
@@ -456,4 +895,19 @@ function constantTimeEqual(left: string, right: string): boolean {
     difference |= left.charCodeAt(index) ^ right.charCodeAt(index);
   }
   return difference === 0;
+}
+
+function decodeFloat32(value: string): Float32Array {
+  const buffer = Buffer.from(value, "base64");
+  if (buffer.byteLength % Float32Array.BYTES_PER_ELEMENT !== 0) return new Float32Array();
+  return new Float32Array(buffer.buffer, buffer.byteOffset, buffer.byteLength / 4);
+}
+
+function allFinite(values: Float32Array): boolean {
+  for (const value of values) if (!Number.isFinite(value)) return false;
+  return true;
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

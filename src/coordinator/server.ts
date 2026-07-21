@@ -5,7 +5,7 @@ import { timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { z, ZodError } from "zod";
-import { runAndPersistRealSuite } from "../benchlab/cli.js";
+import { runAndPersistRealSuite } from "../benchlab/run.js";
 import { loadBenchmarkRuns } from "../benchlab/history.js";
 import {
   chatCompletionRequestSchema,
