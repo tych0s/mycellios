@@ -1521,25 +1521,28 @@
 }
 
 .public-panel .inference-console {
-  max-width: 1040px;
+  max-width: 1120px;
+  overflow: hidden;
 }
 
 .public-panel .inference-toolbar {
-  min-height: 68px;
+  min-height: 82px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 18px;
-  padding: 0 20px;
+  gap: 24px;
+  padding: 14px 22px;
   border-bottom: 1px solid var(--border-subtle);
 }
 
 .public-panel .inference-toolbar label {
-  display: flex;
-  align-items: center;
-  gap: 12px;
+  min-width: min(440px, 55%);
+  display: grid;
+  gap: 7px;
   color: var(--text-tertiary);
-  font-size: 10px;
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.12em;
 }
 
 .public-panel .inference-toolbar select,
@@ -1553,15 +1556,25 @@
   background: var(--bg-input);
 }
 
-.public-panel .inference-toolbar > span {
+.public-panel .inference-model-summary {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  color: var(--text-secondary);
+  font-size: 10px;
+}
+
+.public-panel .inference-live {
   display: flex;
   align-items: center;
   gap: 7px;
   color: var(--success);
-  font-size: 10px;
+  font-weight: 500;
 }
 
-.public-panel .inference-toolbar > span i {
+.public-panel .inference-live i {
   width: 7px;
   height: 7px;
   border-radius: 50%;
@@ -1569,15 +1582,95 @@
 }
 
 .public-panel .inference-output {
-  min-height: 390px;
-  display: grid;
-  place-items: center;
-  padding: 34px;
+  min-height: 330px;
+  max-height: 520px;
+  padding: 26px;
+  overflow-y: auto;
+  scroll-behavior: smooth;
+}
+
+.public-panel .inference-welcome {
+  min-height: 280px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  text-align: center;
+}
+
+.public-panel .inference-welcome > svg {
+  width: 32px;
+  height: 32px;
+  margin-bottom: 13px;
+  color: var(--blue-300);
+}
+
+.public-panel .inference-welcome h2 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 500;
+}
+
+.public-panel .inference-welcome p {
+  margin: 7px 0 20px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.public-panel .inference-suggestions {
+  display: flex;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.public-panel .inference-suggestions button {
+  min-height: 36px;
+  padding: 0 13px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.025);
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.public-panel .inference-suggestions button:hover {
+  color: var(--text-primary);
+  border-color: var(--border-strong);
+  background: rgba(63, 124, 255, 0.08);
+}
+
+.public-panel .inference-turn + .inference-turn {
+  margin-top: 26px;
+  padding-top: 26px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.public-panel .inference-user-message {
+  max-width: 76%;
+  margin: 0 0 20px auto;
+  padding: 13px 16px;
+  border: 1px solid rgba(116, 157, 255, 0.18);
+  border-radius: 14px 14px 4px 14px;
+  background: rgba(63, 124, 255, 0.1);
+}
+
+.public-panel .inference-user-message span {
+  color: var(--blue-300);
+  font-size: 8px;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+}
+
+.public-panel .inference-user-message p {
+  margin: 5px 0 0;
+  color: var(--text-primary);
+  font-size: 12px;
+  line-height: 1.55;
 }
 
 .public-panel .inference-message {
-  align-self: start;
-  justify-self: stretch;
   display: flex;
   gap: 14px;
 }
@@ -1593,49 +1686,249 @@
 }
 
 .public-panel .inference-message p {
+  margin: 7px 0 0;
+  white-space: pre-wrap;
   color: var(--text-primary);
   font-size: 13px;
   line-height: 1.7;
 }
 
-.public-panel .inference-error {
+.public-panel .inference-response-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.public-panel .inference-response-metrics span {
+  display: grid;
+  gap: 2px;
+  color: var(--text-tertiary);
+  font-size: 8px;
+  text-transform: uppercase;
+}
+
+.public-panel .inference-response-metrics b {
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: none;
+}
+
+.public-panel .inference-thinking {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 10px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.public-panel .inference-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  padding: 14px;
+  border: 1px solid rgba(255, 107, 122, 0.18);
+  border-radius: 12px;
   color: #ffb5bd;
+  background: rgba(116, 24, 38, 0.12);
+}
+
+.public-panel .inference-error div {
+  display: grid;
+  gap: 4px;
+}
+
+.public-panel .inference-error strong {
+  color: var(--text-primary);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.public-panel .inference-error span {
+  font-size: 10px;
+  line-height: 1.5;
 }
 
 .public-panel .inference-input {
-  display: grid;
-  grid-template-columns: 1fr 50px;
-  gap: 10px;
-  padding: 15px;
+  display: block;
+  padding: 14px 16px 12px;
   border-top: 1px solid var(--border-subtle);
   background: rgba(5, 16, 37, 0.42);
 }
 
 .public-panel .inference-input textarea {
-  height: 66px;
-  resize: none;
-  padding: 13px;
+  width: 100%;
+  min-height: 72px;
+  max-height: 180px;
+  resize: vertical;
+  padding: 13px 14px;
   border: 1px solid var(--border-subtle);
   border-radius: 11px;
   color: var(--text-primary);
   background: var(--bg-input);
   font-size: 12px;
+  line-height: 1.5;
 }
 
-.public-panel .inference-input button {
-  border: 0;
-  border-radius: 11px;
-  color: #fff;
-  background: linear-gradient(135deg, #3978ff, #5c91ff);
+.public-panel .inference-input-foot {
+  min-height: 42px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  padding-top: 9px;
+}
+
+.public-panel .inference-input-foot > span {
+  color: var(--text-tertiary);
+  font-size: 9px;
+}
+
+.public-panel .inference-input-foot kbd {
+  font-family: inherit;
+  color: var(--text-secondary);
+}
+
+.public-panel .inference-input-foot > div {
+  display: flex;
+  gap: 8px;
+}
+
+.public-panel .inference-send,
+.public-panel .inference-clear {
+  min-height: 38px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 0 15px;
+  border-radius: 10px;
   cursor: pointer;
 }
 
-.public-panel .inference-input button:disabled {
+.public-panel .inference-send {
+  border: 0;
+  color: #fff;
+  background: linear-gradient(135deg, #3978ff, #5c91ff);
+}
+
+.public-panel .inference-clear {
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  background: transparent;
+  font-size: 10px;
+}
+
+.public-panel .inference-send:disabled {
   opacity: 0.4;
   cursor: not-allowed;
+}
+
+.public-panel .inference-unavailable {
+  max-width: 960px;
+  min-height: 360px;
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  align-items: start;
+  gap: 24px;
+  padding: 34px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  background: linear-gradient(145deg, rgba(23, 46, 84, 0.74), rgba(10, 25, 51, 0.86));
+  box-shadow: var(--shadow-card);
+}
+
+.public-panel .inference-unavailable-icon {
+  width: 64px;
+  height: 64px;
+  display: grid;
+  place-items: center;
+  border: 1px solid rgba(105, 151, 255, 0.16);
+  border-radius: 18px;
+  color: var(--blue-300);
+  background: rgba(63, 124, 255, 0.12);
+}
+
+.public-panel .inference-unavailable-copy > span {
+  color: var(--warning);
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+}
+
+.public-panel .inference-unavailable-copy h2 {
+  margin: 7px 0 10px;
+  color: var(--text-primary);
+  font-size: 23px;
+  font-weight: 500;
+}
+
+.public-panel .inference-unavailable-copy > p {
+  max-width: 650px;
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.public-panel .inference-unavailable-copy code {
+  color: var(--blue-300);
+}
+
+.public-panel .inference-unavailable-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 24px;
+}
+
+.public-panel .inference-unavailable-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 42px;
+  padding: 0 16px;
+  border-radius: 11px;
+  cursor: pointer;
+}
+
+.public-panel .inference-request-state {
+  max-width: 680px;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 20px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 11px;
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.025);
+  font-size: 10px;
+}
+
+.public-panel .inference-request-state span,
+.public-panel .inference-request-state strong {
+  display: block;
+}
+
+.public-panel .inference-request-state strong {
+  margin-bottom: 3px;
+  color: var(--text-primary);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.public-panel .inference-diagnostic-error {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 12px;
+  color: var(--danger);
+  font-size: 10px;
 }
 
 .public-panel .join-grid,
@@ -2614,6 +2907,19 @@
   .public-panel .benchmark-chart-grid {
     grid-template-columns: 1fr;
   }
+
+  .public-panel .inference-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .public-panel .inference-toolbar label {
+    min-width: 0;
+  }
+
+  .public-panel .inference-model-summary {
+    justify-content: flex-start;
+  }
 }
 
 @media (max-width: 680px) {
@@ -2680,6 +2986,49 @@
 
   .public-panel .benchmark-chart {
     padding: 18px 14px 12px;
+  }
+
+  .public-panel .inference-unavailable {
+    min-height: 0;
+    grid-template-columns: 1fr;
+    padding: 24px 20px;
+  }
+
+  .public-panel .inference-unavailable-icon {
+    width: 54px;
+    height: 54px;
+  }
+
+  .public-panel .inference-unavailable-copy h2 {
+    font-size: 20px;
+  }
+
+  .public-panel .inference-unavailable-actions,
+  .public-panel .inference-unavailable-actions button {
+    width: 100%;
+  }
+
+  .public-panel .inference-output {
+    min-height: 300px;
+    padding: 20px 16px;
+  }
+
+  .public-panel .inference-user-message {
+    max-width: 90%;
+  }
+
+  .public-panel .inference-input-foot {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .public-panel .inference-input-foot > span {
+    display: none;
+  }
+
+  .public-panel .inference-input-foot > div,
+  .public-panel .inference-send {
+    flex: 1;
   }
 
   .public-panel .activity-card,

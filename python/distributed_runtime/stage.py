@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import math
 from pathlib import Path
@@ -79,6 +79,8 @@ class TreeCapacityReservation:
     deadline_at: float
     committed: bool = False
     consumed_forks: int = 0
+    quoted_children: dict[int, int] = field(default_factory=dict)
+    consumed_verifies: set[int] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -90,15 +92,16 @@ class TreeLeafShape:
 
 @dataclass
 class TreeReservationBook:
-    """One globally serialized logical quote for a physical stage.
+    """One globally serialized capacity quote for a physical stage.
 
     The quote allocates no KV. Its count/byte guarantee is made transactional by
     deferring every unrelated frame that can mutate runtime-visible KV, blocking
     another PREPARE/FORK, and revalidating the exact snapshot at COMMIT. This
-    seals the runtime KV budget; it is deliberately not advertised as a physical
-    CUDA/allocator reservation because no such runner ABI exists yet. The engine
-    must serialize one global tree wave from PREPARE until RESULT+CANCEL or the
-    end-to-end COMMIT result plus all quoted FORKs are consumed.
+    seals both the configured budget and, when the runner exposes it, its
+    runner-owned physical KV pool.  It is not a reservation of arbitrary CUDA
+    workspace or process-wide VRAM outside that pool.  The engine must serialize
+    one global tree wave from PREPARE until RESULT+CANCEL or the end-to-end
+    COMMIT result plus every quoted VERIFY has materialised its KV growth.
     """
 
     active: TreeCapacityReservation | None = None
@@ -462,6 +465,7 @@ def run_stage_process(
                     return_socket=return_socket,
                     emulator=emulator,
                 )
+                consume_tree_reservation_verifies(frames, tree_reservations)
             elif frame.frame_type == FrameType.TRUNCATE:
                 runner.truncate(frame.request_id, frame.token_count)
                 if downstream is not None:
@@ -629,6 +633,10 @@ def expire_tree_reservation(
     observed = time.monotonic() if now is None else now
     if observed < active.deadline_at:
         return False
+    if active.consumed_forks:
+        raise TimeoutError(
+            "committed tree reservation expired after speculative KV mutation"
+        )
     reservations.active = None
     return True
 
@@ -640,16 +648,22 @@ def tree_reservation_defers_frame(
 ) -> bool:
     """Hold every unrelated KV mutation behind one active tree transaction.
 
-    The stage cannot reserve arbitrary CUDA allocator state through the legacy
-    runner ABI.  Serializing runtime-visible cache mutations from PREPARE until
-    the final quoted FORK is therefore the only truthful fail-closed guarantee.
-    Control frames are never hidden here: malformed/replayed tree controls must
+    Serializing runtime-visible cache mutations from PREPARE until every quoted
+    VERIFY has materialised its KV prevents another request from stealing the
+    runner-owned blocks promised by the quote.  Control frames and mutations of
+    the quoted parent/children are never hidden here: malformed ordering must
     reach the validator and fail the route immediately.
     """
 
-    del branch_parents  # all ordinary KV owners share the same allocator budget
-    if reservations.active is None:
+    active = reservations.active
+    if active is None:
         return False
+    if (
+        frame.request_id == active.parent_request_id
+        or frame.request_id in active.quoted_children
+    ):
+        return False
+    del branch_parents  # all ordinary KV owners share the same allocator budget
     return frame.frame_type in {
         FrameType.BEGIN,
         FrameType.ACTIVATION,
@@ -667,7 +681,7 @@ def validate_tree_reservation_frame_order(
     reservations: TreeReservationBook,
     branch_parents: Mapping[int, int],
 ) -> None:
-    """Protect the quoted tree while unrelated real requests keep progressing."""
+    """Allow only the canonical tree mutation at each reservation phase."""
 
     active = reservations.active
     if active is None:
@@ -685,6 +699,22 @@ def validate_tree_reservation_frame_order(
             raise ValueError("tree reservation COMMIT cannot be replayed")
         return
     if frame.frame_type == FrameType.FORK and active.committed:
+        return
+    if frame.frame_type == FrameType.VERIFY and active.committed:
+        if active.consumed_forks != len(active.path_lengths):
+            raise ValueError("tree VERIFY cannot overtake quoted FORKs")
+        expected_tokens = active.quoted_children.get(frame.request_id)
+        if expected_tokens is None:
+            raise ValueError("tree VERIFY is not bound to a quoted child")
+        if branch_parents.get(frame.request_id) != active.parent_request_id:
+            raise ValueError("quoted tree VERIFY lost its parent binding")
+        if frame.request_id in active.consumed_verifies:
+            raise ValueError("quoted tree VERIFY cannot be replayed")
+        if frame.token_count != expected_tokens:
+            raise ValueError(
+                "quoted tree VERIFY token count mismatch: "
+                f"got {frame.token_count}, expected {expected_tokens}"
+            )
         return
     del branch_parents
     phase = "committed" if active.committed else "prepared"
@@ -1237,8 +1267,47 @@ def fork_stage_request(
             expected_tokens=1 + quoted_path_length,
         )
         reservation.consumed_forks += 1
-        if reservation.consumed_forks == len(reservation.path_lengths):
-            tree_reservations.active = None
+        reservation.quoted_children[child_request_id] = 1 + quoted_path_length
+        reservation.deadline_at = time.monotonic() + TREE_RESERVATION_TTL_SECONDS
+
+
+def consume_tree_reservation_verifies(
+    frames: tuple[Frame, ...],
+    reservations: TreeReservationBook,
+) -> bool:
+    """Commit successful quoted VERIFY growth and release the mutation barrier.
+
+    This must run only after every frame in ``frames`` has completed locally and
+    its output has been forwarded.  A failed model call or socket write therefore
+    leaves the reservation active and makes the route fail closed.
+    """
+
+    active = reservations.active
+    if active is None:
+        return False
+    quoted = tuple(
+        frame for frame in frames if frame.request_id in active.quoted_children
+    )
+    if not quoted:
+        return False
+    if active.consumed_forks != len(active.path_lengths):
+        raise RuntimeError("quoted VERIFY completed before every FORK")
+    for frame in quoted:
+        if frame.frame_type != FrameType.VERIFY:
+            raise RuntimeError("non-VERIFY frame consumed quoted tree capacity")
+        expected_tokens = active.quoted_children[frame.request_id]
+        if frame.token_count != expected_tokens:
+            raise RuntimeError("quoted VERIFY changed shape after validation")
+        if frame.request_id in active.consumed_verifies:
+            raise RuntimeError("quoted VERIFY was consumed twice")
+        active.consumed_verifies.add(frame.request_id)
+    active.deadline_at = time.monotonic() + TREE_RESERVATION_TTL_SECONDS
+    if len(active.consumed_verifies) > len(active.path_lengths):
+        raise RuntimeError("tree reservation consumed too many VERIFY frames")
+    if len(active.consumed_verifies) == len(active.path_lengths):
+        reservations.active = None
+        return True
+    return False
 
 
 def promote_stage_request(

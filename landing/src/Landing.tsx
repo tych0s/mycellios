@@ -188,8 +188,8 @@ function LivingBackdrop() {
     <div className="living-background" aria-hidden="true">
       <svg viewBox="0 0 1440 900" preserveAspectRatio="xMidYMid slice">
         <defs>
-          <linearGradient id="hyphaGradient" x1="1" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#d9fff5" /><stop offset=".42" stopColor="#72d9c6" /><stop offset=".75" stopColor="#7888bf" /><stop offset="1" stopColor="#8a5ca9" /></linearGradient>
-          <radialGradient id="colonyGlow"><stop offset="0" stopColor="#6ce5ca" stopOpacity=".12" /><stop offset="1" stopColor="#07080b" stopOpacity="0" /></radialGradient>
+          <linearGradient id="hyphaGradient" x1="1" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#e2edff" /><stop offset=".42" stopColor="#83b5ff" /><stop offset=".75" stopColor="#5c7fda" /><stop offset="1" stopColor="#445caa" /></linearGradient>
+          <radialGradient id="colonyGlow"><stop offset="0" stopColor="#5c96ff" stopOpacity=".14" /><stop offset="1" stopColor="#11172f" stopOpacity="0" /></radialGradient>
         </defs>
         <g className="colony-glow">
           <ellipse cx="1040" cy="312" rx="330" ry="250" fill="url(#colonyGlow)" />
@@ -290,7 +290,7 @@ function EfficiencyCurve({ text }: { text: typeof copy.acceleration }) {
           <span className="curve-axis">{text.axis}</span>
           <svg className="curve-plot" viewBox="0 0 1000 470" preserveAspectRatio="none" aria-hidden="true">
             <defs>
-              <linearGradient id="efficiencyLine" x1="0" x2="1"><stop offset="0" stopColor="#7085ff" /><stop offset=".55" stopColor="#65f6d1" /><stop offset="1" stopColor="#e8fffb" /></linearGradient>
+              <linearGradient id="efficiencyLine" x1="0" x2="1"><stop offset="0" stopColor="#7189ce" /><stop offset=".55" stopColor="#5c96ff" /><stop offset="1" stopColor="#e2edff" /></linearGradient>
               <filter id="curveGlow" x="-30%" y="-50%" width="160%" height="200%"><feGaussianBlur stdDeviation="7" result="blur" /><feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge></filter>
             </defs>
             <g className="curve-grid">

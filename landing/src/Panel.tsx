@@ -42,6 +42,7 @@ import { useCallback, useEffect, useMemo, useState, type CSSProperties, type For
 import "@fontsource-variable/manrope";
 import type {
   DashboardSnapshot,
+  ChatResponse,
   DesktopBridge,
   DesktopSettings,
   DesktopUpdateStatus,
@@ -78,8 +79,10 @@ interface PublicDeployment {
   deploymentId: string;
   model: string;
   mode: string;
+  adapter?: string;
   freeSlots: number;
   tokensPerSecond: number;
+  ttftMs?: number;
 }
 
 interface PublicWorker {
@@ -149,7 +152,7 @@ const sharedNavItems: Array<{ id: PanelView; label: string; icon: typeof Network
   { id: "jobs", label: "Tasks", icon: Activity },
   { id: "tests", label: "Tests", icon: Gauge },
   { id: "models", label: "Models", icon: Boxes },
-  { id: "inference", label: "Inference", icon: MessageSquareText },
+  { id: "inference", label: "Chat", icon: MessageSquareText },
   { id: "contribute", label: "Contribute", icon: Zap },
   { id: "downloads", label: "Downloads", icon: Download },
 ];
@@ -291,12 +294,30 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     await refresh();
   }
 
-  async function sendPrompt(model: string, prompt: string) {
-    if (desktopBridge) return (await desktopBridge.sendChat({ model, prompt })).text;
+  async function sendPrompt(model: string, prompt: string): Promise<ChatResponse> {
+    if (desktopBridge) return desktopBridge.sendChat({ model, prompt });
     const response = await fetch("/v1/chat/completions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }], max_tokens: 256 }) });
-    const body = await response.json() as { choices?: Array<{ message?: { content?: string } }>; error?: { message?: string } };
+    const body = await response.json() as {
+      id?: string;
+      model?: string;
+      choices?: Array<{ message?: { content?: string } }>;
+      usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+      x_network?: { route_class?: string; affinity_hit?: boolean; ttft_ms?: number; active_ms?: number };
+      error?: { message?: string };
+    };
     if (!response.ok) throw new Error(body.error?.message ?? `HTTP ${response.status}`);
-    return body.choices?.[0]?.message?.content ?? "The network returned an empty response.";
+    return {
+      requestId: body.id ?? "unknown",
+      model: body.model ?? model,
+      text: body.choices?.[0]?.message?.content ?? "",
+      promptTokens: body.usage?.prompt_tokens ?? 0,
+      outputTokens: body.usage?.completion_tokens ?? 0,
+      totalTokens: body.usage?.total_tokens ?? 0,
+      routeClass: body.x_network?.route_class ?? "unknown",
+      affinityHit: body.x_network?.affinity_hit ?? false,
+      ttftMs: body.x_network?.ttft_ms ?? 0,
+      activeMs: body.x_network?.active_ms ?? 0,
+    };
   }
 
   const publicOrigin = desktopSnapshot?.settings.coordinatorMode === "remote"
@@ -361,7 +382,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
               {view === "models" && <Models snapshot={snapshot} onRequest={requestModel} onRemove={removeRequestedModel} adminToken={modelAdminToken} requiresAdminToken={!desktop && !localBrowser} />}
               {view === "jobs" && <Jobs snapshot={snapshot} />}
               {view === "tests" && <Tests bridge={desktopBridge} />}
-              {view === "inference" && <Inference snapshot={snapshot} onSend={sendPrompt} />}
+              {view === "inference" && <Inference snapshot={snapshot} onSend={sendPrompt} onNavigate={navigate} />}
               {view === "contribute" && <Contribute />}
               {view === "join" && <JoinNetwork publicLink={publicLink} external={desktop} />}
               {view === "downloads" && <Downloads publicLink={publicLink} external={desktop} />}
@@ -686,26 +707,87 @@ function BenchmarkResultRow({ measurement }: { measurement: BenchmarkMeasurement
   </div>;
 }
 
-function Inference({ snapshot, onSend }: { snapshot: PublicSnapshot; onSend: (model: string, prompt: string) => Promise<string> }) {
-  const [model, setModel] = useState(snapshot.models[0]?.id ?? "");
+interface InferenceTurn {
+  id: string;
+  prompt: string;
+  response: ChatResponse;
+}
+
+function Inference({ snapshot, onSend, onNavigate }: {
+  snapshot: PublicSnapshot;
+  onSend: (model: string, prompt: string) => Promise<ChatResponse>;
+  onNavigate: (view: PanelView) => void;
+}) {
+  const options = useMemo(() => snapshot.models.map((item) => inferenceModelOption(snapshot, item)), [snapshot]);
+  const realModels = options.filter((item) => !item.connectivityOnly);
+  const connectivityModel = options.find((item) => item.connectivityOnly) ?? null;
+  const [model, setModel] = useState("");
   const [prompt, setPrompt] = useState("");
-  const [result, setResult] = useState<string | null>(null);
+  const [turns, setTurns] = useState<InferenceTurn[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [sending, setSending] = useState(false);
-  const selectedModel = useMemo(() => snapshot.models.some((item) => item.id === model) ? model : snapshot.models[0]?.id ?? "", [model, snapshot.models]);
+  const [pendingPrompt, setPendingPrompt] = useState<string | null>(null);
+  const [diagnostic, setDiagnostic] = useState<"idle" | "running" | "ok" | "failed">("idle");
+  const selectedModel = realModels.some((item) => item.id === model) ? model : realModels[0]?.id ?? "";
+  const selectedOption = realModels.find((item) => item.id === selectedModel) ?? null;
+
   async function send() {
-    if (!selectedModel || !prompt.trim()) return;
-    setSending(true); setError(null); setResult(null);
+    const cleanPrompt = prompt.trim();
+    if (!selectedModel || !cleanPrompt || pendingPrompt) return;
+    setPendingPrompt(cleanPrompt);
+    setPrompt("");
+    setError(null);
     try {
-      setResult(await onSend(selectedModel, prompt.trim()));
-    } catch (caught) { setError(caught instanceof Error ? caught.message : String(caught)); }
-    finally { setSending(false); }
+      const response = await onSend(selectedModel, cleanPrompt);
+      if (!response.text.trim()) throw new Error("El modelo terminó sin devolver texto.");
+      setTurns((current) => [...current, { id: response.requestId, prompt: cleanPrompt, response }]);
+    } catch (caught) {
+      setPrompt(cleanPrompt);
+      setError(errorText(caught));
+    } finally {
+      setPendingPrompt(null);
+    }
   }
-  return <section><PageTitle eyebrow="INFERENCE CONSOLE" title="Test the network" copy="Send a real request through the public test coordinator." />
-    <div className="inference-console"><div className="inference-toolbar"><label>MODEL<select value={selectedModel} onChange={(event) => setModel(event.target.value)}><option value="">No model available</option>{snapshot.models.map((item) => <option key={item.id}>{item.id}</option>)}</select></label><span><i />PUBLIC TEST API</span></div>
-      <div className="inference-output">{!result && !error && <Empty icon={MessageSquareText} title="Console ready" copy={selectedModel ? "Write a prompt to test the complete route." : "Connect a model before sending a request."} />}{result && <div className="inference-message"><img src={brandIcon} alt="" /><div><span>mycellios · {selectedModel}</span><p>{result}</p></div></div>}{error && <div className="inference-error"><CircleAlert />{error}</div>}</div>
-      <div className="inference-input"><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="Ask the network something…" /><button disabled={!selectedModel || !prompt.trim() || sending} onClick={() => void send()}>{sending ? <LoaderCircle className="spin" /> : <Send />}</button></div>
-    </div></section>;
+
+  async function checkConnection() {
+    if (!connectivityModel || diagnostic === "running") return;
+    setDiagnostic("running");
+    try {
+      await onSend(connectivityModel.id, "ping");
+      setDiagnostic("ok");
+    } catch {
+      setDiagnostic("failed");
+    }
+  }
+
+  return <section className="inference-page">
+    <PageTitle eyebrow="INFERENCIA REAL" title="Probar un modelo" copy="Habla con un modelo conectado y comprueba la ruta, la latencia y los tokens de cada respuesta." />
+    {realModels.length === 0 ? <div className="inference-unavailable">
+      <div className="inference-unavailable-icon"><MessageSquareText /></div>
+      <div className="inference-unavailable-copy"><span>NO HAY MODELOS DE IA DISPONIBLES</span><h2>Ahora mismo no se puede hacer una inferencia real</h2><p>La red no tiene ningún modelo real conectado. La prueba <code>mycellios-connectivity-check</code> solo verifica la comunicación y nunca genera respuestas de IA.</p>
+        {snapshot.requestedModels[0] && <div className="inference-request-state"><LoaderCircle className={snapshot.requestedModels[0].status === "active" ? "" : "spin"} /><span><strong>{snapshot.requestedModels[0].id}</strong>{snapshot.requestedModels[0].message}</span></div>}
+        <div className="inference-unavailable-actions"><button className="primary-button" onClick={() => onNavigate("models")}><Boxes size={16} />Ver y activar modelos</button>{connectivityModel && <button className="secondary-button" disabled={diagnostic === "running"} onClick={() => void checkConnection()}>{diagnostic === "running" ? <LoaderCircle className="spin" size={16} /> : diagnostic === "ok" ? <CheckCircle2 size={16} /> : <Wifi size={16} />}{diagnostic === "idle" ? "Comprobar conexión" : diagnostic === "running" ? "Comprobando…" : diagnostic === "ok" ? "Conexión correcta" : "Reintentar conexión"}</button>}</div>
+        {diagnostic === "failed" && <div className="inference-diagnostic-error"><CircleAlert size={15} />El coordinador no ha completado la prueba de conexión.</div>}
+      </div>
+    </div> : <div className="inference-console">
+      <div className="inference-toolbar">
+        <label><span>MODELO REAL</span><select value={selectedModel} onChange={(event) => setModel(event.target.value)}>{realModels.map((item) => <option key={item.id} value={item.id}>{item.id}</option>)}</select></label>
+        <div className="inference-model-summary"><span className="inference-live"><i />DISPONIBLE</span><span>{selectedOption?.routeLabel}</span><span>{selectedOption?.freeSlots ?? 0} hueco{selectedOption?.freeSlots === 1 ? "" : "s"} libre{selectedOption?.freeSlots === 1 ? "" : "s"}</span></div>
+      </div>
+      <div className="inference-output" aria-live="polite">
+        {turns.length === 0 && !pendingPrompt && !error && <div className="inference-welcome"><Sparkles /><h2>Escribe una pregunta</h2><p>La respuesta vendrá del modelo seleccionado, no del adaptador de conectividad.</p><div className="inference-suggestions">{["Resume cómo funciona esta red", "Explica una idea en tres frases", "Responde con una prueba corta"].map((suggestion) => <button key={suggestion} onClick={() => setPrompt(suggestion)}>{suggestion}</button>)}</div></div>}
+        {turns.map((turn) => <div className="inference-turn" key={turn.id}>
+          <div className="inference-user-message"><span>TÚ</span><p>{turn.prompt}</p></div>
+          <div className="inference-message"><img src={brandIcon} alt="" /><div><span>{turn.response.model}</span><p>{turn.response.text}</p><div className="inference-response-metrics"><span><b>{formatDuration(turn.response.ttftMs)}</b>primer token</span><span><b>{formatDuration(turn.response.activeMs)}</b>tiempo total</span><span><b>{turn.response.outputTokens}</b>tokens salida</span><span><b>{formatResponseThroughput(turn.response)}</b>tokens/s</span><span><b>{turn.response.routeClass}</b>ruta</span></div></div></div>
+        </div>)}
+        {pendingPrompt && <div className="inference-turn pending"><div className="inference-user-message"><span>TÚ</span><p>{pendingPrompt}</p></div><div className="inference-thinking"><LoaderCircle className="spin" /><span>El modelo está procesando la petición…</span></div></div>}
+        {error && <div className="inference-error"><CircleAlert /><div><strong>No se pudo completar la inferencia</strong><span>{friendlyInferenceError(error)}</span></div></div>}
+      </div>
+      <div className="inference-input">
+        <textarea aria-label="Mensaje" value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder={`Escribe a ${selectedModel}…`} />
+        <div className="inference-input-foot"><span><kbd>Enter</kbd> enviar · <kbd>Shift</kbd> + <kbd>Enter</kbd> nueva línea</span><div>{turns.length > 0 && <button className="inference-clear" onClick={() => { setTurns([]); setError(null); }}><Trash2 size={14} />Limpiar</button>}<button className="inference-send" disabled={!prompt.trim() || pendingPrompt !== null} onClick={() => void send()}>{pendingPrompt ? <LoaderCircle className="spin" /> : <Send />}<span>Enviar</span></button></div></div>
+      </div>
+    </div>}
+  </section>;
 }
 
 function JoinNetwork({ publicLink, external }: { publicLink: (path: string) => string; external: boolean }) {
@@ -835,6 +917,35 @@ function workerLabel(worker: PublicWorker) { return worker.kind === "browser" ? 
 function shortId(value: string) { return value.length <= 10 ? value : `${value.slice(0, 6)}…${value.slice(-4)}`; }
 function formatMemory(value: number) { return value >= 1_024 ? `${(value / 1_024).toFixed(value >= 10_240 ? 0 : 1)} GB` : `${Math.round(value)} MB`; }
 function relativeTime(value: string) { const seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1_000)); if (seconds < 5) return "now"; if (seconds < 60) return `${seconds}s ago`; const minutes = Math.floor(seconds / 60); if (minutes < 60) return `${minutes}m ago`; return `${Math.floor(minutes / 60)}h ago`; }
+
+function inferenceModelOption(snapshot: PublicSnapshot, model: PublicSnapshot["models"][number]) {
+  const deployments = snapshot.workers.flatMap((worker) => worker.deployments).filter((deployment) => deployment.model === model.id);
+  const adapters = deployments.map((deployment) => deployment.adapter).filter((adapter): adapter is NonNullable<PublicDeployment["adapter"]> => adapter !== undefined);
+  const connectivityOnly = model.id === "mycellios-connectivity-check" || (adapters.length > 0 && adapters.every((adapter) => adapter === "mock"));
+  const freeSlots = deployments.reduce((total, deployment) => total + deployment.freeSlots, 0);
+  const routeLabel = model.pipelines > 0
+    ? `${model.pipelines} pipeline${model.pipelines === 1 ? "" : "s"}`
+    : `${model.replicas} réplica${model.replicas === 1 ? "" : "s"}`;
+  return { ...model, connectivityOnly, freeSlots, routeLabel };
+}
+
+function formatDuration(milliseconds: number): string {
+  if (!Number.isFinite(milliseconds) || milliseconds <= 0) return "—";
+  return milliseconds < 1_000 ? `${Math.round(milliseconds)} ms` : `${(milliseconds / 1_000).toFixed(milliseconds < 10_000 ? 2 : 1)} s`;
+}
+
+function formatResponseThroughput(response: ChatResponse): string {
+  if (response.activeMs <= 0 || response.outputTokens <= 0) return "—";
+  return (response.outputTokens / (response.activeMs / 1_000)).toFixed(2);
+}
+
+function friendlyInferenceError(message: string): string {
+  const normalized = message.toLowerCase();
+  if (normalized.includes("no_candidates") || normalized.includes("no candidate") || normalized.includes("unavailable")) return "El modelo dejó de estar disponible. Comprueba el estado de sus nodos y vuelve a intentarlo.";
+  if (normalized.includes("timeout") || normalized.includes("deadline")) return "La red tardó demasiado en responder. La petición se ha cancelado sin inventar una respuesta.";
+  if (normalized.includes("401") || normalized.includes("token")) return "La red requiere una credencial válida para usar este modelo.";
+  return message;
+}
 
 async function fetchBenchmarkRuns(): Promise<BenchmarkRun[]> {
   const response = await fetch("/local/v1/benchmarks", { cache: "no-store" });

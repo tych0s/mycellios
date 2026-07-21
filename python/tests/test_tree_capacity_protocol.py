@@ -11,6 +11,9 @@ import torch
 
 from distributed_runtime.model import StageModelSpec
 from distributed_runtime.protocol import (
+    HEADER,
+    MAGIC,
+    VERSION,
     Frame,
     FrameType,
     TensorCodec,
@@ -18,6 +21,7 @@ from distributed_runtime.protocol import (
     TreePrepareRejection,
     TreePrepareStatus,
     branch_request_payload,
+    decode_tree_reservation_nonce,
     decode_tree_prepare,
     encode_tensor,
     encode_tree_prepare_quote,
@@ -32,6 +36,7 @@ from distributed_runtime.stage import (
     cancel_tree_reservation,
     collect_compatible_activation_frames,
     commit_tree_reservation,
+    consume_tree_reservation_verifies,
     expire_tree_reservation,
     fork_stage_request,
     prepare_tree_capacity,
@@ -161,6 +166,156 @@ def _prepare_frame(
 
 
 class TreeCapacityPayloadTests(unittest.TestCase):
+    def test_commit_and_route_ack_metadata_are_canonical(self) -> None:
+        sender, receiver = socket.socketpair()
+        try:
+            nonce = 2**63 + 11
+            payload = tree_reservation_payload(nonce)
+            for predecessor_count in (0, (2**16) - 2):
+                send_frame(
+                    sender,
+                    FrameType.TREE_RESERVATION_COMMIT,
+                    41,
+                    step=5,
+                    token_count=predecessor_count,
+                    payload=payload,
+                )
+                commit = recv_frame(receiver)
+                self.assertEqual(commit.token_count, predecessor_count)
+                self.assertEqual(decode_tree_reservation_nonce(commit), nonce)
+
+            for stage_count in (1, (2**16) - 1):
+                send_frame(
+                    sender,
+                    FrameType.TREE_RESERVATION_COMMIT_RESULT,
+                    41,
+                    step=5,
+                    token_count=stage_count,
+                    payload=payload,
+                )
+                result = recv_frame(receiver)
+                self.assertEqual(result.token_count, stage_count)
+                self.assertEqual(decode_tree_reservation_nonce(result), nonce)
+
+            with self.assertRaisesRegex(ValueError, "predecessor count"):
+                send_frame(
+                    sender,
+                    FrameType.TREE_RESERVATION_COMMIT,
+                    41,
+                    token_count=(2**16) - 1,
+                    payload=payload,
+                )
+            for stage_count in (0, 2**16):
+                with self.subTest(stage_count=stage_count):
+                    with self.assertRaisesRegex(ValueError, "positive uint16"):
+                        send_frame(
+                            sender,
+                            FrameType.TREE_RESERVATION_COMMIT_RESULT,
+                            41,
+                            token_count=stage_count,
+                            payload=payload,
+                        )
+
+            for frame_type, token_count in (
+                (FrameType.TREE_RESERVATION_COMMIT, 0),
+                (FrameType.TREE_RESERVATION_COMMIT_RESULT, 1),
+            ):
+                with self.subTest(frame_type=frame_type.name, field="flags"):
+                    with self.assertRaisesRegex(ValueError, "flags=hidden_size=0"):
+                        send_frame(
+                            sender,
+                            frame_type,
+                            41,
+                            token_count=token_count,
+                            flags=1,
+                            payload=payload,
+                        )
+                with self.subTest(frame_type=frame_type.name, field="hidden_size"):
+                    with self.assertRaisesRegex(ValueError, "flags=hidden_size=0"):
+                        send_frame(
+                            sender,
+                            frame_type,
+                            41,
+                            token_count=token_count,
+                            hidden_size=1,
+                            payload=payload,
+                        )
+                with self.subTest(frame_type=frame_type.name, field="payload"):
+                    with self.assertRaisesRegex(ValueError, "exactly one uint64"):
+                        send_frame(
+                            sender,
+                            frame_type,
+                            41,
+                            token_count=token_count,
+                            payload=b"short",
+                        )
+        finally:
+            sender.close()
+            receiver.close()
+
+    def test_commit_and_route_ack_reject_noncanonical_wire_headers(self) -> None:
+        payload = tree_reservation_payload(99)
+        cases = (
+            (FrameType.TREE_RESERVATION_COMMIT, 1, 0, 0, 8, "flags"),
+            (FrameType.TREE_RESERVATION_COMMIT, 0, 0, 1, 8, "hidden_size"),
+            (
+                FrameType.TREE_RESERVATION_COMMIT,
+                0,
+                (2**16) - 1,
+                0,
+                8,
+                "predecessor count",
+            ),
+            (FrameType.TREE_RESERVATION_COMMIT, 0, 0, 0, 7, "one uint64"),
+            (
+                FrameType.TREE_RESERVATION_COMMIT_RESULT,
+                0,
+                0,
+                0,
+                8,
+                "positive uint16",
+            ),
+            (
+                FrameType.TREE_RESERVATION_COMMIT_RESULT,
+                0,
+                2**16,
+                0,
+                8,
+                "positive uint16",
+            ),
+            (
+                FrameType.TREE_RESERVATION_COMMIT_RESULT,
+                0,
+                1,
+                0,
+                9,
+                "one uint64",
+            ),
+        )
+        for frame_type, flags, token_count, hidden_size, size, pattern in cases:
+            with self.subTest(frame_type=frame_type.name, pattern=pattern):
+                sender, receiver = socket.socketpair()
+                try:
+                    sender.sendall(
+                        HEADER.pack(
+                            MAGIC,
+                            VERSION,
+                            int(frame_type),
+                            flags,
+                            41,
+                            5,
+                            token_count,
+                            hidden_size,
+                            size,
+                        )
+                        + payload[:size]
+                    )
+                    with self.assertRaisesRegex(ValueError, pattern):
+                        recv_frame(receiver)
+                finally:
+                    sender.close()
+                    receiver.close()
+
     def test_quote_and_structured_result_are_canonical_and_bounded(self) -> None:
         sender, receiver = socket.socketpair()
         try:
@@ -317,10 +472,20 @@ class TreeCapacityStageTests(unittest.TestCase):
                 book,
                 shapes,
             )
-            self.assertIsNone(book.active)
+            self.assertIsNotNone(book.active)
+            self.assertTrue(book.active and book.active.committed)
             self.assertEqual(shapes[12].expected_tokens, 3)
             self.assertEqual(recv_frame(peer).frame_type, FrameType.FORK)
             valid = Frame(FrameType.VERIFY, 0, 12, 3, 3, 4, b"")
+            self.assertFalse(tree_reservation_defers_frame(valid, book, branches))
+            validate_tree_reservation_frame_order(valid, book, branches)
+            self.assertTrue(
+                tree_reservation_defers_frame(
+                    Frame(FrameType.ACTIVATION, 0, 99, 0, 1, 4, b""),
+                    book,
+                    branches,
+                )
+            )
             # Payload decoding belongs to process_activation_frames; this helper
             # proves the committed quote is bound to the VERIFY shape first.
             validate_activation(valid, config, runner, metrics, branches, shapes)
@@ -333,11 +498,13 @@ class TreeCapacityStageTests(unittest.TestCase):
                     branches,
                     shapes,
                 )
+            self.assertTrue(consume_tree_reservation_verifies((valid,), book))
+            self.assertIsNone(book.active)
         finally:
             stage_sock.close()
             peer.close()
 
-    def test_unquoted_fork_is_rejected_on_the_v5_stage_path(self) -> None:
+    def test_unquoted_fork_is_rejected_on_the_v6_stage_path(self) -> None:
         config = _last_stage_config(max_kv_bytes=10_000)
         runner = _QuoteRunner(config.spec)
         runner.begin(11)
@@ -570,6 +737,79 @@ class TreeCapacityStageTests(unittest.TestCase):
                     reservations=book,
                     downstream=None,
                 )
+        finally:
+            stage_sock.close()
+            peer.close()
+
+    def test_expired_reservation_after_fork_is_route_fatal_and_stays_barred(self) -> None:
+        config = _last_stage_config(max_kv_bytes=10_000)
+        runner = _QuoteRunner(config.spec)
+        runner.begin(11)
+        runner.active[11] = 2
+        metrics = {
+            11: {
+                "frames": 3,
+                "compute_ms": 0,
+                "bytes_out": 0,
+                "tokens": 2,
+            }
+        }
+        book = TreeReservationBook()
+        stage_sock, peer = socket.socketpair()
+        try:
+            prepare_tree_capacity(
+                _prepare_frame(11, 3, 710, (1,)),
+                config=config,
+                runner=runner,
+                request_metrics=metrics,
+                branch_parents={},
+                reservations=book,
+                downstream=stage_sock,
+                return_socket=None,
+            )
+            recv_frame(peer)
+            commit_tree_reservation(
+                Frame(
+                    FrameType.TREE_RESERVATION_COMMIT,
+                    0,
+                    11,
+                    3,
+                    0,
+                    0,
+                    tree_reservation_payload(710),
+                ),
+                config=config,
+                runner=runner,
+                request_metrics=metrics,
+                branch_parents={},
+                reservations=book,
+                downstream=stage_sock,
+            )
+            recv_frame(peer)
+            branches: dict[int, int] = {}
+            fork_stage_request(
+                Frame(
+                    FrameType.FORK,
+                    0,
+                    12,
+                    0,
+                    0,
+                    0,
+                    branch_request_payload(11),
+                ),
+                config,
+                runner,
+                metrics,
+                branches,
+                stage_sock,
+                book,
+                {},
+            )
+            recv_frame(peer)
+            assert book.active is not None
+            with self.assertRaisesRegex(TimeoutError, "after speculative KV mutation"):
+                expire_tree_reservation(book, now=book.active.deadline_at + 0.001)
+            self.assertIsNotNone(book.active)
         finally:
             stage_sock.close()
             peer.close()
@@ -831,14 +1071,39 @@ class TreeCapacityStageTests(unittest.TestCase):
                     0,
                 )
 
-                # Consuming the sole quoted FORK releases the route barrier;
-                # the unrelated chat then resumes in original TCP order.
+                # FORK alone cannot release the physical capacity guarantee:
+                # the unrelated chat remains held until the quoted VERIFY has
+                # materialised all of its promised KV growth on every stage.
                 child = 78
                 send_frame(
                     upstream,
                     FrameType.FORK,
                     child,
                     payload=branch_request_payload(parent),
+                )
+                direct_return.settimeout(0.05)
+                with self.assertRaises(socket.timeout):
+                    recv_frame(direct_return)
+                direct_return.settimeout(5)
+                tree_hidden = torch.arange(8, dtype=torch.float32).reshape(1, 2, 4)
+                send_frame(
+                    upstream,
+                    FrameType.VERIFY,
+                    child,
+                    step=1,
+                    token_count=2,
+                    hidden_size=4,
+                    flags=int(TensorCodec.FP32),
+                    payload=encode_tensor(tree_hidden, TensorCodec.FP32),
+                )
+                tree_result = recv_frame(direct_return)
+                self.assertEqual(
+                    (
+                        tree_result.frame_type,
+                        tree_result.request_id,
+                        tree_result.token_count,
+                    ),
+                    (FrameType.VERIFY_RESULT, child, 2),
                 )
                 other_result = recv_frame(direct_return)
                 self.assertEqual(
