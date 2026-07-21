@@ -2,7 +2,7 @@ import websocket from "@fastify/websocket";
 import staticFiles from "@fastify/static";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { timingSafeEqual } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { z, ZodError } from "zod";
 import { runAndPersistRealSuite } from "../benchlab/run.js";
@@ -18,6 +18,7 @@ import { MeshDatabase } from "../storage/database.js";
 import { MeshStore } from "../storage/store.js";
 import { MeshService, MeshServiceError, type JobStreamEvent } from "./mesh-service.js";
 import { MobileComputeHub, type MobileWorkerSnapshot } from "./mobile-compute-hub.js";
+import { verifyGitHubReleaseUploadToken } from "./github-oidc.js";
 import type { ModelActivationManager } from "./model-activation-manager.js";
 import {
   inspectHubModelCapacity,
@@ -25,6 +26,11 @@ import {
   searchHubModelCatalog,
   shouldQueueAutomaticActivation,
 } from "./model-catalog.js";
+import {
+  parseReleaseChunkMetadata,
+  storeReleaseChunk,
+  type ReleaseAssetChannel,
+} from "./release-upload.js";
 import { WorkerHub } from "./worker-hub.js";
 
 export interface CoordinatorRuntime {
@@ -49,6 +55,7 @@ export async function createCoordinator(
     logger?: boolean;
     activationManager?: ModelActivationManager;
     activationManagerFactory?: (context: CoordinatorActivationContext) => ModelActivationManager;
+    releaseTokenVerifier?: (token: string) => Promise<unknown>;
   } = {},
 ): Promise<CoordinatorRuntime> {
   const app = Fastify({ logger: options.logger ?? false, bodyLimit: 2 * 1024 * 1024 });
@@ -57,6 +64,7 @@ export async function createCoordinator(
     app.addHook("onRequest", async (request, reply) => {
       const path = request.url.split("?", 1)[0] ?? request.url;
       if (!path.startsWith("/internal/v1/") && !path.startsWith("/v1/")) return;
+      if (path.startsWith("/internal/v1/releases/")) return;
       const received = parseBearerToken(request.headers.authorization);
       if (!received || !constantTimeEqual(received, expectedToken)) {
         return reply.code(401).send({ error: { code: "invalid_network_token" } });
@@ -102,6 +110,7 @@ export async function createCoordinator(
     app.get("/mobile", async (_request, reply) => reply.redirect("/mobile/"));
   }
   const desktopUpdatesPath = resolveDesktopUpdatesPath(config.desktopUpdatesPath);
+  const publicAssetVersion = readPackageVersion();
   if (desktopUpdatesPath) {
     await app.register(staticFiles, {
       root: desktopUpdatesPath,
@@ -112,7 +121,7 @@ export async function createCoordinator(
     });
     app.get("/downloads/windows", async (_request, reply) => {
       reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
-      return reply.redirect("/updates/win32/x64/mycellios-setup.exe?v=0.2.8");
+      return reply.redirect(`/updates/win32/x64/mycellios-setup.exe?v=${publicAssetVersion}`);
     });
   }
   const hub = new WorkerHub(store);
@@ -201,6 +210,7 @@ export async function createCoordinator(
       mobilePwa: mobileAssetsPath ? "/mobile/" : null,
       landing: config.landingAssetsPath ? "/" : null,
       desktopUpdates: desktopUpdatesPath ? "/updates/win32/x64/" : null,
+      features: { distributedActivation: activationManager !== undefined },
     };
   });
 
@@ -494,22 +504,63 @@ export async function createCoordinator(
   });
 
   const landingAssetsPath = resolveLandingAssetsPath(config.landingAssetsPath);
+  const releaseTokenVerifier = options.releaseTokenVerifier ?? verifyGitHubReleaseUploadToken;
+  app.put("/internal/v1/releases/:channel/:fileName", async (request, reply) => {
+    const authorization = parseBearerToken(request.headers.authorization);
+    if (!authorization) {
+      return reply.code(401).send({ error: { code: "release_upload_token_missing" } });
+    }
+    try {
+      await releaseTokenVerifier(authorization);
+    } catch {
+      return reply.code(401).send({ error: { code: "release_upload_token_invalid" } });
+    }
+    const params = z.object({
+      channel: z.enum(["updates", "downloads"]),
+      fileName: z.string().min(1).max(160),
+    }).parse(request.params);
+    if (!Buffer.isBuffer(request.body)) {
+      return reply.code(400).send({ error: { code: "release_chunk_body_invalid" } });
+    }
+    try {
+      const root = releaseAssetRoot(
+        params.channel,
+        config.desktopUpdatesPath,
+        config.landingAssetsPath,
+      );
+      const result = await storeReleaseChunk({
+        root,
+        channel: params.channel as ReleaseAssetChannel,
+        fileName: params.fileName,
+        metadata: parseReleaseChunkMetadata(request.headers),
+        body: request.body,
+      });
+      return reply.code(result.complete ? 201 : 202).send(result);
+    } catch (error) {
+      return reply.code(400).send({
+        error: {
+          code: "release_chunk_rejected",
+          message: error instanceof Error ? error.message : "release_chunk_rejected",
+        },
+      });
+    }
+  });
   if (landingAssetsPath) {
     app.get("/downloads/macos-arm64", async (_request, reply) => {
       reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
-      return reply.redirect("/downloads/mycellios-macos-arm64.dmg?v=0.2.8");
+      return reply.redirect(`/downloads/mycellios-macos-arm64.dmg?v=${publicAssetVersion}`);
     });
     app.get("/downloads/macos-x64", async (_request, reply) => {
       reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
-      return reply.redirect("/downloads/mycellios-macos-x64.dmg?v=0.2.8");
+      return reply.redirect(`/downloads/mycellios-macos-x64.dmg?v=${publicAssetVersion}`);
     });
     app.get("/downloads/linux-deb", async (_request, reply) => {
       reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
-      return reply.redirect("/downloads/mycellios-linux-x64.deb?v=0.2.8");
+      return reply.redirect(`/downloads/mycellios-linux-x64.deb?v=${publicAssetVersion}`);
     });
     app.get("/downloads/linux-rpm", async (_request, reply) => {
       reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
-      return reply.redirect("/downloads/mycellios-linux-x64.rpm?v=0.2.8");
+      return reply.redirect(`/downloads/mycellios-linux-x64.rpm?v=${publicAssetVersion}`);
     });
     await app.register(staticFiles, {
       root: landingAssetsPath,
@@ -621,6 +672,38 @@ function resolveDesktopUpdatesPath(configured: string | undefined): string | nul
     (candidate): candidate is string => Boolean(candidate),
   );
   return candidates.find((candidate) => existsSync(resolve(candidate, "RELEASES"))) ?? null;
+}
+
+function releaseAssetRoot(
+  channel: ReleaseAssetChannel,
+  configuredUpdates: string | undefined,
+  configuredLanding: string | undefined,
+): string {
+  if (channel === "updates") {
+    return resolve(configuredUpdates ?? resolve(process.cwd(), "updates", "win32", "x64"));
+  }
+  return resolve(
+    configuredLanding ?? resolve(process.cwd(), "landing-dist"),
+    "downloads",
+  );
+}
+
+function readPackageVersion(): string {
+  const environmentVersion = process.env.npm_package_version?.trim();
+  if (environmentVersion && /^\d+\.\d+\.\d+$/.test(environmentVersion)) {
+    return environmentVersion;
+  }
+  try {
+    const metadata = JSON.parse(
+      readFileSync(resolve(process.cwd(), "package.json"), "utf8"),
+    ) as { version?: unknown };
+    if (typeof metadata.version === "string" && /^\d+\.\d+\.\d+$/.test(metadata.version)) {
+      return metadata.version;
+    }
+  } catch {
+    // Packaged clients do not need public download redirects.
+  }
+  return "0";
 }
 
 function resolveLandingAssetsPath(configured: string | undefined): string | null {

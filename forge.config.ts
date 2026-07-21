@@ -7,6 +7,7 @@ import { MakerZIP } from "@electron-forge/maker-zip";
 import { FusesPlugin } from "@electron-forge/plugin-fuses";
 import { VitePlugin } from "@electron-forge/plugin-vite";
 import { FuseV1Options, FuseVersion } from "@electron/fuses";
+import { existsSync } from "node:fs";
 
 const windowsSign = process.env.WINDOWS_CERTIFICATE_FILE
   ? {
@@ -34,6 +35,8 @@ const macNotarize =
       }
     : undefined;
 
+const portableRuntimeArchive = "build/distribution-runtime.tar.gz";
+
 const config: ForgeConfig = {
   packagerConfig: {
     asar: true,
@@ -53,8 +56,11 @@ const config: ForgeConfig = {
       "assets/mycellios-logo.png",
       "build/icons",
       "mobile-dist",
+      "landing-dist",
       "python",
-      "build/distribution-runtime.tar.gz",
+      ...(process.platform === "win32" && existsSync(portableRuntimeArchive)
+        ? [portableRuntimeArchive]
+        : []),
     ],
     ...(windowsSign ? { windowsSign } : {}),
     ...(macSign ? { osxSign: macSign } : {}),

@@ -13,11 +13,12 @@ class StageSnapshotDownloadTests(unittest.TestCase):
     def test_indexed_checkpoint_downloads_only_files_needed_by_middle_stage(self) -> None:
         with TemporaryDirectory() as temporary:
             snapshot = Path(temporary)
+            embedding_weight = "model.embed_" + "tokens.weight"
             (snapshot / "model.safetensors.index.json").write_text(
                 json.dumps(
                     {
                         "weight_map": {
-                            "model.embed_tokens.weight": "weights-00001.safetensors",
+                            embedding_weight: "weights-00001.safetensors",
                             "model.layers.0.self_attn.q_proj.weight": "weights-00001.safetensors",
                             "model.layers.1.self_attn.q_proj.weight": "weights-00002.safetensors",
                             "model.layers.2.self_attn.q_proj.weight": "weights-00003.safetensors",

@@ -305,6 +305,9 @@ async function startCoordinatorIfNeeded(): Promise<void> {
       mobileAssetsPath: app.isPackaged
         ? join(process.resourcesPath, "mobile-dist")
         : join(app.getAppPath(), "mobile-dist"),
+      landingAssetsPath: app.isPackaged
+        ? join(process.resourcesPath, "landing-dist")
+        : join(app.getAppPath(), "landing-dist"),
     },
     {
       logger: false,
@@ -331,8 +334,11 @@ async function coordinatorIsReachable(baseUrl: string): Promise<boolean> {
       redirect: "error",
     });
     if (!response.ok) return false;
-    const body = await response.json() as { status?: unknown };
-    return body.status === "ok";
+    const body = await response.json() as {
+      status?: unknown;
+      features?: { distributedActivation?: unknown };
+    };
+    return body.status === "ok" && body.features?.distributedActivation === true;
   } catch {
     return false;
   }
@@ -390,8 +396,25 @@ async function buildWorkerConfig(): Promise<WorkerConfig> {
 
 async function startWorkerIfEnabled(): Promise<void> {
   if (!settings.contributionEnabled || worker) return;
-  distributedExecutor ??= await createDesktopDistributedExecutor();
-  const config = await buildWorkerConfig();
+  writeDesktopLog("worker-start-requested", { coordinatorUrl, contributionEnabled: settings.contributionEnabled });
+  try {
+    distributedExecutor ??= await createDesktopDistributedExecutor();
+    writeDesktopLog("distributed-executor-ready", {
+      nodeId: distributedExecutor.nodeId,
+      stageHost: distributedExecutor.stageHost,
+      stagePort: distributedExecutor.stagePort,
+    });
+  } catch (error) {
+    writeDesktopLog("distributed-executor-failed", { error: errorText(error) });
+    throw error;
+  }
+  let config: WorkerConfig;
+  try {
+    config = await buildWorkerConfig();
+  } catch (error) {
+    writeDesktopLog("worker-config-failed", { error: errorText(error) });
+    throw error;
+  }
   const nextWorker = new WorkerAgent(config, {
     coordinatorUrl,
     ...(settings.coordinatorMode === "remote" && settings.remoteCoordinatorToken
@@ -809,9 +832,11 @@ async function createDesktopDistributedExecutor() {
 function distributionPythonExecutable(root = app.isPackaged
   ? join(app.getPath("userData"), "distribution-runtime-v1")
   : join(app.getAppPath(), "runtime", "distribution-venv")): string {
-  return process.platform === "win32"
-    ? join(root, "Scripts", "python.exe")
-    : join(root, "bin", "python3");
+  if (process.platform === "win32") {
+    const portable = join(root, "python.exe");
+    return app.isPackaged || existsSync(portable) ? portable : join(root, "Scripts", "python.exe");
+  }
+  return join(root, "bin", "python3");
 }
 
 function ensureDistributionRuntime(): Promise<string> {
@@ -827,7 +852,11 @@ async function ensureDistributionRuntimeOnce(): Promise<string> {
   if (!existsSync(archive)) throw new Error("The packaged shard runtime archive is missing. Reinstall mycellios.");
   mkdirSync(root, { recursive: true });
   await runProcess("tar", ["-xzf", archive, "-C", root]);
-  if (!existsSync(distributionPythonExecutable(root))) {
+  const executable = distributionPythonExecutable(root);
+  for (let attempt = 0; attempt < 30 && !existsSync(executable); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  if (!existsSync(executable)) {
     throw new Error("The shard runtime could not be extracted. Reinstall mycellios.");
   }
   return root;
@@ -962,6 +991,7 @@ app.whenReady().then(async () => {
   registerIpc();
   await restartRuntime().catch((error: unknown) => {
     runtimeError = errorText(error);
+    writeDesktopLog("runtime-start-failed", { error: runtimeError });
   });
   createWindow();
   createTray();
