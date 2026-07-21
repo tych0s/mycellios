@@ -19,7 +19,7 @@ import {
   type MobileWorkerLevel,
   type MobileWorkerSnapshot,
 } from "../../src/mobile/runtime";
-import brandIcon from "./assets/mycellios-mark-transparent.png";
+import brandIcon from "./assets/mycellios-app-icon-v2.png";
 
 export function Contribute() {
   const [worker, setWorker] = useState<MobileWorkerSnapshot>(() => getMobileWorkerSnapshot());

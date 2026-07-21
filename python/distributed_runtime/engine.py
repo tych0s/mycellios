@@ -1902,7 +1902,8 @@ class DistributedPipelineEngine:
                 if not active:
                     continue
                 if (
-                    len(active) < self.config.max_active_sequences
+                    getattr(self, "_pending_tree_reservation", None) is None
+                    and len(active) < self.config.max_active_sequences
                     and (
                         decode_since_admission >= max(1, len(active))
                         or any(
@@ -1943,7 +1944,10 @@ class DistributedPipelineEngine:
                     # new chat enter while another request is between network hops.
                     batch = (
                         self._next_submission(timeout=0.0)
-                        if len(active) < self.config.max_active_sequences
+                        if (
+                            getattr(self, "_pending_tree_reservation", None) is None
+                            and len(active) < self.config.max_active_sequences
+                        )
                         else None
                     )
                     if batch is not None:

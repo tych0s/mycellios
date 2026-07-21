@@ -501,6 +501,8 @@ export class WorkerAgent {
       };
       this.sendMessage("task.complete", result);
     } catch (error) {
+      const failureMessage = errorText(error).slice(0, 300);
+      this.logger.error(`Inference job ${payload.jobId} failed: ${failureMessage}`);
       this.sendMessage("task.fail", {
         jobId: payload.jobId,
         leaseId: payload.leaseId,
@@ -510,7 +512,7 @@ export class WorkerAgent {
             : controller.signal.aborted
               ? "cancelled"
               : "adapter_error",
-        message: errorText(error).slice(0, 300),
+        message: failureMessage,
       });
     } finally {
       clearTimeout(deadlineTimer);

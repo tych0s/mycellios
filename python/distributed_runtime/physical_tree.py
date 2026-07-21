@@ -6,8 +6,10 @@ commands that a pipeline engine can apply locally and enqueue on its ordered
 wire stream.  One physical request is allocated per candidate *leaf*; every
 leaf is a direct child of the real request.
 
-This is the safe-copy MVP described in ``docs/PHYSICAL_SPARSE_TREE_EXECUTION``.
-It does not claim paged/COW KV storage or tree attention.
+This is the flat-leaf MVP described in ``docs/PHYSICAL_SPARSE_TREE_EXECUTION``.
+Its lifecycle is backend-agnostic: runners may use safe copies or the optional
+paged/COW ABI.  It still does not implement prefix-closed execution or tree
+attention.
 """
 
 from __future__ import annotations

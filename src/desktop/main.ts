@@ -20,6 +20,7 @@ import { probeHardware, type HardwareProbe } from "../worker/hardware.js";
 import type {
   ChatRequest,
   ChatResponse,
+  ChatStreamUpdate,
   DashboardJob,
   DashboardModel,
   DashboardSnapshot,
@@ -27,14 +28,18 @@ import type {
   DesktopSettings,
   DesktopUpdateStatus,
 } from "./contracts.js";
+import { consumeChatCompletionStream } from "./chat-stream.js";
 
 if (started) app.quit();
 
 app.setName("mycellios");
+if (process.platform === "win32") app.setAppUserModelId("app.mycellios.desktop.v2");
+
+const PUBLIC_COORDINATOR_URL = "https://www.mycellios.com";
 
 const DEFAULT_SETTINGS: DesktopSettings = {
   coordinatorMode: "remote",
-  remoteCoordinatorUrl: "https://mycellios.com",
+  remoteCoordinatorUrl: PUBLIC_COORDINATOR_URL,
   remoteCoordinatorToken: "",
   contributionEnabled: false,
   launchAtLogin: false,
@@ -48,9 +53,12 @@ const DEFAULT_SETTINGS: DesktopSettings = {
   modelDigest: "",
 };
 
-const UPDATE_FEED_URL = "https://mycellios.com/updates/win32/x64/";
+const UPDATE_FEED_URL = "https://www.mycellios.com/updates/win32/x64/";
 const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1_000;
-const LEGACY_PUBLIC_COORDINATOR_URL = "https://www.mycellios.com";
+const LEGACY_PUBLIC_COORDINATOR_URLS = new Set([
+  "https://www.mycellios.com",
+  "https://mycellios.com",
+]);
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
@@ -176,7 +184,7 @@ function loadSettings(): DesktopSettings {
   try {
     const stored = JSON.parse(readFileSync(settingsPath(), "utf8")) as Partial<DesktopSettings>;
     const storedCoordinatorUrl = stored.remoteCoordinatorUrl?.trim().replace(/\/+$/, "");
-    const migrated = storedCoordinatorUrl === LEGACY_PUBLIC_COORDINATOR_URL
+    const migrated = storedCoordinatorUrl && LEGACY_PUBLIC_COORDINATOR_URLS.has(storedCoordinatorUrl)
       ? { ...stored, remoteCoordinatorUrl: DEFAULT_SETTINGS.remoteCoordinatorUrl }
       : stored;
     const loaded = sanitizeSettings({ ...DEFAULT_SETTINGS, ...migrated });
@@ -445,8 +453,8 @@ async function sendChat(request: ChatRequest): Promise<ChatResponse> {
     id: string;
     model: string;
     choices: Array<{ message: { content: string } }>;
-    usage: { total_tokens: number };
-    x_network: { route_class: string };
+    usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+    x_network: { route_class: string; affinity_hit: boolean; ttft_ms: number; active_ms: number };
   }>("v1/chat/completions", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -454,16 +462,48 @@ async function sendChat(request: ChatRequest): Promise<ChatResponse> {
       model: request.model,
       messages: [{ role: "user", content: prompt }],
       stream: false,
-      max_tokens: Math.max(1, Math.min(2_048, request.maxTokens ?? 256)),
+      max_tokens: Math.max(1, Math.min(2_048, request.maxTokens ?? 128)),
+      temperature: 0,
+      top_p: 1,
     }),
   });
   return {
     requestId: response.id,
     model: response.model,
     text: response.choices[0]?.message.content ?? "",
+    promptTokens: response.usage.prompt_tokens,
+    outputTokens: response.usage.completion_tokens,
     totalTokens: response.usage.total_tokens,
     routeClass: response.x_network.route_class,
+    affinityHit: response.x_network.affinity_hit,
+    ttftMs: response.x_network.ttft_ms,
+    activeMs: response.x_network.active_ms,
   };
+}
+
+async function streamChat(request: ChatRequest, onUpdate: (update: ChatStreamUpdate) => void): Promise<ChatResponse> {
+  const prompt = request.prompt.trim();
+  if (!prompt) throw new Error("Escribe un mensaje antes de enviarlo.");
+  const headers = new Headers({ accept: "text/event-stream", "content-type": "application/json" });
+  if (settings.coordinatorMode === "remote" && settings.remoteCoordinatorToken) {
+    headers.set("authorization", `Bearer ${settings.remoteCoordinatorToken}`);
+  }
+  const startedAt = Date.now();
+  const response = await fetch(new URL("v1/chat/completions", `${coordinatorUrl}/`), {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: request.model,
+      messages: [{ role: "user", content: prompt }],
+      stream: true,
+      max_tokens: Math.max(1, Math.min(2_048, request.maxTokens ?? 128)),
+      temperature: 0,
+      top_p: 1,
+    }),
+    signal: AbortSignal.timeout(3 * 60_000),
+    redirect: "error",
+  });
+  return consumeChatCompletionStream(response, request.model, onUpdate, startedAt);
 }
 
 function registerIpc(): void {
@@ -484,6 +524,9 @@ function registerIpc(): void {
     return readSnapshot();
   });
   ipcMain.handle("chat:send", (_event, request: ChatRequest) => sendChat(request));
+  ipcMain.handle("chat:stream", (event, streamId: string, request: ChatRequest) => streamChat(request, (update) => {
+    if (!event.sender.isDestroyed()) event.sender.send("chat:stream:update", streamId, update);
+  }));
   ipcMain.handle("workers:remove", async (_event, workerId: string) => {
     await fetchJson(`public/v1/workers/${encodeURIComponent(workerId)}`, { method: "DELETE" });
     return readSnapshot();
@@ -547,7 +590,7 @@ function registerIpc(): void {
 }
 
 function createWindow(): void {
-  const icon = resourcePath("build", "icons", "icon.png");
+  const icon = resourcePath("build", "icons", "app-icon-v2.png");
   mainWindow = new BrowserWindow({
     width: 1_520,
     height: 920,
@@ -621,7 +664,7 @@ function createTray(): void {
 }
 
 function createTrayUnsafe(): void {
-  const trayImage = nativeImage.createFromPath(resourcePath("build", "icons", "icon.png"));
+  const trayImage = nativeImage.createFromPath(resourcePath("build", "icons", "app-icon-v2.png"));
   tray?.destroy();
   tray = new Tray(trayImage.resize({ width: 22, height: 22 }));
   tray.setToolTip("mycellios");

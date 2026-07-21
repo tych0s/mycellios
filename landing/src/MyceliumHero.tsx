@@ -35,8 +35,8 @@ type GpuLight = {
   color: number;
 };
 
-const FILAMENT = [223, 242, 255] as const;
-const GPU_COLORS = ["#65f5d0", "#7890ff", "#cf72ff"] as const;
+const FILAMENT = [196, 220, 255] as const;
+const GPU_COLORS = ["#5c96ff", "#83b5ff", "#b9d2ff", "#718dff", "#f97b2d"] as const;
 
 function MyceliumHero() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -63,8 +63,8 @@ function MyceliumHero() {
     if (!spriteContext) return;
     const spriteGradient = spriteContext.createRadialGradient(32, 32, 0, 32, 32, 32);
     spriteGradient.addColorStop(0, "rgba(255,255,255,1)");
-    spriteGradient.addColorStop(0.2, "rgba(224,248,255,.62)");
-    spriteGradient.addColorStop(0.48, "rgba(113,230,215,.2)");
+    spriteGradient.addColorStop(0.2, "rgba(224,237,255,.62)");
+    spriteGradient.addColorStop(0.48, "rgba(92,150,255,.2)");
     spriteGradient.addColorStop(1, "rgba(120,200,255,0)");
     spriteContext.fillStyle = spriteGradient;
     spriteContext.fillRect(0, 0, 64, 64);
@@ -135,7 +135,7 @@ function MyceliumHero() {
       breath = 0;
       opacity = 0;
 
-      const primaryCount = width < 760 ? 29 : 34;
+      const primaryCount = width < 760 ? 16 : 22;
       for (let index = 0; index < primaryCount; index += 1) {
         const angle = (index / primaryCount) * Math.PI * 2 + (Math.random() - .5) * .86;
         tips.push(makeTip(originX, originY, angle, 0, true));
@@ -161,7 +161,7 @@ function MyceliumHero() {
       if (!nextWidth || !nextHeight || (nextWidth === width && nextHeight === height)) return;
       width = nextWidth;
       height = nextHeight;
-      dpr = Math.min(window.devicePixelRatio || 1, 1.75);
+      dpr = Math.min(window.devicePixelRatio || 1, 1.35);
       canvas.width = Math.round(width * dpr);
       canvas.height = Math.round(height * dpr);
       trail.width = Math.round(width * dpr);
@@ -222,7 +222,7 @@ function MyceliumHero() {
         }
 
         const branchChance = .046 * (tip.primary ? 1.5 : 1) * (radius < maxRadius * .35 ? 1.38 : 1);
-        if (Math.random() < branchChance && tip.generation < 7 && tips.length + newTips.length < 760) {
+        if (Math.random() < branchChance && tip.generation < 7 && tips.length + newTips.length < 380) {
           const offset = (Math.random() < .5 ? -1 : 1) * (.28 + Math.random() * .56);
           newTips.push(makeTip(tip.x, tip.y, tip.angle + offset, tip.generation + 1, false));
           if (junctions.length < 520) {
@@ -269,7 +269,7 @@ function MyceliumHero() {
 
     function ensureGpuLights() {
       if (junctions.length < 48) return;
-      const targetCount = width < 760 ? 14 : 26;
+      const targetCount = width < 760 ? 9 : 16;
       while (gpuLights.length < targetCount) {
         const start = junctions[Math.floor(Math.random() * junctions.length)]!;
         const target = nearbyJunction(start.x, start.y);
@@ -358,25 +358,12 @@ function MyceliumHero() {
       }
       context.restore();
 
-      const opening = context.createRadialGradient(originX, originY, 0, originX, originY, coreRadius * 1.28);
-      opening.addColorStop(0, "rgba(0,0,0,.985)");
-      opening.addColorStop(.42, "rgba(0,0,0,.78)");
-      opening.addColorStop(1, "rgba(0,0,0,0)");
-      context.save();
-      context.globalCompositeOperation = "destination-out";
-      context.fillStyle = opening;
-      context.beginPath();
-      context.arc(originX, originY, coreRadius * 1.28, 0, Math.PI * 2);
-      context.fill();
-      context.restore();
-
       const coreGradient = context.createRadialGradient(originX, originY, 0, originX, originY, coreRadius * 2.35);
-      coreGradient.addColorStop(0, `rgba(23,72,67,${.52 * opacity})`);
-      coreGradient.addColorStop(.16, `rgba(43,126,112,${.28 * opacity})`);
-      coreGradient.addColorStop(.38, `rgba(101,245,208,${.14 * opacity})`);
-      coreGradient.addColorStop(.58, `rgba(120,144,255,${.09 * opacity})`);
-      coreGradient.addColorStop(.76, `rgba(207,114,255,${.045 * opacity})`);
-      coreGradient.addColorStop(1, "rgba(7,13,16,0)");
+      coreGradient.addColorStop(0, `rgba(119,167,255,${.48 * opacity})`);
+      coreGradient.addColorStop(.18, `rgba(76,132,242,${.27 * opacity})`);
+      coreGradient.addColorStop(.42, `rgba(63,124,255,${.14 * opacity})`);
+      coreGradient.addColorStop(.7, `rgba(88,112,196,${.06 * opacity})`);
+      coreGradient.addColorStop(1, "rgba(17,23,47,0)");
       context.save();
       context.fillStyle = coreGradient;
       context.beginPath();
@@ -391,17 +378,17 @@ function MyceliumHero() {
         originY,
         nucleusRadius,
       );
-      nucleusGradient.addColorStop(0, "rgb(44,225,185)");
-      nucleusGradient.addColorStop(.22, "rgb(23,188,158)");
-      nucleusGradient.addColorStop(.68, "rgb(10,112,102)");
-      nucleusGradient.addColorStop(1, "rgb(5,56,57)");
+      nucleusGradient.addColorStop(0, "rgb(224,237,255)");
+      nucleusGradient.addColorStop(.2, "rgb(131,181,255)");
+      nucleusGradient.addColorStop(.66, "rgb(63,124,255)");
+      nucleusGradient.addColorStop(1, "rgb(36,72,157)");
       context.fillStyle = nucleusGradient;
       context.beginPath();
       context.arc(originX, originY, nucleusRadius, 0, Math.PI * 2);
       context.fill();
       context.globalCompositeOperation = "lighter";
       for (let ring = 0; ring < 3; ring += 1) {
-        context.strokeStyle = ring === 2 ? `rgba(207,114,255,${.23 * pulse * opacity})` : `rgba(${red},${green},${blue},${(.42 - ring * .1) * pulse * opacity})`;
+        context.strokeStyle = ring === 2 ? `rgba(131,181,255,${.22 * pulse * opacity})` : `rgba(${red},${green},${blue},${(.42 - ring * .1) * pulse * opacity})`;
         context.lineWidth = ring === 0 ? 1.8 : .8;
         context.setLineDash(ring === 0 ? [] : [3 + ring * 2, 7 + ring * 3]);
         context.lineDashOffset = (ring % 2 ? 1 : -1) * breath * (5 + ring * 2);
@@ -419,7 +406,7 @@ function MyceliumHero() {
         context.globalAlpha = .55 * opacity;
         context.drawImage(gpuSprites[satellite % gpuSprites.length]!, x - size, y - size, size * 2, size * 2);
       }
-      context.fillStyle = "rgba(170,255,234,.9)";
+      context.fillStyle = "rgba(240,247,255,.94)";
       context.globalAlpha = opacity;
       context.beginPath();
       context.arc(originX - nucleusRadius * .2, originY - nucleusRadius * .22, 2.2, 0, Math.PI * 2);
@@ -454,7 +441,6 @@ function MyceliumHero() {
       if (!visible || destroyed) return;
       if (phase === "growing") {
         step();
-        step();
         opacity = Math.min(1, opacity + .02);
       }
       renderFrame();
@@ -484,6 +470,10 @@ function MyceliumHero() {
       <canvas ref={canvasRef} aria-hidden="true" />
       <div className="mycelium-core-overlay" aria-hidden="true" />
       <div className="mycelium-growth-status" aria-hidden="true"><i /><span>GPU LIGHTS · LIVE</span><b>EACH LIGHT = ONE GPU</b></div>
+      <div className="gpu-coordinate gpu-coordinate-a" aria-hidden="true"><i /><span>RTX 4090</span><b>24 GB</b></div>
+      <div className="gpu-coordinate gpu-coordinate-b" aria-hidden="true"><i /><span>APPLE M3</span><b>36 GB</b></div>
+      <div className="gpu-coordinate gpu-coordinate-c" aria-hidden="true"><i /><span>RTX 3060</span><b>12 GB</b></div>
+      <div className="network-whisper" aria-hidden="true"><span>ROUTE 7FA3</span><i /><b>MODEL SHARD MOVING</b></div>
     </div>
   );
 }

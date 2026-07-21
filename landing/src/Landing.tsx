@@ -21,7 +21,7 @@ import {
   Zap,
 } from "lucide-react";
 import { useEffect, useRef, useState, type CSSProperties, type PointerEvent } from "react";
-import brandIcon from "./assets/mycellios-mark-transparent.png";
+import brandIcon from "./assets/mycellios-app-icon-v2.png";
 import efficiencyCurve from "./assets/efficiency-curve-ai.webp";
 import myceliumNetwork from "./assets/mycelium-network.jpg";
 import { MyceliumHero } from "./MyceliumHero";
@@ -188,8 +188,8 @@ function LivingBackdrop() {
     <div className="living-background" aria-hidden="true">
       <svg viewBox="0 0 1440 900" preserveAspectRatio="xMidYMid slice">
         <defs>
-          <linearGradient id="hyphaGradient" x1="1" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#d9fff5" /><stop offset=".42" stopColor="#72d9c6" /><stop offset=".75" stopColor="#7888bf" /><stop offset="1" stopColor="#8a5ca9" /></linearGradient>
-          <radialGradient id="colonyGlow"><stop offset="0" stopColor="#6ce5ca" stopOpacity=".12" /><stop offset="1" stopColor="#07080b" stopOpacity="0" /></radialGradient>
+          <linearGradient id="hyphaGradient" x1="1" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#e2edff" /><stop offset=".42" stopColor="#83b5ff" /><stop offset=".75" stopColor="#5c7fda" /><stop offset="1" stopColor="#445caa" /></linearGradient>
+          <radialGradient id="colonyGlow"><stop offset="0" stopColor="#5c96ff" stopOpacity=".14" /><stop offset="1" stopColor="#11172f" stopOpacity="0" /></radialGradient>
         </defs>
         <g className="colony-glow">
           <ellipse cx="1040" cy="312" rx="330" ry="250" fill="url(#colonyGlow)" />
@@ -290,7 +290,7 @@ function EfficiencyCurve({ text }: { text: typeof copy.acceleration }) {
           <span className="curve-axis">{text.axis}</span>
           <svg className="curve-plot" viewBox="0 0 1000 470" preserveAspectRatio="none" aria-hidden="true">
             <defs>
-              <linearGradient id="efficiencyLine" x1="0" x2="1"><stop offset="0" stopColor="#7085ff" /><stop offset=".55" stopColor="#65f6d1" /><stop offset="1" stopColor="#e8fffb" /></linearGradient>
+              <linearGradient id="efficiencyLine" x1="0" x2="1"><stop offset="0" stopColor="#7189ce" /><stop offset=".55" stopColor="#5c96ff" /><stop offset="1" stopColor="#e2edff" /></linearGradient>
               <filter id="curveGlow" x="-30%" y="-50%" width="160%" height="200%"><feGaussianBlur stdDeviation="7" result="blur" /><feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge></filter>
             </defs>
             <g className="curve-grid">
@@ -429,18 +429,18 @@ function Landing() {
 
   return (
     <div className="site" id="top" ref={page} onPointerMove={trackPointer}>
-      <LivingBackdrop /><div className="ambient-pointer" />
+      <div className="scroll-progress" aria-hidden="true" /><LivingBackdrop /><div className="ambient-pointer" />
       <header className="nav-shell"><nav className="nav container" aria-label={t.nav.aria}><Brand homeLabel={t.home} /><div className="nav-links"><a href="/network">Live network</a><a href="/network?view=nodes">Nodes</a><a href="/mobile/">Contribute</a><a href="#architecture">{t.nav.architecture}</a></div><div className="nav-actions"><a className="nav-cta" href="/join">Join now <Zap size={15} /></a></div></nav></header>
 
       <main>
         <section className="hero">
           <MyceliumHero />
           <div className="hero-inner container">
-            <div className="hero-copy"><div className="availability"><span /><strong>EARLY NETWORK</strong><i /> {t.hero.status}</div><h1>{t.hero.line1}<br />{t.hero.line2}<br /><em>{t.hero.line3}</em></h1><p>{t.hero.copy}</p><div className="hero-actions"><a className="button button-primary" href="/join">Join the network <Zap size={17} /></a><a className="button button-secondary" href="/network">Open live panel <Network size={17} /></a></div><div className="hero-footnote"><ShieldCheck size={15} /><span>No account or invitation required during public testing.</span></div></div>
+            <div className="hero-copy"><div className="availability"><span /><strong>EARLY NETWORK</strong><i /> {t.hero.status}</div><h1>{t.hero.line1}<br />{t.hero.line2}<br /><em>{t.hero.line3}</em></h1><p>{t.hero.copy}</p><div className="hero-actions"><a className="button button-primary" href="/join">Join the network <Zap size={17} /></a><a className="button button-secondary" href="/network">Open live panel <Network size={17} /></a></div><div className="hero-readouts" aria-label="Network capabilities"><div><span>01</span><strong>POOL MEMORY</strong><small>BEYOND ONE MACHINE</small></div><div><span>02</span><strong>ROUTE SHARDS</strong><small>THROUGH THE FASTEST CELL</small></div><div><span>03</span><strong>KEEP GROWING</strong><small>AS NEW GPUS APPEAR</small></div></div><div className="hero-footnote"><ShieldCheck size={15} /><span>No account or invitation required during public testing.</span></div></div>
           </div>
         </section>
 
-        <section className="signal-strip" aria-label={t.nav.vision}><div className="signal-track">{t.signals.map((item) => <span key={item}>{item}<i /></span>)}</div></section>
+        <section className="signal-strip" aria-label={t.nav.vision}><div className="signal-track">{[...t.signals, ...t.signals].map((item, index) => <span key={`${item}-${index}`}>{item}<i /></span>)}</div></section>
 
         <section className="manifesto container" id="vision"><div className="manifesto-index reveal">{t.manifesto.index}</div><div className="manifesto-copy reveal"><span>{t.manifesto.kicker}</span><h2>{t.manifesto.title}</h2></div><div className="manifesto-side reveal"><p>{t.manifesto.copy}</p><a href="#architecture">{t.manifesto.link} <ArrowUpRight size={15} /></a></div></section>
 

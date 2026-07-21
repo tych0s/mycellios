@@ -84,6 +84,7 @@ describe("inference-only coordinator and worker", () => {
     const stream = await response.text();
     expect(response.headers.get("content-type")).toContain("text/event-stream");
     expect(stream).toContain("chat.completion.chunk");
+    expect(stream).toContain('"token_index":0');
     expect(stream).toContain("data: [DONE]");
   });
 

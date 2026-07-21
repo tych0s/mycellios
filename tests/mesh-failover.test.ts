@@ -179,6 +179,53 @@ describe("active-route recovery policy", () => {
     expect(store.getJob(handle.jobId)?.status).toBe("failed");
     expect(store.getJob(handle.jobId)?.failureCode).toBe("gpu_lost");
   });
+
+  it("preserves the adapter failure message when no standby remains", async () => {
+    const primary = addWorker(store, {
+      id: "primary",
+      modelDigest: "sha256:revision-a",
+      tokensPerSecond: 50,
+    });
+    hub.connected.add(primary.id);
+    service = new MeshService(
+      store,
+      new Scheduler(store),
+      hub as unknown as WorkerHub,
+      30_000,
+    );
+    const handle = service.submit({
+      model: "distributed-small",
+      messages: [{ role: "user", content: "hola" }],
+      max_tokens: 32,
+    });
+    const offer = leaseOffers(hub)[0]!;
+
+    hub.workerMessage({
+      v: 1,
+      type: "lease.accept",
+      workerId: primary.id,
+      payload: { jobId: handle.jobId, leaseId: offer.payload.leaseId },
+    });
+    hub.workerMessage({
+      v: 1,
+      type: "task.fail",
+      workerId: primary.id,
+      payload: {
+        jobId: handle.jobId,
+        leaseId: offer.payload.leaseId,
+        code: "adapter_error",
+        message: "Backend requires greedy temperature=0",
+      },
+    });
+
+    const events = [];
+    for await (const event of handle.events) events.push(event);
+    expect(events.at(-1)).toMatchObject({
+      type: "failed",
+      code: "adapter_error",
+      message: "Backend requires greedy temperature=0",
+    });
+  });
 });
 
 function leaseOffers(hub: FakeWorkerHub): Array<{
