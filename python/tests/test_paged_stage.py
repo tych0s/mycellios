@@ -18,6 +18,10 @@ from distributed_runtime.model import StageModelSpec, StageRunner
 from distributed_runtime.executor_abi import StageKVPhysicalAccounting
 from distributed_runtime.protocol import Frame, FrameType, TreePrepareRejection
 from distributed_runtime.stage import (
+    StageBranchLedger,
+    end_physical_stage_request,
+    fork_physical_stage_request,
+    promote_physical_stage_descendant,
     project_tree_capacity,
     speculative_kv_bytes,
     validate_speculative_kv_preflight,
@@ -81,6 +85,159 @@ def _write_tiny_checkpoint(directory: str, seed: int) -> None:
 
 
 class HFPagedStageRunnerTests(unittest.TestCase):
+    def test_nested_cow_carrier_can_end_then_descendant_promotes_exactly(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _write_tiny_checkpoint(temporary, 743)
+            spec = StageModelSpec(temporary, 0, 1, 2, 1)
+            classic = StageRunner(spec)
+            paged = HFPagedStageRunner(
+                spec,
+                block_size=4,
+                num_blocks=16,
+                max_batch_tokens=16,
+                max_active_requests=4,
+                max_sequence_tokens=32,
+            )
+            try:
+                classic.base.set_attn_implementation("eager")
+                config = type(
+                    "NestedBranchConfig",
+                    (),
+                    {
+                        "max_speculative_branches": 3,
+                        "max_speculative_branch_tokens": 32,
+                        "max_speculative_kv_bytes": (
+                            4 * paged.paged_cache.bytes_per_block
+                        ),
+                    },
+                )()
+                prompt = torch.tensor([[1, 2, 3, 4, 5, 6]], dtype=torch.long)
+                carrier_token = torch.tensor([[7]], dtype=torch.long)
+                descendant_token = torch.tensor([[9]], dtype=torch.long)
+                continued_token = torch.tensor([[10]], dtype=torch.long)
+
+                paged.begin(1)
+                paged.forward_ids(1, prompt)
+                root_before = _requests(paged.paged_cache.snapshot())[1]
+                lineage = StageBranchLedger()
+                request_metrics = {
+                    1: {
+                        "frames": 1,
+                        "tokens": 6,
+                        "compute_ms": 0,
+                        "bytes_out": 0,
+                    }
+                }
+
+                fork_physical_stage_request(
+                    child_request_id=2,
+                    fork_source_physical_request_id=1,
+                    logical_owner_request_id=1,
+                    config=config,
+                    runner=paged,
+                    request_metrics=request_metrics,
+                    branch_lineage=lineage,
+                )
+                paged.forward_ids(2, carrier_token)
+                request_metrics[2]["frames"] = 2
+                request_metrics[2]["tokens"] = 7
+                fork_physical_stage_request(
+                    child_request_id=3,
+                    fork_source_physical_request_id=2,
+                    logical_owner_request_id=1,
+                    config=config,
+                    runner=paged,
+                    request_metrics=request_metrics,
+                    branch_lineage=lineage,
+                )
+                paged.forward_ids(3, descendant_token)
+                request_metrics[3]["frames"] = 3
+                request_metrics[3]["tokens"] = 8
+
+                nested = _requests(paged.paged_cache.snapshot())
+                self.assertEqual(nested[1].block_ids, root_before.block_ids)
+                self.assertEqual(nested[1].ref_counts, (3, 1))
+                self.assertEqual(nested[2].ref_counts, (3, 1))
+                self.assertEqual(nested[3].ref_counts, (3, 1))
+                self.assertEqual(lineage.logical_owners, {2: 1, 3: 1})
+                self.assertEqual(lineage.fork_sources, {2: 1, 3: 2})
+                self.assertEqual(
+                    request_metrics[3]["branch_logical_owner_request_id"], 1
+                )
+                self.assertEqual(
+                    request_metrics[3]["branch_fork_source_request_id"], 2
+                )
+                self.assertEqual(
+                    speculative_kv_bytes(paged, lineage.logical_owners),
+                    2 * paged.paged_cache.bytes_per_block,
+                )
+                with self.assertRaisesRegex(ValueError, "logically owns"):
+                    end_physical_stage_request(
+                        1,
+                        operation="END",
+                        runner=paged,
+                        request_metrics=request_metrics,
+                        branch_lineage=lineage,
+                    )
+                self.assertEqual(paged.sequence_length(1), 6)
+
+                # The physical source is no longer needed. Ending it releases
+                # only its references; the descendant stays live and budgeted.
+                ended_metrics = end_physical_stage_request(
+                    2,
+                    operation="END",
+                    runner=paged,
+                    request_metrics=request_metrics,
+                    branch_lineage=lineage,
+                )
+                self.assertIsNotNone(ended_metrics)
+                after_carrier_end = _requests(paged.paged_cache.snapshot())
+                self.assertEqual(set(after_carrier_end), {1, 3})
+                self.assertEqual(after_carrier_end[1].ref_counts, (2, 1))
+                self.assertEqual(after_carrier_end[3].ref_counts, (2, 1))
+                self.assertEqual(paged.sequence_length(1), 6)
+                self.assertEqual(paged.sequence_length(3), 8)
+                self.assertEqual(lineage.logical_owners, {3: 1})
+                self.assertEqual(lineage.fork_sources, {3: 2})
+                self.assertEqual(
+                    speculative_kv_bytes(paged, lineage.logical_owners),
+                    paged.paged_cache.bytes_per_block,
+                )
+
+                promote_physical_stage_descendant(
+                    logical_owner_request_id=1,
+                    descendant_request_id=3,
+                    config=config,
+                    runner=paged,
+                    request_metrics=request_metrics,
+                    branch_lineage=lineage,
+                )
+                self.assertEqual(lineage.logical_owners, {})
+                self.assertEqual(lineage.fork_sources, {})
+                self.assertEqual(paged.sequence_length(1), 8)
+                self.assertEqual(request_metrics[1]["tokens"], 8)
+                promoted = paged.paged_cache.snapshot()
+                promoted_requests = _requests(promoted)
+                self.assertEqual(set(promoted_requests), {1})
+                self.assertEqual(promoted_requests[1].ref_counts, (1, 1))
+                self.assertEqual(promoted.free_blocks, paged.paged_cache.num_blocks - 2)
+
+                actual = paged.forward_ids(1, continued_token)[:, -1]
+                classic.begin(99)
+                expected = classic.forward_ids(
+                    99,
+                    torch.cat(
+                        (prompt, carrier_token, descendant_token, continued_token),
+                        dim=1,
+                    ),
+                )[:, -1]
+                self.assertTrue(
+                    torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+                )
+            finally:
+                classic.close()
+                paged.close()
+
     def test_selective_first_stage_parity_manifest_and_cow_accounting(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             _write_tiny_checkpoint(temporary, 751)

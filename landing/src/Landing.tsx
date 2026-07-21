@@ -429,18 +429,18 @@ function Landing() {
 
   return (
     <div className="site" id="top" ref={page} onPointerMove={trackPointer}>
-      <LivingBackdrop /><div className="ambient-pointer" />
+      <div className="scroll-progress" aria-hidden="true" /><LivingBackdrop /><div className="ambient-pointer" />
       <header className="nav-shell"><nav className="nav container" aria-label={t.nav.aria}><Brand homeLabel={t.home} /><div className="nav-links"><a href="/network">Live network</a><a href="/network?view=nodes">Nodes</a><a href="/mobile/">Contribute</a><a href="#architecture">{t.nav.architecture}</a></div><div className="nav-actions"><a className="nav-cta" href="/join">Join now <Zap size={15} /></a></div></nav></header>
 
       <main>
         <section className="hero">
           <MyceliumHero />
           <div className="hero-inner container">
-            <div className="hero-copy"><div className="availability"><span /><strong>EARLY NETWORK</strong><i /> {t.hero.status}</div><h1>{t.hero.line1}<br />{t.hero.line2}<br /><em>{t.hero.line3}</em></h1><p>{t.hero.copy}</p><div className="hero-actions"><a className="button button-primary" href="/join">Join the network <Zap size={17} /></a><a className="button button-secondary" href="/network">Open live panel <Network size={17} /></a></div><div className="hero-footnote"><ShieldCheck size={15} /><span>No account or invitation required during public testing.</span></div></div>
+            <div className="hero-copy"><div className="availability"><span /><strong>EARLY NETWORK</strong><i /> {t.hero.status}</div><h1>{t.hero.line1}<br />{t.hero.line2}<br /><em>{t.hero.line3}</em></h1><p>{t.hero.copy}</p><div className="hero-actions"><a className="button button-primary" href="/join">Join the network <Zap size={17} /></a><a className="button button-secondary" href="/network">Open live panel <Network size={17} /></a></div><div className="hero-readouts" aria-label="Network capabilities"><div><span>01</span><strong>POOL MEMORY</strong><small>BEYOND ONE MACHINE</small></div><div><span>02</span><strong>ROUTE SHARDS</strong><small>THROUGH THE FASTEST CELL</small></div><div><span>03</span><strong>KEEP GROWING</strong><small>AS NEW GPUS APPEAR</small></div></div><div className="hero-footnote"><ShieldCheck size={15} /><span>No account or invitation required during public testing.</span></div></div>
           </div>
         </section>
 
-        <section className="signal-strip" aria-label={t.nav.vision}><div className="signal-track">{t.signals.map((item) => <span key={item}>{item}<i /></span>)}</div></section>
+        <section className="signal-strip" aria-label={t.nav.vision}><div className="signal-track">{[...t.signals, ...t.signals].map((item, index) => <span key={`${item}-${index}`}>{item}<i /></span>)}</div></section>
 
         <section className="manifesto container" id="vision"><div className="manifesto-index reveal">{t.manifesto.index}</div><div className="manifesto-copy reveal"><span>{t.manifesto.kicker}</span><h2>{t.manifesto.title}</h2></div><div className="manifesto-side reveal"><p>{t.manifesto.copy}</p><a href="#architecture">{t.manifesto.link} <ArrowUpRight size={15} /></a></div></section>
 

@@ -4,6 +4,7 @@ from collections import deque
 import queue
 import socket
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -500,6 +501,20 @@ class TreeCapacityStageTests(unittest.TestCase):
                 )
             self.assertTrue(consume_tree_reservation_verifies((valid,), book))
             self.assertIsNone(book.active)
+            with self.assertRaisesRegex(ValueError, "after FORK consumption"):
+                cancel_tree_reservation(
+                    Frame(
+                        FrameType.TREE_RESERVATION_CANCEL,
+                        0,
+                        11,
+                        3,
+                        0,
+                        0,
+                        tree_reservation_payload(700),
+                    ),
+                    reservations=book,
+                    downstream=None,
+                )
         finally:
             stage_sock.close()
             peer.close()
@@ -689,6 +704,130 @@ class TreeCapacityStageTests(unittest.TestCase):
                     downstream=None,
                 )
             self.assertEqual(runner.active, {11: 2, 99: 2})
+        finally:
+            quote_sock.close()
+            quote_peer.close()
+            sender.close()
+            upstream.close()
+
+    def test_tree_batch_read_ahead_queues_unrelated_mutation_until_verify_release(
+        self,
+    ) -> None:
+        config = _last_stage_config(max_kv_bytes=10_000)
+        runner = _QuoteRunner(config.spec)
+        runner.max_active_requests = 8
+        runner.executor_manifest = SimpleNamespace(
+            features=(
+                "exact-tree-verify-batching",
+                "bounded-tree-verify-workspace",
+            )
+        )
+        runner.physical_batch_key = lambda *_args, **_kwargs: ("same",)
+        runner.forward_hidden_batch = lambda *_args, **_kwargs: ()
+        runner.begin(11)
+        runner.begin(99)
+        runner.active[11] = 2
+        runner.active[99] = 2
+        metrics = {
+            11: {"frames": 3, "compute_ms": 0, "bytes_out": 0, "tokens": 2},
+            99: {"frames": 3, "compute_ms": 0, "bytes_out": 0, "tokens": 2},
+        }
+        book = TreeReservationBook()
+        quote_sock, quote_peer = socket.socketpair()
+        sender, upstream = socket.socketpair()
+        try:
+            prepare_tree_capacity(
+                _prepare_frame(11, 3, 711, (1,)),
+                config=config,
+                runner=runner,
+                request_metrics=metrics,
+                branch_parents={},
+                reservations=book,
+                downstream=quote_sock,
+                return_socket=None,
+            )
+            recv_frame(quote_peer)
+            commit_tree_reservation(
+                Frame(
+                    FrameType.TREE_RESERVATION_COMMIT,
+                    0,
+                    11,
+                    3,
+                    0,
+                    0,
+                    tree_reservation_payload(711),
+                ),
+                config=config,
+                runner=runner,
+                request_metrics=metrics,
+                branch_parents={},
+                reservations=book,
+                downstream=quote_sock,
+            )
+            recv_frame(quote_peer)
+            branches: dict[int, int] = {}
+            shapes = {}
+            fork_stage_request(
+                Frame(
+                    FrameType.FORK,
+                    0,
+                    12,
+                    0,
+                    0,
+                    0,
+                    branch_request_payload(11),
+                ),
+                config,
+                runner,
+                metrics,
+                branches,
+                quote_sock,
+                book,
+                shapes,
+            )
+            recv_frame(quote_peer)
+            tree_hidden = torch.arange(8, dtype=torch.float32).reshape(1, 2, 4)
+            tree_payload = encode_tensor(tree_hidden, TensorCodec.FP32)
+            first = Frame(
+                FrameType.VERIFY,
+                int(TensorCodec.FP32),
+                12,
+                3,
+                2,
+                4,
+                tree_payload,
+            )
+            validate_activation(first, config, runner, metrics, branches, shapes)
+            ordinary_hidden = torch.arange(4, dtype=torch.float32).reshape(1, 1, 4)
+            send_frame(
+                sender,
+                FrameType.ACTIVATION,
+                99,
+                step=3,
+                token_count=1,
+                hidden_size=4,
+                flags=int(TensorCodec.FP32),
+                payload=encode_tensor(ordinary_hidden, TensorCodec.FP32),
+            )
+            pending = deque()
+            self.assertEqual(
+                collect_compatible_activation_frames(
+                    first,
+                    upstream=upstream,
+                    pending_frames=pending,
+                    config=config,
+                    runner=runner,
+                    request_metrics=metrics,
+                    branch_parents=branches,
+                    tree_leaf_shapes=shapes,
+                    tree_reservations=book,
+                    downstream=None,
+                ),
+                (first,),
+            )
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0].request_id, 99)
+            self.assertIsNotNone(book.active)
         finally:
             quote_sock.close()
             quote_peer.close()

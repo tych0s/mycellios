@@ -298,7 +298,7 @@ export class MeshService {
     if (!this.validJobEnvelope(envelope.workerId, payload.jobId, payload.leaseId)) return;
     const runtime = this.runtimes.get(payload.jobId);
     if (runtime?.nextTokenIndex === 0) {
-      this.retryOrFail(payload.jobId, payload.code ?? "worker_failed");
+      this.retryOrFail(payload.jobId, payload.code ?? "worker_failed", payload.message);
     }
     else this.failRuntime(payload.jobId, payload.code ?? "worker_failed", payload.message);
   }
@@ -311,7 +311,7 @@ export class MeshService {
     }
   }
 
-  private retryOrFail(jobId: string, reason: string): void {
+  private retryOrFail(jobId: string, reason: string, failureMessage?: string): void {
     const job = this.store.getJob(jobId);
     const runtime = this.runtimes.get(jobId);
     if (!job || !runtime) return;
@@ -340,7 +340,7 @@ export class MeshService {
     this.failRuntime(
       jobId,
       reason,
-      "No exact-model preplanned standby remains for prompt recomputation",
+      failureMessage ?? "No exact-model preplanned standby remains for prompt recomputation",
     );
   }
 

@@ -20,6 +20,7 @@ import { probeHardware, type HardwareProbe } from "../worker/hardware.js";
 import type {
   ChatRequest,
   ChatResponse,
+  ChatStreamUpdate,
   DashboardJob,
   DashboardModel,
   DashboardSnapshot,
@@ -27,6 +28,7 @@ import type {
   DesktopSettings,
   DesktopUpdateStatus,
 } from "./contracts.js";
+import { consumeChatCompletionStream } from "./chat-stream.js";
 
 if (started) app.quit();
 
@@ -454,7 +456,9 @@ async function sendChat(request: ChatRequest): Promise<ChatResponse> {
       model: request.model,
       messages: [{ role: "user", content: prompt }],
       stream: false,
-      max_tokens: Math.max(1, Math.min(2_048, request.maxTokens ?? 256)),
+      max_tokens: Math.max(1, Math.min(2_048, request.maxTokens ?? 128)),
+      temperature: 0,
+      top_p: 1,
     }),
   });
   return {
@@ -469,6 +473,31 @@ async function sendChat(request: ChatRequest): Promise<ChatResponse> {
     ttftMs: response.x_network.ttft_ms,
     activeMs: response.x_network.active_ms,
   };
+}
+
+async function streamChat(request: ChatRequest, onUpdate: (update: ChatStreamUpdate) => void): Promise<ChatResponse> {
+  const prompt = request.prompt.trim();
+  if (!prompt) throw new Error("Escribe un mensaje antes de enviarlo.");
+  const headers = new Headers({ accept: "text/event-stream", "content-type": "application/json" });
+  if (settings.coordinatorMode === "remote" && settings.remoteCoordinatorToken) {
+    headers.set("authorization", `Bearer ${settings.remoteCoordinatorToken}`);
+  }
+  const startedAt = Date.now();
+  const response = await fetch(new URL("v1/chat/completions", `${coordinatorUrl}/`), {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: request.model,
+      messages: [{ role: "user", content: prompt }],
+      stream: true,
+      max_tokens: Math.max(1, Math.min(2_048, request.maxTokens ?? 128)),
+      temperature: 0,
+      top_p: 1,
+    }),
+    signal: AbortSignal.timeout(3 * 60_000),
+    redirect: "error",
+  });
+  return consumeChatCompletionStream(response, request.model, onUpdate, startedAt);
 }
 
 function registerIpc(): void {
@@ -489,6 +518,9 @@ function registerIpc(): void {
     return readSnapshot();
   });
   ipcMain.handle("chat:send", (_event, request: ChatRequest) => sendChat(request));
+  ipcMain.handle("chat:stream", (event, streamId: string, request: ChatRequest) => streamChat(request, (update) => {
+    if (!event.sender.isDestroyed()) event.sender.send("chat:stream:update", streamId, update);
+  }));
   ipcMain.handle("workers:remove", async (_event, workerId: string) => {
     await fetchJson(`public/v1/workers/${encodeURIComponent(workerId)}`, { method: "DELETE" });
     return readSnapshot();

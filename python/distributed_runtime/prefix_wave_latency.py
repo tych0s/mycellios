@@ -8,6 +8,13 @@ tree has been reserved route-wide, what is the latency trade-off between:
     One record per complete leaf.  Shared prefixes are recomputed, but records
     can pipeline between stages.
 
+``flat_batched``
+    Complete leaves with the same token length are one exact batch work unit.
+    Prefixes are still recomputed for every leaf and compute cost remains
+    linear in the total token steps; only compatible launch/record overhead is
+    amortized.  The model therefore does not invent a batching throughput
+    multiplier.
+
 ``monolithic_packed``
     One prefix-closed tree-attention record.  Every unique prefix is computed
     once and each stage launches once, but the next stage cannot start until
@@ -18,6 +25,16 @@ tree has been reserved route-wide, what is the latency trade-off between:
     Each record contains one or more adjacent trie frontiers.  A downstream
     stage may start segment ``k`` while its predecessor computes ``k + 1``.
 
+One model work unit is charged as one kernel launch.  That is physically valid
+for one compatible flat length cohort or prefix frontier group only when the
+executor has certified exact batching.  Combining several groups in one
+record additionally assumes a
+certified ragged/tree-attention kernel; merely packing several wire records
+does not make heterogeneous cache depths one GPU launch.  The current
+HFPagedStageRunner has not yet supplied that device-level certification, so
+these timings remain an architecture projection rather than measured runtime
+performance.
+
 The streaming schedule has no application acknowledgement dependency between
 segments.  It is therefore one logical request/response barrier, not one RTT
 per trie node.  That claim assumes a warm ordered byte stream, a route-wide
@@ -26,10 +43,19 @@ state which can be discarded on any framing, digest, stage, or connection
 failure.  TCP acknowledgements and congestion control still exist, of course;
 they are transport mechanics rather than application barriers.
 
+Physical branch creation is explicit.  Both flat forms send all ``K`` FORK
+controls as one ordered prelude before any VERIFY compute.  Prefix execution
+sends one carrier FORK in its first record plus ``K - 1`` internal FORKs at
+their topological divergence records.  Every control frame serializes on each
+forward link, while propagation intervals may overlap; none waits for a return
+acknowledgement.
+
 Times are deterministic model inputs, not measured performance.  Category
 totals are *resource work*, so they are not additive wall time when stages or
 links overlap.  The event timeline is exposed to make that distinction
-auditable.
+auditable.  Return traffic follows the runtime contract: flat leaves each
+return one uint32 target per verified position, whereas both prefix strategies
+return one final canonical vector covering every unique computed node.
 """
 
 from __future__ import annotations
@@ -45,6 +71,7 @@ from .prefix_segment_schedule import plan_prefix_segment_schedule
 
 class PrefixWaveStrategy(str, Enum):
     FLAT_LEGACY = "flat_legacy"
+    FLAT_BATCHED = "flat_batched"
     MONOLITHIC_PACKED = "monolithic_packed"
     STREAMING_SEGMENTED = "streaming_segmented"
 
@@ -54,14 +81,18 @@ class PrefixWaveCostModel:
     """Explicit deterministic costs for one linear virtual-stage route.
 
     There are ``len(stage_compute_ms_per_token)`` stages and one fewer network
-    hops.  A link is full duplex in the model: forward activations and reverse
-    results have independent serialization resources, as a normal TCP
-    connection does at the physical-link level.
+    forward hops.  The production runtime gives the last stage a separate
+    direct-return socket to the root, so result propagation/bandwidth are one
+    explicit path, not a reverse traversal through every virtual stage.  When
+    omitted, a clearly mechanical fallback uses the sum of forward one-way
+    propagation and the forward bottleneck bandwidth; measured direct-return
+    values should replace that estimate for any decision.
 
     ``pack_bytes_per_ms`` and ``hash_bytes_per_ms`` are local memory/codec
     throughputs.  Decode uses the same copy throughput as encode.  GPU work and
     the stage's forward codec path are conservatively serialized; reverse
-    result relay is a separate lightweight resource and may overlap them.
+    result receive is a separate lightweight root resource and may overlap
+    forward execution.
     """
 
     stage_compute_ms_per_token: tuple[float, ...]
@@ -69,8 +100,13 @@ class PrefixWaveCostModel:
     hop_one_way_propagation_ms: tuple[float, ...]
     hop_bandwidth_mbps: tuple[float, ...]
     activation_bytes_per_token: int
-    result_bytes_per_leaf: int = 16
-    record_header_bytes: int = 96
+    return_one_way_propagation_ms: float | None = None
+    return_bandwidth_mbps: float | None = None
+    result_bytes_per_token: int = 4
+    flat_record_header_bytes: int = 32
+    prefix_record_header_bytes: int = 92
+    result_record_header_bytes: int = 32
+    fork_control_frame_bytes: int = 40
     node_metadata_bytes: int = 12
     fork_metadata_bytes: int = 16
     pack_fixed_ms_per_record: float = 0.02
@@ -115,13 +151,34 @@ class PrefixWaveCostModel:
                 "hop cost tuples must contain exactly one entry per adjacent "
                 "stage pair"
             )
+        return_propagation = (
+            sum(propagation)
+            if self.return_one_way_propagation_ms is None
+            else _finite_number(
+                "return_one_way_propagation_ms",
+                self.return_one_way_propagation_ms,
+                positive=False,
+            )
+        )
+        return_bandwidth = (
+            (min(bandwidth) if bandwidth else None)
+            if self.return_bandwidth_mbps is None
+            else _finite_number(
+                "return_bandwidth_mbps",
+                self.return_bandwidth_mbps,
+                positive=True,
+            )
+        )
         for name in (
             "activation_bytes_per_token",
-            "result_bytes_per_leaf",
+            "result_bytes_per_token",
+            "fork_control_frame_bytes",
         ):
             _positive_integer(name, getattr(self, name))
         for name in (
-            "record_header_bytes",
+            "flat_record_header_bytes",
+            "prefix_record_header_bytes",
+            "result_record_header_bytes",
             "node_metadata_bytes",
             "fork_metadata_bytes",
         ):
@@ -139,6 +196,10 @@ class PrefixWaveCostModel:
         object.__setattr__(self, "stage_kernel_launch_ms", stage_launch)
         object.__setattr__(self, "hop_one_way_propagation_ms", propagation)
         object.__setattr__(self, "hop_bandwidth_mbps", bandwidth)
+        object.__setattr__(
+            self, "return_one_way_propagation_ms", return_propagation
+        )
+        object.__setattr__(self, "return_bandwidth_mbps", return_bandwidth)
 
     @property
     def stage_count(self) -> int:
@@ -158,7 +219,10 @@ class PrefixWaveWorkUnit:
     token_steps: int
     node_count: int
     fork_edges: int
+    fork_control_count: int
     terminal_leaf_count: int
+    result_target_count: int
+    result_leaf_count: int
     activation_frame_bytes: int
     result_frame_bytes: int
 
@@ -219,6 +283,9 @@ class PrefixWaveSimulation:
     flat_equivalent_token_steps: int
     executed_token_steps: int
     kernel_launch_count: int
+    physical_fork_count: int
+    fork_control_frame_count: int
+    fork_control_wire_bytes: int
     forward_frame_count: int
     reverse_frame_count: int
     forward_wire_bytes: int
@@ -237,6 +304,7 @@ class PrefixWaveSimulation:
 @dataclass(frozen=True, slots=True)
 class PrefixWaveComparison:
     flat_legacy: PrefixWaveSimulation
+    flat_batched: PrefixWaveSimulation
     monolithic_packed: PrefixWaveSimulation
     streaming_segmented: PrefixWaveSimulation
 
@@ -281,6 +349,12 @@ def compare_prefix_wave_strategies(
             candidate_paths,
             cost_model,
             strategy=PrefixWaveStrategy.FLAT_LEGACY,
+            shared_root_tokens=shared_root_tokens,
+        ),
+        flat_batched=simulate_prefix_wave(
+            candidate_paths,
+            cost_model,
+            strategy=PrefixWaveStrategy.FLAT_BATCHED,
             shared_root_tokens=shared_root_tokens,
         ),
         monolithic_packed=simulate_prefix_wave(
@@ -408,7 +482,24 @@ def simulate_prefix_wave(
         stream_groups_per_record=groups_per_record,
         cost_model=cost_model,
     )
-    events, result_times = _simulate_units(units, cost_model)
+    leaf_count = len(schedule.candidate_paths)
+    internal_prefix_forks = sum(unit.fork_edges for unit in units)
+    flat_strategy = selected in (
+        PrefixWaveStrategy.FLAT_LEGACY,
+        PrefixWaveStrategy.FLAT_BATCHED,
+    )
+    if not flat_strategy:
+        if internal_prefix_forks != leaf_count - 1:
+            raise RuntimeError("prefix schedule lost an internal physical FORK")
+        if sum(unit.fork_control_count for unit in units) != leaf_count:
+            raise RuntimeError("prefix schedule lost its carrier FORK")
+    events, result_times = _simulate_units(
+        units,
+        cost_model,
+        flat_fork_prelude_count=(
+            leaf_count if flat_strategy else 0
+        ),
+    )
     if len(result_times) != len(schedule.candidate_paths):
         raise RuntimeError("event simulation did not return every terminal leaf")
 
@@ -428,6 +519,10 @@ def simulate_prefix_wave(
     flat_steps = schedule.cost.flat_token_steps
     executed_steps = sum(unit.token_steps for unit in units)
     hop_count = cost_model.hop_count
+    fork_control_frame_count = leaf_count * hop_count
+    fork_control_wire_bytes = (
+        fork_control_frame_count * cost_model.fork_control_frame_bytes
+    )
     return PrefixWaveSimulation(
         strategy=selected,
         work_units=units,
@@ -435,26 +530,29 @@ def simulate_prefix_wave(
         makespan_ms=max(result_times),
         first_result_ms=min(result_times),
         last_result_ms=max(result_times),
-        propagation_floor_ms=2.0
-        * sum(cost_model.hop_one_way_propagation_ms),
+        propagation_floor_ms=(
+            sum(cost_model.hop_one_way_propagation_ms)
+            + float(cost_model.return_one_way_propagation_ms or 0.0)
+        ),
         inter_stage_compute_overlap_ms=_inter_stage_compute_overlap(event_tuple),
         cost=cost,
         flat_equivalent_token_steps=flat_steps,
         executed_token_steps=executed_steps,
         kernel_launch_count=len(units) * cost_model.stage_count,
-        forward_frame_count=len(units) * hop_count,
-        reverse_frame_count=sum(
-            unit.terminal_leaf_count > 0 for unit in units
-        )
-        * hop_count,
-        forward_wire_bytes=sum(unit.activation_frame_bytes for unit in units)
-        * hop_count,
+        physical_fork_count=leaf_count,
+        fork_control_frame_count=fork_control_frame_count,
+        fork_control_wire_bytes=fork_control_wire_bytes,
+        forward_frame_count=(len(units) * hop_count + fork_control_frame_count),
+        reverse_frame_count=sum(unit.result_target_count > 0 for unit in units),
+        forward_wire_bytes=(
+            sum(unit.activation_frame_bytes for unit in units) * hop_count
+            + fork_control_wire_bytes
+        ),
         reverse_wire_bytes=sum(
             unit.result_frame_bytes
             for unit in units
-            if unit.terminal_leaf_count > 0
-        )
-        * hop_count,
+            if unit.result_target_count > 0
+        ),
     )
 
 
@@ -533,6 +631,10 @@ def _work_units(
     cost_model: PrefixWaveCostModel,
 ) -> tuple[PrefixWaveWorkUnit, ...]:
     raw_units: list[tuple[str, int, int, int, int, int, int]] = []
+    flat_strategy = strategy in (
+        PrefixWaveStrategy.FLAT_LEGACY,
+        PrefixWaveStrategy.FLAT_BATCHED,
+    )
     if strategy is PrefixWaveStrategy.FLAT_LEGACY:
         for leaf_index, path in enumerate(paths):
             token_steps = len(path) + shared_root_tokens
@@ -543,8 +645,33 @@ def _work_units(
                     len(path),
                     token_steps,
                     token_steps,
+                    0,
                     1,
-                    1,
+                )
+            )
+    elif strategy is PrefixWaveStrategy.FLAT_BATCHED:
+        # Equal total lengths have the same parent-cache depth and causal
+        # shape, so they are the conservative exact-batch compatibility class.
+        # Token work is deliberately summed, not discounted: this row only
+        # amortizes launch/framing overhead and makes no throughput claim.
+        paths_by_token_steps: dict[int, list[tuple[int, ...]]] = {}
+        for path in paths:
+            token_steps = len(path) + shared_root_tokens
+            paths_by_token_steps.setdefault(token_steps, []).append(path)
+        for batch_index, (tokens_per_leaf, grouped_paths) in enumerate(
+            sorted(paths_by_token_steps.items())
+        ):
+            leaf_count = len(grouped_paths)
+            token_steps = tokens_per_leaf * leaf_count
+            raw_units.append(
+                (
+                    f"flat-batch-{batch_index}",
+                    0 if shared_root_tokens else 1,
+                    len(grouped_paths[0]),
+                    token_steps,
+                    token_steps,
+                    0,
+                    leaf_count,
                 )
             )
     elif strategy is PrefixWaveStrategy.MONOLITHIC_PACKED:
@@ -574,6 +701,7 @@ def _work_units(
                 )
             )
 
+    unique_result_target_count = sum(item[3] for item in raw_units)
     units: list[PrefixWaveWorkUnit] = []
     for index, (
         label,
@@ -586,19 +714,43 @@ def _work_units(
     ) in enumerate(raw_units):
         prefix_metadata = (
             0
-            if strategy is PrefixWaveStrategy.FLAT_LEGACY
+            if flat_strategy
             else node_count * cost_model.node_metadata_bytes
             + fork_edges * cost_model.fork_metadata_bytes
         )
+        fork_control_count = (
+            0
+            if flat_strategy
+            else fork_edges + (1 if index == 0 else 0)
+        )
         activation_bytes = (
-            cost_model.record_header_bytes
+            (
+                cost_model.flat_record_header_bytes
+                if flat_strategy
+                else cost_model.prefix_record_header_bytes
+            )
             + token_steps * cost_model.activation_bytes_per_token
             + prefix_metadata
         )
+        if flat_strategy:
+            result_target_count = token_steps
+            result_leaf_count = terminal_count
+        elif strategy is PrefixWaveStrategy.MONOLITHIC_PACKED:
+            result_target_count = token_steps
+            result_leaf_count = len(paths)
+        elif index == len(raw_units) - 1:
+            # Prefix results use canonical unique-node order.  Earlier stream
+            # segments carry activations only; the final result covers every
+            # shared-prefix/node target exactly once.
+            result_target_count = unique_result_target_count
+            result_leaf_count = len(paths)
+        else:
+            result_target_count = 0
+            result_leaf_count = 0
         result_bytes = (
-            cost_model.record_header_bytes
-            + terminal_count * cost_model.result_bytes_per_leaf
-            if terminal_count
+            cost_model.result_record_header_bytes
+            + result_target_count * cost_model.result_bytes_per_token
+            if result_target_count
             else 0
         )
         units.append(
@@ -610,7 +762,10 @@ def _work_units(
                 token_steps=token_steps,
                 node_count=node_count,
                 fork_edges=fork_edges,
+                fork_control_count=fork_control_count,
                 terminal_leaf_count=terminal_count,
+                result_target_count=result_target_count,
+                result_leaf_count=result_leaf_count,
                 activation_frame_bytes=activation_bytes,
                 result_frame_bytes=result_bytes,
             )
@@ -621,15 +776,36 @@ def _work_units(
 def _simulate_units(
     units: tuple[PrefixWaveWorkUnit, ...],
     model: PrefixWaveCostModel,
+    *,
+    flat_fork_prelude_count: int,
 ) -> tuple[list[PrefixWaveEvent], list[float]]:
     events: list[PrefixWaveEvent] = []
     stage_available = [0.0] * model.stage_count
     forward_link_available = [0.0] * model.hop_count
-    reverse_link_available = [0.0] * model.hop_count
-    reverse_codec_available = [0.0] * model.stage_count
+    direct_return_link_available = [0.0]
+    root_return_codec_available = 0.0
     result_times: list[float] = []
 
+    if flat_fork_prelude_count:
+        _schedule_fork_controls(
+            events,
+            control_count=flat_fork_prelude_count,
+            unit_index=-1,
+            stage_available=stage_available,
+            forward_link_available=forward_link_available,
+            model=model,
+        )
+
     for unit in units:
+        if unit.fork_control_count:
+            _schedule_fork_controls(
+                events,
+                control_count=unit.fork_control_count,
+                unit_index=unit.unit_index,
+                stage_available=stage_available,
+                forward_link_available=forward_link_available,
+                model=model,
+            )
         arrival = 0.0
         for stage_index in range(model.stage_count):
             resource = f"stage-{stage_index}-forward"
@@ -644,19 +820,6 @@ def _simulate_units(
                     cursor=cursor,
                     byte_count=unit.activation_frame_bytes,
                     model=model,
-                )
-            if unit.fork_edges:
-                cursor = _append_event(
-                    events,
-                    category="fork",
-                    resource=resource,
-                    direction="local",
-                    unit_index=unit.unit_index,
-                    stage_index=stage_index,
-                    start_ms=cursor,
-                    duration_ms=(
-                        unit.fork_edges * model.fork_apply_ms_per_edge
-                    ),
                 )
             cursor = _append_event(
                 events,
@@ -705,7 +868,7 @@ def _simulate_units(
                     model=model,
                 )
             else:
-                if unit.terminal_leaf_count:
+                if unit.result_target_count:
                     cursor = _codec_encode(
                         events,
                         resource=resource,
@@ -718,52 +881,144 @@ def _simulate_units(
                     )
                 stage_available[stage_index] = cursor
 
-        if not unit.terminal_leaf_count:
+        if not unit.result_target_count:
             continue
         result_arrival = cursor
-        for hop_index in range(model.hop_count - 1, -1, -1):
-            result_arrival = _network_hop(
+        if model.hop_count:
+            result_arrival = _direct_return(
                 events,
-                direction="reverse",
                 unit_index=unit.unit_index,
-                hop_index=hop_index,
                 cursor=result_arrival,
                 byte_count=unit.result_frame_bytes,
-                link_available=reverse_link_available,
+                link_available=direct_return_link_available,
                 model=model,
             )
-            upstream_stage = hop_index
-            reverse_resource = f"stage-{upstream_stage}-reverse"
-            reverse_cursor = max(
-                result_arrival, reverse_codec_available[upstream_stage]
-            )
-            reverse_cursor = _codec_decode(
+            root_cursor = max(result_arrival, root_return_codec_available)
+            root_cursor = _codec_decode(
                 events,
-                resource=reverse_resource,
+                resource="root-direct-return",
                 direction="reverse",
                 unit_index=unit.unit_index,
-                stage_index=upstream_stage,
-                cursor=reverse_cursor,
+                stage_index=0,
+                cursor=root_cursor,
                 byte_count=unit.result_frame_bytes,
                 model=model,
             )
-            if upstream_stage:
-                reverse_cursor = _codec_encode(
-                    events,
-                    resource=reverse_resource,
-                    direction="reverse",
-                    unit_index=unit.unit_index,
-                    stage_index=upstream_stage,
-                    cursor=reverse_cursor,
-                    byte_count=unit.result_frame_bytes,
-                    model=model,
-                )
-            reverse_codec_available[upstream_stage] = reverse_cursor
-            result_arrival = reverse_cursor
+            root_return_codec_available = root_cursor
+            result_arrival = root_cursor
         result_times.extend(
-            [result_arrival] * unit.terminal_leaf_count
+            [result_arrival] * unit.result_leaf_count
         )
     return events, result_times
+
+
+def _schedule_fork_controls(
+    events: list[PrefixWaveEvent],
+    *,
+    control_count: int,
+    unit_index: int,
+    stage_available: list[float],
+    forward_link_available: list[float],
+    model: PrefixWaveCostModel,
+) -> None:
+    """Pipeline ordered FORK frames forward without a reverse dependency."""
+
+    for _ in range(control_count):
+        arrival = 0.0
+        for stage_index in range(model.stage_count):
+            resource = f"stage-{stage_index}-forward"
+            cursor = max(arrival, stage_available[stage_index])
+            if stage_index:
+                cursor = _control_decode(
+                    events,
+                    resource=resource,
+                    unit_index=unit_index,
+                    stage_index=stage_index,
+                    cursor=cursor,
+                    model=model,
+                )
+            cursor = _append_event(
+                events,
+                category="fork",
+                resource=resource,
+                direction="local",
+                unit_index=unit_index,
+                stage_index=stage_index,
+                start_ms=cursor,
+                duration_ms=model.fork_apply_ms_per_edge,
+            )
+            if stage_index < model.stage_count - 1:
+                cursor = _control_encode(
+                    events,
+                    resource=resource,
+                    unit_index=unit_index,
+                    stage_index=stage_index,
+                    cursor=cursor,
+                    model=model,
+                )
+                stage_available[stage_index] = cursor
+                arrival = _network_hop(
+                    events,
+                    direction="forward",
+                    unit_index=unit_index,
+                    hop_index=stage_index,
+                    cursor=cursor,
+                    byte_count=model.fork_control_frame_bytes,
+                    link_available=forward_link_available,
+                    model=model,
+                )
+            else:
+                stage_available[stage_index] = cursor
+
+
+def _control_encode(
+    events: list[PrefixWaveEvent],
+    *,
+    resource: str,
+    unit_index: int,
+    stage_index: int,
+    cursor: float,
+    model: PrefixWaveCostModel,
+) -> float:
+    return _append_event(
+        events,
+        category="pack",
+        resource=resource,
+        direction="forward",
+        unit_index=unit_index,
+        stage_index=stage_index,
+        start_ms=cursor,
+        duration_ms=(
+            model.pack_fixed_ms_per_record
+            + model.fork_control_frame_bytes / model.pack_bytes_per_ms
+        ),
+        byte_count=model.fork_control_frame_bytes,
+    )
+
+
+def _control_decode(
+    events: list[PrefixWaveEvent],
+    *,
+    resource: str,
+    unit_index: int,
+    stage_index: int,
+    cursor: float,
+    model: PrefixWaveCostModel,
+) -> float:
+    return _append_event(
+        events,
+        category="unpack",
+        resource=resource,
+        direction="forward",
+        unit_index=unit_index,
+        stage_index=stage_index,
+        start_ms=cursor,
+        duration_ms=(
+            model.unpack_fixed_ms_per_record
+            + model.fork_control_frame_bytes / model.pack_bytes_per_ms
+        ),
+        byte_count=model.fork_control_frame_bytes,
+    )
 
 
 def _codec_encode(
@@ -878,6 +1133,42 @@ def _network_hop(
         hop_index=hop_index,
         start_ms=tx_end,
         duration_ms=model.hop_one_way_propagation_ms[hop_index],
+        byte_count=byte_count,
+    )
+
+
+def _direct_return(
+    events: list[PrefixWaveEvent],
+    *,
+    unit_index: int,
+    cursor: float,
+    byte_count: int,
+    link_available: list[float],
+    model: PrefixWaveCostModel,
+) -> float:
+    bandwidth = model.return_bandwidth_mbps
+    if bandwidth is None:
+        raise RuntimeError("distributed route has no direct-return bandwidth")
+    tx_start = max(cursor, link_available[0])
+    tx_end = _append_event(
+        events,
+        category="bandwidth",
+        resource="direct-return-link",
+        direction="reverse",
+        unit_index=unit_index,
+        start_ms=tx_start,
+        duration_ms=byte_count * 8.0 / (bandwidth * 1_000.0),
+        byte_count=byte_count,
+    )
+    link_available[0] = tx_end
+    return _append_event(
+        events,
+        category="propagation",
+        resource="direct-return-propagation",
+        direction="reverse",
+        unit_index=unit_index,
+        start_ms=tx_end,
+        duration_ms=float(model.return_one_way_propagation_ms or 0.0),
         byte_count=byte_count,
     )
 
