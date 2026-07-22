@@ -190,6 +190,7 @@ function initialView(desktop: boolean, mobileEntry: boolean): PanelView {
 function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   const desktop = desktopBridge !== undefined;
   const localBrowser = !desktop && ["localhost", "127.0.0.1", "::1", "[::1]"].includes(window.location.hostname);
+  const localProductionProxy = localBrowser && window.location.port === "4174";
   const navItems = useMemo(() => {
     if (!desktop) return sharedNavItems;
     const desktopItems = sharedNavItems.filter((item) => item.id !== "contribute");
@@ -215,7 +216,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   );
   const requiresModelAdminToken = desktop
     ? desktopSnapshot?.settings.coordinatorMode !== "local" && !desktopSnapshot?.modelAdminAuthorization.configured
-    : !localBrowser;
+    : !localBrowser || localProductionProxy;
   const applyDesktopSnapshot = useCallback((next: DashboardSnapshot) => {
     setDesktopSnapshot(next);
     setSnapshot(desktopToPublicSnapshot(next));
@@ -401,6 +402,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
           ><Menu /></button>
           <div className="panel-topbar-status"><span className={`panel-live-dot ${error ? "degraded" : ""}`} /><div><strong>{error ? "Network degraded" : "Network healthy"}</strong><small>{snapshot.capturedAt === EMPTY.capturedAt ? "Waiting for snapshot" : `Updated ${relativeTime(snapshot.capturedAt)}`}</small></div></div>
           <div className="panel-top-actions">
+            {localProductionProxy && <span className="panel-environment-badge"><Globe2 size={13} /> Production via local</span>}
             <div className="panel-zoom-controls" role="group" aria-label="Interface zoom">
               <button type="button" aria-label="Reduce interface size" disabled={contentScale <= 0.9} onClick={() => changeContentScale(-0.1)}><Minus size={14} /></button>
               <output aria-live="polite">{Math.round(contentScale * 100)}%</output>
@@ -681,7 +683,7 @@ function Models({ snapshot, onSearch, onRequest, onRemove, adminToken: initialAd
   const [catalogOpen, setCatalogOpen] = useState(true);
   const [catalogNextCursor, setCatalogNextCursor] = useState<string | null>(null);
   const [catalogSort, setCatalogSort] = useState<HubCatalogSort | "name" | "memory">("downloads");
-  const [catalogStatus, setCatalogStatus] = useState<"all" | "compatible" | "unsupported" | "gated">("all");
+  const [catalogStatus, setCatalogStatus] = useState<"all" | "compatible" | "unsupported" | "gated">("compatible");
   const [catalogFit, setCatalogFit] = useState<"all" | "fits" | "too-large">("all");
   const searchSequence = useRef(0);
   const selectedCatalogModel = catalogModels.find((model) => model.id === source) ?? null;
@@ -793,10 +795,21 @@ function Models({ snapshot, onSearch, onRequest, onRemove, adminToken: initialAd
     <form className="model-request-form" onSubmit={(event) => void submit(event)}>
       <div className="model-form-heading"><div><span>HUGGING FACE CATALOG</span><h2>Choose a model for the network</h2><p>Only certified architectures can be selected. No terminal commands or pre-split files.</p></div><Boxes size={24} /></div>
 
+      <details className="model-advanced model-advanced-top">
+        <summary><SlidersHorizontal size={15} /> Advanced settings or manual model ID <ChevronDown size={15} /></summary>
+        <div className="model-form-grid">
+          <label>HUGGING FACE MODEL<input value={source} onChange={(event) => { setSource(event.target.value); setModelId(networkNameForHubModel(event.target.value)); }} placeholder="Qwen/Qwen3-0.6B" required /></label>
+          <label>NETWORK NAME <small>automatic</small><input value={modelId} onChange={(event) => setModelId(event.target.value)} placeholder="qwen3-0.6b" required pattern="[A-Za-z0-9][A-Za-z0-9._-]*" /></label>
+          <label>REVISION <small>optional</small><input value={revision} onChange={(event) => setRevision(event.target.value)} placeholder="main or commit" /></label>
+          <label>CONTEXT TOKENS<input type="number" min={128} max={1048576} value={contextTokens} onChange={(event) => setContextTokens(Number(event.target.value))} /></label>
+          <label>MINIMUM NODES<AppSelect ariaLabel="Minimum nodes" value={String(minimumNodes)} onChange={(value) => setMinimumNodes(Number(value))} options={[2, 3, 4, 5, 6, 7, 8].map((count) => ({ value: String(count), label: String(count) }))} /></label>
+        </div>
+      </details>
+
       {(!source || catalogOpen) && <>
         <div className="hub-catalog-toolbar">
           <div className="hub-model-search"><Search size={17} /><input value={catalogQuery} onChange={(event) => setCatalogQuery(event.target.value)} placeholder="Search every Hugging Face text-generation model…" aria-label="Search Hugging Face models" />{catalogBusy && <LoaderCircle className="spin" />}</div>
-          <label><span>STATUS</span><AppSelect ariaLabel="Filter by model status" value={catalogStatus} onChange={(value) => setCatalogStatus(value as typeof catalogStatus)} options={[{ value: "all", label: "All models" }, { value: "compatible", label: "Certified" }, { value: "unsupported", label: "Not supported" }, { value: "gated", label: "Gated" }]} /></label>
+          <label><span>AVAILABILITY</span><AppSelect ariaLabel="Filter by model availability" value={catalogStatus} onChange={(value) => setCatalogStatus(value as typeof catalogStatus)} options={[{ value: "compatible", label: "Ready to run" }, { value: "all", label: "All Hugging Face" }, { value: "unsupported", label: "Needs adapter" }, { value: "gated", label: "License required" }]} /></label>
           <label><span>NETWORK FIT</span><AppSelect ariaLabel="Filter by network capacity" value={catalogFit} onChange={(value) => setCatalogFit(value as typeof catalogFit)} options={[{ value: "all", label: "Any size" }, { value: "fits", label: "Fits now" }, { value: "too-large", label: "Needs capacity" }]} /></label>
           <label><span>SORT BY</span><AppSelect ariaLabel="Sort Hugging Face models" value={catalogSort} onChange={(value) => setCatalogSort(value as typeof catalogSort)} options={[{ value: "downloads", label: "Most downloaded" }, { value: "likes", label: "Most liked" }, { value: "lastModified", label: "Recently updated" }, { value: "name", label: "Name A–Z" }, { value: "memory", label: "Memory low–high" }]} /></label>
         </div>
@@ -826,16 +839,6 @@ function Models({ snapshot, onSearch, onRequest, onRemove, adminToken: initialAd
 
       {requiresAdminToken && <label className="model-admin-auth"><ShieldCheck /><span><strong>Network administrator authorization</strong><small>Required because preparing a model changes the shared network. {secureTokenStorage ? "Saved with encrypted operating-system storage after successful authorization." : "Kept only for this browser session."}</small></span><input type="password" autoComplete="off" spellCheck={false} value={adminToken} onChange={(event) => { setAdminToken(event.target.value); setFormError(null); }} placeholder="Administrator token" aria-label="Network administrator token" /></label>}
 
-      <details className="model-advanced">
-        <summary><SlidersHorizontal size={15} /> Advanced settings or manual model ID <ChevronDown size={15} /></summary>
-        <div className="model-form-grid">
-          <label>HUGGING FACE MODEL<input value={source} onChange={(event) => { setSource(event.target.value); setModelId(networkNameForHubModel(event.target.value)); }} placeholder="Qwen/Qwen3-0.6B" required /></label>
-          <label>NETWORK NAME <small>automatic</small><input value={modelId} onChange={(event) => setModelId(event.target.value)} placeholder="qwen3-0.6b" required pattern="[A-Za-z0-9][A-Za-z0-9._-]*" /></label>
-          <label>REVISION <small>optional</small><input value={revision} onChange={(event) => setRevision(event.target.value)} placeholder="main or commit" /></label>
-          <label>CONTEXT TOKENS<input type="number" min={128} max={1048576} value={contextTokens} onChange={(event) => setContextTokens(Number(event.target.value))} /></label>
-          <label>MINIMUM NODES<AppSelect ariaLabel="Minimum nodes" value={String(minimumNodes)} onChange={(value) => setMinimumNodes(Number(value))} options={[2, 3, 4, 5, 6, 7, 8].map((count) => ({ value: String(count), label: String(count) }))} /></label>
-        </div>
-      </details>
       <div className="model-submit-row">
         <label className="model-auto-toggle"><input type="checkbox" checked={autoActivate} onChange={(event) => setAutoActivate(event.target.checked)} /><span><strong>Activate automatically</strong><small>Start as soon as compatible capacity reaches the requirement.</small></span></label>
         <button className="model-submit" disabled={busy || !source.trim() || !modelId.trim() || (requiresAdminToken && !adminToken.trim())}>{busy ? <LoaderCircle className="spin" /> : <Play size={16} />}{busy ? "Inspecting model…" : "Calculate and prepare"}</button>
