@@ -173,7 +173,7 @@ export const workerCapabilitiesSchema = z.object({
     .optional(),
   distributedExecutor: z
     .object({
-      protocol: z.literal("gdlp-worker-tunnel/1"),
+      protocol: z.enum(["gdlp-worker-tunnel/1", "gdlp-worker-tunnel/2"]),
       nodeId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
       stageHost: z.string().min(1).max(253),
       stagePort: z.number().int().min(1).max(65_535),

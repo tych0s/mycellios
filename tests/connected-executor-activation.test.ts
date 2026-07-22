@@ -56,6 +56,19 @@ describe("connected executor activation", () => {
     expect(snapshot.capacityNodes).toEqual([{ id: "node-a", availableVramMiB: 3_500 }]);
     expect(snapshot.config).toBeNull();
   });
+
+  it("does not mix legacy direct-LAN executors into a relay topology", () => {
+    const relayWorker = worker("worker-relay", "node-relay", "node-relay.relay", 9_850, 4_096, 3_500, 10);
+    const legacyWorker = worker("worker-legacy", "node-legacy", "192.168.1.20", 9_850, 4_096, 3_500, 10);
+    legacyWorker.capabilities.distributedExecutor!.protocol = "gdlp-worker-tunnel/1";
+    const snapshot = buildConnectedExecutorActivationSnapshot(
+      baseConfig(),
+      [relayWorker, legacyWorker],
+      new Set([relayWorker.id, legacyWorker.id]),
+    );
+    expect(snapshot.capacityNodes).toEqual([{ id: "node-relay", availableVramMiB: 3_500 }]);
+    expect(snapshot.config).toBeNull();
+  });
 });
 
 function worker(
@@ -91,7 +104,7 @@ function worker(
       deployments: [],
       network: { coordinatorRttMs, uplinkMbps: 100, downlinkMbps: 100 },
       distributedExecutor: {
-        protocol: "gdlp-worker-tunnel/1",
+        protocol: "gdlp-worker-tunnel/2",
         nodeId,
         stageHost,
         stagePort,

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { WorkerEnvelope } from "../contracts/types.js";
-import type { WorkerHub } from "../coordinator/worker-hub.js";
+import type { RuntimeProxyHandle, WorkerHub } from "../coordinator/worker-hub.js";
 import type {
   LaunchAgent,
   LaunchAgentStartRequest,
@@ -28,6 +28,7 @@ export class WorkerTunnelLaunchAgent implements LaunchAgent {
   private readonly pending = new Map<string, PendingStart>();
   private readonly preparations = new Map<string, Deferred<void>>();
   private prepared = false;
+  private readonly runtimeProxies = new Set<RuntimeProxyHandle>();
   private readonly onEnvelope = (envelope: WorkerEnvelope) => this.handleEnvelope(envelope);
   private readonly onDisconnect = (workerId: string) => {
     if (workerId !== this.workerId) return;
@@ -81,9 +82,24 @@ export class WorkerTunnelLaunchAgent implements LaunchAgent {
     };
   }
 
-  close(): void {
+  async createRuntimeProxy(targetPort: number): Promise<RuntimeProxyHandle> {
+    const proxy = await this.hub.createRuntimeProxy(this.workerId, targetPort);
+    this.runtimeProxies.add(proxy);
+    return {
+      ...proxy,
+      close: async () => {
+        this.runtimeProxies.delete(proxy);
+        await proxy.close();
+      },
+    };
+  }
+
+  async close(): Promise<void> {
     this.hub.off("envelope", this.onEnvelope);
     this.hub.off("disconnect", this.onDisconnect);
+    const proxies = [...this.runtimeProxies];
+    this.runtimeProxies.clear();
+    await Promise.all(proxies.map((proxy) => proxy.close().catch(() => undefined)));
   }
 
   private async prepare(signal: AbortSignal): Promise<void> {

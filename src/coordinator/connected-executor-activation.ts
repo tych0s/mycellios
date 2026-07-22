@@ -121,6 +121,7 @@ function connectedExecutors(
   return workers
     .filter((worker) => connectedWorkerIds.has(worker.id) && worker.capabilities.distributedExecutor)
     .map((worker) => ({ worker, executor: worker.capabilities.distributedExecutor! }))
+    .filter(({ executor }) => executor.protocol === "gdlp-worker-tunnel/2")
     .filter((entry, index, all) => all.findIndex(
       (candidate) => candidate.executor.nodeId === entry.executor.nodeId,
     ) === index);

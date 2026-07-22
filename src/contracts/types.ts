@@ -150,7 +150,7 @@ export interface WorkerCapabilities {
   llmfit?: LlmfitAdvisory | undefined;
   /** A node-local shard executor controlled through the existing worker tunnel. */
   distributedExecutor?: {
-    protocol: "gdlp-worker-tunnel/1";
+    protocol: "gdlp-worker-tunnel/1" | "gdlp-worker-tunnel/2";
     nodeId: string;
     stageHost: string;
     stagePort: number;

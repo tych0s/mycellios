@@ -28,6 +28,11 @@ import {
   validatePythonLaunchDescription,
   type PythonPipelineLaunchDescription,
 } from "../distribution/python-launcher.js";
+import { MAX_RUNTIME_STREAM_CHUNK_BYTES } from "../contracts/worker-protocol.js";
+import {
+  RuntimeStreamTunnel,
+  type RuntimeStreamServerMessage,
+} from "./runtime-stream-tunnel.js";
 
 export interface WorkerAgentOptions {
   coordinatorUrl: string;
@@ -54,11 +59,21 @@ const MAX_SERVER_MESSAGE_BYTES = 2 * 1024 * 1024;
 const MAX_OUTPUT_CHUNK_BYTES = 64 * 1024;
 const MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
 const RECENT_JOB_LIMIT = 2_048;
+const MAX_WEBSOCKET_BUFFERED_BYTES = 8 * 1024 * 1024;
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 
 const envelopeFields = {
   v: z.literal(1),
 };
+
+const runtimeStreamDataSchema = z.string()
+  .min(1)
+  .max(Math.ceil(MAX_RUNTIME_STREAM_CHUNK_BYTES / 3) * 4)
+  .refine((value) => /^[A-Za-z0-9+/]+={0,2}$/.test(value), "Runtime stream data must be base64")
+  .refine(
+    (value) => Buffer.from(value, "base64").byteLength <= MAX_RUNTIME_STREAM_CHUNK_BYTES,
+    `Runtime stream chunks cannot exceed ${MAX_RUNTIME_STREAM_CHUNK_BYTES} bytes`,
+  );
 
 const serverMessageSchema = z.discriminatedUnion("type", [
   z
@@ -105,6 +120,41 @@ const serverMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("runtime.stop"),
     payload: z.object({ requestId: z.string().min(1).max(256), reason: z.string().min(1).max(300) }).strict(),
   }).strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.stream.open"),
+    payload: z.object({
+      streamId: z.string().min(1).max(256),
+      targetPort: z.number().int().min(1).max(65_535),
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.stream.opened"),
+    payload: z.object({ streamId: z.string().min(1).max(256) }).strict(),
+  }).strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.stream.data"),
+    payload: z.object({
+      streamId: z.string().min(1).max(256),
+      sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+      data: runtimeStreamDataSchema,
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.stream.end"),
+    payload: z.object({ streamId: z.string().min(1).max(256) }).strict(),
+  }).strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.stream.error"),
+    payload: z.object({
+      streamId: z.string().min(1).max(256),
+      message: z.string().min(1).max(1_024),
+    }).strict(),
+  }).strict(),
 ]);
 
 const registrationResponseSchema = z
@@ -128,6 +178,7 @@ export class WorkerAgent {
   private readonly recentJobs = new Map<string, number>();
   private readonly authorizedRuntimeProcesses = new Map<string, string>();
   private readonly runtimeProcesses = new Map<string, LaunchProcessHandle>();
+  private readonly runtimeTunnel: RuntimeStreamTunnel | null;
   private readonly logger: Pick<Console, "info" | "warn" | "error">;
 
   constructor(
@@ -137,6 +188,12 @@ export class WorkerAgent {
     this.coordinatorBaseUrl = validateCoordinatorUrl(options.coordinatorUrl);
     this.adapter = createAdapter(config);
     this.logger = options.logger ?? console;
+    this.runtimeTunnel = options.distributedExecutor
+      ? new RuntimeStreamTunnel(
+          options.distributedExecutor.nodeId,
+          (type, payload) => this.sendMessage(type, payload),
+        )
+      : null;
   }
 
   async start(): Promise<void> {
@@ -160,11 +217,7 @@ export class WorkerAgent {
     this.stopped = true;
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     await this.abortActiveJobs("Worker shutting down");
-    await Promise.all(
-      [...this.runtimeProcesses.values()].map((handle) => handle.stop("worker_shutting_down").catch(() => undefined)),
-    );
-    this.runtimeProcesses.clear();
-    this.authorizedRuntimeProcesses.clear();
+    await this.resetDistributedRuntime("worker_shutting_down");
     await this.sendGoodbye("user_requested");
     await this.closeSocket();
   }
@@ -292,7 +345,7 @@ export class WorkerAgent {
       ...(this.options.distributedExecutor
         ? {
             distributedExecutor: {
-              protocol: "gdlp-worker-tunnel/1" as const,
+              protocol: "gdlp-worker-tunnel/2" as const,
               nodeId: this.options.distributedExecutor.nodeId,
               stageHost: this.options.distributedExecutor.stageHost,
               stagePort: this.options.distributedExecutor.stagePort,
@@ -422,7 +475,10 @@ export class WorkerAgent {
         this.heartbeatTimer = null;
         this.socket = null;
         void this.abortActiveJobs("Coordinator disconnected");
-        if (opened) resolve();
+        void this.resetDistributedRuntime("coordinator_disconnected").finally(() => {
+          if (opened) resolve();
+          else reject(new Error("Coordinator connection closed before it became ready"));
+        });
       });
     });
   }
@@ -468,6 +524,13 @@ export class WorkerAgent {
       case "runtime.stop":
         await this.stopDistributedRuntime(message.payload.requestId, message.payload.reason);
         break;
+      case "runtime.stream.open":
+      case "runtime.stream.opened":
+      case "runtime.stream.data":
+      case "runtime.stream.end":
+      case "runtime.stream.error":
+        await this.runtimeTunnel?.handle(message as RuntimeStreamServerMessage);
+        break;
     }
   }
 
@@ -479,6 +542,7 @@ export class WorkerAgent {
       const description = input as PythonPipelineLaunchDescription;
       const local = description.launchOrder.filter((process) => process.anchor.memberId === executor.nodeId);
       if (local.length === 0) throw new Error("distributed_plan_has_no_process_for_this_node");
+      await this.runtimeTunnel?.prepare(description);
       this.authorizedRuntimeProcesses.clear();
       for (const process of local) {
         this.authorizedRuntimeProcesses.set(process.processId, JSON.stringify(process));
@@ -500,15 +564,16 @@ export class WorkerAgent {
       }
       if (this.runtimeProcesses.has(requestId)) throw new Error("distributed_launch_request_is_duplicate");
       const controller = new AbortController();
+      const tunneledProcess = this.runtimeTunnel?.rewriteProcess(input.process) ?? input.process;
       const localRequest: LaunchAgentStartRequest = executor.pythonExecutable
         ? {
             ...input,
             process: {
-              ...input.process,
-              command: { ...input.process.command, executable: executor.pythonExecutable },
+              ...tunneledProcess,
+              command: { ...tunneledProcess.command, executable: executor.pythonExecutable },
             },
           }
-        : input;
+        : { ...input, process: tunneledProcess };
       const handle = await executor.launchAgent.start(localRequest, controller.signal);
       this.runtimeProcesses.set(requestId, handle);
       void handle.ready.then(
@@ -533,6 +598,14 @@ export class WorkerAgent {
   private async stopDistributedRuntime(requestId: string, reason: string): Promise<void> {
     const handle = this.runtimeProcesses.get(requestId);
     if (handle) await handle.stop(reason).catch(() => undefined);
+  }
+
+  private async resetDistributedRuntime(reason: string): Promise<void> {
+    const handles = [...this.runtimeProcesses.values()];
+    this.runtimeProcesses.clear();
+    this.authorizedRuntimeProcesses.clear();
+    await Promise.all(handles.map((handle) => handle.stop(reason).catch(() => undefined)));
+    await this.runtimeTunnel?.close();
   }
 
   private sendRuntimeExit(
@@ -739,6 +812,10 @@ export class WorkerAgent {
 
   private sendMessage(type: string, payload: unknown): void {
     if (!this.registeredWorkerId || !this.socket || this.socket.readyState !== WebSocket.OPEN) return;
+    if (this.socket.bufferedAmount > MAX_WEBSOCKET_BUFFERED_BYTES) {
+      this.socket.close(4429, "runtime stream backpressure exceeded");
+      return;
+    }
     const envelope: WorkerEnvelope = {
       v: 1,
       type,

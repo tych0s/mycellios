@@ -4,6 +4,7 @@ import { deploymentSchema, gpuSchema, workerCapabilitiesSchema } from "./schemas
 const MAX_IDENTIFIER_LENGTH = 256;
 const MAX_TOKEN_CHUNK_BYTES = 64 * 1024;
 const MAX_COMPLETION_BYTES = 2 * 1024 * 1024;
+export const MAX_RUNTIME_STREAM_CHUNK_BYTES = 48 * 1024;
 
 const identifierSchema = z.string().min(1).max(MAX_IDENTIFIER_LENGTH);
 const boundedText = (maximum: number) =>
@@ -180,6 +181,13 @@ export const taskFailEnvelopeSchema = envelopeSchema(
 );
 
 const runtimeRequestIdSchema = z.string().min(1).max(MAX_IDENTIFIER_LENGTH);
+const runtimeStreamIdSchema = z.string().min(1).max(MAX_IDENTIFIER_LENGTH);
+const runtimeStreamDataSchema = z.string().min(1).max(Math.ceil(MAX_RUNTIME_STREAM_CHUNK_BYTES / 3) * 4)
+  .refine((value) => /^[A-Za-z0-9+/]+={0,2}$/.test(value), "Runtime stream data must be base64")
+  .refine(
+    (value) => Buffer.from(value, "base64").byteLength <= MAX_RUNTIME_STREAM_CHUNK_BYTES,
+    `Runtime stream chunks cannot exceed ${MAX_RUNTIME_STREAM_CHUNK_BYTES} bytes`,
+  );
 export const runtimePreparedEnvelopeSchema = envelopeSchema(
   "runtime.prepared",
   z.object({ requestId: runtimeRequestIdSchema, ok: z.boolean(), error: z.string().max(2_048).optional() }).strict(),
@@ -197,6 +205,35 @@ export const runtimeExitedEnvelopeSchema = envelopeSchema(
   }).strict(),
 );
 
+export const runtimeStreamOpenEnvelopeSchema = envelopeSchema(
+  "runtime.stream.open",
+  z.object({
+    streamId: runtimeStreamIdSchema,
+    destinationNodeId: identifierSchema,
+    targetPort: z.number().int().min(1).max(65_535),
+  }).strict(),
+);
+export const runtimeStreamOpenedEnvelopeSchema = envelopeSchema(
+  "runtime.stream.opened",
+  z.object({ streamId: runtimeStreamIdSchema }).strict(),
+);
+export const runtimeStreamDataEnvelopeSchema = envelopeSchema(
+  "runtime.stream.data",
+  z.object({
+    streamId: runtimeStreamIdSchema,
+    sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    data: runtimeStreamDataSchema,
+  }).strict(),
+);
+export const runtimeStreamEndEnvelopeSchema = envelopeSchema(
+  "runtime.stream.end",
+  z.object({ streamId: runtimeStreamIdSchema }).strict(),
+);
+export const runtimeStreamErrorEnvelopeSchema = envelopeSchema(
+  "runtime.stream.error",
+  z.object({ streamId: runtimeStreamIdSchema, message: boundedText(1_024) }).strict(),
+);
+
 export const workerEnvelopeSchema = z.discriminatedUnion("type", [
   workerHelloEnvelopeSchema,
   workerHeartbeatEnvelopeSchema,
@@ -209,6 +246,11 @@ export const workerEnvelopeSchema = z.discriminatedUnion("type", [
   runtimePreparedEnvelopeSchema,
   runtimeReadyEnvelopeSchema,
   runtimeExitedEnvelopeSchema,
+  runtimeStreamOpenEnvelopeSchema,
+  runtimeStreamOpenedEnvelopeSchema,
+  runtimeStreamDataEnvelopeSchema,
+  runtimeStreamEndEnvelopeSchema,
+  runtimeStreamErrorEnvelopeSchema,
 ]);
 
 export type ValidatedWorkerEnvelope = z.infer<typeof workerEnvelopeSchema>;

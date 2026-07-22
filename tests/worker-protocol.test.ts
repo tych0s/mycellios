@@ -5,6 +5,8 @@ import {
   taskTokenEnvelopeSchema,
   runtimeExitedEnvelopeSchema,
   runtimePreparedEnvelopeSchema,
+  runtimeStreamDataEnvelopeSchema,
+  runtimeStreamOpenEnvelopeSchema,
   workerGoodbyeEnvelopeSchema,
   workerEnvelopeSchema,
   workerHeartbeatEnvelopeSchema,
@@ -151,7 +153,7 @@ describe("worker protocol schemas", () => {
           ],
           network: { coordinatorRttMs: 10, uplinkMbps: 100, downlinkMbps: 100 },
           distributedExecutor: {
-            protocol: "gdlp-worker-tunnel/1" as const,
+            protocol: "gdlp-worker-tunnel/2" as const,
             nodeId: "desktop-test",
             stageHost: "192.168.1.20",
             stagePort: 9_850,
@@ -198,5 +200,20 @@ describe("worker protocol schemas", () => {
         output: { stdout: "ready", stderr: "", stdoutTruncated: false, stderrTruncated: false },
       },
     }).success).toBe(true);
+    expect(runtimeStreamOpenEnvelopeSchema.safeParse({
+      ...baseEnvelope,
+      type: "runtime.stream.open",
+      payload: { streamId: "stream-1", destinationNodeId: "desktop-b", targetPort: 9_850 },
+    }).success).toBe(true);
+    expect(runtimeStreamDataEnvelopeSchema.safeParse({
+      ...baseEnvelope,
+      type: "runtime.stream.data",
+      payload: { streamId: "stream-1", sequence: 0, data: Buffer.from("hello").toString("base64") },
+    }).success).toBe(true);
+    expect(runtimeStreamDataEnvelopeSchema.safeParse({
+      ...baseEnvelope,
+      type: "runtime.stream.data",
+      payload: { streamId: "stream-1", sequence: 0, data: Buffer.alloc(48 * 1024 + 1).toString("base64") },
+    }).success).toBe(false);
   });
 });

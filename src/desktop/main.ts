@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { networkInterfaces } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { spawn } from "node:child_process";
 import type { AddressInfo } from "node:net";
@@ -25,7 +24,6 @@ import { LocalProcessAgent, type LaunchAgent } from "../distribution/launch-supe
 import type { PythonPipelineLaunchDescription } from "../distribution/python-launcher.js";
 import { WorkerTunnelLaunchAgent } from "../distribution/worker-tunnel-launch-agent.js";
 import type { StoredWorker } from "../storage/store.js";
-import { selectPreferredLanAddress } from "./network.js";
 import type { WorkerHub } from "../coordinator/worker-hub.js";
 import { WorkerAgent, validateCoordinatorUrl } from "../worker/agent.js";
 import { probeHardware, type HardwareProbe } from "../worker/hardware.js";
@@ -174,15 +172,18 @@ function configureAutomaticUpdates(): void {
 
   autoUpdater.setFeedURL({ url: UPDATE_FEED_URL });
   autoUpdater.on("checking-for-update", () => {
+    if (updateStatus.state === "ready") return;
     setUpdateStatus({ state: "checking", message: "Checking for a new version…" });
   });
   autoUpdater.on("update-available", () => {
+    if (updateStatus.state === "ready") return;
     setUpdateStatus({
       state: "downloading",
       message: "A new version is downloading in the background…",
     });
   });
   autoUpdater.on("update-not-available", () => {
+    if (updateStatus.state === "ready") return;
     setUpdateStatus({
       state: "up-to-date",
       availableVersion: null,
@@ -199,6 +200,7 @@ function configureAutomaticUpdates(): void {
     });
   });
   autoUpdater.on("error", (error) => {
+    if (updateStatus.state === "ready") return;
     setUpdateStatus({
       state: "error",
       message: `Could not check for updates: ${error.message}`,
@@ -214,7 +216,7 @@ function configureAutomaticUpdates(): void {
 }
 
 async function checkForUpdates(): Promise<DesktopUpdateStatus> {
-  if (!app.isPackaged || process.platform !== "win32" || updateCheckInFlight) {
+  if (!app.isPackaged || process.platform !== "win32" || updateCheckInFlight || updateStatus.state === "ready") {
     return updateStatus;
   }
   updateCheckInFlight = true;
@@ -877,7 +879,9 @@ async function createDesktopDistributedExecutor() {
   const nodeId = persistentDistributedNodeId();
   return {
     nodeId,
-    stageHost: preferredLanAddress(),
+    // This is a globally unique logical route name, never a reachable LAN IP.
+    // Protocol v2 rewrites every runtime connection onto the coordinator relay.
+    stageHost: `${nodeId}.relay`,
     stagePort: 9_850,
     pythonExecutable,
     launchAgent: new LocalProcessAgent({
@@ -950,10 +954,6 @@ function persistentDistributedNodeId(): string {
   return nodeId;
 }
 
-function preferredLanAddress(): string {
-  return selectPreferredLanAddress(networkInterfaces());
-}
-
 function buildDesktopActivationSnapshot(
   workers: readonly StoredWorker[],
   connectedWorkerIds: ReadonlySet<string>,
@@ -961,6 +961,7 @@ function buildDesktopActivationSnapshot(
   const executors = workers
     .filter((worker) => connectedWorkerIds.has(worker.id) && worker.capabilities.distributedExecutor)
     .map((worker) => ({ worker, executor: worker.capabilities.distributedExecutor! }))
+    .filter(({ executor }) => executor.protocol === "gdlp-worker-tunnel/2")
     .filter((entry, index, all) => all.findIndex((candidate) => candidate.executor.nodeId === entry.executor.nodeId) === index);
   const capacityNodes = executors.map(({ worker, executor }) => ({
     id: executor.nodeId,
@@ -1029,7 +1030,10 @@ function resolveDesktopTunnelAgent(
   nodeId: string,
   launch: PythonPipelineLaunchDescription,
 ): LaunchAgent | undefined {
-  const worker = workers.find((candidate) => candidate.capabilities.distributedExecutor?.nodeId === nodeId);
+  const worker = workers.find((candidate) =>
+    candidate.capabilities.distributedExecutor?.protocol === "gdlp-worker-tunnel/2"
+    && candidate.capabilities.distributedExecutor.nodeId === nodeId
+  );
   return worker ? new WorkerTunnelLaunchAgent(hub, worker.id, nodeId, launch) : undefined;
 }
 

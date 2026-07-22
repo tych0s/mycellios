@@ -54,6 +54,13 @@ export interface LaunchAgentStartRequest {
 export interface LaunchAgent {
   readonly id: string;
   start(request: LaunchAgentStartRequest, signal: AbortSignal): Promise<LaunchProcessHandle>;
+  /** Optional coordinator-side loopback proxy for runtimes behind NAT. */
+  createRuntimeProxy?(targetPort: number): Promise<{
+    host: string;
+    port: number;
+    close(): Promise<void>;
+  }>;
+  close?(): void | Promise<void>;
 }
 
 export type LaunchAgentResolver = (

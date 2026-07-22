@@ -377,9 +377,18 @@ export async function runAutoDistribution(
   });
   let worker: WorkerAgent | null = null;
   let workerPromise: Promise<void> | null = null;
+  let runtimeProxy: { host: string; port: number; close(): Promise<void> } | null = null;
   try {
     await supervisor.start();
-    const apiBaseUrl = `http://${config.runtime.apiAdvertiseHost}:${config.runtime.apiEndpoint.port}`;
+    const rootProcess = compilation.launch.launchOrder.find((process) => process.kind === "root-engine");
+    if (!rootProcess) throw new Error("distributed_root_process_is_missing");
+    const rootAgent = agents.get(rootProcess.anchor.memberId);
+    runtimeProxy = rootAgent?.createRuntimeProxy
+      ? await rootAgent.createRuntimeProxy(rootProcess.apiEndpoint.port)
+      : null;
+    const apiBaseUrl = runtimeProxy
+      ? `http://${runtimeProxy.host}:${runtimeProxy.port}`
+      : `http://${config.runtime.apiAdvertiseHost}:${config.runtime.apiEndpoint.port}`;
     const health = await verifyRootHealth(apiBaseUrl, config, compilation);
     const canary = await runCanary(apiBaseUrl, config);
     if (config.coordinator) {
@@ -412,6 +421,10 @@ export async function runAutoDistribution(
   } finally {
     if (worker) await worker.stop().catch(() => undefined);
     await supervisor.stop("auto_distribute_shutdown").catch(() => undefined);
+    await runtimeProxy?.close().catch(() => undefined);
+    await Promise.all(
+      [...new Set(agents.values())].map((agent) => Promise.resolve(agent.close?.()).catch(() => undefined)),
+    );
   }
 }
 
