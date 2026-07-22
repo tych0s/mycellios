@@ -219,7 +219,7 @@ export class DynamicModelActivationManager implements ModelActivationManager {
     if (this.activePromise) return Promise.reject(new Error(`automatic_activation_busy:${this.activeModelId}`));
     const base = this.current.config;
     if (!base) return Promise.reject(new Error("distributed_activation_requires_two_connected_shard_executors"));
-    const config = parseAutoDistributionConfig({
+    let config = parseAutoDistributionConfig({
       ...structuredClone(base),
       model: { source: model.source, revision: model.revision, publicName: model.id },
       distribution: {
@@ -238,7 +238,23 @@ export class DynamicModelActivationManager implements ModelActivationManager {
     const running = (async () => {
       const profile = await profileCompatibleModel(config, cwd, environment);
       if (controller.signal.aborted) return;
-      const compilation = compileAutoDistribution(config, profile);
+      let compilation = compileAutoDistribution(config, profile);
+      const rootHost = compilation.manifest.plans.decode.stages[0]?.anchor.endpoint.host;
+      if (
+        rootHost
+        && (config.runtime.apiAdvertiseHost !== rootHost
+          || config.runtime.returnEndpoint.host !== rootHost)
+      ) {
+        config = parseAutoDistributionConfig({
+          ...structuredClone(config),
+          runtime: {
+            ...config.runtime,
+            apiAdvertiseHost: rootHost,
+            returnEndpoint: { ...config.runtime.returnEndpoint, host: rootHost },
+          },
+        });
+        compilation = compileAutoDistribution(config, profile);
+      }
       await writeAutoDistributionArtifacts(config, compilation, cwd);
       if (controller.signal.aborted) return;
       await runAutoDistribution(config, compilation, cwd, environment, controller.signal, {

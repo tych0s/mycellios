@@ -25,6 +25,7 @@ import { LocalProcessAgent, type LaunchAgent } from "../distribution/launch-supe
 import type { PythonPipelineLaunchDescription } from "../distribution/python-launcher.js";
 import { WorkerTunnelLaunchAgent } from "../distribution/worker-tunnel-launch-agent.js";
 import type { StoredWorker } from "../storage/store.js";
+import { selectPreferredLanAddress } from "./network.js";
 import type { WorkerHub } from "../coordinator/worker-hub.js";
 import { WorkerAgent, validateCoordinatorUrl } from "../worker/agent.js";
 import { probeHardware, type HardwareProbe } from "../worker/hardware.js";
@@ -871,7 +872,7 @@ async function createDesktopDistributedExecutor() {
     pythonExecutable,
     launchAgent: new LocalProcessAgent({
       id: `desktop-shard-executor:${nodeId}`,
-      cwd: app.getAppPath(),
+      cwd: app.isPackaged ? dirname(app.getAppPath()) : app.getAppPath(),
       env: {
         PYTHONPATH: pythonPath,
         HF_HOME: hfHome,
@@ -940,14 +941,7 @@ function persistentDistributedNodeId(): string {
 }
 
 function preferredLanAddress(): string {
-  for (const addresses of Object.values(networkInterfaces())) {
-    for (const address of addresses ?? []) {
-      if (address.family === "IPv4" && !address.internal && !address.address.startsWith("169.254.")) {
-        return address.address;
-      }
-    }
-  }
-  return "127.0.0.1";
+  return selectPreferredLanAddress(networkInterfaces());
 }
 
 function buildDesktopActivationSnapshot(
