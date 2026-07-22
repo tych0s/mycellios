@@ -263,6 +263,16 @@ export interface AutoDistributionRunOptions {
     nodeId: string,
     launch: PythonPipelineLaunchDescription,
   ) => LaunchAgent | undefined;
+  onProgress?: (event: AutoDistributionProgressEvent) => void;
+}
+
+export interface AutoDistributionProgressEvent {
+  phase: "preparing_nodes" | "launching_stages" | "stages_ready" | "checking_health" | "running_canary" | "publishing_model" | "active" | "failed";
+  message: string;
+  nodeId?: string;
+  processId?: string;
+  device?: string;
+  details?: string[];
 }
 
 export function parseAutoDistributionConfig(value: unknown): AutoDistributionConfig {
@@ -372,6 +382,10 @@ export async function runAutoDistribution(
   options: AutoDistributionRunOptions = {},
 ): Promise<AutoDistributionRunResult> {
   const config = parseAutoDistributionConfig(configValue);
+  options.onProgress?.({
+    phase: "preparing_nodes",
+    message: `Preparing ${config.nodes.length} network nodes.`,
+  });
   const agents = await createLaunchAgents(config, cwd, environment, compilation.launch, options);
   const supervisor = new PythonLaunchSupervisor(compilation.launch, {
     resolveAgent: (nodeId) => agents.get(nodeId),
@@ -381,7 +395,12 @@ export async function runAutoDistribution(
   let workerPromise: Promise<void> | null = null;
   let runtimeProxy: { host: string; port: number; close(): Promise<void> } | null = null;
   try {
+    options.onProgress?.({
+      phase: "launching_stages",
+      message: `Launching ${compilation.manifest.plans.decode.stages.length} distributed model stages.`,
+    });
     const runningSnapshot = await supervisor.start();
+    options.onProgress?.({ phase: "stages_ready", message: "All model stages reported ready." });
     const rootProcess = compilation.launch.launchOrder.find((process) => process.kind === "root-engine");
     if (!rootProcess) throw new Error("distributed_root_process_is_missing");
     const rootAgent = agents.get(rootProcess.anchor.memberId);
@@ -391,9 +410,12 @@ export async function runAutoDistribution(
     const apiBaseUrl = runtimeProxy
       ? `http://${runtimeProxy.host}:${runtimeProxy.port}`
       : `http://${config.runtime.apiAdvertiseHost}:${config.runtime.apiEndpoint.port}`;
+    options.onProgress?.({ phase: "checking_health", message: "Checking the distributed pipeline health." });
     const health = await verifyRootHealth(apiBaseUrl, config, compilation);
+    options.onProgress?.({ phase: "running_canary", message: "Running a real inference canary across the network." });
     const canary = await runCanary(apiBaseUrl, config);
     if (config.coordinator) {
+      options.onProgress?.({ phase: "publishing_model", message: "Canary passed. Publishing the model to the network." });
       const workerConfig = buildCellWorkerConfig(
         config,
         compilation,
@@ -421,10 +443,16 @@ export async function runAutoDistribution(
       workerId: worker?.workerId ?? null,
     };
     await writeRuntimeStatus(config, result, cwd, "running");
+    options.onProgress?.({
+      phase: "active",
+      message: `Model active. Canary measured ${canary.metrics.measuredTokensPerSecond.toFixed(2)} tokens/s.`,
+    });
     await waitForShutdown(supervisor, workerPromise, shutdownSignal);
     return result;
   } catch (error) {
-    await writeRuntimeFailure(config, error, supervisor.snapshot(), cwd).catch(() => undefined);
+    const failureSnapshot = supervisor.snapshot();
+    options.onProgress?.(activationFailureProgress(error, failureSnapshot));
+    await writeRuntimeFailure(config, error, failureSnapshot, cwd).catch(() => undefined);
     throw error;
   } finally {
     if (worker) await worker.stop().catch(() => undefined);
@@ -434,6 +462,54 @@ export async function runAutoDistribution(
       [...new Set(agents.values())].map((agent) => Promise.resolve(agent.close?.()).catch(() => undefined)),
     );
   }
+}
+
+function activationFailureProgress(
+  error: unknown,
+  supervisor: LaunchSupervisorSnapshot,
+): AutoDistributionProgressEvent {
+  const rawError = error instanceof Error ? error.message : String(error);
+  const failedProcess = supervisor.processes.find((process) => process.state === "failed")
+    ?? supervisor.processes.find((process) => process.output);
+  const output = `${failedProcess?.output?.stdout ?? ""}\n${failedProcess?.output?.stderr ?? ""}`;
+  const exitCode = Number(/(?:code=|code\s+)(\d+)/i.exec(rawError)?.[1] ?? Number.NaN);
+  const requestedDevice = /"requested_device"\s*:\s*"([^"]+)"/i.exec(output)?.[1];
+  const layers = /"layers"\s*:\s*\[\s*(\d+)\s*,\s*(\d+)\s*\]/i.exec(output);
+  const details = [
+    failedProcess ? `Node: ${failedProcess.nodeId}` : null,
+    failedProcess ? `Process: ${failedProcess.processId} · stage ${failedProcess.stageIndex}` : null,
+    requestedDevice ? `Requested device: ${requestedDevice}` : null,
+    layers ? `Assigned layers: ${layers[1]}–${layers[2]}` : null,
+    Number.isFinite(exitCode) ? windowsExitCodeDetail(exitCode) : null,
+    ...runtimeOutputDetails(output),
+  ].filter((detail): detail is string => detail !== null);
+  const accessViolation = exitCode === 3_221_225_477;
+  return {
+    phase: "failed",
+    message: accessViolation
+      ? "The Windows accelerator runtime crashed while loading this model stage (memory access violation)."
+      : `The model stage stopped before it became ready: ${rawError}`,
+    ...(failedProcess ? { nodeId: failedProcess.nodeId, processId: failedProcess.processId } : {}),
+    ...(requestedDevice ? { device: requestedDevice } : {}),
+    details,
+  };
+}
+
+function windowsExitCodeDetail(exitCode: number): string {
+  if (exitCode === 3_221_225_477) {
+    return "Windows exit code: 3221225477 · 0xC0000005 · native memory access violation";
+  }
+  return `Process exit code: ${exitCode}`;
+}
+
+function runtimeOutputDetails(output: string): string[] {
+  return output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("Fetching "))
+    .filter((line) => !line.startsWith("{"))
+    .slice(-3)
+    .map((line) => `Runtime: ${line.slice(0, 320)}`);
 }
 
 function automaticCellIdentity(

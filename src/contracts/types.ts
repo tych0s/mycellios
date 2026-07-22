@@ -13,6 +13,7 @@ export type ExecutionBackend =
   | "webgpu";
 export type WorkerStatus = "online" | "suspect" | "offline" | "draining";
 export type WorkerIdentityKind = "device" | "cell";
+export type ComputeMode = "automatic" | "gpu-only" | "cpu-only";
 export type JobStatus =
   | "queued"
   | "leasing"
@@ -39,6 +40,20 @@ export interface HubCatalogModel {
   parameterCount?: number | null;
   estimatedMemoryMiB?: number | null;
   memoryEstimateSource?: "hub_metadata" | "model_name" | null;
+}
+
+export type HubCatalogSort = "downloads" | "likes" | "lastModified";
+
+export interface HubCatalogSearchInput {
+  query: string;
+  cursor?: string | null;
+  sort?: HubCatalogSort;
+  limit?: number;
+}
+
+export interface HubCatalogPage {
+  data: HubCatalogModel[];
+  nextCursor: string | null;
 }
 
 export interface ChatMessage {
@@ -190,6 +205,10 @@ export interface WorkerCapabilities {
     stageHost: string;
     stagePort: number;
     runtime: "python-safetensors";
+    /** User-selected runtime policy. Optional only for legacy registrations. */
+    computeMode?: ComputeMode | undefined;
+    /** True only when this registration explicitly permits CPU model stages. */
+    cpuEligible?: boolean | undefined;
   } | undefined;
 }
 

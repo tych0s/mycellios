@@ -8,7 +8,6 @@ import {
   ChevronRight,
   CircleAlert,
   CirclePower,
-  Coins,
   Cpu,
   Download,
   ExternalLink,
@@ -23,7 +22,6 @@ import {
   MemoryStick,
   Menu,
   MessageSquareText,
-  Milestone,
   Minus,
   Network,
   Play,
@@ -55,6 +53,9 @@ import type {
   DesktopSettings,
   DesktopUpdateStatus,
   HubCatalogModel,
+  HubCatalogPage,
+  HubCatalogSearchInput,
+  HubCatalogSort,
   RequestModelInput,
   RequestedModelCapacity,
 } from "../../src/desktop/contracts";
@@ -69,7 +70,7 @@ const PUBLIC_COORDINATOR_URL = "https://www.mycellios.com";
 import "./panel-downloads.css";
 import "./panel-desktop.css";
 
-type PanelView = "overview" | "nodes" | "models" | "jobs" | "tests" | "roadmap" | "inference" | "contribute" | "join" | "downloads" | "machine" | "settings";
+type PanelView = "overview" | "nodes" | "models" | "jobs" | "tests" | "inference" | "contribute" | "join" | "downloads" | "machine" | "settings";
 
 interface PanelProps {
   desktopBridge?: DesktopBridge;
@@ -115,6 +116,7 @@ interface PublicWorker {
   gpus: PublicGpu[];
   deployments: PublicDeployment[];
   executionNodeId?: string;
+  computeMode?: DesktopSettings["computeMode"];
   mobile?: {
     platform: string;
     backend: "webgpu" | "cpu";
@@ -169,7 +171,6 @@ const sharedNavItems: Array<{ id: PanelView; label: string; icon: typeof Network
   { id: "nodes", label: "Nodes", icon: Server },
   { id: "jobs", label: "Tasks", icon: Activity },
   { id: "tests", label: "Tests", icon: Gauge },
-  { id: "roadmap", label: "Roadmap", icon: Milestone },
   { id: "models", label: "Models", icon: Boxes },
   { id: "inference", label: "Chat", icon: MessageSquareText },
   { id: "contribute", label: "This device", icon: Zap },
@@ -313,15 +314,20 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     await refresh();
   }
 
-  const searchHubModels = useCallback(async (query: string): Promise<HubCatalogModel[]> => {
-    if (desktopBridge) return desktopBridge.searchHubModels(query);
-    const response = await fetch(`/public/v1/huggingface-models?q=${encodeURIComponent(query)}`, { cache: "no-store" });
+  const searchHubModels = useCallback(async (input: HubCatalogSearchInput): Promise<HubCatalogPage> => {
+    if (desktopBridge) return desktopBridge.searchHubModels(input);
+    const parameters = new URLSearchParams({
+      q: input.query,
+      sort: input.sort ?? "downloads",
+      limit: String(input.limit ?? 50),
+    });
+    if (input.cursor) parameters.set("cursor", input.cursor);
+    const response = await fetch(`/public/v1/huggingface-models?${parameters.toString()}`, { cache: "no-store" });
     if (!response.ok) {
       const body = await response.json().catch(() => null) as { error?: { message?: string } } | null;
       throw new Error(body?.error?.message ?? `HTTP ${response.status}`);
     }
-    const body = await response.json() as { data: HubCatalogModel[] };
-    return body.data;
+    return response.json() as Promise<HubCatalogPage>;
   }, [desktopBridge]);
 
   async function removeRequestedModel(modelId: string, adminToken: string) {
@@ -419,7 +425,6 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
               {view === "models" && <Models snapshot={snapshot} onSearch={searchHubModels} onRequest={requestModel} onRemove={removeRequestedModel} adminToken={modelAdminToken} requiresAdminToken={requiresModelAdminToken} secureTokenStorage={desktop} />}
               {view === "jobs" && <Jobs snapshot={snapshot} />}
               {view === "tests" && <Tests bridge={desktopBridge} />}
-              {view === "roadmap" && <Roadmap />}
               {view === "inference" && <Inference snapshot={snapshot} onSend={sendPrompt} onNavigate={navigate} />}
               {view === "contribute" && <Contribute />}
               {view === "join" && <JoinNetwork publicLink={publicLink} external={desktop} />}
@@ -564,7 +569,8 @@ function Nodes({ snapshot, onRemove, onClearOffline }: { snapshot: PublicSnapsho
         <NodeOverviewStat icon={MemoryStick} label="Capacidad activa" value={formatMemory(activeOfferedVramMb)} detail={`${formatMemory(freeVramMb)} libres`} progress={activeOfferedVramMb > 0 ? freeVramMb / activeOfferedVramMb : 0} tone="blue" />
         <NodeOverviewStat icon={Gauge} label="Carga GPU media" value={averageUtilization === null ? "Sin datos" : `${averageUtilization.toFixed(0)}%`} detail={`${telemetryGpus.length} GPU${telemetryGpus.length === 1 ? "" : "s"} con telemetría`} progress={averageUtilization === null ? 0 : averageUtilization / 100} tone="purple" />
         <NodeOverviewStat icon={Zap} label="Rendimiento anunciado" value={activeThroughput > 0 ? `${formatCompactNumber(activeThroughput)} tok/s` : "—"} detail={`${activeDeployments.length} despliegue${activeDeployments.length === 1 ? "" : "s"} activo${activeDeployments.length === 1 ? "" : "s"}`} tone="violet" />
-        <NodeOverviewStat icon={Activity} label="Potencia observada" value={poweredGpus.length > 0 ? formatPower(observedPowerW) : "Sin datos"} detail={poweredGpus.length > 0 ? `${poweredGpus.length} lectura${poweredGpus.length === 1 ? "" : "s"} física${poweredGpus.length === 1 ? "" : "s"}` : "No se estima ni se inventa"} tone="cyan" />
+        <NodeOverviewStat icon={Activity} label="Telemetría de potencia" value={`${poweredGpus.length} / ${activeGpus.length}`} detail={poweredGpus.length > 0 ? `${poweredGpus.length} GPU${poweredGpus.length === 1 ? "" : "s"} enviando lecturas reales` : "Ninguna GPU envía esta lectura"} progress={activeGpus.length > 0 ? poweredGpus.length / activeGpus.length : 0} tone="cyan" />
+        <NodeOverviewStat icon={CirclePower} label="Potencia total del sistema" value={poweredGpus.length > 0 ? formatPower(observedPowerW) : "Sin datos"} detail={poweredGpus.length > 0 ? "Suma de las lecturas actuales" : "No se estima ni se inventa"} tone="orange" />
       </div>
 
       <section className="node-topology-card">
@@ -632,7 +638,7 @@ function NodeInventorySection({ eyebrow, title, workers, snapshot, busy, onRemov
   </>;
 }
 
-function NodeOverviewStat({ icon: Icon, label, value, detail, progress, tone }: { icon: typeof Server; label: string; value: string; detail: string; progress?: number; tone: "green" | "blue" | "purple" | "violet" | "cyan" }) {
+function NodeOverviewStat({ icon: Icon, label, value, detail, progress, tone }: { icon: typeof Server; label: string; value: string; detail: string; progress?: number; tone: "green" | "blue" | "purple" | "violet" | "cyan" | "orange" }) {
   return <article className={`node-overview-stat ${tone}`}><div className="node-overview-icon"><Icon /></div><span>{label}</span><strong>{value}</strong><small>{detail}</small>{progress !== undefined && <div className="node-overview-progress"><i style={{ width: `${Math.max(0, Math.min(1, progress)) * 100}%` }} /></div>}</article>;
 }
 
@@ -651,7 +657,7 @@ function NodeTopologyInspector({ worker, snapshot }: { worker: PublicWorker; sna
 
 function Models({ snapshot, onSearch, onRequest, onRemove, adminToken: initialAdminToken, requiresAdminToken, secureTokenStorage }: {
   snapshot: PublicSnapshot;
-  onSearch: (query: string) => Promise<HubCatalogModel[]>;
+  onSearch: (input: HubCatalogSearchInput) => Promise<HubCatalogPage>;
   onRequest: (input: RequestModelInput, adminToken: string) => Promise<void>;
   onRemove: (modelId: string, adminToken: string) => Promise<void>;
   adminToken: string;
@@ -670,39 +676,88 @@ function Models({ snapshot, onSearch, onRequest, onRemove, adminToken: initialAd
   const [catalogQuery, setCatalogQuery] = useState("");
   const [catalogModels, setCatalogModels] = useState<HubCatalogModel[]>([]);
   const [catalogBusy, setCatalogBusy] = useState(true);
+  const [catalogLoadingMore, setCatalogLoadingMore] = useState(false);
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [catalogOpen, setCatalogOpen] = useState(true);
+  const [catalogNextCursor, setCatalogNextCursor] = useState<string | null>(null);
+  const [catalogSort, setCatalogSort] = useState<HubCatalogSort | "name" | "memory">("downloads");
+  const [catalogStatus, setCatalogStatus] = useState<"all" | "compatible" | "unsupported" | "gated">("all");
+  const [catalogFit, setCatalogFit] = useState<"all" | "fits" | "too-large">("all");
   const searchSequence = useRef(0);
   const selectedCatalogModel = catalogModels.find((model) => model.id === source) ?? null;
+  const catalogRemoteSort: HubCatalogSort = catalogSort === "likes" || catalogSort === "lastModified" ? catalogSort : "downloads";
+  const availableCatalogMemoryMiB = snapshot.workers
+    .filter((worker) => worker.connected && worker.status === "online")
+    .flatMap((worker) => worker.gpus)
+    .reduce((total, gpu) => total + gpu.freeOfferedVramMb, 0);
+  const visibleCatalogModels = useMemo(() => {
+    const filtered = catalogModels.filter((model) => {
+      if (catalogStatus === "compatible" && !model.compatible) return false;
+      if (catalogStatus === "unsupported" && (model.compatible || model.gated)) return false;
+      if (catalogStatus === "gated" && !model.gated) return false;
+      const memory = estimatedHubMemoryMiB(model);
+      if (catalogFit === "fits" && (memory === null || memory > availableCatalogMemoryMiB)) return false;
+      if (catalogFit === "too-large" && (memory === null || memory <= availableCatalogMemoryMiB)) return false;
+      return true;
+    });
+    if (catalogSort === "name") return filtered.toSorted((left, right) => left.id.localeCompare(right.id));
+    if (catalogSort === "memory") return filtered.toSorted((left, right) => (estimatedHubMemoryMiB(left) ?? Number.MAX_SAFE_INTEGER) - (estimatedHubMemoryMiB(right) ?? Number.MAX_SAFE_INTEGER));
+    return filtered;
+  }, [availableCatalogMemoryMiB, catalogFit, catalogModels, catalogSort, catalogStatus]);
 
   useEffect(() => {
     const query = catalogQuery.trim();
     if (query.length === 1) {
       setCatalogModels([]);
+      setCatalogNextCursor(null);
       setCatalogBusy(false);
+      setCatalogLoadingMore(false);
       setCatalogError(null);
       return;
     }
     const sequence = ++searchSequence.current;
     setCatalogBusy(true);
+    setCatalogLoadingMore(false);
     setCatalogError(null);
     const timer = window.setTimeout(() => {
-      void onSearch(query).then(
-        (models) => {
+      void onSearch({ query, sort: catalogRemoteSort, limit: 50 }).then(
+        (page) => {
           if (searchSequence.current !== sequence) return;
-          setCatalogModels(models);
+          setCatalogModels(page.data);
+          setCatalogNextCursor(page.nextCursor);
           setCatalogBusy(false);
         },
         (error: unknown) => {
           if (searchSequence.current !== sequence) return;
           setCatalogModels([]);
+          setCatalogNextCursor(null);
           setCatalogError(errorText(error));
           setCatalogBusy(false);
         },
       );
     }, query ? 320 : 0);
     return () => window.clearTimeout(timer);
-  }, [catalogQuery, onSearch]);
+  }, [catalogQuery, catalogRemoteSort, onSearch]);
+
+  async function loadMoreCatalog() {
+    if (!catalogNextCursor || catalogLoadingMore) return;
+    const sequence = searchSequence.current;
+    setCatalogLoadingMore(true);
+    setCatalogError(null);
+    try {
+      const page = await onSearch({ query: catalogQuery.trim(), cursor: catalogNextCursor, sort: catalogRemoteSort, limit: 50 });
+      if (searchSequence.current !== sequence) return;
+      setCatalogModels((current) => {
+        const known = new Set(current.map((model) => model.id));
+        return [...current, ...page.data.filter((model) => !known.has(model.id))];
+      });
+      setCatalogNextCursor(page.nextCursor);
+    } catch (error) {
+      if (searchSequence.current === sequence) setCatalogError(errorText(error));
+    } finally {
+      if (searchSequence.current === sequence) setCatalogLoadingMore(false);
+    }
+  }
 
   function selectCatalogModel(model: HubCatalogModel) {
     if (!model.compatible) return;
@@ -739,19 +794,32 @@ function Models({ snapshot, onSearch, onRequest, onRemove, adminToken: initialAd
       <div className="model-form-heading"><div><span>HUGGING FACE CATALOG</span><h2>Choose a model for the network</h2><p>Only certified architectures can be selected. No terminal commands or pre-split files.</p></div><Boxes size={24} /></div>
 
       {(!source || catalogOpen) && <>
-        <div className="hub-model-search"><Search size={17} /><input value={catalogQuery} onChange={(event) => setCatalogQuery(event.target.value)} placeholder="Search Qwen, Llama, GLM…" aria-label="Search Hugging Face models" />{catalogBusy && <LoaderCircle className="spin" />}</div>
-        <div className="hub-catalog-heading"><span>{catalogQuery.trim() ? "SEARCH RESULTS" : "POPULAR COMPATIBLE MODELS"}</span><a href="https://huggingface.co/models?pipeline_tag=text-generation" target="_blank" rel="noreferrer">Explore Hugging Face <ExternalLink size={12} /></a></div>
+        <div className="hub-catalog-toolbar">
+          <div className="hub-model-search"><Search size={17} /><input value={catalogQuery} onChange={(event) => setCatalogQuery(event.target.value)} placeholder="Search every Hugging Face text-generation model…" aria-label="Search Hugging Face models" />{catalogBusy && <LoaderCircle className="spin" />}</div>
+          <label><span>STATUS</span><AppSelect ariaLabel="Filter by model status" value={catalogStatus} onChange={(value) => setCatalogStatus(value as typeof catalogStatus)} options={[{ value: "all", label: "All models" }, { value: "compatible", label: "Certified" }, { value: "unsupported", label: "Not supported" }, { value: "gated", label: "Gated" }]} /></label>
+          <label><span>NETWORK FIT</span><AppSelect ariaLabel="Filter by network capacity" value={catalogFit} onChange={(value) => setCatalogFit(value as typeof catalogFit)} options={[{ value: "all", label: "Any size" }, { value: "fits", label: "Fits now" }, { value: "too-large", label: "Needs capacity" }]} /></label>
+          <label><span>SORT BY</span><AppSelect ariaLabel="Sort Hugging Face models" value={catalogSort} onChange={(value) => setCatalogSort(value as typeof catalogSort)} options={[{ value: "downloads", label: "Most downloaded" }, { value: "likes", label: "Most liked" }, { value: "lastModified", label: "Recently updated" }, { value: "name", label: "Name A–Z" }, { value: "memory", label: "Memory low–high" }]} /></label>
+        </div>
+        <div className="hub-catalog-heading"><span>{visibleCatalogModels.length} SHOWN · {catalogModels.length} LOADED FROM HUGGING FACE</span><a href="https://huggingface.co/models?pipeline_tag=text-generation" target="_blank" rel="noreferrer">Explore Hugging Face <ExternalLink size={12} /></a></div>
         {catalogError && <div className="hub-catalog-state error"><CircleAlert size={15} />Catalog unavailable. You can still enter a model manually below.</div>}
         {!catalogError && !catalogBusy && catalogModels.length === 0 && <div className="hub-catalog-state">{catalogQuery.trim().length === 1 ? "Type at least two characters to search." : "No matching models found."}</div>}
-        {catalogModels.length > 0 && <div className="hub-model-grid">{catalogModels.map((model) => {
+        {!catalogError && !catalogBusy && catalogModels.length > 0 && visibleCatalogModels.length === 0 && <div className="hub-catalog-state">No loaded models match these filters. Change a filter or load more results.</div>}
+        {visibleCatalogModels.length > 0 && <div className="hub-model-table-wrap"><table className="hub-model-table">
+          <thead><tr><th>Model</th><th>Architecture</th><th>Memory</th><th>Downloads</th><th>Likes</th><th>Updated</th><th>Status</th><th><span className="sr-only">Select</span></th></tr></thead>
+          <tbody>{visibleCatalogModels.map((model) => {
           const estimatedMemoryMiB = estimatedHubMemoryMiB(model);
-          return <button type="button" key={model.id} className={`hub-model-card ${source === model.id ? "selected" : ""} ${model.compatible ? "compatible" : "unsupported"}`} aria-disabled={!model.compatible} onClick={() => selectCatalogModel(model)} title={model.compatibilityReason ?? `Select ${model.id}`}>
-            <span className="hub-model-card-head"><i><Boxes /></i><strong>{model.id}</strong>{source === model.id && <CheckCircle2 />}</span>
-            <small>{model.architecture ?? model.modelType ?? "Architecture unavailable"}</small>
-            <span className="hub-model-card-memory"><MemoryStick /><span><b>{estimatedMemoryMiB === null ? "Calculating…" : `≈ ${formatMemory(estimatedMemoryMiB)}`}</b><em>BF16 · 4K context</em></span></span>
-            <span className="hub-model-card-meta"><b>{model.compatible ? "CERTIFIED" : model.gated ? "GATED" : "NOT SUPPORTED"}</b><em>{formatHubCount(model.downloads)} downloads</em></span>
-          </button>;
-        })}</div>}
+          const fits = estimatedMemoryMiB !== null && estimatedMemoryMiB <= availableCatalogMemoryMiB;
+          const status = model.compatible ? "Certified" : model.gated ? "Gated" : "Not supported";
+          return <tr key={model.id} className={`${source === model.id ? "selected" : ""} ${model.compatible ? "compatible" : "unsupported"}`} title={model.compatibilityReason ?? undefined}>
+            <td><span className="hub-table-model"><i><Boxes /></i><span><strong>{model.id}</strong><small>{model.author}</small></span></span></td>
+            <td><span className="hub-table-architecture">{model.architecture ?? model.modelType ?? "Unknown"}</span></td>
+            <td><span className={`hub-table-memory ${fits ? "fits" : ""}`}><MemoryStick />{estimatedMemoryMiB === null ? "Unknown" : `≈ ${formatMemory(estimatedMemoryMiB)}`}</span></td>
+            <td>{formatHubCount(model.downloads)}</td><td>{formatHubCount(model.likes)}</td><td>{formatHubDate(model.lastModified)}</td>
+            <td><span className={`hub-status-pill ${model.compatible ? "certified" : model.gated ? "gated" : "unsupported"}`}>{status}</span></td>
+            <td><button type="button" className="hub-table-select" disabled={!model.compatible} onClick={() => selectCatalogModel(model)}>{source === model.id ? <><CheckCircle2 /> Selected</> : "Select"}</button></td>
+          </tr>;
+        })}</tbody></table></div>}
+        {catalogModels.length > 0 && <div className="hub-catalog-pagination"><span>Results are loaded directly from Hugging Face in pages of 50.</span>{catalogNextCursor ? <button type="button" onClick={() => void loadMoreCatalog()} disabled={catalogLoadingMore}>{catalogLoadingMore ? <LoaderCircle className="spin" /> : <Plus />}{catalogLoadingMore ? "Loading…" : "Load 50 more"}</button> : <em>End of results</em>}</div>}
       </>}
 
       {source && <div className="hub-selected-model"><CheckCircle2 /><span><small>SELECTED MODEL</small><strong>{source}</strong><em>It will be published as {modelId}{selectedCatalogModel && estimatedHubMemoryMiB(selectedCatalogModel) !== null ? ` · ≈ ${formatMemory(estimatedHubMemoryMiB(selectedCatalogModel)!)} required` : ""}</em></span><button type="button" onClick={() => setCatalogOpen(true)}>Change model</button></div>}
@@ -802,6 +870,7 @@ function RequestedModelCard({ model, onRemove }: { model: RequestedModelCapacity
   return <article className={`model-request-card ${model.status}`}>
     <div className="model-request-head"><div className="model-request-icon"><Boxes /></div><div><span>{model.source}</span><h2>{model.id}</h2><small>{model.adapterId ?? "Checking architecture"}</small></div><ModelStatus status={model.status} /></div>
     <p className="model-request-message">{model.message}</p>
+    {(model.status === "activating" || model.status === "failed" || (model.activationProgress?.length ?? 0) > 0) && <ActivationProgressLog model={model} />}
     <div className="model-capacity-bar"><i style={{ width: `${progress}%` }} /></div>
     <div className="model-capacity-grid">
       <Metric label="Estimated need" value={model.requiredVramMiB === null ? "Calculating" : formatMemory(model.requiredVramMiB)} />
@@ -899,51 +968,6 @@ function Tests({ bridge }: { bridge: DesktopBridge | undefined }) {
       </div>
       {selected && <BenchmarkRunDetails run={selected} />}
     </>}
-  </section>;
-}
-
-function Roadmap() {
-  return <section className="roadmap-page">
-    <PageTitle eyebrow="FUTURE DIRECTION" title="Roadmap" copy="Dos iniciativas para que mycellios aprenda de la red y recompense el cómputo que realmente aporta valor." />
-    <div className="roadmap-status-banner">
-      <div><Milestone size={20} /><span><small>ESTADO ACTUAL</small><strong>Diseño · todavía no construido</strong></span></div>
-      <p>La hoja de ruta marca la dirección del producto. Cada fase deberá demostrar seguridad, utilidad y resultados medibles antes de activarse en la red.</p>
-    </div>
-    <div className="roadmap-grid">
-      <article className="roadmap-card improvement">
-        <div className="roadmap-card-head">
-          <span className="roadmap-icon"><Sparkles /></span>
-          <span className="roadmap-phase"><i /> INICIATIVA 01</span>
-        </div>
-        <div className="roadmap-metric"><strong>0,1</strong><span>%<small>del cómputo útil</small></span></div>
-        <span className="roadmap-kicker">AUTOMEJORA CONTINUA</span>
-        <h2>Mejorar mycellios cada día</h2>
-        <p>Una pequeña parte de la capacidad agregada se reservará para que agentes autónomos analicen la red, experimenten y propongan mejoras verificables.</p>
-        <ol className="roadmap-steps">
-          <li><b>01</b><span><strong>Observar</strong><small>Detectar fallos, regresiones y cuellos de botella reales.</small></span></li>
-          <li><b>02</b><span><strong>Experimentar</strong><small>Probar cambios en entornos aislados y reproducibles.</small></span></li>
-          <li><b>03</b><span><strong>Validar</strong><small>Conservar solo mejoras que superen tests y métricas.</small></span></li>
-        </ol>
-        <div className="roadmap-card-foot"><ShieldCheck size={16} /><span><strong>Con límites y trazabilidad</strong>El presupuesto no excederá el 0,1 % ni interferirá con las cargas de los usuarios.</span></div>
-      </article>
-
-      <article className="roadmap-card crypto">
-        <div className="roadmap-card-head">
-          <span className="roadmap-icon"><Coins /></span>
-          <span className="roadmap-phase"><i /> INICIATIVA 02</span>
-        </div>
-        <div className="roadmap-metric word"><strong>CRYPTO</strong><span><small>incentivos de red</small></span></div>
-        <span className="roadmap-kicker">TOKEN DE CÓMPUTO</span>
-        <h2>Recompensar el trabajo útil</h2>
-        <p>Un sistema de tokens reconocerá la computación aceptada por la red. Estar conectado no bastará: la recompensa dependerá de trabajo útil, calidad y fiabilidad.</p>
-        <ol className="roadmap-steps">
-          <li><b>01</b><span><strong>Créditos internos</strong><small>Contabilidad verificable, aún sin blockchain ni valor económico.</small></span></li>
-          <li><b>02</b><span><strong>Testnet</strong><small>Pruebas anti-Sybil, antifraude y contratos auditables.</small></span></li>
-          <li><b>03</b><span><strong>Lanzamiento evaluado</strong><small>Economía, seguridad y revisión legal antes de emitir.</small></span></li>
-        </ol>
-        <div className="roadmap-card-foot"><ShieldCheck size={16} /><span><strong>Sin promesas financieras</strong>No existe un token activo; primero deben validarse el modelo y su cumplimiento legal.</span></div>
-      </article>
-    </div>
   </section>;
 }
 
@@ -1153,6 +1177,22 @@ function Machine({ snapshot, bridge, onSnapshot }: { snapshot: DashboardSnapshot
     try { onSnapshot(await bridge.setContribution(!snapshot.settings.contributionEnabled)); }
     finally { setBusy(false); }
   }
+  async function selectComputeMode(computeMode: DesktopSettings["computeMode"]) {
+    if (computeMode === snapshot.settings.computeMode) return;
+    setBusy(true);
+    try { onSnapshot(await bridge.saveSettings({ ...snapshot.settings, computeMode })); }
+    finally { setBusy(false); }
+  }
+  const computeModes: Array<{
+    value: DesktopSettings["computeMode"];
+    label: string;
+    detail: string;
+    Icon: typeof Cpu;
+  }> = [
+    { value: "automatic", label: "Automatic", detail: "Prefer the verified GPU; use CPU only when GPU execution is unavailable.", Icon: Sparkles },
+    { value: "gpu-only", label: "GPU only", detail: "Wait for CUDA, ROCm or MPS. Never run model stages on CPU.", Icon: Zap },
+    { value: "cpu-only", label: "CPU only", detail: "Do not prepare or use the GPU. Contribute with system memory and CPU.", Icon: Cpu },
+  ];
   return <section className="content-page">
     <PageTitle eyebrow="NATIVE NODE" title="This device" copy="Hardware detected on this computer and the resources offered to mycellios." actions={<button disabled={busy} onClick={() => void toggleContribution()}><CirclePower size={16} />{snapshot.settings.contributionEnabled ? "Pause contribution" : "Start contributing"}</button>} />
     <div className="hardware-hero">
@@ -1160,6 +1200,12 @@ function Machine({ snapshot, bridge, onSnapshot }: { snapshot: DashboardSnapshot
       <div><span className="eyebrow">{snapshot.platform.toUpperCase()}</span><h2>{snapshot.localHardware.hostname}</h2><p>{snapshot.localHardware.gpus.length} accelerator(s) · {formatMemory(snapshot.localHardware.ramMb)} RAM</p></div>
       <span className={`state-badge ${snapshot.contribution.state === "connected" ? "online" : snapshot.contribution.state}`}>{contributionLabel}</span>
     </div>
+    <article className="compute-mode-panel">
+      <div className="compute-mode-heading"><div><span>COMPUTE PREFERENCE</span><h2>Choose how this device contributes</h2><p>The coordinator will only use CPU when this device explicitly allows it.</p></div><b>{snapshot.settings.computeMode === "automatic" ? "RECOMMENDED" : "USER SELECTED"}</b></div>
+      <div className="compute-mode-grid" role="radiogroup" aria-label="Compute preference">
+        {computeModes.map(({ value, label, detail, Icon }) => <button type="button" role="radio" aria-checked={snapshot.settings.computeMode === value} className={snapshot.settings.computeMode === value ? "active" : ""} disabled={busy} onClick={() => void selectComputeMode(value)} key={value}><span><Icon /></span><strong>{label}</strong><small>{detail}</small>{snapshot.settings.computeMode === value && <CheckCircle2 />}</button>)}
+      </div>
+    </article>
     <AcceleratorProgressPanel acceleration={snapshot.acceleration} contributionState={snapshot.contribution.state} />
     <div className="cards-grid">
       {snapshot.localHardware.gpus.map((gpu) => {
@@ -1200,6 +1246,69 @@ function AcceleratorCompactBanner({ acceleration, contributionState, onOpen }: {
     </div>}
     <button type="button" onClick={onOpen} aria-label="Open GPU setup details">View setup <ChevronRight /></button>
   </article>;
+}
+
+function ActivationProgressLog({ model }: { model: RequestedModelCapacity }) {
+  const events: RequestedModelCapacity["activationProgress"] = (model.activationProgress?.length ?? 0) > 0
+    ? model.activationProgress
+    : [{
+        phase: "queued",
+        message: model.status === "failed"
+          ? friendlyActivationFailure(model.message)
+          : "Waiting for the coordinator to begin activation.",
+        at: model.activationRequestedAt ?? model.updatedAt,
+        state: model.status === "failed" ? "failed" as const : "running" as const,
+        ...(model.status === "failed" ? { details: fallbackActivationDetails(model.message) } : {}),
+      }];
+  return <div className="model-activation-log" aria-live="polite">
+    <div className="model-activation-log-head"><span><Activity size={14} /> LIVE ACTIVATION LOG</span><small>{events.length} step{events.length === 1 ? "" : "s"}</small></div>
+    <ol>{events.map((event, index) => <li className={event.state} key={`${event.phase}-${event.at}-${index}`}>
+      <i>{event.state === "running" ? <LoaderCircle className="spin" /> : event.state === "failed" ? <CircleAlert /> : <CheckCircle2 />}</i>
+      <span><strong>{activationPhaseLabel(event.phase)}</strong><small>{event.message}</small>{(event.nodeId || event.device) && <em>{event.nodeId && <>NODE · {shortId(event.nodeId)}</>}{event.nodeId && event.device && <> &nbsp;·&nbsp; </>}{event.device && <>DEVICE · {event.device.toUpperCase()}</>}</em>}</span>
+      <time dateTime={event.at}>{formatActivationTime(event.at)}</time>
+      {(event.details?.length ?? 0) > 0 && <details className="model-activation-details"><summary>View technical details</summary><div>{event.details!.map((detail, detailIndex) => <code key={`${detail}-${detailIndex}`}>{detail}</code>)}</div></details>}
+    </li>)}</ol>
+  </div>;
+}
+
+function friendlyActivationFailure(message: string): string {
+  if (message.includes("3221225477")) {
+    return "A Windows accelerator process crashed while loading the model stage. Capacity was available, but the runtime could not complete the load.";
+  }
+  return message.replace(/^Automatic activation failed:\s*/i, "") || "The model runtime stopped before activation completed.";
+}
+
+function fallbackActivationDetails(message: string): string[] {
+  const details: string[] = [];
+  const stage = /(?:stage-|process=)([a-z0-9-]+)/i.exec(message)?.[1];
+  const code = /code=(\d+)/i.exec(message)?.[1];
+  if (stage) details.push(`Failed stage: ${stage}`);
+  if (code === "3221225477") details.push("Windows exit code: 3221225477 · 0xC0000005 · native memory access violation");
+  else if (code) details.push(`Process exit code: ${code}`);
+  details.push("The capacity calculation passed; this failure happened during runtime startup.");
+  return details;
+}
+
+function activationPhaseLabel(phase: string): string {
+  return ({
+    queued: "Request accepted",
+    profiling: "Profiling model",
+    profile_ready: "Profile complete",
+    plan_ready: "Distribution calculated",
+    preparing_nodes: "Preparing nodes",
+    launching_stages: "Launching model stages",
+    stages_ready: "Stages online",
+    checking_health: "Checking pipeline",
+    running_canary: "Testing real inference",
+    publishing_model: "Publishing model",
+    active: "Activation complete",
+    failed: "Activation failed",
+  } as Record<string, string>)[phase] ?? phase.replaceAll("_", " ");
+}
+
+function formatActivationTime(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "—" : date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 function AcceleratorProgressPanel({ acceleration, contributionState }: { acceleration: AcceleratorProgressSnapshot; contributionState: DashboardSnapshot["contribution"]["state"] }) {
@@ -1329,7 +1438,7 @@ function DesktopSettingsView({ snapshot, bridge, onSnapshot }: { snapshot: Dashb
     <PageTitle eyebrow="DESKTOP PREFERENCES" title="Settings" copy="Native connection, contribution, background behavior and updates for this computer." />
     {error && <div className="inline-error"><CircleAlert size={17} />{error}</div>}
     <div className="settings-section"><div><Globe2 size={20} /><div><h3>Coordinator</h3><p>Use the public network or host an isolated local coordinator.</p></div></div><div className="settings-fields"><label>Mode<AppSelect ariaLabel="Coordinator mode" value={draft.coordinatorMode} onChange={(value) => updateCoordinatorMode(value as DesktopSettings["coordinatorMode"])} options={[{ value: "remote", label: "Public mycellios network" }, { value: "local", label: "Local network on this machine" }]} /></label>{draft.coordinatorMode === "remote" && <label>Coordinator URL<input value={draft.remoteCoordinatorUrl} onChange={(event) => update("remoteCoordinatorUrl", event.target.value)} /></label>}<label>Region<input value={draft.region} onChange={(event) => update("region", event.target.value)} placeholder="auto" /></label></div></div>
-    <div className="settings-section"><div><Gauge size={20} /><div><h3>Contribution</h3><p>Register real hardware only, or expose a model through a verified local runtime.</p></div></div><div className="settings-fields"><label>Runtime<AppSelect ariaLabel="Contribution runtime" value={draft.adapterMode} onChange={(value) => update("adapterMode", value as DesktopSettings["adapterMode"])} options={[{ value: "connectivity-test", label: "Hardware only (no model)" }, { value: "local-model-runtime", label: "Local local model runtime" }]} /></label><label>Offered VRAM (GB)<input type="number" min="1" step="1" value={draft.offeredVramMb / 1_024} onChange={(event) => update("offeredVramMb", Math.round(Number(event.target.value) * 1_024))} /></label>{draft.adapterMode === "local-model-runtime" && <><label>local model runtime model<input value={draft.modelName} onChange={(event) => update("modelName", event.target.value)} /></label><label>local model runtime URL<input value={draft.adapterBaseUrl} onChange={(event) => update("adapterBaseUrl", event.target.value)} /></label><label>Pinned digest<input value={draft.modelDigest} onChange={(event) => update("modelDigest", event.target.value)} placeholder="sha256:…" /></label></>}</div></div>
+    <div className="settings-section"><div><Gauge size={20} /><div><h3>Contribution</h3><p>Register real hardware only, or expose a model through a verified local runtime.</p></div></div><div className="settings-fields"><label>Compute mode<AppSelect ariaLabel="Compute mode" value={draft.computeMode} onChange={(value) => update("computeMode", value as DesktopSettings["computeMode"])} options={[{ value: "automatic", label: "Automatic · GPU preferred" }, { value: "gpu-only", label: "GPU only · never CPU" }, { value: "cpu-only", label: "CPU only · GPU disabled" }]} /></label><label>Runtime<AppSelect ariaLabel="Contribution runtime" value={draft.adapterMode} onChange={(value) => update("adapterMode", value as DesktopSettings["adapterMode"])} options={[{ value: "connectivity-test", label: "Hardware only (no model)" }, { value: "local-model-runtime", label: "Local local model runtime" }]} /></label><label>Offered memory (GB)<input type="number" min="1" step="1" value={draft.offeredVramMb / 1_024} onChange={(event) => update("offeredVramMb", Math.round(Number(event.target.value) * 1_024))} /></label>{draft.adapterMode === "local-model-runtime" && <><label>local model runtime model<input value={draft.modelName} onChange={(event) => update("modelName", event.target.value)} /></label><label>local model runtime URL<input value={draft.adapterBaseUrl} onChange={(event) => update("adapterBaseUrl", event.target.value)} /></label><label>Pinned digest<input value={draft.modelDigest} onChange={(event) => update("modelDigest", event.target.value)} placeholder="sha256:…" /></label></>}</div></div>
     <div className="settings-section compact-settings"><div><SlidersHorizontal size={20} /><div><h3>Application</h3><p>Startup and background contribution.</p></div></div><div className="toggle-list"><Toggle label="Start with the system" checked={draft.launchAtLogin} onChange={(value) => update("launchAtLogin", value)} /><Toggle label="Keep running in the tray" checked={draft.closeToTray} onChange={(value) => update("closeToTray", value)} /><Toggle label="Contribute resources" checked={draft.contributionEnabled} onChange={(value) => update("contributionEnabled", value)} /></div></div>
     <div className="settings-section"><div><Download size={20} /><div><h3>Automatic updates</h3><p>Desktop releases are checked and downloaded in the background when supported.</p></div></div><div className="update-settings"><div><span className={`update-state ${snapshot.update.state}`}>{updateStateLabel(snapshot.update.state)}</span><strong>Version {snapshot.appVersion}</strong><p>{snapshot.update.message}</p></div><div className="update-actions"><button className="secondary-button" disabled={checkingUpdate || snapshot.update.state === "checking" || snapshot.update.state === "downloading"} onClick={() => void checkUpdate()}><RefreshCw className={checkingUpdate ? "spin" : ""} size={15} />Check now</button>{snapshot.update.state === "ready" && <button className="primary-button" onClick={() => void bridge.installUpdate()}><Download size={15} />Restart and update</button>}</div></div></div>
     <div className="settings-footer"><button className="primary-button" disabled={saving} onClick={() => void save()}>{saving ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}Save and reconnect</button></div>
@@ -1447,6 +1556,13 @@ function networkNameForHubModel(source: string): string {
 }
 function formatHubCount(value: number): string {
   return new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 }).format(value);
+}
+
+function formatHubDate(value: string | null): string {
+  if (!value) return "Unknown";
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "Unknown";
+  return new Intl.DateTimeFormat("en", { month: "short", day: "numeric", year: "numeric" }).format(date);
 }
 
 function estimatedHubMemoryMiB(model: HubCatalogModel): number | null {
@@ -1750,7 +1866,7 @@ function executionShortLabel(execution: EffectiveExecutionSummary): string {
   if (!execution.verified) return "UNVERIFIED";
   if (execution.deviceType === "cpu") return execution.fallback ? "CPU FALLBACK" : "CPU ACTIVE";
   if (execution.deviceType === "gpu") return "GPU ACTIVE";
-  return execution.fallback ? "MIXED · FALLBACK" : "MIXED CPU + GPU";
+  return execution.fallback ? "MIXED · FALLBACK" : "HYBRID · AUTHORIZED";
 }
 
 function executionDetail(execution: EffectiveExecutionSummary): string {

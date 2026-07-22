@@ -1,5 +1,5 @@
 import type { StoredRequestedModel, StoredWorker } from "../storage/store.js";
-import type { HubCatalogModel } from "../contracts/types.js";
+import type { HubCatalogModel, HubCatalogPage, HubCatalogSearchInput } from "../contracts/types.js";
 
 const MIB = 1024 * 1024;
 const MAX_SAFETENSORS_HEADER_BYTES = 64 * MIB;
@@ -8,13 +8,16 @@ const HUB_MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}\/[A-Za-z0-9][A-Za-z0-9._-
 export async function searchHubModelCatalog(
   query: string,
   fetcher: typeof fetch = fetch,
-): Promise<HubCatalogModel[]> {
+  options: Omit<HubCatalogSearchInput, "query"> = {},
+): Promise<HubCatalogPage> {
   const normalizedQuery = query.trim().slice(0, 80);
+  const limit = Math.max(10, Math.min(100, Math.round(options.limit ?? 50)));
+  const sort = options.sort === "likes" || options.sort === "lastModified" ? options.sort : "downloads";
   const parameters = new URLSearchParams({
     pipeline_tag: "text-generation",
-    sort: "downloads",
+    sort,
     direction: "-1",
-    limit: normalizedQuery ? "30" : "80",
+    limit: String(limit),
   });
   for (const property of [
     "author",
@@ -28,6 +31,7 @@ export async function searchHubModelCatalog(
     "tags",
   ]) parameters.append("expand", property);
   if (normalizedQuery) parameters.set("search", normalizedQuery);
+  if (options.cursor) parameters.set("cursor", options.cursor.slice(0, 4_096));
 
   const response = await fetcher(`https://huggingface.co/api/models?${parameters.toString()}`, {
     headers: { accept: "application/json" },
@@ -78,11 +82,25 @@ export async function searchHubModelCatalog(
     }];
   });
 
-  const sorted = models.toSorted((left, right) => Number(right.compatible) - Number(left.compatible) || right.downloads - left.downloads);
-  const visible = normalizedQuery
-    ? sorted
-    : sorted.filter((model) => model.compatible && model.likes >= 20);
-  return visible.slice(0, normalizedQuery ? 12 : 6);
+  return {
+    data: models,
+    nextCursor: nextHubCursor(response.headers.get("link")),
+  };
+}
+
+function nextHubCursor(linkHeader: string | null): string | null {
+  if (!linkHeader) return null;
+  for (const link of linkHeader.split(",")) {
+    if (!/rel\s*=\s*"?next"?/i.test(link)) continue;
+    const target = link.match(/<([^>]+)>/)?.[1];
+    if (!target) continue;
+    try {
+      return new URL(target).searchParams.get("cursor");
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 function hubSafetensorsParameterCount(value: unknown): number | null {
@@ -143,9 +161,21 @@ export interface RequestedModelCapacityView {
   weightBytes: number | null;
   contextTokens: number;
   message: string;
+  activationProgress: readonly ModelActivationProgressEvent[];
   activationRequestedAt: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface ModelActivationProgressEvent {
+  phase: string;
+  message: string;
+  at: string;
+  state: "running" | "completed" | "failed";
+  nodeId?: string;
+  processId?: string;
+  device?: string;
+  details?: readonly string[];
 }
 
 export interface ModelExecutionCapacityNode {
@@ -212,6 +242,7 @@ export function requestedModelCapacityViews(input: {
   connectedWorkerIds: ReadonlySet<string>;
   activeModelIds: ReadonlySet<string>;
   executionNodesForModel?: (modelId: string) => readonly ModelExecutionCapacityNode[];
+  activationProgressForModel?: (modelId: string) => readonly ModelActivationProgressEvent[];
   activationAvailable?: boolean;
 }): RequestedModelCapacityView[] {
   const workerCapacity = input.workers
@@ -289,6 +320,7 @@ export function requestedModelCapacityViews(input: {
       weightBytes: profile?.weightBytes ?? null,
       contextTokens: request.contextTokens,
       message,
+      activationProgress: input.activationProgressForModel?.(request.id) ?? [],
       activationRequestedAt: request.activationRequestedAt === null
         ? null
         : new Date(request.activationRequestedAt).toISOString(),

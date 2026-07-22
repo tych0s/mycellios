@@ -6,6 +6,7 @@ import {
 } from "../contracts/schemas.js";
 import type {
   CompletionResult,
+  ComputeMode,
   JobPayload,
   WorkerCapabilities,
   WorkerEnvelope,
@@ -76,6 +77,8 @@ export interface WorkerAgentOptions {
     stagePort: number;
     launchAgent: LaunchAgent;
     pythonExecutable?: string;
+    computeMode?: ComputeMode;
+    cpuEligible?: boolean;
   };
   logger?: Pick<Console, "info" | "warn" | "error">;
 }
@@ -254,15 +257,21 @@ export class WorkerAgent {
 
   /**
    * Refresh the capacity published to the coordinator after a physical GPU
-   * probe succeeds or a native runtime is invalidated. This deliberately does
-   * not reconnect the worker: CPU work already in flight must not be aborted
-   * just because GPU setup completed in the background.
+   * probe succeeds or a native runtime is invalidated. Re-registration updates
+   * the full capability document (vendor, model and memory kind); a heartbeat
+   * alone can only update values for devices the coordinator already knows.
+   * This deliberately keeps the existing socket and active work in place.
    */
   async refreshRuntimeCapacity(
     runtime: VerifiedGpuRuntimeEvidence | undefined,
+    executorPolicy?: { computeMode: ComputeMode; cpuEligible: boolean },
   ): Promise<void> {
     const generation = ++this.runtimeCapacityGeneration;
     this.options.verifiedGpuRuntime = runtime;
+    if (executorPolicy && this.options.distributedExecutor) {
+      this.options.distributedExecutor.computeMode = executorPolicy.computeMode;
+      this.options.distributedExecutor.cpuEligible = executorPolicy.cpuEligible;
+    }
     if (!this.capabilities || this.config.capacityScope !== "host") return;
 
     const hardware = await (this.options.hardwareProbe?.() ?? probeHardware());
@@ -295,6 +304,7 @@ export class WorkerAgent {
         peakVramMb: this.config.deployment.peakVramMb ?? defaultPeakVramMb,
       })),
     };
+    if (this.registeredWorkerId) await this.register();
     await this.sendHeartbeat();
   }
 
@@ -435,6 +445,8 @@ export class WorkerAgent {
               stageHost: this.options.distributedExecutor.stageHost,
               stagePort: this.options.distributedExecutor.stagePort,
               runtime: "python-safetensors" as const,
+              computeMode: this.options.distributedExecutor.computeMode ?? "automatic",
+              cpuEligible: this.options.distributedExecutor.cpuEligible === true,
             },
           }
         : {}),

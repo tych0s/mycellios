@@ -165,7 +165,30 @@ describe("worker protocol schemas", () => {
       },
     };
 
-    expect(workerHeartbeatEnvelopeSchema.safeParse(heartbeat).success).toBe(true);
+    const legacyHeartbeat = workerHeartbeatEnvelopeSchema.parse(heartbeat);
+    expect(legacyHeartbeat.payload.capabilities.distributedExecutor).toMatchObject({
+      computeMode: "automatic",
+      cpuEligible: false,
+    });
+
+    const cpuAuthorizedHeartbeat = workerHeartbeatEnvelopeSchema.parse({
+      ...heartbeat,
+      payload: {
+        ...heartbeat.payload,
+        capabilities: {
+          ...heartbeat.payload.capabilities,
+          distributedExecutor: {
+            ...heartbeat.payload.capabilities.distributedExecutor,
+            computeMode: "cpu-only",
+            cpuEligible: true,
+          },
+        },
+      },
+    });
+    expect(cpuAuthorizedHeartbeat.payload.capabilities.distributedExecutor).toMatchObject({
+      computeMode: "cpu-only",
+      cpuEligible: true,
+    });
     expect(workerHeartbeatEnvelopeSchema.safeParse({
       ...heartbeat,
       payload: {

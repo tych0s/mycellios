@@ -38,6 +38,8 @@ type CapabilityHarness = { buildCapabilities(): Promise<{ gpus: Array<{
 
 type MutableCapabilityHarness = CapabilityHarness & {
   capabilities: Awaited<ReturnType<CapabilityHarness["buildCapabilities"]>> | null;
+  registeredWorkerId?: string;
+  register(): Promise<void>;
   sendHeartbeat(): Promise<void>;
 };
 
@@ -107,6 +109,30 @@ describe("worker capacity truth", () => {
       sharedMemoryMb: 4_096,
       offeredVramMb: 4_096,
     });
+  });
+
+  it("re-registers the full capability document before its capacity heartbeat", async () => {
+    const agent = new WorkerAgent(config, {
+      coordinatorUrl: "http://127.0.0.1:9999",
+      reconnect: false,
+      hardwareProbe,
+      logger: { info() {}, warn() {}, error() {} },
+    });
+    const harness = agent as unknown as MutableCapabilityHarness;
+    harness.capabilities = await harness.buildCapabilities();
+    harness.registeredWorkerId = "worker-capacity";
+    const events: string[] = [];
+    harness.register = async () => { events.push("register"); };
+    harness.sendHeartbeat = async () => { events.push("heartbeat"); };
+
+    await agent.refreshRuntimeCapacity({
+      status: "gpu-ready",
+      backend: "cuda",
+      deviceName: "GeForce RTX 4090",
+    });
+
+    expect(events).toEqual(["register", "heartbeat"]);
+    expect(harness.capabilities?.gpus[0]).toMatchObject({ vendor: "nvidia" });
   });
 
   it("keeps the newest runtime evidence when capacity probes overlap", async () => {

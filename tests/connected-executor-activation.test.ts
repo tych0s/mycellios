@@ -57,6 +57,68 @@ describe("connected executor activation", () => {
     expect(snapshot.config).toBeNull();
   });
 
+  it("waits for verified GPU capacity instead of distributing a permanent CPU fallback", () => {
+    const gpuWorker = worker("worker-gpu", "node-gpu", "node-gpu.relay", 9_850, 4_096, 3_500, 10);
+    const cpuWorker = worker("worker-cpu", "node-cpu", "node-cpu.relay", 9_850, 4_096, 3_500, 10);
+    cpuWorker.capabilities.gpus[0]!.id = "cpu-memory";
+    cpuWorker.capabilities.gpus[0]!.vendor = "cpu";
+    cpuWorker.capabilities.gpus[0]!.model = "Intel CPU · system-memory fallback";
+    cpuWorker.capabilities.gpus[0]!.physicalVramMb = 0;
+    cpuWorker.capabilities.gpus[0]!.sharedMemoryMb = 4_096;
+
+    const snapshot = buildConnectedExecutorActivationSnapshot(
+      baseConfig(),
+      [gpuWorker, cpuWorker],
+      new Set([gpuWorker.id, cpuWorker.id]),
+    );
+
+    expect(snapshot.capacityNodes).toEqual([{ id: "node-gpu", availableVramMiB: 3_500 }]);
+    expect(snapshot.config).toBeNull();
+  });
+
+  it("accepts CPU capacity only when the desktop explicitly authorizes it", () => {
+    const gpuWorker = worker("worker-gpu", "node-gpu", "node-gpu.relay", 9_850, 4_096, 3_500, 10);
+    const cpuWorker = worker("worker-cpu", "node-cpu", "node-cpu.relay", 9_850, 4_096, 3_500, 10);
+    Object.assign(cpuWorker.capabilities.gpus[0]!, {
+      id: "cpu-memory",
+      vendor: "cpu",
+      model: "Intel CPU · system-memory",
+      physicalVramMb: 0,
+      sharedMemoryMb: 4_096,
+    });
+    Object.assign(cpuWorker.capabilities.distributedExecutor!, {
+      computeMode: "cpu-only",
+      cpuEligible: true,
+    });
+
+    const snapshot = buildConnectedExecutorActivationSnapshot(
+      baseConfig(),
+      [gpuWorker, cpuWorker],
+      new Set([gpuWorker.id, cpuWorker.id]),
+    );
+
+    expect(snapshot.capacityNodes.map((node) => node.id)).toEqual(["node-gpu", "node-cpu"]);
+    expect(snapshot.config?.nodes.map((node) => node.id)).toEqual(["node-gpu", "node-cpu"]);
+  });
+
+  it("never schedules CPU capacity from a GPU-only desktop", () => {
+    const cpuWorker = worker("worker-cpu", "node-cpu", "node-cpu.relay", 9_850, 4_096, 3_500, 10);
+    cpuWorker.capabilities.gpus[0]!.vendor = "cpu";
+    Object.assign(cpuWorker.capabilities.distributedExecutor!, {
+      computeMode: "gpu-only",
+      cpuEligible: true,
+    });
+
+    const snapshot = buildConnectedExecutorActivationSnapshot(
+      baseConfig(),
+      [cpuWorker],
+      new Set([cpuWorker.id]),
+    );
+
+    expect(snapshot.capacityNodes).toEqual([]);
+    expect(snapshot.config).toBeNull();
+  });
+
   it("does not mix legacy direct-LAN executors into a relay topology", () => {
     const relayWorker = worker("worker-relay", "node-relay", "node-relay.relay", 9_850, 4_096, 3_500, 10);
     const legacyWorker = worker("worker-legacy", "node-legacy", "192.168.1.20", 9_850, 4_096, 3_500, 10);

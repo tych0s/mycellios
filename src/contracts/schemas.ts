@@ -237,6 +237,10 @@ export const workerCapabilitiesSchema = z.object({
       stageHost: z.string().min(1).max(253),
       stagePort: z.number().int().min(1).max(65_535),
       runtime: z.literal("python-safetensors"),
+      computeMode: z.enum(["automatic", "gpu-only", "cpu-only"]).default("automatic"),
+      // Legacy clients must never gain CPU scheduling consent merely by
+      // upgrading the coordinator; only a new client can opt in explicitly.
+      cpuEligible: z.boolean().default(false),
     })
     .strict()
     .optional(),

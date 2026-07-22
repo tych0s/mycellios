@@ -9,13 +9,14 @@ import {
 import type { StoredRequestedModel, StoredWorker } from "../src/storage/store.js";
 
 describe("requested model capacity catalog", () => {
-  it("searches the public Hub catalog and prioritizes selectable certified models", async () => {
+  it("searches and paginates the public Hub catalog without hiding unsupported models", async () => {
     const results = await searchHubModelCatalog("qwen", async (input) => {
       const url = new URL(String(input));
       expect(url.searchParams.get("search")).toBe("qwen");
       expect(url.searchParams.get("pipeline_tag")).toBe("text-generation");
       expect(url.searchParams.getAll("expand")).toContain("safetensors");
       expect(url.searchParams.getAll("expand")).toContain("config");
+      expect(url.searchParams.get("limit")).toBe("50");
       return Response.json([
         {
           id: "org/unsupported-popular",
@@ -40,16 +41,17 @@ describe("requested model capacity catalog", () => {
           safetensors: { parameters: { BF16: 751_632_384 }, total: 751_632_384 },
           config: { model_type: "qwen3", architectures: ["Qwen3ForCausalLM"] },
         },
-      ]);
+      ], { headers: { link: '<https://huggingface.co/api/models?cursor=next-page-token>; rel="next"' } });
     });
 
-    expect(results.map((model) => model.id)).toEqual(["Qwen/Qwen3-0.6B", "org/unsupported-popular"]);
-    expect(results[0]?.compatible).toBe(true);
-    expect(results[0]?.adapterId).toBe("transformers-qwen3-v1");
-    expect(results[0]?.parameterCount).toBe(751_632_384);
-    expect(results[0]?.estimatedMemoryMiB).toBeGreaterThan(1_500);
-    expect(results[1]?.compatible).toBe(false);
-    expect(results[1]?.compatibilityReason).toContain("certified");
+    expect(results.data.map((model) => model.id)).toEqual(["org/unsupported-popular", "Qwen/Qwen3-0.6B"]);
+    expect(results.nextCursor).toBe("next-page-token");
+    expect(results.data[1]?.compatible).toBe(true);
+    expect(results.data[1]?.adapterId).toBe("transformers-qwen3-v1");
+    expect(results.data[1]?.parameterCount).toBe(751_632_384);
+    expect(results.data[1]?.estimatedMemoryMiB).toBeGreaterThan(1_500);
+    expect(results.data[0]?.compatible).toBe(false);
+    expect(results.data[0]?.compatibilityReason).toContain("certified");
   });
 
   it("profiles a compatible Hub checkpoint from metadata without downloading weights", async () => {

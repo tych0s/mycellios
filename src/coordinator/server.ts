@@ -33,6 +33,19 @@ import {
 } from "./release-upload.js";
 import { WorkerHub } from "./worker-hub.js";
 
+export function automaticActivationFailureIsTransient(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return [
+    "distributed_worker_disconnected:",
+    "distributed_worker_not_connected:",
+    "worker_tunnel_prepare_timeout",
+    "gpu_only_runtime_not_ready",
+    "gpu_model_stage_unavailable_after_retries:",
+    "launch_readiness_timeout:",
+    "coordinator_worker_registration_timeout",
+  ].some((marker) => normalized.includes(marker));
+}
+
 export interface CoordinatorRuntime {
   app: FastifyInstance;
   database: MeshDatabase;
@@ -188,10 +201,15 @@ export async function createCoordinator(
     if (!activationManager || activationManager.isManaging(model.id) || activationManager.isBusy()) return;
     void activationManager.activate(model).catch((error: unknown) => {
       if (store.getRequestedModel(model.id)) {
-        store.setRequestedModelActivationError(
-          model.id,
-          error instanceof Error ? error.message : String(error),
-        );
+        const message = error instanceof Error ? error.message : String(error);
+        if (automaticActivationFailureIsTransient(message)) {
+          // Keep auto-activation eligible. Capacity reconciliation will wait
+          // while the node is absent/being re-verified and launch again when
+          // the required GPU topology is healthy.
+          store.setRequestedModelActivation(model.id, false);
+        } else {
+          store.setRequestedModelActivationError(model.id, message);
+        }
       }
     });
   };
@@ -209,6 +227,9 @@ export async function createCoordinator(
       activeModelIds,
       ...(activationManager
         ? { executionNodesForModel: (modelId: string) => activationManager.capacityNodesForModel(modelId) }
+        : {}),
+      ...(activationManager?.activationProgressForModel
+        ? { activationProgressForModel: (modelId: string) => activationManager.activationProgressForModel!(modelId) }
         : {}),
       activationAvailable: activationManager !== undefined,
     });
@@ -273,9 +294,9 @@ export async function createCoordinator(
   });
 
   app.get("/public/v1/huggingface-models", async (request, reply) => {
-    const { q } = huggingFaceModelSearchSchema.parse(request.query);
+    const { q, cursor, sort, limit } = huggingFaceModelSearchSchema.parse(request.query);
     try {
-      return { data: await searchHubModelCatalog(q) };
+      return await searchHubModelCatalog(q, fetch, { ...(cursor ? { cursor } : {}), sort, limit });
     } catch (error) {
       return reply.code(502).send({
         error: {
@@ -419,6 +440,7 @@ export async function createCoordinator(
       gpus: worker.capabilities.gpus,
       deployments: worker.capabilities.deployments,
       executionNodeId: worker.capabilities.distributedExecutor?.nodeId,
+      computeMode: worker.capabilities.distributedExecutor?.computeMode,
       llmfit: worker.capabilities.llmfit,
       reliability: worker.reliability,
       jobsCompleted: worker.jobsCompleted,
@@ -677,6 +699,9 @@ const benchmarkRunRequestSchema = z.object({
 
 const huggingFaceModelSearchSchema = z.object({
   q: z.string().trim().max(80).default(""),
+  cursor: z.string().trim().max(4_096).optional(),
+  sort: z.enum(["downloads", "likes", "lastModified"]).default("downloads"),
+  limit: z.coerce.number().int().min(10).max(100).default(50),
 });
 
 const requestedModelCreateSchema = z.object({
@@ -815,6 +840,7 @@ function dashboardWorkers(store: MeshStore, hub: WorkerHub, mobileHub: MobileCom
       gpus: worker.capabilities.gpus,
       deployments: worker.capabilities.deployments,
       executionNodeId: worker.capabilities.distributedExecutor?.nodeId,
+      computeMode: worker.capabilities.distributedExecutor?.computeMode,
       reliability: worker.reliability,
       jobsCompleted: worker.jobsCompleted,
       lastSeenAt: new Date(worker.lastSeenAt).toISOString(),
@@ -857,6 +883,9 @@ function publicSnapshot(
     activeModelIds: new Set(models.map((model) => model.id)),
     ...(activationManager
       ? { executionNodesForModel: (modelId: string) => activationManager.capacityNodesForModel(modelId) }
+      : {}),
+    ...(activationManager?.activationProgressForModel
+      ? { activationProgressForModel: (modelId: string) => activationManager.activationProgressForModel!(modelId) }
       : {}),
     activationAvailable: activationManager !== undefined,
   });

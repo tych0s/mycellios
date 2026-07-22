@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ModelActivationManager } from "../src/coordinator/model-activation-manager.js";
-import { createCoordinator, type CoordinatorRuntime } from "../src/coordinator/server.js";
+import {
+  automaticActivationFailureIsTransient,
+  createCoordinator,
+  type CoordinatorRuntime,
+} from "../src/coordinator/server.js";
 import type { StoredRequestedModel } from "../src/storage/store.js";
 
 describe("requested model API activation flow", () => {
@@ -89,6 +93,21 @@ describe("requested model API activation flow", () => {
         message: "The network administrator token is missing or invalid.",
       },
     });
+  });
+});
+
+describe("automatic activation recovery", () => {
+  it.each([
+    "distributed_worker_disconnected:wrk-test",
+    "gpu_only_runtime_not_ready",
+    "launch_process_exited:stage-1:gpu_model_stage_unavailable_after_retries:cuda:out of memory",
+    "launch_readiness_timeout:stage-1:600000",
+  ])("retries transient distributed failure %s", (message) => {
+    expect(automaticActivationFailureIsTransient(message)).toBe(true);
+  });
+
+  it("keeps deterministic model incompatibility as an actionable failure", () => {
+    expect(automaticActivationFailureIsTransient("unsupported_model_architecture:qwen-next")).toBe(false);
   });
 });
 

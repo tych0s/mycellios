@@ -73,7 +73,14 @@ export class WorkerTunnelLaunchAgent implements LaunchAgent {
     }
     const abort = () => void this.stop(requestId, "launch_aborted");
     signal.addEventListener("abort", abort, { once: true });
-    void start.exited.promise.finally(() => signal.removeEventListener("abort", abort));
+    // Do not use an ignored `finally()` here. `finally()` returns a second
+    // promise which rejects when the worker disconnects; leaving that derived
+    // promise unobserved used to terminate the coordinator process even though
+    // the supervisor was already handling the original rejection.
+    void start.exited.promise.then(
+      () => signal.removeEventListener("abort", abort),
+      () => signal.removeEventListener("abort", abort),
+    );
     return {
       ready: start.ready.promise,
       exited: start.exited.promise,

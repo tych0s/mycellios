@@ -5,6 +5,7 @@ import type {
   ChatStreamUpdate,
   DesktopBridge,
   DesktopSettings,
+  HubCatalogSearchInput,
   RequestModelInput,
 } from "./contracts.js";
 
@@ -29,7 +30,7 @@ const bridge: DesktopBridge = Object.freeze({
   },
   removeWorker: (workerId: string) => ipcRenderer.invoke("workers:remove", workerId),
   clearOfflineWorkers: () => ipcRenderer.invoke("workers:clear-offline"),
-  searchHubModels: (query: string) => ipcRenderer.invoke("models:search-hub", query),
+  searchHubModels: (input: HubCatalogSearchInput) => ipcRenderer.invoke("models:search-hub", input),
   requestModel: (input: RequestModelInput, adminToken?: string) => ipcRenderer.invoke("models:request", input, adminToken),
   removeRequestedModel: (modelId: string, adminToken?: string) => ipcRenderer.invoke("models:remove-request", modelId, adminToken),
   getBenchmarkRuns: () => ipcRenderer.invoke("benchmarks:read"),

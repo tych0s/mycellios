@@ -1,13 +1,15 @@
 export type CoordinatorMode = "local" | "remote";
 export type AdapterMode = "connectivity-test" | "local-model-runtime";
-import type { HubCatalogModel } from "../contracts/types.js";
-export type { HubCatalogModel } from "../contracts/types.js";
+import type { ComputeMode, HubCatalogModel, HubCatalogPage, HubCatalogSearchInput, HubCatalogSort } from "../contracts/types.js";
+export type { ComputeMode } from "../contracts/types.js";
+export type { HubCatalogModel, HubCatalogPage, HubCatalogSearchInput, HubCatalogSort } from "../contracts/types.js";
 
 export interface DesktopSettings {
   coordinatorMode: CoordinatorMode;
   remoteCoordinatorUrl: string;
   remoteCoordinatorToken: string;
   contributionEnabled: boolean;
+  computeMode: ComputeMode;
   launchAtLogin: boolean;
   closeToTray: boolean;
   onboardingComplete: boolean;
@@ -79,6 +81,7 @@ export interface DashboardWorker {
   deployments: DashboardDeployment[];
   /** Stable runtime node identity used to bind effective stage telemetry. */
   executionNodeId?: string;
+  computeMode?: ComputeMode;
   mobile?: {
     platform: string;
     backend: "webgpu" | "cpu";
@@ -121,6 +124,16 @@ export interface RequestedModelCapacity {
   weightBytes: number | null;
   contextTokens: number;
   message: string;
+  activationProgress: Array<{
+    phase: string;
+    message: string;
+    at: string;
+    state: "running" | "completed" | "failed";
+    nodeId?: string;
+    processId?: string;
+    device?: string;
+    details?: string[];
+  }>;
   activationRequestedAt: string | null;
   createdAt: string;
   updatedAt: string;
@@ -328,7 +341,7 @@ export interface DesktopBridge {
   streamChat?(request: ChatRequest, onUpdate: (update: ChatStreamUpdate) => void): Promise<ChatResponse>;
   removeWorker(workerId: string): Promise<DashboardSnapshot>;
   clearOfflineWorkers(): Promise<DashboardSnapshot>;
-  searchHubModels(query: string): Promise<HubCatalogModel[]>;
+  searchHubModels(input: HubCatalogSearchInput): Promise<HubCatalogPage>;
   requestModel(input: RequestModelInput, adminToken?: string): Promise<DashboardSnapshot>;
   removeRequestedModel(modelId: string, adminToken?: string): Promise<DashboardSnapshot>;
   getBenchmarkRuns(): Promise<BenchmarkRun[]>;

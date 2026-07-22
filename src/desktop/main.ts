@@ -49,7 +49,7 @@ import type {
   DesktopSettings,
   DesktopUpdateStatus,
 } from "./contracts.js";
-import type { HubCatalogModel } from "../contracts/types.js";
+import type { HubCatalogPage, HubCatalogSearchInput } from "../contracts/types.js";
 import {
   applyAccelerationProgress,
   appendAccelerationLog,
@@ -65,6 +65,7 @@ import {
   readVerifiedAccelerationUsage,
 } from "./acceleration-evidence.js";
 import { consumeChatCompletionStream } from "./chat-stream.js";
+import { desktopExecutorPolicy, normalizeComputeMode } from "./compute-mode.js";
 import {
   selectDesktopHardwareGpu,
   selectWorkerCapacityHardware,
@@ -92,6 +93,7 @@ const DEFAULT_SETTINGS: DesktopSettings = {
   remoteCoordinatorUrl: PUBLIC_COORDINATOR_URL,
   remoteCoordinatorToken: "",
   contributionEnabled: false,
+  computeMode: "automatic",
   launchAtLogin: false,
   closeToTray: true,
   onboardingComplete: false,
@@ -121,7 +123,6 @@ let distributionRuntimePromise: Promise<string> | null = null;
 let cpuRuntimePromise: Promise<AcceleratorRuntimeResult> | null = null;
 let acceleratorRuntimePromise: Promise<AcceleratorRuntimeResult> | null = null;
 let resolvedAcceleratorRuntime: AcceleratorRuntimeResult | null = null;
-let acceleratorRuntimeBlockedByStageFailure = false;
 let acceleratorRuntimeRoot: string | null = null;
 let acceleratorRetryTimer: NodeJS.Timeout | null = null;
 let acceleratorRetryAttempt = 0;
@@ -315,6 +316,7 @@ function sanitizeSettings(input: DesktopSettings): DesktopSettings {
     remoteCoordinatorUrl,
     remoteCoordinatorToken,
     contributionEnabled: Boolean(input.contributionEnabled),
+    computeMode: normalizeComputeMode(input.computeMode),
     launchAtLogin: Boolean(input.launchAtLogin),
     closeToTray: Boolean(input.closeToTray),
     onboardingComplete: Boolean(input.onboardingComplete),
@@ -503,7 +505,9 @@ async function startWorkerIfEnabled(): Promise<void> {
       stageHost: distributedExecutor.stageHost,
       stagePort: distributedExecutor.stagePort,
     });
-    if (acceleratorRuntimeRoot) startDesktopAcceleratorPreparation(acceleratorRuntimeRoot);
+    if (settings.computeMode !== "cpu-only" && acceleratorRuntimeRoot) {
+      startDesktopAcceleratorPreparation(acceleratorRuntimeRoot);
+    }
   } catch (error) {
     writeDesktopLog("distributed-executor-failed", { error: errorText(error) });
     throw error;
@@ -539,7 +543,7 @@ async function startWorkerIfEnabled(): Promise<void> {
       ? { preferredHardwareGpu: { id: preferredHardwareGpu.id, vendor: preferredHardwareGpu.vendor, model: preferredHardwareGpu.model } }
       : {}),
     ...(verifiedGpuRuntime ? { verifiedGpuRuntime } : {}),
-    distributedExecutor,
+    distributedExecutor: { ...distributedExecutor, ...currentDesktopExecutorPolicy() },
     logger: {
       info: (message) => {
         console.info(`[agent] ${message}`);
@@ -559,7 +563,10 @@ async function startWorkerIfEnabled(): Promise<void> {
   // Close the small race where the background physical probe can finish
   // between hardware selection and WorkerAgent construction. The method
   // updates constructor state synchronously while capabilities are still null.
-  await nextWorker.refreshRuntimeCapacity(currentVerifiedGpuRuntime());
+  await nextWorker.refreshRuntimeCapacity(
+    currentVerifiedGpuRuntime(),
+    currentDesktopExecutorPolicy(),
+  );
   void nextWorker.start().catch((error: unknown) => {
     runtimeError = errorText(error);
     writeDesktopLog("worker-start-failed", { error: runtimeError });
@@ -778,9 +785,14 @@ function registerIpc(): void {
     await fetchJson("public/v1/workers/clear-offline", { method: "POST" });
     return readSnapshot();
   });
-  ipcMain.handle("models:search-hub", async (_event, query: string) => {
-    const result = await fetchJson<{ data: HubCatalogModel[] }>(`public/v1/huggingface-models?q=${encodeURIComponent(query)}`);
-    return result.data;
+  ipcMain.handle("models:search-hub", async (_event, input: HubCatalogSearchInput) => {
+    const parameters = new URLSearchParams({
+      q: input.query,
+      sort: input.sort ?? "downloads",
+      limit: String(input.limit ?? 50),
+    });
+    if (input.cursor) parameters.set("cursor", input.cursor);
+    return fetchJson<HubCatalogPage>(`public/v1/huggingface-models?${parameters.toString()}`);
   });
   ipcMain.handle("models:request", async (_event, input: import("./contracts.js").RequestModelInput, adminToken?: string) => {
     const providedToken = adminToken?.trim() ?? "";
@@ -971,6 +983,7 @@ function desktopHardwareSelectionInput() {
 }
 
 function currentVerifiedGpuRuntime(): VerifiedGpuRuntimeEvidence | undefined {
+  if (settings.computeMode === "cpu-only") return undefined;
   const runtime = resolvedAcceleratorRuntime;
   if (!runtime || runtime.status !== "gpu-ready") return undefined;
   const backend = runtime.effectiveBackend;
@@ -982,15 +995,28 @@ function currentVerifiedGpuRuntime(): VerifiedGpuRuntimeEvidence | undefined {
   };
 }
 
+function currentDesktopExecutorPolicy(): {
+  computeMode: DesktopSettings["computeMode"];
+  cpuEligible: boolean;
+} {
+  return desktopExecutorPolicy(
+    settings.computeMode,
+    gpuPreparationIsContinuing(accelerationStatus),
+  );
+}
+
 function refreshPublishedRuntimeCapacity(): void {
   const activeWorker = worker;
   if (!activeWorker) return;
   const runtime = currentVerifiedGpuRuntime();
-  void activeWorker.refreshRuntimeCapacity(runtime).then(
+  const policy = currentDesktopExecutorPolicy();
+  void activeWorker.refreshRuntimeCapacity(runtime, policy).then(
     () => {
       writeDesktopLog("worker-runtime-capacity-refreshed", {
         backend: runtime?.backend ?? "cpu",
         deviceName: runtime?.deviceName ?? cpus()[0]?.model ?? "CPU",
+        computeMode: policy.computeMode,
+        cpuEligible: policy.cpuEligible,
       });
     },
     (error: unknown) => {
@@ -1009,7 +1035,7 @@ function startDesktopAcceleratorPreparation(runtimeRoot: string): void {
   if (
     isQuitting
     || !settings.contributionEnabled
-    || acceleratorRuntimeBlockedByStageFailure
+    || settings.computeMode === "cpu-only"
     || resolvedAcceleratorRuntime?.status === "gpu-ready"
     || acceleratorRuntimePromise !== null
   ) return;
@@ -1022,13 +1048,19 @@ function startDesktopAcceleratorPreparation(runtimeRoot: string): void {
       precision: runtime.precision,
       fallbackReason: runtime.fallbackReason,
     });
+    refreshPublishedRuntimeCapacity();
   }).catch((error: unknown) => {
     writeDesktopLog("accelerator-runtime-failed", { error: errorText(error) });
   });
 }
 
 function scheduleDesktopAcceleratorRetry(runtimeRoot: string, issueCode: string): void {
-  if (isQuitting || !settings.contributionEnabled || acceleratorRetryTimer) return;
+  if (
+    isQuitting
+    || !settings.contributionEnabled
+    || settings.computeMode === "cpu-only"
+    || acceleratorRetryTimer
+  ) return;
 
   if (acceleratorRetryIssueCode !== issueCode) {
     acceleratorRetryIssueCode = issueCode;
@@ -1060,6 +1092,7 @@ function scheduleDesktopAcceleratorRetry(runtimeRoot: string, issueCode: string)
       level: "error",
       message: `Automatic GPU setup stopped after ${issueAttempts} failed automatic retr${issueAttempts === 1 ? "y" : "ies"}. CPU contribution remains available.`,
     });
+    refreshPublishedRuntimeCapacity();
     return;
   }
 
@@ -1117,47 +1150,70 @@ class DesktopAcceleratedLaunchAgent implements LaunchAgent {
     request: LaunchAgentStartRequest,
     signal: AbortSignal,
   ): Promise<LaunchProcessHandle> {
-    // Capture the best runtime already available. Do not await the background
-    // GPU installer: the bundled CPU runtime can serve work immediately. Once
-    // the physical GPU probe passes, only subsequent launches switch to GPU;
-    // an in-flight CPU stage is never migrated or interrupted.
-    const runtime = await selectImmediateRuntime(
-      () => resolvedAcceleratorRuntime,
-      () => prepareDesktopCpuRuntime(this.baseRuntimeRoot),
-    );
-    const handle = await this.launchWithRuntime(request, signal, runtime);
+    // Automatic distribution only selects this node as GPU capacity after the
+    // physical accelerator probe has passed. A CPU runtime remains available
+    // for explicitly CPU-only work, but a node that claimed GPU capacity must
+    // not silently turn a distributed model into a permanent mixed pipeline.
+    const runtime = settings.computeMode === "cpu-only"
+      ? await prepareDesktopCpuRuntime(this.baseRuntimeRoot)
+      : await selectImmediateRuntime(
+          () => resolvedAcceleratorRuntime,
+          () => prepareDesktopCpuRuntime(this.baseRuntimeRoot),
+        );
+    if (settings.computeMode === "gpu-only" && runtime.deviceType !== "gpu") {
+      throw new Error("gpu_only_runtime_not_ready");
+    }
+    if (runtime.deviceType === "gpu") return this.startVerifiedGpuStage(request, signal, runtime);
 
-    if (runtime.deviceType === "gpu") {
+    const cpuHandle = await this.launchWithRuntime(request, signal, runtime);
+    this.observeHandle(cpuHandle, request, runtime, false);
+    return cpuHandle;
+  }
+
+  private async startVerifiedGpuStage(
+    request: LaunchAgentStartRequest,
+    signal: AbortSignal,
+    runtime: AcceleratorRuntimeResult,
+  ): Promise<LaunchProcessHandle> {
+    const maximumAttempts = 2;
+    let lastError: unknown = new Error("gpu_model_stage_failed");
+    for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
+      let handle: LaunchProcessHandle | null = null;
       try {
-        // A physical FP16 probe proves the backend works in isolation. Model
-        // loading is the second gate: if that fails, retry this same stage on
-        // CPU before returning a handle to the supervisor.
+        handle = await this.launchWithRuntime(request, signal, runtime);
         await handle.ready;
         this.observeHandle(handle, request, runtime, true);
         return handle;
       } catch (error) {
+        lastError = error;
         if (signal.aborted) {
           throw signal.reason instanceof Error ? signal.reason : new Error("distributed_launch_cancelled");
         }
-        await handle.stop("gpu_model_stage_failed").catch(() => undefined);
-        invalidateGpuRuntimeAfterStageFailure(runtime, request.launchId, errorText(error));
-        const cpuRuntime = await prepareDesktopCpuRuntime(this.baseRuntimeRoot);
-        if (signal.aborted) {
-          throw signal.reason instanceof Error ? signal.reason : new Error("distributed_launch_cancelled");
+        await handle?.stop("gpu_model_stage_failed").catch(() => undefined);
+        if (attempt < maximumAttempts) {
+          accelerationStatus = appendAccelerationLog(accelerationStatus, {
+            at: new Date().toISOString(),
+            level: "warning",
+            message: `GPU model stage ${request.launchId} failed to load; retrying once on ${runtime.deviceName}.`,
+          });
         }
-        accelerationStatus = appendAccelerationLog(accelerationStatus, {
-          at: new Date().toISOString(),
-          level: "warning",
-          message: `Retrying model stage ${request.launchId} on CPU automatically; no user action is required.`,
-        });
-        const cpuHandle = await this.launchWithRuntime(request, signal, cpuRuntime);
-        this.observeHandle(cpuHandle, request, cpuRuntime, false);
-        return cpuHandle;
       }
     }
 
-    this.observeHandle(handle, request, runtime, false);
-    return handle;
+    const reason = errorText(lastError);
+    invalidateGpuRuntimeAfterStageFailure(runtime, request.launchId, reason);
+    if (settings.computeMode === "automatic") {
+      accelerationStatus = appendAccelerationLog(accelerationStatus, {
+        at: new Date().toISOString(),
+        level: "warning",
+        message: `GPU retries were exhausted for ${request.launchId}; Automatic mode is using the authorized CPU runtime.`,
+      });
+      const cpuRuntime = await prepareDesktopCpuRuntime(this.baseRuntimeRoot);
+      const cpuHandle = await this.launchWithRuntime(request, signal, cpuRuntime);
+      this.observeHandle(cpuHandle, request, cpuRuntime, false);
+      return cpuHandle;
+    }
+    throw new Error(`gpu_model_stage_unavailable_after_retries:${runtime.effectiveBackend}:${reason}`);
   }
 
   private async launchWithRuntime(
@@ -1274,9 +1330,8 @@ function invalidateGpuRuntimeAfterStageFailure(
   if (runtime.deviceType !== "gpu" || resolvedAcceleratorRuntime !== runtime) return;
   resolvedAcceleratorRuntime = null;
   acceleratorRuntimePromise = null;
-  acceleratorRuntimeBlockedByStageFailure = true;
   clearAcceleratorRetryTimer();
-  const message = `${runtime.deviceName} could not run model stage ${launchId}; certified CPU fallback is active.`;
+  const message = `${runtime.deviceName} could not run model stage ${launchId}; GPU capacity was withdrawn until verification passes again.`;
   accelerationStatus = {
     ...accelerationStatus,
     state: "gpu-fallback",
@@ -1289,7 +1344,7 @@ function invalidateGpuRuntimeAfterStageFailure(
       state: accelerationStatus.cpu.activeStages > 0 ? "active" : "ready",
       message: accelerationStatus.cpu.activeStages > 0
         ? accelerationStatus.cpu.message
-        : "Certified CPU fallback is ready after a native GPU model-stage failure.",
+        : "Certified CPU runtime remains ready for explicitly CPU-compatible work.",
     },
     gpu: {
       ...accelerationStatus.gpu,
@@ -1304,8 +1359,8 @@ function invalidateGpuRuntimeAfterStageFailure(
       issue: {
         code: "gpu-model-stage",
         message: reason,
-        action: "CPU contribution continues automatically. Restart or update mycellios before retrying this native GPU runtime.",
-        retryable: false,
+        action: "mycellios will verify the accelerator again automatically before this device rejoins GPU distribution.",
+        retryable: true,
       },
     },
   };
@@ -1315,6 +1370,7 @@ function invalidateGpuRuntimeAfterStageFailure(
     message: `${message} Reason: ${reason}`,
   });
   refreshPublishedRuntimeCapacity();
+  if (acceleratorRuntimeRoot) scheduleDesktopAcceleratorRetry(acceleratorRuntimeRoot, "gpu-model-stage");
 }
 
 function prepareDesktopCpuRuntime(runtimeRoot: string): Promise<AcceleratorRuntimeResult> {
@@ -1440,7 +1496,6 @@ function prepareDesktopAcceleratorRuntime(runtimeRoot: string): Promise<Accelera
       },
     };
     if (runtime.status === "gpu-ready") {
-      acceleratorRuntimeBlockedByStageFailure = false;
       acceleratorRetryAttempt = 0;
       acceleratorRetryIssueCode = null;
       acceleratorRetryIssueAttempts.clear();

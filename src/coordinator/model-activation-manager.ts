@@ -8,9 +8,10 @@ import {
   runAutoDistribution,
   writeAutoDistributionArtifacts,
   type AutoDistributionConfig,
+  type AutoDistributionProgressEvent,
 } from "../distribution/auto-distribute.js";
 import { HttpLaunchAgent } from "../distribution/launch-agent-rpc.js";
-import type { ModelExecutionCapacityNode } from "./model-catalog.js";
+import type { ModelActivationProgressEvent, ModelExecutionCapacityNode } from "./model-catalog.js";
 
 export type AutomaticModelRunner = (
   config: AutoDistributionConfig,
@@ -21,6 +22,7 @@ export interface ModelActivationManager {
   initialize(): Promise<void>;
   refresh(): Promise<void>;
   capacityNodesForModel(modelId: string): readonly ModelExecutionCapacityNode[];
+  activationProgressForModel?(modelId: string): readonly ModelActivationProgressEvent[];
   isManaging(modelId: string): boolean;
   isBusy(): boolean;
   activate(model: StoredRequestedModel): Promise<void>;
@@ -194,6 +196,7 @@ export class DynamicModelActivationManager implements ModelActivationManager {
   private activeModelId: string | null = null;
   private activeAbort: AbortController | null = null;
   private activePromise: Promise<void> | null = null;
+  private readonly progress = new Map<string, ModelActivationProgressEvent[]>();
 
   constructor(private readonly options: DynamicModelActivationManagerOptions) {}
 
@@ -214,6 +217,10 @@ export class DynamicModelActivationManager implements ModelActivationManager {
 
   isBusy(): boolean { return this.activePromise !== null; }
 
+  activationProgressForModel(modelId: string): readonly ModelActivationProgressEvent[] {
+    return this.progress.get(modelId)?.map((event) => ({ ...event })) ?? [];
+  }
+
   activate(model: StoredRequestedModel): Promise<void> {
     if (this.isManaging(model.id)) return this.activePromise!;
     if (this.activePromise) return Promise.reject(new Error(`automatic_activation_busy:${this.activeModelId}`));
@@ -231,12 +238,16 @@ export class DynamicModelActivationManager implements ModelActivationManager {
       artifactsDirectory: modelArtifactsDirectory(base, model.id),
     });
     const controller = new AbortController();
+    this.progress.set(model.id, []);
+    this.appendProgress(model.id, "queued", "Activation accepted by the coordinator.");
     this.activeModelId = model.id;
     this.activeAbort = controller;
     const cwd = this.options.cwd ?? process.cwd();
     const environment = this.options.environment ?? process.env;
     const running = (async () => {
+      this.appendProgress(model.id, "profiling", "Reading the model and preparing its execution profile.");
       const profile = await profileCompatibleModel(config, cwd, environment);
+      this.appendProgress(model.id, "profile_ready", "Model profile ready. Calculating the layer distribution.");
       if (controller.signal.aborted) return;
       let compilation = compileAutoDistribution(config, profile);
       const rootHost = compilation.manifest.plans.decode.stages[0]?.anchor.endpoint.host;
@@ -256,17 +267,65 @@ export class DynamicModelActivationManager implements ModelActivationManager {
         compilation = compileAutoDistribution(config, profile);
       }
       await writeAutoDistributionArtifacts(config, compilation, cwd);
+      this.appendProgress(
+        model.id,
+        "plan_ready",
+        `Distribution plan ready: ${compilation.manifest.plans.decode.stages.length} stages across ${config.nodes.length} nodes.`,
+      );
       if (controller.signal.aborted) return;
       await runAutoDistribution(config, compilation, cwd, environment, controller.signal, {
         resolveManagedAgent: (nodeId, launch) => this.options.resolveManagedAgent(nodeId, launch),
+        onProgress: (event) => this.appendRuntimeProgress(model.id, event),
       });
-    })();
+    })().catch((error: unknown) => {
+      this.failProgress(model.id, error instanceof Error ? error.message : String(error));
+      throw error;
+    });
     this.activePromise = running.finally(() => {
       this.activePromise = null;
       this.activeModelId = null;
       this.activeAbort = null;
     });
     return this.activePromise;
+  }
+
+  private appendRuntimeProgress(modelId: string, event: AutoDistributionProgressEvent): void {
+    this.appendProgress(
+      modelId,
+      event.phase,
+      event.message,
+      event.phase === "active" ? "completed" : event.phase === "failed" ? "failed" : "running",
+      {
+        ...(event.nodeId ? { nodeId: event.nodeId } : {}),
+        ...(event.processId ? { processId: event.processId } : {}),
+        ...(event.device ? { device: event.device } : {}),
+        ...(event.details ? { details: [...event.details] } : {}),
+      },
+    );
+  }
+
+  private appendProgress(
+    modelId: string,
+    phase: string,
+    message: string,
+    state: ModelActivationProgressEvent["state"] = "running",
+    context: Pick<ModelActivationProgressEvent, "nodeId" | "processId" | "device" | "details"> = {},
+  ): void {
+    const events = this.progress.get(modelId) ?? [];
+    const previous = events.at(-1);
+    if (previous?.state === "running") previous.state = "completed";
+    if (previous?.phase === phase && previous.message === message) return;
+    events.push({ phase, message, at: new Date().toISOString(), state, ...context });
+    this.progress.set(modelId, events.slice(-20));
+  }
+
+  private failProgress(modelId: string, message: string): void {
+    const events = this.progress.get(modelId) ?? [];
+    const previous = events.at(-1);
+    if (previous?.phase === "failed") return;
+    if (previous?.state === "running") previous.state = "failed";
+    events.push({ phase: "failed", message, at: new Date().toISOString(), state: "failed" });
+    this.progress.set(modelId, events.slice(-20));
   }
 
   async deactivate(modelId: string): Promise<boolean> {

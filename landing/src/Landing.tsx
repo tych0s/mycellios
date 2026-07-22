@@ -6,6 +6,7 @@ import {
   Check,
   ChevronRight,
   CircleDot,
+  Coins,
   Cpu,
   Download,
   Gauge,
@@ -14,6 +15,7 @@ import {
   MonitorDown,
   Network,
   Radio,
+  Route,
   ShieldCheck,
   Sparkles,
   Users,
@@ -109,6 +111,50 @@ const copy = {
     ],
     modes: { eyebrow: "One network, two guarantees", title1: "Fast when it helps.", title2: "Exact when it matters.", copy: "The architecture explicitly separates reference-equivalent inference from every approximate optimization. They are never mixed silently.", exactTitle: "Exact mode", exactCopy: "Distribution changes where the model is computed, not the result it must produce.", exactFooter: "Verification and rollback", optTitle: "Voluntary approximation", optCopy: "Compression and alternative codecs are used only when chosen by the user and the degradation is measured.", optFooter: "Always opt-in" },
     evidence: { eyebrow: "Evidence before promises", title: "We are building in public.", copy: "We do not call a simulation a global network. Every important claim passes a reproducible test before it becomes a product promise.", done: "Implemented", next: "Next physical milestone", gate: "NEXT GATE", rows: [["Partitioned-model runtime", "Real pipeline and compatible API", "READY"], ["Heterogeneous scheduler", "Memory, topology, and availability", "READY"], ["Stage recovery", "Alternate route and greedy continuation", "LAB"], ["Model larger than every node", "Test across 2–4 physical machines", "TESTING"]] },
+    future: {
+      eyebrow: "The next layer",
+      title1: "A network that",
+      title2: "improves itself.",
+      copy: "Three long-term systems designed to make mycellios more capable every day, route every request intelligently, and return value to the machines that make that progress possible.",
+      status: "VISION · NOT LIVE YET",
+      bridge: "PROVEN WORK → MEASURABLE VALUE",
+      improvement: {
+        index: "01",
+        label: "AUTONOMOUS IMPROVEMENT",
+        metric: "0.1",
+        unit: "%",
+        metricDetail: "OF VERIFIED USEFUL COMPUTE",
+        title: "The network improves the network.",
+        copy: "Reserve a strictly bounded share of useful compute for daily agents that inspect failures, run isolated experiments and propose measurable improvements.",
+        steps: ["Observe real bottlenecks", "Experiment inside a sandbox", "Promote only verified gains"],
+        footer: "Bounded budget · auditable history · controlled rollout",
+      },
+      token: {
+        index: "02",
+        label: "VERIFIABLE INCENTIVES",
+        metric: "TOKEN",
+        metricDetail: "FOR ACCEPTED NETWORK WORK",
+        title: "Useful compute becomes verifiable value.",
+        copy: "Build a crypto token around work the network actually accepts — not advertised capacity or passive connection — with quality, reliability and fraud resistance built in.",
+        steps: ["Internal credits first", "Public testnet without monetary value", "Audited launch after legal review"],
+        footer: "No active token · no financial promise",
+      },
+      router: {
+        index: "03",
+        label: "INTELLIGENT MODEL ROUTING",
+        metric: "ONE API",
+        metricDetail: "EVERY MODEL · BEST AVAILABLE PATH",
+        title: "One request. The right intelligence.",
+        copy: "A unified AI router inspired by the model gateways behind products such as OpenRouter and Cursor. It will evaluate the task, quality, cost, latency, privacy and live network capacity before selecting the best model and execution path.",
+        steps: ["Unify Mycellios, local and external models", "Choose by quality, price, speed and privacy", "Fail over without changing the application"],
+        footer: "Provider-neutral · policy-controlled · every routing decision observable",
+        input: "UNIFIED REQUEST",
+        engine: "ROUTING ENGINE",
+        policies: ["QUALITY", "COST", "LATENCY", "PRIVACY"],
+        destinations: ["MYCELLIOS", "LOCAL GPU", "OPEN MODELS", "CLOUD APIs"],
+      },
+      principle: "Direction, not a promise. Each stage must prove security, usefulness and measurable results before it can reach the public network.",
+    },
     install: {
       eyebrow: "From download to network",
       title1: "One click.",
@@ -347,6 +393,70 @@ function PipelineVisual({ text }: { text: typeof copy.pipeline }) {
   );
 }
 
+function FutureRoadmap({ text }: { text: typeof copy.future }) {
+  return (
+    <section className="future-roadmap-section" id="roadmap">
+      <div className="future-roadmap-field" aria-hidden="true"><i /><i /><i /><i /></div>
+      <div className="container">
+        <div className="future-roadmap-heading reveal">
+          <div>
+            <span className="eyebrow"><i />{text.eyebrow}</span>
+            <h2>{text.title1}<br /><em>{text.title2}</em></h2>
+          </div>
+          <div className="future-roadmap-intro">
+            <span className="future-roadmap-status"><CircleDot size={12} />{text.status}</span>
+            <p>{text.copy}</p>
+          </div>
+        </div>
+
+        <div className="future-roadmap-stage">
+          <article className="future-roadmap-card improvement reveal" data-index={text.improvement.index}>
+            <header><span>{text.improvement.index} / {text.improvement.label}</span><Sparkles size={23} /></header>
+            <div className="future-roadmap-metric"><strong>{text.improvement.metric}</strong><span><b>{text.improvement.unit}</b><small>{text.improvement.metricDetail}</small></span></div>
+            <h3>{text.improvement.title}</h3>
+            <p>{text.improvement.copy}</p>
+            <ol>{text.improvement.steps.map((step, index) => <li key={step}><b>0{index + 1}</b><span>{step}</span></li>)}</ol>
+            <footer><ShieldCheck size={15} /><span>{text.improvement.footer}</span></footer>
+          </article>
+
+          <div className="future-roadmap-bridge" aria-hidden="true"><i /><span><Zap size={15} /></span><b>{text.bridge}</b></div>
+
+          <article className="future-roadmap-card token reveal" data-index={text.token.index}>
+            <header><span>{text.token.index} / {text.token.label}</span><Coins size={23} /></header>
+            <div className="future-roadmap-metric word"><strong>{text.token.metric}</strong><span><small>{text.token.metricDetail}</small></span></div>
+            <h3>{text.token.title}</h3>
+            <p>{text.token.copy}</p>
+            <ol>{text.token.steps.map((step, index) => <li key={step}><b>0{index + 1}</b><span>{step}</span></li>)}</ol>
+            <footer><ShieldCheck size={15} /><span>{text.token.footer}</span></footer>
+          </article>
+        </div>
+
+        <article className="future-roadmap-router reveal" data-index={text.router.index}>
+          <header><span>{text.router.index} / {text.router.label}</span><Route size={23} /></header>
+          <div className="future-router-content">
+            <div className="future-router-copy">
+              <div className="future-roadmap-metric word"><strong>{text.router.metric}</strong><span><small>{text.router.metricDetail}</small></span></div>
+              <h3>{text.router.title}</h3>
+              <p>{text.router.copy}</p>
+            </div>
+            <div className="future-router-visual" aria-label="A unified request routed to the best available AI model">
+              <div className="future-router-input"><Radio size={15} /><span>{text.router.input}</span></div>
+              <i className="future-router-line incoming" />
+              <div className="future-router-engine"><Route size={24} /><strong>{text.router.engine}</strong><span>{text.router.policies.map((policy) => <b key={policy}>{policy}</b>)}</span></div>
+              <i className="future-router-line outgoing" />
+              <div className="future-router-destinations">{text.router.destinations.map((destination, index) => <span key={destination} style={{ "--route-delay": `${index * .7}s` } as CSSProperties}><i />{destination}</span>)}</div>
+            </div>
+          </div>
+          <ol>{text.router.steps.map((step, index) => <li key={step}><b>0{index + 1}</b><span>{step}</span></li>)}</ol>
+          <footer><ShieldCheck size={15} /><span>{text.router.footer}</span></footer>
+        </article>
+
+        <div className="future-roadmap-principle reveal"><ShieldCheck size={17} /><span>{text.principle}</span></div>
+      </div>
+    </section>
+  );
+}
+
 function InstallSection({ text }: { text: typeof copy.install }) {
   const [recommended, setRecommended] = useState<DownloadKey>("windows");
 
@@ -430,7 +540,7 @@ function Landing() {
   return (
     <div className="site" id="top" ref={page} onPointerMove={trackPointer}>
       <div className="scroll-progress" aria-hidden="true" /><LivingBackdrop /><div className="ambient-pointer" />
-      <header className="nav-shell"><nav className="nav container" aria-label={t.nav.aria}><Brand homeLabel={t.home} /><div className="nav-links"><a href="/network">Live network</a><a href="/network?view=nodes">Nodes</a><a href="/mobile/">Contribute</a><a href="#architecture">{t.nav.architecture}</a></div><div className="nav-actions"><a className="nav-cta" href="/join">Join now <Zap size={15} /></a></div></nav></header>
+      <header className="nav-shell"><nav className="nav container" aria-label={t.nav.aria}><Brand homeLabel={t.home} /><div className="nav-links"><a href="/network">Live network</a><a href="/mobile/">Contribute</a><a href="#architecture">{t.nav.architecture}</a><a href="#roadmap">Roadmap</a></div><div className="nav-actions"><a className="nav-cta" href="/join">Join now <Zap size={15} /></a></div></nav></header>
 
       <main>
         <section className="hero">
@@ -462,6 +572,8 @@ function Landing() {
 
         <section className="evidence-section" id="evidence"><div className="container evidence-grid"><div><SectionHeading eyebrow={t.evidence.eyebrow} title={t.evidence.title} copy={t.evidence.copy} /><div className="status-legend reveal"><span><i className="done" />{t.evidence.done}</span><span><i className="next" />{t.evidence.next}</span></div></div><div className="status-board reveal"><div className="board-head"><span>BUILD STATUS</span><span>20 · 07 · 2026</span></div>{t.evidence.rows.map((row, index) => <div className={`status-row ${index === 3 ? "active" : ""}`} key={row[0]}><i className={index === 3 ? "next" : "done"}>{index === 3 ? <CircleDot size={12} /> : <Check size={12} />}</i><div><strong>{row[0]}</strong><small>{row[1]}</small></div><span>{row[2]}</span></div>)}<div className="board-footer"><span>{t.evidence.gate}</span><strong>Multi-node · GPU · LAN</strong><Gauge size={19} /></div></div></div></section>
 
+        <FutureRoadmap text={t.future} />
+
         <InstallSection text={t.install} />
 
         <section className="participate container"><SectionHeading eyebrow={t.participate.eyebrow} title={t.participate.title} copy={t.participate.copy} /><div className="participate-grid">{([t.participate.contributor, t.participate.organization] as const).map((audience, index) => <article className={`participate-card ${index === 1 ? "featured" : ""} reveal`} key={audience.label}><div className="participate-icon">{index === 0 ? <Cpu size={28} /> : <Users size={28} />}</div><span>{audience.label}</span><h3>{audience.title}</h3><p>{audience.copy}</p><ul>{audience.bullets.map((bullet) => <li key={bullet}><Check size={14} />{bullet}</li>)}</ul></article>)}</div></section>
@@ -469,7 +581,7 @@ function Landing() {
         <section className="closing" id="join"><div className="closing-grid" /><div className="container closing-inner reveal"><Brand compact homeLabel={t.home} /><span className="eyebrow"><i />{t.closing.eyebrow}</span><h2>{t.closing.title1}<br /><em>{t.closing.title2}</em></h2><p>{t.closing.copy}</p><a className="button button-primary button-large" href="/join">Connect this device <Zap size={18} /></a><small>Public test network · no login required</small></div></section>
       </main>
 
-      <footer className="footer container"><Brand homeLabel={t.home} /><p>{t.footer.tagline}</p><div><a href="/network">Network panel</a><a href="/mobile/">Mobile worker</a><a href="/downloads">Downloads</a><a href={`mailto:${EMAIL}`}>{t.footer.contact}</a></div><span>© 2026 mycellios</span></footer>
+      <footer className="footer container"><Brand homeLabel={t.home} /><p>{t.footer.tagline}</p><div><a href="/network">Network panel</a><a href="#roadmap">Roadmap</a><a href="/mobile/">Mobile worker</a><a href="/downloads">Downloads</a><a href={`mailto:${EMAIL}`}>{t.footer.contact}</a></div><span>© 2026 mycellios</span></footer>
     </div>
   );
 }

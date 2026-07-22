@@ -76,4 +76,37 @@ describe("worker tunnel execution telemetry", () => {
     expect(hub.sent.map(({ type }) => type)).toEqual(["runtime.prepare", "runtime.start"]);
     await agent.close();
   });
+
+  it("rejects a disconnected launch through the supervised promises without an orphan rejection", async () => {
+    const hub = new FakeWorkerHub();
+    const description = {
+      launchId: "launch-disconnect",
+      pipelineId: "pipeline-disconnect",
+      launchOrder: [],
+    } as unknown as PythonPipelineLaunchDescription;
+    const agent = new WorkerTunnelLaunchAgent(
+      hub as unknown as WorkerHub,
+      "worker-disconnect",
+      "node-disconnect",
+      description,
+      1_000,
+    );
+    const request = {
+      launchId: "launch-disconnect",
+      pipelineId: "pipeline-disconnect",
+      nodeId: "node-disconnect",
+      process: { processId: "stage-disconnect" },
+    } as unknown as LaunchAgentStartRequest;
+
+    const handle = await agent.start(request, new AbortController().signal);
+    await handle.ready;
+    const exited = handle.exited.catch((error: unknown) => error);
+    hub.emit("disconnect", "worker-disconnect");
+
+    await expect(exited).resolves.toMatchObject({
+      message: "distributed_worker_disconnected:worker-disconnect",
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await agent.close();
+  });
 });

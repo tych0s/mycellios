@@ -120,9 +120,25 @@ function connectedExecutors(
 ): ConnectedExecutor[] {
   return workers
     .filter((worker) => connectedWorkerIds.has(worker.id) && worker.capabilities.distributedExecutor)
+    .filter((worker) => executorCapacityIsEligible(worker))
     .map((worker) => ({ worker, executor: worker.capabilities.distributedExecutor! }))
     .filter(({ executor }) => executor.protocol === "gdlp-worker-tunnel/2")
     .filter((entry, index, all) => all.findIndex(
       (candidate) => candidate.executor.nodeId === entry.executor.nodeId,
     ) === index);
+}
+
+function executorCapacityIsEligible(worker: StoredWorker): boolean {
+  const executor = worker.capabilities.distributedExecutor;
+  if (!executor) return false;
+  const hasVerifiedGpu = worker.capabilities.gpus.some(
+    (gpu) => gpu.vendor.trim().toLowerCase() !== "cpu",
+  );
+  const mode = executor.computeMode ?? "automatic";
+  if (mode === "gpu-only") return hasVerifiedGpu;
+  if (mode === "cpu-only") return executor.cpuEligible === true;
+  // Automatic mode can use a verified GPU immediately. CPU is accepted only
+  // after a current desktop client explicitly announces that fallback is
+  // allowed; old clients remain GPU-only by default.
+  return hasVerifiedGpu || executor.cpuEligible === true;
 }
