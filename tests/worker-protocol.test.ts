@@ -5,6 +5,7 @@ import {
   taskTokenEnvelopeSchema,
   runtimeExitedEnvelopeSchema,
   runtimePreparedEnvelopeSchema,
+  runtimeReadyEnvelopeSchema,
   runtimeStreamDataEnvelopeSchema,
   runtimeStreamOpenEnvelopeSchema,
   workerGoodbyeEnvelopeSchema,
@@ -199,6 +200,26 @@ describe("worker protocol schemas", () => {
         exit: { code: 0, signal: null },
         output: { stdout: "ready", stderr: "", stdoutTruncated: false, stderrTruncated: false },
       },
+    }).success).toBe(true);
+    expect(runtimeReadyEnvelopeSchema.safeParse({
+      ...baseEnvelope,
+      type: "runtime.ready",
+      payload: {
+        requestId: "run-1",
+        output: {
+          stdout: "root online",
+          stderr: '{"execution":{"backend":"cuda"}}',
+          stdoutTruncated: false,
+          stderrTruncated: false,
+        },
+      },
+    }).success).toBe(true);
+    // gdlp-worker-tunnel/2 remains rolling-upgrade compatible with workers
+    // released before readiness output was introduced.
+    expect(runtimeReadyEnvelopeSchema.safeParse({
+      ...baseEnvelope,
+      type: "runtime.ready",
+      payload: { requestId: "run-legacy" },
     }).success).toBe(true);
     expect(runtimeStreamOpenEnvelopeSchema.safeParse({
       ...baseEnvelope,

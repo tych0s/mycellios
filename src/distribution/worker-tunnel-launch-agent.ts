@@ -142,6 +142,8 @@ export class WorkerTunnelLaunchAgent implements LaunchAgent {
     const start = this.pending.get(requestId);
     if (!start) return;
     if (envelope.type === "runtime.ready") {
+      const output = payload.output as LaunchCapturedOutput | undefined;
+      if (output) Object.assign(start.output, output);
       start.ready.resolve();
       return;
     }

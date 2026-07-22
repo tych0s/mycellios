@@ -17,6 +17,7 @@ from typing import Any, Callable
 import torch
 from transformers import AutoConfig
 
+from .device import normalize_torch_device_request
 from .macro_wave import KVVersion, MacroWaveState
 from .macro_wave_adapter import (
     MacroWaveProposal,
@@ -181,6 +182,7 @@ class PipelineEngineConfig:
     boundaries: tuple[int, ...]
     codec: TensorCodec = TensorCodec.FP16
     threads_per_stage: int = 1
+    device: str = "auto"
     startup_timeout_seconds: float = 180.0
     socket_timeout_seconds: float = 180.0
     one_way_delay_ms: float = 0.0
@@ -251,6 +253,7 @@ class PipelineEngineConfig:
     retained_session_ttl_seconds: float = 600.0
 
     def __post_init__(self) -> None:
+        normalize_torch_device_request(self.device)
         if not self.model_name.strip():
             raise ValueError("model_name cannot be empty")
         for name, value in (
@@ -1018,6 +1021,45 @@ class DistributedPipelineEngine:
         return self._require_runner().parameter_bytes
 
     @property
+    def execution_topology(self) -> dict[str, Any]:
+        """Return effective device evidence observed by this root process.
+
+        Remote workers publish their startup snapshot in their own process log.
+        This root reports only snapshots it has directly observed, so absent
+        remote or child evidence remains unobserved rather than being guessed
+        from the launch plan.
+        """
+
+        if self._metrics_queue is not None:
+            self.stage_metrics.extend(drain_metrics(self._metrics_queue))
+        runner = self._require_runner()
+        snapshot = getattr(runner, "execution_snapshot", None)
+        root_execution = snapshot() if callable(snapshot) else {}
+        observed: dict[int, dict[str, Any]] = {
+            int(self.config.boundaries[0]): {
+                "stage": int(self.config.boundaries[0]),
+                "layer_end": int(self.config.boundaries[1]),
+                "execution": root_execution,
+            }
+        }
+        for metric in self.stage_metrics:
+            if (
+                not isinstance(metric, dict)
+                or metric.get("event") != "stage_runtime_ready"
+                or not isinstance(metric.get("stage"), int)
+                or not isinstance(metric.get("execution"), dict)
+            ):
+                continue
+            observed[int(metric["stage"])] = copy.deepcopy(metric)
+        stages = [observed[index] for index in sorted(observed)]
+        return {
+            "requested_device": self.config.device,
+            "observed_stage_count": len(stages),
+            "total_stage_count": self.stages,
+            "stages": stages,
+        }
+
+    @property
     def healthy(self) -> bool:
         with self._state_lock:
             return not self._closed and self._fatal_error is None
@@ -1709,6 +1751,7 @@ class DistributedPipelineEngine:
                         codec=config.codec,
                         one_way_delay_ms=config.one_way_delay_ms,
                         bandwidth_mbps=config.bandwidth_mbps,
+                        device=config.device,
                         connect_timeout_seconds=config.startup_timeout_seconds,
                         sealed_wave_tokens=config.sealed_wave_tokens,
                         max_prefill_chunk_tokens=config.max_prefill_chunk_tokens,
@@ -1745,7 +1788,7 @@ class DistributedPipelineEngine:
             canonical_model_revision=self.model_artifact.canonical_revision,
         )
         self._runner = (
-            StageRunner(root_spec)
+            StageRunner(root_spec, device=config.device)
             if root_ram_config is None
             else build_ram_backed_moe_stage_runner(
                 root_spec,

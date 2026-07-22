@@ -43,6 +43,26 @@ export interface DashboardDeployment {
   freeSlots: number;
   tokensPerSecond: number;
   ttftMs: number;
+  execution?: {
+    deviceType: "cpu" | "gpu" | "mixed";
+    backend: "cpu" | "cuda" | "rocm" | "directml" | "mps" | "vulkan" | "webgpu";
+    deviceName: string;
+    precision: string;
+    fallback: boolean;
+    fallbackReason?: string;
+    stages?: Array<{
+      nodeId: string;
+      stageIndex: number;
+      layerStart: number;
+      layerEnd: number;
+      deviceType: "cpu" | "gpu";
+      backend: "cpu" | "cuda" | "rocm" | "directml" | "mps" | "vulkan" | "webgpu";
+      deviceName: string;
+      precision: string;
+      fallback: boolean;
+      fallbackReason?: string;
+    }>;
+  };
 }
 
 export interface DashboardWorker {
@@ -57,6 +77,8 @@ export interface DashboardWorker {
   lastSeenAt: string;
   gpus: DashboardGpu[];
   deployments: DashboardDeployment[];
+  /** Stable runtime node identity used to bind effective stage telemetry. */
+  executionNodeId?: string;
   mobile?: {
     platform: string;
     backend: "webgpu" | "cpu";
@@ -179,6 +201,14 @@ export interface DashboardSnapshot {
   contribution: {
     state: "paused" | "connecting" | "connected" | "error";
     workerId: string | null;
+  };
+  acceleration: {
+    state: "idle" | "preparing" | "cpu-ready" | "gpu-ready" | "gpu-fallback" | "error";
+    requestedBackend: "cpu" | "cuda" | "rocm" | null;
+    effectiveBackend: "cpu" | "cuda" | "rocm" | null;
+    deviceName: string | null;
+    precision: "float32" | "float16" | null;
+    message: string;
   };
   modelAdminAuthorization: {
     configured: boolean;

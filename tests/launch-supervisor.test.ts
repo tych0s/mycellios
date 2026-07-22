@@ -362,6 +362,41 @@ describe("Python launch supervisor", () => {
     expect(local.id).toBe("explicit-local");
   });
 
+  it("retains a final readiness marker when bounded process output is truncated", async () => {
+    const marker = "FINAL_EXECUTION_MARKER";
+    const local = new LocalProcessAgent({
+      id: "tail-capture-local",
+      maxOutputBytesPerStream: 1_024,
+      stopGraceMs: 1_000,
+      readyWhen: ({ recentStdout }) => recentStdout.includes(marker),
+    });
+    const request = {
+      launchId: "tail-capture-launch",
+      pipelineId: "tail-capture-pipeline",
+      nodeId: "local-node",
+      process: {
+        processId: "tail-capture-process",
+        kind: "root-engine",
+        command: {
+          executable: process.execPath,
+          args: [
+            "-e",
+            `process.stdout.write("x".repeat(4096) + "${marker}\\n"); setInterval(() => {}, 1000);`,
+          ],
+        },
+      },
+    } as unknown as LaunchAgentStartRequest;
+
+    const handle = await local.start(request, new AbortController().signal);
+    await handle.ready;
+    expect(handle.output?.()).toMatchObject({
+      stdoutTruncated: true,
+    });
+    expect(handle.output?.().stdout).toContain(marker);
+    await handle.stop("test_complete");
+    await handle.exited;
+  });
+
   it("stops from idle idempotently without resolving any agent", async () => {
     const description = fixtureDescription();
     const setup = harness(description);

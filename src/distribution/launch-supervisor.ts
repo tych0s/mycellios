@@ -637,17 +637,15 @@ class BoundedTextCapture {
 
   append(chunk: string): void {
     this.recent = `${this.recent}${chunk}`.slice(-8_192);
-    const remaining = this.limit - Buffer.byteLength(this.text, "utf8");
-    if (remaining <= 0) {
-      this.truncated = true;
-      return;
-    }
-    const buffer = Buffer.from(chunk, "utf8");
-    if (buffer.length <= remaining) {
+    const combined = Buffer.from(this.text + chunk, "utf8");
+    if (combined.length <= this.limit) {
       this.text += chunk;
       return;
     }
-    this.text += buffer.subarray(0, remaining).toString("utf8");
+    // Readiness and execution evidence are emitted after model loading, so the
+    // bounded diagnostic capture must retain the tail rather than freezing the
+    // first bytes of download/progress output.
+    this.text = combined.subarray(combined.length - this.limit).toString("utf8");
     this.truncated = true;
   }
 }

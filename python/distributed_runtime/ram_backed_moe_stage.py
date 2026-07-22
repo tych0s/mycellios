@@ -28,6 +28,7 @@ from torch import nn
 from torch.nn import functional as F
 from transformers import AutoConfig, AutoModelForCausalLM
 
+from .device import describe_torch_execution_device
 from .model import (
     StageModelSpec,
     StageRunner,
@@ -1081,6 +1082,11 @@ class RamBackedMoeStageRunner(StageRunner):
             model,
             loader="selective-safetensors-ram-backed-moe",
             device_kinds=(store.effective_device.type,),
+            execution_device=describe_torch_execution_device(
+                store.effective_device
+            ),
+            compute_dtype=loaded.source_dtype,
+            move_model=False,
             semantic_features=semantic_features,
         )
         self.expert_store = store

@@ -335,6 +335,9 @@ export class WorkerAgent {
           ...(this.config.deployment.internalPipeline
             ? { internalPipeline: structuredClone(this.config.deployment.internalPipeline) }
             : {}),
+          ...(this.config.deployment.execution
+            ? { execution: structuredClone(this.config.deployment.execution) }
+            : {}),
         }],
       network: {
         coordinatorRttMs: 0,
@@ -577,7 +580,15 @@ export class WorkerAgent {
       const handle = await executor.launchAgent.start(localRequest, controller.signal);
       this.runtimeProcesses.set(requestId, handle);
       void handle.ready.then(
-        () => this.sendMessage("runtime.ready", { requestId }),
+        () => this.sendMessage("runtime.ready", {
+          requestId,
+          output: handle.output?.() ?? {
+            stdout: "",
+            stderr: "",
+            stdoutTruncated: false,
+            stderrTruncated: false,
+          },
+        }),
         (error: unknown) => {
           // The exited promise carries the original spawn/runtime error and
           // captured output. Avoid racing it with a lossy wrapper error.
@@ -774,7 +785,26 @@ export class WorkerAgent {
 
   private async sendHeartbeat(): Promise<void> {
     if (!this.capabilities || !this.socket || this.socket.readyState !== WebSocket.OPEN) return;
-    const metrics = await this.adapter.metrics();
+    const [metrics, liveHardware] = await Promise.all([
+      this.adapter.metrics(),
+      this.config.capacityScope === "host" ? probeHardware().catch(() => null) : Promise.resolve(null),
+    ]);
+    if (liveHardware) {
+      const byId = new Map(liveHardware.gpus.map((gpu) => [gpu.id, gpu]));
+      this.capabilities = {
+        ...this.capabilities,
+        gpus: this.capabilities.gpus.map((gpu) => {
+          const live = byId.get(gpu.id);
+          if (!live) return gpu;
+          return {
+            ...gpu,
+            ...(live.utilizationPct === undefined ? {} : { utilizationPct: live.utilizationPct }),
+            ...(live.temperatureC === undefined ? {} : { temperatureC: live.temperatureC }),
+            ...(live.powerW === undefined ? {} : { powerW: live.powerW }),
+          };
+        }),
+      };
+    }
     const heartbeat: WorkerHeartbeat = {
       draining: false,
       pausedReason: null,

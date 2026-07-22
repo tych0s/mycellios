@@ -16,6 +16,7 @@ from torch import nn
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from transformers.cache_utils import DynamicLayer
 
+from .device import TorchExecutionDevice, resolve_torch_execution_device
 from .model_adapters import (
     SelectiveStageAdapter,
     resolve_selective_stage_adapter,
@@ -149,14 +150,23 @@ class StageRunnerContract(Protocol):
 class StageRunner:
     MAX_PHYSICAL_BATCH_SIZE = MAX_PHYSICAL_STAGE_BATCH_SIZE
 
-    def __init__(self, spec: StageModelSpec) -> None:
+    def __init__(self, spec: StageModelSpec, *, device: str = "auto") -> None:
         torch.set_num_threads(spec.threads)
+        execution_device = resolve_torch_execution_device(device)
+        compute_dtype = (
+            torch.float16 if execution_device.accelerated else torch.float32
+        )
+        if spec.quantize == "dynamic-int8" and execution_device.accelerated:
+            raise ValueError("dynamic-int8 stage quantization is CPU-only")
         model = _load_selective_stage_model(spec)
         self._initialize_from_loaded_model(
             spec,
             model,
             loader="selective-safetensors",
-            device_kinds=("cpu",),
+            device_kinds=(execution_device.device.type,),
+            execution_device=execution_device,
+            compute_dtype=compute_dtype,
+            move_model=True,
         )
 
     def _initialize_from_loaded_model(
@@ -166,6 +176,9 @@ class StageRunner:
         *,
         loader: str,
         device_kinds: tuple[str, ...],
+        execution_device: TorchExecutionDevice,
+        compute_dtype: torch.dtype,
+        move_model: bool,
         semantic_features: tuple[str, ...] | None = None,
     ) -> None:
         """Adopt one already-loaded, adapter-certified local model.
@@ -183,6 +196,10 @@ class StageRunner:
             not isinstance(kind, str) or not kind.strip() for kind in device_kinds
         ):
             raise ValueError("device_kinds must contain non-empty strings")
+        if tuple(device_kinds) != (execution_device.device.type,):
+            raise ValueError("device_kinds do not match the effective Torch device")
+        if compute_dtype not in (torch.float16, torch.float32, torch.bfloat16):
+            raise ValueError("compute_dtype is unsupported")
         adapter = getattr(model, "_gdlp_selective_stage_adapter", None)
         if not isinstance(adapter, SelectiveStageAdapter):
             raise TypeError("selective model loader did not return a certified family adapter")
@@ -192,15 +209,20 @@ class StageRunner:
         # cache lookup and sequence-length accounting dense and O(number of local layers).
         for local_index, layer in enumerate(selected):
             layer.self_attn.layer_idx = local_index
+        if move_model:
+            model.to(device=execution_device.device, dtype=compute_dtype)
         self.base = model.model
         self.head = model.lm_head if spec.last else None
+        self.execution_device = execution_device
+        self.compute_device = execution_device.device
+        self.compute_dtype = compute_dtype
         self.hidden_size = int(model.config.hidden_size)
         self.parameter_bytes = _unique_parameter_bytes(self.base, self.head)
         self.loader = loader
         self.spec = spec
         self._physical_batch_cache_supported = _supports_dynamic_tensor_batching(
             self.base.config
-        )
+        ) and execution_device.backend != "rocm"
         self.model_forward_calls = 0
         self.physical_batch_calls = 0
         self.physical_batch_items = 0
@@ -237,7 +259,7 @@ class StageRunner:
             layer_end=spec.layer_end,
             total_layers=spec.total_layers,
             hidden_size=self.hidden_size,
-            activation_dtype="float32",
+            activation_dtype=str(compute_dtype).removeprefix("torch."),
             activation_codecs=(
                 "fp32",
                 "fp16",
@@ -284,8 +306,18 @@ class StageRunner:
         self.tokens_seen: dict[int, int] = {}
         self.active_requests: set[int] = set()
         self._last_fork_report = None
+        if self.compute_device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(self.compute_device)
         del model
         gc.collect()
+
+    def execution_snapshot(self) -> dict[str, Any]:
+        """Return effective backend and current allocator evidence."""
+
+        return self.execution_device.snapshot(
+            weight_bytes=self.parameter_bytes,
+            precision=str(self.compute_dtype).removeprefix("torch."),
+        )
 
     def begin(self, request_id: int) -> None:
         if request_id in self.active_requests:
@@ -533,6 +565,26 @@ class StageRunner:
         if request_id not in self.active_requests:
             raise ValueError(f"request {request_id} has not received BEGIN")
 
+    def _effective_compute_device(self) -> torch.device:
+        configured = getattr(self, "compute_device", None)
+        if configured is not None:
+            return torch.device(configured)
+        parameter = next(self.base.parameters(), None)
+        return torch.device("cpu") if parameter is None else parameter.device
+
+    def _effective_compute_dtype(self) -> torch.dtype:
+        configured = getattr(self, "compute_dtype", None)
+        if isinstance(configured, torch.dtype):
+            return configured
+        return next(
+            (
+                parameter.dtype
+                for parameter in self.base.parameters()
+                if parameter.is_floating_point()
+            ),
+            torch.float32,
+        )
+
     @torch.inference_mode()
     def forward_ids(self, request_id: int, input_ids: torch.Tensor) -> torch.Tensor:
         if not self.spec.first:
@@ -542,6 +594,7 @@ class StageRunner:
             raise ValueError("input_ids must have shape [1, tokens] with at least one token")
         if input_ids.dtype not in (torch.int32, torch.int64):
             raise TypeError("input_ids must contain integer token IDs")
+        input_ids = input_ids.to(device=self._effective_compute_device())
         output = self.base(
             input_ids=input_ids,
             past_key_values=self.caches.get(request_id),
@@ -574,8 +627,11 @@ class StageRunner:
             integer=True,
         )
         cache = self._merge_dynamic_caches(ids)
+        prepared = torch.cat(tensors, dim=0).to(
+            device=self._effective_compute_device()
+        )
         output = self.base(
-            input_ids=torch.cat(tensors, dim=0),
+            input_ids=prepared,
             past_key_values=cache,
             use_cache=True,
         )
@@ -607,6 +663,10 @@ class StageRunner:
             raise TypeError("hidden state must be floating point")
         if token_mode not in ("none", "last", "all"):
             raise ValueError("token_mode must be none, last or all")
+        hidden = hidden.to(
+            device=self._effective_compute_device(),
+            dtype=self._effective_compute_dtype(),
+        )
         output = self.base(
             inputs_embeds=hidden,
             past_key_values=self.caches.get(request_id),
@@ -699,8 +759,12 @@ class StageRunner:
                 "physical batching requires equal cache length, token count and cache layout"
             )
         cache = self._merge_dynamic_caches(ids)
+        prepared = torch.cat(tensors, dim=0).to(
+            device=self._effective_compute_device(),
+            dtype=self._effective_compute_dtype(),
+        )
         output = self.base(
-            inputs_embeds=torch.cat(tensors, dim=0),
+            inputs_embeds=prepared,
             past_key_values=cache,
             use_cache=True,
         )

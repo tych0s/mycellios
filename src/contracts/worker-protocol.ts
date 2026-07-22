@@ -194,7 +194,15 @@ export const runtimePreparedEnvelopeSchema = envelopeSchema(
 );
 export const runtimeReadyEnvelopeSchema = envelopeSchema(
   "runtime.ready",
-  z.object({ requestId: runtimeRequestIdSchema }).strict(),
+  z.object({
+    requestId: runtimeRequestIdSchema,
+    output: z.object({
+      stdout: boundedText(256 * 1024),
+      stderr: boundedText(256 * 1024),
+      stdoutTruncated: z.boolean(),
+      stderrTruncated: z.boolean(),
+    }).strict().optional(),
+  }).strict(),
 );
 export const runtimeExitedEnvelopeSchema = envelopeSchema(
   "runtime.exited",

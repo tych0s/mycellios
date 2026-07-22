@@ -15,6 +15,7 @@ from typing import Any
 
 import torch
 
+from .device import normalize_torch_device_request
 from .model import (
     MAX_PHYSICAL_STAGE_BATCH_SIZE,
     StageModelSpec,
@@ -182,6 +183,7 @@ class StageProcessConfig:
     codec: TensorCodec
     one_way_delay_ms: float
     bandwidth_mbps: float
+    device: str = "auto"
     sealed_wave_tokens: int | None = None
     max_prefill_chunk_tokens: int | None = None
     connect_timeout_seconds: float = 120.0
@@ -347,6 +349,15 @@ def run_stage_process(
         runner = build_stage_runner(config)
         validate_speculative_runner(config, runner)
         request_admission = request_admission_for_runner(runner)
+        put_startup_metric_best_effort(
+            metrics_queue,
+            {
+                "event": "stage_runtime_ready",
+                "stage": config.spec.layer_start,
+                "layer_end": config.spec.layer_end,
+                "execution": execution_metric_snapshot(runner),
+            },
+        )
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind((config.listen_host, config.listen_port))
@@ -667,6 +678,7 @@ def begin_stage_request(
         "parameter_bytes": runner.parameter_bytes,
         "loader": runner.loader,
         **executor_metric_fields(runner),
+        "execution": execution_metric_snapshot(runner),
         "frames": 0,
         "compute_ms": 0,
         "bytes_out": 0,
@@ -1505,6 +1517,8 @@ def end_physical_stage_request(
         )
     runner.end(request_id)
     metrics = request_metrics.pop(request_id, None)
+    if metrics is not None:
+        metrics["execution"] = execution_metric_snapshot(runner)
     branch_lineage.release(request_id)
     return metrics
 
@@ -2060,7 +2074,9 @@ def build_stage_runner(config: StageProcessConfig) -> StageRunnerContract:
             ),
         )
     if config.cell_fixture is None:
-        return StageRunner(config.spec)
+        if normalize_torch_device_request(config.device) == "auto":
+            return StageRunner(config.spec)
+        return StageRunner(config.spec, device=config.device)
     if config.cell_manifest_sha256 is not None:
         actual = _sha256_file(Path(config.cell_fixture) / "cell.json")
         if actual != config.cell_manifest_sha256:
@@ -2142,6 +2158,7 @@ def validate_hello(frame: Frame, config: StageProcessConfig, hidden_size: int) -
 
 
 def validate_stage_config(config: StageProcessConfig) -> None:
+    normalized_device = normalize_torch_device_request(config.device)
     if (
         not isinstance(config.pipeline_id, int)
         or isinstance(config.pipeline_id, bool)
@@ -2253,6 +2270,13 @@ def validate_stage_config(config: StageProcessConfig) -> None:
         )
     has_native_stage = config.native_stage_package is not None
     has_ram_backed_moe = config.ram_backed_moe is not None
+    if normalized_device != "auto" and (
+        has_ram_backed_moe or has_native_stage or config.cell_fixture is not None
+    ):
+        raise ValueError(
+            "device applies only to the dense Torch stage backend; specialised "
+            "backends have their own sealed device settings"
+        )
     if has_ram_backed_moe:
         if has_native_stage or config.cell_fixture is not None:
             raise ValueError(
@@ -2665,6 +2689,24 @@ def put_metric_best_effort(metrics_sink: Any, value: dict[str, Any]) -> None:
         pass
 
 
+def put_startup_metric_best_effort(
+    metrics_sink: Any, value: dict[str, Any]
+) -> None:
+    """Publish startup evidence only to sinks with a separate startup channel.
+
+    Request metric queues are a stable FIFO ABI consumed by the engine. A
+    process logger may opt into startup events without inserting a different
+    document shape into that request stream.
+    """
+
+    try:
+        put_startup = getattr(metrics_sink, "put_startup", None)
+        if callable(put_startup):
+            put_startup(value)
+    except BaseException:
+        pass
+
+
 def executor_metric_fields(runner: StageRunnerContract) -> dict[str, str]:
     manifest = getattr(runner, "executor_manifest", None)
     to_document = getattr(manifest, "to_document", None)
@@ -2679,6 +2721,23 @@ def executor_metric_fields(runner: StageRunnerContract) -> dict[str, str]:
         "executor_engine": str(manifest.engine),
         "executor_adapter": str(manifest.adapter),
     }
+
+
+def execution_metric_snapshot(runner: StageRunnerContract) -> dict[str, Any]:
+    """Return JSON-safe evidence for the device that really executes the stage."""
+
+    try:
+        snapshot = getattr(runner, "execution_snapshot", None)
+        if not callable(snapshot):
+            return {}
+        value = snapshot()
+        if not isinstance(value, dict):
+            return {}
+        return dict(value)
+    except BaseException:
+        # Execution telemetry follows the same best-effort contract as the
+        # metric sink. It must not disrupt a valid inference path.
+        return {}
 
 
 def cell_rank_work_metric(runner: StageRunnerContract) -> list[dict[str, Any]]:
