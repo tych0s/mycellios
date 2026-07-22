@@ -11,7 +11,9 @@ import {
   LocalProcessAgent,
   PythonLaunchSupervisor,
   type LaunchAgent,
+  type LaunchSupervisorSnapshot,
 } from "./launch-supervisor.js";
+import type { ModelDeployment } from "../contracts/types.js";
 import {
   compilePythonLaunchDescription,
   type PythonPipelineLaunchDescription,
@@ -379,7 +381,7 @@ export async function runAutoDistribution(
   let workerPromise: Promise<void> | null = null;
   let runtimeProxy: { host: string; port: number; close(): Promise<void> } | null = null;
   try {
-    await supervisor.start();
+    const runningSnapshot = await supervisor.start();
     const rootProcess = compilation.launch.launchOrder.find((process) => process.kind === "root-engine");
     if (!rootProcess) throw new Error("distributed_root_process_is_missing");
     const rootAgent = agents.get(rootProcess.anchor.memberId);
@@ -392,7 +394,13 @@ export async function runAutoDistribution(
     const health = await verifyRootHealth(apiBaseUrl, config, compilation);
     const canary = await runCanary(apiBaseUrl, config);
     if (config.coordinator) {
-      const workerConfig = buildCellWorkerConfig(config, compilation, apiBaseUrl, canary.metrics);
+      const workerConfig = buildCellWorkerConfig(
+        config,
+        compilation,
+        apiBaseUrl,
+        canary.metrics,
+        collectExecutionTelemetry(compilation, runningSnapshot),
+      );
       const token = optionalSecret(environment, config.coordinator.networkTokenEnv);
       worker = new WorkerAgent(workerConfig, {
         coordinatorUrl: config.coordinator.url,
@@ -797,6 +805,7 @@ function buildCellWorkerConfig(
   compilation: AutoDistributionCompilation,
   apiBaseUrl: string,
   canary: AutoDistributionCanaryMetrics,
+  execution?: NonNullable<ModelDeployment["execution"]>,
 ): WorkerConfig {
   const stages = compilation.manifest.plans.decode.stages;
   const peakMiB = Math.max(512, Math.ceil(stages.reduce((sum, stage) => sum + stage.memoryBytes, 0) / MIB));
@@ -830,8 +839,127 @@ function buildCellWorkerConfig(
         stageCount: stages.length,
         boundaries: [...compilation.boundaries],
       },
+      ...(execution ? { execution } : {}),
     },
   });
+}
+
+export function collectExecutionTelemetry(
+  compilation: AutoDistributionCompilation,
+  snapshot: LaunchSupervisorSnapshot,
+): NonNullable<ModelDeployment["execution"]> | undefined {
+  const processes = new Map(snapshot.processes.map((process) => [process.processId, process]));
+  const stages: NonNullable<NonNullable<ModelDeployment["execution"]>["stages"]> = [];
+  for (const launch of compilation.launch.launchOrder) {
+    if (launch.kind === "cell-member") continue;
+    const process = processes.get(launch.processId);
+    const evidence = parseExecutionEvidence(process?.output);
+    if (!evidence) return undefined;
+    const backend = executionBackend(evidence.backend);
+    if (!backend || !new Set(["cpu", "cuda", "rocm"]).has(backend)) return undefined;
+    if (
+      typeof evidence.accelerated !== "boolean"
+      || typeof evidence.requested_device !== "string"
+      || !evidence.requested_device.trim()
+      || typeof evidence.device !== "string"
+      || !evidence.device.trim()
+      || (evidence.device_kind !== "cpu" && evidence.device_kind !== "gpu")
+      || typeof evidence.device_name !== "string"
+      || !evidence.device_name.trim()
+      || typeof evidence.precision !== "string"
+      || !evidence.precision.trim()
+      || typeof evidence.weight_bytes !== "number"
+      || evidence.weight_bytes <= 0
+    ) return undefined;
+    const gpu = evidence.accelerated === true && backend !== "cpu";
+    if (backend === "cpu" && (
+      evidence.accelerated !== false
+      || evidence.device_kind !== "cpu"
+      || !evidence.device.trim().toLowerCase().startsWith("cpu")
+    )) return undefined;
+    if (backend !== "cpu" && (
+      evidence.accelerated !== true
+      || evidence.device_kind !== "gpu"
+      || !evidence.device.trim().toLowerCase().startsWith("cuda")
+    )) return undefined;
+    if (gpu && (
+      typeof evidence.allocated_bytes !== "number"
+      || evidence.allocated_bytes <= 0
+    )) return undefined;
+    if (!gpu && backend !== "cpu") return undefined;
+    const requested = evidence.requested_device.trim().toLowerCase();
+    const fallback = !gpu && requested !== "cpu";
+    stages.push({
+      nodeId: launch.anchor.memberId,
+      stageIndex: launch.stageIndex,
+      layerStart: launch.layerStart,
+      layerEnd: launch.layerEnd,
+      deviceType: gpu ? "gpu" : "cpu",
+      backend,
+      deviceName: evidence.device_name.trim().slice(0, 256),
+      precision: evidence.precision.trim().slice(0, 64),
+      fallback,
+      ...(fallback
+        ? { fallbackReason: "No compatible CUDA or ROCm runtime passed the execution probe; this stage is running on CPU." }
+        : {}),
+    });
+  }
+  if (stages.length !== compilation.manifest.plans.decode.stages.length) return undefined;
+  stages.sort((left, right) => left.stageIndex - right.stageIndex);
+  const gpuStages = stages.filter((stage) => stage.deviceType === "gpu");
+  const cpuStages = stages.filter((stage) => stage.deviceType === "cpu");
+  const deviceType = gpuStages.length > 0 && cpuStages.length > 0
+    ? "mixed"
+    : gpuStages.length > 0 ? "gpu" : "cpu";
+  const preferred = gpuStages[0] ?? cpuStages[0]!;
+  const deviceNames = [...new Set(stages.map((stage) => stage.deviceName))];
+  const fallbackReasons = [...new Set(stages.flatMap((stage) => stage.fallbackReason ? [stage.fallbackReason] : []))];
+  return {
+    deviceType,
+    backend: preferred.backend,
+    deviceName: deviceNames.join(" + ").slice(0, 256),
+    precision: [...new Set(stages.map((stage) => stage.precision))].join(" + ").slice(0, 64),
+    fallback: stages.some((stage) => stage.fallback),
+    ...(fallbackReasons.length > 0 ? { fallbackReason: fallbackReasons.join(" ").slice(0, 1_024) } : {}),
+    stages,
+  };
+}
+
+function parseExecutionEvidence(
+  output: { stdout: string; stderr: string } | undefined,
+): Record<string, unknown> | undefined {
+  if (!output) return undefined;
+  const lines = `${output.stdout}\n${output.stderr}`.split(/\r?\n/).reverse();
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) continue;
+    try {
+      const decoded = JSON.parse(trimmed) as unknown;
+      if (!isRecord(decoded) || !isRecord(decoded.execution)) continue;
+      if (executionBackend(decoded.execution.backend)) return decoded.execution;
+      const nestedStages = decoded.execution.stages;
+      if (!Array.isArray(nestedStages)) continue;
+      const nested = nestedStages.find((stage) => isRecord(stage) && isRecord(stage.execution));
+      if (!isRecord(nested) || !isRecord(nested.execution)) continue;
+      return {
+        ...nested.execution,
+        ...(nested.execution.requested_device === undefined
+          && typeof decoded.execution.requested_device === "string"
+          ? { requested_device: decoded.execution.requested_device }
+          : {}),
+      };
+    } catch {
+      // Runtime output may contain ordinary non-JSON diagnostics.
+    }
+  }
+  return undefined;
+}
+
+function executionBackend(value: unknown): NonNullable<ModelDeployment["execution"]>["backend"] | null {
+  return value === "cpu" || value === "cuda" || value === "rocm"
+    || value === "directml" || value === "mps" || value === "vulkan" || value === "webgpu"
+    ? value
+    : null;
 }
 
 async function waitForWorkerRegistration(

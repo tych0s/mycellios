@@ -1,6 +1,15 @@
 export type WorkloadClass = "interactive" | "batch" | "benchmark";
 export type AdapterKind = "mock" | "local-model-runtime" | "externalggufruntime" | "openai-compatible";
 export type ExecutionMode = "replica" | "pipeline";
+export type ExecutionDeviceType = "cpu" | "gpu" | "mixed";
+export type ExecutionBackend =
+  | "cpu"
+  | "cuda"
+  | "rocm"
+  | "directml"
+  | "mps"
+  | "vulkan"
+  | "webgpu";
 export type WorkerStatus = "online" | "suspect" | "offline" | "draining";
 export type WorkerIdentityKind = "device" | "cell";
 export type JobStatus =
@@ -73,6 +82,31 @@ export interface ModelDeployment {
   internalPipeline?: {
     stageCount: number;
     boundaries: number[];
+  } | undefined;
+  /**
+   * Device telemetry reported by the runtime after model weights have loaded.
+   * This is deliberately separate from advertised hardware: a detected GPU is
+   * not proof that inference is actually using it.
+   */
+  execution?: {
+    deviceType: ExecutionDeviceType;
+    backend: ExecutionBackend;
+    deviceName: string;
+    precision: string;
+    fallback: boolean;
+    fallbackReason?: string | undefined;
+    stages?: Array<{
+      nodeId: string;
+      stageIndex: number;
+      layerStart: number;
+      layerEnd: number;
+      deviceType: Exclude<ExecutionDeviceType, "mixed">;
+      backend: ExecutionBackend;
+      deviceName: string;
+      precision: string;
+      fallback: boolean;
+      fallbackReason?: string | undefined;
+    }> | undefined;
   } | undefined;
 }
 

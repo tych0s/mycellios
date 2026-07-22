@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
+import { cpus } from "node:os";
 import { spawn } from "node:child_process";
 import type { AddressInfo } from "node:net";
 import {
@@ -40,6 +41,12 @@ import type {
 } from "./contracts.js";
 import type { HubCatalogModel } from "../contracts/types.js";
 import { consumeChatCompletionStream } from "./chat-stream.js";
+import {
+  prepareAcceleratorRuntime,
+  readPortableRuntimeManifest,
+  selectAcceleratorPack,
+  type AcceleratorRuntimeResult,
+} from "./accelerator-runtime.js";
 
 if (started) app.quit();
 
@@ -81,11 +88,20 @@ let coordinatorUrl = "";
 let worker: WorkerAgent | null = null;
 let distributedExecutor: Awaited<ReturnType<typeof createDesktopDistributedExecutor>> | null = null;
 let distributionRuntimePromise: Promise<string> | null = null;
+let acceleratorRuntimePromise: Promise<AcceleratorRuntimeResult> | null = null;
 let hardwarePromise: Promise<HardwareProbe> | null = null;
 let settings: DesktopSettings = DEFAULT_SETTINGS;
 let modelAdminToken = "";
 let isQuitting = false;
 let runtimeError: string | null = null;
+let accelerationStatus: DashboardSnapshot["acceleration"] = {
+  state: "idle",
+  requestedBackend: null,
+  effectiveBackend: null,
+  deviceName: null,
+  precision: null,
+  message: "The effective device will be verified when a model stage starts.",
+};
 let updateCheckTimer: NodeJS.Timeout | null = null;
 let updateCheckInFlight = false;
 let updateStatus: DesktopUpdateStatus = {
@@ -586,6 +602,7 @@ async function readSnapshot(): Promise<DashboardSnapshot> {
     jobs,
     localHardware,
     contribution: { state: contributionState, workerId: localWorkerId },
+    acceleration: { ...accelerationStatus },
     modelAdminAuthorization: {
       configured: Boolean(modelAdminToken),
       encrypted: Boolean(modelAdminToken) && safeStorage.isEncryptionAvailable(),
@@ -873,10 +890,22 @@ async function createDesktopDistributedExecutor() {
   if (!existsSync(pythonExecutable)) {
     throw new Error("The packaged shard runtime is missing. Reinstall mycellios to contribute this device.");
   }
-  const pythonPath = resourcePath("python");
-  const hfHome = join(app.getPath("userData"), "model-shards");
-  mkdirSync(hfHome, { recursive: true });
   const nodeId = persistentDistributedNodeId();
+  const launchAgent = new DesktopAcceleratedLaunchAgent(runtimeRoot, nodeId);
+  // Provision in the background so the desktop UI and worker registration are
+  // immediate. A physical stage launch awaits this same promise before spawn.
+  void prepareDesktopAcceleratorRuntime(runtimeRoot).then((runtime) => {
+    writeDesktopLog("accelerator-runtime-ready", {
+      status: runtime.status,
+      requestedBackend: runtime.requestedBackend,
+      effectiveBackend: runtime.effectiveBackend,
+      deviceName: runtime.deviceName,
+      precision: runtime.precision,
+      fallbackReason: runtime.fallbackReason,
+    });
+  }).catch((error: unknown) => {
+    writeDesktopLog("accelerator-runtime-failed", { error: errorText(error) });
+  });
   return {
     nodeId,
     // This is a globally unique logical route name, never a reachable LAN IP.
@@ -884,22 +913,158 @@ async function createDesktopDistributedExecutor() {
     stageHost: `${nodeId}.relay`,
     stagePort: 9_850,
     pythonExecutable,
-    launchAgent: new LocalProcessAgent({
-      id: `desktop-shard-executor:${nodeId}`,
-      cwd: app.isPackaged ? dirname(app.getAppPath()) : app.getAppPath(),
-      env: {
-        PYTHONPATH: pythonPath,
-        HF_HOME: hfHome,
-        TOKENIZERS_PARALLELISM: "false",
-        PATH: [dirname(pythonExecutable), process.env.PATH].filter(Boolean).join(delimiter),
-      },
-      maxOutputBytesPerStream: 256 * 1024,
-    }),
+    launchAgent,
   };
 }
 
+class DesktopAcceleratedLaunchAgent implements LaunchAgent {
+  readonly id: string;
+
+  constructor(
+    private readonly baseRuntimeRoot: string,
+    private readonly nodeId: string,
+  ) {
+    this.id = `desktop-shard-executor:${nodeId}`;
+  }
+
+  async start(
+    request: import("../distribution/launch-supervisor.js").LaunchAgentStartRequest,
+    signal: AbortSignal,
+  ): Promise<import("../distribution/launch-supervisor.js").LaunchProcessHandle> {
+    const runtime = await prepareDesktopAcceleratorRuntime(this.baseRuntimeRoot);
+    if (signal.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("distributed_launch_cancelled");
+    const pythonPath = resourcePath("python");
+    const hfHome = join(app.getPath("userData"), "model-shards");
+    mkdirSync(hfHome, { recursive: true });
+    const executor = new LocalProcessAgent({
+      id: this.id,
+      cwd: app.isPackaged ? dirname(app.getAppPath()) : app.getAppPath(),
+      env: {
+        PYTHONPATH: [...runtime.pythonPathAdditions, pythonPath].join(delimiter),
+        HF_HOME: hfHome,
+        TOKENIZERS_PARALLELISM: "false",
+        PATH: [...runtime.pathAdditions, dirname(runtime.pythonExecutable), process.env.PATH]
+          .filter(Boolean)
+          .join(delimiter),
+      },
+      maxOutputBytesPerStream: 256 * 1024,
+    });
+    const commandArgs = [...request.process.command.args];
+    const deviceFlag = commandArgs.lastIndexOf("--device");
+    if (deviceFlag >= 0 && deviceFlag + 1 < commandArgs.length) {
+      if (runtime.status === "gpu-ready") commandArgs[deviceFlag + 1] = "cuda";
+      else if (runtime.status === "cpu-ready") commandArgs[deviceFlag + 1] = "cpu";
+      // gpu-fallback deliberately keeps `auto`: the runtime then reports that
+      // an accelerator was requested but CPU was the effective backend.
+    }
+    return executor.start({
+      ...request,
+      process: {
+        ...request.process,
+        command: {
+          ...request.process.command,
+          executable: runtime.pythonExecutable,
+          args: commandArgs,
+        },
+      },
+    }, signal);
+  }
+}
+
+function prepareDesktopAcceleratorRuntime(runtimeRoot: string): Promise<AcceleratorRuntimeResult> {
+  if (acceleratorRuntimePromise) return acceleratorRuntimePromise;
+  if (!app.isPackaged && process.env.MYCELLIOS_PROVISION_ACCELERATOR !== "1") {
+    const developmentCpu: AcceleratorRuntimeResult = {
+      status: "cpu-ready",
+      requestedBackend: "cpu",
+      effectiveBackend: "cpu",
+      deviceType: "cpu",
+      runtimeRoot,
+      pythonExecutable: distributionPythonExecutable(runtimeRoot),
+      pythonPathAdditions: [],
+      pathAdditions: [dirname(distributionPythonExecutable(runtimeRoot))],
+      deviceName: cpus()[0]?.model ?? "CPU",
+      precision: "float32",
+      torchVersion: "2.13.0+cpu",
+    };
+    accelerationStatus = {
+      state: "cpu-ready",
+      requestedBackend: "cpu",
+      effectiveBackend: "cpu",
+      deviceName: developmentCpu.deviceName,
+      precision: "float32",
+      message: "Development mode uses the existing certified CPU runtime.",
+    };
+    acceleratorRuntimePromise = Promise.resolve(developmentCpu);
+    return acceleratorRuntimePromise;
+  }
+  accelerationStatus = {
+    state: "preparing",
+    requestedBackend: null,
+    effectiveBackend: null,
+    deviceName: null,
+    precision: null,
+    message: "Checking the vendor runtime and physical accelerator…",
+  };
+  acceleratorRuntimePromise = getHardware().then((hardware) => {
+    const cpuModel = cpus()[0]?.model;
+    // Win32_VideoController ordering is not stable and commonly puts an Intel
+    // adapter or a virtual display ahead of a supported AMD accelerator. Pick
+    // the first device for which this release actually has a certified pack;
+    // otherwise the desktop could silently stay on CPU despite a usable GPU.
+    const gpu = hardware.gpus.find((candidate) => selectAcceleratorPack({
+      platform: process.platform,
+      arch: process.arch,
+      gpuVendor: candidate.vendor,
+      gpuModel: candidate.model,
+      cpuModel,
+    }) !== null) ?? hardware.gpus[0];
+    return prepareAcceleratorRuntime({
+      baseRuntimeRoot: runtimeRoot,
+      userDataPath: app.getPath("userData"),
+      hardware: {
+        platform: process.platform,
+        arch: process.arch,
+        gpuVendor: gpu?.vendor,
+        gpuModel: gpu?.model,
+        cpuModel,
+      },
+      allowProvisioning: app.isPackaged || process.env.MYCELLIOS_PROVISION_ACCELERATOR === "1",
+      onStatus: (status) => {
+        accelerationStatus = { ...accelerationStatus, state: "preparing", message: status };
+        writeDesktopLog("accelerator-runtime-progress", { status });
+      },
+    });
+  }).then((runtime) => {
+    accelerationStatus = {
+      state: runtime.status,
+      requestedBackend: runtime.requestedBackend,
+      effectiveBackend: runtime.effectiveBackend,
+      deviceName: runtime.deviceName,
+      precision: runtime.precision,
+      message: runtime.status === "gpu-ready"
+        ? `${runtime.deviceName} passed the physical FP16 probe.`
+        : runtime.status === "gpu-fallback"
+          ? runtime.fallbackReason ?? "The accelerator probe failed; CPU fallback is active."
+          : "The certified CPU runtime is ready.",
+    };
+    return runtime;
+  }, (error: unknown) => {
+    accelerationStatus = {
+      state: "error",
+      requestedBackend: null,
+      effectiveBackend: null,
+      deviceName: null,
+      precision: null,
+      message: errorText(error),
+    };
+    throw error;
+  });
+  return acceleratorRuntimePromise;
+}
+
 function distributionPythonExecutable(root = app.isPackaged
-  ? join(app.getPath("userData"), "distribution-runtime-v1")
+  ? join(app.getPath("userData"), "distribution-runtime-v2")
   : join(app.getAppPath(), "runtime", "distribution-venv")): string {
   if (process.platform === "win32") {
     const portable = join(root, "python.exe");
@@ -915,8 +1080,17 @@ function ensureDistributionRuntime(): Promise<string> {
 
 async function ensureDistributionRuntimeOnce(): Promise<string> {
   if (!app.isPackaged) return join(app.getAppPath(), "runtime", "distribution-venv");
-  const root = join(app.getPath("userData"), "distribution-runtime-v1");
-  if (existsSync(distributionPythonExecutable(root))) return root;
+  const root = join(app.getPath("userData"), "distribution-runtime-v2");
+  if (existsSync(distributionPythonExecutable(root))) {
+    try {
+      await readPortableRuntimeManifest(root);
+      return root;
+    } catch (error) {
+      writeDesktopLog("distribution-runtime-v2-invalid", { error: errorText(error) });
+      if (dirname(root) !== app.getPath("userData")) throw error;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
   const archive = resourcePath("distribution-runtime.tar.gz");
   if (!existsSync(archive)) throw new Error("The packaged shard runtime archive is missing. Reinstall mycellios.");
   mkdirSync(root, { recursive: true });
@@ -928,6 +1102,7 @@ async function ensureDistributionRuntimeOnce(): Promise<string> {
   if (!existsSync(executable)) {
     throw new Error("The shard runtime could not be extracted. Reinstall mycellios.");
   }
+  await readPortableRuntimeManifest(root);
   return root;
 }
 
@@ -1015,7 +1190,9 @@ function buildDesktopActivationSnapshot(
       returnBindHost: "0.0.0.0",
       threadsPerStage: 1,
       connectTimeoutSeconds: 300,
-      readinessTimeoutMs: 600_000,
+      // The first physical launch may install a multi-gigabyte vendor runtime.
+      // Subsequent launches reuse the content-addressed accelerator pack.
+      readinessTimeoutMs: 3_600_000,
       maxOutputTokens: 2_048,
     },
     canary: { prompt: "Reply with only OK. /no_think", maxTokens: 16, timeoutMs: 300_000 },

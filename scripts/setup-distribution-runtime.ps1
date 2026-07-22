@@ -15,6 +15,14 @@ if ([string]::IsNullOrWhiteSpace($VenvPath)) {
 $requirementsPath = Join-Path $workspacePath "python\requirements-distribution.txt"
 $cachePath = Join-Path $workspacePath "runtime\hf-cache"
 
+$pythonVersion = & $PythonExe -c "import sys; print('.'.join(map(str, sys.version_info[:3])))"
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not inspect the Python interpreter (exit code $LASTEXITCODE)."
+}
+if (-not $pythonVersion.StartsWith("3.12.")) {
+    throw "The portable Windows runtime requires CPython 3.12; found $pythonVersion."
+}
+
 Write-Host "Creating distribution runtime at $VenvPath"
 & $PythonExe -m venv $VenvPath
 if ($LASTEXITCODE -ne 0) {
@@ -37,7 +45,7 @@ if ($LASTEXITCODE -ne 0) {
 if ($LASTEXITCODE -ne 0) {
     throw "Could not install the distribution requirements (exit code $LASTEXITCODE)."
 }
-& $venvPython -c "import accelerate, torch, transformers; assert accelerate.__version__ == '1.14.0'; assert transformers.__version__ == '5.14.1'; assert torch.__version__ == '2.13.0+cpu'; assert torch.version.cuda is None; print('HF native TP/EP runtime:', 'accelerate=' + accelerate.__version__, 'transformers=' + transformers.__version__, 'torch=' + torch.__version__)"
+& $venvPython -c "import accelerate, sys, torch, transformers; assert sys.version_info[:2] == (3, 12); assert accelerate.__version__ == '1.14.0'; assert transformers.__version__ == '5.14.1'; assert torch.__version__ == '2.13.0+cpu'; assert torch.version.cuda is None; assert getattr(torch.version, 'hip', None) is None; assert not torch.cuda.is_available(); print('HF CPU bootstrap runtime:', 'python=' + '.'.join(map(str, sys.version_info[:3])), 'accelerate=' + accelerate.__version__, 'transformers=' + transformers.__version__, 'torch=' + torch.__version__)"
 if ($LASTEXITCODE -ne 0) {
     throw "Could not validate the pinned HF native TP/EP runtime (exit code $LASTEXITCODE)."
 }

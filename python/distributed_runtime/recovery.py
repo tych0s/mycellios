@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+import copy
 from concurrent.futures import (
     CancelledError as FutureCancelledError,
     FIRST_COMPLETED,
@@ -143,6 +144,11 @@ class RecoveringPipelineEngine:
     @property
     def root_parameter_bytes(self) -> int:
         return self._root_parameter_bytes
+
+    @property
+    def execution_topology(self) -> dict[str, Any]:
+        with self._condition:
+            return copy.deepcopy(self._engine.execution_topology)
 
     @property
     def recovery_identity(self) -> PipelineRecoveryIdentity:

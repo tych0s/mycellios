@@ -1,6 +1,64 @@
 import { z } from "zod";
 
 const adapterKind = z.enum(["mock", "local-model-runtime", "externalggufruntime", "openai-compatible"]);
+const executionBackend = z.enum(["cpu", "cuda", "rocm", "directml", "mps", "vulkan", "webgpu"]);
+
+const executionStageSchema = z.object({
+  nodeId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
+  stageIndex: z.number().int().nonnegative(),
+  layerStart: z.number().int().nonnegative(),
+  layerEnd: z.number().int().positive(),
+  deviceType: z.enum(["cpu", "gpu"]),
+  backend: executionBackend,
+  deviceName: z.string().min(1).max(256),
+  precision: z.string().min(1).max(64),
+  fallback: z.boolean(),
+  fallbackReason: z.string().min(1).max(1_024).optional(),
+}).strict().superRefine((stage, context) => {
+  if (stage.layerEnd <= stage.layerStart) {
+    context.addIssue({ code: "custom", message: "layerEnd must be greater than layerStart", path: ["layerEnd"] });
+  }
+  if ((stage.deviceType === "cpu") !== (stage.backend === "cpu")) {
+    context.addIssue({ code: "custom", message: "CPU stages require the cpu backend and GPU stages require a GPU backend", path: ["backend"] });
+  }
+  if (!stage.fallback && stage.fallbackReason !== undefined) {
+    context.addIssue({ code: "custom", message: "fallbackReason requires fallback=true", path: ["fallbackReason"] });
+  }
+});
+
+const executionTelemetrySchema = z.object({
+  deviceType: z.enum(["cpu", "gpu", "mixed"]),
+  backend: executionBackend,
+  deviceName: z.string().min(1).max(256),
+  precision: z.string().min(1).max(64),
+  fallback: z.boolean(),
+  fallbackReason: z.string().min(1).max(1_024).optional(),
+  stages: z.array(executionStageSchema).min(1).max(64).optional(),
+}).strict().superRefine((execution, context) => {
+  if (execution.deviceType === "cpu" && execution.backend !== "cpu") {
+    context.addIssue({ code: "custom", message: "CPU execution requires the cpu backend", path: ["backend"] });
+  }
+  if (execution.deviceType === "gpu" && execution.backend === "cpu") {
+    context.addIssue({ code: "custom", message: "GPU execution requires a GPU backend", path: ["backend"] });
+  }
+  if (!execution.fallback && execution.fallbackReason !== undefined) {
+    context.addIssue({ code: "custom", message: "fallbackReason requires fallback=true", path: ["fallbackReason"] });
+  }
+  if (!execution.stages) return;
+  const stageIndexes = new Set<number>();
+  for (const [index, stage] of execution.stages.entries()) {
+    if (stageIndexes.has(stage.stageIndex)) {
+      context.addIssue({ code: "custom", message: "stageIndex values must be unique", path: ["stages", index, "stageIndex"] });
+    }
+    stageIndexes.add(stage.stageIndex);
+  }
+  const hasCpu = execution.stages.some((stage) => stage.deviceType === "cpu");
+  const hasGpu = execution.stages.some((stage) => stage.deviceType === "gpu");
+  const derived = hasCpu && hasGpu ? "mixed" : hasGpu ? "gpu" : "cpu";
+  if (execution.deviceType !== derived) {
+    context.addIssue({ code: "custom", message: "deviceType must match the effective stage devices", path: ["deviceType"] });
+  }
+});
 
 export const chatMessageSchema = z.object({
   role: z.enum(["system", "developer", "user", "assistant", "tool"]),
@@ -51,6 +109,7 @@ export const deploymentSchema = z
       })
       .strict()
       .optional(),
+    execution: executionTelemetrySchema.optional(),
   })
   .superRefine((deployment, context) => {
     if (deployment.mode === "pipeline" && deployment.stage === undefined) {
@@ -253,6 +312,7 @@ export const workerConfigSchema = z.object({
         })
         .strict()
         .optional(),
+      execution: executionTelemetrySchema.optional(),
     })
     .default({ contextLimit: 8_192 }),
   llmfit: z

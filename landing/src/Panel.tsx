@@ -45,6 +45,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, 
 import "@fontsource-variable/manrope";
 import type {
   DashboardSnapshot,
+  DashboardDeployment,
   ChatResponse,
   ChatStreamUpdate,
   DesktopBridge,
@@ -92,6 +93,7 @@ interface PublicDeployment {
   freeSlots: number;
   tokensPerSecond: number;
   ttftMs?: number;
+  execution?: DashboardDeployment["execution"];
 }
 
 interface PublicWorker {
@@ -106,6 +108,7 @@ interface PublicWorker {
   lastSeenAt: string;
   gpus: PublicGpu[];
   deployments: PublicDeployment[];
+  executionNodeId?: string;
   mobile?: {
     platform: string;
     backend: "webgpu" | "cpu";
@@ -441,6 +444,7 @@ function Overview({ snapshot, onNavigate, publicLink, external }: { snapshot: Pu
     : null;
   const observedPowerW = poweredGpus.reduce((total, gpu) => total + (gpu.powerW ?? 0), 0);
   const activeThroughput = activeDeployments.reduce((total, deployment) => total + deployment.tokensPerSecond, 0);
+  const execution = summarizeDeploymentExecution(activeDeployments);
   const nativeNodes = operational.filter((worker) => worker.kind === "desktop").length;
   const browserNodes = operational.filter((worker) => worker.kind === "browser").length;
   const cellNodes = operational.filter((worker) => worker.kind === "cell").length;
@@ -450,12 +454,13 @@ function Overview({ snapshot, onNavigate, publicLink, external }: { snapshot: Pu
       <article className="global-capacity-card">
         <div className="global-capacity-main">
           <div className="global-capacity-heading"><span>GLOBAL NODE CAPACITY</span><b><i /> LIVE</b></div>
+          <div className="execution-overview"><ExecutionBadge execution={execution} large /><span><strong>Effective inference device</strong><small>Reported by the runtime after loading the model, never inferred from detected hardware.</small></span></div>
           <div className="global-capacity-total"><strong>{formatMemory(activeOfferedVramMb)}</strong><div><b>Active usable memory</b><small>Offered by {operational.length} operational node{operational.length === 1 ? "" : "s"}</small></div></div>
           <div className="global-capacity-bar" aria-label={`${Math.round(freeRatio * 100)}% of offered memory is free`}><i style={{ width: `${freeRatio * 100}%` }} /></div>
           <div className="global-capacity-legend"><span>{formatMemory(freeVramMb)} free now</span><span>{formatMemory(usedVramMb)} in use</span></div>
         </div>
         <div className="global-capacity-metrics">
-          <CapacityMetric icon={Cpu} label="Compute engines" value={String(activeGpus.length)} detail={`${nativeNodes} native · ${browserNodes} browser · ${cellNodes} cells`} />
+          <CapacityMetric icon={Cpu} label="Runtime stages" value={execution.verified ? String(execution.unitCount) : "Unverified"} detail={execution.verified ? executionDetail(execution) : `${nativeNodes} native · ${browserNodes} browser · ${cellNodes} cells connected`} />
           <CapacityMetric icon={Gauge} label="Average GPU load" value={averageUtilization === null ? "No telemetry" : `${averageUtilization.toFixed(0)}%`} detail={`${telemetryGpus.length} reporting engine${telemetryGpus.length === 1 ? "" : "s"}`} />
           <CapacityMetric icon={Zap} label="Active throughput" value={activeThroughput > 0 ? `${formatCompactNumber(activeThroughput)} tok/s` : "No active runtime"} detail={`${activeDeployments.length} deployment${activeDeployments.length === 1 ? "" : "s"}`} />
           <CapacityMetric icon={Activity} label="Observed power" value={poweredGpus.length > 0 ? formatPower(observedPowerW) : "No telemetry"} detail={poweredGpus.length > 0 ? `${poweredGpus.length} physical reading${poweredGpus.length === 1 ? "" : "s"}` : "Never estimated"} />
@@ -582,21 +587,22 @@ function Nodes({ snapshot, onRemove, onClearOffline }: { snapshot: PublicSnapsho
           })}
           {snapshot.workers.length === 0 && <div className="node-topology-empty"><Server /><strong>Aún no hay nodos</strong><span>Conecta una máquina para verla aparecer en la red.</span></div>}
         </div>
-        {selectedWorker && <NodeTopologyInspector worker={selectedWorker} />}
+        {selectedWorker && <NodeTopologyInspector worker={selectedWorker} snapshot={snapshot} />}
       </section>
 
-      <NodeInventorySection eyebrow="DISPOSITIVOS INSTALADOS" title="Equipos físicos" workers={installedWorkers} busy={busy} onRemove={remove} />
-      {browserWorkers.length > 0 && <NodeInventorySection eyebrow="CAPACIDAD TEMPORAL" title="Navegadores activos" workers={browserWorkers} busy={busy} onRemove={remove} />}
-      {cellWorkers.length > 0 && <NodeInventorySection eyebrow="EJECUTORES DISTRIBUIDOS" title="Celdas de cómputo" workers={cellWorkers} busy={busy} onRemove={remove} />}
+      <NodeInventorySection eyebrow="DISPOSITIVOS INSTALADOS" title="Equipos físicos" workers={installedWorkers} snapshot={snapshot} busy={busy} onRemove={remove} />
+      {browserWorkers.length > 0 && <NodeInventorySection eyebrow="CAPACIDAD TEMPORAL" title="Navegadores activos" workers={browserWorkers} snapshot={snapshot} busy={busy} onRemove={remove} />}
+      {cellWorkers.length > 0 && <NodeInventorySection eyebrow="EJECUTORES DISTRIBUIDOS" title="Celdas de cómputo" workers={cellWorkers} snapshot={snapshot} busy={busy} onRemove={remove} />}
       {snapshot.workers.length === 0 && <div className="node-card-grid"><div className="wide-empty"><Empty icon={Server} title="No hay nodos registrados" copy="Abre el worker móvil o instala mycellios para añadir la primera máquina." /><a href="/mobile/">Conectar un dispositivo <ArrowRight size={15} /></a></div></div>}
     </section>
   );
 }
 
-function NodeInventorySection({ eyebrow, title, workers, busy, onRemove }: {
+function NodeInventorySection({ eyebrow, title, workers, snapshot, busy, onRemove }: {
   eyebrow: string;
   title: string;
   workers: PublicWorker[];
+  snapshot: PublicSnapshot;
   busy: string | null;
   onRemove: (workerId: string) => Promise<void>;
 }) {
@@ -604,11 +610,15 @@ function NodeInventorySection({ eyebrow, title, workers, busy, onRemove }: {
   return <>
     <div className="node-list-heading"><div><span>{eyebrow}</span><h2>{title}</h2></div><strong>{workers.length} registrado{workers.length === 1 ? "" : "s"}</strong></div>
     <div className="node-card-grid">
-      {workers.map((worker) => <article className="node-card" key={worker.id}>
+      {workers.map((worker) => {
+        const execution = workerExecutionSummary(snapshot, worker);
+        return <article className="node-card" key={worker.id}>
         <div className="node-card-head"><div className={`node-device ${worker.kind}`}><WorkerKindIcon worker={worker} /></div><div><span>{workerKindLabel(worker)}</span><h2>{workerLabel(worker)}</h2><small>{shortId(worker.id)}</small></div><span className={`node-status ${worker.status}`}><i />{nodeStatusLabel(worker)}</span></div>
+        <div className="node-runtime-state"><ExecutionBadge execution={execution} /><span><strong>{execution.verified ? executionDetail(execution) : "No active model is reporting execution on this node"}</strong><small>{execution.verified ? executionDeviceNames(execution) : "Detected GPU hardware is not counted as active compute."}</small></span></div>
+        {execution.stages.length > 0 && <ExecutionStages execution={execution} compact />}
         <div className="node-card-metrics"><Metric label={worker.kind === "cell" ? "Capacidad" : "Hardware"} value={worker.gpus[0]?.model ?? "Desconocido"} /><Metric label="Ofrecido" value={formatMemory(worker.offeredVramMb)} /><Metric label="Región" value={worker.region} /><Metric label="Completadas" value={String(worker.jobsCompleted)} /></div>
         <div className="node-card-foot"><span>Visto {relativeTimeEs(worker.lastSeenAt)}</span><button disabled={busy === worker.id} onClick={() => void onRemove(worker.id)}>{busy === worker.id ? <LoaderCircle className="spin" /> : <Trash2 />} Eliminar</button></div>
-      </article>)}
+      </article>;})}
     </div>
   </>;
 }
@@ -617,15 +627,16 @@ function NodeOverviewStat({ icon: Icon, label, value, detail, progress, tone }: 
   return <article className={`node-overview-stat ${tone}`}><div className="node-overview-icon"><Icon /></div><span>{label}</span><strong>{value}</strong><small>{detail}</small>{progress !== undefined && <div className="node-overview-progress"><i style={{ width: `${Math.max(0, Math.min(1, progress)) * 100}%` }} /></div>}</article>;
 }
 
-function NodeTopologyInspector({ worker }: { worker: PublicWorker }) {
+function NodeTopologyInspector({ worker, snapshot }: { worker: PublicWorker; snapshot: PublicSnapshot }) {
   const gpus = worker.gpus;
   const free = gpus.reduce((total, gpu) => total + gpu.freeOfferedVramMb, 0);
   const utilizations = gpus.filter((gpu) => gpu.utilizationPct !== undefined);
   const utilization = utilizations.length > 0 ? utilizations.reduce((total, gpu) => total + (gpu.utilizationPct ?? 0), 0) / utilizations.length : null;
   const throughput = worker.deployments.reduce((total, deployment) => total + deployment.tokensPerSecond, 0);
+  const execution = workerExecutionSummary(snapshot, worker);
   return <div className="node-topology-inspector">
-    <div className={`node-inspector-identity ${nodeVisualState(worker)}`}><div><WorkerKindIcon worker={worker} /></div><span><small>{worker.kind === "cell" ? "CELDA SELECCIONADA" : "NODO SELECCIONADO"}</small><strong>{workerLabel(worker)}</strong><em>{worker.region} · {shortId(worker.id)}</em></span></div>
-    <div className="node-inspector-metrics"><Metric label="Estado" value={nodeStatusLabel(worker)} /><Metric label="GPU libre" value={formatMemory(free)} /><Metric label="Carga" value={utilization === null ? "Sin datos" : `${utilization.toFixed(0)}%`} /><Metric label="Rend. anunciado" value={throughput > 0 ? `${formatCompactNumber(throughput)} tok/s` : "—"} /><Metric label="Fiabilidad" value={`${Math.round(worker.reliability * 100)}%`} /><Metric label="Modelos" value={String(worker.deployments.length)} /></div>
+    <div className={`node-inspector-identity ${nodeVisualState(worker)}`}><div><WorkerKindIcon worker={worker} /></div><span><small>{worker.kind === "cell" ? "CELDA SELECCIONADA" : "NODO SELECCIONADO"}</small><strong>{workerLabel(worker)}</strong><em>{worker.region} · {shortId(worker.id)}</em><ExecutionBadge execution={execution} /></span></div>
+    <div className="node-inspector-metrics"><Metric label="Estado" value={nodeStatusLabel(worker)} /><Metric label="GPU libre" value={formatMemory(free)} /><Metric label="Carga física" value={utilization === null ? "Sin datos" : `${utilization.toFixed(0)}%`} /><Metric label="Rend. anunciado" value={throughput > 0 ? `${formatCompactNumber(throughput)} tok/s` : "—"} /><Metric label="Cómputo real" value={execution.verified ? executionShortLabel(execution) : "No verificado"} /><Metric label="Modelos" value={String(worker.deployments.length)} /></div>
   </div>;
 }
 
@@ -759,8 +770,11 @@ function Models({ snapshot, onSearch, onRequest, onRemove, adminToken: initialAd
       {snapshot.requestedModels.map((model) => <RequestedModelCard key={model.id} model={model} onRemove={(modelId) => onRemove(modelId, adminToken)} />)}
     </div>
 
-    <div className="panel-table model-active-table"><div className="panel-table-head"><span>Active model</span><span>Replicas</span><span>Pipelines</span><span>Status</span></div>
-      {snapshot.models.map((model) => <div className="panel-table-row" key={model.id}><strong><Boxes size={17} />{model.id}</strong><span>{model.replicas}</span><span>{model.pipelines}</span><b><i />Available</b></div>)}
+    <div className="panel-table model-active-table"><div className="panel-table-head"><span>Active model</span><span>Replicas</span><span>Pipelines</span><span>Effective device</span></div>
+      {snapshot.models.map((model) => {
+        const execution = modelExecutionSummary(snapshot, model.id);
+        return <div className="panel-table-row model-execution-row" key={model.id}><strong><Boxes size={17} />{model.id}</strong><span>{model.replicas}</span><span>{model.pipelines}</span><ExecutionBadge execution={execution} /></div>;
+      })}
       {snapshot.models.length === 0 && <Empty icon={Boxes} title="No active models" copy="Choose a model above. It will remain queued with an exact capacity shortfall until the network can run it." />}
     </div>
   </section>;
@@ -1019,7 +1033,7 @@ function Inference({ snapshot, onSend, onNavigate }: {
     </div> : <div className="inference-console">
       <div className="inference-toolbar">
         <label><span>MODELO REAL</span><AppSelect ariaLabel="Modelo real" value={selectedModel} onChange={setModel} options={realModels.map((item) => ({ value: item.id, label: item.id }))} /></label>
-        <div className="inference-model-summary"><span className="inference-live"><i />DISPONIBLE</span><span>{selectedOption?.routeLabel}</span><span>{selectedOption?.freeSlots ?? 0} hueco{selectedOption?.freeSlots === 1 ? "" : "s"} libre{selectedOption?.freeSlots === 1 ? "" : "s"}</span></div>
+        <div className="inference-model-summary"><ExecutionBadge execution={selectedOption?.execution ?? unknownExecutionSummary()} large /><span className="inference-live"><i />DISPONIBLE</span><span>{selectedOption?.routeLabel}</span><span>{selectedOption?.freeSlots ?? 0} hueco{selectedOption?.freeSlots === 1 ? "" : "s"} libre{selectedOption?.freeSlots === 1 ? "" : "s"}</span></div>
       </div>
       <div className="inference-output" aria-live="polite" ref={outputRef}>
         {turns.length === 0 && !pendingTurn && !error && <div className="inference-welcome"><Sparkles /><h2>Escribe una pregunta</h2><p>La respuesta vendrá del modelo seleccionado, no del adaptador de conectividad.</p><div className="inference-suggestions">{["Resume cómo funciona esta red", "Explica una idea en tres frases", "Responde con una prueba corta"].map((suggestion) => <button key={suggestion} onClick={() => setPrompt(suggestion)}>{suggestion}</button>)}</div></div>}
@@ -1089,6 +1103,12 @@ function Machine({ snapshot, bridge, onSnapshot }: { snapshot: DashboardSnapshot
       <div className="device-orb"><Cpu size={42} /></div>
       <div><span className="eyebrow">{snapshot.platform.toUpperCase()}</span><h2>{snapshot.localHardware.hostname}</h2><p>{snapshot.localHardware.gpus.length} accelerator(s) · {formatMemory(snapshot.localHardware.ramMb)} RAM</p></div>
       <span className={`state-badge ${snapshot.contribution.state === "connected" ? "online" : "paused"}`}>{contributionLabel}</span>
+    </div>
+    <div className={`accelerator-runtime-state ${snapshot.acceleration.state}`}>
+      <div className="accelerator-runtime-icon">{snapshot.acceleration.state === "preparing" ? <LoaderCircle className="spin" /> : snapshot.acceleration.state === "gpu-ready" ? <Zap /> : <Cpu />}</div>
+      <div><span>LOCAL EXECUTION RUNTIME</span><strong>{accelerationStateLabel(snapshot.acceleration.state)}</strong><small>{snapshot.acceleration.message}</small></div>
+      <div className="accelerator-runtime-facts"><b>{snapshot.acceleration.effectiveBackend?.toUpperCase() ?? "NOT VERIFIED"}</b><b>{snapshot.acceleration.precision?.toUpperCase() ?? "—"}</b></div>
+      <p>A model is marked <em>GPU ACTIVE</em> only after its weights load on the device and the distributed canary succeeds.</p>
     </div>
     <div className="cards-grid">
       {snapshot.localHardware.gpus.map((gpu) => <article className="hardware-card" key={gpu.id}><div className="hardware-card-icon"><Gauge size={23} /></div><span className="card-kicker">{gpu.vendor}</span><h3>{gpu.model}</h3><div className="capacity-line"><span style={{ width: `${Math.min(100, snapshot.settings.offeredVramMb / Math.max(1, gpu.physicalVramMb + (gpu.sharedMemoryMb ?? 0)) * 100)}%` }} /></div><div className="hardware-metrics"><DesktopMetric label="Physical VRAM" value={formatMemory(gpu.physicalVramMb)} /><DesktopMetric label="Shared" value={formatMemory(gpu.sharedMemoryMb ?? 0)} /><DesktopMetric label="Utilization" value={`${gpu.utilizationPct ?? 0}%`} /><DesktopMetric label="Temperature" value={gpu.temperatureC === undefined ? "—" : `${gpu.temperatureC} °C`} /></div></article>)}
@@ -1338,8 +1358,126 @@ function formatCompactNumber(value: number): string { return new Intl.NumberForm
 function formatPower(watts: number): string { return watts >= 1_000 ? `${(watts / 1_000).toFixed(1)} kW` : `${Math.round(watts)} W`; }
 function shortId(value: string) { return value.length <= 10 ? value : `${value.slice(0, 6)}…${value.slice(-4)}`; }
 function formatMemory(value: number) { return value >= 1_024 ? `${(value / 1_024).toFixed(value >= 10_240 ? 0 : 1)} GB` : `${Math.round(value)} MB`; }
+function accelerationStateLabel(state: DashboardSnapshot["acceleration"]["state"]): string {
+  if (state === "gpu-ready") return "GPU runtime physically verified";
+  if (state === "gpu-fallback") return "CPU fallback ready";
+  if (state === "cpu-ready") return "CPU runtime ready";
+  if (state === "preparing") return "Preparing accelerator runtime…";
+  if (state === "error") return "Runtime preparation failed";
+  return "Waiting for runtime verification";
+}
 function relativeTime(value: string) { const seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1_000)); if (seconds < 5) return "now"; if (seconds < 60) return `${seconds}s ago`; const minutes = Math.floor(seconds / 60); if (minutes < 60) return `${minutes}m ago`; return `${Math.floor(minutes / 60)}h ago`; }
 function relativeTimeEs(value: string) { const seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1_000)); if (seconds < 5) return "ahora"; if (seconds < 60) return `hace ${seconds} s`; const minutes = Math.floor(seconds / 60); if (minutes < 60) return `hace ${minutes} min`; return `hace ${Math.floor(minutes / 60)} h`; }
+
+type ExecutionTelemetry = NonNullable<DashboardDeployment["execution"]>;
+type ExecutionStageTelemetry = NonNullable<ExecutionTelemetry["stages"]>[number];
+
+interface EffectiveExecutionSummary {
+  verified: boolean;
+  deviceType: "cpu" | "gpu" | "mixed" | "unknown";
+  backends: ExecutionTelemetry["backend"][];
+  deviceNames: string[];
+  precisions: string[];
+  fallback: boolean;
+  fallbackReasons: string[];
+  stages: ExecutionStageTelemetry[];
+  unitCount: number;
+}
+
+function unknownExecutionSummary(): EffectiveExecutionSummary {
+  return { verified: false, deviceType: "unknown", backends: [], deviceNames: [], precisions: [], fallback: false, fallbackReasons: [], stages: [], unitCount: 0 };
+}
+
+function summarizeDeploymentExecution(deployments: PublicDeployment[]): EffectiveExecutionSummary {
+  const executions = deployments.map((deployment) => deployment.execution).filter((execution): execution is ExecutionTelemetry => execution !== undefined);
+  if (executions.length === 0) return unknownExecutionSummary();
+  const stages = executions.flatMap((execution) => execution.stages ?? []);
+  if (stages.length > 0) return summarizeExecutionStages(stages, executions);
+  const deviceTypes = new Set(executions.map((execution) => execution.deviceType));
+  const hasCpu = deviceTypes.has("cpu") || deviceTypes.has("mixed");
+  const hasGpu = deviceTypes.has("gpu") || deviceTypes.has("mixed");
+  return {
+    verified: true,
+    deviceType: hasCpu && hasGpu ? "mixed" : hasGpu ? "gpu" : "cpu",
+    backends: unique(executions.map((execution) => execution.backend)),
+    deviceNames: unique(executions.map((execution) => execution.deviceName)),
+    precisions: unique(executions.map((execution) => execution.precision)),
+    fallback: executions.some((execution) => execution.fallback),
+    fallbackReasons: unique(executions.flatMap((execution) => execution.fallbackReason ? [execution.fallbackReason] : [])),
+    stages: [],
+    unitCount: executions.length,
+  };
+}
+
+function summarizeExecutionStages(stages: ExecutionStageTelemetry[], parents: ExecutionTelemetry[] = []): EffectiveExecutionSummary {
+  const hasCpu = stages.some((stage) => stage.deviceType === "cpu");
+  const hasGpu = stages.some((stage) => stage.deviceType === "gpu");
+  return {
+    verified: true,
+    deviceType: hasCpu && hasGpu ? "mixed" : hasGpu ? "gpu" : "cpu",
+    backends: unique(stages.map((stage) => stage.backend)),
+    deviceNames: unique(stages.map((stage) => stage.deviceName)),
+    precisions: unique(stages.map((stage) => stage.precision)),
+    fallback: stages.some((stage) => stage.fallback) || parents.some((execution) => execution.fallback),
+    fallbackReasons: unique([
+      ...stages.flatMap((stage) => stage.fallbackReason ? [stage.fallbackReason] : []),
+      ...parents.flatMap((execution) => execution.fallbackReason ? [execution.fallbackReason] : []),
+    ]),
+    stages: [...stages].sort((left, right) => left.stageIndex - right.stageIndex),
+    unitCount: stages.length,
+  };
+}
+
+function modelExecutionSummary(snapshot: PublicSnapshot, modelId: string): EffectiveExecutionSummary {
+  return summarizeDeploymentExecution(snapshot.workers.flatMap((worker) => worker.deployments).filter((deployment) => deployment.model === modelId));
+}
+
+function workerExecutionSummary(snapshot: PublicSnapshot, worker: PublicWorker): EffectiveExecutionSummary {
+  const runtimeNodeId = worker.executionNodeId ?? worker.id;
+  const matchingStages = snapshot.workers
+    .flatMap((candidate) => candidate.deployments)
+    .flatMap((deployment) => deployment.execution?.stages ?? [])
+    .filter((stage) => stage.nodeId === runtimeNodeId);
+  if (matchingStages.length > 0) return summarizeExecutionStages(matchingStages);
+  return summarizeDeploymentExecution(worker.deployments);
+}
+
+function unique<T>(values: T[]): T[] { return [...new Set(values)]; }
+
+function executionShortLabel(execution: EffectiveExecutionSummary): string {
+  if (!execution.verified) return "UNVERIFIED";
+  if (execution.deviceType === "cpu") return execution.fallback ? "CPU FALLBACK" : "CPU ACTIVE";
+  if (execution.deviceType === "gpu") return "GPU ACTIVE";
+  return execution.fallback ? "MIXED · FALLBACK" : "MIXED CPU + GPU";
+}
+
+function executionDetail(execution: EffectiveExecutionSummary): string {
+  if (!execution.verified) return "No effective runtime telemetry";
+  const units = `${execution.unitCount} ${execution.stages.length > 0 ? "stage" : "runtime"}${execution.unitCount === 1 ? "" : "s"}`;
+  const backends = execution.backends.map((backend) => backend.toUpperCase()).join(" + ");
+  const precision = execution.precisions.join(" + ");
+  return [units, backends, precision].filter(Boolean).join(" · ");
+}
+
+function executionDeviceNames(execution: EffectiveExecutionSummary): string {
+  return execution.deviceNames.length > 0 ? execution.deviceNames.join(" · ") : "Device name unavailable";
+}
+
+function ExecutionBadge({ execution, large = false }: { execution: EffectiveExecutionSummary; large?: boolean }) {
+  const Icon = execution.deviceType === "gpu" ? Zap : execution.deviceType === "mixed" ? Network : Cpu;
+  const title = execution.fallbackReasons.length > 0 ? execution.fallbackReasons.join(" · ") : executionDetail(execution);
+  return <span className={`execution-badge ${execution.deviceType}${execution.fallback ? " fallback" : ""}${large ? " large" : ""}`} title={title}><Icon /><span><strong>{executionShortLabel(execution)}</strong>{large && <small>{execution.verified ? execution.backends.map((backend) => backend.toUpperCase()).join(" + ") : "NO DEVICE CLAIM"}</small>}</span></span>;
+}
+
+function ExecutionStages({ execution, compact = false }: { execution: EffectiveExecutionSummary; compact?: boolean }) {
+  if (execution.stages.length === 0) return null;
+  return <div className={`execution-stage-list${compact ? " compact" : ""}`}>
+    {execution.stages.map((stage) => {
+      const summary = summarizeExecutionStages([stage]);
+      return <div className="execution-stage" key={`${stage.nodeId}-${stage.stageIndex}`}><span><small>STAGE {stage.stageIndex + 1} · LAYERS {stage.layerStart}–{stage.layerEnd}</small><strong>{stage.deviceName}</strong><em>{shortId(stage.nodeId)} · {stage.backend.toUpperCase()} · {stage.precision}</em></span><ExecutionBadge execution={summary} /></div>;
+    })}
+  </div>;
+}
 
 function inferenceModelOption(snapshot: PublicSnapshot, model: PublicSnapshot["models"][number]) {
   const deployments = snapshot.workers.flatMap((worker) => worker.deployments).filter((deployment) => deployment.model === model.id);
@@ -1349,7 +1487,7 @@ function inferenceModelOption(snapshot: PublicSnapshot, model: PublicSnapshot["m
   const routeLabel = model.pipelines > 0
     ? `${model.pipelines} pipeline${model.pipelines === 1 ? "" : "s"}`
     : `${model.replicas} réplica${model.replicas === 1 ? "" : "s"}`;
-  return { ...model, connectivityOnly, freeSlots, routeLabel };
+  return { ...model, connectivityOnly, freeSlots, routeLabel, execution: summarizeDeploymentExecution(deployments) };
 }
 
 function formatDuration(milliseconds: number): string {

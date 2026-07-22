@@ -37,6 +37,9 @@ class JsonMetricSink:
             # or non-serializable observation must never stop token inference.
             pass
 
+    def put_startup(self, value: dict[str, Any]) -> None:
+        self.put(value)
+
 
 def _uint64_argument(value: str) -> int:
     try:
@@ -63,6 +66,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--layer-end", type=int, required=True)
     parser.add_argument("--total-layers", type=int, required=True)
     parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help=(
+            "Dense Torch execution device: auto, cpu, cuda or cuda:<index>. "
+            "An explicit accelerator request fails if it is unavailable."
+        ),
+    )
     parser.add_argument("--listen-host", default="0.0.0.0")
     parser.add_argument("--listen-port", type=int, required=True)
     parser.add_argument("--next-host")
@@ -297,6 +308,7 @@ def build_config(args: argparse.Namespace) -> StageProcessConfig:
         codec=codec,
         one_way_delay_ms=args.one_way_delay_ms,
         bandwidth_mbps=args.bandwidth_mbps,
+        device=args.device,
         connect_timeout_seconds=args.connect_timeout_seconds,
         sealed_wave_tokens=args.sealed_wave_tokens,
         max_prefill_chunk_tokens=args.max_prefill_chunk_tokens,
@@ -350,6 +362,7 @@ def main(argv: list[str] | None = None) -> int:
                 "next": [config.next_host, config.next_port],
                 "return": [config.return_host, config.return_port],
                 "codec": config.codec.name.lower(),
+                "requested_device": config.device,
                 "cell": (
                     None
                     if config.cell_fixture is None

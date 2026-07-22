@@ -867,6 +867,9 @@ function renderRemoteStageArguments(
     "--listen-port",
     String(launch.anchor.endpoint.port),
   );
+  if (!ramBackedMoe && !launch.native_stage && !launch.cell) {
+    args.push("--device", "auto");
+  }
   if (launch.downstream) {
     args.push(
       "--next-host",
@@ -1097,6 +1100,7 @@ function renderRootEngineArguments(
     "--socket-timeout-seconds",
     finiteNumber(configuration.connectTimeoutSeconds),
   );
+  if (!ramBackedMoe) args.push("--device", "auto");
   return args;
 }
 

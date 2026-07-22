@@ -381,6 +381,16 @@ class DistributedOpenAIServer:
                 "root_batching": self.engine.root_batch_stats,
                 "recovery": recovery,
                 "root_parameter_bytes": self.engine.root_parameter_bytes,
+                "execution": getattr(
+                    self.engine,
+                    "execution_topology",
+                    {
+                        "requested_device": "unknown",
+                        "observed_stage_count": 0,
+                        "total_stage_count": self.engine.stages,
+                        "stages": [],
+                    },
+                ),
                 "batcher": {
                     "queued": self.batcher.queue.qsize(),
                     "batches": self.batcher.batches,
@@ -812,6 +822,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="fp16",
     )
     parser.add_argument("--threads-per-stage", type=int, default=1)
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help=(
+            "Dense Torch execution device: auto, cpu, cuda or cuda:<index>. "
+            "An explicit accelerator request fails if it is unavailable."
+        ),
+    )
     parser.add_argument("--max-batch-size", type=int, default=8)
     parser.add_argument("--max-active-sequences", type=int, default=8)
     parser.add_argument("--max-pending-requests", type=int, default=128)
@@ -1088,6 +1106,7 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
             boundaries=boundaries,
             codec=codec,
             threads_per_stage=args.threads_per_stage,
+            device=args.device,
             startup_timeout_seconds=args.startup_timeout_seconds,
             socket_timeout_seconds=args.socket_timeout_seconds,
             spawn_local_stages=not remote,
@@ -1182,6 +1201,7 @@ def main(argv: list[str] | None = None) -> int:
                 "stages": server.engine.stages,
                 "boundaries": list(server.engine.config.boundaries),
                 "root_batch_window_ms": server.engine.config.root_batch_window_ms,
+                "execution": server.engine.execution_topology,
             },
             sort_keys=True,
         ),
