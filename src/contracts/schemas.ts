@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 const adapterKind = z.enum(["mock", "local-model-runtime", "externalggufruntime", "openai-compatible"]);
-const executionBackend = z.enum(["cpu", "cuda", "rocm", "directml", "mps", "vulkan", "webgpu"]);
+const executionBackend = z.enum(["cpu", "cuda", "rocm", "directml", "mps", "xpu", "vulkan", "webgpu"]);
 
 const executionStageSchema = z.object({
   nodeId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),

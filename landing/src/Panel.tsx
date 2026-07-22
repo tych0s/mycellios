@@ -48,6 +48,7 @@ import type {
   DashboardDeployment,
   ChatResponse,
   ChatStreamUpdate,
+  DesktopAccelerationStatus,
   DesktopBridge,
   DesktopSettings,
   DesktopUpdateStatus,
@@ -59,6 +60,7 @@ import { consumeChatCompletionStream } from "../../src/desktop/chat-stream";
 import type { BenchmarkMeasurement, BenchmarkRun } from "../../src/benchlab/types";
 import { Contribute } from "./Contribute";
 import brandIcon from "./assets/mycellios-app-icon-v2.png";
+import { isAdvertisedGpuSelected } from "./panel-hardware";
 import "./panel.css";
 
 const PUBLIC_COORDINATOR_URL = "https://www.mycellios.com";
@@ -71,6 +73,8 @@ interface PanelProps {
   desktopBridge?: DesktopBridge;
   mobileEntry?: boolean;
 }
+
+type AcceleratorProgressSnapshot = DesktopAccelerationStatus;
 
 interface PublicGpu {
   id: string;
@@ -407,7 +411,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
           <div className="panel-content-scale" style={{ transform: `scale(${contentScale})`, width: `${100 / contentScale}%` } as CSSProperties}>
             {loading && snapshot.capturedAt === EMPTY.capturedAt ? <PanelLoading /> : (
               <>
-              {view === "overview" && <Overview snapshot={snapshot} onNavigate={navigate} publicLink={publicLink} external={desktop} />}
+              {view === "overview" && <Overview snapshot={snapshot} onNavigate={navigate} publicLink={publicLink} external={desktop} localAcceleration={desktopSnapshot?.acceleration} localContributionState={desktopSnapshot?.contribution.state} />}
               {view === "nodes" && <Nodes snapshot={snapshot} onRemove={removeWorker} onClearOffline={clearOfflineWorkers} />}
               {view === "models" && <Models snapshot={snapshot} onSearch={searchHubModels} onRequest={requestModel} onRemove={removeRequestedModel} adminToken={modelAdminToken} requiresAdminToken={requiresModelAdminToken} secureTokenStorage={desktop} />}
               {view === "jobs" && <Jobs snapshot={snapshot} />}
@@ -428,7 +432,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   );
 }
 
-function Overview({ snapshot, onNavigate, publicLink, external }: { snapshot: PublicSnapshot; onNavigate: (view: PanelView) => void; publicLink: (path: string) => string; external: boolean }) {
+function Overview({ snapshot, onNavigate, publicLink, external, localAcceleration, localContributionState }: { snapshot: PublicSnapshot; onNavigate: (view: PanelView) => void; publicLink: (path: string) => string; external: boolean; localAcceleration: AcceleratorProgressSnapshot | undefined; localContributionState: DashboardSnapshot["contribution"]["state"] | undefined }) {
   const active = snapshot.workers.filter((worker) => worker.connected);
   const operational = active.filter((worker) => worker.status === "online");
   const activeGpus = operational.flatMap((worker) => worker.gpus);
@@ -451,6 +455,7 @@ function Overview({ snapshot, onNavigate, publicLink, external }: { snapshot: Pu
   return (
     <section className="overview-page">
       <PageTitle eyebrow="NETWORK CONTROL" title="Overview" copy="A live view of the capacity, models and tasks connected to your mycellios network." actions={<><button onClick={() => onNavigate("nodes")}>Manage nodes</button><a href={publicLink("/mobile/")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}>Add this device <ArrowRight size={16} /></a></>} />
+      {localAcceleration && shouldShowAccelerationBanner(localAcceleration) && <AcceleratorCompactBanner acceleration={localAcceleration} contributionState={localContributionState} onOpen={() => onNavigate("machine")} />}
       <article className="global-capacity-card">
         <div className="global-capacity-main">
           <div className="global-capacity-heading"><span>GLOBAL NODE CAPACITY</span><b><i /> LIVE</b></div>
@@ -1071,20 +1076,22 @@ function InferenceCompletedTurn({ turn }: { turn: InferenceTurn }) {
 }
 
 function JoinNetwork({ publicLink, external }: { publicLink: (path: string) => string; external: boolean }) {
-  return <section><PageTitle eyebrow="ZERO-CONFIG JOIN" title="Add this device" copy="No account, invitation or terminal. Choose the fastest option for this device." />
-    <div className="join-grid"><a className="join-card featured" href={publicLink("/mobile/")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><div><Smartphone /><span>INSTANT</span></div><h2>Use this browser</h2><p>Works on Android, iPhone, tablets and desktop browsers. Keep the page visible while contributing.</p><ul><li><CheckCircle2 />WebGPU when available</li><li><CheckCircle2 />CPU fallback everywhere</li><li><CheckCircle2 />Nothing to install</li></ul><strong>Open browser worker <ArrowRight /></strong></a>
-      <a className="join-card" href={publicLink("/downloads")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><div><Laptop /><span>WINDOWS · MACOS</span></div><h2>Install the desktop agent</h2><p>Runs in the background and can expose native GPU runtimes such as local model runtime.</p><ul><li><CheckCircle2 />Windows 10/11</li><li><CheckCircle2 />Apple Silicon and Intel Macs</li><li><CheckCircle2 />Background contribution</li></ul><strong>Choose your computer <Download /></strong></a></div>
+  return <section><PageTitle eyebrow="ZERO-CONFIG JOIN" title="Add this device" copy="No account, invitation or terminal. Choose an option, review the detected hardware and confirm participation." />
+    <div className="join-grid"><a className="join-card featured" href={publicLink("/mobile/?autostart=1")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><div><Smartphone /><span>INSTANT</span></div><h2>Use this browser</h2><p>Works on modern Android, iPhone, tablet and desktop browsers. Keep the page visible while contributing.</p><ul><li><CheckCircle2 />WebGPU when available</li><li><CheckCircle2 />Automatic CPU fallback</li><li><CheckCircle2 />One explicit confirmation</li></ul><strong>Open and confirm <ArrowRight /></strong></a>
+      <a className="join-card" href={publicLink("/downloads")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><div><Laptop /><span>WINDOWS · MACOS · LINUX</span></div><h2>Install the desktop agent</h2><p>Detects the hardware, prepares the certified runtime automatically and contributes on CPU while GPU setup finishes.</p><ul><li><CheckCircle2 />Windows CUDA/ROCm and Apple Silicon MPS when certified</li><li><CheckCircle2 />Automatic verified downloads</li><li><CheckCircle2 />Safe CPU fallback</li></ul><strong>Choose your computer <Download /></strong></a></div>
   </section>;
 }
 
 function Downloads({ publicLink, external }: { publicLink: (path: string) => string; external: boolean }) {
   return <section><PageTitle eyebrow="CLIENTS" title="Downloads" copy="Install the native client or enter immediately through the universal browser worker." />
-    <div className="download-grid"><a className="download-card ready" href={publicLink("/downloads/windows")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Laptop />WINDOWS</span><h2>Windows 10/11</h2><p>x64 installer · Electron desktop agent with automatic updates</p><strong>Download installer <Download /></strong></a><a className="download-card ready" href={publicLink("/downloads/macos-arm64")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Cpu />MACOS · APPLE SILICON</span><h2>Mac M1–M4</h2><p>Unsigned test DMG · Apple Silicon arm64</p><strong>Download DMG <Download /></strong></a><a className="download-card ready" href={publicLink("/downloads/macos-x64")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Cpu />MACOS · INTEL</span><h2>Mac Intel</h2><p>Unsigned test DMG · Intel x64</p><strong>Download DMG <Download /></strong></a><a className="download-card ready" href={publicLink("/downloads/linux-deb")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Cpu />LINUX · DEBIAN</span><h2>Ubuntu / Debian</h2><p>x64 native desktop agent · DEB package</p><strong>Download DEB <Download /></strong></a><a className="download-card ready" href={publicLink("/downloads/linux-rpm")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Cpu />LINUX · RPM</span><h2>Fedora / RHEL</h2><p>x64 native desktop agent · RPM package</p><strong>Download RPM <Download /></strong></a><a className="download-card ready" href={publicLink("/mobile/")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Globe2 />UNIVERSAL</span><h2>Browser worker</h2><p>Android, iOS, macOS, Linux and Windows</p><strong>Open now <ExternalLink /></strong></a></div>
+    <div className="download-grid"><a className="download-card ready" href={publicLink("/downloads/windows")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Laptop />WINDOWS</span><h2>Windows 10/11</h2><p>x64 installer · automatic CPU runtime, CUDA verification and ROCm on certified Windows 11 hardware</p><strong>Download installer <Download /></strong></a><a className="download-card ready" href={publicLink("/downloads/macos-arm64")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Cpu />MACOS · APPLE SILICON</span><h2>Mac M1 or newer</h2><p>macOS 14+ arm64 DMG · bundled PyTorch runtime with automatic Metal / MPS verification</p><strong>Download DMG <Download /></strong></a><a className="download-card ready" href={publicLink("/downloads/macos-x64")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Cpu />MACOS · INTEL</span><h2>Mac Intel</h2><p>x64 DMG · self-contained CPU runtime; WebGPU remains available in the browser</p><strong>Download DMG <Download /></strong></a><a className="download-card ready" href={publicLink("/downloads/linux-deb")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Cpu />LINUX · DEBIAN</span><h2>Ubuntu / Debian</h2><p>x64 DEB · automatic certified CPU runtime; compatible GPUs can contribute through the browser worker</p><strong>Download DEB <Download /></strong></a><a className="download-card ready" href={publicLink("/downloads/linux-rpm")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Cpu />LINUX · RPM</span><h2>Fedora / RHEL</h2><p>x64 RPM · automatic certified CPU runtime; compatible GPUs can contribute through the browser worker</p><strong>Download RPM <Download /></strong></a><a className="download-card ready" href={publicLink("/mobile/?autostart=1")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Globe2 />UNIVERSAL</span><h2>Browser worker</h2><p>Android, iOS and desktops · real WebGPU probe with automatic CPU fallback after confirmation</p><strong>Open and confirm <ExternalLink /></strong></a></div>
   </section>;
 }
 
 function Machine({ snapshot, bridge, onSnapshot }: { snapshot: DashboardSnapshot; bridge: DesktopBridge; onSnapshot: (snapshot: DashboardSnapshot) => void }) {
   const [busy, setBusy] = useState(false);
+  const localWorker = snapshot.workers.find((worker) => worker.id === snapshot.contribution.workerId);
+  const advertisedGpu = localWorker?.gpus[0];
   const contributionLabel = snapshot.contribution.state === "connected"
     ? "Connected"
     : snapshot.contribution.state === "connecting"
@@ -1102,19 +1109,129 @@ function Machine({ snapshot, bridge, onSnapshot }: { snapshot: DashboardSnapshot
     <div className="hardware-hero">
       <div className="device-orb"><Cpu size={42} /></div>
       <div><span className="eyebrow">{snapshot.platform.toUpperCase()}</span><h2>{snapshot.localHardware.hostname}</h2><p>{snapshot.localHardware.gpus.length} accelerator(s) · {formatMemory(snapshot.localHardware.ramMb)} RAM</p></div>
-      <span className={`state-badge ${snapshot.contribution.state === "connected" ? "online" : "paused"}`}>{contributionLabel}</span>
+      <span className={`state-badge ${snapshot.contribution.state === "connected" ? "online" : snapshot.contribution.state}`}>{contributionLabel}</span>
     </div>
-    <div className={`accelerator-runtime-state ${snapshot.acceleration.state}`}>
-      <div className="accelerator-runtime-icon">{snapshot.acceleration.state === "preparing" ? <LoaderCircle className="spin" /> : snapshot.acceleration.state === "gpu-ready" ? <Zap /> : <Cpu />}</div>
-      <div><span>LOCAL EXECUTION RUNTIME</span><strong>{accelerationStateLabel(snapshot.acceleration.state)}</strong><small>{snapshot.acceleration.message}</small></div>
-      <div className="accelerator-runtime-facts"><b>{snapshot.acceleration.effectiveBackend?.toUpperCase() ?? "NOT VERIFIED"}</b><b>{snapshot.acceleration.precision?.toUpperCase() ?? "—"}</b></div>
-      <p>A model is marked <em>GPU ACTIVE</em> only after its weights load on the device and the distributed canary succeeds.</p>
-    </div>
+    <AcceleratorProgressPanel acceleration={snapshot.acceleration} contributionState={snapshot.contribution.state} />
     <div className="cards-grid">
-      {snapshot.localHardware.gpus.map((gpu) => <article className="hardware-card" key={gpu.id}><div className="hardware-card-icon"><Gauge size={23} /></div><span className="card-kicker">{gpu.vendor}</span><h3>{gpu.model}</h3><div className="capacity-line"><span style={{ width: `${Math.min(100, snapshot.settings.offeredVramMb / Math.max(1, gpu.physicalVramMb + (gpu.sharedMemoryMb ?? 0)) * 100)}%` }} /></div><div className="hardware-metrics"><DesktopMetric label="Physical VRAM" value={formatMemory(gpu.physicalVramMb)} /><DesktopMetric label="Shared" value={formatMemory(gpu.sharedMemoryMb ?? 0)} /><DesktopMetric label="Utilization" value={`${gpu.utilizationPct ?? 0}%`} /><DesktopMetric label="Temperature" value={gpu.temperatureC === undefined ? "—" : `${gpu.temperatureC} °C`} /></div></article>)}
+      {snapshot.localHardware.gpus.map((gpu) => {
+        const selected = isAdvertisedGpuSelected(gpu, advertisedGpu);
+        const offered = selected && advertisedGpu ? advertisedGpu.offeredVramMb : 0;
+        const budget = gpu.physicalVramMb + (gpu.sharedMemoryMb ?? 0);
+        return <article className={`hardware-card ${selected ? "selected" : ""}`} key={gpu.id}><div className="hardware-card-icon"><Gauge size={23} /></div><span className="card-kicker">{gpu.vendor} · {selected ? "SELECTED" : "DETECTED"}</span><h3>{gpu.model}</h3><div className="capacity-line"><span style={{ width: `${budget > 0 ? Math.min(100, offered / budget * 100) : 0}%` }} /></div><div className="hardware-metrics"><DesktopMetric label="Physical VRAM" value={formatMemory(gpu.physicalVramMb)} /><DesktopMetric label="Offered" value={selected ? formatMemory(offered) : "—"} /><DesktopMetric label="Utilization" value={`${gpu.utilizationPct ?? 0}%`} /><DesktopMetric label="Temperature" value={gpu.temperatureC === undefined ? "—" : `${gpu.temperatureC} °C`} /></div></article>;
+      })}
       {snapshot.localHardware.gpus.length === 0 && <div className="wide-empty"><Empty icon={Cpu} title="No GPU detected" copy="This machine can register its real hardware, but it will not advertise a model until a compatible runtime is active." /></div>}
     </div>
   </section>;
+}
+
+function AcceleratorCompactBanner({ acceleration, contributionState, onOpen }: { acceleration: AcceleratorProgressSnapshot; contributionState: DashboardSnapshot["contribution"]["state"] | undefined; onOpen: () => void }) {
+  const cpuLabel = accelerationCpuLabel(acceleration, contributionState);
+  const cpuUnavailable = acceleration.cpu?.state === "unavailable";
+  const cpuVisualState = (acceleration.cpu?.activeStages ?? 0) > 0 ? "active" : cpuUnavailable ? "unavailable" : contributionState === "error" ? "error" : "ready";
+  const gpuLabel = accelerationGpuLabel(acceleration);
+  const gpuPreparing = isGpuPreparing(acceleration.gpu?.state);
+  const progress = visibleAccelerationProgress(acceleration);
+  const gpuName = accelerationGpuName(acceleration);
+  const detail = acceleration.preparation?.issue?.message
+    ?? acceleration.message
+    ?? "Preparing the local accelerator runtime.";
+  return <article className={`accelerator-compact-banner gpu-${acceleration.gpu?.state ?? "checking"}${gpuPreparing ? "" : " progress-hidden"}`} aria-label="Local compute transition">
+    <div className={`accelerator-compact-engine cpu ${cpuVisualState}`}>
+      <span className="accelerator-compact-icon"><Cpu /></span>
+      <span><small>{cpuUnavailable ? "NEEDS ATTENTION" : "AVAILABLE NOW"}</small><strong>{cpuLabel}</strong><em>{acceleration.cpu?.deviceName || "Local CPU runtime"}</em></span>
+    </div>
+    <ArrowRight className="accelerator-transition-arrow" aria-hidden="true" />
+    <div className="accelerator-compact-gpu">
+      <span className="accelerator-compact-icon">{gpuPreparing ? <LoaderCircle className="spin" /> : acceleration.preparation?.issue ? <CircleAlert /> : <Zap />}</span>
+      <span className="accelerator-compact-copy" aria-live="polite" aria-atomic="true"><small>{gpuLabel}</small><strong>{gpuName}</strong><em title={detail}>{detail}</em></span>
+      {progress !== null && <b>{progress}%</b>}
+    </div>
+    {gpuPreparing && <div className={`accelerator-compact-progress ${progress === null ? "indeterminate" : ""}`} role="progressbar" aria-label="GPU runtime preparation" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress ?? undefined}>
+      <i style={progress === null ? undefined : { width: `${progress}%` }} />
+    </div>}
+    <button type="button" onClick={onOpen} aria-label="Open GPU setup details">View setup <ChevronRight /></button>
+  </article>;
+}
+
+function AcceleratorProgressPanel({ acceleration, contributionState }: { acceleration: AcceleratorProgressSnapshot; contributionState: DashboardSnapshot["contribution"]["state"] }) {
+  const cpuActive = (acceleration.cpu?.activeStages ?? 0) > 0;
+  const cpuUnavailable = acceleration.cpu?.state === "unavailable";
+  const connectionError = contributionState === "error";
+  const gpuPreparing = isGpuPreparing(acceleration.gpu?.state);
+  const gpuActive = acceleration.gpu?.state === "ready" && (acceleration.gpu?.activeStages ?? 0) > 0;
+  const progress = visibleAccelerationProgress(acceleration);
+  const issue = acceleration.preparation?.issue ?? null;
+  const log = (acceleration.preparation?.log ?? []).slice(-50);
+  const gpuName = accelerationGpuName(acceleration);
+  const backend = acceleration.gpu?.state === "not-detected" || acceleration.gpu?.state === "unsupported"
+    ? "NOT AVAILABLE"
+    : acceleration.gpu?.backend?.toUpperCase() ?? acceleration.requestedBackend?.toUpperCase() ?? "NOT SELECTED";
+  const phase = acceleration.preparation?.phase || acceleration.gpu?.state || acceleration.state;
+  const phaseLabel = humanizeAccelerationPhase(phase);
+  const phaseMessage = issue?.message ?? acceleration.message;
+  const panelTitle = accelerationPanelTitle(acceleration, contributionState);
+  const panelCopy = accelerationPanelCopy(acceleration, contributionState);
+  const showProgress = gpuPreparing || progress !== null;
+  return <article className={`accelerator-progress-panel gpu-${acceleration.gpu?.state ?? "not-detected"}`}>
+    <header className="accelerator-progress-header">
+      <div className="accelerator-progress-heading">
+        <span className="accelerator-runtime-icon">{gpuPreparing ? <LoaderCircle className="spin" /> : gpuActive ? <Zap /> : issue ? <CircleAlert /> : <Cpu />}</span>
+        <div><span>LOCAL COMPUTE TRANSITION</span><h2>{panelTitle}</h2><p>{panelCopy}</p></div>
+      </div>
+      <span className={`accelerator-overall-badge ${gpuActive ? "gpu-active" : cpuActive ? "cpu-active" : cpuUnavailable ? "unavailable" : connectionError ? "connection-error" : "cpu-ready"}`}><i />{gpuActive ? "GPU ACTIVE" : cpuActive ? "CPU ACTIVE" : cpuUnavailable ? "CPU UNAVAILABLE" : contributionState === "connected" ? "CPU READY · NODE ONLINE" : contributionState === "connecting" ? "CPU READY · CONNECTING" : connectionError ? "CPU READY · CONNECTION ERROR" : "CPU READY · CONTRIBUTION PAUSED"}</span>
+    </header>
+
+    <div className="accelerator-engine-grid">
+      <section className={`accelerator-engine-card cpu ${cpuActive ? "active" : cpuUnavailable ? "unavailable" : connectionError ? "connection-error" : "ready"}`} aria-label="CPU runtime status">
+        <div className="accelerator-engine-title"><span><Cpu /></span><div><small>CPU RUNTIME</small><strong>{accelerationCpuLabel(acceleration, contributionState)}</strong></div><b>{acceleration.cpu?.precision?.toUpperCase() ?? "FP32"}</b></div>
+        <h3>{acceleration.cpu?.deviceName || "Local CPU"}</h3>
+        <p>{accelerationCpuCopy(acceleration, contributionState)}</p>
+        <div className="accelerator-engine-foot"><span><i />{cpuActive ? `${acceleration.cpu.activeStages} active stage${acceleration.cpu.activeStages === 1 ? "" : "s"}` : cpuUnavailable ? "Runtime unavailable" : contributionState === "connected" ? "Ready for network work" : contributionState === "connecting" ? "Connecting to the network" : connectionError ? "Network connection needs attention" : "Ready when contribution resumes"}</span></div>
+      </section>
+
+      <section className={`accelerator-engine-card gpu ${acceleration.gpu?.state ?? "not-detected"}`} aria-label="GPU runtime status">
+        <div className="accelerator-engine-title"><span>{gpuPreparing ? <LoaderCircle className="spin" /> : <Zap />}</span><div><small>GPU ACCELERATOR</small><strong aria-live="polite" aria-atomic="true">{accelerationGpuLabel(acceleration)}</strong></div><b>{backend}</b></div>
+        <h3>{gpuName}</h3>
+        <p>{acceleration.gpu?.vendor ? `${acceleration.gpu.vendor} · ` : ""}{gpuActive ? `${acceleration.gpu.activeStages} verified stage${acceleration.gpu.activeStages === 1 ? "" : "s"} running now.` : phaseMessage}</p>
+        <div className="accelerator-engine-foot"><span><i />{gpuActive ? "Model weights verified on device" : gpuPreparing ? "Automatic setup in progress" : accelerationGpuLabel(acceleration)}</span></div>
+      </section>
+    </div>
+
+    {showProgress && <section className="accelerator-preparation" aria-label="GPU runtime preparation progress">
+      <div className="accelerator-preparation-head">
+        <div role="status" aria-live="polite" aria-atomic="true"><span>CURRENT STEP</span><strong>{phaseLabel}</strong><small>{acceleration.preparation?.currentArtifact ? `Preparing ${acceleration.preparation.currentArtifact}` : phaseMessage}</small></div>
+        <div className="accelerator-preparation-value"><strong>{progress === null ? "Working" : `${progress}%`}</strong><small>{formatAccelerationEta(acceleration.preparation?.etaSeconds ?? null, phase)}</small></div>
+      </div>
+      <div className={`accelerator-progress-track ${progress === null ? "indeterminate" : ""}`} role="progressbar" aria-label={`${phaseLabel} progress`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress ?? undefined}>
+        <i style={progress === null ? undefined : { width: `${progress}%` }} />
+      </div>
+      <div className="accelerator-progress-meta">
+        <span><small>TRANSFERRED</small><strong>{formatAccelerationTransfer(acceleration.preparation)}</strong></span>
+        <span><small>SPEED</small><strong>{formatAccelerationRate(acceleration.preparation?.bytesPerSecond ?? null)}</strong></span>
+        <span><small>PACKAGE</small><strong>{formatAccelerationArtifact(acceleration.preparation)}</strong></span>
+        <span><small>ESTIMATED TIME</small><strong>{formatAccelerationEta(acceleration.preparation?.etaSeconds ?? null, phase)}</strong></span>
+      </div>
+    </section>}
+
+    {issue && <section className="accelerator-requirement" role="alert">
+      <span><CircleAlert /></span>
+      <div><small>{issue.retryable ? "SETUP NEEDS ATTENTION" : "GPU REQUIREMENT"}</small><strong>{issue.message}</strong><p><b>What to do:</b> {issue.action}</p></div>
+      {(issue.requiredBytes !== undefined || issue.availableBytes !== undefined) && <div className="accelerator-requirement-space">
+        {issue.requiredBytes !== undefined && <span><small>REQUIRED</small><strong>{formatAccelerationBytes(issue.requiredBytes)}</strong></span>}
+        {issue.availableBytes !== undefined && <span><small>AVAILABLE</small><strong>{formatAccelerationBytes(issue.availableBytes)}</strong></span>}
+      </div>}
+      {!issue.retryable && (issue.code === "unsupported-platform" || issue.code === "unsupported-gpu" || issue.code === "installation-required") && <a className="accelerator-browser-fallback" href={`${PUBLIC_COORDINATOR_URL}/mobile/?autostart=1`} target="_blank" rel="noreferrer"><Globe2 />Start WebGPU in your browser <ExternalLink /></a>}
+    </section>}
+
+    <details className="accelerator-log">
+      <summary><Activity /> GPU setup log <span>{log.length} event{log.length === 1 ? "" : "s"}</span><ChevronDown /></summary>
+      <div className="accelerator-log-body" aria-label="GPU setup event log">
+        {log.length > 0 ? <ol>{log.map((entry, index) => <li className={entry.level} key={`${entry.at}-${index}`}><i /><time dateTime={entry.at}>{formatAccelerationLogTime(entry.at)}</time><span>{entry.message}</span></li>)}</ol> : <p>Waiting for the first GPU setup event. CPU availability is unaffected.</p>}
+      </div>
+    </details>
+
+    <footer className="accelerator-evidence-note"><ShieldCheck /><span><strong>No guessed GPU status.</strong> GPU ACTIVE appears only after model weights load on this device and the distributed canary succeeds.</span></footer>
+  </article>;
 }
 
 function DesktopSettingsView({ snapshot, bridge, onSnapshot }: { snapshot: DashboardSnapshot; bridge: DesktopBridge; onSnapshot: (snapshot: DashboardSnapshot) => void }) {
@@ -1358,13 +1475,149 @@ function formatCompactNumber(value: number): string { return new Intl.NumberForm
 function formatPower(watts: number): string { return watts >= 1_000 ? `${(watts / 1_000).toFixed(1)} kW` : `${Math.round(watts)} W`; }
 function shortId(value: string) { return value.length <= 10 ? value : `${value.slice(0, 6)}…${value.slice(-4)}`; }
 function formatMemory(value: number) { return value >= 1_024 ? `${(value / 1_024).toFixed(value >= 10_240 ? 0 : 1)} GB` : `${Math.round(value)} MB`; }
-function accelerationStateLabel(state: DashboardSnapshot["acceleration"]["state"]): string {
-  if (state === "gpu-ready") return "GPU runtime physically verified";
-  if (state === "gpu-fallback") return "CPU fallback ready";
-  if (state === "cpu-ready") return "CPU runtime ready";
-  if (state === "preparing") return "Preparing accelerator runtime…";
-  if (state === "error") return "Runtime preparation failed";
-  return "Waiting for runtime verification";
+function shouldShowAccelerationBanner(acceleration: AcceleratorProgressSnapshot): boolean {
+  return acceleration.state !== "idle"
+    || acceleration.cpu?.state !== "unavailable"
+    || acceleration.preparation?.phase !== "idle";
+}
+
+function isGpuPreparing(state: AcceleratorProgressSnapshot["gpu"]["state"] | undefined): boolean {
+  return state === "checking" || state === "downloading" || state === "installing" || state === "verifying";
+}
+
+function accelerationProgress(acceleration: AcceleratorProgressSnapshot): number | null {
+  const value = acceleration.preparation?.progressPct;
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.max(0, Math.min(100, Math.round(value)))
+    : null;
+}
+
+function visibleAccelerationProgress(acceleration: AcceleratorProgressSnapshot): number | null {
+  const progress = accelerationProgress(acceleration);
+  const state = acceleration.gpu?.state;
+  if (state === "fallback" || state === "error" || state === "unsupported" || state === "not-detected") return null;
+  return progress;
+}
+
+function accelerationCpuLabel(acceleration: AcceleratorProgressSnapshot, contributionState?: DashboardSnapshot["contribution"]["state"]): string {
+  if ((acceleration.cpu?.activeStages ?? 0) > 0) return "CPU ACTIVE";
+  if (acceleration.cpu?.state === "unavailable") return "CPU UNAVAILABLE";
+  if (contributionState === "connected") return "CPU READY · NODE ONLINE";
+  if (contributionState === "connecting") return "CPU READY · CONNECTING";
+  if (contributionState === "error") return "CPU READY · CONNECTION ERROR";
+  return "CPU READY · CONTRIBUTION PAUSED";
+}
+
+function accelerationCpuCopy(acceleration: AcceleratorProgressSnapshot, contributionState: DashboardSnapshot["contribution"]["state"]): string {
+  if (acceleration.cpu?.state === "unavailable") return "The certified CPU runtime could not start. Open the runtime log, then restart or update mycellios.";
+  if (contributionState === "error") return "The CPU runtime is ready, but this worker is not connected to the network. mycellios will keep retrying the connection.";
+  if (contributionState === "paused") return "The CPU runtime is installed and ready; contribution is currently paused.";
+  return acceleration.cpu?.message || "The CPU runtime is available while GPU setup continues.";
+}
+
+function accelerationGpuLabel(acceleration: AcceleratorProgressSnapshot): string {
+  const state = acceleration.gpu?.state;
+  if (state === "ready" && (acceleration.gpu?.activeStages ?? 0) > 0) return "GPU ACTIVE";
+  if (state === "ready") return "GPU READY";
+  if (isGpuPreparing(state)) return "GPU PREPARING";
+  if (state === "fallback") return "CPU FALLBACK";
+  if (state === "unsupported") return "GPU NOT SUPPORTED YET";
+  if (state === "error") return "GPU SETUP FAILED";
+  if (state === "not-detected") return "NO GPU DETECTED";
+  return "GPU CHECKING";
+}
+
+function accelerationGpuName(acceleration: AcceleratorProgressSnapshot): string {
+  if (acceleration.gpu?.state === "not-detected") return "No physical GPU detected";
+  if (acceleration.gpu?.state === "unsupported") return acceleration.gpu.model ?? "Unsupported GPU";
+  return acceleration.gpu?.model ?? acceleration.deviceName ?? "GPU accelerator";
+}
+
+function accelerationPanelTitle(acceleration: AcceleratorProgressSnapshot, contributionState: DashboardSnapshot["contribution"]["state"]): string {
+  const gpuState = acceleration.gpu?.state;
+  if (acceleration.cpu?.state === "unavailable") return "The local compute runtime needs attention.";
+  if (contributionState === "error") return "CPU ready. Network connection needs attention.";
+  if (contributionState === "paused" && isGpuPreparing(gpuState)) return "Contribution paused. GPU setup continues safely.";
+  if (contributionState === "paused") return "CPU ready. Contribution is paused.";
+  if (gpuState === "ready" && (acceleration.gpu?.activeStages ?? 0) > 0) return "GPU acceleration is active.";
+  if (gpuState === "ready") return "GPU acceleration is ready for the next stage.";
+  if (isGpuPreparing(gpuState)) return "CPU online. GPU acceleration is preparing automatically.";
+  if (gpuState === "fallback" || gpuState === "error") return "CPU remains online. GPU setup needs attention.";
+  if (gpuState === "unsupported") return "CPU online. This GPU is not supported yet.";
+  return "CPU online. No compatible GPU was detected.";
+}
+
+function accelerationPanelCopy(acceleration: AcceleratorProgressSnapshot, contributionState: DashboardSnapshot["contribution"]["state"]): string {
+  const gpuState = acceleration.gpu?.state;
+  if (acceleration.cpu?.state === "unavailable") return "The certified CPU runtime is not available. Review the runtime log before contributing from this device.";
+  if (contributionState === "error") return "The CPU runtime remains ready, but the worker could not connect. mycellios will keep retrying the network connection.";
+  if (contributionState === "paused" && isGpuPreparing(gpuState)) return "The CPU runtime stays ready and the current GPU setup can finish, but this device will not accept network work until contribution resumes.";
+  if (contributionState === "paused") return "Installed runtimes remain ready, but this device will not accept network work until contribution resumes.";
+  if (gpuState === "ready") return "The physical accelerator probe passed; model execution remains visible separately from hardware readiness.";
+  if (isGpuPreparing(gpuState)) return "The CPU runtime stays available while mycellios installs and verifies the best runtime for this machine.";
+  if (gpuState === "fallback" || gpuState === "error") return "CPU service is preserved; follow the requirement below to make GPU acceleration available.";
+  if (gpuState === "unsupported") return "This release will continue safely on CPU until a certified accelerator pack is available.";
+  return "The certified CPU runtime remains available for network work.";
+}
+
+function humanizeAccelerationPhase(value: string): string {
+  const normalized = value.trim().replace(/[_-]+/g, " ");
+  if (!normalized) return "Checking accelerator";
+  return normalized.replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function formatAccelerationBytes(value: number): string {
+  if (!Number.isFinite(value) || value < 0) return "—";
+  if (value < 1_024) return `${Math.round(value)} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let amount = value;
+  let unit = -1;
+  do { amount /= 1_024; unit += 1; } while (amount >= 1_024 && unit < units.length - 1);
+  return `${amount.toFixed(amount >= 100 ? 0 : amount >= 10 ? 1 : 2)} ${units[unit]}`;
+}
+
+function formatAccelerationTransfer(preparation: AcceleratorProgressSnapshot["preparation"]): string {
+  const completed = preparation?.bytesCompleted;
+  const total = preparation?.bytesTotal;
+  if (completed === null || completed === undefined) return total === null || total === undefined ? "Calculating…" : `0 B / ${formatAccelerationBytes(total)}`;
+  return total === null || total === undefined
+    ? formatAccelerationBytes(completed)
+    : `${formatAccelerationBytes(completed)} / ${formatAccelerationBytes(total)}`;
+}
+
+function formatAccelerationRate(value: number | null): string {
+  return value !== null && Number.isFinite(value) && value > 0
+    ? `${formatAccelerationBytes(value)}/s`
+    : "Calculating…";
+}
+
+function formatAccelerationEta(value: number | null, phase = "downloading"): string {
+  if (value === null || !Number.isFinite(value) || value < 0) {
+    if (phase === "installing" || phase === "copying-base") return "Finishing installation…";
+    if (phase === "physical-probe" || phase === "activating") return "Running verification…";
+    if (phase === "verifying-package") return "Checking package…";
+    return "Estimating…";
+  }
+  const seconds = Math.ceil(value);
+  if (seconds < 60) return `${seconds}s remaining`;
+  const minutes = Math.ceil(seconds / 60);
+  if (minutes < 60) return `~${minutes}m remaining`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return `~${hours}h${rest > 0 ? ` ${rest}m` : ""} remaining`;
+}
+
+function formatAccelerationArtifact(preparation: AcceleratorProgressSnapshot["preparation"]): string {
+  const index = preparation?.artifactIndex;
+  const count = preparation?.artifactCount;
+  if (index !== null && index !== undefined && count !== null && count !== undefined) return `${Math.max(0, index)} of ${Math.max(0, count)}`;
+  return preparation?.currentArtifact ?? "Preparing…";
+}
+
+function formatAccelerationLogTime(value: string): string {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "—";
+  return date.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 function relativeTime(value: string) { const seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1_000)); if (seconds < 5) return "now"; if (seconds < 60) return `${seconds}s ago`; const minutes = Math.floor(seconds / 60); if (minutes < 60) return `${minutes}m ago`; return `${Math.floor(minutes / 60)}h ago`; }
 function relativeTimeEs(value: string) { const seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1_000)); if (seconds < 5) return "ahora"; if (seconds < 60) return `hace ${seconds} s`; const minutes = Math.floor(seconds / 60); if (minutes < 60) return `hace ${minutes} min`; return `hace ${Math.floor(minutes / 60)} h`; }

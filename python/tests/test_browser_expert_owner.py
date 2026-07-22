@@ -3,13 +3,20 @@ from __future__ import annotations
 import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
+from pathlib import Path
+import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
 
-from distributed_runtime.browser_expert_owner import BrowserExpertOwner
+from distributed_runtime.browser_expert_owner import (
+    BrowserExpertOwner,
+    BrowserExpertOwnerError,
+)
 from distributed_runtime.ram_expert_cache import ExpertKey, ExpertRecord
 from distributed_runtime.resident_expert_mesh import (
     AuthoritativeRouting,
@@ -26,13 +33,19 @@ class _CoordinatorHandler(BaseHTTPRequestHandler):
     down: torch.Tensor
     artifact_id = "a" * 64
     execution_calls = 0
+    requests: list[tuple[str, str | None]] = []
 
     def do_PUT(self) -> None:  # noqa: N802
+        type(self).requests.append((self.path, self.headers.get("authorization")))
         self._read_body()
         self._json(201, {"stored": True})
 
     def do_POST(self) -> None:  # noqa: N802
+        type(self).requests.append((self.path, self.headers.get("authorization")))
         body = json.loads(self._read_body().decode("utf-8"))
+        if self.path == "/public/test":
+            self._json(200, {"public": True})
+            return
         if self.path.endswith("/register"):
             self._json(201, {"artifactId": self.artifact_id})
             return
@@ -82,6 +95,7 @@ class BrowserExpertOwnerTests(unittest.TestCase):
         _CoordinatorHandler.up = torch.randn((4, 3), dtype=torch.float32) * 0.2
         _CoordinatorHandler.down = torch.randn((3, 4), dtype=torch.float32) * 0.2
         _CoordinatorHandler.execution_calls = 0
+        _CoordinatorHandler.requests = []
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), _CoordinatorHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -97,6 +111,7 @@ class BrowserExpertOwnerTests(unittest.TestCase):
         owner = BrowserExpertOwner(
             "mobile-browser",
             f"http://127.0.0.1:{self.server.server_port}",
+            internal_token="expert-admin",
         )
         owner.publish_swiglu_expert(
             key=key,
@@ -148,6 +163,73 @@ class BrowserExpertOwnerTests(unittest.TestCase):
         torch.testing.assert_close(actual, expected, rtol=0, atol=1e-6)
         self.assertEqual(_CoordinatorHandler.execution_calls, 1)
         self.assertEqual({dispatch.path for dispatch in plan.dispatches}, {"remote-resident"})
+        self.assertGreaterEqual(len(_CoordinatorHandler.requests), 3)
+        self.assertTrue(all(
+            authorization == "Bearer expert-admin"
+            for path, authorization in _CoordinatorHandler.requests
+            if path.startswith("/internal/")
+        ))
+
+    def test_loads_internal_token_from_environment_or_secret_file(self) -> None:
+        coordinator_url = f"http://127.0.0.1:{self.server.server_port}"
+        key = ExpertKey(0, 0)
+        artifact_id = "a" * 64
+
+        with patch.dict(
+            os.environ,
+            {"MYCELLIOS_INTERNAL_TOKEN": "environment-secret"},
+            clear=False,
+        ):
+            os.environ.pop("MYCELLIOS_INTERNAL_TOKEN_FILE", None)
+            owner = BrowserExpertOwner("environment-owner", coordinator_url)
+            owner.attach_registered_expert(key, "sha256:environment", artifact_id)
+            self.assertTrue(owner.is_expert_resident(key, "sha256:environment"))
+
+        with tempfile.TemporaryDirectory() as directory:
+            secret_file = Path(directory, "internal-token")
+            secret_file.write_text("file-secret\n", encoding="utf-8")
+            with patch.dict(
+                os.environ,
+                {"MYCELLIOS_INTERNAL_TOKEN_FILE": str(secret_file)},
+                clear=False,
+            ):
+                os.environ.pop("MYCELLIOS_INTERNAL_TOKEN", None)
+                owner = BrowserExpertOwner("file-owner", coordinator_url)
+                owner.attach_registered_expert(key, "sha256:file", artifact_id)
+                self.assertTrue(owner.is_expert_resident(key, "sha256:file"))
+
+        self.assertIn(
+            ("/internal/v1/mobile/experts/prepare", "Bearer environment-secret"),
+            _CoordinatorHandler.requests,
+        )
+        self.assertIn(
+            ("/internal/v1/mobile/experts/prepare", "Bearer file-secret"),
+            _CoordinatorHandler.requests,
+        )
+
+    def test_fails_closed_without_an_internal_token(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MYCELLIOS_INTERNAL_TOKEN", None)
+            os.environ.pop("MYCELLIOS_INTERNAL_TOKEN_FILE", None)
+            with self.assertRaisesRegex(BrowserExpertOwnerError, "requires internal_token"):
+                BrowserExpertOwner(
+                    "missing-token",
+                    f"http://127.0.0.1:{self.server.server_port}",
+                )
+
+    def test_does_not_send_internal_token_to_public_routes(self) -> None:
+        owner = BrowserExpertOwner(
+            "public-route-check",
+            f"http://127.0.0.1:{self.server.server_port}",
+            internal_token="must-not-leak",
+        )
+        owner._request(  # noqa: SLF001 - explicit security boundary regression test
+            "POST",
+            "/public/test",
+            b"{}",
+            content_type="application/json",
+        )
+        self.assertIn(("/public/test", None), _CoordinatorHandler.requests)
 
 
 if __name__ == "__main__":

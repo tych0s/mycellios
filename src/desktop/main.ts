@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
-import { cpus } from "node:os";
+import { cpus, release } from "node:os";
 import { spawn } from "node:child_process";
 import type { AddressInfo } from "node:net";
 import {
@@ -21,13 +21,23 @@ import type { CoordinatorRuntime } from "../coordinator/server.js";
 import { createCoordinator } from "../coordinator/server.js";
 import { DynamicModelActivationManager } from "../coordinator/model-activation-manager.js";
 import { parseAutoDistributionConfig } from "../distribution/auto-distribute.js";
-import { LocalProcessAgent, type LaunchAgent } from "../distribution/launch-supervisor.js";
+import {
+  LocalProcessAgent,
+  type LaunchAgent,
+  type LaunchAgentStartRequest,
+  type LaunchProcessExit,
+  type LaunchProcessHandle,
+} from "../distribution/launch-supervisor.js";
 import type { PythonPipelineLaunchDescription } from "../distribution/python-launcher.js";
 import { WorkerTunnelLaunchAgent } from "../distribution/worker-tunnel-launch-agent.js";
 import type { StoredWorker } from "../storage/store.js";
 import type { WorkerHub } from "../coordinator/worker-hub.js";
 import { WorkerAgent, validateCoordinatorUrl } from "../worker/agent.js";
-import { probeHardware, type HardwareProbe } from "../worker/hardware.js";
+import {
+  probeHardware,
+  type HardwareProbe,
+  type VerifiedGpuRuntimeEvidence,
+} from "../worker/hardware.js";
 import type {
   ChatRequest,
   ChatResponse,
@@ -40,11 +50,31 @@ import type {
   DesktopUpdateStatus,
 } from "./contracts.js";
 import type { HubCatalogModel } from "../contracts/types.js";
+import {
+  applyAccelerationProgress,
+  appendAccelerationLog,
+  beginAccelerationPreparation,
+  createInitialAccelerationStatus,
+  gpuPreparationIsContinuing,
+  selectImmediateRuntime,
+} from "./acceleration-progress.js";
+import {
+  applyVerifiedAccelerationUsage,
+  gpuPreparationAutomaticRetryLimit,
+  gpuPreparationRetryDelayMs,
+  readVerifiedAccelerationUsage,
+} from "./acceleration-evidence.js";
 import { consumeChatCompletionStream } from "./chat-stream.js";
+import {
+  selectDesktopHardwareGpu,
+  selectWorkerCapacityHardware,
+  type DesktopHardwareGpu,
+} from "./hardware-selection.js";
 import {
   prepareAcceleratorRuntime,
   readPortableRuntimeManifest,
   selectAcceleratorPack,
+  type AcceleratorProgressEvent,
   type AcceleratorRuntimeResult,
 } from "./accelerator-runtime.js";
 
@@ -88,20 +118,23 @@ let coordinatorUrl = "";
 let worker: WorkerAgent | null = null;
 let distributedExecutor: Awaited<ReturnType<typeof createDesktopDistributedExecutor>> | null = null;
 let distributionRuntimePromise: Promise<string> | null = null;
+let cpuRuntimePromise: Promise<AcceleratorRuntimeResult> | null = null;
 let acceleratorRuntimePromise: Promise<AcceleratorRuntimeResult> | null = null;
+let resolvedAcceleratorRuntime: AcceleratorRuntimeResult | null = null;
+let acceleratorRuntimeBlockedByStageFailure = false;
+let acceleratorRuntimeRoot: string | null = null;
+let acceleratorRetryTimer: NodeJS.Timeout | null = null;
+let acceleratorRetryAttempt = 0;
+let acceleratorRetryIssueCode: string | null = null;
+// Keep expensive-failure budgets per code until a GPU really passes verification.
+// Alternating through a transient network error must not unlock another 2.6 GB integrity retry.
+const acceleratorRetryIssueAttempts = new Map<string, number>();
 let hardwarePromise: Promise<HardwareProbe> | null = null;
 let settings: DesktopSettings = DEFAULT_SETTINGS;
 let modelAdminToken = "";
 let isQuitting = false;
 let runtimeError: string | null = null;
-let accelerationStatus: DashboardSnapshot["acceleration"] = {
-  state: "idle",
-  requestedBackend: null,
-  effectiveBackend: null,
-  deviceName: null,
-  precision: null,
-  message: "The effective device will be verified when a model stage starts.",
-};
+let accelerationStatus: DashboardSnapshot["acceleration"] = createInitialAccelerationStatus();
 let updateCheckTimer: NodeJS.Timeout | null = null;
 let updateCheckInFlight = false;
 let updateStatus: DesktopUpdateStatus = {
@@ -406,16 +439,27 @@ function normalizeHttpUrl(url: URL): string {
   return normalized.toString().replace(/\/$/, "");
 }
 
-async function buildWorkerConfig(): Promise<WorkerConfig> {
-  const hardware = await getHardware();
-  const primary = hardware.gpus[0];
+async function buildWorkerConfig(
+  primary: DesktopHardwareGpu | undefined,
+): Promise<WorkerConfig> {
   const detectedBudget = primary
     ? primary.physicalVramMb + (primary.sharedMemoryMb ?? 0)
     : 0;
-  if (detectedBudget > 0 && settings.offeredVramMb > detectedBudget) {
-    throw new Error(
-      `La cuota de ${settings.offeredVramMb} MB supera los ${detectedBudget} MB detectados.`,
-    );
+  // A fresh install must start on smaller and unified-memory devices without
+  // asking the user to understand VRAM first. The stored preference remains
+  // untouched and is capped only for the adapter actually advertised.
+  // Keep the user's upper limit in config and let WorkerAgent clamp the live
+  // capability to verified CPU/GPU memory. This allows the same connection to
+  // grow from CPU RAM to GPU VRAM after the background physical probe passes.
+  const offeredVramMb = primary?.id === "cpu-memory" || detectedBudget < 512
+    ? settings.offeredVramMb
+    : Math.min(settings.offeredVramMb, detectedBudget);
+  if (offeredVramMb !== settings.offeredVramMb) {
+    writeDesktopLog("worker-vram-auto-capped", {
+      configuredMb: settings.offeredVramMb,
+      offeredMb: offeredVramMb,
+      gpu: primary?.model,
+    });
   }
   const adapter =
     settings.adapterMode === "local-model-runtime"
@@ -434,7 +478,7 @@ async function buildWorkerConfig(): Promise<WorkerConfig> {
   return workerConfigSchema.parse({
     region: settings.region,
     capacityScope: "host",
-    offeredVramMb: settings.offeredVramMb,
+    offeredVramMb,
     limits: {
       maxConcurrency: 1,
       maxTemperatureC: 80,
@@ -459,13 +503,25 @@ async function startWorkerIfEnabled(): Promise<void> {
       stageHost: distributedExecutor.stageHost,
       stagePort: distributedExecutor.stagePort,
     });
+    if (acceleratorRuntimeRoot) startDesktopAcceleratorPreparation(acceleratorRuntimeRoot);
   } catch (error) {
     writeDesktopLog("distributed-executor-failed", { error: errorText(error) });
     throw error;
   }
   let config: WorkerConfig;
+  let preferredHardwareGpu: DesktopHardwareGpu | undefined;
+  let capacityHardwareGpu: DesktopHardwareGpu | undefined;
+  const verifiedGpuRuntime = currentVerifiedGpuRuntime();
   try {
-    config = await buildWorkerConfig();
+    const hardware = await getHardware();
+    preferredHardwareGpu = selectDesktopHardwareGpu(hardware.gpus, desktopHardwareSelectionInput());
+    capacityHardwareGpu = selectWorkerCapacityHardware(
+      hardware,
+      preferredHardwareGpu,
+      cpus()[0]?.model,
+      verifiedGpuRuntime,
+    );
+    config = await buildWorkerConfig(capacityHardwareGpu);
   } catch (error) {
     writeDesktopLog("worker-config-failed", { error: errorText(error) });
     throw error;
@@ -479,6 +535,10 @@ async function startWorkerIfEnabled(): Promise<void> {
     // The legacy connectivity option now means hardware-only standby. It
     // registers this physical PC but never advertises a fake model.
     advertiseDeployment: settings.adapterMode !== "connectivity-test",
+    ...(preferredHardwareGpu
+      ? { preferredHardwareGpu: { id: preferredHardwareGpu.id, vendor: preferredHardwareGpu.vendor, model: preferredHardwareGpu.model } }
+      : {}),
+    ...(verifiedGpuRuntime ? { verifiedGpuRuntime } : {}),
     distributedExecutor,
     logger: {
       info: (message) => {
@@ -496,6 +556,10 @@ async function startWorkerIfEnabled(): Promise<void> {
     },
   });
   worker = nextWorker;
+  // Close the small race where the background physical probe can finish
+  // between hardware selection and WorkerAgent construction. The method
+  // updates constructor state synchronously while capabilities are still null.
+  await nextWorker.refreshRuntimeCapacity(currentVerifiedGpuRuntime());
   void nextWorker.start().catch((error: unknown) => {
     runtimeError = errorText(error);
     writeDesktopLog("worker-start-failed", { error: runtimeError });
@@ -510,6 +574,7 @@ async function stopWorker(): Promise<void> {
 }
 
 async function stopRuntime(): Promise<void> {
+  clearAcceleratorRetryTimer();
   await stopWorker();
   const activeCoordinator = coordinator;
   coordinator = null;
@@ -588,6 +653,15 @@ async function readSnapshot(): Promise<DashboardSnapshot> {
         : localWorkerConnected
           ? "connected"
           : "connecting";
+  accelerationStatus = applyVerifiedAccelerationUsage(
+    accelerationStatus,
+    readVerifiedAccelerationUsage({
+      workers,
+      runtimeNodeId: distributedExecutor?.nodeId ?? null,
+      localWorkerId,
+      contributionConnected: contributionState === "connected",
+    }),
+  );
   return {
     capturedAt: new Date().toISOString(),
     coordinatorUrl,
@@ -682,10 +756,13 @@ function registerIpc(): void {
   ipcMain.handle("contribution:set", async (_event, enabled: boolean) => {
     persistSettings({ ...settings, contributionEnabled: Boolean(enabled) });
     if (enabled) await startWorkerIfEnabled();
-    else if (worker) {
-      const active = worker;
-      worker = null;
-      await active.stop();
+    else {
+      clearAcceleratorRetryTimer();
+      if (worker) {
+        const active = worker;
+        worker = null;
+        await active.stop();
+      }
     }
     return readSnapshot();
   });
@@ -884,16 +961,58 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-async function createDesktopDistributedExecutor() {
-  const runtimeRoot = await ensureDistributionRuntime();
-  const pythonExecutable = distributionPythonExecutable(runtimeRoot);
-  if (!existsSync(pythonExecutable)) {
-    throw new Error("The packaged shard runtime is missing. Reinstall mycellios to contribute this device.");
-  }
-  const nodeId = persistentDistributedNodeId();
-  const launchAgent = new DesktopAcceleratedLaunchAgent(runtimeRoot, nodeId);
-  // Provision in the background so the desktop UI and worker registration are
-  // immediate. A physical stage launch awaits this same promise before spawn.
+function desktopHardwareSelectionInput() {
+  return {
+    platform: process.platform,
+    arch: process.arch,
+    osRelease: release(),
+    cpuModel: cpus()[0]?.model,
+  };
+}
+
+function currentVerifiedGpuRuntime(): VerifiedGpuRuntimeEvidence | undefined {
+  const runtime = resolvedAcceleratorRuntime;
+  if (!runtime || runtime.status !== "gpu-ready") return undefined;
+  const backend = runtime.effectiveBackend;
+  if (backend === "cpu") return undefined;
+  return {
+    status: "gpu-ready",
+    backend,
+    deviceName: runtime.deviceName,
+  };
+}
+
+function refreshPublishedRuntimeCapacity(): void {
+  const activeWorker = worker;
+  if (!activeWorker) return;
+  const runtime = currentVerifiedGpuRuntime();
+  void activeWorker.refreshRuntimeCapacity(runtime).then(
+    () => {
+      writeDesktopLog("worker-runtime-capacity-refreshed", {
+        backend: runtime?.backend ?? "cpu",
+        deviceName: runtime?.deviceName ?? cpus()[0]?.model ?? "CPU",
+      });
+    },
+    (error: unknown) => {
+      writeDesktopLog("worker-runtime-capacity-refresh-failed", { error: errorText(error) });
+    },
+  );
+}
+
+function clearAcceleratorRetryTimer(): void {
+  if (!acceleratorRetryTimer) return;
+  clearTimeout(acceleratorRetryTimer);
+  acceleratorRetryTimer = null;
+}
+
+function startDesktopAcceleratorPreparation(runtimeRoot: string): void {
+  if (
+    isQuitting
+    || !settings.contributionEnabled
+    || acceleratorRuntimeBlockedByStageFailure
+    || resolvedAcceleratorRuntime?.status === "gpu-ready"
+    || acceleratorRuntimePromise !== null
+  ) return;
   void prepareDesktopAcceleratorRuntime(runtimeRoot).then((runtime) => {
     writeDesktopLog("accelerator-runtime-ready", {
       status: runtime.status,
@@ -906,6 +1025,73 @@ async function createDesktopDistributedExecutor() {
   }).catch((error: unknown) => {
     writeDesktopLog("accelerator-runtime-failed", { error: errorText(error) });
   });
+}
+
+function scheduleDesktopAcceleratorRetry(runtimeRoot: string, issueCode: string): void {
+  if (isQuitting || !settings.contributionEnabled || acceleratorRetryTimer) return;
+
+  if (acceleratorRetryIssueCode !== issueCode) {
+    acceleratorRetryIssueCode = issueCode;
+    acceleratorRetryAttempt = 0;
+  }
+
+  const automaticRetryLimit = gpuPreparationAutomaticRetryLimit(issueCode);
+  const issueAttempts = acceleratorRetryIssueAttempts.get(issueCode) ?? 0;
+  if (automaticRetryLimit !== null && issueAttempts >= automaticRetryLimit) {
+    const action = issueCode === "integrity"
+      ? "Automatic retries stopped after a repeated integrity failure. Update mycellios before retrying; CPU contribution remains available."
+      : "Automatic retries stopped after repeated GPU setup failures. Restart or update mycellios before retrying; CPU contribution remains available.";
+    accelerationStatus = {
+      ...accelerationStatus,
+      preparation: {
+        ...accelerationStatus.preparation,
+        issue: accelerationStatus.preparation.issue
+          ? { ...accelerationStatus.preparation.issue, retryable: false, action }
+          : {
+              code: issueCode,
+              message: accelerationStatus.message,
+              retryable: false,
+              action,
+            },
+      },
+    };
+    accelerationStatus = appendAccelerationLog(accelerationStatus, {
+      at: new Date().toISOString(),
+      level: "error",
+      message: `Automatic GPU setup stopped after ${issueAttempts} failed automatic retr${issueAttempts === 1 ? "y" : "ies"}. CPU contribution remains available.`,
+    });
+    return;
+  }
+
+  const delayMs = gpuPreparationRetryDelayMs(acceleratorRetryAttempt);
+  acceleratorRetryAttempt += 1;
+  acceleratorRetryIssueAttempts.set(issueCode, issueAttempts + 1);
+  const seconds = Math.ceil(delayMs / 1_000);
+  accelerationStatus = appendAccelerationLog(accelerationStatus, {
+    at: new Date().toISOString(),
+    level: "warning",
+    message: `GPU setup will retry automatically in ${seconds} seconds. The CPU runtime remains available.`,
+  });
+  acceleratorRetryTimer = setTimeout(() => {
+    acceleratorRetryTimer = null;
+    startDesktopAcceleratorPreparation(runtimeRoot);
+  }, delayMs);
+}
+
+async function createDesktopDistributedExecutor() {
+  const runtimeRoot = await ensureDistributionRuntime();
+  acceleratorRuntimeRoot = runtimeRoot;
+  const pythonExecutable = distributionPythonExecutable(runtimeRoot);
+  if (!existsSync(pythonExecutable)) {
+    throw new Error("The packaged shard runtime is missing. Reinstall mycellios to contribute this device.");
+  }
+  const nodeId = persistentDistributedNodeId();
+  const launchAgent = new DesktopAcceleratedLaunchAgent(runtimeRoot, nodeId);
+  // The small certified CPU runtime ships with the app and becomes available
+  // before registration. GPU provisioning always happens beside it in an
+  // isolated app-data directory, so a multi-gigabyte download never blocks
+  // this device from accepting a compatible CPU stage.
+  await prepareDesktopCpuRuntime(runtimeRoot);
   return {
     nodeId,
     // This is a globally unique logical route name, never a reachable LAN IP.
@@ -928,10 +1114,57 @@ class DesktopAcceleratedLaunchAgent implements LaunchAgent {
   }
 
   async start(
-    request: import("../distribution/launch-supervisor.js").LaunchAgentStartRequest,
+    request: LaunchAgentStartRequest,
     signal: AbortSignal,
-  ): Promise<import("../distribution/launch-supervisor.js").LaunchProcessHandle> {
-    const runtime = await prepareDesktopAcceleratorRuntime(this.baseRuntimeRoot);
+  ): Promise<LaunchProcessHandle> {
+    // Capture the best runtime already available. Do not await the background
+    // GPU installer: the bundled CPU runtime can serve work immediately. Once
+    // the physical GPU probe passes, only subsequent launches switch to GPU;
+    // an in-flight CPU stage is never migrated or interrupted.
+    const runtime = await selectImmediateRuntime(
+      () => resolvedAcceleratorRuntime,
+      () => prepareDesktopCpuRuntime(this.baseRuntimeRoot),
+    );
+    const handle = await this.launchWithRuntime(request, signal, runtime);
+
+    if (runtime.deviceType === "gpu") {
+      try {
+        // A physical FP16 probe proves the backend works in isolation. Model
+        // loading is the second gate: if that fails, retry this same stage on
+        // CPU before returning a handle to the supervisor.
+        await handle.ready;
+        this.observeHandle(handle, request, runtime, true);
+        return handle;
+      } catch (error) {
+        if (signal.aborted) {
+          throw signal.reason instanceof Error ? signal.reason : new Error("distributed_launch_cancelled");
+        }
+        await handle.stop("gpu_model_stage_failed").catch(() => undefined);
+        invalidateGpuRuntimeAfterStageFailure(runtime, request.launchId, errorText(error));
+        const cpuRuntime = await prepareDesktopCpuRuntime(this.baseRuntimeRoot);
+        if (signal.aborted) {
+          throw signal.reason instanceof Error ? signal.reason : new Error("distributed_launch_cancelled");
+        }
+        accelerationStatus = appendAccelerationLog(accelerationStatus, {
+          at: new Date().toISOString(),
+          level: "warning",
+          message: `Retrying model stage ${request.launchId} on CPU automatically; no user action is required.`,
+        });
+        const cpuHandle = await this.launchWithRuntime(request, signal, cpuRuntime);
+        this.observeHandle(cpuHandle, request, cpuRuntime, false);
+        return cpuHandle;
+      }
+    }
+
+    this.observeHandle(handle, request, runtime, false);
+    return handle;
+  }
+
+  private async launchWithRuntime(
+    request: LaunchAgentStartRequest,
+    signal: AbortSignal,
+    runtime: AcceleratorRuntimeResult,
+  ): Promise<LaunchProcessHandle> {
     if (signal.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("distributed_launch_cancelled");
     const pythonPath = resourcePath("python");
     const hfHome = join(app.getPath("userData"), "model-shards");
@@ -952,12 +1185,12 @@ class DesktopAcceleratedLaunchAgent implements LaunchAgent {
     const commandArgs = [...request.process.command.args];
     const deviceFlag = commandArgs.lastIndexOf("--device");
     if (deviceFlag >= 0 && deviceFlag + 1 < commandArgs.length) {
-      if (runtime.status === "gpu-ready") commandArgs[deviceFlag + 1] = "cuda";
-      else if (runtime.status === "cpu-ready") commandArgs[deviceFlag + 1] = "cpu";
-      // gpu-fallback deliberately keeps `auto`: the runtime then reports that
-      // an accelerator was requested but CPU was the effective backend.
+      // The preparation result owns this mapping. In particular, MPS/XPU must
+      // never be rewritten to CUDA, and a failed accelerator probe must launch
+      // explicitly on CPU instead of letting `auto` rediscover the failed GPU.
+      commandArgs[deviceFlag + 1] = runtime.launchDevice;
     }
-    return executor.start({
+    const handle = await executor.start({
       ...request,
       process: {
         ...request.process,
@@ -968,103 +1201,338 @@ class DesktopAcceleratedLaunchAgent implements LaunchAgent {
         },
       },
     }, signal);
+    const deviceType = runtime.deviceType;
+    const setupInProgress = deviceType === "cpu" && gpuPreparationIsContinuing(accelerationStatus);
+    accelerationStatus = appendAccelerationLog(accelerationStatus, {
+      at: new Date().toISOString(),
+      level: "info",
+      message: deviceType === "gpu"
+        ? `Model stage ${request.launchId} launched on ${runtime.deviceName}; waiting for model load and the distributed canary.`
+        : setupInProgress
+          ? `Model stage ${request.launchId} launched on CPU while GPU setup continues; waiting for model load and the distributed canary.`
+          : `Model stage ${request.launchId} launched on CPU; waiting for model load and the distributed canary.`,
+    });
+    return handle;
   }
+
+  private observeHandle(
+    handle: LaunchProcessHandle,
+    request: LaunchAgentStartRequest,
+    runtime: AcceleratorRuntimeResult,
+    readyAlready: boolean,
+  ): void {
+    const deviceType = runtime.deviceType;
+    const recordReady = () => {
+      accelerationStatus = appendAccelerationLog(accelerationStatus, {
+        at: new Date().toISOString(),
+        level: "info",
+        message: `Model stage ${request.launchId} loaded on ${deviceType.toUpperCase()}; ACTIVE will appear only after coordinator canary evidence is published.`,
+      });
+    };
+    if (readyAlready) recordReady();
+    else void handle.ready.then(
+      recordReady,
+      (error: unknown) => {
+        accelerationStatus = appendAccelerationLog(accelerationStatus, {
+          at: new Date().toISOString(),
+          level: "warning",
+          message: `Model stage ${request.launchId} did not become ready on ${deviceType.toUpperCase()}: ${errorText(error)}`,
+        });
+      },
+    );
+    void handle.exited.then((exit) => {
+      const unexpected = unexpectedRuntimeExit(exit);
+      accelerationStatus = appendAccelerationLog(accelerationStatus, {
+        at: new Date().toISOString(),
+        level: unexpected ? "warning" : "info",
+        message: unexpected
+          ? `Model stage ${request.launchId} exited unexpectedly on ${deviceType.toUpperCase()} (code ${exit.code ?? "none"}${exit.signal ? `, ${exit.signal}` : ""}).`
+          : `Model stage ${request.launchId} stopped on ${deviceType.toUpperCase()}.`,
+      });
+      if (deviceType === "gpu" && unexpected) {
+        invalidateGpuRuntimeAfterStageFailure(
+          runtime,
+          request.launchId,
+          exit.error ?? `process exited with code ${exit.code ?? "none"}${exit.signal ? ` and signal ${exit.signal}` : ""}`,
+        );
+      }
+    });
+  }
+}
+
+function unexpectedRuntimeExit(exit: LaunchProcessExit): boolean {
+  if (exit.error) return true;
+  if (exit.code !== null && exit.code !== 0) return true;
+  return exit.signal !== null && exit.signal !== "SIGTERM" && exit.signal !== "SIGINT";
+}
+
+function invalidateGpuRuntimeAfterStageFailure(
+  runtime: AcceleratorRuntimeResult,
+  launchId: string,
+  reason: string,
+): void {
+  if (runtime.deviceType !== "gpu" || resolvedAcceleratorRuntime !== runtime) return;
+  resolvedAcceleratorRuntime = null;
+  acceleratorRuntimePromise = null;
+  acceleratorRuntimeBlockedByStageFailure = true;
+  clearAcceleratorRetryTimer();
+  const message = `${runtime.deviceName} could not run model stage ${launchId}; certified CPU fallback is active.`;
+  accelerationStatus = {
+    ...accelerationStatus,
+    state: "gpu-fallback",
+    requestedBackend: runtime.effectiveBackend,
+    effectiveBackend: "cpu",
+    precision: "float32",
+    message,
+    cpu: {
+      ...accelerationStatus.cpu,
+      state: accelerationStatus.cpu.activeStages > 0 ? "active" : "ready",
+      message: accelerationStatus.cpu.activeStages > 0
+        ? accelerationStatus.cpu.message
+        : "Certified CPU fallback is ready after a native GPU model-stage failure.",
+    },
+    gpu: {
+      ...accelerationStatus.gpu,
+      state: "fallback",
+      activeStages: 0,
+    },
+    preparation: {
+      ...accelerationStatus.preparation,
+      phase: "fallback",
+      progressPct: null,
+      updatedAt: new Date().toISOString(),
+      issue: {
+        code: "gpu-model-stage",
+        message: reason,
+        action: "CPU contribution continues automatically. Restart or update mycellios before retrying this native GPU runtime.",
+        retryable: false,
+      },
+    },
+  };
+  accelerationStatus = appendAccelerationLog(accelerationStatus, {
+    at: new Date().toISOString(),
+    level: "error",
+    message: `${message} Reason: ${reason}`,
+  });
+  refreshPublishedRuntimeCapacity();
+}
+
+function prepareDesktopCpuRuntime(runtimeRoot: string): Promise<AcceleratorRuntimeResult> {
+  if (cpuRuntimePromise) return cpuRuntimePromise;
+  const cpuModel = cpus()[0]?.model;
+  cpuRuntimePromise = prepareAcceleratorRuntime({
+    baseRuntimeRoot: runtimeRoot,
+    userDataPath: app.getPath("userData"),
+    hardware: {
+      platform: process.platform,
+      arch: process.arch,
+      cpuModel,
+    },
+    preferredBackend: "cpu",
+    allowProvisioning: false,
+  }).then((runtime) => {
+    accelerationStatus = {
+      ...accelerationStatus,
+      effectiveBackend: "cpu",
+      precision: "float32",
+      cpu: {
+        ...accelerationStatus.cpu,
+        state: accelerationStatus.cpu.activeStages > 0 ? "active" : "ready",
+        deviceName: cpuModel?.trim() || "CPU",
+        message: accelerationStatus.cpu.activeStages > 0
+          ? accelerationStatus.cpu.message
+          : "Certified CPU runtime ready; this device can accept compatible work now.",
+      },
+    };
+    accelerationStatus = appendAccelerationLog(accelerationStatus, {
+      at: new Date().toISOString(),
+      level: "success",
+      message: "Certified CPU runtime ready; this device can accept compatible work now.",
+    });
+    return runtime;
+  });
+  return cpuRuntimePromise;
 }
 
 function prepareDesktopAcceleratorRuntime(runtimeRoot: string): Promise<AcceleratorRuntimeResult> {
   if (acceleratorRuntimePromise) return acceleratorRuntimePromise;
   if (!app.isPackaged && process.env.MYCELLIOS_PROVISION_ACCELERATOR !== "1") {
-    const developmentCpu: AcceleratorRuntimeResult = {
-      status: "cpu-ready",
-      requestedBackend: "cpu",
-      effectiveBackend: "cpu",
-      deviceType: "cpu",
-      runtimeRoot,
-      pythonExecutable: distributionPythonExecutable(runtimeRoot),
-      pythonPathAdditions: [],
-      pathAdditions: [dirname(distributionPythonExecutable(runtimeRoot))],
-      deviceName: cpus()[0]?.model ?? "CPU",
-      precision: "float32",
-      torchVersion: "2.13.0+cpu",
-    };
-    accelerationStatus = {
-      state: "cpu-ready",
-      requestedBackend: "cpu",
-      effectiveBackend: "cpu",
-      deviceName: developmentCpu.deviceName,
-      precision: "float32",
-      message: "Development mode uses the existing certified CPU runtime.",
-    };
-    acceleratorRuntimePromise = Promise.resolve(developmentCpu);
+    acceleratorRuntimePromise = prepareDesktopCpuRuntime(runtimeRoot).then((developmentCpu) => {
+      resolvedAcceleratorRuntime = developmentCpu;
+      accelerationStatus = {
+        ...accelerationStatus,
+        state: "cpu-ready",
+        requestedBackend: "cpu",
+        effectiveBackend: "cpu",
+        deviceName: developmentCpu.deviceName,
+        precision: "float32",
+        message: "Development mode uses the existing certified CPU runtime.",
+        preparation: {
+          ...accelerationStatus.preparation,
+          phase: "fallback",
+          progressPct: null,
+          updatedAt: new Date().toISOString(),
+        },
+      };
+      return developmentCpu;
+    });
     return acceleratorRuntimePromise;
   }
-  accelerationStatus = {
-    state: "preparing",
-    requestedBackend: null,
-    effectiveBackend: null,
-    deviceName: null,
-    precision: null,
-    message: "Checking the vendor runtime and physical accelerator…",
-  };
-  acceleratorRuntimePromise = getHardware().then((hardware) => {
+  accelerationStatus = applyAccelerationProgress(accelerationStatus, {
+    phase: "detecting",
+    progressPct: 0,
+    message: "Detecting the local GPU while the certified CPU runtime remains ready.",
+  });
+  const preparation = getHardware().then((hardware) => {
     const cpuModel = cpus()[0]?.model;
     // Win32_VideoController ordering is not stable and commonly puts an Intel
     // adapter or a virtual display ahead of a supported AMD accelerator. Pick
     // the first device for which this release actually has a certified pack;
     // otherwise the desktop could silently stay on CPU despite a usable GPU.
-    const gpu = hardware.gpus.find((candidate) => selectAcceleratorPack({
+    const gpu = selectDesktopHardwareGpu(hardware.gpus, desktopHardwareSelectionInput());
+    const selectedPack = selectAcceleratorPack({
       platform: process.platform,
       arch: process.arch,
-      gpuVendor: candidate.vendor,
-      gpuModel: candidate.model,
+      osRelease: release(),
+      gpuVendor: gpu?.vendor,
+      gpuModel: gpu?.model,
       cpuModel,
-    }) !== null) ?? hardware.gpus[0];
+    });
+    accelerationStatus = beginAccelerationPreparation(accelerationStatus, {
+      vendor: gpu?.vendor ?? null,
+      model: gpu?.model ?? null,
+      backend: selectedPack?.backend ?? null,
+      cpuName: cpuModel,
+    });
     return prepareAcceleratorRuntime({
       baseRuntimeRoot: runtimeRoot,
       userDataPath: app.getPath("userData"),
       hardware: {
         platform: process.platform,
         arch: process.arch,
+        osRelease: release(),
         gpuVendor: gpu?.vendor,
         gpuModel: gpu?.model,
+        gpuDeviceIndex: gpu?.runtimeDeviceIndex,
         cpuModel,
       },
       allowProvisioning: app.isPackaged || process.env.MYCELLIOS_PROVISION_ACCELERATOR === "1",
-      onStatus: (status) => {
-        accelerationStatus = { ...accelerationStatus, state: "preparing", message: status };
-        writeDesktopLog("accelerator-runtime-progress", { status });
-      },
+      onProgress: applyDesktopAcceleratorProgress,
     });
   }).then((runtime) => {
+    resolvedAcceleratorRuntime = runtime.status === "gpu-ready" ? runtime : null;
+    const targetDevice = accelerationStatus.gpu.model;
     accelerationStatus = {
+      ...accelerationStatus,
       state: runtime.status,
       requestedBackend: runtime.requestedBackend,
       effectiveBackend: runtime.effectiveBackend,
-      deviceName: runtime.deviceName,
+      deviceName: runtime.status === "gpu-ready" ? runtime.deviceName : targetDevice ?? runtime.deviceName,
       precision: runtime.precision,
       message: runtime.status === "gpu-ready"
         ? `${runtime.deviceName} passed the physical FP16 probe.`
         : runtime.status === "gpu-fallback"
           ? runtime.fallbackReason ?? "The accelerator probe failed; CPU fallback is active."
           : "The certified CPU runtime is ready.",
+      cpu: {
+        ...accelerationStatus.cpu,
+        state: accelerationStatus.cpu.activeStages > 0 ? "active" : "ready",
+      },
     };
+    if (runtime.status === "gpu-ready") {
+      acceleratorRuntimeBlockedByStageFailure = false;
+      acceleratorRetryAttempt = 0;
+      acceleratorRetryIssueCode = null;
+      acceleratorRetryIssueAttempts.clear();
+      clearAcceleratorRetryTimer();
+      refreshPublishedRuntimeCapacity();
+    } else if (accelerationStatus.preparation.issue?.retryable) {
+      scheduleDesktopAcceleratorRetry(runtimeRoot, accelerationStatus.preparation.issue.code);
+    }
     return runtime;
   }, (error: unknown) => {
+    const message = errorText(error);
+    accelerationStatus = applyAccelerationProgress(accelerationStatus, {
+      phase: "error",
+      message,
+      issue: {
+        code: "runtime-error",
+        message,
+        action: "Keep mycellios open for the automatic retry. Restart only if repeated retries cannot complete.",
+        retryable: true,
+      },
+      level: "error",
+    });
     accelerationStatus = {
+      ...accelerationStatus,
       state: "error",
-      requestedBackend: null,
-      effectiveBackend: null,
-      deviceName: null,
-      precision: null,
-      message: errorText(error),
+      effectiveBackend: "cpu",
+      precision: "float32",
     };
+    resolvedAcceleratorRuntime = null;
+    scheduleDesktopAcceleratorRetry(runtimeRoot, "runtime-error");
     throw error;
   });
-  return acceleratorRuntimePromise;
+  acceleratorRuntimePromise = preparation;
+  void preparation.then(
+    (runtime) => {
+      if (runtime.status !== "gpu-ready" && acceleratorRuntimePromise === preparation) {
+        acceleratorRuntimePromise = null;
+      }
+    },
+    () => {
+      if (acceleratorRuntimePromise === preparation) acceleratorRuntimePromise = null;
+    },
+  );
+  return preparation;
+}
+
+function applyDesktopAcceleratorProgress(event: AcceleratorProgressEvent): void {
+  accelerationStatus = {
+    ...accelerationStatus,
+    requestedBackend: event.backend ?? accelerationStatus.requestedBackend,
+    deviceName: event.gpuModel ?? accelerationStatus.deviceName,
+    gpu: {
+      ...accelerationStatus.gpu,
+      vendor: event.gpuVendor ?? accelerationStatus.gpu.vendor,
+      model: event.gpuModel ?? accelerationStatus.gpu.model,
+      backend: event.backend ?? accelerationStatus.gpu.backend,
+    },
+  };
+  accelerationStatus = applyAccelerationProgress(accelerationStatus, {
+    phase: event.phase,
+    message: event.message,
+    progressPct: event.percent,
+    bytesCompleted: event.download?.aggregateDownloaded,
+    bytesTotal: event.download?.aggregateTotal,
+    bytesPerSecond: event.download?.bytesPerSecond ?? null,
+    etaSeconds: event.download?.etaSeconds ?? null,
+    currentArtifact: event.download?.artifact ?? null,
+    artifactIndex: event.download?.artifactIndex ?? null,
+    artifactCount: event.download?.artifactCount ?? null,
+    issue: event.issue
+      ? {
+          ...event.issue,
+          message: event.message,
+        }
+      : undefined,
+    recordLog: event.recordLog,
+    at: event.at,
+  });
+  if (event.recordLog) {
+    writeDesktopLog("accelerator-runtime-progress", {
+      phase: event.phase,
+      percent: event.percent,
+      backend: event.backend,
+      gpuModel: event.gpuModel,
+      message: event.message,
+      issue: event.issue,
+    });
+  }
 }
 
 function distributionPythonExecutable(root = app.isPackaged
-  ? join(app.getPath("userData"), "distribution-runtime-v2")
+  ? join(app.getPath("userData"), "distribution-runtime-v3")
   : join(app.getAppPath(), "runtime", "distribution-venv")): string {
   if (process.platform === "win32") {
     const portable = join(root, "python.exe");
@@ -1080,13 +1548,13 @@ function ensureDistributionRuntime(): Promise<string> {
 
 async function ensureDistributionRuntimeOnce(): Promise<string> {
   if (!app.isPackaged) return join(app.getAppPath(), "runtime", "distribution-venv");
-  const root = join(app.getPath("userData"), "distribution-runtime-v2");
+  const root = join(app.getPath("userData"), "distribution-runtime-v3");
   if (existsSync(distributionPythonExecutable(root))) {
     try {
-      await readPortableRuntimeManifest(root);
+      await readPortableRuntimeManifest(root, { platform: process.platform, arch: process.arch });
       return root;
     } catch (error) {
-      writeDesktopLog("distribution-runtime-v2-invalid", { error: errorText(error) });
+      writeDesktopLog("distribution-runtime-v3-invalid", { error: errorText(error) });
       if (dirname(root) !== app.getPath("userData")) throw error;
       rmSync(root, { recursive: true, force: true });
     }
@@ -1102,7 +1570,7 @@ async function ensureDistributionRuntimeOnce(): Promise<string> {
   if (!existsSync(executable)) {
     throw new Error("The shard runtime could not be extracted. Reinstall mycellios.");
   }
-  await readPortableRuntimeManifest(root);
+  await readPortableRuntimeManifest(root, { platform: process.platform, arch: process.arch });
   return root;
 }
 

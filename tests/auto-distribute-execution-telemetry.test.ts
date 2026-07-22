@@ -97,6 +97,34 @@ describe("auto-distribution execution evidence", () => {
   });
 
   it.each([
+    { backend: "mps", device: "mps", name: "Apple M4 Pro" },
+    { backend: "xpu", device: "xpu:0", name: "Intel Arc B580" },
+  ])("accepts truthful $backend allocator evidence", ({ backend, device, name }) => {
+    const result = collectExecutionTelemetry(
+      compilation,
+      snapshot(
+        processOutput("root-process", completeCpuEvidence),
+        processOutput("remote-process", {
+          ...completeCudaEvidence,
+          requested_device: device,
+          device,
+          backend,
+          device_name: name,
+        }),
+      ),
+    );
+
+    expect(result).toMatchObject({
+      deviceType: "mixed",
+      backend,
+      stages: [
+        { stageIndex: 0, deviceType: "cpu", backend: "cpu" },
+        { stageIndex: 1, deviceType: "gpu", backend },
+      ],
+    });
+  });
+
+  it.each([
     {
       name: "one stage has no ready output",
       value: snapshot(processOutput("root-process", completeCpuEvidence)),

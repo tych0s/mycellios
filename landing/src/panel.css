@@ -1899,32 +1899,345 @@
 .public-panel .execution-badge.unknown { color: #8d99b0; border-style: dashed; background: rgba(98, 111, 139, 0.06); }
 .public-panel .execution-badge.fallback { color: #ffbd78; border-color: rgba(255, 164, 82, 0.32); background: rgba(174, 81, 29, 0.13); box-shadow: inset 0 0 20px rgba(255, 139, 64, 0.05); }
 
-.public-panel .accelerator-runtime-state {
+.public-panel .accelerator-compact-banner {
+  position: relative;
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: minmax(220px, 0.8fr) 34px minmax(300px, 1.2fr) auto;
+  grid-template-areas:
+    "cpu arrow gpu action"
+    "cpu arrow progress action";
   align-items: center;
-  gap: 14px;
-  margin-bottom: 18px;
-  padding: 15px 17px;
-  border: 1px solid rgba(91, 139, 230, 0.18);
-  border-radius: 14px;
-  background: rgba(8, 21, 47, 0.66);
+  gap: 7px 14px;
+  margin-bottom: 22px;
+  padding: 14px 15px;
+  overflow: hidden;
+  border: 1px solid rgba(117, 101, 255, 0.28);
+  border-radius: 16px;
+  background:
+    radial-gradient(circle at 72% 50%, rgba(89, 62, 254, 0.13), transparent 42%),
+    linear-gradient(120deg, rgba(18, 35, 72, 0.97), rgba(20, 24, 51, 0.98));
+  box-shadow: 0 18px 44px rgba(3, 7, 24, 0.2), inset 0 1px rgba(255, 255, 255, 0.035);
 }
-.public-panel .accelerator-runtime-icon { display: grid; width: 38px; height: 38px; place-items: center; border-radius: 11px; color: #8bb6ff; background: rgba(67, 125, 244, 0.13); }
-.public-panel .accelerator-runtime-icon svg { width: 18px; }
-.public-panel .accelerator-runtime-state > div:nth-child(2) { min-width: 0; display: grid; gap: 3px; }
-.public-panel .accelerator-runtime-state > div:nth-child(2) span { color: var(--blue-300); font-size: 7px; font-weight: 650; letter-spacing: 0.12em; }
-.public-panel .accelerator-runtime-state > div:nth-child(2) strong { color: var(--text-primary); font-size: 12px; font-weight: 560; }
-.public-panel .accelerator-runtime-state > div:nth-child(2) small { overflow: hidden; color: var(--text-tertiary); font-size: 9px; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }
-.public-panel .accelerator-runtime-facts { display: flex; gap: 7px; }
-.public-panel .accelerator-runtime-facts b { padding: 6px 8px; border: 1px solid rgba(120, 151, 211, 0.16); border-radius: 7px; color: var(--text-secondary); background: rgba(80, 112, 180, 0.08); font-size: 7px; letter-spacing: 0.08em; }
-.public-panel .accelerator-runtime-state > p { grid-column: 2 / -1; margin: -3px 0 0; color: var(--text-disabled); font-size: 8px; line-height: 1.45; }
-.public-panel .accelerator-runtime-state > p em { color: #68efbf; font-style: normal; font-weight: 650; }
-.public-panel .accelerator-runtime-state.gpu-ready { border-color: rgba(104, 239, 191, 0.25); background: rgba(31, 119, 94, 0.1); }
-.public-panel .accelerator-runtime-state.gpu-ready .accelerator-runtime-icon { color: #68efbf; background: rgba(38, 191, 139, 0.12); }
-.public-panel .accelerator-runtime-state.gpu-fallback { border-color: rgba(255, 164, 82, 0.27); background: rgba(174, 81, 29, 0.1); }
-.public-panel .accelerator-runtime-state.gpu-fallback .accelerator-runtime-icon { color: #ffbd78; background: rgba(174, 81, 29, 0.13); }
-.public-panel .accelerator-runtime-state.error { border-color: rgba(255, 104, 128, 0.25); }
+
+.public-panel .accelerator-compact-banner.progress-hidden {
+  grid-template-areas: "cpu arrow gpu action";
+}
+
+.public-panel .accelerator-compact-banner::before {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  background: linear-gradient(180deg, var(--blue-400), #593efe, #9a88ff);
+  box-shadow: 0 0 18px rgba(89, 62, 254, 0.75);
+  content: "";
+}
+
+.public-panel .accelerator-compact-engine,
+.public-panel .accelerator-compact-gpu {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+}
+
+.public-panel .accelerator-compact-engine { grid-area: cpu; }
+.public-panel .accelerator-compact-gpu { grid-area: gpu; }
+.public-panel .accelerator-compact-engine > span:last-child,
+.public-panel .accelerator-compact-copy { min-width: 0; display: grid; gap: 2px; }
+.public-panel .accelerator-compact-copy { flex: 1; }
+
+.public-panel .accelerator-compact-icon {
+  width: 38px;
+  height: 38px;
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid rgba(105, 151, 255, 0.19);
+  border-radius: 11px;
+  color: #8bb6ff;
+  background: rgba(63, 124, 255, 0.12);
+}
+
+.public-panel .accelerator-compact-gpu .accelerator-compact-icon {
+  color: #ad9fff;
+  border-color: rgba(123, 101, 255, 0.28);
+  background: rgba(89, 62, 254, 0.14);
+  box-shadow: inset 0 0 18px rgba(89, 62, 254, 0.08);
+}
+
+.public-panel .accelerator-compact-icon svg { width: 17px; height: 17px; }
+.public-panel .accelerator-compact-engine small,
+.public-panel .accelerator-compact-gpu small { color: var(--text-tertiary); font-size: 7px; font-style: normal; font-weight: 650; letter-spacing: 0.13em; }
+.public-panel .accelerator-compact-engine.error small,
+.public-panel .accelerator-compact-engine.unavailable small { color: #ff8fa4; }
+.public-panel .accelerator-compact-engine.error .accelerator-compact-icon,
+.public-panel .accelerator-compact-engine.unavailable .accelerator-compact-icon { color: #ff8fa4; border-color: rgba(255, 116, 143, 0.26); background: rgba(187, 45, 78, 0.12); }
+.public-panel .accelerator-compact-engine strong,
+.public-panel .accelerator-compact-gpu strong { overflow: hidden; color: var(--text-primary); font-size: 10px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.public-panel .accelerator-compact-engine em,
+.public-panel .accelerator-compact-gpu em { overflow: hidden; color: var(--text-tertiary); font-size: 8px; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
+.public-panel .accelerator-compact-gpu > b { flex: 0 0 auto; color: #b7abff; font-size: 11px; font-variant-numeric: tabular-nums; }
+
+.public-panel .accelerator-transition-arrow { grid-area: arrow; width: 16px; color: rgba(160, 177, 219, 0.52); }
+
+.public-panel .accelerator-compact-progress,
+.public-panel .accelerator-progress-track {
+  position: relative;
+  height: 5px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.065);
+}
+
+.public-panel .accelerator-compact-progress { grid-area: progress; }
+.public-panel .accelerator-compact-progress > i,
+.public-panel .accelerator-progress-track > i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #3978ff, #593efe 60%, #9a88ff);
+  box-shadow: 0 0 15px rgba(89, 62, 254, 0.58);
+  transition: width 280ms ease;
+}
+
+.public-panel .accelerator-compact-progress.indeterminate > i,
+.public-panel .accelerator-progress-track.indeterminate > i {
+  width: 34%;
+  animation: accelerator-indeterminate 1.4s ease-in-out infinite;
+}
+
+@keyframes accelerator-indeterminate {
+  from { transform: translateX(-110%); }
+  to { transform: translateX(310%); }
+}
+
+.public-panel .accelerator-compact-banner > button {
+  grid-area: action;
+  min-height: 38px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 0 13px;
+  border: 1px solid rgba(126, 105, 255, 0.28);
+  border-radius: 10px;
+  color: #d7d1ff;
+  background: rgba(89, 62, 254, 0.11);
+  font-size: 9px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.public-panel .accelerator-compact-banner > button:hover,
+.public-panel .accelerator-compact-banner > button:focus-visible {
+  color: #fff;
+  border-color: rgba(145, 126, 255, 0.55);
+  background: rgba(89, 62, 254, 0.22);
+  outline: none;
+}
+
+.public-panel .accelerator-compact-banner > button svg { width: 13px; }
+
+.public-panel .accelerator-progress-panel {
+  position: relative;
+  display: grid;
+  gap: 16px;
+  margin-bottom: 20px;
+  padding: 22px;
+  overflow: hidden;
+  border: 1px solid rgba(107, 121, 195, 0.19);
+  border-radius: 19px;
+  background:
+    radial-gradient(circle at 88% 0%, rgba(89, 62, 254, 0.12), transparent 38%),
+    linear-gradient(145deg, rgba(22, 31, 63, 0.98), rgba(14, 22, 46, 0.98));
+  box-shadow: var(--shadow-card), inset 0 1px rgba(255, 255, 255, 0.035);
+}
+
+.public-panel .accelerator-progress-panel::before {
+  position: absolute;
+  inset: 0 0 auto;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--blue-400), #593efe, transparent);
+  opacity: 0.72;
+  content: "";
+}
+
+.public-panel .accelerator-progress-panel.gpu-ready::before { background: linear-gradient(90deg, transparent, #50d8ad, #8affd5, transparent); }
+.public-panel .accelerator-progress-panel.gpu-error::before,
+.public-panel .accelerator-progress-panel.gpu-fallback::before { background: linear-gradient(90deg, transparent, #ff7088, #8f73ff, transparent); }
+
+.public-panel .accelerator-progress-header,
+.public-panel .accelerator-progress-heading,
+.public-panel .accelerator-engine-title,
+.public-panel .accelerator-engine-foot,
+.public-panel .accelerator-preparation-head,
+.public-panel .accelerator-requirement,
+.public-panel .accelerator-evidence-note {
+  display: flex;
+  align-items: center;
+}
+
+.public-panel .accelerator-progress-header { justify-content: space-between; gap: 20px; }
+.public-panel .accelerator-progress-heading { min-width: 0; gap: 13px; }
+.public-panel .accelerator-progress-heading > div { min-width: 0; display: grid; gap: 3px; }
+.public-panel .accelerator-progress-heading > div > span { color: #9584ff; font-size: 8px; font-weight: 650; letter-spacing: 0.14em; }
+.public-panel .accelerator-progress-heading h2 { margin: 0; color: var(--text-primary); font-size: 15px; font-weight: 540; letter-spacing: -0.01em; }
+.public-panel .accelerator-progress-heading p { margin: 0; color: var(--text-tertiary); font-size: 9px; line-height: 1.45; }
+
+.public-panel .accelerator-runtime-icon {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid rgba(125, 105, 255, 0.26);
+  border-radius: 12px;
+  color: #aa9cff;
+  background: rgba(89, 62, 254, 0.14);
+  box-shadow: inset 0 0 20px rgba(89, 62, 254, 0.08);
+}
+.public-panel .accelerator-runtime-icon svg { width: 19px; }
+
+.public-panel .accelerator-overall-badge {
+  min-height: 30px;
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px;
+  border: 1px solid rgba(97, 151, 255, 0.23);
+  border-radius: 999px;
+  color: #8bb6ff;
+  background: rgba(63, 124, 255, 0.09);
+  font-size: 8px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+}
+
+.public-panel .accelerator-overall-badge > i,
+.public-panel .accelerator-engine-foot i {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 10px currentColor;
+}
+.public-panel .accelerator-overall-badge.cpu-active,
+.public-panel .accelerator-overall-badge.gpu-active { color: #68efbf; border-color: rgba(104, 239, 191, 0.24); background: rgba(38, 191, 139, 0.1); }
+.public-panel .accelerator-overall-badge.connection-error,
+.public-panel .accelerator-overall-badge.unavailable { color: #ff8fa4; border-color: rgba(255, 116, 143, 0.28); background: rgba(187, 45, 78, 0.12); }
+
+.public-panel .accelerator-engine-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.public-panel .accelerator-engine-card {
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid rgba(102, 138, 210, 0.14);
+  border-radius: 14px;
+  background: rgba(5, 15, 36, 0.44);
+}
+.public-panel .accelerator-engine-card.cpu.active { border-color: rgba(104, 239, 191, 0.2); background: linear-gradient(135deg, rgba(22, 95, 83, 0.14), rgba(7, 18, 40, 0.54)); }
+.public-panel .accelerator-engine-card.cpu.connection-error,
+.public-panel .accelerator-engine-card.cpu.unavailable { border-color: rgba(255, 116, 143, 0.24); background: linear-gradient(135deg, rgba(125, 31, 58, 0.13), rgba(7, 18, 40, 0.54)); }
+.public-panel .accelerator-engine-card.gpu.checking,
+.public-panel .accelerator-engine-card.gpu.downloading,
+.public-panel .accelerator-engine-card.gpu.installing,
+.public-panel .accelerator-engine-card.gpu.verifying { border-color: rgba(123, 103, 255, 0.27); background: linear-gradient(135deg, rgba(89, 62, 254, 0.12), rgba(7, 18, 40, 0.54)); }
+.public-panel .accelerator-engine-card.gpu.ready { border-color: rgba(104, 239, 191, 0.22); background: linear-gradient(135deg, rgba(29, 111, 87, 0.13), rgba(7, 18, 40, 0.54)); }
+.public-panel .accelerator-engine-card.gpu.error,
+.public-panel .accelerator-engine-card.gpu.fallback { border-color: rgba(255, 104, 128, 0.22); }
+
+.public-panel .accelerator-engine-title { gap: 10px; }
+.public-panel .accelerator-engine-title > span {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 9px;
+  color: #8bb6ff;
+  background: rgba(63, 124, 255, 0.11);
+}
+.public-panel .accelerator-engine-card.gpu .accelerator-engine-title > span { color: #ad9fff; background: rgba(89, 62, 254, 0.14); }
+.public-panel .accelerator-engine-title svg { width: 15px; }
+.public-panel .accelerator-engine-title > div { display: grid; gap: 2px; }
+.public-panel .accelerator-engine-title small { color: var(--text-tertiary); font-size: 7px; letter-spacing: 0.13em; }
+.public-panel .accelerator-engine-title strong { color: var(--text-primary); font-size: 10px; font-weight: 600; }
+.public-panel .accelerator-engine-title > b { margin-left: auto; padding: 5px 7px; border: 1px solid rgba(120, 151, 211, 0.14); border-radius: 7px; color: var(--text-secondary); background: rgba(80, 112, 180, 0.07); font-size: 7px; letter-spacing: 0.08em; }
+.public-panel .accelerator-engine-card h3 { margin: 14px 0 4px; overflow: hidden; color: var(--text-primary); font-size: 14px; font-weight: 520; text-overflow: ellipsis; white-space: nowrap; }
+.public-panel .accelerator-engine-card > p { min-height: 28px; margin: 0; color: var(--text-tertiary); font-size: 8px; line-height: 1.55; }
+.public-panel .accelerator-engine-foot { margin-top: 12px; padding-top: 10px; border-top: 1px solid rgba(255, 255, 255, 0.055); }
+.public-panel .accelerator-engine-foot span { display: flex; align-items: center; gap: 7px; color: #7faeff; font-size: 8px; }
+.public-panel .accelerator-engine-card.active .accelerator-engine-foot span,
+.public-panel .accelerator-engine-card.gpu.ready .accelerator-engine-foot span { color: #68efbf; }
+.public-panel .accelerator-engine-card.gpu.installing .accelerator-engine-foot span,
+.public-panel .accelerator-engine-card.gpu.downloading .accelerator-engine-foot span,
+.public-panel .accelerator-engine-card.gpu.checking .accelerator-engine-foot span,
+.public-panel .accelerator-engine-card.gpu.verifying .accelerator-engine-foot span { color: #a99aff; }
+
+.public-panel .accelerator-preparation {
+  padding: 16px;
+  border: 1px solid rgba(123, 103, 255, 0.2);
+  border-radius: 14px;
+  background: linear-gradient(135deg, rgba(89, 62, 254, 0.08), rgba(7, 17, 39, 0.42));
+}
+.public-panel .accelerator-preparation-head { justify-content: space-between; gap: 18px; margin-bottom: 12px; }
+.public-panel .accelerator-preparation-head > div:first-child { min-width: 0; display: grid; gap: 3px; }
+.public-panel .accelerator-preparation-head span { color: #9584ff; font-size: 7px; font-weight: 650; letter-spacing: 0.14em; }
+.public-panel .accelerator-preparation-head strong { color: var(--text-primary); font-size: 12px; font-weight: 560; }
+.public-panel .accelerator-preparation-head small { overflow: hidden; color: var(--text-tertiary); font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.public-panel .accelerator-preparation-value { flex: 0 0 auto; display: grid; gap: 2px; text-align: right; }
+.public-panel .accelerator-preparation-value strong { color: #b7acff; font-size: 16px; font-variant-numeric: tabular-nums; }
+.public-panel .accelerator-preparation-value small { color: var(--text-tertiary); font-size: 8px; }
+.public-panel .accelerator-progress-track { height: 7px; }
+.public-panel .accelerator-progress-meta { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
+.public-panel .accelerator-progress-meta > span { min-width: 0; display: grid; gap: 3px; padding: 8px 9px; border: 1px solid rgba(116, 139, 196, 0.1); border-radius: 9px; background: rgba(5, 13, 31, 0.26); }
+.public-panel .accelerator-progress-meta small { color: var(--text-disabled); font-size: 6px; letter-spacing: 0.11em; }
+.public-panel .accelerator-progress-meta strong { overflow: hidden; color: var(--text-secondary); font-size: 8px; font-weight: 550; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
+
+.public-panel .accelerator-requirement {
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 15px;
+  border: 1px solid rgba(255, 104, 128, 0.23);
+  border-radius: 13px;
+  background: rgba(111, 25, 48, 0.13);
+}
+.public-panel .accelerator-requirement > span { width: 32px; height: 32px; display: grid; flex: 0 0 auto; place-items: center; border-radius: 9px; color: #ff8ba0; background: rgba(255, 104, 128, 0.1); }
+.public-panel .accelerator-requirement > span svg { width: 16px; }
+.public-panel .accelerator-requirement > div:nth-child(2) { min-width: 0; display: grid; gap: 3px; }
+.public-panel .accelerator-requirement small { color: #ff91a4; font-size: 7px; font-weight: 650; letter-spacing: 0.13em; }
+.public-panel .accelerator-requirement strong { color: #ffd5dc; font-size: 10px; font-weight: 560; }
+.public-panel .accelerator-requirement p { margin: 2px 0 0; color: var(--text-secondary); font-size: 8px; line-height: 1.5; }
+.public-panel .accelerator-requirement-space { display: flex !important; flex: 0 0 auto; gap: 7px !important; margin-left: auto; }
+.public-panel .accelerator-requirement-space > span { display: grid; gap: 3px; min-width: 78px; padding: 7px 9px; border: 1px solid rgba(255, 139, 157, 0.12); border-radius: 8px; background: rgba(15, 17, 39, 0.36); }
+.public-panel .accelerator-requirement-space strong { color: var(--text-primary); font-size: 9px; font-variant-numeric: tabular-nums; }
+.public-panel .accelerator-browser-fallback { min-height: 34px; display: inline-flex; flex: 0 0 auto; align-items: center; gap: 7px; margin-left: auto; padding: 0 11px; border: 1px solid rgba(126, 105, 255, 0.32); border-radius: 9px; color: #d8d2ff; background: rgba(89, 62, 254, 0.14); font-size: 8px; font-weight: 650; text-decoration: none; white-space: nowrap; }
+.public-panel .accelerator-browser-fallback:hover { border-color: rgba(146, 126, 255, 0.58); background: rgba(89, 62, 254, 0.22); }
+.public-panel .accelerator-browser-fallback svg { width: 13px; }
+
+.public-panel .accelerator-log { overflow: hidden; border: 1px solid rgba(112, 137, 198, 0.13); border-radius: 12px; background: rgba(5, 14, 33, 0.35); }
+.public-panel .accelerator-log summary { min-height: 44px; display: flex; align-items: center; gap: 9px; padding: 0 13px; color: var(--text-secondary); font-size: 9px; font-weight: 550; cursor: pointer; list-style: none; }
+.public-panel .accelerator-log summary::-webkit-details-marker { display: none; }
+.public-panel .accelerator-log summary:focus-visible { outline: 2px solid rgba(126, 105, 255, 0.65); outline-offset: -2px; }
+.public-panel .accelerator-log summary > svg:first-child { width: 14px; color: #9787ff; }
+.public-panel .accelerator-log summary > span { margin-left: auto; color: var(--text-disabled); font-size: 8px; font-weight: 500; }
+.public-panel .accelerator-log summary > svg:last-child { width: 14px; transition: transform 160ms ease; }
+.public-panel .accelerator-log[open] summary > svg:last-child { transform: rotate(180deg); }
+.public-panel .accelerator-log-body { max-height: 230px; overflow: auto; border-top: 1px solid rgba(255, 255, 255, 0.055); background: rgba(1, 8, 23, 0.38); scrollbar-width: thin; }
+.public-panel .accelerator-log-body ol { margin: 0; padding: 7px 13px; list-style: none; }
+.public-panel .accelerator-log-body li { min-height: 30px; display: grid; grid-template-columns: 6px 70px minmax(0, 1fr); align-items: center; gap: 9px; border-bottom: 1px solid rgba(255, 255, 255, 0.04); color: var(--text-secondary); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 8px; line-height: 1.45; }
+.public-panel .accelerator-log-body li:last-child { border-bottom: 0; }
+.public-panel .accelerator-log-body li > i { width: 5px; height: 5px; border-radius: 50%; background: #719fff; }
+.public-panel .accelerator-log-body li.success > i { background: #68efbf; box-shadow: 0 0 8px rgba(104, 239, 191, 0.55); }
+.public-panel .accelerator-log-body li.warning > i { background: #aa97ff; box-shadow: 0 0 8px rgba(170, 151, 255, 0.55); }
+.public-panel .accelerator-log-body li.error > i { background: #ff7088; box-shadow: 0 0 8px rgba(255, 112, 136, 0.55); }
+.public-panel .accelerator-log-body time { color: var(--text-disabled); font-variant-numeric: tabular-nums; }
+.public-panel .accelerator-log-body p { margin: 0; padding: 13px; color: var(--text-tertiary); font-size: 8px; }
+
+.public-panel .accelerator-evidence-note { align-items: flex-start; gap: 9px; color: var(--text-disabled); font-size: 8px; line-height: 1.5; }
+.public-panel .accelerator-evidence-note svg { width: 14px; flex: 0 0 auto; color: #68efbf; }
+.public-panel .accelerator-evidence-note strong { color: var(--text-secondary); font-weight: 560; }
 
 .public-panel .node-runtime-state {
   display: flex;
@@ -1963,12 +2276,19 @@
 .public-panel .node-inspector-identity .execution-badge { justify-self: start; margin-top: 7px; }
 
 .public-panel .state-badge.paused,
+.public-panel .state-badge.connecting,
 .public-panel .node-status.draining,
 .public-panel .update-state.checking,
 .public-panel .update-state.downloading {
   color: var(--warning);
   border-color: rgba(246, 184, 95, 0.18);
   background: rgba(246, 184, 95, 0.08);
+}
+
+.public-panel .state-badge.error {
+  color: #ff8fa4;
+  border-color: rgba(255, 116, 143, 0.26);
+  background: rgba(187, 45, 78, 0.12);
 }
 
 .public-panel .node-card-metrics,
@@ -4557,6 +4877,24 @@
 }
 
 @media (max-width: 920px) {
+  .public-panel .accelerator-compact-banner {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "cpu cpu"
+      "gpu action"
+      "progress progress";
+  }
+
+  .public-panel .accelerator-compact-banner.progress-hidden {
+    grid-template-areas:
+      "cpu cpu"
+      "gpu action";
+  }
+
+  .public-panel .accelerator-transition-arrow { display: none; }
+
+  .public-panel .accelerator-engine-grid { grid-template-columns: 1fr; }
+
   .public-panel .model-admin-auth {
     grid-template-columns: 34px minmax(0, 1fr);
   }
@@ -4592,9 +4930,37 @@
 }
 
 @media (max-width: 680px) {
-  .public-panel .accelerator-runtime-state { grid-template-columns: auto minmax(0, 1fr); }
-  .public-panel .accelerator-runtime-facts { grid-column: 2; justify-content: flex-start; }
-  .public-panel .accelerator-runtime-state > p { grid-column: 1 / -1; margin-top: 0; }
+  .public-panel .accelerator-compact-banner {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "cpu"
+      "gpu"
+      "progress"
+      "action";
+    gap: 11px;
+  }
+
+
+  .public-panel .accelerator-compact-banner.progress-hidden {
+    grid-template-areas:
+      "cpu"
+      "gpu"
+      "action";
+  }
+
+  .public-panel .accelerator-compact-banner > button { width: 100%; }
+  .public-panel .accelerator-progress-panel { padding: 16px; border-radius: 16px; }
+  .public-panel .accelerator-progress-header { align-items: flex-start; flex-direction: column; }
+  .public-panel .accelerator-overall-badge { align-self: flex-start; }
+  .public-panel .accelerator-progress-heading { align-items: flex-start; }
+  .public-panel .accelerator-progress-heading h2 { font-size: 13px; }
+  .public-panel .accelerator-preparation-head { align-items: flex-start; }
+  .public-panel .accelerator-preparation-value strong { font-size: 14px; }
+  .public-panel .accelerator-progress-meta { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .public-panel .accelerator-requirement { flex-wrap: wrap; }
+  .public-panel .accelerator-requirement-space { width: 100%; margin-left: 44px; }
+  .public-panel .accelerator-browser-fallback { width: calc(100% - 44px); justify-content: center; margin-left: 44px; }
+  .public-panel .accelerator-log-body li { grid-template-columns: 6px 60px minmax(0, 1fr); }
 
   .public-panel .hub-model-grid {
     grid-template-columns: 1fr;

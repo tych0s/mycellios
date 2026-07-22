@@ -16,7 +16,13 @@ import { createAdapter } from "../adapters/factory.js";
 import { sha256Text } from "../core/json.js";
 import { estimateInputTokens } from "../core/request.js";
 import { safeVramBudget } from "../core/tiers.js";
-import { probeHardware } from "./hardware.js";
+import {
+  probeHardware,
+  selectHardwareGpu,
+  selectRuntimeCapacityHardware,
+  type HardwareProbe,
+  type VerifiedGpuRuntimeEvidence,
+} from "./hardware.js";
 import { llmfitHardwareFallback, probeLlmfit } from "./llmfit.js";
 import {
   LaunchProcessExitedError,
@@ -45,6 +51,25 @@ export interface WorkerAgentOptions {
   };
   /** Register the physical node without claiming that a model runtime exists. */
   advertiseDeployment?: boolean;
+  /** Deterministic hardware source for embedded agents and tests. */
+  hardwareProbe?: () => Promise<HardwareProbe>;
+  /** Adapter chosen by the verified runtime selector, independent of OS ordering. */
+  preferredHardwareGpu?: {
+    id?: string;
+    vendor: string;
+    model: string;
+  };
+  /** Real CPU-memory capacity used when no reliable GPU memory budget exists. */
+  hardwareCapacityOverride?: {
+    id: string;
+    vendor: string;
+    model: string;
+    physicalVramMb: number;
+    sharedMemoryMb?: number | undefined;
+    unifiedMemory?: boolean | undefined;
+  };
+  /** Physical GPU probe evidence. Without it, host capacity is CPU RAM only. */
+  verifiedGpuRuntime?: VerifiedGpuRuntimeEvidence | undefined;
   distributedExecutor?: {
     nodeId: string;
     stageHost: string;
@@ -180,6 +205,7 @@ export class WorkerAgent {
   private readonly runtimeProcesses = new Map<string, LaunchProcessHandle>();
   private readonly runtimeTunnel: RuntimeStreamTunnel | null;
   private readonly logger: Pick<Console, "info" | "warn" | "error">;
+  private runtimeCapacityGeneration = 0;
 
   constructor(
     private readonly config: WorkerConfig,
@@ -224,6 +250,52 @@ export class WorkerAgent {
 
   get workerId(): string | undefined {
     return this.registeredWorkerId;
+  }
+
+  /**
+   * Refresh the capacity published to the coordinator after a physical GPU
+   * probe succeeds or a native runtime is invalidated. This deliberately does
+   * not reconnect the worker: CPU work already in flight must not be aborted
+   * just because GPU setup completed in the background.
+   */
+  async refreshRuntimeCapacity(
+    runtime: VerifiedGpuRuntimeEvidence | undefined,
+  ): Promise<void> {
+    const generation = ++this.runtimeCapacityGeneration;
+    this.options.verifiedGpuRuntime = runtime;
+    if (!this.capabilities || this.config.capacityScope !== "host") return;
+
+    const hardware = await (this.options.hardwareProbe?.() ?? probeHardware());
+    if (generation !== this.runtimeCapacityGeneration) return;
+    const selectedHardwareGpu = selectHardwareGpu(hardware.gpus, this.options.preferredHardwareGpu)
+      ?? hardware.gpus[0];
+    const primary = this.options.hardwareCapacityOverride
+      ?? selectRuntimeCapacityHardware(hardware, selectedHardwareGpu, runtime);
+    const capacityMb = primary.physicalVramMb + (primary.sharedMemoryMb ?? 0);
+    const offeredVramMb = Math.min(
+      this.config.offeredVramMb,
+      Math.max(512, capacityMb),
+    );
+    const previous = this.capabilities.gpus[0];
+    const usedVramMb = previous
+      ? Math.max(0, previous.offeredVramMb - previous.freeOfferedVramMb)
+      : 0;
+    const freeOfferedVramMb = Math.max(0, offeredVramMb - usedVramMb);
+    const defaultPeakVramMb = Math.max(512, Math.floor(safeVramBudget(offeredVramMb) * 0.9));
+
+    this.capabilities = {
+      ...this.capabilities,
+      gpus: [{
+        ...primary,
+        offeredVramMb,
+        freeOfferedVramMb,
+      }],
+      deployments: this.capabilities.deployments.map((deployment) => ({
+        ...deployment,
+        peakVramMb: this.config.deployment.peakVramMb ?? defaultPeakVramMb,
+      })),
+    };
+    await this.sendHeartbeat();
   }
 
   private async sendGoodbye(reason: "user_requested" | "shutdown"): Promise<void> {
@@ -271,16 +343,26 @@ export class WorkerAgent {
 
   private async buildCapabilities(): Promise<WorkerCapabilities> {
     const [hardware, adapter, llmfit] = await Promise.all([
-      probeHardware(),
+      this.options.hardwareProbe?.() ?? probeHardware(),
       this.adapter.probe(),
       this.inspectWithLlmfit(),
     ]);
-    const detectedPrimary = hardware.gpus[0]!;
+    const selectedHardwareGpu = selectHardwareGpu(hardware.gpus, this.options.preferredHardwareGpu)
+      ?? hardware.gpus[0];
+    const detectedPrimary = this.options.hardwareCapacityOverride
+      ?? selectRuntimeCapacityHardware(
+        hardware,
+        selectedHardwareGpu,
+        this.options.verifiedGpuRuntime,
+      );
     const primary =
       detectedPrimary.vendor === "unknown" && detectedPrimary.physicalVramMb === 0 && llmfit
         ? (llmfitHardwareFallback(llmfit) ?? detectedPrimary)
         : detectedPrimary;
-    const offeredVramMb = this.config.offeredVramMb;
+    const primaryCapacityMb = primary.physicalVramMb + (primary.sharedMemoryMb ?? 0);
+    const offeredVramMb = this.config.capacityScope === "cell"
+      ? this.config.offeredVramMb
+      : Math.min(this.config.offeredVramMb, Math.max(512, primaryCapacityMb));
     const safeBudget = safeVramBudget(offeredVramMb);
     const model = this.config.adapter.model;
     const deploymentId = `dep-${sha256Text(`${model}:${adapter.kind}`).slice(-12)}`;
@@ -787,14 +869,22 @@ export class WorkerAgent {
     if (!this.capabilities || !this.socket || this.socket.readyState !== WebSocket.OPEN) return;
     const [metrics, liveHardware] = await Promise.all([
       this.adapter.metrics(),
-      this.config.capacityScope === "host" ? probeHardware().catch(() => null) : Promise.resolve(null),
+      this.config.capacityScope === "host"
+        ? (this.options.hardwareProbe?.() ?? probeHardware()).catch(() => null)
+        : Promise.resolve(null),
     ]);
     if (liveHardware) {
-      const byId = new Map(liveHardware.gpus.map((gpu) => [gpu.id, gpu]));
       this.capabilities = {
         ...this.capabilities,
         gpus: this.capabilities.gpus.map((gpu) => {
-          const live = byId.get(gpu.id);
+          // gpu-N is intentionally synthetic and OS enumeration can change
+          // between heartbeats. Require identity as well as id, then fall back
+          // to vendor/model only; never copy telemetry from another adapter.
+          const live = selectHardwareGpu(liveHardware.gpus, {
+            id: gpu.id,
+            vendor: gpu.vendor,
+            model: gpu.model,
+          });
           if (!live) return gpu;
           return {
             ...gpu,

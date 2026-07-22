@@ -856,7 +856,7 @@ export function collectExecutionTelemetry(
     const evidence = parseExecutionEvidence(process?.output);
     if (!evidence) return undefined;
     const backend = executionBackend(evidence.backend);
-    if (!backend || !new Set(["cpu", "cuda", "rocm"]).has(backend)) return undefined;
+    if (!backend || !new Set(["cpu", "cuda", "rocm", "mps", "xpu"]).has(backend)) return undefined;
     if (
       typeof evidence.accelerated !== "boolean"
       || typeof evidence.requested_device !== "string"
@@ -877,10 +877,11 @@ export function collectExecutionTelemetry(
       || evidence.device_kind !== "cpu"
       || !evidence.device.trim().toLowerCase().startsWith("cpu")
     )) return undefined;
+    const expectedDevicePrefix = backend === "rocm" ? "cuda" : backend;
     if (backend !== "cpu" && (
       evidence.accelerated !== true
       || evidence.device_kind !== "gpu"
-      || !evidence.device.trim().toLowerCase().startsWith("cuda")
+      || !evidence.device.trim().toLowerCase().startsWith(expectedDevicePrefix)
     )) return undefined;
     if (gpu && (
       typeof evidence.allocated_bytes !== "number"
@@ -900,7 +901,7 @@ export function collectExecutionTelemetry(
       precision: evidence.precision.trim().slice(0, 64),
       fallback,
       ...(fallback
-        ? { fallbackReason: "No compatible CUDA or ROCm runtime passed the execution probe; this stage is running on CPU." }
+        ? { fallbackReason: "No compatible native accelerator passed the execution probe; this stage is running on CPU." }
         : {}),
     });
   }
@@ -957,7 +958,7 @@ function parseExecutionEvidence(
 
 function executionBackend(value: unknown): NonNullable<ModelDeployment["execution"]>["backend"] | null {
   return value === "cpu" || value === "cuda" || value === "rocm"
-    || value === "directml" || value === "mps" || value === "vulkan" || value === "webgpu"
+    || value === "directml" || value === "mps" || value === "xpu" || value === "vulkan" || value === "webgpu"
     ? value
     : null;
 }

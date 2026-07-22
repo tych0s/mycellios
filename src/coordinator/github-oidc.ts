@@ -16,6 +16,7 @@ export interface GitHubReleaseClaims {
   ref: string;
   sha: string;
   workflowRef: string;
+  environment: "production";
 }
 
 export async function verifyGitHubReleaseUploadToken(
@@ -37,6 +38,7 @@ export function validateGitHubReleaseClaims(payload: JWTPayload): GitHubReleaseC
   const sha = stringClaim(payload, "sha");
   const workflowRef = stringClaim(payload, "workflow_ref");
   const eventName = stringClaim(payload, "event_name");
+  const environment = stringClaim(payload, "environment");
 
   if (repository !== RELEASE_REPOSITORY) throw new Error("release_repository_not_allowed");
   if (eventName !== "push" && eventName !== "workflow_dispatch") {
@@ -48,9 +50,10 @@ export function validateGitHubReleaseClaims(payload: JWTPayload): GitHubReleaseC
   if (!RELEASE_WORKFLOWS.some((workflow) => workflowRef.startsWith(workflow))) {
     throw new Error("release_workflow_not_allowed");
   }
+  if (environment !== "production") throw new Error("release_environment_not_allowed");
   if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error("release_sha_invalid");
 
-  return { repository, ref, sha, workflowRef };
+  return { repository, ref, sha, workflowRef, environment };
 }
 
 function stringClaim(payload: JWTPayload, name: string): string {

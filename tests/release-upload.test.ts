@@ -136,6 +136,7 @@ describe("release uploads", () => {
       sha: "a".repeat(40),
       workflow_ref: "tych0s/mycellios/.github/workflows/desktop-build.yml@refs/heads/main",
       event_name: "push",
+      environment: "production",
     })).toMatchObject({ ref: "refs/heads/main", sha: "a".repeat(40) });
 
     expect(() => validateGitHubReleaseClaims({
@@ -144,6 +145,7 @@ describe("release uploads", () => {
       sha: "a".repeat(40),
       workflow_ref: "attacker/fork/.github/workflows/desktop-build.yml@refs/heads/main",
       event_name: "push",
+      environment: "production",
     })).toThrow("release_repository_not_allowed");
 
     expect(validateGitHubReleaseClaims({
@@ -153,7 +155,17 @@ describe("release uploads", () => {
       workflow_ref:
         "tych0s/mycellios/.github/workflows/publish-existing-release.yml@refs/heads/main",
       event_name: "workflow_dispatch",
+      environment: "production",
     })).toMatchObject({ ref: "refs/heads/main", sha: "b".repeat(40) });
+
+    expect(() => validateGitHubReleaseClaims({
+      repository: "tych0s/mycellios",
+      ref: "refs/heads/main",
+      sha: "c".repeat(40),
+      workflow_ref: "tych0s/mycellios/.github/workflows/desktop-build.yml@refs/heads/main",
+      event_name: "push",
+      environment: "attestation",
+    })).toThrow("release_environment_not_allowed");
   });
 });
 

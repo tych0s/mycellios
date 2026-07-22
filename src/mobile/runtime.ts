@@ -1,3 +1,13 @@
+import {
+  isMobileExecutionCancelled,
+  MobileExecutionCancelledError,
+  mobileCpuFallbackLabel,
+  mobileGpuAdapterLabel,
+  requestMobileGpuAdapter,
+  runWithMobileBackendFallback,
+  throwIfMobileExecutionCancelled,
+} from "./backend-state";
+
 export type MobileWorkerBackend = "webgpu" | "cpu";
 export type MobileWorkerLevel = "low" | "balanced" | "maximum";
 
@@ -57,8 +67,11 @@ interface RuntimeState {
   verifiedTasks: number;
   gpu: GPUAdapter | null;
   device: GPUDevice | null;
+  detectedGpuLabel: string | null;
   residentExperts: Map<string, ResidentExpert>;
   cancelledMatrixTasks: Set<string>;
+  executionController: AbortController;
+  resumePromise: Promise<void> | null;
 }
 
 export type MobileWorkerConnection = "online" | "offline" | "connecting";
@@ -93,8 +106,11 @@ const state: RuntimeState = {
   verifiedTasks: 0,
   gpu: null,
   device: null,
+  detectedGpuLabel: null,
   residentExperts: new Map(),
   cancelledMatrixTasks: new Set(),
+  executionController: new AbortController(),
+  resumePromise: null,
 };
 
 const viewState: Pick<MobileWorkerSnapshot, "connection" | "connectionLabel" | "statusText" | "gpuLabel" | "activity"> = {
@@ -106,6 +122,7 @@ const viewState: Pick<MobileWorkerSnapshot, "connection" | "connectionLabel" | "
 };
 const listeners = new Set<(snapshot: MobileWorkerSnapshot) => void>();
 let initialized = false;
+let backendProbeVersion = 0;
 
 export function initializeMobileWorker(): void {
   if (initialized) return;
@@ -135,59 +152,79 @@ export function setMobileWorkerLevel(level: MobileWorkerLevel): void {
 }
 
 function handleVisibilityChange(): void {
-  if (!state.running) return;
+  if (!state.running && !state.starting) return;
   if (document.visibilityState === "visible") {
-    void acquireWakeLock();
-    sendHeartbeat();
-    requestWork();
+    if (state.running) void resumeVisibleWorker();
   } else {
     sendHeartbeat();
+    cancelActiveExecutions("mycellios is no longer visible");
+    if (state.heartbeatTimer !== null) window.clearInterval(state.heartbeatTimer);
+    if (state.reconnectTimer !== null) window.clearTimeout(state.reconnectTimer);
+    state.heartbeatTimer = null;
+    state.reconnectTimer = null;
+    const socket = state.socket;
+    state.socket = null;
+    socket?.close(1000, "page hidden");
+    void state.wakeLock?.release().catch(() => undefined);
+    state.wakeLock = null;
+    renderWakeLock();
+    setConnection("offline", "Paused");
     setStatus("Paused because mycellios is not visible.");
+    addLog("Compute cancelled because this page is hidden.");
   }
 }
 
 async function start(): Promise<void> {
   if (state.starting || state.running) return;
+  backendProbeVersion += 1;
+  const signal = beginExecutionSession("a new contribution session started");
   state.starting = true;
   const clientIdPromise = persistentClientId();
   const persistentStoragePromise = requestPersistentBrowserStorage();
   setBusy(true);
   setConnection("connecting", "Preparing");
+  setStatus("Preparing this device. No work is active until the network connects.");
   addLog("Checking the device compute engine.");
   try {
-    await initializeComputeBackend();
+    await initializeComputeBackend(signal);
+    assertExecutionAllowed(signal);
     setStatus(`Measuring the ${state.backend === "webgpu" ? "GPU" : "CPU"} with a real task…`);
-    const benchmarkSize = state.backend === "webgpu" ? 96 : 48;
-    const benchmark = await runMatrixTask(benchmarkSize, 73);
+    addLog(`${state.backend === "webgpu" ? `Validating ${state.detectedGpuLabel ?? "the WebGPU adapter"}` : "Validating the CPU fallback"} with a real matrix task.`);
+    const { size: benchmarkSize, result: benchmark } = await runStartupBenchmark(73, signal);
+    assertExecutionAllowed(signal);
     state.estimatedGflops = benchmark.estimatedGflops;
     renderPerformance();
-    addLog(`Benchmark complete: ${formatGflops(state.estimatedGflops)} GFLOPS.`);
-    await acquireWakeLock();
-    const clientId = await clientIdPromise;
-    const persistentStorage = await persistentStoragePromise;
+    addLog(`${state.backend === "webgpu" ? "GPU" : "CPU"} validation passed: ${formatGflops(state.estimatedGflops)} GFLOPS.`);
+    await acquireWakeLock(signal);
+    const clientId = await abortable(clientIdPromise, signal);
+    const persistentStorage = await abortable(persistentStoragePromise, signal);
+    assertExecutionAllowed(signal);
     addLog(persistentStorage
       ? "Browser identity protected from automatic storage eviction."
       : "Browser identity will be retained while site storage remains available.");
-    const credentials = await registerWorker(benchmarkSize, benchmark.durationMs, clientId);
+    const credentials = await registerWorker(benchmarkSize, benchmark.durationMs, clientId, signal);
+    assertExecutionAllowed(signal);
     state.workerId = credentials.workerId;
     state.token = credentials.token;
     state.running = true;
     setBusy(false);
     connect();
   } catch (error) {
+    if (isMobileExecutionCancelled(error)) return;
     addLog(`Could not start: ${errorText(error)}`);
+    await stop(false, true);
     setStatus(errorText(error));
     setConnection("offline", "Unavailable");
-    await stop(false);
   } finally {
     state.starting = false;
     setBusy(false);
   }
 }
 
-async function stop(log = true): Promise<void> {
+async function stop(log = true, preserveView = false): Promise<void> {
   state.running = false;
   state.starting = false;
+  cancelActiveExecutions("contribution stopped");
   if (state.heartbeatTimer !== null) window.clearInterval(state.heartbeatTimer);
   if (state.reconnectTimer !== null) window.clearTimeout(state.reconnectTimer);
   state.heartbeatTimer = null;
@@ -196,64 +233,106 @@ async function stop(log = true): Promise<void> {
   state.socket = null;
   await state.wakeLock?.release().catch(() => undefined);
   state.wakeLock = null;
-  state.device?.destroy();
-  state.device = null;
-  state.gpu = null;
   state.residentExperts.clear();
   state.cancelledMatrixTasks.clear();
   renderWakeLock();
   setBusy(false);
-  setConnection("offline", "Disconnected");
-  setStatus("Press the button and keep this screen open.");
+  if (!preserveView) {
+    setConnection("offline", "Disconnected");
+    setStatus("Press the button and keep this screen open.");
+  }
   if (log) addLog("Contribution stopped by the user.");
 }
 
 async function detectBackendPreview(): Promise<void> {
-  if (!navigator.gpu) {
-    state.backend = "cpu";
-    viewState.gpuLabel = "Universal CPU fallback";
-    emit();
-    return;
-  }
-  state.backend = "webgpu";
-  viewState.gpuLabel = "GPU available";
-  emit();
-}
-
-async function initializeComputeBackend(): Promise<void> {
+  const probeVersion = backendProbeVersion;
   if (!window.isSecureContext) {
     state.backend = "cpu";
+    state.detectedGpuLabel = null;
     viewState.gpuLabel = "WebGPU requires HTTPS";
     emit();
     return;
   }
   if (!navigator.gpu) {
     state.backend = "cpu";
-    viewState.gpuLabel = "WebGPU unavailable";
+    state.detectedGpuLabel = null;
+    viewState.gpuLabel = "Universal CPU fallback";
     emit();
     return;
   }
+  viewState.gpuLabel = "Checking for a WebGPU adapter…";
+  emit();
+  const adapter = await requestMobileGpuAdapter(navigator.gpu);
+  if (probeVersion !== backendProbeVersion || state.starting || state.running) return;
+  if (!adapter) {
+    state.backend = "cpu";
+    state.detectedGpuLabel = null;
+    viewState.gpuLabel = "No WebGPU adapter found · CPU available";
+    emit();
+    return;
+  }
+  const label = mobileGpuAdapterLabel(adapter.info);
+  state.backend = "webgpu";
+  state.detectedGpuLabel = label;
+  viewState.gpuLabel = label;
+  emit();
+}
+
+async function initializeComputeBackend(signal: AbortSignal): Promise<void> {
+  assertExecutionAllowed(signal);
+  if (!window.isSecureContext) {
+    state.backend = "cpu";
+    state.detectedGpuLabel = null;
+    viewState.gpuLabel = "WebGPU requires HTTPS";
+    emit();
+    addLog("WebGPU is blocked outside HTTPS; the universal CPU engine is ready.");
+    return;
+  }
+  if (!navigator.gpu) {
+    state.backend = "cpu";
+    state.detectedGpuLabel = null;
+    viewState.gpuLabel = "WebGPU unavailable";
+    emit();
+    addLog("This browser does not expose WebGPU; the universal CPU engine is ready.");
+    return;
+  }
   try {
-    const compatibilityOptions = { featureLevel: "compatibility" } as GPURequestAdapterOptions;
-    const adapter =
-      (await navigator.gpu.requestAdapter(compatibilityOptions)) ??
-      (await navigator.gpu.requestAdapter({ powerPreference: "high-performance" }));
+    addLog("Requesting a compatible GPU adapter from the browser.");
+    const adapter = await abortable(requestMobileGpuAdapter(navigator.gpu), signal);
     if (!adapter) throw new Error("No WebGPU adapter found");
-    const device = await adapter.requestDevice();
+    const label = mobileGpuAdapterLabel(adapter.info);
+    state.detectedGpuLabel = label;
+    addLog(`GPU adapter detected: ${label}. Requesting a compute device.`);
+    const device = await abortable(adapter.requestDevice(), signal);
+    try {
+      assertExecutionAllowed(signal);
+    } catch (error) {
+      device.destroy();
+      throw error;
+    }
     device.lost.then((info) => {
-      if (!state.running) return;
-      addLog(`The GPU became unavailable: ${info.message || info.reason}.`);
-      void stop(false);
+      if (state.device !== device) return;
+      transitionToCpuFallback(
+        `device lost: ${info.message || info.reason}`,
+        device,
+      );
+      setStatus(state.running
+        ? "The GPU became unavailable; contribution continues on CPU."
+        : "The GPU became unavailable; setup continues on CPU.");
+      if (state.running) requestWork();
     });
     state.backend = "webgpu";
     state.gpu = adapter;
     state.device = device;
-    const info = adapter.info as GPUAdapterInfo & { description?: string };
-    viewState.gpuLabel = info.description || info.device || info.architecture || "Mobile GPU";
+    viewState.gpuLabel = label;
     emit();
+    addLog(`WebGPU device ready: ${label}. No vendor runtime installation is required in this browser.`);
   } catch (error) {
+    throwIfMobileExecutionCancelled(signal);
     state.backend = "cpu";
-    viewState.gpuLabel = "Browser fallback";
+    state.gpu = null;
+    state.device = null;
+    viewState.gpuLabel = mobileCpuFallbackLabel(state.detectedGpuLabel);
     emit();
     addLog(`WebGPU unavailable; using CPU: ${errorText(error)}`);
   }
@@ -263,11 +342,11 @@ async function registerWorker(
   matrixSize: number,
   durationMs: number,
   clientId: string,
+  signal: AbortSignal,
 ): Promise<{ workerId: string; token: string }> {
   const query = new URLSearchParams(window.location.search);
   const invitationFromUrl = query.get("join")?.trim();
   const joinToken = persistentJoinToken(invitationFromUrl);
-  const adapterInfo = state.gpu?.info as (GPUAdapterInfo & { description?: string }) | undefined;
   const body = {
     clientId,
     name: mobileName(),
@@ -281,7 +360,7 @@ async function registerWorker(
       wasm: typeof WebAssembly === "object",
       hardwareConcurrency: Math.max(1, navigator.hardwareConcurrency || 1),
       ...(deviceMemory() ? { deviceMemoryGb: deviceMemory() } : {}),
-      ...(adapterInfo?.description ? { gpuDescription: adapterInfo.description } : {}),
+      ...(state.detectedGpuLabel ? { gpuDescription: state.detectedGpuLabel } : {}),
       ...(state.device ? { maxBufferSize: Number(state.device.limits.maxBufferSize) } : {}),
     },
     benchmark: {
@@ -290,11 +369,12 @@ async function registerWorker(
       matrixSize,
     },
   };
-  const response = await fetch("/mobile/v1/register", {
+  const response = await abortable(fetch("/mobile/v1/register", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
-  });
+    signal,
+  }), signal);
   if (!response.ok) {
     if (response.status === 401) throw new Error("The invitation link is invalid.");
     throw new Error(`The coordinator rejected registration (HTTP ${response.status}).`);
@@ -311,25 +391,80 @@ function persistentJoinToken(invitationFromUrl: string | undefined): string | un
   }
 }
 
+async function resumeVisibleWorker(): Promise<void> {
+  if (state.resumePromise || !state.running || document.visibilityState !== "visible") return;
+  const signal = state.executionController.signal;
+  const resume = (async () => {
+    setConnection("connecting", "Preparing");
+    setStatus("Preparing the compute engine after returning to mycellios…");
+    try {
+      await initializeComputeBackend(signal);
+      assertExecutionAllowed(signal);
+      await acquireWakeLock(signal);
+      assertExecutionAllowed(signal);
+      connect();
+    } catch (error) {
+      if (isMobileExecutionCancelled(error)) return;
+      state.running = false;
+      setStatus(errorText(error));
+      setConnection("offline", "Unavailable");
+      addLog(`Could not resume: ${errorText(error)}`);
+    }
+  })();
+  state.resumePromise = resume;
+  try {
+    await resume;
+  } finally {
+    if (state.resumePromise === resume) state.resumePromise = null;
+  }
+}
+
 function connect(): void {
-  if (!state.running || !state.workerId || !state.token) return;
-  setConnection("connecting", "Connecting");
+  if (!state.running || document.visibilityState !== "visible" || !state.workerId || !state.token) return;
+  if (state.socket && state.socket.readyState <= WebSocket.OPEN) return;
+  if (state.reconnectTimer !== null) window.clearTimeout(state.reconnectTimer);
+  state.reconnectTimer = null;
+  if (viewState.connectionLabel !== "Reconnecting") {
+    setConnection("connecting", "Preparing");
+    setStatus("Compute is ready; waiting for coordinator confirmation…");
+  }
   const url = new URL("/mobile/v1/connect", window.location.origin);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   url.searchParams.set("workerId", state.workerId);
   url.searchParams.set("token", state.token);
-  const socket = new WebSocket(url);
+  let socket: WebSocket;
+  try {
+    socket = new WebSocket(url);
+  } catch (error) {
+    state.running = false;
+    cancelActiveExecutions("the coordinator channel could not be opened");
+    setConnection("offline", "Unavailable");
+    setStatus(errorText(error));
+    addLog(`Could not open the coordinator channel: ${errorText(error)}`);
+    return;
+  }
   state.socket = socket;
-  socket.addEventListener("open", () => addLog("Secure coordinator channel opened."));
-  socket.addEventListener("message", (event) => void handleServerMessage(String(event.data)));
+  socket.addEventListener("open", () => {
+    if (state.socket === socket) addLog("Secure coordinator channel opened; waiting for coordinator readiness.");
+  });
+  socket.addEventListener("message", (event) => {
+    if (state.socket === socket) void handleServerMessage(String(event.data));
+  });
   socket.addEventListener("close", () => {
-    if (state.socket === socket) state.socket = null;
+    if (state.socket !== socket) return;
+    state.socket = null;
     if (!state.running) return;
+    if (document.visibilityState !== "visible") {
+      setConnection("offline", "Paused");
+      return;
+    }
     setConnection("connecting", "Reconnecting");
     setStatus("Connection lost; retrying automatically…");
     state.reconnectTimer = window.setTimeout(connect, 2_000);
   });
-  socket.addEventListener("error", () => socket.close());
+  socket.addEventListener("error", () => {
+    if (state.socket === socket) socket.close();
+  });
 }
 
 async function handleServerMessage(raw: string): Promise<void> {
@@ -339,14 +474,24 @@ async function handleServerMessage(raw: string): Promise<void> {
   } catch {
     return;
   }
+  if (!state.running || document.visibilityState !== "visible") return;
+  if (message.type !== "server.ready" && viewState.connection !== "online") return;
   if (message.type === "server.ready") {
+    const payload = message.payload as { verifiedTasks?: number; inferenceReady?: boolean };
+    state.verifiedTasks = payload.verifiedTasks ?? state.verifiedTasks;
     setConnection("online", "Connected");
-    setStatus("Contributing power. Keep mycellios visible.");
-    addLog("Mobile worker registered and ready.");
     sendHeartbeat();
     if (state.heartbeatTimer !== null) window.clearInterval(state.heartbeatTimer);
     state.heartbeatTimer = window.setInterval(sendHeartbeat, 5_000);
-    requestWork();
+    if (payload.inferenceReady || state.verifiedTasks > 0) {
+      setStatus("Device validated and waiting for real inference work.");
+      addLog("Device already validated · ready for real model inference.");
+      emit();
+    } else {
+      setStatus("Connected. Running the one-time network admission check…");
+      addLog("Mobile worker connected · requesting its one-time admission check.");
+      requestWork();
+    }
     return;
   }
   if (message.type === "compute.offer") {
@@ -373,24 +518,24 @@ async function handleServerMessage(raw: string): Promise<void> {
     return;
   }
   if (message.type === "expert.verified") {
-    const payload = message.payload as { phase?: string; verifiedTasks?: number };
-    if (payload.phase === "executed") {
+    const payload = message.payload as { phase?: string; replicas?: number; verifiedTasks?: number };
+    if (payload.phase === "consensus") {
       state.verifiedTasks = payload.verifiedTasks ?? state.verifiedTasks + 1;
       emit();
-      setStatus("Expert output verified and used by the model network.");
-      addLog("Real MoE expert result accepted by the coordinator.");
+      setStatus("Expert output matched an independent replica and was accepted by the model network.");
+      addLog(`Replicated MoE consensus accepted · ${payload.replicas ?? 2} devices.`);
     }
     return;
   }
   if (message.type === "expert.rejected") {
-    addLog("Expert weights failed the network canary and were removed.");
+    addLog("Expert weights or replicated output failed validation and were removed.");
   }
   if (message.type === "compute.verified") {
-    const payload = message.payload as { verifiedTasks?: number };
+    const payload = message.payload as { verifiedTasks?: number; inferenceReady?: boolean };
     state.verifiedTasks = payload.verifiedTasks ?? state.verifiedTasks + 1;
+    setStatus("Device validated and waiting for real inference work.");
     emit();
-    addLog(`Result verified by the network · task ${state.verifiedTasks}.`);
-    window.setTimeout(requestWork, coolDownMs());
+    addLog("Admission check verified · this device is ready for real model inference.");
     return;
   }
   if (message.type === "compute.rejected") {
@@ -402,11 +547,13 @@ async function handleServerMessage(raw: string): Promise<void> {
 async function executeOffer(offer: ComputeOffer): Promise<void> {
   if (!state.running || document.visibilityState !== "visible") return;
   if (offer.operation !== "matrix-multiply" || offer.deadlineAt <= Date.now()) return;
+  const signal = state.executionController.signal;
   send("compute.accept", { taskId: offer.taskId, leaseId: offer.leaseId });
   setStatus(`Computing a ${offer.size}×${offer.size} matrix with ${state.backend.toUpperCase()}…`);
   addLog(`Job received: ${offer.size}×${offer.size} multiplication.`);
   try {
-    const result = await runMatrixTask(offer.size, offer.seed);
+    const result = await runMatrixTask(offer.size, offer.seed, signal);
+    assertExecutionAllowed(signal);
     if (state.cancelledMatrixTasks.delete(offer.taskId)) return;
     state.estimatedGflops = result.estimatedGflops;
     renderPerformance();
@@ -418,6 +565,7 @@ async function executeOffer(offer: ComputeOffer): Promise<void> {
     });
     setStatus("Result sent; waiting for coordinator verification…");
   } catch (error) {
+    if (isMobileExecutionCancelled(error)) return;
     send("compute.fail", {
       taskId: offer.taskId,
       leaseId: offer.leaseId,
@@ -436,19 +584,24 @@ async function loadExpert(offer: {
   deadlineAt: number;
 }): Promise<void> {
   if (!state.running || document.visibilityState !== "visible" || offer.deadlineAt <= Date.now()) return;
+  const signal = state.executionController.signal;
   try {
     setStatus("Downloading and verifying a real model expert…");
-    const manifestResponse = await fetch(new URL(offer.manifestUrl, window.location.origin));
+    const manifestResponse = await abortable(fetch(
+      new URL(offer.manifestUrl, window.location.origin),
+      { signal },
+    ), signal);
     if (!manifestResponse.ok) throw new Error(`expert manifest HTTP ${manifestResponse.status}`);
-    const manifest = (await manifestResponse.json()) as ExpertManifest;
+    const manifest = (await abortable(manifestResponse.json(), signal)) as ExpertManifest;
     if (manifest.artifactId !== offer.artifactId || manifest.dtype !== "float32"
       || manifest.activation !== "silu") throw new Error("unsupported expert manifest");
-    const weightsResponse = await fetch(
+    const weightsResponse = await abortable(fetch(
       new URL(`/mobile/v1/experts/weights/${manifest.weightsHash}`, window.location.origin),
-    );
+      { signal },
+    ), signal);
     if (!weightsResponse.ok) throw new Error(`expert weights HTTP ${weightsResponse.status}`);
-    const bytes = await weightsResponse.arrayBuffer();
-    const digest = hex(await crypto.subtle.digest("SHA-256", bytes));
+    const bytes = await abortable(weightsResponse.arrayBuffer(), signal);
+    const digest = hex(await abortable(crypto.subtle.digest("SHA-256", bytes), signal));
     if (digest !== manifest.weightsHash) throw new Error("expert weight hash mismatch");
     const expectedValues = 3 * manifest.hiddenSize * manifest.intermediateSize;
     if (bytes.byteLength !== expectedValues * Float32Array.BYTES_PER_ELEMENT) {
@@ -465,7 +618,17 @@ async function loadExpert(offer: {
     const canaryInput = float32FromBase64(manifest.canaryInputBase64);
     if (canaryInput.length !== manifest.hiddenSize) throw new Error("invalid expert canary input");
     const started = performance.now();
-    const computed = await computeSwiGlu(expert, canaryInput, 1);
+    const canaryDevice = state.device;
+    let computed = await computeSwiGlu(expert, canaryInput, 1, signal);
+    const expectedCanary = float32FromBase64(manifest.canaryOutputBase64);
+    if (!float32Close(computed.values, expectedCanary, 2e-4) && computed.backend === "webgpu") {
+      assertExecutionAllowed(signal);
+      transitionToCpuFallback("expert canary returned an invalid result", canaryDevice);
+      computed = { values: await swiGluCpu(expert, canaryInput, 1, signal), backend: "cpu" };
+    }
+    if (!float32Close(computed.values, expectedCanary, 2e-4)) {
+      throw new Error("expert canary verification failed");
+    }
     state.residentExperts.set(offer.artifactId, expert);
     send("expert.ready", {
       taskId: offer.taskId,
@@ -479,6 +642,7 @@ async function loadExpert(offer: {
     addLog(`Loaded ${manifest.modelId} L${manifest.layer}/E${manifest.expert}; SHA-256 verified.`);
   } catch (error) {
     state.residentExperts.delete(offer.artifactId);
+    if (isMobileExecutionCancelled(error)) return;
     send("expert.fail", {
       taskId: offer.taskId,
       leaseId: offer.leaseId,
@@ -499,6 +663,7 @@ async function executeExpert(offer: {
   deadlineAt: number;
 }): Promise<void> {
   if (!state.running || document.visibilityState !== "visible" || offer.deadlineAt <= Date.now()) return;
+  const signal = state.executionController.signal;
   const expert = state.residentExperts.get(offer.artifactId);
   try {
     if (!expert) throw new Error("expert is not resident");
@@ -507,7 +672,8 @@ async function executeExpert(offer: {
     if (activations.length !== offer.rows * offer.hiddenSize) throw new Error("activation payload mismatch");
     setStatus(`Running real model expert L${expert.manifest.layer}/E${expert.manifest.expert}…`);
     const started = performance.now();
-    const computed = await computeSwiGlu(expert, activations, offer.rows);
+    const computed = await computeSwiGlu(expert, activations, offer.rows, signal);
+    assertExecutionAllowed(signal);
     send("expert.result", {
       taskId: offer.taskId,
       leaseId: offer.leaseId,
@@ -520,6 +686,7 @@ async function executeExpert(offer: {
     });
     setStatus("Expert activation returned; awaiting network verification…");
   } catch (error) {
+    if (isMobileExecutionCancelled(error)) return;
     state.residentExperts.delete(offer.artifactId);
     send("expert.fail", {
       taskId: offer.taskId,
@@ -534,24 +701,35 @@ async function computeSwiGlu(
   expert: ResidentExpert,
   activations: Float32Array,
   rows: number,
+  signal: AbortSignal,
 ): Promise<{ values: Float32Array; backend: Backend }> {
-  if (state.device) {
-    try {
-      return { values: await swiGluWebGpu(state.device, expert, activations, rows), backend: "webgpu" };
-    } catch (error) {
-      addLog(`Expert WebGPU fallback to CPU: ${errorText(error)}`);
-    }
-  }
-  return { values: await swiGluCpu(expert, activations, rows), backend: "cpu" };
+  const device = state.device;
+  const execution = await runWithMobileBackendFallback({
+    backend: state.backend === "webgpu" && device ? "webgpu" : "cpu",
+    runGpu: async () => {
+      if (!device) throw new Error("WebGPU device is unavailable");
+      return await swiGluWebGpu(device, expert, activations, rows, signal);
+    },
+    runCpu: () => swiGluCpu(expert, activations, rows, signal),
+    onGpuFailure: (error) => transitionToCpuFallback(
+      `expert kernel failed: ${errorText(error)}`,
+      device,
+    ),
+    signal,
+  });
+  return { values: execution.value, backend: execution.backend };
 }
 
 async function swiGluCpu(
   expert: ResidentExpert,
   activations: Float32Array,
   rows: number,
+  signal: AbortSignal,
 ): Promise<Float32Array> {
+  assertExecutionAllowed(signal);
   const { hiddenSize, intermediateSize } = expert.manifest;
   const activated = new Float32Array(rows * intermediateSize);
+  let operationsUntilYield = 16_384;
   for (let row = 0; row < rows; row += 1) {
     for (let intermediate = 0; intermediate < intermediateSize; intermediate += 1) {
       let gate = 0;
@@ -562,10 +740,14 @@ async function swiGluCpu(
         const input = activations[inputOffset + hidden] ?? 0;
         gate += input * (expert.gate[weightOffset + hidden] ?? 0);
         up += input * (expert.up[weightOffset + hidden] ?? 0);
+        operationsUntilYield -= 1;
+        if (operationsUntilYield === 0) {
+          operationsUntilYield = 16_384;
+          await yieldToBrowser(signal);
+        }
       }
       activated[row * intermediateSize + intermediate] = (gate / (1 + Math.exp(-gate))) * up;
     }
-    if (row % 4 === 0) await new Promise<void>((resolvePromise) => window.setTimeout(resolvePromise, 0));
   }
   const output = new Float32Array(rows * hiddenSize);
   for (let row = 0; row < rows; row += 1) {
@@ -575,6 +757,11 @@ async function swiGluCpu(
       for (let intermediate = 0; intermediate < intermediateSize; intermediate += 1) {
         sum += (activated[row * intermediateSize + intermediate] ?? 0)
           * (expert.down[downOffset + intermediate] ?? 0);
+        operationsUntilYield -= 1;
+        if (operationsUntilYield === 0) {
+          operationsUntilYield = 16_384;
+          await yieldToBrowser(signal);
+        }
       }
       output[row * hiddenSize + hidden] = sum;
     }
@@ -587,7 +774,9 @@ async function swiGluWebGpu(
   expert: ResidentExpert,
   activations: Float32Array,
   rows: number,
+  signal: AbortSignal,
 ): Promise<Float32Array> {
+  assertExecutionAllowed(signal);
   const { hiddenSize, intermediateSize } = expert.manifest;
   const byteSizes = [activations.byteLength, expert.gate.byteLength, expert.up.byteLength,
     expert.down.byteLength, rows * intermediateSize * 4, rows * hiddenSize * 4];
@@ -683,7 +872,8 @@ async function swiGluWebGpu(
     secondPass.dispatchWorkgroups(Math.ceil((rows * hiddenSize) / 64)); secondPass.end();
     encoder.copyBufferToBuffer(output, 0, readback, 0, rows * hiddenSize * 4);
     device.queue.submit([encoder.finish()]);
-    await readback.mapAsync(GPUMapMode.READ);
+    await abortable(readback.mapAsync(GPUMapMode.READ), signal);
+    assertExecutionAllowed(signal);
     return new Float32Array(readback.getMappedRange().slice(0));
   } finally {
     if (readback.mapState === "mapped") readback.unmap();
@@ -713,17 +903,74 @@ function hex(value: ArrayBuffer): string {
   return [...new Uint8Array(value)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-async function runMatrixTask(size: number, seed: number): Promise<ComputeResult> {
+async function runMatrixTask(size: number, seed: number, signal: AbortSignal): Promise<ComputeResult> {
+  const device = state.device;
+  const execution = await runWithMobileBackendFallback({
+    backend: state.backend === "webgpu" && device ? "webgpu" : "cpu",
+    runGpu: async () => {
+      if (!device) throw new Error("WebGPU device is unavailable");
+      const result = await measureMatrixTask(size, () => multiplyWebGpu(device, size, seed, signal), signal);
+      if (!matrixSamplesMatch(result.samples, size, seed)) throw new Error("GPU matrix canary mismatch");
+      return result;
+    },
+    runCpu: () => measureMatrixTask(size, () => multiplyCpu(size, seed, signal), signal),
+    onGpuFailure: (error) => transitionToCpuFallback(
+      `matrix kernel failed: ${errorText(error)}`,
+      device,
+    ),
+    signal,
+  });
+  return execution.value;
+}
+
+async function runStartupBenchmark(
+  seed: number,
+  signal: AbortSignal,
+): Promise<{ size: number; result: ComputeResult }> {
+  const device = state.device;
+  const execution = await runWithMobileBackendFallback({
+    backend: state.backend === "webgpu" && device ? "webgpu" : "cpu",
+    runGpu: async () => {
+      if (!device) throw new Error("WebGPU device is unavailable");
+      const size = 96;
+      const result = await measureMatrixTask(size, () => multiplyWebGpu(device, size, seed, signal), signal);
+      if (!matrixSamplesMatch(result.samples, size, seed)) throw new Error("GPU matrix canary mismatch");
+      return { size, result };
+    },
+    runCpu: async () => {
+      const size = 48;
+      return { size, result: await measureMatrixTask(size, () => multiplyCpu(size, seed, signal), signal) };
+    },
+    onGpuFailure: (error) => transitionToCpuFallback(
+      `startup canary failed: ${errorText(error)}`,
+      device,
+    ),
+    signal,
+  });
+  return execution.value;
+}
+
+async function measureMatrixTask(
+  size: number,
+  compute: () => Promise<number[]>,
+  signal: AbortSignal,
+): Promise<ComputeResult> {
+  assertExecutionAllowed(signal);
   const started = performance.now();
-  const samples = state.backend === "webgpu" && state.device
-    ? await multiplyWebGpu(state.device, size, seed)
-    : await multiplyCpu(size, seed);
+  const samples = await compute();
+  assertExecutionAllowed(signal);
   const durationMs = Math.max(0.01, performance.now() - started);
   const estimatedGflops = (2 * size * size * size) / durationMs / 1_000_000;
   return { samples, durationMs, estimatedGflops };
 }
 
-async function multiplyWebGpu(device: GPUDevice, size: number, seed: number): Promise<number[]> {
+async function multiplyWebGpu(
+  device: GPUDevice,
+  size: number,
+  seed: number,
+  signal: AbortSignal,
+): Promise<number[]> {
+  assertExecutionAllowed(signal);
   const elementCount = size * size;
   const byteLength = elementCount * Float32Array.BYTES_PER_ELEMENT;
   if (byteLength > Number(device.limits.maxBufferSize)) throw new Error("The matrix does not fit on the GPU");
@@ -791,7 +1038,8 @@ async function multiplyWebGpu(device: GPUDevice, size: number, seed: number): Pr
     pass.end();
     commands.copyBufferToBuffer(output, 0, readback, 0, byteLength);
     device.queue.submit([commands.finish()]);
-    await readback.mapAsync(GPUMapMode.READ);
+    await abortable(readback.mapAsync(GPUMapMode.READ), signal);
+    assertExecutionAllowed(signal);
     const values = new Float32Array(readback.getMappedRange());
     return samplePositions(size).map(([row, column]) => values[row * size + column] ?? Number.NaN);
   } finally {
@@ -803,18 +1051,27 @@ async function multiplyWebGpu(device: GPUDevice, size: number, seed: number): Pr
   }
 }
 
-async function multiplyCpu(size: number, seed: number): Promise<number[]> {
+async function multiplyCpu(size: number, seed: number, signal: AbortSignal): Promise<number[]> {
+  assertExecutionAllowed(signal);
   const positions = samplePositions(size);
   const wanted = new Map(positions.map(([row, column], index) => [`${row}:${column}`, index]));
   const samples = new Array<number>(positions.length).fill(0);
+  let operationsUntilYield = 16_384;
   for (let row = 0; row < size; row += 1) {
     for (let column = 0; column < size; column += 1) {
       let sum = 0;
-      for (let k = 0; k < size; k += 1) sum += valueA(row, k, seed) * valueB(k, column, seed);
+      for (let k = 0; k < size; k += 1) {
+        sum += valueA(row, k, seed) * valueB(k, column, seed);
+        operationsUntilYield -= 1;
+        if (operationsUntilYield === 0) {
+          operationsUntilYield = 16_384;
+          await yieldToBrowser(signal);
+        }
+      }
       const sampleIndex = wanted.get(`${row}:${column}`);
       if (sampleIndex !== undefined) samples[sampleIndex] = sum;
     }
-    if (row % 8 === 0) await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+    if (row % 8 === 0) await yieldToBrowser(signal);
   }
   return samples;
 }
@@ -831,15 +1088,45 @@ function samplePositions(size: number): Array<readonly [number, number]> {
   return [[0, 0], [Math.floor(size / 2), Math.floor(size / 3)], [size - 1, size - 1], [Math.floor(size / 3), Math.max(0, size - 2)]];
 }
 
-async function acquireWakeLock(): Promise<void> {
+function matrixSamplesMatch(samples: number[], size: number, seed: number): boolean {
+  if (samples.length !== samplePositions(size).length) return false;
+  return samplePositions(size).every(([row, column], sampleIndex) => {
+    let expected = 0;
+    for (let k = 0; k < size; k += 1) expected += valueA(row, k, seed) * valueB(k, column, seed);
+    const actual = samples[sampleIndex];
+    return actual !== undefined && Number.isFinite(actual) && Math.abs(actual - expected) < 0.02;
+  });
+}
+
+function float32Close(actual: Float32Array, expected: Float32Array, tolerance: number): boolean {
+  return actual.length > 0 && actual.length === expected.length
+    && actual.every((value, index) => Number.isFinite(value)
+      && Math.abs(value - (expected[index] ?? Number.POSITIVE_INFINITY)) <= tolerance);
+}
+
+async function acquireWakeLock(signal?: AbortSignal): Promise<void> {
+  if (signal) assertExecutionAllowed(signal);
   if (!("wakeLock" in navigator) || document.visibilityState !== "visible") {
     renderWakeLock();
     return;
   }
   try {
-    state.wakeLock = await navigator.wakeLock.request("screen");
-    state.wakeLock.addEventListener("release", renderWakeLock, { once: true });
-  } catch {
+    const wakeLock = signal
+      ? await abortable(navigator.wakeLock.request("screen"), signal)
+      : await navigator.wakeLock.request("screen");
+    if (signal) {
+      try {
+        assertExecutionAllowed(signal);
+      } catch (error) {
+        await wakeLock.release().catch(() => undefined);
+        throw error;
+      }
+    }
+    state.wakeLock = wakeLock;
+    wakeLock.addEventListener("release", renderWakeLock, { once: true });
+  } catch (error) {
+    if (isMobileExecutionCancelled(error)) throw error;
+    if (signal) throwIfMobileExecutionCancelled(signal);
     state.wakeLock = null;
   }
   renderWakeLock();
@@ -855,7 +1142,7 @@ function sendHeartbeat(): void {
 }
 
 function requestWork(): void {
-  if (!state.running || document.visibilityState !== "visible") return;
+  if (!state.running || document.visibilityState !== "visible" || viewState.connection !== "online") return;
   send("work.request", {});
 }
 
@@ -889,8 +1176,74 @@ function setStatus(text: string): void {
 
 function addLog(text: string): void {
   const entry = `${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} · ${text}`;
-  viewState.activity = [entry, ...viewState.activity].slice(0, 5);
+  viewState.activity = [entry, ...viewState.activity].slice(0, 50);
   emit();
+}
+
+function beginExecutionSession(reason: string): AbortSignal {
+  state.executionController.abort(new MobileExecutionCancelledError(reason));
+  state.executionController = new AbortController();
+  return state.executionController.signal;
+}
+
+function cancelActiveExecutions(reason: string): void {
+  state.executionController.abort(new MobileExecutionCancelledError(reason));
+  state.executionController = new AbortController();
+  const device = state.device;
+  state.device = null;
+  state.gpu = null;
+  state.backend = "cpu";
+  if (state.detectedGpuLabel) viewState.gpuLabel = mobileCpuFallbackLabel(state.detectedGpuLabel);
+  device?.destroy();
+}
+
+function assertExecutionAllowed(signal: AbortSignal): void {
+  throwIfMobileExecutionCancelled(signal);
+  if ((!state.running && !state.starting) || document.visibilityState !== "visible") {
+    throw new MobileExecutionCancelledError("Mobile compute is paused");
+  }
+}
+
+function abortable<T>(promise: PromiseLike<T>, signal: AbortSignal): Promise<T> {
+  throwIfMobileExecutionCancelled(signal);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new MobileExecutionCancelledError());
+    signal.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve(promise).then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        try {
+          throwIfMobileExecutionCancelled(signal);
+          resolve(value);
+        } catch (error) {
+          reject(error);
+        }
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        if (signal.aborted) reject(new MobileExecutionCancelledError());
+        else reject(error);
+      },
+    );
+  });
+}
+
+async function yieldToBrowser(signal: AbortSignal): Promise<void> {
+  await abortable(new Promise<void>((resolve) => window.setTimeout(resolve, 0)), signal);
+  assertExecutionAllowed(signal);
+}
+
+function transitionToCpuFallback(reason: string, failedDevice: GPUDevice | null): void {
+  if (failedDevice && state.device !== failedDevice) return;
+  const device = state.device;
+  state.device = null;
+  state.gpu = null;
+  state.backend = "cpu";
+  viewState.gpuLabel = mobileCpuFallbackLabel(state.detectedGpuLabel);
+  emit();
+  sendHeartbeat();
+  addLog(`GPU unavailable; continuing with CPU (${reason}).`);
+  device?.destroy();
 }
 
 function coolDownMs(): number {

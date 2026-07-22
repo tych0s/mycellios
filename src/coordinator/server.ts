@@ -60,12 +60,42 @@ export async function createCoordinator(
   } = {},
 ): Promise<CoordinatorRuntime> {
   const app = Fastify({ logger: options.logger ?? false, bodyLimit: 2 * 1024 * 1024 });
+  app.addHook("onRequest", async (_request, reply) => {
+    // The public UI and mobile worker must never be embeddable as drive-by
+    // compute. Apply the policy to static and dynamic responses so it remains
+    // true even when a reverse proxy does not add security headers.
+    reply.header("Content-Security-Policy", "frame-ancestors 'none'; object-src 'none'; base-uri 'self'");
+    reply.header("X-Frame-Options", "DENY");
+    reply.header("X-Content-Type-Options", "nosniff");
+    reply.header("Referrer-Policy", "strict-origin-when-cross-origin");
+  });
+  const internalToken = config.internalToken ?? config.modelAdminToken ?? config.networkToken;
+  app.addHook("onRequest", async (request, reply) => {
+    const path = request.url.split("?", 1)[0] ?? request.url;
+    if (!path.startsWith("/internal/v1/mobile/experts/")) return;
+    if (!internalToken) {
+      return reply.code(503).send({
+        error: {
+          code: "internal_administration_not_configured",
+          message: "Mobile expert administration requires MYCELLIOS_INTERNAL_TOKEN.",
+        },
+      });
+    }
+    const received = parseBearerToken(request.headers.authorization);
+    if (!received || !constantTimeEqual(received, internalToken)) {
+      return reply.code(401).send({ error: { code: "invalid_internal_token" } });
+    }
+  });
   if (config.networkToken) {
     const expectedToken = config.networkToken;
     app.addHook("onRequest", async (request, reply) => {
       const path = request.url.split("?", 1)[0] ?? request.url;
       if (!path.startsWith("/internal/v1/") && !path.startsWith("/v1/")) return;
       if (path.startsWith("/internal/v1/releases/")) return;
+      // Mobile expert administration has its own stronger control-plane
+      // credential above. Requiring both secrets in one Authorization header
+      // would make the route impossible to use when the tokens differ.
+      if (path.startsWith("/internal/v1/mobile/experts/")) return;
       const received = parseBearerToken(request.headers.authorization);
       if (!received || !constantTimeEqual(received, expectedToken)) {
         return reply.code(401).send({ error: { code: "invalid_network_token" } });

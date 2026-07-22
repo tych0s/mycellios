@@ -70,7 +70,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--device",
         default="auto",
         help=(
-            "Dense Torch execution device: auto, cpu, cuda or cuda:<index>. "
+            "Dense Torch execution device: auto, cpu, cuda[:index], mps or xpu[:index]. "
             "An explicit accelerator request fails if it is unavailable."
         ),
     )

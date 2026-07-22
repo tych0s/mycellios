@@ -256,6 +256,7 @@ interface PendingExpertTask {
 
 export interface ExpertExecutionResult {
   workerId: string;
+  replicaWorkerIds?: string[];
   outputBase64: string;
   rows: number;
   hiddenSize: number;
@@ -325,7 +326,6 @@ export class MobileComputeHub {
       const stored = { ...manifest, artifactId };
       this.expertManifests.set(artifactId, stored);
       writeFileSync(this.manifestPath(artifactId), JSON.stringify(stored, null, 2));
-      this.cancelSyntheticWork();
       return reply.code(201).send({ artifactId });
     });
 
@@ -386,7 +386,11 @@ export class MobileComputeHub {
       worker.disconnectedAt = null;
       worker.visible = true;
       worker.lastSeenAt = Date.now();
-      this.send(socket, "server.ready", { workerId: worker.id });
+      this.send(socket, "server.ready", {
+        workerId: worker.id,
+        verifiedTasks: worker.verifiedTasks,
+        inferenceReady: worker.verifiedTasks > 0,
+      });
       socket.on("message", (raw) => this.handleMessage(worker, raw.toString()));
       socket.on("close", (code, reason) => {
         this.disconnect(
@@ -581,7 +585,10 @@ export class MobileComputeHub {
 
   private offerWork(worker: MobileWorkerState): void {
     if (!worker.socket || worker.socket.readyState !== worker.socket.OPEN || !worker.visible) return;
-    if (this.expertManifests.size > 0 || worker.pendingExpertTask) return;
+    // Matrix work is an admission check, not a permanent workload. Once one
+    // result has been independently verified, this worker stays idle and is
+    // reserved for real model-expert inference.
+    if (worker.verifiedTasks > 0 || worker.pendingExpertTask) return;
     if (worker.pendingTask) {
       if (Date.now() - worker.pendingTask.issuedAt <= this.taskTimeoutMs) return;
       worker.failedTasks += 1;
@@ -636,18 +643,26 @@ export class MobileComputeHub {
       taskId: task.taskId,
       completedTasks: worker.completedTasks,
       verifiedTasks: worker.verifiedTasks,
+      inferenceReady: true,
     });
   }
 
-  private async prepareExpert(artifactId: string): Promise<MobileWorkerState> {
+  private async prepareExpert(
+    artifactId: string,
+    excludedWorkerIds: ReadonlySet<string> = new Set(),
+  ): Promise<MobileWorkerState> {
     const manifest = this.expertManifests.get(artifactId) ?? this.loadManifest(artifactId);
     if (!manifest) throw new Error(`expert artifact ${artifactId} is not registered`);
     const resident = [...this.workers.values()].find(
-      (worker) => this.usableForExpert(worker) && worker.residentExperts.has(artifactId),
+      (worker) => !excludedWorkerIds.has(worker.id)
+        && this.usableForExpert(worker)
+        && worker.residentExperts.has(artifactId),
     );
     if (resident) return resident;
-    const worker = [...this.workers.values()].find((candidate) => this.usableForExpert(candidate));
-    if (!worker) throw new Error("no visible mobile worker is available");
+    const worker = [...this.workers.values()].find(
+      (candidate) => !excludedWorkerIds.has(candidate.id) && this.usableForExpert(candidate),
+    );
+    if (!worker) throw new Error("two distinct validated visible mobile workers are required for replicated expert consensus");
     this.cancelMatrixWork(worker);
     return await new Promise<MobileWorkerState>((resolvePromise, rejectPromise) => {
       const taskId = randomUUID();
@@ -687,7 +702,46 @@ export class MobileComputeHub {
     if (activations.length !== input.rows * input.hiddenSize || !allFinite(activations)) {
       throw new Error("activation payload does not match its declared shape");
     }
-    const worker = await this.prepareExpert(input.artifactId);
+    const primary = await this.prepareExpert(input.artifactId);
+    const replica = await this.prepareExpert(input.artifactId, new Set([primary.id]));
+    let results: [ExpertExecutionResult, ExpertExecutionResult];
+    try {
+      results = await Promise.all([
+        this.executeExpertOnWorker(primary, input),
+        this.executeExpertOnWorker(replica, input),
+      ]);
+    } catch (error) {
+      this.rejectExpertConsensus([primary, replica], input.artifactId, "replica_failed");
+      throw error;
+    }
+    const [primaryResult, replicaResult] = results;
+    const primaryOutput = decodeFloat32(primaryResult.outputBase64);
+    const replicaOutput = decodeFloat32(replicaResult.outputBase64);
+    if (!floatTensorsAgree(primaryOutput, replicaOutput)) {
+      this.rejectExpertConsensus([primary, replica], input.artifactId, "replica_mismatch");
+      throw new Error("mobile expert replicas returned different tensors");
+    }
+    for (const [worker, result] of [[primary, primaryResult], [replica, replicaResult]] as const) {
+      worker.completedTasks += 1;
+      worker.verifiedTasks += 1;
+      worker.registration.backend = result.backend;
+      this.send(worker.socket, "expert.verified", {
+        artifactId: input.artifactId,
+        phase: "consensus",
+        replicas: 2,
+        verifiedTasks: worker.verifiedTasks,
+      });
+    }
+    return {
+      ...primaryResult,
+      replicaWorkerIds: [primary.id, replica.id],
+    };
+  }
+
+  private async executeExpertOnWorker(
+    worker: MobileWorkerState,
+    input: z.infer<typeof expertExecuteSchema>,
+  ): Promise<ExpertExecutionResult> {
     return await new Promise<ExpertExecutionResult>((resolvePromise, rejectPromise) => {
       const taskId = randomUUID();
       const leaseId = randomUUID();
@@ -721,6 +775,23 @@ export class MobileComputeHub {
         deadlineAt: Date.now() + this.taskTimeoutMs,
       });
     });
+  }
+
+  private rejectExpertConsensus(
+    workers: readonly MobileWorkerState[],
+    artifactId: string,
+    reason: string,
+  ): void {
+    for (const worker of workers) {
+      const pending = worker.pendingExpertTask;
+      if (pending?.artifactId === artifactId) {
+        clearTimeout(pending.timer);
+        worker.pendingExpertTask = null;
+        pending.reject(new Error(`replicated expert consensus cancelled: ${reason}`));
+      }
+      if (worker.residentExperts.delete(artifactId)) worker.failedTasks += 1;
+      this.send(worker.socket, "expert.rejected", { artifactId, reason });
+    }
   }
 
   private completeExpertLoad(
@@ -766,9 +837,6 @@ export class MobileComputeHub {
       pending.reject(new Error("mobile expert returned an invalid tensor"));
       return;
     }
-    worker.completedTasks += 1;
-    worker.verifiedTasks += 1;
-    worker.registration.backend = payload.backend;
     pending.resolve({
       workerId: worker.id,
       outputBase64: payload.outputBase64,
@@ -776,11 +844,6 @@ export class MobileComputeHub {
       hiddenSize: payload.hiddenSize,
       backend: payload.backend,
       durationMs: payload.durationMs,
-    });
-    this.send(worker.socket, "expert.verified", {
-      artifactId: pending.artifactId,
-      phase: "executed",
-      verifiedTasks: worker.verifiedTasks,
     });
   }
 
@@ -800,12 +863,9 @@ export class MobileComputeHub {
   private usableForExpert(worker: MobileWorkerState): boolean {
     return Boolean(
       worker.connected && worker.visible && worker.socket
-      && worker.socket.readyState === worker.socket.OPEN && !worker.pendingExpertTask,
+      && worker.socket.readyState === worker.socket.OPEN && worker.verifiedTasks > 0
+      && !worker.pendingExpertTask,
     );
-  }
-
-  private cancelSyntheticWork(): void {
-    for (const worker of this.workers.values()) this.cancelMatrixWork(worker);
   }
 
   private cancelMatrixWork(worker: MobileWorkerState): void {
@@ -926,6 +986,18 @@ function decodeFloat32(value: string): Float32Array {
 
 function allFinite(values: Float32Array): boolean {
   for (const value of values) if (!Number.isFinite(value)) return false;
+  return true;
+}
+
+function floatTensorsAgree(left: Float32Array, right: Float32Array): boolean {
+  if (left.length === 0 || left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    const leftValue = left[index] ?? Number.NaN;
+    const rightValue = right[index] ?? Number.NaN;
+    if (!Number.isFinite(leftValue) || !Number.isFinite(rightValue)) return false;
+    const scale = Math.max(Math.abs(leftValue), Math.abs(rightValue));
+    if (Math.abs(leftValue - rightValue) > 2e-4 + 2e-4 * scale) return false;
+  }
   return true;
 }
 

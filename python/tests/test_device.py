@@ -29,6 +29,8 @@ class TorchExecutionDeviceTests(unittest.TestCase):
     def test_auto_falls_back_truthfully_to_cpu(self) -> None:
         with (
             patch("distributed_runtime.device.torch.cuda.is_available", return_value=False),
+            patch("distributed_runtime.device._xpu_is_usable", return_value=False),
+            patch("distributed_runtime.device._mps_is_usable", return_value=False),
             patch("distributed_runtime.device.platform.processor", return_value="Test CPU"),
         ):
             selected = resolve_torch_execution_device("auto")
@@ -116,6 +118,45 @@ class TorchExecutionDeviceTests(unittest.TestCase):
         self.assertEqual(selected.backend, "rocm")
         self.assertEqual(selected.device, torch.device("cuda:0"))
         self.assertTrue(selected.accelerated)
+
+    def test_mps_reports_real_device_and_allocator_evidence(self) -> None:
+        with (
+            patch("distributed_runtime.device._mps_is_usable", return_value=True),
+            patch("distributed_runtime.device._mps_device_name", return_value="Apple M4 GPU"),
+            patch("distributed_runtime.device._mps_total_memory", return_value=12_000),
+            patch("distributed_runtime.device.torch.mps.current_allocated_memory", return_value=101),
+            patch("distributed_runtime.device.torch.mps.driver_allocated_memory", return_value=202),
+        ):
+            selected = resolve_torch_execution_device("mps")
+            snapshot = selected.snapshot(weight_bytes=77, precision="float16")
+
+        self.assertEqual(selected.backend, "mps")
+        self.assertEqual(selected.device, torch.device("mps"))
+        self.assertEqual(selected.name, "Apple M4 GPU")
+        self.assertTrue(selected.accelerated)
+        self.assertEqual(snapshot["allocated_bytes"], 101)
+        self.assertEqual(snapshot["reserved_bytes"], 202)
+        self.assertIsNone(snapshot["peak_allocated_bytes"])
+
+    def test_xpu_reports_real_intel_device(self) -> None:
+        fake_xpu = SimpleNamespace(
+            is_available=lambda: True,
+            device_count=lambda: 1,
+            get_device_properties=lambda _index: SimpleNamespace(name="Intel Arc Test", total_memory=9_000),
+            memory_allocated=lambda _device: 111,
+            memory_reserved=lambda _device: 222,
+            max_memory_allocated=lambda _device: 333,
+        )
+        with patch.object(torch, "xpu", fake_xpu, create=True):
+            selected = resolve_torch_execution_device("xpu:0")
+            snapshot = selected.snapshot(weight_bytes=88, precision="float16")
+
+        self.assertEqual(selected.backend, "xpu")
+        self.assertEqual(selected.device, torch.device("xpu:0"))
+        self.assertEqual(selected.name, "Intel Arc Test")
+        self.assertEqual(snapshot["allocated_bytes"], 111)
+        self.assertEqual(snapshot["reserved_bytes"], 222)
+        self.assertEqual(snapshot["peak_allocated_bytes"], 333)
 
     def test_unknown_backends_are_rejected(self) -> None:
         for requested in ("", "directml", "vulkan", "cuda:-1", "cuda:x"):
@@ -239,6 +280,8 @@ class StageDeviceWiringTests(unittest.TestCase):
         ]
         self.assertEqual(parse_stage_args(base).device, "auto")
         self.assertEqual(parse_stage_args([*base, "--device", "cuda:2"]).device, "cuda:2")
+        self.assertEqual(parse_stage_args([*base, "--device", "mps"]).device, "mps")
+        self.assertEqual(parse_stage_args([*base, "--device", "xpu:0"]).device, "xpu:0")
         self.assertEqual(parse_server_args([]).device, "auto")
         self.assertEqual(parse_server_args(["--device", "cuda:1"]).device, "cuda:1")
 

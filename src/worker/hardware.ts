@@ -9,7 +9,65 @@ export interface HardwareProbe {
   hostname: string;
   platform: NodeJS.Platform;
   ramMb: number;
-  gpus: Array<Omit<GpuCapability, "offeredVramMb" | "freeOfferedVramMb">>;
+  gpus: HardwareGpu[];
+}
+
+export interface HardwareGpu extends Omit<GpuCapability, "offeredVramMb" | "freeOfferedVramMb"> {
+  /** Ordinal reported by the vendor runtime itself, never inferred from OS display ordering. */
+  runtimeDeviceIndex?: number | undefined;
+}
+
+export interface VerifiedGpuRuntimeEvidence {
+  status: "gpu-ready";
+  backend: "cuda" | "rocm" | "mps" | "xpu";
+  deviceName: string;
+}
+
+/** Compare stable model identity while ignoring vendor/UI-only decorations. */
+export function gpuModelsMatch(left: string, right: string): boolean {
+  const exactLeft = left.trim().toLowerCase();
+  const exactRight = right.trim().toLowerCase();
+  if (!exactLeft || !exactRight) return false;
+  if (exactLeft === exactRight) return true;
+  const leftKey = normalizedGpuIdentity(left);
+  const rightKey = normalizedGpuIdentity(right);
+  return leftKey.length >= 3 && leftKey === rightKey;
+}
+
+/**
+ * Publish GPU memory only after a physical runtime probe confirms the selected
+ * adapter. Until then, publish a conservative fraction of real system RAM.
+ */
+export function selectRuntimeCapacityHardware(
+  hardware: HardwareProbe,
+  selected: HardwareGpu | undefined,
+  runtime: VerifiedGpuRuntimeEvidence | undefined,
+  cpuModel?: string | undefined,
+): HardwareGpu {
+  const selectedBudget = selected
+    ? selected.physicalVramMb + (selected.sharedMemoryMb ?? 0)
+    : 0;
+  if (selected && selectedBudget >= 512 && runtimeMatchesGpu(runtime, selected)) return selected;
+  return cpuMemoryCapacityHardware(hardware, cpuModel);
+}
+
+export function selectHardwareGpu(
+  gpus: readonly HardwareProbe["gpus"][number][],
+  preferred?: { id?: string | undefined; vendor: string; model: string } | undefined,
+): HardwareProbe["gpus"][number] | undefined {
+  if (!preferred) return gpus[0];
+  if (preferred.id) {
+    const exact = gpus.find((gpu) => gpu.id === preferred.id);
+    if (
+      exact
+      && exact.vendor.toLowerCase() === preferred.vendor.toLowerCase()
+      && exact.model.toLowerCase() === preferred.model.toLowerCase()
+    ) return exact;
+  }
+  return gpus.find((gpu) =>
+    gpu.vendor.toLowerCase() === preferred.vendor.toLowerCase()
+    && gpu.model.toLowerCase() === preferred.model.toLowerCase()
+  );
 }
 
 export async function probeHardware(): Promise<HardwareProbe> {
@@ -19,13 +77,12 @@ export async function probeHardware(): Promise<HardwareProbe> {
     ramMb: Math.floor(totalmem() / 1024 / 1024),
   };
   const nvidia = await probeNvidia();
-  if (nvidia.length > 0) return { ...base, gpus: nvidia };
   const windows = platform() === "win32" ? await probeWindowsGpu(base.ramMb) : [];
-  if (windows.length > 0) return { ...base, gpus: windows };
   const mac = platform() === "darwin" ? await probeMacGpu(base.ramMb) : [];
-  if (mac.length > 0) return { ...base, gpus: mac };
   const linux = platform() === "linux" ? await probeLinuxGpu(base.ramMb) : [];
-  if (linux.length > 0) return { ...base, gpus: linux };
+  const native = windows.length > 0 ? windows : mac.length > 0 ? mac : linux;
+  const gpus = mergeHardwareGpuProbes(native, nvidia);
+  if (gpus.length > 0) return { ...base, gpus };
   return {
     ...base,
     gpus: [
@@ -37,6 +94,29 @@ export async function probeHardware(): Promise<HardwareProbe> {
       },
     ],
   };
+}
+
+export function mergeHardwareGpuProbes(
+  native: readonly HardwareProbe["gpus"][number][],
+  nvidia: readonly HardwareProbe["gpus"][number][],
+): HardwareProbe["gpus"] {
+  const remainingNvidia = [...nvidia];
+  const merged = native.map((gpu) => {
+    if (gpu.vendor !== "nvidia") return gpu;
+    const index = remainingNvidia.findIndex((candidate) =>
+      candidate.vendor === "nvidia" && normalizedGpuModel(candidate.model) === normalizedGpuModel(gpu.model)
+    );
+    if (index < 0) return gpu;
+    const measured = remainingNvidia.splice(index, 1)[0]!;
+    return { ...gpu, ...measured };
+  });
+  merged.push(...remainingNvidia);
+  return merged.map((gpu, index) => {
+    return {
+      ...gpu,
+      id: `gpu-${index}`,
+    };
+  });
 }
 
 async function probeMacGpu(systemRamMb: number): Promise<HardwareProbe["gpus"]> {
@@ -120,6 +200,7 @@ async function probeNvidia(): Promise<HardwareProbe["gpus"]> {
           id: `gpu-${id ?? "0"}`,
           vendor: "nvidia",
           model: model ?? "NVIDIA GPU",
+          runtimeDeviceIndex: Number(id ?? 0),
           physicalVramMb: Number(memory ?? 0),
           utilizationPct: Number(utilization ?? 0),
           temperatureC: Number(temperature ?? 0),
@@ -132,9 +213,27 @@ async function probeNvidia(): Promise<HardwareProbe["gpus"]> {
 }
 
 async function probeWindowsGpu(systemRamMb: number): Promise<HardwareProbe["gpus"]> {
-  const script =
-    "Get-CimInstance Win32_VideoController | " +
-    "Select-Object Name,AdapterRAM | ConvertTo-Json -Compress";
+  // Win32_VideoController.AdapterRAM is a uint32 and wraps/truncates modern
+  // cards above 4 GiB. Prefer the driver's 64-bit registry value and retain
+  // AdapterRAM only as a compatibility fallback for older drivers.
+  const script = [
+    "$class = 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}'",
+    "$registry = @(Get-ChildItem -LiteralPath $class -ErrorAction SilentlyContinue | ForEach-Object {",
+    "  $p = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue",
+    "  $raw = $p.'HardwareInformation.qwMemorySize'",
+    "  $bytes = if ($raw -is [byte[]] -and $raw.Length -ge 8) { [BitConverter]::ToUInt64($raw, 0) } elseif ($null -ne $raw) { [uint64]$raw } else { [uint64]0 }",
+    "  $name = if ($p.DriverDesc) { [string]$p.DriverDesc } elseif ($p.'HardwareInformation.AdapterString') { [string]$p.'HardwareInformation.AdapterString' } else { '' }",
+    "  $matchingId = if ($p.MatchingDeviceId) { [string]$p.MatchingDeviceId } else { '' }",
+    "  if ($name -and $bytes -gt 0) { [pscustomobject]@{ Name = $name; MatchingDeviceId = $matchingId; DedicatedBytes = $bytes } }",
+    "})",
+    "$devices = @(Get-CimInstance Win32_VideoController | ForEach-Object {",
+    "  $deviceName = [string]$_.Name",
+    "  $pnpId = [string]$_.PNPDeviceID",
+    "  $match = $registry | Where-Object { $vendorDevice = [regex]::Match($_.MatchingDeviceId, '^PCI\\\\VEN_[^&]+&DEV_[^&]+').Value; ($vendorDevice -and $pnpId.StartsWith($vendorDevice, [StringComparison]::OrdinalIgnoreCase)) -or (-not $vendorDevice -and $_.Name -eq $deviceName) } | Sort-Object DedicatedBytes -Descending | Select-Object -First 1",
+    "  [pscustomobject]@{ Name = $deviceName; PNPDeviceID = $pnpId; AdapterRAM = $_.AdapterRAM; DedicatedBytes = if ($match) { [uint64]$match.DedicatedBytes } else { [uint64]0 } }",
+    "})",
+    "$devices | ConvertTo-Json -Compress",
+  ].join("; ");
   try {
     const { stdout } = await execFileAsync("powershell.exe", [
       "-NoProfile",
@@ -143,13 +242,13 @@ async function probeWindowsGpu(systemRamMb: number): Promise<HardwareProbe["gpus
       script,
     ]);
     const raw = JSON.parse(stdout.trim()) as
-      | { Name?: string; AdapterRAM?: number }
-      | Array<{ Name?: string; AdapterRAM?: number }>;
+      | { Name?: string; AdapterRAM?: number; DedicatedBytes?: number }
+      | Array<{ Name?: string; AdapterRAM?: number; DedicatedBytes?: number }>;
     const devices = Array.isArray(raw) ? raw : [raw];
     return devices.map((device, index) => {
       const model = device.Name ?? "Windows GPU";
       const vendor = classifyVendor(model);
-      const physicalVramMb = Math.floor(Number(device.AdapterRAM ?? 0) / 1024 / 1024);
+      const physicalVramMb = windowsGpuPhysicalVramMb(device);
       const unifiedMemory = isLikelyUnifiedMemory(vendor, model, physicalVramMb);
       return {
         id: `gpu-${index}`,
@@ -173,6 +272,20 @@ async function probeWindowsGpu(systemRamMb: number): Promise<HardwareProbe["gpus
   }
 }
 
+export function windowsGpuPhysicalVramMb(device: {
+  AdapterRAM?: number | undefined;
+  DedicatedBytes?: number | undefined;
+}): number {
+  const dedicatedBytes = Number(device.DedicatedBytes ?? 0);
+  const adapterBytes = Number(device.AdapterRAM ?? 0);
+  const bytes = Number.isFinite(dedicatedBytes) && dedicatedBytes > 0
+    ? dedicatedBytes
+    : Number.isFinite(adapterBytes) && adapterBytes > 0
+      ? adapterBytes
+      : 0;
+  return Math.max(0, Math.floor(bytes / 1024 / 1024));
+}
+
 function isLikelyUnifiedMemory(vendor: string, model: string, physicalVramMb: number): boolean {
   if (vendor === "apple" || vendor === "intel") return true;
   if (vendor !== "amd" || physicalVramMb > 2_048) return false;
@@ -186,6 +299,50 @@ function classifyVendor(model: string): string {
   if (normalized.includes("intel")) return "intel";
   if (normalized.includes("apple")) return "apple";
   return "unknown";
+}
+
+function normalizedGpuModel(model: string): string {
+  return model.toLowerCase().replace(/\b(?:nvidia|corporation|inc\.?|amd|advanced micro devices)\b/g, "").replace(/[^a-z0-9]+/g, "");
+}
+
+function normalizedGpuIdentity(model: string): string {
+  return model
+    .toLowerCase()
+    .replace(/\(tm\)|\(r\)/g, " ")
+    .replace(/\b(?:advanced micro devices|nvidia|amd|ati|intel|apple|radeon|geforce|graphics|graphic|gpu|display|adapter|series|corporation|inc)\b/g, " ")
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+function runtimeMatchesGpu(
+  runtime: VerifiedGpuRuntimeEvidence | undefined,
+  gpu: HardwareGpu,
+): boolean {
+  if (!runtime || runtime.status !== "gpu-ready") return false;
+  const vendor = gpu.vendor.toLowerCase();
+  if (runtime.backend === "mps") {
+    return vendor === "apple";
+  }
+  const expectedVendor = runtime.backend === "xpu"
+    ? "intel"
+    : runtime.backend === "cuda"
+      ? "nvidia"
+      : "amd";
+  return vendor === expectedVendor && gpuModelsMatch(runtime.deviceName, gpu.model);
+}
+
+function cpuMemoryCapacityHardware(
+  hardware: HardwareProbe,
+  cpuModel?: string | undefined,
+): HardwareGpu {
+  const cpuMemoryBudget = Math.max(512, Math.floor(hardware.ramMb / 4));
+  return {
+    id: "cpu-memory",
+    vendor: "cpu",
+    model: `${cpuModel?.trim() || "CPU"} · system-memory fallback`,
+    physicalVramMb: 0,
+    sharedMemoryMb: cpuMemoryBudget,
+    unifiedMemory: true,
+  };
 }
 
 function stringValue(value: unknown): string | undefined {

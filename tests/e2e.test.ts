@@ -224,6 +224,17 @@ async function startNetwork(options: { llmfit?: boolean; networkToken?: string }
       coordinatorUrl: address,
       heartbeatIntervalMs: 100,
       reconnect: false,
+      hardwareProbe: async () => ({
+        hostname: "e2e-worker",
+        platform: process.platform,
+        ramMb: 16_384,
+        gpus: [{
+          id: "gpu-0",
+          vendor: "test",
+          model: "Deterministic test accelerator",
+          physicalVramMb: 8_192,
+        }],
+      }),
       logger: { info() {}, warn() {}, error() {} },
       ...(options.networkToken ? { networkToken: options.networkToken } : {}),
     },

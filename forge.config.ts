@@ -8,6 +8,7 @@ import { FusesPlugin } from "@electron-forge/plugin-fuses";
 import { VitePlugin } from "@electron-forge/plugin-vite";
 import { FuseV1Options, FuseVersion } from "@electron/fuses";
 import { existsSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 
 const windowsSign = process.env.WINDOWS_CERTIFICATE_FILE
   ? {
@@ -37,6 +38,43 @@ const macNotarize =
 
 const portableRuntimeArchive = "build/distribution-runtime.tar.gz";
 
+function commandLineOption(name: string): string | undefined {
+  const equalsPrefix = `--${name}=`;
+  const equalsValue = process.argv.find((value) => value.startsWith(equalsPrefix));
+  if (equalsValue) return equalsValue.slice(equalsPrefix.length);
+  const index = process.argv.indexOf(`--${name}`);
+  return index >= 0 ? process.argv[index + 1] : undefined;
+}
+
+const targetPlatform = commandLineOption("platform") ?? process.platform;
+const targetArch = commandLineOption("arch") ?? process.arch;
+const bundlesPortableRuntime =
+  (targetPlatform === "win32" && targetArch === "x64") ||
+  (targetPlatform === "linux" && targetArch === "x64") ||
+  (targetPlatform === "darwin" && (targetArch === "arm64" || targetArch === "x64"));
+
+function portableRuntimeMatchesTarget(): boolean {
+  if (!bundlesPortableRuntime || !existsSync(portableRuntimeArchive)) return false;
+  for (const entry of ["./runtime-manifest.json", "runtime-manifest.json"]) {
+    const result = spawnSync("tar", ["-xOf", portableRuntimeArchive, entry], {
+      encoding: "utf8",
+      maxBuffer: 4 * 1024 * 1024,
+      shell: false,
+      windowsHide: true,
+    });
+    if (result.status !== 0 || !result.stdout.trim()) continue;
+    try {
+      const manifest = JSON.parse(result.stdout) as { platform?: unknown; arch?: unknown };
+      return manifest.platform === targetPlatform && manifest.arch === targetArch;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+const includePortableRuntime = portableRuntimeMatchesTarget();
+
 const config: ForgeConfig = {
   packagerConfig: {
     asar: true,
@@ -52,13 +90,16 @@ const config: ForgeConfig = {
       "requested-execution-level": "asInvoker",
     },
     icon: "build/icons/app-icon-v2",
+    ...(targetPlatform === "darwin" && targetArch === "arm64"
+      ? { extendInfo: { LSMinimumSystemVersion: "14.0" } }
+      : {}),
     extraResource: [
       "assets/mycellios-logo.png",
       "build/icons",
       "mobile-dist",
       "landing-dist",
       "python",
-      ...(process.platform === "win32" && existsSync(portableRuntimeArchive)
+      ...(includePortableRuntime
         ? [portableRuntimeArchive]
         : []),
     ],

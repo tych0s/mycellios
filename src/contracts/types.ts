@@ -8,6 +8,7 @@ export type ExecutionBackend =
   | "rocm"
   | "directml"
   | "mps"
+  | "xpu"
   | "vulkan"
   | "webgpu";
 export type WorkerStatus = "online" | "suspect" | "offline" | "draining";

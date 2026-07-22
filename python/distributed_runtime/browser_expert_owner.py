@@ -11,6 +11,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
+from pathlib import Path
 from typing import Sequence
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -41,6 +43,7 @@ class BrowserExpertOwner:
         node_id: str,
         coordinator_url: str,
         *,
+        internal_token: str | None = None,
         timeout_seconds: float = 60.0,
     ) -> None:
         if not isinstance(node_id, str) or not node_id.strip():
@@ -51,6 +54,7 @@ class BrowserExpertOwner:
             raise ValueError("timeout_seconds must be positive")
         self.node_id = node_id.strip()
         self.coordinator_url = coordinator_url.rstrip("/")
+        self._internal_token = _load_internal_token(internal_token)
         self.timeout_seconds = float(timeout_seconds)
         self._artifacts: dict[tuple[ExpertKey, str], str] = {}
 
@@ -207,11 +211,14 @@ class BrowserExpertOwner:
         *,
         content_type: str,
     ) -> bytes:
+        headers = {"content-type": content_type, "accept": "application/json"}
+        if path.startswith("/internal/"):
+            headers["authorization"] = f"Bearer {self._internal_token}"
         request = Request(
             f"{self.coordinator_url}{path}",
             data=body,
             method=method,
-            headers={"content-type": content_type, "accept": "application/json"},
+            headers=headers,
         )
         try:
             with urlopen(request, timeout=self.timeout_seconds) as response:
@@ -223,6 +230,32 @@ class BrowserExpertOwner:
             ) from exc
         except (URLError, TimeoutError, OSError) as exc:
             raise BrowserExpertOwnerError(f"browser expert coordinator unavailable: {exc}") from exc
+
+
+def _load_internal_token(explicit: str | None) -> str:
+    token = explicit.strip() if explicit is not None else ""
+    if not token:
+        token = os.environ.get("MYCELLIOS_INTERNAL_TOKEN", "").strip()
+    if not token:
+        secret_path = os.environ.get("MYCELLIOS_INTERNAL_TOKEN_FILE", "").strip()
+        if secret_path:
+            try:
+                token = Path(secret_path).expanduser().read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                raise BrowserExpertOwnerError(
+                    "could not read MYCELLIOS_INTERNAL_TOKEN_FILE"
+                ) from exc
+    if not token:
+        raise BrowserExpertOwnerError(
+            "browser expert control requires internal_token, "
+            "MYCELLIOS_INTERNAL_TOKEN, or MYCELLIOS_INTERNAL_TOKEN_FILE"
+        )
+    if len(token) > 4096 or any(
+        character.isspace() or ord(character) < 0x21 or ord(character) > 0x7E
+        for character in token
+    ):
+        raise BrowserExpertOwnerError("the internal token is not a valid HTTP bearer token")
+    return token
 
 
 def _float32_cpu(tensor: torch.Tensor, name: str) -> torch.Tensor:

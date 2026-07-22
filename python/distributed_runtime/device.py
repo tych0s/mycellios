@@ -7,7 +7,7 @@ from typing import Any
 import torch
 
 
-SUPPORTED_TORCH_DEVICE_REQUESTS = ("auto", "cpu", "cuda")
+SUPPORTED_TORCH_DEVICE_REQUESTS = ("auto", "cpu", "cuda", "mps", "xpu")
 
 
 @dataclass(frozen=True)
@@ -51,6 +51,19 @@ class TorchExecutionDevice:
                 # health state. Metrics remain available without inventing
                 # allocator values after the CUDA/ROCm context is gone.
                 allocated = reserved = peak_allocated = None
+        elif self.device.type == "xpu":
+            try:
+                allocated = int(torch.xpu.memory_allocated(self.device))
+                reserved = int(torch.xpu.memory_reserved(self.device))
+                peak_allocated = int(torch.xpu.max_memory_allocated(self.device))
+            except (AttributeError, AssertionError, RuntimeError):
+                allocated = reserved = peak_allocated = None
+        elif self.device.type == "mps":
+            try:
+                allocated = int(torch.mps.current_allocated_memory())
+                reserved = int(torch.mps.driver_allocated_memory())
+            except (AttributeError, AssertionError, RuntimeError):
+                allocated = reserved = None
 
         return {
             "requested_device": self.requested,
@@ -69,7 +82,7 @@ class TorchExecutionDevice:
 
 
 def resolve_torch_execution_device(requested: str = "auto") -> TorchExecutionDevice:
-    """Resolve CPU or a real CUDA/ROCm device without optimistic fallbacks.
+    """Resolve CPU or a physically usable CUDA/ROCm, XPU or MPS device.
 
     ``auto`` prefers an accelerator only when the installed Torch build reports
     it usable. An explicit ``cuda`` request fails closed rather than silently
@@ -78,7 +91,14 @@ def resolve_torch_execution_device(requested: str = "auto") -> TorchExecutionDev
 
     normalized = normalize_torch_device_request(requested)
     if normalized == "auto":
-        normalized = "cuda:0" if _cuda_is_usable() else "cpu"
+        if _cuda_is_usable():
+            normalized = "cuda:0"
+        elif _xpu_is_usable():
+            normalized = "xpu:0"
+        elif _mps_is_usable():
+            normalized = "mps"
+        else:
+            normalized = "cpu"
     if normalized == "cpu":
         return TorchExecutionDevice(
             requested=requested.strip().lower(),
@@ -90,31 +110,73 @@ def resolve_torch_execution_device(requested: str = "auto") -> TorchExecutionDev
             total_memory_bytes=None,
         )
 
-    if not _cuda_is_usable():
-        raise RuntimeError(
-            f"Torch device {normalized!r} was requested, but the installed "
-            "PyTorch build cannot use a CUDA/ROCm accelerator"
-        )
     device = torch.device(normalized)
-    index = 0 if device.index is None else device.index
-    count = int(torch.cuda.device_count())
-    if not 0 <= index < count:
-        raise RuntimeError(
-            f"Torch device {normalized!r} does not exist; {count} CUDA/ROCm "
-            "device(s) are available"
+    if device.type == "cuda":
+        if not _cuda_is_usable():
+            raise RuntimeError(
+                f"Torch device {normalized!r} was requested, but the installed "
+                "PyTorch build cannot use a CUDA/ROCm accelerator"
+            )
+        index = 0 if device.index is None else device.index
+        count = int(torch.cuda.device_count())
+        if not 0 <= index < count:
+            raise RuntimeError(
+                f"Torch device {normalized!r} does not exist; {count} CUDA/ROCm "
+                "device(s) are available"
+            )
+        properties = torch.cuda.get_device_properties(index)
+        hip_version = getattr(torch.version, "hip", None)
+        backend = "rocm" if isinstance(hip_version, str) and hip_version else "cuda"
+        return TorchExecutionDevice(
+            requested=requested.strip().lower(),
+            device=torch.device(f"cuda:{index}"),
+            kind="gpu",
+            backend=backend,
+            name=str(properties.name),
+            accelerated=True,
+            total_memory_bytes=int(properties.total_memory),
         )
-    properties = torch.cuda.get_device_properties(index)
-    hip_version = getattr(torch.version, "hip", None)
-    backend = "rocm" if isinstance(hip_version, str) and hip_version else "cuda"
-    return TorchExecutionDevice(
-        requested=requested.strip().lower(),
-        device=torch.device(f"cuda:{index}"),
-        kind="gpu",
-        backend=backend,
-        name=str(properties.name),
-        accelerated=True,
-        total_memory_bytes=int(properties.total_memory),
-    )
+
+    if device.type == "xpu":
+        if not _xpu_is_usable():
+            raise RuntimeError(
+                f"Torch device {normalized!r} was requested, but the installed "
+                "PyTorch build cannot use an Intel XPU accelerator"
+            )
+        index = 0 if device.index is None else device.index
+        count = int(torch.xpu.device_count())
+        if not 0 <= index < count:
+            raise RuntimeError(
+                f"Torch device {normalized!r} does not exist; {count} XPU device(s) are available"
+            )
+        properties = torch.xpu.get_device_properties(index)
+        return TorchExecutionDevice(
+            requested=requested.strip().lower(),
+            device=torch.device(f"xpu:{index}"),
+            kind="gpu",
+            backend="xpu",
+            name=str(properties.name),
+            accelerated=True,
+            total_memory_bytes=int(properties.total_memory),
+        )
+
+    if device.type == "mps":
+        if not _mps_is_usable():
+            raise RuntimeError(
+                "Torch device 'mps' was requested, but this PyTorch/macOS combination "
+                "cannot use Metal Performance Shaders"
+            )
+        return TorchExecutionDevice(
+            requested=requested.strip().lower(),
+            device=torch.device("mps"),
+            kind="gpu",
+            backend="mps",
+            name=_mps_device_name(),
+            accelerated=True,
+            total_memory_bytes=_mps_total_memory(),
+        )
+
+    raise RuntimeError(f"Torch device type {device.type!r} has no certified dense-stage backend")
 
 
 def describe_torch_execution_device(device: torch.device | str) -> TorchExecutionDevice:
@@ -123,7 +185,7 @@ def describe_torch_execution_device(device: torch.device | str) -> TorchExecutio
     parsed = torch.device(device)
     if parsed.type == "cpu":
         return resolve_torch_execution_device("cpu")
-    if parsed.type != "cuda":
+    if parsed.type not in {"cuda", "mps", "xpu"}:
         raise RuntimeError(
             f"Torch device type {parsed.type!r} has no certified dense-stage backend"
         )
@@ -141,7 +203,11 @@ def normalize_torch_device_request(requested: str) -> str:
         index_text = normalized.removeprefix("cuda:")
         if index_text.isdigit():
             return f"cuda:{int(index_text)}"
-    raise ValueError("device must be auto, cpu, cuda or cuda:<index>")
+    if normalized.startswith("xpu:"):
+        index_text = normalized.removeprefix("xpu:")
+        if index_text.isdigit():
+            return f"xpu:{int(index_text)}"
+    raise ValueError("device must be auto, cpu, cuda[:index], mps or xpu[:index]")
 
 
 def _cuda_is_usable() -> bool:
@@ -149,3 +215,37 @@ def _cuda_is_usable() -> bool:
         return bool(torch.cuda.is_available()) and int(torch.cuda.device_count()) > 0
     except (AssertionError, RuntimeError):
         return False
+
+
+def _xpu_is_usable() -> bool:
+    try:
+        xpu = getattr(torch, "xpu", None)
+        return xpu is not None and bool(xpu.is_available()) and int(xpu.device_count()) > 0
+    except (AttributeError, AssertionError, RuntimeError):
+        return False
+
+
+def _mps_is_usable() -> bool:
+    try:
+        backend = getattr(torch.backends, "mps", None)
+        return backend is not None and bool(backend.is_built()) and bool(backend.is_available())
+    except (AttributeError, AssertionError, RuntimeError):
+        return False
+
+
+def _mps_device_name() -> str:
+    backend = getattr(torch.backends, "mps", None)
+    getter = getattr(backend, "get_name", None)
+    if callable(getter):
+        name = str(getter()).strip()
+        if name:
+            return name
+    return "Apple GPU"
+
+
+def _mps_total_memory() -> int | None:
+    try:
+        value = int(torch.mps.recommended_max_memory())
+        return value if value > 0 else None
+    except (AttributeError, AssertionError, RuntimeError):
+        return None
