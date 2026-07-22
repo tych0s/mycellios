@@ -15,6 +15,10 @@ const asarPath =
   platform === "darwin"
     ? resolve(bundleDirectory, "mycellios.app", "Contents", "Resources", "app.asar")
     : resolve(bundleDirectory, "resources", "app.asar");
+const resourcesDirectory =
+  platform === "darwin"
+    ? resolve(bundleDirectory, "mycellios.app", "Contents", "Resources")
+    : resolve(bundleDirectory, "resources");
 
 if (!existsSync(asarPath)) {
   throw new Error(`No existe el paquete esperado: ${asarPath}`);
@@ -55,6 +59,10 @@ for (const dependency of forbiddenRuntimeImports) {
 
 const expectedUpdateFeed = "https://www.mycellios.com/updates/win32/x64/";
 if (platform === "win32") {
+  const trayIconPath = resolve(resourcesDirectory, "icons", "app-icon-v2.ico");
+  if (!existsSync(trayIconPath)) {
+    throw new Error(`El paquete no contiene el icono de bandeja de Windows: ${trayIconPath}`);
+  }
   if (!mainBundle.includes(expectedUpdateFeed)) {
     throw new Error(`El paquete no contiene el canal de actualización: ${expectedUpdateFeed}`);
   }

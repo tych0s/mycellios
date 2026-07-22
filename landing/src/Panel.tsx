@@ -401,7 +401,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
 
         {error && <div className="panel-error" title={error}><CircleAlert size={17} /> Coordinator unavailable. Retrying automatically.</div>}
         <main className="panel-content">
-          <div className="panel-content-scale" style={{ zoom: contentScale, width: `${100 / contentScale}%` } as CSSProperties}>
+          <div className="panel-content-scale" style={{ transform: `scale(${contentScale})`, width: `${100 / contentScale}%` } as CSSProperties}>
             {loading && snapshot.capturedAt === EMPTY.capturedAt ? <PanelLoading /> : (
               <>
               {view === "overview" && <Overview snapshot={snapshot} onNavigate={navigate} publicLink={publicLink} external={desktop} />}

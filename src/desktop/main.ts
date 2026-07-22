@@ -105,6 +105,12 @@ function resourcePath(...segments: string[]): string {
   return join(app.getAppPath(), ...segments);
 }
 
+function desktopIconPath(...segments: string[]): string {
+  return app.isPackaged
+    ? resourcePath("icons", ...segments)
+    : resourcePath("build", "icons", ...segments);
+}
+
 function settingsPath(): string {
   return join(app.getPath("userData"), "desktop-settings.json");
 }
@@ -747,7 +753,7 @@ function registerIpc(): void {
 }
 
 function createWindow(): void {
-  const icon = resourcePath("build", "icons", "app-icon-v2.png");
+  const icon = desktopIconPath("app-icon-v2.png");
   mainWindow = new BrowserWindow({
     width: 1_520,
     height: 920,
@@ -821,9 +827,13 @@ function createTray(): void {
 }
 
 function createTrayUnsafe(): void {
-  const trayImage = nativeImage.createFromPath(resourcePath("build", "icons", "app-icon-v2.png"));
+  const trayIconPath = process.platform === "win32"
+    ? desktopIconPath("app-icon-v2.ico")
+    : desktopIconPath("32x32", "mycellios.png");
+  const trayImage = nativeImage.createFromPath(trayIconPath);
+  if (trayImage.isEmpty()) throw new Error(`Tray icon could not be loaded: ${trayIconPath}`);
   tray?.destroy();
-  tray = new Tray(trayImage.resize({ width: 22, height: 22 }));
+  tray = new Tray(trayImage);
   tray.setToolTip("mycellios");
   tray.setContextMenu(
     Menu.buildFromTemplate([
