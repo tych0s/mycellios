@@ -10,6 +10,10 @@ import {
   normalizePythonMachine,
   portableRuntimeSpec,
 } from "./portable-runtime-policy.mjs";
+import {
+  assertNoEscapingSymlinks,
+  samePath,
+} from "./portable-runtime-filesystem.mjs";
 
 const platform = readArgument("platform") ?? process.platform;
 const arch = readArgument("arch") ?? process.arch;
@@ -74,6 +78,7 @@ if (
 const temporary = mkdtempSync(join(tmpdir(), "mycellios-portable-runtime-"));
 try {
   tar(["-xzf", archive, "-C", temporary]);
+  assertNoEscapingSymlinks(temporary);
   const python = join(temporary, ...spec.pythonExecutable.split("/"));
   if (!existsSync(python)) throw new Error(`Relocated Python is missing: ${python}.`);
   const extractedProvenance = JSON.parse(
@@ -156,12 +161,4 @@ function tarEntry(path, candidates) {
     if (result.status === 0 && result.stdout.trim()) return result.stdout;
   }
   throw new Error(`Portable runtime ${path} has no runtime-manifest.json.`);
-}
-
-function samePath(left, right) {
-  const normalize = (value) => {
-    const normalized = resolve(String(value)).replaceAll("\\", "/");
-    return process.platform === "win32" ? normalized.toLowerCase() : normalized;
-  };
-  return normalize(left) === normalize(right);
 }

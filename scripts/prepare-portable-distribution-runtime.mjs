@@ -3,12 +3,10 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
-  readlinkSync,
-  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import {
   PORTABLE_PYTHON_PROVENANCE_FILE,
@@ -18,6 +16,11 @@ import {
   normalizePythonMachine,
   portableRuntimeSpec,
 } from "./portable-runtime-policy.mjs";
+import {
+  assertNoEscapingSymlinks,
+  normalizeCopiedInternalAbsoluteSymlinks,
+  samePath,
+} from "./portable-runtime-filesystem.mjs";
 
 const workspace = resolve(import.meta.dirname, "..");
 const spec = portableRuntimeSpec(process.platform, process.arch);
@@ -63,7 +66,8 @@ assertCertifiedRuntime(sourceRuntime, standalone, "Installed standalone runtime"
 
 rmSync(output, { recursive: true, force: true });
 mkdirSync(resolvedBuild, { recursive: true });
-cpSync(standalone, output, { recursive: true });
+cpSync(standalone, output, { recursive: true, verbatimSymlinks: true });
+normalizeCopiedInternalAbsoluteSymlinks(output, standalone);
 assertNoEscapingSymlinks(output);
 
 const packagedPython = join(output, ...spec.pythonExecutable.split("/"));
@@ -166,31 +170,4 @@ function assertCertifiedRuntime(runtime, expectedRoot, label) {
   if (spec.bundledAccelerators.includes("mps") && runtime.mpsBuilt !== true) {
     throw new Error(`${label} does not contain an MPS-enabled PyTorch build.`);
   }
-}
-
-function assertNoEscapingSymlinks(root) {
-  const visit = (directory) => {
-    for (const entry of readdirSync(directory, { withFileTypes: true })) {
-      const path = join(directory, entry.name);
-      if (entry.isSymbolicLink()) {
-        const target = readlinkSync(path);
-        const resolvedTarget = resolve(dirname(path), target);
-        const back = relative(root, resolvedTarget);
-        if (back === ".." || back.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`)) {
-          throw new Error(`Portable runtime contains an escaping symlink: ${relative(root, path)} -> ${target}`);
-        }
-      } else if (entry.isDirectory()) {
-        visit(path);
-      }
-    }
-  };
-  visit(root);
-}
-
-function samePath(left, right) {
-  const normalize = (value) => {
-    const normalized = resolve(String(value)).replaceAll("\\", "/");
-    return process.platform === "win32" ? normalized.toLowerCase() : normalized;
-  };
-  return normalize(left) === normalize(right);
 }

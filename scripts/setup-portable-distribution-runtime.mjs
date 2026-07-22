@@ -1,5 +1,6 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
+  cpSync,
   createReadStream,
   createWriteStream,
   existsSync,
@@ -7,6 +8,7 @@ import {
   mkdtempSync,
   readlinkSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -24,6 +26,10 @@ import {
   normalizePythonMachine,
   portableRuntimeSpec,
 } from "./portable-runtime-policy.mjs";
+import {
+  assertNoEscapingSymlinks,
+  normalizeCopiedInternalAbsoluteSymlinks,
+} from "./portable-runtime-filesystem.mjs";
 
 const workspace = resolve(import.meta.dirname, "..");
 const runtimeDirectory = resolve(workspace, "runtime");
@@ -70,7 +76,7 @@ try {
   } else {
     mkdirSync(runtimeDirectory, { recursive: true });
     rmSync(standalone, { recursive: true, force: true });
-    renameSync(extracted, standalone);
+    moveDirectory(extracted, standalone);
     writeProvenance(standalone, spec);
 
     const standalonePython = join(standalone, ...spec.pythonExecutable.split("/"));
@@ -330,10 +336,43 @@ function assertSafeTree(root) {
 
 function samePath(left, right) {
   const normalize = (value) => {
-    const normalized = resolve(String(value)).replaceAll("\\", "/");
+    // Python reports the canonical prefix on macOS (`/private/var/...`) even
+    // when the temporary directory was opened through its `/var/...` alias.
+    // Resolve both existing paths physically before comparing them.
+    const normalized = realpathSync.native(resolve(String(value))).replaceAll("\\", "/");
     return process.platform === "win32" ? normalized.toLowerCase() : normalized;
   };
   return normalize(left) === normalize(right);
+}
+
+function moveDirectory(source, destination) {
+  try {
+    renameSync(source, destination);
+    return;
+  } catch (error) {
+    if (error?.code !== "EXDEV") throw error;
+  }
+
+  // Windows runners can keep the OS temp directory on C: while the checkout
+  // lives on D:. A rename cannot cross volumes, so copy into a sibling staging
+  // directory and finish with an atomic same-volume rename.
+  const staging = `${destination}.copy-${randomUUID()}`;
+  try {
+    cpSync(source, staging, {
+      recursive: true,
+      errorOnExist: true,
+      force: false,
+      preserveTimestamps: true,
+      verbatimSymlinks: true,
+    });
+    normalizeCopiedInternalAbsoluteSymlinks(staging, source);
+    assertNoEscapingSymlinks(staging);
+    renameSync(staging, destination);
+  } catch (error) {
+    rmSync(staging, { recursive: true, force: true });
+    throw error;
+  }
+  rmSync(source, { recursive: true, force: true });
 }
 
 function assertDirectChild(parent, child, label) {
