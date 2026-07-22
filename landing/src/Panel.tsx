@@ -8,6 +8,7 @@ import {
   ChevronRight,
   CircleAlert,
   CirclePower,
+  Coins,
   Cpu,
   Download,
   ExternalLink,
@@ -22,6 +23,7 @@ import {
   MemoryStick,
   Menu,
   MessageSquareText,
+  Milestone,
   Minus,
   Network,
   Play,
@@ -67,7 +69,7 @@ const PUBLIC_COORDINATOR_URL = "https://www.mycellios.com";
 import "./panel-downloads.css";
 import "./panel-desktop.css";
 
-type PanelView = "overview" | "nodes" | "models" | "jobs" | "tests" | "inference" | "contribute" | "join" | "downloads" | "machine" | "settings";
+type PanelView = "overview" | "nodes" | "models" | "jobs" | "tests" | "roadmap" | "inference" | "contribute" | "join" | "downloads" | "machine" | "settings";
 
 interface PanelProps {
   desktopBridge?: DesktopBridge;
@@ -167,6 +169,7 @@ const sharedNavItems: Array<{ id: PanelView; label: string; icon: typeof Network
   { id: "nodes", label: "Nodes", icon: Server },
   { id: "jobs", label: "Tasks", icon: Activity },
   { id: "tests", label: "Tests", icon: Gauge },
+  { id: "roadmap", label: "Roadmap", icon: Milestone },
   { id: "models", label: "Models", icon: Boxes },
   { id: "inference", label: "Chat", icon: MessageSquareText },
   { id: "contribute", label: "This device", icon: Zap },
@@ -416,6 +419,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
               {view === "models" && <Models snapshot={snapshot} onSearch={searchHubModels} onRequest={requestModel} onRemove={removeRequestedModel} adminToken={modelAdminToken} requiresAdminToken={requiresModelAdminToken} secureTokenStorage={desktop} />}
               {view === "jobs" && <Jobs snapshot={snapshot} />}
               {view === "tests" && <Tests bridge={desktopBridge} />}
+              {view === "roadmap" && <Roadmap />}
               {view === "inference" && <Inference snapshot={snapshot} onSend={sendPrompt} onNavigate={navigate} />}
               {view === "contribute" && <Contribute />}
               {view === "join" && <JoinNetwork publicLink={publicLink} external={desktop} />}
@@ -895,6 +899,51 @@ function Tests({ bridge }: { bridge: DesktopBridge | undefined }) {
       </div>
       {selected && <BenchmarkRunDetails run={selected} />}
     </>}
+  </section>;
+}
+
+function Roadmap() {
+  return <section className="roadmap-page">
+    <PageTitle eyebrow="FUTURE DIRECTION" title="Roadmap" copy="Dos iniciativas para que mycellios aprenda de la red y recompense el cómputo que realmente aporta valor." />
+    <div className="roadmap-status-banner">
+      <div><Milestone size={20} /><span><small>ESTADO ACTUAL</small><strong>Diseño · todavía no construido</strong></span></div>
+      <p>La hoja de ruta marca la dirección del producto. Cada fase deberá demostrar seguridad, utilidad y resultados medibles antes de activarse en la red.</p>
+    </div>
+    <div className="roadmap-grid">
+      <article className="roadmap-card improvement">
+        <div className="roadmap-card-head">
+          <span className="roadmap-icon"><Sparkles /></span>
+          <span className="roadmap-phase"><i /> INICIATIVA 01</span>
+        </div>
+        <div className="roadmap-metric"><strong>0,1</strong><span>%<small>del cómputo útil</small></span></div>
+        <span className="roadmap-kicker">AUTOMEJORA CONTINUA</span>
+        <h2>Mejorar mycellios cada día</h2>
+        <p>Una pequeña parte de la capacidad agregada se reservará para que agentes autónomos analicen la red, experimenten y propongan mejoras verificables.</p>
+        <ol className="roadmap-steps">
+          <li><b>01</b><span><strong>Observar</strong><small>Detectar fallos, regresiones y cuellos de botella reales.</small></span></li>
+          <li><b>02</b><span><strong>Experimentar</strong><small>Probar cambios en entornos aislados y reproducibles.</small></span></li>
+          <li><b>03</b><span><strong>Validar</strong><small>Conservar solo mejoras que superen tests y métricas.</small></span></li>
+        </ol>
+        <div className="roadmap-card-foot"><ShieldCheck size={16} /><span><strong>Con límites y trazabilidad</strong>El presupuesto no excederá el 0,1 % ni interferirá con las cargas de los usuarios.</span></div>
+      </article>
+
+      <article className="roadmap-card crypto">
+        <div className="roadmap-card-head">
+          <span className="roadmap-icon"><Coins /></span>
+          <span className="roadmap-phase"><i /> INICIATIVA 02</span>
+        </div>
+        <div className="roadmap-metric word"><strong>CRYPTO</strong><span><small>incentivos de red</small></span></div>
+        <span className="roadmap-kicker">TOKEN DE CÓMPUTO</span>
+        <h2>Recompensar el trabajo útil</h2>
+        <p>Un sistema de tokens reconocerá la computación aceptada por la red. Estar conectado no bastará: la recompensa dependerá de trabajo útil, calidad y fiabilidad.</p>
+        <ol className="roadmap-steps">
+          <li><b>01</b><span><strong>Créditos internos</strong><small>Contabilidad verificable, aún sin blockchain ni valor económico.</small></span></li>
+          <li><b>02</b><span><strong>Testnet</strong><small>Pruebas anti-Sybil, antifraude y contratos auditables.</small></span></li>
+          <li><b>03</b><span><strong>Lanzamiento evaluado</strong><small>Economía, seguridad y revisión legal antes de emitir.</small></span></li>
+        </ol>
+        <div className="roadmap-card-foot"><ShieldCheck size={16} /><span><strong>Sin promesas financieras</strong>No existe un token activo; primero deben validarse el modelo y su cumplimiento legal.</span></div>
+      </article>
+    </div>
   </section>;
 }
 
