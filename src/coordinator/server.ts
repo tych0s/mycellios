@@ -37,6 +37,10 @@ import {
   modelHasGpuFallback,
   verifiedGpuCapacityCanRepairModel,
 } from "./connected-executor-activation.js";
+import {
+  ContentHubClient,
+  registerContentHubRoutes,
+} from "./content-hub.js";
 
 export function automaticActivationFailureIsTransient(message: string): boolean {
   const normalized = message.toLowerCase();
@@ -881,6 +885,16 @@ export async function createCoordinator(
       return reply.redirect(`/downloads/mycellios-linux-x64.rpm?v=${publicAssetVersion}`);
     });
   }
+  const contentHubClient = config.contentHubApiUrl
+    ? new ContentHubClient({ baseUrl: config.contentHubApiUrl })
+    : null;
+  await registerContentHubRoutes(app, {
+    client: contentHubClient,
+    publicationWebhookSecret: config.publicationWebhookSecret,
+    ...(landingAssetsPath
+      ? { fallbackSitemapPath: resolve(landingAssetsPath, "sitemap.xml") }
+      : {}),
+  });
   if (landingAssetsPath) {
     await app.register(staticFiles, {
       root: landingAssetsPath,
@@ -969,6 +983,7 @@ function setPublicAssetCacheHeaders(
   const normalized = filePath.replaceAll("\\", "/");
   if (
     normalized.endsWith("/index.html") ||
+    normalized.endsWith("/blog.css") ||
     normalized.endsWith("/sw.js") ||
     normalized.endsWith("/manifest.webmanifest") ||
     normalized.includes("/downloads/") ||

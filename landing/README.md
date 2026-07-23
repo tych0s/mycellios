@@ -1,7 +1,7 @@
 # mycellios landing page
 
 Public website independent from the Electron client, ready to be published at
-`https://mycellios.com`.
+`https://www.mycellios.com`.
 
 ## Development
 
@@ -18,8 +18,21 @@ npm run landing:preview
 ```
 
 Static output is generated in `landing-dist/`. This is the directory the hosting
-provider should publish. Public routes include `robots.txt`, `sitemap.xml`, and
-the brand favicon.
+provider should make available to the coordinator. Public routes include
+`robots.txt`, `sitemap.xml`, and the brand favicon.
+
+The coordinator owns the server-rendered `/blog` and `/blog/:slug` routes. Set
+`CONTENT_HUB_API_URL` to the Content Hub API and configure the same
+`MYCELLIOS_PUBLICATION_WEBHOOK_SECRET` in Mycellios and in the Content Hub
+publication destination. Publication events are received at
+`/api/content-hub/webhook`, invalidate the in-memory cache, and make new or
+updated articles visible without rebuilding the landing page.
+
+For a production-like local test, build the project and run the coordinator
+with `MYCELLIOS_LANDING_DIST=./landing-dist`. Running only `landing:dev` serves
+the static React landing and does not own the server-rendered blog routes.
+Because the Mycellios coordinator uses port `8787`, start a local Content Hub
+API with `PORT=8788` to match `.env.example`.
 
 The interface and all SEO metadata are English-only so every visitor sees the
 same public message.

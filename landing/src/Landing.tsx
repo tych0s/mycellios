@@ -569,7 +569,7 @@ function Landing() {
   return (
     <div className="site" id="top" ref={page} onPointerMove={trackPointer}>
       <div className="scroll-progress" aria-hidden="true" /><LivingBackdrop /><div className="ambient-pointer" />
-      <header className="nav-shell"><nav className="nav container" aria-label={t.nav.aria}><Brand homeLabel={t.home} /><div className="nav-links"><a href="/network">Live network</a><a href="/mobile/">Contribute</a><a href="#architecture">{t.nav.architecture}</a><a href="#roadmap">Roadmap</a></div><div className="nav-actions"><a className="nav-cta" href="/join">Join now <Zap size={15} /></a></div></nav></header>
+      <header className="nav-shell"><nav className="nav container" aria-label={t.nav.aria}><Brand homeLabel={t.home} /><div className="nav-links"><a href="/network">Live network</a><a href="/mobile/">Contribute</a><a href="#architecture">{t.nav.architecture}</a><a href="#roadmap">Roadmap</a><a href="/blog">Research</a></div><div className="nav-actions"><a className="nav-cta" href="/join">Join now <Zap size={15} /></a></div></nav></header>
 
       <main>
         <section className="hero">
@@ -610,7 +610,7 @@ function Landing() {
         <section className="closing" id="join"><div className="closing-grid" /><div className="container closing-inner reveal"><Brand compact homeLabel={t.home} /><span className="eyebrow"><i />{t.closing.eyebrow}</span><h2>{t.closing.title1}<br /><em>{t.closing.title2}</em></h2><p>{t.closing.copy}</p><a className="button button-primary button-large" href="/join">Connect this device <Zap size={18} /></a><small>Public test network · no login required</small></div></section>
       </main>
 
-      <footer className="footer container"><Brand homeLabel={t.home} /><p>{t.footer.tagline}</p><div><a href="/network">Network panel</a><a href="#roadmap">Roadmap</a><a href="/mobile/">Mobile worker</a><a href="/downloads">Downloads</a><a href={`mailto:${EMAIL}`}>{t.footer.contact}</a></div><span>© 2026 mycellios</span></footer>
+      <footer className="footer container"><Brand homeLabel={t.home} /><p>{t.footer.tagline}</p><div><a href="/network">Network panel</a><a href="#roadmap">Roadmap</a><a href="/blog">Research</a><a href="/mobile/">Mobile worker</a><a href="/downloads">Downloads</a><a href={`mailto:${EMAIL}`}>{t.footer.contact}</a></div><span>© 2026 mycellios</span></footer>
     </div>
   );
 }

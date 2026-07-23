@@ -54,7 +54,7 @@ button { font: inherit; }
 .spore-field { position: absolute; z-index: 3; inset: 0; opacity: .1; background-image: radial-gradient(circle, rgba(178,207,255,.72) 0 1px, transparent 1.5px), radial-gradient(circle, rgba(100,132,211,.52) 0 1px, transparent 1.5px); background-position: 0 0, 44px 67px; background-size: 151px 163px, 211px 227px; mask-image: linear-gradient(to bottom, black, transparent 74%); }
 
 /* Navigation */
-.nav-shell { position: absolute; z-index: 20; inset: 0 0 auto; border-bottom: 1px solid rgba(225,231,255,.055); background: linear-gradient(180deg, rgba(12,18,39,.88), rgba(12,18,39,.48)); backdrop-filter: blur(18px); }
+.nav-shell { position: absolute; z-index: 20; inset: 0 0 auto; padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left); border-bottom: 1px solid rgba(225,231,255,.055); background: linear-gradient(180deg, rgba(12,18,39,.88), rgba(12,18,39,.48)); backdrop-filter: blur(18px); }
 .nav { height: 82px; display: flex; align-items: center; justify-content: space-between; }
 .brand { display: inline-flex; align-items: center; gap: 12px; color: var(--ink); font-size: 21px; font-weight: 700; letter-spacing: -.035em; }
 .brand img { width: 31px; height: 31px; object-fit: contain; filter: drop-shadow(0 0 10px rgba(92,150,255,.18)); }
@@ -1110,7 +1110,7 @@ button { font: inherit; }
 
 @media (max-width: 760px) {
   .container { width: calc(100% - 34px); }
-  .nav-shell { inset: 8px 9px auto; border-radius: 15px; }
+  .nav-shell { inset: calc(8px + env(safe-area-inset-top)) calc(9px + env(safe-area-inset-right)) auto calc(9px + env(safe-area-inset-left)); padding: 0; border-radius: 15px; }
   .nav { height: 70px; }
   .brand { font-size: 18px; }
   .brand img { width: 27px; height: 27px; }
