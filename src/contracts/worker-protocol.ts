@@ -271,3 +271,12 @@ export function parseWorkerEnvelope(input: unknown): ValidatedWorkerEnvelope | n
   const result = workerEnvelopeSchema.safeParse(input);
   return result.success ? result.data : null;
 }
+
+export function workerEnvelopeValidationIssues(input: unknown): string[] {
+  const result = workerEnvelopeSchema.safeParse(input);
+  if (result.success) return [];
+  return result.error.issues.slice(0, 8).map((issue) => {
+    const path = issue.path.length > 0 ? issue.path.join(".") : "envelope";
+    return `${path}: ${issue.message}`;
+  });
+}

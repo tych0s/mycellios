@@ -7,6 +7,7 @@ import type { ServerEnvelope, WorkerEnvelope } from "../contracts/types.js";
 import {
   MAX_RUNTIME_STREAM_CHUNK_BYTES,
   parseWorkerEnvelope,
+  workerEnvelopeValidationIssues,
   type WorkerHeartbeatPayload,
 } from "../contracts/worker-protocol.js";
 import type { MeshStore } from "../storage/store.js";
@@ -49,6 +50,7 @@ const MAX_WEBSOCKET_BUFFERED_BYTES = 8 * 1024 * 1024;
 export class WorkerHub extends EventEmitter<HubEvents> {
   private readonly connections = new Map<string, ConnectionState>();
   private readonly allConnections = new Set<ConnectionState>();
+  private logger: FastifyInstance["log"] | null = null;
   private pendingConnections = 0;
   private readonly runtimeStreams = new Map<string, RuntimeStreamSession>();
   private readonly runtimeProxyServers = new Set<Server>();
@@ -58,6 +60,7 @@ export class WorkerHub extends EventEmitter<HubEvents> {
   }
 
   attach(app: FastifyInstance): void {
+    this.logger = app.log;
     app.get("/internal/v1/workers/connect", { websocket: true }, (socket) => {
       if (this.pendingConnections >= 256) {
         socket.close(4429, "too many pending connections");
@@ -212,8 +215,14 @@ export class WorkerHub extends EventEmitter<HubEvents> {
         this.closeInvalid(state, "frame too large");
         return;
       }
-      const envelope = parseWorkerEnvelope(JSON.parse(raw));
+      const decoded = JSON.parse(raw) as unknown;
+      const envelope = parseWorkerEnvelope(decoded);
       if (!envelope) {
+        this.logger?.warn({
+          workerId: state.workerId,
+          messageType: messageType(decoded),
+          issues: workerEnvelopeValidationIssues(decoded),
+        }, "worker message validation failed");
         this.closeInvalid(state, "invalid worker message");
         return;
       }
@@ -279,7 +288,11 @@ export class WorkerHub extends EventEmitter<HubEvents> {
         return;
       }
       this.emit("envelope", envelope);
-    } catch {
+    } catch (error) {
+      this.logger?.warn({
+        workerId: state.workerId,
+        error: error instanceof Error ? error.message : String(error),
+      }, "worker message processing failed");
       this.closeInvalid(state, "invalid worker message");
     }
   }
@@ -516,4 +529,10 @@ export class WorkerHub extends EventEmitter<HubEvents> {
     }
     session.localSocket?.destroy();
   }
+}
+
+function messageType(input: unknown): string | null {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+  const type = (input as Record<string, unknown>).type;
+  return typeof type === "string" ? type : null;
 }
