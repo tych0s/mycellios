@@ -1,11 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
+  AUTOMATIC_UPDATE_CHECK_INTERVAL_MS,
   automaticUpdateRetryDelayMs,
   canInstallAutomaticUpdate,
   summarizeAutomaticUpdateError,
 } from "../src/desktop/update-recovery.js";
 
 describe("automatic desktop update recovery", () => {
+  it("checks for unattended repairs at least every fifteen minutes", () => {
+    expect(AUTOMATIC_UPDATE_CHECK_INTERVAL_MS).toBe(15 * 60_000);
+  });
+
   it("installs a downloaded repair when the node is idle", () => {
     expect(canInstallAutomaticUpdate({
       updateReady: true,

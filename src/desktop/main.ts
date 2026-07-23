@@ -83,6 +83,7 @@ import {
 } from "./accelerator-runtime.js";
 import { buildWorkerAccelerationDiagnostics } from "./acceleration-diagnostics.js";
 import {
+  AUTOMATIC_UPDATE_CHECK_INTERVAL_MS,
   AUTOMATIC_UPDATE_GRACE_MS,
   AUTOMATIC_UPDATE_IDLE_RECHECK_MS,
   automaticUpdateRetryDelayMs,
@@ -117,7 +118,6 @@ const DEFAULT_SETTINGS: DesktopSettings = {
 };
 
 const UPDATE_FEED_URL = "https://www.mycellios.com/updates/win32/x64/";
-const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1_000;
 const LEGACY_PUBLIC_COORDINATOR_URLS = new Set([
   "https://www.mycellios.com",
   "https://mycellios.com",
@@ -289,7 +289,7 @@ function configureAutomaticUpdates(): void {
   // Squirrel holds a file lock for a few seconds after first install.
   const initialDelayMs = process.argv.includes("--squirrel-firstrun") ? 15_000 : 10_000;
   setTimeout(() => void checkForUpdates(), initialDelayMs).unref();
-  updateCheckTimer = setInterval(() => void checkForUpdates(), UPDATE_CHECK_INTERVAL_MS);
+  updateCheckTimer = setInterval(() => void checkForUpdates(), AUTOMATIC_UPDATE_CHECK_INTERVAL_MS);
   updateCheckTimer.unref();
 }
 
@@ -1256,9 +1256,10 @@ function scheduleDesktopAcceleratorRetry(runtimeRoot: string, issueCode: string)
     message: `GPU self-repair attempt ${issueAttempts + 1} will run automatically in ${seconds} seconds. The CPU runtime remains available.`,
   });
   scheduleAccelerationDiagnosticsPublish();
-  if ((issueAttempts + 1) % 4 === 0) {
-    void checkForUpdates();
-  }
+  // A failed GPU setup is often repaired by a newer certified pack or desktop
+  // build. Check immediately on every failure so an unattended node does not
+  // repeat a known-bad installer until the general update interval elapses.
+  void checkForUpdates();
   acceleratorRetryTimer = setTimeout(() => {
     acceleratorRetryTimer = null;
     acceleratorNextRetryAt = null;

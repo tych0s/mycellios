@@ -18,6 +18,10 @@ export function canInstallAutomaticUpdate(state: AutomaticUpdateInstallState): b
 
 export const AUTOMATIC_UPDATE_GRACE_MS = 60_000;
 export const AUTOMATIC_UPDATE_IDLE_RECHECK_MS = 30_000;
+// An unattended node must discover repairs promptly. The feed is a tiny local
+// JSON file with no-store headers, so a 15 minute cadence is inexpensive while
+// avoiding the previous four-hour recovery window.
+export const AUTOMATIC_UPDATE_CHECK_INTERVAL_MS = 15 * 60_000;
 
 const AUTOMATIC_UPDATE_RETRY_DELAYS_MS = [
   30_000,
