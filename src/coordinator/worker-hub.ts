@@ -209,6 +209,18 @@ export class WorkerHub extends EventEmitter<HubEvents> {
           return;
         }
         const previous = this.connections.get(envelope.workerId);
+        if (
+          previous &&
+          previous !== state &&
+          previous.ready &&
+          previous.socket.readyState === previous.socket.OPEN
+        ) {
+          // Two desktop starts can briefly overlap around an application
+          // update. Keep the already-healthy connection authoritative so the
+          // duplicate cannot create an endless mutual-supersession loop.
+          this.closeInvalid(state, "duplicate worker connection", 4409);
+          return;
+        }
         if (previous && previous !== state) previous.socket.close(4409, "superseded connection");
         state.workerId = envelope.workerId;
         state.pending = false;
