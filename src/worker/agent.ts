@@ -339,7 +339,10 @@ export class WorkerAgent {
         acceleration: structuredClone(acceleration),
       },
     };
-    if (this.registeredWorkerId) await this.register();
+    if (this.registeredWorkerId) {
+      await this.register();
+      await this.sendHeartbeat();
+    }
   }
 
   get activeJobCount(): number {

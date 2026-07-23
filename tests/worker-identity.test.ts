@@ -28,6 +28,18 @@ describe("stable worker identity", () => {
     expect(store.listWorkers()).toHaveLength(1);
   });
 
+  it("does not mark a connected worker offline when it republishes capabilities", () => {
+    const identity = { kind: "device" as const, id: "desktop-live-refresh" };
+    const first = addWorker(store, { id: "first", identity, offeredVramMb: 4_096 });
+    expect(first.status).toBe("online");
+
+    const refreshed = addWorker(store, { id: "second", identity, offeredVramMb: 6_144 });
+
+    expect(refreshed.id).toBe(first.id);
+    expect(refreshed.status).toBe("online");
+    expect(refreshed.capabilities.gpus[0]?.offeredVramMb).toBe(6_144);
+  });
+
   it("keeps independently identified cells separate from physical devices", () => {
     const device = addWorker(store, {
       id: "device",

@@ -112,8 +112,8 @@ export class MeshStore {
       if (existing) {
         this.database.raw.prepare(
           `UPDATE workers
-           SET status = 'offline', capabilities_json = ?, last_seen_at = ?, updated_at = ?,
-               deregistered = 0
+           SET capabilities_json = ?, last_seen_at = ?, updated_at = ?,
+                deregistered = 0
            WHERE id = ?`,
         ).run(JSON.stringify(registration.capabilities), now, now, existing.id);
         return this.getWorker(existing.id)!;

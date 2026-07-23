@@ -186,6 +186,55 @@ describe("worker capacity truth", () => {
     expect(harness.capabilities?.gpus[0]).toMatchObject({ vendor: "nvidia" });
   });
 
+  it("heartbeats immediately after publishing accelerator diagnostics", async () => {
+    const agent = new WorkerAgent(config, {
+      coordinatorUrl: "http://127.0.0.1:9999",
+      reconnect: false,
+      hardwareProbe,
+      distributedExecutor: {
+        nodeId: "desktop-diagnostics",
+        stageHost: "desktop-diagnostics.relay",
+        stagePort: 9_850,
+        launchAgent: {
+          id: "test-agent",
+          async start() {
+            throw new Error("not used");
+          },
+        },
+        computeMode: "automatic",
+        cpuEligible: true,
+      },
+      logger: { info() {}, warn() {}, error() {} },
+    });
+    const harness = agent as unknown as MutableCapabilityHarness;
+    harness.capabilities = await harness.buildCapabilities();
+    harness.registeredWorkerId = "worker-diagnostics";
+    const events: string[] = [];
+    harness.register = async () => { events.push("register"); };
+    harness.sendHeartbeat = async () => { events.push("heartbeat"); };
+
+    await agent.refreshRuntimeDiagnostics({
+      schema: "mycellios-accelerator-diagnostics/1",
+      appVersion: "0.2.33",
+      state: "gpu-ready",
+      backend: "cuda",
+      deviceName: "NVIDIA GeForce RTX 4090",
+      gpuVendor: "nvidia",
+      gpuModel: "NVIDIA GeForce RTX 4090",
+      phase: "ready",
+      progressPct: 100,
+      issueCode: null,
+      issueSummary: null,
+      retryable: false,
+      retryAttempt: 0,
+      nextRetryAt: null,
+      updatedAt: "2026-07-23T14:30:00.000Z",
+      recentEvents: [],
+    });
+
+    expect(events).toEqual(["register", "heartbeat"]);
+  });
+
   it("keeps the newest runtime evidence when capacity probes overlap", async () => {
     type Hardware = Awaited<ReturnType<typeof hardwareProbe>>;
     let delayed = false;
