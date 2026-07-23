@@ -226,6 +226,93 @@ describe("active-route recovery policy", () => {
       message: "Backend requires greedy temperature=0",
     });
   });
+
+  it("accepts tokenizer-specific chat-template overhead within the certified context", async () => {
+    const primary = addWorker(store, {
+      id: "primary",
+      modelDigest: "sha256:revision-a",
+      contextLimit: 128,
+    });
+    hub.connected.add(primary.id);
+    service = new MeshService(store, new Scheduler(store), hub as unknown as WorkerHub, 30_000);
+    const handle = service.submit({
+      model: "distributed-small",
+      messages: [{ role: "user", content: "Reply with only OK" }],
+      max_tokens: 16,
+    });
+    const offer = leaseOffers(hub)[0]!;
+
+    hub.workerMessage({
+      v: 1,
+      type: "lease.accept",
+      workerId: primary.id,
+      payload: { jobId: handle.jobId, leaseId: offer.payload.leaseId },
+    });
+    hub.workerMessage({
+      v: 1,
+      type: "task.token",
+      workerId: primary.id,
+      payload: { jobId: handle.jobId, leaseId: offer.payload.leaseId, index: 0, text: "OK" },
+    });
+    hub.workerMessage({
+      v: 1,
+      type: "task.complete",
+      workerId: primary.id,
+      payload: {
+        jobId: handle.jobId,
+        leaseId: offer.payload.leaseId,
+        text: "OK",
+        finishReason: "stop",
+        metrics: { inputTokens: 32, outputTokens: 1, ttftMs: 20, activeMs: 40 },
+      },
+    });
+
+    const events = [];
+    for await (const event of handle.events) events.push(event);
+    expect(events.at(-1)).toMatchObject({
+      type: "completed",
+      result: { metrics: { inputTokens: 32, outputTokens: 1 } },
+    });
+    expect(store.getJob(handle.jobId)?.status).toBe("completed");
+  });
+
+  it("still rejects reported input tokens beyond the deployment context", async () => {
+    const primary = addWorker(store, {
+      id: "primary",
+      modelDigest: "sha256:revision-a",
+      contextLimit: 128,
+    });
+    hub.connected.add(primary.id);
+    service = new MeshService(store, new Scheduler(store), hub as unknown as WorkerHub, 30_000);
+    const handle = service.submit({
+      model: "distributed-small",
+      messages: [{ role: "user", content: "short prompt" }],
+      max_tokens: 16,
+    });
+    const offer = leaseOffers(hub)[0]!;
+
+    hub.workerMessage({
+      v: 1,
+      type: "task.complete",
+      workerId: primary.id,
+      payload: {
+        jobId: handle.jobId,
+        leaseId: offer.payload.leaseId,
+        text: "",
+        finishReason: "stop",
+        metrics: { inputTokens: 129, outputTokens: 1, ttftMs: 20, activeMs: 40 },
+      },
+    });
+
+    const events = [];
+    for await (const event of handle.events) events.push(event);
+    expect(events.at(-1)).toMatchObject({
+      type: "failed",
+      code: "invalid_completion",
+      message: "Implausible input token count",
+    });
+    expect(store.getJob(handle.jobId)?.status).toBe("failed");
+  });
 });
 
 function leaseOffers(hub: FakeWorkerHub): Array<{

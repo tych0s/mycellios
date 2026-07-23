@@ -390,8 +390,25 @@ export class MeshService {
       return { ok: false, reason: "Model digest mismatch" };
     }
     const expectedInput = runtime.promptCheckpoint.inputTokens;
+    const promptBytes = runtime.promptCheckpoint.request.messages.reduce(
+      (sum, message) => sum + Buffer.byteLength(`${message.role}\n${message.content}`, "utf8"),
+      0,
+    );
+    // The coordinator's characters/4 estimate is useful for scheduling, but
+    // it is not an exact tokenizer. Real chat templates add control tokens and
+    // byte-level tokenizers can legitimately diverge by far more than 10%.
+    // Keep the trust boundary by bounding the worker report against both the
+    // request bytes and the deployment's certified context window.
+    const plausibleInputMaximum = Math.min(
+      deployment.contextLimit,
+      Math.max(
+        64,
+        expectedInput * 8,
+        promptBytes * 2 + 256 + runtime.promptCheckpoint.request.messages.length * 64,
+      ),
+    );
     const expectedOutput = Math.max(1, Math.ceil(runtime.output.length / 4));
-    if (Math.abs(result.metrics.inputTokens - expectedInput) > Math.max(4, expectedInput * 0.1)) {
+    if (result.metrics.inputTokens < 1 || result.metrics.inputTokens > plausibleInputMaximum) {
       return { ok: false, reason: "Implausible input token count" };
     }
     if (Math.abs(result.metrics.outputTokens - expectedOutput) > Math.max(4, expectedOutput * 0.1)) {
