@@ -15,7 +15,7 @@ import type { ChatCompletionRequest } from "../contracts/types.js";
 import type { CoordinatorConfig } from "../core/config.js";
 import { Scheduler } from "../scheduler/scheduler.js";
 import { MeshDatabase } from "../storage/database.js";
-import { MeshStore, type StoredWorker } from "../storage/store.js";
+import { MeshStore, type StoredRequestedModel, type StoredWorker } from "../storage/store.js";
 import { MeshService, MeshServiceError, type JobStreamEvent } from "./mesh-service.js";
 import { MobileComputeHub, type MobileWorkerSnapshot } from "./mobile-compute-hub.js";
 import { verifyGitHubReleaseUploadToken } from "./github-oidc.js";
@@ -25,6 +25,7 @@ import {
   requestedModelCapacityViews,
   searchHubModelCatalog,
   shouldQueueAutomaticActivation,
+  type ModelActivationProgressEvent,
 } from "./model-catalog.js";
 import {
   parseReleaseChunkMetadata,
@@ -39,15 +40,50 @@ import {
 
 export function automaticActivationFailureIsTransient(message: string): boolean {
   const normalized = message.toLowerCase();
+  if (normalized.startsWith("automatic_activation_retries_exhausted:")) return false;
   return [
     "distributed_worker_disconnected:",
     "distributed_worker_not_connected:",
+    "managed_launch_agent_is_unavailable:",
     "worker_tunnel_prepare_timeout",
     "gpu_only_runtime_not_ready",
     "gpu_model_stage_unavailable_after_retries:",
     "launch_readiness_timeout:",
     "coordinator_worker_registration_timeout",
   ].some((marker) => normalized.includes(marker));
+}
+
+export const DEFAULT_AUTOMATIC_ACTIVATION_RETRY_DELAYS_MS = [
+  5_000,
+  15_000,
+  30_000,
+  120_000,
+  300_000,
+] as const;
+
+export interface AutomaticActivationRetryState {
+  retryCount: number;
+  nextAttemptAt: number;
+  lastError: string;
+  updatedAt: number;
+  launching: boolean;
+}
+
+export function nextAutomaticActivationRetry(
+  retriesStarted: number,
+  message: string,
+  now = Date.now(),
+  delays: readonly number[] = DEFAULT_AUTOMATIC_ACTIVATION_RETRY_DELAYS_MS,
+): AutomaticActivationRetryState | null {
+  const delay = delays[retriesStarted];
+  if (delay === undefined) return null;
+  return {
+    retryCount: retriesStarted,
+    nextAttemptAt: now + Math.max(0, delay),
+    lastError: message,
+    updatedAt: now,
+    launching: false,
+  };
 }
 
 export interface CoordinatorRuntime {
@@ -74,6 +110,7 @@ export async function createCoordinator(
     activationManagerFactory?: (context: CoordinatorActivationContext) => ModelActivationManager;
     releaseTokenVerifier?: (token: string) => Promise<unknown>;
     mobileDisconnectedRetentionMs?: number;
+    automaticActivationRetryDelaysMs?: readonly number[];
   } = {},
 ): Promise<CoordinatorRuntime> {
   const app = Fastify({ logger: options.logger ?? false, bodyLimit: 2 * 1024 * 1024 });
@@ -203,24 +240,105 @@ export async function createCoordinator(
   await activationManager?.initialize();
   const automaticRepairState = new Map<string, { attempts: number; nextAttemptAt: number }>();
   const automaticRepairInFlight = new Set<string>();
-  const launchRequestedModel = (model: import("../storage/store.js").StoredRequestedModel) => {
-    if (!activationManager || activationManager.isManaging(model.id) || activationManager.isBusy()) return;
-    void activationManager.activate(model).catch((error: unknown) => {
-      if (store.getRequestedModel(model.id)) {
-        const message = error instanceof Error ? error.message : String(error);
-        if (automaticActivationFailureIsTransient(message)) {
-          // Keep auto-activation eligible. Capacity reconciliation will wait
-          // while the node is absent/being re-verified and launch again when
-          // the required GPU topology is healthy.
-          store.setRequestedModelActivation(model.id, false);
-        } else {
-          store.setRequestedModelActivationError(model.id, message);
-        }
-      }
-    });
+  const automaticActivationRetryDelaysMs = (
+    options.automaticActivationRetryDelaysMs
+    ?? DEFAULT_AUTOMATIC_ACTIVATION_RETRY_DELAYS_MS
+  ).map((delay) => Math.max(0, Math.round(delay)));
+  const automaticActivationRetryState = new Map<string, AutomaticActivationRetryState>();
+  const automaticActivationRetryProgressForModel = (
+    modelId: string,
+  ): readonly ModelActivationProgressEvent[] => {
+    const retry = automaticActivationRetryState.get(modelId);
+    if (!retry) return [];
+    const retryNumber = retry.launching ? retry.retryCount : retry.retryCount + 1;
+    const secondsRemaining = Math.max(0, Math.ceil((retry.nextAttemptAt - Date.now()) / 1_000));
+    const waitMessage = secondsRemaining > 0
+      ? `Automatic retry ${retryNumber} of ${automaticActivationRetryDelaysMs.length} starts in ${secondsRemaining}s.`
+      : `Automatic retry ${retryNumber} of ${automaticActivationRetryDelaysMs.length} is ready and waiting for healthy capacity and a free activation slot.`;
+    return [{
+      phase: retry.launching ? "retrying" : "retry_wait",
+      message: retry.launching
+        ? `Automatic retry ${retryNumber} of ${automaticActivationRetryDelaysMs.length} is starting.`
+        : `A node became unavailable during startup. ${waitMessage}`,
+      at: new Date(retry.updatedAt).toISOString(),
+      state: "running",
+      details: [retry.lastError],
+    }];
+  };
+  const activationProgressForModel = (
+    modelId: string,
+  ): readonly ModelActivationProgressEvent[] => {
+    const managerProgress = activationManager?.activationProgressForModel?.(modelId) ?? [];
+    const retryProgress = automaticActivationRetryProgressForModel(modelId);
+    if (retryProgress.length === 0) return managerProgress;
+    return automaticActivationRetryState.get(modelId)?.launching
+      ? [...retryProgress, ...managerProgress]
+      : [...managerProgress, ...retryProgress];
+  };
+  const activationStatusMessageForModel = (modelId: string): string | null => {
+    const retry = automaticActivationRetryState.get(modelId);
+    if (!retry) return null;
+    const retryNumber = retry.launching ? retry.retryCount : retry.retryCount + 1;
+    if (retry.launching) {
+      return `Automatic retry ${retryNumber} of ${automaticActivationRetryDelaysMs.length} is starting.`;
+    }
+    const secondsRemaining = Math.max(0, Math.ceil((retry.nextAttemptAt - Date.now()) / 1_000));
+    return secondsRemaining > 0
+      ? `A node disconnected during startup. Automatic retry ${retryNumber} of ${automaticActivationRetryDelaysMs.length} starts in ${secondsRemaining}s.`
+      : `Automatic retry ${retryNumber} of ${automaticActivationRetryDelaysMs.length} is ready and waiting for healthy capacity and a free activation slot.`;
+  };
+  const handleRequestedModelActivationFailure = (
+    modelId: string,
+    error: unknown,
+  ): void => {
+    if (!store.getRequestedModel(modelId)) return;
+    const message = error instanceof Error ? error.message : String(error);
+    if (!automaticActivationFailureIsTransient(message)) {
+      automaticActivationRetryState.delete(modelId);
+      store.setRequestedModelActivationError(modelId, message);
+      return;
+    }
+    const previous = automaticActivationRetryState.get(modelId);
+    const retriesStarted = previous?.launching
+      ? previous.retryCount
+      : previous?.retryCount ?? 0;
+    const nextRetry = nextAutomaticActivationRetry(
+      retriesStarted,
+      message,
+      Date.now(),
+      automaticActivationRetryDelaysMs,
+    );
+    if (!nextRetry) {
+      automaticActivationRetryState.delete(modelId);
+      store.setRequestedModelActivationError(
+        modelId,
+        `automatic_activation_retries_exhausted:${retriesStarted}:${message}`,
+      );
+      return;
+    }
+    automaticActivationRetryState.set(modelId, nextRetry);
+    store.setRequestedModelActivation(modelId, false);
+  };
+  const launchRequestedModel = (model: StoredRequestedModel): boolean => {
+    if (!activationManager || activationManager.isManaging(model.id) || activationManager.isBusy()) {
+      return false;
+    }
+    try {
+      void activationManager.activate(model)
+        .then(() => {
+          automaticActivationRetryState.delete(model.id);
+        })
+        .catch((error: unknown) => {
+          handleRequestedModelActivationFailure(model.id, error);
+        });
+      return true;
+    } catch (error) {
+      handleRequestedModelActivationFailure(model.id, error);
+      return true;
+    }
   };
   const reconcileAutomaticGpuRepair = (
-    model: import("../storage/store.js").StoredRequestedModel,
+    model: StoredRequestedModel,
     activeModelIds: ReadonlySet<string>,
     workers: readonly StoredWorker[],
     connectedWorkerIds: ReadonlySet<string>,
@@ -270,7 +388,27 @@ export async function createCoordinator(
         .listAvailableModels({ connectedWorkerIds })
         .map((model) => model.id),
     );
-    const requests = store.listRequestedModels();
+    let requests = store.listRequestedModels();
+    const now = Date.now();
+    for (const request of requests) {
+      if (
+        request.autoActivate
+        && request.activationError
+        && automaticActivationFailureIsTransient(request.activationError)
+      ) {
+        if (!automaticActivationRetryState.has(request.id)) {
+          const retry = nextAutomaticActivationRetry(
+            0,
+            request.activationError,
+            now,
+            automaticActivationRetryDelaysMs,
+          );
+          if (retry) automaticActivationRetryState.set(request.id, retry);
+        }
+        store.clearRequestedModelActivationError(request.id);
+      }
+    }
+    requests = store.listRequestedModels();
     const views = requestedModelCapacityViews({
       requests,
       workers,
@@ -279,14 +417,46 @@ export async function createCoordinator(
       ...(activationManager
         ? { executionNodesForModel: (modelId: string) => activationManager.capacityNodesForModel(modelId) }
         : {}),
-      ...(activationManager?.activationProgressForModel
-        ? { activationProgressForModel: (modelId: string) => activationManager.activationProgressForModel!(modelId) }
+      ...(activationManager
+        ? {
+            activationProgressForModel,
+            activationStatusMessageForModel,
+          }
         : {}),
       activationAvailable: activationManager !== undefined,
     });
     for (const view of views) {
       const stored = requests.find((request) => request.id === view.id)!;
+      if (view.status === "active") {
+        automaticActivationRetryState.delete(view.id);
+      }
       if (shouldQueueAutomaticActivation(view)) {
+        const retry = automaticActivationRetryState.get(view.id);
+        if (retry) {
+          if (
+            retry.launching
+            || Date.now() < retry.nextAttemptAt
+            || !activationManager
+            || activationManager.isManaging(view.id)
+            || activationManager.isBusy()
+          ) {
+            continue;
+          }
+          const launchingRetry: AutomaticActivationRetryState = {
+            ...retry,
+            retryCount: retry.retryCount + 1,
+            nextAttemptAt: Date.now(),
+            updatedAt: Date.now(),
+            launching: true,
+          };
+          automaticActivationRetryState.set(view.id, launchingRetry);
+          store.setRequestedModelActivation(view.id, true);
+          if (!launchRequestedModel(store.getRequestedModel(view.id)!)) {
+            automaticActivationRetryState.set(view.id, retry);
+            store.setRequestedModelActivation(view.id, false);
+          }
+          continue;
+        }
         store.setRequestedModelActivation(view.id, true);
         launchRequestedModel(store.getRequestedModel(view.id)!);
       } else if (
@@ -344,7 +514,10 @@ export async function createCoordinator(
 
   app.get("/public/v1/snapshot", async () => {
     reconcileRequestedModels();
-    return publicSnapshot(store, scheduler, hub, mobileHub, activationManager);
+    return publicSnapshot(store, scheduler, hub, mobileHub, activationManager, {
+      activationProgressForModel,
+      activationStatusMessageForModel,
+    });
   });
 
   app.get("/public/v1/huggingface-models", async (request, reply) => {
@@ -364,6 +537,7 @@ export async function createCoordinator(
   app.post("/public/v1/requested-models", async (request, reply) => {
     if (!authorizeModelMutation(request, reply)) return;
     const body = requestedModelCreateSchema.parse(request.body);
+    automaticActivationRetryState.delete(body.id);
     const stored = store.upsertRequestedModel({
       id: body.id,
       source: body.source,
@@ -388,7 +562,10 @@ export async function createCoordinator(
       );
     }
     reconcileRequestedModels();
-    const snapshot = publicSnapshot(store, scheduler, hub, mobileHub, activationManager);
+    const snapshot = publicSnapshot(store, scheduler, hub, mobileHub, activationManager, {
+      activationProgressForModel,
+      activationStatusMessageForModel,
+    });
     return reply.code(201).send({
       model: snapshot.requestedModels.find((model) => model.id === stored.id),
     });
@@ -401,6 +578,9 @@ export async function createCoordinator(
     if (!store.removeRequestedModel(modelId)) {
       return reply.code(404).send({ error: { code: "requested_model_not_found" } });
     }
+    automaticActivationRetryState.delete(modelId);
+    automaticRepairState.delete(modelId);
+    automaticRepairInFlight.delete(modelId);
     return { removed: true, modelId };
   });
 
@@ -927,6 +1107,10 @@ function publicSnapshot(
   hub: WorkerHub,
   mobileHub: MobileComputeHub,
   activationManager?: ModelActivationManager,
+  activationPresentation?: {
+    activationProgressForModel(modelId: string): readonly ModelActivationProgressEvent[];
+    activationStatusMessageForModel(modelId: string): string | null;
+  },
 ) {
   const workers = dashboardWorkers(store, hub, mobileHub);
   const models = scheduler.listAvailableModels({ connectedWorkerIds: hub.connectedWorkerIds() });
@@ -938,9 +1122,14 @@ function publicSnapshot(
     ...(activationManager
       ? { executionNodesForModel: (modelId: string) => activationManager.capacityNodesForModel(modelId) }
       : {}),
-    ...(activationManager?.activationProgressForModel
-      ? { activationProgressForModel: (modelId: string) => activationManager.activationProgressForModel!(modelId) }
-      : {}),
+    ...(activationPresentation
+      ? {
+          activationProgressForModel: activationPresentation.activationProgressForModel,
+          activationStatusMessageForModel: activationPresentation.activationStatusMessageForModel,
+        }
+      : activationManager?.activationProgressForModel
+        ? { activationProgressForModel: (modelId: string) => activationManager.activationProgressForModel!(modelId) }
+        : {}),
     activationAvailable: activationManager !== undefined,
   });
   const jobs = store.listJobs(100).map((job) => ({

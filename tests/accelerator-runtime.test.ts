@@ -12,6 +12,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ACCELERATOR_RUNTIME_SCHEMA,
   MACOS_MPS_PACK,
+  PORTABLE_RUNTIME_PROBE_MARKER,
   PORTABLE_RUNTIME_SCHEMA,
   WINDOWS_ACCELERATOR_PACKS,
   acceleratorRuntimeTargetPath,
@@ -20,6 +21,7 @@ import {
   probeAcceleratorRuntime,
   readPortableRuntimeManifest,
   selectAcceleratorPack,
+  verifyPortableRuntimeInstallation,
   type RuntimeCommandRunner,
 } from "../src/desktop/accelerator-runtime.js";
 
@@ -312,6 +314,52 @@ describe("desktop accelerator runtime", () => {
 
     await expect(readPortableRuntimeManifest(base, { platform: "win32", arch: "x64" }))
       .rejects.toThrow("package versions do not match win32/x64");
+  });
+
+  it("executes the portable Python before accepting an extracted runtime", async () => {
+    const root = temporaryRoot();
+    const base = createBaseRuntime(root);
+    const runner: RuntimeCommandRunner = vi.fn(async () => ({
+      code: 0,
+      stderr: "",
+      stdout: `${PORTABLE_RUNTIME_PROBE_MARKER}${JSON.stringify({
+        prefix: base,
+        basePrefix: base,
+        pythonVersion: "3.12.13",
+        torchVersion: "2.13.0+cpu",
+        transformersVersion: "5.14.1",
+        accelerateVersion: "1.14.0",
+        safetensorsVersion: "0.8.0",
+        aiohttpVersion: "3.14.1",
+        sentencepieceVersion: "0.2.2",
+        numpyVersion: "1.26.4",
+      })}\n`,
+    }));
+
+    await expect(verifyPortableRuntimeInstallation(
+      base,
+      { platform: "win32", arch: "x64" },
+      runner,
+    )).resolves.toMatchObject({ pythonVersion: "3.12.13", backend: "cpu" });
+    expect(runner).toHaveBeenCalledOnce();
+    expect(vi.mocked(runner).mock.calls[0]?.[1].slice(0, 2)).toEqual(["-I", "-c"]);
+    expect(vi.mocked(runner).mock.calls[0]?.[1][2]).toContain("import encodings");
+  });
+
+  it("rejects the exact incomplete extraction that cannot import encodings", async () => {
+    const root = temporaryRoot();
+    const base = createBaseRuntime(root);
+    const runner: RuntimeCommandRunner = vi.fn(async () => ({
+      code: 1,
+      stdout: "",
+      stderr: "Fatal Python error: init_fs_encoding\nModuleNotFoundError: No module named 'encodings'",
+    }));
+
+    await expect(verifyPortableRuntimeInstallation(
+      base,
+      { platform: "win32", arch: "x64" },
+      runner,
+    )).rejects.toThrow("No module named 'encodings'");
   });
 
   it("accepts the certified CPU runtime for macOS Intel", async () => {

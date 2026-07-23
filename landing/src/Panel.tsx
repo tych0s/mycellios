@@ -423,7 +423,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
           <div className="panel-content-scale" style={{ transform: `scale(${contentScale})`, width: `${100 / contentScale}%` } as CSSProperties}>
             {loading && snapshot.capturedAt === EMPTY.capturedAt ? <PanelLoading /> : (
               <>
-              {view === "overview" && <Overview snapshot={snapshot} onNavigate={navigate} publicLink={publicLink} external={desktop} localAcceleration={desktopSnapshot?.acceleration} localContributionState={desktopSnapshot?.contribution.state} />}
+              {view === "overview" && <Overview snapshot={snapshot} onNavigate={navigate} publicLink={publicLink} external={desktop} localAcceleration={desktopSnapshot?.acceleration} localContributionState={desktopSnapshot?.contribution.state} localComputeMode={desktopSnapshot?.settings.computeMode} />}
               {view === "nodes" && <Nodes snapshot={snapshot} onRemove={removeWorker} onClearOffline={clearOfflineWorkers} />}
               {view === "models" && <Models snapshot={snapshot} onSearch={searchHubModels} onRequest={requestModel} onRemove={removeRequestedModel} adminToken={modelAdminToken} requiresAdminToken={requiresModelAdminToken} secureTokenStorage={desktop} />}
               {view === "jobs" && <Jobs snapshot={snapshot} />}
@@ -444,7 +444,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   );
 }
 
-function Overview({ snapshot, onNavigate, publicLink, external, localAcceleration, localContributionState }: { snapshot: PublicSnapshot; onNavigate: (view: PanelView) => void; publicLink: (path: string) => string; external: boolean; localAcceleration: AcceleratorProgressSnapshot | undefined; localContributionState: DashboardSnapshot["contribution"]["state"] | undefined }) {
+function Overview({ snapshot, onNavigate, publicLink, external, localAcceleration, localContributionState, localComputeMode }: { snapshot: PublicSnapshot; onNavigate: (view: PanelView) => void; publicLink: (path: string) => string; external: boolean; localAcceleration: AcceleratorProgressSnapshot | undefined; localContributionState: DashboardSnapshot["contribution"]["state"] | undefined; localComputeMode: DesktopSettings["computeMode"] | undefined }) {
   const active = snapshot.workers.filter((worker) => worker.connected);
   const operational = active.filter((worker) => worker.status === "online");
   const activeGpus = operational.flatMap((worker) => worker.gpus);
@@ -467,7 +467,7 @@ function Overview({ snapshot, onNavigate, publicLink, external, localAcceleratio
   return (
     <section className="overview-page">
       <PageTitle eyebrow="NETWORK CONTROL" title="Overview" copy="A live view of the capacity, models and tasks connected to your mycellios network." actions={<><button onClick={() => onNavigate("nodes")}>Manage nodes</button><a href={publicLink("/mobile/")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}>Add this device <ArrowRight size={16} /></a></>} />
-      {localAcceleration && shouldShowAccelerationBanner(localAcceleration) && <AcceleratorCompactBanner acceleration={localAcceleration} contributionState={localContributionState} onOpen={() => onNavigate("machine")} />}
+      {localAcceleration && shouldShowAccelerationBanner(localAcceleration) && <AcceleratorCompactBanner acceleration={localAcceleration} contributionState={localContributionState} computeMode={localComputeMode} onOpen={() => onNavigate("machine")} />}
       <article className="global-capacity-card">
         <div className="global-capacity-main">
           <div className="global-capacity-heading"><span>GLOBAL NODE CAPACITY</span><b><i /> LIVE</b></div>
@@ -1211,7 +1211,7 @@ function Machine({ snapshot, bridge, onSnapshot }: { snapshot: DashboardSnapshot
         {computeModes.map(({ value, label, detail, Icon }) => <button type="button" role="radio" aria-checked={snapshot.settings.computeMode === value} className={snapshot.settings.computeMode === value ? "active" : ""} disabled={busy} onClick={() => void selectComputeMode(value)} key={value}><span><Icon /></span><strong>{label}</strong><small>{detail}</small>{snapshot.settings.computeMode === value && <CheckCircle2 />}</button>)}
       </div>
     </article>
-    <AcceleratorProgressPanel acceleration={snapshot.acceleration} contributionState={snapshot.contribution.state} />
+    <AcceleratorProgressPanel acceleration={snapshot.acceleration} contributionState={snapshot.contribution.state} computeMode={snapshot.settings.computeMode} />
     <div className="cards-grid">
       {snapshot.localHardware.gpus.map((gpu) => {
         const selected = isAdvertisedGpuSelected(gpu, advertisedGpu);
@@ -1224,9 +1224,10 @@ function Machine({ snapshot, bridge, onSnapshot }: { snapshot: DashboardSnapshot
   </section>;
 }
 
-function AcceleratorCompactBanner({ acceleration, contributionState, onOpen }: { acceleration: AcceleratorProgressSnapshot; contributionState: DashboardSnapshot["contribution"]["state"] | undefined; onOpen: () => void }) {
-  const cpuLabel = accelerationCpuLabel(acceleration, contributionState);
+function AcceleratorCompactBanner({ acceleration, contributionState, computeMode, onOpen }: { acceleration: AcceleratorProgressSnapshot; contributionState: DashboardSnapshot["contribution"]["state"] | undefined; computeMode: DesktopSettings["computeMode"] | undefined; onOpen: () => void }) {
+  const cpuLabel = accelerationCpuLabel(acceleration, contributionState, computeMode);
   const cpuUnavailable = acceleration.cpu?.state === "unavailable";
+  const cpuStandby = computeMode === "gpu-only" && (acceleration.cpu?.activeStages ?? 0) === 0;
   const cpuVisualState = (acceleration.cpu?.activeStages ?? 0) > 0 ? "active" : cpuUnavailable ? "unavailable" : contributionState === "error" ? "error" : "ready";
   const gpuLabel = accelerationGpuLabel(acceleration);
   const gpuPreparing = isGpuPreparing(acceleration.gpu?.state);
@@ -1238,7 +1239,7 @@ function AcceleratorCompactBanner({ acceleration, contributionState, onOpen }: {
   return <article className={`accelerator-compact-banner gpu-${acceleration.gpu?.state ?? "checking"}${gpuPreparing ? "" : " progress-hidden"}`} aria-label="Local compute transition">
     <div className={`accelerator-compact-engine cpu ${cpuVisualState}`}>
       <span className="accelerator-compact-icon"><Cpu /></span>
-      <span><small>{cpuUnavailable ? "NEEDS ATTENTION" : "AVAILABLE NOW"}</small><strong>{cpuLabel}</strong><em>{acceleration.cpu?.deviceName || "Local CPU runtime"}</em></span>
+      <span><small>{cpuUnavailable ? "NEEDS ATTENTION" : cpuStandby ? "STANDBY" : "AVAILABLE NOW"}</small><strong>{cpuLabel}</strong><em>{acceleration.cpu?.deviceName || "Local CPU runtime"}</em></span>
     </div>
     <ArrowRight className="accelerator-transition-arrow" aria-hidden="true" />
     <div className="accelerator-compact-gpu">
@@ -1277,6 +1278,9 @@ function ActivationProgressLog({ model }: { model: RequestedModelCapacity }) {
 }
 
 function friendlyActivationFailure(message: string): string {
+  if (message.includes("automatic_activation_retries_exhausted:")) {
+    return "Automatic activation stopped after repeated temporary node disconnections. The model was not published.";
+  }
   if (message.includes("3221225477")) {
     return "A Windows accelerator process crashed while loading the model stage. Capacity was available, but the runtime could not complete the load.";
   }
@@ -1285,8 +1289,10 @@ function friendlyActivationFailure(message: string): string {
 
 function fallbackActivationDetails(message: string): string[] {
   const details: string[] = [];
+  const exhaustedRetries = /automatic_activation_retries_exhausted:(\d+):/i.exec(message)?.[1];
   const stage = /(?:stage-|process=)([a-z0-9-]+)/i.exec(message)?.[1];
   const code = /code=(\d+)/i.exec(message)?.[1];
+  if (exhaustedRetries) details.push(`Automatic retries attempted: ${exhaustedRetries}`);
   if (stage) details.push(`Failed stage: ${stage}`);
   if (code === "3221225477") details.push("Windows exit code: 3221225477 · 0xC0000005 · native memory access violation");
   else if (code) details.push(`Process exit code: ${code}`);
@@ -1306,6 +1312,8 @@ function activationPhaseLabel(phase: string): string {
     checking_health: "Checking pipeline",
     running_canary: "Testing real inference",
     publishing_model: "Publishing model",
+    retry_wait: "Waiting to retry",
+    retrying: "Retrying activation",
     active: "Activation complete",
     failed: "Activation failed",
   } as Record<string, string>)[phase] ?? phase.replaceAll("_", " ");
@@ -1316,9 +1324,10 @@ function formatActivationTime(value: string): string {
   return Number.isNaN(date.getTime()) ? "—" : date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
-function AcceleratorProgressPanel({ acceleration, contributionState }: { acceleration: AcceleratorProgressSnapshot; contributionState: DashboardSnapshot["contribution"]["state"] }) {
+function AcceleratorProgressPanel({ acceleration, contributionState, computeMode }: { acceleration: AcceleratorProgressSnapshot; contributionState: DashboardSnapshot["contribution"]["state"]; computeMode: DesktopSettings["computeMode"] }) {
   const cpuActive = (acceleration.cpu?.activeStages ?? 0) > 0;
   const cpuUnavailable = acceleration.cpu?.state === "unavailable";
+  const cpuStandby = computeMode === "gpu-only" && !cpuActive;
   const connectionError = contributionState === "error";
   const gpuPreparing = isGpuPreparing(acceleration.gpu?.state);
   const gpuActive = acceleration.gpu?.state === "ready" && (acceleration.gpu?.activeStages ?? 0) > 0;
@@ -1332,8 +1341,8 @@ function AcceleratorProgressPanel({ acceleration, contributionState }: { acceler
   const phase = acceleration.preparation?.phase || acceleration.gpu?.state || acceleration.state;
   const phaseLabel = humanizeAccelerationPhase(phase);
   const phaseMessage = issue?.message ?? acceleration.message;
-  const panelTitle = accelerationPanelTitle(acceleration, contributionState);
-  const panelCopy = accelerationPanelCopy(acceleration, contributionState);
+  const panelTitle = accelerationPanelTitle(acceleration, contributionState, computeMode);
+  const panelCopy = accelerationPanelCopy(acceleration, contributionState, computeMode);
   const showProgress = gpuPreparing || progress !== null;
   return <article className={`accelerator-progress-panel gpu-${acceleration.gpu?.state ?? "not-detected"}`}>
     <header className="accelerator-progress-header">
@@ -1341,15 +1350,15 @@ function AcceleratorProgressPanel({ acceleration, contributionState }: { acceler
         <span className="accelerator-runtime-icon">{gpuPreparing ? <LoaderCircle className="spin" /> : gpuActive ? <Zap /> : issue ? <CircleAlert /> : <Cpu />}</span>
         <div><span>LOCAL COMPUTE TRANSITION</span><h2>{panelTitle}</h2><p>{panelCopy}</p></div>
       </div>
-      <span className={`accelerator-overall-badge ${gpuActive ? "gpu-active" : cpuActive ? "cpu-active" : cpuUnavailable ? "unavailable" : connectionError ? "connection-error" : "cpu-ready"}`}><i />{gpuActive ? "GPU ACTIVE" : cpuActive ? "CPU ACTIVE" : cpuUnavailable ? "CPU UNAVAILABLE" : contributionState === "connected" ? "CPU READY · NODE ONLINE" : contributionState === "connecting" ? "CPU READY · CONNECTING" : connectionError ? "CPU READY · CONNECTION ERROR" : "CPU READY · CONTRIBUTION PAUSED"}</span>
+      <span className={`accelerator-overall-badge ${gpuActive ? "gpu-active" : cpuActive ? "cpu-active" : cpuUnavailable ? "unavailable" : connectionError ? "connection-error" : "cpu-ready"}`}><i />{gpuActive ? "GPU ACTIVE" : cpuActive ? "CPU ACTIVE" : cpuUnavailable ? "CPU UNAVAILABLE" : cpuStandby ? "CPU STANDBY · GPU ONLY" : contributionState === "connected" ? "CPU READY · NODE ONLINE" : contributionState === "connecting" ? "CPU READY · CONNECTING" : connectionError ? "CPU READY · CONNECTION ERROR" : "CPU READY · CONTRIBUTION PAUSED"}</span>
     </header>
 
     <div className="accelerator-engine-grid">
       <section className={`accelerator-engine-card cpu ${cpuActive ? "active" : cpuUnavailable ? "unavailable" : connectionError ? "connection-error" : "ready"}`} aria-label="CPU runtime status">
-        <div className="accelerator-engine-title"><span><Cpu /></span><div><small>CPU RUNTIME</small><strong>{accelerationCpuLabel(acceleration, contributionState)}</strong></div><b>{acceleration.cpu?.precision?.toUpperCase() ?? "FP32"}</b></div>
+        <div className="accelerator-engine-title"><span><Cpu /></span><div><small>CPU RUNTIME</small><strong>{accelerationCpuLabel(acceleration, contributionState, computeMode)}</strong></div><b>{acceleration.cpu?.precision?.toUpperCase() ?? "FP32"}</b></div>
         <h3>{acceleration.cpu?.deviceName || "Local CPU"}</h3>
-        <p>{accelerationCpuCopy(acceleration, contributionState)}</p>
-        <div className="accelerator-engine-foot"><span><i />{cpuActive ? `${acceleration.cpu.activeStages} active stage${acceleration.cpu.activeStages === 1 ? "" : "s"}` : cpuUnavailable ? "Runtime unavailable" : contributionState === "connected" ? "Ready for network work" : contributionState === "connecting" ? "Connecting to the network" : connectionError ? "Network connection needs attention" : "Ready when contribution resumes"}</span></div>
+        <p>{accelerationCpuCopy(acceleration, contributionState, computeMode)}</p>
+        <div className="accelerator-engine-foot"><span><i />{cpuActive ? `${acceleration.cpu.activeStages} active stage${acceleration.cpu.activeStages === 1 ? "" : "s"}` : cpuUnavailable ? "Runtime unavailable" : cpuStandby ? "Disabled for model stages by GPU-only mode" : contributionState === "connected" ? "Ready for network work" : contributionState === "connecting" ? "Connecting to the network" : connectionError ? "Network connection needs attention" : "Ready when contribution resumes"}</span></div>
       </section>
 
       <section className={`accelerator-engine-card gpu ${acceleration.gpu?.state ?? "not-detected"}`} aria-label="GPU runtime status">
@@ -1669,17 +1678,19 @@ function visibleAccelerationProgress(acceleration: AcceleratorProgressSnapshot):
   return progress;
 }
 
-function accelerationCpuLabel(acceleration: AcceleratorProgressSnapshot, contributionState?: DashboardSnapshot["contribution"]["state"]): string {
+function accelerationCpuLabel(acceleration: AcceleratorProgressSnapshot, contributionState?: DashboardSnapshot["contribution"]["state"], computeMode?: DesktopSettings["computeMode"]): string {
   if ((acceleration.cpu?.activeStages ?? 0) > 0) return "CPU ACTIVE";
   if (acceleration.cpu?.state === "unavailable") return "CPU UNAVAILABLE";
+  if (computeMode === "gpu-only") return "CPU STANDBY · GPU ONLY";
   if (contributionState === "connected") return "CPU READY · NODE ONLINE";
   if (contributionState === "connecting") return "CPU READY · CONNECTING";
   if (contributionState === "error") return "CPU READY · CONNECTION ERROR";
   return "CPU READY · CONTRIBUTION PAUSED";
 }
 
-function accelerationCpuCopy(acceleration: AcceleratorProgressSnapshot, contributionState: DashboardSnapshot["contribution"]["state"]): string {
+function accelerationCpuCopy(acceleration: AcceleratorProgressSnapshot, contributionState: DashboardSnapshot["contribution"]["state"], computeMode?: DesktopSettings["computeMode"]): string {
   if (acceleration.cpu?.state === "unavailable") return "The certified CPU runtime could not start. Open the runtime log, then restart or update mycellios.";
+  if (computeMode === "gpu-only" && (acceleration.cpu?.activeStages ?? 0) === 0) return "The CPU runtime is installed but excluded from model execution because GPU-only mode is selected.";
   if (contributionState === "error") return "The CPU runtime is ready, but this worker is not connected to the network. mycellios will keep retrying the connection.";
   if (contributionState === "paused") return "The CPU runtime is installed and ready; contribution is currently paused.";
   return acceleration.cpu?.message || "The CPU runtime is available while GPU setup continues.";
@@ -1703,9 +1714,10 @@ function accelerationGpuName(acceleration: AcceleratorProgressSnapshot): string 
   return acceleration.gpu?.model ?? acceleration.deviceName ?? "GPU accelerator";
 }
 
-function accelerationPanelTitle(acceleration: AcceleratorProgressSnapshot, contributionState: DashboardSnapshot["contribution"]["state"]): string {
+function accelerationPanelTitle(acceleration: AcceleratorProgressSnapshot, contributionState: DashboardSnapshot["contribution"]["state"], computeMode?: DesktopSettings["computeMode"]): string {
   const gpuState = acceleration.gpu?.state;
   if (acceleration.cpu?.state === "unavailable") return "The local compute runtime needs attention.";
+  if (computeMode === "gpu-only" && (gpuState === "fallback" || gpuState === "error")) return "GPU-only mode is waiting for a verified accelerator.";
   if (contributionState === "error") return "CPU ready. Network connection needs attention.";
   if (contributionState === "paused" && isGpuPreparing(gpuState)) return "Contribution paused. GPU setup continues safely.";
   if (contributionState === "paused") return "CPU ready. Contribution is paused.";
@@ -1717,9 +1729,10 @@ function accelerationPanelTitle(acceleration: AcceleratorProgressSnapshot, contr
   return "CPU online. No compatible GPU was detected.";
 }
 
-function accelerationPanelCopy(acceleration: AcceleratorProgressSnapshot, contributionState: DashboardSnapshot["contribution"]["state"]): string {
+function accelerationPanelCopy(acceleration: AcceleratorProgressSnapshot, contributionState: DashboardSnapshot["contribution"]["state"], computeMode?: DesktopSettings["computeMode"]): string {
   const gpuState = acceleration.gpu?.state;
   if (acceleration.cpu?.state === "unavailable") return "The certified CPU runtime is not available. Review the runtime log before contributing from this device.";
+  if (computeMode === "gpu-only" && gpuState !== "ready") return "This node stays connected, but it will not execute CPU model stages while GPU-only mode is selected.";
   if (contributionState === "error") return "The CPU runtime remains ready, but the worker could not connect. mycellios will keep retrying the network connection.";
   if (contributionState === "paused" && isGpuPreparing(gpuState)) return "The CPU runtime stays ready and the current GPU setup can finish, but this device will not accept network work until contribution resumes.";
   if (contributionState === "paused") return "Installed runtimes remain ready, but this device will not accept network work until contribution resumes.";

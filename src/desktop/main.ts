@@ -73,8 +73,8 @@ import {
 } from "./hardware-selection.js";
 import {
   prepareAcceleratorRuntime,
-  readPortableRuntimeManifest,
   selectAcceleratorPack,
+  verifyPortableRuntimeInstallation,
   type AcceleratorProgressEvent,
   type AcceleratorRuntimeResult,
 } from "./accelerator-runtime.js";
@@ -1597,36 +1597,55 @@ function distributionPythonExecutable(root = app.isPackaged
 }
 
 function ensureDistributionRuntime(): Promise<string> {
-  distributionRuntimePromise ??= ensureDistributionRuntimeOnce();
+  if (!distributionRuntimePromise) {
+    distributionRuntimePromise = ensureDistributionRuntimeOnce().catch((error: unknown) => {
+      distributionRuntimePromise = null;
+      throw error;
+    });
+  }
   return distributionRuntimePromise;
 }
 
 async function ensureDistributionRuntimeOnce(): Promise<string> {
   if (!app.isPackaged) return join(app.getAppPath(), "runtime", "distribution-venv");
-  const root = join(app.getPath("userData"), "distribution-runtime-v3");
-  if (existsSync(distributionPythonExecutable(root))) {
+  const userData = app.getPath("userData");
+  const root = join(userData, "distribution-runtime-v3");
+  const staging = join(userData, "distribution-runtime-v3.staging");
+  if (dirname(root) !== userData || dirname(staging) !== userData) {
+    throw new Error("The shard runtime escaped its managed application directory.");
+  }
+  if (existsSync(root)) {
     try {
-      await readPortableRuntimeManifest(root, { platform: process.platform, arch: process.arch });
+      await verifyPortableRuntimeInstallation(
+        root,
+        { platform: process.platform, arch: process.arch },
+      );
+      rmSync(staging, { recursive: true, force: true });
       return root;
     } catch (error) {
       writeDesktopLog("distribution-runtime-v3-invalid", { error: errorText(error) });
-      if (dirname(root) !== app.getPath("userData")) throw error;
       rmSync(root, { recursive: true, force: true });
     }
   }
   const archive = resourcePath("distribution-runtime.tar.gz");
   if (!existsSync(archive)) throw new Error("The packaged shard runtime archive is missing. Reinstall mycellios.");
-  mkdirSync(root, { recursive: true });
-  await runProcess("tar", ["-xzf", archive, "-C", root]);
-  const executable = distributionPythonExecutable(root);
-  for (let attempt = 0; attempt < 30 && !existsSync(executable); attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 500));
+  rmSync(staging, { recursive: true, force: true });
+  mkdirSync(staging, { recursive: true });
+  try {
+    // Never expose a half-extracted runtime as usable. If the application is
+    // closed during extraction, only the staging directory is left behind and
+    // the next launch safely starts it again.
+    await runProcess("tar", ["-xzf", archive, "-C", staging]);
+    await verifyPortableRuntimeInstallation(
+      staging,
+      { platform: process.platform, arch: process.arch },
+    );
+    renameSync(staging, root);
+    return root;
+  } catch (error) {
+    rmSync(staging, { recursive: true, force: true });
+    throw error;
   }
-  if (!existsSync(executable)) {
-    throw new Error("The shard runtime could not be extracted. Reinstall mycellios.");
-  }
-  await readPortableRuntimeManifest(root, { platform: process.platform, arch: process.arch });
-  return root;
 }
 
 function runProcess(executable: string, args: readonly string[]): Promise<void> {

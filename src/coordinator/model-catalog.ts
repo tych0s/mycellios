@@ -243,6 +243,7 @@ export function requestedModelCapacityViews(input: {
   activeModelIds: ReadonlySet<string>;
   executionNodesForModel?: (modelId: string) => readonly ModelExecutionCapacityNode[];
   activationProgressForModel?: (modelId: string) => readonly ModelActivationProgressEvent[];
+  activationStatusMessageForModel?: (modelId: string) => string | null;
   activationAvailable?: boolean;
 }): RequestedModelCapacityView[] {
   const workerCapacity = input.workers
@@ -296,7 +297,8 @@ export function requestedModelCapacityViews(input: {
       message = capacityMessage(missingVramMiB ?? 0, missingNodes);
     } else if (request.autoActivate && (input.activationAvailable ?? true)) {
       status = "activating";
-      message = "Capacity reached. Automatic activation is queued.";
+      message = input.activationStatusMessageForModel?.(request.id)
+        ?? "Capacity reached. Automatic activation is queued.";
     } else {
       status = "ready";
       message = request.autoActivate
