@@ -14,6 +14,13 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
 const WEBHOOK_REPLAY_TTL_MS = 24 * 60 * 60 * 1_000;
 const MAX_WEBHOOK_EVENTS = 1_000;
 const MAX_SITEMAP_PAGES = 200;
+const PUBLIC_PRODUCT_SITEMAP_ROUTES = [
+  { path: "/", changeFrequency: "weekly", priority: "1.0" },
+  { path: "/network", changeFrequency: "daily", priority: "0.9" },
+  { path: "/join", changeFrequency: "weekly", priority: "0.8" },
+  { path: "/downloads", changeFrequency: "weekly", priority: "0.9" },
+  { path: "/mobile/", changeFrequency: "weekly", priority: "0.7" },
+] as const;
 
 const localeSchema = z.string().regex(/^[a-z]{2}(?:-[A-Z]{2})?$/);
 
@@ -693,7 +700,14 @@ function formatDate(value: string): string {
 
 function renderSitemap(posts: readonly BlogPostSummary[]): string {
   const urls = [
-    sitemapEntry(`${SITE_ORIGIN}/`, undefined, "weekly", "1.0"),
+    ...PUBLIC_PRODUCT_SITEMAP_ROUTES.map((route) =>
+      sitemapEntry(
+        `${SITE_ORIGIN}${route.path}`,
+        undefined,
+        route.changeFrequency,
+        route.priority,
+      ),
+    ),
     sitemapEntry(`${SITE_ORIGIN}${BLOG_PATH}`, undefined, "daily", "0.8"),
     ...posts.map((post) =>
       sitemapEntry(

@@ -51,7 +51,6 @@ function downloadUrl(key: DownloadKey): string {
 }
 
 const copy = {
-    meta: { title: "mycellios — One model. Many machines.", description: "mycellios coordinates heterogeneous machines to run AI models that do not fit on any single computer." },
     home: "mycellios, home",
     languageLabel: "Change language",
     nav: { aria: "Main navigation", vision: "Vision", architecture: "Architecture", evidence: "Real progress", join: "Download" },
@@ -545,14 +544,6 @@ function InstallSection({ text }: { text: typeof copy.install }) {
 function Landing() {
   const page = useRef<HTMLDivElement>(null);
   const t = copy;
-
-  useEffect(() => {
-    document.documentElement.lang = "en";
-    document.title = t.meta.title;
-    document.querySelector('meta[name="description"]')?.setAttribute("content", t.meta.description);
-    document.querySelector('meta[property="og:title"]')?.setAttribute("content", t.meta.title);
-    document.querySelector('meta[property="og:description"]')?.setAttribute("content", t.meta.description);
-  }, [t.meta.description, t.meta.title]);
 
   useEffect(() => {
     const observer = new IntersectionObserver((entries) => entries.forEach((entry) => entry.isIntersecting && entry.target.classList.add("is-visible")), { threshold: 0.14 });

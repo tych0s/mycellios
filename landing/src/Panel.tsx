@@ -66,6 +66,7 @@ import type { BenchmarkMeasurement, BenchmarkRun } from "../../src/benchlab/type
 import { Contribute } from "./Contribute";
 import brandIcon from "./assets/mycellios-app-icon-v2.png";
 import { isAdvertisedGpuSelected } from "./panel-hardware";
+import { applySeoMetadata } from "./seo";
 import "./panel.css";
 
 const PUBLIC_COORDINATOR_URL = "https://www.mycellios.com";
@@ -268,6 +269,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
         ? next === "contribute" ? "" : `?view=${next}`
         : next === "overview" || next === "join" || next === "downloads" ? "" : `?view=${next}`;
       window.history.replaceState({}, "", `${path}${query}`);
+      applySeoMetadata(path);
     }
   }
 
@@ -469,7 +471,7 @@ function Overview({ snapshot, onNavigate, publicLink, external, localAcceleratio
   const cellNodes = operational.filter((worker) => worker.kind === "cell").length;
   return (
     <section className="overview-page">
-      <PageTitle eyebrow="NETWORK CONTROL" title="Overview" copy="A live view of the capacity, models and tasks connected to your mycellios network." actions={<><button onClick={() => onNavigate("nodes")}>Manage nodes</button><a href={publicLink("/mobile/")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}>Add this device <ArrowRight size={16} /></a></>} />
+      <PageTitle eyebrow="NETWORK CONTROL" title="Distributed AI network" copy="A live view of the capacity, models and tasks connected to your mycellios network." actions={<><button onClick={() => onNavigate("nodes")}>Manage nodes</button><a href={publicLink("/mobile/")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}>Add this device <ArrowRight size={16} /></a></>} />
       {localAcceleration && shouldShowAccelerationBanner(localAcceleration) && <AcceleratorCompactBanner acceleration={localAcceleration} contributionState={localContributionState} computeMode={localComputeMode} onOpen={() => onNavigate("machine")} />}
       <article className="global-capacity-card">
         <div className="global-capacity-main">
@@ -744,8 +746,8 @@ function Models({ snapshot, onSearch, onRequest, onRemove, adminToken: initialAd
       if (catalogFit === "too-large" && (memory === null || memory <= availableCatalogMemoryMiB)) return false;
       return true;
     });
-    if (catalogSort === "name") return filtered.toSorted((left, right) => left.id.localeCompare(right.id));
-    if (catalogSort === "memory") return filtered.toSorted((left, right) => (estimatedHubMemoryMiB(left) ?? Number.MAX_SAFE_INTEGER) - (estimatedHubMemoryMiB(right) ?? Number.MAX_SAFE_INTEGER));
+    if (catalogSort === "name") return filtered.slice().sort((left, right) => left.id.localeCompare(right.id));
+    if (catalogSort === "memory") return filtered.slice().sort((left, right) => (estimatedHubMemoryMiB(left) ?? Number.MAX_SAFE_INTEGER) - (estimatedHubMemoryMiB(right) ?? Number.MAX_SAFE_INTEGER));
     return filtered;
   }, [availableCatalogMemoryMiB, catalogFit, catalogModels, catalogSort, catalogStatus]);
 
@@ -1213,7 +1215,7 @@ function InferenceCompletedTurn({ turn }: { turn: InferenceTurn }) {
 }
 
 function JoinNetwork({ publicLink, external }: { publicLink: (path: string) => string; external: boolean }) {
-  return <section><PageTitle eyebrow="ZERO-CONFIG JOIN" title="Add this device" copy="No account, invitation or terminal. Choose an option, review the detected hardware and confirm participation." />
+  return <section><PageTitle eyebrow="ZERO-CONFIG JOIN" title="Join the network" copy="No account, invitation or terminal. Choose an option, review the detected hardware and confirm participation." />
     <div className="join-grid"><a className="join-card featured" href={publicLink("/mobile/?autostart=1")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><div><Smartphone /><span>INSTANT</span></div><h2>Use this browser</h2><p>Works on modern Android, iPhone, tablet and desktop browsers. Keep the page visible while contributing.</p><ul><li><CheckCircle2 />WebGPU when available</li><li><CheckCircle2 />Automatic CPU fallback</li><li><CheckCircle2 />One explicit confirmation</li></ul><strong>Open and confirm <ArrowRight /></strong></a>
       <a className="join-card" href={publicLink("/downloads")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><div><Laptop /><span>WINDOWS · MACOS · LINUX</span></div><h2>Install the desktop agent</h2><p>Detects the hardware, prepares the certified runtime automatically and contributes on CPU while GPU setup finishes.</p><ul><li><CheckCircle2 />Windows CUDA/ROCm and Apple Silicon MPS when certified</li><li><CheckCircle2 />Automatic verified downloads</li><li><CheckCircle2 />Safe CPU fallback</li></ul><strong>Choose your computer <Download /></strong></a></div>
   </section>;

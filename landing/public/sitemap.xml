@@ -2,7 +2,20 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url>
     <loc>https://www.mycellios.com/</loc>
-    <changefreq>weekly</changefreq>
-    <priority>1.0</priority>
+  </url>
+  <url>
+    <loc>https://www.mycellios.com/network</loc>
+  </url>
+  <url>
+    <loc>https://www.mycellios.com/join</loc>
+  </url>
+  <url>
+    <loc>https://www.mycellios.com/downloads</loc>
+  </url>
+  <url>
+    <loc>https://www.mycellios.com/mobile/</loc>
+  </url>
+  <url>
+    <loc>https://www.mycellios.com/blog</loc>
   </url>
 </urlset>

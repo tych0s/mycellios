@@ -904,8 +904,17 @@ export async function createCoordinator(
       cacheControl: false,
       setHeaders: setPublicAssetCacheHeaders,
     });
-    for (const path of ["/network", "/admin", "/join", "/downloads"] as const) {
-      app.get(path, async (_request, reply) => reply.sendFile("index.html"));
+    const landingRouteDocuments = {
+      "/network": "network/index.html",
+      "/admin": "admin/index.html",
+      "/join": "join/index.html",
+      "/downloads": "downloads/index.html",
+    } as const;
+    for (const [path, routeDocument] of Object.entries(landingRouteDocuments)) {
+      const document = existsSync(resolve(landingAssetsPath, routeDocument))
+        ? routeDocument
+        : "index.html";
+      app.get(path, async (_request, reply) => reply.sendFile(document));
     }
   }
 
