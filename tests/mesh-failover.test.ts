@@ -276,6 +276,58 @@ describe("active-route recovery policy", () => {
     expect(store.getJob(handle.jobId)?.status).toBe("completed");
   });
 
+  it("accepts real output-token counts that differ from characters divided by four", async () => {
+    const primary = addWorker(store, {
+      id: "primary",
+      modelDigest: "sha256:revision-a",
+      contextLimit: 128,
+    });
+    hub.connected.add(primary.id);
+    service = new MeshService(store, new Scheduler(store), hub as unknown as WorkerHub, 30_000);
+    const handle = service.submit({
+      model: "distributed-small",
+      messages: [{ role: "user", content: "test" }],
+      max_tokens: 16,
+    });
+    const offer = leaseOffers(hub)[0]!;
+    const pieces = Array.from({ length: 16 }, () => "é");
+
+    hub.workerMessage({
+      v: 1,
+      type: "lease.accept",
+      workerId: primary.id,
+      payload: { jobId: handle.jobId, leaseId: offer.payload.leaseId },
+    });
+    for (const [index, text] of pieces.entries()) {
+      hub.workerMessage({
+        v: 1,
+        type: "task.token",
+        workerId: primary.id,
+        payload: { jobId: handle.jobId, leaseId: offer.payload.leaseId, index, text },
+      });
+    }
+    hub.workerMessage({
+      v: 1,
+      type: "task.complete",
+      workerId: primary.id,
+      payload: {
+        jobId: handle.jobId,
+        leaseId: offer.payload.leaseId,
+        text: pieces.join(""),
+        finishReason: "length",
+        metrics: { inputTokens: 9, outputTokens: 16, ttftMs: 20, activeMs: 40 },
+      },
+    });
+
+    const events = [];
+    for await (const event of handle.events) events.push(event);
+    expect(events.at(-1)).toMatchObject({
+      type: "completed",
+      result: { metrics: { inputTokens: 9, outputTokens: 16 } },
+    });
+    expect(store.getJob(handle.jobId)?.status).toBe("completed");
+  });
+
   it("still rejects reported input tokens beyond the deployment context", async () => {
     const primary = addWorker(store, {
       id: "primary",

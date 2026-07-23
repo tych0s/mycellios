@@ -407,15 +407,25 @@ export class MeshService {
         promptBytes * 2 + 256 + runtime.promptCheckpoint.request.messages.length * 64,
       ),
     );
-    const expectedOutput = Math.max(1, Math.ceil(runtime.output.length / 4));
     if (result.metrics.inputTokens < 1 || result.metrics.inputTokens > plausibleInputMaximum) {
       return { ok: false, reason: "Implausible input token count" };
     }
-    if (Math.abs(result.metrics.outputTokens - expectedOutput) > Math.max(4, expectedOutput * 0.1)) {
+    const maximumOutputTokens = runtime.request.max_tokens ?? 256;
+    const outputBytes = Buffer.byteLength(runtime.output, "utf8");
+    // Output text length is not a tokenizer. Byte-level tokens, Unicode and
+    // model-specific vocabularies can differ dramatically from characters/4,
+    // especially for tiny/random validation models. Keep the trust boundary
+    // against the caller's token ceiling and the actual emitted bytes instead.
+    if (
+      result.metrics.outputTokens < 0 ||
+      result.metrics.outputTokens > maximumOutputTokens ||
+      (runtime.output.length > 0 && result.metrics.outputTokens === 0) ||
+      result.metrics.outputTokens > outputBytes + 16
+    ) {
       return { ok: false, reason: "Implausible output token count" };
     }
     if (result.text !== runtime.output) return { ok: false, reason: "Completion body mismatch" };
-    if (Buffer.byteLength(runtime.output, "utf8") > (runtime.request.max_tokens ?? 256) * 32) {
+    if (outputBytes > maximumOutputTokens * 32) {
       return { ok: false, reason: "Completion exceeds the configured expansion limit" };
     }
     return { ok: true };

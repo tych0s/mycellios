@@ -2118,7 +2118,13 @@ function friendlyInferenceError(message: string): string {
   const normalized = message.toLowerCase();
   if (normalized.includes("no_candidates") || normalized.includes("no candidate") || normalized.includes("unavailable")) return "El modelo dejó de estar disponible. Comprueba el estado de sus nodos y vuelve a intentarlo.";
   if (normalized.includes("timeout") || normalized.includes("deadline")) return "La red tardó demasiado en responder. La petición se ha cancelado sin inventar una respuesta.";
-  if (normalized.includes("401") || normalized.includes("token")) return "La red requiere una credencial válida para usar este modelo.";
+  if (
+    normalized.includes("401") ||
+    normalized.includes("invalid_network_token") ||
+    normalized.includes("invalid network token") ||
+    normalized.includes("administrator token") ||
+    normalized.includes("credential")
+  ) return "La red requiere una credencial válida para usar este modelo.";
   return message;
 }
 
