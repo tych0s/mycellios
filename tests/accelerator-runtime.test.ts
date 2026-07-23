@@ -48,8 +48,14 @@ describe("desktop accelerator runtime", () => {
       }
     }
     expect(WINDOWS_ACCELERATOR_PACKS.cuda.installGroups.flat().reduce((sum, artifact) => sum + artifact.sizeBytes, 0)).toBe(2_594_590_371);
-    expect(WINDOWS_ACCELERATOR_PACKS.rocm.installGroups.flat().reduce((sum, artifact) => sum + artifact.sizeBytes, 0)).toBe(2_188_664_060);
-    expect(WINDOWS_ACCELERATOR_PACKS.rocm.installGroups.flat().every((artifact) => artifact.url.split("#")[0]?.endsWith(".whl"))).toBe(true);
+    expect(WINDOWS_ACCELERATOR_PACKS.rocm.installGroups.flat().reduce((sum, artifact) => sum + artifact.sizeBytes, 0)).toBe(2_188_680_000);
+    expect(WINDOWS_ACCELERATOR_PACKS.rocm.installGroups.flat().map((artifact) => artifact.url.split("#")[0])).toEqual([
+      "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_core-7.2.1-py3-none-win_amd64.whl",
+      "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_devel-7.2.1-py3-none-win_amd64.whl",
+      "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_libraries_custom-7.2.1-py3-none-win_amd64.whl",
+      "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm-7.2.1.tar.gz",
+      "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl",
+    ]);
   });
 
   it("selects certified native providers by platform, architecture and hardware", () => {
@@ -433,7 +439,7 @@ describe("desktop accelerator runtime", () => {
     writeFileSync(join(target, "python.exe"), "test", "utf8");
     writeFileSync(join(target, "accelerator-runtime.json"), JSON.stringify({
       schema: ACCELERATOR_RUNTIME_SCHEMA,
-      packId: "win-x64-py312-torch291-rocm721-v1",
+      packId: "win-x64-py312-torch291-rocm721-v2",
       backend: "rocm",
       baseRuntimeSchema: PORTABLE_RUNTIME_SCHEMA,
       pythonVersion: "3.12.13",
@@ -567,7 +573,7 @@ describe("desktop accelerator runtime", () => {
     ]));
     const pipInstall = vi.mocked(runner).mock.calls.find((call) => call[1].includes("install"));
     expect(pipInstall?.[1]).toEqual(expect.arrayContaining(downloadedPaths));
-    expect(pipInstall?.[1]).toEqual(expect.arrayContaining(["--no-index", "--no-deps"]));
+    expect(pipInstall?.[1]).toEqual(expect.arrayContaining(["--no-index", "--no-deps", "--no-build-isolation"]));
     expect(pipInstall?.[1].some((argument) => argument.startsWith("https://"))).toBe(false);
   });
 

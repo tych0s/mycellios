@@ -261,6 +261,11 @@ const AMD_SDK_ARTIFACTS = [
   artifact("ROCm SDK core", `${AMD_ROCM_BASE}/rocm_sdk_core-7.2.1-py3-none-win_amd64.whl`, "f68989d48df71cbfc3cb68bf705dc37c0f56e9666feddb59a1a0f5ff7539fe1c", 644_793_492),
   artifact("ROCm SDK development files", `${AMD_ROCM_BASE}/rocm_sdk_devel-7.2.1-py3-none-win_amd64.whl`, "19e6ee67e13432b7c1e8a4077df795dcb1239546ae314700c4b4d97e5b4b8f63", 232_840_013),
   artifact("ROCm SDK libraries", `${AMD_ROCM_BASE}/rocm_sdk_libraries_custom-7.2.1-py3-none-win_amd64.whl`, "c7fe0b0731af8896093ff69e11496830d3cb6a4aed73e895c60b7cbdc200be92", 489_964_648),
+  // PyTorch imports `rocm_sdk` during its own module initialization. AMD
+  // distributes that Python bootstrap separately from the three binary SDK
+  // wheels, so it must be installed explicitly when dependencies are pinned
+  // and `pip --no-deps` is used.
+  artifact("ROCm SDK bootstrap", `${AMD_ROCM_BASE}/rocm-7.2.1.tar.gz`, "9084902eaa69213a00a90784ad89e6e5fe73c702df0cc6cc3a70d777c7a6142b", 15_940),
 ] as const;
 const AMD_TORCH = artifact(
   "PyTorch ROCm 7.2.1",
@@ -322,7 +327,7 @@ export const WINDOWS_ACCELERATOR_PACKS: Readonly<Record<"cuda" | "rocm", Acceler
     installGroups: [[CUDA_TORCH]],
   },
   rocm: {
-    id: "win-x64-py312-torch291-rocm721-v1",
+    id: "win-x64-py312-torch291-rocm721-v2",
     backend: "rocm",
     platform: "win32",
     arch: "x64",
@@ -667,6 +672,11 @@ export async function prepareAcceleratorRuntime(
           "--no-cache-dir",
           "--no-index",
           "--no-deps",
+          // ROCm's signed SDK bootstrap is distributed as a source archive.
+          // Reuse the certified runtime's pinned setuptools instead of asking
+          // pip to create an isolated build environment that would require an
+          // unpinned network dependency.
+          "--no-build-isolation",
           ...group.map((packageArtifact) => requiredMapValue(downloadedPaths, packageArtifact.sha256)),
         ],
         commandEnvironment(initialEnvironment),
