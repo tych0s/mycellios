@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import unittest
 
@@ -8,11 +9,33 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 
 from distributed_runtime.api_benchmark import (
+    OpenLoopSample,
+    mean_inflight,
     parse_final_stream_evidence,
     percentile,
     positive_csv,
+    positive_float_csv,
     stream_request,
+    summarize_open_loop,
+    summary_stats,
 )
+
+
+def _sample(index: int, started: float, finished: float, *, tokens: int | None = 8,
+            error: str | None = None) -> OpenLoopSample:
+    return OpenLoopSample(
+        index=index,
+        scheduled_offset_s=started,
+        started_offset_s=started,
+        finished_offset_s=finished,
+        response_ms=(finished - started) * 1_000,
+        server_token_ttft_ms=None if error else 10.0,
+        server_token_tpot_ms=None if error else 5.0,
+        completion_tokens=None if error else tokens,
+        finish_reason=None if error else "length",
+        text_nonempty=error is None,
+        error=error,
+    )
 
 
 class ApiBenchmarkUtilityTests(unittest.TestCase):
@@ -139,6 +162,45 @@ class ApiBenchmarkHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(value.finish_reason, "stop")
         self.assertEqual(value.output_token_ids_sha256, "sha256:" + "1" * 64)
         self.assertTrue(value.text_nonempty)
+
+
+class OpenLoopBenchmarkTests(unittest.TestCase):
+    def test_rate_list_is_strictly_positive_finite(self) -> None:
+        self.assertEqual(positive_float_csv("0.6, 1.0,1.2"), (0.6, 1.0, 1.2))
+        for raw in ("", "0", "-1", "1,nope", "inf"):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                positive_float_csv(raw)
+
+    def test_summary_stats_reports_none_when_empty(self) -> None:
+        self.assertIsNone(summary_stats([]))
+        stats = summary_stats([1, 2, 3, 4])
+        self.assertEqual(stats["count"], 4)
+        self.assertEqual((stats["min"], stats["max"]), (1.0, 4.0))
+
+    def test_mean_inflight_is_overlap_over_window(self) -> None:
+        # two requests each occupying 2s of a 3s window -> 4/3 mean in-flight
+        samples = [_sample(0, 0.0, 2.0), _sample(1, 1.0, 3.0)]
+        self.assertAlmostEqual(mean_inflight(samples, 0.0, 3.0), 4 / 3)
+        self.assertEqual(mean_inflight(samples, 2.0, 2.0), 0.0)
+
+    def test_summarize_open_loop_discards_warmup_and_counts_errors(self) -> None:
+        args = argparse.Namespace(warmup_seconds=0.5, duration_seconds=3.0, seed=7)
+        samples = [
+            _sample(0, 0.0, 2.0),  # starts before warmup -> excluded from steady state
+            _sample(1, 1.0, 3.0),  # steady
+            _sample(2, 2.0, 2.1, error="RuntimeError: boom"),
+        ]
+        out = summarize_open_loop(samples, 1.0, args)
+        self.assertEqual(out["offered_requests"], 3)
+        self.assertEqual(out["completed_requests"], 2)
+        self.assertEqual(out["errors"], 1)
+        self.assertEqual(out["error_examples"], ["RuntimeError: boom"])
+        steady = out["steady_state"]
+        self.assertEqual(steady["requests"], 1)  # only the request that starts >= warmup
+        self.assertEqual(steady["completion_tokens_per_request"]["count"], 1)
+        self.assertEqual(
+            steady["aggregate_completion_tokens_per_second"], 8 / (3.0 - 0.5)
+        )
 
 
 if __name__ == "__main__":
