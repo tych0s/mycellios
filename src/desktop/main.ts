@@ -90,6 +90,7 @@ import {
   canInstallAutomaticUpdate,
   summarizeAutomaticUpdateError,
 } from "./update-recovery.js";
+import { SingleFlight } from "./single-flight.js";
 
 if (started) app.quit();
 
@@ -129,6 +130,7 @@ let tray: Tray | null = null;
 let coordinator: CoordinatorRuntime | null = null;
 let coordinatorUrl = "";
 let worker: WorkerAgent | null = null;
+const workerStartFlight = new SingleFlight();
 let distributedExecutor: Awaited<ReturnType<typeof createDesktopDistributedExecutor>> | null = null;
 let distributionRuntimePromise: Promise<string> | null = null;
 let cpuRuntimePromise: Promise<AcceleratorRuntimeResult> | null = null;
@@ -625,6 +627,11 @@ async function buildWorkerConfig(
 
 async function startWorkerIfEnabled(): Promise<void> {
   if (!settings.contributionEnabled || worker) return;
+  await workerStartFlight.run(initializeWorker);
+}
+
+async function initializeWorker(): Promise<void> {
+  if (!settings.contributionEnabled || worker || isQuitting) return;
   writeDesktopLog("worker-start-requested", { coordinatorUrl, contributionEnabled: settings.contributionEnabled });
   try {
     distributedExecutor ??= await createDesktopDistributedExecutor();
@@ -708,6 +715,7 @@ async function startWorkerIfEnabled(): Promise<void> {
 }
 
 async function stopWorker(): Promise<void> {
+  await workerStartFlight.wait().catch(() => undefined);
   const activeWorker = worker;
   worker = null;
   if (activeWorker) await activeWorker.stop();
