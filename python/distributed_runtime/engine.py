@@ -5,8 +5,10 @@ from collections import deque
 from collections.abc import Sequence
 import copy
 from dataclasses import dataclass, field
+import json
 import math
 import multiprocessing as mp
+import os
 import queue
 import select
 import socket
@@ -132,6 +134,25 @@ def _hadamard_quantization_block_count(hidden_size: int) -> int:
         remaining -= size
         blocks += 1
     return blocks
+
+
+_BATCH_DEBUG_PATH = os.environ.get("GDLP_BATCH_DEBUG")
+
+
+def _batch_debug(record: dict[str, Any]) -> None:
+    """Append one JSON line of root-batching diagnostics when GDLP_BATCH_DEBUG is set.
+
+    Zero-cost when the environment variable is absent; failures to write are
+    swallowed so instrumentation can never break the serving path.
+    """
+
+    if not _BATCH_DEBUG_PATH:
+        return
+    try:
+        with open(_BATCH_DEBUG_PATH, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+    except (OSError, TypeError, ValueError):
+        pass
 
 
 def _prefill_frame_byte_reservation(
@@ -2071,7 +2092,8 @@ class DistributedPipelineEngine:
 
         values: list[tuple[Any, float] | BaseException] = [first]
         limit = max(1, self.config.max_active_sequences)
-        deadline = time.monotonic() + self.config.root_batch_window_ms / 1_000
+        collect_started = time.monotonic()
+        deadline = collect_started + self.config.root_batch_window_ms / 1_000
         while len(values) < limit:
             try:
                 values.append(self._received_frames.get_nowait())
@@ -2085,6 +2107,15 @@ class DistributedPipelineEngine:
                 values.append(self._received_frames.get(timeout=remaining))
             except queue.Empty:
                 break
+        _batch_debug(
+            {
+                "ev": "collect",
+                "n": len(values),
+                "wait_ms": (time.monotonic() - collect_started) * 1_000,
+                "qsize_after": self._received_frames.qsize(),
+                "limit": limit,
+            }
+        )
         return tuple(values)
 
     def _admit_batch(
@@ -4823,6 +4854,33 @@ class DistributedPipelineEngine:
             # preserving its position relative to the first compatible group.
             group_key = key if key is not None else ("sequential", index)
             groups.setdefault(group_key, []).append(wave)
+
+        if _BATCH_DEBUG_PATH:
+            keyed = [
+                key
+                for key in groups
+                if not (
+                    isinstance(key, tuple) and len(key) == 2 and key[0] == "sequential"
+                )
+            ]
+            kv_lengths: list[int] = []
+            for key in keyed:
+                try:
+                    kv_lengths.append(int(key[4][0]))
+                except (IndexError, TypeError, ValueError):
+                    pass
+            _batch_debug(
+                {
+                    "ev": "dispatch",
+                    "waves": len(waves),
+                    "group_sizes": sorted(
+                        (len(group) for group in groups.values()), reverse=True
+                    ),
+                    "keyed_groups": len(keyed),
+                    "keyless_groups": len(groups) - len(keyed),
+                    "kv_lengths": kv_lengths,
+                }
+            )
 
         for group in groups.values():
             for offset in range(0, len(group), max(1, maximum)):
