@@ -497,6 +497,7 @@ describe("desktop accelerator runtime", () => {
   it("emits monotonic structured progress and installs verified local artifacts", async () => {
     const root = temporaryRoot();
     const base = createBaseRuntime(root);
+    const userData = join(root, "user-data");
     const abandonedStaging = join(
       root,
       "user-data",
@@ -545,7 +546,7 @@ describe("desktop accelerator runtime", () => {
 
     const result = await prepareAcceleratorRuntime({
       baseRuntimeRoot: base,
-      userDataPath: join(root, "user-data"),
+      userDataPath: userData,
       hardware: {
         platform: "win32",
         arch: "x64",
@@ -589,9 +590,8 @@ describe("desktop accelerator runtime", () => {
       "ready",
     ]));
     const pipInstall = vi.mocked(runner).mock.calls.find((call) => call[1].includes("install"));
-    expect(pipInstall?.[0]).toMatch(
-      /[\\/]accelerator-runtimes-v1[\\/]stg-[0-9a-f]{12}[\\/]/,
-    );
+    expect(pipInstall?.[0]).toMatch(/[\\/]mcg[\\/]stg-[0-9a-f]{12}[\\/]/);
+    expect(result.runtimeRoot).toBe(join(root, "mcg", "cuda"));
     expect(pipInstall?.[1]).toEqual(expect.arrayContaining(downloadedPaths));
     expect(pipInstall?.[1]).toEqual(expect.arrayContaining([
       "--no-index",
@@ -603,6 +603,17 @@ describe("desktop accelerator runtime", () => {
     expect(vi.mocked(runner).mock.calls.some((call) => call[1].includes("uninstall"))).toBe(false);
     expect(existsSync(abandonedStaging)).toBe(false);
     expect(existsSync(abandonedShortStaging)).toBe(false);
+  });
+
+  it("uses a compact persistent Windows CUDA path without moving the package cache", () => {
+    const root = temporaryRoot();
+    const userData = join(root, "user-data");
+    expect(acceleratorRuntimeTargetPath(userData, "cuda", "win32")).toBe(
+      join(root, "mcg", "cuda"),
+    );
+    expect(acceleratorRuntimeTargetPath(userData, "rocm", "win32")).toBe(
+      join(userData, "accelerator-runtimes-v1", WINDOWS_ACCELERATOR_PACKS.rocm.id),
+    );
   });
 
   it("rejects an injected downloader path outside the artifact cache", async () => {
