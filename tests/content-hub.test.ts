@@ -93,6 +93,9 @@ describe("Content Hub blog integration", () => {
     expect(listing.headers["content-type"]).toContain("text/html");
     expect(listing.body).toContain(`href="/blog.css?v=20260723"`);
     expect(listing.body).toContain(`class="blog-feed"`);
+    expect(listing.body).toContain(
+      `<a href="/blog" aria-current="page">Blog</a>`,
+    );
     expect(listing.body).toContain("&lt;strong&gt;markup&lt;/strong&gt;");
     expect(listing.body).not.toContain("<strong>markup</strong>");
 

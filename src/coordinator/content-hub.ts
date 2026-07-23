@@ -647,7 +647,7 @@ function renderNavigation(): string {
       <a class="blog-nav__brand" href="/" aria-label="mycellios home"><img src="/mycellios-favicon-v2.png" alt="" width="31" height="31" />mycellios</a>
       <div class="blog-nav__links">
         <a href="/">Home</a>
-        <a href="/blog" aria-current="page">Journal</a>
+        <a href="/blog" aria-current="page">Blog</a>
         <a href="/join">Join now</a>
       </div>
     </nav>
