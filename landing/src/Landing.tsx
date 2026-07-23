@@ -178,7 +178,7 @@ const copy = {
     },
     participate: { eyebrow: "Build the network", title: "There is more than one way to take part.", copy: "We are looking for the first machines, organizations, and people ready to turn a difficult idea into real infrastructure.", contributor: { label: "FOR CONTRIBUTORS", title: "Turn idle capacity into useful capacity.", copy: "Connect a PC, workstation, or server. Decide how much you contribute and pause whenever you want.", bullets: ["Different hardware, one network", "Voluntary contribution", "Verifiable work"] }, organization: { label: "FOR TEAMS AND ORGANIZATIONS", title: "Run open models on infrastructure you control.", copy: "Create private networks for labs, companies, and communities with distributed hardware.", bullets: ["Larger models through pooled memory", "A familiar API for your applications", "Topology adapted to your network"] } },
     closing: { eyebrow: "Founding network", title1: "Many machines.", title2: "One model.", copy: "Join the first mycellios test network and help us prove that the next great machine can be a community.", button: "Request early access", email: "Write to us at", subject: "I want to join mycellios" },
-  footer: { tagline: "Distributed intelligence, built together.", architecture: "Architecture", status: "Status", contact: "Contact" },
+  footer: { tagline: "Distributed intelligence, built together.", architecture: "Architecture", status: "Status" },
 } as const;
 
 const nodes = [
@@ -610,7 +610,7 @@ function Landing() {
         <section className="closing" id="join"><div className="closing-grid" /><div className="container closing-inner reveal"><Brand compact homeLabel={t.home} /><span className="eyebrow"><i />{t.closing.eyebrow}</span><h2>{t.closing.title1}<br /><em>{t.closing.title2}</em></h2><p>{t.closing.copy}</p><a className="button button-primary button-large" href="/join">Connect this device <Zap size={18} /></a><small>Public test network · no login required</small></div></section>
       </main>
 
-      <footer className="footer container"><Brand homeLabel={t.home} /><p>{t.footer.tagline}</p><div><a href="/network">Network panel</a><a href="#roadmap">Roadmap</a><a href="/blog">Research</a><a href="/mobile/">Mobile worker</a><a href="/downloads">Downloads</a><a href={`mailto:${EMAIL}`}>{t.footer.contact}</a></div><span>© 2026 mycellios</span></footer>
+      <footer className="footer container"><Brand homeLabel={t.home} /><p>{t.footer.tagline}</p><div><a href="/network">Network panel</a><a href="#roadmap">Roadmap</a><a href="/blog">Research</a><a href="/mobile/">Mobile worker</a><a href="/downloads">Downloads</a><a href={`mailto:${EMAIL}`}>{EMAIL}</a></div><span>© 2026 mycellios</span></footer>
     </div>
   );
 }
