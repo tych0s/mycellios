@@ -75,8 +75,23 @@ export class WorkerHub extends EventEmitter<HubEvents> {
       this.pendingConnections += 1;
       this.allConnections.add(state);
       socket.on("message", (raw) => this.handleRawMessage(state, raw.toString()));
-      socket.on("close", () => this.handleClose(state));
-      socket.on("error", () => this.handleClose(state));
+      socket.on("close", (code, reason) => {
+        app.log.warn({
+          workerId: state.workerId,
+          code,
+          reason: reason.toString("utf8"),
+          ready: state.ready,
+        }, "worker websocket closed");
+        this.handleClose(state);
+      });
+      socket.on("error", (error) => {
+        app.log.warn({
+          workerId: state.workerId,
+          error: error instanceof Error ? error.message : String(error),
+          ready: state.ready,
+        }, "worker websocket error");
+        this.handleClose(state);
+      });
     });
   }
 
