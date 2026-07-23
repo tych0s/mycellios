@@ -12,6 +12,7 @@ const hardwareProbe = async () => ({
     id: "gpu-0",
     vendor: "nvidia",
     model: "NVIDIA GeForce RTX 4090",
+    runtimeDeviceIndex: 0,
     physicalVramMb: 24_576,
   }],
 });
@@ -129,6 +130,7 @@ describe("worker capacity truth", () => {
       physicalVramMb: 24_576,
       offeredVramMb: 24_576,
     });
+    expect(capabilities.gpus[0]).not.toHaveProperty("runtimeDeviceIndex");
   });
 
   it("switches published capacity in place without restarting active work", async () => {
@@ -152,6 +154,7 @@ describe("worker capacity truth", () => {
       physicalVramMb: 24_576,
       offeredVramMb: 24_576,
     });
+    expect(harness.capabilities?.gpus[0]).not.toHaveProperty("runtimeDeviceIndex");
 
     await agent.refreshRuntimeCapacity(undefined);
     expect(harness.capabilities?.gpus[0]).toMatchObject({

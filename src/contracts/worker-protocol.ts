@@ -13,9 +13,22 @@ const boundedText = (maximum: number) =>
   });
 
 const strictDeploymentSchema = deploymentSchema.strict();
+const strictWireGpuSchema = gpuSchema
+  .extend({
+    // v0.2.34 briefly exposed the NVIDIA runtime ordinal in capabilities.
+    // Accept it during the rolling upgrade, but remove it before capabilities
+    // reach storage, scheduling, or public snapshots.
+    runtimeDeviceIndex: z.number().int().nonnegative().max(1_024).optional(),
+  })
+  .strict()
+  .transform((gpu) => {
+    const { runtimeDeviceIndex, ...capability } = gpu;
+    void runtimeDeviceIndex;
+    return capability;
+  });
 const strictCapabilitiesSchema = workerCapabilitiesSchema
   .extend({
-    gpus: z.array(gpuSchema.strict()).min(1).max(16),
+    gpus: z.array(strictWireGpuSchema).min(1).max(16),
     limits: z
       .object({
         maxConcurrency: z.number().int().positive().max(1_024),
