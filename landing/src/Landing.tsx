@@ -459,10 +459,17 @@ function FutureRoadmap({ text }: { text: typeof copy.future }) {
 
 function InstallSection({ text }: { text: typeof copy.install }) {
   const [recommended, setRecommended] = useState<DownloadKey>("windows");
+  const [macVisitor, setMacVisitor] = useState(false);
 
   useEffect(() => {
     const agent = navigator.userAgent.toLowerCase();
-    if (agent.includes("mac")) setRecommended("mac-arm64");
+    const isAppleMobile =
+      /iphone|ipad|ipod/.test(agent) ||
+      (agent.includes("mac") && navigator.maxTouchPoints > 1);
+    if (agent.includes("mac") && !isAppleMobile) {
+      setMacVisitor(true);
+      setRecommended("mac-arm64");
+    }
     else if (agent.includes("linux")) setRecommended("linux-deb");
     else setRecommended("windows");
   }, []);
@@ -507,6 +514,28 @@ function InstallSection({ text }: { text: typeof copy.install }) {
             return <a className={key === recommended ? "recommended" : ""} href={downloadUrl(key)} key={key}><HardDriveDownload size={18} /><span><strong>{option.label}</strong><small>{option.detail}</small></span>{key === recommended ? <b>RECOMMENDED</b> : <ArrowDownRight size={14} />}</a>;
           })}
         </div>
+        {macVisitor && (
+          <aside className="mac-test-guide" aria-labelledby="mac-test-title">
+            <div className="mac-test-guide-head">
+              <span><ShieldCheck size={15} />MACOS TEST BUILD</span>
+              <div>
+                <h3 id="mac-test-title">Try mycellios without an Apple developer licence</h3>
+                <p>The app is ad-hoc signed and package-attested. macOS still asks you to approve this test build once.</p>
+              </div>
+              <div className="mac-test-downloads">
+                <a href={downloadUrl("mac-arm64")}><Cpu size={15} /><span><strong>Apple Silicon</strong><small>M1 · M2 · M3 · M4</small></span><Download size={14} /></a>
+                <a href={downloadUrl("mac-x64")}><Cpu size={15} /><span><strong>Intel</strong><small>Intel processor</small></span><Download size={14} /></a>
+              </div>
+            </div>
+            <ol>
+              <li><b>01</b><span><strong>Install</strong><small>Open the DMG and drag mycellios to Applications.</small></span></li>
+              <li><b>02</b><span><strong>Try to open it once</strong><small>macOS shows a security warning. Close that message.</small></span></li>
+              <li><b>03</b><span><strong>Open Privacy &amp; Security</strong><small>Go to System Settings → Privacy &amp; Security.</small></span></li>
+              <li><b>04</b><span><strong>Choose Open Anyway</strong><small>Confirm once, then open mycellios normally.</small></span></li>
+            </ol>
+            <footer><Check size={13} />No Terminal commands required <i /> Manual downloads remain required for test builds</footer>
+          </aside>
+        )}
         <p className="install-safety"><ShieldCheck size={14} />{text.safety}</p>
       </div>
     </section>

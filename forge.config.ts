@@ -20,22 +20,6 @@ const windowsSign = process.env.WINDOWS_CERTIFICATE_FILE
     }
   : undefined;
 
-const macSign = process.env.MYCELLIOS_MAC_SIGN_IDENTITY
-  ? { identity: process.env.MYCELLIOS_MAC_SIGN_IDENTITY }
-  : undefined;
-
-const macNotarize =
-  macSign &&
-  process.env.APPLE_ID &&
-  process.env.APPLE_APP_SPECIFIC_PASSWORD &&
-  process.env.APPLE_TEAM_ID
-    ? {
-        appleId: process.env.APPLE_ID,
-        appleIdPassword: process.env.APPLE_APP_SPECIFIC_PASSWORD,
-        teamId: process.env.APPLE_TEAM_ID,
-      }
-    : undefined;
-
 const portableRuntimeArchive = "build/distribution-runtime.tar.gz";
 
 function commandLineOption(name: string): string | undefined {
@@ -48,6 +32,29 @@ function commandLineOption(name: string): string | undefined {
 
 const targetPlatform = commandLineOption("platform") ?? process.platform;
 const targetArch = commandLineOption("arch") ?? process.arch;
+const macDistributionIdentity = process.env.MYCELLIOS_MAC_SIGN_IDENTITY?.trim();
+const macSign =
+  targetPlatform === "darwin"
+    ? macDistributionIdentity
+      ? { identity: macDistributionIdentity }
+      : {
+          identity: "-",
+          identityValidation: false,
+          preAutoEntitlements: false,
+          optionsForFile: () => ({ timestamp: "none" }),
+        }
+    : undefined;
+const macNotarize =
+  macDistributionIdentity &&
+  process.env.APPLE_ID &&
+  process.env.APPLE_APP_SPECIFIC_PASSWORD &&
+  process.env.APPLE_TEAM_ID
+    ? {
+        appleId: process.env.APPLE_ID,
+        appleIdPassword: process.env.APPLE_APP_SPECIFIC_PASSWORD,
+        teamId: process.env.APPLE_TEAM_ID,
+      }
+    : undefined;
 const bundlesPortableRuntime =
   (targetPlatform === "win32" && targetArch === "x64") ||
   (targetPlatform === "linux" && targetArch === "x64") ||

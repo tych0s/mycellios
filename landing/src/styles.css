@@ -536,6 +536,29 @@ button { font: inherit; }
 .download-options > a span small { margin-top: 4px; color: var(--dim); font: 600 6px var(--mono); }
 .download-options > a > b { color: #83b5ff; font: 600 6px var(--mono); }
 .download-options > a > svg:last-child { width: 14px; }
+.mac-test-guide { margin-top: 24px; overflow: hidden; border: 1px solid rgba(99,230,176,.18); border-radius: 18px; background: radial-gradient(circle at 92% 0, rgba(63,124,255,.15), transparent 31%), linear-gradient(145deg, rgba(19,29,58,.96), rgba(12,21,45,.96)); box-shadow: inset 0 1px rgba(255,255,255,.025), 0 20px 52px rgba(2,5,18,.14); }
+.mac-test-guide-head { display: grid; grid-template-columns: .42fr 1fr .72fr; gap: 28px; align-items: center; padding: 27px 28px; border-bottom: 1px solid var(--line); }
+.mac-test-guide-head > span { display: flex; align-items: center; gap: 8px; color: var(--success); font: 650 7px var(--mono); letter-spacing: .09em; }
+.mac-test-guide-head > span svg { flex: 0 0 auto; }
+.mac-test-guide-head h3 { margin: 0; font-size: 20px; font-weight: 520; letter-spacing: -.035em; }
+.mac-test-guide-head p { max-width: 570px; margin: 8px 0 0; color: var(--muted); font-size: 10px; line-height: 1.65; }
+.mac-test-downloads { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.mac-test-downloads > a { min-height: 58px; display: grid; grid-template-columns: 20px 1fr 15px; gap: 8px; align-items: center; padding: 9px 11px; border: 1px solid rgba(92,150,255,.17); border-radius: 11px; color: #dce6ff; background: rgba(63,124,255,.055); transition: transform .2s, border-color .2s, background .2s; }
+.mac-test-downloads > a:hover { transform: translateY(-2px); border-color: rgba(92,150,255,.34); background: rgba(63,124,255,.1); }
+.mac-test-downloads > a > svg { color: #83b5ff; }
+.mac-test-downloads span strong, .mac-test-downloads span small { display: block; }
+.mac-test-downloads span strong { font-size: 9px; font-weight: 650; }
+.mac-test-downloads span small { margin-top: 3px; color: var(--dim); font: 600 5px var(--mono); }
+.mac-test-guide ol { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin: 0; padding: 0; list-style: none; }
+.mac-test-guide li { min-height: 92px; display: grid; grid-template-columns: 27px 1fr; gap: 11px; align-items: start; padding: 22px 20px; border-right: 1px solid var(--line); }
+.mac-test-guide li:last-child { border-right: 0; }
+.mac-test-guide li > b { width: 26px; height: 26px; display: grid; place-items: center; border: 1px solid rgba(92,150,255,.17); border-radius: 8px; color: #83b5ff; background: rgba(63,124,255,.07); font: 650 6px var(--mono); }
+.mac-test-guide li strong, .mac-test-guide li small { display: block; }
+.mac-test-guide li strong { font-size: 10px; font-weight: 650; }
+.mac-test-guide li small { margin-top: 6px; color: var(--dim); font-size: 8px; line-height: 1.55; }
+.mac-test-guide footer { display: flex; align-items: center; justify-content: center; gap: 9px; padding: 13px 18px; border-top: 1px solid var(--line); color: var(--dim); font: 600 6px var(--mono); letter-spacing: .04em; }
+.mac-test-guide footer svg { color: var(--success); }
+.mac-test-guide footer i { width: 3px; height: 3px; border-radius: 50%; background: var(--dim); }
 .install-safety { max-width: 860px; display: flex; align-items: flex-start; gap: 9px; margin: 19px 0 0; color: var(--dim); font-size: 9px; line-height: 1.65; }
 .install-safety svg { flex: 0 0 auto; margin-top: 1px; color: var(--muted); }
 
@@ -1078,6 +1101,11 @@ button { font: inherit; }
   .install-copy h2 { font-size: clamp(50px,6.8vw,72px); }
   .download-options { grid-template-columns: repeat(3,1fr); }
   .download-options > a:nth-child(4) { border-left: 1px solid var(--line); }
+  .mac-test-guide-head { grid-template-columns: 1fr 1.2fr; }
+  .mac-test-guide-head > span { grid-column: 1 / -1; }
+  .mac-test-guide ol { grid-template-columns: 1fr 1fr; }
+  .mac-test-guide li:nth-child(2) { border-right: 0; }
+  .mac-test-guide li:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
 }
 
 @media (max-width: 760px) {
@@ -1228,6 +1256,13 @@ button { font: inherit; }
   .download-shelf-head a { max-width: 145px; justify-content: flex-end; text-align: right; }
   .download-options { grid-template-columns: 1fr; }
   .download-options > a, .download-options > a:nth-child(4) { border-left: 1px solid var(--line); }
+  .mac-test-guide-head { grid-template-columns: 1fr; gap: 19px; padding: 23px 19px; }
+  .mac-test-guide-head > span { grid-column: auto; }
+  .mac-test-downloads { grid-template-columns: 1fr; }
+  .mac-test-guide ol { grid-template-columns: 1fr; }
+  .mac-test-guide li, .mac-test-guide li:nth-child(2) { min-height: 76px; border-right: 0; border-bottom: 1px solid var(--line); }
+  .mac-test-guide li:last-child { border-bottom: 0; }
+  .mac-test-guide footer { flex-wrap: wrap; text-align: center; line-height: 1.6; }
   .install-safety { font-size: 8px; }
   .participate-grid { grid-template-columns: 1fr; }
   .participate-card { min-height: auto; padding: 30px; }
