@@ -505,6 +505,14 @@ describe("desktop accelerator runtime", () => {
     );
     mkdirSync(abandonedStaging, { recursive: true });
     writeFileSync(join(abandonedStaging, "incomplete.txt"), "interrupted", "utf8");
+    const abandonedShortStaging = join(
+      root,
+      "user-data",
+      "accelerator-runtimes-v1",
+      "stg-deadbeefcafe",
+    );
+    mkdirSync(abandonedShortStaging, { recursive: true });
+    writeFileSync(join(abandonedShortStaging, "incomplete.txt"), "interrupted", "utf8");
     const artifactBytes = Buffer.from("verified-test-cuda-wheel");
     replaceCudaArtifact(artifactBytes);
     const events: import("../src/desktop/accelerator-runtime.js").AcceleratorProgressEvent[] = [];
@@ -581,6 +589,9 @@ describe("desktop accelerator runtime", () => {
       "ready",
     ]));
     const pipInstall = vi.mocked(runner).mock.calls.find((call) => call[1].includes("install"));
+    expect(pipInstall?.[0]).toMatch(
+      /[\\/]accelerator-runtimes-v1[\\/]stg-[0-9a-f]{12}[\\/]/,
+    );
     expect(pipInstall?.[1]).toEqual(expect.arrayContaining(downloadedPaths));
     expect(pipInstall?.[1]).toEqual(expect.arrayContaining([
       "--no-index",
@@ -591,6 +602,7 @@ describe("desktop accelerator runtime", () => {
     expect(pipInstall?.[1].some((argument) => argument.startsWith("https://"))).toBe(false);
     expect(vi.mocked(runner).mock.calls.some((call) => call[1].includes("uninstall"))).toBe(false);
     expect(existsSync(abandonedStaging)).toBe(false);
+    expect(existsSync(abandonedShortStaging)).toBe(false);
   });
 
   it("rejects an injected downloader path outside the artifact cache", async () => {

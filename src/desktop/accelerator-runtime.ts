@@ -24,6 +24,11 @@ const PROBE_MARKER = "MYCELLIOS_RUNTIME_PROBE=";
 export const PORTABLE_RUNTIME_PROBE_MARKER = "MYCELLIOS_PORTABLE_RUNTIME_PROBE=";
 const ACCELERATOR_DIRECTORY = "accelerator-runtimes-v1";
 const ACCELERATOR_MANIFEST = "accelerator-runtime.json";
+// Keep provisioning paths short enough for Python wheels on Windows systems
+// where Win32 long-path support is not enabled. Some PyTorch headers are more
+// than 120 characters below site-packages, so repeating the full pack id and a
+// UUID in the staging directory can cross MAX_PATH.
+const ACCELERATOR_STAGING_PREFIX = "stg-";
 const PORTABLE_MANIFEST = "runtime-manifest.json";
 
 export type AcceleratorBackend = "cuda" | "rocm" | "mps" | "xpu";
@@ -568,7 +573,10 @@ export async function prepareAcceleratorRuntime(
     );
   }
 
-  const staging = resolve(acceleratorRoot, `${pack.id}.staging-${randomUUID()}`);
+  const staging = resolve(
+    acceleratorRoot,
+    `${ACCELERATOR_STAGING_PREFIX}${randomUUID().replaceAll("-", "").slice(0, 12)}`,
+  );
   assertDirectChild(acceleratorRoot, staging);
   let failurePhase: AcceleratorProgressPhase = "checking-prerequisites";
   try {
@@ -738,10 +746,13 @@ async function removeAbandonedAcceleratorStaging(
   acceleratorRoot: string,
   packId: string,
 ): Promise<void> {
-  const prefix = `${packId}.staging-`;
+  const legacyPrefix = `${packId}.staging-`;
   const entries = await readdir(acceleratorRoot, { withFileTypes: true });
   await Promise.all(entries
-    .filter((entry) => entry.isDirectory() && entry.name.startsWith(prefix))
+    .filter((entry) => entry.isDirectory() && (
+      entry.name.startsWith(legacyPrefix)
+      || entry.name.startsWith(ACCELERATOR_STAGING_PREFIX)
+    ))
     .map(async (entry) => {
       const candidate = resolve(acceleratorRoot, entry.name);
       assertDirectChild(acceleratorRoot, candidate);
