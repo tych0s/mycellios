@@ -85,7 +85,9 @@ import { buildWorkerAccelerationDiagnostics } from "./acceleration-diagnostics.j
 import {
   AUTOMATIC_UPDATE_GRACE_MS,
   AUTOMATIC_UPDATE_IDLE_RECHECK_MS,
+  automaticUpdateRetryDelayMs,
   canInstallAutomaticUpdate,
+  summarizeAutomaticUpdateError,
 } from "./update-recovery.js";
 
 if (started) app.quit();
@@ -150,6 +152,8 @@ let isQuitting = false;
 let runtimeError: string | null = null;
 let accelerationStatus: DashboardSnapshot["acceleration"] = createInitialAccelerationStatus();
 let updateCheckTimer: NodeJS.Timeout | null = null;
+let updateRetryTimer: NodeJS.Timeout | null = null;
+let updateRetryAttempt = 0;
 let updateCheckInFlight = false;
 let automaticUpdateInstallTimer: NodeJS.Timeout | null = null;
 let automaticUpdateInstallInFlight = false;
@@ -241,6 +245,7 @@ function configureAutomaticUpdates(): void {
     setUpdateStatus({ state: "checking", message: "Checking for a new version…" });
   });
   autoUpdater.on("update-available", () => {
+    resetAutomaticUpdateRetry();
     if (updateStatus.state === "ready") return;
     setUpdateStatus({
       state: "downloading",
@@ -248,6 +253,7 @@ function configureAutomaticUpdates(): void {
     });
   });
   autoUpdater.on("update-not-available", () => {
+    resetAutomaticUpdateRetry();
     if (updateStatus.state === "ready") return;
     setUpdateStatus({
       state: "up-to-date",
@@ -257,6 +263,7 @@ function configureAutomaticUpdates(): void {
     });
   });
   autoUpdater.on("update-downloaded", (_event, _releaseNotes, releaseName) => {
+    resetAutomaticUpdateRetry();
     setUpdateStatus({
       state: "ready",
       availableVersion: releaseName || null,
@@ -270,11 +277,13 @@ function configureAutomaticUpdates(): void {
   });
   autoUpdater.on("error", (error) => {
     if (updateStatus.state === "ready") return;
+    const summary = summarizeAutomaticUpdateError(error.message);
     setUpdateStatus({
       state: "error",
-      message: `Could not check for updates: ${error.message}`,
+      message: `Could not check for updates: ${summary}`,
       checkedAt: new Date().toISOString(),
     });
+    scheduleAutomaticUpdateRetry(summary);
   });
 
   // Squirrel holds a file lock for a few seconds after first install.
@@ -292,15 +301,50 @@ async function checkForUpdates(): Promise<DesktopUpdateStatus> {
   try {
     await autoUpdater.checkForUpdates();
   } catch (error) {
+    const summary = summarizeAutomaticUpdateError(errorText(error));
     setUpdateStatus({
       state: "error",
-      message: `Could not check for updates: ${errorText(error)}`,
+      message: `Could not check for updates: ${summary}`,
       checkedAt: new Date().toISOString(),
     });
+    scheduleAutomaticUpdateRetry(summary);
   } finally {
     updateCheckInFlight = false;
   }
   return updateStatus;
+}
+
+function resetAutomaticUpdateRetry(): void {
+  updateRetryAttempt = 0;
+  if (!updateRetryTimer) return;
+  clearTimeout(updateRetryTimer);
+  updateRetryTimer = null;
+}
+
+function scheduleAutomaticUpdateRetry(reason: string): void {
+  if (
+    process.platform !== "win32"
+    || !app.isPackaged
+    || updateStatus.state === "ready"
+    || isQuitting
+    || updateRetryTimer
+  ) return;
+  const attempt = updateRetryAttempt;
+  const delayMs = automaticUpdateRetryDelayMs(attempt);
+  updateRetryAttempt += 1;
+  writeDesktopLog("automatic-update-retry-scheduled", {
+    attempt: attempt + 1,
+    delayMs,
+    reason,
+  });
+  setUpdateStatus({
+    message: `Update check will retry automatically in ${Math.ceil(delayMs / 60_000)} minute${delayMs > 60_000 ? "s" : ""}. ${reason}`,
+  });
+  updateRetryTimer = setTimeout(() => {
+    updateRetryTimer = null;
+    void checkForUpdates();
+  }, delayMs);
+  updateRetryTimer.unref();
 }
 
 function clearAutomaticUpdateInstallTimer(): void {
@@ -1913,6 +1957,7 @@ app.on("window-all-closed", () => {
 
 app.on("will-quit", () => {
   if (updateCheckTimer) clearInterval(updateCheckTimer);
+  resetAutomaticUpdateRetry();
   clearAutomaticUpdateInstallTimer();
   if (accelerationDiagnosticsPublishTimer) {
     clearTimeout(accelerationDiagnosticsPublishTimer);
