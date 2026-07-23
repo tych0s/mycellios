@@ -78,6 +78,7 @@ const completionMetricsSchema = z
     outputTokens: z.number().int().nonnegative().max(100_000_000),
     ttftMs: z.number().int().nonnegative().max(3_600_000),
     activeMs: z.number().int().positive().max(86_400_000),
+    reusedKvTokens: z.number().int().nonnegative().max(100_000_000).optional(),
     energyWh: z.number().nonnegative().max(1_000_000).optional(),
   })
   .strict();

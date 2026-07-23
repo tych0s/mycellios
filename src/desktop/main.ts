@@ -49,7 +49,11 @@ import type {
   DesktopSettings,
   DesktopUpdateStatus,
 } from "./contracts.js";
-import type { HubCatalogPage, HubCatalogSearchInput } from "../contracts/types.js";
+import type {
+  HubCatalogPage,
+  HubCatalogSearchInput,
+  WorkerAcceleratorDiagnostics,
+} from "../contracts/types.js";
 import {
   applyAccelerationProgress,
   appendAccelerationLog,
@@ -60,7 +64,6 @@ import {
 } from "./acceleration-progress.js";
 import {
   applyVerifiedAccelerationUsage,
-  gpuPreparationAutomaticRetryLimit,
   gpuPreparationRetryDelayMs,
   readVerifiedAccelerationUsage,
 } from "./acceleration-evidence.js";
@@ -78,6 +81,12 @@ import {
   type AcceleratorProgressEvent,
   type AcceleratorRuntimeResult,
 } from "./accelerator-runtime.js";
+import { buildWorkerAccelerationDiagnostics } from "./acceleration-diagnostics.js";
+import {
+  AUTOMATIC_UPDATE_GRACE_MS,
+  AUTOMATIC_UPDATE_IDLE_RECHECK_MS,
+  canInstallAutomaticUpdate,
+} from "./update-recovery.js";
 
 if (started) app.quit();
 
@@ -127,9 +136,13 @@ let acceleratorRuntimeRoot: string | null = null;
 let acceleratorRetryTimer: NodeJS.Timeout | null = null;
 let acceleratorRetryAttempt = 0;
 let acceleratorRetryIssueCode: string | null = null;
+let acceleratorNextRetryAt: string | null = null;
 // Keep expensive-failure budgets per code until a GPU really passes verification.
-// Alternating through a transient network error must not unlock another 2.6 GB integrity retry.
+// Alternating through a transient network error must not reset the expanding
+// backoff for another multi-gigabyte repair attempt.
 const acceleratorRetryIssueAttempts = new Map<string, number>();
+let accelerationDiagnosticsPublishTimer: NodeJS.Timeout | null = null;
+const activeDistributedStages = new Set<LaunchProcessHandle>();
 let hardwarePromise: Promise<HardwareProbe> | null = null;
 let settings: DesktopSettings = DEFAULT_SETTINGS;
 let modelAdminToken = "";
@@ -138,6 +151,8 @@ let runtimeError: string | null = null;
 let accelerationStatus: DashboardSnapshot["acceleration"] = createInitialAccelerationStatus();
 let updateCheckTimer: NodeJS.Timeout | null = null;
 let updateCheckInFlight = false;
+let automaticUpdateInstallTimer: NodeJS.Timeout | null = null;
+let automaticUpdateInstallInFlight = false;
 let updateStatus: DesktopUpdateStatus = {
   state: app.isPackaged ? "idle" : "development",
   currentVersion: app.getVersion(),
@@ -245,9 +260,13 @@ function configureAutomaticUpdates(): void {
     setUpdateStatus({
       state: "ready",
       availableVersion: releaseName || null,
-      message: "Update ready. It will be installed automatically on the next restart.",
+      message: "Update ready. mycellios will restart automatically as soon as active work is idle.",
       checkedAt: new Date().toISOString(),
     });
+    scheduleAutomaticUpdateInstall(AUTOMATIC_UPDATE_GRACE_MS);
+  });
+  autoUpdater.on("before-quit-for-update", () => {
+    isQuitting = true;
   });
   autoUpdater.on("error", (error) => {
     if (updateStatus.state === "ready") return;
@@ -282,6 +301,71 @@ async function checkForUpdates(): Promise<DesktopUpdateStatus> {
     updateCheckInFlight = false;
   }
   return updateStatus;
+}
+
+function clearAutomaticUpdateInstallTimer(): void {
+  if (!automaticUpdateInstallTimer) return;
+  clearTimeout(automaticUpdateInstallTimer);
+  automaticUpdateInstallTimer = null;
+}
+
+function scheduleAutomaticUpdateInstall(delayMs = AUTOMATIC_UPDATE_IDLE_RECHECK_MS): void {
+  if (
+    process.platform !== "win32"
+    || !app.isPackaged
+    || updateStatus.state !== "ready"
+    || isQuitting
+    || automaticUpdateInstallTimer
+    || automaticUpdateInstallInFlight
+  ) return;
+  automaticUpdateInstallTimer = setTimeout(() => {
+    automaticUpdateInstallTimer = null;
+    void installDownloadedUpdate(false, "automatic-idle-repair");
+  }, delayMs);
+  automaticUpdateInstallTimer.unref();
+}
+
+async function installDownloadedUpdate(force: boolean, reason: string): Promise<void> {
+  if (updateStatus.state !== "ready" || automaticUpdateInstallInFlight || isQuitting) return;
+  const installable = canInstallAutomaticUpdate({
+    updateReady: true,
+    quitting: isQuitting,
+    activeJobs: worker?.activeJobCount ?? 0,
+    activeStages: activeDistributedStages.size,
+  });
+  if (!force && !installable) {
+    setUpdateStatus({
+      message: "Update ready. Waiting for active inference to finish before the automatic restart.",
+    });
+    scheduleAutomaticUpdateInstall();
+    return;
+  }
+
+  clearAutomaticUpdateInstallTimer();
+  automaticUpdateInstallInFlight = true;
+  writeDesktopLog("automatic-update-installing", {
+    reason,
+    activeJobs: worker?.activeJobCount ?? 0,
+    activeStages: activeDistributedStages.size,
+    availableVersion: updateStatus.availableVersion,
+  });
+  isQuitting = true;
+  try {
+    await stopRuntime();
+    autoUpdater.quitAndInstall();
+  } catch (error) {
+    isQuitting = false;
+    automaticUpdateInstallInFlight = false;
+    setUpdateStatus({
+      state: "error",
+      message: `Could not install the downloaded update automatically: ${errorText(error)}`,
+      checkedAt: new Date().toISOString(),
+    });
+    await restartRuntime().catch((restartError: unknown) => {
+      runtimeError = errorText(restartError);
+      writeDesktopLog("runtime-restart-after-update-failed", { error: runtimeError });
+    });
+  }
 }
 
 function loadSettings(): DesktopSettings {
@@ -532,6 +616,7 @@ async function startWorkerIfEnabled(): Promise<void> {
   }
   const nextWorker = new WorkerAgent(config, {
     coordinatorUrl,
+    agentVersion: app.getVersion(),
     ...(settings.coordinatorMode === "remote" && settings.remoteCoordinatorToken
       ? { networkToken: settings.remoteCoordinatorToken }
       : {}),
@@ -543,7 +628,11 @@ async function startWorkerIfEnabled(): Promise<void> {
       ? { preferredHardwareGpu: { id: preferredHardwareGpu.id, vendor: preferredHardwareGpu.vendor, model: preferredHardwareGpu.model } }
       : {}),
     ...(verifiedGpuRuntime ? { verifiedGpuRuntime } : {}),
-    distributedExecutor: { ...distributedExecutor, ...currentDesktopExecutorPolicy() },
+    distributedExecutor: {
+      ...distributedExecutor,
+      ...currentDesktopExecutorPolicy(),
+      acceleration: currentAccelerationDiagnostics(),
+    },
     logger: {
       info: (message) => {
         console.info(`[agent] ${message}`);
@@ -694,20 +783,27 @@ async function readSnapshot(): Promise<DashboardSnapshot> {
 }
 
 async function sendChat(request: ChatRequest): Promise<ChatResponse> {
-  const prompt = request.prompt.trim();
-  if (!prompt) throw new Error("Escribe un mensaje antes de enviarlo.");
+  const messages = normalizeDesktopChatMessages(request.messages);
   const response = await fetchJson<{
     id: string;
     model: string;
     choices: Array<{ message: { content: string } }>;
     usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
-    x_network: { route_class: string; affinity_hit: boolean; ttft_ms: number; active_ms: number };
+    x_network: {
+      session_id: string;
+      route_class: string;
+      affinity_hit: boolean;
+      reused_kv_tokens?: number;
+      ttft_ms: number;
+      active_ms: number;
+    };
   }>("v1/chat/completions", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       model: request.model,
-      messages: [{ role: "user", content: prompt }],
+      messages,
+      session_id: request.sessionId,
       stream: false,
       max_tokens: Math.max(1, Math.min(2_048, request.maxTokens ?? 128)),
       temperature: 0,
@@ -723,14 +819,15 @@ async function sendChat(request: ChatRequest): Promise<ChatResponse> {
     totalTokens: response.usage.total_tokens,
     routeClass: response.x_network.route_class,
     affinityHit: response.x_network.affinity_hit,
+    sessionId: response.x_network.session_id,
+    reusedKvTokens: response.x_network.reused_kv_tokens ?? 0,
     ttftMs: response.x_network.ttft_ms,
     activeMs: response.x_network.active_ms,
   };
 }
 
 async function streamChat(request: ChatRequest, onUpdate: (update: ChatStreamUpdate) => void): Promise<ChatResponse> {
-  const prompt = request.prompt.trim();
-  if (!prompt) throw new Error("Escribe un mensaje antes de enviarlo.");
+  const messages = normalizeDesktopChatMessages(request.messages);
   const headers = new Headers({ accept: "text/event-stream", "content-type": "application/json" });
   if (settings.coordinatorMode === "remote" && settings.remoteCoordinatorToken) {
     headers.set("authorization", `Bearer ${settings.remoteCoordinatorToken}`);
@@ -741,7 +838,8 @@ async function streamChat(request: ChatRequest, onUpdate: (update: ChatStreamUpd
     headers,
     body: JSON.stringify({
       model: request.model,
-      messages: [{ role: "user", content: prompt }],
+      messages,
+      session_id: request.sessionId,
       stream: true,
       max_tokens: Math.max(1, Math.min(2_048, request.maxTokens ?? 128)),
       temperature: 0,
@@ -751,6 +849,15 @@ async function streamChat(request: ChatRequest, onUpdate: (update: ChatStreamUpd
     redirect: "error",
   });
   return consumeChatCompletionStream(response, request.model, onUpdate, startedAt);
+}
+
+function normalizeDesktopChatMessages(messages: ChatRequest["messages"]): ChatRequest["messages"] {
+  const normalized = messages.map((message) => ({ ...message }));
+  const last = normalized.at(-1);
+  if (!last || last.role !== "user" || !last.content.trim()) {
+    throw new Error("Escribe un mensaje antes de enviarlo.");
+  }
+  return normalized;
 }
 
 function registerIpc(): void {
@@ -842,8 +949,7 @@ function registerIpc(): void {
     if (updateStatus.state !== "ready") {
       throw new Error("There is no downloaded update ready to install.");
     }
-    isQuitting = true;
-    autoUpdater.quitAndInstall();
+    return installDownloadedUpdate(true, "user-requested");
   });
   ipcMain.handle("window:minimize", (event) => {
     BrowserWindow.fromWebContents(event.sender)?.minimize();
@@ -1005,12 +1111,38 @@ function currentDesktopExecutorPolicy(): {
   );
 }
 
+function currentAccelerationDiagnostics(): WorkerAcceleratorDiagnostics {
+  return buildWorkerAccelerationDiagnostics({
+    appVersion: app.getVersion(),
+    acceleration: accelerationStatus,
+    retryAttempt: acceleratorRetryAttempt,
+    nextRetryAt: acceleratorNextRetryAt,
+  });
+}
+
+function scheduleAccelerationDiagnosticsPublish(delayMs = 1_500): void {
+  if (!worker || accelerationDiagnosticsPublishTimer || isQuitting) return;
+  accelerationDiagnosticsPublishTimer = setTimeout(() => {
+    accelerationDiagnosticsPublishTimer = null;
+    const activeWorker = worker;
+    if (!activeWorker || isQuitting) return;
+    const diagnostics = currentAccelerationDiagnostics();
+    void activeWorker.refreshRuntimeDiagnostics(diagnostics).catch((error: unknown) => {
+      writeDesktopLog("worker-acceleration-diagnostics-refresh-failed", {
+        error: errorText(error),
+      });
+    });
+  }, delayMs);
+  accelerationDiagnosticsPublishTimer.unref();
+}
+
 function refreshPublishedRuntimeCapacity(): void {
   const activeWorker = worker;
   if (!activeWorker) return;
   const runtime = currentVerifiedGpuRuntime();
   const policy = currentDesktopExecutorPolicy();
-  void activeWorker.refreshRuntimeCapacity(runtime, policy).then(
+  const diagnostics = currentAccelerationDiagnostics();
+  void activeWorker.refreshRuntimeCapacity(runtime, policy, diagnostics).then(
     () => {
       writeDesktopLog("worker-runtime-capacity-refreshed", {
         backend: runtime?.backend ?? "cpu",
@@ -1026,9 +1158,10 @@ function refreshPublishedRuntimeCapacity(): void {
 }
 
 function clearAcceleratorRetryTimer(): void {
-  if (!acceleratorRetryTimer) return;
-  clearTimeout(acceleratorRetryTimer);
+  if (acceleratorRetryTimer) clearTimeout(acceleratorRetryTimer);
   acceleratorRetryTimer = null;
+  acceleratorNextRetryAt = null;
+  scheduleAccelerationDiagnosticsPublish();
 }
 
 function startDesktopAcceleratorPreparation(runtimeRoot: string): void {
@@ -1067,48 +1200,28 @@ function scheduleDesktopAcceleratorRetry(runtimeRoot: string, issueCode: string)
     acceleratorRetryAttempt = 0;
   }
 
-  const automaticRetryLimit = gpuPreparationAutomaticRetryLimit(issueCode);
   const issueAttempts = acceleratorRetryIssueAttempts.get(issueCode) ?? 0;
-  if (automaticRetryLimit !== null && issueAttempts >= automaticRetryLimit) {
-    const action = issueCode === "integrity"
-      ? "Automatic retries stopped after a repeated integrity failure. Update mycellios before retrying; CPU contribution remains available."
-      : "Automatic retries stopped after repeated GPU setup failures. Restart or update mycellios before retrying; CPU contribution remains available.";
-    accelerationStatus = {
-      ...accelerationStatus,
-      preparation: {
-        ...accelerationStatus.preparation,
-        issue: accelerationStatus.preparation.issue
-          ? { ...accelerationStatus.preparation.issue, retryable: false, action }
-          : {
-              code: issueCode,
-              message: accelerationStatus.message,
-              retryable: false,
-              action,
-            },
-      },
-    };
-    accelerationStatus = appendAccelerationLog(accelerationStatus, {
-      at: new Date().toISOString(),
-      level: "error",
-      message: `Automatic GPU setup stopped after ${issueAttempts} failed automatic retr${issueAttempts === 1 ? "y" : "ies"}. CPU contribution remains available.`,
-    });
-    refreshPublishedRuntimeCapacity();
-    return;
-  }
-
   const delayMs = gpuPreparationRetryDelayMs(acceleratorRetryAttempt);
   acceleratorRetryAttempt += 1;
   acceleratorRetryIssueAttempts.set(issueCode, issueAttempts + 1);
+  acceleratorNextRetryAt = new Date(Date.now() + delayMs).toISOString();
   const seconds = Math.ceil(delayMs / 1_000);
   accelerationStatus = appendAccelerationLog(accelerationStatus, {
     at: new Date().toISOString(),
     level: "warning",
-    message: `GPU setup will retry automatically in ${seconds} seconds. The CPU runtime remains available.`,
+    message: `GPU self-repair attempt ${issueAttempts + 1} will run automatically in ${seconds} seconds. The CPU runtime remains available.`,
   });
+  scheduleAccelerationDiagnosticsPublish();
+  if ((issueAttempts + 1) % 4 === 0) {
+    void checkForUpdates();
+  }
   acceleratorRetryTimer = setTimeout(() => {
     acceleratorRetryTimer = null;
+    acceleratorNextRetryAt = null;
+    scheduleAccelerationDiagnosticsPublish();
     startDesktopAcceleratorPreparation(runtimeRoot);
   }, delayMs);
+  acceleratorRetryTimer.unref();
 }
 
 async function createDesktopDistributedExecutor() {
@@ -1257,6 +1370,7 @@ class DesktopAcceleratedLaunchAgent implements LaunchAgent {
         },
       },
     }, signal);
+    activeDistributedStages.add(handle);
     const deviceType = runtime.deviceType;
     const setupInProgress = deviceType === "cpu" && gpuPreparationIsContinuing(accelerationStatus);
     accelerationStatus = appendAccelerationLog(accelerationStatus, {
@@ -1297,6 +1411,8 @@ class DesktopAcceleratedLaunchAgent implements LaunchAgent {
       },
     );
     void handle.exited.then((exit) => {
+      activeDistributedStages.delete(handle);
+      if (updateStatus.state === "ready") scheduleAutomaticUpdateInstall();
       const unexpected = unexpectedRuntimeExit(exit);
       accelerationStatus = appendAccelerationLog(accelerationStatus, {
         at: new Date().toISOString(),
@@ -1513,7 +1629,7 @@ function prepareDesktopAcceleratorRuntime(runtimeRoot: string): Promise<Accelera
       issue: {
         code: "runtime-error",
         message,
-        action: "Keep mycellios open for the automatic retry. Restart only if repeated retries cannot complete.",
+        action: "mycellios will keep retrying, rebuild damaged files and apply repair updates automatically.",
         retryable: true,
       },
       level: "error",
@@ -1584,6 +1700,7 @@ function applyDesktopAcceleratorProgress(event: AcceleratorProgressEvent): void 
       issue: event.issue,
     });
   }
+  scheduleAccelerationDiagnosticsPublish(event.recordLog ? 500 : 10_000);
 }
 
 function distributionPythonExecutable(root = app.isPackaged
@@ -1796,5 +1913,10 @@ app.on("window-all-closed", () => {
 
 app.on("will-quit", () => {
   if (updateCheckTimer) clearInterval(updateCheckTimer);
+  clearAutomaticUpdateInstallTimer();
+  if (accelerationDiagnosticsPublishTimer) {
+    clearTimeout(accelerationDiagnosticsPublishTimer);
+    accelerationDiagnosticsPublishTimer = null;
+  }
   void stopRuntime();
 });

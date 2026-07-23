@@ -17,6 +17,13 @@ export interface AdapterMetrics {
 export interface AdapterChunk {
   index: number;
   text: string;
+  metrics?: {
+    inputTokens?: number | undefined;
+    outputTokens?: number | undefined;
+    ttftMs?: number | undefined;
+    activeMs?: number | undefined;
+    reusedKvTokens?: number | undefined;
+  };
 }
 
 export interface AdapterRequest {

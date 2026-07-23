@@ -1,6 +1,14 @@
 export type CoordinatorMode = "local" | "remote";
 export type AdapterMode = "connectivity-test" | "local-model-runtime";
-import type { ComputeMode, HubCatalogModel, HubCatalogPage, HubCatalogSearchInput, HubCatalogSort } from "../contracts/types.js";
+import type {
+  ChatMessage,
+  ComputeMode,
+  HubCatalogModel,
+  HubCatalogPage,
+  HubCatalogSearchInput,
+  HubCatalogSort,
+  WorkerAcceleratorDiagnostics,
+} from "../contracts/types.js";
 export type { ComputeMode } from "../contracts/types.js";
 export type { HubCatalogModel, HubCatalogPage, HubCatalogSearchInput, HubCatalogSort } from "../contracts/types.js";
 
@@ -82,6 +90,8 @@ export interface DashboardWorker {
   /** Stable runtime node identity used to bind effective stage telemetry. */
   executionNodeId?: string;
   computeMode?: ComputeMode;
+  agentVersion?: string;
+  acceleration?: WorkerAcceleratorDiagnostics;
   mobile?: {
     platform: string;
     backend: "webgpu" | "cpu";
@@ -304,7 +314,8 @@ export interface DashboardSnapshot {
 
 export interface ChatRequest {
   model: string;
-  prompt: string;
+  messages: ChatMessage[];
+  sessionId: string;
   maxTokens?: number;
 }
 
@@ -317,6 +328,8 @@ export interface ChatResponse {
   totalTokens: number;
   routeClass: string;
   affinityHit: boolean;
+  sessionId: string;
+  reusedKvTokens: number;
   ttftMs: number;
   activeMs: number;
 }
@@ -329,6 +342,8 @@ export interface ChatStreamUpdate {
   outputTokens: number;
   routeClass: string;
   affinityHit: boolean;
+  sessionId: string;
+  reusedKvTokens: number;
   ttftMs: number;
   elapsedMs: number;
 }

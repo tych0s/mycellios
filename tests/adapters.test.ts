@@ -15,6 +15,7 @@ describe("inference adapters", () => {
 
   it("normalizes an OpenAI-compatible SSE stream", async () => {
     let receivedTemperature: number | undefined;
+    let receivedSessionId: string | undefined;
     const baseUrl = await listen((request, response) => {
       if (request.url === "/v1/models") {
         response.setHeader("content-type", "application/json");
@@ -22,6 +23,7 @@ describe("inference adapters", () => {
         return;
       }
       if (request.url === "/v1/chat/completions") {
+        receivedSessionId = request.headers["x-session-id"] as string | undefined;
         const chunks: Buffer[] = [];
         request.on("data", (chunk: Buffer) => chunks.push(chunk));
         request.on("end", () => {
@@ -30,6 +32,7 @@ describe("inference adapters", () => {
           response.setHeader("content-type", "text/event-stream");
           response.write('data: {"choices":[{"delta":{"content":"hola "}}]}\n\n');
           response.write('data: {"choices":[{"delta":{"content":"mundo"}}]}\n\n');
+          response.write('data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":2},"distribution_metrics":{"ttft_ms":18.4,"pipeline_ms":41.2,"reused_kv_tokens":9}}\n\n');
           response.end("data: [DONE]\n\n");
         });
       }
@@ -41,18 +44,24 @@ describe("inference adapters", () => {
       requestTemperature: 0,
     });
     expect((await adapter.probe()).models).toContain("test-model");
-    const chunks = [];
+    const chunks: Array<{ text: string; metrics?: { reusedKvTokens?: number | undefined } }> = [];
     for await (const chunk of adapter.generate(
       {
         jobId: "job",
-        request: { model: "test-model", messages: [{ role: "user", content: "hola" }] },
+        request: {
+          model: "test-model",
+          messages: [{ role: "user", content: "hola" }],
+          session_id: "chat-stable",
+        },
       },
       new AbortController().signal,
     )) {
-      chunks.push(chunk.text);
+      chunks.push(chunk);
     }
-    expect(chunks.join("")).toBe("hola mundo");
+    expect(chunks.map((chunk) => chunk.text).join("")).toBe("hola mundo");
     expect(receivedTemperature).toBe(0);
+    expect(receivedSessionId).toBe("chat-stable");
+    expect(chunks.at(-1)).toMatchObject({ text: "", metrics: { reusedKvTokens: 9 } });
   });
 
   it("normalizes local model runtime NDJSON", async () => {

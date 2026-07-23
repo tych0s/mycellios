@@ -667,6 +667,7 @@ export async function createCoordinator(
       status: worker.status,
       connected: hub.isConnected(worker.id),
       region: worker.capabilities.region,
+      agentVersion: worker.capabilities.agentVersion,
       offeredVramMb: worker.capabilities.gpus.reduce(
         (sum, gpu) => sum + gpu.offeredVramMb,
         0,
@@ -675,6 +676,7 @@ export async function createCoordinator(
       deployments: worker.capabilities.deployments,
       executionNodeId: worker.capabilities.distributedExecutor?.nodeId,
       computeMode: worker.capabilities.distributedExecutor?.computeMode,
+      acceleration: worker.capabilities.distributedExecutor?.acceleration,
       llmfit: worker.capabilities.llmfit,
       reliability: worker.reliability,
       jobsCompleted: worker.jobsCompleted,
@@ -785,6 +787,7 @@ export async function createCoordinator(
         session_id: handle.sessionId,
         route_class: routeClass,
         affinity_hit: affinityHit,
+        reused_kv_tokens: result.result.metrics.reusedKvTokens ?? 0,
         ttft_ms: result.result.metrics.ttftMs,
         active_ms: result.result.metrics.activeMs,
       },
@@ -1067,6 +1070,7 @@ function dashboardWorkers(store: MeshStore, hub: WorkerHub, mobileHub: MobileCom
       status: worker.status,
       connected: hub.isConnected(worker.id),
       region: worker.capabilities.region,
+      agentVersion: worker.capabilities.agentVersion,
       offeredVramMb: worker.capabilities.gpus.reduce(
         (sum, gpu) => sum + gpu.offeredVramMb,
         0,
@@ -1075,6 +1079,7 @@ function dashboardWorkers(store: MeshStore, hub: WorkerHub, mobileHub: MobileCom
       deployments: worker.capabilities.deployments,
       executionNodeId: worker.capabilities.distributedExecutor?.nodeId,
       computeMode: worker.capabilities.distributedExecutor?.computeMode,
+      acceleration: worker.capabilities.distributedExecutor?.acceleration,
       reliability: worker.reliability,
       jobsCompleted: worker.jobsCompleted,
       lastSeenAt: new Date(worker.lastSeenAt).toISOString(),
@@ -1283,6 +1288,7 @@ function writeOpenAiEvent(
         x_network: {
           ttft_ms: event.result.metrics.ttftMs,
           active_ms: event.result.metrics.activeMs,
+          reused_kv_tokens: event.result.metrics.reusedKvTokens ?? 0,
         },
       })}\n\n`,
     );

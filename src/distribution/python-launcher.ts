@@ -22,6 +22,9 @@ const MAX_PREFILL_INFLIGHT_BYTES = 1024 * 1024 * 1024;
 const MAX_SPECULATIVE_BRANCHES = 64;
 const MAX_SPECULATIVE_BRANCH_TOKENS = 1_048_576;
 const MAX_SPECULATIVE_KV_BYTES = 2 ** 40;
+const DEFAULT_RETAINED_SESSIONS = 4;
+const DEFAULT_RETAINED_SESSION_TOKENS = 8_192;
+const DEFAULT_RETAINED_SESSION_TTL_SECONDS = 10 * 60;
 
 export type PythonLaunchPhase = "prefill" | "decode";
 
@@ -151,6 +154,11 @@ export interface PythonLaunchCompilerOptions {
   maxPendingRequests?: number;
   maxOutputTokens?: number;
   speculationMinimumSpeedup?: number;
+  /** Exact completed-chat KV slots kept hot for the next turn. Zero disables reuse. */
+  maxRetainedSessions?: number;
+  /** Aggregate idle KV token ceiling across retained chats. */
+  maxRetainedSessionTokens?: number;
+  retainedSessionTtlSeconds?: number;
   /** Explicit host-local sub-GGUF bindings. A generic backend never enables these. */
   native_stageStages?: Record<string, PythonNativeStageStageInput>;
   /**
@@ -281,6 +289,9 @@ export interface PythonLaunchConfiguration {
   maxPendingRequests: number;
   maxOutputTokens: number;
   speculationMinimumSpeedup: number;
+  maxRetainedSessions: number;
+  maxRetainedSessionTokens: number;
+  retainedSessionTtlSeconds: number;
   /** Sorted by stageId so hashing and transport are deterministic. */
   native_stageStages: Record<string, PythonNativeStageStageConfiguration>;
   /** Sorted, host-local bindings for the certified physical RAM-backed runner. */
@@ -1085,6 +1096,12 @@ function renderRootEngineArguments(
     finiteNumber(configuration.speculationMinimumSpeedup),
     "--max-output-tokens",
     String(configuration.maxOutputTokens),
+    "--max-retained-sessions",
+    String(configuration.maxRetainedSessions),
+    "--max-retained-session-tokens",
+    String(configuration.maxRetainedSessionTokens),
+    "--retained-session-ttl-seconds",
+    finiteNumber(configuration.retainedSessionTtlSeconds),
     "--first-stage-host",
     launch.firstRemoteStage.endpoint.host,
     "--first-stage-port",
@@ -1295,6 +1312,22 @@ function normalizeConfiguration(
     speculationMinimumSpeedup: atLeastOneFinite(
       value.speculationMinimumSpeedup ?? 1.05,
       "python_speculation_speedup_is_invalid",
+    ),
+    maxRetainedSessions: boundedInteger(
+      value.maxRetainedSessions ?? DEFAULT_RETAINED_SESSIONS,
+      0,
+      10_000,
+      "python_max_retained_sessions_is_invalid",
+    ),
+    maxRetainedSessionTokens: boundedInteger(
+      value.maxRetainedSessionTokens ?? DEFAULT_RETAINED_SESSION_TOKENS,
+      0,
+      100_000_000,
+      "python_max_retained_session_tokens_is_invalid",
+    ),
+    retainedSessionTtlSeconds: positiveFinite(
+      value.retainedSessionTtlSeconds ?? DEFAULT_RETAINED_SESSION_TTL_SECONDS,
+      "python_retained_session_ttl_is_invalid",
     ),
     native_stageStages,
     ramBackedMoeStages,

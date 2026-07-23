@@ -426,6 +426,7 @@ function generationOnlyRequest(request: ChatCompletionRequest): ChatCompletionRe
   return {
     model: request.model,
     messages: request.messages.map((message) => ({ ...message })),
+    ...(request.session_id === undefined ? {} : { session_id: request.session_id }),
     ...(request.max_tokens === undefined ? {} : { max_tokens: request.max_tokens }),
     ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
     ...(request.top_p === undefined ? {} : { top_p: request.top_p }),

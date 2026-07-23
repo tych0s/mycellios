@@ -186,6 +186,58 @@ export interface LlmfitAdvisory {
   model?: LlmfitModelAdvisory | undefined;
 }
 
+export type WorkerAcceleratorDiagnosticState =
+  | "idle"
+  | "preparing"
+  | "cpu-ready"
+  | "gpu-ready"
+  | "gpu-fallback"
+  | "error";
+
+export type WorkerAcceleratorDiagnosticPhase =
+  | "idle"
+  | "detecting"
+  | "checking-cache"
+  | "checking-prerequisites"
+  | "copying-base"
+  | "downloading"
+  | "verifying-package"
+  | "installing"
+  | "physical-probe"
+  | "activating"
+  | "ready"
+  | "fallback"
+  | "blocked"
+  | "error";
+
+/**
+ * Bounded, path-free accelerator telemetry published by desktop workers.
+ * It intentionally excludes command lines, environment variables and raw
+ * stack traces so the public network can diagnose unattended nodes safely.
+ */
+export interface WorkerAcceleratorDiagnostics {
+  schema: "mycellios-accelerator-diagnostics/1";
+  appVersion: string;
+  state: WorkerAcceleratorDiagnosticState;
+  backend: "cpu" | "cuda" | "rocm" | "mps" | "xpu" | null;
+  deviceName: string | null;
+  gpuVendor: string | null;
+  gpuModel: string | null;
+  phase: WorkerAcceleratorDiagnosticPhase;
+  progressPct: number | null;
+  issueCode: string | null;
+  issueSummary: string | null;
+  retryable: boolean;
+  retryAttempt: number;
+  nextRetryAt: string | null;
+  updatedAt: string;
+  recentEvents: Array<{
+    at: string;
+    level: "info" | "success" | "warning" | "error";
+    message: string;
+  }>;
+}
+
 export interface WorkerCapabilities {
   region: string;
   agentVersion: string;
@@ -209,6 +261,8 @@ export interface WorkerCapabilities {
     computeMode?: ComputeMode | undefined;
     /** True only when this registration explicitly permits CPU model stages. */
     cpuEligible?: boolean | undefined;
+    /** Sanitized self-repair state; absent on legacy and non-desktop workers. */
+    acceleration?: WorkerAcceleratorDiagnostics | undefined;
   } | undefined;
 }
 
@@ -239,6 +293,8 @@ export interface CompletionMetrics {
   outputTokens: number;
   ttftMs: number;
   activeMs: number;
+  /** Exact prompt KV positions reused by the selected runtime, when reported. */
+  reusedKvTokens?: number | undefined;
   energyWh?: number | undefined;
 }
 

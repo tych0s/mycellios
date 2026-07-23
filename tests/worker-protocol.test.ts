@@ -181,6 +181,24 @@ describe("worker protocol schemas", () => {
             ...heartbeat.payload.capabilities.distributedExecutor,
             computeMode: "cpu-only",
             cpuEligible: true,
+            acceleration: {
+              schema: "mycellios-accelerator-diagnostics/1",
+              appVersion: "0.2.26",
+              state: "gpu-fallback",
+              backend: "cpu",
+              deviceName: "NVIDIA GeForce RTX 2060",
+              gpuVendor: "nvidia",
+              gpuModel: "NVIDIA GeForce RTX 2060",
+              phase: "physical-probe",
+              progressPct: 95,
+              issueCode: "physical-probe",
+              issueSummary: "CUDA probe failed",
+              retryable: true,
+              retryAttempt: 2,
+              nextRetryAt: "2026-07-23T10:30:00.000Z",
+              updatedAt: "2026-07-23T10:00:00.000Z",
+              recentEvents: [],
+            },
           },
         },
       },
@@ -188,6 +206,11 @@ describe("worker protocol schemas", () => {
     expect(cpuAuthorizedHeartbeat.payload.capabilities.distributedExecutor).toMatchObject({
       computeMode: "cpu-only",
       cpuEligible: true,
+      acceleration: {
+        schema: "mycellios-accelerator-diagnostics/1",
+        issueCode: "physical-probe",
+        retryAttempt: 2,
+      },
     });
     expect(workerHeartbeatEnvelopeSchema.safeParse({
       ...heartbeat,

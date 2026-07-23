@@ -13,8 +13,10 @@ interface OpenAiStreamChunk {
     total_tokens?: number;
   };
   x_network?: {
+    session_id?: string;
     route_class?: string;
     affinity_hit?: boolean;
+    reused_kv_tokens?: number;
     token_index?: number;
     ttft_ms?: number;
     active_ms?: number;
@@ -45,6 +47,8 @@ export async function consumeChatCompletionStream(
   let totalTokens = 0;
   let routeClass = "unknown";
   let affinityHit = false;
+  let sessionId = "";
+  let reusedKvTokens = 0;
   let ttftMs = 0;
   let activeMs = 0;
   let completed = false;
@@ -58,6 +62,8 @@ export async function consumeChatCompletionStream(
     outputTokens,
     routeClass,
     affinityHit,
+    sessionId,
+    reusedKvTokens,
     ttftMs,
     elapsedMs: Math.max(0, Date.now() - startedAt),
   });
@@ -86,6 +92,10 @@ export async function consumeChatCompletionStream(
     const receivedRoute = chunk.x_network?.route_class !== undefined;
     if (chunk.x_network?.route_class) routeClass = chunk.x_network.route_class;
     if (chunk.x_network?.affinity_hit !== undefined) affinityHit = chunk.x_network.affinity_hit;
+    if (chunk.x_network?.session_id) sessionId = chunk.x_network.session_id;
+    if (chunk.x_network?.reused_kv_tokens !== undefined) {
+      reusedKvTokens = chunk.x_network.reused_kv_tokens;
+    }
 
     const delta = chunk.choices?.[0]?.delta?.content ?? "";
     if (delta) {
@@ -133,6 +143,8 @@ export async function consumeChatCompletionStream(
     totalTokens: totalTokens || promptTokens + outputTokens,
     routeClass,
     affinityHit,
+    sessionId,
+    reusedKvTokens,
     ttftMs,
     activeMs,
   };

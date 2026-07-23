@@ -63,9 +63,14 @@ export class OpenAICompatibleAdapter implements InferenceAdapter {
   async *generate(request: AdapterRequest, signal: AbortSignal): AsyncIterable<AdapterChunk> {
     this.activeJobs += 1;
     try {
+      const sessionId = request.request.session_id;
       const response = await fetch(this.endpoint("chat/completions"), {
         method: "POST",
-        headers: { ...this.headers(), "content-type": "application/json" },
+        headers: {
+          ...this.headers(),
+          "content-type": "application/json",
+          ...(sessionId ? { "x-session-id": sessionId } : {}),
+        },
         body: JSON.stringify({
           model: this.options.model,
           messages: request.request.messages,
@@ -91,9 +96,32 @@ export class OpenAICompatibleAdapter implements InferenceAdapter {
         if (payload === "[DONE]") break;
         const parsed = JSON.parse(payload) as {
           choices?: Array<{ delta?: { content?: string }; text?: string }>;
+          usage?: {
+            prompt_tokens?: number;
+            completion_tokens?: number;
+          };
+          distribution_metrics?: {
+            ttft_ms?: number;
+            pipeline_ms?: number;
+            reused_kv_tokens?: number;
+          };
         };
         const text = parsed.choices?.[0]?.delta?.content ?? parsed.choices?.[0]?.text ?? "";
         if (text) yield { index: index++, text };
+        const metrics = parsed.distribution_metrics;
+        if (metrics || parsed.usage) {
+          yield {
+            index,
+            text: "",
+            metrics: {
+              inputTokens: parsed.usage?.prompt_tokens,
+              outputTokens: parsed.usage?.completion_tokens,
+              ttftMs: metrics?.ttft_ms,
+              activeMs: metrics?.pipeline_ms,
+              reusedKvTokens: metrics?.reused_kv_tokens,
+            },
+          };
+        }
       }
     } finally {
       this.activeJobs -= 1;

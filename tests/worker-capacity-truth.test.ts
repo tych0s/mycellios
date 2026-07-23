@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { workerConfigSchema } from "../src/contracts/schemas.js";
+import type { WorkerAcceleratorDiagnostics } from "../src/contracts/types.js";
+import type { LaunchAgent } from "../src/distribution/launch-supervisor.js";
 import { WorkerAgent } from "../src/worker/agent.js";
 
 const hardwareProbe = async () => ({
@@ -44,6 +46,55 @@ type MutableCapabilityHarness = CapabilityHarness & {
 };
 
 describe("worker capacity truth", () => {
+  it("publishes the real desktop version and sanitized repair state", async () => {
+    const acceleration: WorkerAcceleratorDiagnostics = {
+      schema: "mycellios-accelerator-diagnostics/1",
+      appVersion: "0.2.26",
+      state: "gpu-fallback",
+      backend: "cpu",
+      deviceName: "NVIDIA GeForce RTX 4090",
+      gpuVendor: "nvidia",
+      gpuModel: "NVIDIA GeForce RTX 4090",
+      phase: "physical-probe",
+      progressPct: 95,
+      issueCode: "physical-probe",
+      issueSummary: "CUDA driver probe failed",
+      retryable: true,
+      retryAttempt: 2,
+      nextRetryAt: "2026-07-23T10:30:00.000Z",
+      updatedAt: "2026-07-23T10:00:00.000Z",
+      recentEvents: [],
+    };
+    const launchAgent: LaunchAgent = {
+      id: "test-agent",
+      async start() {
+        throw new Error("not used");
+      },
+    };
+    const agent = new WorkerAgent(config, {
+      coordinatorUrl: "http://127.0.0.1:9999",
+      reconnect: false,
+      agentVersion: "0.2.26",
+      hardwareProbe,
+      distributedExecutor: {
+        nodeId: "desktop-test",
+        stageHost: "desktop-test.relay",
+        stagePort: 9_850,
+        launchAgent,
+        computeMode: "automatic",
+        cpuEligible: true,
+        acceleration,
+      },
+      logger: { info() {}, warn() {}, error() {} },
+    });
+    const capabilities = await (agent as unknown as { buildCapabilities(): Promise<{
+      agentVersion: string;
+      distributedExecutor?: { acceleration?: WorkerAcceleratorDiagnostics };
+    }> }).buildCapabilities();
+    expect(capabilities.agentVersion).toBe("0.2.26");
+    expect(capabilities.distributedExecutor?.acceleration).toEqual(acceleration);
+  });
+
   it("announces bounded CPU RAM while no verified GPU backend exists", async () => {
     const agent = new WorkerAgent(config, {
       coordinatorUrl: "http://127.0.0.1:9999",

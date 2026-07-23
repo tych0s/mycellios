@@ -905,7 +905,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-retained-sessions",
         type=int,
-        default=0,
+        default=4,
         help=(
             "Keep the KV of up to this many finished chats alive on every stage "
             "so the next turn (X-Session-Id header or OpenAI user field) only "
@@ -915,7 +915,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-retained-session-tokens",
         type=int,
-        default=0,
+        default=8_192,
         help="Total idle KV tokens across retained sessions; zero is unbounded.",
     )
     parser.add_argument("--retained-session-ttl-seconds", type=float, default=600.0)

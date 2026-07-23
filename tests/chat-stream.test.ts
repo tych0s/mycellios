@@ -5,10 +5,10 @@ import type { ChatStreamUpdate } from "../src/desktop/contracts.js";
 describe("chat completion stream", () => {
   it("publishes every token before returning the final metrics", async () => {
     const source = [
-      'data: {"id":"job_live","model":"qwen","choices":[{"delta":{"role":"assistant"}}],"x_network":{"route_class":"replica","affinity_hit":true}}\n\n',
+      'data: {"id":"job_live","model":"qwen","choices":[{"delta":{"role":"assistant"}}],"x_network":{"session_id":"chat-stable","route_class":"replica","affinity_hit":true}}\n\n',
       'data: {"id":"job_live","model":"qwen","choices":[{"delta":{"content":"hola "}}],"x_network":{"token_index":0}}\n\n',
       'data: {"id":"job_live","model":"qwen","choices":[{"delta":{"content":"mundo"}}],"x_network":{"token_index":1}}\n\n',
-      'data: {"id":"job_live","model":"qwen","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6},"x_network":{"ttft_ms":120,"active_ms":500}}\n\n',
+      'data: {"id":"job_live","model":"qwen","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6},"x_network":{"ttft_ms":120,"active_ms":500,"reused_kv_tokens":3}}\n\n',
       "data: [DONE]\n\n",
     ].join("");
     const response = streamingResponse([source.slice(0, 37), source.slice(37, 181), source.slice(181)]);
@@ -28,6 +28,8 @@ describe("chat completion stream", () => {
       totalTokens: 6,
       routeClass: "replica",
       affinityHit: true,
+      sessionId: "chat-stable",
+      reusedKvTokens: 3,
       ttftMs: 120,
       activeMs: 500,
     });

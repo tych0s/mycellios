@@ -1,4 +1,5 @@
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -496,6 +497,14 @@ describe("desktop accelerator runtime", () => {
   it("emits monotonic structured progress and installs verified local artifacts", async () => {
     const root = temporaryRoot();
     const base = createBaseRuntime(root);
+    const abandonedStaging = join(
+      root,
+      "user-data",
+      "accelerator-runtimes-v1",
+      `${WINDOWS_ACCELERATOR_PACKS.cuda.id}.staging-abandoned`,
+    );
+    mkdirSync(abandonedStaging, { recursive: true });
+    writeFileSync(join(abandonedStaging, "incomplete.txt"), "interrupted", "utf8");
     const artifactBytes = Buffer.from("verified-test-cuda-wheel");
     replaceCudaArtifact(artifactBytes);
     const events: import("../src/desktop/accelerator-runtime.js").AcceleratorProgressEvent[] = [];
@@ -575,6 +584,7 @@ describe("desktop accelerator runtime", () => {
     expect(pipInstall?.[1]).toEqual(expect.arrayContaining(downloadedPaths));
     expect(pipInstall?.[1]).toEqual(expect.arrayContaining(["--no-index", "--no-deps", "--no-build-isolation"]));
     expect(pipInstall?.[1].some((argument) => argument.startsWith("https://"))).toBe(false);
+    expect(existsSync(abandonedStaging)).toBe(false);
   });
 
   it("rejects an injected downloader path outside the artifact cache", async () => {

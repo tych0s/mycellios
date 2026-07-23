@@ -241,6 +241,46 @@ export const workerCapabilitiesSchema = z.object({
       // Legacy clients must never gain CPU scheduling consent merely by
       // upgrading the coordinator; only a new client can opt in explicitly.
       cpuEligible: z.boolean().default(false),
+      acceleration: z
+        .object({
+          schema: z.literal("mycellios-accelerator-diagnostics/1"),
+          appVersion: z.string().min(1).max(64),
+          state: z.enum(["idle", "preparing", "cpu-ready", "gpu-ready", "gpu-fallback", "error"]),
+          backend: z.enum(["cpu", "cuda", "rocm", "mps", "xpu"]).nullable(),
+          deviceName: z.string().max(256).nullable(),
+          gpuVendor: z.string().max(128).nullable(),
+          gpuModel: z.string().max(256).nullable(),
+          phase: z.enum([
+            "idle",
+            "detecting",
+            "checking-cache",
+            "checking-prerequisites",
+            "copying-base",
+            "downloading",
+            "verifying-package",
+            "installing",
+            "physical-probe",
+            "activating",
+            "ready",
+            "fallback",
+            "blocked",
+            "error",
+          ]),
+          progressPct: z.number().min(0).max(100).nullable(),
+          issueCode: z.string().max(64).nullable(),
+          issueSummary: z.string().max(500).nullable(),
+          retryable: z.boolean(),
+          retryAttempt: z.number().int().nonnegative().max(1_000_000),
+          nextRetryAt: z.string().datetime().nullable(),
+          updatedAt: z.string().datetime(),
+          recentEvents: z.array(z.object({
+            at: z.string().datetime(),
+            level: z.enum(["info", "success", "warning", "error"]),
+            message: z.string().min(1).max(500),
+          }).strict()).max(12),
+        })
+        .strict()
+        .optional(),
     })
     .strict()
     .optional(),

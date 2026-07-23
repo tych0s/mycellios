@@ -115,14 +115,21 @@ describe("verified desktop acceleration evidence", () => {
     expect(next.gpu.activeStages).toBe(0);
   });
 
-  it("uses bounded automatic retry backoff", () => {
-    expect([0, 1, 2, 9].map(gpuPreparationRetryDelayMs)).toEqual([30_000, 120_000, 300_000, 300_000]);
+  it("uses expanding automatic retry backoff with a 30 minute ceiling", () => {
+    expect([0, 1, 2, 3, 4, 9].map(gpuPreparationRetryDelayMs)).toEqual([
+      30_000,
+      120_000,
+      300_000,
+      900_000,
+      1_800_000,
+      1_800_000,
+    ]);
   });
 
-  it("keeps recoverable unattended failures retrying while bounding corrupt installs", () => {
-    expect(gpuPreparationAutomaticRetryLimit("integrity")).toBe(1);
-    expect(gpuPreparationAutomaticRetryLimit("install")).toBe(2);
-    expect(gpuPreparationAutomaticRetryLimit("physical-probe")).toBe(2);
+  it("never abandons an unattended node after a retryable setup failure", () => {
+    expect(gpuPreparationAutomaticRetryLimit("integrity")).toBeNull();
+    expect(gpuPreparationAutomaticRetryLimit("install")).toBeNull();
+    expect(gpuPreparationAutomaticRetryLimit("physical-probe")).toBeNull();
     expect(gpuPreparationAutomaticRetryLimit("runtime-error")).toBeNull();
     expect(gpuPreparationAutomaticRetryLimit("gpu-model-stage")).toBeNull();
     expect(gpuPreparationAutomaticRetryLimit("network")).toBeNull();

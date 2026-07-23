@@ -61,6 +61,7 @@ import type {
   RequestedModelCapacity,
 } from "../../src/desktop/contracts";
 import { consumeChatCompletionStream } from "../../src/desktop/chat-stream";
+import type { ChatMessage } from "../../src/contracts/types";
 import type { BenchmarkMeasurement, BenchmarkRun } from "../../src/benchlab/types";
 import { Contribute } from "./Contribute";
 import brandIcon from "./assets/mycellios-app-icon-v2.png";
@@ -118,6 +119,8 @@ interface PublicWorker {
   deployments: PublicDeployment[];
   executionNodeId?: string;
   computeMode?: DesktopSettings["computeMode"];
+  agentVersion?: string;
+  acceleration?: DashboardSnapshot["workers"][number]["acceleration"];
   mobile?: {
     platform: string;
     backend: "webgpu" | "cpu";
@@ -347,14 +350,14 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     await refresh();
   }
 
-  async function sendPrompt(model: string, prompt: string, onUpdate?: (update: ChatStreamUpdate) => void): Promise<ChatResponse> {
-    if (desktopBridge?.streamChat) return desktopBridge.streamChat({ model, prompt }, onUpdate ?? (() => undefined));
-    if (desktopBridge) return desktopBridge.sendChat({ model, prompt });
+  async function sendPrompt(model: string, messages: ChatMessage[], sessionId: string, onUpdate?: (update: ChatStreamUpdate) => void): Promise<ChatResponse> {
+    if (desktopBridge?.streamChat) return desktopBridge.streamChat({ model, messages, sessionId }, onUpdate ?? (() => undefined));
+    if (desktopBridge) return desktopBridge.sendChat({ model, messages, sessionId });
     const startedAt = Date.now();
     const response = await fetch("/v1/chat/completions", {
       method: "POST",
       headers: { accept: "text/event-stream", "content-type": "application/json" },
-      body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }], stream: true, max_tokens: 128, temperature: 0, top_p: 1 }),
+      body: JSON.stringify({ model, messages, session_id: sessionId, stream: true, max_tokens: 128, temperature: 0, top_p: 1 }),
     });
     return consumeChatCompletionStream(response, model, onUpdate ?? (() => undefined), startedAt);
   }
@@ -630,10 +633,13 @@ function NodeInventorySection({ eyebrow, title, workers, snapshot, busy, onRemov
     <div className="node-card-grid">
       {workers.map((worker) => {
         const execution = workerExecutionSummary(snapshot, worker);
-        const autoRepair = executionAutoRepairActive(execution, snapshot.workers);
+        const remoteRepair = worker.acceleration;
+        const autoRepair = executionAutoRepairActive(execution, snapshot.workers)
+          || Boolean(remoteRepair?.retryable && remoteRepair.state !== "gpu-ready");
         return <article className="node-card" key={worker.id}>
         <div className="node-card-head"><div className={`node-device ${worker.kind}`}><WorkerKindIcon worker={worker} /></div><div><span>{workerKindLabel(worker)}</span><h2>{workerLabel(worker)}</h2><small>{shortId(worker.id)}</small></div><span className={`node-status ${worker.status}`}><i />{nodeStatusLabel(worker)}</span></div>
-        <div className={`node-runtime-state${autoRepair ? " repairing" : ""}`}><ExecutionBadge execution={execution} workers={snapshot.workers} /><span><strong>{autoRepair ? "Servicio mantenido en CPU · autoreparación activa" : execution.verified ? executionDetail(execution) : "No active model is reporting execution on this node"}</strong><small>{autoRepair ? "mycellios revalidará la GPU y migrará esta etapa automáticamente." : execution.verified ? executionDeviceNames(execution) : "Detected GPU hardware is not counted as active compute."}</small></span></div>
+        <div className={`node-runtime-state${autoRepair ? " repairing" : ""}`}><ExecutionBadge execution={execution} workers={snapshot.workers} /><span><strong>{remoteRepair?.retryable && remoteRepair.state !== "gpu-ready" ? `GPU autorepair · ${remoteRepair.phase} · ${remoteRepair.progressPct ?? 0}%` : autoRepair ? "Servicio mantenido en CPU · autoreparación activa" : execution.verified ? executionDetail(execution) : "No active model is reporting execution on this node"}</strong><small>{remoteRepair?.retryable && remoteRepair.state !== "gpu-ready" ? remoteRepair.issueSummary ?? "mycellios is rebuilding and revalidating the local GPU runtime." : autoRepair ? "mycellios revalidará la GPU y migrará esta etapa automáticamente." : execution.verified ? executionDeviceNames(execution) : "Detected GPU hardware is not counted as active compute."}</small></span></div>
+        {remoteRepair && <RemoteAccelerationDiagnostics diagnostics={remoteRepair} />}
         {execution.stages.length > 0 && <ExecutionStages execution={execution} workers={snapshot.workers} compact />}
         <div className="node-card-metrics"><Metric label={worker.kind === "cell" ? "Capacidad" : "Hardware"} value={worker.gpus[0]?.model ?? "Desconocido"} /><Metric label="Ofrecido" value={formatMemory(worker.offeredVramMb)} /><Metric label="Región" value={worker.region} /><Metric label="Completadas" value={String(worker.jobsCompleted)} /></div>
         <div className="node-card-foot"><span>Visto {relativeTimeEs(worker.lastSeenAt)}</span><button disabled={busy === worker.id} onClick={() => void onRemove(worker.id)}>{busy === worker.id ? <LoaderCircle className="spin" /> : <Trash2 />} Eliminar</button></div>
@@ -655,8 +661,42 @@ function NodeTopologyInspector({ worker, snapshot }: { worker: PublicWorker; sna
   const execution = workerExecutionSummary(snapshot, worker);
   return <div className="node-topology-inspector">
     <div className={`node-inspector-identity ${nodeVisualState(worker)}`}><div><WorkerKindIcon worker={worker} /></div><span><small>{worker.kind === "cell" ? "CELDA SELECCIONADA" : "NODO SELECCIONADO"}</small><strong>{workerLabel(worker)}</strong><em>{worker.region} · {shortId(worker.id)}</em><ExecutionBadge execution={execution} workers={snapshot.workers} /></span></div>
-    <div className="node-inspector-metrics"><Metric label="Estado" value={nodeStatusLabel(worker)} /><Metric label="GPU libre" value={formatMemory(free)} /><Metric label="Carga física" value={utilization === null ? "Sin datos" : `${utilization.toFixed(0)}%`} /><Metric label="Rend. anunciado" value={throughput > 0 ? `${formatCompactNumber(throughput)} tok/s` : "—"} /><Metric label="Cómputo real" value={execution.verified ? executionShortLabel(execution) : "No verificado"} /><Metric label="Modelos" value={String(worker.deployments.length)} /></div>
+    <div className="node-inspector-metrics"><Metric label="Estado" value={nodeStatusLabel(worker)} /><Metric label="GPU libre" value={formatMemory(free)} /><Metric label="Carga física" value={utilization === null ? "Sin datos" : `${utilization.toFixed(0)}%`} /><Metric label="Rend. anunciado" value={throughput > 0 ? `${formatCompactNumber(throughput)} tok/s` : "—"} /><Metric label="Cómputo real" value={execution.verified ? executionShortLabel(execution) : "No verificado"} /><Metric label="Versión" value={worker.agentVersion ? `v${worker.agentVersion}` : "Legacy"} /><Metric label="GPU runtime" value={worker.acceleration ? remoteAccelerationLabel(worker.acceleration) : "Sin diagnóstico"} /><Metric label="Modelos" value={String(worker.deployments.length)} /></div>
+    {worker.acceleration && <RemoteAccelerationDiagnostics diagnostics={worker.acceleration} />}
   </div>;
+}
+
+function RemoteAccelerationDiagnostics({
+  diagnostics,
+}: {
+  diagnostics: NonNullable<PublicWorker["acceleration"]>;
+}) {
+  const repairing = diagnostics.retryable && diagnostics.state !== "gpu-ready";
+  return <details className={`remote-accelerator-diagnostics${repairing ? " repairing" : diagnostics.state === "gpu-ready" ? " ready" : ""}`}>
+    <summary>
+      <span><Activity />{repairing ? "GPU self-repair" : "GPU diagnostics"}</span>
+      <strong>{remoteAccelerationLabel(diagnostics)}</strong>
+      <ChevronDown />
+    </summary>
+    <div className="remote-accelerator-body">
+      <div className="remote-accelerator-grid">
+        <Metric label="App" value={`v${diagnostics.appVersion}`} />
+        <Metric label="Backend" value={(diagnostics.backend ?? "pending").toUpperCase()} />
+        <Metric label="Phase" value={diagnostics.phase} />
+        <Metric label="Attempt" value={String(diagnostics.retryAttempt)} />
+      </div>
+      {diagnostics.progressPct !== null && <div className="remote-accelerator-progress"><i style={{ width: `${diagnostics.progressPct}%` }} /></div>}
+      {diagnostics.issueSummary && <p><CircleAlert />{diagnostics.issueSummary}</p>}
+      {diagnostics.nextRetryAt && <small>Next automatic retry: {new Date(diagnostics.nextRetryAt).toLocaleString()}</small>}
+      {diagnostics.recentEvents.length > 0 && <ol>{diagnostics.recentEvents.map((event, index) => <li className={event.level} key={`${event.at}-${index}`}><time>{new Date(event.at).toLocaleTimeString()}</time><span>{event.message}</span></li>)}</ol>}
+    </div>
+  </details>;
+}
+
+function remoteAccelerationLabel(diagnostics: NonNullable<PublicWorker["acceleration"]>): string {
+  if (diagnostics.state === "gpu-ready") return `${diagnostics.gpuModel ?? diagnostics.deviceName ?? "GPU"} ready`;
+  if (diagnostics.retryable) return `${diagnostics.phase} · retry ${diagnostics.retryAttempt}`;
+  return diagnostics.issueCode ?? diagnostics.state;
 }
 
 function Models({ snapshot, onSearch, onRequest, onRemove, adminToken: initialAdminToken, requiresAdminToken, secureTokenStorage }: {
@@ -1040,7 +1080,7 @@ interface InferencePendingTurn extends ChatStreamUpdate {
 
 function Inference({ snapshot, onSend, onNavigate }: {
   snapshot: PublicSnapshot;
-  onSend: (model: string, prompt: string, onUpdate?: (update: ChatStreamUpdate) => void) => Promise<ChatResponse>;
+  onSend: (model: string, messages: ChatMessage[], sessionId: string, onUpdate?: (update: ChatStreamUpdate) => void) => Promise<ChatResponse>;
   onNavigate: (view: PanelView) => void;
 }) {
   const options = useMemo(() => snapshot.models.map((item) => inferenceModelOption(snapshot, item)), [snapshot]);
@@ -1049,6 +1089,7 @@ function Inference({ snapshot, onSend, onNavigate }: {
   const [model, setModel] = useState("");
   const [prompt, setPrompt] = useState("");
   const [turns, setTurns] = useState<InferenceTurn[]>([]);
+  const [sessionId, setSessionId] = useState(() => newInferenceSessionId());
   const [error, setError] = useState<string | null>(null);
   const [pendingTurn, setPendingTurn] = useState<InferencePendingTurn | null>(null);
   const [diagnostic, setDiagnostic] = useState<"idle" | "running" | "ok" | "failed">("idle");
@@ -1074,13 +1115,22 @@ function Inference({ snapshot, onSend, onNavigate }: {
       outputTokens: 0,
       routeClass: "waiting",
       affinityHit: false,
+      sessionId,
+      reusedKvTokens: 0,
       ttftMs: 0,
       elapsedMs: 0,
     });
     setPrompt("");
     setError(null);
     try {
-      const response = await onSend(selectedModel, cleanPrompt, (update) => {
+      const messages: ChatMessage[] = [
+        ...turns.flatMap((turn): ChatMessage[] => [
+          { role: "user", content: turn.prompt },
+          { role: "assistant", content: turn.response.text },
+        ]),
+        { role: "user", content: cleanPrompt },
+      ];
+      const response = await onSend(selectedModel, messages, sessionId, (update) => {
         setPendingTurn((current) => current ? { ...current, ...update } : current);
       });
       if (!response.text.trim()) throw new Error("El modelo terminó sin devolver texto.");
@@ -1097,11 +1147,20 @@ function Inference({ snapshot, onSend, onNavigate }: {
     if (!connectivityModel || diagnostic === "running") return;
     setDiagnostic("running");
     try {
-      await onSend(connectivityModel.id, "ping");
+      await onSend(connectivityModel.id, [{ role: "user", content: "ping" }], newInferenceSessionId());
       setDiagnostic("ok");
     } catch {
       setDiagnostic("failed");
     }
+  }
+
+  function resetConversation(nextModel?: string) {
+    if (nextModel !== undefined) setModel(nextModel);
+    setTurns([]);
+    setPrompt("");
+    setError(null);
+    setPendingTurn(null);
+    setSessionId(newInferenceSessionId());
   }
 
   return <section className="inference-page">
@@ -1115,7 +1174,7 @@ function Inference({ snapshot, onSend, onNavigate }: {
       </div>
     </div> : <div className="inference-console">
       <div className="inference-toolbar">
-        <label><span>MODELO REAL</span><AppSelect ariaLabel="Modelo real" value={selectedModel} onChange={setModel} options={realModels.map((item) => ({ value: item.id, label: item.id }))} /></label>
+        <label><span>MODELO REAL</span><AppSelect ariaLabel="Modelo real" value={selectedModel} onChange={(nextModel) => resetConversation(nextModel)} options={realModels.map((item) => ({ value: item.id, label: item.id }))} /></label>
         <div className="inference-model-summary"><ExecutionBadge execution={selectedOption?.execution ?? unknownExecutionSummary()} workers={snapshot.workers} large /><span className="inference-live"><i />DISPONIBLE</span><span>{selectedOption?.routeLabel}</span><span>{selectedOption?.freeSlots ?? 0} hueco{selectedOption?.freeSlots === 1 ? "" : "s"} libre{selectedOption?.freeSlots === 1 ? "" : "s"}</span></div>
       </div>
       <div className="inference-output" aria-live="polite" ref={outputRef}>
@@ -1126,7 +1185,7 @@ function Inference({ snapshot, onSend, onNavigate }: {
       </div>
       <div className="inference-input">
         <textarea aria-label="Mensaje" value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder={`Escribe a ${selectedModel}…`} />
-        <div className="inference-input-foot"><span><kbd>Enter</kbd> enviar · <kbd>Shift</kbd> + <kbd>Enter</kbd> nueva línea</span><div>{turns.length > 0 && <button className="inference-clear" onClick={() => { setTurns([]); setError(null); }}><Trash2 size={14} />Limpiar</button>}<button className="inference-send" disabled={!prompt.trim() || pendingTurn !== null} onClick={() => void send()}>{pendingTurn ? <LoaderCircle className="spin" /> : <Send />}<span>Enviar</span></button></div></div>
+        <div className="inference-input-foot"><span><kbd>Enter</kbd> enviar · <kbd>Shift</kbd> + <kbd>Enter</kbd> nueva línea</span><div>{turns.length > 0 && <button className="inference-clear" onClick={() => resetConversation()}><Trash2 size={14} />Nueva conversación</button>}<button className="inference-send" disabled={!prompt.trim() || pendingTurn !== null} onClick={() => void send()}>{pendingTurn ? <LoaderCircle className="spin" /> : <Send />}<span>Enviar</span></button></div></div>
       </div>
     </div>}
   </section>;
@@ -1140,7 +1199,7 @@ function InferenceStreamingTurn({ turn }: { turn: InferencePendingTurn }) {
       <div className="inference-stream-head"><span>{turn.model}</span><b><i />GENERANDO EN VIVO</b></div>
       {content.reasoning !== null && <div className="inference-live-reasoning"><span>RAZONAMIENTO</span><p>{content.reasoning}{content.answer === "" && <i className="stream-cursor" />}</p></div>}
       {content.answer && <p>{content.answer}<i className="stream-cursor" /></p>}
-      <div className="inference-response-metrics live"><span><b>{formatDuration(turn.ttftMs)}</b>primer token</span><span><b>{formatDuration(turn.elapsedMs)}</b>tiempo actual</span><span><b>{turn.outputTokens}</b>tokens recibidos</span><span><b>{formatLiveThroughput(turn)}</b>tokens/s ahora</span><span><b>{turn.routeClass}</b>ruta</span></div>
+      <div className="inference-response-metrics live"><span><b>{formatDuration(turn.ttftMs)}</b>primer token</span><span><b>{formatDuration(turn.elapsedMs)}</b>tiempo actual</span><span><b>{turn.outputTokens}</b>tokens recibidos</span><span><b>{formatLiveThroughput(turn)}</b>tokens/s ahora</span><span><b>{turn.routeClass}</b>ruta</span>{turn.affinityHit && <span><b>AFÍN</b>misma ruta</span>}</div>
     </div></div> : <div className="inference-thinking"><LoaderCircle className="spin" /><span>Esperando el primer token del modelo…</span></div>}
   </div>;
 }
@@ -1149,7 +1208,7 @@ function InferenceCompletedTurn({ turn }: { turn: InferenceTurn }) {
   const content = splitThinkingContent(turn.response.text);
   return <div className="inference-turn">
     <div className="inference-user-message"><span>TÚ</span><p>{turn.prompt}</p></div>
-    <div className="inference-message"><img src={brandIcon} alt="" /><div><span>{turn.response.model}</span>{content.reasoning && <details className="inference-reasoning"><summary>Ver razonamiento del modelo</summary><p>{content.reasoning}</p></details>}<p>{content.answer}</p><div className="inference-response-metrics"><span><b>{formatDuration(turn.response.ttftMs)}</b>primer token</span><span><b>{formatDuration(turn.response.activeMs)}</b>tiempo total</span><span><b>{turn.response.outputTokens}</b>tokens salida</span><span><b>{formatResponseThroughput(turn.response)}</b>tokens/s</span><span><b>{turn.response.routeClass}</b>ruta</span></div></div></div>
+    <div className="inference-message"><img src={brandIcon} alt="" /><div><span>{turn.response.model}</span>{content.reasoning && <details className="inference-reasoning"><summary>Ver razonamiento del modelo</summary><p>{content.reasoning}</p></details>}<p>{content.answer}</p><div className="inference-response-metrics"><span><b>{formatDuration(turn.response.ttftMs)}</b>primer token</span><span><b>{formatDuration(turn.response.activeMs)}</b>tiempo total</span><span><b>{turn.response.outputTokens}</b>tokens salida</span><span><b>{formatResponseThroughput(turn.response)}</b>tokens/s</span><span><b>{turn.response.routeClass}</b>ruta</span>{turn.response.reusedKvTokens > 0 ? <span><b>{turn.response.reusedKvTokens}</b>tokens KV reutilizados</span> : turn.response.affinityHit ? <span><b>AFÍN</b>misma ruta</span> : null}</div></div></div>
   </div>;
 }
 
@@ -1324,6 +1383,11 @@ function formatActivationTime(value: string): string {
   return Number.isNaN(date.getTime()) ? "—" : date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
+function newInferenceSessionId(): string {
+  const id = globalThis.crypto?.randomUUID?.();
+  return id ? `chat-${id}` : `chat-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
 function AcceleratorProgressPanel({ acceleration, contributionState, computeMode }: { acceleration: AcceleratorProgressSnapshot; contributionState: DashboardSnapshot["contribution"]["state"]; computeMode: DesktopSettings["computeMode"] }) {
   const cpuActive = (acceleration.cpu?.activeStages ?? 0) > 0;
   const cpuUnavailable = acceleration.cpu?.state === "unavailable";
@@ -1454,7 +1518,7 @@ function DesktopSettingsView({ snapshot, bridge, onSnapshot }: { snapshot: Dashb
     <div className="settings-section"><div><Globe2 size={20} /><div><h3>Coordinator</h3><p>Use the public network or host an isolated local coordinator.</p></div></div><div className="settings-fields"><label>Mode<AppSelect ariaLabel="Coordinator mode" value={draft.coordinatorMode} onChange={(value) => updateCoordinatorMode(value as DesktopSettings["coordinatorMode"])} options={[{ value: "remote", label: "Public mycellios network" }, { value: "local", label: "Local network on this machine" }]} /></label>{draft.coordinatorMode === "remote" && <label>Coordinator URL<input value={draft.remoteCoordinatorUrl} onChange={(event) => update("remoteCoordinatorUrl", event.target.value)} /></label>}<label>Region<input value={draft.region} onChange={(event) => update("region", event.target.value)} placeholder="auto" /></label></div></div>
     <div className="settings-section"><div><Gauge size={20} /><div><h3>Contribution</h3><p>Register real hardware only, or expose a model through a verified local runtime.</p></div></div><div className="settings-fields"><label>Compute mode<AppSelect ariaLabel="Compute mode" value={draft.computeMode} onChange={(value) => update("computeMode", value as DesktopSettings["computeMode"])} options={[{ value: "automatic", label: "Automatic · GPU preferred" }, { value: "gpu-only", label: "GPU only · never CPU" }, { value: "cpu-only", label: "CPU only · GPU disabled" }]} /></label><label>Runtime<AppSelect ariaLabel="Contribution runtime" value={draft.adapterMode} onChange={(value) => update("adapterMode", value as DesktopSettings["adapterMode"])} options={[{ value: "connectivity-test", label: "Hardware only (no model)" }, { value: "local-model-runtime", label: "Local local model runtime" }]} /></label><label>Offered memory (GB)<input type="number" min="1" step="1" value={draft.offeredVramMb / 1_024} onChange={(event) => update("offeredVramMb", Math.round(Number(event.target.value) * 1_024))} /></label>{draft.adapterMode === "local-model-runtime" && <><label>local model runtime model<input value={draft.modelName} onChange={(event) => update("modelName", event.target.value)} /></label><label>local model runtime URL<input value={draft.adapterBaseUrl} onChange={(event) => update("adapterBaseUrl", event.target.value)} /></label><label>Pinned digest<input value={draft.modelDigest} onChange={(event) => update("modelDigest", event.target.value)} placeholder="sha256:…" /></label></>}</div></div>
     <div className="settings-section compact-settings"><div><SlidersHorizontal size={20} /><div><h3>Application</h3><p>Startup and background contribution.</p></div></div><div className="toggle-list"><Toggle label="Start with the system" checked={draft.launchAtLogin} onChange={(value) => update("launchAtLogin", value)} /><Toggle label="Keep running in the tray" checked={draft.closeToTray} onChange={(value) => update("closeToTray", value)} /><Toggle label="Contribute resources" checked={draft.contributionEnabled} onChange={(value) => update("contributionEnabled", value)} /></div></div>
-    <div className="settings-section"><div><Download size={20} /><div><h3>Automatic updates</h3><p>Desktop releases are checked and downloaded in the background when supported.</p></div></div><div className="update-settings"><div><span className={`update-state ${snapshot.update.state}`}>{updateStateLabel(snapshot.update.state)}</span><strong>Version {snapshot.appVersion}</strong><p>{snapshot.update.message}</p></div><div className="update-actions"><button className="secondary-button" disabled={checkingUpdate || snapshot.update.state === "checking" || snapshot.update.state === "downloading"} onClick={() => void checkUpdate()}><RefreshCw className={checkingUpdate ? "spin" : ""} size={15} />Check now</button>{snapshot.update.state === "ready" && <button className="primary-button" onClick={() => void bridge.installUpdate()}><Download size={15} />Restart and update</button>}</div></div></div>
+    <div className="settings-section"><div><Download size={20} /><div><h3>Automatic updates</h3><p>Desktop releases download in the background and install automatically as soon as active inference is idle.</p></div></div><div className="update-settings"><div><span className={`update-state ${snapshot.update.state}`}>{updateStateLabel(snapshot.update.state)}</span><strong>Version {snapshot.appVersion}</strong><p>{snapshot.update.message}</p></div><div className="update-actions"><button className="secondary-button" disabled={checkingUpdate || snapshot.update.state === "checking" || snapshot.update.state === "downloading"} onClick={() => void checkUpdate()}><RefreshCw className={checkingUpdate ? "spin" : ""} size={15} />Check now</button>{snapshot.update.state === "ready" && <button className="primary-button" onClick={() => void bridge.installUpdate()}><Download size={15} />Restart now</button>}</div></div></div>
     <div className="settings-footer"><button className="primary-button" disabled={saving} onClick={() => void save()}>{saving ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}Save and reconnect</button></div>
   </section>;
 }

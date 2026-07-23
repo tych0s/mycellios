@@ -75,7 +75,13 @@ export function applyVerifiedAccelerationUsage(
   };
 }
 
-const GPU_RETRY_DELAYS_MS = [30_000, 120_000, 300_000] as const;
+const GPU_RETRY_DELAYS_MS = [
+  30_000,
+  120_000,
+  300_000,
+  900_000,
+  1_800_000,
+] as const;
 
 export function gpuPreparationRetryDelayMs(attempt: number): number {
   const safeAttempt = Number.isFinite(attempt) ? Math.max(0, Math.floor(attempt)) : 0;
@@ -83,18 +89,12 @@ export function gpuPreparationRetryDelayMs(attempt: number): number {
 }
 
 /** Null means a cheap/recoverable condition can keep retrying with backoff. */
-export function gpuPreparationAutomaticRetryLimit(issueCode: string): number | null {
-  // A model-specific native crash or a transient runtime failure can recover
-  // after a driver update, an application update, a reboot, or the accelerator
-  // cache being rebuilt. Keep the certified CPU runtime serving work and
-  // re-probe in the background with capped backoff instead of permanently
-  // abandoning the GPU on an unattended user's machine.
-  if (
-    issueCode === "network"
-    || issueCode === "disk-space"
-    || issueCode === "runtime-error"
-    || issueCode === "gpu-model-stage"
-  ) return null;
-  if (issueCode === "integrity") return 1;
-  return 2;
+export function gpuPreparationAutomaticRetryLimit(_issueCode: string): number | null {
+  // Every issue passed to the scheduler has already been marked retryable by
+  // the certified installer. Never abandon an unattended node permanently:
+  // corrupted caches are replaced, downloads resume, updates repair bad pack
+  // manifests and physical probes may recover after a driver or OS update.
+  // The expanding delay above prevents a persistent external prerequisite
+  // from hammering the network or repeatedly rebuilding multi-gigabyte packs.
+  return null;
 }

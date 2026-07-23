@@ -9,10 +9,11 @@ import type {
   ComputeMode,
   JobPayload,
   WorkerCapabilities,
+  WorkerAcceleratorDiagnostics,
   WorkerEnvelope,
   WorkerHeartbeat,
 } from "../contracts/types.js";
-import type { InferenceAdapter } from "../adapters/base.js";
+import type { AdapterChunk, InferenceAdapter } from "../adapters/base.js";
 import { createAdapter } from "../adapters/factory.js";
 import { sha256Text } from "../core/json.js";
 import { estimateInputTokens } from "../core/request.js";
@@ -71,6 +72,8 @@ export interface WorkerAgentOptions {
   };
   /** Physical GPU probe evidence. Without it, host capacity is CPU RAM only. */
   verifiedGpuRuntime?: VerifiedGpuRuntimeEvidence | undefined;
+  /** Desktop application version reported to the coordinator. */
+  agentVersion?: string | undefined;
   distributedExecutor?: {
     nodeId: string;
     stageHost: string;
@@ -79,6 +82,7 @@ export interface WorkerAgentOptions {
     pythonExecutable?: string;
     computeMode?: ComputeMode;
     cpuEligible?: boolean;
+    acceleration?: WorkerAcceleratorDiagnostics;
   };
   logger?: Pick<Console, "info" | "warn" | "error">;
 }
@@ -265,12 +269,16 @@ export class WorkerAgent {
   async refreshRuntimeCapacity(
     runtime: VerifiedGpuRuntimeEvidence | undefined,
     executorPolicy?: { computeMode: ComputeMode; cpuEligible: boolean },
+    acceleration?: WorkerAcceleratorDiagnostics,
   ): Promise<void> {
     const generation = ++this.runtimeCapacityGeneration;
     this.options.verifiedGpuRuntime = runtime;
     if (executorPolicy && this.options.distributedExecutor) {
       this.options.distributedExecutor.computeMode = executorPolicy.computeMode;
       this.options.distributedExecutor.cpuEligible = executorPolicy.cpuEligible;
+    }
+    if (acceleration && this.options.distributedExecutor) {
+      this.options.distributedExecutor.acceleration = acceleration;
     }
     if (!this.capabilities || this.config.capacityScope !== "host") return;
 
@@ -303,9 +311,39 @@ export class WorkerAgent {
         ...deployment,
         peakVramMb: this.config.deployment.peakVramMb ?? defaultPeakVramMb,
       })),
+      ...(this.capabilities.distributedExecutor
+        ? {
+            distributedExecutor: {
+              ...this.capabilities.distributedExecutor,
+              computeMode: this.options.distributedExecutor?.computeMode ?? "automatic",
+              cpuEligible: this.options.distributedExecutor?.cpuEligible === true,
+              ...(this.options.distributedExecutor?.acceleration
+                ? { acceleration: structuredClone(this.options.distributedExecutor.acceleration) }
+                : {}),
+            },
+          }
+        : {}),
     };
     if (this.registeredWorkerId) await this.register();
     await this.sendHeartbeat();
+  }
+
+  async refreshRuntimeDiagnostics(acceleration: WorkerAcceleratorDiagnostics): Promise<void> {
+    if (!this.options.distributedExecutor) return;
+    this.options.distributedExecutor.acceleration = acceleration;
+    if (!this.capabilities?.distributedExecutor) return;
+    this.capabilities = {
+      ...this.capabilities,
+      distributedExecutor: {
+        ...this.capabilities.distributedExecutor,
+        acceleration: structuredClone(acceleration),
+      },
+    };
+    if (this.registeredWorkerId) await this.register();
+  }
+
+  get activeJobCount(): number {
+    return this.activeJobs.size;
   }
 
   private async sendGoodbye(reason: "user_requested" | "shutdown"): Promise<void> {
@@ -388,7 +426,7 @@ export class WorkerAgent {
     const defaultTtft = this.config.adapter.kind === "mock" ? this.config.adapter.ttftMs : 2_000;
     return {
       region: this.config.region,
-      agentVersion: "0.1.0",
+      agentVersion: this.options.agentVersion?.trim() || "0.1.0",
       gpus: [
         {
           ...(this.config.capacityScope === "cell"
@@ -447,6 +485,9 @@ export class WorkerAgent {
               runtime: "python-safetensors" as const,
               computeMode: this.options.distributedExecutor.computeMode ?? "automatic",
               cpuEligible: this.options.distributedExecutor.cpuEligible === true,
+              ...(this.options.distributedExecutor.acceleration
+                ? { acceleration: structuredClone(this.options.distributedExecutor.acceleration) }
+                : {}),
             },
           }
         : {}),
@@ -776,6 +817,7 @@ export class WorkerAgent {
     let firstTokenAt: number | null = null;
     let output = "";
     let outputBytes = 0;
+    let backendMetrics: AdapterChunk["metrics"] | undefined;
     const outputByteLimit = Math.min(
       MAX_OUTPUT_BYTES,
       (payload.request.max_tokens ?? 256) * 32,
@@ -785,6 +827,8 @@ export class WorkerAgent {
         { jobId: payload.jobId, request: payload.request },
         controller.signal,
       )) {
+        if (chunk.metrics) backendMetrics = { ...backendMetrics, ...chunk.metrics };
+        if (!chunk.text) continue;
         const chunkBytes = Buffer.byteLength(chunk.text, "utf8");
         if (chunkBytes > MAX_OUTPUT_CHUNK_BYTES) {
           const error = new WorkerOutputLimitError(
@@ -814,10 +858,13 @@ export class WorkerAgent {
       const outputTokens = Math.max(1, Math.ceil(output.length / 4));
       const activeMs = Math.max(1, Math.round(finished - started));
       const metrics = {
-        inputTokens: estimateInputTokens(payload.request),
-        outputTokens,
-        ttftMs: Math.round((firstTokenAt ?? finished) - started),
-        activeMs,
+        inputTokens: Math.max(0, Math.round(backendMetrics?.inputTokens ?? estimateInputTokens(payload.request))),
+        outputTokens: Math.max(0, Math.round(backendMetrics?.outputTokens ?? outputTokens)),
+        ttftMs: Math.max(0, Math.round(backendMetrics?.ttftMs ?? (firstTokenAt ?? finished) - started)),
+        activeMs: Math.max(1, Math.round(backendMetrics?.activeMs ?? activeMs)),
+        ...(backendMetrics?.reusedKvTokens === undefined
+          ? {}
+          : { reusedKvTokens: Math.max(0, Math.round(backendMetrics.reusedKvTokens)) }),
         energyWh: this.config.limits.maxPowerW
           ? (this.config.limits.maxPowerW * activeMs) / 3_600_000
           : undefined,

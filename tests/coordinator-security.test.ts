@@ -97,6 +97,56 @@ describe("public coordinator security boundaries", () => {
     expect(response.headers["content-security-policy"]).toContain("frame-ancestors 'none'");
     expect(response.headers["x-content-type-options"]).toBe("nosniff");
   });
+
+  it("exposes bounded desktop repair diagnostics without requiring machine access", async () => {
+    const runtime = await coordinator();
+    const payload = validWorkerRegistration();
+    payload.capabilities.distributedExecutor = {
+      protocol: "gdlp-worker-tunnel/2",
+      nodeId: "desktop-public-worker",
+      stageHost: "desktop-public-worker.relay",
+      stagePort: 9_850,
+      runtime: "python-safetensors",
+      computeMode: "automatic",
+      cpuEligible: true,
+      acceleration: {
+        schema: "mycellios-accelerator-diagnostics/1",
+        appVersion: "0.2.26",
+        state: "gpu-fallback",
+        backend: "cpu",
+        deviceName: "NVIDIA GeForce RTX 2060",
+        gpuVendor: "nvidia",
+        gpuModel: "NVIDIA GeForce RTX 2060",
+        phase: "physical-probe",
+        progressPct: 95,
+        issueCode: "physical-probe",
+        issueSummary: "CUDA driver probe failed",
+        retryable: true,
+        retryAttempt: 3,
+        nextRetryAt: "2026-07-23T10:30:00.000Z",
+        updatedAt: "2026-07-23T10:00:00.000Z",
+        recentEvents: [],
+      },
+    };
+    const registration = await runtime.app.inject({
+      method: "POST",
+      url: "/internal/v1/workers/register",
+      payload,
+    });
+    expect(registration.statusCode).toBe(201);
+
+    const snapshot = await runtime.app.inject({ method: "GET", url: "/public/v1/snapshot" });
+    expect(snapshot.statusCode).toBe(200);
+    expect(snapshot.json().workers[0]).toMatchObject({
+      agentVersion: "test",
+      acceleration: {
+        schema: "mycellios-accelerator-diagnostics/1",
+        appVersion: "0.2.26",
+        issueCode: "physical-probe",
+        retryAttempt: 3,
+      },
+    });
+  });
 });
 
 async function coordinator(internalToken?: string, networkToken?: string): Promise<CoordinatorRuntime> {
@@ -112,7 +162,30 @@ async function coordinator(internalToken?: string, networkToken?: string): Promi
   return runtime;
 }
 
-function validWorkerRegistration() {
+function validWorkerRegistration(): {
+  identity: { kind: "device"; id: string };
+  capabilities: {
+    region: string;
+    agentVersion: string;
+    gpus: Array<{
+      id: string;
+      vendor: string;
+      model: string;
+      physicalVramMb: number;
+      offeredVramMb: number;
+      freeOfferedVramMb: number;
+    }>;
+    deployments: never[];
+    limits: {
+      maxConcurrency: number;
+      maxTemperatureC: number;
+      maxPowerW: number;
+      pauseWhenForeground: boolean;
+    };
+    network: { coordinatorRttMs: number; uplinkMbps: number; downlinkMbps: number };
+    distributedExecutor?: Record<string, unknown>;
+  };
+} {
   return {
     identity: { kind: "device", id: "public-worker" },
     capabilities: {

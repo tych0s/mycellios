@@ -4,6 +4,7 @@ import {
   cp,
   mkdir,
   open,
+  readdir,
   readFile,
   rename,
   rm,
@@ -571,6 +572,7 @@ export async function prepareAcceleratorRuntime(
   assertDirectChild(acceleratorRoot, staging);
   let failurePhase: AcceleratorProgressPhase = "checking-prerequisites";
   try {
+    await removeAbandonedAcceleratorStaging(acceleratorRoot, pack.id);
     emit("checking-prerequisites", 8, `Checking free space for the ${pack.backend.toUpperCase()} runtime.`);
     const availableBytes = await requireFreeSpace(acceleratorRoot, pack.minimumFreeBytes);
     emit(
@@ -731,6 +733,21 @@ export async function prepareAcceleratorRuntime(
       shortError(error),
     );
   }
+}
+
+async function removeAbandonedAcceleratorStaging(
+  acceleratorRoot: string,
+  packId: string,
+): Promise<void> {
+  const prefix = `${packId}.staging-`;
+  const entries = await readdir(acceleratorRoot, { withFileTypes: true });
+  await Promise.all(entries
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith(prefix))
+    .map(async (entry) => {
+      const candidate = resolve(acceleratorRoot, entry.name);
+      assertDirectChild(acceleratorRoot, candidate);
+      await rm(candidate, { recursive: true, force: true });
+    }));
 }
 
 export async function readPortableRuntimeManifest(
@@ -1802,7 +1819,7 @@ function progressIssue(
       code: "physical-probe",
       message,
       retryable: true,
-      action: "Update the GPU driver and retry. CPU remains available in the meantime.",
+      action: "mycellios will revalidate the GPU automatically. Compatible operating-system driver updates can then recover the node without reinstalling mycellios.",
     };
   }
   if (phase === "downloading" || phase === "verifying-package") {
@@ -1817,7 +1834,7 @@ function progressIssue(
     code: "install",
     message,
     retryable: true,
-    action: "Retry GPU setup. If it repeats, update mycellios or the GPU driver.",
+    action: "mycellios will rebuild the isolated GPU runtime and retry automatically with expanding backoff.",
   };
 }
 
