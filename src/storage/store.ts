@@ -298,6 +298,14 @@ export class MeshStore {
     ).run(error, Date.now(), id);
   }
 
+  clearRequestedModelActivationError(id: string): void {
+    this.database.raw.prepare(
+      `UPDATE requested_models
+       SET activation_requested_at = NULL, activation_error = NULL, updated_at = ?
+       WHERE id = ?`,
+    ).run(Date.now(), id);
+  }
+
   removeRequestedModel(id: string): boolean {
     return Number(
       this.database.raw.prepare("DELETE FROM requested_models WHERE id = ?").run(id).changes,

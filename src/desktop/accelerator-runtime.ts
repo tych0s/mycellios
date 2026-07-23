@@ -20,6 +20,7 @@ export const ACCELERATOR_RUNTIME_SCHEMA = "mycellios-accelerator-runtime/1" as c
 
 const GIB = 1024 ** 3;
 const PROBE_MARKER = "MYCELLIOS_RUNTIME_PROBE=";
+export const PORTABLE_RUNTIME_PROBE_MARKER = "MYCELLIOS_PORTABLE_RUNTIME_PROBE=";
 const ACCELERATOR_DIRECTORY = "accelerator-runtimes-v1";
 const ACCELERATOR_MANIFEST = "accelerator-runtime.json";
 const PORTABLE_MANIFEST = "runtime-manifest.json";
@@ -782,6 +783,71 @@ export async function readPortableRuntimeManifest(
     );
   }
   return raw as unknown as PortableRuntimeManifest;
+}
+
+export async function verifyPortableRuntimeInstallation(
+  runtimeRoot: string,
+  expected?: { platform: string; arch: string },
+  runner: RuntimeCommandRunner = runRuntimeCommand,
+): Promise<PortableRuntimeManifest> {
+  const root = resolve(runtimeRoot);
+  const manifest = await readPortableRuntimeManifest(root, expected);
+  const python = runtimePythonExecutable(root, manifest.executable);
+  await requireFile(python, "portable CPU Python executable");
+  const result = await runner(
+    python,
+    ["-I", "-c", portableRuntimeProbeScript()],
+    {
+      env: {
+        ...process.env,
+        PYTHONNOUSERSITE: "1",
+      },
+    },
+  );
+  if (result.code !== 0) {
+    throw new Error(
+      `portable runtime health check failed (${result.code}): ${tail(result.stderr || result.stdout).trim()}`,
+    );
+  }
+  const marker = result.stdout
+    .split(/\r?\n/)
+    .reverse()
+    .find((line) => line.startsWith(PORTABLE_RUNTIME_PROBE_MARKER));
+  if (!marker) throw new Error("portable runtime health check did not emit verified metadata");
+  let value: unknown;
+  try {
+    value = JSON.parse(marker.slice(PORTABLE_RUNTIME_PROBE_MARKER.length));
+  } catch {
+    throw new Error("portable runtime health check metadata is not valid JSON");
+  }
+  if (
+    !isRecord(value)
+    || !sameResolvedPath(value.prefix, root)
+    || !sameResolvedPath(value.basePrefix, root)
+    || value.pythonVersion !== manifest.pythonVersion
+    || value.torchVersion !== manifest.torchVersion
+    || value.transformersVersion !== manifest.transformersVersion
+    || value.accelerateVersion !== manifest.accelerateVersion
+    || value.safetensorsVersion !== manifest.safetensorsVersion
+    || value.aiohttpVersion !== manifest.aiohttpVersion
+    || value.sentencepieceVersion !== manifest.sentencepieceVersion
+    || value.numpyVersion !== manifest.numpyVersion
+  ) {
+    throw new Error("portable runtime health check does not match its certified manifest");
+  }
+  return manifest;
+}
+
+function portableRuntimeProbeScript(): string {
+  return [
+    "import encodings, importlib.metadata, importlib.util, json, sys",
+    "packages = ('torch', 'transformers', 'accelerate', 'safetensors', 'aiohttp', 'sentencepiece', 'numpy')",
+    "missing = [name for name in packages if importlib.util.find_spec(name) is None]",
+    "assert not missing, f'missing runtime packages: {missing}'",
+    "versions = {name: importlib.metadata.version(name) for name in packages}",
+    "payload = {'prefix': sys.prefix, 'basePrefix': sys.base_prefix, 'pythonVersion': '.'.join(map(str, sys.version_info[:3])), 'torchVersion': versions['torch'], 'transformersVersion': versions['transformers'], 'accelerateVersion': versions['accelerate'], 'safetensorsVersion': versions['safetensors'], 'aiohttpVersion': versions['aiohttp'], 'sentencepieceVersion': versions['sentencepiece'], 'numpyVersion': versions['numpy']}",
+    `print('${PORTABLE_RUNTIME_PROBE_MARKER}' + json.dumps(payload, separators=(',', ':')), flush=True)`,
+  ].join("\n");
 }
 
 function validatePortablePythonArtifact(value: unknown, platform: string, arch: string): void {
@@ -1603,6 +1669,15 @@ function safeResolve(root: string, value: string): string {
   return result;
 }
 
+function sameResolvedPath(value: unknown, expected: string): boolean {
+  if (typeof value !== "string" || !value.trim()) return false;
+  const actual = resolve(value);
+  const target = resolve(expected);
+  return process.platform === "win32"
+    ? actual.toLowerCase() === target.toLowerCase()
+    : actual === target;
+}
+
 function unique(values: readonly string[]): string[] {
   return [...new Set(values.map((value) => resolve(value)))];
 }
@@ -1703,10 +1778,19 @@ function progressIssue(
   phase: AcceleratorProgressPhase,
 ): AcceleratorProgressIssue {
   if (error instanceof AcceleratorSetupError) return error.issue;
+  const message = shortError(error);
+  if (/init_fs_encoding|no module named ['"]encodings['"]/i.test(message)) {
+    return {
+      code: "cache-invalid",
+      message: "The bundled Python runtime is incomplete after an interrupted application update.",
+      retryable: true,
+      action: "Restart mycellios so it can rebuild the runtime automatically. The node will not advertise compute until verification passes.",
+    };
+  }
   if (phase === "physical-probe") {
     return {
       code: "physical-probe",
-      message: shortError(error),
+      message,
       retryable: true,
       action: "Update the GPU driver and retry. CPU remains available in the meantime.",
     };
@@ -1714,14 +1798,14 @@ function progressIssue(
   if (phase === "downloading" || phase === "verifying-package") {
     return {
       code: phase === "verifying-package" ? "integrity" : "network",
-      message: shortError(error),
+      message,
       retryable: true,
       action: "Check the internet connection and retry; verified partial downloads are reusable.",
     };
   }
   return {
     code: "install",
-    message: shortError(error),
+    message,
     retryable: true,
     action: "Retry GPU setup. If it repeats, update mycellios or the GPU driver.",
   };
