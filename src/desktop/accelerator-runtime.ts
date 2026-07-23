@@ -647,14 +647,12 @@ export async function prepareAcceleratorRuntime(
     const python = runtimePythonExecutable(staging, baseManifest.executable);
     const initialEnvironment = runtimeEnvironmentAdditions(staging);
     failurePhase = "installing";
-    emit("installing", 74, "Removing the CPU-only PyTorch wheel from the isolated GPU runtime.");
-    await runChecked(
-      runner,
-      python,
-      ["-m", "pip", "uninstall", "--yes", "torch"],
-      commandEnvironment(initialEnvironment),
-      "remove the CPU torch wheel",
-    );
+    // The certified portable base deliberately omits wheel RECORD files. A
+    // regular uninstall/reinstall therefore cannot remove its CPU-only torch
+    // package and pip aborts with `uninstall-no-record-file`. The accelerator
+    // runtime is an isolated copy, so overwrite that package in place and rely
+    // on the mandatory physical probe below before activating the runtime.
+    emit("installing", 74, "Replacing CPU-only PyTorch inside the isolated GPU runtime.");
     for (const [index, group] of pack.installGroups.entries()) {
       const installPercent = 76 + 16 * (index / pack.installGroups.length);
       emit(
@@ -674,6 +672,7 @@ export async function prepareAcceleratorRuntime(
           "--no-cache-dir",
           "--no-index",
           "--no-deps",
+          "--ignore-installed",
           // ROCm's signed SDK bootstrap is distributed as a source archive.
           // Reuse the certified runtime's pinned setuptools instead of asking
           // pip to create an isolated build environment that would require an

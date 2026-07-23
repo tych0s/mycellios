@@ -582,8 +582,14 @@ describe("desktop accelerator runtime", () => {
     ]));
     const pipInstall = vi.mocked(runner).mock.calls.find((call) => call[1].includes("install"));
     expect(pipInstall?.[1]).toEqual(expect.arrayContaining(downloadedPaths));
-    expect(pipInstall?.[1]).toEqual(expect.arrayContaining(["--no-index", "--no-deps", "--no-build-isolation"]));
+    expect(pipInstall?.[1]).toEqual(expect.arrayContaining([
+      "--no-index",
+      "--no-deps",
+      "--no-build-isolation",
+      "--ignore-installed",
+    ]));
     expect(pipInstall?.[1].some((argument) => argument.startsWith("https://"))).toBe(false);
+    expect(vi.mocked(runner).mock.calls.some((call) => call[1].includes("uninstall"))).toBe(false);
     expect(existsSync(abandonedStaging)).toBe(false);
   });
 
