@@ -84,7 +84,17 @@ export function gpuPreparationRetryDelayMs(attempt: number): number {
 
 /** Null means a cheap/recoverable condition can keep retrying with backoff. */
 export function gpuPreparationAutomaticRetryLimit(issueCode: string): number | null {
-  if (issueCode === "network" || issueCode === "disk-space") return null;
+  // A model-specific native crash or a transient runtime failure can recover
+  // after a driver update, an application update, a reboot, or the accelerator
+  // cache being rebuilt. Keep the certified CPU runtime serving work and
+  // re-probe in the background with capped backoff instead of permanently
+  // abandoning the GPU on an unattended user's machine.
+  if (
+    issueCode === "network"
+    || issueCode === "disk-space"
+    || issueCode === "runtime-error"
+    || issueCode === "gpu-model-stage"
+  ) return null;
   if (issueCode === "integrity") return 1;
   return 2;
 }

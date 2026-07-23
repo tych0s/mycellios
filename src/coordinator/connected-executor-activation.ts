@@ -3,7 +3,7 @@ import { parseAutoDistributionConfig } from "../distribution/auto-distribute.js"
 import type { LaunchAgent } from "../distribution/launch-supervisor.js";
 import type { PythonPipelineLaunchDescription } from "../distribution/python-launcher.js";
 import { WorkerTunnelLaunchAgent } from "../distribution/worker-tunnel-launch-agent.js";
-import type { StoredWorker } from "../storage/store.js";
+import type { StoredRequestedModel, StoredWorker } from "../storage/store.js";
 import type { WorkerHub } from "./worker-hub.js";
 import type { DynamicActivationSnapshot } from "./model-activation-manager.js";
 
@@ -98,6 +98,53 @@ export function buildConnectedExecutorActivationSnapshot(
     },
   });
   return { capacityNodes, config };
+}
+
+/** True only for a currently published model route that runtime telemetry marks as degraded. */
+export function modelHasGpuFallback(
+  modelId: string,
+  workers: readonly StoredWorker[],
+  connectedWorkerIds: ReadonlySet<string>,
+): boolean {
+  return workers
+    .filter((worker) => connectedWorkerIds.has(worker.id) && worker.status === "online")
+    .flatMap((worker) => worker.capabilities.deployments)
+    .filter((deployment) => deployment.model === modelId)
+    .some((deployment) => {
+      const execution = deployment.execution;
+      if (!execution) return false;
+      return execution.fallback || execution.stages?.some((stage) => stage.fallback) === true;
+    });
+}
+
+/**
+ * A fallback route is recycled only after enough physical executors have
+ * re-published verified GPU capacity for the whole requested topology. CPU
+ * availability keeps inference alive while this condition is false.
+ */
+export function verifiedGpuCapacityCanRepairModel(
+  model: StoredRequestedModel,
+  workers: readonly StoredWorker[],
+  connectedWorkerIds: ReadonlySet<string>,
+): boolean {
+  const minimumStageVramMiB = positiveProfileNumber(model.profile, "minimumStageVramMiB") ?? 512;
+  const requiredVramMiB = positiveProfileNumber(model.profile, "requiredVramMiB")
+    ?? minimumStageVramMiB * model.minimumNodes;
+  const candidates = connectedExecutors(workers, connectedWorkerIds)
+    .filter(({ executor }) => executor.computeMode !== "cpu-only")
+    .map(({ worker }) => ({
+      availableVramMiB: worker.capabilities.gpus
+        .filter((gpu) => gpu.vendor.trim().toLowerCase() !== "cpu" && gpu.physicalVramMb > 0)
+        .reduce((sum, gpu) => sum + gpu.freeOfferedVramMb, 0),
+    }))
+    .filter((candidate) => candidate.availableVramMiB >= minimumStageVramMiB);
+  return candidates.length >= model.minimumNodes
+    && candidates.reduce((sum, candidate) => sum + candidate.availableVramMiB, 0) >= requiredVramMiB;
+}
+
+function positiveProfileNumber(profile: Record<string, unknown> | null, key: string): number | null {
+  const value = profile?.[key];
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
 }
 
 export function resolveConnectedExecutorAgent(

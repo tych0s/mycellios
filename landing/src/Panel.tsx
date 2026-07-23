@@ -41,7 +41,8 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type FormEvent } from "react";
+import { createPortal } from "react-dom";
 import "@fontsource-variable/manrope";
 import type {
   DashboardSnapshot,
@@ -470,7 +471,7 @@ function Overview({ snapshot, onNavigate, publicLink, external, localAcceleratio
       <article className="global-capacity-card">
         <div className="global-capacity-main">
           <div className="global-capacity-heading"><span>GLOBAL NODE CAPACITY</span><b><i /> LIVE</b></div>
-          <div className="execution-overview"><ExecutionBadge execution={execution} large /><span><strong>Effective inference device</strong><small>Reported by the runtime after loading the model, never inferred from detected hardware.</small></span></div>
+          <div className="execution-overview"><ExecutionBadge execution={execution} workers={snapshot.workers} large /><span><strong>Effective inference device</strong><small>Reported by the runtime after loading the model, never inferred from detected hardware.</small></span></div>
           <div className="global-capacity-total"><strong>{formatMemory(activeOfferedVramMb)}</strong><div><b>Active usable memory</b><small>Offered by {operational.length} operational node{operational.length === 1 ? "" : "s"}</small></div></div>
           <div className="global-capacity-bar" aria-label={`${Math.round(freeRatio * 100)}% of offered memory is free`}><i style={{ width: `${freeRatio * 100}%` }} /></div>
           <div className="global-capacity-legend"><span>{formatMemory(freeVramMb)} free now</span><span>{formatMemory(usedVramMb)} in use</span></div>
@@ -629,10 +630,11 @@ function NodeInventorySection({ eyebrow, title, workers, snapshot, busy, onRemov
     <div className="node-card-grid">
       {workers.map((worker) => {
         const execution = workerExecutionSummary(snapshot, worker);
+        const autoRepair = executionAutoRepairActive(execution, snapshot.workers);
         return <article className="node-card" key={worker.id}>
         <div className="node-card-head"><div className={`node-device ${worker.kind}`}><WorkerKindIcon worker={worker} /></div><div><span>{workerKindLabel(worker)}</span><h2>{workerLabel(worker)}</h2><small>{shortId(worker.id)}</small></div><span className={`node-status ${worker.status}`}><i />{nodeStatusLabel(worker)}</span></div>
-        <div className="node-runtime-state"><ExecutionBadge execution={execution} /><span><strong>{execution.verified ? executionDetail(execution) : "No active model is reporting execution on this node"}</strong><small>{execution.verified ? executionDeviceNames(execution) : "Detected GPU hardware is not counted as active compute."}</small></span></div>
-        {execution.stages.length > 0 && <ExecutionStages execution={execution} compact />}
+        <div className={`node-runtime-state${autoRepair ? " repairing" : ""}`}><ExecutionBadge execution={execution} workers={snapshot.workers} /><span><strong>{autoRepair ? "Servicio mantenido en CPU · autoreparación activa" : execution.verified ? executionDetail(execution) : "No active model is reporting execution on this node"}</strong><small>{autoRepair ? "mycellios revalidará la GPU y migrará esta etapa automáticamente." : execution.verified ? executionDeviceNames(execution) : "Detected GPU hardware is not counted as active compute."}</small></span></div>
+        {execution.stages.length > 0 && <ExecutionStages execution={execution} workers={snapshot.workers} compact />}
         <div className="node-card-metrics"><Metric label={worker.kind === "cell" ? "Capacidad" : "Hardware"} value={worker.gpus[0]?.model ?? "Desconocido"} /><Metric label="Ofrecido" value={formatMemory(worker.offeredVramMb)} /><Metric label="Región" value={worker.region} /><Metric label="Completadas" value={String(worker.jobsCompleted)} /></div>
         <div className="node-card-foot"><span>Visto {relativeTimeEs(worker.lastSeenAt)}</span><button disabled={busy === worker.id} onClick={() => void onRemove(worker.id)}>{busy === worker.id ? <LoaderCircle className="spin" /> : <Trash2 />} Eliminar</button></div>
       </article>;})}
@@ -652,7 +654,7 @@ function NodeTopologyInspector({ worker, snapshot }: { worker: PublicWorker; sna
   const throughput = worker.deployments.reduce((total, deployment) => total + deployment.tokensPerSecond, 0);
   const execution = workerExecutionSummary(snapshot, worker);
   return <div className="node-topology-inspector">
-    <div className={`node-inspector-identity ${nodeVisualState(worker)}`}><div><WorkerKindIcon worker={worker} /></div><span><small>{worker.kind === "cell" ? "CELDA SELECCIONADA" : "NODO SELECCIONADO"}</small><strong>{workerLabel(worker)}</strong><em>{worker.region} · {shortId(worker.id)}</em><ExecutionBadge execution={execution} /></span></div>
+    <div className={`node-inspector-identity ${nodeVisualState(worker)}`}><div><WorkerKindIcon worker={worker} /></div><span><small>{worker.kind === "cell" ? "CELDA SELECCIONADA" : "NODO SELECCIONADO"}</small><strong>{workerLabel(worker)}</strong><em>{worker.region} · {shortId(worker.id)}</em><ExecutionBadge execution={execution} workers={snapshot.workers} /></span></div>
     <div className="node-inspector-metrics"><Metric label="Estado" value={nodeStatusLabel(worker)} /><Metric label="GPU libre" value={formatMemory(free)} /><Metric label="Carga física" value={utilization === null ? "Sin datos" : `${utilization.toFixed(0)}%`} /><Metric label="Rend. anunciado" value={throughput > 0 ? `${formatCompactNumber(throughput)} tok/s` : "—"} /><Metric label="Cómputo real" value={execution.verified ? executionShortLabel(execution) : "No verificado"} /><Metric label="Modelos" value={String(worker.deployments.length)} /></div>
   </div>;
 }
@@ -853,7 +855,7 @@ function Models({ snapshot, onSearch, onRequest, onRemove, adminToken: initialAd
     <div className="panel-table model-active-table"><div className="panel-table-head"><span>Active model</span><span>Replicas</span><span>Pipelines</span><span>Effective device</span></div>
       {snapshot.models.map((model) => {
         const execution = modelExecutionSummary(snapshot, model.id);
-        return <div className="panel-table-row model-execution-row" key={model.id}><strong><Boxes size={17} />{model.id}</strong><span>{model.replicas}</span><span>{model.pipelines}</span><ExecutionBadge execution={execution} /></div>;
+        return <div className="panel-table-row model-execution-row" key={model.id}><strong><Boxes size={17} />{model.id}</strong><span>{model.replicas}</span><span>{model.pipelines}</span><ExecutionBadge execution={execution} workers={snapshot.workers} /></div>;
       })}
       {snapshot.models.length === 0 && <Empty icon={Boxes} title="No active models" copy="Choose a model above. It will remain queued with an exact capacity shortfall until the network can run it." />}
     </div>
@@ -1114,7 +1116,7 @@ function Inference({ snapshot, onSend, onNavigate }: {
     </div> : <div className="inference-console">
       <div className="inference-toolbar">
         <label><span>MODELO REAL</span><AppSelect ariaLabel="Modelo real" value={selectedModel} onChange={setModel} options={realModels.map((item) => ({ value: item.id, label: item.id }))} /></label>
-        <div className="inference-model-summary"><ExecutionBadge execution={selectedOption?.execution ?? unknownExecutionSummary()} large /><span className="inference-live"><i />DISPONIBLE</span><span>{selectedOption?.routeLabel}</span><span>{selectedOption?.freeSlots ?? 0} hueco{selectedOption?.freeSlots === 1 ? "" : "s"} libre{selectedOption?.freeSlots === 1 ? "" : "s"}</span></div>
+        <div className="inference-model-summary"><ExecutionBadge execution={selectedOption?.execution ?? unknownExecutionSummary()} workers={snapshot.workers} large /><span className="inference-live"><i />DISPONIBLE</span><span>{selectedOption?.routeLabel}</span><span>{selectedOption?.freeSlots ?? 0} hueco{selectedOption?.freeSlots === 1 ? "" : "s"} libre{selectedOption?.freeSlots === 1 ? "" : "s"}</span></div>
       </div>
       <div className="inference-output" aria-live="polite" ref={outputRef}>
         {turns.length === 0 && !pendingTurn && !error && <div className="inference-welcome"><Sparkles /><h2>Escribe una pregunta</h2><p>La respuesta vendrá del modelo seleccionado, no del adaptador de conectividad.</p><div className="inference-suggestions">{["Resume cómo funciona esta red", "Explica una idea en tres frases", "Responde con una prueba corta"].map((suggestion) => <button key={suggestion} onClick={() => setPrompt(suggestion)}>{suggestion}</button>)}</div></div>}
@@ -1884,20 +1886,107 @@ function executionDeviceNames(execution: EffectiveExecutionSummary): string {
   return execution.deviceNames.length > 0 ? execution.deviceNames.join(" · ") : "Device name unavailable";
 }
 
-function ExecutionBadge({ execution, large = false }: { execution: EffectiveExecutionSummary; large?: boolean }) {
+function ExecutionBadge({ execution, workers = [], large = false, interactive = true }: {
+  execution: EffectiveExecutionSummary;
+  workers?: PublicWorker[];
+  large?: boolean;
+  interactive?: boolean;
+}) {
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const dialogTitleId = useId();
   const Icon = execution.deviceType === "gpu" ? Zap : execution.deviceType === "mixed" ? Network : Cpu;
   const title = execution.fallbackReasons.length > 0 ? execution.fallbackReasons.join(" · ") : executionDetail(execution);
-  return <span className={`execution-badge ${execution.deviceType}${execution.fallback ? " fallback" : ""}${large ? " large" : ""}`} title={title}><Icon /><span><strong>{executionShortLabel(execution)}</strong>{large && <small>{execution.verified ? execution.backends.map((backend) => backend.toUpperCase()).join(" + ") : "NO DEVICE CLAIM"}</small>}</span></span>;
+  const diagnosticsAvailable = interactive && execution.verified && (execution.stages.length > 0 || execution.fallbackReasons.length > 0);
+  const autoRepair = executionAutoRepairActive(execution, workers);
+  const className = `execution-badge ${execution.deviceType}${execution.fallback ? " fallback" : ""}${large ? " large" : ""}`;
+  const contents = <><Icon /><span><strong>{executionShortLabel(execution)}</strong>{large && <small>{execution.verified ? execution.backends.map((backend) => backend.toUpperCase()).join(" + ") : "NO DEVICE CLAIM"}</small>}</span>{diagnosticsAvailable && <ChevronRight className="execution-badge-arrow" />}</>;
+
+  useEffect(() => {
+    if (!diagnosticsOpen) return;
+    const previousOverflow = document.body.style.overflow;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setDiagnosticsOpen(false);
+    };
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [diagnosticsOpen]);
+
+  if (!diagnosticsAvailable) return <span className={className} title={title}>{contents}</span>;
+  return <>
+    <button type="button" className={className} title={title} aria-haspopup="dialog" aria-expanded={diagnosticsOpen} onClick={() => setDiagnosticsOpen(true)}>{contents}</button>
+    {diagnosticsOpen && createPortal(
+      <div className="execution-diagnostic-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setDiagnosticsOpen(false); }}>
+        <section className="execution-diagnostic-dialog" role="dialog" aria-modal="true" aria-labelledby={dialogTitleId}>
+          <header className="execution-diagnostic-head">
+            <div><span>TELEMETRÍA REAL</span><h2 id={dialogTitleId}>Diagnóstico de ejecución</h2><p>Dispositivo y backend confirmados por cada proceso después de cargar el modelo.</p></div>
+            <button type="button" aria-label="Cerrar diagnóstico" onClick={() => setDiagnosticsOpen(false)}><X /></button>
+          </header>
+          <div className="execution-diagnostic-summary">
+            <div><small>ESTADO</small><strong>{executionShortLabel(execution)}</strong></div>
+            <div><small>BACKENDS</small><strong>{execution.backends.map((backend) => backend.toUpperCase()).join(" + ")}</strong></div>
+            <div><small>ETAPAS</small><strong>{execution.unitCount}</strong></div>
+            <div><small>FALLBACK</small><strong>{execution.fallback ? "Sí" : "No"}</strong></div>
+          </div>
+          {execution.fallbackReasons.length > 0 && <div className="execution-diagnostic-alert"><CircleAlert /><span><small>MOTIVO DEL FALLBACK</small><strong>{execution.fallbackReasons.join(" · ")}</strong></span></div>}
+          {autoRepair && <div className="execution-diagnostic-repair"><RefreshCw /><span><small>AUTOREPARACIÓN ACTIVA</small><strong>La CPU mantiene el servicio mientras mycellios revalida la GPU. Cuando haya capacidad GPU verificada suficiente, el coordinador reconstruirá la ruta y ejecutará un canary real antes de publicarla.</strong></span></div>}
+          <div className="execution-diagnostic-stages">
+            <div className="execution-diagnostic-section-title"><span>RUTA DEL MODELO</span><small>{execution.stages.length > 0 ? `${execution.stages.length} etapas verificadas` : "Runtime verificado"}</small></div>
+            {execution.stages.length > 0 ? execution.stages.map((stage) => {
+              const host = executionWorkerForNode(workers, stage.nodeId);
+              const stageSummary = summarizeExecutionStages([stage]);
+              return <article className={`execution-diagnostic-stage${stage.fallback ? " fallback" : ""}`} key={`${stage.nodeId}-${stage.stageIndex}`}>
+                <div className="execution-diagnostic-stage-head"><span><b>{String(stage.stageIndex + 1).padStart(2, "0")}</b><span><small>ETAPA {stage.stageIndex + 1}</small><strong>Capas {stage.layerStart}–{stage.layerEnd}</strong></span></span><ExecutionBadge execution={stageSummary} interactive={false} /></div>
+                <div className="execution-diagnostic-stage-grid">
+                  <div><small>EQUIPO FÍSICO</small><strong>{host ? workerLabel(host) : "Equipo no identificado"}</strong></div>
+                  <div><small>DISPOSITIVO USADO</small><strong>{stage.deviceName}</strong></div>
+                  <div><small>BACKEND</small><strong>{stage.backend.toUpperCase()} · {stage.precision}</strong></div>
+                  <div><small>NODO</small><code title={stage.nodeId}>{shortId(stage.nodeId)}</code></div>
+                  {host?.computeMode && <div><small>MODO</small><strong>{computeModeLabel(host.computeMode)}</strong></div>}
+                </div>
+                {stage.fallbackReason && <p><CircleAlert />{stage.fallbackReason}</p>}
+              </article>;
+            }) : <article className="execution-diagnostic-runtime"><strong>{executionDeviceNames(execution)}</strong><span>{executionDetail(execution)}</span></article>}
+          </div>
+          <footer className="execution-diagnostic-foot"><HardDrive /><span><strong>Registro completo en la máquina afectada</strong><small>Windows: <code>%APPDATA%\mycellios\mycellios.log</code>. En macOS y Linux se guarda como <code>mycellios.log</code> dentro de la carpeta de datos de la aplicación.</small></span></footer>
+        </section>
+      </div>,
+      document.body,
+    )}
+  </>;
 }
 
-function ExecutionStages({ execution, compact = false }: { execution: EffectiveExecutionSummary; compact?: boolean }) {
+function ExecutionStages({ execution, workers = [], compact = false }: { execution: EffectiveExecutionSummary; workers?: PublicWorker[]; compact?: boolean }) {
   if (execution.stages.length === 0) return null;
   return <div className={`execution-stage-list${compact ? " compact" : ""}`}>
     {execution.stages.map((stage) => {
       const summary = summarizeExecutionStages([stage]);
-      return <div className="execution-stage" key={`${stage.nodeId}-${stage.stageIndex}`}><span><small>STAGE {stage.stageIndex + 1} · LAYERS {stage.layerStart}–{stage.layerEnd}</small><strong>{stage.deviceName}</strong><em>{shortId(stage.nodeId)} · {stage.backend.toUpperCase()} · {stage.precision}</em></span><ExecutionBadge execution={summary} /></div>;
+      const host = executionWorkerForNode(workers, stage.nodeId);
+      return <div className="execution-stage" key={`${stage.nodeId}-${stage.stageIndex}`}><span><small>STAGE {stage.stageIndex + 1} · LAYERS {stage.layerStart}–{stage.layerEnd}</small><strong>{stage.deviceName}</strong><em>{host ? `${workerLabel(host)} · ` : ""}{shortId(stage.nodeId)} · {stage.backend.toUpperCase()} · {stage.precision}</em></span><ExecutionBadge execution={summary} interactive={false} /></div>;
     })}
   </div>;
+}
+
+function executionWorkerForNode(workers: readonly PublicWorker[], nodeId: string): PublicWorker | undefined {
+  return workers.find((worker) => (worker.executionNodeId ?? worker.id) === nodeId);
+}
+
+function executionAutoRepairActive(
+  execution: EffectiveExecutionSummary,
+  workers: readonly PublicWorker[],
+): boolean {
+  return execution.fallback && execution.stages.some((stage) => (
+    executionWorkerForNode(workers, stage.nodeId)?.computeMode === "automatic"
+  ));
+}
+
+function computeModeLabel(mode: NonNullable<PublicWorker["computeMode"]>): string {
+  if (mode === "gpu-only") return "Solo GPU";
+  if (mode === "cpu-only") return "Solo CPU";
+  return "Automático";
 }
 
 function inferenceModelOption(snapshot: PublicSnapshot, model: PublicSnapshot["models"][number]) {

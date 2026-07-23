@@ -119,11 +119,12 @@ describe("verified desktop acceleration evidence", () => {
     expect([0, 1, 2, 9].map(gpuPreparationRetryDelayMs)).toEqual([30_000, 120_000, 300_000, 300_000]);
   });
 
-  it("limits expensive repeated failures while network failures keep resumable backoff", () => {
+  it("keeps recoverable unattended failures retrying while bounding corrupt installs", () => {
     expect(gpuPreparationAutomaticRetryLimit("integrity")).toBe(1);
     expect(gpuPreparationAutomaticRetryLimit("install")).toBe(2);
     expect(gpuPreparationAutomaticRetryLimit("physical-probe")).toBe(2);
-    expect(gpuPreparationAutomaticRetryLimit("runtime-error")).toBe(2);
+    expect(gpuPreparationAutomaticRetryLimit("runtime-error")).toBeNull();
+    expect(gpuPreparationAutomaticRetryLimit("gpu-model-stage")).toBeNull();
     expect(gpuPreparationAutomaticRetryLimit("network")).toBeNull();
     expect(gpuPreparationAutomaticRetryLimit("disk-space")).toBeNull();
   });

@@ -32,6 +32,10 @@ import {
   type ReleaseAssetChannel,
 } from "./release-upload.js";
 import { WorkerHub } from "./worker-hub.js";
+import {
+  modelHasGpuFallback,
+  verifiedGpuCapacityCanRepairModel,
+} from "./connected-executor-activation.js";
 
 export function automaticActivationFailureIsTransient(message: string): boolean {
   const normalized = message.toLowerCase();
@@ -197,6 +201,8 @@ export async function createCoordinator(
   const service = new MeshService(store, scheduler, hub, config.requestTimeoutMs);
   const activationManager = options.activationManager ?? options.activationManagerFactory?.({ store, hub });
   await activationManager?.initialize();
+  const automaticRepairState = new Map<string, { attempts: number; nextAttemptAt: number }>();
+  const automaticRepairInFlight = new Set<string>();
   const launchRequestedModel = (model: import("../storage/store.js").StoredRequestedModel) => {
     if (!activationManager || activationManager.isManaging(model.id) || activationManager.isBusy()) return;
     void activationManager.activate(model).catch((error: unknown) => {
@@ -213,17 +219,62 @@ export async function createCoordinator(
       }
     });
   };
+  const reconcileAutomaticGpuRepair = (
+    model: import("../storage/store.js").StoredRequestedModel,
+    activeModelIds: ReadonlySet<string>,
+    workers: readonly StoredWorker[],
+    connectedWorkerIds: ReadonlySet<string>,
+  ) => {
+    if (!activationManager || !model.autoActivate || !activeModelIds.has(model.id)) return;
+    const degraded = modelHasGpuFallback(model.id, workers, connectedWorkerIds);
+    if (!degraded) {
+      automaticRepairState.delete(model.id);
+      return;
+    }
+    if (
+      automaticRepairInFlight.has(model.id)
+      || !activationManager.isManaging(model.id)
+      || !verifiedGpuCapacityCanRepairModel(model, workers, connectedWorkerIds)
+    ) return;
+    const now = Date.now();
+    const previous = automaticRepairState.get(model.id) ?? { attempts: 0, nextAttemptAt: 0 };
+    if (now < previous.nextAttemptAt) return;
+    const repairDelays = [30_000, 120_000, 300_000] as const;
+    const delay = repairDelays[Math.min(previous.attempts, repairDelays.length - 1)]!;
+    automaticRepairState.set(model.id, {
+      attempts: previous.attempts + 1,
+      nextAttemptAt: now + delay,
+    });
+    automaticRepairInFlight.add(model.id);
+    void (async () => {
+      // Keep the CPU fallback online until verified GPU capacity is ready, then
+      // recycle the managed topology. The normal activation path runs a fresh
+      // health check and real inference canary before publishing it again.
+      const stopped = await activationManager.deactivate(model.id);
+      if (!stopped) return;
+      const latest = store.getRequestedModel(model.id);
+      if (!latest?.autoActivate) return;
+      store.setRequestedModelActivation(model.id, true);
+      launchRequestedModel(store.getRequestedModel(model.id)!);
+    })().catch((error: unknown) => {
+      app.log.warn({ modelId: model.id, error }, "automatic GPU repair could not be started");
+    }).finally(() => {
+      automaticRepairInFlight.delete(model.id);
+    });
+  };
   const reconcileRequestedModels = () => {
+    const workers = store.listWorkers();
+    const connectedWorkerIds = hub.connectedWorkerIds();
     const activeModelIds = new Set(
       scheduler
-        .listAvailableModels({ connectedWorkerIds: hub.connectedWorkerIds() })
+        .listAvailableModels({ connectedWorkerIds })
         .map((model) => model.id),
     );
     const requests = store.listRequestedModels();
     const views = requestedModelCapacityViews({
       requests,
-      workers: store.listWorkers(),
-      connectedWorkerIds: hub.connectedWorkerIds(),
+      workers,
+      connectedWorkerIds,
       activeModelIds,
       ...(activationManager
         ? { executionNodesForModel: (modelId: string) => activationManager.capacityNodesForModel(modelId) }
@@ -252,6 +303,9 @@ export async function createCoordinator(
       ) {
         store.setRequestedModelActivation(view.id, false);
       }
+    }
+    for (const model of requests) {
+      reconcileAutomaticGpuRepair(model, activeModelIds, workers, connectedWorkerIds);
     }
   };
   const benchmarkRoot = process.env.MYCELLIOS_BENCHMARK_ROOT?.trim() || process.cwd();
