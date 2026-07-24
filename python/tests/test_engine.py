@@ -96,6 +96,17 @@ class EngineUnitTests(unittest.TestCase):
         self.assertEqual(len(wave), 4)
         self.assertEqual(engine._received_frames.qsize(), 0)
 
+    def test_ragged_grouping_env_switch_defaults_off(self) -> None:
+        from distributed_runtime.engine import _ragged_grouping_enabled
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GDLP_RAGGED_GROUPING", None)
+            self.assertFalse(_ragged_grouping_enabled())
+        with mock.patch.dict(os.environ, {"GDLP_RAGGED_GROUPING": "1"}):
+            self.assertTrue(_ragged_grouping_enabled())
+        with mock.patch.dict(os.environ, {"GDLP_RAGGED_GROUPING": "0"}):
+            self.assertFalse(_ragged_grouping_enabled())
+
     def test_prefill_and_speculation_configuration_is_bounded(self) -> None:
         common = dict(model_name="fake", boundaries=(0, 2, 4))
         configured = PipelineEngineConfig(

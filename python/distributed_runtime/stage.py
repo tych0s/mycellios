@@ -1761,11 +1761,18 @@ def collect_compatible_activation_frames(
     """
 
     batch_forward = getattr(runner, "forward_hidden_batch", None)
-    # Strict equal-length grouping by default. `physical_batch_group_key` enables
-    # ragged fusion (checklist 2.6, token-exact) but regresses throughput with a
-    # fixed window (see engine.py note + REGISTRO_VERIFICACIONES.md §8); wire it
-    # only with the adaptive window.
-    batch_key = getattr(runner, "physical_batch_key", None)
+    # Strict equal-length grouping by default; GDLP_RAGGED_GROUPING=1 opts in to
+    # the length-agnostic key (ragged fusion, checklist 2.6; see engine.py note
+    # + REGISTRO_VERIFICACIONES.md §8). Read at call time from the environment —
+    # stage runs in a subprocess and inherits the launcher's env.
+    import os as _os
+
+    if _os.environ.get("GDLP_RAGGED_GROUPING") == "1":
+        batch_key = getattr(runner, "physical_batch_group_key", None) or getattr(
+            runner, "physical_batch_key", None
+        )
+    else:
+        batch_key = getattr(runner, "physical_batch_key", None)
     first_is_tree_leaf = (
         branch_parents is not None and first.request_id in branch_parents
     )

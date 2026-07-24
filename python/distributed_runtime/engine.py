@@ -139,6 +139,20 @@ def _hadamard_quantization_block_count(hidden_size: int) -> int:
 _BATCH_DEBUG_PATH = os.environ.get("GDLP_BATCH_DEBUG")
 
 
+def _ragged_grouping_enabled() -> bool:
+    """Opt-in switch for length-agnostic (ragged) physical batching.
+
+    Checked at call time so tests and deployments can toggle it via the
+    environment without reloading modules. Default OFF: the strict equal-length
+    grouping stays the production default until ragged fusion is re-measured at
+    saturation on a weight-bound model (checklist 2.6; the 135M/CPU testbed
+    regressed, larger models measure fusion-efficient — see
+    docs/benchmarks/ragged-batching-integration-2026-07-23/).
+    """
+
+    return os.environ.get("GDLP_RAGGED_GROUPING") == "1"
+
+
 def _batch_debug(record: dict[str, Any]) -> None:
     """Append one JSON line of root-batching diagnostics when GDLP_BATCH_DEBUG is set.
 
@@ -4836,13 +4850,16 @@ class DistributedPipelineEngine:
         self._root_ready_items += len(waves)
 
         batch_forward = getattr(runner, "forward_ids_batch", None)
-        # Strict equal-length grouping by default. The length-agnostic
-        # `physical_batch_group_key` enables ragged fusion (checklist 2.6) and is
-        # proven token-exact, BUT measured (23-07) to regress service throughput
-        # with the current FIXED collection window (it fuses — B_eff 1->3.5 — yet
-        # backs up: the window cost is paid every step). Wire it here only
-        # together with the adaptive window; see REGISTRO_VERIFICACIONES.md §8.
-        batch_key = getattr(runner, "physical_batch_key", None)
+        # Strict equal-length grouping by default; GDLP_RAGGED_GROUPING=1 opts in
+        # to the length-agnostic key (ragged fusion, checklist 2.6 — token-exact,
+        # pending saturation re-measurement on a weight-bound model/GPU; see
+        # REGISTRO_VERIFICACIONES.md §8).
+        if _ragged_grouping_enabled():
+            batch_key = getattr(runner, "physical_batch_group_key", None) or getattr(
+                runner, "physical_batch_key", None
+            )
+        else:
+            batch_key = getattr(runner, "physical_batch_key", None)
         maximum = getattr(runner, "MAX_PHYSICAL_BATCH_SIZE", 1)
         if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 2:
             maximum = 1
