@@ -12,4 +12,16 @@ describe("Landing navigation", () => {
     );
     expect(html).toContain('<a href="/blog">Blog</a>');
   });
+
+  it("places the short visual explanation before the first idea section", () => {
+    const html = renderToStaticMarkup(<Landing />);
+    const explainer = html.indexOf('id="explainer"');
+    const idea = html.indexOf('id="vision"');
+
+    expect(explainer).toBeGreaterThan(-1);
+    expect(idea).toBeGreaterThan(-1);
+    expect(explainer).toBeLessThan(idea);
+    expect(html).toContain("Several devices. One AI model.");
+    expect(html).toContain('href="#explainer"');
+  });
 });
