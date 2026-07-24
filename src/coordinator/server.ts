@@ -47,6 +47,7 @@ import {
   ContentHubClient,
   registerContentHubRoutes,
 } from "./content-hub.js";
+import { SupabaseAuthService } from "./supabase-auth.js";
 
 export function automaticActivationFailureIsTransient(message: string): boolean {
   const normalized = message.toLowerCase();
@@ -157,6 +158,7 @@ export async function createCoordinator(
       const path = request.url.split("?", 1)[0] ?? request.url;
       if (!path.startsWith("/internal/v1/") && !path.startsWith("/v1/")) return;
       if (path.startsWith("/internal/v1/releases/")) return;
+      if (path === "/v1/auth/me") return;
       // Mobile expert administration has its own stronger control-plane
       // credential above. Requiring both secrets in one Authorization header
       // would make the route impossible to use when the tokens differ.
@@ -167,24 +169,57 @@ export async function createCoordinator(
       }
     });
   }
-  const authorizeModelMutation = (request: FastifyRequest, reply: FastifyReply): boolean => {
+  const supabaseAuth = config.supabaseUrl && config.supabaseServiceRoleKey
+    ? new SupabaseAuthService(config.supabaseUrl, config.supabaseServiceRoleKey)
+    : null;
+  const authorizeModelMutation = async (
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ): Promise<boolean> => {
     const expected = config.modelAdminToken;
     if (!expected && isLoopbackAddress(request.ip)) return true;
-    if (!expected) {
+    const legacyHeader = request.headers["x-mycellios-admin-token"];
+    const legacyToken = typeof legacyHeader === "string"
+      ? legacyHeader.trim()
+      : Array.isArray(legacyHeader) ? legacyHeader[0]?.trim() : undefined;
+    const bearer = parseBearerToken(request.headers.authorization);
+    if (expected && (
+      (legacyToken && constantTimeEqual(legacyToken, expected))
+      || (bearer && constantTimeEqual(bearer, expected))
+    )) return true;
+    if (bearer && supabaseAuth) {
+      try {
+        const user = await supabaseAuth.authenticate(bearer);
+        if (user && user.role && ["owner", "admin", "operator"].includes(user.role)) return true;
+        if (user) {
+          void reply.code(403).send({
+            error: {
+              code: "insufficient_network_role",
+              message: "Your Mycellios account does not have permission to change shared models.",
+            },
+          });
+          return false;
+        }
+      } catch (error) {
+        app.log.warn(
+          { error: error instanceof Error ? error.message : String(error) },
+          "Supabase authorization lookup failed",
+        );
+      }
+    }
+    if (!expected && !supabaseAuth) {
       void reply.code(503).send({
         error: {
           code: "model_administration_not_configured",
-          message: "Remote model administration requires MYCELLIOS_MODEL_ADMIN_TOKEN.",
+          message: "Remote model administration requires Supabase Auth or MYCELLIOS_MODEL_ADMIN_TOKEN.",
         },
       });
       return false;
     }
-    const received = parseBearerToken(request.headers.authorization);
-    if (received && constantTimeEqual(received, expected)) return true;
     void reply.code(401).send({
       error: {
         code: "invalid_model_admin_token",
-        message: "The network administrator token is missing or invalid.",
+        message: "Sign in with an authorized Mycellios account or enter the administrator token.",
       },
     });
     return false;
@@ -706,6 +741,23 @@ export async function createCoordinator(
     };
   });
 
+  app.get("/public/v1/auth-config", async () => ({
+    enabled: Boolean(config.supabaseUrl && config.supabaseAnonKey),
+    ...(config.supabaseUrl && config.supabaseAnonKey
+      ? { url: config.supabaseUrl, anonKey: config.supabaseAnonKey }
+      : {}),
+  }));
+
+  app.get("/v1/auth/me", async (request, reply) => {
+    const token = parseBearerToken(request.headers.authorization);
+    if (!token || !supabaseAuth) {
+      return reply.code(401).send({ error: { code: "authentication_required" } });
+    }
+    const user = await supabaseAuth.authenticate(token);
+    if (!user) return reply.code(401).send({ error: { code: "invalid_access_token" } });
+    return { user };
+  });
+
   app.get("/public/v1/snapshot", async () => {
     reconcileRequestedModels();
     return publicSnapshot(store, scheduler, hub, mobileHub, activationManager, {
@@ -729,7 +781,7 @@ export async function createCoordinator(
   });
 
   app.post("/public/v1/requested-models", async (request, reply) => {
-    if (!authorizeModelMutation(request, reply)) return;
+    if (!await authorizeModelMutation(request, reply)) return;
     const body = requestedModelCreateSchema.parse(request.body);
     automaticActivationRetryState.delete(body.id);
     const stored = store.upsertRequestedModel({
@@ -766,7 +818,7 @@ export async function createCoordinator(
   });
 
   app.delete("/public/v1/requested-models/:modelId", async (request, reply) => {
-    if (!authorizeModelMutation(request, reply)) return;
+    if (!await authorizeModelMutation(request, reply)) return;
     const { modelId } = requestedModelParamsSchema.parse(request.params);
     await activationManager?.deactivate(modelId);
     if (!store.removeRequestedModel(modelId)) {
