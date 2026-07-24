@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ModelActivationManager } from "../src/coordinator/model-activation-manager.js";
+import type { ModelActivationProgressEvent } from "../src/coordinator/model-catalog.js";
 import {
   automaticActivationFailureIsTransient,
   createCoordinator,
@@ -152,6 +153,12 @@ describe("requested model API activation flow", () => {
     const manager = new FakeActivationManager([
       "managed_launch_agent_is_unavailable:desktop-a",
     ]);
+    manager.progress.push({
+      phase: "profiling",
+      message: "Existing activation event.",
+      at: "2026-01-01T00:00:00.000Z",
+      state: "completed",
+    });
     runtime = await createCoordinator({
       host: "127.0.0.1",
       port: 8_787,
@@ -196,6 +203,10 @@ describe("requested model API activation flow", () => {
     expect(model.activationProgress).toEqual(expect.arrayContaining([
       expect.objectContaining({ phase: "retrying", state: "running" }),
     ]));
+    const timestamps = model.activationProgress.map(
+      (event: ModelActivationProgressEvent) => Date.parse(event.at),
+    );
+    expect(timestamps).toEqual([...timestamps].sort((left, right) => left - right));
   });
 
   it("rebuilds a managed cell immediately when its inference proxy fails before token zero", async () => {
@@ -323,6 +334,7 @@ describe("automatic activation recovery", () => {
 class FakeActivationManager implements ModelActivationManager {
   readonly activated: StoredRequestedModel[] = [];
   readonly deactivated: string[] = [];
+  readonly progress: ModelActivationProgressEvent[] = [];
   private managing: string | null = null;
 
   constructor(private readonly failures: string[] = []) {}
@@ -350,6 +362,9 @@ class FakeActivationManager implements ModelActivationManager {
     this.deactivated.push(modelId);
     this.managing = null;
     return true;
+  }
+  activationProgressForModel(): readonly ModelActivationProgressEvent[] {
+    return this.progress;
   }
   async close(): Promise<void> { this.managing = null; }
 }
