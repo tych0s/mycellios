@@ -253,7 +253,20 @@ export class DynamicModelActivationManager implements ModelActivationManager {
     const running = (async () => {
       this.appendProgress(model.id, "profiling", "Reading the model and preparing its execution profile.");
       const profile = await profileCompatibleModel(config, cwd, environment);
-      this.appendProgress(model.id, "profile_ready", "Model profile ready. Calculating the layer distribution.");
+      this.appendProgress(
+        model.id,
+        "profile_ready",
+        "Model profile ready. Calculating the layer distribution.",
+        "running",
+        {
+          details: [
+            `Model: ${profile.source.model}`,
+            `Architecture: ${profile.inspection.architecture ?? "not reported"}`,
+            `Layers detected: ${profile.model.layers.length}`,
+            `Snapshot: ${profile.source.snapshotCommit ?? profile.source.revision ?? "default revision"}`,
+          ],
+        },
+      );
       if (controller.signal.aborted) return;
       let compilation = compileAutoDistribution(config, profile);
       const rootHost = compilation.manifest.plans.decode.stages[0]?.anchor.endpoint.host;
@@ -277,6 +290,14 @@ export class DynamicModelActivationManager implements ModelActivationManager {
         model.id,
         "plan_ready",
         `Distribution plan ready: ${compilation.manifest.plans.decode.stages.length} stages across ${config.nodes.length} nodes.`,
+        "running",
+        {
+          details: compilation.manifest.plans.decode.stages.map((stage, index, stages) => (
+            `Stage ${index + 1}/${stages.length}: layers ${stage.layerStart}–`
+            + `${Math.max(stage.layerStart, stage.layerEnd - 1)} of ${profile.model.layers.length} · `
+            + `node ${stage.anchor.memberId}`
+          )),
+        },
       );
       if (controller.signal.aborted) return;
       await runAutoDistribution(config, compilation, cwd, environment, controller.signal, {

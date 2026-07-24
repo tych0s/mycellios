@@ -881,7 +881,7 @@ async function sendChat(request: ChatRequest): Promise<ChatResponse> {
 async function streamChat(request: ChatRequest, onUpdate: (update: ChatStreamUpdate) => void): Promise<ChatResponse> {
   const messages = normalizeDesktopChatMessages(request.messages);
   return consumeChatCompletionStreamWithRecovery(
-    async () => {
+    async (_attempt, signal) => {
       const headers = new Headers({ accept: "text/event-stream", "content-type": "application/json" });
       if (settings.coordinatorMode === "remote" && settings.remoteCoordinatorToken) {
         headers.set("authorization", `Bearer ${settings.remoteCoordinatorToken}`);
@@ -898,7 +898,7 @@ async function streamChat(request: ChatRequest, onUpdate: (update: ChatStreamUpd
           temperature: 0,
           top_p: 1,
         }),
-        signal: AbortSignal.timeout(3 * 60_000),
+        signal,
         redirect: "error",
       });
     },

@@ -350,6 +350,7 @@ export interface ChatStreamUpdate {
   phase?: "connecting" | "waiting_first_token" | "recovering" | "streaming";
   statusMessage?: string;
   attempt?: number;
+  maximumAttempts?: number;
   affectedWorkerId?: string;
   affectedNodeId?: string;
 }

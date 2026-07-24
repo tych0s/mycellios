@@ -267,7 +267,7 @@ export interface AutoDistributionRunOptions {
 }
 
 export interface AutoDistributionProgressEvent {
-  phase: "preparing_nodes" | "launching_stages" | "stages_ready" | "checking_health" | "running_canary" | "publishing_model" | "active" | "failed";
+  phase: "preparing_nodes" | "launching_stages" | "stage_loading" | "stage_ready" | "stages_ready" | "checking_health" | "running_canary" | "publishing_model" | "active" | "failed";
   message: string;
   nodeId?: string;
   processId?: string;
@@ -385,6 +385,10 @@ export async function runAutoDistribution(
   options.onProgress?.({
     phase: "preparing_nodes",
     message: `Preparing ${config.nodes.length} network nodes.`,
+    details: config.nodes.map((node, index) => (
+      `Node ${index + 1}/${config.nodes.length}: ${node.id} · `
+      + `${Math.max(0, node.memoryMiB - node.reserveMiB)} MiB available · ${node.agent.kind} agent`
+    )),
   });
   const agents = await createLaunchAgents(config, cwd, environment, compilation.launch, options);
   const supervisor = new PythonLaunchSupervisor(compilation.launch, {
@@ -394,6 +398,50 @@ export async function runAutoDistribution(
   let worker: WorkerAgent | null = null;
   let workerPromise: Promise<void> | null = null;
   let runtimeProxy: { host: string; port: number; close(): Promise<void> } | null = null;
+  const stageCount = new Set(compilation.launch.launchOrder.map((process) => process.stageIndex)).size;
+  let readyProcesses = 0;
+  const unsubscribeTelemetry = supervisor.subscribe((event) => {
+    if (
+      (event.type !== "process_starting" && event.type !== "process_ready")
+      || !event.processId
+    ) return;
+    const process = compilation.launch.launchOrder.find((candidate) => candidate.processId === event.processId);
+    if (!process) return;
+    const device = requestedLaunchDevice(process);
+    const layerLabel = `${process.layerStart}–${Math.max(process.layerStart, process.layerEnd - 1)}`;
+    if (event.type === "process_starting") {
+      options.onProgress?.({
+        phase: "stage_loading",
+        message: `Stage ${process.stageIndex + 1}/${stageCount} is loading layers ${layerLabel} on ${process.anchor.memberId}.`,
+        nodeId: process.anchor.memberId,
+        processId: process.processId,
+        ...(device ? { device } : {}),
+        details: [
+          `Stage: ${process.stageIndex + 1} of ${stageCount}`,
+          `Layers: ${layerLabel} of ${process.totalLayers}`,
+          `Node: ${process.anchor.memberId}`,
+          `Runtime: ${process.kind}`,
+          ...(device ? [`Device: ${device}`] : []),
+          `Processes ready: ${readyProcesses}/${compilation.launch.launchOrder.length}`,
+        ],
+      });
+      return;
+    }
+    readyProcesses += 1;
+    options.onProgress?.({
+      phase: "stage_ready",
+      message: `Stage ${process.stageIndex + 1}/${stageCount} is ready on ${process.anchor.memberId}.`,
+      nodeId: process.anchor.memberId,
+      processId: process.processId,
+      ...(device ? { device } : {}),
+      details: [
+        `Stage: ${process.stageIndex + 1} of ${stageCount}`,
+        `Layers loaded: ${layerLabel} of ${process.totalLayers}`,
+        `Node: ${process.anchor.memberId}`,
+        `Processes ready: ${readyProcesses}/${compilation.launch.launchOrder.length}`,
+      ],
+    });
+  });
   try {
     options.onProgress?.({
       phase: "launching_stages",
@@ -455,6 +503,7 @@ export async function runAutoDistribution(
     await writeRuntimeFailure(config, error, failureSnapshot, cwd).catch(() => undefined);
     throw error;
   } finally {
+    unsubscribeTelemetry();
     if (worker) await worker.stop().catch(() => undefined);
     await supervisor.stop("auto_distribute_shutdown").catch(() => undefined);
     await runtimeProxy?.close().catch(() => undefined);
@@ -462,6 +511,15 @@ export async function runAutoDistribution(
       [...new Set(agents.values())].map((agent) => Promise.resolve(agent.close?.()).catch(() => undefined)),
     );
   }
+}
+
+function requestedLaunchDevice(
+  process: PythonPipelineLaunchDescription["launchOrder"][number],
+): string | undefined {
+  if (process.kind === "cell-member") return process.device;
+  const index = process.command.args.findIndex((argument) => argument === "--device");
+  const device = index >= 0 ? process.command.args[index + 1] : undefined;
+  return device?.trim() || undefined;
 }
 
 function activationFailureProgress(
