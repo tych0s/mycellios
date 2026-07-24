@@ -109,4 +109,37 @@ describe("worker tunnel execution telemetry", () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
     await agent.close();
   });
+
+  it("does not block route cleanup when a connected worker never acknowledges stop", async () => {
+    const hub = new FakeWorkerHub();
+    const description = {
+      launchId: "launch-stop-timeout",
+      pipelineId: "pipeline-stop-timeout",
+      launchOrder: [],
+    } as unknown as PythonPipelineLaunchDescription;
+    const agent = new WorkerTunnelLaunchAgent(
+      hub as unknown as WorkerHub,
+      "worker-stop-timeout",
+      "node-stop-timeout",
+      description,
+      20,
+    );
+    const request = {
+      launchId: "launch-stop-timeout",
+      pipelineId: "pipeline-stop-timeout",
+      nodeId: "node-stop-timeout",
+      process: { processId: "stage-stop-timeout" },
+    } as unknown as LaunchAgentStartRequest;
+
+    const handle = await agent.start(request, new AbortController().signal);
+    await handle.ready;
+    const exited = handle.exited.catch((error: unknown) => error);
+
+    await expect(handle.stop("route_repair")).resolves.toBeUndefined();
+    await expect(exited).resolves.toMatchObject({
+      message: "worker_tunnel_stop_timeout:worker-stop-timeout",
+    });
+    expect(hub.sent.map(({ type }) => type)).toContain("runtime.stop");
+    await agent.close();
+  });
 });

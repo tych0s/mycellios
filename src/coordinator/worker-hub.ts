@@ -139,11 +139,12 @@ export class WorkerHub extends EventEmitter<HubEvents> {
     if (!Number.isInteger(targetPort) || targetPort < 1 || targetPort > 65_535) {
       throw new Error("runtime_proxy_target_port_is_invalid");
     }
-    const server = createServer((socket) => this.attachLocalRuntimeStream(
-      socket,
-      destinationWorkerId,
-      targetPort,
-    ));
+    const sockets = new Set<Socket>();
+    const server = createServer((socket) => {
+      sockets.add(socket);
+      socket.once("close", () => sockets.delete(socket));
+      this.attachLocalRuntimeStream(socket, destinationWorkerId, targetPort);
+    });
     this.runtimeProxyServers.add(server);
     await new Promise<void>((resolve, reject) => {
       const onError = (error: Error) => {
@@ -164,7 +165,15 @@ export class WorkerHub extends EventEmitter<HubEvents> {
       port: address.port,
       close: async () => {
         this.runtimeProxyServers.delete(server);
-        await new Promise<void>((resolve) => server.close(() => resolve()));
+        // `server.close()` stops accepting new clients but deliberately waits
+        // for existing TCP connections. A distributed inference request may
+        // leave one of those connections open after a node disappears, which
+        // used to block model deactivation and every later reactivation.
+        // Destroy the proxy-owned sockets so Wi-Fi recovery cannot be held by
+        // a stale HTTP keep-alive or an interrupted streaming response.
+        const closed = new Promise<void>((resolve) => server.close(() => resolve()));
+        for (const socket of sockets) socket.destroy();
+        await closed;
       },
     };
   }
