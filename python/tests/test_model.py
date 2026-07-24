@@ -375,7 +375,7 @@ class PhysicalTensorBatchTests(unittest.TestCase):
         self.assertEqual(runner.physical_batch_items, 4)
         self.assertEqual(runner.max_observed_physical_batch_size, 2)
 
-    def test_hidden_batch_is_token_exact_and_refuses_unequal_cache_lengths(self) -> None:
+    def test_hidden_batch_is_token_exact_including_unequal_cache_lengths(self) -> None:
         runner = _tiny_stage_runner()
         torch.manual_seed(73)
         first = torch.randn(1, 3, runner.hidden_size)
@@ -404,25 +404,55 @@ class PhysicalTensorBatchTests(unittest.TestCase):
                 actual_hidden, expected_hidden, rtol=1e-5, atol=1e-6
             )
             self.assertEqual(actual_tokens, expected_tokens)
+        runner.end(3)
+        runner.end(4)
 
-        runner.forward_hidden(3, torch.randn(1, 1, runner.hidden_size))
-        self.assertNotEqual(
-            runner.physical_batch_key(3, token_count=1, token_mode="last"),
-            runner.physical_batch_key(4, token_count=1, token_mode="last"),
+        # Ragged fusion (checklist 2.6): requests with DIFFERENT cache lengths
+        # must fuse in one forward and stay token-exact versus sequential decode.
+        prefill_long = torch.randn(1, 5, runner.hidden_size)
+        prefill_short = torch.randn(1, 2, runner.hidden_size)
+        decode_a = torch.randn(1, 1, runner.hidden_size)
+        decode_b = torch.randn(1, 1, runner.hidden_size)
+        for request_id in (5, 6):
+            runner.begin(request_id)
+        runner.forward_hidden(5, prefill_long, token_mode="none")
+        runner.forward_hidden(6, prefill_short, token_mode="none")
+        ragged_sequential = (
+            runner.forward_hidden(5, decode_a),
+            runner.forward_hidden(6, decode_b),
         )
-        with self.assertRaisesRegex(ValueError, "equal cache length"):
-            runner.forward_hidden_batch(
-                (3, 4),
-                (
-                    torch.randn(1, 1, runner.hidden_size),
-                    torch.randn(1, 1, runner.hidden_size),
-                ),
+        runner.end(5)
+        runner.end(6)
+
+        for request_id in (7, 8):
+            runner.begin(request_id)
+        runner.forward_hidden(7, prefill_long, token_mode="none")
+        runner.forward_hidden(8, prefill_short, token_mode="none")
+        self.assertNotEqual(runner.sequence_length(7), runner.sequence_length(8))
+        # Unequal lengths now share a group key (fused) instead of being refused.
+        self.assertEqual(
+            runner.physical_batch_group_key(7, token_count=1, token_mode="last"),
+            runner.physical_batch_group_key(8, token_count=1, token_mode="last"),
+        )
+        calls_before = runner.model_forward_calls
+        ragged_batched = runner.forward_hidden_batch((7, 8), (decode_a, decode_b))
+        self.assertEqual(runner.model_forward_calls - calls_before, 1)
+        for (actual_hidden, actual_tokens), (expected_hidden, expected_tokens) in zip(
+            ragged_batched, ragged_sequential, strict=True
+        ):
+            torch.testing.assert_close(
+                actual_hidden, expected_hidden, rtol=1e-5, atol=1e-6
             )
+            self.assertEqual(actual_tokens, expected_tokens)
+        self.assertEqual(runner.sequence_length(7), 6)
+        self.assertEqual(runner.sequence_length(8), 3)
 
         runner._physical_batch_cache_supported = False
         self.assertIsNone(
-            runner.physical_batch_key(3, token_count=1, token_mode="last")
+            runner.physical_batch_group_key(7, token_count=1, token_mode="last")
         )
+        runner.end(7)
+        runner.end(8)
 
 
 @unittest.skipUnless(
@@ -517,6 +547,81 @@ class SmolLMPartitionIntegrationTests(unittest.TestCase):
             runner.physical_batch_key(101, token_count=1, token_mode="last"),
             runner.physical_batch_key(202, token_count=1, token_mode="last"),
         )
+        runner.end(101)
+        runner.end(202)
+
+    def test_ragged_stage_batches_unequal_kv_lengths_token_exact(self) -> None:
+        """Physical batching must fuse requests with DIFFERENT KV lengths and
+        stay token-exact versus sequential decode (checklist 2.6)."""
+
+        with patch(
+            "distributed_runtime.model.AutoModelForCausalLM.from_pretrained",
+            side_effect=AssertionError("stage loader must remain selective"),
+        ):
+            runner = StageRunner(StageModelSpec(self.MODEL_NAME, 15, 30, 30, 2))
+        torch.manual_seed(83)
+        # Deliberately unequal prefill lengths -> staggered caches (5 vs 3).
+        prefill_a = torch.randn(1, 5, runner.hidden_size)
+        prefill_b = torch.randn(1, 3, runner.hidden_size)
+        decode_a = torch.randn(1, 1, runner.hidden_size)
+        decode_b = torch.randn(1, 1, runner.hidden_size)
+
+        # Reference: each request decoded sequentially with its own cache.
+        for request_id in (11, 22):
+            runner.begin(request_id)
+        runner.forward_hidden(11, prefill_a, token_mode="none")
+        runner.forward_hidden(22, prefill_b, token_mode="none")
+        sequential_decode = (
+            runner.forward_hidden(11, decode_a),
+            runner.forward_hidden(22, decode_b),
+        )
+        sequential_caches = {
+            request_id: tuple(
+                (layer.keys.clone(), layer.values.clone())
+                for layer in runner.caches[request_id].layers
+            )
+            for request_id in (11, 22)
+        }
+        runner.end(11)
+        runner.end(22)
+
+        # Batched: same inputs, unequal cache lengths fused in one forward.
+        for request_id in (101, 202):
+            runner.begin(request_id)
+        runner.forward_hidden(101, prefill_a, token_mode="none")
+        runner.forward_hidden(202, prefill_b, token_mode="none")
+        self.assertNotEqual(
+            runner.sequence_length(101), runner.sequence_length(202)
+        )
+        # Length-agnostic grouping must place them in the same physical group.
+        self.assertEqual(
+            runner.physical_batch_group_key(101, token_count=1, token_mode="last"),
+            runner.physical_batch_group_key(202, token_count=1, token_mode="last"),
+        )
+        before = runner.model_forward_calls
+        batched_decode = runner.forward_hidden_batch(
+            (101, 202), (decode_a, decode_b)
+        )
+        self.assertEqual(runner.model_forward_calls - before, 1)
+
+        for actual, expected in zip(batched_decode, sequential_decode, strict=True):
+            torch.testing.assert_close(actual[0], expected[0], rtol=1e-3, atol=3e-5)
+            self.assertEqual(actual[1], expected[1])  # token-exact argmax
+        # Per-request caches must be split, trimmed and length-correct.
+        self.assertEqual(runner.sequence_length(101), 6)
+        self.assertEqual(runner.sequence_length(202), 4)
+        for batched_id, sequential_id in ((101, 11), (202, 22)):
+            for layer, (expected_keys, expected_values) in zip(
+                runner.caches[batched_id].layers,
+                sequential_caches[sequential_id],
+                strict=True,
+            ):
+                torch.testing.assert_close(
+                    layer.keys, expected_keys, rtol=1e-3, atol=3e-5
+                )
+                torch.testing.assert_close(
+                    layer.values, expected_values, rtol=1e-3, atol=3e-5
+                )
         runner.end(101)
         runner.end(202)
 

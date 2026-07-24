@@ -1761,6 +1761,10 @@ def collect_compatible_activation_frames(
     """
 
     batch_forward = getattr(runner, "forward_hidden_batch", None)
+    # Strict equal-length grouping by default. `physical_batch_group_key` enables
+    # ragged fusion (checklist 2.6, token-exact) but regresses throughput with a
+    # fixed window (see engine.py note + REGISTRO_VERIFICACIONES.md §8); wire it
+    # only with the adaptive window.
     batch_key = getattr(runner, "physical_batch_key", None)
     first_is_tree_leaf = (
         branch_parents is not None and first.request_id in branch_parents

@@ -4822,6 +4822,12 @@ class DistributedPipelineEngine:
         self._root_ready_items += len(waves)
 
         batch_forward = getattr(runner, "forward_ids_batch", None)
+        # Strict equal-length grouping by default. The length-agnostic
+        # `physical_batch_group_key` enables ragged fusion (checklist 2.6) and is
+        # proven token-exact, BUT measured (23-07) to regress service throughput
+        # with the current FIXED collection window (it fuses — B_eff 1->3.5 — yet
+        # backs up: the window cost is paid every step). Wire it here only
+        # together with the adaptive window; see REGISTRO_VERIFICACIONES.md §8.
         batch_key = getattr(runner, "physical_batch_key", None)
         maximum = getattr(runner, "MAX_PHYSICAL_BATCH_SIZE", 1)
         if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 2:

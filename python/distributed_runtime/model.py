@@ -626,16 +626,18 @@ class StageRunner:
             expected_hidden_size=None,
             integer=True,
         )
-        cache = self._merge_dynamic_caches(ids)
+        cache, pad_amounts, max_len = self._merge_dynamic_caches_padded(ids)
         prepared = torch.cat(tensors, dim=0).to(
             device=self._effective_compute_device()
         )
+        extra = self._ragged_forward_kwargs(ids, pad_amounts, max_len, token_count, prepared.device)
         output = self.base(
             input_ids=prepared,
             past_key_values=cache,
             use_cache=True,
+            **extra,
         )
-        self._commit_physical_batch(ids, output.past_key_values, token_count)
+        self._commit_physical_batch(ids, output.past_key_values, token_count, pad_amounts)
         return tuple(
             output.last_hidden_state[index : index + 1].contiguous()
             for index in range(len(ids))
@@ -725,6 +727,108 @@ class StageRunner:
             return None
         return current, token_count, token_mode
 
+    def physical_batch_group_key(
+        self,
+        request_id: int,
+        *,
+        token_count: int,
+        token_mode: str,
+    ) -> tuple[int, str] | None:
+        """Length-agnostic grouping key for RAGGED physical batching.
+
+        Unlike :meth:`physical_batch_key`, this deliberately omits the
+        accumulated KV length: requests that differ only in cache length are
+        placed in the same physical group and fused via left-padding plus an
+        attention mask and explicit position ids (checklist 2.6, proven
+        token-exact).  ``None`` still means "not physically batchable at all"
+        (unsupported layout or non-DynamicCache request state).
+        """
+
+        self._require_active(request_id)
+        if not self._physical_batch_cache_supported:
+            return None
+        if (
+            not isinstance(token_count, int)
+            or isinstance(token_count, bool)
+            or token_count < 1
+        ):
+            raise ValueError("token_count must be a positive integer")
+        if token_mode not in ("none", "last", "all"):
+            raise ValueError("token_mode must be none, last or all")
+        current = self.tokens_seen[request_id]
+        cache = self.caches.get(request_id)
+        if cache is not None:
+            if not isinstance(cache, DynamicCache):
+                return None
+            if cache.get_seq_length() != current:
+                return None
+        elif current != 0:
+            return None
+        return token_count, token_mode
+
+    def _ragged_attention_mask(
+        self, pad_amounts: tuple[int, ...], max_len: int, token_count: int, device: Any
+    ) -> torch.Tensor:
+        """Mask [B, max_len + token_count] marking real cache + new tokens.
+
+        For request ``i`` the first ``pad_amounts[i]`` cache positions are
+        left-padding (masked); everything from there on — its real cache tail
+        and the ``token_count`` new tokens — is valid.
+        """
+
+        mask = torch.zeros(
+            len(pad_amounts), max_len + token_count, dtype=torch.long, device=device
+        )
+        for index, pad in enumerate(pad_amounts):
+            mask[index, pad:] = 1
+        return mask
+
+    def _ragged_position_ids(
+        self, request_ids: tuple[int, ...], token_count: int, device: Any
+    ) -> torch.Tensor:
+        """Position ids [B, token_count]: each request's true next positions.
+
+        ``tokens_seen`` still holds the pre-forward length here (it is advanced
+        in :meth:`_commit_physical_batch`), so the new tokens of request ``i``
+        occupy positions ``L_i, L_i+1, ...`` regardless of left-padding.
+        """
+
+        rows = [
+            torch.arange(
+                self.tokens_seen[request_id],
+                self.tokens_seen[request_id] + token_count,
+                device=device,
+            )
+            for request_id in request_ids
+        ]
+        return torch.stack(rows, dim=0)
+
+    def _ragged_forward_kwargs(
+        self,
+        request_ids: tuple[int, ...],
+        pad_amounts: tuple[int, ...],
+        max_len: int,
+        token_count: int,
+        device: Any,
+    ) -> dict[str, torch.Tensor]:
+        """Attention mask + position ids only when the batch is ragged.
+
+        When every request already has the same length (``pad_amounts`` all
+        zero) this returns ``{}`` so the equal-length forward stays byte-for-byte
+        the pre-2.6 behaviour; the ragged path engages only when it must.
+        """
+
+        if max_len == 0 or not any(pad_amounts):
+            return {}
+        return {
+            "attention_mask": self._ragged_attention_mask(
+                pad_amounts, max_len, token_count, device
+            ),
+            "position_ids": self._ragged_position_ids(
+                request_ids, token_count, device
+            ),
+        }
+
     @torch.inference_mode()
     def forward_hidden_batch(
         self,
@@ -746,8 +850,11 @@ class StageRunner:
             expected_hidden_size=self.hidden_size,
             integer=False,
         )
+        # Length-agnostic grouping: requests may differ in accumulated KV length
+        # and are fused via left-padding (checklist 2.6). Only token_count,
+        # token_mode and a batchable layout must agree.
         keys = {
-            self.physical_batch_key(
+            self.physical_batch_group_key(
                 request_id,
                 token_count=token_count,
                 token_mode=token_mode,
@@ -756,19 +863,23 @@ class StageRunner:
         }
         if None in keys or len(keys) != 1:
             raise ValueError(
-                "physical batching requires equal cache length, token count and cache layout"
+                "physical batching requires equal token count and a batchable cache layout"
             )
-        cache = self._merge_dynamic_caches(ids)
+        cache, pad_amounts, max_len = self._merge_dynamic_caches_padded(ids)
         prepared = torch.cat(tensors, dim=0).to(
             device=self._effective_compute_device(),
             dtype=self._effective_compute_dtype(),
+        )
+        extra = self._ragged_forward_kwargs(
+            ids, pad_amounts, max_len, token_count, prepared.device
         )
         output = self.base(
             inputs_embeds=prepared,
             past_key_values=cache,
             use_cache=True,
+            **extra,
         )
-        self._commit_physical_batch(ids, output.past_key_values, token_count)
+        self._commit_physical_batch(ids, output.past_key_values, token_count, pad_amounts)
 
         token_rows: list[int | tuple[int, ...] | None]
         if self.head is None or token_mode == "none":
@@ -896,11 +1007,138 @@ class StageRunner:
             )
         return merged
 
+    def _merge_dynamic_caches_padded(
+        self, request_ids: tuple[int, ...]
+    ) -> tuple[DynamicCache, tuple[int, ...], int]:
+        """Merge per-request caches of possibly DIFFERENT lengths.
+
+        Each request's KV is left-padded with zeros up to the batch maximum so
+        the layers stack into a rectangular ``[B, heads, max_len, dim]`` tensor.
+        Returns ``(merged, pad_amounts, max_len)`` where ``pad_amounts[i]`` is
+        the number of masked left-pad positions for request ``i`` (all zero when
+        every request already has the same length, i.e. the exact fast path).
+        The caller builds the attention mask / position ids from ``pad_amounts``
+        and trims the padding back off in :meth:`_commit_physical_batch`.
+        """
+
+        if not self._physical_batch_cache_supported:
+            raise ValueError("this model cache layout cannot be physically batched")
+        caches = tuple(self.caches.get(request_id) for request_id in request_ids)
+        lengths = tuple(int(self.tokens_seen[request_id]) for request_id in request_ids)
+        max_len = max(lengths)
+        merged = DynamicCache(config=self.base.config)
+        if max_len == 0:
+            if any(
+                cache is not None
+                and (
+                    not isinstance(cache, DynamicCache)
+                    or cache.get_seq_length() != 0
+                )
+                for cache in caches
+            ):
+                raise ValueError("empty physical batch has inconsistent caches")
+            return merged, tuple(0 for _ in request_ids), 0
+
+        for cache, length in zip(caches, lengths):
+            if length == 0:
+                if cache is not None and (
+                    not isinstance(cache, DynamicCache) or cache.get_seq_length() != 0
+                ):
+                    raise ValueError("physical batch cache tensors are inconsistent")
+                continue
+            if not isinstance(cache, DynamicCache):
+                raise ValueError("physical batching requires DynamicCache request state")
+            if len(cache.layers) != len(merged.layers):
+                raise ValueError("physical batch caches have different layer counts")
+            if cache.get_seq_length() != length:
+                raise ValueError("physical batch cache tensors are inconsistent")
+
+        pad_amounts = tuple(max_len - length for length in lengths)
+        for layer_index, target in enumerate(merged.layers):
+            if type(target) is not DynamicLayer:
+                raise ValueError("physical batching only supports plain DynamicCache layers")
+            reference: DynamicLayer | None = None
+            for cache, length in zip(caches, lengths):
+                if length == 0:
+                    continue
+                source = cache.layers[layer_index]
+                if (
+                    type(source) is not DynamicLayer
+                    or not source.is_initialized
+                    or source.keys is None
+                    or source.values is None
+                    or int(source.keys.shape[0]) != 1
+                ):
+                    raise ValueError("physical batch cache tensors are inconsistent")
+                reference = source
+                break
+            if reference is None:
+                raise ValueError("physical batch cache tensors are inconsistent")
+            keys: list[torch.Tensor] = []
+            values: list[torch.Tensor] = []
+            for cache, length, pad in zip(caches, lengths, pad_amounts):
+                if length == 0:
+                    keys.append(
+                        torch.zeros(
+                            1,
+                            reference.keys.shape[1],
+                            max_len,
+                            reference.keys.shape[3],
+                            dtype=reference.keys.dtype,
+                            device=reference.keys.device,
+                        )
+                    )
+                    values.append(
+                        torch.zeros(
+                            1,
+                            reference.values.shape[1],
+                            max_len,
+                            reference.values.shape[3],
+                            dtype=reference.values.dtype,
+                            device=reference.values.device,
+                        )
+                    )
+                    continue
+                source = cache.layers[layer_index]
+                key = source.keys
+                value = source.values
+                if pad:
+                    key = torch.cat(
+                        [
+                            torch.zeros(
+                                1, key.shape[1], pad, key.shape[3],
+                                dtype=key.dtype, device=key.device,
+                            ),
+                            key,
+                        ],
+                        dim=2,
+                    )
+                    value = torch.cat(
+                        [
+                            torch.zeros(
+                                1, value.shape[1], pad, value.shape[3],
+                                dtype=value.dtype, device=value.device,
+                            ),
+                            value,
+                        ],
+                        dim=2,
+                    )
+                keys.append(key)
+                values.append(value)
+            if (
+                len({tuple(key.shape[1:]) for key in keys}) != 1
+                or len({tuple(value.shape[1:]) for value in values}) != 1
+            ):
+                raise ValueError("physical batch cache tensor shapes differ")
+            target.update(torch.cat(keys, dim=0), torch.cat(values, dim=0))
+        return merged, pad_amounts, max_len
+
     def _commit_physical_batch(
         self,
         request_ids: tuple[int, ...],
         cache: Any,
         token_count: int,
+        pad_amounts: tuple[int, ...] | None = None,
     ) -> None:
         if not isinstance(cache, DynamicCache):
             raise TypeError("physical model forward did not return DynamicCache")
@@ -915,15 +1153,20 @@ class StageRunner:
         ):
             raise TypeError("physical model forward returned an unsupported cache layout")
 
+        # ``pad_amounts`` (from _merge_dynamic_caches_padded) says how many
+        # left-pad positions each request carried; trim them so the per-request
+        # cache holds exactly its real tail plus the new tokens.
+        pads = pad_amounts if pad_amounts is not None else tuple(0 for _ in request_ids)
         split = [DynamicCache(config=self.base.config) for _ in request_ids]
         for layer_index, source in enumerate(cache.layers):
             for batch_index, target_cache in enumerate(split):
                 target = target_cache.layers[layer_index]
                 if type(target) is not DynamicLayer:
                     raise TypeError("physical cache split changed the cache layout")
+                pad = pads[batch_index]
                 target.update(
-                    source.keys[batch_index : batch_index + 1].clone(),
-                    source.values[batch_index : batch_index + 1].clone(),
+                    source.keys[batch_index : batch_index + 1, :, pad:, :].clone(),
+                    source.values[batch_index : batch_index + 1, :, pad:, :].clone(),
                 )
         for request_id, request_cache in zip(request_ids, split, strict=True):
             self.caches[request_id] = request_cache
