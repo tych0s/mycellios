@@ -244,6 +244,19 @@ export interface WorkerAcceleratorDiagnostics {
   }>;
 }
 
+/**
+ * Hashed physical identity emitted by unattended/headless executors.
+ * Provider ids and GPU UUIDs must never be published in their raw form.
+ */
+export interface WorkerPhysicalIdentity {
+  schema: "gdlp-worker-physical-identity/1";
+  provider: "gpu_cloud" | "generic";
+  providerMachineFingerprintSha256: string;
+  hostFingerprintSha256: string;
+  gpuFingerprintsSha256: string[];
+  attestedAt: string;
+}
+
 export interface WorkerCapabilities {
   region: string;
   agentVersion: string;
@@ -293,6 +306,8 @@ export interface WorkerCapabilities {
       maxSessions: number;
       maxSessionBytes: number;
     } | undefined;
+    /** Hashed physical evidence; raw provider ids and GPU UUIDs are forbidden. */
+    physicalIdentity?: WorkerPhysicalIdentity | undefined;
   } | undefined;
 }
 

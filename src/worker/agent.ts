@@ -10,6 +10,7 @@ import type {
   JobPayload,
   WorkerCapabilities,
   WorkerAcceleratorDiagnostics,
+  WorkerPhysicalIdentity,
   WorkerEnvelope,
   WorkerExecutorIsolationCapability,
   WorkerHeartbeat,
@@ -118,6 +119,7 @@ export interface WorkerAgentOptions {
     isolation?: WorkerExecutorIsolationCapability;
     /** Native peer transport. Enabled by default; options can pin listener/candidates. */
     directTransport?: RuntimeDirectTransportOptions;
+    physicalIdentity?: WorkerPhysicalIdentity;
   };
   /** Runs the packaged, physical runtime calibration for this exact node. */
   runtimePerformanceProfileProbe?: (challenge: RuntimePerformanceChallenge) =>
@@ -792,6 +794,9 @@ export class WorkerAgent {
                 : {}),
               ...(this.directTransportAdvertisement
                 ? { directTransport: structuredClone(this.directTransportAdvertisement) }
+                : {}),
+              ...(this.options.distributedExecutor.physicalIdentity
+                ? { physicalIdentity: structuredClone(this.options.distributedExecutor.physicalIdentity) }
                 : {}),
             },
           }

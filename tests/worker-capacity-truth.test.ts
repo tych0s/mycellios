@@ -91,6 +91,14 @@ describe("worker capacity truth", () => {
         computeMode: "automatic",
         cpuEligible: true,
         acceleration,
+        physicalIdentity: {
+          schema: "gdlp-worker-physical-identity/1",
+          provider: "gpu_cloud",
+          providerMachineFingerprintSha256: `sha256:${"1".repeat(64)}`,
+          hostFingerprintSha256: `sha256:${"2".repeat(64)}`,
+          gpuFingerprintsSha256: [`sha256:${"3".repeat(64)}`],
+          attestedAt: "2026-07-24T00:00:00.000Z",
+        },
       },
       logger: { info() {}, warn() {}, error() {} },
     });
@@ -110,6 +118,14 @@ describe("worker capacity truth", () => {
       sourceId: `sha256:${"a".repeat(64)}`,
     });
     expect(capabilities.distributedExecutor?.acceleration).toEqual(acceleration);
+    expect(capabilities.distributedExecutor).toHaveProperty("physicalIdentity", {
+      schema: "gdlp-worker-physical-identity/1",
+      provider: "gpu_cloud",
+      providerMachineFingerprintSha256: `sha256:${"1".repeat(64)}`,
+      hostFingerprintSha256: `sha256:${"2".repeat(64)}`,
+      gpuFingerprintsSha256: [`sha256:${"3".repeat(64)}`],
+      attestedAt: "2026-07-24T00:00:00.000Z",
+    });
   });
 
   it("announces bounded CPU RAM while no verified GPU backend exists", async () => {

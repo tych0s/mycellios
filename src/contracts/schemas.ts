@@ -19,6 +19,7 @@ const adapterKind = z.enum([
 ]);
 const deploymentAdapterKind = z.enum(["mycellios-pipeline", "mock"]);
 const executionBackend = z.enum(["cpu", "cuda", "rocm", "directml", "mps", "xpu", "vulkan", "webgpu"]);
+const sha256Digest = z.string().regex(/^sha256:[0-9a-f]{64}$/);
 
 const executionStageSchema = z.object({
   nodeId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
@@ -377,6 +378,17 @@ export const workerCapabilitiesSchema = z.object({
           }).strict()).min(1).max(8),
           maxSessions: z.number().int().min(1).max(256),
           maxSessionBytes: z.number().int().min(1024 * 1024).max(16 * 1024 * 1024 * 1024),
+        })
+        .strict()
+        .optional(),
+      physicalIdentity: z
+        .object({
+          schema: z.literal("gdlp-worker-physical-identity/1"),
+          provider: z.enum(["gpu_cloud", "generic"]),
+          providerMachineFingerprintSha256: sha256Digest,
+          hostFingerprintSha256: sha256Digest,
+          gpuFingerprintsSha256: z.array(sha256Digest).min(1).max(64),
+          attestedAt: z.iso.datetime(),
         })
         .strict()
         .optional(),
