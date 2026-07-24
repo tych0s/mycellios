@@ -55,6 +55,77 @@ describe("active-route recovery policy", () => {
 
   afterEach(() => database.close());
 
+  it("supersedes an identical orphaned request after the client reconnects", () => {
+    const primary = addWorker(store, {
+      id: "primary",
+      modelDigest: "sha256:revision-a",
+      tokensPerSecond: 50,
+    });
+    hub.connected.add(primary.id);
+    service = new MeshService(
+      store,
+      new Scheduler(store),
+      hub as unknown as WorkerHub,
+      30_000,
+    );
+    const request: ChatCompletionRequest = {
+      model: "distributed-small",
+      messages: [{ role: "user", content: "mismo mensaje" }],
+      max_tokens: 32,
+      stream: true,
+    };
+    const first = service.submit(request, "reconnected-session");
+
+    expect(service.cancelMatchingActiveSession(
+      structuredClone(request),
+      "reconnected-session",
+    )).toBe(first.jobId);
+    expect(store.getJob(first.jobId)?.status).toBe("cancelled");
+    expect(hub.sent).toContainEqual({
+      workerId: primary.id,
+      type: "task.cancel",
+      payload: { jobId: first.jobId },
+    });
+
+    const replacement = service.submit(structuredClone(request), "reconnected-session");
+    expect(replacement.jobId).not.toBe(first.jobId);
+    expect(service.cancel(replacement.jobId)).toBe(true);
+  });
+
+  it("keeps session_busy protection for a different concurrent message", () => {
+    const primary = addWorker(store, {
+      id: "primary",
+      modelDigest: "sha256:revision-a",
+      tokensPerSecond: 50,
+    });
+    hub.connected.add(primary.id);
+    service = new MeshService(
+      store,
+      new Scheduler(store),
+      hub as unknown as WorkerHub,
+      30_000,
+    );
+    const first = service.submit({
+      model: "distributed-small",
+      messages: [{ role: "user", content: "primer mensaje" }],
+      max_tokens: 32,
+      stream: true,
+    }, "protected-session");
+
+    const different: ChatCompletionRequest = {
+      model: "distributed-small",
+      messages: [{ role: "user", content: "mensaje diferente" }],
+      max_tokens: 32,
+      stream: true,
+    };
+    expect(service.cancelMatchingActiveSession(different, "protected-session")).toBeNull();
+    expect(() => service.submit(different, "protected-session")).toThrow(
+      "Session already has an active request",
+    );
+    expect(store.getJob(first.jobId)?.status).not.toBe("cancelled");
+    expect(service.cancel(first.jobId)).toBe(true);
+  });
+
   it("replays the immutable prompt checkpoint on an exact-revision standby before token zero", () => {
     const primary = addWorker(store, {
       id: "primary",

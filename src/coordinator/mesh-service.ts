@@ -178,6 +178,36 @@ export class MeshService extends EventEmitter<MeshServiceEvents> {
     return { jobId, sessionId, events: queue };
   }
 
+  /**
+   * Cancels an orphaned request only when a reconnect repeats the exact same
+   * immutable prompt in the same session. A genuinely different concurrent
+   * message keeps the normal session_busy protection.
+   */
+  cancelMatchingActiveSession(
+    request: ChatCompletionRequest,
+    requestedSessionId?: string,
+  ): string | null {
+    const sessionId = requestedSessionId ?? request.session_id;
+    if (!sessionId) return null;
+    const activeJobId = this.activeSessions.get(sessionId);
+    if (!activeJobId) return null;
+    const runtime = this.runtimes.get(activeJobId);
+    if (!runtime) return null;
+    if (inputHashForRequest(cloneRequest(request)) !== runtime.promptCheckpoint.requestHash) {
+      return null;
+    }
+    return this.cancel(activeJobId) ? activeJobId : null;
+  }
+
+  hasCapacity(request: ChatCompletionRequest, requestedSessionId?: string): boolean {
+    const sessionId = requestedSessionId ?? request.session_id ?? newId("capacity");
+    return this.scheduler.selectRoutePlan(cloneRequest(request), sessionId, {
+      connectedWorkerIds: this.hub.connectedWorkerIds(),
+      allowPipeline: false,
+      maxStandbyRoutes: 2,
+    }) !== null;
+  }
+
   cancel(jobId: string): boolean {
     const job = this.store.getJob(jobId);
     if (!job) return false;

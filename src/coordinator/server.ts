@@ -914,6 +914,23 @@ export async function createCoordinator(
   app.post("/v1/chat/completions", async (request, reply) => {
     const parsed = chatCompletionRequestSchema.parse(request.body) as ChatCompletionRequest;
     const idempotencyKey = parseIdempotencyKey(request.headers["idempotency-key"]);
+    const supersededJobId = service.cancelMatchingActiveSession(parsed, parsed.session_id);
+    if (supersededJobId) {
+      app.log.warn({
+        supersededJobId,
+        sessionId: parsed.session_id,
+        model: parsed.model,
+      }, "replacing an interrupted identical chat request after client reconnection");
+      // Give the cell worker time to process task.cancel and publish its freed
+      // slot before the replacement lease is offered on the same socket.
+      await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 1_000));
+    }
+    if (parsed.stream && !service.hasCapacity(parsed, parsed.session_id)) {
+      // A reconnect can race both route rebuilding and the automatic startup
+      // benchmark. Keep the fetch pending while capacity returns instead of
+      // making the installed desktop surface a transient 503.
+      await waitForChatCapacity(service, parsed, parsed.session_id, 45_000);
+    }
     const handle = service.submit(parsed, parsed.session_id, idempotencyKey);
     reply.header("x-network-request-id", handle.jobId);
     reply.header("x-network-session-id", handle.sessionId);
@@ -1431,6 +1448,18 @@ function mobileDashboardWorker(worker: MobileWorkerSnapshot) {
       residentExperts: worker.residentExperts,
     },
   };
+}
+
+async function waitForChatCapacity(
+  service: MeshService,
+  request: ChatCompletionRequest,
+  sessionId: string | undefined,
+  timeoutMs: number,
+): Promise<void> {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  while (!service.hasCapacity(request, sessionId) && Date.now() < deadline) {
+    await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 250));
+  }
 }
 
 function parseIdempotencyKey(received: string | string[] | undefined): string | undefined {
