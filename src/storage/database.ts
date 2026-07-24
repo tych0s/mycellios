@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 10;
 
 export interface PersistenceOutboxRow {
   id: number;
@@ -14,6 +14,18 @@ export interface PersistenceOutboxRow {
   lastError: string | null;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface ArtifactBackupOutboxRow {
+  id: string;
+  localPath: string;
+  storagePath: string;
+  contentType: string;
+  sha256: string;
+  sizeBytes: number;
+  metadataJson: string;
+  attempts: number;
+  lastError: string | null;
 }
 
 export class MeshDatabase {
@@ -197,6 +209,20 @@ export class MeshDatabase {
       CREATE INDEX IF NOT EXISTS activation_events_model_occurred
       ON activation_events(model_id, occurred_at DESC);
 
+      CREATE TABLE IF NOT EXISTS artifact_backup_outbox (
+        id TEXT PRIMARY KEY,
+        local_path TEXT NOT NULL,
+        storage_path TEXT NOT NULL,
+        content_type TEXT NOT NULL,
+        sha256 TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
     `);
     if (currentVersion >= 2 && currentVersion < 3) {
       const columns = this.raw.prepare("PRAGMA table_info(workers)").all() as Array<{
@@ -297,6 +323,89 @@ export class MeshDatabase {
   pendingRemoteChangeCount(): number {
     const row = this.raw.prepare(
       "SELECT COUNT(*) AS count FROM persistence_outbox",
+    ).get() as { count: number };
+    return Number(row.count);
+  }
+
+  enqueueArtifactBackup(input: {
+    id: string;
+    localPath: string;
+    storagePath: string;
+    contentType: string;
+    sha256: string;
+    sizeBytes: number;
+    metadata: Record<string, unknown>;
+  }): void {
+    const now = Date.now();
+    this.raw.prepare(
+      `INSERT INTO artifact_backup_outbox(
+         id, local_path, storage_path, content_type, sha256, size_bytes,
+         metadata_json, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         local_path=excluded.local_path, storage_path=excluded.storage_path,
+         content_type=excluded.content_type, sha256=excluded.sha256,
+         size_bytes=excluded.size_bytes, metadata_json=excluded.metadata_json,
+         attempts=0, last_error=NULL, updated_at=excluded.updated_at`,
+    ).run(
+      input.id,
+      input.localPath,
+      input.storagePath,
+      input.contentType,
+      input.sha256,
+      input.sizeBytes,
+      JSON.stringify(input.metadata),
+      now,
+      now,
+    );
+  }
+
+  listPendingArtifactBackups(limit = 10): ArtifactBackupOutboxRow[] {
+    const rows = this.raw.prepare(
+      `SELECT id, local_path, storage_path, content_type, sha256, size_bytes,
+              metadata_json, attempts, last_error
+       FROM artifact_backup_outbox
+       ORDER BY updated_at, id
+       LIMIT ?`,
+    ).all(limit) as unknown as Array<{
+      id: string;
+      local_path: string;
+      storage_path: string;
+      content_type: string;
+      sha256: string;
+      size_bytes: number;
+      metadata_json: string;
+      attempts: number;
+      last_error: string | null;
+    }>;
+    return rows.map((row) => ({
+      id: row.id,
+      localPath: row.local_path,
+      storagePath: row.storage_path,
+      contentType: row.content_type,
+      sha256: row.sha256,
+      sizeBytes: Number(row.size_bytes),
+      metadataJson: row.metadata_json,
+      attempts: Number(row.attempts),
+      lastError: row.last_error,
+    }));
+  }
+
+  markArtifactBackupSynced(id: string): void {
+    this.raw.prepare("DELETE FROM artifact_backup_outbox WHERE id = ?").run(id);
+  }
+
+  markArtifactBackupFailed(id: string, error: string): void {
+    this.raw.prepare(
+      `UPDATE artifact_backup_outbox
+       SET attempts=attempts+1, last_error=?, updated_at=?
+       WHERE id=?`,
+    ).run(error.slice(0, 2_000), Date.now(), id);
+  }
+
+  pendingArtifactBackupCount(): number {
+    const row = this.raw.prepare(
+      "SELECT COUNT(*) AS count FROM artifact_backup_outbox",
     ).get() as { count: number };
     return Number(row.count);
   }

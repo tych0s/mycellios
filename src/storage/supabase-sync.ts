@@ -1,5 +1,7 @@
 import type { MeshStore } from "./store.js";
 import type { BenchmarkRun } from "../benchlab/types.js";
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 
 const TABLE_PRIMARY_KEYS = Object.freeze({
   workers: "id",
@@ -28,6 +30,7 @@ export interface SupabasePersistenceStatus {
   connected: boolean;
   required: boolean;
   pendingChanges: number;
+  pendingArtifacts: number;
   lastSuccessfulSyncAt: string | null;
   lastError: string | null;
 }
@@ -80,6 +83,7 @@ export class SupabasePersistence {
       connected: this.connected,
       required: this.required,
       pendingChanges: this.store.database.pendingRemoteChangeCount(),
+      pendingArtifacts: this.store.database.pendingArtifactBackupCount(),
       lastSuccessfulSyncAt: this.lastSuccessfulSyncAt,
       lastError: this.lastError,
     };
@@ -88,9 +92,11 @@ export class SupabasePersistence {
   flush(): Promise<void> {
     if (this.closed) return Promise.resolve();
     if (this.flushPromise) return this.flushPromise;
-    this.flushPromise = this.flushPendingChanges().finally(() => {
+    this.flushPromise = this.flushPendingChanges()
+      .then(() => this.flushPendingArtifacts())
+      .finally(() => {
       this.flushPromise = null;
-    });
+      });
     return this.flushPromise;
   }
 
@@ -102,6 +108,25 @@ export class SupabasePersistence {
     await this.flushPendingChanges().catch((error) => {
       if (this.required) throw error;
     });
+    await this.flushPendingArtifacts().catch((error) => {
+      if (this.required) throw error;
+    });
+  }
+
+  registerArtifactBackup(input: {
+    id: string;
+    localPath: string;
+    storagePath: string;
+    contentType: string;
+    sha256: string;
+    sizeBytes: number;
+    metadata?: Record<string, unknown>;
+  }): void {
+    this.store.database.enqueueArtifactBackup({
+      ...input,
+      metadata: input.metadata ?? {},
+    });
+    void this.flush();
   }
 
   async readBenchmarkRuns(): Promise<BenchmarkRun[]> {
@@ -210,6 +235,62 @@ export class SupabasePersistence {
         processed += 1;
       }
       if (pending.length < 100) break;
+    }
+  }
+
+  private async flushPendingArtifacts(): Promise<void> {
+    const pending = this.store.database.listPendingArtifactBackups(10);
+    for (const artifact of pending) {
+      try {
+        const body = await readFile(artifact.localPath);
+        if (body.length !== artifact.sizeBytes) {
+          throw new Error(`Artifact size changed before backup: ${artifact.id}`);
+        }
+        const digest = createHash("sha256").update(body).digest("hex");
+        if (digest !== artifact.sha256) {
+          throw new Error(`Artifact digest changed before backup: ${artifact.id}`);
+        }
+        const upload = await this.fetchImpl(
+          new URL(`/storage/v1/object/mycellios-artifacts/${artifact.storagePath}`, this.baseUrl),
+          {
+            method: "POST",
+            signal: AbortSignal.timeout(5 * 60_000),
+            headers: {
+              apikey: this.options.serviceRoleKey,
+              authorization: `Bearer ${this.options.serviceRoleKey}`,
+              "content-type": artifact.contentType,
+              "x-upsert": "true",
+            },
+            body,
+          },
+        );
+        if (!upload.ok) throw await responseError(upload, `Could not back up artifact ${artifact.id}`);
+        const metadata = await this.request("artifacts", {
+          method: "POST",
+          headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+          body: JSON.stringify({
+            id: artifact.id,
+            kind: JSON.parse(artifact.metadataJson).kind ?? "runtime",
+            storage_bucket: "mycellios-artifacts",
+            storage_path: artifact.storagePath,
+            sha256: artifact.sha256,
+            size_bytes: artifact.sizeBytes,
+            metadata: JSON.parse(artifact.metadataJson),
+          }),
+        });
+        if (!metadata.ok) throw await responseError(metadata, `Could not persist artifact metadata ${artifact.id}`);
+        this.store.database.markArtifactBackupSynced(artifact.id);
+        this.connected = true;
+        this.lastSuccessfulSyncAt = new Date().toISOString();
+        this.lastError = null;
+      } catch (error) {
+        const message = errorText(error);
+        this.store.database.markArtifactBackupFailed(artifact.id, message);
+        this.connected = false;
+        this.lastError = message;
+        if (this.required && artifact.attempts >= 4) throw error;
+        return;
+      }
     }
   }
 

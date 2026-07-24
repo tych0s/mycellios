@@ -1,8 +1,8 @@
 import websocket from "@fastify/websocket";
 import staticFiles from "@fastify/static";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
-import { timingSafeEqual } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { createHash, timingSafeEqual } from "node:crypto";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { z, ZodError } from "zod";
 import { loadBenchmarkRuns } from "../benchlab/history.js";
@@ -287,8 +287,15 @@ export async function createCoordinator(
     joinToken: config.mobileJoinToken,
     expertArtifactsPath: config.mobileExpertArtifactsPath,
     disconnectedRetentionMs: options.mobileDisconnectedRetentionMs,
+    ...(persistence
+      ? { onArtifactStored: (artifact: Parameters<SupabasePersistence["registerArtifactBackup"]>[0]) =>
+          persistence.registerArtifactBackup(artifact) }
+      : {}),
   });
   mobileHub.attach(app);
+  if (persistence && config.mobileExpertArtifactsPath) {
+    queueExistingMobileArtifacts(persistence, config.mobileExpertArtifactsPath);
+  }
   const service = new MeshService(store, scheduler, hub, config.requestTimeoutMs);
   const activationManager = options.activationManager ?? options.activationManagerFactory?.({ store, hub });
   await activationManager?.initialize();
@@ -735,6 +742,7 @@ export async function createCoordinator(
         connected: false,
         required: false,
         pendingChanges: database.pendingRemoteChangeCount(),
+        pendingArtifacts: database.pendingArtifactBackupCount(),
         lastSuccessfulSyncAt: null,
         lastError: null,
       },
@@ -1323,6 +1331,49 @@ export async function createCoordinator(
       database.close();
     },
   };
+}
+
+function queueExistingMobileArtifacts(
+  persistence: SupabasePersistence,
+  directory: string,
+): void {
+  let files: string[];
+  try {
+    files = readdirSync(directory);
+  } catch {
+    return;
+  }
+  for (const file of files) {
+    const path = resolve(directory, file);
+    if (file.endsWith(".bin")) {
+      const weightsHash = file.slice(0, -4);
+      if (!/^[a-f0-9]{64}$/.test(weightsHash)) continue;
+      const sizeBytes = statSync(path).size;
+      persistence.registerArtifactBackup({
+        id: `mobile-weight-${weightsHash}`,
+        localPath: path,
+        storagePath: `mobile-experts/weights/${file}`,
+        contentType: "application/octet-stream",
+        sha256: weightsHash,
+        sizeBytes,
+        metadata: { kind: "mobile-expert-weights", weightsHash },
+      });
+      continue;
+    }
+    if (!file.endsWith(".json")) continue;
+    const artifactId = file.slice(0, -5);
+    if (!/^[a-f0-9]{64}$/.test(artifactId)) continue;
+    const body = readFileSync(path);
+    persistence.registerArtifactBackup({
+      id: `mobile-manifest-${artifactId}`,
+      localPath: path,
+      storagePath: `mobile-experts/manifests/${file}`,
+      contentType: "application/json",
+      sha256: createHash("sha256").update(body).digest("hex"),
+      sizeBytes: body.length,
+      metadata: { kind: "mobile-expert-manifest", artifactId },
+    });
+  }
 }
 
 const benchmarkRunRequestSchema = z.object({

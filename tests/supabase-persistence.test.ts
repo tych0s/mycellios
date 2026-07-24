@@ -1,4 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { MeshDatabase } from "../src/storage/database.js";
 import { MeshStore } from "../src/storage/store.js";
 import { SupabasePersistence } from "../src/storage/supabase-sync.js";
@@ -6,9 +10,13 @@ import { addWorker } from "./helpers.js";
 
 describe("Supabase durable persistence", () => {
   const databases: MeshDatabase[] = [];
+  const directories: string[] = [];
 
   afterEach(() => {
     for (const database of databases.splice(0)) database.close();
+    for (const directory of directories.splice(0)) {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it("flushes transactional coordinator state and history to Supabase", async () => {
@@ -152,6 +160,48 @@ describe("Supabase durable persistence", () => {
       jobsCompleted: 12,
       identityId: "remote-device",
     });
+    await sync.close();
+  });
+
+  it("backs runtime artifacts up to Supabase Storage with durable metadata", async () => {
+    const database = new MeshDatabase(":memory:");
+    databases.push(database);
+    const store = new MeshStore(database);
+    const directory = mkdtempSync(join(tmpdir(), "mycellios-artifact-"));
+    directories.push(directory);
+    const localPath = join(directory, "weights.bin");
+    const bytes = Buffer.from("durable-expert-weights");
+    writeFileSync(localPath, bytes);
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    const requests: string[] = [];
+    const sync = new SupabasePersistence(store, {
+      url: "https://supabase.example.test",
+      serviceRoleKey: "test-service-role",
+      flushIntervalMs: 60_000,
+      fetchImpl: async (input, init) => {
+        const url = new URL(String(input));
+        requests.push(`${init?.method ?? "GET"} ${url.pathname}`);
+        if ((init?.method ?? "GET") === "GET") return Response.json([]);
+        return new Response(null, { status: 201 });
+      },
+    });
+    await sync.initialize();
+    sync.registerArtifactBackup({
+      id: `mobile-weight-${sha256}`,
+      localPath,
+      storagePath: `mobile-experts/weights/${sha256}.bin`,
+      contentType: "application/octet-stream",
+      sha256,
+      sizeBytes: bytes.length,
+      metadata: { kind: "mobile-expert-weights" },
+    });
+    await sync.flush();
+
+    expect(database.pendingArtifactBackupCount()).toBe(0);
+    expect(requests).toContain(
+      `POST /storage/v1/object/mycellios-artifacts/mobile-experts/weights/${sha256}.bin`,
+    );
+    expect(requests).toContain("POST /rest/v1/artifacts");
     await sync.close();
   });
 });
