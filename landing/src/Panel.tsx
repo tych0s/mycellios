@@ -1,6 +1,7 @@
 import {
   Activity,
   ArrowRight,
+  Bot,
   Boxes,
   Check,
   CheckCircle2,
@@ -67,6 +68,7 @@ import { consumeChatCompletionStreamWithRecovery } from "../../src/desktop/chat-
 import type { ChatMessage } from "../../src/contracts/types";
 import type { BenchmarkMeasurement, BenchmarkRun } from "../../src/benchlab/types";
 import { Contribute } from "./Contribute";
+import { SupportAssistant } from "./SupportAssistant";
 import brandIcon from "./assets/mycellios-app-icon-v2.png";
 import {
   benchmarkRunHasModel,
@@ -95,7 +97,7 @@ const PUBLIC_COORDINATOR_URL = "https://www.mycellios.com";
 import "./panel-downloads.css";
 import "./panel-desktop.css";
 
-type PanelView = "overview" | "nodes" | "models" | "jobs" | "tests" | "inference" | "contribute" | "join" | "downloads" | "machine" | "settings";
+type PanelView = "overview" | "nodes" | "models" | "jobs" | "tests" | "inference" | "contribute" | "join" | "downloads" | "machine" | "settings" | "admin";
 
 interface PanelProps {
   desktopBridge?: DesktopBridge;
@@ -203,6 +205,7 @@ const sharedNavItems: Array<{ id: PanelView; label: string; icon: typeof Network
   { id: "inference", label: "Chat", icon: MessageSquareText },
   { id: "contribute", label: "This device", icon: Zap },
   { id: "downloads", label: "Downloads", icon: Download },
+  { id: "admin", label: "Admin", icon: ShieldCheck },
 ];
 
 function initialView(desktop: boolean, mobileEntry: boolean): PanelView {
@@ -212,6 +215,7 @@ function initialView(desktop: boolean, mobileEntry: boolean): PanelView {
   if (mobileEntry || window.location.pathname.startsWith("/mobile")) return "contribute";
   if (window.location.pathname === "/join") return "join";
   if (window.location.pathname === "/downloads") return "downloads";
+  if (window.location.pathname === "/admin") return "admin";
   return "overview";
 }
 
@@ -316,10 +320,10 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     setView(next);
     setMenuOpen(false);
     if (!desktop) {
-      const path = mobileEntry ? "/mobile/" : next === "join" ? "/join" : next === "downloads" ? "/downloads" : "/network";
+      const path = mobileEntry ? "/mobile/" : next === "join" ? "/join" : next === "downloads" ? "/downloads" : next === "admin" ? "/admin" : "/network";
       const query = mobileEntry
         ? next === "contribute" ? "" : `?view=${next}`
-        : next === "overview" || next === "join" || next === "downloads" ? "" : `?view=${next}`;
+        : next === "overview" || next === "join" || next === "downloads" || next === "admin" ? "" : `?view=${next}`;
       window.history.replaceState({}, "", `${path}${query}`);
       applySeoMetadata(path);
     }
@@ -434,7 +438,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     );
   }
 
-  const publicOrigin = desktopSnapshot?.settings.coordinatorMode === "remote"
+  const publicOrigin = desktopSnapshot?.coordinatorUrl
     ? desktopSnapshot.coordinatorUrl.replace(/\/$/, "")
     : PUBLIC_COORDINATOR_URL;
   const publicLink = (path: string) => desktop ? `${publicOrigin}${path}` : path;
@@ -464,7 +468,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
         <nav>
           <span className="panel-nav-label">CONTROL CENTER</span>
           {navItems.map(({ id, label, icon: Icon }) => (
-            <button key={id} className={view === id ? "active" : ""} onClick={() => navigate(id)}>
+            <button key={id} className={view === id ? "active" : ""} title={label} aria-label={label} onClick={() => navigate(id)}>
               <Icon size={18} /><span>{label}</span>{id === "nodes" && <b>{snapshot.summary.connected}</b>}
             </button>
           ))}
@@ -528,6 +532,17 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
               {view === "contribute" && <Contribute />}
               {view === "join" && <JoinNetwork publicLink={publicLink} external={desktop} />}
               {view === "downloads" && <Downloads publicLink={publicLink} external={desktop} />}
+              {view === "admin" && <AssistantAdmin
+                apiOrigin={desktop ? publicOrigin : ""}
+                adminToken={modelAdminToken}
+                authSession={authSession}
+                {...(desktopBridge ? { desktopBridge } : {})}
+                onAdminTokenChange={(token) => {
+                  setModelAdminToken(token);
+                  if (token) window.sessionStorage.setItem("mycellios-model-admin-token", token);
+                  else window.sessionStorage.removeItem("mycellios-model-admin-token");
+                }}
+              />}
               {view === "machine" && desktopSnapshot && desktopBridge && <Machine snapshot={desktopSnapshot} bridge={desktopBridge} onSnapshot={applyDesktopSnapshot} />}
               {view === "settings" && desktopSnapshot && desktopBridge && <DesktopSettingsView snapshot={desktopSnapshot} bridge={desktopBridge} onSnapshot={applyDesktopSnapshot} />}
               </>
@@ -549,6 +564,25 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
         onClose={() => setAuthOpen(false)}
       />}
       </div>
+      <SupportAssistant
+        surface="panel"
+        apiOrigin={desktop ? publicOrigin : ""}
+        {...(desktopBridge ? { desktopBridge } : {})}
+        onNavigate={(destination) => navigate(
+          destination === "machine"
+            ? desktop ? "machine" : "contribute"
+            : destination,
+        )}
+        {...(desktopSnapshot && desktopBridge ? {
+          deviceControl: {
+            currentMode: desktopSnapshot.settings.computeMode,
+            onChange: async (computeMode: DesktopSettings["computeMode"]) => {
+              const next = await desktopBridge.saveSettings({ ...desktopSnapshot.settings, computeMode });
+              applyDesktopSnapshot(next);
+            },
+          },
+        } : {})}
+      />
     </div>
   );
 }
@@ -613,6 +647,293 @@ function AccountModal({
       </>}
     </section>
   </div>;
+}
+
+interface AssistantAdminSettings {
+  enabled: boolean;
+  modelId: string | null;
+  systemPrompt: string;
+  welcomeMessage: string;
+  suggestions: string[];
+  maxOutputTokens: number;
+  temperature: number;
+  allowDeviceControl: boolean;
+  updatedAt: number;
+}
+
+interface AssistantAdminRuntime {
+  enabled: boolean;
+  available: boolean;
+  provider: "mycellios-network";
+  configuredModel: string | null;
+  selectedModel: string | null;
+  availableModels: string[];
+  welcomeMessage: string;
+  suggestions: string[];
+  allowDeviceControl: boolean;
+  updatedAt: string | null;
+}
+
+interface AssistantAdminResponse {
+  settings: AssistantAdminSettings;
+  runtime: AssistantAdminRuntime;
+}
+
+function AssistantAdmin({
+  apiOrigin,
+  adminToken,
+  authSession,
+  desktopBridge,
+  onAdminTokenChange,
+}: {
+  apiOrigin: string;
+  adminToken: string;
+  authSession: AuthSession | null;
+  desktopBridge?: DesktopBridge;
+  onAdminTokenChange: (token: string) => void;
+}) {
+  const [draftToken, setDraftToken] = useState(adminToken);
+  const [settings, setSettings] = useState<AssistantAdminSettings | null>(null);
+  const [runtime, setRuntime] = useState<AssistantAdminRuntime | null>(null);
+  const [suggestionsText, setSuggestionsText] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+
+  function authorizationHeaders(token = draftToken): Record<string, string> {
+    const trimmed = token.trim();
+    if (authSession) {
+      return {
+        authorization: `Bearer ${authSession.accessToken}`,
+        ...(trimmed ? { "x-mycellios-admin-token": trimmed } : {}),
+      };
+    }
+    return trimmed ? { authorization: `Bearer ${trimmed}` } : {};
+  }
+
+  function applyResponse(response: AssistantAdminResponse) {
+    setSettings(response.settings);
+    setRuntime(response.runtime);
+    setSuggestionsText(response.settings.suggestions.join("\n"));
+  }
+
+  async function load(token = draftToken) {
+    setLoading(true);
+    setError(null);
+    setSaved(false);
+    try {
+      const result = desktopBridge
+        ? await desktopBridge.getSupportAssistantAdmin(token.trim() || undefined)
+        : await fetch(`${apiOrigin}/public/v1/admin/assistant`, {
+            cache: "no-store",
+            headers: authorizationHeaders(token),
+          }).then(async (response) => {
+            if (!response.ok) {
+              const body = await response.json().catch(() => null) as { error?: { message?: string } } | null;
+              throw new Error(body?.error?.message ?? `HTTP ${response.status}`);
+            }
+            return response.json() as Promise<AssistantAdminResponse>;
+          });
+      applyResponse(result);
+      if (token.trim()) onAdminTokenChange(token.trim());
+    } catch (caught) {
+      setSettings(null);
+      setRuntime(null);
+      setError(errorText(caught));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void load(adminToken);
+  }, [apiOrigin, authSession?.accessToken, desktopBridge]);
+
+  function update<K extends keyof AssistantAdminSettings>(key: K, value: AssistantAdminSettings[K]) {
+    setSettings((current) => current ? { ...current, [key]: value } : current);
+    setSaved(false);
+  }
+
+  async function save(event: FormEvent) {
+    event.preventDefault();
+    if (!settings) return;
+    const suggestions = suggestionsText
+      .split("\n")
+      .map((suggestion) => suggestion.trim())
+      .filter(Boolean)
+      .slice(0, 6);
+    setSaving(true);
+    setError(null);
+    setSaved(false);
+    try {
+      const payload = {
+        enabled: settings.enabled,
+        modelId: settings.modelId,
+        systemPrompt: settings.systemPrompt,
+        welcomeMessage: settings.welcomeMessage,
+        suggestions,
+        maxOutputTokens: settings.maxOutputTokens,
+        temperature: settings.temperature,
+        allowDeviceControl: settings.allowDeviceControl,
+      };
+      const result = desktopBridge
+        ? await desktopBridge.saveSupportAssistantAdmin(payload, draftToken.trim() || undefined)
+        : await fetch(`${apiOrigin}/public/v1/admin/assistant`, {
+            method: "PUT",
+            headers: {
+              "content-type": "application/json",
+              ...authorizationHeaders(),
+            },
+            body: JSON.stringify(payload),
+          }).then(async (response) => {
+            if (!response.ok) {
+              const body = await response.json().catch(() => null) as { error?: { message?: string } } | null;
+              throw new Error(body?.error?.message ?? `HTTP ${response.status}`);
+            }
+            return response.json() as Promise<AssistantAdminResponse>;
+          });
+      applyResponse(result);
+      if (draftToken.trim()) onAdminTokenChange(draftToken.trim());
+      setSaved(true);
+    } catch (caught) {
+      setError(errorText(caught));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const modelOptions = [
+    { value: "", label: "Automatic · first available network model" },
+    ...(runtime?.availableModels ?? []).map((model) => ({ value: model, label: model })),
+  ];
+  if (settings?.modelId && !modelOptions.some((option) => option.value === settings.modelId)) {
+    modelOptions.push({ value: settings.modelId, label: `${settings.modelId} · currently offline` });
+  }
+
+  return (
+    <section className="assistant-admin-page">
+      <PageTitle
+        eyebrow="NETWORK ADMINISTRATION"
+        title="Support assistant"
+        copy="Control the help agent shown across mycellios. Its answers always run on a real model connected to this network."
+        actions={<span className="assistant-network-only"><ShieldCheck size={15} /> Network models only</span>}
+      />
+
+      <article className="assistant-admin-auth">
+        <div className="assistant-admin-auth-copy">
+          <ShieldCheck size={21} />
+          <span><strong>Administrator authorization</strong><small>{authSession ? "Your signed-in network role is used first. A token can also be supplied if needed." : "Enter the network administrator token to read or change private assistant instructions."}</small></span>
+        </div>
+        <div className="assistant-admin-auth-control">
+          <input
+            type="password"
+            autoComplete="off"
+            spellCheck={false}
+            value={draftToken}
+            onChange={(event) => setDraftToken(event.target.value)}
+            placeholder="Administrator token"
+            aria-label="Assistant administrator token"
+          />
+          <button type="button" disabled={loading || (!draftToken.trim() && !authSession)} onClick={() => void load()}>
+            {loading ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}Unlock
+          </button>
+        </div>
+      </article>
+
+      {error && <div className="assistant-admin-error"><CircleAlert size={17} /><span>{error}</span></div>}
+
+      {loading && !settings ? (
+        <div className="assistant-admin-loading"><LoaderCircle className="spin" /><strong>Loading private assistant configuration…</strong></div>
+      ) : settings && runtime ? (
+        <form className="assistant-admin-form" onSubmit={(event) => void save(event)}>
+          <div className="assistant-admin-status-grid">
+            <article>
+              <span>PUBLIC STATUS</span>
+              <strong className={runtime.available ? "healthy" : "offline"}><i />{!runtime.enabled ? "Disabled" : runtime.available ? "Online" : "Waiting for a model"}</strong>
+              <small>The widget never falls back to an external AI.</small>
+            </article>
+            <article>
+              <span>MODEL IN USE</span>
+              <strong>{runtime.selectedModel ?? "None connected"}</strong>
+              <small>{runtime.configuredModel ? "Fixed by the administrator" : "Selected automatically from live models"}</small>
+            </article>
+            <article>
+              <span>LIVE OPTIONS</span>
+              <strong>{runtime.availableModels.length}</strong>
+              <small>Real non-test models announced by connected nodes.</small>
+            </article>
+          </div>
+
+          <article className="assistant-admin-section assistant-admin-primary">
+            <div className="assistant-admin-section-heading">
+              <div className="assistant-admin-section-icon"><Bot size={21} /></div>
+              <span><strong>Assistant availability and model</strong><small>Choose Automatic to keep support online when network capacity changes.</small></span>
+            </div>
+            <div className="assistant-admin-field-grid">
+              <label>
+                <span>NETWORK MODEL</span>
+                <AppSelect
+                  ariaLabel="Support assistant network model"
+                  value={settings.modelId ?? ""}
+                  options={modelOptions}
+                  onChange={(value) => update("modelId", value || null)}
+                />
+              </label>
+              <div className="assistant-admin-toggle-stack">
+                <Toggle label="Show assistant publicly" checked={settings.enabled} onChange={(value) => update("enabled", value)} />
+                <Toggle label="Offer confirmed device actions" checked={settings.allowDeviceControl} onChange={(value) => update("allowDeviceControl", value)} />
+              </div>
+            </div>
+          </article>
+
+          <article className="assistant-admin-section">
+            <div className="assistant-admin-section-heading">
+              <div className="assistant-admin-section-icon"><MessageSquareText size={21} /></div>
+              <span><strong>Conversation</strong><small>These texts are visible to users. One suggested question per line, up to six.</small></span>
+            </div>
+            <label className="assistant-admin-full-field">
+              <span>WELCOME MESSAGE</span>
+              <textarea rows={3} value={settings.welcomeMessage} onChange={(event) => update("welcomeMessage", event.target.value)} />
+            </label>
+            <label className="assistant-admin-full-field">
+              <span>SUGGESTED QUESTIONS</span>
+              <textarea rows={4} value={suggestionsText} onChange={(event) => { setSuggestionsText(event.target.value); setSaved(false); }} />
+            </label>
+          </article>
+
+          <article className="assistant-admin-section">
+            <div className="assistant-admin-section-heading">
+              <div className="assistant-admin-section-icon"><Sparkles size={21} /></div>
+              <span><strong>Project knowledge and behaviour</strong><small>The coordinator adds verified live network data separately on every request.</small></span>
+            </div>
+            <label className="assistant-admin-full-field">
+              <span>PRIVATE SYSTEM INSTRUCTIONS</span>
+              <textarea className="assistant-admin-system-prompt" rows={12} value={settings.systemPrompt} onChange={(event) => update("systemPrompt", event.target.value)} />
+              <small>Never place passwords or private tokens here. The instructions are sent only to the selected network model for each support request.</small>
+            </label>
+            <div className="assistant-admin-number-grid">
+              <label><span>MAXIMUM OUTPUT TOKENS</span><input type="number" min={64} max={4096} step={64} value={settings.maxOutputTokens} onChange={(event) => update("maxOutputTokens", Number(event.target.value))} /></label>
+              <label><span>TEMPERATURE</span><input type="number" min={0} max={1.5} step={0.1} value={settings.temperature} onChange={(event) => update("temperature", Number(event.target.value))} /></label>
+            </div>
+          </article>
+
+          <div className="assistant-admin-savebar">
+            <span><ShieldCheck size={15} />Shared model activation remains protected by administrator authorization.</span>
+            {saved && <b><Check size={15} />Saved</b>}
+            <button type="submit" disabled={saving || settings.systemPrompt.trim().length < 20 || settings.welcomeMessage.trim().length < 10 || suggestionsText.trim().length < 3}>
+              {saving ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}{saving ? "Saving…" : "Save assistant"}
+            </button>
+          </div>
+        </form>
+      ) : (
+        <article className="assistant-admin-locked">
+          <ShieldCheck size={26} />
+          <div><strong>Private configuration is locked</strong><p>Sign in with an owner, admin or operator account, or enter the administrator token above.</p></div>
+        </article>
+      )}
+    </section>
+  );
 }
 
 function Overview({ snapshot, onNavigate, publicLink, external, localAcceleration, localContributionState, localComputeMode }: { snapshot: PublicSnapshot; onNavigate: (view: PanelView) => void; publicLink: (path: string) => string; external: boolean; localAcceleration: AcceleratorProgressSnapshot | undefined; localContributionState: DashboardSnapshot["contribution"]["state"] | undefined; localComputeMode: DesktopSettings["computeMode"] | undefined }) {

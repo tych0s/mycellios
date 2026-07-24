@@ -501,7 +501,7 @@ function SplitScene({ frame }: { frame: number }) {
             [colors.cyan, "NODE B", "Stores shard B"],
             [colors.violet, "NODE C", "Stores shard C"],
           ].map(([color, name, detail], index) => {
-            const value = [first, second, third][index];
+            const value = [first, second, third][index] ?? 0;
             return (
               <div
                 key={name}

@@ -355,12 +355,59 @@ export interface ChatStreamUpdate {
   affectedNodeId?: string;
 }
 
+export interface SupportAssistantPublicConfig {
+  enabled: boolean;
+  available: boolean;
+  provider: "mycellios-network";
+  configuredModel: string | null;
+  selectedModel: string | null;
+  availableModels: string[];
+  welcomeMessage: string;
+  suggestions: string[];
+  allowDeviceControl: boolean;
+  updatedAt: string | null;
+}
+
+export interface SupportAssistantAdminSettings {
+  enabled: boolean;
+  modelId: string | null;
+  systemPrompt: string;
+  welcomeMessage: string;
+  suggestions: string[];
+  maxOutputTokens: number;
+  temperature: number;
+  allowDeviceControl: boolean;
+  updatedAt: number;
+}
+
+export interface SupportAssistantAdminResponse {
+  settings: SupportAssistantAdminSettings;
+  runtime: SupportAssistantPublicConfig;
+}
+
+export interface SupportAssistantChatRequest {
+  sessionId: string;
+  messages: Array<{ role: "user" | "assistant"; content: string }>;
+  page?: string;
+  platform?: string;
+}
+
 export interface DesktopBridge {
   getSnapshot(): Promise<DashboardSnapshot>;
   saveSettings(settings: DesktopSettings): Promise<DashboardSnapshot>;
   setContribution(enabled: boolean): Promise<DashboardSnapshot>;
   sendChat(request: ChatRequest): Promise<ChatResponse>;
   streamChat?(request: ChatRequest, onUpdate: (update: ChatStreamUpdate) => void): Promise<ChatResponse>;
+  getSupportAssistantConfig(): Promise<SupportAssistantPublicConfig>;
+  streamSupportAssistant(
+    request: SupportAssistantChatRequest,
+    onUpdate: (update: ChatStreamUpdate) => void,
+  ): Promise<ChatResponse>;
+  getSupportAssistantAdmin(adminToken?: string): Promise<SupportAssistantAdminResponse>;
+  saveSupportAssistantAdmin(
+    settings: Omit<SupportAssistantAdminSettings, "updatedAt">,
+    adminToken?: string,
+  ): Promise<SupportAssistantAdminResponse>;
   removeWorker(workerId: string): Promise<DashboardSnapshot>;
   clearOfflineWorkers(): Promise<DashboardSnapshot>;
   searchHubModels(input: HubCatalogSearchInput): Promise<HubCatalogPage>;

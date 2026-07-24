@@ -24,4 +24,12 @@ describe("Landing navigation", () => {
     expect(html).toContain("Several devices. One AI model.");
     expect(html).toContain('href="#explainer"');
   });
+
+  it("renders the network-only support assistant entry point", () => {
+    const html = renderToStaticMarkup(<Landing />);
+
+    expect(html).toContain('aria-label="Abrir asistente de mycellios"');
+    expect(html).toContain("¿Necesitas ayuda?");
+    expect(html).toContain("Asistente sin conexión");
+  });
 });

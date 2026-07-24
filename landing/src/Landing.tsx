@@ -24,6 +24,7 @@ import {
   Workflow,
   Zap,
 } from "lucide-react";
+import { SupportAssistant } from "./SupportAssistant";
 import { lazy, Suspense, useEffect, useRef, useState, type CSSProperties, type PointerEvent } from "react";
 import brandIcon from "./assets/mycellios-app-icon-v2.png";
 import efficiencyCurve from "./assets/efficiency-curve-ai.webp";
@@ -677,6 +678,7 @@ function Landing() {
       </main>
 
       <footer className="footer container"><Brand homeLabel={t.home} /><p>{t.footer.tagline}</p><div><a href="/network">Network panel</a><a href="#roadmap">Roadmap</a><a href="/blog">Blog</a><a href="/mobile/">Mobile worker</a><a href="/downloads">Downloads</a><a href={`mailto:${EMAIL}`}>{EMAIL}</a></div><span>© 2026 mycellios</span></footer>
+      <SupportAssistant surface="landing" />
     </div>
   );
 }

@@ -22,6 +22,12 @@ import { Scheduler } from "../scheduler/scheduler.js";
 import { MeshDatabase } from "../storage/database.js";
 import { MeshStore, type StoredRequestedModel, type StoredWorker } from "../storage/store.js";
 import { SupabasePersistence } from "../storage/supabase-sync.js";
+import {
+  buildSupportAssistantMessages,
+  resolveSupportAssistantModel,
+  supportAssistantChatRequestSchema,
+  supportAssistantSettingsUpdateSchema,
+} from "../support/assistant.js";
 import { MeshService, MeshServiceError, type JobStreamEvent } from "./mesh-service.js";
 import { MobileComputeHub, type MobileWorkerSnapshot } from "./mobile-compute-hub.js";
 import { verifyGitHubReleaseUploadToken } from "./github-oidc.js";
@@ -297,6 +303,8 @@ export async function createCoordinator(
     queueExistingMobileArtifacts(persistence, config.mobileExpertArtifactsPath);
   }
   const service = new MeshService(store, scheduler, hub, config.requestTimeoutMs);
+  const supportAssistantRateLimits = new Map<string, SupportAssistantRateState>();
+  let activeSupportAssistantRequests = 0;
   const activationManager = options.activationManager ?? options.activationManagerFactory?.({ store, hub });
   await activationManager?.initialize();
   const benchmarkWorkspace = process.cwd();
@@ -777,6 +785,215 @@ export async function createCoordinator(
       activationProgressForModel,
       activationStatusMessageForModel,
     });
+  });
+
+  const availableSupportAssistantModels = (): string[] =>
+    benchmarkableActiveModelIds().sort((left, right) => left.localeCompare(right));
+
+  const publicSupportAssistantConfig = () => {
+    const settings = store.getSupportAssistantSettings();
+    const availableModels = availableSupportAssistantModels();
+    const selectedModel = resolveSupportAssistantModel(settings, availableModels);
+    return {
+      enabled: settings.enabled,
+      available: settings.enabled && selectedModel !== null,
+      provider: "mycellios-network" as const,
+      configuredModel: settings.modelId,
+      selectedModel,
+      availableModels,
+      welcomeMessage: settings.welcomeMessage,
+      suggestions: settings.suggestions,
+      allowDeviceControl: settings.allowDeviceControl,
+      updatedAt: settings.updatedAt ? new Date(settings.updatedAt).toISOString() : null,
+    };
+  };
+
+  app.get("/public/v1/assistant/config", async () => publicSupportAssistantConfig());
+
+  app.get("/public/v1/admin/assistant", async (request, reply) => {
+    if (!await authorizeModelMutation(request, reply)) return;
+    return {
+      settings: store.getSupportAssistantSettings(),
+      runtime: publicSupportAssistantConfig(),
+    };
+  });
+
+  app.put("/public/v1/admin/assistant", async (request, reply) => {
+    if (!await authorizeModelMutation(request, reply)) return;
+    const body = supportAssistantSettingsUpdateSchema.parse(request.body);
+    const availableModels = availableSupportAssistantModels();
+    if (body.modelId && !availableModels.includes(body.modelId)) {
+      return reply.code(409).send({
+        error: {
+          code: "assistant_model_not_available",
+          message: `${body.modelId} is not currently announced by a real mycellios inference node.`,
+        },
+      });
+    }
+    const settings = store.saveSupportAssistantSettings(body);
+    return {
+      settings,
+      runtime: publicSupportAssistantConfig(),
+    };
+  });
+
+  app.post("/public/v1/assistant/chat", async (request, reply) => {
+    const body = supportAssistantChatRequestSchema.parse(request.body);
+    if (activeSupportAssistantRequests >= 8) {
+      return reply.code(429).send({
+        error: {
+          code: "assistant_capacity_limited",
+          message: "All support assistant slots are busy. Try again shortly.",
+        },
+      });
+    }
+    const releaseRateLimit = claimSupportAssistantRequest(
+      supportAssistantRateLimits,
+      supportAssistantRateKey(request, body.session_id),
+    );
+    if (!releaseRateLimit) {
+      return reply.code(429).send({
+        error: {
+          code: "assistant_rate_limited",
+          message: "The mycellios assistant is already handling too many requests. Try again shortly.",
+        },
+      });
+    }
+    activeSupportAssistantRequests += 1;
+    try {
+      const settings = store.getSupportAssistantSettings();
+      if (!settings.enabled) {
+        return reply.code(503).send({
+          error: {
+            code: "assistant_disabled",
+            message: "The mycellios assistant is disabled by the network administrator.",
+          },
+        });
+      }
+      const availableModels = availableSupportAssistantModels();
+      const selectedModel = resolveSupportAssistantModel(settings, availableModels);
+      if (!selectedModel) {
+        return reply.code(503).send({
+          error: {
+            code: "assistant_model_unavailable",
+            message: settings.modelId
+              ? `The configured network model ${settings.modelId} is not connected right now.`
+              : "No real mycellios network model is available for support right now.",
+          },
+        });
+      }
+
+      const snapshot = publicSnapshot(store, scheduler, hub, mobileHub, activationManager, {
+        activationProgressForModel,
+        activationStatusMessageForModel,
+      });
+      const parsed: ChatCompletionRequest = {
+        model: selectedModel,
+        messages: buildSupportAssistantMessages(
+          settings,
+          {
+            registeredNodes: snapshot.summary.registered,
+            connectedNodes: snapshot.summary.connected,
+            offeredMemoryGb: snapshot.summary.offeredVramMb / 1_024,
+            availableModels,
+            requestedModels: snapshot.requestedModels.map((model) => ({
+              id: model.id,
+              status: model.status,
+            })),
+          },
+          body.messages,
+          { ...(body.page ? { page: body.page } : {}), ...(body.platform ? { platform: body.platform } : {}) },
+        ),
+        stream: true,
+        max_tokens: settings.maxOutputTokens,
+        temperature: settings.temperature,
+        top_p: 1,
+        workload_class: "interactive",
+        session_id: `support-${body.session_id}`,
+        deadline_ms: Math.min(config.requestTimeoutMs, 180_000),
+      };
+
+      const supersededJobId = service.cancelMatchingActiveSession(parsed, parsed.session_id);
+      if (supersededJobId) {
+        await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 1_000));
+      }
+      if (!service.hasCapacity(parsed, parsed.session_id)) {
+        await waitForChatCapacity(service, parsed, parsed.session_id, 30_000);
+      }
+      const handle = service.submit(parsed, parsed.session_id);
+      const conversationId = store.startInferenceConversation(
+        handle.sessionId,
+        parsed.model,
+        parsed.messages,
+      );
+      reply.header("x-network-request-id", handle.jobId);
+      reply.header("x-network-session-id", handle.sessionId);
+      reply.header("x-mycellios-assistant-provider", "mycellios-network");
+      reply.header("x-mycellios-assistant-model", selectedModel);
+      reply.hijack();
+      reply.raw.writeHead(200, {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache, no-transform",
+        connection: "keep-alive",
+        "x-accel-buffering": "no",
+        "x-network-request-id": handle.jobId,
+        "x-network-session-id": handle.sessionId,
+        "x-mycellios-assistant-provider": "mycellios-network",
+        "x-mycellios-assistant-model": selectedModel,
+      });
+
+      let finished = false;
+      let streamedText = "";
+      let streamedRouteClass = "replica";
+      let streamedResult: Extract<JobStreamEvent, { type: "completed" }> | null = null;
+      let streamedFailure: Extract<JobStreamEvent, { type: "failed" }> | null = null;
+      reply.raw.once("close", () => {
+        if (!finished) service.cancel(handle.jobId);
+      });
+      const heartbeatTimer = setInterval(() => {
+        if (!reply.raw.destroyed && !reply.raw.writableEnded) {
+          reply.raw.write(`: mycellios-assistant-heartbeat ${Date.now()}\n\n`);
+        }
+      }, 10_000);
+      heartbeatTimer.unref();
+      try {
+        for await (const event of handle.events) {
+          if (event.type === "accepted") streamedRouteClass = event.route.routeClass;
+          if (event.type === "token") streamedText += event.token.text;
+          if (event.type === "completed") streamedResult = event;
+          if (event.type === "failed") streamedFailure = event;
+          writeOpenAiEvent(reply.raw, event, parsed.model, handle.jobId);
+        }
+      } finally {
+        clearInterval(heartbeatTimer);
+      }
+      finished = true;
+      store.appendInferenceMessage({
+        conversationId,
+        jobId: handle.jobId,
+        role: "assistant",
+        content: streamedResult?.result.text ?? streamedText,
+        status: streamedFailure ? "failed" : "completed",
+        inputTokens: streamedResult?.result.metrics.inputTokens ?? null,
+        outputTokens: streamedResult?.result.metrics.outputTokens ?? null,
+        routeClass: streamedRouteClass,
+        latencyMs: streamedResult?.result.metrics.activeMs ?? null,
+        metadata: streamedFailure
+          ? { failure_code: streamedFailure.code, failure_message: streamedFailure.message, assistant: true }
+          : {
+              finish_reason: streamedResult?.result.finishReason ?? null,
+              assistant: true,
+              provider: "mycellios-network",
+            },
+      });
+      void persistence?.flush();
+      reply.raw.write("data: [DONE]\n\n");
+      reply.raw.end();
+      return;
+    } finally {
+      activeSupportAssistantRequests = Math.max(0, activeSupportAssistantRequests - 1);
+      releaseRateLimit();
+    }
   });
 
   app.get("/public/v1/huggingface-models", async (request, reply) => {
@@ -1687,6 +1904,56 @@ function parseIdempotencyKey(received: string | string[] | undefined): string | 
     );
   }
   return value;
+}
+
+interface SupportAssistantRateState {
+  windowStartedAt: number;
+  requests: number;
+  active: number;
+}
+
+function supportAssistantRateKey(request: FastifyRequest, sessionId: string): string {
+  const userAgent = request.headers["user-agent"] ?? "unknown";
+  const forwardedFor = request.headers["x-forwarded-for"];
+  const address = typeof forwardedFor === "string"
+    ? forwardedFor.split(",", 1)[0]?.trim() || request.ip
+    : request.ip;
+  return createHash("sha256")
+    .update(`${address}\n${userAgent}\n${sessionId}`)
+    .digest("hex")
+    .slice(0, 24);
+}
+
+function claimSupportAssistantRequest(
+  states: Map<string, SupportAssistantRateState>,
+  key: string,
+  now = Date.now(),
+): (() => void) | null {
+  const windowMs = 10 * 60_000;
+  const previous = states.get(key);
+  const state = !previous || now - previous.windowStartedAt >= windowMs
+    ? { windowStartedAt: now, requests: 0, active: 0 }
+    : previous;
+  // A reconnect can overlap briefly with the abandoned socket. Two active
+  // attempts let the new request supersede the stale job without opening an
+  // unlimited parallel-inference path for one browser session.
+  if (state.requests >= 24 || state.active >= 2) return null;
+  state.requests += 1;
+  state.active += 1;
+  states.set(key, state);
+  if (states.size > 2_000) {
+    for (const [candidateKey, candidate] of states) {
+      if (now - candidate.windowStartedAt >= windowMs && candidate.active === 0) {
+        states.delete(candidateKey);
+      }
+    }
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    state.active = Math.max(0, state.active - 1);
+  };
 }
 
 const jobIdParamsSchema = z.object({ jobId: z.string().min(1).max(128) }).strict();

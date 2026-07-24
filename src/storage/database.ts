@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-const SCHEMA_VERSION = 10;
+const SCHEMA_VERSION = 11;
 
 export interface PersistenceOutboxRow {
   id: number;
@@ -220,6 +220,19 @@ export class MeshDatabase {
         attempts INTEGER NOT NULL DEFAULT 0,
         last_error TEXT,
         created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS assistant_settings (
+        id TEXT PRIMARY KEY,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        model_id TEXT,
+        system_prompt TEXT NOT NULL,
+        welcome_message TEXT NOT NULL,
+        suggestions_json TEXT NOT NULL,
+        max_output_tokens INTEGER NOT NULL DEFAULT 512,
+        temperature REAL NOT NULL DEFAULT 0.2,
+        allow_device_control INTEGER NOT NULL DEFAULT 1,
         updated_at INTEGER NOT NULL
       );
 

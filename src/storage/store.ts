@@ -8,6 +8,11 @@ import type {
 } from "../contracts/types.js";
 import type { BenchmarkRun } from "../benchlab/types.js";
 import { newId } from "../core/ids.js";
+import {
+  ASSISTANT_SETTINGS_ID,
+  DEFAULT_SUPPORT_ASSISTANT_SETTINGS,
+  type SupportAssistantSettings,
+} from "../support/assistant.js";
 import { MeshDatabase } from "./database.js";
 
 export interface StoredWorker {
@@ -126,6 +131,80 @@ interface RequestedModelRow {
 
 export class MeshStore {
   constructor(readonly database: MeshDatabase) {}
+
+  getSupportAssistantSettings(): SupportAssistantSettings {
+    const row = this.database.raw.prepare(
+      `SELECT enabled, model_id, system_prompt, welcome_message, suggestions_json,
+              max_output_tokens, temperature, allow_device_control, updated_at
+       FROM assistant_settings
+       WHERE id = ?`,
+    ).get(ASSISTANT_SETTINGS_ID) as {
+      enabled: number;
+      model_id: string | null;
+      system_prompt: string;
+      welcome_message: string;
+      suggestions_json: string;
+      max_output_tokens: number;
+      temperature: number;
+      allow_device_control: number;
+      updated_at: number;
+    } | undefined;
+    if (!row) return { ...DEFAULT_SUPPORT_ASSISTANT_SETTINGS };
+    let suggestions = DEFAULT_SUPPORT_ASSISTANT_SETTINGS.suggestions;
+    try {
+      const parsed = JSON.parse(row.suggestions_json) as unknown;
+      if (Array.isArray(parsed) && parsed.every((item) => typeof item === "string")) {
+        suggestions = parsed;
+      }
+    } catch {
+      // Keep the safe defaults if a manually edited row is malformed.
+    }
+    return {
+      enabled: Boolean(row.enabled),
+      modelId: row.model_id,
+      systemPrompt: row.system_prompt,
+      welcomeMessage: row.welcome_message,
+      suggestions,
+      maxOutputTokens: Number(row.max_output_tokens),
+      temperature: Number(row.temperature),
+      allowDeviceControl: Boolean(row.allow_device_control),
+      updatedAt: Number(row.updated_at),
+    };
+  }
+
+  saveSupportAssistantSettings(
+    input: Omit<SupportAssistantSettings, "updatedAt">,
+  ): SupportAssistantSettings {
+    const updatedAt = Date.now();
+    this.database.raw.prepare(
+      `INSERT INTO assistant_settings(
+         id, enabled, model_id, system_prompt, welcome_message, suggestions_json,
+         max_output_tokens, temperature, allow_device_control, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         enabled = excluded.enabled,
+         model_id = excluded.model_id,
+         system_prompt = excluded.system_prompt,
+         welcome_message = excluded.welcome_message,
+         suggestions_json = excluded.suggestions_json,
+         max_output_tokens = excluded.max_output_tokens,
+         temperature = excluded.temperature,
+         allow_device_control = excluded.allow_device_control,
+         updated_at = excluded.updated_at`,
+    ).run(
+      ASSISTANT_SETTINGS_ID,
+      input.enabled ? 1 : 0,
+      input.modelId,
+      input.systemPrompt,
+      input.welcomeMessage,
+      JSON.stringify(input.suggestions),
+      input.maxOutputTokens,
+      input.temperature,
+      input.allowDeviceControl ? 1 : 0,
+      updatedAt,
+    );
+    return { ...input, updatedAt };
+  }
 
   registerWorker(registration: WorkerRegistration): StoredWorker {
     return this.database.transaction(() => {

@@ -48,6 +48,10 @@ import type {
   DashboardWorker,
   DesktopSettings,
   DesktopUpdateStatus,
+  SupportAssistantAdminResponse,
+  SupportAssistantAdminSettings,
+  SupportAssistantChatRequest,
+  SupportAssistantPublicConfig,
 } from "./contracts.js";
 import type {
   HubCatalogPage,
@@ -908,6 +912,63 @@ async function streamChat(request: ChatRequest, onUpdate: (update: ChatStreamUpd
   );
 }
 
+async function getSupportAssistantConfig(): Promise<SupportAssistantPublicConfig> {
+  return fetchJson<SupportAssistantPublicConfig>("public/v1/assistant/config");
+}
+
+async function streamSupportAssistant(
+  request: SupportAssistantChatRequest,
+  onUpdate: (update: ChatStreamUpdate) => void,
+): Promise<ChatResponse> {
+  const messages = request.messages
+    .map((message) => ({ role: message.role, content: message.content.trim() }))
+    .filter((message) => message.content);
+  const last = messages.at(-1);
+  if (!last || last.role !== "user") throw new Error("Escribe un mensaje antes de enviarlo.");
+  return consumeChatCompletionStreamWithRecovery(
+    (_attempt, signal) => fetch(new URL("public/v1/assistant/chat", `${coordinatorUrl}/`), {
+      method: "POST",
+      headers: { accept: "text/event-stream", "content-type": "application/json" },
+      body: JSON.stringify({
+        session_id: request.sessionId,
+        messages,
+        ...(request.page ? { page: request.page } : {}),
+        ...(request.platform ? { platform: request.platform } : {}),
+      }),
+      signal,
+      redirect: "error",
+    }),
+    "mycellios-network",
+    onUpdate,
+    {
+      sessionId: request.sessionId,
+      maximumAttempts: 4,
+      retryDelayMs: 900,
+      connectionTimeoutMs: 15_000,
+      streamIdleTimeoutMs: 35_000,
+    },
+  );
+}
+
+async function supportAssistantAdminRequest(
+  method: "GET" | "PUT",
+  providedAdminToken: string | undefined,
+  assistantSettings?: Omit<SupportAssistantAdminSettings, "updatedAt">,
+): Promise<SupportAssistantAdminResponse> {
+  const providedToken = providedAdminToken?.trim() ?? "";
+  const token = providedToken || modelAdminToken;
+  const response = await fetchJson<SupportAssistantAdminResponse>("public/v1/admin/assistant", {
+    method,
+    headers: {
+      ...(assistantSettings ? { "content-type": "application/json" } : {}),
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+    },
+    ...(assistantSettings ? { body: JSON.stringify(assistantSettings) } : {}),
+  });
+  if (providedToken && providedToken !== modelAdminToken) persistModelAdminToken(providedToken);
+  return response;
+}
+
 function normalizeDesktopChatMessages(messages: ChatRequest["messages"]): ChatRequest["messages"] {
   const normalized = messages.map((message) => ({ ...message }));
   const last = normalized.at(-1);
@@ -941,6 +1002,26 @@ function registerIpc(): void {
   ipcMain.handle("chat:stream", (event, streamId: string, request: ChatRequest) => streamChat(request, (update) => {
     if (!event.sender.isDestroyed()) event.sender.send("chat:stream:update", streamId, update);
   }));
+  ipcMain.handle("assistant:config", () => getSupportAssistantConfig());
+  ipcMain.handle(
+    "assistant:stream",
+    (event, streamId: string, request: SupportAssistantChatRequest) =>
+      streamSupportAssistant(request, (update) => {
+        if (!event.sender.isDestroyed()) event.sender.send("assistant:stream:update", streamId, update);
+      }),
+  );
+  ipcMain.handle(
+    "assistant:admin:read",
+    (_event, adminToken?: string) => supportAssistantAdminRequest("GET", adminToken),
+  );
+  ipcMain.handle(
+    "assistant:admin:save",
+    (
+      _event,
+      assistantSettings: Omit<SupportAssistantAdminSettings, "updatedAt">,
+      adminToken?: string,
+    ) => supportAssistantAdminRequest("PUT", adminToken, assistantSettings),
+  );
   ipcMain.handle("workers:remove", async (_event, workerId: string) => {
     await fetchJson(`public/v1/workers/${encodeURIComponent(workerId)}`, { method: "DELETE" });
     return readSnapshot();
