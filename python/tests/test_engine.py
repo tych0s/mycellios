@@ -71,6 +71,31 @@ class EngineUnitTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "plus bonus"):
             _resolve_verified_tokens((10, 20), (10, 20))
 
+    def test_collect_ready_return_values_window_is_adaptive_to_inflight(self) -> None:
+        """Adaptive collection window (2.6 enabler): with <=1 sequence in flight
+        the window is zero (no coalescing latency); with more it drains a wave."""
+
+        engine = DistributedPipelineEngine.__new__(DistributedPipelineEngine)
+        engine.config = SimpleNamespace(
+            max_active_sequences=8, root_batch_window_ms=50.0
+        )
+        engine._received_frames = queue.Queue()
+        for value in (("b", 1.0), ("c", 2.0), ("d", 3.0)):
+            engine._received_frames.put(value)
+
+        # One in flight -> limit 1 -> returns only the first, no wait, no drain.
+        started = time.monotonic()
+        single = engine._collect_ready_return_values(("a", 0.0), active_count=1)
+        elapsed_ms = (time.monotonic() - started) * 1_000
+        self.assertEqual(single, (("a", 0.0),))
+        self.assertLess(elapsed_ms, 25.0)  # did NOT block for the 50 ms window
+        self.assertEqual(engine._received_frames.qsize(), 3)
+
+        # Many in flight -> drains everything already available immediately.
+        wave = engine._collect_ready_return_values(("a", 0.0), active_count=8)
+        self.assertEqual(len(wave), 4)
+        self.assertEqual(engine._received_frames.qsize(), 0)
+
     def test_prefill_and_speculation_configuration_is_bounded(self) -> None:
         common = dict(model_name="fake", boundaries=(0, 2, 4))
         configured = PipelineEngineConfig(

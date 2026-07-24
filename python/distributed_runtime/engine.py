@@ -2018,7 +2018,7 @@ class DistributedPipelineEngine:
                         self._admit_batch(batch, active, runner, downstream, emulator)
                         decode_since_admission = 0
                     continue
-                ready_values = self._collect_ready_return_values(value)
+                ready_values = self._collect_ready_return_values(value, len(active))
                 prepared: list[
                     _PreparedRootWave
                     | _PreparedPhysicalTreeWave
@@ -2087,13 +2087,26 @@ class DistributedPipelineEngine:
     def _collect_ready_return_values(
         self,
         first: tuple[Any, float] | BaseException,
+        active_count: int | None = None,
     ) -> tuple[tuple[Any, float] | BaseException, ...]:
-        """Reconstruct one downstream completion wave without blocking fairness."""
+        """Reconstruct one downstream completion wave without blocking fairness.
+
+        Adaptive collection window: the window only pays when more than one
+        sequence is in flight (else no wave can form and the wait is pure
+        latency). With <=1 in flight the effective window is zero, so a
+        low-load or single-stream workload never eats the coalescing delay;
+        the window opens only when there is a real backlog to fuse. This is
+        what makes ragged batching (checklist 2.6) safe to enable without a
+        low-load latency penalty.
+        """
 
         values: list[tuple[Any, float] | BaseException] = [first]
         limit = max(1, self.config.max_active_sequences)
+        if active_count is not None:
+            limit = max(1, min(limit, int(active_count)))
+        window_ms = self.config.root_batch_window_ms if limit >= 2 else 0.0
         collect_started = time.monotonic()
-        deadline = collect_started + self.config.root_batch_window_ms / 1_000
+        deadline = collect_started + window_ms / 1_000
         while len(values) < limit:
             try:
                 values.append(self._received_frames.get_nowait())
@@ -2114,6 +2127,7 @@ class DistributedPipelineEngine:
                 "wait_ms": (time.monotonic() - collect_started) * 1_000,
                 "qsize_after": self._received_frames.qsize(),
                 "limit": limit,
+                "window_ms": window_ms,
             }
         )
         return tuple(values)
