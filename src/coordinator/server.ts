@@ -247,7 +247,11 @@ export async function createCoordinator(
   const service = new MeshService(store, scheduler, hub, config.requestTimeoutMs);
   const activationManager = options.activationManager ?? options.activationManagerFactory?.({ store, hub });
   await activationManager?.initialize();
-  const benchmarkRoot = process.env.MYCELLIOS_BENCHMARK_ROOT?.trim() || process.cwd();
+  const benchmarkWorkspace = process.cwd();
+  const benchmarkStorageRoot = process.env.MYCELLIOS_BENCHMARK_ROOT?.trim();
+  const benchmarkHistoryDirectory = benchmarkStorageRoot
+    ? resolve(benchmarkStorageRoot, "history")
+    : undefined;
   type PersistedBenchmark = Awaited<ReturnType<typeof runAndPersistCoordinatorSuite>>;
   let benchmarkRunInFlight: Promise<PersistedBenchmark> | null = null;
   const automaticBenchmarkQueue: CoordinatorBenchmarkModel[] = [];
@@ -280,7 +284,8 @@ export async function createCoordinator(
     trigger: "automatic-model-start" | "manual",
     metadata: { label?: string; version?: string } = {},
   ): Promise<PersistedBenchmark> => runAndPersistCoordinatorSuite({
-    cwd: benchmarkRoot,
+    cwd: benchmarkWorkspace,
+    ...(benchmarkHistoryDirectory ? { historyDirectory: benchmarkHistoryDirectory } : {}),
     coordinatorUrl: `http://127.0.0.1:${config.port}`,
     model,
     inventory: (routedWorkerIds) => buildCoordinatorBenchmarkInventory(
@@ -765,7 +770,10 @@ export async function createCoordinator(
   });
 
   const benchmarkHistoryResponse = () => ({
-    runs: loadBenchmarkRuns(benchmarkRoot).toReversed(),
+    runs: loadBenchmarkRuns(
+      benchmarkWorkspace,
+      benchmarkHistoryDirectory,
+    ).toReversed(),
   });
 
   app.get("/public/v1/benchmarks", async () => benchmarkHistoryResponse());
