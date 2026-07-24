@@ -30,8 +30,10 @@ interface OpenAiStreamChunk {
 }
 
 const RECOVERABLE_PRETOKEN_CODES = new Set([
+  "connection_timeout",
   "first_token_timeout",
   "pipeline_stage_disconnected",
+  "stream_idle_timeout",
   "worker_disconnected",
   "worker_unreachable",
   "lease_accept_timeout",
@@ -52,16 +54,20 @@ export interface RecoveringChatStreamOptions {
   sessionId: string;
   maximumAttempts?: number;
   retryDelayMs?: number;
+  connectionTimeoutMs?: number;
+  streamIdleTimeoutMs?: number;
 }
 
 export async function consumeChatCompletionStreamWithRecovery(
-  openResponse: (attempt: number) => Promise<Response>,
+  openResponse: (attempt: number, signal: AbortSignal) => Promise<Response>,
   fallbackModel: string,
   onUpdate: (update: ChatStreamUpdate) => void,
   options: RecoveringChatStreamOptions,
 ): Promise<ChatResponse> {
-  const maximumAttempts = Math.max(1, Math.min(2, options.maximumAttempts ?? 2));
-  const retryDelayMs = Math.max(0, options.retryDelayMs ?? 2_500);
+  const maximumAttempts = Math.max(1, Math.min(12, options.maximumAttempts ?? 8));
+  const retryDelayMs = Math.max(0, options.retryDelayMs ?? 1_000);
+  const connectionTimeoutMs = Math.max(1, options.connectionTimeoutMs ?? 15_000);
+  const streamIdleTimeoutMs = Math.max(1, options.streamIdleTimeoutMs ?? 25_000);
   let latest: ChatStreamUpdate = {
     requestId: "pending",
     model: fallbackModel,
@@ -77,47 +83,80 @@ export async function consumeChatCompletionStreamWithRecovery(
     phase: "connecting",
     statusMessage: "Connecting to an available model route.",
     attempt: 1,
+    maximumAttempts,
   };
+  let replayPrefix = "";
   onUpdate(latest);
   for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
     const startedAt = Date.now();
+    const attemptController = new AbortController();
+    let connectionTimedOut = false;
+    const connectionTimer = setTimeout(() => {
+      connectionTimedOut = true;
+      attemptController.abort();
+    }, connectionTimeoutMs);
     try {
-      const response = await openResponse(attempt);
+      const response = await openResponse(attempt, attemptController.signal);
+      clearTimeout(connectionTimer);
       return await consumeChatCompletionStream(
         response,
         fallbackModel,
         (update) => {
+          const replaying = replayPrefix.length > 0 && replayPrefix.startsWith(update.text);
+          if (!replaying) replayPrefix = "";
           latest = {
             ...update,
-            ...(update.outputTokens > 0
+            ...(replaying
+              ? {
+                  delta: "",
+                  text: replayPrefix,
+                  outputTokens: Math.max(latest.outputTokens, update.outputTokens),
+                  phase: "recovering" as const,
+                  statusMessage: "Reconectado. Recuperando el punto alcanzado antes del corte…",
+                }
+              : update.outputTokens > 0
               ? { phase: "streaming" as const }
               : update.phase
                 ? { phase: update.phase }
                 : {}),
             attempt,
+            maximumAttempts,
           };
           onUpdate(latest);
         },
         startedAt,
+        streamIdleTimeoutMs,
+        () => attemptController.abort(),
       );
-    } catch (error) {
+    } catch (caught) {
+      const error = connectionTimedOut
+        ? new ChatStreamError(
+            "connection_timeout",
+            "The coordinator connection stopped responding while the network was changing.",
+          )
+        : caught;
       if (
         attempt >= maximumAttempts ||
-        latest.outputTokens > 0 ||
         !isRecoverablePretokenStreamError(error)
       ) {
         throw error;
       }
+      if (latest.text) replayPrefix = latest.text;
       latest = {
         ...latest,
         requestId: "pending",
         phase: "recovering",
-        statusMessage: "A route node disconnected before the first token. Reconnecting and retrying once.",
+        statusMessage: connectionTimedOut
+          ? "La conexión cambió o dejó de responder. Reconectando automáticamente…"
+          : "La ruta se interrumpió antes del primer token. Reconectando automáticamente…",
         attempt: attempt + 1,
+        maximumAttempts,
         elapsedMs: Math.max(latest.elapsedMs, Date.now() - startedAt),
       };
       onUpdate(latest);
-      await delay(retryDelayMs);
+      await waitForReconnect(Math.min(8_000, retryDelayMs * (2 ** (attempt - 1))));
+    } finally {
+      clearTimeout(connectionTimer);
     }
   }
   throw new ChatStreamError("retry_exhausted", "The inference retry was exhausted.");
@@ -128,6 +167,8 @@ export async function consumeChatCompletionStream(
   fallbackModel: string,
   onUpdate: (update: ChatStreamUpdate) => void,
   startedAt = Date.now(),
+  streamIdleTimeoutMs = 25_000,
+  abortAttempt?: () => void,
 ): Promise<ChatResponse> {
   if (!response.ok) throw await responseError(response);
   if (!response.headers.get("content-type")?.includes("text/event-stream")) {
@@ -246,7 +287,7 @@ export async function consumeChatCompletionStream(
   };
 
   while (!doneMarker) {
-    const { done, value } = await reader.read();
+    const { done, value } = await readStreamChunk(reader, streamIdleTimeoutMs, abortAttempt);
     buffer += decoder.decode(value, { stream: !done }).replaceAll("\r\n", "\n");
     let boundary = buffer.indexOf("\n\n");
     while (boundary >= 0) {
@@ -282,8 +323,49 @@ export function isRecoverablePretokenStreamError(error: unknown): boolean {
     (error.name === "AbortError" || error.name === "TimeoutError" || error.name === "NetworkError");
 }
 
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+async function readStreamChunk(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs: number,
+  abortAttempt?: () => void,
+) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      reader.read(),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          abortAttempt?.();
+          void reader.cancel().catch(() => undefined);
+          reject(new ChatStreamError(
+            "stream_idle_timeout",
+            "The token stream stopped responding after the network changed.",
+          ));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function waitForReconnect(milliseconds: number): Promise<void> {
+  if (milliseconds <= 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    const onlineEvents = globalThis as unknown as {
+      addEventListener?: (type: string, listener: () => void, options?: { once?: boolean }) => void;
+      removeEventListener?: (type: string, listener: () => void) => void;
+    };
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      onlineEvents.removeEventListener?.("online", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, milliseconds);
+    onlineEvents.addEventListener?.("online", finish, { once: true });
+  });
 }
 
 async function responseError(response: Response): Promise<Error> {

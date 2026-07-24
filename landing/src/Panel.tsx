@@ -422,10 +422,11 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     if (desktopBridge?.streamChat) return desktopBridge.streamChat({ model, messages, sessionId }, onUpdate ?? (() => undefined));
     if (desktopBridge) return desktopBridge.sendChat({ model, messages, sessionId });
     return consumeChatCompletionStreamWithRecovery(
-      () => fetch("/v1/chat/completions", {
+      (_attempt, signal) => fetch("/v1/chat/completions", {
         method: "POST",
         headers: { accept: "text/event-stream", "content-type": "application/json" },
         body: JSON.stringify({ model, messages, session_id: sessionId, stream: true, max_tokens: 128, temperature: 0, top_p: 1 }),
+        signal,
       }),
       model,
       onUpdate ?? (() => undefined),
@@ -446,7 +447,17 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   }
 
   return (
-    <div className={`public-panel ${desktop ? `desktop-panel platform-${desktopSnapshot?.platform ?? "loading"}` : ""}`}>
+    <div className="public-panel-viewport">
+      <div
+        className={`public-panel ${desktop ? `desktop-panel platform-${desktopSnapshot?.platform ?? "loading"}` : ""}`}
+        style={{
+          width: `${100 / contentScale}%`,
+          height: `${100 / contentScale}vh`,
+          minHeight: `${100 / contentScale}vh`,
+          transform: `scale(${contentScale})`,
+          transformOrigin: "top left",
+        } as CSSProperties}
+      >
       <aside className={menuOpen ? "panel-sidebar open" : "panel-sidebar"}>
         <button className="panel-sidebar-close" aria-label="Close navigation" onClick={() => setMenuOpen(false)}><X size={18} /></button>
         <a className="panel-brand" href={publicLink("/")} {...externalProps}><img src={brandIcon} alt="" /><div><strong>mycellios</strong><span>network control</span></div></a>
@@ -505,7 +516,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
 
         {error && <div className="panel-error" title={error}><CircleAlert size={17} /> Coordinator unavailable. Retrying automatically.</div>}
         <main className="panel-content">
-          <div className="panel-content-scale" style={{ transform: `scale(${contentScale})`, width: `${100 / contentScale}%` } as CSSProperties}>
+          <div className="panel-content-scale">
             {loading && snapshot.capturedAt === EMPTY.capturedAt ? <PanelLoading /> : (
               <>
               {view === "overview" && <Overview snapshot={snapshot} onNavigate={navigate} publicLink={publicLink} external={desktop} localAcceleration={desktopSnapshot?.acceleration} localContributionState={desktopSnapshot?.contribution.state} localComputeMode={desktopSnapshot?.settings.computeMode} />}
@@ -537,6 +548,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
         onSignOut={() => void disconnectAccount().finally(() => setAuthOpen(false))}
         onClose={() => setAuthOpen(false)}
       />}
+      </div>
     </div>
   );
 }
@@ -813,14 +825,42 @@ function NodeOverviewStat({ icon: Icon, label, value, detail, progress, tone }: 
 function NodeTopologyInspector({ worker, snapshot }: { worker: PublicWorker; snapshot: PublicSnapshot }) {
   const gpus = worker.gpus;
   const free = gpus.reduce((total, gpu) => total + gpu.freeOfferedVramMb, 0);
+  const physicalVram = gpus.reduce((total, gpu) => total + gpu.physicalVramMb, 0);
   const utilizations = gpus.filter((gpu) => gpu.utilizationPct !== undefined);
   const utilization = utilizations.length > 0 ? utilizations.reduce((total, gpu) => total + (gpu.utilizationPct ?? 0), 0) / utilizations.length : null;
+  const temperatures = gpus.map((gpu) => gpu.temperatureC).filter((value): value is number => Number.isFinite(value));
+  const maximumTemperature = temperatures.length > 0 ? Math.max(...temperatures) : null;
+  const powerReadings = gpus.map((gpu) => gpu.powerW).filter(
+    (value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0,
+  );
+  const observedPower = powerReadings.length > 0 ? powerReadings.reduce((total, value) => total + value, 0) : null;
   const measuredDeployments = worker.deployments.filter(isMeasuredDeployment);
   const throughput = measuredDeployments.reduce((total, deployment) => total + deployment.tokensPerSecond, 0);
   const execution = workerExecutionSummary(snapshot, worker);
+  const kind = worker.kind === "cell" ? "Celda lógica" : worker.kind === "browser" ? "Navegador" : "Equipo instalado";
+  const computeMode = worker.computeMode ? computeModeLabel(worker.computeMode) : worker.kind === "cell" ? "Orquestado" : "No informado";
   return <div className="node-topology-inspector">
     <div className={`node-inspector-identity ${nodeVisualState(worker)}`}><div><WorkerKindIcon worker={worker} /></div><span><small>{worker.kind === "cell" ? "CELDA SELECCIONADA" : "NODO SELECCIONADO"}</small><strong>{workerLabel(worker)}</strong><em>{worker.region} · {shortId(worker.id)}</em><ExecutionBadge execution={execution} workers={snapshot.workers} /></span></div>
-    <div className="node-inspector-metrics"><Metric label="Estado" value={nodeStatusLabel(worker)} /><Metric label="Memoria libre" value={formatMemory(free)} /><Metric label="Carga física" value={utilization === null ? "Sin datos" : `${utilization.toFixed(0)}%`} /><Metric label="Inferencia medida" value={throughput > 0 ? `${formatCompactNumber(throughput)} tok/s` : "Sin medir"} /><Metric label="Cómputo real" value={execution.verified ? executionShortLabel(execution) : "No verificado"} /><Metric label="Versión" value={worker.agentVersion ? `v${worker.agentVersion}` : "Legacy"} /><Metric label="GPU runtime" value={worker.acceleration ? remoteAccelerationLabel(worker.acceleration) : "Sin diagnóstico"} /><Metric label="Modelos" value={String(worker.deployments.length)} /></div>
+    <div className="node-inspector-metrics">
+      <Metric label="Estado" value={nodeStatusLabel(worker)} />
+      <Metric label="Tipo" value={kind} />
+      <Metric label="Región" value={worker.region} />
+      <Metric label="Última señal" value={relativeTimeEs(worker.lastSeenAt)} />
+      <Metric label="Fiabilidad" value={`${Math.round(Math.max(0, Math.min(1, worker.reliability)) * 100)}%`} />
+      <Metric label="Versión" value={worker.agentVersion ? `v${worker.agentVersion}` : "Legacy"} />
+      <Metric label={worker.kind === "cell" ? "Capacidad agregada" : "VRAM física"} value={physicalVram > 0 ? formatMemory(physicalVram) : "Sin datos"} />
+      <Metric label="Memoria ofrecida" value={formatMemory(worker.offeredVramMb)} />
+      <Metric label="Memoria libre" value={formatMemory(free)} />
+      <Metric label="Carga física" value={utilization === null ? "Sin datos" : `${utilization.toFixed(0)}%`} />
+      <Metric label="Temperatura máx." value={maximumTemperature === null ? "Sin datos" : `${maximumTemperature.toFixed(0)} °C`} />
+      <Metric label="Consumo GPU" value={observedPower === null ? "Sin datos" : formatPower(observedPower)} />
+      <Metric label="Cómputo real" value={execution.verified ? executionShortLabel(execution) : "No verificado"} />
+      <Metric label="GPU runtime" value={worker.acceleration ? remoteAccelerationLabel(worker.acceleration) : "Sin diagnóstico"} />
+      <Metric label="Modo" value={computeMode} />
+      <Metric label="Inferencia medida" value={throughput > 0 ? `${formatCompactNumber(throughput)} tok/s` : "Sin medir"} />
+      <Metric label="Modelos" value={String(worker.deployments.length)} />
+      <Metric label="Completadas" value={String(worker.jobsCompleted)} />
+    </div>
     {worker.acceleration && <RemoteAccelerationDiagnostics diagnostics={worker.acceleration} />}
   </div>;
 }
@@ -1568,10 +1608,11 @@ function InferenceStreamingTurn({ turn }: { turn: InferencePendingTurn }) {
     <div className="inference-user-message"><span>TÚ</span><p>{turn.prompt}</p></div>
     {turn.text ? <div className="inference-message streaming"><img src={brandIcon} alt="" /><div>
       <div className="inference-stream-head"><span>{turn.model}</span><b><i />GENERANDO EN VIVO</b></div>
+      {turn.phase === "recovering" && <div className="inference-stream-recovery"><LoaderCircle className="spin" size={14} />{turn.statusMessage ?? "Reconectando y recuperando la respuesta…"} <small>intento {turn.attempt ?? 1} de {turn.maximumAttempts ?? 8}</small></div>}
       {content.reasoning !== null && <div className="inference-live-reasoning"><span>RAZONAMIENTO</span><p>{content.reasoning}{content.answer === "" && <i className="stream-cursor" />}</p></div>}
       {content.answer && <p>{content.answer}<i className="stream-cursor" /></p>}
       <div className="inference-response-metrics live"><span><b>{formatDuration(turn.ttftMs)}</b>primer token</span><span><b>{formatDuration(turn.elapsedMs)}</b>tiempo actual</span><span><b>{turn.outputTokens}</b>tokens recibidos</span><span><b>{formatLiveThroughput(turn)}</b>tokens/s ahora</span><span><b>{turn.routeClass}</b>ruta</span>{turn.affinityHit && <span><b>AFÍN</b>misma ruta</span>}</div>
-    </div></div> : <div className={`inference-thinking ${turn.phase === "recovering" ? "recovering" : ""}`}><LoaderCircle className="spin" /><span><strong>{waitingStatus}</strong><small>{formatDuration(turn.elapsedMs)}{(turn.attempt ?? 1) > 1 ? ` · intento ${turn.attempt} de 2` : ""}</small></span></div>}
+    </div></div> : <div className={`inference-thinking ${turn.phase === "recovering" ? "recovering" : ""}`}><LoaderCircle className="spin" /><span><strong>{waitingStatus}</strong><small>{formatDuration(turn.elapsedMs)}{(turn.attempt ?? 1) > 1 ? ` · intento ${turn.attempt} de ${turn.maximumAttempts ?? 8}` : ""}</small></span></div>}
   </div>;
 }
 
@@ -1685,7 +1726,7 @@ function AcceleratorCompactBanner({ acceleration, contributionState, computeMode
 }
 
 function ActivationProgressLog({ model }: { model: RequestedModelCapacity }) {
-  const events: RequestedModelCapacity["activationProgress"] = (model.activationProgress?.length ?? 0) > 0
+  const rawEvents: RequestedModelCapacity["activationProgress"] = (model.activationProgress?.length ?? 0) > 0
     ? model.activationProgress
     : [{
         phase: "queued",
@@ -1696,15 +1737,88 @@ function ActivationProgressLog({ model }: { model: RequestedModelCapacity }) {
         state: model.status === "failed" ? "failed" as const : "running" as const,
         ...(model.status === "failed" ? { details: fallbackActivationDetails(model.message) } : {}),
       }];
+  const events = useMemo(() => orderActivationProgressEvents(rawEvents), [rawEvents]);
+  const listRef = useRef<HTMLOListElement>(null);
+  const actionableIndex = events.findLastIndex(
+    (event) => event.state === "running" || event.state === "failed",
+  );
+  const currentIndex = actionableIndex >= 0 ? actionableIndex : Math.max(0, events.length - 1);
+  const current = events[currentIndex] ?? events.at(-1)!;
+  const nodeCount = new Set(events.flatMap((event) => event.nodeId ? [event.nodeId] : [])).size;
+  const stageCount = activationStageCount(events);
+  useEffect(() => {
+    const list = listRef.current;
+    if (!list) return;
+    list.scrollTo({ top: list.scrollHeight, behavior: "smooth" });
+  }, [events.length, current.at, current.message]);
   return <div className="model-activation-log" aria-live="polite">
-    <div className="model-activation-log-head"><span><Activity size={14} /> LIVE ACTIVATION LOG</span><small>{events.length} step{events.length === 1 ? "" : "s"}</small></div>
-    <ol>{events.map((event, index) => <li className={event.state} key={`${event.phase}-${event.at}-${index}`}>
-      <i>{event.state === "running" ? <LoaderCircle className="spin" /> : event.state === "failed" ? <CircleAlert /> : <CheckCircle2 />}</i>
-      <span><strong>{activationPhaseLabel(event.phase)}</strong><small>{event.message}</small>{(event.nodeId || event.device) && <em>{event.nodeId && <>NODE · {shortId(event.nodeId)}</>}{event.nodeId && event.device && <> &nbsp;·&nbsp; </>}{event.device && <>DEVICE · {event.device.toUpperCase()}</>}</em>}</span>
-      <time dateTime={event.at}>{formatActivationTime(event.at)}</time>
-      {(event.details?.length ?? 0) > 0 && <details className="model-activation-details"><summary>View technical details</summary><div>{event.details!.map((detail, detailIndex) => <code key={`${detail}-${detailIndex}`}>{detail}</code>)}</div></details>}
-    </li>)}</ol>
+    <div className="model-activation-log-head">
+      <span><Activity size={14} /> ACTIVATION TIMELINE</span>
+      <small>{events.length} events{stageCount > 0 ? ` · ${stageCount} stages` : ""}{nodeCount > 0 ? ` · ${nodeCount} nodes` : ""}</small>
+    </div>
+    <div className={`model-activation-current ${current.state}`}>
+      <span>{current.state === "running" ? "NOW" : current.state === "failed" ? "ATTENTION" : "LATEST"}</span>
+      <div><strong>{activationPhaseLabel(current.phase)}</strong><small>{current.message}</small></div>
+      <b>{Math.min(currentIndex + 1, events.length)} / {events.length}</b>
+    </div>
+    <ol ref={listRef}>{events.map((event, index) => {
+      const visibleDetails = (event.details ?? []).filter(activationDetailIsReadable);
+      const technicalDetails = (event.details ?? []).filter((detail) => !activationDetailIsReadable(detail));
+      return <li className={`${event.state}${index === currentIndex ? " current" : ""}`} key={`${event.phase}-${event.at}-${index}`}>
+        <i>{event.state === "running" ? <LoaderCircle className="spin" /> : event.state === "failed" ? <CircleAlert /> : <CheckCircle2 />}</i>
+        <span>
+          <strong><b>{String(index + 1).padStart(2, "0")}</b>{activationPhaseLabel(event.phase)}</strong>
+          <small>{event.message}</small>
+          {(event.nodeId || event.device || event.processId) && <em>
+            {event.nodeId && <>NODE · {shortId(event.nodeId)}</>}
+            {event.nodeId && event.device && <> &nbsp;·&nbsp; </>}
+            {event.device && <>DEVICE · {event.device.toUpperCase()}</>}
+            {(event.nodeId || event.device) && event.processId && <> &nbsp;·&nbsp; </>}
+            {event.processId && <>PROCESS · {shortId(event.processId)}</>}
+          </em>}
+          {visibleDetails.length > 0 && <ul className="model-activation-facts">
+            {visibleDetails.map((detail, detailIndex) => <li key={`${detail}-${detailIndex}`}>{detail}</li>)}
+          </ul>}
+        </span>
+        <time dateTime={event.at}>{formatActivationTime(event.at)}</time>
+        {technicalDetails.length > 0 && <details className="model-activation-details"><summary>View raw runtime details</summary><div>{technicalDetails.map((detail, detailIndex) => <code key={`${detail}-${detailIndex}`}>{detail}</code>)}</div></details>}
+      </li>;
+    })}</ol>
   </div>;
+}
+
+export function orderActivationProgressEvents<T extends { at: string }>(events: readonly T[]): T[] {
+  return events
+    .map((event, index) => ({ event, index, timestamp: Date.parse(event.at) }))
+    .sort((left, right) => {
+      const leftAt = Number.isFinite(left.timestamp) ? left.timestamp : Number.MAX_SAFE_INTEGER;
+      const rightAt = Number.isFinite(right.timestamp) ? right.timestamp : Number.MAX_SAFE_INTEGER;
+      return leftAt - rightAt || left.index - right.index;
+    })
+    .map(({ event }) => event);
+}
+
+function activationStageCount(events: RequestedModelCapacity["activationProgress"]): number {
+  let count = 0;
+  for (const event of events) {
+    for (const value of [event.message, ...(event.details ?? [])]) {
+      const match = /(?:stage|stages)(?:\s+ready)?(?:\s*:)?\s*(?:\d+\s*(?:of|\/)\s*)?(\d+)/i.exec(value);
+      if (/stages?\s+across/i.test(value)) {
+        const planned = /(\d+)\s+stages?/i.exec(value)?.[1];
+        if (planned) count = Math.max(count, Number(planned));
+      } else if (match?.[1]) {
+        count = Math.max(count, Number(match[1]));
+      }
+    }
+  }
+  return count;
+}
+
+function activationDetailIsReadable(detail: string): boolean {
+  return detail.length <= 180
+    && !detail.includes("launch_process_exited:")
+    && !detail.includes("managed_launch_agent_")
+    && !detail.includes("distributed_worker_disconnected:");
 }
 
 function friendlyActivationFailure(message: string): string {
@@ -1738,6 +1852,8 @@ function activationPhaseLabel(phase: string): string {
     plan_ready: "Distribution calculated",
     preparing_nodes: "Preparing nodes",
     launching_stages: "Launching model stages",
+    stage_loading: "Loading model stage",
+    stage_ready: "Model stage ready",
     stages_ready: "Stages online",
     checking_health: "Checking pipeline",
     running_canary: "Testing real inference",
@@ -2509,6 +2625,7 @@ function friendlyInferenceError(message: string): string {
 
 function inferenceWaitingStatus(update: ChatStreamUpdate): string {
   if (update.phase === "recovering") {
+    if (update.statusMessage) return update.statusMessage;
     return update.affectedNodeId
       ? `Se desconectó el nodo ${shortId(update.affectedNodeId)}. Reconectando la ruta y reintentando…`
       : "Una etapa perdió la conexión. Reconectando la ruta y reintentando…";

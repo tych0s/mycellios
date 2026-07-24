@@ -424,9 +424,14 @@ export async function createCoordinator(
     const managerProgress = activationManager?.activationProgressForModel?.(modelId) ?? [];
     const retryProgress = automaticActivationRetryProgressForModel(modelId);
     if (retryProgress.length === 0) return managerProgress;
-    return automaticActivationRetryState.get(modelId)?.launching
-      ? [...retryProgress, ...managerProgress]
-      : [...managerProgress, ...retryProgress];
+    return [...managerProgress, ...retryProgress]
+      .map((event, index) => ({ event, index, at: Date.parse(event.at) }))
+      .sort((left, right) => {
+        const leftAt = Number.isFinite(left.at) ? left.at : Number.MAX_SAFE_INTEGER;
+        const rightAt = Number.isFinite(right.at) ? right.at : Number.MAX_SAFE_INTEGER;
+        return leftAt - rightAt || left.index - right.index;
+      })
+      .map(({ event }) => event);
   };
   const activationStatusMessageForModel = (modelId: string): string | null => {
     const retry = automaticActivationRetryState.get(modelId);
