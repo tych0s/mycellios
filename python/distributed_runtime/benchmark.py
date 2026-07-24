@@ -95,6 +95,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Requires a working C++ toolchain on the host."
         ),
     )
+    parser.add_argument(
+        "--kv-cache",
+        choices=("arena", "dynamic"),
+        default="arena",
+        help=(
+            "KV cache layout for every stage. 'arena' appends new positions into "
+            "preallocated storage; 'dynamic' restores Transformers' concatenating "
+            "cache. Both are token-exact, so the flag exists to run the A/B."
+        ),
+    )
+    parser.add_argument(
+        "--decode-attention",
+        choices=("grouped-prefix", "stock"),
+        default="grouped-prefix",
+        help=(
+            "Decode attention for every stage. 'grouped-prefix' regroups the query "
+            "into its KV groups and reads the cache in place; 'stock' expands the "
+            "cached keys/values by the group factor as Transformers does."
+        ),
+    )
     parser.add_argument("--one-way-delay-ms", type=nonnegative_float, default=0.0)
     parser.add_argument("--bandwidth-mbps", type=nonnegative_float, default=0.0)
     parser.add_argument("--startup-timeout-seconds", type=positive_float, default=180.0)
@@ -457,6 +477,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                         threads=args.threads_per_stage,
                         quantize=stage_quantize,
                         compile_mode=stage_compile,
+                        kv_cache=args.kv_cache,
+                        decode_attention=args.decode_attention,
                     ),
                     pipeline_id=pipeline_id,
                     listen_host=HOST,
@@ -504,6 +526,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 threads=args.threads_per_stage,
                 quantize=stage_quantize,
                 compile_mode=stage_compile,
+                kv_cache=args.kv_cache,
+                decode_attention=args.decode_attention,
             )
         )
         root_stage_info = {
@@ -642,6 +666,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "boundaries": boundaries,
             "codec": args.codec,
             "concurrency": args.concurrency,
+            "kv_cache": args.kv_cache,
+            "decode_attention": args.decode_attention,
             "warmups": args.warmups,
             "iterations": args.iterations,
             "threads_per_stage": args.threads_per_stage,
