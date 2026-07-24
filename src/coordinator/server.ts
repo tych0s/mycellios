@@ -1,8 +1,8 @@
 import websocket from "@fastify/websocket";
 import staticFiles from "@fastify/static";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
-import { timingSafeEqual } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { createHash, timingSafeEqual } from "node:crypto";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { z, ZodError } from "zod";
 import { loadBenchmarkRuns } from "../benchlab/history.js";
@@ -21,6 +21,7 @@ import type { CoordinatorConfig } from "../core/config.js";
 import { Scheduler } from "../scheduler/scheduler.js";
 import { MeshDatabase } from "../storage/database.js";
 import { MeshStore, type StoredRequestedModel, type StoredWorker } from "../storage/store.js";
+import { SupabasePersistence } from "../storage/supabase-sync.js";
 import { MeshService, MeshServiceError, type JobStreamEvent } from "./mesh-service.js";
 import { MobileComputeHub, type MobileWorkerSnapshot } from "./mobile-compute-hub.js";
 import { verifyGitHubReleaseUploadToken } from "./github-oidc.js";
@@ -46,6 +47,7 @@ import {
   ContentHubClient,
   registerContentHubRoutes,
 } from "./content-hub.js";
+import { SupabaseAuthService } from "./supabase-auth.js";
 
 export function automaticActivationFailureIsTransient(message: string): boolean {
   const normalized = message.toLowerCase();
@@ -103,6 +105,7 @@ export interface CoordinatorRuntime {
   hub: WorkerHub;
   mobileHub: MobileComputeHub;
   service: MeshService;
+  persistence: SupabasePersistence | null;
   close(): Promise<void>;
 }
 
@@ -155,6 +158,7 @@ export async function createCoordinator(
       const path = request.url.split("?", 1)[0] ?? request.url;
       if (!path.startsWith("/internal/v1/") && !path.startsWith("/v1/")) return;
       if (path.startsWith("/internal/v1/releases/")) return;
+      if (path === "/v1/auth/me") return;
       // Mobile expert administration has its own stronger control-plane
       // credential above. Requiring both secrets in one Authorization header
       // would make the route impossible to use when the tokens differ.
@@ -165,24 +169,57 @@ export async function createCoordinator(
       }
     });
   }
-  const authorizeModelMutation = (request: FastifyRequest, reply: FastifyReply): boolean => {
+  const supabaseAuth = config.supabaseUrl && config.supabaseServiceRoleKey
+    ? new SupabaseAuthService(config.supabaseUrl, config.supabaseServiceRoleKey)
+    : null;
+  const authorizeModelMutation = async (
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ): Promise<boolean> => {
     const expected = config.modelAdminToken;
     if (!expected && isLoopbackAddress(request.ip)) return true;
-    if (!expected) {
+    const legacyHeader = request.headers["x-mycellios-admin-token"];
+    const legacyToken = typeof legacyHeader === "string"
+      ? legacyHeader.trim()
+      : Array.isArray(legacyHeader) ? legacyHeader[0]?.trim() : undefined;
+    const bearer = parseBearerToken(request.headers.authorization);
+    if (expected && (
+      (legacyToken && constantTimeEqual(legacyToken, expected))
+      || (bearer && constantTimeEqual(bearer, expected))
+    )) return true;
+    if (bearer && supabaseAuth) {
+      try {
+        const user = await supabaseAuth.authenticate(bearer);
+        if (user && user.role && ["owner", "admin", "operator"].includes(user.role)) return true;
+        if (user) {
+          void reply.code(403).send({
+            error: {
+              code: "insufficient_network_role",
+              message: "Your Mycellios account does not have permission to change shared models.",
+            },
+          });
+          return false;
+        }
+      } catch (error) {
+        app.log.warn(
+          { error: error instanceof Error ? error.message : String(error) },
+          "Supabase authorization lookup failed",
+        );
+      }
+    }
+    if (!expected && !supabaseAuth) {
       void reply.code(503).send({
         error: {
           code: "model_administration_not_configured",
-          message: "Remote model administration requires MYCELLIOS_MODEL_ADMIN_TOKEN.",
+          message: "Remote model administration requires Supabase Auth or MYCELLIOS_MODEL_ADMIN_TOKEN.",
         },
       });
       return false;
     }
-    const received = parseBearerToken(request.headers.authorization);
-    if (received && constantTimeEqual(received, expected)) return true;
     void reply.code(401).send({
       error: {
         code: "invalid_model_admin_token",
-        message: "The network administrator token is missing or invalid.",
+        message: "Sign in with an authorized Mycellios account or enter the administrator token.",
       },
     });
     return false;
@@ -194,6 +231,14 @@ export async function createCoordinator(
   );
   const database = new MeshDatabase(config.databasePath);
   const store = new MeshStore(database);
+  const persistence = config.supabaseUrl && config.supabaseServiceRoleKey
+    ? new SupabasePersistence(store, {
+        url: config.supabaseUrl,
+        serviceRoleKey: config.supabaseServiceRoleKey,
+        required: config.supabasePersistenceRequired ?? false,
+      })
+    : null;
+  await persistence?.initialize();
   const scheduler = new Scheduler(store);
   await app.register(websocket, { options: { maxPayload: 10 * 1024 * 1024 } });
   const mobileAssetsPath = resolveMobileAssetsPath(config.mobileAssetsPath);
@@ -242,8 +287,15 @@ export async function createCoordinator(
     joinToken: config.mobileJoinToken,
     expertArtifactsPath: config.mobileExpertArtifactsPath,
     disconnectedRetentionMs: options.mobileDisconnectedRetentionMs,
+    ...(persistence
+      ? { onArtifactStored: (artifact: Parameters<SupabasePersistence["registerArtifactBackup"]>[0]) =>
+          persistence.registerArtifactBackup(artifact) }
+      : {}),
   });
   mobileHub.attach(app);
+  if (persistence && config.mobileExpertArtifactsPath) {
+    queueExistingMobileArtifacts(persistence, config.mobileExpertArtifactsPath);
+  }
   const service = new MeshService(store, scheduler, hub, config.requestTimeoutMs);
   const activationManager = options.activationManager ?? options.activationManagerFactory?.({ store, hub });
   await activationManager?.initialize();
@@ -252,6 +304,10 @@ export async function createCoordinator(
   const benchmarkHistoryDirectory = benchmarkStorageRoot
     ? resolve(benchmarkStorageRoot, "history")
     : undefined;
+  for (const run of loadBenchmarkRuns(benchmarkWorkspace, benchmarkHistoryDirectory)) {
+    store.queueBenchmarkRun(run);
+  }
+  void persistence?.flush();
   type PersistedBenchmark = Awaited<ReturnType<typeof runAndPersistCoordinatorSuite>>;
   let benchmarkRunInFlight: Promise<PersistedBenchmark> | null = null;
   const automaticBenchmarkQueue: CoordinatorBenchmarkModel[] = [];
@@ -299,6 +355,10 @@ export async function createCoordinator(
     ...(metadata.label ? { label: metadata.label } : {}),
     ...(metadata.version ? { version: metadata.version } : {}),
     trigger,
+  }).then((result) => {
+    store.queueBenchmarkRun(result.run);
+    void persistence?.flush();
+    return result;
   });
   const drainAutomaticBenchmarkQueue = (): void => {
     if (benchmarkRunInFlight) return;
@@ -677,7 +737,33 @@ export async function createCoordinator(
       desktopUpdates: desktopUpdatesPath ? "/updates/win32/x64/" : null,
       downloads: releaseDownloadsPath ? "/downloads/" : null,
       features: { distributedActivation: activationManager !== undefined },
+      persistence: persistence?.status() ?? {
+        configured: false,
+        connected: false,
+        required: false,
+        pendingChanges: database.pendingRemoteChangeCount(),
+        pendingArtifacts: database.pendingArtifactBackupCount(),
+        lastSuccessfulSyncAt: null,
+        lastError: null,
+      },
     };
+  });
+
+  app.get("/public/v1/auth-config", async () => ({
+    enabled: Boolean(config.supabaseUrl && config.supabaseAnonKey),
+    ...(config.supabaseUrl && config.supabaseAnonKey
+      ? { url: config.supabaseUrl, anonKey: config.supabaseAnonKey }
+      : {}),
+  }));
+
+  app.get("/v1/auth/me", async (request, reply) => {
+    const token = parseBearerToken(request.headers.authorization);
+    if (!token || !supabaseAuth) {
+      return reply.code(401).send({ error: { code: "authentication_required" } });
+    }
+    const user = await supabaseAuth.authenticate(token);
+    if (!user) return reply.code(401).send({ error: { code: "invalid_access_token" } });
+    return { user };
   });
 
   app.get("/public/v1/snapshot", async () => {
@@ -703,7 +789,7 @@ export async function createCoordinator(
   });
 
   app.post("/public/v1/requested-models", async (request, reply) => {
-    if (!authorizeModelMutation(request, reply)) return;
+    if (!await authorizeModelMutation(request, reply)) return;
     const body = requestedModelCreateSchema.parse(request.body);
     automaticActivationRetryState.delete(body.id);
     const stored = store.upsertRequestedModel({
@@ -740,7 +826,7 @@ export async function createCoordinator(
   });
 
   app.delete("/public/v1/requested-models/:modelId", async (request, reply) => {
-    if (!authorizeModelMutation(request, reply)) return;
+    if (!await authorizeModelMutation(request, reply)) return;
     const { modelId } = requestedModelParamsSchema.parse(request.params);
     await activationManager?.deactivate(modelId);
     if (!store.removeRequestedModel(modelId)) {
@@ -769,12 +855,25 @@ export async function createCoordinator(
     };
   });
 
-  const benchmarkHistoryResponse = () => ({
-    runs: loadBenchmarkRuns(
-      benchmarkWorkspace,
-      benchmarkHistoryDirectory,
-    ).toReversed(),
-  });
+  const benchmarkHistoryResponse = async () => {
+    const localRuns = loadBenchmarkRuns(benchmarkWorkspace, benchmarkHistoryDirectory);
+    let remoteRuns: typeof localRuns = [];
+    if (persistence) {
+      try {
+        remoteRuns = await persistence.readBenchmarkRuns();
+      } catch (error) {
+        app.log.warn(
+          { error: error instanceof Error ? error.message : String(error) },
+          "Supabase benchmark history could not be read; serving the local durable copy",
+        );
+      }
+    }
+    const byId = new Map([...remoteRuns, ...localRuns].map((run) => [run.runId, run]));
+    return {
+      runs: [...byId.values()]
+        .sort((left, right) => right.finishedAt.localeCompare(left.finishedAt)),
+    };
+  };
 
   app.get("/public/v1/benchmarks", async () => benchmarkHistoryResponse());
 
@@ -932,6 +1031,11 @@ export async function createCoordinator(
       await waitForChatCapacity(service, parsed, parsed.session_id, 45_000);
     }
     const handle = service.submit(parsed, parsed.session_id, idempotencyKey);
+    const conversationId = store.startInferenceConversation(
+      handle.sessionId,
+      parsed.model,
+      parsed.messages,
+    );
     reply.header("x-network-request-id", handle.jobId);
     reply.header("x-network-session-id", handle.sessionId);
 
@@ -946,6 +1050,10 @@ export async function createCoordinator(
         "x-network-session-id": handle.sessionId,
       });
       let finished = false;
+      let streamedText = "";
+      let streamedRouteClass = "replica";
+      let streamedResult: Extract<JobStreamEvent, { type: "completed" }> | null = null;
+      let streamedFailure: Extract<JobStreamEvent, { type: "failed" }> | null = null;
       reply.raw.once("close", () => {
         if (!finished) service.cancel(handle.jobId);
       });
@@ -957,12 +1065,31 @@ export async function createCoordinator(
       heartbeatTimer.unref();
       try {
         for await (const event of handle.events) {
+          if (event.type === "accepted") streamedRouteClass = event.route.routeClass;
+          if (event.type === "token") streamedText += event.token.text;
+          if (event.type === "completed") streamedResult = event;
+          if (event.type === "failed") streamedFailure = event;
           writeOpenAiEvent(reply.raw, event, parsed.model, handle.jobId);
         }
       } finally {
         clearInterval(heartbeatTimer);
       }
       finished = true;
+      store.appendInferenceMessage({
+        conversationId,
+        jobId: handle.jobId,
+        role: "assistant",
+        content: streamedResult?.result.text ?? streamedText,
+        status: streamedFailure ? "failed" : "completed",
+        inputTokens: streamedResult?.result.metrics.inputTokens ?? null,
+        outputTokens: streamedResult?.result.metrics.outputTokens ?? null,
+        routeClass: streamedRouteClass,
+        latencyMs: streamedResult?.result.metrics.activeMs ?? null,
+        metadata: streamedFailure
+          ? { failure_code: streamedFailure.code, failure_message: streamedFailure.message }
+          : { finish_reason: streamedResult?.result.finishReason ?? null },
+      });
+      void persistence?.flush();
       reply.raw.write("data: [DONE]\n\n");
       reply.raw.end();
       return;
@@ -985,6 +1112,24 @@ export async function createCoordinator(
       throw new MeshServiceError("missing_result", "Worker stream ended without a result", 502);
     }
     reply.header("x-route-class", routeClass);
+    store.appendInferenceMessage({
+      conversationId,
+      jobId: handle.jobId,
+      role: "assistant",
+      content: result.result.text,
+      status: "completed",
+      inputTokens: result.result.metrics.inputTokens,
+      outputTokens: result.result.metrics.outputTokens,
+      routeClass,
+      latencyMs: result.result.metrics.activeMs,
+      metadata: {
+        finish_reason: result.result.finishReason,
+        affinity_hit: affinityHit,
+        ttft_ms: result.result.metrics.ttftMs,
+        reused_kv_tokens: result.result.metrics.reusedKvTokens ?? 0,
+      },
+    });
+    void persistence?.flush();
     return {
       id: handle.jobId,
       object: "chat.completion",
@@ -1028,6 +1173,25 @@ export async function createCoordinator(
       deadline_at: new Date(job.deadlineAt).toISOString(),
       created_at: new Date(job.createdAt).toISOString(),
       updated_at: new Date(job.updatedAt).toISOString(),
+    };
+  });
+
+  app.get("/v1/conversations/:sessionId/messages", async (request) => {
+    const { sessionId } = z.object({ sessionId: z.string().min(1).max(200) }).parse(request.params);
+    return {
+      data: store.listInferenceMessages(sessionId).map((message) => ({
+        id: message.id,
+        job_id: message.jobId,
+        role: message.role,
+        content: message.content,
+        status: message.status,
+        input_tokens: message.inputTokens,
+        output_tokens: message.outputTokens,
+        route_class: message.routeClass,
+        latency_ms: message.latencyMs,
+        metadata: message.metadata,
+        created_at: new Date(message.createdAt).toISOString(),
+      })),
     };
   });
 
@@ -1156,15 +1320,60 @@ export async function createCoordinator(
     hub,
     mobileHub,
     service,
+    persistence,
     async close() {
       clearInterval(staleTimer);
       hub.close();
       mobileHub.close();
       await activationManager?.close();
       await app.close();
+      await persistence?.close();
       database.close();
     },
   };
+}
+
+function queueExistingMobileArtifacts(
+  persistence: SupabasePersistence,
+  directory: string,
+): void {
+  let files: string[];
+  try {
+    files = readdirSync(directory);
+  } catch {
+    return;
+  }
+  for (const file of files) {
+    const path = resolve(directory, file);
+    if (file.endsWith(".bin")) {
+      const weightsHash = file.slice(0, -4);
+      if (!/^[a-f0-9]{64}$/.test(weightsHash)) continue;
+      const sizeBytes = statSync(path).size;
+      persistence.registerArtifactBackup({
+        id: `mobile-weight-${weightsHash}`,
+        localPath: path,
+        storagePath: `mobile-experts/weights/${file}`,
+        contentType: "application/octet-stream",
+        sha256: weightsHash,
+        sizeBytes,
+        metadata: { kind: "mobile-expert-weights", weightsHash },
+      });
+      continue;
+    }
+    if (!file.endsWith(".json")) continue;
+    const artifactId = file.slice(0, -5);
+    if (!/^[a-f0-9]{64}$/.test(artifactId)) continue;
+    const body = readFileSync(path);
+    persistence.registerArtifactBackup({
+      id: `mobile-manifest-${artifactId}`,
+      localPath: path,
+      storagePath: `mobile-experts/manifests/${file}`,
+      contentType: "application/json",
+      sha256: createHash("sha256").update(body).digest("hex"),
+      sizeBytes: body.length,
+      metadata: { kind: "mobile-expert-manifest", artifactId },
+    });
+  }
 }
 
 const benchmarkRunRequestSchema = z.object({

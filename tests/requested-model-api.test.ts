@@ -92,7 +92,7 @@ describe("requested model API activation flow", () => {
     expect(response.json()).toEqual({
       error: {
         code: "invalid_model_admin_token",
-        message: "The network administrator token is missing or invalid.",
+        message: "Sign in with an authorized Mycellios account or enter the administrator token.",
       },
     });
   });

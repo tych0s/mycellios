@@ -18,6 +18,7 @@ import {
   Laptop,
   LayoutDashboard,
   LoaderCircle,
+  LogOut,
   Maximize2,
   MemoryStick,
   Menu,
@@ -38,6 +39,7 @@ import {
   Smartphone,
   Timer,
   Trash2,
+  UserRound,
   Wifi,
   X,
   Zap,
@@ -76,6 +78,17 @@ import {
 } from "./benchmark-comparison";
 import { isAdvertisedGpuSelected } from "./panel-hardware";
 import { applySeoMetadata } from "./seo";
+import {
+  loadAuthConfig,
+  loadNetworkIdentity,
+  restoreAuthSession,
+  signIn,
+  signOut,
+  signUp,
+  type AuthSession,
+  type NetworkIdentity,
+  type PublicAuthConfig,
+} from "./auth";
 import "./panel.css";
 
 const PUBLIC_COORDINATOR_URL = "https://www.mycellios.com";
@@ -229,9 +242,16 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   const [modelAdminToken, setModelAdminToken] = useState(() =>
     window.sessionStorage.getItem("mycellios-model-admin-token") ?? "",
   );
+  const [authConfig, setAuthConfig] = useState<PublicAuthConfig>({ enabled: false });
+  const [authSession, setAuthSession] = useState<AuthSession | null>(null);
+  const [networkIdentity, setNetworkIdentity] = useState<NetworkIdentity | null>(null);
+  const [authOpen, setAuthOpen] = useState(false);
+  const canManageModels = networkIdentity?.role === "owner"
+    || networkIdentity?.role === "admin"
+    || networkIdentity?.role === "operator";
   const requiresModelAdminToken = desktop
     ? desktopSnapshot?.settings.coordinatorMode !== "local" && !desktopSnapshot?.modelAdminAuthorization.configured
-    : !localBrowser || localProductionProxy;
+    : (!localBrowser || localProductionProxy) && !canManageModels;
   const applyDesktopSnapshot = useCallback((next: DashboardSnapshot) => {
     setDesktopSnapshot(next);
     setSnapshot(desktopToPublicSnapshot(next));
@@ -261,6 +281,28 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     const timer = window.setInterval(() => void refresh(), 2_000);
     return () => window.clearInterval(timer);
   }, [refresh]);
+
+  useEffect(() => {
+    if (desktop) return;
+    let cancelled = false;
+    void loadAuthConfig().then(async (config) => {
+      if (cancelled) return;
+      setAuthConfig(config);
+      const session = await restoreAuthSession(config);
+      if (cancelled || !session) return;
+      setAuthSession(session);
+      try {
+        const identity = await loadNetworkIdentity(session.accessToken);
+        if (!cancelled) setNetworkIdentity(identity);
+      } catch {
+        if (!cancelled) {
+          setAuthSession(null);
+          setNetworkIdentity(null);
+        }
+      }
+    });
+    return () => { cancelled = true; };
+  }, [desktop]);
 
   function changeContentScale(delta: number) {
     setContentScale((current) => {
@@ -320,7 +362,12 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        ...(token ? { authorization: `Bearer ${token}` } : {}),
+        ...(authSession
+          ? {
+              authorization: `Bearer ${authSession.accessToken}`,
+              ...(token ? { "x-mycellios-admin-token": token } : {}),
+            }
+          : token ? { authorization: `Bearer ${token}` } : {}),
       },
       body: JSON.stringify(input),
     });
@@ -356,7 +403,16 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     }
     const response = await fetch(`/public/v1/requested-models/${encodeURIComponent(modelId)}`, {
       method: "DELETE",
-      ...(token ? { headers: { authorization: `Bearer ${token}` } } : {}),
+      ...((authSession || token)
+        ? {
+            headers: authSession
+              ? {
+                  authorization: `Bearer ${authSession.accessToken}`,
+                  ...(token ? { "x-mycellios-admin-token": token } : {}),
+                }
+              : { authorization: `Bearer ${token}` },
+          }
+        : {}),
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     await refresh();
@@ -382,6 +438,12 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     : PUBLIC_COORDINATOR_URL;
   const publicLink = (path: string) => desktop ? `${publicOrigin}${path}` : path;
   const externalProps = desktop ? { target: "_blank", rel: "noreferrer" } as const : {};
+
+  async function disconnectAccount() {
+    if (authSession) await signOut(authConfig, authSession);
+    setAuthSession(null);
+    setNetworkIdentity(null);
+  }
 
   return (
     <div className={`public-panel ${desktop ? `desktop-panel platform-${desktopSnapshot?.platform ?? "loading"}` : ""}`}>
@@ -430,6 +492,11 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
             {desktopSnapshot?.update.state === "ready" && <button className="panel-update-ready" onClick={() => void desktopBridge?.installUpdate()} title="Restart and install update"><Download size={15} /></button>}
             {desktopSnapshot && <span>v{desktopSnapshot.appVersion}</span>}
             <span>API {snapshot.version}</span>
+            {!desktop && authConfig.enabled && (
+              networkIdentity
+                ? <button className="panel-account-button signed-in" onClick={() => setAuthOpen(true)} title={networkIdentity.email ?? "Mycellios account"}><UserRound size={16} /><span>{networkIdentity.role ?? "member"}</span></button>
+                : <button className="panel-account-button" onClick={() => setAuthOpen(true)}><UserRound size={16} /><span>Sign in</span></button>
+            )}
             <button onClick={() => void refresh()} aria-label="Refresh"><RefreshCw className={loading ? "spin" : ""} size={17} /></button>
             {!desktop && <a href={mobileEntry ? "/mobile/" : "/network?view=contribute"}>This device <Zap size={15} /></a>}
             {desktopBridge && <div className="panel-window-controls"><button onClick={() => void desktopBridge.minimizeWindow()} aria-label="Minimize"><Minus size={16} /></button><button onClick={() => void desktopBridge.toggleMaximizeWindow()} aria-label="Maximize"><Maximize2 size={15} /></button><button className="close" onClick={() => void desktopBridge.closeWindow()} aria-label="Close"><X size={16} /></button></div>}
@@ -458,8 +525,82 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
         </main>
       </div>
       {desktopSnapshot && desktopBridge && !desktopSnapshot.settings.onboardingComplete && <DesktopOnboarding snapshot={desktopSnapshot} bridge={desktopBridge} onSnapshot={applyDesktopSnapshot} />}
+      {!desktop && authOpen && <AccountModal
+        config={authConfig}
+        session={authSession}
+        identity={networkIdentity}
+        onAuthenticated={(session, identity) => {
+          setAuthSession(session);
+          setNetworkIdentity(identity);
+          setAuthOpen(false);
+        }}
+        onSignOut={() => void disconnectAccount().finally(() => setAuthOpen(false))}
+        onClose={() => setAuthOpen(false)}
+      />}
     </div>
   );
+}
+
+function AccountModal({
+  config,
+  session,
+  identity,
+  onAuthenticated,
+  onSignOut,
+  onClose,
+}: {
+  config: PublicAuthConfig;
+  session: AuthSession | null;
+  identity: NetworkIdentity | null;
+  onAuthenticated: (session: AuthSession, identity: NetworkIdentity) => void;
+  onSignOut: () => void;
+  onClose: () => void;
+}) {
+  const [mode, setMode] = useState<"signin" | "signup">("signin");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      const nextSession = mode === "signin"
+        ? await signIn(config, email.trim(), password)
+        : await signUp(config, email.trim(), password);
+      const nextIdentity = await loadNetworkIdentity(nextSession.accessToken);
+      onAuthenticated(nextSession, nextIdentity);
+    } catch (caught) {
+      setError(errorText(caught));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <div className="modal-backdrop account-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) onClose(); }}>
+    <section className="account-modal" role="dialog" aria-modal="true" aria-label="Mycellios account">
+      <button className="account-modal-close" aria-label="Close" onClick={onClose}><X size={18} /></button>
+      <div className="account-modal-brand"><img src={brandIcon} alt="" /><span>MYCELLIOS ID</span></div>
+      {session && identity ? <>
+        <h2>Your network identity</h2>
+        <p>History and permissions now follow this account across devices.</p>
+        <div className="account-identity-card"><UserRound /><span><strong>{identity.email ?? session.user.email ?? identity.id}</strong><small>{identity.role ?? "member"} · public network</small></span></div>
+        <button className="account-signout" onClick={onSignOut}><LogOut size={16} />Sign out</button>
+      </> : <>
+        <h2>{mode === "signin" ? "Welcome back" : "Create your account"}</h2>
+        <p>Use one identity for network access, history and administration.</p>
+        <div className="account-mode-tabs"><button className={mode === "signin" ? "active" : ""} onClick={() => setMode("signin")}>Sign in</button><button className={mode === "signup" ? "active" : ""} onClick={() => setMode("signup")}>Create account</button></div>
+        <form onSubmit={(event) => void submit(event)}>
+          <label>Email<input type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} required /></label>
+          <label>Password<input type="password" autoComplete={mode === "signin" ? "current-password" : "new-password"} minLength={8} value={password} onChange={(event) => setPassword(event.target.value)} required /></label>
+          {error && <div className="account-auth-error"><CircleAlert size={16} />{error}</div>}
+          <button className="account-submit" disabled={busy}>{busy ? <LoaderCircle className="spin" /> : <ShieldCheck />}{busy ? "Connecting…" : mode === "signin" ? "Sign in securely" : "Create account"}</button>
+        </form>
+      </>}
+    </section>
+  </div>;
 }
 
 function Overview({ snapshot, onNavigate, publicLink, external, localAcceleration, localContributionState, localComputeMode }: { snapshot: PublicSnapshot; onNavigate: (view: PanelView) => void; publicLink: (path: string) => string; external: boolean; localAcceleration: AcceleratorProgressSnapshot | undefined; localContributionState: DashboardSnapshot["contribution"]["state"] | undefined; localComputeMode: DesktopSettings["computeMode"] | undefined }) {
