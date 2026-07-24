@@ -21,6 +21,7 @@ import type { CoordinatorConfig } from "../core/config.js";
 import { Scheduler } from "../scheduler/scheduler.js";
 import { MeshDatabase } from "../storage/database.js";
 import { MeshStore, type StoredRequestedModel, type StoredWorker } from "../storage/store.js";
+import { SupabasePersistence } from "../storage/supabase-sync.js";
 import { MeshService, MeshServiceError, type JobStreamEvent } from "./mesh-service.js";
 import { MobileComputeHub, type MobileWorkerSnapshot } from "./mobile-compute-hub.js";
 import { verifyGitHubReleaseUploadToken } from "./github-oidc.js";
@@ -103,6 +104,7 @@ export interface CoordinatorRuntime {
   hub: WorkerHub;
   mobileHub: MobileComputeHub;
   service: MeshService;
+  persistence: SupabasePersistence | null;
   close(): Promise<void>;
 }
 
@@ -194,6 +196,14 @@ export async function createCoordinator(
   );
   const database = new MeshDatabase(config.databasePath);
   const store = new MeshStore(database);
+  const persistence = config.supabaseUrl && config.supabaseServiceRoleKey
+    ? new SupabasePersistence(store, {
+        url: config.supabaseUrl,
+        serviceRoleKey: config.supabaseServiceRoleKey,
+        required: config.supabasePersistenceRequired ?? false,
+      })
+    : null;
+  await persistence?.initialize();
   const scheduler = new Scheduler(store);
   await app.register(websocket, { options: { maxPayload: 10 * 1024 * 1024 } });
   const mobileAssetsPath = resolveMobileAssetsPath(config.mobileAssetsPath);
@@ -252,6 +262,10 @@ export async function createCoordinator(
   const benchmarkHistoryDirectory = benchmarkStorageRoot
     ? resolve(benchmarkStorageRoot, "history")
     : undefined;
+  for (const run of loadBenchmarkRuns(benchmarkWorkspace, benchmarkHistoryDirectory)) {
+    store.queueBenchmarkRun(run);
+  }
+  void persistence?.flush();
   type PersistedBenchmark = Awaited<ReturnType<typeof runAndPersistCoordinatorSuite>>;
   let benchmarkRunInFlight: Promise<PersistedBenchmark> | null = null;
   const automaticBenchmarkQueue: CoordinatorBenchmarkModel[] = [];
@@ -299,6 +313,10 @@ export async function createCoordinator(
     ...(metadata.label ? { label: metadata.label } : {}),
     ...(metadata.version ? { version: metadata.version } : {}),
     trigger,
+  }).then((result) => {
+    store.queueBenchmarkRun(result.run);
+    void persistence?.flush();
+    return result;
   });
   const drainAutomaticBenchmarkQueue = (): void => {
     if (benchmarkRunInFlight) return;
@@ -677,6 +695,14 @@ export async function createCoordinator(
       desktopUpdates: desktopUpdatesPath ? "/updates/win32/x64/" : null,
       downloads: releaseDownloadsPath ? "/downloads/" : null,
       features: { distributedActivation: activationManager !== undefined },
+      persistence: persistence?.status() ?? {
+        configured: false,
+        connected: false,
+        required: false,
+        pendingChanges: database.pendingRemoteChangeCount(),
+        lastSuccessfulSyncAt: null,
+        lastError: null,
+      },
     };
   });
 
@@ -769,12 +795,25 @@ export async function createCoordinator(
     };
   });
 
-  const benchmarkHistoryResponse = () => ({
-    runs: loadBenchmarkRuns(
-      benchmarkWorkspace,
-      benchmarkHistoryDirectory,
-    ).toReversed(),
-  });
+  const benchmarkHistoryResponse = async () => {
+    const localRuns = loadBenchmarkRuns(benchmarkWorkspace, benchmarkHistoryDirectory);
+    let remoteRuns: typeof localRuns = [];
+    if (persistence) {
+      try {
+        remoteRuns = await persistence.readBenchmarkRuns();
+      } catch (error) {
+        app.log.warn(
+          { error: error instanceof Error ? error.message : String(error) },
+          "Supabase benchmark history could not be read; serving the local durable copy",
+        );
+      }
+    }
+    const byId = new Map([...remoteRuns, ...localRuns].map((run) => [run.runId, run]));
+    return {
+      runs: [...byId.values()]
+        .sort((left, right) => right.finishedAt.localeCompare(left.finishedAt)),
+    };
+  };
 
   app.get("/public/v1/benchmarks", async () => benchmarkHistoryResponse());
 
@@ -932,6 +971,11 @@ export async function createCoordinator(
       await waitForChatCapacity(service, parsed, parsed.session_id, 45_000);
     }
     const handle = service.submit(parsed, parsed.session_id, idempotencyKey);
+    const conversationId = store.startInferenceConversation(
+      handle.sessionId,
+      parsed.model,
+      parsed.messages,
+    );
     reply.header("x-network-request-id", handle.jobId);
     reply.header("x-network-session-id", handle.sessionId);
 
@@ -946,6 +990,10 @@ export async function createCoordinator(
         "x-network-session-id": handle.sessionId,
       });
       let finished = false;
+      let streamedText = "";
+      let streamedRouteClass = "replica";
+      let streamedResult: Extract<JobStreamEvent, { type: "completed" }> | null = null;
+      let streamedFailure: Extract<JobStreamEvent, { type: "failed" }> | null = null;
       reply.raw.once("close", () => {
         if (!finished) service.cancel(handle.jobId);
       });
@@ -957,12 +1005,31 @@ export async function createCoordinator(
       heartbeatTimer.unref();
       try {
         for await (const event of handle.events) {
+          if (event.type === "accepted") streamedRouteClass = event.route.routeClass;
+          if (event.type === "token") streamedText += event.token.text;
+          if (event.type === "completed") streamedResult = event;
+          if (event.type === "failed") streamedFailure = event;
           writeOpenAiEvent(reply.raw, event, parsed.model, handle.jobId);
         }
       } finally {
         clearInterval(heartbeatTimer);
       }
       finished = true;
+      store.appendInferenceMessage({
+        conversationId,
+        jobId: handle.jobId,
+        role: "assistant",
+        content: streamedResult?.result.text ?? streamedText,
+        status: streamedFailure ? "failed" : "completed",
+        inputTokens: streamedResult?.result.metrics.inputTokens ?? null,
+        outputTokens: streamedResult?.result.metrics.outputTokens ?? null,
+        routeClass: streamedRouteClass,
+        latencyMs: streamedResult?.result.metrics.activeMs ?? null,
+        metadata: streamedFailure
+          ? { failure_code: streamedFailure.code, failure_message: streamedFailure.message }
+          : { finish_reason: streamedResult?.result.finishReason ?? null },
+      });
+      void persistence?.flush();
       reply.raw.write("data: [DONE]\n\n");
       reply.raw.end();
       return;
@@ -985,6 +1052,24 @@ export async function createCoordinator(
       throw new MeshServiceError("missing_result", "Worker stream ended without a result", 502);
     }
     reply.header("x-route-class", routeClass);
+    store.appendInferenceMessage({
+      conversationId,
+      jobId: handle.jobId,
+      role: "assistant",
+      content: result.result.text,
+      status: "completed",
+      inputTokens: result.result.metrics.inputTokens,
+      outputTokens: result.result.metrics.outputTokens,
+      routeClass,
+      latencyMs: result.result.metrics.activeMs,
+      metadata: {
+        finish_reason: result.result.finishReason,
+        affinity_hit: affinityHit,
+        ttft_ms: result.result.metrics.ttftMs,
+        reused_kv_tokens: result.result.metrics.reusedKvTokens ?? 0,
+      },
+    });
+    void persistence?.flush();
     return {
       id: handle.jobId,
       object: "chat.completion",
@@ -1028,6 +1113,25 @@ export async function createCoordinator(
       deadline_at: new Date(job.deadlineAt).toISOString(),
       created_at: new Date(job.createdAt).toISOString(),
       updated_at: new Date(job.updatedAt).toISOString(),
+    };
+  });
+
+  app.get("/v1/conversations/:sessionId/messages", async (request) => {
+    const { sessionId } = z.object({ sessionId: z.string().min(1).max(200) }).parse(request.params);
+    return {
+      data: store.listInferenceMessages(sessionId).map((message) => ({
+        id: message.id,
+        job_id: message.jobId,
+        role: message.role,
+        content: message.content,
+        status: message.status,
+        input_tokens: message.inputTokens,
+        output_tokens: message.outputTokens,
+        route_class: message.routeClass,
+        latency_ms: message.latencyMs,
+        metadata: message.metadata,
+        created_at: new Date(message.createdAt).toISOString(),
+      })),
     };
   });
 
@@ -1156,12 +1260,14 @@ export async function createCoordinator(
     hub,
     mobileHub,
     service,
+    persistence,
     async close() {
       clearInterval(staleTimer);
       hub.close();
       mobileHub.close();
       await activationManager?.close();
       await app.close();
+      await persistence?.close();
       database.close();
     },
   };

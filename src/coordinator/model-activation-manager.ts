@@ -43,6 +43,8 @@ export interface DynamicModelActivationManagerOptions {
   ): import("../distribution/launch-supervisor.js").LaunchAgent | undefined;
   cwd?: string;
   environment?: NodeJS.ProcessEnv;
+  loadProgress?(modelId: string): readonly ModelActivationProgressEvent[];
+  onProgress?(modelId: string, event: ModelActivationProgressEvent): void;
 }
 
 export class AutomaticModelActivationManager implements ModelActivationManager {
@@ -218,7 +220,11 @@ export class DynamicModelActivationManager implements ModelActivationManager {
   isBusy(): boolean { return this.activePromise !== null; }
 
   activationProgressForModel(modelId: string): readonly ModelActivationProgressEvent[] {
-    return this.progress.get(modelId)?.map((event) => ({ ...event })) ?? [];
+    const cached = this.progress.get(modelId);
+    if (cached) return cached.map((event) => ({ ...event }));
+    const restored = this.options.loadProgress?.(modelId).map((event) => ({ ...event })) ?? [];
+    if (restored.length > 0) this.progress.set(modelId, restored.slice(-100));
+    return restored;
   }
 
   activate(model: StoredRequestedModel): Promise<void> {
@@ -315,8 +321,10 @@ export class DynamicModelActivationManager implements ModelActivationManager {
     const previous = events.at(-1);
     if (previous?.state === "running") previous.state = "completed";
     if (previous?.phase === phase && previous.message === message) return;
-    events.push({ phase, message, at: new Date().toISOString(), state, ...context });
-    this.progress.set(modelId, events.slice(-20));
+    const event = { phase, message, at: new Date().toISOString(), state, ...context };
+    events.push(event);
+    this.progress.set(modelId, events.slice(-100));
+    this.options.onProgress?.(modelId, { ...event });
   }
 
   private failProgress(modelId: string, message: string): void {
@@ -324,8 +332,15 @@ export class DynamicModelActivationManager implements ModelActivationManager {
     const previous = events.at(-1);
     if (previous?.phase === "failed") return;
     if (previous?.state === "running") previous.state = "failed";
-    events.push({ phase: "failed", message, at: new Date().toISOString(), state: "failed" });
-    this.progress.set(modelId, events.slice(-20));
+    const event = {
+      phase: "failed",
+      message,
+      at: new Date().toISOString(),
+      state: "failed" as const,
+    };
+    events.push(event);
+    this.progress.set(modelId, events.slice(-100));
+    this.options.onProgress?.(modelId, { ...event });
   }
 
   async deactivate(modelId: string): Promise<boolean> {

@@ -42,6 +42,8 @@ const runtime = await createCoordinator(config, {
             nodeId,
             launch,
           ),
+          loadProgress: (modelId) => store.listActivationEvents(modelId),
+          onProgress: (modelId, event) => store.appendActivationEvent(modelId, event),
         }),
       }
     : {}),
