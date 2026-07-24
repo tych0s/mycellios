@@ -5,8 +5,13 @@ import { timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { z, ZodError } from "zod";
-import { runAndPersistRealSuite } from "../benchlab/run.js";
 import { loadBenchmarkRuns } from "../benchlab/history.js";
+import {
+  buildCoordinatorBenchmarkInventory,
+  detectNewActiveModels,
+  runAndPersistCoordinatorSuite,
+  type CoordinatorBenchmarkModel,
+} from "../benchlab/coordinator-suite.js";
 import {
   chatCompletionRequestSchema,
   workerRegistrationSchema,
@@ -242,8 +247,87 @@ export async function createCoordinator(
   const service = new MeshService(store, scheduler, hub, config.requestTimeoutMs);
   const activationManager = options.activationManager ?? options.activationManagerFactory?.({ store, hub });
   await activationManager?.initialize();
+  const benchmarkRoot = process.env.MYCELLIOS_BENCHMARK_ROOT?.trim() || process.cwd();
+  type PersistedBenchmark = Awaited<ReturnType<typeof runAndPersistCoordinatorSuite>>;
+  let benchmarkRunInFlight: Promise<PersistedBenchmark> | null = null;
+  const automaticBenchmarkQueue: CoordinatorBenchmarkModel[] = [];
+  const queuedAutomaticBenchmarkModels = new Set<string>();
+  const observedActiveBenchmarkModels = new Set<string>();
+  const benchmarkTargetForModel = (modelId: string): CoordinatorBenchmarkModel => {
+    const requested = store.getRequestedModel(modelId);
+    return {
+      id: modelId,
+      source: requested?.source ?? modelId,
+      revision: requested?.revision ?? null,
+    };
+  };
+  const benchmarkableActiveModelIds = (): string[] => {
+    const connectedWorkerIds = hub.connectedWorkerIds();
+    const realDeploymentModels = new Set(
+      store.listWorkers()
+        .filter((worker) => connectedWorkerIds.has(worker.id))
+        .flatMap((worker) => worker.capabilities.deployments)
+        .filter((deployment) => deployment.adapter !== "mock")
+        .map((deployment) => deployment.model),
+    );
+    return scheduler
+      .listAvailableModels({ connectedWorkerIds })
+      .map((model) => model.id)
+      .filter((modelId) => realDeploymentModels.has(modelId));
+  };
+  const startCoordinatorBenchmark = (
+    model: CoordinatorBenchmarkModel,
+    trigger: "automatic-model-start" | "manual",
+    metadata: { label?: string; version?: string } = {},
+  ): Promise<PersistedBenchmark> => runAndPersistCoordinatorSuite({
+    cwd: benchmarkRoot,
+    coordinatorUrl: `http://127.0.0.1:${config.port}`,
+    model,
+    inventory: (routedWorkerIds) => buildCoordinatorBenchmarkInventory(
+      model.id,
+      store.listWorkers(),
+      hub.connectedWorkerIds(),
+      routedWorkerIds,
+    ),
+    resolveWorkerId: (jobId) => store.getJob(jobId)?.workerId ?? null,
+    ...(config.networkToken ? { networkToken: config.networkToken } : {}),
+    ...(metadata.label ? { label: metadata.label } : {}),
+    ...(metadata.version ? { version: metadata.version } : {}),
+    trigger,
+  });
+  const drainAutomaticBenchmarkQueue = (): void => {
+    if (benchmarkRunInFlight) return;
+    const model = automaticBenchmarkQueue.shift();
+    if (!model) return;
+    benchmarkRunInFlight = startCoordinatorBenchmark(model, "automatic-model-start");
+    void benchmarkRunInFlight
+      .then(({ run }) => {
+        app.log.info(
+          { modelId: model.id, benchmarkRunId: run.runId, status: run.status },
+          "automatic model-start benchmark saved",
+        );
+      })
+      .catch((error: unknown) => {
+        app.log.error(
+          { modelId: model.id, error: error instanceof Error ? error.message : String(error) },
+          "automatic model-start benchmark could not be saved",
+        );
+      })
+      .finally(() => {
+        queuedAutomaticBenchmarkModels.delete(model.id);
+        benchmarkRunInFlight = null;
+        drainAutomaticBenchmarkQueue();
+      });
+  };
+  const queueAutomaticBenchmark = (modelId: string): void => {
+    if (queuedAutomaticBenchmarkModels.has(modelId)) return;
+    queuedAutomaticBenchmarkModels.add(modelId);
+    automaticBenchmarkQueue.push(benchmarkTargetForModel(modelId));
+    drainAutomaticBenchmarkQueue();
+  };
   const automaticRepairState = new Map<string, { attempts: number; nextAttemptAt: number }>();
   const automaticRepairInFlight = new Set<string>();
+  const inferenceRouteFailures = new Map<string, { count: number; lastAt: number }>();
   const automaticActivationRetryDelaysMs = (
     options.automaticActivationRetryDelaysMs
     ?? DEFAULT_AUTOMATIC_ACTIVATION_RETRY_DELAYS_MS
@@ -384,6 +468,45 @@ export async function createCoordinator(
       automaticRepairInFlight.delete(model.id);
     });
   };
+  const startInferenceRouteRepair = (modelId: string, reason: string): void => {
+    const requested = store.getRequestedModel(modelId);
+    if (
+      !activationManager ||
+      !requested?.autoActivate ||
+      automaticRepairInFlight.has(modelId) ||
+      !activationManager.isManaging(modelId)
+    ) return;
+    automaticRepairInFlight.add(modelId);
+    void (async () => {
+      app.log.warn({ modelId, reason }, "rebuilding an unresponsive distributed model route");
+      const stopped = await activationManager.deactivate(modelId);
+      if (!stopped) return;
+      const latest = store.getRequestedModel(modelId);
+      if (!latest?.autoActivate) return;
+      store.setRequestedModelActivation(modelId, true);
+      launchRequestedModel(store.getRequestedModel(modelId)!);
+    })().catch((error: unknown) => {
+      app.log.warn(
+        { modelId, reason, error: error instanceof Error ? error.message : String(error) },
+        "automatic inference route repair could not be started",
+      );
+    }).finally(() => {
+      automaticRepairInFlight.delete(modelId);
+    });
+  };
+  const modelsDependingOnExecutor = (workerId: string): string[] => {
+    const nodeId = store.getWorker(workerId)?.capabilities.distributedExecutor?.nodeId;
+    if (!nodeId) return [];
+    return [...new Set(
+      store.listWorkers()
+        .filter((worker) => worker.identityKind === "cell")
+        .flatMap((worker) => worker.capabilities.deployments)
+        .filter((deployment) => deployment.execution?.stages?.some(
+          (stage) => stage.nodeId === nodeId,
+        ))
+        .map((deployment) => deployment.model),
+    )];
+  };
   const reconcileRequestedModels = () => {
     const workers = store.listWorkers();
     const connectedWorkerIds = hub.connectedWorkerIds();
@@ -392,6 +515,13 @@ export async function createCoordinator(
         .listAvailableModels({ connectedWorkerIds })
         .map((model) => model.id),
     );
+    const benchmarkableRoutes = new Set(benchmarkableActiveModelIds());
+    const benchmarkableModelIds = new Set(
+      [...activeModelIds].filter((modelId) => benchmarkableRoutes.has(modelId)),
+    );
+    for (const modelId of detectNewActiveModels(benchmarkableModelIds, observedActiveBenchmarkModels)) {
+      queueAutomaticBenchmark(modelId);
+    }
     let requests = store.listRequestedModels();
     const now = Date.now();
     for (const request of requests) {
@@ -482,8 +612,37 @@ export async function createCoordinator(
       reconcileAutomaticGpuRepair(model, activeModelIds, workers, connectedWorkerIds);
     }
   };
-  const benchmarkRoot = process.env.MYCELLIOS_BENCHMARK_ROOT?.trim() || process.cwd();
-  let benchmarkRunInFlight: ReturnType<typeof runAndPersistRealSuite> | null = null;
+  hub.on("envelope", (envelope) => {
+    if (envelope.type === "worker.heartbeat") queueMicrotask(reconcileRequestedModels);
+  });
+  hub.on("disconnect", (workerId) => {
+    for (const modelId of modelsDependingOnExecutor(workerId)) {
+      startInferenceRouteRepair(modelId, `pipeline_stage_disconnected:${workerId}`);
+    }
+    queueMicrotask(reconcileRequestedModels);
+  });
+  service.on("healthy", ({ model }) => {
+    inferenceRouteFailures.delete(model);
+  });
+  service.on("degraded", ({ model, code, jobId, workerId }) => {
+    const now = Date.now();
+    const previous = inferenceRouteFailures.get(model);
+    const count = previous && now - previous.lastAt <= 5 * 60_000
+      ? previous.count + 1
+      : 1;
+    inferenceRouteFailures.set(model, { count, lastAt: now });
+    app.log.warn(
+      { modelId: model, code, jobId, workerId, consecutiveFailures: count },
+      "distributed inference route degraded before its first token",
+    );
+    const routeWorker = workerId ? store.getWorker(workerId) : null;
+    const definitelyBrokenCellRoute =
+      code === "adapter_error" && routeWorker?.identityKind === "cell";
+    if (definitelyBrokenCellRoute || count >= 2) {
+      inferenceRouteFailures.delete(model);
+      startInferenceRouteRepair(model, `${code}:${jobId}`);
+    }
+  });
   const staleTimer = setInterval(() => {
     store.markStaleWorkers();
     hub.closeStaleConnections();
@@ -605,13 +764,19 @@ export async function createCoordinator(
     };
   });
 
+  const benchmarkHistoryResponse = () => ({
+    runs: loadBenchmarkRuns(benchmarkRoot).toReversed(),
+  });
+
+  app.get("/public/v1/benchmarks", async () => benchmarkHistoryResponse());
+
   app.get("/local/v1/benchmarks", async (request, reply) => {
     if (!isLoopbackAddress(request.ip)) {
       return reply.code(403).send({
         error: { code: "local_access_required", message: "Benchmark history is available on the coordinator host only." },
       });
     }
-    return { runs: loadBenchmarkRuns(benchmarkRoot).toReversed() };
+    return benchmarkHistoryResponse();
   });
 
   app.post("/local/v1/benchmarks/run", async (request, reply) => {
@@ -626,12 +791,26 @@ export async function createCoordinator(
       });
     }
     const body = benchmarkRunRequestSchema.parse(request.body ?? {});
-    benchmarkRunInFlight = runAndPersistRealSuite({
-      cwd: benchmarkRoot,
-      coordinatorUrl: `http://127.0.0.1:${config.port}`,
-      ...(body.version ? { version: body.version } : {}),
-      ...(body.label ? { label: body.label } : {}),
-    });
+    const activeModelIds = benchmarkableActiveModelIds();
+    const modelId = body.model ?? activeModelIds[0];
+    if (!modelId || !activeModelIds.includes(modelId)) {
+      return reply.code(409).send({
+        error: {
+          code: "benchmark_model_unavailable",
+          message: body.model
+            ? `El modelo ${body.model} no está activo; no se ha generado ningún dato.`
+            : "No hay ningún modelo activo para medir; no se ha generado ningún dato.",
+        },
+      });
+    }
+    benchmarkRunInFlight = startCoordinatorBenchmark(
+      benchmarkTargetForModel(modelId),
+      "manual",
+      {
+        ...(body.label ? { label: body.label } : {}),
+        ...(body.version ? { version: body.version } : {}),
+      },
+    );
     try {
       const result = await benchmarkRunInFlight;
       return { run: result.run };
@@ -644,6 +823,7 @@ export async function createCoordinator(
       });
     } finally {
       benchmarkRunInFlight = null;
+      drainAutomaticBenchmarkQueue();
     }
   });
 
@@ -744,8 +924,18 @@ export async function createCoordinator(
       reply.raw.once("close", () => {
         if (!finished) service.cancel(handle.jobId);
       });
-      for await (const event of handle.events) {
-        writeOpenAiEvent(reply.raw, event, parsed.model, handle.jobId);
+      const heartbeatTimer = setInterval(() => {
+        if (!reply.raw.destroyed && !reply.raw.writableEnded) {
+          reply.raw.write(`: mycellios-heartbeat ${Date.now()}\n\n`);
+        }
+      }, 10_000);
+      heartbeatTimer.unref();
+      try {
+        for await (const event of handle.events) {
+          writeOpenAiEvent(reply.raw, event, parsed.model, handle.jobId);
+        }
+      } finally {
+        clearInterval(heartbeatTimer);
       }
       finished = true;
       reply.raw.write("data: [DONE]\n\n");
@@ -953,6 +1143,7 @@ export async function createCoordinator(
 }
 
 const benchmarkRunRequestSchema = z.object({
+  model: z.string().trim().min(1).max(200).optional(),
   version: z.string().trim().min(1).max(80).optional(),
   label: z.string().trim().min(1).max(160).optional(),
 });
@@ -1282,6 +1473,23 @@ function writeOpenAiEvent(
           session_id: event.sessionId,
           route_class: event.route.routeClass,
           affinity_hit: event.route.affinityHit,
+        },
+      })}\n\n`,
+    );
+  } else if (event.type === "progress") {
+    stream.write(
+      `data: ${JSON.stringify({
+        id: jobId,
+        object: "chat.completion.chunk",
+        created: Math.floor(Date.now() / 1_000),
+        model,
+        choices: [{ index: 0, delta: {}, finish_reason: null }],
+        x_network: {
+          phase: event.phase,
+          status_message: event.message,
+          attempt: event.attempt,
+          ...(event.workerId ? { affected_worker_id: event.workerId } : {}),
+          ...(event.nodeId ? { affected_node_id: event.nodeId } : {}),
         },
       })}\n\n`,
     );

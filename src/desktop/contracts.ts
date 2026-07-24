@@ -52,6 +52,7 @@ export interface DashboardDeployment {
   contextLimit: number;
   freeSlots: number;
   tokensPerSecond: number;
+  throughputSource?: "measured" | "estimated" | "configured" | "default";
   ttftMs: number;
   execution?: {
     deviceType: "cpu" | "gpu" | "mixed";
@@ -346,6 +347,11 @@ export interface ChatStreamUpdate {
   reusedKvTokens: number;
   ttftMs: number;
   elapsedMs: number;
+  phase?: "connecting" | "waiting_first_token" | "recovering" | "streaming";
+  statusMessage?: string;
+  attempt?: number;
+  affectedWorkerId?: string;
+  affectedNodeId?: string;
 }
 
 export interface DesktopBridge {

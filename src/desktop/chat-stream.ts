@@ -20,8 +20,107 @@ interface OpenAiStreamChunk {
     token_index?: number;
     ttft_ms?: number;
     active_ms?: number;
+    phase?: ChatStreamUpdate["phase"];
+    status_message?: string;
+    attempt?: number;
+    affected_worker_id?: string;
+    affected_node_id?: string;
   };
-  error?: { message?: string };
+  error?: { code?: string; message?: string };
+}
+
+const RECOVERABLE_PRETOKEN_CODES = new Set([
+  "first_token_timeout",
+  "pipeline_stage_disconnected",
+  "worker_disconnected",
+  "worker_unreachable",
+  "lease_accept_timeout",
+  "no_capacity",
+]);
+
+export class ChatStreamError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "ChatStreamError";
+  }
+}
+
+export interface RecoveringChatStreamOptions {
+  sessionId: string;
+  maximumAttempts?: number;
+  retryDelayMs?: number;
+}
+
+export async function consumeChatCompletionStreamWithRecovery(
+  openResponse: (attempt: number) => Promise<Response>,
+  fallbackModel: string,
+  onUpdate: (update: ChatStreamUpdate) => void,
+  options: RecoveringChatStreamOptions,
+): Promise<ChatResponse> {
+  const maximumAttempts = Math.max(1, Math.min(2, options.maximumAttempts ?? 2));
+  const retryDelayMs = Math.max(0, options.retryDelayMs ?? 2_500);
+  let latest: ChatStreamUpdate = {
+    requestId: "pending",
+    model: fallbackModel,
+    delta: "",
+    text: "",
+    outputTokens: 0,
+    routeClass: "waiting",
+    affinityHit: false,
+    sessionId: options.sessionId,
+    reusedKvTokens: 0,
+    ttftMs: 0,
+    elapsedMs: 0,
+    phase: "connecting",
+    statusMessage: "Connecting to an available model route.",
+    attempt: 1,
+  };
+  onUpdate(latest);
+  for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
+    const startedAt = Date.now();
+    try {
+      const response = await openResponse(attempt);
+      return await consumeChatCompletionStream(
+        response,
+        fallbackModel,
+        (update) => {
+          latest = {
+            ...update,
+            ...(update.outputTokens > 0
+              ? { phase: "streaming" as const }
+              : update.phase
+                ? { phase: update.phase }
+                : {}),
+            attempt,
+          };
+          onUpdate(latest);
+        },
+        startedAt,
+      );
+    } catch (error) {
+      if (
+        attempt >= maximumAttempts ||
+        latest.outputTokens > 0 ||
+        !isRecoverablePretokenStreamError(error)
+      ) {
+        throw error;
+      }
+      latest = {
+        ...latest,
+        requestId: "pending",
+        phase: "recovering",
+        statusMessage: "A route node disconnected before the first token. Reconnecting and retrying once.",
+        attempt: attempt + 1,
+        elapsedMs: Math.max(latest.elapsedMs, Date.now() - startedAt),
+      };
+      onUpdate(latest);
+      await delay(retryDelayMs);
+    }
+  }
+  throw new ChatStreamError("retry_exhausted", "The inference retry was exhausted.");
 }
 
 export async function consumeChatCompletionStream(
@@ -30,7 +129,7 @@ export async function consumeChatCompletionStream(
   onUpdate: (update: ChatStreamUpdate) => void,
   startedAt = Date.now(),
 ): Promise<ChatResponse> {
-  if (!response.ok) throw new Error(await responseError(response));
+  if (!response.ok) throw await responseError(response);
   if (!response.headers.get("content-type")?.includes("text/event-stream")) {
     throw new Error("El coordinador no devolvió un flujo de tokens válido.");
   }
@@ -54,7 +153,13 @@ export async function consumeChatCompletionStream(
   let completed = false;
   let doneMarker = false;
 
-  const emit = (delta: string) => onUpdate({
+  const emit = (
+    delta: string,
+    extra: Partial<Pick<
+      ChatStreamUpdate,
+      "phase" | "statusMessage" | "attempt" | "affectedWorkerId" | "affectedNodeId"
+    >> = {},
+  ) => onUpdate({
     requestId,
     model,
     delta,
@@ -66,6 +171,7 @@ export async function consumeChatCompletionStream(
     reusedKvTokens,
     ttftMs,
     elapsedMs: Math.max(0, Date.now() - startedAt),
+    ...extra,
   });
 
   const consumeEvent = (event: string) => {
@@ -86,7 +192,9 @@ export async function consumeChatCompletionStream(
     } catch {
       throw new Error("El coordinador devolvió un fragmento de tokens no válido.");
     }
-    if (chunk.error?.message) throw new Error(chunk.error.message);
+    if (chunk.error?.message) {
+      throw new ChatStreamError(chunk.error.code ?? "stream_error", chunk.error.message);
+    }
     if (chunk.id) requestId = chunk.id;
     if (chunk.model) model = chunk.model;
     const receivedRoute = chunk.x_network?.route_class !== undefined;
@@ -96,6 +204,11 @@ export async function consumeChatCompletionStream(
     if (chunk.x_network?.reused_kv_tokens !== undefined) {
       reusedKvTokens = chunk.x_network.reused_kv_tokens;
     }
+    const phase = chunk.x_network?.phase;
+    const statusMessage = chunk.x_network?.status_message;
+    const attempt = chunk.x_network?.attempt;
+    const affectedWorkerId = chunk.x_network?.affected_worker_id;
+    const affectedNodeId = chunk.x_network?.affected_node_id;
 
     const delta = chunk.choices?.[0]?.delta?.content ?? "";
     if (delta) {
@@ -104,7 +217,13 @@ export async function consumeChatCompletionStream(
         ? outputTokens + 1
         : Math.max(outputTokens, chunk.x_network.token_index + 1);
       if (ttftMs === 0) ttftMs = Math.max(1, Date.now() - startedAt);
-      emit(delta);
+      emit(delta, {
+        phase: "streaming",
+        ...(statusMessage ? { statusMessage } : {}),
+        ...(attempt === undefined ? {} : { attempt }),
+        ...(affectedWorkerId ? { affectedWorkerId } : {}),
+        ...(affectedNodeId ? { affectedNodeId } : {}),
+      });
     }
 
     if (chunk.usage) {
@@ -115,8 +234,14 @@ export async function consumeChatCompletionStream(
       activeMs = chunk.x_network?.active_ms ?? Math.max(0, Date.now() - startedAt);
       completed = true;
       emit("");
-    } else if (!delta && receivedRoute) {
-      emit("");
+    } else if (!delta && (receivedRoute || phase !== undefined || statusMessage !== undefined)) {
+      emit("", {
+        ...(phase ? { phase } : {}),
+        ...(statusMessage ? { statusMessage } : {}),
+        ...(attempt === undefined ? {} : { attempt }),
+        ...(affectedWorkerId ? { affectedWorkerId } : {}),
+        ...(affectedNodeId ? { affectedNodeId } : {}),
+      });
     }
   };
 
@@ -150,12 +275,26 @@ export async function consumeChatCompletionStream(
   };
 }
 
-async function responseError(response: Response): Promise<string> {
+export function isRecoverablePretokenStreamError(error: unknown): boolean {
+  if (error instanceof ChatStreamError) return RECOVERABLE_PRETOKEN_CODES.has(error.code);
+  if (error instanceof TypeError) return true;
+  return typeof DOMException !== "undefined" && error instanceof DOMException &&
+    (error.name === "AbortError" || error.name === "TimeoutError" || error.name === "NetworkError");
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function responseError(response: Response): Promise<Error> {
   const body = await response.text();
   try {
-    const parsed = JSON.parse(body) as { error?: { message?: string } };
-    return parsed.error?.message ?? `HTTP ${response.status}`;
+    const parsed = JSON.parse(body) as { error?: { code?: string; message?: string } };
+    return new ChatStreamError(
+      parsed.error?.code ?? `http_${response.status}`,
+      parsed.error?.message ?? `HTTP ${response.status}`,
+    );
   } catch {
-    return body.trim() || `HTTP ${response.status}`;
+    return new ChatStreamError(`http_${response.status}`, body.trim() || `HTTP ${response.status}`);
   }
 }

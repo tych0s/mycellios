@@ -8,6 +8,15 @@ export interface BenchmarkDeviceProfile {
   kind: "gpu" | "cpu";
   count: number;
   memoryGb: number | null;
+  nodeId?: string;
+  backend?: string | null;
+  precision?: string | null;
+  physicalMemoryGb?: number | null;
+  offeredMemoryGb?: number | null;
+  observedPowerWatts?: number | null;
+  powerLimitWatts?: number | null;
+  utilizationPct?: number | null;
+  temperatureC?: number | null;
 }
 
 export interface BenchmarkInventory {
@@ -15,6 +24,10 @@ export interface BenchmarkInventory {
   connectedDevices: number;
   selectedDevices: number;
   profiles: BenchmarkDeviceProfile[];
+  physicalMemoryGb?: number | null;
+  offeredMemoryGb?: number | null;
+  observedPowerWatts?: number | null;
+  powerLimitWatts?: number | null;
 }
 
 export interface BenchmarkModel {
@@ -32,6 +45,8 @@ export interface BenchmarkMetrics {
   ttftMsP95: number | null;
   tpotMsP50: number | null;
   tpotMsP95: number | null;
+  latencyMsP50?: number | null;
+  latencyMsP95?: number | null;
   acceptanceRate: number | null;
   energyWhPerToken: number | null;
 }
@@ -56,6 +71,10 @@ export interface BenchmarkMeasurement {
     promptTokens: number;
     outputTokens: number;
     concurrentSequences: number;
+    requests?: number;
+    successfulRequests?: number;
+    durationMs?: number;
+    routeClasses?: string[];
   };
   metrics: BenchmarkMetrics;
   status: BenchmarkStatus;
@@ -74,6 +93,8 @@ export interface BenchmarkRun {
   startedAt: string;
   finishedAt: string;
   suite: "real-runtime" | "physical-import";
+  trigger?: "automatic-model-start" | "manual" | "physical-import";
+  triggerModelId?: string | null;
   status: BenchmarkStatus;
   measurements: BenchmarkMeasurement[];
 }

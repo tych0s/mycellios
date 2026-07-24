@@ -136,6 +136,55 @@ describe("multi-objective scheduler", () => {
     expect(scheduler.selectRoute(request, "cell-route")?.routeClass).toBe("replica");
   });
 
+  it("withdraws an internal pipeline while one of its physical stages is disconnected", () => {
+    const physical = addWorker(store, {
+      id: "physical-stage",
+      model: "unrelated-model",
+      distributedExecutor: {
+        protocol: "gdlp-worker-tunnel/2",
+        nodeId: "desktop-stage",
+        stageHost: "desktop-stage.relay",
+        stagePort: 43110,
+        runtime: "python-safetensors",
+        computeMode: "gpu-only",
+        cpuEligible: false,
+      },
+    });
+    const cell = addWorker(store, {
+      id: "dependent-cell",
+      internalPipeline: { stageCount: 2, boundaries: [0, 14, 28] },
+      execution: {
+        deviceType: "gpu",
+        backend: "cuda",
+        deviceName: "Distributed GPU pipeline",
+        precision: "float16",
+        fallback: false,
+        stages: [{
+          nodeId: "desktop-stage",
+          stageIndex: 0,
+          layerStart: 0,
+          layerEnd: 28,
+          deviceType: "gpu",
+          backend: "cuda",
+          deviceName: "Physical GPU",
+          precision: "float16",
+          fallback: false,
+        }],
+      },
+    });
+
+    expect(scheduler.listAvailableModels({
+      connectedWorkerIds: new Set([physical.id, cell.id]),
+    }).find((model) => model.id === "distributed-small")).toEqual({
+      id: "distributed-small",
+      replicas: 0,
+      pipelines: 1,
+    });
+    expect(scheduler.listAvailableModels({
+      connectedWorkerIds: new Set([cell.id]),
+    }).find((model) => model.id === "distributed-small")).toBeUndefined();
+  });
+
   it("preplans disjoint standbys with the exact primary model revision", () => {
     const primary = addWorker(store, {
       id: "primary",

@@ -87,6 +87,11 @@ export interface ModelDeployment {
   maxConcurrency: number;
   freeSlots: number;
   tokensPerSecond: number;
+  /**
+   * Origin of the throughput figure. Only `measured` represents completed
+   * inference observed by this worker; the other values are planning inputs.
+   */
+  throughputSource?: "measured" | "estimated" | "configured" | "default" | undefined;
   ttftMs: number;
   dataLocality: "local" | "external";
   stage?: {

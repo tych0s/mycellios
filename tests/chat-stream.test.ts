@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { consumeChatCompletionStream } from "../src/desktop/chat-stream.js";
+import {
+  consumeChatCompletionStream,
+  consumeChatCompletionStreamWithRecovery,
+} from "../src/desktop/chat-stream.js";
 import type { ChatStreamUpdate } from "../src/desktop/contracts.js";
 
 describe("chat completion stream", () => {
@@ -41,6 +44,40 @@ describe("chat completion stream", () => {
       "data: [DONE]\n\n",
     ]);
     await expect(consumeChatCompletionStream(response, "qwen", () => undefined)).rejects.toThrow("El worker perdió el modelo");
+  });
+
+  it("retries once before token zero when a distributed stage disconnects", async () => {
+    let attempts = 0;
+    const updates: ChatStreamUpdate[] = [];
+    const result = await consumeChatCompletionStreamWithRecovery(
+      async () => {
+        attempts += 1;
+        if (attempts === 1) {
+          return streamingResponse([
+            'data: {"id":"job-1","choices":[{"delta":{"role":"assistant"}}],"x_network":{"session_id":"session","route_class":"replica","affinity_hit":false}}\n\n',
+            'data: {"error":{"code":"pipeline_stage_disconnected","message":"AMD stage disconnected"}}\n\n',
+          ]);
+        }
+        return streamingResponse([
+          ": mycellios-heartbeat 1\n\n",
+          'data: {"id":"job-2","model":"qwen","choices":[{"delta":{"role":"assistant"}}],"x_network":{"session_id":"session","route_class":"replica","affinity_hit":false}}\n\n',
+          'data: {"id":"job-2","model":"qwen","choices":[{"delta":{"content":"recuperado"}}],"x_network":{"token_index":0}}\n\n',
+          'data: {"id":"job-2","model":"qwen","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":1,"total_tokens":5},"x_network":{"ttft_ms":80,"active_ms":120}}\n\n',
+          "data: [DONE]\n\n",
+        ]);
+      },
+      "qwen",
+      (update) => updates.push(update),
+      { sessionId: "session", retryDelayMs: 0 },
+    );
+
+    expect(attempts).toBe(2);
+    expect(updates).toContainEqual(expect.objectContaining({
+      phase: "recovering",
+      attempt: 2,
+      outputTokens: 0,
+    }));
+    expect(result.text).toBe("recuperado");
   });
 });
 

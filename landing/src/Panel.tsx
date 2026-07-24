@@ -36,6 +36,7 @@ import {
   SlidersHorizontal,
   Sparkles,
   Smartphone,
+  Timer,
   Trash2,
   Wifi,
   X,
@@ -60,11 +61,19 @@ import type {
   RequestModelInput,
   RequestedModelCapacity,
 } from "../../src/desktop/contracts";
-import { consumeChatCompletionStream } from "../../src/desktop/chat-stream";
+import { consumeChatCompletionStreamWithRecovery } from "../../src/desktop/chat-stream";
 import type { ChatMessage } from "../../src/contracts/types";
 import type { BenchmarkMeasurement, BenchmarkRun } from "../../src/benchlab/types";
 import { Contribute } from "./Contribute";
 import brandIcon from "./assets/mycellios-app-icon-v2.png";
+import {
+  benchmarkRunHasModel,
+  benchmarkRunSnapshot,
+  compareBenchmarkRuns,
+  defaultBenchmarkBaseline,
+  type BenchmarkRunComparison,
+  type BenchmarkRunSnapshot,
+} from "./benchmark-comparison";
 import { isAdvertisedGpuSelected } from "./panel-hardware";
 import { applySeoMetadata } from "./seo";
 import "./panel.css";
@@ -102,6 +111,7 @@ interface PublicDeployment {
   adapter?: string;
   freeSlots: number;
   tokensPerSecond: number;
+  throughputSource?: "measured" | "estimated" | "configured" | "default";
   ttftMs?: number;
   execution?: DashboardDeployment["execution"];
 }
@@ -355,13 +365,16 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   async function sendPrompt(model: string, messages: ChatMessage[], sessionId: string, onUpdate?: (update: ChatStreamUpdate) => void): Promise<ChatResponse> {
     if (desktopBridge?.streamChat) return desktopBridge.streamChat({ model, messages, sessionId }, onUpdate ?? (() => undefined));
     if (desktopBridge) return desktopBridge.sendChat({ model, messages, sessionId });
-    const startedAt = Date.now();
-    const response = await fetch("/v1/chat/completions", {
-      method: "POST",
-      headers: { accept: "text/event-stream", "content-type": "application/json" },
-      body: JSON.stringify({ model, messages, session_id: sessionId, stream: true, max_tokens: 128, temperature: 0, top_p: 1 }),
-    });
-    return consumeChatCompletionStream(response, model, onUpdate ?? (() => undefined), startedAt);
+    return consumeChatCompletionStreamWithRecovery(
+      () => fetch("/v1/chat/completions", {
+        method: "POST",
+        headers: { accept: "text/event-stream", "content-type": "application/json" },
+        body: JSON.stringify({ model, messages, session_id: sessionId, stream: true, max_tokens: 128, temperature: 0, top_p: 1 }),
+      }),
+      model,
+      onUpdate ?? (() => undefined),
+      { sessionId },
+    );
   }
 
   const publicOrigin = desktopSnapshot?.settings.coordinatorMode === "remote"
@@ -464,7 +477,8 @@ function Overview({ snapshot, onNavigate, publicLink, external, localAcceleratio
     ? telemetryGpus.reduce((total, gpu) => total + (gpu.utilizationPct ?? 0), 0) / telemetryGpus.length
     : null;
   const observedPowerW = poweredGpus.reduce((total, gpu) => total + (gpu.powerW ?? 0), 0);
-  const activeThroughput = activeDeployments.reduce((total, deployment) => total + deployment.tokensPerSecond, 0);
+  const measuredDeployments = activeDeployments.filter(isMeasuredDeployment);
+  const measuredThroughput = measuredDeployments.reduce((total, deployment) => total + deployment.tokensPerSecond, 0);
   const execution = summarizeDeploymentExecution(activeDeployments);
   const nativeNodes = operational.filter((worker) => worker.kind === "desktop").length;
   const browserNodes = operational.filter((worker) => worker.kind === "browser").length;
@@ -484,8 +498,8 @@ function Overview({ snapshot, onNavigate, publicLink, external, localAcceleratio
         <div className="global-capacity-metrics">
           <CapacityMetric icon={Cpu} label="Runtime stages" value={execution.verified ? String(execution.unitCount) : "Unverified"} detail={execution.verified ? executionDetail(execution) : `${nativeNodes} native · ${browserNodes} browser · ${cellNodes} cells connected`} />
           <CapacityMetric icon={Gauge} label="Average GPU load" value={averageUtilization === null ? "No telemetry" : `${averageUtilization.toFixed(0)}%`} detail={`${telemetryGpus.length} reporting engine${telemetryGpus.length === 1 ? "" : "s"}`} />
-          <CapacityMetric icon={Zap} label="Active throughput" value={activeThroughput > 0 ? `${formatCompactNumber(activeThroughput)} tok/s` : "No active runtime"} detail={`${activeDeployments.length} deployment${activeDeployments.length === 1 ? "" : "s"}`} />
-          <CapacityMetric icon={Activity} label="Observed power" value={poweredGpus.length > 0 ? formatPower(observedPowerW) : "No telemetry"} detail={poweredGpus.length > 0 ? `${poweredGpus.length} physical reading${poweredGpus.length === 1 ? "" : "s"}` : "Never estimated"} />
+          <CapacityMetric icon={Zap} label="Measured inference capacity" value={measuredThroughput > 0 ? `${formatCompactNumber(measuredThroughput)} tok/s` : "Not measured"} detail={measuredDeployments.length > 0 ? `${measuredDeployments.length} runtime${measuredDeployments.length === 1 ? "" : "s"} with completed inference` : activeDeployments.length > 0 ? "Measured after the first real inference" : "Requires an active model"} />
+          <CapacityMetric icon={Activity} label="Observed GPU draw" value={poweredGpus.length > 0 ? formatPower(observedPowerW) : "No telemetry"} detail={poweredGpus.length > 0 ? `${poweredGpus.length} physical reading${poweredGpus.length === 1 ? "" : "s"}` : telemetryGpus.length > 0 ? "GPU load is visible, but the driver does not expose watts" : "Never estimated"} />
         </div>
       </article>
       <div className="panel-stat-grid">
@@ -549,7 +563,8 @@ function Nodes({ snapshot, onRemove, onClearOffline }: { snapshot: PublicSnapsho
   const freeVramMb = activeGpus.reduce((total, gpu) => total + gpu.freeOfferedVramMb, 0);
   const averageUtilization = telemetryGpus.length > 0 ? telemetryGpus.reduce((total, gpu) => total + (gpu.utilizationPct ?? 0), 0) / telemetryGpus.length : null;
   const observedPowerW = poweredGpus.reduce((total, gpu) => total + (gpu.powerW ?? 0), 0);
-  const activeThroughput = activeDeployments.reduce((total, deployment) => total + deployment.tokensPerSecond, 0);
+  const measuredDeployments = activeDeployments.filter(isMeasuredDeployment);
+  const measuredThroughput = measuredDeployments.reduce((total, deployment) => total + deployment.tokensPerSecond, 0);
   const sortedWorkers = [...snapshot.workers].sort((left, right) => nodeStateOrder(left) - nodeStateOrder(right));
   const selectedWorker = snapshot.workers.find((worker) => worker.id === selectedWorkerId) ?? activeWorkers[0] ?? snapshot.workers[0] ?? null;
   async function remove(workerId: string) {
@@ -574,11 +589,11 @@ function Nodes({ snapshot, onRemove, onClearOffline }: { snapshot: PublicSnapsho
 
       <div className="node-overview-grid">
         <NodeOverviewStat icon={Server} label="Dispositivos activos" value={`${activePhysicalWorkers.length} / ${physicalWorkers.length}`} detail={`${connectedPhysicalWorkers.length} conectados ahora · ${cellWorkers.length} celdas`} progress={physicalWorkers.length > 0 ? activePhysicalWorkers.length / physicalWorkers.length : 0} tone="green" />
-        <NodeOverviewStat icon={MemoryStick} label="Capacidad activa" value={formatMemory(activeOfferedVramMb)} detail={`${formatMemory(freeVramMb)} libres`} progress={activeOfferedVramMb > 0 ? freeVramMb / activeOfferedVramMb : 0} tone="blue" />
+        <NodeOverviewStat icon={MemoryStick} label="Memoria ofrecida" value={formatMemory(activeOfferedVramMb)} detail={`${formatMemory(freeVramMb)} disponibles para modelos`} progress={activeOfferedVramMb > 0 ? freeVramMb / activeOfferedVramMb : 0} tone="blue" />
         <NodeOverviewStat icon={Gauge} label="Carga GPU media" value={averageUtilization === null ? "Sin datos" : `${averageUtilization.toFixed(0)}%`} detail={`${telemetryGpus.length} GPU${telemetryGpus.length === 1 ? "" : "s"} con telemetría`} progress={averageUtilization === null ? 0 : averageUtilization / 100} tone="purple" />
-        <NodeOverviewStat icon={Zap} label="Rendimiento anunciado" value={activeThroughput > 0 ? `${formatCompactNumber(activeThroughput)} tok/s` : "—"} detail={`${activeDeployments.length} despliegue${activeDeployments.length === 1 ? "" : "s"} activo${activeDeployments.length === 1 ? "" : "s"}`} tone="violet" />
-        <NodeOverviewStat icon={Activity} label="Telemetría de potencia" value={`${poweredGpus.length} / ${activeGpus.length}`} detail={poweredGpus.length > 0 ? `${poweredGpus.length} GPU${poweredGpus.length === 1 ? "" : "s"} enviando lecturas reales` : "Ninguna GPU envía esta lectura"} progress={activeGpus.length > 0 ? poweredGpus.length / activeGpus.length : 0} tone="cyan" />
-        <NodeOverviewStat icon={CirclePower} label="Potencia total del sistema" value={poweredGpus.length > 0 ? formatPower(observedPowerW) : "Sin datos"} detail={poweredGpus.length > 0 ? "Suma de las lecturas actuales" : "No se estima ni se inventa"} tone="orange" />
+        <NodeOverviewStat icon={Zap} label="Capacidad de inferencia medida" value={measuredThroughput > 0 ? `${formatCompactNumber(measuredThroughput)} tok/s` : "Sin medir"} detail={measuredDeployments.length > 0 ? `${measuredDeployments.length} runtime${measuredDeployments.length === 1 ? "" : "s"} con inferencias completadas` : activeDeployments.length > 0 ? "Se medirá tras la primera inferencia real" : "Requiere un modelo activo"} tone="violet" />
+        <NodeOverviewStat icon={Activity} label="GPU con telemetría" value={`${telemetryGpus.length} / ${activeGpus.length}`} detail={telemetryGpus.length > 0 ? `${telemetryGpus.length} GPU${telemetryGpus.length === 1 ? "" : "s"} enviando carga física` : "Ninguna GPU envía esta lectura"} progress={activeGpus.length > 0 ? telemetryGpus.length / activeGpus.length : 0} tone="cyan" />
+        <NodeOverviewStat icon={CirclePower} label="Consumo GPU observado" value={poweredGpus.length > 0 ? formatPower(observedPowerW) : "Sin datos"} detail={poweredGpus.length > 0 ? "Suma de vatios reportados por las GPU" : telemetryGpus.length > 0 ? "Hay carga real, pero el controlador no expone vatios" : "No se estima ni se inventa"} tone="orange" />
       </div>
 
       <section className="node-topology-card">
@@ -659,11 +674,12 @@ function NodeTopologyInspector({ worker, snapshot }: { worker: PublicWorker; sna
   const free = gpus.reduce((total, gpu) => total + gpu.freeOfferedVramMb, 0);
   const utilizations = gpus.filter((gpu) => gpu.utilizationPct !== undefined);
   const utilization = utilizations.length > 0 ? utilizations.reduce((total, gpu) => total + (gpu.utilizationPct ?? 0), 0) / utilizations.length : null;
-  const throughput = worker.deployments.reduce((total, deployment) => total + deployment.tokensPerSecond, 0);
+  const measuredDeployments = worker.deployments.filter(isMeasuredDeployment);
+  const throughput = measuredDeployments.reduce((total, deployment) => total + deployment.tokensPerSecond, 0);
   const execution = workerExecutionSummary(snapshot, worker);
   return <div className="node-topology-inspector">
     <div className={`node-inspector-identity ${nodeVisualState(worker)}`}><div><WorkerKindIcon worker={worker} /></div><span><small>{worker.kind === "cell" ? "CELDA SELECCIONADA" : "NODO SELECCIONADO"}</small><strong>{workerLabel(worker)}</strong><em>{worker.region} · {shortId(worker.id)}</em><ExecutionBadge execution={execution} workers={snapshot.workers} /></span></div>
-    <div className="node-inspector-metrics"><Metric label="Estado" value={nodeStatusLabel(worker)} /><Metric label="GPU libre" value={formatMemory(free)} /><Metric label="Carga física" value={utilization === null ? "Sin datos" : `${utilization.toFixed(0)}%`} /><Metric label="Rend. anunciado" value={throughput > 0 ? `${formatCompactNumber(throughput)} tok/s` : "—"} /><Metric label="Cómputo real" value={execution.verified ? executionShortLabel(execution) : "No verificado"} /><Metric label="Versión" value={worker.agentVersion ? `v${worker.agentVersion}` : "Legacy"} /><Metric label="GPU runtime" value={worker.acceleration ? remoteAccelerationLabel(worker.acceleration) : "Sin diagnóstico"} /><Metric label="Modelos" value={String(worker.deployments.length)} /></div>
+    <div className="node-inspector-metrics"><Metric label="Estado" value={nodeStatusLabel(worker)} /><Metric label="Memoria libre" value={formatMemory(free)} /><Metric label="Carga física" value={utilization === null ? "Sin datos" : `${utilization.toFixed(0)}%`} /><Metric label="Inferencia medida" value={throughput > 0 ? `${formatCompactNumber(throughput)} tok/s` : "Sin medir"} /><Metric label="Cómputo real" value={execution.verified ? executionShortLabel(execution) : "No verificado"} /><Metric label="Versión" value={worker.agentVersion ? `v${worker.agentVersion}` : "Legacy"} /><Metric label="GPU runtime" value={worker.acceleration ? remoteAccelerationLabel(worker.acceleration) : "Sin diagnóstico"} /><Metric label="Modelos" value={String(worker.deployments.length)} /></div>
     {worker.acceleration && <RemoteAccelerationDiagnostics diagnostics={worker.acceleration} />}
   </div>;
 }
@@ -953,25 +969,30 @@ function Jobs({ snapshot }: { snapshot: PublicSnapshot }) {
 function Tests({ bridge }: { bridge: DesktopBridge | undefined }) {
   const [runs, setRuns] = useState<BenchmarkRun[]>([]);
   const [selectedRunId, setSelectedRunId] = useState("");
+  const [comparisonRunId, setComparisonRunId] = useState("");
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const loadRuns = useCallback(async () => {
-    setLoading(true);
+  const loadRuns = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
     try {
       const next = bridge ? await bridge.getBenchmarkRuns() : await fetchBenchmarkRuns();
       setRuns(next);
       setSelectedRunId((current) => next.some((run) => run.runId === current) ? current : next[0]?.runId ?? "");
       setError(null);
     } catch (caught) {
-      setError(errorText(caught));
+      if (!silent) setError(errorText(caught));
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, [bridge]);
 
-  useEffect(() => { void loadRuns(); }, [loadRuns]);
+  useEffect(() => {
+    void loadRuns();
+    const timer = window.setInterval(() => { void loadRuns(true); }, 5_000);
+    return () => window.clearInterval(timer);
+  }, [loadRuns]);
 
   async function runNow() {
     setRunning(true);
@@ -980,6 +1001,7 @@ function Tests({ bridge }: { bridge: DesktopBridge | undefined }) {
       const run = bridge ? await bridge.runBenchmark() : await requestBenchmarkRun();
       setRuns((current) => [run, ...current.filter((item) => item.runId !== run.runId)]);
       setSelectedRunId(run.runId);
+      setComparisonRunId("");
     } catch (caught) {
       setError(errorText(caught));
     } finally {
@@ -987,87 +1009,282 @@ function Tests({ bridge }: { bridge: DesktopBridge | undefined }) {
     }
   }
 
+  function selectRun(runId: string) {
+    setSelectedRunId(runId);
+    setComparisonRunId("");
+  }
+
   const selected = runs.find((run) => run.runId === selectedRunId) ?? runs[0] ?? null;
-  const measurements = runs.flatMap((run) => run.measurements);
-  const bestThroughput = measurements.reduce<number | null>((best, item) => {
+  const selectedSnapshot = benchmarkRunSnapshot(selected);
+  const selectedModelKey = selectedSnapshot?.modelKey ?? "";
+  const trendRuns = selectedModelKey
+    ? runs.filter((run) => benchmarkRunHasModel(run, selectedModelKey)
+      && benchmarkRunSnapshot(run)?.measurement.evidence === selectedSnapshot?.measurement.evidence)
+    : runs;
+  const comparableMeasurements = trendRuns
+    .flatMap((run) => run.measurements)
+    .filter((measurement) => !selectedSnapshot || measurement.evidence === selectedSnapshot.measurement.evidence);
+  const bestThroughput = comparableMeasurements.reduce<number | null>((best, item) => {
     const value = item.metrics.tokensPerSecond;
     return value === null ? best : best === null ? value : Math.max(best, value);
   }, null);
-  const latestDevices = selected?.measurements.reduce((best, item) => Math.max(best, item.inventory.connectedDevices), 0) ?? 0;
+  const selectedMeasurement = selectedSnapshot?.measurement ?? null;
+  const selectedInventory = selectedMeasurement?.inventory ?? null;
+  const selectedNodes = selectedInventory?.selectedDevices ?? 0;
+  const selectedOfferedGb = selectedInventory?.offeredMemoryGb
+    ?? nullableBenchmarkSum(selectedInventory?.profiles
+      .filter((profile) => profile.kind === "gpu")
+      .map((profile) => profile.offeredMemoryGb ?? profile.memoryGb) ?? []);
+  const selectedPower = selectedInventory?.observedPowerWatts
+    ?? nullableBenchmarkSum(selectedInventory?.profiles.map((profile) => profile.observedPowerWatts) ?? []);
+  const selectedPowerLimit = selectedInventory?.powerLimitWatts
+    ?? nullableBenchmarkSum(selectedInventory?.profiles.map((profile) => profile.powerLimitWatts) ?? []);
+  const automaticBaseline = defaultBenchmarkBaseline(selected, runs);
+  const comparisonRun = runs.find((run) => run.runId === comparisonRunId && run.runId !== selected?.runId)
+    ?? automaticBaseline;
+  const comparison = compareBenchmarkRuns(selected, comparisonRun);
+  const runOptions = runs.map((run) => {
+    const snapshot = benchmarkRunSnapshot(run);
+    return {
+      value: run.runId,
+      label: `${run.trigger === "automatic-model-start" ? "Auto" : "Manual"} · ${snapshot?.measurement.model.label ?? run.triggerModelId ?? "modelo"} · v${run.version} · ${formatBenchmarkDate(run.finishedAt)}`,
+    };
+  });
+  const comparisonOptions = [
+    { value: "", label: "Sin referencia comparable" },
+    ...runs.filter((run) => run.runId !== selected?.runId).map((run) => {
+      const snapshot = benchmarkRunSnapshot(run);
+      return {
+        value: run.runId,
+        label: `${snapshot?.measurement.model.label ?? "modelo"} · ${snapshot?.nodes ?? 0} nodos · v${run.version} · ${formatBenchmarkDate(run.finishedAt)}`,
+      };
+    }),
+  ];
 
   return <section className="tests-page">
-    <PageTitle eyebrow="REAL BENCHMARKS" title="Performance tests" copy="Real measurements from the active runtime, saved by version so improvements and regressions stay visible." actions={<button disabled={running} onClick={() => void runNow()}>{running ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}{running ? "Running real test…" : "Run real test"}</button>} />
-    {error && <div className="benchmark-error"><CircleAlert size={17} /><span><strong>Benchmark unavailable</strong>{error}</span></div>}
+    <PageTitle eyebrow="PRUEBAS REALES AUTOMÁTICAS" title="Rendimiento por versión" copy="Cada arranque de un modelo ejecuta una prueba corta sobre la ruta real y guarda el hardware y las métricas para compararlas." actions={<button disabled={running} onClick={() => void runNow()}>{running ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}{running ? "Midiendo…" : "Repetir prueba ahora"}</button>} />
+    <div className="benchmark-auto-notice"><Activity size={17} /><span><strong>Automático al arrancar</strong>Al detectar un modelo activo se miden 3 respuestas reales. Si no hay modelo o nodos, no se inventa ningún resultado.</span></div>
+    {error && <div className="benchmark-error"><CircleAlert size={17} /><span><strong>No se pudo ejecutar la prueba</strong>{error}</span></div>}
     <div className="panel-stat-grid benchmark-stats">
-      <Stat icon={Activity} label="Recorded runs" value={String(runs.length)} detail="No simulated records" />
-      <Stat icon={Gauge} label="Best throughput" value={formatBenchmark(bestThroughput, " tok/s")} detail="Measured per request" tone="purple" />
-      <Stat icon={Server} label="Connected devices" value={String(latestDevices)} detail="In the selected run" />
-      <Stat icon={Boxes} label="Selected version" value={selected ? `v${selected.version}` : "—"} detail={selected ? formatBenchmarkDate(selected.finishedAt) : "No measurements yet"} />
+      <Stat icon={Activity} label="Pruebas guardadas" value={String(runs.length)} detail="Solo ejecuciones reales" />
+      <Stat icon={Boxes} label="Modelo seleccionado" value={selectedMeasurement?.model.label ?? "—"} detail={selected ? `v${selected.version} · ${formatBenchmarkDate(selected.finishedAt)}` : "Sin mediciones"} />
+      <Stat icon={Server} label="Nodos del modelo" value={selectedNodes > 0 ? String(selectedNodes) : "—"} detail={selectedInventory ? `${selectedInventory.connectedDevices}/${selectedInventory.totalDevices} nodos conectados` : "Sin inventario"} />
+      <Stat icon={Gauge} label="Mejor velocidad del modelo" value={formatBenchmark(bestThroughput, " tok/s")} detail={selectedMeasurement ? `${selectedMeasurement.model.label} · misma evidencia` : "Medida con inferencia real"} tone="purple" />
     </div>
-    {loading && runs.length === 0 ? <div className="benchmark-loading"><LoaderCircle className="spin" /><span>Loading real benchmark history…</span></div> : runs.length === 0 ? <Empty icon={Gauge} title="No real tests recorded" copy="Start the active runtime and run the first measurement. Nothing is generated if the runtime is not ready." /> : <>
+    {selectedMeasurement && <div className="benchmark-capacity-strip">
+      <BenchmarkMetric icon={MemoryStick} label="Memoria ofrecida" value={formatBenchmark(selectedOfferedGb, " GB")} detail={formatBenchmark(selectedInventory?.physicalMemoryGb ?? null, " GB físicos")} />
+      <BenchmarkMetric icon={Zap} label="Potencia observada" value={selectedPower === null ? "Sin lectura" : formatPower(selectedPower)} detail={selectedPower === null ? selectedPowerLimit === null ? "El controlador no reportó vatios" : `Límite ofrecido ${formatPower(selectedPowerLimit)}` : selectedPowerLimit === null ? "Heartbeat físico de los nodos" : `Límite ofrecido ${formatPower(selectedPowerLimit)}`} />
+      <BenchmarkMetric icon={Gauge} label="Velocidad" value={formatBenchmark(selectedMeasurement.metrics.tokensPerSecond, " tok/s")} detail={`P95 ${formatBenchmark(selectedMeasurement.metrics.tokensPerSecondP95, " tok/s")}`} />
+      <BenchmarkMetric icon={Timer} label="Primer token P95" value={formatBenchmark(selectedMeasurement.metrics.ttftMsP95, " ms")} detail={`P50 ${formatBenchmark(selectedMeasurement.metrics.ttftMsP50, " ms")}`} />
+    </div>}
+    {loading && runs.length === 0 ? <div className="benchmark-loading"><LoaderCircle className="spin" /><span>Cargando el historial real…</span></div> : runs.length === 0 ? <Empty icon={Gauge} title="Todavía no hay pruebas reales" copy="Arranca un modelo. La primera medición se guardará automáticamente cuando tenga una ruta física disponible." /> : <>
       <div className="benchmark-toolbar">
-        <label>RUN<AppSelect ariaLabel="Benchmark run" value={selected?.runId ?? ""} onChange={setSelectedRunId} options={runs.map((run) => ({ value: run.runId, label: `v${run.version} · ${formatBenchmarkDate(run.finishedAt)} · ${benchmarkStatusLabel(run.status)}` }))} /></label>
-        {selected && <div className={`benchmark-run-state ${selected.status}`}><i />{benchmarkStatusLabel(selected.status)}<span>{selected.suite === "physical-import" ? "physical campaign" : "active runtime"}</span></div>}
+        <div className="benchmark-toolbar-selects">
+          <label>RESULTADO ACTUAL<AppSelect ariaLabel="Resultado actual" value={selected?.runId ?? ""} onChange={selectRun} options={runOptions} /></label>
+          <label>COMPARAR CON<AppSelect ariaLabel="Resultado de referencia" value={comparisonRun?.runId ?? ""} onChange={setComparisonRunId} options={comparisonOptions} /></label>
+        </div>
+        {selected && <div className={`benchmark-run-state ${selected.status}`}><i />{benchmarkStatusLabel(selected.status)}<span>{selected.trigger === "automatic-model-start" ? "arranque automático" : selected.suite === "physical-import" ? "campaña física" : "prueba manual"}</span></div>}
       </div>
+      <BenchmarkComparisonPanel comparison={comparison} />
       <div className="benchmark-chart-grid">
-        <BenchmarkTrend runs={runs} metric="tokensPerSecond" label="Throughput by version" unit="tok/s" />
-        <BenchmarkTrend runs={runs} metric="ttftMsP95" label="TTFT P95 by version" unit="ms" />
+        <BenchmarkTrend runs={trendRuns} metric="tokensPerSecond" label="Velocidad por versión" unit="tok/s" tone="blue" />
+        <BenchmarkTrend runs={trendRuns} metric="ttftMsP95" label="Primer token P95" unit="ms" tone="purple" />
+        <BenchmarkTrend runs={trendRuns} metric="nodes" label="Nodos usados" unit=" nodos" tone="green" />
+        <BenchmarkTrend runs={trendRuns} metric="tokensPerSecondPerNode" label="Eficiencia por nodo" unit=" tok/s/nodo" tone="orange" />
       </div>
+      <BenchmarkHistory runs={runs} selectedRunId={selected?.runId ?? ""} onSelect={selectRun} />
       {selected && <BenchmarkRunDetails run={selected} />}
     </>}
   </section>;
 }
 
-function BenchmarkTrend({ runs, metric, label, unit }: { runs: BenchmarkRun[]; metric: "tokensPerSecond" | "ttftMsP95"; label: string; unit: string }) {
+type BenchmarkTrendMetric = "tokensPerSecond" | "ttftMsP95" | "nodes" | "tokensPerSecondPerNode";
+
+function BenchmarkTrend({ runs, metric, label, unit, tone }: { runs: BenchmarkRun[]; metric: BenchmarkTrendMetric; label: string; unit: string; tone: "blue" | "purple" | "green" | "orange" }) {
   const chronological = [...runs].reverse();
-  const ids = Array.from(new Set(chronological.flatMap((run) => run.measurements.map((item) => item.id))));
-  const values = chronological.flatMap((run) => run.measurements.map((item) => item.metrics[metric])).filter((value): value is number => value !== null);
-  const width = 720; const height = 240; const left = 52; const right = 30; const top = 28; const bottom = 42;
+  const points = chronological.map((run) => {
+    const snapshot = benchmarkRunSnapshot(run);
+    if (!snapshot) return null;
+    const value = benchmarkSnapshotMetric(snapshot, metric);
+    return value === null ? null : { run, snapshot, value };
+  }).filter((point): point is NonNullable<typeof point> => point !== null);
+  const values = points.map((point) => point.value);
+  const width = 720; const height = 240; const left = 52; const right = 30; const top = 28; const bottom = 50;
   const ceiling = Math.max(...values, 1);
-  const x = (index: number) => chronological.length === 1 ? (left + width - right) / 2 : left + (index / (chronological.length - 1)) * (width - left - right);
+  const x = (index: number) => points.length === 1 ? (left + width - right) / 2 : left + (index / Math.max(points.length - 1, 1)) * (width - left - right);
   const y = (value: number) => top + (1 - value / ceiling) * (height - top - bottom);
   return <article className="benchmark-chart">
-    <div><span>VERSION TREND</span><h2>{label}</h2></div>
-    <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${label}. ${ids.length} measured test series.`}>
+    <div><span>EVOLUCIÓN REAL · {points[0]?.snapshot.measurement.model.label ?? "SIN DATOS"}</span><h2>{label}</h2></div>
+    <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${label}. ${points.length} pruebas reales.`}>
       <line className="benchmark-axis" x1={left} y1={height - bottom} x2={width - right} y2={height - bottom} />
       {[0, 0.5, 1].map((ratio) => <g key={ratio}><line className="benchmark-grid-line" x1={left} y1={top + ratio * (height - top - bottom)} x2={width - right} y2={top + ratio * (height - top - bottom)} /><text x={left - 8} y={top + ratio * (height - top - bottom) + 4} textAnchor="end">{formatBenchmark(ceiling * (1 - ratio), "")}</text></g>)}
-      {ids.map((id, seriesIndex) => {
-        const points = chronological.map((run, runIndex) => {
-          const measurement = run.measurements.find((item) => item.id === id);
-          const value = measurement?.metrics[metric] ?? null;
-          return value === null ? null : { run, value, x: x(runIndex), y: y(value) };
-        }).filter((point): point is NonNullable<typeof point> => point !== null);
-        return <g className={`benchmark-series series-${seriesIndex % 4}`} key={id}>
-          {points.length > 1 && <polyline points={points.map((point) => `${point.x},${point.y}`).join(" ")} />}
-          {points.map((point) => <circle key={point.run.runId} cx={point.x} cy={point.y} r="5"><title>{`${id} · v${point.run.version}: ${formatBenchmark(point.value, ` ${unit}`)}`}</title></circle>)}
-        </g>;
+      <g className={`benchmark-series tone-${tone}`}>
+        {points.length > 1 && <polyline points={points.map((point, index) => `${x(index)},${y(point.value)}`).join(" ")} />}
+        {points.map((point, index) => <circle key={point.run.runId} cx={x(index)} cy={y(point.value)} r="5"><title>{`v${point.run.version} · ${formatBenchmarkDate(point.run.finishedAt)}: ${formatBenchmark(point.value, ` ${unit}`)}`}</title></circle>)}
+      </g>
+      {points.map((point, index) => {
+        const labelEvery = Math.max(1, Math.ceil(points.length / 6));
+        if (index % labelEvery !== 0 && index !== points.length - 1) return null;
+        return <text className="benchmark-x-label" key={point.run.runId} x={x(index)} textAnchor="middle">
+          <tspan x={x(index)} y={height - 23}>v{point.run.version}</tspan>
+          <tspan x={x(index)} y={height - 9}>{formatBenchmarkChartTime(point.run.finishedAt)}</tspan>
+        </text>;
       })}
-      {chronological.map((run, index) => <text className="benchmark-x-label" key={run.runId} x={x(index)} y={height - 14} textAnchor="middle">v{run.version}</text>)}
     </svg>
-    <div className="benchmark-legend">{ids.map((id, index) => <span key={id}><i className={`series-${index % 4}`} />{id}</span>)}</div>
+    <div className="benchmark-chart-summary"><span>{points.length} mediciones</span><strong>{formatBenchmark(points.at(-1)?.value ?? null, ` ${unit}`)}</strong></div>
+  </article>;
+}
+
+function BenchmarkComparisonPanel({ comparison }: { comparison: BenchmarkRunComparison }) {
+  const copy = benchmarkComparisonCopy(comparison);
+  return <article className={`benchmark-comparison ${comparison.mode}`}>
+    <div className="benchmark-comparison-heading">
+      <div><span>{copy.eyebrow}</span><h2>{copy.title}</h2><p>{copy.description}</p></div>
+      {comparison.current && comparison.baseline && <div className="benchmark-comparison-versions">
+        <span><small>REFERENCIA</small><strong>v{comparison.baseline.run.version}</strong><em>{formatBenchmarkDate(comparison.baseline.run.finishedAt)}</em></span>
+        <ArrowRight size={17} />
+        <span><small>ACTUAL</small><strong>v{comparison.current.run.version}</strong><em>{formatBenchmarkDate(comparison.current.run.finishedAt)}</em></span>
+      </div>}
+    </div>
+    <div className="benchmark-comparison-grid">
+      <BenchmarkComparisonMetric
+        label="Velocidad"
+        baseline={formatBenchmark(comparison.baseline?.tokensPerSecond ?? null, " tok/s")}
+        current={formatBenchmark(comparison.current?.tokensPerSecond ?? null, " tok/s")}
+        delta={comparison.speedChangePct}
+      />
+      <BenchmarkComparisonMetric
+        label="Primer token P95"
+        baseline={formatBenchmark(comparison.baseline?.ttftMsP95 ?? null, " ms")}
+        current={formatBenchmark(comparison.current?.ttftMsP95 ?? null, " ms")}
+        delta={comparison.latencyImprovementPct}
+      />
+      <BenchmarkComparisonMetric
+        label="Nodos usados"
+        baseline={comparison.baseline ? String(comparison.baseline.nodes) : "—"}
+        current={comparison.current ? String(comparison.current.nodes) : "—"}
+        rawDelta={formatSignedBenchmark(comparison.nodesDelta, "")}
+        neutral
+      />
+      <BenchmarkComparisonMetric
+        label="Velocidad por nodo"
+        baseline={formatBenchmark(comparison.baseline?.tokensPerSecondPerNode ?? null, " tok/s")}
+        current={formatBenchmark(comparison.current?.tokensPerSecondPerNode ?? null, " tok/s")}
+        delta={comparison.efficiencyPerNodeChangePct}
+      />
+      <BenchmarkComparisonMetric
+        label="Velocidad por GB"
+        baseline={formatBenchmark(comparison.baseline?.tokensPerSecondPerGb ?? null, " tok/s/GB")}
+        current={formatBenchmark(comparison.current?.tokensPerSecondPerGb ?? null, " tok/s/GB")}
+        delta={comparison.efficiencyPerGbChangePct}
+      />
+      <BenchmarkComparisonMetric
+        label="Velocidad por vatio"
+        baseline={formatBenchmark(comparison.baseline?.tokensPerSecondPerWatt ?? null, " tok/s/W")}
+        current={formatBenchmark(comparison.current?.tokensPerSecondPerWatt ?? null, " tok/s/W")}
+        delta={comparison.efficiencyPerWattChangePct}
+      />
+    </div>
+  </article>;
+}
+
+function BenchmarkComparisonMetric({ label, baseline, current, delta = null, rawDelta, neutral = false }: {
+  label: string;
+  baseline: string;
+  current: string;
+  delta?: number | null;
+  rawDelta?: string;
+  neutral?: boolean;
+}) {
+  const tone = neutral ? "neutral" : delta === null ? "unavailable" : delta >= 0 ? "positive" : "negative";
+  const deltaLabel = rawDelta ?? (delta === null ? "Sin comparación" : delta >= 0 ? `+${delta.toFixed(1)}% mejor` : `${delta.toFixed(1)}% peor`);
+  return <div className="benchmark-comparison-metric">
+    <small>{label}</small>
+    <div><span><em>Antes</em><strong>{baseline}</strong></span><ArrowRight size={14} /><span><em>Ahora</em><strong>{current}</strong></span></div>
+    <b className={tone}>{deltaLabel}</b>
+  </div>;
+}
+
+function BenchmarkHistory({ runs, selectedRunId, onSelect }: { runs: BenchmarkRun[]; selectedRunId: string; onSelect: (runId: string) => void }) {
+  return <article className="benchmark-history">
+    <div className="card-heading"><div><span>HISTORIAL DE EVOLUCIÓN</span><h2>Todas las pruebas reales</h2></div><small>Selecciona una fila para analizarla</small></div>
+    <div className="benchmark-history-table">
+      <div className="benchmark-history-head"><span>Versión</span><span>Modelo</span><span>Nodos</span><span>VRAM ofrecida</span><span>Velocidad</span><span>Primer token</span><span>Estado</span></div>
+      {runs.map((run) => {
+        const snapshot = benchmarkRunSnapshot(run);
+        if (!snapshot) return null;
+        return <button className={`benchmark-history-row ${run.runId === selectedRunId ? "selected" : ""}`} aria-pressed={run.runId === selectedRunId} key={run.runId} onClick={() => onSelect(run.runId)}>
+          <span><strong>v{run.version}</strong><small>{formatBenchmarkDate(run.finishedAt)}</small></span>
+          <span><strong>{snapshot.measurement.model.label}</strong><small>{snapshot.measurement.evidence === "physical" ? "Física" : "Loopback"} · {run.trigger === "automatic-model-start" ? "Auto" : "Manual"}</small></span>
+          <span><strong>{snapshot.nodes}</strong><small>{snapshot.measurement.inventory.connectedDevices} conectados</small></span>
+          <span><strong>{formatBenchmark(snapshot.offeredMemoryGb, " GB")}</strong><small>capacidad aportada</small></span>
+          <span><strong>{formatBenchmark(snapshot.tokensPerSecond, " tok/s")}</strong><small>{formatBenchmark(snapshot.tokensPerSecondPerNode, " por nodo")}</small></span>
+          <span><strong>{formatBenchmark(snapshot.ttftMsP95, " ms")}</strong><small>P95</small></span>
+          <span><b className={run.status}><i />{benchmarkStatusLabel(run.status)}</b><ChevronRight size={15} /></span>
+        </button>;
+      })}
+    </div>
   </article>;
 }
 
 function BenchmarkRunDetails({ run }: { run: BenchmarkRun }) {
-  return <div className="benchmark-results panel-table">
-    <div className="card-heading"><div><span>SELECTED REAL RUN</span><h2>{run.label}</h2></div><small>{run.gitCommit ? run.gitCommit.slice(0, 8) : "uncommitted"}{run.gitDirty ? " · working tree changed" : ""}</small></div>
-    <div className="benchmark-table-head"><span>Test / model</span><span>Devices</span><span>Evidence</span><span>Tokens/s</span><span>TTFT P95</span><span>Change</span><span>Status</span></div>
-    {run.measurements.map((measurement) => <BenchmarkResultRow measurement={measurement} key={measurement.id} />)}
+  return <div className="benchmark-results">
+    <div className="card-heading"><div><span>RESULTADO SELECCIONADO</span><h2>{run.triggerModelId ?? run.label}</h2></div><small>v{run.version} · {run.gitCommit ? run.gitCommit.slice(0, 8) : "sin commit"}{run.gitDirty ? " · código con cambios" : ""}</small></div>
+    <div className="benchmark-result-list">
+      {run.measurements.map((measurement) => <BenchmarkResultCard measurement={measurement} key={measurement.id} />)}
+    </div>
   </div>;
 }
 
-function BenchmarkResultRow({ measurement }: { measurement: BenchmarkMeasurement }) {
-  const devices = measurement.inventory.profiles.map((profile) => `${profile.count}× ${profile.label}`).join(" · ");
+function BenchmarkResultCard({ measurement }: { measurement: BenchmarkMeasurement }) {
   const delta = measurement.comparison.tokensPerSecondPct;
-  return <div className="benchmark-table-row">
-    <strong><Gauge size={16} /><span>{measurement.title}<small>{measurement.model.label} · {measurement.model.precision} · rev {measurement.model.revision?.slice(0, 8) ?? "—"}</small></span></strong>
-    <span>{measurement.inventory.connectedDevices}/{measurement.inventory.totalDevices}<small>{devices || "No device profile"}</small></span>
-    <span>{measurement.evidence}<small>{measurement.environment}</small></span>
-    <span className="metric-value">{formatBenchmark(measurement.metrics.tokensPerSecond, " tok/s")}</span>
-    <span className="metric-value">{formatBenchmark(measurement.metrics.ttftMsP95, " ms")}</span>
-    <span className={delta !== null && delta < 0 ? "negative" : "positive"}>{delta === null ? "baseline" : `${delta >= 0 ? "+" : ""}${delta.toFixed(2)}%`}</span>
-    <b className={measurement.status}><i />{benchmarkStatusLabel(measurement.status)}</b>
-  </div>;
+  const physicalMemory = measurement.inventory.physicalMemoryGb
+    ?? nullableBenchmarkSum(measurement.inventory.profiles
+      .filter((profile) => profile.kind === "gpu")
+      .map((profile) => profile.physicalMemoryGb));
+  const offeredMemory = measurement.inventory.offeredMemoryGb
+    ?? nullableBenchmarkSum(measurement.inventory.profiles
+      .filter((profile) => profile.kind === "gpu")
+      .map((profile) => profile.offeredMemoryGb ?? profile.memoryGb));
+  const power = measurement.inventory.observedPowerWatts
+    ?? nullableBenchmarkSum(measurement.inventory.profiles.map((profile) => profile.observedPowerWatts));
+  const powerLimit = measurement.inventory.powerLimitWatts
+    ?? nullableBenchmarkSum(measurement.inventory.profiles.map((profile) => profile.powerLimitWatts));
+  return <article className="benchmark-result-card">
+    <div className="benchmark-result-heading">
+      <div><span className="benchmark-result-icon"><Gauge size={18} /></span><span><small>{measurement.evidence === "physical" ? "EVIDENCIA FÍSICA REAL" : "RUNTIME LOCAL REAL"}</small><strong>{measurement.model.label}</strong><em>{measurement.model.precision} · rev {measurement.model.revision?.slice(0, 12) ?? "sin revisión"}</em></span></div>
+      <b className={measurement.status}><i />{benchmarkStatusLabel(measurement.status)}</b>
+    </div>
+    <div className="benchmark-result-metrics">
+      <BenchmarkValue label="Nodos usados" value={String(measurement.inventory.selectedDevices)} detail={`${measurement.inventory.connectedDevices}/${measurement.inventory.totalDevices} conectados`} />
+      <BenchmarkValue label="VRAM ofrecida" value={formatBenchmark(offeredMemory, " GB")} detail={formatBenchmark(physicalMemory, " GB físicos")} />
+      <BenchmarkValue label="Potencia real" value={power === null ? "Sin lectura" : formatPower(power)} detail={powerLimit === null ? power === null ? "No estimada" : "Último heartbeat" : `Límite ${formatPower(powerLimit)}`} />
+      <BenchmarkValue label="Tokens / segundo" value={formatBenchmark(measurement.metrics.tokensPerSecond, " tok/s")} detail={`P95 ${formatBenchmark(measurement.metrics.tokensPerSecondP95, " tok/s")}`} accent />
+      <BenchmarkValue label="Primer token" value={formatBenchmark(measurement.metrics.ttftMsP95, " ms")} detail={`P50 ${formatBenchmark(measurement.metrics.ttftMsP50, " ms")}`} />
+      <BenchmarkValue label="Cambio guardado" value={delta === null ? "Primera base" : `${delta >= 0 ? "+" : ""}${delta.toFixed(2)}%`} detail={measurement.comparison.baselineRunId ? "Base automática del banco" : "Sin ejecución comparable"} tone={delta !== null && delta < 0 ? "negative" : "positive"} />
+    </div>
+    <div className="benchmark-node-list">
+      {measurement.inventory.profiles.map((profile) => <span key={profile.nodeId ?? profile.label}><Server size={14} /><strong>{profile.label}</strong><small>{profile.backend ?? profile.kind} · {formatBenchmark(profile.offeredMemoryGb ?? profile.memoryGb, " GB")}{profile.utilizationPct === null || profile.utilizationPct === undefined ? "" : ` · ${profile.utilizationPct.toFixed(0)}% GPU`}</small></span>)}
+    </div>
+    <details className="benchmark-technical-details">
+      <summary>Ver todas las métricas de esta prueba</summary>
+      <div>
+        <BenchmarkValue label="Peticiones" value={`${measurement.workload.successfulRequests ?? "—"} / ${measurement.workload.requests ?? "—"}`} detail={`${measurement.workload.outputTokens} tokens generados`} />
+        <BenchmarkValue label="Duración total" value={formatBenchmark(measurement.workload.durationMs ?? null, " ms")} detail={`Latencia P95 ${formatBenchmark(measurement.metrics.latencyMsP95 ?? null, " ms")}`} />
+        <BenchmarkValue label="Tiempo por token" value={formatBenchmark(measurement.metrics.tpotMsP95, " ms")} detail={`P50 ${formatBenchmark(measurement.metrics.tpotMsP50, " ms")}`} />
+        <BenchmarkValue label="Velocidad agregada" value={formatBenchmark(measurement.metrics.aggregateTokensPerSecond, " tok/s")} detail={(measurement.workload.routeClasses ?? []).join(", ") || "Sin ruta completada"} />
+      </div>
+      <ul>{measurement.notes.map((note) => <li key={note}>{note}</li>)}</ul>
+    </details>
+  </article>;
+}
+
+function BenchmarkMetric({ icon: Icon, label, value, detail }: { icon: typeof Gauge; label: string; value: string; detail: string }) {
+  return <div className="benchmark-capacity-metric"><Icon size={18} /><span><small>{label}</small><strong>{value}</strong><em>{detail}</em></span></div>;
+}
+
+function BenchmarkValue({ label, value, detail, accent = false, tone = "" }: { label: string; value: string; detail: string; accent?: boolean; tone?: string }) {
+  return <div className={`benchmark-value ${accent ? "accent" : ""} ${tone}`}><small>{label}</small><strong>{value}</strong><em>{detail}</em></div>;
 }
 
 interface InferenceTurn {
@@ -1104,6 +1321,16 @@ function Inference({ snapshot, onSend, onNavigate }: {
     const output = outputRef.current;
     if (output) output.scrollTop = output.scrollHeight;
   }, [pendingTurn?.text, pendingTurn?.outputTokens]);
+
+  useEffect(() => {
+    if (!pendingTurn) return;
+    const timer = window.setInterval(() => {
+      setPendingTurn((current) => current
+        ? { ...current, elapsedMs: current.elapsedMs + 250 }
+        : current);
+    }, 250);
+    return () => window.clearInterval(timer);
+  }, [pendingTurn !== null]);
 
   async function send() {
     const cleanPrompt = prompt.trim();
@@ -1195,6 +1422,7 @@ function Inference({ snapshot, onSend, onNavigate }: {
 
 function InferenceStreamingTurn({ turn }: { turn: InferencePendingTurn }) {
   const content = splitStreamingContent(turn.text);
+  const waitingStatus = inferenceWaitingStatus(turn);
   return <div className="inference-turn pending">
     <div className="inference-user-message"><span>TÚ</span><p>{turn.prompt}</p></div>
     {turn.text ? <div className="inference-message streaming"><img src={brandIcon} alt="" /><div>
@@ -1202,7 +1430,7 @@ function InferenceStreamingTurn({ turn }: { turn: InferencePendingTurn }) {
       {content.reasoning !== null && <div className="inference-live-reasoning"><span>RAZONAMIENTO</span><p>{content.reasoning}{content.answer === "" && <i className="stream-cursor" />}</p></div>}
       {content.answer && <p>{content.answer}<i className="stream-cursor" /></p>}
       <div className="inference-response-metrics live"><span><b>{formatDuration(turn.ttftMs)}</b>primer token</span><span><b>{formatDuration(turn.elapsedMs)}</b>tiempo actual</span><span><b>{turn.outputTokens}</b>tokens recibidos</span><span><b>{formatLiveThroughput(turn)}</b>tokens/s ahora</span><span><b>{turn.routeClass}</b>ruta</span>{turn.affinityHit && <span><b>AFÍN</b>misma ruta</span>}</div>
-    </div></div> : <div className="inference-thinking"><LoaderCircle className="spin" /><span>Esperando el primer token del modelo…</span></div>}
+    </div></div> : <div className={`inference-thinking ${turn.phase === "recovering" ? "recovering" : ""}`}><LoaderCircle className="spin" /><span><strong>{waitingStatus}</strong><small>{formatDuration(turn.elapsedMs)}{(turn.attempt ?? 1) > 1 ? ` · intento ${turn.attempt} de 2` : ""}</small></span></div>}
   </div>;
 }
 
@@ -1911,6 +2139,14 @@ function summarizeDeploymentExecution(deployments: PublicDeployment[]): Effectiv
   };
 }
 
+function isMeasuredDeployment(
+  deployment: PublicDeployment,
+): deployment is PublicDeployment & { throughputSource: "measured" } {
+  return deployment.throughputSource === "measured"
+    && Number.isFinite(deployment.tokensPerSecond)
+    && deployment.tokensPerSecond > 0;
+}
+
 function summarizeExecutionStages(stages: ExecutionStageTelemetry[], parents: ExecutionTelemetry[] = []): EffectiveExecutionSummary {
   const hasCpu = stages.some((stage) => stage.deviceType === "cpu");
   const hasGpu = stages.some((stage) => stage.deviceType === "gpu");
@@ -2116,6 +2352,8 @@ function splitThinkingContent(text: string): { reasoning: string | null; answer:
 
 function friendlyInferenceError(message: string): string {
   const normalized = message.toLowerCase();
+  if (normalized.includes("first token")) return "La ruta no produjo ningún token después del reintento. El coordinador la ha marcado como degradada y activará su autorreparación.";
+  if (normalized.includes("disconnected from the distributed pipeline")) return "Un equipo de la ruta distribuida se desconectó. Se ha cancelado la petición de forma segura y la red está reconstruyendo la ruta.";
   if (normalized.includes("no_candidates") || normalized.includes("no candidate") || normalized.includes("unavailable")) return "El modelo dejó de estar disponible. Comprueba el estado de sus nodos y vuelve a intentarlo.";
   if (normalized.includes("timeout") || normalized.includes("deadline")) return "La red tardó demasiado en responder. La petición se ha cancelado sin inventar una respuesta.";
   if (
@@ -2128,8 +2366,19 @@ function friendlyInferenceError(message: string): string {
   return message;
 }
 
+function inferenceWaitingStatus(update: ChatStreamUpdate): string {
+  if (update.phase === "recovering") {
+    return update.affectedNodeId
+      ? `Se desconectó el nodo ${shortId(update.affectedNodeId)}. Reconectando la ruta y reintentando…`
+      : "Una etapa perdió la conexión. Reconectando la ruta y reintentando…";
+  }
+  if (update.phase === "connecting") return "Buscando una ruta disponible…";
+  if (update.phase === "waiting_first_token") return "Ruta preparada. Esperando el primer token…";
+  return "Esperando el primer token del modelo…";
+}
+
 async function fetchBenchmarkRuns(): Promise<BenchmarkRun[]> {
-  const response = await fetch("/local/v1/benchmarks", { cache: "no-store" });
+  const response = await fetch("/public/v1/benchmarks", { cache: "no-store" });
   const body = await response.json() as { runs?: BenchmarkRun[]; error?: { message?: string } };
   if (!response.ok) throw new Error(body.error?.message ?? `HTTP ${response.status}`);
   return body.runs ?? [];
@@ -2146,20 +2395,79 @@ async function requestBenchmarkRun(): Promise<BenchmarkRun> {
   return body.run;
 }
 
+function benchmarkSnapshotMetric(snapshot: BenchmarkRunSnapshot, metric: BenchmarkTrendMetric): number | null {
+  if (metric === "tokensPerSecond") return snapshot.tokensPerSecond;
+  if (metric === "ttftMsP95") return snapshot.ttftMsP95;
+  if (metric === "nodes") return snapshot.nodes;
+  return snapshot.tokensPerSecondPerNode;
+}
+
+function benchmarkComparisonCopy(comparison: BenchmarkRunComparison): { eyebrow: string; title: string; description: string } {
+  if (comparison.mode === "same-scenario") {
+    return {
+      eyebrow: "COMPARACIÓN LIMPIA",
+      title: "Mismo modelo, hardware y carga",
+      description: "La configuración es equivalente y permite vigilar rendimiento. Repetir varias veces ayuda a separar una mejora real de la variación normal.",
+    };
+  }
+  if (comparison.mode === "capacity-change") {
+    return {
+      eyebrow: "CAMBIO DE CAPACIDAD",
+      title: "Ha cambiado el hardware o la carga",
+      description: "La velocidad total permite estudiar el escalado. Mira también tok/s por nodo y por GB: no se atribuye al código como mejora limpia.",
+    };
+  }
+  if (comparison.mode === "different-evidence") {
+    return {
+      eyebrow: "EVIDENCIA DISTINTA",
+      title: "Físico y loopback no se mezclan",
+      description: "Se muestran los valores reales de cada ejecución, pero no se calcula una mejora entre entornos diferentes.",
+    };
+  }
+  if (comparison.mode === "different-model") {
+    return {
+      eyebrow: "MODELOS DISTINTOS",
+      title: "Esta selección no es comparable",
+      description: "Selecciona una referencia del mismo modelo para medir evolución de velocidad y eficiencia.",
+    };
+  }
+  return {
+    eyebrow: "SIN REFERENCIA",
+    title: "Hace falta una segunda ejecución",
+    description: "Cuando haya otra prueba real podrás comparar versiones, nodos, VRAM, latencia y eficiencia.",
+  };
+}
+
+function formatSignedBenchmark(value: number | null, suffix: string): string {
+  if (value === null || !Number.isFinite(value)) return "Sin comparación";
+  return `${value > 0 ? "+" : ""}${value.toLocaleString("es-ES", { maximumFractionDigits: 2 })}${suffix}`;
+}
+
 function formatBenchmark(value: number | null, suffix: string): string {
   if (value === null || !Number.isFinite(value)) return "—";
   return `${value.toLocaleString("en-US", { maximumFractionDigits: 2 })}${suffix}`;
+}
+
+function nullableBenchmarkSum(values: Array<number | null | undefined>): number | null {
+  const present = values.filter((value): value is number =>
+    value !== null && value !== undefined && Number.isFinite(value)
+  );
+  return present.length > 0 ? present.reduce((sum, value) => sum + value, 0) : null;
 }
 
 function formatBenchmarkDate(value: string): string {
   return new Date(value).toLocaleString("es-ES", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
 }
 
+function formatBenchmarkChartTime(value: string): string {
+  return new Date(value).toLocaleString("es-ES", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+
 function benchmarkStatusLabel(status: BenchmarkRun["status"]): string {
   if (status === "baseline") return "Baseline";
-  if (status === "passed") return "Improved / stable";
-  if (status === "regression") return "Regression";
-  return "Failed";
+  if (status === "passed") return "Mejora / estable";
+  if (status === "regression") return "Regresión";
+  return "Fallido";
 }
 
 export { Panel };

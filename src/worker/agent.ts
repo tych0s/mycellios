@@ -423,6 +423,16 @@ export class WorkerAgent {
       ? (llmfit?.model?.measuredTokensPerSecond ??
         llmfit?.model?.estimatedTokensPerSecond)
       : undefined;
+    const throughputSource =
+      this.config.deployment.tokensPerSecond !== undefined
+        ? "configured"
+        : this.config.llmfit.applyPerformanceEstimate && llmfit?.model?.measuredTokensPerSecond !== undefined
+          ? "measured"
+          : this.config.llmfit.applyPerformanceEstimate && llmfit?.model?.estimatedTokensPerSecond !== undefined
+            ? "estimated"
+            : this.config.adapter.kind === "mock"
+              ? "configured"
+              : "default";
     const defaultTokensPerSecond =
       this.config.adapter.kind === "mock"
         ? this.config.adapter.tokensPerSecond
@@ -465,6 +475,7 @@ export class WorkerAgent {
           freeSlots: this.config.limits.maxConcurrency,
           tokensPerSecond:
             this.config.deployment.tokensPerSecond ?? defaultTokensPerSecond,
+          throughputSource,
           ttftMs: this.config.deployment.ttftMs ?? defaultTtft,
           dataLocality: adapterDataLocality(this.config),
           ...(this.config.deployment.internalPipeline
@@ -874,6 +885,24 @@ export class WorkerAgent {
           ? (this.config.limits.maxPowerW * activeMs) / 3_600_000
           : undefined,
       };
+      const measuredTokensPerSecond = metrics.outputTokens > 0
+        ? metrics.outputTokens / (metrics.activeMs / 1_000)
+        : 0;
+      if (this.capabilities && measuredTokensPerSecond > 0) {
+        this.capabilities = {
+          ...this.capabilities,
+          deployments: this.capabilities.deployments.map((deployment) =>
+            deployment.model === payload.request.model && deployment.modelDigest === payload.modelDigest
+              ? {
+                  ...deployment,
+                  tokensPerSecond: Math.max(0.001, Number(measuredTokensPerSecond.toFixed(3))),
+                  throughputSource: "measured",
+                  ttftMs: metrics.ttftMs,
+                }
+              : deployment
+          ),
+        };
+      }
       const result: CompletionResult = {
         jobId: payload.jobId,
         leaseId: payload.leaseId,

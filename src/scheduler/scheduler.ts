@@ -128,6 +128,7 @@ export class Scheduler {
     >();
     for (const worker of workers) {
       for (const deployment of worker.capabilities.deployments) {
+        if (!this.internalPipelineDependenciesConnected(deployment, workers)) continue;
         const entry = models.get(deployment.model) ?? {
           replicas: 0,
           internalPipelines: 0,
@@ -270,6 +271,7 @@ export class Scheduler {
         worker.capabilities.deployments
           .filter((deployment) => deployment.model === request.model && deployment.mode === "replica")
           .filter((deployment) => this.isEligible(worker, deployment, request))
+          .filter((deployment) => this.internalPipelineDependenciesConnected(deployment, workers))
           .map((deployment) => ({
             worker,
             deployment,
@@ -316,9 +318,26 @@ export class Scheduler {
         worker &&
           deployment &&
           deployment.modelDigest === stage.modelDigest &&
-          this.isEligible(worker, deployment, request),
+          this.isEligible(worker, deployment, request) &&
+          this.internalPipelineDependenciesConnected(deployment, workers),
       );
     });
+  }
+
+  private internalPipelineDependenciesConnected(
+    deployment: ModelDeployment,
+    connectedWorkers: readonly StoredWorker[],
+  ): boolean {
+    if (!deployment.internalPipeline) return true;
+    const executionStages = deployment.execution?.stages;
+    if (!executionStages || executionStages.length === 0) return true;
+    const connectedNodeIds = new Set(
+      connectedWorkers.flatMap((worker) => {
+        const nodeId = worker.capabilities.distributedExecutor?.nodeId;
+        return nodeId ? [nodeId] : [];
+      }),
+    );
+    return executionStages.every((stage) => connectedNodeIds.has(stage.nodeId));
   }
 
   private excludeRouteWorkers(route: ScheduledRoute, excludedWorkerIds: Set<string>): void {

@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { selectDesktopHardwareGpu, selectWorkerCapacityHardware } from "../src/desktop/hardware-selection.js";
-import { mergeHardwareGpuProbes, selectHardwareGpu, windowsGpuPhysicalVramMb } from "../src/worker/hardware.js";
+import {
+  mergeHardwareGpuProbes,
+  selectHardwareGpu,
+  windowsGpuEngineUtilizationPct,
+  windowsGpuPhysicalVramMb,
+} from "../src/worker/hardware.js";
 
 describe("desktop hardware selection", () => {
   it("prefers a certified discrete adapter over the first integrated adapter", () => {
@@ -103,6 +108,46 @@ describe("Windows VRAM parsing", () => {
 
   it("retains AdapterRAM as a compatibility fallback", () => {
     expect(windowsGpuPhysicalVramMb({ AdapterRAM: 2 * 1_024 ** 3 })).toBe(2_048);
+  });
+});
+
+describe("Windows GPU engine telemetry", () => {
+  it("sums processes per engine and reports the busiest physical engine", () => {
+    expect(windowsGpuEngineUtilizationPct([
+      {
+        Name: "pid_10_luid_0x00000000_0x00016125_phys_0_eng_2_engtype_Compute 0",
+        UtilizationPercentage: 18,
+      },
+      {
+        Name: "pid_20_luid_0x00000000_0x00016125_phys_0_eng_2_engtype_Compute 0",
+        UtilizationPercentage: 14,
+      },
+      {
+        Name: "pid_10_luid_0x00000000_0x00016125_phys_0_eng_0_engtype_3D",
+        UtilizationPercentage: 25,
+      },
+    ])).toBe(32);
+  });
+
+  it("does not turn absent or malformed counters into zero telemetry", () => {
+    expect(windowsGpuEngineUtilizationPct([])).toBeUndefined();
+    expect(windowsGpuEngineUtilizationPct([
+      { Name: "_Total", UtilizationPercentage: 75 },
+      { Name: "not-a-gpu-engine", UtilizationPercentage: 50 },
+    ])).toBeUndefined();
+  });
+
+  it("caps combined process counters at a physical 100 percent", () => {
+    expect(windowsGpuEngineUtilizationPct([
+      {
+        Name: "pid_10_luid_0x00000000_0x00016125_phys_0_eng_0_engtype_3D",
+        UtilizationPercentage: 70,
+      },
+      {
+        Name: "pid_20_luid_0x00000000_0x00016125_phys_0_eng_0_engtype_3D",
+        UtilizationPercentage: 55,
+      },
+    ])).toBe(100);
   });
 });
 

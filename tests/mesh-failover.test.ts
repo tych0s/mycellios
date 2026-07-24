@@ -193,6 +193,13 @@ describe("active-route recovery policy", () => {
       hub as unknown as WorkerHub,
       30_000,
     );
+    const degradedEvents: Array<{
+      jobId: string;
+      model: string;
+      code: string;
+      workerId: string | null;
+    }> = [];
+    service.on("degraded", (event) => degradedEvents.push(event));
     const handle = service.submit({
       model: "distributed-small",
       messages: [{ role: "user", content: "hola" }],
@@ -224,6 +231,124 @@ describe("active-route recovery policy", () => {
       type: "failed",
       code: "adapter_error",
       message: "Backend requires greedy temperature=0",
+    });
+    expect(degradedEvents).toEqual([expect.objectContaining({
+      jobId: handle.jobId,
+      model: "distributed-small",
+      code: "adapter_error",
+    })]);
+  });
+
+  it("fails fast when an accepted route never emits its first token", async () => {
+    const primary = addWorker(store, {
+      id: "primary",
+      modelDigest: "sha256:revision-a",
+      ttftMs: 1,
+    });
+    hub.connected.add(primary.id);
+    service = new MeshService(
+      store,
+      new Scheduler(store),
+      hub as unknown as WorkerHub,
+      30_000,
+      { firstTokenTimeoutMs: 20 },
+    );
+    const handle = service.submit({
+      model: "distributed-small",
+      messages: [{ role: "user", content: "hola" }],
+      max_tokens: 32,
+    });
+    const offer = leaseOffers(hub)[0]!;
+    hub.workerMessage({
+      v: 1,
+      type: "lease.accept",
+      workerId: primary.id,
+      payload: { jobId: handle.jobId, leaseId: offer.payload.leaseId },
+    });
+
+    const events = [];
+    for await (const event of handle.events) events.push(event);
+
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "progress",
+      phase: "waiting_first_token",
+    }));
+    expect(events.at(-1)).toMatchObject({
+      type: "failed",
+      code: "first_token_timeout",
+    });
+    expect(store.getJob(handle.jobId)?.status).toBe("failed");
+  });
+
+  it("attributes a distributed request failure to the physical stage that disconnected", async () => {
+    const physical = addWorker(store, {
+      id: "physical-amd",
+      model: "unrelated-model",
+      distributedExecutor: {
+        protocol: "gdlp-worker-tunnel/2",
+        nodeId: "desktop-amd",
+        stageHost: "desktop-amd.relay",
+        stagePort: 43110,
+        runtime: "python-safetensors",
+        computeMode: "gpu-only",
+        cpuEligible: false,
+      },
+    });
+    const cell = addWorker(store, {
+      id: "cell",
+      model: "distributed-small",
+      modelDigest: "sha256:revision-a",
+      internalPipeline: { stageCount: 1, boundaries: [0, 14] },
+      execution: {
+        deviceType: "gpu",
+        backend: "rocm",
+        deviceName: "AMD pipeline",
+        precision: "float16",
+        fallback: false,
+        stages: [{
+          nodeId: "desktop-amd",
+          stageIndex: 0,
+          layerStart: 0,
+          layerEnd: 14,
+          deviceType: "gpu",
+          backend: "rocm",
+          deviceName: "AMD Radeon",
+          precision: "float16",
+          fallback: false,
+        }],
+      },
+    });
+    hub.connected.add(physical.id);
+    hub.connected.add(cell.id);
+    service = new MeshService(store, new Scheduler(store), hub as unknown as WorkerHub, 30_000);
+    const handle = service.submit({
+      model: "distributed-small",
+      messages: [{ role: "user", content: "hola" }],
+      max_tokens: 32,
+    });
+    const offer = leaseOffers(hub)[0]!;
+    hub.workerMessage({
+      v: 1,
+      type: "lease.accept",
+      workerId: cell.id,
+      payload: { jobId: handle.jobId, leaseId: offer.payload.leaseId },
+    });
+
+    hub.connected.delete(physical.id);
+    hub.emit("disconnect", physical.id);
+    const events = [];
+    for await (const event of handle.events) events.push(event);
+
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "progress",
+      phase: "recovering",
+      nodeId: "desktop-amd",
+      workerId: physical.id,
+    }));
+    expect(events.at(-1)).toMatchObject({
+      type: "failed",
+      code: "pipeline_stage_disconnected",
+      message: expect.stringContaining("AMD Radeon"),
     });
   });
 

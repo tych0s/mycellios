@@ -67,7 +67,7 @@ import {
   gpuPreparationRetryDelayMs,
   readVerifiedAccelerationUsage,
 } from "./acceleration-evidence.js";
-import { consumeChatCompletionStream } from "./chat-stream.js";
+import { consumeChatCompletionStreamWithRecovery } from "./chat-stream.js";
 import { desktopExecutorPolicy, normalizeComputeMode } from "./compute-mode.js";
 import {
   selectDesktopHardwareGpu,
@@ -880,27 +880,32 @@ async function sendChat(request: ChatRequest): Promise<ChatResponse> {
 
 async function streamChat(request: ChatRequest, onUpdate: (update: ChatStreamUpdate) => void): Promise<ChatResponse> {
   const messages = normalizeDesktopChatMessages(request.messages);
-  const headers = new Headers({ accept: "text/event-stream", "content-type": "application/json" });
-  if (settings.coordinatorMode === "remote" && settings.remoteCoordinatorToken) {
-    headers.set("authorization", `Bearer ${settings.remoteCoordinatorToken}`);
-  }
-  const startedAt = Date.now();
-  const response = await fetch(new URL("v1/chat/completions", `${coordinatorUrl}/`), {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      model: request.model,
-      messages,
-      session_id: request.sessionId,
-      stream: true,
-      max_tokens: Math.max(1, Math.min(2_048, request.maxTokens ?? 128)),
-      temperature: 0,
-      top_p: 1,
-    }),
-    signal: AbortSignal.timeout(3 * 60_000),
-    redirect: "error",
-  });
-  return consumeChatCompletionStream(response, request.model, onUpdate, startedAt);
+  return consumeChatCompletionStreamWithRecovery(
+    async () => {
+      const headers = new Headers({ accept: "text/event-stream", "content-type": "application/json" });
+      if (settings.coordinatorMode === "remote" && settings.remoteCoordinatorToken) {
+        headers.set("authorization", `Bearer ${settings.remoteCoordinatorToken}`);
+      }
+      return fetch(new URL("v1/chat/completions", `${coordinatorUrl}/`), {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: request.model,
+          messages,
+          session_id: request.sessionId,
+          stream: true,
+          max_tokens: Math.max(1, Math.min(2_048, request.maxTokens ?? 128)),
+          temperature: 0,
+          top_p: 1,
+        }),
+        signal: AbortSignal.timeout(3 * 60_000),
+        redirect: "error",
+      });
+    },
+    request.model,
+    onUpdate,
+    { sessionId: request.sessionId },
+  );
 }
 
 function normalizeDesktopChatMessages(messages: ChatRequest["messages"]): ChatRequest["messages"] {
@@ -978,7 +983,7 @@ function registerIpc(): void {
     return readSnapshot();
   });
   ipcMain.handle("benchmarks:read", async () => {
-    const result = await fetchJson<{ runs: import("../benchlab/types.js").BenchmarkRun[] }>("local/v1/benchmarks");
+    const result = await fetchJson<{ runs: import("../benchlab/types.js").BenchmarkRun[] }>("public/v1/benchmarks");
     return result.runs;
   });
   ipcMain.handle("benchmarks:run", async () => {
