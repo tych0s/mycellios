@@ -1,0 +1,44 @@
+# Congela los finales de línea en LF dentro del repositorio.
+#
+# Sin esto, editar desde Windows convierte ficheros enteros de LF a CRLF y cada
+# línea aparece como modificada: en la sesión del 25-jul-2026 un cambio real de
+# 200 líneas se presentó como 2.559, lo que hace la revisión inviable y esconde
+# los cambios de verdad entre el ruido.
+#
+# `text=auto eol=lf` normaliza al escribir en el índice y entrega LF en el árbol
+# de trabajo, así que el comportamiento es el mismo en Windows, macOS y Linux —
+# que importa porque el runtime corre en contenedores Linux.
+* text=auto eol=lf
+
+# Binarios: nunca tocar.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.safetensors binary
+*.gguf binary
+*.bin binary
+*.pt binary
+*.pth binary
+*.onnx binary
+*.woff binary
+*.woff2 binary
+*.mp3 binary
+*.mp4 binary
+
+# Scripts de shell: CRLF los rompe al ejecutarlos en Linux.
+*.sh text eol=lf
+*.bash text eol=lf
+
+# Scripts de Windows: aquí CRLF sí es lo correcto.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Ficheros generados que no conviene diferenciar línea a línea.
+package-lock.json -diff
+Cargo.lock -diff
