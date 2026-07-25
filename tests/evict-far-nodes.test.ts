@@ -11,14 +11,17 @@ import type { ComputeNodeProfile, DistributionTopology } from "../src/distributi
 function node(id: string): ComputeNodeProfile {
   return {
     id,
-    memoryMiB: 4_096,
-    reserveMiB: 256,
+    region: "test",
+    memoryBytes: 4 * 1024 ** 3,
+    reserveBytes: 256 * 1024 ** 2,
     decodeScale: 1,
     prefillScale: 1,
     codecScale: 1,
+    batchGain: 1,
+    maxBatchSpeedup: 1,
     powerWatts: 60,
     availability: 0.99,
-  } as ComputeNodeProfile;
+  };
 }
 
 function mesh(latencies: Record<string, number>): DistributionTopology {
