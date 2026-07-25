@@ -1,3 +1,5 @@
+import type { NetworkExecutionTrace } from "../contracts/types.js";
+
 export const LEGACY_BENCHMARK_RUN_SCHEMA = "mycellios-benchmark-run/1" as const;
 export const BENCHMARK_RUN_SCHEMA = "mycellios-benchmark-run/2" as const;
 
@@ -121,6 +123,8 @@ export interface BenchmarkMeasurement {
     routeClasses?: string[];
   };
   metrics: BenchmarkMetrics;
+  /** Per-request physical route evidence emitted by the coordinator. */
+  networkTraces?: NetworkExecutionTrace[];
   status: BenchmarkStatus;
   comparison: BenchmarkComparison;
   notes: string[];

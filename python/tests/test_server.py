@@ -18,7 +18,7 @@ from distributed_runtime.engine import (
 from distributed_runtime.protocol import TensorCodec
 from distributed_runtime.server import (
     ContinuousMicroBatcher,
-    DistributedOpenAIServer,
+    DistributedMycelliosServer,
     IncrementalTokenDecoder,
     OUTPUT_TOKEN_HASH_SCHEME,
     PendingGeneration,
@@ -27,10 +27,25 @@ from distributed_runtime.server import (
     output_token_ids_sha256,
     parse_args as parse_server_args,
     parse_remote_recovery_standby_routes,
+    tree_draft_provider_from_args,
 )
 
 
 class EngineConfigurationTests(unittest.TestCase):
+    def test_server_cli_rejects_known_external_backends(self) -> None:
+        for argument, backend in (
+            ("--native_stage-package", "native_stage"),
+            ("--external-gguf-runtime-server", "external GGUF runtime"),
+            ("--local-model-runtime-url", "local-model-runtime"),
+            ("--model-serving-runtime-endpoint", "model-serving-runtime"),
+        ):
+            with self.subTest(argument=argument):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    f"mycellios_native_runtime_forbids_external_backend:{backend}",
+                ):
+                    parse_server_args([argument, "research-only"])
+
     def test_remote_recovery_cli_accepts_only_complete_unique_standby_contracts(
         self,
     ) -> None:
@@ -157,6 +172,74 @@ class EngineConfigurationTests(unittest.TestCase):
         args = parse_server_args(["--sealed-wave-tokens", "1"])
         with self.assertRaisesRegex(ValueError, "must be supplied together"):
             build_server(args)
+
+    def test_native_draft_tree_cli_preserves_every_sealed_limit(self) -> None:
+        args = parse_server_args(
+            [
+                "--speculation",
+                "draft-tree",
+                "--speculative-max-draft-tokens",
+                "4",
+                "--max-speculative-branches",
+                "6",
+                "--max-speculative-branch-tokens",
+                "32768",
+                "--max-speculative-kv-bytes",
+                str(384 * 1024 * 1024),
+                "--sealed-wave-tokens",
+                "5",
+            ]
+        )
+        provider = tree_draft_provider_from_args(args)
+        self.assertIsNotNone(provider)
+        assert provider is not None
+        self.assertEqual(provider.strategy, "ngram-tree")
+        self.assertEqual(provider.max_draft_tokens, 4)
+        self.assertEqual(provider.max_branches, 6)
+        self.assertIsNone(
+            tree_draft_provider_from_args(parse_server_args(["--speculation", "ngram"]))
+        )
+
+    def test_native_draft_tree_cli_fails_closed_before_model_loading(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires sealed positive"):
+            build_server(
+                parse_server_args(
+                    [
+                        "--speculation",
+                        "draft-tree",
+                        "--sealed-wave-tokens",
+                        "5",
+                        "--max-prefill-chunk-tokens",
+                        "32",
+                    ]
+                )
+            )
+        complete_limits = [
+            "--speculation",
+            "draft-tree",
+            "--speculative-max-draft-tokens",
+            "4",
+            "--max-speculative-branches",
+            "4",
+            "--max-speculative-branch-tokens",
+            "8192",
+            "--max-speculative-kv-bytes",
+            str(64 * 1024 * 1024),
+        ]
+        with self.assertRaisesRegex(ValueError, "explicit sealed-wave-tokens"):
+            build_server(parse_server_args(complete_limits))
+        with self.assertRaisesRegex(ValueError, "must equal draft depth plus one"):
+            build_server(
+                parse_server_args(
+                    [
+                        *complete_limits,
+                        "--sealed-wave-tokens",
+                        "6",
+                        "--max-prefill-chunk-tokens",
+                        "32",
+                    ]
+                )
+            )
 
     def test_server_rejects_invalid_prefill_pipeline_credits_before_model_loading(self) -> None:
         for arguments, message in (
@@ -291,7 +374,7 @@ class OutputTokenDigestTests(unittest.TestCase):
 class HttpInferenceEvidenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_real_http_health_non_stream_and_sse_expose_sealed_evidence(self) -> None:
         engine = _HttpEngine()
-        server = DistributedOpenAIServer(
+        server = DistributedMycelliosServer(
             engine,
             _HttpTokenizer(),
             public_model_name="distributed-test",
@@ -356,7 +439,7 @@ class HttpInferenceEvidenceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_real_http_mismatch_fails_closed_for_non_stream_and_sse(self) -> None:
         engine = _HttpEngine(emitted_token_ids=(10,), output_token_ids=(10, 11))
-        server = DistributedOpenAIServer(
+        server = DistributedMycelliosServer(
             engine,
             _HttpTokenizer(),
             public_model_name="distributed-test",
@@ -458,7 +541,7 @@ class ContinuousMicroBatcherTests(unittest.IsolatedAsyncioTestCase):
 
 class RequestValidationTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.server = DistributedOpenAIServer(
+        self.server = DistributedMycelliosServer(
             _PrepareEngine(),
             _TemplateTokenizer(),
             public_model_name="distributed-small",

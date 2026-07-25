@@ -18,6 +18,7 @@ import torch
 from transformers import AutoConfig
 
 from .device import normalize_torch_device_request
+from .dense_tiering import DenseTieringConfig
 from .macro_wave import KVVersion, MacroWaveState
 from .macro_wave_adapter import (
     MacroWaveProposal,
@@ -33,6 +34,11 @@ from .model import (
     model_artifact_reference,
     ragged_grouping_enabled,
     resolve_model_snapshot,
+)
+from .native_gguf import NativeGgufStagePackage, verify_native_gguf_stage
+from .native_gguf_runtime import (
+    NativeGgufRuntimeConfig,
+    build_native_gguf_stage_runner,
 )
 from .paged_stage import HFPagedStageRunner, HFPagedStageRuntimeConfig
 from .protocol import (
@@ -185,6 +191,7 @@ class PipelineEngineConfig:
     codec: TensorCodec = TensorCodec.FP16
     threads_per_stage: int = 1
     device: str = "auto"
+    dense_tiering: DenseTieringConfig = DenseTieringConfig()
     startup_timeout_seconds: float = 180.0
     socket_timeout_seconds: float = 180.0
     one_way_delay_ms: float = 0.0
@@ -197,6 +204,7 @@ class PipelineEngineConfig:
     return_port: int = 0
     revision: str | None = None
     artifact_identity: str | None = None
+    stage_package_identity: str | None = None
     canonical_model_source: str | None = None
     canonical_model_revision: str | None = None
     pipeline_snapshot_identity: int | None = None
@@ -208,6 +216,9 @@ class PipelineEngineConfig:
     # remote mode only the root slot belongs here; child bindings are sealed by
     # stage_cli on their own hosts.
     paged_kv_stages: tuple[HFPagedStageRuntimeConfig | None, ...] | None = None
+    # Authenticated native Mycellios GGUF packages for root + every local
+    # child. Remote child bindings are supplied independently to stage_cli.
+    native_gguf_stages: tuple[NativeGgufRuntimeConfig | None, ...] | None = None
     # Ordered executor ids for root + every child stage. Remote recovery must
     # receive this sealed route contract from its launcher because the root
     # process cannot infer a remote cell/GGUF/quantized backend from boundaries.
@@ -260,6 +271,8 @@ class PipelineEngineConfig:
 
     def __post_init__(self) -> None:
         normalize_torch_device_request(self.device)
+        if not isinstance(self.dense_tiering, DenseTieringConfig):
+            raise TypeError("dense_tiering must be DenseTieringConfig")
         if not self.model_name.strip():
             raise ValueError("model_name cannot be empty")
         for name, value in (
@@ -364,6 +377,91 @@ class PipelineEngineConfig:
                     "device applies only to dense Torch stages; paged KV has a "
                     "sealed per-stage device"
                 )
+        if self.native_gguf_stages is not None:
+            if len(self.native_gguf_stages) != stage_count:
+                raise ValueError(
+                    "native_gguf_stages must contain one entry per stage"
+                )
+            configured_native = tuple(
+                entry for entry in self.native_gguf_stages if entry is not None
+            )
+            if configured_native and self.native_gguf_stages[0] is None:
+                raise ValueError(
+                    "native GGUF execution requires a root-stage binding"
+                )
+            if any(
+                not isinstance(entry, NativeGgufRuntimeConfig)
+                for entry in configured_native
+            ):
+                raise TypeError(
+                    "native_gguf_stages entries must be NativeGgufRuntimeConfig"
+                )
+            if self.spawn_local_stages and configured_native and (
+                len(configured_native) != stage_count
+            ):
+                raise ValueError(
+                    "local native GGUF execution requires a binding for every stage"
+                )
+            if not self.spawn_local_stages and any(
+                entry is not None for entry in self.native_gguf_stages[1:]
+            ):
+                raise ValueError(
+                    "remote child native GGUF bindings belong to stage_cli"
+                )
+            ram_stages = self.ram_backed_moe_stages or (None,) * stage_count
+            paged_stages = self.paged_kv_stages or (None,) * stage_count
+            if any(
+                native is not None and (ram is not None or paged is not None)
+                for native, ram, paged in zip(
+                    self.native_gguf_stages,
+                    ram_stages,
+                    paged_stages,
+                    strict=True,
+                )
+            ):
+                raise ValueError(
+                    "native GGUF, paged KV and RAM-backed MoE bindings are "
+                    "mutually exclusive"
+                )
+            verified_native = tuple(
+                verify_native_gguf_stage(
+                    entry.package,
+                    expected_package_id=entry.package_id,
+                    expected_layer_start=self.boundaries[index],
+                    expected_layer_end=self.boundaries[index + 1],
+                    expected_total_layers=self.boundaries[-1],
+                )
+                for index, entry in enumerate(self.native_gguf_stages)
+                if entry is not None
+            )
+            if len({package.artifact_identity for package in verified_native}) > 1:
+                raise ValueError(
+                    "native GGUF stages must bind one common model identity"
+                )
+            if verified_native:
+                root_package = verified_native[0]
+                for name, supplied, sealed in (
+                    ("artifact_identity", self.artifact_identity, root_package.artifact_identity),
+                    (
+                        "canonical_model_source",
+                        self.canonical_model_source,
+                        root_package.model_source,
+                    ),
+                    (
+                        "canonical_model_revision",
+                        self.canonical_model_revision,
+                        root_package.model_revision,
+                    ),
+                    (
+                        "stage_package_identity",
+                        self.stage_package_identity,
+                        root_package.package_identity,
+                    ),
+                ):
+                    if supplied is not None and supplied != sealed:
+                        raise ValueError(
+                            f"{name} differs from the authenticated native GGUF package"
+                        )
         if self.stage_executor_ids is not None:
             if len(self.stage_executor_ids) != len(self.boundaries) - 1:
                 raise ValueError("stage_executor_ids must contain one id per stage")
@@ -770,6 +868,14 @@ class _GenerationJob:
     physical_tree_parent_closed: bool = False
     physical_tree_pending_result: GenerationOutput | None = None
     physical_tree_pending_exception: BaseException | None = None
+    # A physical tree is measured as one complete route operation, including
+    # its capacity quote, FORKs, VERIFY payloads and ordered cleanup. These
+    # fields are populated only after the conservative controller selects a
+    # measured candidate or an explicitly enabled warm-up probe.
+    tree_proposed_tokens: int = 0
+    tree_is_probe: bool = False
+    tree_outbound_bytes: int = 0
+    tree_inbound_bytes: int = 0
 
     def __post_init__(self) -> None:
         if self.next_step is None:
@@ -865,6 +971,13 @@ class DistributedPipelineEngine:
         tree_draft_provider: NgramTreeDraftProvider | TreeDraftProvider | None = None,
     ) -> None:
         self.config = config
+        # One sender owns the root-to-stage TCP stream for its entire
+        # lifecycle. Reusing it across startup probes, data and shutdown keeps
+        # every frame in one FIFO when link emulation is enabled.
+        self._link_emulator = LinkEmulator(
+            config.one_way_delay_ms,
+            config.bandwidth_mbps,
+        )
         self._state_lock = threading.Lock()
         self._closed = False
         self._close_error: PipelineShutdownError | None = None
@@ -927,6 +1040,11 @@ class DistributedPipelineEngine:
         self._speculation_probe_waves = 0
         self._speculation_decision_reasons: dict[str, int] = {}
         self._speculation_selected_sizes: dict[int, int] = {}
+        self._tree_gate_enabled_decisions = 0
+        self._tree_gate_disabled_decisions = 0
+        self._tree_gate_probe_waves = 0
+        self._tree_gate_measured_waves = 0
+        self._tree_gate_decision_reasons: dict[str, int] = {}
         # Session retention state. The map is owned by the scheduler thread;
         # insertion order doubles as the LRU order because every retention
         # refresh re-inserts the entry. The integer counters are read without a
@@ -969,8 +1087,18 @@ class DistributedPipelineEngine:
         self._route_probe_count = 0
         self.stage_metrics: list[dict[str, Any]] = []
         if config.speculative_max_draft_tokens > 0:
-            self.draft_provider: DraftProvider | None = draft_provider or NgramDraftProvider(
-                max_draft_tokens=config.speculative_max_draft_tokens
+            if tree_draft_provider is not None and draft_provider is not None:
+                raise ValueError(
+                    "draft-tree uses its own measured provider and cannot mix "
+                    "linear draft observations"
+                )
+            self.draft_provider: DraftProvider | None = (
+                None
+                if tree_draft_provider is not None
+                else draft_provider
+                or NgramDraftProvider(
+                    max_draft_tokens=config.speculative_max_draft_tokens
+                )
             )
             self.speculation_controller: AdaptiveSpeculationController | None = (
                 speculation_controller
@@ -1012,13 +1140,49 @@ class DistributedPipelineEngine:
                 raise ValueError(
                     "tree_draft_provider requires speculative_max_draft_tokens > 0"
                 )
+            if (
+                int(tree_draft_provider.max_draft_tokens)
+                != config.speculative_max_draft_tokens
+            ):
+                raise ValueError(
+                    "tree_draft_provider max_draft_tokens must match the sealed limit"
+                )
+            if (
+                int(tree_draft_provider.max_branches)
+                != config.max_speculative_branches
+            ):
+                raise ValueError(
+                    "tree_draft_provider max_branches must match the sealed limit"
+                )
         self.tree_draft_provider: TreeDraftProvider | None = tree_draft_provider
 
         ram_stage_configs = config.ram_backed_moe_stages or tuple(
             None for _ in range(len(config.boundaries) - 1)
         )
+        native_stage_configs = config.native_gguf_stages or tuple(
+            None for _ in range(len(config.boundaries) - 1)
+        )
         root_ram_config = ram_stage_configs[0]
-        if root_ram_config is not None:
+        root_native_config = native_stage_configs[0]
+        root_native_package: NativeGgufStagePackage | None = None
+        if root_native_config is not None:
+            root_native_package = verify_native_gguf_stage(
+                root_native_config.package,
+                expected_package_id=root_native_config.package_id,
+                expected_layer_start=config.boundaries[0],
+                expected_layer_end=config.boundaries[1],
+                expected_total_layers=config.boundaries[-1],
+            )
+            # Tokenizer coordinates remain independent of the weight package.
+            # AutoTokenizer may resolve only tokenizer assets later; config and
+            # every executable weight come from this authenticated package.
+            self.model_snapshot = config.model_name
+            model_config = AutoConfig.from_pretrained(
+                root_native_package.root,
+                local_files_only=True,
+                trust_remote_code=False,
+            )
+        elif root_ram_config is not None:
             snapshot_path = validate_ram_backed_moe_binding(
                 root_ram_config,
                 model_name=config.model_name,
@@ -1052,7 +1216,14 @@ class DistributedPipelineEngine:
                 raise ValueError(
                     "paged max_sequence_tokens exceeds the model context limit"
                 )
-        if root_ram_config is not None:
+        if root_native_package is not None:
+            self.model_artifact = model_artifact_reference(
+                str(root_native_package.root),
+                artifact_identity=root_native_package.artifact_identity,
+                canonical_source=root_native_package.model_source,
+                canonical_revision=root_native_package.model_revision,
+            )
+        elif root_ram_config is not None:
             self.model_artifact = model_artifact_reference(
                 self.model_snapshot,
                 artifact_identity=root_ram_config.artifact_identity,
@@ -1328,6 +1499,10 @@ class DistributedPipelineEngine:
                                 "predicted_speedup": _finite_or_none(
                                     estimate.predicted_speedup
                                 ),
+                                "predicted_speedup_lower_bound": _finite_or_none(
+                                    estimate.predicted_speedup_lower_bound
+                                ),
+                                "confidence_level": estimate.confidence_level,
                                 "predicted_latency_speedup": _finite_or_none(
                                     estimate.predicted_latency_speedup
                                 ),
@@ -1344,6 +1519,12 @@ class DistributedPipelineEngine:
 
     def _physical_tree_stats(self) -> dict[str, Any]:
         provider = getattr(self, "tree_draft_provider", None)
+        controller = getattr(self, "speculation_controller", None)
+        confidence_level = (
+            float(controller.config.confidence_level)
+            if controller is not None
+            else None
+        )
         return {
             "configured": provider is not None,
             "strategy": getattr(provider, "strategy", None),
@@ -1369,6 +1550,25 @@ class DistributedPipelineEngine:
                 getattr(self, "_physical_tree_live_children", ())
             ),
             "virtual_routes": len(getattr(self, "_leaf_routes", {})),
+            "statistical_gate": {
+                "policy": "speedup-lower-confidence-bound",
+                "confidence_level": confidence_level,
+                "enabled_decisions": int(
+                    getattr(self, "_tree_gate_enabled_decisions", 0)
+                ),
+                "disabled_decisions": int(
+                    getattr(self, "_tree_gate_disabled_decisions", 0)
+                ),
+                "probe_waves": int(
+                    getattr(self, "_tree_gate_probe_waves", 0)
+                ),
+                "measured_waves": int(
+                    getattr(self, "_tree_gate_measured_waves", 0)
+                ),
+                "decision_reasons": dict(
+                    getattr(self, "_tree_gate_decision_reasons", {})
+                ),
+            },
             "capacity_quote": {
                 "pending": getattr(self, "_pending_tree_reservation", None)
                 is not None,
@@ -1588,6 +1788,19 @@ class DistributedPipelineEngine:
                     f"SHUTDOWN send failed: {type(error).__name__}: {error}"
                 )
 
+        if not scheduler_alive:
+            emulator = getattr(self, "_link_emulator", None)
+            if emulator is not None:
+                try:
+                    emulator.close(
+                        timeout_seconds=self.config.socket_timeout_seconds,
+                    )
+                except BaseException as error:
+                    cleanup_errors.append(
+                        "emulated-link drain failed: "
+                        f"{type(error).__name__}: {error}"
+                    )
+
         protocol_shutdown_ready = (
             not downstream_was_present or self._shutdown_sent
         )
@@ -1767,6 +1980,9 @@ class DistributedPipelineEngine:
         paged_stage_configs = config.paged_kv_stages or tuple(
             None for _ in range(self.stages)
         )
+        native_stage_configs = config.native_gguf_stages or tuple(
+            None for _ in range(self.stages)
+        )
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind((config.return_bind_host, config.return_port))
@@ -1789,15 +2005,35 @@ class DistributedPipelineEngine:
                 has_next = stage_index + 1 < self.stages
                 ram_stage_config = ram_stage_configs[stage_index]
                 paged_stage_config = paged_stage_configs[stage_index]
+                native_stage_config = native_stage_configs[stage_index]
+                native_package = (
+                    None
+                    if native_stage_config is None
+                    else verify_native_gguf_stage(
+                        native_stage_config.package,
+                        expected_package_id=native_stage_config.package_id,
+                        expected_layer_start=boundaries[stage_index],
+                        expected_layer_end=boundaries[stage_index + 1],
+                        expected_total_layers=self.total_layers,
+                    )
+                )
                 stage_artifact_identity = (
                     ram_stage_config.artifact_identity
                     if ram_stage_config is not None
-                    else self.model_artifact.identity
+                    else (
+                        native_package.artifact_identity
+                        if native_package is not None
+                        else self.model_artifact.identity
+                    )
                 )
                 stage_canonical_source = (
                     f"content-addressed://{stage_artifact_identity}"
                     if ram_stage_config is not None
-                    else self.model_artifact.canonical_source
+                    else (
+                        native_package.model_source
+                        if native_package is not None
+                        else self.model_artifact.canonical_source
+                    )
                 )
                 child_configs.append(
                     StageProcessConfig(
@@ -1812,7 +2048,16 @@ class DistributedPipelineEngine:
                             canonical_model_revision=(
                                 None
                                 if ram_stage_config is not None
-                                else self.model_artifact.canonical_revision
+                                else (
+                                    native_package.model_revision
+                                    if native_package is not None
+                                    else self.model_artifact.canonical_revision
+                                )
+                            ),
+                            stage_package_identity=(
+                                native_package.package_identity
+                                if native_package is not None
+                                else None
                             ),
                         ),
                         pipeline_id=self.pipeline_id,
@@ -1827,6 +2072,7 @@ class DistributedPipelineEngine:
                         one_way_delay_ms=config.one_way_delay_ms,
                         bandwidth_mbps=config.bandwidth_mbps,
                         device=config.device,
+                        dense_tiering=config.dense_tiering,
                         connect_timeout_seconds=config.startup_timeout_seconds,
                         sealed_wave_tokens=config.sealed_wave_tokens,
                         max_prefill_chunk_tokens=config.max_prefill_chunk_tokens,
@@ -1837,6 +2083,7 @@ class DistributedPipelineEngine:
                         max_speculative_kv_bytes=config.max_speculative_kv_bytes,
                         ram_backed_moe=ram_stage_config,
                         paged_kv=paged_stage_config,
+                        native_gguf=native_stage_config,
                     )
                 )
             for child_config in reversed(child_configs):
@@ -1854,6 +2101,18 @@ class DistributedPipelineEngine:
             raise RuntimeError("first stage port was not resolved")
         root_ram_config = ram_stage_configs[0]
         root_paged_config = paged_stage_configs[0]
+        root_native_config = native_stage_configs[0]
+        root_native_package = (
+            None
+            if root_native_config is None
+            else verify_native_gguf_stage(
+                root_native_config.package,
+                expected_package_id=root_native_config.package_id,
+                expected_layer_start=boundaries[0],
+                expected_layer_end=boundaries[1],
+                expected_total_layers=self.total_layers,
+            )
+        )
         root_spec = StageModelSpec(
             self.model_snapshot,
             0,
@@ -1863,8 +2122,20 @@ class DistributedPipelineEngine:
             artifact_identity=self.model_artifact.identity,
             canonical_model_source=self.model_artifact.canonical_source,
             canonical_model_revision=self.model_artifact.canonical_revision,
+            stage_package_identity=(
+                root_native_package.package_identity
+                if root_native_package is not None
+                else config.stage_package_identity
+            ),
         )
-        if root_ram_config is not None:
+        if root_native_config is not None:
+            self._runner = build_native_gguf_stage_runner(
+                root_spec,
+                root_native_config,
+                device=config.device,
+                dense_tiering=config.dense_tiering,
+            )
+        elif root_ram_config is not None:
             self._runner = build_ram_backed_moe_stage_runner(
                 root_spec,
                 root_ram_config,
@@ -1876,7 +2147,11 @@ class DistributedPipelineEngine:
                 root_paged_config,
             )
         else:
-            self._runner = StageRunner(root_spec, device=config.device)
+            self._runner = StageRunner(
+                root_spec,
+                device=config.device,
+                dense_tiering=config.dense_tiering,
+            )
         if self._runner.hidden_size != self.hidden_size:
             raise RuntimeError("root stage hidden size differs from the model configuration")
         validate_speculative_runner(config, self._runner)
@@ -1926,10 +2201,7 @@ class DistributedPipelineEngine:
                     FrameType.PING,
                     self.pipeline_id,
                     step=0,
-                    emulator=LinkEmulator(
-                        config.one_way_delay_ms,
-                        config.bandwidth_mbps,
-                    ),
+                    emulator=self._link_emulator,
                 )
                 readable, _, _ = select.select(
                     (return_socket, downstream),
@@ -1991,10 +2263,7 @@ class DistributedPipelineEngine:
     def _scheduler_loop(self) -> None:
         runner = self._require_runner()
         downstream = self._require_socket(self._downstream, "downstream")
-        emulator = LinkEmulator(
-            self.config.one_way_delay_ms,
-            self.config.bandwidth_mbps,
-        )
+        emulator = getattr(self, "_link_emulator", None)
         active: dict[int, _GenerationJob] = {}
         decode_since_admission = 0
         fatal: BaseException | None = None
@@ -2131,6 +2400,14 @@ class DistributedPipelineEngine:
                     self._shutdown_sent = True
                 except BaseException:
                     pass
+            if emulator is not None:
+                try:
+                    emulator.close(
+                        timeout_seconds=self.config.socket_timeout_seconds,
+                    )
+                except BaseException as error:
+                    if fatal is None:
+                        self._set_fatal(error)
 
     def _next_submission(self, timeout: float) -> list[_GenerationJob] | None:
         if self._deferred_batches:
@@ -2278,6 +2555,7 @@ class DistributedPipelineEngine:
         session.last_used = time.monotonic()
         job.session = session
         job.prefill_offset = reuse
+        job.prefill_acked_offset = reuse
         job.kv_valid = reuse
         job.reused_tokens = reuse
         self._session_reuse_hits += 1
@@ -2613,6 +2891,10 @@ class DistributedPipelineEngine:
         if flight.is_prefill:
             if flight.prefill_end is None or flight.prefill_end <= job.prefill_acked_offset:
                 raise RuntimeError("prefill completion offsets are not strictly increasing")
+            # A prefix is reusable only after every remote stage has
+            # acknowledged it. Root execution at dispatch is not durable
+            # evidence for a route that may fail while the chunk is in flight.
+            job.kv_valid += flight.prefill_end - job.prefill_acked_offset
             job.prefill_acked_offset = flight.prefill_end
             current_chunks = int(getattr(self, "_prefill_current_chunks", 0))
             current_bytes = int(getattr(self, "_prefill_current_bytes", 0))
@@ -2752,6 +3034,10 @@ class DistributedPipelineEngine:
             verify_base_tokens = job.verify_base_tokens
             job.verify_proposal = None
             job.verify_base_tokens = 0
+            # The previously emitted token that seeded this VERIFY wave is now
+            # committed by every stage. Accepted draft positions are accounted
+            # separately below.
+            job.kv_valid += 1
             appended_before = len(job.token_ids)
             reason = self._append_verified_tokens(
                 job,
@@ -2790,6 +3076,10 @@ class DistributedPipelineEngine:
             raise RuntimeError(
                 f"request {frame.request_id} returned TOKEN for a verification wave"
             )
+        # The returned TOKEN proves that the prior emitted input token has been
+        # committed into every stage KV. This newly returned token itself is
+        # still outside KV until a later wave succeeds.
+        job.kv_valid += 1
         prior_output_tokens = len(job.token_ids)
         token = decode_token(frame)
         job.token_ids.append(token)
@@ -2882,6 +3172,7 @@ class DistributedPipelineEngine:
         self._physical_tree_quote_rtt_seconds = float(
             getattr(self, "_physical_tree_quote_rtt_seconds", 0.0)
         ) + max(0.0, arrived - pending.sent_at)
+        job.tree_inbound_bytes += HEADER_BYTES + len(frame.payload)
         if job.cancel_requested.is_set():
             self._cancel_pending_tree_reservation(
                 job,
@@ -2933,7 +3224,7 @@ class DistributedPipelineEngine:
                 getattr(self, "_physical_tree_quote_protocol_failures", 0)
             ) + 1
             raise RuntimeError("root tree capacity changed before remote COMMIT")
-        send_frame(
+        job.tree_outbound_bytes += send_frame(
             downstream,
             FrameType.TREE_RESERVATION_COMMIT,
             parent_request_id,
@@ -2993,6 +3284,7 @@ class DistributedPipelineEngine:
             ) + 1
             raise
 
+        prepared.job.tree_inbound_bytes += HEADER_BYTES + len(frame.payload)
         pending.committed = True
         self._physical_tree_quote_ready = int(
             getattr(self, "_physical_tree_quote_ready", 0)
@@ -3016,6 +3308,7 @@ class DistributedPipelineEngine:
             raise RuntimeError(
                 f"virtual leaf {frame.request_id} lost parent {parent_request_id}"
             )
+        job.tree_inbound_bytes += HEADER_BYTES + len(frame.payload)
         targets = decode_verify_result(frame)
         outcome = self._physical_tree.accept_verify_result(
             frame.request_id,
@@ -3089,8 +3382,11 @@ class DistributedPipelineEngine:
 
         job.step = outcome.next_step
         job.next_step = outcome.next_step
+        tree_base_kv_tokens = self._physical_tree.wave(
+            parent_request_id
+        ).base_kv_tokens
         expected_parent_tokens = (
-            self._physical_tree.wave(parent_request_id).base_kv_tokens
+            tree_base_kv_tokens
             + 1
             + outcome.resolution.accepted_draft_tokens
         )
@@ -3127,13 +3423,38 @@ class DistributedPipelineEngine:
             return None
 
         # Publishing happens strictly after every physical mutation above.
+        appended_before = len(job.token_ids)
         reason = self._append_verified_tokens(
             job,
             outcome.resolution.emitted_tokens,
             arrived,
         )
+        appended = len(job.token_ids) - appended_before
+        exact_committed_drafts = min(
+            outcome.resolution.accepted_draft_tokens,
+            appended,
+        )
+        job.kv_valid = max(
+            job.kv_valid,
+            tree_base_kv_tokens + 1 + exact_committed_drafts,
+        )
+        # Conservatively reserve the final emitted position for the target
+        # continuation. If EOS stopped inside an accepted draft prefix this
+        # under-counts the gain instead of claiming unserved speculative work.
+        measured_accepted = min(
+            outcome.resolution.accepted_draft_tokens,
+            max(0, appended - 1),
+        )
         if reason is not None:
-            send_frame(downstream, FrameType.END, parent_request_id)
+            job.tree_outbound_bytes += send_frame(
+                downstream,
+                FrameType.END,
+                parent_request_id,
+            )
+            self._record_tree_measurement(
+                job,
+                accepted_tokens=measured_accepted,
+            )
             active.pop(parent_request_id)
             self._retire_job(
                 job,
@@ -3141,6 +3462,10 @@ class DistributedPipelineEngine:
                 result=self._generation_output(job, reason),
             )
             return None
+        self._record_tree_measurement(
+            job,
+            accepted_tokens=measured_accepted,
+        )
         return self._prepare_decode_wave(
             job,
             runner,
@@ -3154,12 +3479,13 @@ class DistributedPipelineEngine:
         runner: StageRunnerContract,
         downstream: socket.socket,
     ) -> CancelCommand | None:
+        parent_job = self._callback_routes.get(parent_request_id)
         if isinstance(command, EndCommand):
             if command.request_id not in self._physical_tree_live_children:
                 raise RuntimeError("physical tree END targets a non-live leaf")
             runner.end(command.request_id)
             self._physical_tree_live_children.remove(command.request_id)
-            send_frame(downstream, FrameType.END, command.request_id)
+            sent_bytes = send_frame(downstream, FrameType.END, command.request_id)
         elif isinstance(command, PromoteCommand):
             if command.parent_request_id != parent_request_id:
                 raise RuntimeError("physical tree PROMOTE targets another parent")
@@ -3170,7 +3496,7 @@ class DistributedPipelineEngine:
                 raise TypeError("root runner lost its exact PROMOTE capability")
             promote_request(command.parent_request_id, command.child_request_id)
             self._physical_tree_live_children.remove(command.child_request_id)
-            send_frame(
+            sent_bytes = send_frame(
                 downstream,
                 FrameType.PROMOTE,
                 command.parent_request_id,
@@ -3180,7 +3506,7 @@ class DistributedPipelineEngine:
             if command.request_id != parent_request_id:
                 raise RuntimeError("physical tree TRUNCATE targets another parent")
             runner.truncate(command.request_id, command.keep_tokens)
-            send_frame(
+            sent_bytes = send_frame(
                 downstream,
                 FrameType.TRUNCATE,
                 command.request_id,
@@ -3188,6 +3514,8 @@ class DistributedPipelineEngine:
             )
         else:
             raise TypeError("unknown physical tree cleanup command")
+        if parent_job is not None:
+            parent_job.tree_outbound_bytes += sent_bytes
         deferred = self._physical_tree.confirm_cleanup_command(
             parent_request_id,
             command,
@@ -3304,6 +3632,11 @@ class DistributedPipelineEngine:
         coordinator = getattr(self, "_physical_tree", None)
         if (
             tree_provider is not None
+            and getattr(self, "speculation_controller", None) is not None
+        ):
+            job.speculation_profile = _speculation_load_profile(active_sequences)
+        if (
+            tree_provider is not None
             and remaining > 1
             and (
                 getattr(self, "_pending_tree_reservation", None) is not None
@@ -3357,27 +3690,200 @@ class DistributedPipelineEngine:
                     max_branches=available_branches,
                 )
                 if proposal is not None:
-                    if self._physical_tree_preflight(
-                        job,
-                        proposal,
-                        runner,
-                        base_kv_tokens=base_kv_tokens,
-                    ):
-                        return _PreparedPhysicalTreeWave(
-                            job=job,
-                            proposal=proposal,
+                    controller = getattr(self, "speculation_controller", None)
+                    decision = None
+                    is_probe = False
+                    if controller is not None:
+                        profile = _speculation_load_profile(active_sequences)
+                        job.speculation_profile = profile
+                        with self._speculation_lock:
+                            controller = self._speculation_controller_for_profile_locked(
+                                profile
+                            )
+                            decision = controller.decide(
+                                history_tokens=len(history),
+                                available_draft_tokens=proposal.max_depth,
+                            )
+                            selected_depth = (
+                                decision.candidate_size if decision.enabled else 0
+                            )
+                            if selected_depth == 0 and self.config.speculation_probe:
+                                selected_depth = controller.next_probe_size(
+                                    history_tokens=len(history),
+                                    available_draft_tokens=proposal.max_depth,
+                                ) or 0
+                                is_probe = selected_depth > 0
+
+                        if selected_depth == 0:
+                            self._record_tree_gate_selection(
+                                enabled=False,
+                                is_probe=False,
+                                selected_depth=0,
+                                reason=decision.reason,
+                            )
+                            if proposal.tree.state is MacroWaveState.OPEN:
+                                proposal.tree.rollback()
+                            proposal = None
+                        elif proposal.max_depth != selected_depth:
+                            if proposal.tree.state is MacroWaveState.OPEN:
+                                proposal.tree.rollback()
+                            proposal = prepare_tree_macro_wave(
+                                tree_provider,
+                                history,
+                                request_id=job.wire_id,
+                                ordinal=job.step,
+                                parent_kv_version=KVVersion(base_kv_tokens),
+                                max_tokens=selected_depth,
+                                max_branches=available_branches,
+                            )
+                            if (
+                                proposal is None
+                                or proposal.max_depth != selected_depth
+                            ):
+                                self._record_tree_gate_selection(
+                                    enabled=False,
+                                    is_probe=False,
+                                    selected_depth=0,
+                                    reason="tree_candidate_unavailable",
+                                )
+                                if (
+                                    proposal is not None
+                                    and proposal.tree.state is MacroWaveState.OPEN
+                                ):
+                                    proposal.tree.rollback()
+                                proposal = None
+                    if proposal is not None:
+                        if self._physical_tree_preflight(
+                            job,
+                            proposal,
+                            runner,
                             base_kv_tokens=base_kv_tokens,
-                            pending_token=job.token_ids[-1],
-                            step=job.next_step if job.next_step is not None else job.step,
-                            active_sequences=active_sequences,
-                        )
-                    if proposal.tree.state is MacroWaveState.OPEN:
+                        ):
+                            if controller is not None:
+                                assert decision is not None
+                                self._record_tree_gate_selection(
+                                    enabled=decision.enabled,
+                                    is_probe=is_probe,
+                                    selected_depth=proposal.max_depth,
+                                    reason=decision.reason,
+                                )
+                            job.tree_proposed_tokens = proposal.max_depth
+                            job.tree_is_probe = (
+                                is_probe if controller is not None else False
+                            )
+                            job.tree_outbound_bytes = 0
+                            job.tree_inbound_bytes = 0
+                            return _PreparedPhysicalTreeWave(
+                                job=job,
+                                proposal=proposal,
+                                base_kv_tokens=base_kv_tokens,
+                                pending_token=job.token_ids[-1],
+                                step=(
+                                    job.next_step
+                                    if job.next_step is not None
+                                    else job.step
+                                ),
+                                active_sequences=active_sequences,
+                            )
+                        if controller is not None:
+                            self._record_tree_gate_selection(
+                                enabled=False,
+                                is_probe=False,
+                                selected_depth=0,
+                                reason="tree_capacity_unavailable",
+                            )
+                    if (
+                        proposal is not None
+                        and proposal.tree.state is MacroWaveState.OPEN
+                    ):
                         proposal.tree.rollback()
         return self._prepare_linear_or_classic_decode_wave(
             job,
             runner,
             active_sequences=active_sequences,
         )
+
+    def _record_tree_gate_selection(
+        self,
+        *,
+        enabled: bool,
+        is_probe: bool,
+        selected_depth: int,
+        reason: str,
+    ) -> None:
+        """Expose measured/probe decisions without calling a probe a speedup."""
+
+        rendered_reason = (
+            f"probe:{reason}" if is_probe else reason
+        )
+        reasons = getattr(self, "_tree_gate_decision_reasons", {})
+        reasons[rendered_reason] = int(reasons.get(rendered_reason, 0)) + 1
+        self._tree_gate_decision_reasons = reasons
+        if enabled:
+            self._tree_gate_enabled_decisions = int(
+                getattr(self, "_tree_gate_enabled_decisions", 0)
+            ) + 1
+            self._speculation_enabled_decisions = int(
+                getattr(self, "_speculation_enabled_decisions", 0)
+            ) + 1
+        else:
+            self._tree_gate_disabled_decisions = int(
+                getattr(self, "_tree_gate_disabled_decisions", 0)
+            ) + 1
+            self._speculation_disabled_decisions = int(
+                getattr(self, "_speculation_disabled_decisions", 0)
+            ) + 1
+        if is_probe:
+            self._tree_gate_probe_waves = int(
+                getattr(self, "_tree_gate_probe_waves", 0)
+            ) + 1
+            self._speculation_probe_waves = int(
+                getattr(self, "_speculation_probe_waves", 0)
+            ) + 1
+        decision_reasons = getattr(self, "_speculation_decision_reasons", {})
+        decision_reasons[rendered_reason] = (
+            int(decision_reasons.get(rendered_reason, 0)) + 1
+        )
+        self._speculation_decision_reasons = decision_reasons
+        if selected_depth > 0:
+            sizes = getattr(self, "_speculation_selected_sizes", {})
+            sizes[selected_depth] = int(sizes.get(selected_depth, 0)) + 1
+            self._speculation_selected_sizes = sizes
+
+    def _record_tree_measurement(
+        self,
+        job: _GenerationJob,
+        *,
+        accepted_tokens: int,
+    ) -> None:
+        """Feed one complete physical tree wave into its conservative gate."""
+
+        proposed = int(job.tree_proposed_tokens)
+        controller = getattr(self, "speculation_controller", None)
+        if proposed > 0 and controller is not None:
+            with self._speculation_lock:
+                profiled = self._speculation_controller_for_profile_locked(
+                    job.speculation_profile
+                )
+                profiled.record_verification(
+                    proposed_tokens=proposed,
+                    accepted_tokens=max(0, min(int(accepted_tokens), proposed)),
+                    latency_seconds=max(
+                        1e-9,
+                        time.perf_counter() - job.wave_started_at,
+                    ),
+                    transferred_bytes=(
+                        int(job.tree_outbound_bytes)
+                        + int(job.tree_inbound_bytes)
+                    ),
+                )
+            self._tree_gate_measured_waves = int(
+                getattr(self, "_tree_gate_measured_waves", 0)
+            ) + 1
+        job.tree_proposed_tokens = 0
+        job.tree_is_probe = False
+        job.tree_outbound_bytes = 0
+        job.tree_inbound_bytes = 0
 
     def _prepare_linear_or_classic_decode_wave(
         self,
@@ -4301,6 +4807,7 @@ class DistributedPipelineEngine:
         path_lengths = tuple(len(path) for path in ordered_paths)
         nonce = self._next_tree_quote_nonce()
         sent_at = time.perf_counter()
+        job.wave_started_at = sent_at
         pending = _PendingTreeReservation(
             prepared=prepared,
             nonce=nonce,
@@ -4314,7 +4821,7 @@ class DistributedPipelineEngine:
         self._physical_tree_quote_requests = int(
             getattr(self, "_physical_tree_quote_requests", 0)
         ) + 1
-        send_frame(
+        job.tree_outbound_bytes += send_frame(
             downstream,
             FrameType.TREE_PREPARE,
             parent_request_id,
@@ -4501,7 +5008,7 @@ class DistributedPipelineEngine:
                     self._physical_tree_live_children.remove(command.child_request_id)
                     runner.end(command.child_request_id)
                     raise RuntimeError("root FORK physical accounting report mismatch")
-            send_frame(
+            job.tree_outbound_bytes += send_frame(
                 downstream,
                 FrameType.FORK,
                 command.child_request_id,
@@ -4522,7 +5029,6 @@ class DistributedPipelineEngine:
             if command is None:
                 break
             verify_commands.append(command)
-        job.wave_started_at = time.perf_counter()
         self._dispatch_physical_tree_verifies(
             verify_commands,
             runner,
@@ -4542,6 +5048,12 @@ class DistributedPipelineEngine:
 
         if not commands:
             raise RuntimeError("physical tree has no VERIFY commands")
+        parent_request_id = self._leaf_routes.get(commands[0].request_id)
+        if parent_request_id is None:
+            raise RuntimeError("physical tree VERIFY lost its parent route")
+        parent_job = self._callback_routes.get(parent_request_id)
+        if parent_job is None:
+            raise RuntimeError("physical tree VERIFY lost its parent job")
         self._root_ready_items += len(commands)
         manifest = getattr(runner, "executor_manifest", None)
         features = tuple(getattr(manifest, "features", ()))
@@ -4661,7 +5173,7 @@ class DistributedPipelineEngine:
                         raise RuntimeError(
                             "root physical tree output has an incompatible shape"
                         )
-                    self._send_activation(
+                    parent_job.tree_outbound_bytes += self._send_activation(
                         downstream,
                         emulator,
                         command.request_id,
@@ -4683,9 +5195,6 @@ class DistributedPipelineEngine:
 
         if last_verify_sent_at is None:
             raise RuntimeError("physical tree sent no VERIFY frame")
-        parent_request_id = self._leaf_routes.get(commands[0].request_id)
-        if parent_request_id is None:
-            raise RuntimeError("physical tree VERIFY lost its parent route")
         # FORK cloning and root compute have their own fatal execution path;
         # they must not consume a leaf's return budget. Protocol v4 exposes one
         # wave deadline, so arm it after the last VERIFY is physically written.
@@ -4967,14 +5476,6 @@ class DistributedPipelineEngine:
                     if not isinstance(hidden, torch.Tensor):
                         raise TypeError("root stage output must be a tensor")
                     job = wave.job
-                    if wave.prefill_end is not None:
-                        # Prompt tokens are the served sequence by definition.
-                        job.kv_valid += wave.prefill_end - job.prefill_offset
-                    else:
-                        # A decode wave re-forwards the last emitted token, which
-                        # always matches the served sequence; any draft position
-                        # after it becomes valid only once verification accepts it.
-                        job.kv_valid += 1
                     outbound_bytes = self._send_activation(
                         downstream,
                         emulator,

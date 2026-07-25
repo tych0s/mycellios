@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from .device import normalize_torch_device_request
+from .dense_tiering import DenseTieringConfig
 from .model import (
     MAX_PHYSICAL_STAGE_BATCH_SIZE,
     StageModelSpec,
@@ -23,6 +24,7 @@ from .model import (
     StageRunnerContract,
     ragged_grouping_enabled,
 )
+from .native_gguf_runtime import NativeGgufRuntimeConfig
 from .protocol import (
     Frame,
     FrameType,
@@ -188,6 +190,7 @@ class StageProcessConfig:
     one_way_delay_ms: float
     bandwidth_mbps: float
     device: str = "auto"
+    dense_tiering: DenseTieringConfig = DenseTieringConfig()
     sealed_wave_tokens: int | None = None
     max_prefill_chunk_tokens: int | None = None
     connect_timeout_seconds: float = 120.0
@@ -215,16 +218,7 @@ class StageProcessConfig:
     max_speculative_kv_bytes: int = 0
     ram_backed_moe: RamBackedMoeRuntimeConfig | None = None
     paged_kv: HFPagedStageRuntimeConfig | None = None
-    native_stage_package: str | None = None
-    native_stage_package_id: str | None = None
-    native_stage_manifest_sha256: str | None = None
-    native_stage_daemon_command: tuple[str, ...] = ()
-    native_stage_context_tokens: int | None = None
-    native_stage_gpu_layers: int = 0
-    native_stage_compute_api: str = "cpu"
-    native_stage_startup_timeout_seconds: float = 120.0
-    native_stage_call_timeout_seconds: float = 120.0
-    native_stage_close_timeout_seconds: float = 5.0
+    native_gguf: NativeGgufRuntimeConfig | None = None
 
 
 _REQUEST_SCOPED_FRAMES = frozenset(
@@ -241,12 +235,12 @@ _REQUEST_SCOPED_FRAMES = frozenset(
 
 
 class SingleRequestAdmission:
-    """Serialize a multiplexed stage stream onto one backend KV sequence.
+    """Serialize a multiplexed stage stream onto one native KV sequence.
 
-    NativeStage's pinned daemon has only seq0. Other request frames are retained
-    per request while the admitted request continues to consume the upstream
-    stream. This preserves each request's frame order without head-of-line
-    blocking the active request behind a queued BEGIN from another request.
+    Native runners may advertise a single active request. Other request frames
+    are retained per request while the admitted request continues to consume
+    the upstream stream. This preserves each request's frame order without
+    head-of-line blocking the active request behind a queued BEGIN.
     """
 
     def __init__(self) -> None:
@@ -349,6 +343,8 @@ def run_stage_process(
     branch_parents = branch_lineage.logical_owners
     tree_reservations = TreeReservationBook()
     tree_leaf_shapes: dict[int, TreeLeafShape] = {}
+    emulator: LinkEmulator | None = None
+    stage_failed = False
     try:
         validate_stage_config(config)
         runner = build_stage_runner(config)
@@ -609,6 +605,7 @@ def run_stage_process(
                         downstream,
                         frame.request_id,
                         control_thread,
+                        emulator=emulator,
                     )
                 break
             elif frame.frame_type == FrameType.ERROR:
@@ -617,6 +614,7 @@ def run_stage_process(
             else:
                 raise ValueError(f"unexpected frame {frame.frame_type.name}")
     except BaseException as error:
+        stage_failed = True
         stopping.set()
         original_error = error
         if downstream_failed.is_set() and downstream_errors:
@@ -648,6 +646,14 @@ def run_stage_process(
         raise
     finally:
         stopping.set()
+        emulator_close_error: BaseException | None = None
+        if emulator is not None:
+            try:
+                emulator.close(
+                    timeout_seconds=config.connect_timeout_seconds,
+                )
+            except BaseException as error:
+                emulator_close_error = error
         if downstream is not None:
             try:
                 downstream.shutdown(socket.SHUT_RD)
@@ -665,6 +671,8 @@ def run_stage_process(
             close = getattr(runner, "close", None)
             if callable(close):
                 close()
+        if emulator_close_error is not None and not stage_failed:
+            raise emulator_close_error
 
 
 def begin_stage_request(
@@ -2055,6 +2063,21 @@ def activation_token_mode(frame_type: FrameType) -> str:
 def build_stage_runner(config: StageProcessConfig) -> StageRunnerContract:
     """Construct the single-member runner or a logical local TP cell."""
 
+    if config.native_gguf is not None:
+        from .native_gguf_runtime import build_native_gguf_stage_runner
+
+        if config.dense_tiering == DenseTieringConfig():
+            return build_native_gguf_stage_runner(
+                config.spec,
+                config.native_gguf,
+                device=config.device,
+            )
+        return build_native_gguf_stage_runner(
+            config.spec,
+            config.native_gguf,
+            device=config.device,
+            dense_tiering=config.dense_tiering,
+        )
     if config.paged_kv is not None:
         from .paged_stage import HFPagedStageRunner
 
@@ -2065,34 +2088,16 @@ def build_stage_runner(config: StageProcessConfig) -> StageRunnerContract:
             config.ram_backed_moe,
             pipeline_snapshot_identity=config.pipeline_id,
         )
-    if config.native_stage_package is not None:
-        from .native_stage import NativeStageStageRunner, NativeStageStageRuntimeSpec
-
-        if not config.native_stage_daemon_command:
-            raise ValueError("NativeStage daemon command is missing")
-        if config.native_stage_context_tokens is None:
-            raise ValueError("NativeStage context-token limit is missing")
-        return NativeStageStageRunner(
-            config.spec,
-            NativeStageStageRuntimeSpec(
-                package=config.native_stage_package,
-                daemon_command=config.native_stage_daemon_command,
-                context_tokens=config.native_stage_context_tokens,
-                threads=config.spec.threads,
-                gpu_layers=config.native_stage_gpu_layers,
-                compute_api=config.native_stage_compute_api,
-                startup_timeout_seconds=config.native_stage_startup_timeout_seconds,
-                call_timeout_seconds=config.native_stage_call_timeout_seconds,
-                close_timeout_seconds=config.native_stage_close_timeout_seconds,
-                expected_pipeline_id=config.pipeline_id,
-                expected_package_id=config.native_stage_package_id,
-                expected_manifest_sha256=config.native_stage_manifest_sha256,
-            ),
-        )
     if config.cell_fixture is None:
         if normalize_torch_device_request(config.device) == "auto":
             return StageRunner(config.spec)
-        return StageRunner(config.spec, device=config.device)
+        if config.dense_tiering == DenseTieringConfig():
+            return StageRunner(config.spec, device=config.device)
+        return StageRunner(
+            config.spec,
+            device=config.device,
+            dense_tiering=config.dense_tiering,
+        )
     if config.cell_manifest_sha256 is not None:
         actual = _sha256_file(Path(config.cell_fixture) / "cell.json")
         if actual != config.cell_manifest_sha256:
@@ -2175,6 +2180,8 @@ def validate_hello(frame: Frame, config: StageProcessConfig, hidden_size: int) -
 
 def validate_stage_config(config: StageProcessConfig) -> None:
     normalized_device = normalize_torch_device_request(config.device)
+    if not isinstance(config.dense_tiering, DenseTieringConfig):
+        raise TypeError("dense_tiering must be DenseTieringConfig")
     if (
         not isinstance(config.pipeline_id, int)
         or isinstance(config.pipeline_id, bool)
@@ -2284,13 +2291,24 @@ def validate_stage_config(config: StageProcessConfig) -> None:
             "speculative branch count, tokens and KV bytes must all be zero "
             "or all be positive"
         )
-    has_native_stage = config.native_stage_package is not None
     has_ram_backed_moe = config.ram_backed_moe is not None
     has_paged_kv = config.paged_kv is not None
+    has_native_gguf = config.native_gguf is not None
+    if (
+        config.dense_tiering != DenseTieringConfig()
+        and (
+            has_ram_backed_moe
+            or has_paged_kv
+            or config.cell_fixture is not None
+        )
+    ):
+        raise ValueError(
+            "dense tiering budgets apply only to dense SafeTensors or native "
+            "GGUF stages"
+        )
     if normalized_device != "auto" and (
         has_ram_backed_moe
         or has_paged_kv
-        or has_native_stage
         or config.cell_fixture is not None
     ):
         raise ValueError(
@@ -2298,10 +2316,14 @@ def validate_stage_config(config: StageProcessConfig) -> None:
             "backends have their own sealed device settings"
         )
     if has_ram_backed_moe:
-        if has_paged_kv or has_native_stage or config.cell_fixture is not None:
+        if (
+            has_paged_kv
+            or has_native_gguf
+            or config.cell_fixture is not None
+        ):
             raise ValueError(
-                "paged KV, RAM-backed MoE, NativeStage and tensor-parallel cell backends "
-                "are mutually exclusive"
+                "native GGUF, paged KV, RAM-backed MoE and "
+                "tensor-parallel cell backends are mutually exclusive"
             )
         validate_ram_backed_moe_binding(
             config.ram_backed_moe,
@@ -2318,10 +2340,10 @@ def validate_stage_config(config: StageProcessConfig) -> None:
 
         if not isinstance(config.paged_kv, HFPagedStageRuntimeConfig):
             raise TypeError("paged_kv must be HFPagedStageRuntimeConfig")
-        if has_native_stage or config.cell_fixture is not None:
+        if has_native_gguf or config.cell_fixture is not None:
             raise ValueError(
-                "paged KV, RAM-backed MoE, NativeStage and tensor-parallel cell backends "
-                "are mutually exclusive"
+                "native GGUF, paged KV, RAM-backed MoE and "
+                "tensor-parallel cell backends are mutually exclusive"
             )
         required_request_slots = 1 + config.max_speculative_branches
         if config.paged_kv.max_active_requests < required_request_slots:
@@ -2338,66 +2360,21 @@ def validate_stage_config(config: StageProcessConfig) -> None:
                 "paged max_sequence_tokens is smaller than the sealed "
                 "speculative branch token ceiling"
             )
-    if has_native_stage:
-        if not isinstance(config.native_stage_package, str) or not config.native_stage_package.strip():
-            raise ValueError("native_stage_package cannot be empty")
-        if config.spec.first:
+    if has_native_gguf:
+        if not isinstance(config.native_gguf, NativeGgufRuntimeConfig):
+            raise TypeError("native_gguf must be NativeGgufRuntimeConfig")
+        if config.cell_fixture is not None:
             raise ValueError(
-                "NativeStage child-stage adapter cannot execute layer_start=0"
+                "native GGUF and tensor-parallel cell backends are "
+                "mutually exclusive"
             )
-        if (
-            not isinstance(config.native_stage_daemon_command, tuple)
-            or not config.native_stage_daemon_command
-            or any(
-                not isinstance(argument, str) or not argument
-                for argument in config.native_stage_daemon_command
+        expected_stage_identity = f"sha256:{config.native_gguf.package_id}"
+        if config.spec.stage_package_identity != expected_stage_identity:
+            raise ValueError(
+                "native GGUF stage package identity does not match the launch spec"
             )
-        ):
-            raise ValueError("NativeStage daemon command must be a non-empty argv tuple")
-        if (
-            not isinstance(config.native_stage_context_tokens, int)
-            or isinstance(config.native_stage_context_tokens, bool)
-            or config.native_stage_context_tokens < 1
-        ):
-            raise ValueError("native_stage_context_tokens must be a positive integer")
-        for name, digest in (
-            ("native_stage_package_id", config.native_stage_package_id),
-            ("native_stage_manifest_sha256", config.native_stage_manifest_sha256),
-        ):
-            if digest is not None and (
-                not isinstance(digest, str)
-                or len(digest) != 64
-                or any(character not in "0123456789abcdef" for character in digest)
-            ):
-                raise ValueError(f"{name} must be a lowercase SHA-256 digest")
-    elif (
-        config.native_stage_package_id is not None
-        or config.native_stage_manifest_sha256 is not None
-        or config.native_stage_daemon_command
-        or config.native_stage_context_tokens is not None
-        or config.native_stage_gpu_layers != 0
-        or config.native_stage_compute_api != "cpu"
-    ):
-        raise ValueError("NativeStage runtime settings require native_stage_package")
-    if (
-        not isinstance(config.native_stage_gpu_layers, int)
-        or isinstance(config.native_stage_gpu_layers, bool)
-        or config.native_stage_gpu_layers < 0
-    ):
-        raise ValueError("native_stage_gpu_layers must be a non-negative integer")
-    if config.native_stage_compute_api not in ("cpu", "cuda", "rocm", "metal", "vulkan"):
-        raise ValueError("native_stage_compute_api is unsupported")
-    for name, value in (
-        ("native_stage_startup_timeout_seconds", config.native_stage_startup_timeout_seconds),
-        ("native_stage_call_timeout_seconds", config.native_stage_call_timeout_seconds),
-        ("native_stage_close_timeout_seconds", config.native_stage_close_timeout_seconds),
-    ):
-        if not math.isfinite(value) or value <= 0:
-            raise ValueError(f"{name} must be finite and positive")
     has_cell_fixture = config.cell_fixture is not None
     has_cell_size = config.cell_world_size is not None
-    if has_native_stage and has_cell_fixture:
-        raise ValueError("NativeStage and tensor-parallel cell backends are mutually exclusive")
     if config.cell_mode not in ("local", "external"):
         raise ValueError("cell_mode must be local or external")
     if has_cell_fixture != has_cell_size:
@@ -2675,6 +2652,7 @@ def forward_shutdown_and_wait(
     request_id: int,
     control_thread: threading.Thread | None,
     *,
+    emulator: LinkEmulator | None = None,
     timeout_seconds: float = STAGE_SHUTDOWN_GRACE_SECONDS,
 ) -> None:
     """Forward planned shutdown and wait for downstream EOF as its ACK.
@@ -2687,7 +2665,14 @@ def forward_shutdown_and_wait(
 
     if not math.isfinite(timeout_seconds) or timeout_seconds < 0:
         raise ValueError("shutdown timeout must be finite and non-negative")
-    send_frame(downstream, FrameType.SHUTDOWN, request_id)
+    send_frame(
+        downstream,
+        FrameType.SHUTDOWN,
+        request_id,
+        emulator=emulator,
+    )
+    if emulator is not None and emulator.enabled:
+        emulator.flush(timeout_seconds=timeout_seconds)
     try:
         downstream.shutdown(socket.SHUT_WR)
     except OSError:

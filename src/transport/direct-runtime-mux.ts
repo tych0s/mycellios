@@ -221,7 +221,7 @@ export class DirectRuntimeMux extends EventEmitter<MuxEvents> {
   setDataHandler(streamId: string, handler: DirectRuntimeDataHandler): void {
     const state = this.requiredStream(streamId);
     state.handler = handler;
-    void this.drainIncoming(state);
+    this.scheduleIncomingDrain(state);
   }
 
   async closeStream(streamId: string): Promise<void> {
@@ -367,7 +367,7 @@ export class DirectRuntimeMux extends EventEmitter<MuxEvents> {
     }
     state.receiveBufferedBytes += frame.payload.byteLength;
     state.incoming.push({ offset: frame.offset, data: frame.payload });
-    void this.drainIncoming(state);
+    this.scheduleIncomingDrain(state);
   }
 
   private receiveAcknowledgement(frame: RuntimeFrame): void {
@@ -427,6 +427,7 @@ export class DirectRuntimeMux extends EventEmitter<MuxEvents> {
           await this.resetStream(state.id, failure.message);
           return;
         }
+        if (this.closed || !this.streams.has(state.id)) return;
         state.receiveOffset += chunk.data.byteLength;
         state.receiveBufferedBytes -= chunk.data.byteLength;
         await this.queueAcknowledgement(state, chunk.data.byteLength);
@@ -438,6 +439,13 @@ export class DirectRuntimeMux extends EventEmitter<MuxEvents> {
     } finally {
       state.drainingIncoming = false;
     }
+  }
+
+  private scheduleIncomingDrain(state: StreamState): void {
+    void this.drainIncoming(state).catch((error: unknown) => {
+      if (this.closed || !this.streams.has(state.id)) return;
+      this.fail(error instanceof Error ? error : new Error(String(error)));
+    });
   }
 
   private flushWrites(state: StreamState): void {

@@ -2,7 +2,7 @@
 
 This module owns the subset of GGUF needed to turn a complete model artifact
 into an authenticated, contiguous GDLP stage.  It deliberately does not invoke
-``external GGUF runtime``, ``llama-gguf-split`` or another daemon:
+an external converter, splitter or model-serving daemon:
 
 * the parser validates GGUF v2/v3 metadata and tensor descriptors itself;
 * the writer copies only the selected raw tensor payloads into a new GGUF;
@@ -19,7 +19,7 @@ falling back to a whole-model external runtime.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import math
@@ -40,6 +40,8 @@ NATIVE_GGUF_STAGE_SCHEMA = "gdlp-native-gguf-stage/1"
 NATIVE_GGUF_STAGE_MANIFEST = "native-stage.json"
 NATIVE_GGUF_STAGE_WEIGHTS = "native-stage.gguf"
 NATIVE_GGUF_STAGE_CONFIG = "config.json"
+NATIVE_GGUF_FLEET_SCHEMA = "gdlp-native-gguf-fleet/1"
+NATIVE_GGUF_FLEET_MANIFEST = "native-fleet.json"
 SUPPORTED_ARCHITECTURES = frozenset(("llama", "qwen3"))
 DEFAULT_ALIGNMENT = 32
 MAX_METADATA_ITEMS = 1_000_000
@@ -121,7 +123,37 @@ class NativeGgufStagePackage:
 
     @property
     def artifact_identity(self) -> str:
+        """Canonical full-model identity shared by every stage range."""
+
+        return _native_model_identity(
+            self.source_gguf_sha256,
+            self.config_sha256,
+        )
+
+    @property
+    def package_identity(self) -> str:
+        """Identity of this exact range package, distinct across stages."""
+
         return "sha256:" + self.package_id
+
+
+@dataclass(frozen=True, slots=True)
+class NativeGgufFleet:
+    root: Path
+    fleet_id: str
+    model_source: str
+    model_revision: str | None
+    source_gguf_sha256: str
+    config_sha256: str
+    total_layers: int
+    stages: tuple[NativeGgufStagePackage, ...]
+
+    @property
+    def artifact_identity(self) -> str:
+        return _native_model_identity(
+            self.source_gguf_sha256,
+            self.config_sha256,
+        )
 
 
 # ggml_type -> (elements per block, encoded bytes per block).  Keeping the
@@ -149,7 +181,9 @@ _GGML_LAYOUTS: dict[int, tuple[int, int]] = {
     28: (1, 8),      # F64
     30: (1, 2),      # BF16
 }
-_EXECUTABLE_GGML_TYPES = frozenset((0, 1, 2, 3, 6, 7, 8, 24, 25, 26, 27, 28, 30))
+_EXECUTABLE_GGML_TYPES = frozenset(
+    (0, 1, 2, 3, 6, 7, 8, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 30)
+)
 _SCALAR_FORMATS: dict[int, str] = {
     0: "<B",
     1: "<b",
@@ -208,7 +242,7 @@ def parse_gguf(path_value: str | os.PathLike[str]) -> GgufDocument:
                 raise NativeGgufError("GGUF tensor names must be non-empty and unique")
             seen_tensors.add(name)
             dimension_count = reader.u32()
-            if not 1 <= dimension_count <= 8:
+            if not 1 <= dimension_count <= 4:
                 raise NativeGgufError(f"GGUF tensor {name!r} has invalid rank")
             dimensions = tuple(reader.u64() for _ in range(dimension_count))
             if any(value < 1 for value in dimensions):
@@ -279,10 +313,14 @@ def build_native_gguf_stage(
     total_layers: int | None = None,
     model_source: str,
     model_revision: str | None,
+    _source_document: GgufDocument | None = None,
 ) -> NativeGgufStagePackage:
     """Atomically build one authenticated contiguous native GGUF stage."""
 
-    source = parse_gguf(source_gguf)
+    requested_source = Path(source_gguf).expanduser().resolve()
+    source = _source_document or parse_gguf(requested_source)
+    if source.path != requested_source:
+        raise NativeGgufError("preparsed GGUF source differs from requested source")
     architecture = source.architecture
     if architecture not in SUPPORTED_ARCHITECTURES:
         raise NativeGgufError(
@@ -374,6 +412,11 @@ def build_native_gguf_stage(
                 "engine": "mycellios-native-gguf",
                 "externalRuntimeRequired": False,
                 "materialization": "stage-only-dequantize-to-torch",
+                "tensorLayout": (
+                    "llama-rope-qk-permuted"
+                    if architecture == "llama"
+                    else "huggingface-row-major"
+                ),
                 "executableGgmlTypes": sorted(_EXECUTABLE_GGML_TYPES),
             },
         }
@@ -401,6 +444,237 @@ def build_native_gguf_stage(
         raise
 
 
+def build_native_gguf_fleet(
+    source_gguf: str | os.PathLike[str],
+    destination: str | os.PathLike[str],
+    *,
+    config_source: str | os.PathLike[str],
+    model_source: str,
+    model_revision: str | None,
+    ranges: Sequence[tuple[int, int]] | None = None,
+    layers_per_stage: int | None = None,
+) -> NativeGgufFleet:
+    """Compile a complete contiguous stage fleet with one source scan.
+
+    Either explicit ``ranges`` or ``layers_per_stage`` must be supplied.  The
+    complete fleet is published atomically only after every child package and
+    the fleet-level identity verify.
+    """
+
+    source = parse_gguf(source_gguf)
+    metadata = source.metadata_map()
+    declared_layers = metadata.get(f"{source.architecture}.block_count")
+    if not isinstance(declared_layers, int) or isinstance(declared_layers, bool):
+        raise NativeGgufError("GGUF block_count is missing")
+    if (ranges is None) == (layers_per_stage is None):
+        raise NativeGgufError(
+            "exactly one of ranges or layers_per_stage must be supplied"
+        )
+    if layers_per_stage is not None:
+        if (
+            not isinstance(layers_per_stage, int)
+            or isinstance(layers_per_stage, bool)
+            or layers_per_stage < 1
+        ):
+            raise NativeGgufError("layers_per_stage must be positive")
+        selected_ranges = tuple(
+            (start, min(declared_layers, start + layers_per_stage))
+            for start in range(0, declared_layers, layers_per_stage)
+        )
+    else:
+        assert ranges is not None
+        selected_ranges = tuple(ranges)
+    _validate_complete_ranges(selected_ranges, declared_layers)
+
+    target = Path(destination).expanduser().resolve()
+    if target.exists():
+        raise FileExistsError(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.parent / f".{target.name}.part-{uuid.uuid4().hex}"
+    temporary.mkdir()
+    try:
+        stage_records: list[dict[str, Any]] = []
+        fleet_config_sha256: str | None = None
+        for index, (layer_start, layer_end) in enumerate(selected_ranges):
+            relative = f"stage-{index:04d}-{layer_start:05d}-{layer_end:05d}"
+            package = build_native_gguf_stage(
+                source.path,
+                temporary / relative,
+                config_source=config_source,
+                layer_start=layer_start,
+                layer_end=layer_end,
+                total_layers=declared_layers,
+                model_source=model_source,
+                model_revision=model_revision,
+                _source_document=source,
+            )
+            if fleet_config_sha256 is None:
+                fleet_config_sha256 = package.config_sha256
+            elif package.config_sha256 != fleet_config_sha256:
+                raise NativeGgufError("native GGUF fleet configs are inconsistent")
+            stage_records.append(
+                {
+                    "path": relative,
+                    "packageId": package.package_id,
+                    "layerStart": layer_start,
+                    "layerEnd": layer_end,
+                }
+            )
+        assert fleet_config_sha256 is not None
+        without_id = {
+            "schema": NATIVE_GGUF_FLEET_SCHEMA,
+            "model": {
+                "source": model_source,
+                "revision": model_revision,
+                "sourceGgufSha256": source.file_sha256,
+                "configSha256": fleet_config_sha256,
+                "architecture": source.architecture,
+            },
+            "totalLayers": declared_layers,
+            "stages": stage_records,
+        }
+        fleet_id = hashlib.sha256(_canonical_json(without_id)).hexdigest()
+        _write_json_atomic(
+            temporary / NATIVE_GGUF_FLEET_MANIFEST,
+            {**without_id, "fleetId": fleet_id},
+        )
+        verified = verify_native_gguf_fleet(temporary)
+        os.replace(temporary, target)
+        return NativeGgufFleet(
+            root=target,
+            fleet_id=verified.fleet_id,
+            model_source=verified.model_source,
+            model_revision=verified.model_revision,
+            source_gguf_sha256=verified.source_gguf_sha256,
+            config_sha256=verified.config_sha256,
+            total_layers=verified.total_layers,
+            stages=tuple(
+                replace(stage, root=target / stage.root.name)
+                for stage in verified.stages
+            ),
+        )
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+
+
+def verify_native_gguf_fleet(
+    fleet_root: str | os.PathLike[str],
+    *,
+    expected_fleet_id: str | None = None,
+) -> NativeGgufFleet:
+    """Verify fleet identity, exact child set and complete contiguous coverage."""
+
+    root = Path(fleet_root).expanduser().resolve()
+    manifest_path = root / NATIVE_GGUF_FLEET_MANIFEST
+    if not manifest_path.is_file():
+        raise FileNotFoundError(manifest_path)
+    if any(entry.is_symlink() for entry in root.iterdir()):
+        raise NativeGgufError("native GGUF fleet cannot contain symbolic links")
+    document = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(document, dict) or document.get("schema") != NATIVE_GGUF_FLEET_SCHEMA:
+        raise NativeGgufError("native GGUF fleet manifest schema is invalid")
+    fleet_id = _digest(document.get("fleetId"), "fleet ID")
+    without_id = dict(document)
+    without_id.pop("fleetId", None)
+    if hashlib.sha256(_canonical_json(without_id)).hexdigest() != fleet_id:
+        raise NativeGgufError("native GGUF fleet identity does not match manifest")
+    if expected_fleet_id is not None and expected_fleet_id != fleet_id:
+        raise NativeGgufError("native GGUF fleet differs from launch contract")
+    if set(document) != {"schema", "fleetId", "model", "totalLayers", "stages"}:
+        raise NativeGgufError("native GGUF fleet has unknown or missing fields")
+    model = _exact_mapping(
+        document.get("model"),
+        (
+            "source",
+            "revision",
+            "sourceGgufSha256",
+            "configSha256",
+            "architecture",
+        ),
+        "fleet model",
+    )
+    model_source = _nonempty(model.get("source"), "fleet model source")
+    revision_value = model.get("revision")
+    if revision_value is not None and (
+        not isinstance(revision_value, str) or not revision_value.strip()
+    ):
+        raise NativeGgufError("fleet model revision must be null or non-empty")
+    source_digest = _digest(
+        model.get("sourceGgufSha256"),
+        "fleet source GGUF SHA-256",
+    )
+    config_digest = _digest(
+        model.get("configSha256"),
+        "fleet config SHA-256",
+    )
+    architecture = _nonempty(model.get("architecture"), "fleet architecture")
+    if architecture not in SUPPORTED_ARCHITECTURES:
+        raise NativeGgufError("native GGUF fleet architecture is unsupported")
+    total_layers = _positive_integer(document.get("totalLayers"), "totalLayers")
+    stage_values = document.get("stages")
+    if not isinstance(stage_values, list) or not stage_values:
+        raise NativeGgufError("native GGUF fleet stages are empty")
+    stages: list[NativeGgufStagePackage] = []
+    declared_paths: list[str] = []
+    declared_ranges: list[tuple[int, int]] = []
+    for value in stage_values:
+        record = _exact_mapping(
+            value,
+            ("path", "packageId", "layerStart", "layerEnd"),
+            "fleet stage",
+        )
+        relative_text = _nonempty(record.get("path"), "fleet stage path")
+        relative = Path(relative_text)
+        if (
+            relative.is_absolute()
+            or len(relative.parts) != 1
+            or relative.name != relative_text
+            or relative_text == NATIVE_GGUF_FLEET_MANIFEST
+        ):
+            raise NativeGgufError("native GGUF fleet stage path is invalid")
+        package_id = _digest(record.get("packageId"), "fleet stage package ID")
+        layer_start = _integer(record.get("layerStart"), "layerStart")
+        layer_end = _integer(record.get("layerEnd"), "layerEnd")
+        package = verify_native_gguf_stage(
+            root / relative,
+            expected_package_id=package_id,
+            expected_layer_start=layer_start,
+            expected_layer_end=layer_end,
+            expected_total_layers=total_layers,
+        )
+        if package.source_gguf_sha256 != source_digest:
+            raise NativeGgufError("fleet stages do not share one source GGUF")
+        if package.config_sha256 != config_digest:
+            raise NativeGgufError("fleet stages do not share one model config")
+        if package.model_source != model_source or package.model_revision != revision_value:
+            raise NativeGgufError("fleet stage model coordinates are inconsistent")
+        if package.architecture != architecture:
+            raise NativeGgufError("fleet stage architecture is inconsistent")
+        declared_paths.append(relative_text)
+        declared_ranges.append((layer_start, layer_end))
+        stages.append(package)
+    if len(set(declared_paths)) != len(declared_paths):
+        raise NativeGgufError("native GGUF fleet repeats a stage path")
+    _validate_complete_ranges(tuple(declared_ranges), total_layers)
+    actual_entries = {entry.name for entry in root.iterdir()}
+    expected_entries = {NATIVE_GGUF_FLEET_MANIFEST, *declared_paths}
+    if actual_entries != expected_entries:
+        raise NativeGgufError("native GGUF fleet contains unsealed entries")
+    if any((root / name).is_symlink() for name in expected_entries):
+        raise NativeGgufError("native GGUF fleet cannot contain symbolic links")
+    return NativeGgufFleet(
+        root=root,
+        fleet_id=fleet_id,
+        model_source=model_source,
+        model_revision=revision_value,
+        source_gguf_sha256=source_digest,
+        config_sha256=config_digest,
+        total_layers=total_layers,
+        stages=tuple(stages),
+    )
+
+
 def verify_native_gguf_stage(
     package_root: str | os.PathLike[str],
     *,
@@ -415,6 +689,15 @@ def verify_native_gguf_stage(
     manifest_path = root / NATIVE_GGUF_STAGE_MANIFEST
     if not manifest_path.is_file():
         raise FileNotFoundError(manifest_path)
+    expected_entries = {
+        NATIVE_GGUF_STAGE_MANIFEST,
+        NATIVE_GGUF_STAGE_WEIGHTS,
+        NATIVE_GGUF_STAGE_CONFIG,
+    }
+    if {entry.name for entry in root.iterdir()} != expected_entries:
+        raise NativeGgufError("native GGUF stage contains unsealed entries")
+    if any((root / name).is_symlink() for name in expected_entries):
+        raise NativeGgufError("native GGUF stage cannot contain symbolic links")
     document = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not isinstance(document, dict) or document.get("schema") != NATIVE_GGUF_STAGE_SCHEMA:
         raise NativeGgufError("native GGUF stage manifest schema is invalid")
@@ -445,6 +728,33 @@ def verify_native_gguf_stage(
     if architecture not in SUPPORTED_ARCHITECTURES:
         raise NativeGgufError("native GGUF architecture is unsupported")
     source_digest = _digest(model.get("sourceGgufSha256"), "source GGUF SHA-256")
+    execution = _exact_mapping(
+        document.get("execution"),
+        (
+            "engine",
+            "externalRuntimeRequired",
+            "materialization",
+            "tensorLayout",
+            "executableGgmlTypes",
+        ),
+        "execution",
+    )
+    if execution.get("engine") != "mycellios-native-gguf":
+        raise NativeGgufError("native GGUF execution engine is invalid")
+    if execution.get("externalRuntimeRequired") is not False:
+        raise NativeGgufError("native GGUF package cannot require an external runtime")
+    if execution.get("materialization") != "stage-only-dequantize-to-torch":
+        raise NativeGgufError("native GGUF materialization contract is invalid")
+    expected_layout = (
+        "llama-rope-qk-permuted"
+        if architecture == "llama"
+        else "huggingface-row-major"
+    )
+    if execution.get("tensorLayout") != expected_layout:
+        raise NativeGgufError("native GGUF tensor layout is invalid")
+    executable_types = execution.get("executableGgmlTypes")
+    if executable_types != sorted(_EXECUTABLE_GGML_TYPES):
+        raise NativeGgufError("native GGUF executable type contract is invalid")
     stage = _exact_mapping(
         document.get("stage"),
         ("layerStart", "layerEnd", "totalLayers", "first", "last"),
@@ -562,19 +872,33 @@ def materialize_native_gguf_stage(
     temporary.mkdir()
     try:
         parsed = parse_gguf(package.root / NATIVE_GGUF_STAGE_WEIGHTS)
+        config = _load_config(package.root / NATIVE_GGUF_STAGE_CONFIG)
         state: dict[str, torch.Tensor] = {}
         with parsed.path.open("rb") as stream:
             for tensor in parsed.tensors:
+                stream.seek(tensor.data_offset)
+                raw = stream.read(tensor.size_bytes)
+                if len(raw) != tensor.size_bytes:
+                    raise NativeGgufError(f"GGUF tensor {tensor.name!r} is truncated")
+                decoded = dequantize_gguf_tensor(tensor, raw)
+                if tensor.name == "rope_freqs.weight":
+                    _validate_derived_rope_factors(
+                        decoded,
+                        architecture=package.architecture,
+                        config=config,
+                    )
+                    continue
                 checkpoint_name = _hf_checkpoint_name(tensor.name)
                 if checkpoint_name in state:
                     raise NativeGgufError(
                         f"multiple GGUF tensors map to {checkpoint_name!r}"
                     )
-                stream.seek(tensor.data_offset)
-                raw = stream.read(tensor.size_bytes)
-                if len(raw) != tensor.size_bytes:
-                    raise NativeGgufError(f"GGUF tensor {tensor.name!r} is truncated")
-                state[checkpoint_name] = dequantize_gguf_tensor(tensor, raw)
+                state[checkpoint_name] = _restore_huggingface_tensor_layout(
+                    tensor.name,
+                    decoded,
+                    architecture=package.architecture,
+                    config=config,
+                )
         save_file(state, temporary / "model.safetensors")
         shutil.copyfile(
             package.root / NATIVE_GGUF_STAGE_CONFIG,
@@ -623,6 +947,8 @@ def dequantize_gguf_tensor(tensor: GgufTensor, raw: bytes) -> torch.Tensor:
     elif ggml_type == 28:
         values = np.frombuffer(raw, dtype="<f8").astype(np.float32)
         result = torch.from_numpy(values)
+    elif ggml_type in (10, 11, 12, 13, 14, 15):
+        result = torch.from_numpy(_dequantize_k_blocks(raw, ggml_type))
     else:
         result = torch.from_numpy(_dequantize_blocks(raw, ggml_type))
     if result.numel() != count:
@@ -630,6 +956,152 @@ def dequantize_gguf_tensor(tensor: GgufTensor, raw: bytes) -> torch.Tensor:
             f"GGUF tensor {tensor.name!r} decoded {result.numel()} values, expected {count}"
         )
     return result.reshape(tensor.torch_shape).contiguous()
+
+
+def _restore_huggingface_tensor_layout(
+    gguf_name: str,
+    value: torch.Tensor,
+    *,
+    architecture: str,
+    config: Mapping[str, Any],
+) -> torch.Tensor:
+    """Undo architecture-specific conversion transforms after dequantization.
+
+    The canonical Llama GGUF layout interleaves the two rotary components of Q
+    and K. Transformers expects the original Hugging Face row
+    order, so a direct name mapping is not sufficient even though shapes match.
+    Qwen3's canonical converter does not apply this transform.
+    """
+
+    if architecture != "llama":
+        return value
+    if not (
+        gguf_name.endswith(".attn_q.weight")
+        or gguf_name.endswith(".attn_q.bias")
+        or gguf_name.endswith(".attn_k.weight")
+        or gguf_name.endswith(".attn_k.bias")
+    ):
+        return value
+    attention_heads = config.get("num_attention_heads")
+    kv_heads = config.get("num_key_value_heads", attention_heads)
+    if not isinstance(attention_heads, int) or isinstance(attention_heads, bool):
+        raise NativeGgufError("Llama config num_attention_heads is invalid")
+    if not isinstance(kv_heads, int) or isinstance(kv_heads, bool):
+        raise NativeGgufError("Llama config num_key_value_heads is invalid")
+    heads = kv_heads if ".attn_k." in gguf_name else attention_heads
+    if heads < 1 or value.shape[0] % (heads * 2):
+        raise NativeGgufError(
+            f"GGUF tensor {gguf_name!r} cannot restore Llama rotary layout"
+        )
+    trailing = tuple(value.shape[1:])
+    restored = (
+        value.reshape(heads, value.shape[0] // heads // 2, 2, *trailing)
+        .swapaxes(1, 2)
+        .reshape(value.shape)
+    )
+    return restored.contiguous()
+
+
+def _validate_derived_rope_factors(
+    value: torch.Tensor,
+    *,
+    architecture: str,
+    config: Mapping[str, Any],
+) -> None:
+    """Prove that a GGUF-only RoPE tensor is recreated by the sealed config."""
+
+    scaling = config.get("rope_scaling")
+    if architecture != "llama" or not isinstance(scaling, Mapping):
+        raise NativeGgufError(
+            "rope_freqs.weight is unsupported without a sealed Llama3 RoPE config"
+        )
+    rope_type = scaling.get("rope_type", scaling.get("type"))
+    if rope_type != "llama3":
+        raise NativeGgufError(
+            "rope_freqs.weight is supported only for certified Llama3 RoPE"
+        )
+
+    def number(mapping: Mapping[str, Any], key: str) -> float:
+        candidate = mapping.get(key)
+        if (
+            not isinstance(candidate, (int, float))
+            or isinstance(candidate, bool)
+            or not math.isfinite(float(candidate))
+            or float(candidate) <= 0
+        ):
+            raise NativeGgufError(f"Llama3 RoPE config {key!r} is invalid")
+        return float(candidate)
+
+    hidden_size = config.get("hidden_size")
+    attention_heads = config.get("num_attention_heads")
+    head_dim_value = config.get("head_dim")
+    if head_dim_value is None:
+        if (
+            not isinstance(hidden_size, int)
+            or isinstance(hidden_size, bool)
+            or not isinstance(attention_heads, int)
+            or isinstance(attention_heads, bool)
+            or attention_heads < 1
+            or hidden_size % attention_heads
+        ):
+            raise NativeGgufError("Llama3 RoPE head dimension is invalid")
+        head_dim = hidden_size // attention_heads
+    elif (
+        not isinstance(head_dim_value, int)
+        or isinstance(head_dim_value, bool)
+        or head_dim_value < 2
+    ):
+        raise NativeGgufError("Llama3 RoPE head dimension is invalid")
+    else:
+        head_dim = head_dim_value
+    if head_dim % 2:
+        raise NativeGgufError("Llama3 RoPE head dimension must be even")
+    base_value = config.get("rope_theta", 10_000.0)
+    if (
+        not isinstance(base_value, (int, float))
+        or isinstance(base_value, bool)
+        or not math.isfinite(float(base_value))
+        or float(base_value) <= 0
+    ):
+        raise NativeGgufError("Llama3 rope_theta is invalid")
+    factor = number(scaling, "factor")
+    low_factor = number(scaling, "low_freq_factor")
+    high_factor = number(scaling, "high_freq_factor")
+    original_context = number(scaling, "original_max_position_embeddings")
+    if high_factor <= low_factor:
+        raise NativeGgufError(
+            "Llama3 high_freq_factor must exceed low_freq_factor"
+        )
+
+    positions = np.arange(0, head_dim, 2, dtype=np.float64)
+    frequencies = 1.0 / (
+        float(base_value) ** (positions / float(head_dim))
+    )
+    low_wavelength = original_context / low_factor
+    high_wavelength = original_context / high_factor
+    expected: list[float] = []
+    for frequency in frequencies:
+        wavelength = 2.0 * math.pi / float(frequency)
+        if wavelength < high_wavelength:
+            expected.append(1.0)
+        elif wavelength > low_wavelength:
+            expected.append(factor)
+        else:
+            smooth = (
+                original_context / wavelength - low_factor
+            ) / (high_factor - low_factor)
+            expected.append(1.0 / ((1.0 - smooth) / factor + smooth))
+    actual = value.detach().cpu().to(torch.float32).reshape(-1)
+    expected_tensor = torch.tensor(expected, dtype=torch.float32)
+    if actual.shape != expected_tensor.shape or not torch.allclose(
+        actual,
+        expected_tensor,
+        rtol=1e-5,
+        atol=1e-6,
+    ):
+        raise NativeGgufError(
+            "rope_freqs.weight differs from the sealed Llama3 RoPE config"
+        )
 
 
 def _dequantize_blocks(raw: bytes, ggml_type: int) -> np.ndarray:
@@ -682,6 +1154,353 @@ def _dequantize_blocks(raw: bytes, ggml_type: int) -> np.ndarray:
     raise NativeGgufError(f"native decoder is missing for ggml type {ggml_type}")
 
 
+def _dequantize_k_blocks(raw: bytes, ggml_type: int) -> np.ndarray:
+    """Decode GGML's 256-element K-quant super-blocks."""
+
+    block_elements, block_bytes = _GGML_LAYOUTS[ggml_type]
+    if block_elements != 256 or len(raw) % block_bytes:
+        raise NativeGgufError("K-quantized GGUF tensor has an invalid block size")
+    blocks = np.frombuffer(raw, dtype=np.uint8).reshape(-1, block_bytes)
+    decoders = {
+        10: _decode_q2_k_blocks,
+        11: _decode_q3_k_blocks,
+        12: _decode_q4_k_blocks,
+        13: _decode_q5_k_blocks,
+        14: _decode_q6_k_blocks,
+        15: _decode_q8_k_blocks,
+    }
+    values = decoders[ggml_type](blocks)
+    if values.shape != (blocks.shape[0], 256) or not np.isfinite(values).all():
+        raise NativeGgufError("K-quantized GGUF tensor decoded invalid values")
+    return values.astype(np.float32, copy=False).reshape(-1)
+
+
+def _half(raw: np.ndarray) -> float:
+    return float(raw.copy().view("<f2")[0])
+
+
+def _halves(raw: np.ndarray) -> np.ndarray:
+    return raw.copy().view("<f2").reshape(raw.shape[0]).astype(np.float32)
+
+
+def _decode_q2_k_blocks(blocks: np.ndarray) -> np.ndarray:
+    scales = blocks[:, :16]
+    quants = blocks[:, 16:80]
+    d = _halves(blocks[:, 80:82])
+    minimum = _halves(blocks[:, 82:84])
+    output = np.empty((blocks.shape[0], 256), dtype=np.float32)
+    scale_index = 0
+    cursor = 0
+    for base in (0, 32):
+        q = quants[:, base : base + 32]
+        for shift in (0, 2, 4, 6):
+            for offset in (0, 16):
+                encoded = scales[:, scale_index]
+                scale_index += 1
+                values = ((q[:, offset : offset + 16] >> shift) & 3).astype(
+                    np.float32
+                )
+                output[:, cursor : cursor + 16] = (
+                    d[:, None] * (encoded & 15)[:, None] * values
+                    - minimum[:, None] * (encoded >> 4)[:, None]
+                )
+                cursor += 16
+    return output
+
+
+def _decode_q3_k_blocks(blocks: np.ndarray) -> np.ndarray:
+    high_mask = blocks[:, :32]
+    quants = blocks[:, 32:96]
+    words = blocks[:, 96:108].copy().view("<u4").reshape(-1, 3)
+    d = _halves(blocks[:, 108:110])
+    mask_low = np.uint32(0x03030303)
+    mask_nibble = np.uint32(0x0F0F0F0F)
+    temporary = words[:, 2]
+    expanded = np.empty((blocks.shape[0], 4), dtype="<u4")
+    expanded[:, 0] = (words[:, 0] & mask_nibble) | (
+        ((temporary >> 0) & mask_low) << 4
+    )
+    expanded[:, 1] = (words[:, 1] & mask_nibble) | (
+        ((temporary >> 2) & mask_low) << 4
+    )
+    expanded[:, 2] = ((words[:, 0] >> 4) & mask_nibble) | (
+        ((temporary >> 4) & mask_low) << 4
+    )
+    expanded[:, 3] = ((words[:, 1] >> 4) & mask_nibble) | (
+        ((temporary >> 6) & mask_low) << 4
+    )
+    scales = expanded.view(np.uint8).reshape(-1, 16).astype(np.int16) - 32
+    output = np.empty((blocks.shape[0], 256), dtype=np.float32)
+    scale_index = 0
+    mask_bit = 1
+    cursor = 0
+    for base in (0, 32):
+        q = quants[:, base : base + 32]
+        for shift in (0, 2, 4, 6):
+            for offset in (0, 16):
+                low = ((q[:, offset : offset + 16] >> shift) & 3).astype(
+                    np.int16
+                )
+                signed = low - np.where(
+                    high_mask[:, offset : offset + 16] & mask_bit,
+                    0,
+                    4,
+                )
+                output[:, cursor : cursor + 16] = (
+                    d[:, None] * scales[:, scale_index, None] * signed
+                )
+                scale_index += 1
+                cursor += 16
+            mask_bit <<= 1
+    return output
+
+
+def _k_scale_min_blocks(
+    index: int,
+    packed: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    if index < 4:
+        return packed[:, index] & 63, packed[:, index + 4] & 63
+    scale = (packed[:, index + 4] & 15) | (
+        (packed[:, index - 4] >> 6) << 4
+    )
+    minimum = (packed[:, index + 4] >> 4) | (
+        (packed[:, index] >> 6) << 4
+    )
+    return scale, minimum
+
+
+def _decode_q4_k_blocks(blocks: np.ndarray) -> np.ndarray:
+    d = _halves(blocks[:, :2])
+    minimum = _halves(blocks[:, 2:4])
+    scales = blocks[:, 4:16]
+    quants = blocks[:, 16:144]
+    output = np.empty((blocks.shape[0], 256), dtype=np.float32)
+    cursor = 0
+    for pair in range(4):
+        q = quants[:, pair * 32 : (pair + 1) * 32]
+        for local, values in enumerate((q & 15, q >> 4)):
+            scale, encoded_min = _k_scale_min_blocks(pair * 2 + local, scales)
+            output[:, cursor : cursor + 32] = (
+                d[:, None] * scale[:, None] * values
+                - minimum[:, None] * encoded_min[:, None]
+            )
+            cursor += 32
+    return output
+
+
+def _decode_q5_k_blocks(blocks: np.ndarray) -> np.ndarray:
+    d = _halves(blocks[:, :2])
+    minimum = _halves(blocks[:, 2:4])
+    scales = blocks[:, 4:16]
+    high = blocks[:, 16:48]
+    low = blocks[:, 48:176]
+    output = np.empty((blocks.shape[0], 256), dtype=np.float32)
+    cursor = 0
+    for pair, bits in enumerate(((1, 2), (4, 8), (16, 32), (64, 128))):
+        q = low[:, pair * 32 : (pair + 1) * 32]
+        for local, (values, bit) in enumerate(
+            ((q & 15, bits[0]), (q >> 4, bits[1]))
+        ):
+            scale, encoded_min = _k_scale_min_blocks(pair * 2 + local, scales)
+            quant = values.astype(np.int16) + np.where(high & bit, 16, 0)
+            output[:, cursor : cursor + 32] = (
+                d[:, None] * scale[:, None] * quant
+                - minimum[:, None] * encoded_min[:, None]
+            )
+            cursor += 32
+    return output
+
+
+def _decode_q6_k_blocks(blocks: np.ndarray) -> np.ndarray:
+    low = blocks[:, :128]
+    high = blocks[:, 128:192]
+    scales = blocks[:, 192:208].view(np.int8).astype(np.int16)
+    d = _halves(blocks[:, 208:210])
+    output = np.empty((blocks.shape[0], 256), dtype=np.float32)
+    for segment in range(2):
+        ql = low[:, segment * 64 : (segment + 1) * 64]
+        qh = high[:, segment * 32 : (segment + 1) * 32]
+        local_scales = scales[:, segment * 8 : (segment + 1) * 8]
+        scale_pairs = tuple(
+            np.repeat(local_scales[:, group * 2 : group * 2 + 2], 16, axis=1)
+            for group in range(4)
+        )
+        quants = (
+            (ql[:, :32] & 15) | (((qh >> 0) & 3) << 4),
+            (ql[:, 32:64] & 15) | (((qh >> 2) & 3) << 4),
+            (ql[:, :32] >> 4) | (((qh >> 4) & 3) << 4),
+            (ql[:, 32:64] >> 4) | (((qh >> 6) & 3) << 4),
+        )
+        for group, (quant, local_scale) in enumerate(
+            zip(quants, scale_pairs, strict=True)
+        ):
+            start = segment * 128 + group * 32
+            output[:, start : start + 32] = (
+                d[:, None]
+                * local_scale
+                * (quant.astype(np.int16) - 32)
+            )
+    return output
+
+
+def _decode_q8_k_blocks(blocks: np.ndarray) -> np.ndarray:
+    d = blocks[:, :4].copy().view("<f4").reshape(-1).astype(np.float32)
+    return d[:, None] * blocks[:, 4:260].view(np.int8).astype(np.float32)
+
+
+def _decode_q2_k(block: np.ndarray) -> np.ndarray:
+    scales = block[:16]
+    quants = block[16:80]
+    d = _half(block[80:82])
+    minimum = _half(block[82:84])
+    output: list[np.ndarray] = []
+    scale_index = 0
+    for base in (0, 32):
+        q = quants[base : base + 32]
+        for shift in (0, 2, 4, 6):
+            for half in (q[:16], q[16:]):
+                encoded_scale = int(scales[scale_index])
+                scale_index += 1
+                local_d = d * (encoded_scale & 0x0F)
+                local_min = minimum * (encoded_scale >> 4)
+                values = ((half >> shift) & 0x03).astype(np.float32)
+                output.append(local_d * values - local_min)
+    return np.concatenate(output)
+
+
+def _decode_q3_k(block: np.ndarray) -> np.ndarray:
+    high_mask = block[:32]
+    quants = block[32:96]
+    packed_scales = block[96:108]
+    d = _half(block[108:110])
+    scale_words = [
+        int.from_bytes(packed_scales[offset : offset + 4].tobytes(), "little")
+        for offset in (0, 4, 8)
+    ]
+    mask_low = 0x03030303
+    mask_nibble = 0x0F0F0F0F
+    temporary = scale_words[2]
+    expanded_words = (
+        (scale_words[0] & mask_nibble)
+        | (((temporary >> 0) & mask_low) << 4),
+        (scale_words[1] & mask_nibble)
+        | (((temporary >> 2) & mask_low) << 4),
+        ((scale_words[0] >> 4) & mask_nibble)
+        | (((temporary >> 4) & mask_low) << 4),
+        ((scale_words[1] >> 4) & mask_nibble)
+        | (((temporary >> 6) & mask_low) << 4),
+    )
+    scales = np.frombuffer(
+        b"".join(word.to_bytes(4, "little") for word in expanded_words),
+        dtype=np.uint8,
+    ).astype(np.int16) - 32
+    output: list[np.ndarray] = []
+    scale_index = 0
+    mask_bit = 1
+    for base in (0, 32):
+        q = quants[base : base + 32]
+        for shift in (0, 2, 4, 6):
+            for offset in (0, 16):
+                low = ((q[offset : offset + 16] >> shift) & 0x03).astype(
+                    np.int16
+                )
+                high = high_mask[offset : offset + 16] & mask_bit
+                signed = low - np.where(high != 0, 0, 4)
+                output.append(
+                    (d * int(scales[scale_index]) * signed).astype(np.float32)
+                )
+                scale_index += 1
+            mask_bit <<= 1
+    return np.concatenate(output)
+
+
+def _k_scale_min(index: int, packed: np.ndarray) -> tuple[int, int]:
+    if index < 4:
+        return int(packed[index] & 63), int(packed[index + 4] & 63)
+    scale = int(packed[index + 4] & 0x0F) | (
+        int(packed[index - 4] >> 6) << 4
+    )
+    minimum = int(packed[index + 4] >> 4) | (
+        int(packed[index] >> 6) << 4
+    )
+    return scale, minimum
+
+
+def _decode_q4_k(block: np.ndarray) -> np.ndarray:
+    d = _half(block[:2])
+    minimum = _half(block[2:4])
+    scales = block[4:16]
+    quants = block[16:144]
+    output: list[np.ndarray] = []
+    for pair in range(4):
+        q = quants[pair * 32 : (pair + 1) * 32]
+        for local, values in enumerate((q & 0x0F, q >> 4)):
+            scale, encoded_min = _k_scale_min(pair * 2 + local, scales)
+            output.append(
+                (
+                    d * scale * values.astype(np.float32)
+                    - minimum * encoded_min
+                ).astype(np.float32)
+            )
+    return np.concatenate(output)
+
+
+def _decode_q5_k(block: np.ndarray) -> np.ndarray:
+    d = _half(block[:2])
+    minimum = _half(block[2:4])
+    scales = block[4:16]
+    high = block[16:48]
+    low = block[48:176]
+    output: list[np.ndarray] = []
+    high_bits = ((1, 2), (4, 8), (16, 32), (64, 128))
+    for pair, bits in enumerate(high_bits):
+        q = low[pair * 32 : (pair + 1) * 32]
+        pairs = ((q & 0x0F, bits[0]), (q >> 4, bits[1]))
+        for local, (values, bit) in enumerate(pairs):
+            scale, encoded_min = _k_scale_min(pair * 2 + local, scales)
+            quant = values.astype(np.int16) + np.where(high & bit, 16, 0)
+            output.append(
+                (d * scale * quant - minimum * encoded_min).astype(np.float32)
+            )
+    return np.concatenate(output)
+
+
+def _decode_q6_k(block: np.ndarray) -> np.ndarray:
+    low = block[:128]
+    high = block[128:192]
+    scales = block[192:208].view(np.int8).astype(np.int16)
+    d = _half(block[208:210])
+    output = np.empty(256, dtype=np.float32)
+    for segment in range(2):
+        ql = low[segment * 64 : (segment + 1) * 64]
+        qh = high[segment * 32 : (segment + 1) * 32]
+        local_scales = scales[segment * 8 : (segment + 1) * 8]
+        for index in range(32):
+            scale_pair = index // 16
+            quantized = (
+                int(ql[index] & 0x0F) | (int((qh[index] >> 0) & 0x03) << 4),
+                int(ql[index + 32] & 0x0F)
+                | (int((qh[index] >> 2) & 0x03) << 4),
+                int(ql[index] >> 4) | (int((qh[index] >> 4) & 0x03) << 4),
+                int(ql[index + 32] >> 4)
+                | (int((qh[index] >> 6) & 0x03) << 4),
+            )
+            positions = (index, index + 32, index + 64, index + 96)
+            for group, (position, quant) in enumerate(
+                zip(positions, quantized, strict=True)
+            ):
+                output[segment * 128 + position] = (
+                    d * int(local_scales[scale_pair + group * 2]) * (quant - 32)
+                )
+    return output
+
+
+def _decode_q8_k(block: np.ndarray) -> np.ndarray:
+    d = float(block[:4].copy().view("<f4")[0])
+    return d * block[4:260].view(np.int8).astype(np.float32)
+
+
 def _write_stage_gguf(
     source: GgufDocument,
     destination: Path,
@@ -691,11 +1510,19 @@ def _write_stage_gguf(
     layer_end: int,
     total_layers: int,
 ) -> None:
+    architecture_prefix = source.architecture + "."
+    retained_general = frozenset(
+        (
+            "general.architecture",
+            "general.alignment",
+            "general.file_type",
+            "general.quantization_version",
+        )
+    )
     metadata = [
         entry
         for entry in source.metadata
-        if not entry.key.startswith("split.")
-        and not entry.key.startswith("mycellios.stage.")
+        if entry.key in retained_general or entry.key.startswith(architecture_prefix)
     ]
     metadata.extend(
         (
@@ -905,9 +1732,9 @@ def _tensor_size_bytes(
         )
     elements = math.prod(dimensions)
     block_elements, block_bytes = layout
-    if elements % block_elements:
+    if dimensions[0] % block_elements:
         raise NativeGgufError(
-            f"GGUF tensor {name!r} element count is not divisible by its block size"
+            f"GGUF tensor {name!r} row width is not divisible by its block size"
         )
     return elements // block_elements * block_bytes
 
@@ -973,7 +1800,9 @@ class _Reader:
 
 def _write_metadata_value(output: BinaryIO, value_type: int, value: Any) -> None:
     if value_type == 8:
-        _write_string(output, _nonempty(value, "GGUF string"))
+        if not isinstance(value, str):
+            raise NativeGgufError("GGUF string is invalid")
+        _write_string(output, value)
         return
     if value_type == 9:
         if not isinstance(value, GgufArray):
@@ -1031,6 +1860,36 @@ def _validate_range(layer_start: int, layer_end: int, total_layers: int) -> None
         raise NativeGgufError("native GGUF layer range is invalid")
 
 
+def _validate_complete_ranges(
+    ranges: Sequence[tuple[int, int]],
+    total_layers: int,
+) -> None:
+    if not ranges:
+        raise NativeGgufError("native GGUF fleet ranges are empty")
+    cursor = 0
+    for value in ranges:
+        if (
+            not isinstance(value, tuple)
+            or len(value) != 2
+            or any(
+                not isinstance(item, int) or isinstance(item, bool)
+                for item in value
+            )
+        ):
+            raise NativeGgufError("native GGUF fleet range is invalid")
+        layer_start, layer_end = value
+        _validate_range(layer_start, layer_end, total_layers)
+        if layer_start != cursor:
+            raise NativeGgufError(
+                "native GGUF fleet ranges must be ordered, contiguous and complete"
+            )
+        cursor = layer_end
+    if cursor != total_layers:
+        raise NativeGgufError(
+            "native GGUF fleet ranges must be ordered, contiguous and complete"
+        )
+
+
 def _file_record(path: Path) -> dict[str, Any]:
     return {"sizeBytes": path.stat().st_size, "sha256": _sha256_file(path)}
 
@@ -1080,6 +1939,18 @@ def _canonical_json(value: Any) -> bytes:
     ).encode("utf-8")
 
 
+def _native_model_identity(source_digest: str, config_digest: str) -> str:
+    return "sha256:" + hashlib.sha256(
+        _canonical_json(
+            {
+                "schema": "gdlp-native-gguf-model-identity/1",
+                "sourceGgufSha256": source_digest,
+                "configSha256": config_digest,
+            }
+        )
+    ).hexdigest()
+
+
 def _exact_mapping(
     value: object, keys: Sequence[str], name: str
 ) -> Mapping[str, Any]:
@@ -1119,14 +1990,19 @@ __all__ = [
     "GgufMetadata",
     "GgufTensor",
     "NATIVE_GGUF_STAGE_CONFIG",
+    "NATIVE_GGUF_FLEET_MANIFEST",
+    "NATIVE_GGUF_FLEET_SCHEMA",
     "NATIVE_GGUF_STAGE_MANIFEST",
     "NATIVE_GGUF_STAGE_SCHEMA",
     "NATIVE_GGUF_STAGE_WEIGHTS",
     "NativeGgufError",
+    "NativeGgufFleet",
     "NativeGgufStagePackage",
+    "build_native_gguf_fleet",
     "build_native_gguf_stage",
     "dequantize_gguf_tensor",
     "materialize_native_gguf_stage",
     "parse_gguf",
+    "verify_native_gguf_fleet",
     "verify_native_gguf_stage",
 ]

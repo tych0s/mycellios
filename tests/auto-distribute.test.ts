@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   AUTO_DISTRIBUTE_SCHEMA,
+  buildCellWorkerConfig,
   compileAutoDistribution,
   parseAutoDistributionConfig,
   type AutoDistributionConfig,
   type CompiledModelProfile,
 } from "../src/distribution/auto-distribute.js";
+import { deploymentMetricsFromCanaryEvidence } from "../src/contracts/deployment-canary.js";
 import type { DistributedModelProfile } from "../src/distribution/types.js";
 
 const MIB = 1024 * 1024;
@@ -54,6 +56,50 @@ describe("automatic compatible-model distribution", () => {
     value.distribution.minimumStages = 3;
 
     expect(() => parseAutoDistributionConfig(value)).toThrow();
+  });
+
+  it("seals the activation canary instead of configuring measured TPS manually", () => {
+    const input = configFixture();
+    input.coordinator = {
+      url: "http://127.0.0.1:8080",
+      region: "test-lan",
+      maxConcurrency: 1,
+    };
+    const config = parseAutoDistributionConfig(input);
+    const compilation = compileAutoDistribution(config, profileFixture());
+    const worker = buildCellWorkerConfig(
+      config,
+      compilation,
+      "http://127.0.0.1:8088",
+      [1, 2, 3].map((index) => ({
+        sampleId: `canary-${index}`,
+        outputTokens: 8,
+        activeMs: 1_000,
+        ttftMs: 250 + index,
+        completed: true as const,
+      })),
+      "pipeline-activation-123",
+    );
+
+    expect(worker.deployment.tokensPerSecond).toBeUndefined();
+    expect(worker.deployment.ttftMs).toBeUndefined();
+    expect(worker.deployment.canaryEvidence).toMatchObject({
+      model: config.model.publicName,
+      modelDigest: ARTIFACT_IDENTITY,
+      activationId: "pipeline-activation-123",
+      warmupSamples: 1,
+    });
+    expect(deploymentMetricsFromCanaryEvidence(
+      worker.deployment.canaryEvidence!,
+      {
+        model: config.model.publicName,
+        modelDigest: ARTIFACT_IDENTITY,
+        activationId: "pipeline-activation-123",
+      },
+    )).toMatchObject({
+      tokensPerSecond: 8,
+      ttftMs: 252,
+    });
   });
 });
 

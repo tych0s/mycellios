@@ -8,6 +8,11 @@ import {
   type CoordinatorRuntime,
 } from "../src/coordinator/server.js";
 import type { StoredRequestedModel } from "../src/storage/store.js";
+import {
+  MODEL_ADAPTER_EVIDENCE_SCOPE,
+  MODEL_ADAPTER_REGISTRY_ID,
+  resolveModelAdapterContract,
+} from "../src/contracts/model-adapter-registry.js";
 import { addWorker } from "./helpers.js";
 
 describe("requested model API activation flow", () => {
@@ -137,6 +142,9 @@ describe("requested model API activation flow", () => {
       schema: "mycellios-hub-model-capacity/1",
       compatible: true,
       adapterId: "transformers-qwen3-v1",
+      ...qwenAdapterIdentity(),
+      modelType: "qwen3",
+      architecture: "Qwen3ForCausalLM",
       requiredVramMiB: 2_200,
       minimumStageVramMiB: 512,
       minimumNodes: 2,
@@ -196,6 +204,9 @@ describe("requested model API activation flow", () => {
       schema: "mycellios-hub-model-capacity/1",
       compatible: true,
       adapterId: "transformers-qwen3-v1",
+      ...qwenAdapterIdentity(),
+      modelType: "qwen3",
+      architecture: "Qwen3ForCausalLM",
       requiredVramMiB: 2_200,
       minimumStageVramMiB: 512,
       minimumNodes: 2,
@@ -398,9 +409,26 @@ function requestedModel(runtime: CoordinatorRuntime, id: string): StoredRequeste
     schema: "mycellios-hub-model-capacity/1",
     compatible: true,
     adapterId: "transformers-qwen3-v1",
+    ...qwenAdapterIdentity(),
+    modelType: "qwen3",
+    architecture: "Qwen3ForCausalLM",
     requiredVramMiB: 2_200,
     minimumStageVramMiB: 512,
     minimumNodes: 2,
   }, null);
   return runtime.store.getRequestedModel(id)!;
+}
+
+function qwenAdapterIdentity(): {
+  adapterContractId: string;
+  adapterRegistryId: string;
+  adapterEvidenceScope: "software-contract-only";
+} {
+  const adapter = resolveModelAdapterContract("qwen3", "Qwen3ForCausalLM");
+  if (!adapter) throw new Error("qwen3 adapter registry fixture is missing");
+  return {
+    adapterContractId: adapter.adapterContractId,
+    adapterRegistryId: MODEL_ADAPTER_REGISTRY_ID,
+    adapterEvidenceScope: MODEL_ADAPTER_EVIDENCE_SCOPE,
+  };
 }

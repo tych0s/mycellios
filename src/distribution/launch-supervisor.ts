@@ -50,9 +50,31 @@ export interface LaunchAgentStartRequest {
   process: PythonLaunchProcess;
 }
 
+export interface RuntimePreparationProgressEvent {
+  stageIndex: number;
+  layerStart: number;
+  layerEnd: number;
+  state: "preparing" | "ready";
+  packageId?: string;
+  weightsSizeBytes?: number;
+}
+
 /** Implement this interface with an RPC client to launch on a remote node. */
 export interface LaunchAgent {
   readonly id: string;
+  /**
+   * Optional worker-local model preparation. The returned processes may only
+   * replace host-local command arguments; the coordinator description remains
+   * the authorization contract sent with runtime.start.
+   */
+  prepareRuntime?(
+    description: PythonPipelineLaunchDescription,
+    nodeId: string,
+    onProgress?: (event: RuntimePreparationProgressEvent) => void,
+  ): Promise<readonly PythonLaunchProcess[]>;
+  subscribeRuntimePreparation?(
+    listener: (event: RuntimePreparationProgressEvent) => void,
+  ): () => void;
   start(request: LaunchAgentStartRequest, signal: AbortSignal): Promise<LaunchProcessHandle>;
   /** Optional coordinator-side loopback proxy for runtimes behind NAT. */
   createRuntimeProxy?(targetPort: number): Promise<{

@@ -98,6 +98,34 @@ describe("public coordinator security boundaries", () => {
     expect(response.headers["x-content-type-options"]).toBe("nosniff");
   });
 
+  it("rejects development mock deployments on the production coordinator boundary", async () => {
+    const runtime = await coordinator();
+    const payload = validWorkerRegistration();
+    (payload.capabilities.deployments as Array<Record<string, unknown>>).push({
+      deploymentId: "dep-mock",
+      model: "fixture",
+      modelDigest: "sha256:fixture",
+      mode: "replica",
+      adapter: "mock",
+      peakVramMb: 512,
+      contextLimit: 4_096,
+      maxConcurrency: 1,
+      freeSlots: 1,
+      tokensPerSecond: 20,
+      ttftMs: 10,
+      dataLocality: "local",
+    });
+    const response = await runtime.app.inject({
+      method: "POST",
+      url: "/internal/v1/workers/register",
+      payload,
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({
+      error: { code: "development_adapter_not_allowed" },
+    });
+  });
+
   it("exposes bounded desktop repair diagnostics without requiring machine access", async () => {
     const runtime = await coordinator();
     const payload = validWorkerRegistration();

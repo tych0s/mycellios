@@ -124,6 +124,7 @@ describe("automatic coordinator benchmark", () => {
         reused_kv_tokens: 0,
         ttft_ms: 420,
         active_ms: 6_000,
+        execution_trace: benchmarkTrace("job-real"),
       },
     }), { status: 200, headers: { "content-type": "application/json" } });
 
@@ -159,6 +160,20 @@ describe("automatic coordinator benchmark", () => {
     expect(measurement.workload.routeClasses).toEqual(["pipeline"]);
     expect(measurement.model.digest).toBe("sha256:rev-1");
     expect(measurement.scenarioFingerprint).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(measurement.networkTraces).toHaveLength(3);
+    expect(measurement.networkTraces?.[0]).toMatchObject({
+      jobId: "job-real",
+      stages: [
+        { nodeId: "node-a", layerStart: 0, layerEnd: 14 },
+        { nodeId: "node-b", layerStart: 14, layerEnd: 28 },
+      ],
+      boundaries: [{
+        transport: "relay",
+        bytesSourceToDestination: 8_192,
+        bytesDestinationToSource: 512,
+      }],
+    });
+    expect(measurement.topology.digest).toMatch(/^sha256:[0-9a-f]{64}$/);
     expect(measurement.notes.join(" ")).toContain("no hay datos simulados");
   });
 
@@ -196,6 +211,83 @@ function distributedWorkers(): StoredWorker[] {
     worker("worker-a", "node-a", "NVIDIA RTX A", 4_096, 6_144, 70, true),
     worker("worker-b", "node-b", "AMD Radeon B", 6_144, 6_144, 80, false),
   ];
+}
+
+function benchmarkTrace(jobId: string) {
+  return {
+    schema: "mycellios-network-execution-trace/1",
+    jobId,
+    attempt: 1,
+    observedFrom: 1_000,
+    observedUntil: 7_000,
+    durationMs: 6_000,
+    routeClass: "replica",
+    affinityHit: false,
+    selectedRoute: [{
+      routeStageIndex: 0,
+      workerId: "worker-a",
+      deploymentId: "qwen-pipeline",
+      modelDigest: "sha256:model",
+      stageIndex: 0,
+    }],
+    stages: [
+      {
+        routeStageIndex: 0,
+        stageIndex: 0,
+        nodeId: "node-a",
+        workerId: "worker-a",
+        deploymentId: "qwen-pipeline",
+        deploymentOwnerWorkerId: "worker-a",
+        modelDigest: "sha256:model",
+        layerStart: 0,
+        layerEnd: 14,
+        deviceType: "gpu",
+        backend: "cuda",
+        precision: "bf16",
+        deviceName: "NVIDIA RTX A",
+        startedAt: null,
+        endedAt: null,
+        durationMs: null,
+      },
+      {
+        routeStageIndex: 0,
+        stageIndex: 1,
+        nodeId: "node-b",
+        workerId: "worker-b",
+        deploymentId: "qwen-pipeline",
+        deploymentOwnerWorkerId: "worker-a",
+        modelDigest: "sha256:model",
+        layerStart: 14,
+        layerEnd: 28,
+        deviceType: "gpu",
+        backend: "rocm",
+        precision: "bf16",
+        deviceName: "AMD Radeon B",
+        startedAt: null,
+        endedAt: null,
+        durationMs: null,
+      },
+    ],
+    physicalBoundaryCount: 1,
+    boundaries: [{
+      boundaryIndex: 0,
+      fromStageIndex: 0,
+      toStageIndex: 1,
+      sourceNodeId: "node-a",
+      destinationNodeId: "node-b",
+      physicalBoundary: true,
+      transport: "relay",
+      streamId: "stream-ab",
+      bytesSourceToDestination: 8_192,
+      bytesDestinationToSource: 512,
+      countersExclusive: true,
+      connectRttMs: 14,
+      streamCreatedAt: 900,
+      streamConnectedAt: 950,
+      streamEndedAt: null,
+      observedOverlapMs: 6_000,
+    }],
+  };
 }
 
 function worker(
@@ -239,7 +331,7 @@ function worker(
         model: "qwen3-0.6b",
         modelDigest: "sha256:model",
         mode: "replica",
-        adapter: "local-model-runtime",
+        adapter: "mycellios-pipeline",
         peakVramMb: 8_192,
         contextLimit: 4_096,
         maxConcurrency: 1,

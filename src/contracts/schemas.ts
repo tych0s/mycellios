@@ -1,7 +1,16 @@
 import { z } from "zod";
 import { runtimePerformanceProfileSchema } from "../performance/runtime-profile.js";
+import {
+  deploymentCanaryEvidenceSchema,
+  deploymentMetricsFromCanaryEvidence,
+} from "./deployment-canary.js";
 
-const adapterKind = z.enum(["mock", "local-model-runtime", "externalggufruntime", "openai-compatible"]);
+const adapterKind = z.enum([
+  "mycellios-native",
+  "mycellios-pipeline",
+  "mock",
+]);
+const deploymentAdapterKind = z.enum(["mycellios-pipeline", "mock"]);
 const executionBackend = z.enum(["cpu", "cuda", "rocm", "directml", "mps", "xpu", "vulkan", "webgpu"]);
 
 const executionStageSchema = z.object({
@@ -86,8 +95,9 @@ export const deploymentSchema = z
     deploymentId: z.string().min(1),
     model: z.string().min(1),
     modelDigest: z.string().min(1),
+    activationId: z.string().trim().min(1).max(256).optional(),
     mode: z.enum(["replica", "pipeline"]),
-    adapter: adapterKind,
+    adapter: deploymentAdapterKind,
     peakVramMb: z.number().int().positive(),
     contextLimit: z.number().int().positive(),
     maxConcurrency: z.number().int().positive(),
@@ -95,7 +105,8 @@ export const deploymentSchema = z
     tokensPerSecond: z.number().positive(),
     throughputSource: z.enum(["measured", "estimated", "configured", "default"]).optional(),
     ttftMs: z.number().nonnegative(),
-    dataLocality: z.enum(["local", "external"]),
+    canaryEvidence: deploymentCanaryEvidenceSchema.optional(),
+    dataLocality: z.literal("local"),
     stage: z
       .object({
         index: z.number().int().nonnegative(),
@@ -141,6 +152,52 @@ export const deploymentSchema = z
           path: ["internalPipeline", "boundaries"],
         });
       }
+    }
+    if (deployment.adapter === "mycellios-pipeline") {
+      if (
+        !deployment.activationId
+        || !deployment.canaryEvidence
+        || deployment.throughputSource !== "measured"
+      ) {
+        context.addIssue({
+          code: "custom",
+          message: "A native pipeline deployment requires bound measured canary evidence",
+          path: ["canaryEvidence"],
+        });
+      } else {
+        try {
+          const measured = deploymentMetricsFromCanaryEvidence(
+            deployment.canaryEvidence,
+            {
+              model: deployment.model,
+              modelDigest: deployment.modelDigest,
+              activationId: deployment.activationId,
+            },
+          );
+          if (
+            measured.tokensPerSecond !== deployment.tokensPerSecond
+            || measured.ttftMs !== deployment.ttftMs
+          ) {
+            context.addIssue({
+              code: "custom",
+              message: "Native pipeline metrics must be derived from its canary evidence",
+              path: ["tokensPerSecond"],
+            });
+          }
+        } catch (error) {
+          context.addIssue({
+            code: "custom",
+            message: error instanceof Error ? error.message : String(error),
+            path: ["canaryEvidence"],
+          });
+        }
+      }
+    } else if (deployment.canaryEvidence || deployment.activationId) {
+      context.addIssue({
+        code: "custom",
+        message: "Canary activation evidence is reserved for native pipelines",
+        path: ["canaryEvidence"],
+      });
     }
   });
 
@@ -195,43 +252,6 @@ export const workerCapabilitiesSchema = z.object({
     uplinkMbps: z.number().nonnegative(),
     downlinkMbps: z.number().nonnegative(),
   }),
-  llmfit: z
-    .object({
-      source: z.literal("llmfit"),
-      scope: z.literal("host"),
-      backend: z.string().min(1),
-      cpuName: z.string(),
-      cpuCores: z.number().int().nonnegative(),
-      totalRamMb: z.number().int().nonnegative(),
-      availableRamMb: z.number().int().nonnegative(),
-      gpuCount: z.number().int().nonnegative(),
-      gpus: z.array(
-        z.object({
-          name: z.string().min(1),
-          backend: z.string().min(1),
-          vramMb: z.number().int().nonnegative(),
-          unifiedMemory: z.boolean(),
-        }).strict(),
-      ),
-      model: z
-        .object({
-          deploymentId: z.string().min(1).optional(),
-          requestedModel: z.string().min(1),
-          resolvedModel: z.string().min(1),
-          fitLevel: z.string().min(1),
-          runMode: z.string().min(1),
-          runtime: z.string().min(1).optional(),
-          bestQuant: z.string().min(1).optional(),
-          estimatedTokensPerSecond: z.number().positive().optional(),
-          measuredTokensPerSecond: z.number().positive().optional(),
-          memoryRequiredMb: z.number().int().nonnegative().optional(),
-          usableContext: z.number().int().positive().optional(),
-        })
-        .strict()
-        .optional(),
-    })
-    .strict()
-    .optional(),
   distributedExecutor: z
     .object({
       protocol: z.enum(["gdlp-worker-tunnel/1", "gdlp-worker-tunnel/2"]),
@@ -295,7 +315,7 @@ export const workerCapabilitiesSchema = z.object({
           candidates: z.array(z.object({
             host: z.string().min(1).max(253),
             port: z.number().int().min(1).max(65_535),
-            scope: z.enum(["lan", "configured"]),
+            scope: z.enum(["lan", "configured", "public-mapped"]),
           }).strict()).min(1).max(8),
           maxSessions: z.number().int().min(1).max(256),
           maxSessionBytes: z.number().int().min(1024 * 1024).max(16 * 1024 * 1024 * 1024),
@@ -321,8 +341,8 @@ export const workerRegistrationSchema = z.object({
 export const workerConfigSchema = z.object({
   region: z.string().min(1),
   instanceId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/).optional(),
-  // `cell` means that offeredVramMb is the aggregate capacity of a sidecar
-  // cell represented by this gateway, not the gateway host's physical GPU.
+  // `cell` means that offeredVramMb is the aggregate capacity of a native
+  // Mycellios pipeline represented by this gateway, not one physical GPU.
   capacityScope: z.enum(["host", "cell"]).default("host"),
   offeredVramMb: z.number().int().min(512),
   limits: z.object({
@@ -333,43 +353,56 @@ export const workerConfigSchema = z.object({
   }),
   adapter: z.discriminatedUnion("kind", [
     z.object({
+      kind: z.literal("mycellios-native"),
+      model: z.literal("mycellios-native-control"),
+    }),
+    z.object({
       kind: z.literal("mock"),
+      developmentOnly: z.literal(true),
       model: z.string().min(1),
       tokensPerSecond: z.number().positive().default(20),
       ttftMs: z.number().nonnegative().default(150),
       failureRate: z.number().min(0).max(1).default(0),
     }),
     z.object({
-      kind: z.literal("local-model-runtime"),
+      kind: z.literal("mycellios-pipeline"),
       model: z.string().min(1),
-      baseUrl: z.string().url().default("http://127.0.0.1:11434"),
-    }),
-    z.object({
-      kind: z.literal("externalggufruntime"),
-      model: z.string().min(1),
-      baseUrl: z.string().url().default("http://127.0.0.1:8080"),
-    }),
-    z.object({
-      kind: z.literal("openai-compatible"),
-      model: z.string().min(1),
-      baseUrl: z.string().url(),
-      requestTemperature: z.number().min(0).max(2).optional(),
-      apiPathPrefix: z
-        .string()
-        .max(128)
-        .regex(/^(?:[A-Za-z0-9._~-]+\/?)*$/)
-        .default("v1"),
-      apiKeyEnv: z.string().min(1).optional(),
-      allowedHosts: z.array(z.string().min(1)).default([]),
-    }),
+      baseUrl: z.string().url().superRefine((value, context) => {
+        try {
+          const url = new URL(value);
+          const hostname = url.hostname.toLowerCase();
+          if (
+            !new Set(["localhost", "127.0.0.1", "::1", "[::1]"]).has(hostname)
+            || !new Set(["http:", "https:"]).has(url.protocol)
+            || url.username !== ""
+            || url.password !== ""
+            || url.search !== ""
+            || url.hash !== ""
+            || !new Set(["", "/"]).has(url.pathname)
+          ) {
+            context.addIssue({
+              code: "custom",
+              message: "mycellios-pipeline requires a credential-free loopback origin",
+            });
+          }
+        } catch {
+          context.addIssue({
+            code: "custom",
+            message: "mycellios-pipeline requires a valid loopback origin",
+          });
+        }
+      }),
+    }).strict(),
   ]),
   deployment: z
     .object({
       modelDigest: z.string().min(1).optional(),
+      activationId: z.string().trim().min(1).max(256).optional(),
       peakVramMb: z.number().int().positive().optional(),
       contextLimit: z.number().int().positive().default(8_192),
       tokensPerSecond: z.number().positive().optional(),
       ttftMs: z.number().nonnegative().optional(),
+      canaryEvidence: deploymentCanaryEvidenceSchema.optional(),
       internalPipeline: z
         .object({
           stageCount: z.number().int().min(2).max(64),
@@ -380,38 +413,72 @@ export const workerConfigSchema = z.object({
       execution: executionTelemetrySchema.optional(),
     })
     .default({ contextLimit: 8_192 }),
-  llmfit: z
-    .object({
-      enabled: z.boolean().default(false),
-      required: z.boolean().default(false),
-      executable: z.string().min(1).max(4_096).default("llmfit"),
-      arguments: z.array(z.string().max(4_096)).max(32).default([]),
-      timeoutMs: z.number().int().min(1_000).max(120_000).default(15_000),
-      model: z.string().min(1).optional(),
-      applyPerformanceEstimate: z.boolean().default(false),
-    })
-    .strict()
-    .default({
-      enabled: false,
-      required: false,
-      executable: "llmfit",
-      arguments: [],
-      timeoutMs: 15_000,
-      applyPerformanceEstimate: false,
-    }),
 }).strict().superRefine((config, context) => {
-  if (config.adapter.kind !== "mock" && !config.deployment.modelDigest) {
+  if (
+    config.adapter.kind === "mycellios-pipeline"
+    && !config.deployment.modelDigest
+  ) {
     context.addIssue({
       code: "custom",
       message: "A real inference adapter requires a pinned modelDigest",
       path: ["deployment", "modelDigest"],
     });
   }
-  if (config.capacityScope === "cell" && config.adapter.kind !== "openai-compatible") {
+  if (config.capacityScope === "cell" && config.adapter.kind !== "mycellios-pipeline") {
     context.addIssue({
       code: "custom",
-      message: "capacityScope=cell requires an OpenAI-compatible sidecar gateway",
+      message: "capacityScope=cell requires a native Mycellios pipeline gateway",
       path: ["capacityScope"],
+    });
+  }
+  if (
+    config.adapter.kind === "mycellios-pipeline"
+    && !config.deployment.canaryEvidence
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "mycellios-pipeline requires sealed canary evidence",
+      path: ["deployment", "canaryEvidence"],
+    });
+  }
+  if (
+    config.adapter.kind === "mycellios-pipeline"
+    && !config.deployment.activationId
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "mycellios-pipeline requires an independently verified activationId",
+      path: ["deployment", "activationId"],
+    });
+  }
+  if (
+    config.adapter.kind === "mycellios-pipeline"
+    && (
+      config.deployment.tokensPerSecond !== undefined
+      || config.deployment.ttftMs !== undefined
+    )
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "mycellios-pipeline performance cannot be configured manually",
+      path: ["deployment"],
+    });
+  }
+  if (
+    config.adapter.kind === "mycellios-pipeline"
+    && config.deployment.canaryEvidence
+    && (
+      config.deployment.canaryEvidence.model !== config.adapter.model
+      || config.deployment.canaryEvidence.modelDigest
+        !== config.deployment.modelDigest
+      || config.deployment.canaryEvidence.activationId
+        !== config.deployment.activationId
+    )
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "mycellios-pipeline canary evidence does not match the deployment",
+      path: ["deployment", "canaryEvidence"],
     });
   }
 });

@@ -25,19 +25,24 @@ from .model import (
     _checkpoint_name,
     _hub_snapshot_commit,
     _validate_checkpoint_coverage,
-    resolve_model_snapshot,
+    model_artifact_reference,
+    resolve_stage_model_snapshot,
 )
 from .model_adapters import (
+    ADAPTER_REGISTRY_ID,
     SelectiveStageAdapter,
+    canonical_adapter_registry_bytes,
     resolve_selective_stage_adapter,
+    validate_adapter_registry_document,
 )
 
 
-STAGE_ARTIFACT_SCHEMA = "mycellios-safetensors-stage-package/1"
+STAGE_ARTIFACT_SCHEMA = "mycellios-safetensors-stage-package/2"
 STAGE_ARTIFACT_FORMAT = "mycellios-stage-safetensors"
 STAGE_ARTIFACT_MANIFEST = "mycellios-stage.json"
 STAGE_ARTIFACT_CONFIG = "config.json"
 STAGE_ARTIFACT_WEIGHTS = "stage.safetensors"
+STAGE_ARTIFACT_ADAPTER_REGISTRY = "model-adapter-registry.json"
 STAGE_TENSOR_ABI = "mycellios-transformers-global-stage-tensors/1"
 
 _COPY_BUFFER_BYTES = 8 * 1024 * 1024
@@ -137,6 +142,7 @@ class VerifiedStageArtifact:
     manifest: SafeTensorsStageArtifact
     config_path: Path
     weights_path: Path
+    adapter_registry_path: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,20 +201,34 @@ def compile_safetensors_stage_artifact(
             f"stage artifact compiler requires a {STAGE_ENDIANNESS}-endian host"
         )
 
-    snapshot = Path(resolve_model_snapshot(model_name, revision)).resolve()
+    source_config = AutoConfig.from_pretrained(model_name, revision=revision)
+    total_layers = _positive_integer(
+        getattr(source_config, "num_hidden_layers", None), "num_hidden_layers"
+    )
+    if not 0 <= layer_start < layer_end <= total_layers:
+        raise ValueError(
+            f"layer range [{layer_start}, {layer_end}) is outside [0, {total_layers})"
+        )
+    snapshot = Path(
+        resolve_stage_model_snapshot(
+            model_name,
+            revision=revision,
+            layer_start=layer_start,
+            layer_end=layer_end,
+            total_layers=total_layers,
+        )
+    ).resolve()
     config_path = snapshot / STAGE_ARTIFACT_CONFIG
     if not config_path.is_file():
         raise FileNotFoundError(f"model checkpoint has no config.json: {snapshot}")
     config_bytes = config_path.read_bytes()
     config_document = _json_object(config_bytes, "model config")
     config = AutoConfig.from_pretrained(str(snapshot), local_files_only=True)
-    total_layers = _positive_integer(
+    resolved_total_layers = _positive_integer(
         getattr(config, "num_hidden_layers", None), "num_hidden_layers"
     )
-    if not 0 <= layer_start < layer_end <= total_layers:
-        raise ValueError(
-            f"layer range [{layer_start}, {layer_end}) is outside [0, {total_layers})"
-        )
+    if resolved_total_layers != total_layers:
+        raise ValueError("resolved stage snapshot changed its total layer count")
 
     key_map = _checkpoint_key_map(snapshot)
     _validate_checkpoint_namespace(key_map, total_layers)
@@ -232,18 +252,10 @@ def compile_safetensors_stage_artifact(
         )
     ).hexdigest()
     stable_revision = _hub_snapshot_commit(snapshot) or revision
-    model_identity = (
-        "sha256:"
-        + hashlib.sha256(
-            _canonical_json(
-                {
-                    "schema": "mycellios-model-source-contract/1",
-                    "sourceContractSha256": source_contract_sha256,
-                    "revision": stable_revision,
-                }
-            )
-        ).hexdigest()
-    )
+    # This identity names the complete immutable source model and therefore
+    # must be identical to the profile compiled by the coordinator. The stage
+    # package receives its own independent package_id below.
+    model_identity = model_artifact_reference(str(snapshot)).identity
     quantization = _quantization_document(config_document, source_dtypes)
 
     destination_path = Path(destination).resolve()
@@ -260,6 +272,10 @@ def compile_safetensors_stage_artifact(
     )
     try:
         _write_bytes_atomic_payload(temporary / STAGE_ARTIFACT_CONFIG, canonical_config)
+        _write_bytes_atomic_payload(
+            temporary / STAGE_ARTIFACT_ADAPTER_REGISTRY,
+            canonical_adapter_registry_bytes(),
+        )
         weights_path = temporary / STAGE_ARTIFACT_WEIGHTS
         _write_stage_safetensors(weights_path, selected)
         weights_size = weights_path.stat().st_size
@@ -271,6 +287,16 @@ def compile_safetensors_stage_artifact(
                 "role": "model-config",
                 "sizeBytes": config_size,
                 "sha256": _sha256_file(temporary / STAGE_ARTIFACT_CONFIG),
+            },
+            {
+                "path": STAGE_ARTIFACT_ADAPTER_REGISTRY,
+                "role": "model-adapter-registry",
+                "sizeBytes": (
+                    temporary / STAGE_ARTIFACT_ADAPTER_REGISTRY
+                ).stat().st_size,
+                "sha256": _sha256_file(
+                    temporary / STAGE_ARTIFACT_ADAPTER_REGISTRY
+                ),
             },
             {
                 "path": STAGE_ARTIFACT_WEIGHTS,
@@ -308,6 +334,8 @@ def compile_safetensors_stage_artifact(
                 "family": adapter.model_type,
                 "architecture": architecture,
                 "adapter": adapter.adapter_id,
+                "adapterContractId": adapter.adapter_contract_id,
+                "adapterRegistryId": ADAPTER_REGISTRY_ID,
                 "quantization": quantization,
             },
             "stage": {
@@ -381,6 +409,95 @@ def compile_safetensors_stage_artifact(
         raise
 
 
+def prepare_safetensors_stage_artifact(
+    model_name: str,
+    destination: str | os.PathLike[str],
+    *,
+    layer_start: int,
+    layer_end: int,
+    revision: str | None = None,
+) -> StageArtifactCompilation:
+    """Reuse one authenticated stage package or compile it atomically.
+
+    Desktop contributors call this entrypoint during ``runtime.prepare``.  A
+    cache hit is never trusted from its directory name: the complete manifest,
+    file digests, tensor contract and exact layer range are revalidated before
+    the package is exposed to a model process.
+    """
+
+    destination_path = Path(destination).resolve()
+    if not destination_path.exists():
+        return compile_safetensors_stage_artifact(
+            model_name,
+            destination_path,
+            layer_start=layer_start,
+            layer_end=layer_end,
+            revision=revision,
+        )
+    verified = verify_stage_artifact(
+        destination_path,
+        expected_layer_start=layer_start,
+        expected_layer_end=layer_end,
+    )
+    document = verified.manifest.to_document()
+    model = _exact_mapping(
+        document.get("model"),
+        {
+            "identity",
+            "source",
+            "revision",
+            "snapshotCommit",
+            "sourceContractSha256",
+            "configSha256",
+            "family",
+            "architecture",
+            "adapter",
+            "adapterContractId",
+            "adapterRegistryId",
+            "quantization",
+        },
+        "stage artifact model",
+    )
+    if model.get("source") != model_name:
+        raise ValueError("cached stage artifact belongs to a different model source")
+    artifact = _exact_mapping(
+        document.get("artifact"),
+        {"fileCount", "payloadSizeBytes", "tensorCount", "tensorBytes"},
+        "stage artifact accounting",
+    )
+    files = {
+        str(item["role"]): item
+        for item in _sequence(document.get("files"), "stage artifact files")
+        if isinstance(item, dict)
+    }
+    weights = files.get("stage-weights")
+    if weights is None:
+        raise ValueError("cached stage artifact has no stage weights")
+    return StageArtifactCompilation(
+        destination=str(destination_path),
+        schema=STAGE_ARTIFACT_SCHEMA,
+        package_id=verified.manifest.package_id,
+        artifact_identity=f"sha256:{verified.manifest.package_id}",
+        manifest_sha256=_sha256_file(destination_path / STAGE_ARTIFACT_MANIFEST),
+        model_identity=verified.manifest.model_identity,
+        family=verified.manifest.family,
+        adapter=verified.manifest.adapter,
+        layer_start=verified.manifest.layer_start,
+        layer_end=verified.manifest.layer_end,
+        total_layers=verified.manifest.total_layers,
+        tensor_count=_nonnegative_integer(
+            artifact.get("tensorCount"), "artifact tensor count"
+        ),
+        tensor_bytes=_nonnegative_integer(
+            artifact.get("tensorBytes"), "artifact tensor bytes"
+        ),
+        weights_sha256=_sha256(weights.get("sha256"), "stage weights digest"),
+        weights_size_bytes=_nonnegative_integer(
+            weights.get("sizeBytes"), "stage weights size"
+        ),
+    )
+
+
 def parse_stage_artifact_manifest(value: object) -> SafeTensorsStageArtifact:
     document = _exact_mapping(
         value,
@@ -418,6 +535,8 @@ def parse_stage_artifact_manifest(value: object) -> SafeTensorsStageArtifact:
             "family",
             "architecture",
             "adapter",
+            "adapterContractId",
+            "adapterRegistryId",
             "quantization",
         ),
         "stage artifact model",
@@ -436,6 +555,30 @@ def parse_stage_artifact_manifest(value: object) -> SafeTensorsStageArtifact:
     family = _string(model.get("family"), "model family")
     architecture = _string(model.get("architecture"), "model architecture")
     adapter_id = _string(model.get("adapter"), "model adapter")
+    adapter_contract_id = _string(
+        model.get("adapterContractId"), "model adapter contract identity"
+    )
+    if (
+        not adapter_contract_id.startswith("sha256:")
+        or len(adapter_contract_id) != 71
+    ):
+        raise ValueError("model adapter contract identity must be a sha256 identity")
+    _sha256(
+        adapter_contract_id.removeprefix("sha256:"),
+        "model adapter contract identity",
+    )
+    adapter_registry_id = _string(
+        model.get("adapterRegistryId"), "model adapter registry identity"
+    )
+    if (
+        not adapter_registry_id.startswith("sha256:")
+        or len(adapter_registry_id) != 71
+    ):
+        raise ValueError("model adapter registry identity must be a sha256 identity")
+    _sha256(
+        adapter_registry_id.removeprefix("sha256:"),
+        "model adapter registry identity",
+    )
     quantization = _parse_quantization(model.get("quantization"))
 
     stage = _exact_mapping(
@@ -494,10 +637,13 @@ def parse_stage_artifact_manifest(value: object) -> SafeTensorsStageArtifact:
         files.append({"path": path, "role": role, "sizeBytes": size, "sha256": digest})
     expected_files = {
         STAGE_ARTIFACT_CONFIG: "model-config",
+        STAGE_ARTIFACT_ADAPTER_REGISTRY: "model-adapter-registry",
         STAGE_ARTIFACT_WEIGHTS: "stage-weights",
     }
     if {item["path"]: item["role"] for item in files} != expected_files:
-        raise ValueError("stage artifact must contain exactly config and stage weights")
+        raise ValueError(
+            "stage artifact must contain exactly config, adapter registry and stage weights"
+        )
 
     tensors_value = _sequence(document.get("tensors"), "stage tensors")
     tensors: list[dict[str, Any]] = []
@@ -567,6 +713,11 @@ def parse_stage_artifact_manifest(value: object) -> SafeTensorsStageArtifact:
     adapter = resolve_selective_stage_adapter(config_probe)
     if adapter.adapter_id != adapter_id:
         raise ValueError("stage adapter does not match its certified family")
+    if (
+        adapter.adapter_contract_id != adapter_contract_id
+        or adapter_registry_id != ADAPTER_REGISTRY_ID
+    ):
+        raise ValueError("stage adapter registry contract is not implemented")
 
     body = {key: value for key, value in document.items() if key != "packageId"}
     expected_id = hashlib.sha256(_canonical_json(body)).hexdigest()
@@ -647,6 +798,14 @@ def verify_stage_artifact(
 
     config_path = by_role["model-config"]
     weights_path = by_role["stage-weights"]
+    adapter_registry_path = by_role["model-adapter-registry"]
+    packaged_registry = _json_object(
+        adapter_registry_path.read_bytes(), "packaged model adapter registry"
+    )
+    validate_adapter_registry_document(
+        packaged_registry,
+        expected_registry_id=document["model"]["adapterRegistryId"],
+    )
     config_document = _json_object(config_path.read_bytes(), "stage model config")
     config_sha256 = hashlib.sha256(_canonical_json(config_document) + b"\n").hexdigest()
     model_document = document["model"]
@@ -657,6 +816,11 @@ def verify_stage_artifact(
     adapter.validate_source_config(config, manifest.total_layers)
     if adapter.model_type != manifest.family or adapter.adapter_id != manifest.adapter:
         raise ValueError("stage config does not match the sealed family adapter")
+    if (
+        adapter.adapter_contract_id != model_document["adapterContractId"]
+        or model_document["adapterRegistryId"] != ADAPTER_REGISTRY_ID
+    ):
+        raise ValueError("stage config adapter contract is not installed")
     if _single_architecture(config) != model_document["architecture"]:
         raise ValueError("stage config architecture does not match the manifest")
     if _positive_integer(getattr(config, "hidden_size", None), "hidden_size") != int(
@@ -717,6 +881,7 @@ def verify_stage_artifact(
         manifest=manifest,
         config_path=config_path,
         weights_path=weights_path,
+        adapter_registry_path=adapter_registry_path,
     )
 
 
@@ -1211,12 +1376,22 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--revision")
     parser.add_argument("--layer-start", type=int, required=True)
     parser.add_argument("--layer-end", type=int, required=True)
+    parser.add_argument(
+        "--reuse-verified",
+        action="store_true",
+        help="reuse an existing package only after full fail-closed verification",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
-    result = compile_safetensors_stage_artifact(
+    compiler = (
+        prepare_safetensors_stage_artifact
+        if args.reuse_verified
+        else compile_safetensors_stage_artifact
+    )
+    result = compiler(
         args.model_name,
         args.destination,
         revision=args.revision,
@@ -1232,6 +1407,7 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "STAGE_ARTIFACT_ADAPTER_REGISTRY",
     "STAGE_ARTIFACT_CONFIG",
     "STAGE_ARTIFACT_FORMAT",
     "STAGE_ARTIFACT_MANIFEST",
@@ -1244,5 +1420,6 @@ __all__ = [
     "compile_safetensors_stage_artifact",
     "main",
     "parse_stage_artifact_manifest",
+    "prepare_safetensors_stage_artifact",
     "verify_stage_artifact",
 ]

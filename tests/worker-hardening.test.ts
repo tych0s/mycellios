@@ -1,8 +1,7 @@
 import { createServer, type RequestListener, type Server } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
 import type { InferenceAdapter } from "../src/adapters/base.js";
-import { local model runtimeAdapter } from "../src/adapters/local-model-runtime.js";
-import { OpenAICompatibleAdapter } from "../src/adapters/openai-compatible.js";
+import { MycelliosPipelineAdapter } from "../src/adapters/mycellios-pipeline.js";
 import { workerConfigSchema } from "../src/contracts/schemas.js";
 import type {
   JobPayload,
@@ -14,6 +13,11 @@ import {
   validateCoordinatorUrl,
   WorkerAgent,
 } from "../src/worker/agent.js";
+import { sealDeploymentCanaryEvidence } from "../src/contracts/deployment-canary.js";
+import { sha256Text } from "../src/core/json.js";
+
+const CELL_MODEL_DIGEST = `sha256:${"b".repeat(64)}`;
+const CELL_ACTIVATION_ID = "pipeline-activation-7";
 
 describe("worker boundary hardening", () => {
   const servers: Server[] = [];
@@ -85,21 +89,22 @@ describe("worker boundary hardening", () => {
     })).toThrow(/Invalid coordinator message/);
   });
 
-  it("requires HTTPS whenever an OpenAI-compatible API key is present", () => {
+  it("does not expose a remote host or credential escape hatch", () => {
     expect(
       () =>
-        new OpenAICompatibleAdapter({
-          baseUrl: "http://127.0.0.1:8080",
+        new MycelliosPipelineAdapter({
+          baseUrl: "https://inference.example",
           model: "test",
-          apiKey: "secret",
+          modelDigest: "sha256:test",
+          activationId: "test-activation",
         }),
-    ).toThrow(/must use HTTPS/);
+    ).toThrow(/loopback/);
   });
 
-  it("does not follow backend redirects", async () => {
+  it("does not follow native pipeline redirects", async () => {
     let followed = false;
     const baseUrl = await listen(servers, (request, response) => {
-      if (request.url === "/v1/models") {
+      if (request.url === "/health") {
         response.statusCode = 302;
         response.setHeader("location", "/redirect-target");
         response.end();
@@ -108,19 +113,35 @@ describe("worker boundary hardening", () => {
       followed = true;
       response.end("unexpected");
     });
-    const adapter = new OpenAICompatibleAdapter({
+    const adapter = new MycelliosPipelineAdapter({
       baseUrl,
       model: "test",
-      kind: "externalggufruntime",
+      modelDigest: "sha256:test",
+      activationId: "test-activation",
     });
     await expect(adapter.probe()).rejects.toThrow(/HTTP 302/);
     expect(followed).toBe(false);
   });
 
-  it("represents a sidecar cell as aggregate capacity without claiming one huge GPU", async () => {
-    const baseUrl = await listen(servers, (_request, response) => {
-      response.setHeader("content-type", "application/json");
-      response.end('{"object":"list","data":[]}');
+  it("represents a native pipeline as aggregate capacity without claiming one huge GPU", async () => {
+    const canaryEvidence = cellCanaryEvidence();
+    const baseUrl = await listen(servers, (request, response) => {
+      if (request.url === "/health") {
+        response.setHeader("content-type", "application/json");
+        response.end(JSON.stringify({
+          status: "ready",
+          model: "regional-large",
+          artifact_identity: CELL_MODEL_DIGEST,
+          pipeline_snapshot_identity: CELL_ACTIVATION_ID,
+          stages: 2,
+          boundaries: [0, 12, 24],
+        }));
+        return;
+      }
+      response.setHeader("content-type", "text/event-stream");
+      response.write('data: {"choices":[{"delta":{"content":"ok"}}]}\n\n');
+      response.write('data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":1,"completion_tokens":1},"distribution_metrics":{"ttft_ms":1,"pipeline_ms":1}}\n\n');
+      response.end("data: [DONE]\n\n");
     });
     const config = workerConfigSchema.parse({
       region: "test-cell",
@@ -128,15 +149,16 @@ describe("worker boundary hardening", () => {
       offeredVramMb: 98_304,
       limits: { maxConcurrency: 8, pauseWhenForeground: false },
       adapter: {
-        kind: "openai-compatible",
+        kind: "mycellios-pipeline",
         model: "regional-large",
         baseUrl,
-        allowedHosts: [],
       },
       deployment: {
-        modelDigest: "sha256:pinned-cell-manifest",
+        modelDigest: CELL_MODEL_DIGEST,
+        activationId: CELL_ACTIVATION_ID,
         peakVramMb: 72_000,
         contextLimit: 32_768,
+        canaryEvidence,
       },
     });
     const agent = new WorkerAgent(config, {
@@ -149,11 +171,63 @@ describe("worker boundary hardening", () => {
     ).buildCapabilities();
     expect(capabilities.gpus[0]).toMatchObject({
       id: "cell-aggregate",
-      vendor: "sidecar-cell",
+      vendor: "mycellios",
       physicalVramMb: 0,
       offeredVramMb: 98_304,
     });
     expect(capabilities.deployments[0]?.peakVramMb).toBe(72_000);
+    expect(capabilities.deployments[0]).toMatchObject({
+      deploymentId: `dep-${sha256Text([
+        "regional-large",
+        "mycellios-pipeline",
+        CELL_MODEL_DIGEST,
+        CELL_ACTIVATION_ID,
+      ].join(":")).slice(-12)}`,
+      activationId: CELL_ACTIVATION_ID,
+      tokensPerSecond: 16,
+      throughputSource: "measured",
+      ttftMs: 310,
+      canaryEvidence: {
+        modelDigest: CELL_MODEL_DIGEST,
+        activationId: CELL_ACTIVATION_ID,
+      },
+    });
+
+    expect(workerConfigSchema.safeParse({
+      ...config,
+      deployment: {
+        ...config.deployment,
+        canaryEvidence: undefined,
+        tokensPerSecond: 99_999,
+        ttftMs: 0,
+      },
+    }).success).toBe(false);
+
+    const sent: WorkerEnvelope[] = [];
+    const harness = agent as unknown as AgentHarness;
+    harness.registeredWorkerId = "worker-cell";
+    harness.capabilities = capabilities;
+    harness.socket = {
+      readyState: 1,
+      send(serialized) {
+        sent.push(JSON.parse(serialized) as WorkerEnvelope);
+      },
+    };
+    await harness.execute(payload({
+      jobId: "cell-job",
+      modelDigest: CELL_MODEL_DIGEST,
+      request: {
+        model: "regional-large",
+        messages: [{ role: "user", content: "test" }],
+        max_tokens: 8,
+      },
+    }));
+    expect(messagePayload(sent, "task.complete")).toBeDefined();
+    expect(harness.capabilities.deployments[0]).toMatchObject({
+      tokensPerSecond: 16,
+      ttftMs: 310,
+      canaryEvidence: { evidenceId: canaryEvidence.evidenceId },
+    });
 
     expect(
       workerConfigSchema.safeParse({
@@ -163,28 +237,33 @@ describe("worker boundary hardening", () => {
     ).toBe(false);
   });
 
-  it("caps incomplete SSE and NDJSON buffers at 1 MiB", async () => {
+  it("caps incomplete native SSE buffers at 1 MiB", async () => {
     const sseBaseUrl = await listen(servers, (request, response) => {
+      if (request.url === "/health") {
+        response.setHeader("content-type", "application/json");
+        response.end(JSON.stringify({
+          status: "ready",
+          model: "test",
+          artifact_identity: "sha256:test",
+          pipeline_snapshot_identity: "test-activation",
+          stages: 1,
+          boundaries: [0, 1],
+        }));
+        return;
+      }
       if (request.url === "/v1/chat/completions") {
         response.setHeader("content-type", "text/event-stream");
         response.end(`data: ${"x".repeat(1024 * 1024 + 1)}`);
       }
     });
-    const sseAdapter = new OpenAICompatibleAdapter({
+    const sseAdapter = new MycelliosPipelineAdapter({
       baseUrl: sseBaseUrl,
       model: "test",
-      kind: "externalggufruntime",
+      modelDigest: "sha256:test",
+      activationId: "test-activation",
     });
+    await sseAdapter.probe();
     await expect(collect(sseAdapter)).rejects.toThrow(/buffer exceeded 1 MiB/);
-
-    const ndjsonBaseUrl = await listen(servers, (request, response) => {
-      if (request.url === "/api/chat") {
-        response.setHeader("content-type", "application/x-ndjson");
-        response.end("x".repeat(1024 * 1024 + 1));
-      }
-    });
-    const ndjsonAdapter = new local model runtimeAdapter({ baseUrl: ndjsonBaseUrl, model: "test" });
-    await expect(collect(ndjsonAdapter)).rejects.toThrow(/buffer exceeded 1 MiB/);
   });
 
   it("rejects a mismatched digest, duplicate job and oversized adapter chunk", async () => {
@@ -240,6 +319,7 @@ function baseConfig() {
     limits: { maxConcurrency: 1, pauseWhenForeground: false },
     adapter: {
       kind: "mock",
+      developmentOnly: true,
       model: "test-model",
       tokensPerSecond: 1_000,
       ttftMs: 0,
@@ -340,6 +420,41 @@ async function collect(adapter: InferenceAdapter): Promise<string> {
     output += chunk.text;
   }
   return output;
+}
+
+function cellCanaryEvidence() {
+  return sealDeploymentCanaryEvidence({
+    model: "regional-large",
+    modelDigest: CELL_MODEL_DIGEST,
+    activationId: CELL_ACTIVATION_ID,
+    promptDigest: `sha256:${"e".repeat(64)}`,
+    maxOutputTokens: 16,
+    measuredAt: new Date().toISOString(),
+    warmupSamples: 1,
+    samples: [
+      {
+        sampleId: "canary-1",
+        outputTokens: 16,
+        activeMs: 1_000,
+        ttftMs: 320,
+        completed: true,
+      },
+      {
+        sampleId: "canary-2",
+        outputTokens: 16,
+        activeMs: 1_000,
+        ttftMs: 300,
+        completed: true,
+      },
+      {
+        sampleId: "canary-3",
+        outputTokens: 16,
+        activeMs: 1_000,
+        ttftMs: 310,
+        completed: true,
+      },
+    ],
+  });
 }
 
 async function listen(servers: Server[], handler: RequestListener): Promise<string> {

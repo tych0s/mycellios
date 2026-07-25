@@ -492,6 +492,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     runner: StageRunner | None = None
     stage_metrics: list[dict[str, Any]] = []
     shutdown_sent = False
+    emulator: LinkEmulator | None = None
     all_batches: list[dict[str, Any]] = []
     all_requests: list[dict[str, Any]] = []
     fatal_errors: list[dict[str, Any]] = []
@@ -596,7 +597,10 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         return_socket, _ = return_listener.accept()
         configure_socket(return_socket)
         return_socket.settimeout(args.socket_timeout_seconds)
-        emulator = LinkEmulator(delay_for_link(args.one_way_delay_ms, 0), args.bandwidth_mbps)
+        emulator = LinkEmulator(
+            delay_for_link(args.one_way_delay_ms, 0),
+            args.bandwidth_mbps,
+        )
 
         total_batches = args.warmups + args.iterations
         for batch_offset in range(total_batches):
@@ -626,6 +630,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
         send_frame(downstream, FrameType.SHUTDOWN, 0)
         shutdown_sent = True
+        emulator.close(timeout_seconds=args.socket_timeout_seconds)
         for process in processes:
             process.join(timeout=args.socket_timeout_seconds)
         stage_metrics.extend(drain_metrics(metrics_queue))
@@ -643,6 +648,11 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         if downstream is not None and not shutdown_sent:
             try:
                 send_frame(downstream, FrameType.SHUTDOWN, 0)
+            except BaseException:
+                pass
+        if emulator is not None:
+            try:
+                emulator.close(timeout_seconds=args.socket_timeout_seconds)
             except BaseException:
                 pass
         for sock in (return_socket, downstream, return_listener):

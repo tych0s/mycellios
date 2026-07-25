@@ -1,5 +1,4 @@
 export type CoordinatorMode = "local" | "remote";
-export type AdapterMode = "connectivity-test" | "local-model-runtime";
 import type {
   ChatMessage,
   ComputeMode,
@@ -23,10 +22,6 @@ export interface DesktopSettings {
   onboardingComplete: boolean;
   region: string;
   offeredVramMb: number;
-  adapterMode: AdapterMode;
-  modelName: string;
-  adapterBaseUrl: string;
-  modelDigest: string;
 }
 
 export interface DashboardGpu {

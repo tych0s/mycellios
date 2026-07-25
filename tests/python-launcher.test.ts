@@ -5,7 +5,7 @@ import {
   pythonPrefillFrameByteReservation,
   validatePythonLaunchDescription,
   type PythonLaunchCompilerOptions,
-  type PythonNativeStageStageInput,
+  type PythonNativeGgufStageInput,
   type PythonCellMemberLaunch,
   type PythonPipelineLaunchDescription,
   type PythonRemoteStageLaunch,
@@ -13,12 +13,14 @@ import {
 } from "../src/distribution/python-launcher.js";
 import {
   buildRuntimePipelineManifest,
+  certifyRuntimeTensorParallelCollectives,
   materializeRuntimeTensorParallelCell,
   validateRuntimePipelineManifest,
   type RuntimePipelineManifestV1,
   type RuntimePipelineManifestV2,
   type RuntimePlanRequest,
   type RuntimeSpeculationPolicy,
+  type RuntimeTopology,
   type RuntimeVirtualStageManifest,
 } from "../src/distribution/runtime-manifest.js";
 import type {
@@ -176,6 +178,26 @@ function remotes(description: PythonPipelineLaunchDescription): PythonRemoteStag
   );
 }
 
+function legacyNativeStageBindings(
+  description: PythonPipelineLaunchDescription,
+): Record<string, LegacyNativeStageStageInput> {
+  return (
+    description.configuration as unknown as {
+      native_stageStages: Record<string, LegacyNativeStageStageInput>;
+    }
+  ).native_stageStages;
+}
+
+function legacyNativeStageLaunch(
+  launch: PythonRemoteStageLaunch,
+): LegacyNativeStageStageInput | null {
+  return (
+    launch as unknown as {
+      native_stage: LegacyNativeStageStageInput | null;
+    }
+  ).native_stage;
+}
+
 function cellMembers(description: PythonPipelineLaunchDescription): PythonCellMemberLaunch[] {
   return description.launchOrder.filter(
     (entry): entry is PythonCellMemberLaunch => entry.kind === "cell-member",
@@ -198,6 +220,35 @@ function moduleName(args: string[]): string | undefined {
 }
 
 const NATIVE_STAGE_TEST_COMMIT = "12fd25f77366fa6b3b4b768ec3050bf629380bac";
+const NATIVE_GGUF_SNAPSHOT_ID = "12345";
+const NATIVE_GGUF_MODEL_IDENTITY = strongArtifactIdentity(NATIVE_GGUF_SNAPSHOT_ID);
+const NATIVE_GGUF_MODEL_SOURCE = "mycellios://models/launcher-native-gguf";
+const NATIVE_GGUF_MODEL_REVISION = "native-gguf-r1";
+
+/** Archived research shape; it is deliberately absent from product exports. */
+interface LegacyNativeStageStageInput {
+  packagePath: string;
+  packageId: string;
+  manifestSha256: string;
+  modelSource: string;
+  modelRevision: string | null;
+  layerStart: number;
+  layerEnd: number;
+  totalLayers: number;
+  daemonExecutable: string;
+  pipelineId: string;
+  contextTokens: number;
+  gpuLayers: number;
+  computeApi: "cpu" | "cuda" | "rocm" | "metal" | "vulkan";
+  startupTimeoutSeconds: number;
+  callTimeoutSeconds: number;
+  closeTimeoutSeconds: number;
+  modelIdentity?: string;
+}
+
+type LegacyNativeStageOptions = Partial<PythonLaunchCompilerOptions> & {
+  native_stageStages: Record<string, LegacyNativeStageStageInput>;
+};
 
 function native_stagePipelineId(commit = NATIVE_STAGE_TEST_COMMIT): string {
   const bytes = createHash("sha256")
@@ -213,8 +264,8 @@ function native_stagePipelineId(commit = NATIVE_STAGE_TEST_COMMIT): string {
 function native_stageStage(
   current: RuntimePipelineManifestV2,
   stageIndex: number,
-  overrides: Partial<PythonNativeStageStageInput> = {},
-): PythonNativeStageStageInput {
+  overrides: Partial<LegacyNativeStageStageInput> = {},
+): LegacyNativeStageStageInput {
   const stage = current.plans.prefill.stages[stageIndex]!;
   return {
     packagePath: `D:\\packages\\${stage.stageId}`,
@@ -240,7 +291,7 @@ function native_stageStage(
 function native_stageOptions(
   current: RuntimePipelineManifestV2,
   stageIndexes: number[] = [2],
-): Partial<PythonLaunchCompilerOptions> {
+): LegacyNativeStageOptions {
   const snapshot = `C:\\cache\\models--HuggingFaceTB--SmolLM2-135M-Instruct\\snapshots\\${NATIVE_STAGE_TEST_COMMIT}`;
   return {
     runtimeModel: { source: snapshot, revision: null },
@@ -248,6 +299,47 @@ function native_stageOptions(
       stageIndexes.map((index) => {
         const stage = current.plans.prefill.stages[index]!;
         return [stage.stageId, native_stageStage(current, index)];
+      }),
+    ),
+  };
+}
+
+function nativeGgufStage(
+  current: RuntimePipelineManifestV2,
+  stageIndex: number,
+  overrides: Partial<PythonNativeGgufStageInput> = {},
+): PythonNativeGgufStageInput {
+  const stage = current.plans.prefill.stages[stageIndex]!;
+  return {
+    packagePath: `D:\\native-gguf\\${stage.stageId}`,
+    packageId: "c".repeat(64),
+    modelIdentity: NATIVE_GGUF_MODEL_IDENTITY,
+    modelSource: NATIVE_GGUF_MODEL_SOURCE,
+    modelRevision: NATIVE_GGUF_MODEL_REVISION,
+    layerStart: stage.layerStart,
+    layerEnd: stage.layerEnd,
+    totalLayers: current.totalLayers,
+    ...overrides,
+  };
+}
+
+function nativeGgufOptions(
+  current: RuntimePipelineManifestV2,
+  stageIndexes: number[] = [2],
+): Partial<PythonLaunchCompilerOptions> {
+  return {
+    runtimeModel: {
+      source: "D:\\models\\launcher-native-root",
+      revision: null,
+      snapshotIdentity: NATIVE_GGUF_SNAPSHOT_ID,
+      artifactIdentity: NATIVE_GGUF_MODEL_IDENTITY,
+      canonicalSource: NATIVE_GGUF_MODEL_SOURCE,
+      canonicalRevision: NATIVE_GGUF_MODEL_REVISION,
+    },
+    nativeGgufStages: Object.fromEntries(
+      stageIndexes.map((index) => {
+        const stage = current.plans.prefill.stages[index]!;
+        return [stage.stageId, nativeGgufStage(current, index)];
       }),
     ),
   };
@@ -382,6 +474,79 @@ function materializeExternalTensorParallelCell(
     members,
     execution,
   });
+}
+
+function certifyTensorParallelCell(
+  current: RuntimePipelineManifestV2,
+): RuntimePipelineManifestV2 {
+  const now = Date.now();
+  return certifyRuntimeTensorParallelCollectives(
+    current,
+    measuredTensorParallelTopology(current, now),
+    now,
+  );
+}
+
+function measuredTensorParallelTopology(
+  current: RuntimePipelineManifestV2,
+  now: number,
+): RuntimeTopology {
+  const nodes = new Map<
+    string,
+    RuntimeTopology["nodes"][number]
+  >();
+  const cellMemberIds: string[][] = [];
+  for (const stage of current.plans.prefill.stages) {
+    for (const member of stage.members) {
+      nodes.set(member.nodeId, {
+        id: member.nodeId,
+        region: "physical-tp-fixture",
+        memoryBytes: member.memoryLimitBytes,
+        reserveBytes: 0,
+        decodeScale: 1,
+        prefillScale: 1,
+        codecScale: 1,
+        batchGain: 0,
+        maxBatchSpeedup: 1,
+        powerWatts: 75,
+        availability: 0.999,
+        endpoint: { ...member.endpoint },
+        backend: structuredClone(member.backend),
+        capabilities: structuredClone(member.capabilities),
+      });
+    }
+    if (stage.execution?.mode === "tensor-parallel-cell") {
+      cellMemberIds.push([...stage.execution.rankMemberIds]);
+    }
+  }
+  const links = new Map<string, RuntimeTopology["links"][number]>();
+  for (const memberIds of cellMemberIds) {
+    for (const from of memberIds) {
+      for (const to of memberIds) {
+        if (from === to) continue;
+        links.set(`${from}\0${to}`, {
+          from,
+          to,
+          oneWayLatencyMs: 0.2,
+          jitterP95Ms: 0.05,
+          bandwidthMbps: 10_000,
+          lossRate: 0,
+          availability: 0.999,
+          evidence: {
+            source: "runtime-probe",
+            measuredAt: now - 1_000,
+            validUntil: now + 60_000,
+            successfulSamples: 8,
+            failedSamples: 0,
+          },
+        });
+      }
+    }
+  }
+  return {
+    nodes: [...nodes.values()],
+    links: [...links.values()],
+  };
 }
 
 function legacy(current: RuntimePipelineManifestV2): RuntimePipelineManifestV1 {
@@ -1024,14 +1189,209 @@ describe("GDLP/2 Python launch compiler", () => {
     ).toThrow("python_runtime_model_canonical_revision_mismatch");
   });
 
-  it("binds one sealed NativeStage package to an exact non-root stage and renders every flag", () => {
+  it("seals a native Mycellios GGUF range with global model and pipeline identity", () => {
+    const current = manifest();
+    const target = current.plans.prefill.stages[2]!;
+    const description = compile(current, nativeGgufOptions(current));
+    const launch = remotes(description).find((stage) => stage.stageId === target.stageId)!;
+    const binding = description.configuration.nativeGgufStages[target.stageId]!;
+
+    expect(launch.nativeGguf).toEqual(binding);
+    expect(Object.hasOwn(launch, "native_stage")).toBe(false);
+    expect(launch.cell).toBeNull();
+    expect(binding).toEqual(nativeGgufStage(current, 2));
+    expect(argumentValue(launch.command.args, "--model")).toBe(
+      description.runtimeModel.source,
+    );
+    expect(argumentValue(launch.command.args, "--model-artifact-identity")).toBe(
+      binding.modelIdentity,
+    );
+    expect(argumentValue(launch.command.args, "--model-canonical-source")).toBe(
+      binding.modelSource,
+    );
+    expect(argumentValue(launch.command.args, "--model-canonical-revision")).toBe(
+      binding.modelRevision,
+    );
+    expect(argumentValue(launch.command.args, "--pipeline-snapshot-identity")).toBe(
+      NATIVE_GGUF_SNAPSHOT_ID,
+    );
+    expect(argumentValue(launch.command.args, "--stage-package-identity")).toBe(
+      `sha256:${binding.packageId}`,
+    );
+    expect(argumentValue(launch.command.args, "--native-gguf-package")).toBe(
+      binding.packagePath,
+    );
+    expect(argumentValue(launch.command.args, "--native-gguf-package-id")).toBe(
+      binding.packageId,
+    );
+    expect(launch.command.args).toContain("--device");
+    expect(launch.command.args.some((argument) => argument.includes("native_stage"))).toBe(false);
+    expect(launch.command.args.some((argument) => argument.includes("local-model-runtime"))).toBe(false);
+    expect(() =>
+      validatePythonLaunchDescription(JSON.parse(JSON.stringify(description))),
+    ).not.toThrow();
+  });
+
+  it("launches a fully native GGUF fleet across root and stages [0,1,2]", () => {
+    const current = manifest();
+    const description = compile(current, nativeGgufOptions(current, [0, 1, 2]));
+    const stages = current.plans.prefill.stages;
+    const rootLaunch = root(description);
+    const rootBinding =
+      description.configuration.nativeGgufStages[stages[0]!.stageId]!;
+
+    expect(Object.keys(description.configuration.nativeGgufStages).sort()).toEqual(
+      stages.map((stage) => stage.stageId).sort(),
+    );
+    expect(rootLaunch.nativeGguf).toEqual(rootBinding);
+    expect(remotes(description).map((stage) => stage.nativeGguf?.packageId)).toEqual([
+      "c".repeat(64),
+      "c".repeat(64),
+    ]);
+    expect(argumentValue(rootLaunch.command.args, "--model-artifact-identity")).toBe(
+      rootBinding.modelIdentity,
+    );
+    expect(argumentValue(rootLaunch.command.args, "--model-canonical-source")).toBe(
+      rootBinding.modelSource,
+    );
+    expect(argumentValue(rootLaunch.command.args, "--model-canonical-revision")).toBe(
+      rootBinding.modelRevision,
+    );
+    expect(
+      argumentValue(rootLaunch.command.args, "--pipeline-snapshot-identity"),
+    ).toBe(NATIVE_GGUF_SNAPSHOT_ID);
+    expect(argumentValue(rootLaunch.command.args, "--stage-package-identity")).toBe(
+      `sha256:${rootBinding.packageId}`,
+    );
+    expect(argumentValue(rootLaunch.command.args, "--native-gguf-package")).toBe(
+      rootBinding.packagePath,
+    );
+    expect(argumentValue(rootLaunch.command.args, "--native-gguf-package-id")).toBe(
+      rootBinding.packageId,
+    );
+    expect(rootLaunch.command.args.some((argument) => argument.includes("native_stage"))).toBe(
+      false,
+    );
+    expect(() =>
+      validatePythonLaunchDescription(JSON.parse(JSON.stringify(description))),
+    ).not.toThrow();
+
+    const metadataTampering = compile(
+      current,
+      nativeGgufOptions(current, [0, 1, 2]),
+    );
+    root(metadataTampering).nativeGguf!.packagePath += "-tampered";
+    expect(() => validatePythonLaunchDescription(metadataTampering)).toThrow(
+      "python_launch_description_mismatch",
+    );
+
+    const argvTampering = compile(current, nativeGgufOptions(current, [0, 1, 2]));
+    const rootArgs = root(argvTampering).command.args;
+    rootArgs[rootArgs.indexOf("--native-gguf-package-id") + 1] = "e".repeat(64);
+    expect(() => validatePythonLaunchDescription(argvTampering)).toThrow(
+      "python_launch_description_mismatch",
+    );
+  });
+
+  it("sorts and authenticates native GGUF bindings in every derived launch identity", () => {
+    const current = manifest();
+    const forward = nativeGgufOptions(current, [1, 2]);
+    const reversed = {
+      ...forward,
+      nativeGgufStages: Object.fromEntries(
+        Object.entries(forward.nativeGgufStages!).reverse(),
+      ),
+    };
+    expect(compile(current, reversed)).toEqual(compile(current, forward));
+
+    const configuration = compile(current, forward);
+    const stageId = current.plans.prefill.stages[2]!.stageId;
+    configuration.configuration.nativeGgufStages[stageId]!.packagePath += "-tampered";
+    expect(() => validatePythonLaunchDescription(configuration)).toThrow(
+      "python_launch_description_mismatch",
+    );
+
+    const argv = compile(current, forward);
+    const args = remotes(argv).find((stage) => stage.stageId === stageId)!.command.args;
+    args[args.indexOf("--native-gguf-package-id") + 1] = "d".repeat(64);
+    expect(() => validatePythonLaunchDescription(argv)).toThrow(
+      "python_launch_description_mismatch",
+    );
+  });
+
+  it("rejects unbound, conflicting or incorrectly ranged native GGUF stages", () => {
+    const current = manifest();
+    const target = current.plans.prefill.stages[2]!;
+
+    const noPipeline = nativeGgufOptions(current);
+    noPipeline.runtimeModel = {
+      source: noPipeline.runtimeModel!.source,
+      revision: null,
+    };
+    expect(() => compile(current, noPipeline)).toThrow(
+      "python_native_gguf_requires_pipeline_snapshot_identity",
+    );
+
+    const wrongIdentity = nativeGgufOptions(current);
+    wrongIdentity.nativeGgufStages![target.stageId]!.modelIdentity =
+      `sha256:${"f".repeat(64)}`;
+    expect(() => compile(current, wrongIdentity)).toThrow(
+      `python_native_gguf_model_identity_mismatch:${target.stageId}`,
+    );
+
+    const wrongSource = nativeGgufOptions(current);
+    wrongSource.nativeGgufStages![target.stageId]!.modelSource += "-other";
+    expect(() => compile(current, wrongSource)).toThrow(
+      `python_native_gguf_model_source_mismatch:${target.stageId}`,
+    );
+
+    const wrongRange = nativeGgufOptions(current);
+    wrongRange.nativeGgufStages![target.stageId]!.layerStart -= 1;
+    expect(() => compile(current, wrongRange)).toThrow(
+      `python_native_gguf_stage_range_mismatch:${target.stageId}`,
+    );
+
+    const conflicting: LegacyNativeStageOptions = {
+      ...nativeGgufOptions(current),
+      native_stageStages: {
+        [target.stageId]: native_stageStage(current, 2, {
+          modelSource: nativeGgufOptions(current).runtimeModel!.source,
+          modelRevision: null,
+          pipelineId: NATIVE_GGUF_SNAPSHOT_ID,
+        }),
+      },
+    };
+    expect(() => compile(current, conflicting)).toThrow(
+      "python_launch_options_have_unknown_or_missing_fields",
+    );
+
+    const cell = certifyTensorParallelCell(
+      materializeTensorParallelCell(manifest()),
+    );
+    const cellStageId = cell.plans.prefill.stages[1]!.stageId;
+    expect(() =>
+      compile(cell, {
+        ...nativeGgufOptions(cell, [1]),
+      })).toThrow(
+      `python_native_gguf_stage_has_conflicting_execution:${cellStageId}`,
+    );
+  });
+
+  it("rejects NativeStage before a production launch description can be built", () => {
+    const current = manifest();
+    expect(() => compile(current, native_stageOptions(current))).toThrow(
+      "python_launch_options_have_unknown_or_missing_fields",
+    );
+  });
+
+  it.skip("research fixture: binds one sealed NativeStage package to an exact non-root stage", () => {
     const current = manifest();
     const target = current.plans.prefill.stages[2]!;
     const description = compile(current, native_stageOptions(current));
     const launch = remotes(description).find((stage) => stage.stageId === target.stageId)!;
-    const normalized = description.configuration.native_stageStages[target.stageId]!;
+    const normalized = legacyNativeStageBindings(description)[target.stageId]!;
 
-    expect(launch.native_stage).toEqual(normalized);
+    expect(legacyNativeStageLaunch(launch)).toEqual(normalized);
     expect(launch.cell).toBeNull();
     expect(normalized.modelIdentity).toBe(description.runtimeModel.artifactIdentity);
     expect(argumentValue(launch.command.args, "--model")).toBe(
@@ -1075,7 +1435,7 @@ describe("GDLP/2 Python launch compiler", () => {
     ).not.toThrow();
   });
 
-  it("binds a local non-Hub snapshot through its content-derived pipeline identity", () => {
+  it.skip("research fixture: binds a local non-Hub NativeStage snapshot", () => {
     const current = manifest();
     const target = current.plans.prefill.stages[2]!;
     const localSource = "D:\\models\\SmolLM2-local-snapshot";
@@ -1093,7 +1453,7 @@ describe("GDLP/2 Python launch compiler", () => {
     });
 
     const description = compile(current, options);
-    const normalized = description.configuration.native_stageStages[target.stageId]!;
+    const normalized = legacyNativeStageBindings(description)[target.stageId]!;
     const launch = remotes(description).find((stage) => stage.stageId === target.stageId)!;
 
     expect(description.runtimeModel.artifactIdentity).toBe(
@@ -1134,7 +1494,7 @@ describe("GDLP/2 Python launch compiler", () => {
     );
   });
 
-  it("sorts multiple NativeStage stage bindings before deriving route and launch identities", () => {
+  it.skip("research fixture: sorts multiple NativeStage stage bindings", () => {
     const current = manifest();
     const forward = native_stageOptions(current, [1, 2]);
     const reversedEntries = Object.entries(forward.native_stageStages!).reverse();
@@ -1145,19 +1505,20 @@ describe("GDLP/2 Python launch compiler", () => {
     expect(compile(current, reversed)).toEqual(compile(current, forward));
   });
 
-  it("detects NativeStage configuration, process metadata and argv tampering", () => {
+  it.skip("research fixture: detects NativeStage metadata tampering", () => {
     const current = manifest();
     const stageId = current.plans.prefill.stages[2]!.stageId;
 
     const configuration = compile(current, native_stageOptions(current));
-    configuration.configuration.native_stageStages[stageId]!.packagePath += "-tampered";
+    legacyNativeStageBindings(configuration)[stageId]!.packagePath += "-tampered";
     expect(() => validatePythonLaunchDescription(configuration)).toThrow(
       "python_launch_description_mismatch",
     );
 
     const process = compile(current, native_stageOptions(current));
-    remotes(process).find((stage) => stage.stageId === stageId)!.native_stage!.packageId =
-      "c".repeat(64);
+    legacyNativeStageLaunch(
+      remotes(process).find((stage) => stage.stageId === stageId)!,
+    )!.packageId = "c".repeat(64);
     expect(() => validatePythonLaunchDescription(process)).toThrow(
       "python_launch_description_mismatch",
     );
@@ -1170,7 +1531,7 @@ describe("GDLP/2 Python launch compiler", () => {
     );
   });
 
-  it("fails closed for invalid NativeStage stage bindings", () => {
+  it.skip("research fixture: validates legacy NativeStage bindings", () => {
     const current = manifest();
     const rootId = current.plans.prefill.stages[0]!.stageId;
     expect(() => compile(current, native_stageOptions(current, [0]))).toThrow(
@@ -1205,15 +1566,20 @@ describe("GDLP/2 Python launch compiler", () => {
     );
 
     const missingIdentity = native_stageOptions(current);
-    delete (missingIdentity.native_stageStages![stageId] as Partial<PythonNativeStageStageInput>)
+    delete (missingIdentity.native_stageStages![stageId] as Partial<LegacyNativeStageStageInput>)
       .packageId;
     expect(() => compile(current, missingIdentity)).toThrow(
       `python_native_stage_stage_configuration_keys_are_invalid:${stageId}`,
     );
 
-    const cell = materializeTensorParallelCell(manifest());
+    const cell = certifyTensorParallelCell(
+      materializeTensorParallelCell(manifest()),
+    );
     const cellStageId = cell.plans.prefill.stages[1]!.stageId;
-    expect(() => compile(cell, native_stageOptions(cell, [1]))).toThrow(
+    expect(() =>
+      compile(cell, {
+        ...native_stageOptions(cell, [1]),
+      })).toThrow(
       `python_native_stage_stage_cannot_use_cell_execution:${cellStageId}`,
     );
   });
@@ -1256,6 +1622,120 @@ describe("GDLP/2 Python launch compiler", () => {
       expect(argumentValue(stage.command.args, "--sealed-wave-tokens")).toBe("6");
       expect(argumentValue(stage.command.args, "--max-prefill-chunk-tokens")).toBe("8");
     }
+  });
+
+  it("maps only manifest-sealed draft-tree limits to every native Python process", () => {
+    const input = request();
+    input.speculation = {
+      mode: "adaptive",
+      controller: "acceptance-adaptive",
+      defaultStrategyId: "native-tree",
+      fallbackStrategyId: "autoregressive",
+      acceptanceWindowTokens: 64,
+      strategies: [
+        {
+          id: "native-tree",
+          kind: "draft-tree",
+          maxDraftTokens: 4,
+          maxBranches: 6,
+          maxBranchTokens: 32_768,
+          maxKvBytes: 384 * MIB,
+          maxWaveTokens: 5,
+          minAcceptanceRate: 0.5,
+          maxWasteRatio: 0.4,
+          priority: 10,
+        },
+        {
+          id: "autoregressive",
+          kind: "autoregressive",
+          maxDraftTokens: 1,
+          minAcceptanceRate: 1,
+          maxWasteRatio: 0,
+          priority: 0,
+        },
+      ],
+    };
+    const current = buildRuntimePipelineManifest(input);
+    const description = compile(current);
+    expect(description.configuration.maxSpeculativeBranches).toBe(6);
+    expect(description.configuration.maxSpeculativeBranchTokens).toBe(32_768);
+    expect(description.configuration.maxSpeculativeKvBytes).toBe(384 * MIB);
+    for (const process of [root(description), ...remotes(description)]) {
+      expect(argumentValue(process.command.args, "--max-speculative-branches")).toBe("6");
+      expect(
+        argumentValue(process.command.args, "--max-speculative-branch-tokens"),
+      ).toBe("32768");
+      expect(argumentValue(process.command.args, "--max-speculative-kv-bytes")).toBe(
+        String(384 * MIB),
+      );
+      expect(argumentValue(process.command.args, "--sealed-wave-tokens")).toBe("5");
+    }
+    expect(argumentValue(root(description).command.args, "--speculation")).toBe(
+      "draft-tree",
+    );
+    expect(
+      argumentValue(
+        root(description).command.args,
+        "--speculative-max-draft-tokens",
+      ),
+    ).toBe("4");
+    expect(() => validatePythonLaunchDescription(description)).not.toThrow();
+
+    expect(() =>
+      compile(current, {
+        maxSpeculativeBranches: 5,
+        maxSpeculativeBranchTokens: 32_768,
+        maxSpeculativeKvBytes: 384 * MIB,
+      }),
+    ).toThrow("python_draft_tree_launch_limits_do_not_match_manifest");
+
+    const tampered = structuredClone(description);
+    tampered.sourceManifest.plans.decode.speculation.strategies[0]!.maxBranches = 5;
+    expect(() => validatePythonLaunchDescription(tampered)).toThrow();
+  });
+
+  it("rejects draft-tree when any physical limit is absent or inconsistent", () => {
+    const input = request();
+    input.speculation = {
+      mode: "adaptive",
+      controller: "acceptance-adaptive",
+      defaultStrategyId: "native-tree",
+      fallbackStrategyId: "autoregressive",
+      acceptanceWindowTokens: 64,
+      strategies: [
+        {
+          id: "native-tree",
+          kind: "draft-tree",
+          maxDraftTokens: 4,
+          maxBranches: 4,
+          maxBranchTokens: 8_192,
+          maxKvBytes: 64 * MIB,
+          maxWaveTokens: 5,
+          minAcceptanceRate: 0.5,
+          maxWasteRatio: 0.4,
+          priority: 10,
+        },
+        {
+          id: "autoregressive",
+          kind: "autoregressive",
+          maxDraftTokens: 1,
+          minAcceptanceRate: 1,
+          maxWasteRatio: 0,
+          priority: 0,
+        },
+      ],
+    };
+    const missing = structuredClone(input);
+    delete missing.speculation!.strategies[0]!.maxKvBytes;
+    expect(() => buildRuntimePipelineManifest(missing)).toThrow(
+      "runtime_draft_tree_limits_are_missing",
+    );
+
+    const inconsistent = structuredClone(input);
+    inconsistent.speculation!.strategies[0]!.maxWaveTokens = 6;
+    expect(() => buildRuntimePipelineManifest(inconsistent)).toThrow(
+      "runtime_draft_tree_wave_does_not_match_draft_depth",
+    );
   });
 
   it("rejects a speculative provider the Python server cannot execute", () => {
@@ -1363,12 +1843,16 @@ describe("GDLP/2 Python launch compiler", () => {
   it("compiles one materialized intermediate TP cell to the exact stage_cli flags", () => {
     const current = materializeTensorParallelCell(manifest());
 
-    const description = compile(current);
+    expect(() => compile(current)).toThrow(
+      "python_tensor_parallel_requires_measured_collective_profile",
+    );
+    const certified = certifyTensorParallelCell(current);
+    const description = compile(certified);
     const cell = remotes(description).find((stage) => stage.stageIndex === 1)!;
     expect(cell.members).toHaveLength(2);
-    expect(cell.cell).toEqual(current.plans.decode.stages[1]!.execution);
+    expect(cell.cell).toEqual(certified.plans.decode.stages[1]!.execution);
     expect(argumentValue(cell.command.args, "--cell-fixture")).toBe(
-      current.plans.decode.stages[1]!.execution!.fixture.path,
+      certified.plans.decode.stages[1]!.execution!.fixture.path,
     );
     expect(argumentValue(cell.command.args, "--cell-world-size")).toBe("2");
     expect(argumentValue(cell.command.args, "--cell-manifest-sha256")).toBe(
@@ -1386,7 +1870,9 @@ describe("GDLP/2 Python launch compiler", () => {
   });
 
   it("launches member-local ranks before their external cell anchor", () => {
-    const current = materializeExternalTensorParallelCell(manifest());
+    const current = certifyTensorParallelCell(
+      materializeExternalTensorParallelCell(manifest()),
+    );
     const description = compile(current, {
       runtimeModel: {
         source: "C:/models/launcher-model",
@@ -1423,11 +1909,13 @@ describe("GDLP/2 Python launch compiler", () => {
   });
 
   it("propagates the NCCL dtype and every rank device to the anchor stage", () => {
-    const current = materializeTensorParallelCell(manifest(), 1, 0, {
-      computeDtype: "bfloat16",
-      computeApi: "rocm",
-      rankDevices: ["cuda:0", "cuda:3"],
-    });
+    const current = certifyTensorParallelCell(
+      materializeTensorParallelCell(manifest(), 1, 0, {
+        computeDtype: "bfloat16",
+        computeApi: "rocm",
+        rankDevices: ["cuda:0", "cuda:3"],
+      }),
+    );
     const description = compile(current);
     const anchor = remotes(description).find((stage) => stage.stageIndex === 1)!;
 
@@ -1441,10 +1929,12 @@ describe("GDLP/2 Python launch compiler", () => {
   });
 
   it("passes only the selected NCCL rank device to each external member CLI", () => {
-    const current = materializeExternalTensorParallelCell(manifest(), {
-      computeDtype: "float16",
-      rankDevices: ["cuda:0", "cuda:7"],
-    });
+    const current = certifyTensorParallelCell(
+      materializeExternalTensorParallelCell(manifest(), {
+        computeDtype: "float16",
+        rankDevices: ["cuda:0", "cuda:7"],
+      }),
+    );
     const description = compile(current, {
       runtimeModel: {
         source: "C:/models/launcher-model",
@@ -1468,7 +1958,9 @@ describe("GDLP/2 Python launch compiler", () => {
   });
 
   it("requires the Python snapshot uint64 before orchestrating external ranks", () => {
-    const current = materializeExternalTensorParallelCell(manifest());
+    const current = certifyTensorParallelCell(
+      materializeExternalTensorParallelCell(manifest()),
+    );
     expect(() => compile(current)).toThrow(
       "python_external_cell_requires_snapshot_identity",
     );
@@ -1660,7 +2152,9 @@ describe("GDLP/2 Python launch compiler", () => {
       "python_launch_description_mismatch",
     );
 
-    const cell = materializeTensorParallelCell(manifest());
+    const cell = certifyTensorParallelCell(
+      materializeTensorParallelCell(manifest()),
+    );
     const cellArgv = compile(cell);
     remotes(cellArgv).find((stage) => stage.stageIndex === 1)!.command.args[
       remotes(cellArgv).find((stage) => stage.stageIndex === 1)!.command.args.indexOf(

@@ -5806,6 +5806,118 @@
   line-height: 1.45;
 }
 
+.public-panel .benchmark-network-trace {
+  margin-top: 12px;
+  padding: 16px;
+  border: 1px solid rgba(81, 219, 190, 0.16);
+  border-radius: 11px;
+  background: rgba(7, 38, 54, 0.34);
+}
+
+.public-panel .benchmark-network-trace.empty {
+  color: var(--text-secondary);
+  background: rgba(13, 34, 69, 0.34);
+}
+
+.public-panel .benchmark-network-trace-heading,
+.public-panel .benchmark-network-trace.empty > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.public-panel .benchmark-network-trace-heading > div,
+.public-panel .benchmark-network-trace.empty > div {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--success);
+}
+
+.public-panel .benchmark-network-trace-heading span,
+.public-panel .benchmark-network-trace-heading small,
+.public-panel .benchmark-network-trace-heading strong,
+.public-panel .benchmark-network-trace.empty span,
+.public-panel .benchmark-network-trace.empty small,
+.public-panel .benchmark-network-trace.empty strong {
+  display: block;
+}
+
+.public-panel .benchmark-network-trace-heading small,
+.public-panel .benchmark-network-trace.empty small {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  letter-spacing: 0.09em;
+}
+
+.public-panel .benchmark-network-trace-heading strong,
+.public-panel .benchmark-network-trace.empty strong {
+  margin-top: 3px;
+  color: var(--text-primary);
+  font-size: 14px;
+}
+
+.public-panel .benchmark-network-trace-heading > em {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-style: normal;
+  white-space: nowrap;
+}
+
+.public-panel .benchmark-trace-stages,
+.public-panel .benchmark-trace-boundaries {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.public-panel .benchmark-trace-stages > span,
+.public-panel .benchmark-trace-boundaries > span {
+  min-width: 0;
+  padding: 11px 12px;
+  border-radius: 9px;
+  background: rgba(4, 15, 35, 0.38);
+}
+
+.public-panel .benchmark-trace-stages b {
+  display: inline-grid;
+  width: 21px;
+  height: 21px;
+  margin-right: 7px;
+  place-items: center;
+  border-radius: 6px;
+  color: var(--blue-200);
+  background: rgba(61, 128, 255, 0.17);
+  font-size: 11px;
+}
+
+.public-panel .benchmark-trace-stages strong,
+.public-panel .benchmark-trace-boundaries strong {
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.public-panel .benchmark-trace-stages small,
+.public-panel .benchmark-trace-stages em,
+.public-panel .benchmark-trace-boundaries small,
+.public-panel .benchmark-trace-boundaries em {
+  display: block;
+  margin-top: 5px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-style: normal;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.public-panel .benchmark-network-trace p {
+  margin: 11px 0 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
 .public-panel .benchmark-technical-details {
   margin-top: 16px;
   border-top: 1px solid var(--border-subtle);

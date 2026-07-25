@@ -1082,8 +1082,9 @@ function validatePythonLaunchProcess(value: unknown, nodeId: string): asserts va
           "startupTimeoutSeconds",
         ]
       : value.kind === "remote-stage"
-        ? ["downstream", "returnEndpoint", "cell", "native_stage"]
+        ? ["downstream", "returnEndpoint", "cell", "nativeGguf"]
         : [
+            "nativeGguf",
             "boundaries",
             "firstRemoteStage",
             "apiEndpoint",
@@ -1165,83 +1166,138 @@ function validateRemoteStage(value: Record<string, unknown>): void {
   if (value.downstream !== null) validateDownstream(value.downstream, "downstream");
   validateEndpoint(value.returnEndpoint, "returnEndpoint");
   if (value.cell !== null) validateCell(value.cell);
-  if (value.native_stage !== null) validateNativeStageStage(value.native_stage, value);
+  if (value.nativeGguf !== null) validateNativeGgufStage(value.nativeGguf, value);
 }
 
-function validateNativeStageStage(
+function validateNativeGgufStage(
   value: unknown,
   launch: Record<string, unknown>,
 ): void {
-  assertRecord(value, "native_stage");
+  assertRecord(value, "nativeGguf");
   assertExactKeys(
     value,
     [
       "packagePath",
       "packageId",
-      "manifestSha256",
+      "modelIdentity",
       "modelSource",
       "modelRevision",
-      "modelIdentity",
       "layerStart",
       "layerEnd",
       "totalLayers",
-      "daemonExecutable",
-      "pipelineId",
-      "contextTokens",
-      "gpuLayers",
-      "computeApi",
-      "startupTimeoutSeconds",
-      "callTimeoutSeconds",
-      "closeTimeoutSeconds",
     ],
     [],
-    "native_stage",
+    "nativeGguf",
   );
-  assertPath(value.packagePath, "native_stage.packagePath");
-  assertSha256(value.packageId, "native_stage.packageId");
-  assertSha256(value.manifestSha256, "native_stage.manifestSha256");
-  assertPath(value.modelSource, "native_stage.modelSource");
-  if (value.modelRevision !== null) {
-    assertPath(value.modelRevision, "native_stage.modelRevision", 1_024);
-  }
+  assertPath(value.packagePath, "nativeGguf.packagePath");
+  assertSha256(value.packageId, "nativeGguf.packageId");
   if (
     typeof value.modelIdentity !== "string" ||
     !/^sha256:[0-9a-f]{64}$/.test(value.modelIdentity)
   ) {
-    throw new Error("native_stage.modelIdentity_is_invalid");
+    throw new Error("nativeGguf.modelIdentity_is_invalid");
   }
-  assertInteger(value.layerStart, 0, Number.MAX_SAFE_INTEGER, "native_stage.layerStart");
-  assertInteger(value.layerEnd, 1, Number.MAX_SAFE_INTEGER, "native_stage.layerEnd");
-  assertInteger(value.totalLayers, 1, Number.MAX_SAFE_INTEGER, "native_stage.totalLayers");
+  assertPath(value.modelSource, "nativeGguf.modelSource");
+  if (value.modelRevision !== null) {
+    assertPath(value.modelRevision, "nativeGguf.modelRevision", 1_024);
+  }
+  assertInteger(value.layerStart, 0, Number.MAX_SAFE_INTEGER, "nativeGguf.layerStart");
+  assertInteger(value.layerEnd, 1, Number.MAX_SAFE_INTEGER, "nativeGguf.layerEnd");
+  assertInteger(value.totalLayers, 1, Number.MAX_SAFE_INTEGER, "nativeGguf.totalLayers");
   if (
     value.layerStart !== launch.layerStart ||
     value.layerEnd !== launch.layerEnd ||
     value.totalLayers !== launch.totalLayers
   ) {
-    throw new Error("native_stage_layer_range_does_not_match_launch");
+    throw new Error("native_gguf_layer_range_does_not_match_launch");
   }
-  if (launch.stageIndex === 0) throw new Error("native_stage_stage_cannot_be_root");
-  if (launch.cell !== null) throw new Error("native_stage_stage_cannot_use_cell_execution");
+  if (
+    launch.macroWave !== null ||
+    (launch.kind === "remote-stage" && launch.cell !== null)
+  ) {
+    throw new Error("native_gguf_stage_has_conflicting_execution");
+  }
   if (!Array.isArray(launch.members) || launch.members.length !== 1) {
-    throw new Error("native_stage_stage_requires_single_member");
+    throw new Error("native_gguf_stage_requires_single_member");
   }
-  assertPath(value.daemonExecutable, "native_stage.daemonExecutable");
-  assertUint64String(value.pipelineId, "native_stage.pipelineId");
-  assertInteger(value.contextTokens, 1, 2_147_483_647, "native_stage.contextTokens");
-  assertInteger(value.gpuLayers, 0, 1_000_000, "native_stage.gpuLayers");
-  if (!(value.computeApi === "cpu" || value.computeApi === "cuda" || value.computeApi === "rocm" || value.computeApi === "metal" || value.computeApi === "vulkan")) {
-    throw new Error("native_stage.computeApi_is_invalid");
+  validateNativeGgufCommand(launch.command, value);
+}
+
+function validateNativeGgufCommand(
+  value: unknown,
+  binding: Record<string, unknown>,
+): void {
+  assertRecord(value, "native_gguf_command");
+  if (!Array.isArray(value.args)) {
+    throw new Error("native_gguf_command_args_are_invalid");
   }
-  if ((value.computeApi === "cpu") !== (value.gpuLayers === 0)) {
-    throw new Error("native_stage_compute_api_gpu_layers_mismatch");
+  assertExactCommandStringFlag(
+    value.args,
+    "--native-gguf-package",
+    binding.packagePath,
+    "native_gguf_package",
+  );
+  assertExactCommandStringFlag(
+    value.args,
+    "--native-gguf-package-id",
+    binding.packageId,
+    "native_gguf_package_id",
+  );
+  assertExactCommandStringFlag(
+    value.args,
+    "--stage-package-identity",
+    `sha256:${String(binding.packageId)}`,
+    "native_gguf_stage_package_identity",
+  );
+  assertExactCommandStringFlag(
+    value.args,
+    "--model-artifact-identity",
+    binding.modelIdentity,
+    "native_gguf_model_identity",
+  );
+  assertExactCommandStringFlag(
+    value.args,
+    "--model-canonical-source",
+    binding.modelSource,
+    "native_gguf_model_source",
+  );
+  const revisionPositions = value.args.flatMap(
+    (argument, index) => argument === "--model-canonical-revision" ? [index] : [],
+  );
+  if (binding.modelRevision === null) {
+    if (revisionPositions.length !== 0) {
+      throw new Error("native_gguf_model_revision_flag_is_invalid");
+    }
+  } else if (
+    revisionPositions.length !== 1 ||
+    value.args[revisionPositions[0]! + 1] !== binding.modelRevision
+  ) {
+    throw new Error("native_gguf_model_revision_flag_is_invalid");
   }
-  assertPositiveFinite(value.startupTimeoutSeconds, "native_stage.startupTimeoutSeconds");
-  assertPositiveFinite(value.callTimeoutSeconds, "native_stage.callTimeoutSeconds");
-  assertPositiveFinite(value.closeTimeoutSeconds, "native_stage.closeTimeoutSeconds");
+  const pipelinePositions = value.args.flatMap(
+    (argument, index) => argument === "--pipeline-snapshot-identity" ? [index] : [],
+  );
+  if (pipelinePositions.length !== 1) {
+    throw new Error("native_gguf_pipeline_identity_flag_is_invalid");
+  }
+  assertUint64String(
+    value.args[pipelinePositions[0]! + 1],
+    "native_gguf_pipeline_identity",
+  );
+  for (const incompatible of [
+    "--native_stage-package",
+    "--ram-moe-artifact-schema",
+    "--cell-fixture",
+  ]) {
+    if (value.args.includes(incompatible)) {
+      throw new Error("native_gguf_command_backend_is_not_exclusive");
+    }
+  }
 }
 
 function validateRootEngine(value: Record<string, unknown>): void {
   if (value.stageIndex !== 0) throw new Error("root_engine_stage_index_is_invalid");
+  if (value.nativeGguf !== null) validateNativeGgufStage(value.nativeGguf, value);
   assertIntegerArray(value.boundaries, "boundaries", 2);
   validateDownstream(value.firstRemoteStage, "firstRemoteStage");
   validateEndpoint(value.apiEndpoint, "apiEndpoint");
@@ -1280,7 +1336,28 @@ function validateCommand(value: unknown): void {
   if (!Array.isArray(value.args) || value.args.length > 2_048) {
     throw new Error("command_args_are_invalid");
   }
-  for (const argument of value.args) assertArgument(argument);
+  for (const argument of value.args) {
+    assertArgument(argument);
+    const lowered = argument.toLowerCase();
+    for (const [prefix, backend] of [
+      ["--native_stage", "native_stage"],
+      ["--external-gguf-runtime", "external GGUF runtime"],
+      ["--local-model-runtime", "local-model-runtime"],
+      ["--model-serving-runtime", "model-serving-runtime"],
+    ] as const) {
+      if (lowered.startsWith(prefix)) {
+        throw new Error(`external_backend_command_is_not_allowed:${backend}`);
+      }
+    }
+    for (const [moduleName, backend] of [
+      ["distributed_runtime.native_stage", "native_stage"],
+      ["distributed_runtime.external_gguf_runtime", "external GGUF runtime"],
+    ] as const) {
+      if (lowered === moduleName || lowered.startsWith(`${moduleName}_`)) {
+        throw new Error(`external_backend_command_is_not_allowed:${backend}`);
+      }
+    }
+  }
 }
 
 function validateRootEngineCommand(value: unknown): void {
@@ -1349,6 +1426,22 @@ function assertCommandIntegerFlag(
   const parsed = Number(raw);
   assertInteger(parsed, minimum, maximum, name);
   return parsed;
+}
+
+function assertExactCommandStringFlag(
+  args: unknown[],
+  flag: string,
+  expected: unknown,
+  name: string,
+): void {
+  const positions = args.flatMap((argument, index) => argument === flag ? [index] : []);
+  if (
+    positions.length !== 1 ||
+    typeof expected !== "string" ||
+    args[positions[0]! + 1] !== expected
+  ) {
+    throw new Error(`${name}_flag_is_invalid`);
+  }
 }
 
 function validateAnchor(value: unknown, name: string): void {
@@ -1939,7 +2032,13 @@ function validateSpeculation(value: unknown): void {
     assertExactKeys(
       strategy,
       ["id", "kind", "maxDraftTokens", "minAcceptanceRate", "maxWasteRatio", "priority"],
-      ["artifactId"],
+      [
+        "artifactId",
+        "maxBranches",
+        "maxBranchTokens",
+        "maxKvBytes",
+        "maxWaveTokens",
+      ],
       "speculation.strategy",
     );
     assertIdentifier(strategy.id, "speculation.strategy.id");
@@ -1949,6 +2048,40 @@ function validateSpeculation(value: unknown): void {
     assertFiniteRange(strategy.maxWasteRatio, 0, 1, "speculation.strategy.maxWasteRatio");
     assertInteger(strategy.priority, 0, 1_000_000, "speculation.strategy.priority");
     if (strategy.artifactId !== undefined) assertIdentifier(strategy.artifactId, "speculation.strategy.artifactId");
+    for (const [name, maximum] of [
+      ["maxBranches", 64],
+      ["maxBranchTokens", 1_048_576],
+      ["maxKvBytes", 2 ** 40],
+      ["maxWaveTokens", 17],
+    ] as const) {
+      if (strategy[name] !== undefined) {
+        assertInteger(
+          strategy[name],
+          1,
+          maximum,
+          `speculation.strategy.${name}`,
+        );
+      }
+    }
+    const treeLimits = [
+      strategy.maxBranches,
+      strategy.maxBranchTokens,
+      strategy.maxKvBytes,
+      strategy.maxWaveTokens,
+    ];
+    if (strategy.kind === "draft-tree") {
+      if (treeLimits.some((limit) => limit === undefined)) {
+        throw new Error("speculation_strategy_tree_limits_are_missing");
+      }
+      if (
+        Number(strategy.maxWaveTokens) !==
+        Number(strategy.maxDraftTokens) + 1
+      ) {
+        throw new Error("speculation_strategy_tree_wave_is_invalid");
+      }
+    } else if (treeLimits.some((limit) => limit !== undefined)) {
+      throw new Error("speculation_strategy_tree_limits_are_unexpected");
+    }
   }
 }
 

@@ -169,6 +169,9 @@ export interface RuntimeStreamTunnelOptions {
   /** Tests can start with the relay intentionally unavailable. */
   transportInitiallyAvailable?: boolean;
   directTransport?: RuntimeDirectTransportOptions;
+  onDirectTransportAdvertisementChanged?: (
+    advertisement: DirectTransportAdvertisement,
+  ) => void;
 }
 
 export interface RuntimeStreamTransportSnapshot {
@@ -242,6 +245,9 @@ export class RuntimeStreamTunnel {
         },
         onSourceClosed: (streamId, error) => {
           this.closeSession(streamId, false, error);
+        },
+        onAdvertisementChanged: (advertisement) => {
+          options.onDirectTransportAdvertisementChanged?.(advertisement);
         },
       },
       options.directTransport,

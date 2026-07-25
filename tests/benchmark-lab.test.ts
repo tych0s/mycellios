@@ -62,9 +62,15 @@ describe("benchmark lab", () => {
   it("persists and reloads versioned history", () => {
     const cwd = mkdtempSync(join(tmpdir(), "mycellios-benchlab-"));
     const run = realRun(IDENTITY);
+    run.measurements[0]!.networkTraces = [singleStageTrace()];
     const path = saveBenchmarkRun(cwd, run);
     expect(JSON.parse(readFileSync(path, "utf8")).schema).toBe("mycellios-benchmark-run/2");
-    expect(loadBenchmarkRuns(cwd)).toHaveLength(1);
+    const loaded = loadBenchmarkRuns(cwd);
+    expect(loaded).toHaveLength(1);
+    expect(loaded[0]?.measurements[0]?.networkTraces?.[0]).toMatchObject({
+      jobId: "job-persisted-trace",
+      stages: [{ nodeId: "node-local", backend: "cuda" }],
+    });
   });
 
   it("uses deployment release and revision without a .git directory", () => {
@@ -178,10 +184,50 @@ describe("benchmark lab", () => {
   });
 });
 
+function singleStageTrace() {
+  return {
+    schema: "mycellios-network-execution-trace/1" as const,
+    jobId: "job-persisted-trace",
+    attempt: 1,
+    observedFrom: 1_000,
+    observedUntil: 2_000,
+    durationMs: 1_000,
+    routeClass: "replica" as const,
+    affinityHit: false,
+    selectedRoute: [{
+      routeStageIndex: 0,
+      workerId: "worker-local",
+      deploymentId: "deployment-local",
+      modelDigest: "sha256:model",
+      stageIndex: 0,
+    }],
+    stages: [{
+      routeStageIndex: 0,
+      stageIndex: 0,
+      nodeId: "node-local",
+      workerId: "worker-local",
+      deploymentId: "deployment-local",
+      deploymentOwnerWorkerId: "worker-local",
+      modelDigest: "sha256:model",
+      layerStart: 0,
+      layerEnd: 28,
+      deviceType: "gpu" as const,
+      backend: "cuda" as const,
+      precision: "bf16",
+      deviceName: "GPU local",
+      startedAt: null,
+      endedAt: null,
+      durationMs: null,
+    }],
+    physicalBoundaryCount: 0,
+    boundaries: [],
+  };
+}
+
 function realRun(identity: RunIdentity) {
   const benchmark: ApiBenchmarkDocument = {
     schema_version: 2,
-    kind: "openai_api_continuous_scheduler",
+    kind: "mycellios_api_continuous_scheduler",
     configuration: {
       base_url: "http://127.0.0.1:8082",
       model: "qwen-real",

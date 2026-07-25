@@ -367,7 +367,7 @@ export async function createCoordinator(
       store.listWorkers()
         .filter((worker) => connectedWorkerIds.has(worker.id))
         .flatMap((worker) => worker.capabilities.deployments)
-        .filter((deployment) => deployment.adapter !== "mock")
+        .filter((deployment) => deployment.adapter === "mycellios-pipeline")
         .map((deployment) => deployment.model),
     );
     return scheduler
@@ -1140,7 +1140,7 @@ export async function createCoordinator(
           if (event.type === "token") streamedText += event.token.text;
           if (event.type === "completed") streamedResult = event;
           if (event.type === "failed") streamedFailure = event;
-          writeOpenAiEvent(reply.raw, event, parsed.model, handle.jobId);
+          writeMycelliosEvent(reply.raw, event, parsed.model, handle.jobId);
         }
       } finally {
         clearInterval(heartbeatTimer);
@@ -1368,6 +1368,19 @@ export async function createCoordinator(
 
   app.post("/internal/v1/workers/register", async (request, reply) => {
     const registration = workerRegistrationSchema.parse(request.body);
+    if (
+      !config.allowDevelopmentAdapters
+      && registration.capabilities.deployments.some(
+        (deployment) => deployment.adapter === "mock",
+      )
+    ) {
+      return reply.code(400).send({
+        error: {
+          code: "development_adapter_not_allowed",
+          message: "Production coordinators accept native Mycellios deployments only.",
+        },
+      });
+    }
     const worker = store.registerWorker(registration);
     return reply.code(201).send({ workerId: worker.id, protocolVersion: 1 });
   });
@@ -1389,7 +1402,6 @@ export async function createCoordinator(
       executionNodeId: worker.capabilities.distributedExecutor?.nodeId,
       computeMode: worker.capabilities.distributedExecutor?.computeMode,
       acceleration: worker.capabilities.distributedExecutor?.acceleration,
-      llmfit: worker.capabilities.llmfit,
       reliability: worker.reliability,
       jobsCompleted: worker.jobsCompleted,
       lastSeenAt: new Date(worker.lastSeenAt).toISOString(),
@@ -1413,20 +1425,6 @@ export async function createCoordinator(
         owned_by: "mycellios",
         x_replicas: model.replicas,
         x_pipelines: model.pipelines,
-        ...(model.llmfit
-          ? {
-              x_llmfit: {
-                advised_replicas: model.llmfit.advisedReplicas,
-                best_fit: model.llmfit.bestFit,
-                quantizations: model.llmfit.quantizations,
-                max_estimated_tokens_per_second:
-                  model.llmfit.maxEstimatedTokensPerSecond,
-                max_measured_tokens_per_second:
-                  model.llmfit.maxMeasuredTokensPerSecond,
-                min_memory_required_mb: model.llmfit.minMemoryRequiredMb,
-              },
-            }
-          : {}),
       })),
     };
   });
@@ -1490,7 +1488,7 @@ export async function createCoordinator(
           if (event.type === "token") streamedText += event.token.text;
           if (event.type === "completed") streamedResult = event;
           if (event.type === "failed") streamedFailure = event;
-          writeOpenAiEvent(reply.raw, event, parsed.model, handle.jobId);
+          writeMycelliosEvent(reply.raw, event, parsed.model, handle.jobId);
         }
       } finally {
         clearInterval(heartbeatTimer);
@@ -1508,7 +1506,10 @@ export async function createCoordinator(
         latencyMs: streamedResult?.result.metrics.activeMs ?? null,
         metadata: streamedFailure
           ? { failure_code: streamedFailure.code, failure_message: streamedFailure.message }
-          : { finish_reason: streamedResult?.result.finishReason ?? null },
+          : {
+              finish_reason: streamedResult?.result.finishReason ?? null,
+              execution_trace: streamedResult?.result.networkTrace ?? null,
+            },
       });
       void persistence?.flush();
       reply.raw.write("data: [DONE]\n\n");
@@ -1548,6 +1549,7 @@ export async function createCoordinator(
         affinity_hit: affinityHit,
         ttft_ms: result.result.metrics.ttftMs,
         reused_kv_tokens: result.result.metrics.reusedKvTokens ?? 0,
+        execution_trace: result.result.networkTrace ?? null,
       },
     });
     void persistence?.flush();
@@ -1575,6 +1577,7 @@ export async function createCoordinator(
         reused_kv_tokens: result.result.metrics.reusedKvTokens ?? 0,
         ttft_ms: result.result.metrics.ttftMs,
         active_ms: result.result.metrics.activeMs,
+        execution_trace: result.result.networkTrace ?? null,
       },
     };
   });
@@ -2175,7 +2178,7 @@ function constantTimeEqual(received: string, expected: string): boolean {
   return left.length === right.length && timingSafeEqual(left, right);
 }
 
-function writeOpenAiEvent(
+function writeMycelliosEvent(
   stream: NodeJS.WritableStream,
   event: JobStreamEvent,
   model: string,
@@ -2241,6 +2244,7 @@ function writeOpenAiEvent(
           ttft_ms: event.result.metrics.ttftMs,
           active_ms: event.result.metrics.activeMs,
           reused_kv_tokens: event.result.metrics.reusedKvTokens ?? 0,
+          execution_trace: event.result.networkTrace ?? null,
         },
       })}\n\n`,
     );

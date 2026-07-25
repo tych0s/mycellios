@@ -19,6 +19,10 @@ from aiohttp import web
 import torch
 from transformers import AutoConfig
 
+from .dense_tiering import (
+    add_dense_tiering_arguments,
+    dense_tiering_config_from_args,
+)
 from .engine import (
     DistributedPipelineEngine,
     GenerationCancelledError,
@@ -29,12 +33,18 @@ from .engine import (
     parse_boundaries,
 )
 from .model import load_tokenizer, resolve_model_snapshot
+from .native_gguf import verify_native_gguf_stage
+from .native_gguf_runtime import (
+    add_native_gguf_arguments,
+    native_gguf_runtime_from_args,
+)
 from .paged_stage import add_paged_kv_arguments, paged_kv_config_from_args
 from .protocol import TensorCodec
 from .ram_backed_moe_runtime import (
     add_ram_backed_moe_arguments,
     ram_backed_moe_config_from_args,
 )
+from .runtime_policy import reject_external_backend_arguments
 from .recovery import (
     RecoveringPipelineEngine,
     RemoteRecoveryStandbyEngineFactory,
@@ -45,6 +55,7 @@ from .stage import (
     MAX_SPECULATIVE_BRANCH_TOKENS,
     MAX_SPECULATIVE_KV_BYTES,
 )
+from .speculation import NgramTreeDraftProvider
 
 
 DEFAULT_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
@@ -55,6 +66,19 @@ DEFAULT_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
 PENDING_PER_ACTIVE_SLOT = 4
 OUTPUT_TOKEN_HASH_SCHEME = "gdlp-output-token-ids-v1"
 OUTPUT_TOKEN_DIGEST_DOMAIN = OUTPUT_TOKEN_HASH_SCHEME.encode("ascii") + b"\0"
+
+
+def tree_draft_provider_from_args(
+    args: argparse.Namespace,
+) -> NgramTreeDraftProvider | None:
+    """Materialize only the native provider explicitly selected by the CLI."""
+
+    if args.speculation != "draft-tree":
+        return None
+    return NgramTreeDraftProvider(
+        max_draft_tokens=args.speculative_max_draft_tokens,
+        max_branches=args.max_speculative_branches,
+    )
 
 
 def output_token_ids_sha256(token_ids: list[int] | tuple[int, ...]) -> str:
@@ -292,7 +316,7 @@ class IncrementalTokenDecoder:
         )
 
 
-class DistributedOpenAIServer:
+class DistributedMycelliosServer:
     def __init__(
         self,
         engine: DistributedPipelineEngine | RecoveringPipelineEngine,
@@ -502,7 +526,7 @@ class DistributedOpenAIServer:
             not isinstance(body["user"], str) or not body["user"].strip()
         ):
             raise ValueError("user must be a non-empty string")
-        # An explicit transport header wins; the OpenAI ``user`` field is the
+        # An explicit transport header wins; the legacy ``user`` field is the
         # compatible fallback so unmodified clients can still pin their chat.
         session_key = normalize_session_key(
             header_session_id if header_session_id is not None else body.get("user")
@@ -794,17 +818,21 @@ def error_response(message: str, kind: str, status: int) -> web.Response:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    reject_external_backend_arguments(arguments)
     parser = argparse.ArgumentParser(
-        description="OpenAI-compatible API backed by the persistent GDLP layer pipeline."
+        description="Mycellios API backed by the persistent native layer pipeline."
     )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--revision")
     parser.add_argument("--model-artifact-identity")
+    parser.add_argument("--stage-package-identity")
     parser.add_argument("--model-canonical-source")
     parser.add_argument("--model-canonical-revision")
     parser.add_argument("--pipeline-snapshot-identity", type=int)
     add_ram_backed_moe_arguments(parser)
     add_paged_kv_arguments(parser)
+    add_native_gguf_arguments(parser)
     parser.add_argument(
         "--stage-executor-id",
         action="append",
@@ -841,6 +869,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "An explicit accelerator request fails if it is unavailable."
         ),
     )
+    add_dense_tiering_arguments(parser)
     parser.add_argument("--max-batch-size", type=int, default=8)
     parser.add_argument(
         "--max-active-sequences",
@@ -848,7 +877,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=32,
         help=(
             "Sequences admitted into decode at once. Measured on separate GPUs over "
-            "WAN (docs/benchmarks/gpu_cloud-exp1-maxactive-2026-07-24): 8 caps aggregate "
+            "WAN: 8 caps aggregate "
             "throughput at roughly half of what the hardware sustains (52,7 vs 102,6 "
             "tok/s under load) and collapses under overload (18,8 tok/s, 177 errors); "
             "32 fixes both and also drains the queue faster at low load. 64 measured "
@@ -865,7 +894,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "must be sized against what the pipeline can actually drain, not set as "
             "a flat number: measured under overload with 8 active slots and a flat "
             "128-deep queue, every admitted request timed out and goodput fell to "
-            "ZERO (docs/benchmarks/gpu_cloud-exp10-salida-larga-2026-07-24). Accepting "
+            "ZERO. Accepting "
             "work that provably cannot be served turns a slowdown into an outage."
         ),
     )
@@ -931,9 +960,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--speculation",
-        choices=("off", "ngram"),
+        choices=("off", "ngram", "draft-tree"),
         default="off",
-        help="Enable exact adaptive speculative verification with the selected drafter.",
+        help=(
+            "Enable exact adaptive speculative verification with the selected "
+            "native Mycellios drafter."
+        ),
     )
     parser.add_argument("--speculative-max-draft-tokens", type=int, default=4)
     parser.add_argument("--speculation-minimum-speedup", type=float, default=1.05)
@@ -944,7 +976,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=4,
         help=(
             "Keep the KV of up to this many finished chats alive on every stage "
-            "so the next turn (X-Session-Id header or OpenAI user field) only "
+            "so the next turn (X-Session-Id header or legacy user field) only "
             "prefills the new suffix; zero disables session retention."
         ),
     )
@@ -983,7 +1015,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--return-port", type=int, default=0)
     parser.add_argument("--startup-timeout-seconds", type=float, default=180.0)
     parser.add_argument("--socket-timeout-seconds", type=float, default=180.0)
-    parsed = parser.parse_args(argv)
+    parsed = parser.parse_args(arguments)
     if parsed.max_pending_requests is None:
         # Resolved here rather than at build time so every caller sees a complete
         # namespace; the backlog is tied to serving capacity, not to a constant.
@@ -993,7 +1025,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parsed
 
 
-def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
+def build_server(args: argparse.Namespace) -> DistributedMycelliosServer:
     if (args.sealed_wave_tokens is None) != (
         args.max_prefill_chunk_tokens is None
     ):
@@ -1002,8 +1034,14 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
         )
     ram_backed_moe = ram_backed_moe_config_from_args(args)
     paged_kv = paged_kv_config_from_args(args)
-    if ram_backed_moe is not None and paged_kv is not None:
-        raise ValueError("paged KV and RAM-backed MoE backends are mutually exclusive")
+    native_gguf = native_gguf_runtime_from_args(args)
+    if sum(
+        backend is not None
+        for backend in (ram_backed_moe, paged_kv, native_gguf)
+    ) > 1:
+        raise ValueError(
+            "native GGUF, paged KV and RAM-backed MoE backends are mutually exclusive"
+        )
     if not 1 <= args.port <= 65_535:
         raise ValueError("port must be between 1 and 65535")
     if not args.public_model_name.strip():
@@ -1078,6 +1116,15 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
             "speculative branch count, tokens and KV bytes must all be zero "
             "or all be positive"
         )
+    if args.speculation == "draft-tree" and not all(
+        speculative_tree_limits_enabled
+    ):
+        raise ValueError(
+            "draft-tree requires sealed positive branch count, branch-token "
+            "and KV-byte limits"
+        )
+    if args.speculation == "draft-tree" and args.sealed_wave_tokens is None:
+        raise ValueError("draft-tree requires an explicit sealed-wave-tokens limit")
     if args.sealed_wave_tokens is not None and not 1 <= args.sealed_wave_tokens <= 17:
         raise ValueError("sealed-wave-tokens must be between 1 and 17")
     if (
@@ -1097,12 +1144,19 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
     if args.sealed_wave_tokens is not None:
         required_wave_tokens = (
             args.speculative_max_draft_tokens + 1
-            if args.speculation == "ngram"
+            if args.speculation in ("ngram", "draft-tree")
             else 1
         )
         if args.sealed_wave_tokens < required_wave_tokens:
             raise ValueError(
                 "sealed-wave-tokens cannot be smaller than the VERIFY input"
+            )
+        if (
+            args.speculation == "draft-tree"
+            and args.sealed_wave_tokens != required_wave_tokens
+        ):
+            raise ValueError(
+                "draft-tree sealed-wave-tokens must equal draft depth plus one"
             )
         if args.speculation == "off" and args.sealed_wave_tokens != 1:
             raise ValueError(
@@ -1162,7 +1216,31 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
                 raise ValueError(
                     f"recovery standby {route.route_id!r} reuses the primary endpoint"
                 )
-    if ram_backed_moe is not None:
+    native_package = (
+        None
+        if native_gguf is None
+        else verify_native_gguf_stage(
+            native_gguf.package,
+            expected_package_id=native_gguf.package_id,
+        )
+    )
+    if native_package is not None:
+        if (
+            args.revision is not None
+            and args.revision != native_package.model_revision
+        ):
+            raise ValueError(
+                "revision differs from the authenticated native GGUF package"
+            )
+        # `model` is retained as the tokenizer coordinate only. Executable
+        # config and weights are loaded from the authenticated Mycellios package.
+        snapshot = args.model
+        model_config = AutoConfig.from_pretrained(
+            native_package.root,
+            local_files_only=True,
+            trust_remote_code=False,
+        )
+    elif ram_backed_moe is not None:
         snapshot = str(Path(args.model).expanduser().resolve())
         model_config = AutoConfig.from_pretrained(
             snapshot,
@@ -1178,6 +1256,14 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
         if args.boundaries
         else balanced_boundaries(total_layers, args.stages)
     )
+    if native_package is not None:
+        verify_native_gguf_stage(
+            native_package.root,
+            expected_package_id=native_package.package_id,
+            expected_layer_start=boundaries[0],
+            expected_layer_end=boundaries[1],
+            expected_total_layers=total_layers,
+        )
     remote = remote_requested
     if remote and (args.first_stage_host is None or args.first_stage_port is None):
         raise ValueError("remote mode requires both first-stage-host and first-stage-port")
@@ -1185,6 +1271,11 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
         raise ValueError(
             "server CLI RAM-backed MoE requires remote child stages with their "
             "own sealed bindings"
+        )
+    if native_gguf is not None and not remote:
+        raise ValueError(
+            "server CLI native GGUF requires remote child stages with their "
+            "own authenticated Mycellios packages"
         )
     if paged_kv is not None:
         required_request_slots = (
@@ -1219,6 +1310,7 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
             codec=codec,
             threads_per_stage=args.threads_per_stage,
             device=args.device,
+            dense_tiering=dense_tiering_config_from_args(args),
             startup_timeout_seconds=args.startup_timeout_seconds,
             socket_timeout_seconds=args.socket_timeout_seconds,
             spawn_local_stages=not remote,
@@ -1228,6 +1320,7 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
             return_advertise_host=args.return_advertise_host,
             return_port=args.return_port,
             artifact_identity=args.model_artifact_identity,
+            stage_package_identity=args.stage_package_identity,
             canonical_model_source=args.model_canonical_source,
             canonical_model_revision=args.model_canonical_revision,
             pipeline_snapshot_identity=args.pipeline_snapshot_identity,
@@ -1245,6 +1338,11 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
                     else (paged_kv,) + (None,) * (len(boundaries) - 2)
                 )
             ),
+            native_gguf_stages=(
+                None
+                if native_gguf is None
+                else (native_gguf,) + (None,) * (len(boundaries) - 2)
+            ),
             stage_executor_ids=(
                 tuple(args.stage_executor_id) if args.stage_executor_id else None
             ),
@@ -1260,7 +1358,7 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
             max_prefill_chunk_tokens=args.max_prefill_chunk_tokens,
             speculative_max_draft_tokens=(
                 args.speculative_max_draft_tokens
-                if args.speculation == "ngram"
+                if args.speculation in ("ngram", "draft-tree")
                 else 0
             ),
             speculation_minimum_speedup=args.speculation_minimum_speedup,
@@ -1272,7 +1370,14 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
             max_retained_session_tokens=args.max_retained_session_tokens,
             retained_session_ttl_seconds=args.retained_session_ttl_seconds,
     )
-    engine_factory = lambda: DistributedPipelineEngine(engine_config)
+    def make_engine(config: PipelineEngineConfig = engine_config) -> DistributedPipelineEngine:
+        tree_provider = tree_draft_provider_from_args(args)
+        return DistributedPipelineEngine(
+            config,
+            tree_draft_provider=tree_provider,
+        )
+
+    engine_factory = make_engine
     initial_engine = engine_factory()
     engine: DistributedPipelineEngine | RecoveringPipelineEngine
     if args.recovery_max_retries > 0:
@@ -1301,7 +1406,7 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
                 RemoteRecoveryStandbyEngineFactory(
                     route=route,
                     engine_factory=(
-                        lambda config=standby_config: DistributedPipelineEngine(config)
+                        lambda config=standby_config: make_engine(config)
                     ),
                 )
             )
@@ -1315,7 +1420,7 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
         engine = initial_engine
     try:
         tokenizer = load_tokenizer(engine.model_snapshot)
-        return DistributedOpenAIServer(
+        return DistributedMycelliosServer(
             engine,
             tokenizer,
             public_model_name=args.public_model_name,

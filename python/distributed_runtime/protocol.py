@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from enum import IntEnum
 import math
 import socket
 import struct
+import threading
 import time
+from typing import Callable
 import zlib
 
 import torch
@@ -182,17 +185,394 @@ class EncodedTensorPayload:
         return self.view.nbytes
 
 
-@dataclass(frozen=True)
-class LinkEmulator:
-    one_way_delay_ms: float = 0.0
-    bandwidth_mbps: float = 0.0
+class LinkEmulatorError(RuntimeError):
+    """An asynchronous emulated-link send failed or could not be drained."""
 
-    def wait_before_send(self, payload_bytes: int) -> None:
-        seconds = max(0.0, self.one_way_delay_ms) / 1_000
+
+@dataclass(frozen=True)
+class _ScheduledLinkFrame:
+    sequence: int
+    sock: socket.socket
+    header: bytes
+    payload: bytes
+    wire_bytes: int
+    deliver_at: float
+
+
+class LinkEmulator:
+    """A bounded, ordered store-and-forward link emulator.
+
+    Bandwidth reserves a serialization interval for every frame. Propagation
+    starts when that interval ends, so several already-serialized frames can be
+    in flight at once. A single owned worker writes due frames to the TCP socket
+    in FIFO order; there is never one sleeping thread per frame.
+
+    ``send_frame`` remains synchronous when the emulator is disabled (both
+    values are zero). With an active emulator it queues an immutable snapshot
+    and returns after admission. Call :meth:`flush` at a lifecycle boundary
+    when the caller must observe a background socket error before proceeding.
+    The worker retires automatically after an idle interval, while
+    :meth:`close` provides deterministic ownership for tests and long-lived
+    runtimes.
+    """
+
+    def __init__(
+        self,
+        one_way_delay_ms: float = 0.0,
+        bandwidth_mbps: float = 0.0,
+        *,
+        max_queued_frames: int = 64,
+        max_queued_bytes: int = MAX_PAYLOAD_BYTES + HEADER_BYTES,
+        enqueue_timeout_seconds: float | None = 30.0,
+        idle_worker_seconds: float = 1.0,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        delay = float(one_way_delay_ms)
+        bandwidth = float(bandwidth_mbps)
+        if not math.isfinite(delay) or not math.isfinite(bandwidth):
+            raise ValueError("link delay and bandwidth must be finite")
+        if max_queued_frames <= 0:
+            raise ValueError("max_queued_frames must be positive")
+        if max_queued_bytes < HEADER_BYTES:
+            raise ValueError(f"max_queued_bytes must be at least {HEADER_BYTES} bytes")
+        if enqueue_timeout_seconds is not None and enqueue_timeout_seconds < 0:
+            raise ValueError("enqueue_timeout_seconds must be non-negative")
+        if not math.isfinite(idle_worker_seconds) or idle_worker_seconds <= 0:
+            raise ValueError("idle_worker_seconds must be positive and finite")
+
+        self.one_way_delay_ms = max(0.0, delay)
+        self.bandwidth_mbps = max(0.0, bandwidth)
+        self.max_queued_frames = int(max_queued_frames)
+        self.max_queued_bytes = int(max_queued_bytes)
+        self.enqueue_timeout_seconds = enqueue_timeout_seconds
+        self.idle_worker_seconds = float(idle_worker_seconds)
+        self._clock = clock or time.monotonic
+        self._condition = threading.Condition()
+        self._queue: deque[_ScheduledLinkFrame] = deque()
+        self._queued_bytes = 0
+        self._next_serial_finish = self._clock()
+        self._submitted_sequence = 0
+        self._completed_sequence = 0
+        self._inflight: _ScheduledLinkFrame | None = None
+        self._bound_socket: socket.socket | None = None
+        self._worker: threading.Thread | None = None
+        self._closed = False
+        self._failure: BaseException | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.one_way_delay_ms > 0 or self.bandwidth_mbps > 0
+
+    @property
+    def pending_frames(self) -> int:
+        with self._condition:
+            return len(self._queue) + (1 if self._inflight is not None else 0)
+
+    @property
+    def pending_bytes(self) -> int:
+        with self._condition:
+            inflight = self._inflight.wire_bytes if self._inflight else 0
+            return self._queued_bytes + inflight
+
+    def single_frame_delay_seconds(self, wire_bytes: int) -> float:
+        if wire_bytes < 0:
+            raise ValueError("wire_bytes must be non-negative")
+        serialization = 0.0
         if self.bandwidth_mbps > 0:
-            seconds += (payload_bytes * 8) / (self.bandwidth_mbps * 1_000_000)
-        if seconds > 0:
-            time.sleep(seconds)
+            serialization = (wire_bytes * 8) / (self.bandwidth_mbps * 1_000_000)
+        return self.one_way_delay_ms / 1_000 + serialization
+
+    def send(
+        self,
+        sock: socket.socket,
+        header: bytes,
+        payload: bytes | bytearray | memoryview,
+    ) -> None:
+        """Queue one validated frame while preserving a bounded snapshot."""
+
+        with self._condition:
+            self._raise_failure_locked()
+            if self._closed:
+                raise LinkEmulatorError("emulated link is closed")
+        payload_bytes = (
+            payload.nbytes if isinstance(payload, memoryview) else len(payload)
+        )
+        wire_bytes = len(header) + payload_bytes
+        if wire_bytes > self.max_queued_bytes:
+            raise ValueError(
+                "frame exceeds emulated link queue byte capacity "
+                f"({wire_bytes} > {self.max_queued_bytes})"
+            )
+        owner, newly_claimed = _claim_link_emulator_socket(sock, self)
+        if owner is not self:
+            # Once one sender owns a TCP stream every later frame must enter
+            # that same FIFO, including control frames whose call site does
+            # not explicitly pass the emulator. Otherwise an inline END or
+            # SHUTDOWN could overtake a delayed ACTIVATION.
+            owner.send(sock, header, payload)
+            return
+        deadline = (
+            None
+            if self.enqueue_timeout_seconds is None
+            else time.monotonic() + self.enqueue_timeout_seconds
+        )
+        try:
+            with self._condition:
+                self._raise_failure_locked()
+                if self._closed:
+                    raise LinkEmulatorError("emulated link is closed")
+                if self._bound_socket is None:
+                    self._bound_socket = sock
+                elif self._bound_socket is not sock:
+                    raise LinkEmulatorError(
+                        "one LinkEmulator instance cannot own multiple TCP sockets"
+                    )
+                while (
+                    len(self._queue) + (1 if self._inflight is not None else 0)
+                    >= self.max_queued_frames
+                    or self._queued_bytes
+                    + (
+                        self._inflight.wire_bytes
+                        if self._inflight is not None
+                        else 0
+                    )
+                    + wire_bytes
+                    > self.max_queued_bytes
+                ):
+                    self._raise_failure_locked()
+                    if self._closed:
+                        raise LinkEmulatorError(
+                            "emulated link closed while queueing"
+                        )
+                    remaining = (
+                        None if deadline is None else deadline - time.monotonic()
+                    )
+                    if remaining is not None and remaining <= 0:
+                        raise LinkEmulatorError(
+                            "timed out waiting for bounded emulated-link queue capacity"
+                        )
+                    self._condition.wait(timeout=remaining)
+
+                # Snapshot mutable payloads before returning from send_frame.
+                payload_snapshot = (
+                    payload if isinstance(payload, bytes) else bytes(payload)
+                )
+                now = self._clock()
+                serial_start = max(now, self._next_serial_finish)
+                serialization = 0.0
+                if self.bandwidth_mbps > 0:
+                    serialization = (
+                        wire_bytes * 8
+                    ) / (self.bandwidth_mbps * 1_000_000)
+                serial_finish = serial_start + serialization
+                self._next_serial_finish = serial_finish
+                self._submitted_sequence += 1
+                self._queue.append(
+                    _ScheduledLinkFrame(
+                        sequence=self._submitted_sequence,
+                        sock=sock,
+                        header=header,
+                        payload=payload_snapshot,
+                        wire_bytes=wire_bytes,
+                        deliver_at=(
+                            serial_finish + self.one_way_delay_ms / 1_000
+                        ),
+                    )
+                )
+                self._queued_bytes += wire_bytes
+                self._ensure_worker_locked()
+                self._condition.notify_all()
+        except BaseException:
+            # A rejected first frame must not poison this socket: otherwise a
+            # later lifecycle frame without an explicit emulator would be
+            # redirected into an owner that never admitted any work.
+            if newly_claimed:
+                with self._condition:
+                    admitted = (
+                        self._bound_socket is sock
+                        and (
+                            self._submitted_sequence > self._completed_sequence
+                            or self._inflight is not None
+                            or bool(self._queue)
+                        )
+                    )
+                    if not admitted and self._bound_socket is sock:
+                        self._bound_socket = None
+                if not admitted:
+                    _release_link_emulator_socket(sock, self)
+            raise
+
+    def flush(self, timeout_seconds: float | None = None) -> None:
+        """Wait until every frame admitted before this call is on the socket."""
+
+        if timeout_seconds is not None and timeout_seconds < 0:
+            raise ValueError("timeout_seconds must be non-negative")
+        deadline = (
+            None if timeout_seconds is None else time.monotonic() + timeout_seconds
+        )
+        with self._condition:
+            target = self._submitted_sequence
+            while self._completed_sequence < target:
+                self._raise_failure_locked()
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise LinkEmulatorError("timed out draining emulated-link frames")
+                self._condition.wait(timeout=remaining)
+            self._raise_failure_locked()
+
+    def close(
+        self,
+        *,
+        drain: bool = True,
+        timeout_seconds: float | None = None,
+    ) -> None:
+        """Close the owned sender, optionally discarding queued frames."""
+
+        if timeout_seconds is not None and timeout_seconds < 0:
+            raise ValueError("timeout_seconds must be non-negative")
+        with self._condition:
+            self._closed = True
+            aborted_socket = None
+            if not drain:
+                self._queue.clear()
+                self._queued_bytes = 0
+                aborted_socket = (
+                    self._inflight.sock
+                    if self._inflight is not None
+                    else self._bound_socket
+                )
+            self._condition.notify_all()
+        if aborted_socket is not None:
+            try:
+                aborted_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        if drain:
+            self.flush(timeout_seconds=timeout_seconds)
+
+        with self._condition:
+            worker = self._worker
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=timeout_seconds)
+            if worker.is_alive():
+                raise LinkEmulatorError("timed out stopping emulated-link sender")
+        with self._condition:
+            self._raise_failure_locked()
+        _release_link_emulator_socket(self._bound_socket, self)
+        self._bound_socket = None
+
+    def notify_clock_advanced(self) -> None:
+        """Wake the worker after advancing an injected deterministic clock."""
+
+        with self._condition:
+            self._condition.notify_all()
+
+    def __enter__(self) -> LinkEmulator:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def _ensure_worker_locked(self) -> None:
+        if self._worker is not None and self._worker.is_alive():
+            return
+        self._worker = threading.Thread(
+            target=self._run_sender,
+            name=f"mycellios-link-sender-{id(self):x}",
+            daemon=True,
+        )
+        self._worker.start()
+
+    def _run_sender(self) -> None:
+        while True:
+            with self._condition:
+                item: _ScheduledLinkFrame | None = None
+                while item is None:
+                    if self._failure is not None:
+                        self._worker = None
+                        self._condition.notify_all()
+                        return
+                    if self._closed and not self._queue:
+                        self._worker = None
+                        self._condition.notify_all()
+                        return
+                    if not self._queue:
+                        notified = self._condition.wait(
+                            timeout=self.idle_worker_seconds
+                        )
+                        if not notified and not self._queue and not self._closed:
+                            self._worker = None
+                            self._condition.notify_all()
+                            return
+                        continue
+                    candidate = self._queue[0]
+                    remaining = candidate.deliver_at - self._clock()
+                    if remaining > 0:
+                        self._condition.wait(timeout=remaining)
+                        continue
+                    item = self._queue.popleft()
+                    self._queued_bytes -= item.wire_bytes
+                    self._inflight = item
+                    self._condition.notify_all()
+
+            try:
+                item.sock.sendall(item.header)
+                if item.payload:
+                    item.sock.sendall(item.payload)
+            except BaseException as error:
+                with self._condition:
+                    self._failure = error
+                    self._queue.clear()
+                    self._queued_bytes = 0
+                    self._inflight = None
+                    self._worker = None
+                    self._condition.notify_all()
+                try:
+                    item.sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                return
+
+            with self._condition:
+                self._completed_sequence = item.sequence
+                self._inflight = None
+                self._condition.notify_all()
+
+    def _raise_failure_locked(self) -> None:
+        if self._failure is not None:
+            raise LinkEmulatorError("emulated-link sender failed") from self._failure
+
+
+_LINK_EMULATOR_OWNERS: dict[object, LinkEmulator] = {}
+_LINK_EMULATOR_OWNERS_LOCK = threading.Lock()
+
+
+def _claim_link_emulator_socket(
+    sock: object,
+    emulator: LinkEmulator,
+) -> tuple[LinkEmulator, bool]:
+    with _LINK_EMULATOR_OWNERS_LOCK:
+        owner = _LINK_EMULATOR_OWNERS.get(sock)
+        if owner is None:
+            _LINK_EMULATOR_OWNERS[sock] = emulator
+            return emulator, True
+        return owner, False
+
+
+def _owned_link_emulator(sock: object) -> LinkEmulator | None:
+    with _LINK_EMULATOR_OWNERS_LOCK:
+        return _LINK_EMULATOR_OWNERS.get(sock)
+
+
+def _release_link_emulator_socket(
+    sock: object | None,
+    emulator: LinkEmulator,
+) -> None:
+    if sock is None:
+        return
+    with _LINK_EMULATOR_OWNERS_LOCK:
+        if _LINK_EMULATOR_OWNERS.get(sock) is emulator:
+            del _LINK_EMULATOR_OWNERS[sock]
 
 
 def configure_socket(sock: socket.socket) -> None:
@@ -251,11 +631,17 @@ def send_frame(
         hidden_size,
         payload_size,
     )
-    if emulator is not None:
-        emulator.wait_before_send(len(header) + payload_size)
-    sock.sendall(header)
-    if payload:
-        sock.sendall(payload)
+    selected_emulator = (
+        emulator
+        if emulator is not None and emulator.enabled
+        else _owned_link_emulator(sock)
+    )
+    if selected_emulator is not None:
+        selected_emulator.send(sock, header, payload)
+    else:
+        sock.sendall(header)
+        if payload:
+            sock.sendall(payload)
     return len(header) + payload_size
 
 

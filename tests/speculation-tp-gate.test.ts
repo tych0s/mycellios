@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 import { speculativeLinkTimeSavedMs } from "../src/distribution/cost-model.js";
 import {
   TP_CELL_MAX_ONE_WAY_LATENCY_MS,
+  TP_CELL_MIN_LINK_AVAILABILITY,
+  TP_CELL_MIN_SUCCESSFUL_LINK_SAMPLES,
   compareParallelismArchitectures,
   isViableTensorParallelCellLatency,
+  tensorParallelCellGateReason,
 } from "../src/distribution/parallelism.js";
 import { evaluatePlanner, TopologyBeamPlanner } from "../src/distribution/planners.js";
 import { fixedDistributionScenarios } from "../src/distribution/scenarios.js";
@@ -73,13 +76,28 @@ describe("tensor-parallel cell latency gate", () => {
     expect(isViableTensorParallelCellLatency(Number.POSITIVE_INFINITY)).toBe(false);
   });
 
-  it("annotates tensor estimates with a non-binding warning on slow cells only", () => {
+  it("hard-rejects slow, absent, expired and low-confidence collective links", () => {
     const base = fixedDistributionScenarios()[0]!;
-    const withLatency = (oneWayLatencyMs: number) => ({
+    const now = Date.now();
+    const withLatency = (
+      oneWayLatencyMs: number,
+      successfulSamples = TP_CELL_MIN_SUCCESSFUL_LINK_SAMPLES,
+    ) => ({
       ...base,
       topology: {
         ...base.topology,
-        links: base.topology.links.map((link) => ({ ...link, oneWayLatencyMs })),
+        links: base.topology.links.map((link) => ({
+          ...link,
+          oneWayLatencyMs,
+          availability: Math.max(0.999, TP_CELL_MIN_LINK_AVAILABILITY),
+          evidence: {
+            source: "runtime-probe" as const,
+            measuredAt: now - 1_000,
+            validUntil: now + 60_000,
+            successfulSamples,
+            failedSamples: 0,
+          },
+        })),
       },
     });
 
@@ -97,8 +115,8 @@ describe("tensor-parallel cell latency gate", () => {
       slowPipeline.plan,
     );
     const slowRing = slowEstimates.find((entry) => entry.architecture === "tensor-ring")!;
-    expect(slowRing.feasible).toBe(true);
-    expect(slowRing.warning).toBe("tp_cell_one_way_latency_above_viability_ceiling");
+    expect(slowRing.feasible).toBe(false);
+    expect(slowRing.reason).toBe("tp_cell_one_way_latency_above_viability_ceiling");
     const slowPipelineEstimate = slowEstimates.find(
       (entry) => entry.architecture === "contiguous-pipeline",
     )!;
@@ -120,5 +138,52 @@ describe("tensor-parallel cell latency gate", () => {
     const fastRing = fastEstimates.find((entry) => entry.architecture === "tensor-ring")!;
     expect(fastRing.feasible).toBe(true);
     expect(fastRing.warning).toBeUndefined();
+
+    const nodeIds = fastPipeline.plan.stages.map((stage) => stage.nodeId);
+    expect(
+      tensorParallelCellGateReason(
+        nodeIds,
+        {
+          ...fast.topology,
+          links: fast.topology.links.map(({ evidence: _evidence, ...link }) => link),
+        },
+        now,
+      ),
+    ).toBe("tp_cell_link_evidence_missing");
+    expect(
+      tensorParallelCellGateReason(
+        nodeIds,
+        withLatency(0.05, TP_CELL_MIN_SUCCESSFUL_LINK_SAMPLES - 1).topology,
+        now,
+      ),
+    ).toBe("tp_cell_link_confidence_insufficient");
+    expect(
+      tensorParallelCellGateReason(
+        nodeIds,
+        {
+          ...fast.topology,
+          links: fast.topology.links.map((link) => ({
+            ...link,
+            evidence: {
+              ...link.evidence!,
+              validUntil: now,
+            },
+          })),
+        },
+        now,
+      ),
+    ).toBe("tp_cell_link_evidence_expired");
+    expect(
+      tensorParallelCellGateReason(
+        nodeIds,
+        {
+          ...fast.topology,
+          links: fast.topology.links.filter(
+            (link) => !(link.from === nodeIds[0] && link.to === nodeIds[1]),
+          ),
+        },
+        now,
+      ),
+    ).toBe("collective_link_missing");
   });
 });

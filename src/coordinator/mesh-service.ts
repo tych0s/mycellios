@@ -3,6 +3,7 @@ import type {
   ChatCompletionRequest,
   CompletionResult,
   JobPayload,
+  NetworkExecutionTrace,
   ScheduledRoute,
   TokenEvent,
   WorkerEnvelope,
@@ -13,6 +14,11 @@ import { estimateInputTokens, inputHashForRequest } from "../core/request.js";
 import { Scheduler } from "../scheduler/scheduler.js";
 import type { MeshStore, StoredJob } from "../storage/store.js";
 import type { WorkerHub } from "./worker-hub.js";
+import type { RuntimeTransportSnapshot } from "./worker-hub.js";
+import {
+  buildNetworkExecutionTrace,
+  networkTraceBoundaryKeys,
+} from "../telemetry/network-execution-trace.js";
 
 export type JobStreamEvent =
   | { type: "accepted"; jobId: string; sessionId: string; route: ScheduledRoute }
@@ -48,6 +54,16 @@ interface RuntimeJob {
   leaseTimer: NodeJS.Timeout | null;
   firstTokenTimer: NodeJS.Timeout | null;
   attempt: number;
+  attemptStartedAt: number;
+  attemptTransportStart: RuntimeTransportSnapshot[];
+  attemptBoundaryKeys: Set<string>;
+}
+
+interface TransportUsageInterval {
+  jobId: string;
+  startedAt: number;
+  endedAt: number;
+  boundaryKeys: Set<string>;
 }
 
 interface PromptCheckpoint {
@@ -77,6 +93,7 @@ interface MeshServiceEvents {
 export class MeshService extends EventEmitter<MeshServiceEvents> {
   private readonly runtimes = new Map<string, RuntimeJob>();
   private readonly activeSessions = new Map<string, string>();
+  private readonly recentTransportUsage: TransportUsageInterval[] = [];
 
   constructor(
     readonly store: MeshStore,
@@ -155,6 +172,7 @@ export class MeshService extends EventEmitter<MeshServiceEvents> {
       () => this.failRuntime(jobId, "deadline_exceeded", "The distributed request timed out"),
       deadlineMs,
     );
+    const attemptStartedAt = Date.now();
     const runtime: RuntimeJob = {
       request: stableRequest,
       route,
@@ -169,6 +187,12 @@ export class MeshService extends EventEmitter<MeshServiceEvents> {
       leaseTimer: null,
       firstTokenTimer: null,
       attempt: 1,
+      attemptStartedAt,
+      attemptTransportStart: this.captureRuntimeTransportSnapshot(),
+      attemptBoundaryKeys: networkTraceBoundaryKeys(
+        route,
+        this.store.listWorkers(),
+      ),
     };
     this.runtimes.set(jobId, runtime);
     this.activeSessions.set(sessionId, jobId);
@@ -362,13 +386,28 @@ export class MeshService extends EventEmitter<MeshServiceEvents> {
       this.failRuntime(job.id, "invalid_completion", validation.reason);
       return;
     }
+    const observedUntil = Date.now();
+    const endTransports = this.captureRuntimeTransportSnapshot();
+    const contendedBoundaryKeys = this.contendedBoundaryKeys(
+      job.id,
+      runtime.attemptStartedAt,
+      observedUntil,
+      runtime.attemptBoundaryKeys,
+    );
+    const networkTrace = this.buildCompletionNetworkTrace(
+      job.id,
+      runtime,
+      observedUntil,
+      endTransports,
+      contendedBoundaryKeys,
+    );
     this.store.database.transaction(() => {
       this.store.completeJob(job.id, result.metrics);
       this.store.saveSession(job.sessionId, job.model, runtime.route);
     });
     runtime.queue.push({
       type: "completed",
-      result: { ...result, text: runtime.output },
+      result: { ...result, text: runtime.output, networkTrace },
     });
     this.emit("healthy", {
       jobId: job.id,
@@ -451,6 +490,7 @@ export class MeshService extends EventEmitter<MeshServiceEvents> {
     }
     const previousWorkerId = job.workerId;
     if (previousWorkerId) this.hub.send(previousWorkerId, "task.cancel", { jobId });
+    this.recordTransportUsage(jobId, runtime, Date.now());
     this.store.requeueJob(jobId, reason);
 
     while (runtime.routeIndex + 1 < runtime.routePlan.length) {
@@ -459,6 +499,12 @@ export class MeshService extends EventEmitter<MeshServiceEvents> {
       if (!route.stages.every((stage) => this.hub.isConnected(stage.workerId))) continue;
       runtime.route = route;
       runtime.attempt += 1;
+      runtime.attemptStartedAt = Date.now();
+      runtime.attemptTransportStart = this.captureRuntimeTransportSnapshot();
+      runtime.attemptBoundaryKeys = networkTraceBoundaryKeys(
+        route,
+        this.store.listWorkers(),
+      );
       runtime.queue.push({
         type: "progress",
         phase: "recovering",
@@ -500,6 +546,7 @@ export class MeshService extends EventEmitter<MeshServiceEvents> {
     clearTimeout(runtime.timeout);
     if (runtime.leaseTimer) clearTimeout(runtime.leaseTimer);
     if (runtime.firstTokenTimer) clearTimeout(runtime.firstTokenTimer);
+    this.recordTransportUsage(jobId, runtime, Date.now());
     const job = this.store.getJob(jobId);
     if (job) {
       if (this.activeSessions.get(job.sessionId) === jobId) {
@@ -508,6 +555,120 @@ export class MeshService extends EventEmitter<MeshServiceEvents> {
     }
     runtime.queue.close();
     this.runtimes.delete(jobId);
+  }
+
+  private captureRuntimeTransportSnapshot(): RuntimeTransportSnapshot[] {
+    const snapshot = (
+      this.hub as WorkerHub & {
+        runtimeTransportSnapshot?: () => RuntimeTransportSnapshot[];
+      }
+    ).runtimeTransportSnapshot;
+    if (typeof snapshot !== "function") return [];
+    try {
+      return snapshot.call(this.hub).map((item) => ({ ...item }));
+    } catch {
+      // Transport telemetry must never turn a valid inference into a failure.
+      return [];
+    }
+  }
+
+  private buildCompletionNetworkTrace(
+    jobId: string,
+    runtime: RuntimeJob,
+    observedUntil: number,
+    endTransports: readonly RuntimeTransportSnapshot[],
+    contendedBoundaryKeys: ReadonlySet<string>,
+  ): NetworkExecutionTrace {
+    const shared = {
+      jobId,
+      attempt: runtime.attempt,
+      route: runtime.route,
+      observedFrom: runtime.attemptStartedAt,
+      observedUntil,
+    };
+    try {
+      return buildNetworkExecutionTrace({
+        ...shared,
+        workers: this.store.listWorkers(),
+        startTransports: runtime.attemptTransportStart,
+        endTransports,
+        contendedBoundaryKeys,
+      });
+    } catch {
+      // Preserve a strictly valid route-selection trace while refusing to
+      // expose malformed stage or transport observations as measurements.
+      return buildNetworkExecutionTrace({
+        ...shared,
+        workers: [],
+        startTransports: [],
+        endTransports: [],
+      });
+    }
+  }
+
+  private contendedBoundaryKeys(
+    jobId: string,
+    startedAt: number,
+    endedAt: number,
+    boundaryKeys: ReadonlySet<string>,
+  ): Set<string> {
+    const contended = new Set<string>();
+    const consider = (
+      otherJobId: string,
+      otherStartedAt: number,
+      otherEndedAt: number,
+      otherBoundaryKeys: ReadonlySet<string>,
+    ): void => {
+      if (
+        otherJobId === jobId
+        || otherStartedAt > endedAt
+        || otherEndedAt < startedAt
+      ) return;
+      for (const key of boundaryKeys) {
+        if (otherBoundaryKeys.has(key)) contended.add(key);
+      }
+    };
+    for (const [otherJobId, runtime] of this.runtimes) {
+      consider(
+        otherJobId,
+        runtime.attemptStartedAt,
+        Date.now(),
+        runtime.attemptBoundaryKeys,
+      );
+    }
+    for (const interval of this.recentTransportUsage) {
+      consider(
+        interval.jobId,
+        interval.startedAt,
+        interval.endedAt,
+        interval.boundaryKeys,
+      );
+    }
+    return contended;
+  }
+
+  private recordTransportUsage(
+    jobId: string,
+    runtime: RuntimeJob,
+    endedAt: number,
+  ): void {
+    if (runtime.attemptBoundaryKeys.size === 0) return;
+    this.recentTransportUsage.unshift({
+      jobId,
+      startedAt: runtime.attemptStartedAt,
+      endedAt,
+      boundaryKeys: new Set(runtime.attemptBoundaryKeys),
+    });
+    const cutoff = Date.now() - 60 * 60 * 1_000;
+    while (
+      this.recentTransportUsage.length > 0
+      && (
+        this.recentTransportUsage.length > 1_024
+        || this.recentTransportUsage.at(-1)!.endedAt < cutoff
+      )
+    ) {
+      this.recentTransportUsage.pop();
+    }
   }
 
   private validJobEnvelope(workerId: string, jobId: string, leaseId: string): StoredJob | null {

@@ -28,6 +28,7 @@ const resourcesDirectory =
     ? resolve(bundleDirectory, "mycellios.app", "Contents", "Resources")
     : resolve(bundleDirectory, "resources");
 const runtimeArchive = resolve(resourcesDirectory, "distribution-runtime.tar.gz");
+const packagedPythonSource = resolve(resourcesDirectory, "python");
 
 if (!existsSync(asarPath)) {
   throw new Error(`No existe el paquete esperado: ${asarPath}`);
@@ -66,6 +67,29 @@ for (const dependency of forbiddenRuntimeImports) {
   }
 }
 
+for (const forbiddenProductRoute of [
+  "local model runtimeAdapter",
+  "OpenAICompatibleAdapter",
+  "probeLlmfit",
+  "apiKeyEnv",
+  "allowedHosts",
+]) {
+  if (mainBundle.includes(forbiddenProductRoute)) {
+    throw new Error(
+      `El bundle incluye una ruta de inferencia externa retirada: ${forbiddenProductRoute}.`,
+    );
+  }
+}
+
+if (
+  !mainBundle.includes("mycellios-pipeline")
+  || !mainBundle.includes("mycellios_pipeline_endpoint_not_local")
+) {
+  throw new Error(
+    "El bundle no contiene la frontera fail-closed de la pipeline nativa Mycellios.",
+  );
+}
+
 const expectedUpdateFeed = "https://www.mycellios.com/updates/win32/x64/";
 if (platform === "win32") {
   const trayIconPath = resolve(resourcesDirectory, "icons", "app-icon-v2.ico");
@@ -84,6 +108,27 @@ const runtimeSpec = portableRuntimeSpec(platform, arch);
 if (runtimeSpec.supported) {
   if (!existsSync(runtimeArchive)) {
     throw new Error(`El paquete ${platform}/${arch} no contiene ${runtimeArchive}.`);
+  }
+  if (!existsSync(packagedPythonSource)) {
+    throw new Error(
+      `El paquete ${platform}/${arch} no contiene el runtime Mycellios en ${packagedPythonSource}.`,
+    );
+  }
+  for (const forbidden of [
+    "external_gguf_runtime.py",
+    "external_gguf_runtime_probe_cli.py",
+    "external_gguf_runtime_rpc.py",
+    "native_stage.py",
+    "native_stage_package.py",
+    "native_stage_package_cli.py",
+    "gpu_cloud_probe.py",
+  ]) {
+    const path = resolve(packagedPythonSource, "distributed_runtime", forbidden);
+    if (existsSync(path)) {
+      throw new Error(
+        `El paquete contiene un backend externo de investigación: ${path}.`,
+      );
+    }
   }
   const archiveEntries = tar(["-tzf", runtimeArchive])
     .split(/\r?\n/)
@@ -139,6 +184,26 @@ if (runtimeSpec.supported) {
       `La procedencia del Python empaquetado no coincide con ${platform}/${arch}: ${JSON.stringify(provenance)}.`,
     );
   }
+  const canaryVerification = spawnSync(process.execPath, [
+    resolve(import.meta.dirname, "verify-portable-runtime-archive.mjs"),
+    `--archive=${runtimeArchive}`,
+    `--platform=${platform}`,
+    `--arch=${arch}`,
+    `--python-source=${packagedPythonSource}`,
+  ], {
+    encoding: "utf8",
+    maxBuffer: 32 * 1024 * 1024,
+    shell: false,
+    windowsHide: true,
+  });
+  if (canaryVerification.error) throw canaryVerification.error;
+  if (canaryVerification.status !== 0) {
+    throw new Error(
+      canaryVerification.stderr?.trim() ||
+        `El canary del runtime instalado terminó con ${canaryVerification.status ?? "estado desconocido"}.`,
+    );
+  }
+  process.stdout.write(canaryVerification.stdout);
 }
 
 const rendererHtml = extractFile(

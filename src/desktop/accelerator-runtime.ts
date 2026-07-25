@@ -14,6 +14,10 @@ import {
 } from "node:fs/promises";
 import { createReadStream, existsSync, readdirSync } from "node:fs";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import {
+  createArtifactSwarmDownloader,
+  type ArtifactSwarmDownloaderOptions,
+} from "../model-fabric/artifact-swarm.js";
 import { gpuModelsMatch } from "../worker/hardware.js";
 
 export const PORTABLE_RUNTIME_SCHEMA = "mycellios-distribution-runtime/3" as const;
@@ -123,6 +127,11 @@ export type AcceleratorArtifactDownloader = (
   onProgress: (progress: AcceleratorArtifactTransfer) => void,
 ) => Promise<string>;
 
+export type AcceleratorArtifactSwarmOptions = Omit<
+  ArtifactSwarmDownloaderOptions,
+  "originDownloader"
+>;
+
 export interface PortableRuntimeManifest {
   schema: typeof PORTABLE_RUNTIME_SCHEMA;
   platform: string;
@@ -226,6 +235,12 @@ export interface PrepareAcceleratorRuntimeOptions {
   preferredBackend?: "auto" | EffectiveRuntimeBackend | undefined;
   commandRunner?: RuntimeCommandRunner | undefined;
   artifactDownloader?: AcceleratorArtifactDownloader | undefined;
+  /**
+   * Optional native peer source. Every peer chunk is verified against a
+   * signed Mycellios manifest; the pinned HTTPS downloader remains the
+   * authoritative fallback when no peer can provide all required bytes.
+   */
+  artifactSwarm?: AcceleratorArtifactSwarmOptions | undefined;
   onStatus?: ((status: string) => void) | undefined;
   onProgress?: ((event: AcceleratorProgressEvent) => void) | undefined;
 }
@@ -520,7 +535,15 @@ export async function prepareAcceleratorRuntime(
     acceleratorRuntimeTargetName(pack, pack.platform),
   );
   assertDirectChild(acceleratorRoot, target);
-  const downloader = options.artifactDownloader ?? downloadPinnedArtifact;
+  const downloader = options.artifactDownloader
+    ?? (
+      options.artifactSwarm
+        ? createArtifactSwarmDownloader({
+            ...options.artifactSwarm,
+            originDownloader: downloadPinnedArtifact,
+          })
+        : downloadPinnedArtifact
+    );
   await mkdir(acceleratorRoot, { recursive: true });
 
   let cachedFailure: string | undefined;

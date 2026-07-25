@@ -1,5 +1,5 @@
 import type { ModelDeployment } from "../contracts/types.js";
-import { sha256Text } from "../core/json.js";
+import { sha256CanonicalEvidence, sha256Text } from "../core/json.js";
 import type { StoredWorker } from "../storage/store.js";
 import {
   sealBenchmarkActivation,
@@ -30,6 +30,8 @@ import {
   saveBenchmarkRun,
   type RunIdentity,
 } from "./history.js";
+import type { NetworkExecutionTrace } from "../contracts/types.js";
+import { parseNetworkExecutionTrace } from "../telemetry/network-execution-trace.js";
 
 export interface CoordinatorBenchmarkModel {
   id: string;
@@ -151,6 +153,7 @@ interface CoordinatorCompletion {
     ttft_ms: number;
     active_ms: number;
     reused_kv_tokens: number;
+    execution_trace?: NetworkExecutionTrace | null;
   };
 }
 
@@ -164,6 +167,7 @@ interface CoordinatorSample {
   latencyMs: number;
   routeClass: string;
   workerId: string | null;
+  executionTrace: NetworkExecutionTrace | null;
 }
 
 export async function runAndPersistCoordinatorSuite(
@@ -541,6 +545,7 @@ async function requestCoordinatorSample(input: {
     latencyMs,
     routeClass: completion.x_network.route_class,
     workerId: input.resolveWorkerId?.(completion.id) ?? null,
+    executionTrace: completion.x_network.execution_trace ?? null,
   };
 }
 
@@ -583,10 +588,31 @@ function buildCoordinatorMeasurement(
   const inventoryNodeIds = inventory.profiles
     .map((profile) => profile.nodeId)
     .filter((nodeId): nodeId is string => Boolean(nodeId));
-  const topologyNodeIds = activation?.participants
+  const networkTraces = samples.flatMap((sample) =>
+    sample.executionTrace ? [sample.executionTrace] : []
+  );
+  const tracedNodeIds = networkTraces.flatMap((trace) =>
+    trace.stages.flatMap((stage) => stage.nodeId ? [stage.nodeId] : [])
+  );
+  const topologyNodeIds = tracedNodeIds.length > 0
+    ? tracedNodeIds
+    : activation?.participants
     .flatMap((participant) => participant.nodeIds)
     ?? inventoryNodeIds;
-  const stageRanges = activation?.participants.flatMap(
+  const tracedStageRanges = networkTraces.flatMap((trace) =>
+    trace.stages.flatMap((stage) =>
+      stage.layerStart !== null && stage.layerEnd !== null
+        ? [{
+            stageIndex: stage.stageIndex,
+            layerStart: stage.layerStart,
+            layerEnd: stage.layerEnd,
+          }]
+        : []
+    )
+  );
+  const stageRanges = tracedStageRanges.length > 0
+    ? tracedStageRanges
+    : activation?.participants.flatMap(
     (participant) => participant.stageRanges,
   ) ?? [];
   const topologyBoundaries = [...new Set(
@@ -619,7 +645,9 @@ function buildCoordinatorMeasurement(
     },
     inventory,
     topology: {
-      digest: activation?.topologyDigest ?? null,
+      digest: networkTraces.length > 0
+        ? benchmarkTraceTopologyDigest(networkTraces)
+        : activation?.topologyDigest ?? null,
       stageCount: stageRanges.length > 0
         ? new Set(stageRanges.map((stage) => stage.stageIndex)).size
         : topologyNodeIds.length > 0
@@ -689,6 +717,7 @@ function buildCoordinatorMeasurement(
       acceptanceRate: requestSuccessRate,
       energyWhPerToken: physicalTelemetry.energyWhPerToken,
     },
+    networkTraces,
     status,
     comparison: emptyComparison(),
     notes: [
@@ -699,6 +728,9 @@ function buildCoordinatorMeasurement(
       activation
         ? `Activación ${activation.activationId}; topología ${activation.topologyDigest}.`
         : "Ejecución manual sin activation ID sellado; la comparación exige el resto del fingerprint exacto.",
+      networkTraces.length > 0
+        ? `${networkTraces.length} trazas de ruta ligadas a peticiones completadas; transporte y bytes sólo aparecen cuando hubo evidencia efectiva no ambigua.`
+        : "El coordinador no entregó una traza física de ruta; transporte, RTT y bytes quedan sin lectura.",
       physicalTelemetry.energyWh === null
         ? "La ventana no tuvo suficientes muestras físicas continuas para calcular energía; no se ha estimado."
         : `${round(physicalTelemetry.energyWh, 6)} Wh integrados con ${round(physicalTelemetry.energyCoveragePct, 1)}% de cobertura temporal.`,
@@ -732,7 +764,58 @@ function parseCoordinatorCompletion(raw: string): CoordinatorCompletion {
   ) {
     throw new Error("La respuesta no contiene métricas físicas verificables.");
   }
-  return completion as CoordinatorCompletion;
+  const traceValue = completion.x_network.execution_trace;
+  const executionTrace = traceValue === undefined || traceValue === null
+    ? null
+    : parseNetworkExecutionTrace(traceValue);
+  if (traceValue !== undefined && traceValue !== null && executionTrace === null) {
+    throw new Error("La traza física de ejecución no supera la validación estricta.");
+  }
+  return {
+    ...(completion as CoordinatorCompletion),
+    x_network: {
+      ...(completion.x_network as CoordinatorCompletion["x_network"]),
+      execution_trace: executionTrace,
+    },
+  };
+}
+
+function benchmarkTraceTopologyDigest(
+  traces: readonly NetworkExecutionTrace[],
+): string {
+  const identities = [...new Set(traces.map((trace) =>
+    sha256CanonicalEvidence({
+      routeClass: trace.routeClass,
+      selectedRoute: trace.selectedRoute,
+      stages: trace.stages.map((stage) => ({
+        routeStageIndex: stage.routeStageIndex,
+        stageIndex: stage.stageIndex,
+        nodeId: stage.nodeId,
+        workerId: stage.workerId,
+        deploymentId: stage.deploymentId,
+        deploymentOwnerWorkerId: stage.deploymentOwnerWorkerId,
+        modelDigest: stage.modelDigest,
+        layerStart: stage.layerStart,
+        layerEnd: stage.layerEnd,
+        deviceType: stage.deviceType,
+        backend: stage.backend,
+        precision: stage.precision,
+        deviceName: stage.deviceName,
+      })),
+      boundaries: trace.boundaries.map((boundary) => ({
+        fromStageIndex: boundary.fromStageIndex,
+        toStageIndex: boundary.toStageIndex,
+        sourceNodeId: boundary.sourceNodeId,
+        destinationNodeId: boundary.destinationNodeId,
+        physicalBoundary: boundary.physicalBoundary,
+        transport: boundary.transport,
+      })),
+    })
+  ))].sort();
+  return sha256CanonicalEvidence({
+    schema: "mycellios-benchmark-observed-topology/1",
+    identities,
+  });
 }
 
 function errorMessage(raw: string): string {

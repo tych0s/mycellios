@@ -1,0 +1,135 @@
+{
+  "schema": "mycellios-transformers-stage-adapters/2",
+  "registryVersion": 2,
+  "evidenceScope": "software-contract-only",
+  "registryId": "sha256:f0213f374a619109dd5b4d155b7084e538f2711d82e7965289eff7cbfa83907a",
+  "adapters": [
+    {
+      "id": "transformers-llama-v1",
+      "modelType": "llama",
+      "architectures": [
+        "LlamaForCausalLM"
+      ],
+      "requiredLayerModules": [
+        "self_attn",
+        "self_attn.q_proj",
+        "self_attn.k_proj",
+        "self_attn.v_proj",
+        "self_attn.o_proj",
+        "mlp",
+        "mlp.gate_proj",
+        "mlp.up_proj",
+        "mlp.down_proj",
+        "input_layernorm",
+        "post_attention_layernorm"
+      ],
+      "semanticFeatures": [
+        "causal-decoder",
+        "grouped-query-attention",
+        "rotary-position",
+        "rms-norm"
+      ],
+      "attentionScope": "full-only",
+      "parallelismScope": "pipeline-stage",
+      "implementationContract": "mycellios-selective-llama/1"
+    },
+    {
+      "id": "transformers-qwen3-v1",
+      "modelType": "qwen3",
+      "architectures": [
+        "Qwen3ForCausalLM"
+      ],
+      "requiredLayerModules": [
+        "self_attn",
+        "self_attn.q_proj",
+        "self_attn.k_proj",
+        "self_attn.v_proj",
+        "self_attn.o_proj",
+        "mlp",
+        "mlp.gate_proj",
+        "mlp.up_proj",
+        "mlp.down_proj",
+        "input_layernorm",
+        "post_attention_layernorm",
+        "self_attn.q_norm",
+        "self_attn.k_norm"
+      ],
+      "semanticFeatures": [
+        "causal-decoder",
+        "grouped-query-attention",
+        "rotary-position",
+        "rms-norm",
+        "qk-rms-norm"
+      ],
+      "attentionScope": "full-only",
+      "parallelismScope": "pipeline-stage",
+      "implementationContract": "mycellios-selective-qwen3/1"
+    },
+    {
+      "id": "transformers-qwen3-moe-v1",
+      "modelType": "qwen3_moe",
+      "architectures": [
+        "Qwen3MoeForCausalLM"
+      ],
+      "requiredLayerModules": [
+        "self_attn",
+        "self_attn.q_proj",
+        "self_attn.k_proj",
+        "self_attn.v_proj",
+        "self_attn.o_proj",
+        "self_attn.q_norm",
+        "self_attn.k_norm",
+        "mlp",
+        "mlp.gate",
+        "mlp.experts",
+        "input_layernorm",
+        "post_attention_layernorm"
+      ],
+      "semanticFeatures": [
+        "causal-decoder",
+        "grouped-query-attention",
+        "rotary-position",
+        "rms-norm",
+        "qk-rms-norm",
+        "sparse-moe",
+        "layer-local-router",
+        "resident-expert-set",
+        "ep-plan-metadata-only"
+      ],
+      "attentionScope": "full-only",
+      "parallelismScope": "pipeline-only",
+      "implementationContract": "mycellios-selective-qwen3-moe/1"
+    },
+    {
+      "id": "transformers-glm4-moe-v1",
+      "modelType": "glm4_moe",
+      "architectures": [
+        "Glm4MoeForCausalLM"
+      ],
+      "requiredLayerModules": [
+        "self_attn",
+        "self_attn.q_proj",
+        "self_attn.k_proj",
+        "self_attn.v_proj",
+        "self_attn.o_proj",
+        "mlp",
+        "input_layernorm",
+        "post_attention_layernorm"
+      ],
+      "semanticFeatures": [
+        "causal-decoder",
+        "grouped-query-attention",
+        "partial-rotary-position",
+        "rms-norm",
+        "hybrid-dense-moe",
+        "layer-local-router",
+        "resident-expert-set",
+        "shared-expert",
+        "ep-plan-metadata-only"
+      ],
+      "attentionScope": "full-only",
+      "parallelismScope": "pipeline-only",
+      "implementationContract": "mycellios-selective-glm4-moe/1"
+    }
+  ]
+}

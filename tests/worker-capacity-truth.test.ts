@@ -23,6 +23,7 @@ const config = workerConfigSchema.parse({
   limits: { maxConcurrency: 1, pauseWhenForeground: false },
   adapter: {
     kind: "mock",
+    developmentOnly: true,
     model: "capacity-test",
     tokensPerSecond: 10,
     ttftMs: 10,

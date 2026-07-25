@@ -5,6 +5,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+if ($env:MYCELLIOS_EXTERNAL_RUNTIME_RESEARCH -ne '1') {
+    throw 'Archived external-runtime research harness. Set MYCELLIOS_EXTERNAL_RUNTIME_RESEARCH=1 only for an isolated research run.'
+}
 $workspace = Split-Path -Parent $PSScriptRoot
 $server = Join-Path $workspace 'runtime\llama-b10068-vulkan\llama-server.exe'
 $model = Join-Path $workspace 'runtime\models\Qwen3-0.6B-Q8_0.gguf'

@@ -251,6 +251,18 @@ export const runtimeStreamOpenEnvelopeSchema = envelopeSchema(
     }).strict(),
   ]),
 );
+export const runtimePrepareProgressEnvelopeSchema = envelopeSchema(
+  "runtime.prepare.progress",
+  z.object({
+    requestId: runtimeRequestIdSchema,
+    stageIndex: z.number().int().nonnegative().max(255),
+    layerStart: z.number().int().nonnegative().max(1_000_000),
+    layerEnd: z.number().int().positive().max(1_000_000),
+    state: z.enum(["preparing", "ready"]),
+    packageId: z.string().length(64).regex(/^[0-9a-f]+$/).optional(),
+    weightsSizeBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+  }).strict(),
+);
 export const runtimeStreamOpenedEnvelopeSchema = envelopeSchema(
   "runtime.stream.opened",
   z.union([
@@ -429,6 +441,7 @@ export const workerEnvelopeSchema = z.discriminatedUnion("type", [
   taskTokenEnvelopeSchema,
   taskCompleteEnvelopeSchema,
   taskFailEnvelopeSchema,
+  runtimePrepareProgressEnvelopeSchema,
   runtimePreparedEnvelopeSchema,
   runtimeReadyEnvelopeSchema,
   runtimeExitedEnvelopeSchema,

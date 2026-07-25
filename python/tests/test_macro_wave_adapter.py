@@ -61,22 +61,27 @@ def _controller(*, verification_ready: bool) -> AdaptiveSpeculationController:
             max_draft_tokens=4,
             candidate_sizes=(2,),
             min_token_history=0,
-            min_classic_observations=1,
-            min_verify_observations=1,
+            min_classic_observations=2,
+            min_verify_observations=2,
             minimum_speedup=1.0,
         )
     )
-    controller.record_classic(
-        latency_seconds=1.0,
-        transferred_bytes=100,
-    )
-    if verification_ready:
-        controller.record_verification(
-            proposed_tokens=2,
-            accepted_tokens=2,
-            latency_seconds=0.1,
+    # A conservative confidence bound is undefined from one observation.
+    # Seed two repeatable measurements so this helper represents a genuinely
+    # activation-ready controller rather than relying on a point estimate.
+    for _ in range(2):
+        controller.record_classic(
+            latency_seconds=1.0,
             transferred_bytes=100,
         )
+    if verification_ready:
+        for _ in range(2):
+            controller.record_verification(
+                proposed_tokens=2,
+                accepted_tokens=2,
+                latency_seconds=0.1,
+                transferred_bytes=100,
+            )
     return controller
 
 

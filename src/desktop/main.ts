@@ -34,6 +34,7 @@ import { WorkerTunnelLaunchAgent } from "../distribution/worker-tunnel-launch-ag
 import type { StoredWorker } from "../storage/store.js";
 import type { WorkerHub } from "../coordinator/worker-hub.js";
 import { WorkerAgent, validateCoordinatorUrl } from "../worker/agent.js";
+import { prepareNodeStageArtifacts } from "../worker/stage-artifact-preparer.js";
 import {
   probeHardware,
   type HardwareProbe,
@@ -73,7 +74,7 @@ import {
   readVerifiedAccelerationUsage,
 } from "./acceleration-evidence.js";
 import { consumeChatCompletionStreamWithRecovery } from "./chat-stream.js";
-import { desktopExecutorPolicy, normalizeComputeMode } from "./compute-mode.js";
+import { desktopExecutorPolicy } from "./compute-mode.js";
 import {
   selectDesktopHardwareGpu,
   selectWorkerCapacityHardware,
@@ -97,39 +98,22 @@ import {
 } from "./update-recovery.js";
 import { SingleFlight } from "./single-flight.js";
 import { probeRuntimePerformanceProfile } from "../performance/runtime-profile-probe.js";
+import {
+  DEFAULT_DESKTOP_SETTINGS as DEFAULT_SETTINGS,
+  PUBLIC_COORDINATOR_URL,
+  desktopSettingsRequireMigration,
+  sanitizeDesktopSettings,
+} from "./settings.js";
 
 if (started) app.quit();
 
 app.setName("mycellios");
 if (process.platform === "win32") app.setAppUserModelId("app.mycellios.desktop.v2");
 
-const PUBLIC_COORDINATOR_URL = "https://www.mycellios.com";
 const LOCAL_DASHBOARD_COORDINATOR_URL = "http://127.0.0.1:4180";
 const LOCAL_DASHBOARD_COORDINATOR_PORT = 4_180;
 
-const DEFAULT_SETTINGS: DesktopSettings = {
-  coordinatorMode: "remote",
-  remoteCoordinatorUrl: PUBLIC_COORDINATOR_URL,
-  remoteCoordinatorToken: "",
-  contributionEnabled: false,
-  computeMode: "automatic",
-  launchAtLogin: false,
-  closeToTray: true,
-  onboardingComplete: false,
-  region: "auto",
-  offeredVramMb: 4_096,
-  adapterMode: "connectivity-test",
-  modelName: "mycellios-connectivity-check",
-  adapterBaseUrl: "http://127.0.0.1:11434",
-  modelDigest: "",
-};
-
 const UPDATE_FEED_URL = "https://www.mycellios.com/updates/win32/x64/";
-const LEGACY_PUBLIC_COORDINATOR_URLS = new Set([
-  "https://www.mycellios.com",
-  "https://mycellios.com",
-  "https://network.mycellios.app",
-]);
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
@@ -422,13 +406,9 @@ async function installDownloadedUpdate(force: boolean, reason: string): Promise<
 
 function loadSettings(): DesktopSettings {
   try {
-    const stored = JSON.parse(readFileSync(settingsPath(), "utf8")) as Partial<DesktopSettings>;
-    const storedCoordinatorUrl = stored.remoteCoordinatorUrl?.trim().replace(/\/+$/, "");
-    const migrated = storedCoordinatorUrl && LEGACY_PUBLIC_COORDINATOR_URLS.has(storedCoordinatorUrl)
-      ? { ...stored, remoteCoordinatorUrl: DEFAULT_SETTINGS.remoteCoordinatorUrl }
-      : stored;
-    const loaded = sanitizeSettings({ ...DEFAULT_SETTINGS, ...migrated });
-    if (migrated !== stored) {
+    const stored: unknown = JSON.parse(readFileSync(settingsPath(), "utf8"));
+    const loaded = sanitizeDesktopSettings(stored);
+    if (desktopSettingsRequireMigration(stored, loaded)) {
       writeFileSync(settingsPath(), `${JSON.stringify(loaded, null, 2)}\n`, "utf8");
     }
     return loaded;
@@ -437,36 +417,8 @@ function loadSettings(): DesktopSettings {
   }
 }
 
-function sanitizeSettings(input: DesktopSettings): DesktopSettings {
-  const offeredVramMb = Number.isFinite(input.offeredVramMb)
-    ? Math.max(512, Math.min(262_144, Math.round(input.offeredVramMb)))
-    : DEFAULT_SETTINGS.offeredVramMb;
-  const remoteCoordinatorUrl = input.remoteCoordinatorUrl.trim();
-  const remoteCoordinatorToken = input.remoteCoordinatorToken.trim();
-  if (input.coordinatorMode === "remote") validateCoordinatorUrl(remoteCoordinatorUrl);
-  if (input.adapterMode === "local-model-runtime" && !input.modelDigest.trim()) {
-    throw new Error("local model runtime requires a pinned model digest before contributing resources.");
-  }
-  return {
-    coordinatorMode: input.coordinatorMode === "remote" ? "remote" : "local",
-    remoteCoordinatorUrl,
-    remoteCoordinatorToken,
-    contributionEnabled: Boolean(input.contributionEnabled),
-    computeMode: normalizeComputeMode(input.computeMode),
-    launchAtLogin: Boolean(input.launchAtLogin),
-    closeToTray: Boolean(input.closeToTray),
-    onboardingComplete: Boolean(input.onboardingComplete),
-    region: input.region.trim() || "auto",
-    offeredVramMb,
-    adapterMode: input.adapterMode === "local-model-runtime" ? "local-model-runtime" : "connectivity-test",
-    modelName: input.modelName.trim() || DEFAULT_SETTINGS.modelName,
-    adapterBaseUrl: input.adapterBaseUrl.trim() || DEFAULT_SETTINGS.adapterBaseUrl,
-    modelDigest: input.modelDigest.trim(),
-  };
-}
-
 function persistSettings(next: DesktopSettings): void {
-  settings = sanitizeSettings(next);
+  settings = sanitizeDesktopSettings(next);
   writeFileSync(settingsPath(), `${JSON.stringify(settings, null, 2)}\n`, "utf8");
   configureLaunchAtLogin(settings.launchAtLogin);
 }
@@ -631,20 +583,6 @@ async function buildWorkerConfig(
       gpu: primary?.model,
     });
   }
-  const adapter =
-    settings.adapterMode === "local-model-runtime"
-      ? {
-          kind: "local-model-runtime" as const,
-          model: settings.modelName,
-          baseUrl: settings.adapterBaseUrl,
-        }
-      : {
-          kind: "mock" as const,
-          model: "mycellios-connectivity-check",
-          tokensPerSecond: 20,
-          ttftMs: 150,
-          failureRate: 0,
-        };
   return workerConfigSchema.parse({
     region: settings.region,
     capacityScope: "host",
@@ -654,12 +592,13 @@ async function buildWorkerConfig(
       maxTemperatureC: 80,
       pauseWhenForeground: false,
     },
-    adapter,
+    adapter: {
+      kind: "mycellios-native",
+      model: "mycellios-native-control",
+    },
     deployment: {
-      ...(settings.adapterMode === "local-model-runtime" ? { modelDigest: settings.modelDigest } : {}),
       contextLimit: 8_192,
     },
-    llmfit: { enabled: false },
   });
 }
 
@@ -710,9 +649,9 @@ async function initializeWorker(): Promise<void> {
       ? { networkToken: settings.remoteCoordinatorToken }
       : {}),
     reconnect: true,
-    // The legacy connectivity option now means hardware-only standby. It
-    // registers this physical PC but never advertises a fake model.
-    advertiseDeployment: settings.adapterMode !== "connectivity-test",
+    // This worker contributes hardware and the authenticated distributed
+    // executor. Models are advertised only by verified native deployments.
+    advertiseDeployment: false,
     ...(preferredHardwareGpu
       ? { preferredHardwareGpu: { id: preferredHardwareGpu.id, vendor: preferredHardwareGpu.vendor, model: preferredHardwareGpu.model } }
       : {}),
@@ -1450,11 +1389,20 @@ async function createDesktopDistributedExecutor() {
   return {
     nodeId,
     // This is a globally unique logical route name, never a reachable LAN IP.
-    // Protocol v2 rewrites every runtime connection onto the coordinator relay.
+    // Protocol v2 rewrites every runtime connection onto an authenticated
+    // tunnel. The worker additionally advertises verified LAN candidates for
+    // the native encrypted data plane; if the listener or candidate probe
+    // fails, the coordinator keeps using the resumable relay.
     stageHost: `${nodeId}.relay`,
     stagePort: 9_850,
     pythonExecutable,
     launchAgent,
+      directTransport: {
+        enabled: true,
+        listenHost: "0.0.0.0",
+        listenPort: 0,
+        publicPortMapping: true,
+      },
   };
 }
 
@@ -1466,6 +1414,46 @@ class DesktopAcceleratedLaunchAgent implements LaunchAgent {
     private readonly nodeId: string,
   ) {
     this.id = `desktop-shard-executor:${nodeId}`;
+  }
+
+  async prepareRuntime(
+    description: PythonPipelineLaunchDescription,
+    nodeId: string,
+    onProgress?: (
+      event: import("../distribution/launch-supervisor.js").RuntimePreparationProgressEvent,
+    ) => void,
+  ) {
+    if (nodeId !== this.nodeId) throw new Error("desktop_stage_artifact_node_mismatch");
+    const runtime = await prepareDesktopCpuRuntime(this.baseRuntimeRoot);
+    const pythonPath = resourcePath("python");
+    const hfHome = join(app.getPath("userData"), "model-shards");
+    mkdirSync(hfHome, { recursive: true });
+    return await prepareNodeStageArtifacts(description, {
+      nodeId,
+      pythonExecutable: runtime.pythonExecutable,
+      cacheDirectory: hfHome,
+      cwd: app.isPackaged ? dirname(app.getAppPath()) : app.getAppPath(),
+      environment: {
+        PYTHONPATH: [...runtime.pythonPathAdditions, pythonPath].join(delimiter),
+        HF_HOME: hfHome,
+        TOKENIZERS_PARALLELISM: "false",
+        PATH: [...runtime.pathAdditions, dirname(runtime.pythonExecutable), process.env.PATH]
+          .filter(Boolean)
+          .join(delimiter),
+      },
+      onProgress: (event) => {
+        onProgress?.(event);
+        const layerLabel = `${event.layerStart}–${Math.max(event.layerStart, event.layerEnd - 1)}`;
+        accelerationStatus = appendAccelerationLog(accelerationStatus, {
+          at: new Date().toISOString(),
+          level: "info",
+          message: event.state === "preparing"
+            ? `Preparing verified model layers ${layerLabel} for this device.`
+            : `Verified model layers ${layerLabel} are ready in the local content cache.`,
+        });
+        scheduleAccelerationDiagnosticsPublish();
+      },
+    });
   }
 
   async start(

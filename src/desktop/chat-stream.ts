@@ -1,6 +1,6 @@
 import type { ChatResponse, ChatStreamUpdate } from "./contracts.js";
 
-interface OpenAiStreamChunk {
+interface MycelliosStreamChunk {
   id?: string;
   model?: string;
   choices?: Array<{
@@ -227,9 +227,9 @@ export async function consumeChatCompletionStream(
       return;
     }
 
-    let chunk: OpenAiStreamChunk;
+    let chunk: MycelliosStreamChunk;
     try {
-      chunk = JSON.parse(data) as OpenAiStreamChunk;
+      chunk = JSON.parse(data) as MycelliosStreamChunk;
     } catch {
       throw new Error("El coordinador devolvió un fragmento de tokens no válido.");
     }

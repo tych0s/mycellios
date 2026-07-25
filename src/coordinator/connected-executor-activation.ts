@@ -21,6 +21,8 @@ interface ProfiledConnectedExecutor extends ConnectedExecutor {
   performance: PlannerPerformanceScales;
 }
 
+const RUNTIME_LINK_EVIDENCE_TTL_MS = 5 * 60_000;
+
 /**
  * Converts live desktop shard executors into the activation topology consumed by
  * DynamicModelActivationManager. Only connected workers count as capacity.
@@ -89,6 +91,13 @@ export function buildConnectedExecutorActivationSnapshot(
         // both loss and unavailability would charge the same failure twice.
         lossRate: 0,
         availability: observation.availability,
+        evidence: {
+          source: "runtime-probe" as const,
+          measuredAt: observation.measuredAt,
+          validUntil: observation.measuredAt + RUNTIME_LINK_EVIDENCE_TTL_MS,
+          successfulSamples: observation.successfulSamples,
+          failedSamples: observation.failedSamples,
+        },
       }];
     }));
   const reciprocalNodeIds = new Set(measuredLinks.flatMap((link) => (

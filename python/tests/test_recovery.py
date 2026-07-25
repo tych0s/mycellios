@@ -190,6 +190,38 @@ class RecoveringPipelineEngineTests(unittest.TestCase):
         self.assertEqual(stats["standby_routes"][0]["promotions"], 1)
         self.assertTrue(stats["standby_routes"][0]["statically_prevalidated"])
 
+    def test_dirty_shutdown_of_failed_route_is_evidence_not_a_promotion_blocker(
+        self,
+    ) -> None:
+        identity = _identity()
+        expected = {18: (80, 81)}
+        first = _DirtyCloseEngine(
+            identity,
+            expected,
+            {18: 1},
+            emit_before_failure=1,
+        )
+        engine = RecoveringPipelineEngine(
+            lambda: _ScriptedEngine(identity, expected, {18: 1}),
+            initial_engine=first,
+            max_retries=1,
+        )
+        try:
+            output = engine.generate(
+                [GenerationInput(18, torch.tensor([[4]]), 2)]
+            )[0]
+            stats = engine.recovery_stats
+        finally:
+            engine.close()
+
+        self.assertEqual(output.token_ids, expected[18])
+        self.assertEqual(stats["route_recovery_successes"], 1)
+        self.assertEqual(stats["failed_route_close_errors"], 1)
+        self.assertIn(
+            "synthetic dirty route shutdown",
+            stats["last_failed_route_close_error"],
+        )
+
     def test_incompatible_remote_standby_is_rejected_before_factory_execution(self) -> None:
         identity = _identity()
         first = _ScriptedEngine(identity, {1: (2,)}, {1: 1})
@@ -566,6 +598,12 @@ class _BlockingEngine(_ScriptedEngine):
         super().close()
         for future in self.pending.values():
             future.cancel()
+
+
+class _DirtyCloseEngine(_ScriptedEngine):
+    def close(self) -> None:
+        self.closed = True
+        raise RuntimeError("synthetic dirty route shutdown")
 
 
 def _identity(

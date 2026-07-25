@@ -551,7 +551,7 @@ function launchDescription(
     model: modelProfile(),
     modelRevision: `sha256:${"d".repeat(64)}`,
     tokenizerId: "campaign-report-tokenizer",
-    topology: { nodes, links: completeLinks(nodes) },
+    topology: { nodes, links: measuredCollectiveLinks(nodes) },
     workload: {
       promptTokens: 12,
       outputTokens: 16,
@@ -706,18 +706,26 @@ function cellNode(id: string, host: string, port: number): RuntimeNodeProfile {
   };
 }
 
-function completeLinks(nodes: RuntimeNodeProfile[]) {
+function measuredCollectiveLinks(nodes: RuntimeNodeProfile[]) {
+  const measuredAt = Date.now();
   return nodes.flatMap((from) =>
     nodes
       .filter((to) => to.id !== from.id)
       .map((to) => ({
         from: from.id,
         to: to.id,
-        oneWayLatencyMs: 0.6,
+        oneWayLatencyMs: 0.2,
         jitterP95Ms: 0.1,
         bandwidthMbps: 1_000,
         lossRate: 0,
         availability: 0.999,
+        evidence: {
+          source: "runtime-probe" as const,
+          measuredAt,
+          validUntil: measuredAt + 60_000,
+          successfulSamples: 8,
+          failedSamples: 0,
+        },
       })),
   );
 }

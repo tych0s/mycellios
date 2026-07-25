@@ -25,13 +25,6 @@ export function addWorker(
     execution?: ModelDeployment["execution"];
     distributedExecutor?: WorkerCapabilities["distributedExecutor"];
     identity?: WorkerRegistration["identity"];
-    llmfit?: {
-      fitLevel: string;
-      bestQuant?: string;
-      estimatedTokensPerSecond?: number;
-      measuredTokensPerSecond?: number;
-      memoryRequiredMb?: number;
-    };
   },
 ): StoredWorker {
   const mode = input.mode ?? "replica";
@@ -75,50 +68,6 @@ export function addWorker(
       ],
       network: { coordinatorRttMs: 20, uplinkMbps: 100, downlinkMbps: 100 },
       ...(input.distributedExecutor ? { distributedExecutor: input.distributedExecutor } : {}),
-      ...(input.llmfit
-        ? {
-            llmfit: {
-              source: "llmfit" as const,
-              scope: "host" as const,
-              backend: "test",
-              cpuName: "Synthetic CPU",
-              cpuCores: 8,
-              totalRamMb: 16_384,
-              availableRamMb: 8_192,
-              gpuCount: 1,
-              gpus: [
-                {
-                  name: "Synthetic GPU",
-                  backend: "test",
-                  vramMb: input.offeredVramMb ?? 8_192,
-                  unifiedMemory: false,
-                },
-              ],
-              model: {
-                deploymentId: `dep-${input.id}`,
-                requestedModel: input.model ?? "distributed-small",
-                resolvedModel: input.model ?? "distributed-small",
-                fitLevel: input.llmfit.fitLevel,
-                runMode: "GPU",
-                ...(input.llmfit.bestQuant
-                  ? { bestQuant: input.llmfit.bestQuant }
-                  : {}),
-                ...(input.llmfit.estimatedTokensPerSecond
-                  ? {
-                      estimatedTokensPerSecond:
-                        input.llmfit.estimatedTokensPerSecond,
-                    }
-                  : {}),
-                ...(input.llmfit.measuredTokensPerSecond
-                  ? { measuredTokensPerSecond: input.llmfit.measuredTokensPerSecond }
-                  : {}),
-                ...(input.llmfit.memoryRequiredMb !== undefined
-                  ? { memoryRequiredMb: input.llmfit.memoryRequiredMb }
-                  : {}),
-              },
-            },
-          }
-        : {}),
     },
   };
   const worker = store.registerWorker(registration);

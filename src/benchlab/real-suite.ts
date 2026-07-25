@@ -68,7 +68,10 @@ interface ApiBenchmarkRow {
 
 export interface ApiBenchmarkDocument {
   schema_version: 2;
-  kind: "openai_api_continuous_scheduler";
+  /** The second value is read-only compatibility for archived benchmark evidence. */
+  kind:
+    | "mycellios_api_continuous_scheduler"
+    | "openai_api_continuous_scheduler";
   configuration: {
     base_url: string;
     model: string;
@@ -275,7 +278,7 @@ function rowToMeasurement(
   return sealBenchmarkScenario({
     id: `runtime-${health.artifact_identity.slice(0, 18)}-c${row.concurrency}`,
     title: `${health.model} real · concurrencia ${row.concurrency}`,
-    description: "Peticiones reales por la API OpenAI-compatible y el pipeline GDLP/2 activo.",
+    description: "Peticiones reales por la API Mycellios y el pipeline GDLP/2 activo.",
     evidence: "loopback",
     environment: "local-loopback",
     model: {
@@ -359,7 +362,13 @@ function distributionPython(cwd: string): string {
 }
 
 function validateBenchmarkDocument(value: ApiBenchmarkDocument): void {
-  if (value.schema_version !== 2 || value.kind !== "openai_api_continuous_scheduler") {
+  if (
+    value.schema_version !== 2
+    || (
+      value.kind !== "mycellios_api_continuous_scheduler"
+      && value.kind !== "openai_api_continuous_scheduler"
+    )
+  ) {
     throw new Error("La salida del benchmark físico no tiene un esquema compatible.");
   }
   if (!Array.isArray(value.rows) || value.rows.length === 0) {

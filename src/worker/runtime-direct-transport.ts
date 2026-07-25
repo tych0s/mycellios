@@ -11,6 +11,13 @@ import {
   DirectRuntimeMux,
   type DirectRuntimeStream,
 } from "../transport/direct-runtime-mux.js";
+import {
+  isPrivateIpv4,
+  isPublicIpv4,
+  type TcpPortMapper,
+  type TcpPortMapping,
+} from "./upnp-port-mapper.js";
+import { NativeTcpPortMapper } from "./native-port-mapper.js";
 
 const READY_MARKER = Buffer.from("MYCELLIOS-DIRECT-READY/1", "utf8");
 const DEFAULT_CONNECT_TIMEOUT_MS = 2_000;
@@ -23,7 +30,7 @@ const MAX_SOCKET_BUFFERED_BYTES = 8 * 1024 * 1024;
 export interface DirectTransportCandidate {
   host: string;
   port: number;
-  scope: "lan" | "configured";
+  scope: "lan" | "configured" | "public-mapped";
 }
 
 export interface DirectTransportAdvertisement {
@@ -38,6 +45,10 @@ export interface RuntimeDirectTransportOptions {
   listenHost?: string;
   listenPort?: number;
   candidateHosts?: string[];
+  /** Opt in to a native UPnP IGD mapping. Failure leaves relay available. */
+  publicPortMapping?: boolean;
+  /** Test/platform injection point. Supplying a mapper also opts in. */
+  portMapper?: TcpPortMapper;
   connectTimeoutMs?: number;
   maxSessions?: number;
   maxSessionBytes?: number;
@@ -93,6 +104,7 @@ export interface RuntimeDirectTransportCallbacks {
   onSourceCommitted(streamId: string): void;
   onSourceFailed(streamId: string, error: Error): void;
   onSourceClosed(streamId: string, error?: Error): void;
+  onAdvertisementChanged?(advertisement: DirectTransportAdvertisement): void;
 }
 
 /**
@@ -113,6 +125,8 @@ export class RuntimeDirectTransport {
   private readonly maxSessionMs: number;
   private server: DirectSecureServer | null = null;
   private advertisement: DirectTransportAdvertisement | null = null;
+  private publicMapping: TcpPortMapping | null = null;
+  private unsubscribePublicMappingInvalidation: (() => void) | null = null;
 
   constructor(
     private readonly nodeId: string,
@@ -147,7 +161,9 @@ export class RuntimeDirectTransport {
 
   async start(): Promise<DirectTransportAdvertisement | null> {
     if (this.options.enabled === false) return null;
-    if (this.server) return this.advertisement;
+    if (this.server) {
+      return this.advertisement ? structuredClone(this.advertisement) : null;
+    }
     const server = new DirectSecureServer({
       host: this.options.listenHost ?? "0.0.0.0",
       port: this.options.listenPort ?? 0,
@@ -165,12 +181,55 @@ export class RuntimeDirectTransport {
       await server.close().catch(() => undefined);
       return null;
     }
-    const candidates = directCandidates(
+    let candidates = directCandidates(
       address.port,
       this.options.candidateHosts,
       this.options.listenHost,
     );
+    if (this.options.publicPortMapping === true || this.options.portMapper) {
+      const internalHosts = Array.from(new Set(
+        candidates
+          .map((candidate) => candidate.host)
+          .filter(isPrivateIpv4),
+      ));
+      if (internalHosts.length > 0) {
+        try {
+          const mapping = await (this.options.portMapper ?? new NativeTcpPortMapper())
+            .mapTcpPort({
+              internalPort: address.port,
+              internalHosts,
+              description: `Mycellios ${this.nodeId}`,
+            });
+          if (mapping) {
+            if (
+              !isPublicIpv4(mapping.externalHost)
+              || !Number.isSafeInteger(mapping.externalPort)
+              || mapping.externalPort < 1
+              || mapping.externalPort > 65_535
+            ) {
+              await mapping.close().catch(() => undefined);
+            } else {
+              this.publicMapping = mapping;
+              this.unsubscribePublicMappingInvalidation = mapping.onInvalidated?.(() => {
+                this.invalidatePublicMapping(mapping);
+              }) ?? null;
+              candidates = candidates.slice(0, MAX_CANDIDATES - 1);
+              addCandidate(
+                candidates,
+                mapping.externalHost,
+                mapping.externalPort,
+                "public-mapped",
+              );
+            }
+          }
+        } catch {
+          // A mapping is an optimization, never a reachability claim. The
+          // authenticated coordinator relay remains the fallback.
+        }
+      }
+    }
     if (candidates.length === 0) {
+      await this.closePublicMapping();
       await server.close();
       return null;
     }
@@ -242,12 +301,12 @@ export class RuntimeDirectTransport {
     );
     const startedAt = process.hrtime.bigint();
     let lastError = new Error("direct_candidate_unreachable");
-    for (const candidate of input.candidates) {
+    for (const candidate of orderDirectCandidates(input.candidates)) {
       let channel: DirectSecureChannel | null = null;
       let provisional: DirectRecord | null = null;
       try {
         channel = await DirectSecureChannel.connect({
-          host: validateHost(candidate.host),
+          host: validateCandidateHost(candidate),
           port: boundedPort(candidate.port),
           grant: input.grant,
           timeoutMs,
@@ -367,7 +426,35 @@ export class RuntimeDirectTransport {
     const server = this.server;
     this.server = null;
     this.advertisement = null;
+    await this.closePublicMapping();
     await server?.close();
+  }
+
+  private async closePublicMapping(): Promise<void> {
+    const mapping = this.publicMapping;
+    this.publicMapping = null;
+    this.unsubscribePublicMappingInvalidation?.();
+    this.unsubscribePublicMappingInvalidation = null;
+    await mapping?.close().catch(() => undefined);
+  }
+
+  private invalidatePublicMapping(mapping: TcpPortMapping): void {
+    if (this.publicMapping !== mapping) return;
+    this.unsubscribePublicMappingInvalidation?.();
+    this.unsubscribePublicMappingInvalidation = null;
+    this.publicMapping = null;
+    if (!this.advertisement) return;
+    this.advertisement = {
+      ...this.advertisement,
+      candidates: this.advertisement.candidates.filter((candidate) =>
+        !(
+          candidate.scope === "public-mapped"
+          && candidate.host === mapping.externalHost
+          && candidate.port === mapping.externalPort
+        )
+      ),
+    };
+    this.callbacks.onAdvertisementChanged?.(structuredClone(this.advertisement));
   }
 
   private async acceptDestinationChannel(
@@ -646,6 +733,86 @@ function directCandidates(
   return candidates.slice(0, MAX_CANDIDATES);
 }
 
+/**
+ * A same-segment private address avoids NAT and is cheapest. On a WAN source,
+ * the verified public mapping is tried before unreachable private addresses.
+ * Configured endpoints remain an explicit operator override.
+ */
+export function orderDirectCandidates(
+  candidates: DirectTransportCandidate[],
+  localHosts?: string[],
+): DirectTransportCandidate[] {
+  const localSubnets = localHosts
+    ? localHosts.flatMap((host) => ipv4Subnet(host, "255.255.255.0"))
+    : localPrivateIpv4Subnets();
+  return candidates
+    .map((candidate, index) => ({ candidate, index }))
+    .sort((left, right) =>
+      directCandidateRank(left.candidate, localSubnets)
+      - directCandidateRank(right.candidate, localSubnets)
+      || left.index - right.index
+    )
+    .map(({ candidate }) => candidate);
+}
+
+function directCandidateRank(
+  candidate: DirectTransportCandidate,
+  localSubnets: Ipv4Subnet[],
+): number {
+  if (
+    isPrivateIpv4(candidate.host)
+    && localSubnets.some((subnet) => subnetContains(subnet, candidate.host))
+  ) return 0;
+  if (candidate.scope === "configured") return 1;
+  if (candidate.scope === "public-mapped") return 2;
+  return 3;
+}
+
+interface Ipv4Subnet {
+  address: number;
+  mask: number;
+}
+
+function localPrivateIpv4Subnets(): Ipv4Subnet[] {
+  return Object.values(networkInterfaces()).flatMap((addresses) =>
+    (addresses ?? [])
+      .filter((address) =>
+        address.family === "IPv4"
+        && !address.internal
+        && isPrivateIpv4(address.address)
+      )
+      .flatMap((address) => ipv4Subnet(address.address, address.netmask))
+  );
+}
+
+function ipv4Subnet(address: string, netmask: string): Ipv4Subnet[] {
+  const addressNumber = ipv4Number(address);
+  const maskNumber = ipv4Number(netmask);
+  return addressNumber === null || maskNumber === null
+    ? []
+    : [{ address: addressNumber, mask: maskNumber }];
+}
+
+function subnetContains(subnet: Ipv4Subnet, host: string): boolean {
+  const candidate = ipv4Number(host);
+  return candidate !== null
+    && (candidate & subnet.mask) === (subnet.address & subnet.mask);
+}
+
+function ipv4Number(host: string): number | null {
+  const parts = host.split(".").map(Number);
+  if (
+    parts.length !== 4
+    || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)
+  ) return null;
+  return (
+    ((parts[0]! << 24) >>> 0)
+    + (parts[1]! << 16)
+    + (parts[2]! << 8)
+    + parts[3]!
+  ) >>> 0;
+}
+
 function isLanIpv4(host: string): boolean {
   const octets = host.split(".").map(Number);
   if (
@@ -682,6 +849,17 @@ function validateHost(value: string): string {
     throw new Error("direct_candidate_host_is_invalid");
   }
   return value;
+}
+
+function validateCandidateHost(candidate: DirectTransportCandidate): string {
+  const host = validateHost(candidate.host);
+  if (candidate.scope === "public-mapped" && !isPublicIpv4(host)) {
+    throw new Error("direct_public_candidate_is_invalid");
+  }
+  if (candidate.scope === "lan" && !isLanIpv4(host)) {
+    throw new Error("direct_lan_candidate_is_invalid");
+  }
+  return host;
 }
 
 function boundedPort(value: number): number {

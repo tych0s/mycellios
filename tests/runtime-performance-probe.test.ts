@@ -93,6 +93,7 @@ describe("physical runtime performance probe", () => {
       limits: { maxConcurrency: 1, pauseWhenForeground: false },
       adapter: {
         kind: "mock",
+        developmentOnly: true,
         model: "profile-test",
         tokensPerSecond: 10,
         ttftMs: 10,

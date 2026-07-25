@@ -73,59 +73,6 @@ describe("multi-objective scheduler", () => {
     expect(route?.affinityHit).toBe(true);
   });
 
-  it("uses llmfit whole-model fit as a soft replica ranking signal", () => {
-    const marginal = addWorker(store, {
-      id: "marginal",
-      tokensPerSecond: 20,
-      llmfit: { fitLevel: "Marginal", bestQuant: "Q4_K_M" },
-    });
-    const perfect = addWorker(store, {
-      id: "perfect",
-      tokensPerSecond: 20,
-      llmfit: { fitLevel: "Perfect", bestQuant: "Q8_0" },
-    });
-    const route = scheduler.selectRoute(request, "llmfit-ranking", {
-      connectedWorkerIds: new Set([marginal.id, perfect.id]),
-    });
-    expect(route?.stages[0]?.workerId).toBe(perfect.id);
-    expect(route!.score).toBeLessThan(
-      scheduler.scoreWorker(marginal, marginal.capabilities.deployments[0]!, request),
-    );
-  });
-
-  it("summarizes linked llmfit advice in the application model catalog", () => {
-    const measured = addWorker(store, {
-      id: "measured",
-      llmfit: {
-        fitLevel: "Good",
-        bestQuant: "Q5_K_M",
-        estimatedTokensPerSecond: 30,
-        measuredTokensPerSecond: 24,
-        memoryRequiredMb: 5_900,
-      },
-    });
-    const perfect = addWorker(store, {
-      id: "catalog-perfect",
-      llmfit: {
-        fitLevel: "Perfect",
-        bestQuant: "Q8_0",
-        estimatedTokensPerSecond: 40,
-        memoryRequiredMb: 7_000,
-      },
-    });
-    const models = scheduler.listAvailableModels({
-      connectedWorkerIds: new Set([measured.id, perfect.id]),
-    });
-    expect(models[0]?.llmfit).toEqual({
-      advisedReplicas: 2,
-      bestFit: "Perfect",
-      quantizations: ["Q5_K_M", "Q8_0"],
-      maxEstimatedTokensPerSecond: 40,
-      maxMeasuredTokensPerSecond: 24,
-      minMemoryRequiredMb: 5_900,
-    });
-  });
-
   it("reports a distributed cell as a pipeline instead of a whole-model replica", () => {
     const cell = addWorker(store, {
       id: "distributed-cell",
@@ -234,7 +181,6 @@ describe("multi-objective scheduler", () => {
         mode: "pipeline",
         offeredVramMb: 12_288,
         peakVramMb: 7_000,
-        ...(index === 0 ? { llmfit: { fitLevel: "Too Tight" } } : {}),
         stage: { index, total: 3, layerStart: index * 10, layerEnd: index * 10 + 9 },
       }),
     );

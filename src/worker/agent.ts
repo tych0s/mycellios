@@ -25,7 +25,6 @@ import {
   type HardwareProbe,
   type VerifiedGpuRuntimeEvidence,
 } from "./hardware.js";
-import { llmfitHardwareFallback, probeLlmfit } from "./llmfit.js";
 import {
   LaunchProcessExitedError,
   type LaunchAgent,
@@ -50,6 +49,7 @@ import {
   runtimePerformanceProfileSchema,
   type RuntimePerformanceProfile,
 } from "../performance/runtime-profile.js";
+import { deploymentMetricsFromCanaryEvidence } from "../contracts/deployment-canary.js";
 
 export interface WorkerAgentOptions {
   coordinatorUrl: string;
@@ -139,7 +139,7 @@ const directGrantSchema = z.object({
 const directCandidateSchema = z.object({
   host: z.string().min(1).max(253),
   port: z.number().int().min(1).max(65_535),
-  scope: z.enum(["lan", "configured"]),
+  scope: z.enum(["lan", "configured", "public-mapped"]),
 }).strict();
 
 const serverMessageSchema = z.discriminatedUnion("type", [
@@ -387,6 +387,7 @@ export class WorkerAgent {
   private readonly activeJobs = new Map<string, AbortController>();
   private readonly recentJobs = new Map<string, number>();
   private readonly authorizedRuntimeProcesses = new Map<string, string>();
+  private readonly preparedRuntimeProcesses = new Map<string, import("../distribution/python-launcher.js").PythonLaunchProcess>();
   private readonly runtimeProcesses = new Map<string, LaunchProcessHandle>();
   private readonly runtimeLinkProbes = new Map<string, PendingRuntimeLinkProbe>();
   private readonly runtimeTunnel: RuntimeStreamTunnel | null;
@@ -400,6 +401,14 @@ export class WorkerAgent {
     private readonly options: WorkerAgentOptions,
   ) {
     this.coordinatorBaseUrl = validateCoordinatorUrl(options.coordinatorUrl);
+    if (
+      config.adapter.kind === "mycellios-native"
+      && options.advertiseDeployment !== false
+    ) {
+      throw new Error(
+        "mycellios_native_control_must_not_advertise_an_inference_deployment",
+      );
+    }
     this.adapter = createAdapter(config);
     this.logger = options.logger ?? console;
     this.runtimeTunnel = options.distributedExecutor
@@ -410,6 +419,9 @@ export class WorkerAgent {
             ...(options.distributedExecutor.directTransport
               ? { directTransport: options.distributedExecutor.directTransport }
               : {}),
+            onDirectTransportAdvertisementChanged: (advertisement) => {
+              this.applyDirectTransportAdvertisement(advertisement);
+            },
           },
         )
       : null;
@@ -552,6 +564,23 @@ export class WorkerAgent {
     return this.activeJobs.size;
   }
 
+  private applyDirectTransportAdvertisement(
+    advertisement: DirectTransportAdvertisement,
+  ): void {
+    this.directTransportAdvertisement = structuredClone(advertisement);
+    const executor = this.capabilities?.distributedExecutor;
+    if (!this.capabilities || !executor) return;
+    this.capabilities = {
+      ...this.capabilities,
+      distributedExecutor: {
+        ...executor,
+        directTransport: structuredClone(advertisement),
+      },
+    };
+    // Heartbeats carry the full capability document, so the coordinator drops
+    // an expired public candidate on the next normal heartbeat.
+  }
+
   runtimeTransportSnapshot(): RuntimeStreamTransportSnapshot[] {
     return this.runtimeTunnel?.transportSnapshot() ?? [];
   }
@@ -600,10 +629,9 @@ export class WorkerAgent {
   }
 
   private async buildCapabilities(): Promise<WorkerCapabilities> {
-    const [hardware, adapter, llmfit, performanceProfile] = await Promise.all([
+    const [hardware, adapter, performanceProfile] = await Promise.all([
       this.options.hardwareProbe?.() ?? probeHardware(),
       this.adapter.probe(),
-      this.inspectWithLlmfit(),
       this.measureRuntimePerformanceProfile(),
     ]);
     const selectedHardwareGpu = selectHardwareGpu(hardware.gpus, this.options.preferredHardwareGpu)
@@ -614,36 +642,46 @@ export class WorkerAgent {
         selectedHardwareGpu,
         this.options.verifiedGpuRuntime,
       );
-    const primary =
-      detectedPrimary.vendor === "unknown" && detectedPrimary.physicalVramMb === 0 && llmfit
-        ? (llmfitHardwareFallback(llmfit) ?? detectedPrimary)
-        : detectedPrimary;
+    const primary = detectedPrimary;
     const primaryCapacityMb = primary.physicalVramMb + (primary.sharedMemoryMb ?? 0);
     const offeredVramMb = this.config.capacityScope === "cell"
       ? this.config.offeredVramMb
       : Math.min(this.config.offeredVramMb, Math.max(512, primaryCapacityMb));
     const safeBudget = safeVramBudget(offeredVramMb);
     const model = this.config.adapter.model;
-    const deploymentId = `dep-${sha256Text(`${model}:${adapter.kind}`).slice(-12)}`;
-    if (llmfit?.model) llmfit.model.deploymentId = deploymentId;
-    const llmfitTokensPerSecond = this.config.llmfit.applyPerformanceEstimate
-      ? (llmfit?.model?.measuredTokensPerSecond ??
-        llmfit?.model?.estimatedTokensPerSecond)
+    // A restarted native pipeline is a new deployment even when it serves the
+    // same public model name. Binding the identifier to the artifact and
+    // independently probed pipeline snapshot prevents stale scheduler state
+    // from being reused across activations.
+    const deploymentId = `dep-${sha256Text([
+      model,
+      adapter.kind,
+      this.config.deployment.modelDigest ?? "",
+      this.config.deployment.activationId ?? "",
+    ].join(":")).slice(-12)}`;
+    const canaryEvidence =
+      this.config.adapter.kind === "mycellios-pipeline"
+        ? this.config.deployment.canaryEvidence!
+        : undefined;
+    const canaryPerformance = canaryEvidence
+      ? deploymentMetricsFromCanaryEvidence(canaryEvidence, {
+          model,
+          modelDigest: this.config.deployment.modelDigest!,
+          activationId: this.config.deployment.activationId!,
+        })
       : undefined;
     const throughputSource =
-      this.config.deployment.tokensPerSecond !== undefined
+      this.config.adapter.kind === "mycellios-pipeline"
+        ? "measured"
+        : this.config.deployment.tokensPerSecond !== undefined
         ? "configured"
-        : this.config.llmfit.applyPerformanceEstimate && llmfit?.model?.measuredTokensPerSecond !== undefined
-          ? "measured"
-          : this.config.llmfit.applyPerformanceEstimate && llmfit?.model?.estimatedTokensPerSecond !== undefined
-            ? "estimated"
-            : this.config.adapter.kind === "mock"
-              ? "configured"
-              : "default";
+        : this.config.adapter.kind === "mock"
+          ? "configured"
+          : "default";
     const defaultTokensPerSecond =
       this.config.adapter.kind === "mock"
         ? this.config.adapter.tokensPerSecond
-        : (llmfitTokensPerSecond ?? 5);
+        : 5;
     const defaultTtft = this.config.adapter.kind === "mock" ? this.config.adapter.ttftMs : 2_000;
     const publicPrimary = publicHardwareGpu(primary);
     return {
@@ -654,8 +692,8 @@ export class WorkerAgent {
           ...(this.config.capacityScope === "cell"
             ? {
                 id: "cell-aggregate",
-                vendor: "sidecar-cell",
-                model: `Aggregate capacity exposed by ${this.config.adapter.model}`,
+                vendor: "mycellios",
+                model: `Native pipeline capacity for ${this.config.adapter.model}`,
                 // Zero means no claim about a single physical GPU. The quota
                 // below represents the independently measured whole cell.
                 physicalVramMb: 0,
@@ -673,18 +711,29 @@ export class WorkerAgent {
           model,
           modelDigest:
             this.config.deployment.modelDigest ?? sha256Text(`${adapter.kind}:${model}`),
+          ...(this.config.deployment.activationId
+            ? { activationId: this.config.deployment.activationId }
+            : {}),
           mode: "replica",
-          adapter: adapter.kind,
+          adapter: deploymentAdapterKind(adapter.kind),
           peakVramMb:
             this.config.deployment.peakVramMb ?? Math.max(512, Math.floor(safeBudget * 0.9)),
           contextLimit: this.config.deployment.contextLimit,
           maxConcurrency: this.config.limits.maxConcurrency,
           freeSlots: this.config.limits.maxConcurrency,
           tokensPerSecond:
-            this.config.deployment.tokensPerSecond ?? defaultTokensPerSecond,
+            canaryPerformance?.tokensPerSecond
+            ?? this.config.deployment.tokensPerSecond
+            ?? defaultTokensPerSecond,
           throughputSource,
-          ttftMs: this.config.deployment.ttftMs ?? defaultTtft,
-          dataLocality: adapterDataLocality(this.config),
+          ttftMs:
+            canaryPerformance?.ttftMs
+            ?? this.config.deployment.ttftMs
+            ?? defaultTtft,
+          ...(canaryEvidence
+            ? { canaryEvidence: structuredClone(canaryEvidence) }
+            : {}),
+          dataLocality: "local",
           ...(this.config.deployment.internalPipeline
             ? { internalPipeline: structuredClone(this.config.deployment.internalPipeline) }
             : {}),
@@ -697,7 +746,6 @@ export class WorkerAgent {
         uplinkMbps: 100,
         downlinkMbps: 100,
       },
-      ...(llmfit ? { llmfit } : {}),
       ...(this.options.distributedExecutor
         ? {
             distributedExecutor: {
@@ -752,39 +800,6 @@ export class WorkerAgent {
         `Native runtime performance calibration unavailable: ${errorText(error)}`,
       );
       return undefined;
-    }
-  }
-
-  private async inspectWithLlmfit(): Promise<WorkerCapabilities["llmfit"] | null> {
-    if (!this.config.llmfit.enabled) return null;
-    if (this.config.capacityScope === "cell") {
-      this.logger.warn(
-        "llmfit reports the gateway host only; it will not replace aggregate cell capacity",
-      );
-    }
-    try {
-      const result = await probeLlmfit({
-        executable: this.config.llmfit.executable,
-        arguments: this.config.llmfit.arguments,
-        timeoutMs: this.config.llmfit.timeoutMs,
-        model: this.config.llmfit.model ?? this.config.adapter.model,
-        maxContext: this.config.deployment.contextLimit,
-      });
-      for (const warning of result.warnings) this.logger.warn(warning);
-      const model = result.advisory.model;
-      if (model) {
-        const basis = model.measuredTokensPerSecond ? "measured" : "estimated";
-        const tps = model.measuredTokensPerSecond ?? model.estimatedTokensPerSecond;
-        this.logger.info(
-          `llmfit matched ${model.resolvedModel}: ${model.fitLevel}, ${model.bestQuant ?? "quant unknown"}${tps ? `, ${tps} tok/s ${basis}` : ""}`,
-        );
-      }
-      return result.advisory;
-    } catch (error) {
-      const message = `llmfit inspection failed: ${errorText(error)}`;
-      if (this.config.llmfit.required) throw new Error(message, { cause: error });
-      this.logger.warn(`${message}; continuing with the native worker probe`);
-      return null;
     }
   }
 
@@ -1047,10 +1062,29 @@ export class WorkerAgent {
       const description = input as PythonPipelineLaunchDescription;
       const local = description.launchOrder.filter((process) => process.anchor.memberId === executor.nodeId);
       if (local.length === 0) throw new Error("distributed_plan_has_no_process_for_this_node");
+      const prepared = executor.launchAgent.prepareRuntime
+        ? await executor.launchAgent.prepareRuntime(
+            description,
+            executor.nodeId,
+            (event) => this.sendMessage("runtime.prepare.progress", {
+              requestId,
+              ...event,
+            }),
+          )
+        : local;
+      const preparedById = new Map(prepared.map((process) => [process.processId, process]));
+      if (
+        preparedById.size !== local.length
+        || local.some((process) => !preparedById.has(process.processId))
+      ) {
+        throw new Error("distributed_runtime_preparation_did_not_cover_local_plan");
+      }
       await this.runtimeTunnel?.prepare(description);
       this.authorizedRuntimeProcesses.clear();
+      this.preparedRuntimeProcesses.clear();
       for (const process of local) {
         this.authorizedRuntimeProcesses.set(process.processId, JSON.stringify(process));
+        this.preparedRuntimeProcesses.set(process.processId, preparedById.get(process.processId)!);
       }
       this.sendMessage("runtime.prepared", { requestId, ok: true });
     } catch (error) {
@@ -1067,9 +1101,11 @@ export class WorkerAgent {
       if (this.authorizedRuntimeProcesses.get(input.process.processId) !== JSON.stringify(input.process)) {
         throw new Error("distributed_launch_process_was_not_prepared");
       }
+      const preparedProcess = this.preparedRuntimeProcesses.get(input.process.processId);
+      if (!preparedProcess) throw new Error("distributed_launch_artifact_was_not_prepared");
       if (this.runtimeProcesses.has(requestId)) throw new Error("distributed_launch_request_is_duplicate");
       const controller = new AbortController();
-      const tunneledProcess = this.runtimeTunnel?.rewriteProcess(input.process) ?? input.process;
+      const tunneledProcess = this.runtimeTunnel?.rewriteProcess(preparedProcess) ?? preparedProcess;
       const localRequest: LaunchAgentStartRequest = executor.pythonExecutable
         ? {
             ...input,
@@ -1118,6 +1154,7 @@ export class WorkerAgent {
     const handles = [...this.runtimeProcesses.values()];
     this.runtimeProcesses.clear();
     this.authorizedRuntimeProcesses.clear();
+    this.preparedRuntimeProcesses.clear();
     await Promise.all(handles.map((handle) => handle.stop(reason).catch(() => undefined)));
     await this.runtimeTunnel?.reset();
   }
@@ -1257,7 +1294,14 @@ export class WorkerAgent {
       const measuredTokensPerSecond = metrics.outputTokens > 0
         ? metrics.outputTokens / (metrics.activeMs / 1_000)
         : 0;
-      if (this.capabilities && measuredTokensPerSecond > 0) {
+      // A normal request is useful operational telemetry, but it is not the
+      // sealed multi-sample activation canary. Keep production pipeline
+      // scheduling metrics immutable until a new bound canary is published.
+      if (
+        this.config.adapter.kind !== "mycellios-pipeline"
+        && this.capabilities
+        && measuredTokensPerSecond > 0
+      ) {
         this.capabilities = {
           ...this.capabilities,
           deployments: this.capabilities.deployments.map((deployment) =>
@@ -1500,6 +1544,15 @@ function normalizeDeviceName(value: string): string {
   return value.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
+function deploymentAdapterKind(
+  adapter: InferenceAdapter["kind"],
+): "mycellios-pipeline" | "mock" {
+  if (adapter === "mycellios-native") {
+    throw new Error("mycellios_native_control_cannot_be_a_model_deployment");
+  }
+  return adapter;
+}
+
 function isLaunchAgentStartRequest(value: unknown): value is LaunchAgentStartRequest {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const request = value as Record<string, unknown>;
@@ -1515,12 +1568,4 @@ function isLaunchAgentStartRequest(value: unknown): value is LaunchAgentStartReq
   const anchor = process.anchor;
   return typeof process.processId === "string" && !!anchor && typeof anchor === "object" &&
     !Array.isArray(anchor) && (anchor as Record<string, unknown>).memberId === request.nodeId;
-}
-
-function adapterDataLocality(config: WorkerConfig): "local" | "external" {
-  if (config.adapter.kind !== "openai-compatible") return "local";
-  const hostname = new URL(config.adapter.baseUrl).hostname.toLowerCase();
-  return new Set(["localhost", "127.0.0.1", "::1", "[::1]"]).has(hostname)
-    ? "local"
-    : "external";
 }

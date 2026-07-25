@@ -4,6 +4,10 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { z } from "zod";
 import { workerConfigSchema, type WorkerConfig } from "../contracts/schemas.js";
+import {
+  sealDeploymentCanaryEvidence,
+  type DeploymentCanarySample,
+} from "../contracts/deployment-canary.js";
 import { WorkerAgent } from "../worker/agent.js";
 import { evaluateDistributionPlan, stageMemoryBytes } from "./cost-model.js";
 import { HttpLaunchAgent } from "./launch-agent-rpc.js";
@@ -88,6 +92,20 @@ const linkSchema = z
     bandwidthMbps: z.number().positive().finite(),
     lossRate: z.number().min(0).max(0.9).default(0),
     availability: z.number().positive().max(1).default(0.999),
+    evidence: z
+      .object({
+        source: z.literal("runtime-probe"),
+        measuredAt: z.number().int().positive(),
+        validUntil: z.number().int().positive(),
+        successfulSamples: z.number().int().nonnegative(),
+        failedSamples: z.number().int().nonnegative(),
+      })
+      .strict()
+      .refine((value) => value.validUntil > value.measuredAt, {
+        message: "link evidence must expire after it was measured",
+        path: ["validUntil"],
+      })
+      .optional(),
   })
   .strict();
 
@@ -272,7 +290,7 @@ export interface AutoDistributionRunOptions {
 }
 
 export interface AutoDistributionProgressEvent {
-  phase: "preparing_nodes" | "launching_stages" | "stage_loading" | "stage_ready" | "stages_ready" | "checking_health" | "running_canary" | "publishing_model" | "active" | "failed";
+  phase: "preparing_nodes" | "preparing_artifact" | "artifact_ready" | "launching_stages" | "stage_loading" | "stage_ready" | "stages_ready" | "checking_health" | "running_canary" | "publishing_model" | "active" | "failed";
   message: string;
   nodeId?: string;
   processId?: string;
@@ -396,6 +414,30 @@ export async function runAutoDistribution(
     )),
   });
   const agents = await createLaunchAgents(config, cwd, environment, compilation.launch, options);
+  const preparationUnsubscribers = [...new Set(agents.values())].flatMap((agent) => {
+    if (!agent.subscribeRuntimePreparation) return [];
+    return [agent.subscribeRuntimePreparation((event) => {
+      const nodeId = compilation.launch.launchOrder.find(
+        (process) => process.stageIndex === event.stageIndex,
+      )?.anchor.memberId;
+      const layers = `${event.layerStart}–${Math.max(event.layerStart, event.layerEnd - 1)}`;
+      options.onProgress?.({
+        phase: event.state === "preparing" ? "preparing_artifact" : "artifact_ready",
+        message: event.state === "preparing"
+          ? `Preparing verified layers ${layers}${nodeId ? ` on ${nodeId}` : ""}.`
+          : `Verified layers ${layers}${nodeId ? ` are cached on ${nodeId}` : " are cached"}.`,
+        ...(nodeId ? { nodeId } : {}),
+        details: [
+          `Stage: ${event.stageIndex + 1}`,
+          `Layers: ${layers}`,
+          ...(event.weightsSizeBytes !== undefined
+            ? [`Verified package: ${(event.weightsSizeBytes / (1024 * 1024)).toFixed(1)} MiB`]
+            : []),
+          ...(event.packageId ? [`Package: sha256:${event.packageId}`] : []),
+        ],
+      });
+    })];
+  });
   const supervisor = new PythonLaunchSupervisor(compilation.launch, {
     resolveAgent: (nodeId) => agents.get(nodeId),
     readinessTimeoutMs: config.runtime.readinessTimeoutMs,
@@ -473,7 +515,8 @@ export async function runAutoDistribution(
         config,
         compilation,
         apiBaseUrl,
-        canary.metrics,
+        canary.evidenceSamples,
+        health.pipeline_snapshot_identity as string,
         collectExecutionTelemetry(compilation, runningSnapshot),
       );
       const token = optionalSecret(environment, config.coordinator.networkTokenEnv);
@@ -509,6 +552,7 @@ export async function runAutoDistribution(
     await writeRuntimeFailure(config, error, failureSnapshot, cwd).catch(() => undefined);
     throw error;
   } finally {
+    for (const unsubscribe of preparationUnsubscribers) unsubscribe();
     unsubscribeTelemetry();
     if (worker) await worker.stop().catch(() => undefined);
     await supervisor.stop("auto_distribute_shutdown").catch(() => undefined);
@@ -667,7 +711,11 @@ function runtimeTopology(config: AutoDistributionConfig): RuntimeTopology {
       if (from.id === to.id) continue;
       const override = overrides.get(`${from.id}\0${to.id}`);
       if (override) {
-        links.push({ ...override });
+        const { evidence, ...link } = override;
+        links.push({
+          ...link,
+          ...(evidence ? { evidence: { ...evidence } } : {}),
+        });
       } else {
         const sameRegion = from.region === to.region;
         links.push({
@@ -874,6 +922,9 @@ async function verifyRootHealth(
     value.status !== "ready" ||
     value.model !== config.model.publicName ||
     value.artifact_identity !== compilation.profile.source.artifactIdentity ||
+    typeof value.pipeline_snapshot_identity !== "string" ||
+    !value.pipeline_snapshot_identity.trim() ||
+    value.pipeline_snapshot_identity.length > 256 ||
     value.stages !== compilation.boundaries.length - 1 ||
     JSON.stringify(value.boundaries) !== JSON.stringify(compilation.boundaries)
   ) {
@@ -883,6 +934,31 @@ async function verifyRootHealth(
 }
 
 async function runCanary(
+  apiBaseUrl: string,
+  config: AutoDistributionConfig,
+): Promise<{
+  text: string;
+  metrics: AutoDistributionCanaryMetrics;
+  evidenceSamples: DeploymentCanarySample[];
+}> {
+  await runCanarySample(apiBaseUrl, config);
+  const measured = [];
+  for (let index = 0; index < 3; index += 1) {
+    measured.push(await runCanarySample(apiBaseUrl, config));
+  }
+  return {
+    ...measured[0]!,
+    evidenceSamples: measured.map(({ metrics }, index) => ({
+      sampleId: `activation-canary-${index + 1}`,
+      outputTokens: metrics.completionTokens,
+      activeMs: Math.max(1, Math.round(metrics.pipelineMs)),
+      ttftMs: Math.max(0, Math.round(metrics.ttftMs)),
+      completed: true,
+    })),
+  };
+}
+
+async function runCanarySample(
   apiBaseUrl: string,
   config: AutoDistributionConfig,
 ): Promise<{ text: string; metrics: AutoDistributionCanaryMetrics }> {
@@ -940,11 +1016,12 @@ async function runCanary(
   };
 }
 
-function buildCellWorkerConfig(
+export function buildCellWorkerConfig(
   config: AutoDistributionConfig,
   compilation: AutoDistributionCompilation,
   apiBaseUrl: string,
-  canary: AutoDistributionCanaryMetrics,
+  evidenceSamples: DeploymentCanarySample[],
+  activationId: string,
   execution?: NonNullable<ModelDeployment["execution"]>,
 ): WorkerConfig {
   const stages = compilation.manifest.plans.decode.stages;
@@ -953,6 +1030,18 @@ function buildCellWorkerConfig(
     peakMiB,
     Math.floor(config.nodes.reduce((sum, node) => sum + node.memoryMiB - node.reserveMiB, 0)),
   );
+  const canaryEvidence = sealDeploymentCanaryEvidence({
+    model: config.model.publicName,
+    modelDigest: compilation.profile.source.artifactIdentity,
+    activationId,
+    promptDigest: `sha256:${createHash("sha256")
+      .update(config.canary.prompt)
+      .digest("hex")}`,
+    maxOutputTokens: config.canary.maxTokens,
+    measuredAt: new Date().toISOString(),
+    warmupSamples: 1,
+    samples: evidenceSamples,
+  });
   return workerConfigSchema.parse({
     region: config.coordinator!.region,
     capacityScope: "cell",
@@ -962,19 +1051,16 @@ function buildCellWorkerConfig(
       pauseWhenForeground: false,
     },
     adapter: {
-      kind: "openai-compatible",
+      kind: "mycellios-pipeline",
       model: config.model.publicName,
       baseUrl: apiBaseUrl,
-      apiPathPrefix: "v1",
-      requestTemperature: 0,
-      allowedHosts: [],
     },
     deployment: {
       modelDigest: compilation.profile.source.artifactIdentity,
+      activationId,
       peakVramMb: peakMiB,
       contextLimit: config.workload.contextTokens,
-      tokensPerSecond: Math.max(0.001, canary.measuredTokensPerSecond),
-      ttftMs: canary.ttftMs,
+      canaryEvidence,
       internalPipeline: {
         stageCount: stages.length,
         boundaries: [...compilation.boundaries],

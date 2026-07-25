@@ -19,7 +19,9 @@ from transformers import (
 
 import distributed_runtime.stage_artifact as stage_artifact
 from distributed_runtime.model import StageModelSpec, StageRunner
+from distributed_runtime.model_adapters import ADAPTER_REGISTRY_ID
 from distributed_runtime.stage_artifact import (
+    STAGE_ARTIFACT_ADAPTER_REGISTRY,
     STAGE_ARTIFACT_CONFIG,
     STAGE_ARTIFACT_MANIFEST,
     STAGE_ARTIFACT_SCHEMA,
@@ -60,6 +62,7 @@ class StageArtifactTests(unittest.TestCase):
                 set(path.name for path in destination.iterdir()),
                 {
                     STAGE_ARTIFACT_CONFIG,
+                    STAGE_ARTIFACT_ADAPTER_REGISTRY,
                     STAGE_ARTIFACT_MANIFEST,
                     STAGE_ARTIFACT_WEIGHTS,
                 },
@@ -84,6 +87,12 @@ class StageArtifactTests(unittest.TestCase):
             self.assertEqual(manifest["model"]["family"], "llama")
             self.assertEqual(manifest["model"]["architecture"], "LlamaForCausalLM")
             self.assertEqual(manifest["model"]["adapter"], "transformers-llama-v1")
+            self.assertEqual(
+                manifest["model"]["adapterRegistryId"], ADAPTER_REGISTRY_ID
+            )
+            self.assertRegex(
+                manifest["model"]["adapterContractId"], r"^sha256:[0-9a-f]{64}$"
+            )
             self.assertEqual(manifest["tensorAbi"]["id"], STAGE_TENSOR_ABI)
             self.assertEqual(manifest["tensorAbi"]["weightDtypes"], ["F16"])
             self.assertEqual(
@@ -225,7 +234,8 @@ class StageArtifactTests(unittest.TestCase):
                 layer_end=3,
                 total_layers=4,
                 threads=1,
-                artifact_identity=result.artifact_identity,
+                artifact_identity=result.model_identity,
+                stage_package_identity=result.artifact_identity,
             )
 
             with self.assertRaisesRegex(
@@ -238,7 +248,8 @@ class StageArtifactTests(unittest.TestCase):
                         layer_end=3,
                         total_layers=4,
                         threads=1,
-                        artifact_identity="sha256:" + "0" * 64,
+                        artifact_identity=result.model_identity,
+                        stage_package_identity="sha256:" + "0" * 64,
                     ),
                     device="cpu",
                 )
@@ -270,7 +281,8 @@ class StageArtifactTests(unittest.TestCase):
                         layer_end=3,
                         total_layers=4,
                         threads=1,
-                        artifact_identity=missing_result.artifact_identity,
+                        artifact_identity=missing_result.model_identity,
+                        stage_package_identity=missing_result.artifact_identity,
                     ),
                     device="cpu",
                 )
@@ -291,6 +303,45 @@ class StageArtifactTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "package identity does not match"):
                 verify_stage_artifact(destination)
+
+            wrong_registry = root / "wrong-registry"
+            compile_safetensors_stage_artifact(
+                str(checkpoint), wrong_registry, layer_start=1, layer_end=3
+            )
+            wrong_manifest_path = wrong_registry / STAGE_ARTIFACT_MANIFEST
+            wrong_document = json.loads(
+                wrong_manifest_path.read_text(encoding="utf-8")
+            )
+            wrong_document["model"]["adapterRegistryId"] = "sha256:" + "0" * 64
+            body = {
+                key: value
+                for key, value in wrong_document.items()
+                if key != "packageId"
+            }
+            wrong_document["packageId"] = hashlib.sha256(
+                stage_artifact._canonical_json(body)
+            ).hexdigest()
+            wrong_manifest_path.write_text(
+                json.dumps(
+                    wrong_document,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "not implemented"):
+                verify_stage_artifact(wrong_registry)
+
+            tampered_registry = root / "tampered-registry-file"
+            compile_safetensors_stage_artifact(
+                str(checkpoint), tampered_registry, layer_start=1, layer_end=3
+            )
+            registry_path = tampered_registry / STAGE_ARTIFACT_ADAPTER_REGISTRY
+            registry_path.write_bytes(registry_path.read_bytes() + b" ")
+            with self.assertRaisesRegex(ValueError, "size mismatch"):
+                verify_stage_artifact(tampered_registry)
 
             canonical = root / "canonical"
             compile_safetensors_stage_artifact(

@@ -6,7 +6,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -25,6 +25,12 @@ import {
   verifyPortableRuntimeInstallation,
   type RuntimeCommandRunner,
 } from "../src/desktop/accelerator-runtime.js";
+import {
+  ARTIFACT_SWARM_SCHEMA,
+  ArtifactSwarmRegistry,
+  artifactChunkId,
+  signArtifactSwarmManifest,
+} from "../src/model-fabric/artifact-swarm.js";
 
 const temporaryDirectories: string[] = [];
 const artifactRestorers: Array<() => void> = [];
@@ -603,6 +609,94 @@ describe("desktop accelerator runtime", () => {
     expect(vi.mocked(runner).mock.calls.some((call) => call[1].includes("uninstall"))).toBe(false);
     expect(existsSync(abandonedStaging)).toBe(false);
     expect(existsSync(abandonedShortStaging)).toBe(false);
+  });
+
+  it("uses the native verified swarm in the real accelerator provisioner before HTTPS origin", async () => {
+    const root = temporaryRoot();
+    const base = createBaseRuntime(root);
+    const userData = join(root, "user-data");
+    const artifactBytes = Buffer.from("verified-test-cuda-wheel");
+    const artifact = replaceCudaArtifact(artifactBytes);
+    const registry = new ArtifactSwarmRegistry();
+    const keys = generateKeyPairSync("ed25519");
+    const packageId = createHash("sha256").update("accelerator-package").digest("hex");
+    const manifestBytes = Buffer.from("accelerator-package-manifest");
+    const manifestDigest = createHash("sha256").update(manifestBytes).digest("hex");
+    const signed = registry.publish(signArtifactSwarmManifest({
+      schema: ARTIFACT_SWARM_SCHEMA,
+      modelIdentity: `sha256:${createHash("sha256").update("accelerator-runtime").digest("hex")}`,
+      sourceRevision: "mycellios-desktop-native",
+      tensorAbi: "mycellios-accelerator-artifact/1",
+      packages: [{
+        packageId,
+        layerStart: 0,
+        layerEnd: 1,
+        manifest: {
+          sha256: manifestDigest,
+          sizeBytes: manifestBytes.length,
+          chunks: [{
+            index: 0,
+            offset: 0,
+            sizeBytes: manifestBytes.length,
+            sha256: manifestDigest,
+          }],
+        },
+        blobs: [{
+          sha256: artifact.sha256,
+          sizeBytes: artifact.sizeBytes,
+          chunks: [{
+            index: 0,
+            offset: 0,
+            sizeBytes: artifact.sizeBytes,
+            sha256: artifact.sha256,
+          }],
+        }],
+      }],
+    }, keys.privateKey, keys.publicKey));
+    const artifactChunk = artifactChunkId(artifact.sha256, 0);
+    registry.announcePeer({
+      peerId: "desktop-peer",
+      chunkIds: [artifactChunk],
+      expiresAt: Date.now() + 60_000,
+      rttMs: 1,
+      goodputMbps: 1_000,
+      activeTransfers: 0,
+      reliability: 1,
+    });
+    const peerClient = {
+      fetchChunk: vi.fn(async () => ({
+        body: (async function* () {
+          yield artifactBytes;
+        })(),
+        contentLength: artifactBytes.length,
+      })),
+    };
+    const fetchMock = vi.fn(async () => {
+      throw new Error("origin_must_not_be_used");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const runner: RuntimeCommandRunner = vi.fn(async (_executable, args) => {
+      if (args[0] === "-c") return cudaProbeResult();
+      return { code: 0, stdout: "", stderr: "" };
+    });
+
+    const result = await prepareAcceleratorRuntime({
+      baseRuntimeRoot: base,
+      userDataPath: userData,
+      hardware: cudaHardware(),
+      allowProvisioning: true,
+      commandRunner: runner,
+      artifactSwarm: {
+        registry,
+        manifestId: signed.manifestId,
+        requesterPeerId: "desktop-requester",
+        peerClient,
+      },
+    });
+
+    expect(result.status).toBe("gpu-ready");
+    expect(peerClient.fetchChunk).toHaveBeenCalledOnce();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("uses a compact persistent Windows CUDA path without moving the package cache", () => {

@@ -399,6 +399,62 @@ describe("HTTP LaunchAgent RPC", () => {
     );
   });
 
+  it("validates a native GGUF binding and exact argv on the root engine", () => {
+    const description = fixtureDescription();
+    const root = description.launchOrder.find((process) => process.kind === "root-engine")!;
+    const request: LaunchAgentStartRequest = {
+      launchId: description.launchId,
+      pipelineId: description.pipelineId,
+      nodeId: root.anchor.memberId,
+      process: structuredClone(root),
+    };
+    if (request.process.kind !== "root-engine") {
+      throw new Error("fixture_root_process_is_not_root_engine");
+    }
+    const packageId = "9".repeat(64);
+    const modelIdentity = `sha256:${"8".repeat(64)}`;
+    request.process.nativeGguf = {
+      packagePath: "D:/packages/native-root-0-2",
+      packageId,
+      modelIdentity,
+      modelSource: "mycellios://models/rpc-native-root",
+      modelRevision: null,
+      layerStart: request.process.layerStart,
+      layerEnd: request.process.layerEnd,
+      totalLayers: request.process.totalLayers,
+    };
+    request.process.command.args.push(
+      "--model-artifact-identity",
+      modelIdentity,
+      "--model-canonical-source",
+      request.process.nativeGguf.modelSource,
+      "--pipeline-snapshot-identity",
+      "54321",
+      "--stage-package-identity",
+      `sha256:${packageId}`,
+      "--native-gguf-package",
+      request.process.nativeGguf.packagePath,
+      "--native-gguf-package-id",
+      packageId,
+    );
+    expect(() => validateLaunchAgentRpcStartRequest(request)).not.toThrow();
+
+    const metadataTampering = structuredClone(request);
+    if (metadataTampering.process.kind !== "root-engine") {
+      throw new Error("fixture_root_process_is_not_root_engine");
+    }
+    metadataTampering.process.nativeGguf!.packageId = "7".repeat(64);
+    expect(() => validateLaunchAgentRpcStartRequest(metadataTampering)).toThrow(
+      "native_gguf_package_id_flag_is_invalid",
+    );
+
+    const conflicting = structuredClone(request);
+    conflicting.process.command.args.push("--ram-moe-artifact-schema");
+    expect(() => validateLaunchAgentRpcStartRequest(conflicting)).toThrow(
+      "native_gguf_command_backend_is_not_exclusive",
+    );
+  });
+
   it("validates complete bounded physical tree flags on root and remote stages", () => {
     const description = fixtureDescription();
     const processes = description.launchOrder.filter(
@@ -614,12 +670,12 @@ describe("HTTP LaunchAgent RPC", () => {
     await handle.stop("weighted_complete");
   });
 
-  it("preserves an explicit sealed NativeStage stage binding through RPC", async () => {
+  it("rejects an unknown legacy process field before the node agent can start it", async () => {
     const request = fixtureRequest();
     if (request.process.kind !== "remote-stage") {
       throw new Error("fixture_first_process_is_not_remote_stage");
     }
-    request.process.native_stage = {
+    (request.process as unknown as Record<string, unknown>).native_stage = {
       packagePath: "D:/packages/stage-4-6",
       packageId: "a".repeat(64),
       manifestSha256: "b".repeat(64),
@@ -641,21 +697,95 @@ describe("HTTP LaunchAgent RPC", () => {
     const fake = new FakeAgent("fake:native_stage");
     const { address } = await serve(fake, request.nodeId);
 
+    await expect(
+      rpcClient(address).start(request, new AbortController().signal),
+    ).rejects.toThrow("python_launch_process_keys_are_invalid");
+    expect(fake.starts).toHaveLength(0);
+  });
+
+  it("rejects external backend argv even when legacy process metadata is null", async () => {
+    const request = fixtureRequest();
+    if (request.process.kind !== "remote-stage") {
+      throw new Error("fixture_first_process_is_not_remote_stage");
+    }
+    request.process.command.args.push("--local-model-runtime-url", "http://127.0.0.1:11434");
+    const fake = new FakeAgent("fake:external-argv");
+    const { address } = await serve(fake, request.nodeId);
+
+    await expect(
+      rpcClient(address).start(request, new AbortController().signal),
+    ).rejects.toThrow("external_backend_command_is_not_allowed:local-model-runtime");
+    expect(fake.starts).toHaveLength(0);
+  });
+
+  it("preserves and revalidates a sealed native GGUF stage through RPC", async () => {
+    const request = fixtureRequest();
+    if (request.process.kind !== "remote-stage") {
+      throw new Error("fixture_first_process_is_not_remote_stage");
+    }
+    const packageId = "d".repeat(64);
+    const modelIdentity = `sha256:${"1".repeat(64)}`;
+    request.process.nativeGguf = {
+      packagePath: "D:/packages/native-stage-4-6",
+      packageId,
+      modelIdentity,
+      modelSource: "mycellios://models/rpc-native",
+      modelRevision: "native-r1",
+      layerStart: request.process.layerStart,
+      layerEnd: request.process.layerEnd,
+      totalLayers: request.process.totalLayers,
+    };
+    request.process.command.args.push(
+      "--model-artifact-identity",
+      modelIdentity,
+      "--model-canonical-source",
+      request.process.nativeGguf.modelSource,
+      "--model-canonical-revision",
+      "native-r1",
+      "--pipeline-snapshot-identity",
+      "12345",
+      "--stage-package-identity",
+      `sha256:${packageId}`,
+      "--native-gguf-package",
+      request.process.nativeGguf.packagePath,
+      "--native-gguf-package-id",
+      packageId,
+    );
+    expect(() => validateLaunchAgentRpcStartRequest(request)).not.toThrow();
+
+    const tamperedPackage = structuredClone(request);
+    if (tamperedPackage.process.kind !== "remote-stage") {
+      throw new Error("fixture_first_process_is_not_remote_stage");
+    }
+    tamperedPackage.process.nativeGguf!.packageId = "e".repeat(64);
+    expect(() => validateLaunchAgentRpcStartRequest(tamperedPackage)).toThrow(
+      "native_gguf_package_id_flag_is_invalid",
+    );
+
+    const tamperedRange = structuredClone(request);
+    if (tamperedRange.process.kind !== "remote-stage") {
+      throw new Error("fixture_first_process_is_not_remote_stage");
+    }
+    tamperedRange.process.nativeGguf!.layerStart -= 1;
+    expect(() => validateLaunchAgentRpcStartRequest(tamperedRange)).toThrow(
+      "native_gguf_layer_range_does_not_match_launch",
+    );
+
+    const fake = new FakeAgent("fake:native-gguf");
+    const { address } = await serve(fake, request.nodeId);
     const handle = await rpcClient(address).start(request, new AbortController().signal);
     expect(fake.starts[0]!.process).toMatchObject({
       kind: "remote-stage",
-      native_stage: {
-        packageId: "a".repeat(64),
-        modelSource: "D:/models/local-snapshot",
-        modelRevision: null,
-        modelIdentity: `sha256:${"c".repeat(64)}`,
-        pipelineId: "18446744073709551615",
-        computeApi: "cpu",
+      nativeGguf: {
+        packageId,
+        modelIdentity,
+        modelSource: "mycellios://models/rpc-native",
+        modelRevision: "native-r1",
       },
     });
     fake.handles.get(request.process.processId)!.markReady();
     await handle.ready;
-    await handle.stop("native_stage_complete");
+    await handle.stop("native_gguf_complete");
   });
 
   it("reads the worst-case JSON expansion of bounded UTF-8 output", async () => {

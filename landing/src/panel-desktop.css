@@ -301,6 +301,45 @@
   width: 100%;
 }
 
+.public-panel .settings-native-runtime {
+  grid-column: 1 / -1;
+  min-height: 58px;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 11px 13px;
+  color: var(--green-300);
+  background: rgba(45, 211, 170, 0.065);
+  border: 1px solid rgba(45, 211, 170, 0.2);
+  border-radius: 10px;
+}
+
+.public-panel .settings-native-runtime > svg {
+  flex: 0 0 auto;
+}
+
+.public-panel .settings-native-runtime > span {
+  display: grid;
+  gap: 2px;
+}
+
+.public-panel .settings-native-runtime small {
+  color: var(--green-300);
+  font-size: 8px;
+  letter-spacing: 0.12em;
+}
+
+.public-panel .settings-native-runtime strong {
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.public-panel .settings-native-runtime em {
+  color: var(--text-secondary);
+  font-size: 9px;
+  font-style: normal;
+}
+
 .public-panel .toggle-list {
   display: grid;
 }

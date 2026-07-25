@@ -37,13 +37,28 @@ describe("inference-only coordinator and worker", () => {
       id: string;
       choices: Array<{ message: { content: string } }>;
       usage: { prompt_tokens: number; completion_tokens: number };
-      x_network: { ttft_ms: number; active_ms: number };
+      x_network: {
+        ttft_ms: number;
+        active_ms: number;
+        execution_trace: {
+          schema: string;
+          jobId: string;
+          stages: unknown[];
+          physicalBoundaryCount: number | null;
+        };
+      };
     };
     expect(response.status).toBe(200);
     expect(body.choices[0]?.message.content).toContain("prueba completa");
     expect(body.usage.prompt_tokens).toBeGreaterThan(0);
     expect(body.usage.completion_tokens).toBeGreaterThan(0);
     expect(body.x_network.active_ms).toBeGreaterThan(0);
+    expect(body.x_network.execution_trace).toMatchObject({
+      schema: "mycellios-network-execution-trace/1",
+      jobId: body.id,
+      stages: [],
+      physicalBoundaryCount: null,
+    });
     expect(runtime.store.listJobs()).toHaveLength(1);
     expect(runtime.store.listJobs()[0]?.status).toBe("completed");
     await waitUntil(
@@ -95,44 +110,8 @@ describe("inference-only coordinator and worker", () => {
     expect(response.headers.get("content-type")).toContain("text/event-stream");
     expect(stream).toContain("chat.completion.chunk");
     expect(stream).toContain('"token_index":0');
+    expect(stream).toContain('"execution_trace":{"schema":"mycellios-network-execution-trace/1"');
     expect(stream).toContain("data: [DONE]");
-  });
-
-  it("carries llmfit from worker startup into the application model catalog", async () => {
-    const { runtime, address, agent, run } = await startNetwork({ llmfit: true });
-    cleanup.push(async () => {
-      await agent.stop();
-      await run;
-      await runtime.close();
-    });
-    const response = await fetch(new URL("v1/models", `${address}/`));
-    const body = (await response.json()) as {
-      data: Array<{
-        id: string;
-        x_llmfit?: {
-          advised_replicas: number;
-          best_fit: string;
-          quantizations: string[];
-          max_estimated_tokens_per_second: number;
-          max_measured_tokens_per_second: number;
-          min_memory_required_mb: number;
-        };
-      }>;
-    };
-    expect(body.data[0]).toMatchObject({
-      id: "distributed-small",
-      x_llmfit: {
-        advised_replicas: 1,
-        best_fit: "Perfect",
-        quantizations: ["Q8_0"],
-        max_estimated_tokens_per_second: 42,
-        max_measured_tokens_per_second: 36,
-        min_memory_required_mb: 3_072,
-      },
-    });
-    expect(runtime.store.listWorkers()[0]?.capabilities.llmfit?.model?.deploymentId).toMatch(
-      /^dep-/,
-    );
   });
 
   it("removes a worker from the visible inventory after a voluntary stop", async () => {
@@ -179,7 +158,7 @@ describe("inference-only coordinator and worker", () => {
   });
 });
 
-async function startNetwork(options: { llmfit?: boolean; networkToken?: string } = {}): Promise<{
+async function startNetwork(options: { networkToken?: string } = {}): Promise<{
   runtime: CoordinatorRuntime;
   address: string;
   agent: WorkerAgent;
@@ -190,6 +169,7 @@ async function startNetwork(options: { llmfit?: boolean; networkToken?: string }
     port: 0,
     databasePath: ":memory:",
     requestTimeoutMs: 10_000,
+    allowDevelopmentAdapters: true,
     mobileAssetsPath: resolve("tests/fixtures/mobile-assets"),
     landingAssetsPath: resolve("tests/fixtures/landing-assets"),
     ...(options.networkToken
@@ -204,6 +184,7 @@ async function startNetwork(options: { llmfit?: boolean; networkToken?: string }
       limits: { maxConcurrency: 2, pauseWhenForeground: true },
       adapter: {
         kind: "mock",
+        developmentOnly: true,
         model: "distributed-small",
         tokensPerSecond: 500,
         ttftMs: 1,
@@ -216,19 +197,6 @@ async function startNetwork(options: { llmfit?: boolean; networkToken?: string }
         tokensPerSecond: 500,
         ttftMs: 1,
       },
-      ...(options.llmfit
-        ? {
-            llmfit: {
-              enabled: true,
-              required: true,
-              executable: process.execPath,
-              arguments: [resolve("tests/fixtures/fake-llmfit.cjs")],
-              timeoutMs: 5_000,
-              model: "fixture/distributed-small",
-              applyPerformanceEstimate: false,
-            },
-          }
-        : {}),
     }),
     {
       coordinatorUrl: address,

@@ -12,6 +12,7 @@ from distributed_runtime.device import (
     normalize_torch_device_request,
     resolve_torch_execution_device,
 )
+from distributed_runtime.dense_tiering import DenseTieringConfig
 from distributed_runtime.engine import PipelineEngineConfig
 from distributed_runtime.model import ModelArtifactReference, StageModelSpec, StageRunner
 from distributed_runtime.model_adapters import SelectiveStageAdapter
@@ -261,6 +262,39 @@ class StageDeviceWiringTests(unittest.TestCase):
             self.assertIs(build_stage_runner(config), sentinel)
         runner.assert_called_once_with(spec, device="cuda:1")
 
+    def test_dense_stage_passes_a_sealed_tiering_budget_to_runner(self) -> None:
+        spec = StageModelSpec("fake", 1, 2, 2, 1)
+        tiering = DenseTieringConfig(
+            host_ram_budget_bytes=8_000,
+            vram_budget_bytes=4_000,
+            activation_reserve_bytes=500,
+            admit_next_layer=False,
+        )
+        config = StageProcessConfig(
+            spec=spec,
+            pipeline_id=1,
+            listen_host="127.0.0.1",
+            listen_port=20_001,
+            next_host=None,
+            next_port=None,
+            next_layer_end=None,
+            return_host="127.0.0.1",
+            return_port=20_002,
+            codec=TensorCodec.FP16,
+            one_way_delay_ms=0,
+            bandwidth_mbps=0,
+            device="cuda:1",
+            dense_tiering=tiering,
+        )
+        sentinel = object()
+        with patch("distributed_runtime.stage.StageRunner", return_value=sentinel) as runner:
+            self.assertIs(build_stage_runner(config), sentinel)
+        runner.assert_called_once_with(
+            spec,
+            device="cuda:1",
+            dense_tiering=tiering,
+        )
+
     def test_cli_defaults_to_auto_and_accepts_an_indexed_cuda_device(self) -> None:
         base = [
             "--model",
@@ -284,6 +318,24 @@ class StageDeviceWiringTests(unittest.TestCase):
         self.assertEqual(parse_stage_args([*base, "--device", "xpu:0"]).device, "xpu:0")
         self.assertEqual(parse_server_args([]).device, "auto")
         self.assertEqual(parse_server_args(["--device", "cuda:1"]).device, "cuda:1")
+        budgeted = parse_stage_args(
+            [
+                *base,
+                "--dense-host-ram-budget-bytes",
+                "8000",
+                "--dense-vram-budget-bytes",
+                "4000",
+                "--dense-activation-reserve-bytes",
+                "500",
+                "--dense-enable-next-layer-admission",
+                "--dense-require-full-residency",
+            ]
+        )
+        self.assertEqual(budgeted.dense_host_ram_budget_bytes, 8_000)
+        self.assertEqual(budgeted.dense_vram_budget_bytes, 4_000)
+        self.assertEqual(budgeted.dense_activation_reserve_bytes, 500)
+        self.assertTrue(budgeted.dense_enable_next_layer_admission)
+        self.assertTrue(budgeted.dense_require_full_residency)
 
     def test_execution_metric_uses_effective_runtime_snapshot(self) -> None:
         runner = SimpleNamespace(

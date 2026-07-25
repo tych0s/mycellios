@@ -15,6 +15,7 @@ import {
   type BenchmarkRun,
   type BenchmarkThresholds,
 } from "./types.js";
+import { parseNetworkExecutionTrace } from "../telemetry/network-execution-trace.js";
 
 export const DEFAULT_HISTORY_DIRECTORY = join("benchmarks", "history");
 
@@ -263,6 +264,13 @@ function isCurrentBenchmarkMeasurement(value: unknown): value is BenchmarkMeasur
     || !Array.isArray(value.inventory.profiles)
     || !isRecord(value.topology)
     || !isRecord(value.workload)
+  ) return false;
+  if (
+    value.networkTraces !== undefined
+    && (
+      !Array.isArray(value.networkTraces)
+      || value.networkTraces.some((trace) => parseNetworkExecutionTrace(trace) === null)
+    )
   ) return false;
   try {
     return benchmarkScenarioFingerprint(

@@ -51,7 +51,7 @@ class OpenLoopSample:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark the complete OpenAI-compatible distributed API path."
+        description="Benchmark the complete Mycellios distributed API path."
     )
     parser.add_argument("--base-url", default="http://127.0.0.1:8081")
     parser.add_argument("--model", default="distributed-small")
@@ -394,7 +394,7 @@ async def run_closed_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             health = await response.json()
     return {
         "schema_version": 2,
-        "kind": "openai_api_continuous_scheduler",
+        "kind": "mycellios_api_continuous_scheduler",
         "configuration": {
             "base_url": args.base_url,
             "model": args.model,
@@ -591,7 +591,7 @@ async def run_open_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             final_health = await response.json()
     return {
         "schema_version": 2,
-        "kind": "openai_api_open_loop",
+        "kind": "mycellios_api_open_loop",
         "configuration": {
             "base_url": args.base_url,
             "mode": "open",

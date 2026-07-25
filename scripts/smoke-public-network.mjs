@@ -5,7 +5,7 @@ import { WorkerAgent } from "../dist/worker/agent.js";
 
 const coordinatorUrl = process.argv[2] ?? "http://127.0.0.1:8787";
 const config = workerConfigSchema.parse(
-  JSON.parse(await readFile(resolve("config/worker.example.json"), "utf8")),
+  JSON.parse(await readFile(resolve("config/worker.mock.dev.json"), "utf8")),
 );
 const before = await snapshot();
 const agent = new WorkerAgent(config, {

@@ -82,7 +82,8 @@ class StageArtifactCacheTests(unittest.TestCase):
                     layer_end=2,
                     total_layers=2,
                     threads=1,
-                    artifact_identity=result.artifact_identity,
+                    artifact_identity=self.compilation.model_identity,
+                    stage_package_identity=result.artifact_identity,
                 ),
                 device="cpu",
             )

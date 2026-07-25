@@ -7,6 +7,7 @@ import {
 } from "./cost-model.js";
 import type {
   ComputeNodeProfile,
+  DirectedLinkProfile,
   DistributedModelProfile,
   DistributionPlan,
   DistributionTopology,
@@ -42,6 +43,8 @@ export interface ParallelismEstimate {
  * ceiling for a TP cell interconnect.
  */
 export const TP_CELL_MAX_ONE_WAY_LATENCY_MS = 0.3;
+export const TP_CELL_MIN_SUCCESSFUL_LINK_SAMPLES = 3;
+export const TP_CELL_MIN_LINK_AVAILABILITY = 0.9;
 
 export function isViableTensorParallelCellLatency(oneWayLatencyMs: number): boolean {
   return (
@@ -149,6 +152,10 @@ function tensorParallelEstimate(
   const byId = new Map(topology.nodes.map((node) => [node.id, node]));
   const nodes = nodeIds.map((id) => byId.get(id)).filter(Boolean) as ComputeNodeProfile[];
   if (nodes.length !== nodeIds.length) return infeasible(architecture, nodes.length, "unknown_node");
+  const linkGateReason = tensorParallelCellGateReason(nodeIds, topology);
+  if (linkGateReason !== null) {
+    return infeasible(architecture, nodes.length, linkGateReason);
+  }
   if (!tensorShardFits(model, workload, nodes)) {
     return infeasible(architecture, nodes.length, "tensor_shard_memory_exceeded");
   }
@@ -207,7 +214,7 @@ function tensorParallelEstimate(
 
   const batchesPerRound = workload.concurrentSequences;
   const tpotMs = decodeMs * batchesPerRound;
-  const estimate: ParallelismEstimate = {
+  return {
     architecture,
     feasible: true,
     reason: null,
@@ -222,30 +229,56 @@ function tensorParallelEstimate(
         ? "2 ring all-reduces per layer (FP16)"
         : "2 root gather/broadcast collectives per layer (FP16)",
   };
-  if (!isViableTensorParallelCellLatency(worstCellOneWayLatencyMs(nodeIds, topology))) {
-    estimate.warning = "tp_cell_one_way_latency_above_viability_ceiling";
-  }
-  return estimate;
 }
 
 /**
- * The gate targets the cell's interconnect class as a whole, so it inspects
- * every directed link between members rather than the links one particular
- * collective schedule happens to use.
+ * Fail-closed physical admission for a TP cell. Every ordered member pair must
+ * have fresh, sufficiently sampled runtime evidence in the same locality
+ * domain. Region defaults and analytical links are intentionally ineligible.
  */
-function worstCellOneWayLatencyMs(
+export function tensorParallelCellGateReason(
   nodeIds: string[],
-  topology: DistributionTopology,
-): number {
-  let worst = 0;
+  topology: {
+    nodes: readonly { id: string; region?: string }[];
+    links: readonly DirectedLinkProfile[];
+  },
+  now = Date.now(),
+): string | null {
+  const byId = new Map(topology.nodes.map((node) => [node.id, node]));
+  const regions = new Set(nodeIds.map((nodeId) => byId.get(nodeId)?.region));
+  if (regions.has(undefined) || regions.size !== 1) {
+    return "tp_cell_cross_region_forbidden";
+  }
   for (const from of nodeIds) {
     for (const to of nodeIds) {
       if (from === to) continue;
-      const link = directedLink(topology, from, to);
-      if (link) worst = Math.max(worst, link.oneWayLatencyMs);
+      const link = topology.links.find(
+        (candidate) => candidate.from === from && candidate.to === to,
+      );
+      if (!link) return "collective_link_missing";
+      const evidence = link.evidence;
+      if (!evidence || evidence.source !== "runtime-probe") {
+        return "tp_cell_link_evidence_missing";
+      }
+      if (evidence.validUntil <= now || evidence.measuredAt > now) {
+        return "tp_cell_link_evidence_expired";
+      }
+      if (
+        evidence.successfulSamples < TP_CELL_MIN_SUCCESSFUL_LINK_SAMPLES
+      ) {
+        return "tp_cell_link_confidence_insufficient";
+      }
+      if (
+        (link.availability ?? 0) < TP_CELL_MIN_LINK_AVAILABILITY
+      ) {
+        return "tp_cell_link_availability_too_low";
+      }
+      if (!isViableTensorParallelCellLatency(link.oneWayLatencyMs)) {
+        return "tp_cell_one_way_latency_above_viability_ceiling";
+      }
     }
   }
-  return worst;
+  return null;
 }
 
 function tensorShardFits(

@@ -65,7 +65,7 @@ import type {
   RequestedModelCapacity,
 } from "../../src/desktop/contracts";
 import { consumeChatCompletionStreamWithRecovery } from "../../src/desktop/chat-stream";
-import type { ChatMessage } from "../../src/contracts/types";
+import type { ChatMessage, NetworkExecutionTrace } from "../../src/contracts/types";
 import type { BenchmarkMeasurement, BenchmarkRun } from "../../src/benchlab/types";
 import { Contribute } from "./Contribute";
 import { SupportAssistant } from "./SupportAssistant";
@@ -1890,6 +1890,7 @@ function BenchmarkResultCard({ measurement, run }: { measurement: BenchmarkMeasu
         <div><dt>Clases de ruta</dt><dd>{measurement.topology.routeClasses.length > 0 ? measurement.topology.routeClasses.join(" · ") : "Sin lectura"}</dd></div>
       </dl>
     </div>
+    <BenchmarkNetworkTrace traces={measurement.networkTraces ?? []} />
     <details className="benchmark-technical-details">
       <summary>Ver todas las métricas de esta prueba</summary>
       <div>
@@ -1907,6 +1908,55 @@ function BenchmarkResultCard({ measurement, run }: { measurement: BenchmarkMeasu
       <ul>{measurement.notes.map((note) => <li key={note}>{note}</li>)}</ul>
     </details>
   </article>;
+}
+
+function BenchmarkNetworkTrace({ traces }: { traces: NetworkExecutionTrace[] }) {
+  const trace = traces.at(-1) ?? null;
+  if (!trace) {
+    return <div className="benchmark-network-trace empty">
+      <div><Wifi size={18} /><span><small>TRAZA DE RED POR PETICIÓN</small><strong>Sin lectura</strong></span></div>
+      <p>Esta ejecución no entregó evidencia física de etapas, transporte, RTT ni bytes.</p>
+    </div>;
+  }
+  return <div className="benchmark-network-trace">
+    <div className="benchmark-network-trace-heading">
+      <div><Wifi size={18} /><span><small>ÚLTIMA TRAZA DE RED · {traces.length} GUARDADAS</small><strong>{trace.stages.length} etapas observadas · {trace.physicalBoundaryCount === null ? "fronteras sin lectura" : `${trace.physicalBoundaryCount} fronteras físicas`}</strong></span></div>
+      <em>{trace.durationMs} ms · intento {trace.attempt}</em>
+    </div>
+    <div className="benchmark-trace-stages">
+      {trace.stages.length > 0
+        ? trace.stages.map((stage, index) => <span key={`${stage.routeStageIndex}-${stage.stageIndex}-${index}`}>
+            <b>{stage.stageIndex + 1}</b>
+            <strong>{stage.nodeId ? shortId(stage.nodeId) : "Nodo sin lectura"}</strong>
+            <small>{stage.layerStart === null || stage.layerEnd === null ? "Capas sin lectura" : `capas ${stage.layerStart}–${stage.layerEnd}`} · {stage.backend} · {stage.precision}</small>
+            <em>{stage.workerId ? `worker ${shortId(stage.workerId)}` : "worker sin lectura"} · despliegue {shortId(stage.deploymentId)} · tiempo sin lectura</em>
+          </span>)
+        : <p>Las etapas físicas no fueron observadas por este runtime.</p>}
+    </div>
+    <div className="benchmark-trace-boundaries">
+      {trace.boundaries.length > 0
+        ? trace.boundaries.map((boundary) => <span key={boundary.boundaryIndex}>
+            <strong>{networkTransportLabel(boundary.transport)}</strong>
+            <small>{boundary.sourceNodeId ? shortId(boundary.sourceNodeId) : "Sin lectura"} → {boundary.destinationNodeId ? shortId(boundary.destinationNodeId) : "Sin lectura"}</small>
+            <em>RTT {formatBenchmark(boundary.connectRttMs, " ms")} · bytes observados ida {formatTraceBytes(boundary.bytesSourceToDestination)} · vuelta {formatTraceBytes(boundary.bytesDestinationToSource)} · ventana {formatBenchmark(boundary.observedOverlapMs, " ms")}</em>
+          </span>)
+        : <p>Sin fronteras de transporte entre etapas.</p>}
+    </div>
+  </div>;
+}
+
+function networkTransportLabel(mode: NetworkExecutionTrace["boundaries"][number]["transport"]): string {
+  if (mode === "direct") return "Directo";
+  if (mode === "relay") return "Relay";
+  if (mode === "local") return "Local";
+  return "Sin lectura";
+}
+
+function formatTraceBytes(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return "Sin lectura";
+  if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(2)} MB`;
+  if (value >= 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${value} B`;
 }
 
 function BenchmarkMetric({ icon: Icon, label, value, detail }: { icon: typeof Gauge; label: string; value: string; detail: string }) {
@@ -1933,15 +1983,13 @@ function Inference({ snapshot, onSend, onNavigate }: {
   onNavigate: (view: PanelView) => void;
 }) {
   const options = useMemo(() => snapshot.models.map((item) => inferenceModelOption(snapshot, item)), [snapshot]);
-  const realModels = options.filter((item) => !item.connectivityOnly);
-  const connectivityModel = options.find((item) => item.connectivityOnly) ?? null;
+  const realModels = options.filter((item) => !item.legacyExternalRuntime);
   const [model, setModel] = useState("");
   const [prompt, setPrompt] = useState("");
   const [turns, setTurns] = useState<InferenceTurn[]>([]);
   const [sessionId, setSessionId] = useState(() => newInferenceSessionId());
   const [error, setError] = useState<string | null>(null);
   const [pendingTurn, setPendingTurn] = useState<InferencePendingTurn | null>(null);
-  const [diagnostic, setDiagnostic] = useState<"idle" | "running" | "ok" | "failed">("idle");
   const outputRef = useRef<HTMLDivElement>(null);
   const selectedModel = realModels.some((item) => item.id === model) ? model : realModels[0]?.id ?? "";
   const selectedOption = realModels.find((item) => item.id === selectedModel) ?? null;
@@ -2002,17 +2050,6 @@ function Inference({ snapshot, onSend, onNavigate }: {
     }
   }
 
-  async function checkConnection() {
-    if (!connectivityModel || diagnostic === "running") return;
-    setDiagnostic("running");
-    try {
-      await onSend(connectivityModel.id, [{ role: "user", content: "ping" }], newInferenceSessionId());
-      setDiagnostic("ok");
-    } catch {
-      setDiagnostic("failed");
-    }
-  }
-
   function resetConversation(nextModel?: string) {
     if (nextModel !== undefined) setModel(nextModel);
     setTurns([]);
@@ -2028,8 +2065,7 @@ function Inference({ snapshot, onSend, onNavigate }: {
       <div className="inference-unavailable-icon"><MessageSquareText /></div>
       <div className="inference-unavailable-copy"><span>NO HAY MODELOS DE IA DISPONIBLES</span><h2>Ahora mismo no se puede hacer una inferencia real</h2><p>La red no tiene ningún runtime de IA real conectado. Un PC puede aparecer como nodo disponible sin inventar un modelo ni respuestas.</p>
         {snapshot.requestedModels[0] && <div className="inference-request-state"><LoaderCircle className={snapshot.requestedModels[0].status === "active" ? "" : "spin"} /><span><strong>{snapshot.requestedModels[0].id}</strong>{snapshot.requestedModels[0].message}</span></div>}
-        <div className="inference-unavailable-actions"><button className="primary-button" onClick={() => onNavigate("models")}><Boxes size={16} />Ver y activar modelos</button>{connectivityModel && <button className="secondary-button" disabled={diagnostic === "running"} onClick={() => void checkConnection()}>{diagnostic === "running" ? <LoaderCircle className="spin" size={16} /> : diagnostic === "ok" ? <CheckCircle2 size={16} /> : <Wifi size={16} />}{diagnostic === "idle" ? "Comprobar conexión" : diagnostic === "running" ? "Comprobando…" : diagnostic === "ok" ? "Conexión correcta" : "Reintentar conexión"}</button>}</div>
-        {diagnostic === "failed" && <div className="inference-diagnostic-error"><CircleAlert size={15} />El coordinador no ha completado la prueba de conexión.</div>}
+        <div className="inference-unavailable-actions"><button className="primary-button" onClick={() => onNavigate("models")}><Boxes size={16} />Ver y activar modelos</button></div>
       </div>
     </div> : <div className="inference-console">
       <div className="inference-toolbar">
@@ -2037,7 +2073,7 @@ function Inference({ snapshot, onSend, onNavigate }: {
         <div className="inference-model-summary"><ExecutionBadge execution={selectedOption?.execution ?? unknownExecutionSummary()} workers={snapshot.workers} large /><span className="inference-live"><i />DISPONIBLE</span><span>{selectedOption?.routeLabel}</span><span>{selectedOption?.freeSlots ?? 0} hueco{selectedOption?.freeSlots === 1 ? "" : "s"} libre{selectedOption?.freeSlots === 1 ? "" : "s"}</span></div>
       </div>
       <div className="inference-output" aria-live="polite" ref={outputRef}>
-        {turns.length === 0 && !pendingTurn && !error && <div className="inference-welcome"><Sparkles /><h2>Escribe una pregunta</h2><p>La respuesta vendrá del modelo seleccionado, no del adaptador de conectividad.</p><div className="inference-suggestions">{["Resume cómo funciona esta red", "Explica una idea en tres frases", "Responde con una prueba corta"].map((suggestion) => <button key={suggestion} onClick={() => setPrompt(suggestion)}>{suggestion}</button>)}</div></div>}
+        {turns.length === 0 && !pendingTurn && !error && <div className="inference-welcome"><Sparkles /><h2>Escribe una pregunta</h2><p>La respuesta vendrá exclusivamente de un despliegue nativo de Mycellios.</p><div className="inference-suggestions">{["Resume cómo funciona esta red", "Explica una idea en tres frases", "Responde con una prueba corta"].map((suggestion) => <button key={suggestion} onClick={() => setPrompt(suggestion)}>{suggestion}</button>)}</div></div>}
         {turns.map((turn) => <InferenceCompletedTurn turn={turn} key={turn.id} />)}
         {pendingTurn && <InferenceStreamingTurn turn={pendingTurn} />}
         {error && <div className="inference-error"><CircleAlert /><div><strong>No se pudo completar la inferencia</strong><span>{friendlyInferenceError(error)}</span></div></div>}
@@ -2188,9 +2224,14 @@ function ActivationProgressLog({ model }: { model: RequestedModelCapacity }) {
       }];
   const events = useMemo(() => orderActivationProgressEvents(rawEvents), [rawEvents]);
   const listRef = useRef<HTMLOListElement>(null);
-  const actionableIndex = events.findLastIndex(
-    (event) => event.state === "running" || event.state === "failed",
-  );
+  let actionableIndex = -1;
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event?.state === "running" || event?.state === "failed") {
+      actionableIndex = index;
+      break;
+    }
+  }
   const currentIndex = actionableIndex >= 0 ? actionableIndex : Math.max(0, events.length - 1);
   const current = events[currentIndex] ?? events.at(-1)!;
   const nodeCount = new Set(events.flatMap((event) => event.nodeId ? [event.nodeId] : [])).size;
@@ -2452,7 +2493,17 @@ function DesktopSettingsView({ snapshot, bridge, onSnapshot }: { snapshot: Dashb
     <PageTitle eyebrow="DESKTOP PREFERENCES" title="Settings" copy="Native connection, contribution, background behavior and updates for this computer." />
     {error && <div className="inline-error"><CircleAlert size={17} />{error}</div>}
     <div className="settings-section"><div><Globe2 size={20} /><div><h3>Coordinator</h3><p>Use the public network or host an isolated local coordinator.</p></div></div><div className="settings-fields"><label>Mode<AppSelect ariaLabel="Coordinator mode" value={draft.coordinatorMode} onChange={(value) => updateCoordinatorMode(value as DesktopSettings["coordinatorMode"])} options={[{ value: "remote", label: "Public mycellios network" }, { value: "local", label: "Local network on this machine" }]} /></label>{draft.coordinatorMode === "remote" && <label>Coordinator URL<input value={draft.remoteCoordinatorUrl} onChange={(event) => update("remoteCoordinatorUrl", event.target.value)} /></label>}<label>Region<input value={draft.region} onChange={(event) => update("region", event.target.value)} placeholder="auto" /></label></div></div>
-    <div className="settings-section"><div><Gauge size={20} /><div><h3>Contribution</h3><p>Register real hardware only, or expose a model through a verified local runtime.</p></div></div><div className="settings-fields"><label>Compute mode<AppSelect ariaLabel="Compute mode" value={draft.computeMode} onChange={(value) => update("computeMode", value as DesktopSettings["computeMode"])} options={[{ value: "automatic", label: "Automatic · GPU preferred" }, { value: "gpu-only", label: "GPU only · never CPU" }, { value: "cpu-only", label: "CPU only · GPU disabled" }]} /></label><label>Runtime<AppSelect ariaLabel="Contribution runtime" value={draft.adapterMode} onChange={(value) => update("adapterMode", value as DesktopSettings["adapterMode"])} options={[{ value: "connectivity-test", label: "Hardware only (no model)" }, { value: "local-model-runtime", label: "Local local model runtime" }]} /></label><label>Offered memory (GB)<input type="number" min="1" step="1" value={draft.offeredVramMb / 1_024} onChange={(event) => update("offeredVramMb", Math.round(Number(event.target.value) * 1_024))} /></label>{draft.adapterMode === "local-model-runtime" && <><label>local model runtime model<input value={draft.modelName} onChange={(event) => update("modelName", event.target.value)} /></label><label>local model runtime URL<input value={draft.adapterBaseUrl} onChange={(event) => update("adapterBaseUrl", event.target.value)} /></label><label>Pinned digest<input value={draft.modelDigest} onChange={(event) => update("modelDigest", event.target.value)} placeholder="sha256:…" /></label></>}</div></div>
+    <div className="settings-section">
+      <div><Gauge size={20} /><div><h3>Contribution</h3><p>This computer always uses the built-in Mycellios runtime. Models appear only after a verified native deployment starts.</p></div></div>
+      <div className="settings-fields">
+        <label>Compute mode<AppSelect ariaLabel="Compute mode" value={draft.computeMode} onChange={(value) => update("computeMode", value as DesktopSettings["computeMode"])} options={[{ value: "automatic", label: "Automatic · GPU preferred" }, { value: "gpu-only", label: "GPU only · never CPU" }, { value: "cpu-only", label: "CPU only · GPU disabled" }]} /></label>
+        <label>Offered memory (GB)<input type="number" min="1" step="1" value={draft.offeredVramMb / 1_024} onChange={(event) => update("offeredVramMb", Math.round(Number(event.target.value) * 1_024))} /></label>
+        <div className="settings-native-runtime" role="status" aria-label="Contribution runtime">
+          <ShieldCheck size={17} />
+          <span><small>RUNTIME</small><strong>Mycellios native</strong><em>No external model service</em></span>
+        </div>
+      </div>
+    </div>
     <div className="settings-section compact-settings"><div><SlidersHorizontal size={20} /><div><h3>Application</h3><p>Startup and background contribution.</p></div></div><div className="toggle-list"><Toggle label="Start with the system" checked={draft.launchAtLogin} onChange={(value) => update("launchAtLogin", value)} /><Toggle label="Keep running in the tray" checked={draft.closeToTray} onChange={(value) => update("closeToTray", value)} /><Toggle label="Contribute resources" checked={draft.contributionEnabled} onChange={(value) => update("contributionEnabled", value)} /></div></div>
     <div className="settings-section"><div><Download size={20} /><div><h3>Automatic updates</h3><p>Desktop releases download in the background and install automatically as soon as active inference is idle.</p></div></div><div className="update-settings"><div><span className={`update-state ${snapshot.update.state}`}>{updateStateLabel(snapshot.update.state)}</span><strong>Version {snapshot.appVersion}</strong><p>{snapshot.update.message}</p></div><div className="update-actions"><button className="secondary-button" disabled={checkingUpdate || snapshot.update.state === "checking" || snapshot.update.state === "downloading"} onClick={() => void checkUpdate()}><RefreshCw className={checkingUpdate ? "spin" : ""} size={15} />Check now</button>{snapshot.update.state === "ready" && <button className="primary-button" onClick={() => void bridge.installUpdate()}><Download size={15} />Restart now</button>}</div></div></div>
     <div className="settings-footer"><button className="primary-button" disabled={saving} onClick={() => void save()}>{saving ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}Save and reconnect</button></div>
@@ -3013,12 +3064,14 @@ function computeModeLabel(mode: NonNullable<PublicWorker["computeMode"]>): strin
 function inferenceModelOption(snapshot: PublicSnapshot, model: PublicSnapshot["models"][number]) {
   const deployments = snapshot.workers.flatMap((worker) => worker.deployments).filter((deployment) => deployment.model === model.id);
   const adapters = deployments.map((deployment) => deployment.adapter).filter((adapter): adapter is NonNullable<PublicDeployment["adapter"]> => adapter !== undefined);
-  const connectivityOnly = model.id === "mycellios-connectivity-check" || (adapters.length > 0 && adapters.every((adapter) => adapter === "mock"));
+  const legacyExternalRuntime = adapters.some(
+    (adapter) => adapter !== "mycellios-pipeline",
+  );
   const freeSlots = deployments.reduce((total, deployment) => total + deployment.freeSlots, 0);
   const routeLabel = model.pipelines > 0
     ? `${model.pipelines} pipeline${model.pipelines === 1 ? "" : "s"}`
     : `${model.replicas} réplica${model.replicas === 1 ? "" : "s"}`;
-  return { ...model, connectivityOnly, freeSlots, routeLabel, execution: summarizeDeploymentExecution(deployments) };
+  return { ...model, legacyExternalRuntime, freeSlots, routeLabel, execution: summarizeDeploymentExecution(deployments) };
 }
 
 function formatDuration(milliseconds: number): string {

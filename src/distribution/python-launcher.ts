@@ -128,7 +128,7 @@ export interface PythonRuntimeModelInput {
 }
 
 export interface PythonLaunchCompilerOptions {
-  /** Bind address for the OpenAI-compatible root server. */
+  /** Bind address for the Mycellios root server. */
   apiEndpoint: RuntimeEndpoint;
   /** Address advertised to remote stages for ACK/token return. */
   returnEndpoint: RuntimeEndpoint;
@@ -165,8 +165,11 @@ export interface PythonLaunchCompilerOptions {
    * physical launcher; the compiler never guesses them from a backend label.
    */
   recovery?: PythonRecoveryInput | PythonRecoveryConfiguration | null;
-  /** Explicit host-local sub-GGUF bindings. A generic backend never enables these. */
-  native_stageStages?: Record<string, PythonNativeStageStageInput>;
+  /**
+   * First-class Mycellios GGUF range packages. Every binding carries the
+   * complete model coordinates as well as the exact physical stage range.
+   */
+  nativeGgufStages?: Record<string, PythonNativeGgufStageInput>;
   /**
    * Host-local bindings for every RAM-backed MoE stage. The compiler requires
    * complete coverage and seals them to the stage budgets before execution.
@@ -205,38 +208,24 @@ export interface PythonRecoveryConfiguration {
   standbyRoutes: PythonRecoveryStandbyRouteConfiguration[];
 }
 
-export type PythonNativeStageComputeApi = "cpu" | "cuda" | "rocm" | "metal" | "vulkan";
-
 /**
- * Predeclared identity and runtime settings for one sealed NativeStage package.
- * The range is duplicated deliberately: the compiler binds it to the logical
- * stage, while the Python loader independently checks it against the package.
+ * Authenticated Mycellios-native GGUF package for one exact contiguous range.
+ * model* names the complete source model and is deliberately distinct from
+ * packageId, which names only this stage package.
  */
-export interface PythonNativeStageStageInput {
+export interface PythonNativeGgufStageInput {
   packagePath: string;
   packageId: string;
-  manifestSha256: string;
+  modelIdentity: string;
   modelSource: string;
   modelRevision: string | null;
   layerStart: number;
   layerEnd: number;
   totalLayers: number;
-  daemonExecutable: string;
-  pipelineId: string;
-  contextTokens: number;
-  gpuLayers: number;
-  computeApi: PythonNativeStageComputeApi;
-  startupTimeoutSeconds: number;
-  callTimeoutSeconds: number;
-  closeTimeoutSeconds: number;
-  /** Present only in normalized descriptions; input values are verified. */
-  modelIdentity?: string;
 }
 
-export interface PythonNativeStageStageConfiguration
-  extends Omit<PythonNativeStageStageInput, "modelIdentity"> {
-  modelIdentity: string;
-}
+export interface PythonNativeGgufStageConfiguration
+  extends PythonNativeGgufStageInput {}
 
 export type PythonRamBackedMoeAdapterId =
   | "transformers-qwen3-moe-v1"
@@ -330,8 +319,8 @@ export interface PythonLaunchConfiguration {
   maxRetainedSessionTokens: number;
   retainedSessionTtlSeconds: number;
   recovery: PythonRecoveryConfiguration | null;
-  /** Sorted by stageId so hashing and transport are deterministic. */
-  native_stageStages: Record<string, PythonNativeStageStageConfiguration>;
+  /** Sorted by stageId and sealed into route/process/launch identities. */
+  nativeGgufStages: Record<string, PythonNativeGgufStageConfiguration>;
   /** Sorted, host-local bindings for the certified physical RAM-backed runner. */
   ramBackedMoeStages: Record<string, PythonRamBackedMoeStageConfiguration>;
 }
@@ -405,8 +394,8 @@ export interface PythonRemoteStageLaunch extends PythonLaunchBase {
   returnEndpoint: RuntimeEndpoint;
   /** Null selects the ordinary single-member StageModelRunner. */
   cell: RuntimeTensorParallelCellExecutionManifest | null;
-  /** Null selects the standard model loader for this single-member stage. */
-  native_stage: PythonNativeStageStageConfiguration | null;
+  /** Null selects the ordinary Mycellios stage loader. */
+  nativeGguf: PythonNativeGgufStageConfiguration | null;
 }
 
 /** One nonzero rank that joins a member-local TP cell before its anchor is ready. */
@@ -431,6 +420,8 @@ export interface PythonCellMemberLaunch extends PythonLaunchBase {
 export interface PythonRootEngineLaunch extends PythonLaunchBase {
   kind: "root-engine";
   stageIndex: 0;
+  /** Null selects the standard root model loader. */
+  nativeGguf: PythonNativeGgufStageConfiguration | null;
   boundaries: number[];
   firstRemoteStage: PythonDownstreamStage;
   apiEndpoint: RuntimeEndpoint;
@@ -478,8 +469,12 @@ export interface PythonPipelineLaunchDescription {
 }
 
 interface PythonSpeculationArguments {
-  provider: "off" | "ngram";
+  provider: "off" | "ngram" | "draft-tree";
   maxDraftTokens: number;
+  maxBranches: number;
+  maxBranchTokens: number;
+  maxKvBytes: number;
+  maxWaveTokens: number;
 }
 
 /**
@@ -545,7 +540,7 @@ function buildDescription(
     phaseSettings,
     stages,
     codec,
-    configuration.native_stageStages,
+    configuration.nativeGgufStages,
     configuration.ramBackedMoeStages,
     configuration.recovery,
   );
@@ -570,7 +565,7 @@ function buildDescription(
     occupiedRemoteEndpoints.add(listenKey);
     const next = stages[index + 1];
     const downstream = next ? downstreamStage(next) : null;
-    const native_stage = configuration.native_stageStages[stage.stageId] ?? null;
+    const nativeGguf = configuration.nativeGgufStages[stage.stageId] ?? null;
     const cell = tensorParallelCellExecution(stage.execution);
     const macroWave = stage.macroWave;
     if (cell?.fixture.location === "member-local") {
@@ -649,7 +644,7 @@ function buildDescription(
       downstream,
       returnEndpoint: { ...configuration.returnEndpoint },
       cell: cell ? structuredClone(cell) : null,
-      native_stage: native_stage ? structuredClone(native_stage) : null,
+      nativeGguf: nativeGguf ? structuredClone(nativeGguf) : null,
     };
     launchOrder.push({
       ...partial,
@@ -662,6 +657,8 @@ function buildDescription(
   }
 
   const rootStage = stages[0]!;
+  const rootNativeGguf =
+    configuration.nativeGgufStages[rootStage.stageId] ?? null;
   const firstRemoteStage = downstreamStage(stages[1]!);
   const rootProcessId = processIdentity(routeId, "root-engine", rootStage);
   const rootPartial: Omit<PythonRootEngineLaunch, "launchIndex" | "command"> = {
@@ -672,6 +669,7 @@ function buildDescription(
     logicalPlanIds: [...planIds],
     stageId: rootStage.stageId,
     stageIndex: 0,
+    nativeGguf: rootNativeGguf ? structuredClone(rootNativeGguf) : null,
     layerStart: rootStage.layerStart,
     layerEnd: rootStage.layerEnd,
     totalLayers: manifest.totalLayers,
@@ -816,6 +814,12 @@ function assertExecutableMacroWaveContract(
     throw new Error("python_macro_wave_phase_contracts_do_not_match");
   }
   const speculation = pythonSpeculation(decode.speculation);
+  if (
+    speculation.provider === "draft-tree" &&
+    decodeContract.waveTokens !== speculation.maxWaveTokens
+  ) {
+    throw new Error("python_draft_tree_wave_contract_mismatch");
+  }
   if (speculation.provider === "off") {
     if (
       decodeContract.waveTokens !== 1 ||
@@ -858,7 +862,7 @@ function executableFrameLimits(
   return {
     sealedWaveTokens:
       decode.macroWave?.waveTokens ??
-      (speculation.provider === "off" ? 1 : speculation.maxDraftTokens + 1),
+      speculation.maxWaveTokens,
     maxPrefillChunkTokens: prefill.chunkTokens,
   };
 }
@@ -894,11 +898,13 @@ function renderRemoteStageArguments(
       configuration.runtimeModel.snapshotIdentity!,
     );
     appendRamBackedMoeArguments(args, ramBackedMoe);
-  } else if (launch.native_stage) {
-    appendBasicModelArguments(
-      args,
-      launch.native_stage.modelSource,
-      launch.native_stage.modelRevision,
+  } else if (launch.nativeGguf) {
+    // The native package is range-local, but the standard model coordinates
+    // and pipeline identity remain global and identical on every stage.
+    appendModelArguments(args, configuration.runtimeModel);
+    args.push(
+      "--stage-package-identity",
+      `sha256:${launch.nativeGguf.packageId}`,
     );
   } else {
     appendModelArguments(args, configuration.runtimeModel);
@@ -917,8 +923,9 @@ function renderRemoteStageArguments(
     "--listen-port",
     String(launch.anchor.endpoint.port),
   );
-  if (!ramBackedMoe && !launch.native_stage && !launch.cell) {
+  if (!ramBackedMoe && !launch.cell) {
     args.push("--device", "auto");
+    appendDenseTieringArguments(args, launch.macroWave);
   }
   if (launch.downstream) {
     args.push(
@@ -979,31 +986,12 @@ function renderRemoteStageArguments(
       );
     }
   }
-  if (launch.native_stage) {
-    const native_stage = launch.native_stage;
+  if (launch.nativeGguf) {
     args.push(
-      "--native_stage-package",
-      native_stage.packagePath,
-      "--native_stage-package-id",
-      native_stage.packageId,
-      "--native_stage-manifest-sha256",
-      native_stage.manifestSha256,
-      "--native_stage-daemon-bin",
-      native_stage.daemonExecutable,
-      "--native_stage-pipeline-id",
-      native_stage.pipelineId,
-      "--native_stage-context-tokens",
-      String(native_stage.contextTokens),
-      "--native_stage-gpu-layers",
-      String(native_stage.gpuLayers),
-      "--native_stage-compute-api",
-      native_stage.computeApi,
-      "--native_stage-startup-timeout-seconds",
-      finiteNumber(native_stage.startupTimeoutSeconds),
-      "--native_stage-call-timeout-seconds",
-      finiteNumber(native_stage.callTimeoutSeconds),
-      "--native_stage-close-timeout-seconds",
-      finiteNumber(native_stage.closeTimeoutSeconds),
+      "--native-gguf-package",
+      launch.nativeGguf.packagePath,
+      "--native-gguf-package-id",
+      launch.nativeGguf.packageId,
     );
   }
   args.push(
@@ -1089,6 +1077,16 @@ function renderRootEngineArguments(
     appendRamBackedMoeArguments(args, ramBackedMoe);
   } else {
     appendModelArguments(args, configuration.runtimeModel);
+    if (launch.nativeGguf) {
+      args.push(
+        "--stage-package-identity",
+        `sha256:${launch.nativeGguf.packageId}`,
+        "--native-gguf-package",
+        launch.nativeGguf.packagePath,
+        "--native-gguf-package-id",
+        launch.nativeGguf.packageId,
+      );
+    }
   }
   args.push(
     "--public-model-name",
@@ -1169,7 +1167,30 @@ function renderRootEngineArguments(
     }
   }
   if (!ramBackedMoe) args.push("--device", "auto");
+  if (!ramBackedMoe) appendDenseTieringArguments(args, launch.macroWave);
   return args;
+}
+
+function appendDenseTieringArguments(
+  args: string[],
+  contract: MacroWaveStageExecutionContractV1 | null,
+): void {
+  if (
+    contract === null
+    || contract.residentKind !== "layers"
+    || contract.ramArtifact !== undefined
+  ) return;
+  args.push(
+    "--dense-host-ram-budget-bytes",
+    String(contract.budgets.hostRamBytes),
+    "--dense-vram-budget-bytes",
+    String(contract.budgets.vramBytes),
+    "--dense-activation-reserve-bytes",
+    String(contract.requirements.activationBufferBytes),
+  );
+  if (contract.memoryMode === "resident") {
+    args.push("--dense-require-full-residency");
+  }
 }
 
 function pythonSpeculation(policy: RuntimeSpeculationPolicy): PythonSpeculationArguments {
@@ -1178,15 +1199,50 @@ function pythonSpeculation(policy: RuntimeSpeculationPolicy): PythonSpeculationA
   );
   if (!selected) throw new Error("python_speculation_default_is_missing");
   if (policy.mode === "disabled" || selected.kind === "autoregressive") {
-    return { provider: "off", maxDraftTokens: 1 };
+    return {
+      provider: "off",
+      maxDraftTokens: 1,
+      maxBranches: 0,
+      maxBranchTokens: 0,
+      maxKvBytes: 0,
+      maxWaveTokens: 1,
+    };
   }
-  if (selected.kind !== "ngram") {
+  if (selected.kind !== "ngram" && selected.kind !== "draft-tree") {
     throw new Error(`python_speculation_strategy_not_supported:${selected.kind}`);
   }
   if (selected.maxDraftTokens > 16) {
     throw new Error("python_speculation_draft_length_exceeds_runtime_limit");
   }
-  return { provider: "ngram", maxDraftTokens: selected.maxDraftTokens };
+  if (selected.kind === "ngram") {
+    return {
+      provider: "ngram",
+      maxDraftTokens: selected.maxDraftTokens,
+      maxBranches: 0,
+      maxBranchTokens: 0,
+      maxKvBytes: 0,
+      maxWaveTokens: selected.maxDraftTokens + 1,
+    };
+  }
+  if (
+    selected.maxBranches === undefined ||
+    selected.maxBranchTokens === undefined ||
+    selected.maxKvBytes === undefined ||
+    selected.maxWaveTokens === undefined
+  ) {
+    throw new Error("python_draft_tree_limits_are_missing");
+  }
+  if (selected.maxWaveTokens !== selected.maxDraftTokens + 1) {
+    throw new Error("python_draft_tree_wave_does_not_match_draft_depth");
+  }
+  return {
+    provider: "draft-tree",
+    maxDraftTokens: selected.maxDraftTokens,
+    maxBranches: selected.maxBranches,
+    maxBranchTokens: selected.maxBranchTokens,
+    maxKvBytes: selected.maxKvBytes,
+    maxWaveTokens: selected.maxWaveTokens,
+  };
 }
 
 function normalizeConfiguration(
@@ -1195,6 +1251,57 @@ function normalizeConfiguration(
   requireNormalized = false,
 ): PythonLaunchConfiguration {
   if (!isRecord(value)) throw new Error("python_launch_options_must_be_an_object");
+  assertExactKeys(
+    value,
+    ["apiEndpoint", "returnEndpoint", "returnBindHost"],
+    [
+      "runtimeModel",
+      "publicModelName",
+      "pythonExecutable",
+      "stageModule",
+      "serverModule",
+      "threadsPerStage",
+      "connectTimeoutSeconds",
+      "batchWindowMs",
+      "prefillInflightChunks",
+      "prefillInflightBytes",
+      "maxSpeculativeBranches",
+      "maxSpeculativeBranchTokens",
+      "maxSpeculativeKvBytes",
+      "maxPendingRequests",
+      "maxOutputTokens",
+      "speculationMinimumSpeedup",
+      "maxRetainedSessions",
+      "maxRetainedSessionTokens",
+      "retainedSessionTtlSeconds",
+      "recovery",
+      "nativeGgufStages",
+      "ramBackedMoeStages",
+    ],
+    "python_launch_options_have_unknown_or_missing_fields",
+  );
+  const hasUncalibratedTensorParallel = [
+    manifest.plans.prefill,
+    manifest.plans.decode,
+  ].some(
+    (plan) =>
+      plan.predicted.calibrationRequired === true
+      && (plan.predicted.calibrationReasons ?? []).some(
+        (reason) =>
+          reason === "tensor_parallel_collective_cost_unprofiled"
+          || reason === "external_cell_internal_links_unprofiled"
+          || reason === "collective_link_missing"
+          || reason.startsWith("tp_cell_"),
+      )
+      && plan.stages.some(
+        (stage) => stage.execution?.mode === "tensor-parallel-cell",
+      ),
+  );
+  if (hasUncalibratedTensorParallel) {
+    throw new Error(
+      "python_tensor_parallel_requires_measured_collective_profile",
+    );
+  }
   validateEndpoint(value.apiEndpoint, "python_api_endpoint_is_invalid");
   validateEndpoint(value.returnEndpoint, "python_return_endpoint_is_invalid");
   const returnBindHost = safeString(
@@ -1246,15 +1353,19 @@ function normalizeConfiguration(
     ...(snapshotIdentity ? { snapshotIdentity } : {}),
     ...artifactCoordinates,
   };
+  const nativeGgufStages = normalizeNativeGgufStages(
+    manifest,
+    value.nativeGgufStages,
+    runtimeModel,
+  );
   const ramBackedMoeStages = normalizeRamBackedMoeStages(
     manifest,
     value.ramBackedMoeStages,
     runtimeModel,
   );
-  const native_stageStages = normalizeNativeStageStages(
-    manifest,
-    value.native_stageStages,
-    runtimeModel,
+  validateExclusiveStageBindings(
+    nativeGgufStages,
+    ramBackedMoeStages,
   );
   const prefillInflightChunks = boundedInteger(
     value.prefillInflightChunks ??
@@ -1279,24 +1390,38 @@ function normalizeConfiguration(
       `python_prefill_inflight_bytes_below_frame_reservation:${minimumPrefillFrameBytes}`,
     );
   }
-  const maxSpeculativeBranches = boundedInteger(
-    value.maxSpeculativeBranches ?? 0,
+  const speculation = pythonSpeculation(manifest.plans.decode.speculation);
+  const requestedMaxSpeculativeBranches = boundedInteger(
+    value.maxSpeculativeBranches ?? speculation.maxBranches,
     0,
     MAX_SPECULATIVE_BRANCHES,
     "python_max_speculative_branches_is_invalid",
   );
-  const maxSpeculativeBranchTokens = boundedInteger(
-    value.maxSpeculativeBranchTokens ?? 0,
+  const requestedMaxSpeculativeBranchTokens = boundedInteger(
+    value.maxSpeculativeBranchTokens ?? speculation.maxBranchTokens,
     0,
     MAX_SPECULATIVE_BRANCH_TOKENS,
     "python_max_speculative_branch_tokens_is_invalid",
   );
-  const maxSpeculativeKvBytes = boundedInteger(
-    value.maxSpeculativeKvBytes ?? 0,
+  const requestedMaxSpeculativeKvBytes = boundedInteger(
+    value.maxSpeculativeKvBytes ?? speculation.maxKvBytes,
     0,
     MAX_SPECULATIVE_KV_BYTES,
     "python_max_speculative_kv_bytes_is_invalid",
   );
+  if (
+    speculation.provider === "draft-tree" &&
+    (
+      requestedMaxSpeculativeBranches !== speculation.maxBranches ||
+      requestedMaxSpeculativeBranchTokens !== speculation.maxBranchTokens ||
+      requestedMaxSpeculativeKvBytes !== speculation.maxKvBytes
+    )
+  ) {
+    throw new Error("python_draft_tree_launch_limits_do_not_match_manifest");
+  }
+  const maxSpeculativeBranches = requestedMaxSpeculativeBranches;
+  const maxSpeculativeBranchTokens = requestedMaxSpeculativeBranchTokens;
+  const maxSpeculativeKvBytes = requestedMaxSpeculativeKvBytes;
   const speculativeTreeLimitsEnabled = [
     maxSpeculativeBranches,
     maxSpeculativeBranchTokens,
@@ -1382,7 +1507,7 @@ function normalizeConfiguration(
       "python_retained_session_ttl_is_invalid",
     ),
     recovery,
-    native_stageStages,
+    nativeGgufStages,
     ramBackedMoeStages,
   };
   if (requireNormalized && canonicalJson(value) !== canonicalJson(normalized)) {
@@ -1508,139 +1633,145 @@ function recoveryExecutorIds(
   });
 }
 
-function normalizeNativeStageStages(
+function normalizeNativeGgufStages(
   manifest: RuntimePipelineManifestV2,
   value: unknown,
   runtimeModel: PythonRuntimeModelSource,
-): Record<string, PythonNativeStageStageConfiguration> {
+): Record<string, PythonNativeGgufStageConfiguration> {
   if (value === undefined) return {};
-  if (!isRecord(value)) throw new Error("python_native_stage_stages_must_be_an_object");
+  if (!isRecord(value)) {
+    throw new Error("python_native_gguf_stages_must_be_an_object");
+  }
+  if (Object.keys(value).length === 0) return {};
+  if (runtimeModel.snapshotIdentity === undefined) {
+    throw new Error("python_native_gguf_requires_pipeline_snapshot_identity");
+  }
+  if (
+    runtimeModel.artifactIdentity === undefined ||
+    runtimeModel.canonicalSource === undefined ||
+    runtimeModel.canonicalRevision === undefined
+  ) {
+    throw new Error("python_native_gguf_requires_global_model_coordinates");
+  }
 
-  const normalizedEntries: Array<[string, PythonNativeStageStageConfiguration]> = [];
+  const entries: Array<[string, PythonNativeGgufStageConfiguration]> = [];
   for (const stageIdValue of Object.keys(value).sort()) {
-    const stageId = safeString(stageIdValue, "python_native_stage_stage_id_is_invalid");
+    const stageId = safeString(
+      stageIdValue,
+      "python_native_gguf_stage_id_is_invalid",
+    );
     const input = value[stageId];
     if (!isRecord(input)) {
-      throw new Error(`python_native_stage_stage_configuration_is_invalid:${stageId}`);
+      throw new Error(`python_native_gguf_stage_configuration_is_invalid:${stageId}`);
     }
     assertExactKeys(
       input,
       [
         "packagePath",
         "packageId",
-        "manifestSha256",
+        "modelIdentity",
         "modelSource",
         "modelRevision",
         "layerStart",
         "layerEnd",
         "totalLayers",
-        "daemonExecutable",
-        "pipelineId",
-        "contextTokens",
-        "gpuLayers",
-        "computeApi",
-        "startupTimeoutSeconds",
-        "callTimeoutSeconds",
-        "closeTimeoutSeconds",
       ],
-      ["modelIdentity"],
-      `python_native_stage_stage_configuration_keys_are_invalid:${stageId}`,
+      [],
+      `python_native_gguf_stage_configuration_keys_are_invalid:${stageId}`,
     );
-    const modelSource = safeString(
-      input.modelSource,
-      `python_native_stage_model_source_is_invalid:${stageId}`,
-    );
-    const modelRevision = nullableSafeString(
-      input.modelRevision,
-      `python_native_stage_model_revision_is_invalid:${stageId}`,
-    );
-    const modelIdentity = modelIdentityForCoordinates(modelSource, modelRevision);
-    if (
-      input.modelIdentity !== undefined &&
-      safeString(
-        input.modelIdentity,
-        `python_native_stage_model_identity_is_invalid:${stageId}`,
-      ) !== modelIdentity
-    ) {
-      throw new Error(`python_native_stage_model_identity_mismatch:${stageId}`);
-    }
-    const computeApi = native_stageComputeApi(input.computeApi, stageId);
-    const gpuLayers = boundedInteger(
-      input.gpuLayers,
-      0,
-      1_000_000,
-      `python_native_stage_gpu_layers_are_invalid:${stageId}`,
-    );
-    if ((computeApi === "cpu") !== (gpuLayers === 0)) {
-      throw new Error(`python_native_stage_compute_api_gpu_layers_mismatch:${stageId}`);
-    }
-    const normalized: PythonNativeStageStageConfiguration = {
+    const normalized: PythonNativeGgufStageConfiguration = {
       packagePath: safeString(
         input.packagePath,
-        `python_native_stage_package_path_is_invalid:${stageId}`,
+        `python_native_gguf_package_path_is_invalid:${stageId}`,
       ),
       packageId: sha256Digest(
         input.packageId,
-        `python_native_stage_package_id_is_invalid:${stageId}`,
+        `python_native_gguf_package_id_is_invalid:${stageId}`,
       ),
-      manifestSha256: sha256Digest(
-        input.manifestSha256,
-        `python_native_stage_manifest_sha256_is_invalid:${stageId}`,
+      modelIdentity: sha256Identity(
+        input.modelIdentity,
+        `python_native_gguf_model_identity_is_invalid:${stageId}`,
       ),
-      modelSource,
-      modelRevision,
-      modelIdentity,
+      modelSource: safeString(
+        input.modelSource,
+        `python_native_gguf_model_source_is_invalid:${stageId}`,
+      ),
+      modelRevision: nullableSafeString(
+        input.modelRevision,
+        `python_native_gguf_model_revision_is_invalid:${stageId}`,
+      ),
       layerStart: boundedInteger(
         input.layerStart,
         0,
         manifest.totalLayers,
-        `python_native_stage_layer_start_is_invalid:${stageId}`,
+        `python_native_gguf_layer_start_is_invalid:${stageId}`,
       ),
       layerEnd: boundedInteger(
         input.layerEnd,
         1,
         manifest.totalLayers,
-        `python_native_stage_layer_end_is_invalid:${stageId}`,
+        `python_native_gguf_layer_end_is_invalid:${stageId}`,
       ),
       totalLayers: boundedInteger(
         input.totalLayers,
         1,
         manifest.totalLayers,
-        `python_native_stage_total_layers_is_invalid:${stageId}`,
-      ),
-      daemonExecutable: safeString(
-        input.daemonExecutable,
-        `python_native_stage_daemon_executable_is_invalid:${stageId}`,
-      ),
-      pipelineId: uint64String(
-        input.pipelineId,
-        `python_native_stage_pipeline_id_is_invalid:${stageId}`,
-      ),
-      contextTokens: boundedInteger(
-        input.contextTokens,
-        1,
-        2_147_483_647,
-        `python_native_stage_context_tokens_are_invalid:${stageId}`,
-      ),
-      gpuLayers,
-      computeApi,
-      startupTimeoutSeconds: positiveFinite(
-        input.startupTimeoutSeconds,
-        `python_native_stage_startup_timeout_is_invalid:${stageId}`,
-      ),
-      callTimeoutSeconds: positiveFinite(
-        input.callTimeoutSeconds,
-        `python_native_stage_call_timeout_is_invalid:${stageId}`,
-      ),
-      closeTimeoutSeconds: positiveFinite(
-        input.closeTimeoutSeconds,
-        `python_native_stage_close_timeout_is_invalid:${stageId}`,
+        `python_native_gguf_total_layers_is_invalid:${stageId}`,
       ),
     };
-    validateNativeStageStageBinding(manifest, stageId, normalized, runtimeModel);
-    normalizedEntries.push([stageId, normalized]);
+    validateNativeGgufStageBinding(manifest, stageId, normalized, runtimeModel);
+    entries.push([stageId, normalized]);
   }
-  return Object.fromEntries(normalizedEntries);
+  return Object.fromEntries(entries);
+}
+
+function validateNativeGgufStageBinding(
+  manifest: RuntimePipelineManifestV2,
+  stageId: string,
+  configuration: PythonNativeGgufStageConfiguration,
+  runtimeModel: PythonRuntimeModelSource,
+): void {
+  const stages = [manifest.plans.prefill, manifest.plans.decode].map((plan) =>
+    plan.stages.find((stage) => stage.stageId === stageId),
+  );
+  if (stages.some((stage) => stage === undefined)) {
+    throw new Error(`python_native_gguf_stage_is_not_in_both_phases:${stageId}`);
+  }
+  for (const stage of stages as RuntimeVirtualStageManifest[]) {
+    if (stage.execution !== undefined || stage.macroWave !== undefined) {
+      throw new Error(`python_native_gguf_stage_has_conflicting_execution:${stageId}`);
+    }
+    if (stage.members.length !== 1) {
+      throw new Error(`python_native_gguf_stage_requires_single_member:${stageId}`);
+    }
+    if (
+      configuration.layerStart !== stage.layerStart ||
+      configuration.layerEnd !== stage.layerEnd ||
+      configuration.totalLayers !== manifest.totalLayers
+    ) {
+      throw new Error(`python_native_gguf_stage_range_mismatch:${stageId}`);
+    }
+  }
+  if (configuration.modelIdentity !== runtimeModel.artifactIdentity) {
+    throw new Error(`python_native_gguf_model_identity_mismatch:${stageId}`);
+  }
+  if (configuration.modelSource !== runtimeModel.canonicalSource) {
+    throw new Error(`python_native_gguf_model_source_mismatch:${stageId}`);
+  }
+  if (configuration.modelRevision !== runtimeModel.canonicalRevision) {
+    throw new Error(`python_native_gguf_model_revision_mismatch:${stageId}`);
+  }
+}
+
+function validateExclusiveStageBindings(
+  nativeGgufStages: Record<string, PythonNativeGgufStageConfiguration>,
+  ramBackedMoeStages: Record<string, PythonRamBackedMoeStageConfiguration>,
+): void {
+  for (const stageId of Object.keys(nativeGgufStages)) {
+    if (Object.hasOwn(ramBackedMoeStages, stageId)) {
+      throw new Error(`python_native_gguf_stage_backend_is_not_exclusive:${stageId}`);
+    }
+  }
 }
 
 function normalizeRamBackedMoeStages(
@@ -1649,7 +1780,9 @@ function normalizeRamBackedMoeStages(
   runtimeModel: PythonRuntimeModelSource,
 ): Record<string, PythonRamBackedMoeStageConfiguration> {
   const requiredStages = manifest.plans.prefill.stages.filter(
-    (stage) => stage.macroWave?.memoryMode === "ram-backed",
+    (stage) =>
+      stage.macroWave?.memoryMode === "ram-backed"
+      && stage.macroWave.ramArtifact !== undefined,
   );
   const requiredIds = new Set(requiredStages.map((stage) => stage.stageId));
   if (value === undefined) {
@@ -1905,66 +2038,6 @@ function normalizeRamBackedMoeStages(
   return Object.fromEntries(normalizedEntries.sort(([left], [right]) => left.localeCompare(right)));
 }
 
-function validateNativeStageStageBinding(
-  manifest: RuntimePipelineManifestV2,
-  stageId: string,
-  configuration: PythonNativeStageStageConfiguration,
-  runtimeModel: PythonRuntimeModelSource,
-): void {
-  const stages = [manifest.plans.prefill, manifest.plans.decode].map((plan) =>
-    plan.stages.find((stage) => stage.stageId === stageId),
-  );
-  if (stages.some((stage) => stage === undefined)) {
-    throw new Error(`python_native_stage_stage_is_not_in_both_phases:${stageId}`);
-  }
-  for (const stage of stages as RuntimeVirtualStageManifest[]) {
-    if (stage.index === 0 || stage.layerStart === 0) {
-      throw new Error(`python_native_stage_stage_cannot_be_root:${stageId}`);
-    }
-    if (stage.execution !== undefined || stage.macroWave !== undefined) {
-      throw new Error(`python_native_stage_stage_cannot_use_cell_execution:${stageId}`);
-    }
-    if (stage.members.length !== 1) {
-      throw new Error(`python_native_stage_stage_requires_single_member:${stageId}`);
-    }
-    if (
-      configuration.layerStart !== stage.layerStart ||
-      configuration.layerEnd !== stage.layerEnd ||
-      configuration.totalLayers !== manifest.totalLayers
-    ) {
-      throw new Error(`python_native_stage_stage_range_mismatch:${stageId}`);
-    }
-  }
-  if (runtimeModel.snapshotIdentity === undefined) {
-    throw new Error(`python_native_stage_requires_runtime_snapshot_identity:${stageId}`);
-  }
-  if (configuration.pipelineId !== runtimeModel.snapshotIdentity) {
-    throw new Error(`python_native_stage_pipeline_identity_mismatch:${stageId}`);
-  }
-  const runtimeArtifactIdentity = runtimeModel.artifactIdentity;
-  if (runtimeArtifactIdentity === undefined) {
-    throw new Error(`python_native_stage_runtime_model_identity_mismatch:${stageId}`);
-  }
-  if (hubSnapshotCommit(runtimeModel.source, runtimeModel.revision) !== undefined) {
-    // A Hub snapshot and the sealed package share the same canonical commit
-    // coordinate, so their SHA-256 executor identities must be identical.
-    if (configuration.modelIdentity !== runtimeArtifactIdentity) {
-      throw new Error(`python_native_stage_runtime_model_identity_mismatch:${stageId}`);
-    }
-  } else if (
-    runtimeArtifactIdentity !== snapshotArtifactIdentity(runtimeModel.snapshotIdentity) &&
-    (!/^sha256:[0-9a-f]{64}$/.test(runtimeArtifactIdentity) ||
-      sha256Uint64Identity(runtimeArtifactIdentity) !== runtimeModel.snapshotIdentity)
-  ) {
-    // A local snapshot has two deliberately separate namespaces: Python's
-    // content-derived uint64 identifies the pipeline, while the full SHA-256
-    // can now be supplied explicitly as its strong parent identity. NativeStage
-    // still has separate package coordinates; the pipeline id equality above
-    // is the cross-backend content binding.
-    throw new Error(`python_native_stage_runtime_model_identity_mismatch:${stageId}`);
-  }
-}
-
 function prefillSettings(plan: RuntimePrefillPlanManifest): PythonPrefillLaunchSettings {
   return {
     phase: "prefill",
@@ -2045,7 +2118,7 @@ function routeIdentity(
   settings: [PythonPrefillLaunchSettings, PythonDecodeLaunchSettings],
   stages: RuntimeVirtualStageManifest[],
   codec: RuntimeActivationCodec,
-  native_stageStages: Record<string, PythonNativeStageStageConfiguration>,
+  nativeGgufStages: Record<string, PythonNativeGgufStageConfiguration>,
   ramBackedMoeStages: Record<string, PythonRamBackedMoeStageConfiguration>,
   recovery: PythonRecoveryConfiguration | null,
 ): string {
@@ -2054,7 +2127,7 @@ function routeIdentity(
       pipelineId,
       settings,
       codec,
-      native_stageStages,
+      nativeGgufStages,
       ramBackedMoeStages,
       recovery,
       stages: stages.map((stage) => ({
@@ -2335,17 +2408,6 @@ function hubSnapshotCommit(
   return commit;
 }
 
-function modelIdentityForCoordinates(source: string, revision: string | null): string {
-  const commit = hubSnapshotCommit(source, revision);
-  const hash = createHash("sha256");
-  if (commit !== undefined) {
-    hash.update("gdlp-hub-snapshot-v1\0").update(commit, "ascii");
-  } else {
-    hash.update(canonicalJson({ source, revision }));
-  }
-  return `sha256:${hash.digest("hex")}`;
-}
-
 function snapshotArtifactIdentity(snapshotIdentity: string): string {
   const hexadecimal = BigInt(snapshotIdentity).toString(16).padStart(16, "0");
   return `snapshot:uint64:${hexadecimal}`;
@@ -2441,13 +2503,6 @@ function ramBackedMoeAdapterId(
     throw new Error(`python_ram_backed_moe_adapter_is_invalid:${stageId}`);
   }
   return value;
-}
-
-function native_stageComputeApi(value: unknown, stageId: string): PythonNativeStageComputeApi {
-  if (!(["cpu", "cuda", "rocm", "metal", "vulkan"] as unknown[]).includes(value)) {
-    throw new Error(`python_native_stage_compute_api_is_invalid:${stageId}`);
-  }
-  return value as PythonNativeStageComputeApi;
 }
 
 function assertExactKeys(

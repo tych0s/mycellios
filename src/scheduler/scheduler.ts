@@ -1,6 +1,5 @@
 import type {
   ChatCompletionRequest,
-  LlmfitModelAdvisory,
   ModelDeployment,
   RouteStage,
   ScheduledRoute,
@@ -38,20 +37,10 @@ interface Candidate {
   score: number;
 }
 
-export interface ModelLlmfitSummary {
-  advisedReplicas: number;
-  bestFit: string;
-  quantizations: string[];
-  maxEstimatedTokensPerSecond?: number | undefined;
-  maxMeasuredTokensPerSecond?: number | undefined;
-  minMemoryRequiredMb?: number | undefined;
-}
-
 export interface AvailableModel {
   id: string;
   replicas: number;
   pipelines: number;
-  llmfit?: ModelLlmfitSummary | undefined;
 }
 
 export class Scheduler {
@@ -142,7 +131,7 @@ export class Scheduler {
       .filter((worker) => !options.connectedWorkerIds || options.connectedWorkerIds.has(worker.id));
     const models = new Map<
       string,
-      { replicas: number; internalPipelines: number; stages: Set<string>; llmfit: LlmfitModelAdvisory[] }
+      { replicas: number; internalPipelines: number; stages: Set<string> }
     >();
     for (const worker of workers) {
       for (const deployment of worker.capabilities.deployments) {
@@ -151,15 +140,10 @@ export class Scheduler {
           replicas: 0,
           internalPipelines: 0,
           stages: new Set<string>(),
-          llmfit: [],
         };
         if (deployment.mode === "replica") {
           if (deployment.internalPipeline) entry.internalPipelines += 1;
           else entry.replicas += 1;
-          const advisory = worker.capabilities.llmfit?.model;
-          if (advisory?.deploymentId === deployment.deploymentId) {
-            entry.llmfit.push(advisory);
-          }
         }
         if (deployment.mode === "pipeline" && deployment.stage) {
           entry.stages.add(`${deployment.model}:${deployment.stage.total}:${deployment.stage.index}`);
@@ -167,15 +151,11 @@ export class Scheduler {
         models.set(deployment.model, entry);
       }
     }
-    return [...models.entries()].map(([id, value]) => {
-      const llmfit = summarizeLlmfit(value.llmfit);
-      return {
-        id,
-        replicas: value.replicas,
-        pipelines: value.internalPipelines + this.countCompletePipelines(value.stages),
-        ...(llmfit ? { llmfit } : {}),
-      };
-    });
+    return [...models.entries()].map(([id, value]) => ({
+      id,
+      replicas: value.replicas,
+      pipelines: value.internalPipelines + this.countCompletePipelines(value.stages),
+    }));
   }
 
   scoreWorker(
@@ -202,7 +182,6 @@ export class Scheduler {
     const rtt = Math.min(1, worker.capabilities.network.coordinatorRttMs / 250);
     const regionPenalty =
       request.preferred_region && request.preferred_region !== worker.capabilities.region ? 0.35 : 0;
-    const llmfitPenalty = this.llmfitReplicaPenalty(worker, deployment);
     if (interactive) {
       return (
         0.3 * slaRisk
@@ -211,7 +190,6 @@ export class Scheduler {
         + 0.18 * queueRatio
         + 0.08 * failure
         + 0.06 * Math.min(1, rtt + regionPenalty)
-        + llmfitPenalty
       );
     }
     // Batch and benchmark traffic optimize the sustained bottleneck. TTFT is
@@ -223,7 +201,6 @@ export class Scheduler {
       + 0.26 * queueRatio
       + 0.08 * failure
       + 0.06 * Math.min(1, rtt + regionPenalty)
-      + llmfitPenalty
     );
   }
 
@@ -417,30 +394,6 @@ export class Scheduler {
     };
   }
 
-  private llmfitReplicaPenalty(
-    worker: StoredWorker,
-    deployment: ModelDeployment,
-  ): number {
-    if (deployment.mode !== "replica") return 0;
-    const advisory = worker.capabilities.llmfit?.model;
-    if (!advisory || advisory.deploymentId !== deployment.deploymentId) return 0;
-    switch (normalizedFit(advisory.fitLevel)) {
-      case "perfect":
-        return 0;
-      case "good":
-        return 0.01;
-      case "marginal":
-        return 0.06;
-      case "tootight":
-        // A live deployment remains eligible: llmfit evaluates whole-model
-        // fit and may not understand backend offload. This is only a ranking
-        // signal, never a hard rejection.
-        return 0.15;
-      default:
-        return 0;
-    }
-  }
-
   private linkPenalty(left: StoredWorker, right: StoredWorker): number {
     const observations = this.evidence.runtimeLinkObservations?.();
     if (observations) {
@@ -523,52 +476,4 @@ export class Scheduler {
       return indexes.size === total;
     }).length;
   }
-}
-
-function summarizeLlmfit(advisories: LlmfitModelAdvisory[]): ModelLlmfitSummary | null {
-  if (advisories.length === 0) return null;
-  const fitOrder = new Map([
-    ["perfect", 0],
-    ["good", 1],
-    ["marginal", 2],
-    ["tootight", 3],
-  ]);
-  const best = advisories
-    .slice()
-    .sort(
-      (left, right) =>
-        (fitOrder.get(normalizedFit(left.fitLevel)) ?? 99) -
-        (fitOrder.get(normalizedFit(right.fitLevel)) ?? 99),
-    )[0]!;
-  const estimated = advisories
-    .map((advisory) => advisory.estimatedTokensPerSecond)
-    .filter((value): value is number => value !== undefined);
-  const measured = advisories
-    .map((advisory) => advisory.measuredTokensPerSecond)
-    .filter((value): value is number => value !== undefined);
-  const memory = advisories
-    .map((advisory) => advisory.memoryRequiredMb)
-    .filter((value): value is number => value !== undefined);
-  return {
-    advisedReplicas: advisories.length,
-    bestFit: best.fitLevel,
-    quantizations: [
-      ...new Set(
-        advisories
-          .map((advisory) => advisory.bestQuant)
-          .filter((value): value is string => value !== undefined),
-      ),
-    ].sort(),
-    ...(estimated.length > 0
-      ? { maxEstimatedTokensPerSecond: Math.max(...estimated) }
-      : {}),
-    ...(measured.length > 0
-      ? { maxMeasuredTokensPerSecond: Math.max(...measured) }
-      : {}),
-    ...(memory.length > 0 ? { minMemoryRequiredMb: Math.min(...memory) } : {}),
-  };
-}
-
-function normalizedFit(value: string): string {
-  return value.toLowerCase().replace(/[\s_-]+/g, "");
 }

@@ -14,6 +14,7 @@ import {
   assertNoEscapingSymlinks,
   samePath,
 } from "./portable-runtime-filesystem.mjs";
+import { runInstalledStageCanary } from "./installed-stage-canary.mjs";
 
 const platform = readArgument("platform") ?? process.platform;
 const arch = readArgument("arch") ?? process.arch;
@@ -22,6 +23,7 @@ if (!spec.supported) throw new Error(spec.reason);
 
 const workspace = resolve(import.meta.dirname, "..");
 const archive = resolve(readArgument("archive") ?? join(workspace, "build", "distribution-runtime.tar.gz"));
+const pythonSource = resolve(readArgument("python-source") ?? join(workspace, "python"));
 if (!existsSync(archive)) throw new Error(`Portable runtime archive is missing: ${archive}.`);
 
 const entries = tar(["-tzf", archive])
@@ -124,6 +126,17 @@ try {
       throw new Error(`Relocated runtime has ${name} ${runtime.packages?.[name] ?? "missing"}; expected ${version}.`);
     }
   }
+  const canary = runInstalledStageCanary({
+    pythonExecutable: python,
+    pythonSourceRoot: pythonSource,
+    expectedPythonPrefix: temporary,
+    expectedTorchVersion: spec.torchVersion,
+    expectedTransformersVersion: spec.packageVersions.transformers,
+  });
+  process.stdout.write(
+    `Installed stage canary verified: ${canary.engine}/${canary.adapter}, ` +
+      `${canary.kvBytes} KV bytes, batch ${canary.batchSize}.\n`,
+  );
 } finally {
   rmSync(temporary, { recursive: true, force: true });
 }

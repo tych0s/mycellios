@@ -3,6 +3,7 @@ dist/
 out/
 build/distribution-runtime/
 build/distribution-runtime.tar.gz
+build/python/
 .vite/
 landing-dist/
 mobile-dist/

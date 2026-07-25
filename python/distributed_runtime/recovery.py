@@ -313,6 +313,8 @@ class RecoveringPipelineEngine:
         self._replayed_prompt_tokens = 0
         self._last_recovery_error: str | None = None
         self._last_recovery_duration_ms: float | None = None
+        self._failed_route_close_errors = 0
+        self._last_failed_route_close_error: str | None = None
         self._active_route_id = "primary"
         self._standby_prevalidations = sum(
             candidate.statically_prevalidated for candidate in candidates[:-1]
@@ -419,6 +421,8 @@ class RecoveringPipelineEngine:
                 "active_requests": len(self._jobs_by_client),
                 "last_recovery_error": self._last_recovery_error,
                 "last_recovery_duration_ms": self._last_recovery_duration_ms,
+                "failed_route_close_errors": self._failed_route_close_errors,
+                "last_failed_route_close_error": self._last_failed_route_close_error,
                 "standby_routes": [
                     {
                         "route_id": candidate.route_id,
@@ -718,7 +722,17 @@ class RecoveringPipelineEngine:
 
         started = time.perf_counter()
         try:
-            failed_engine.close()
+            try:
+                failed_engine.close()
+            except BaseException as close_error:
+                # A physically dead route commonly cannot acknowledge SHUTDOWN.
+                # DistributedPipelineEngine.close() has already exhausted its
+                # bounded graceful path and hard fallback before raising. Keep
+                # that failure as evidence, but do not let the dead route veto
+                # promotion of an independently validated standby.
+                with self._condition:
+                    self._failed_route_close_errors += 1
+                    self._last_failed_route_close_error = str(close_error)
             with self._condition:
                 self._retired_stage_metrics.extend(failed_engine.stage_metrics)
 

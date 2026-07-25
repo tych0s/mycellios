@@ -187,6 +187,212 @@ class EngineUnitTests(unittest.TestCase):
             load_four,
         )
 
+    def test_physical_tree_falls_back_until_conservative_gate_has_evidence(
+        self,
+    ) -> None:
+        engine = _root_batch_test_engine(
+            prefill_chunk_tokens=0,
+            speculative_max_draft_tokens=2,
+            max_speculative_branches=4,
+            max_speculative_branch_tokens=128,
+            max_speculative_kv_bytes=4096,
+        )
+        engine.tree_draft_provider = _FixedTreeDraftProvider(
+            ((20, 21), (20, 22))
+        )
+        engine.speculation_controller = AdaptiveSpeculationController(
+            AdaptiveSpeculationConfig(
+                max_draft_tokens=2,
+                candidate_sizes=(2,),
+                min_token_history=0,
+                min_classic_observations=2,
+                min_verify_observations=2,
+                minimum_speedup=1.05,
+            )
+        )
+        engine._speculation_controllers = {}
+        engine._speculation_lock = threading.Lock()
+        runner = _FakeRootBatchRunner()
+        runner.active = {7: 3}
+        job = _GenerationJob(
+            GenerationInput(920, torch.tensor([[1, 2, 3]]), 5),
+            None,
+            wire_id=7,
+            step=1,
+            token_ids=[10],
+            prefill_offset=3,
+            prefill_acked_offset=3,
+        )
+
+        prepared = engine._prepare_decode_wave(job, runner, active_sequences=1)
+
+        self.assertIsInstance(prepared, _PreparedRootWave)
+        self.assertEqual(prepared.frame_type, FrameType.ACTIVATION)
+        gate = engine.speculation_stats["physical_tree"]["statistical_gate"]
+        self.assertEqual(gate["enabled_decisions"], 0)
+        self.assertEqual(gate["probe_waves"], 0)
+        self.assertEqual(gate["decision_reasons"], {"classic_warmup": 1})
+        candidate = engine.speculation_stats["profiles"]["load-1"]["candidates"][0]
+        self.assertIsNone(candidate["predicted_speedup"])
+        self.assertIsNone(candidate["predicted_speedup_lower_bound"])
+
+    def test_physical_tree_probe_is_labelled_and_never_claims_speedup(self) -> None:
+        engine = _root_batch_test_engine(
+            prefill_chunk_tokens=0,
+            speculative_max_draft_tokens=2,
+            max_speculative_branches=4,
+            max_speculative_branch_tokens=128,
+            max_speculative_kv_bytes=4096,
+        )
+        engine.config.speculation_probe = True
+        engine.tree_draft_provider = _FixedTreeDraftProvider(
+            ((20, 21), (20, 22))
+        )
+        controller = AdaptiveSpeculationController(
+            AdaptiveSpeculationConfig(
+                max_draft_tokens=2,
+                candidate_sizes=(2,),
+                min_token_history=0,
+                min_classic_observations=2,
+                min_verify_observations=2,
+                minimum_speedup=1.05,
+            )
+        )
+        for _ in range(2):
+            controller.record_classic(
+                latency_seconds=0.02,
+                transferred_bytes=100,
+            )
+        engine.speculation_controller = controller
+        engine._speculation_controllers = {}
+        engine._speculation_lock = threading.Lock()
+        runner = _FakeRootBatchRunner()
+        runner.active = {7: 3}
+        job = _GenerationJob(
+            GenerationInput(921, torch.tensor([[1, 2, 3]]), 5),
+            None,
+            wire_id=7,
+            step=1,
+            token_ids=[10],
+            prefill_offset=3,
+            prefill_acked_offset=3,
+        )
+
+        prepared = engine._prepare_decode_wave(job, runner, active_sequences=1)
+
+        self.assertIsInstance(prepared, _PreparedPhysicalTreeWave)
+        gate = engine.speculation_stats["physical_tree"]["statistical_gate"]
+        self.assertEqual(gate["enabled_decisions"], 0)
+        self.assertEqual(gate["probe_waves"], 1)
+        self.assertEqual(gate["measured_waves"], 0)
+        self.assertEqual(gate["decision_reasons"], {"probe:verification_warmup": 1})
+        candidate = engine.speculation_stats["profiles"]["load-1"]["candidates"][0]
+        self.assertFalse(candidate["ready"])
+        self.assertIsNone(candidate["predicted_speedup_lower_bound"])
+        prepared.proposal.tree.rollback()
+
+    def test_physical_tree_activates_only_when_lower_bound_clears_threshold(
+        self,
+    ) -> None:
+        engine = _root_batch_test_engine(
+            prefill_chunk_tokens=0,
+            speculative_max_draft_tokens=2,
+            max_speculative_branches=4,
+            max_speculative_branch_tokens=128,
+            max_speculative_kv_bytes=4096,
+        )
+        engine.tree_draft_provider = _FixedTreeDraftProvider(
+            ((20, 21), (20, 22))
+        )
+        controller = AdaptiveSpeculationController(
+            AdaptiveSpeculationConfig(
+                max_draft_tokens=2,
+                candidate_sizes=(2,),
+                min_token_history=0,
+                min_classic_observations=2,
+                min_verify_observations=2,
+                minimum_speedup=1.05,
+            )
+        )
+        for _ in range(2):
+            controller.record_classic(
+                latency_seconds=0.1,
+                transferred_bytes=100,
+            )
+            controller.record_verification(
+                proposed_tokens=2,
+                accepted_tokens=2,
+                latency_seconds=0.01,
+                transferred_bytes=100,
+            )
+        engine.speculation_controller = controller
+        engine._speculation_controllers = {}
+        engine._speculation_lock = threading.Lock()
+        runner = _FakeRootBatchRunner()
+        runner.active = {7: 3}
+        job = _GenerationJob(
+            GenerationInput(922, torch.tensor([[1, 2, 3]]), 5),
+            None,
+            wire_id=7,
+            step=1,
+            token_ids=[10],
+            prefill_offset=3,
+            prefill_acked_offset=3,
+        )
+
+        prepared = engine._prepare_decode_wave(job, runner, active_sequences=1)
+
+        self.assertIsInstance(prepared, _PreparedPhysicalTreeWave)
+        gate = engine.speculation_stats["physical_tree"]["statistical_gate"]
+        self.assertEqual(gate["enabled_decisions"], 1)
+        self.assertEqual(gate["probe_waves"], 0)
+        candidate = engine.speculation_stats["profiles"]["load-1"]["candidates"][0]
+        self.assertGreater(candidate["predicted_speedup_lower_bound"], 1.05)
+        prepared.proposal.tree.rollback()
+
+    def test_speculation_health_exposes_conservative_speedup_bound(self) -> None:
+        controller = AdaptiveSpeculationController(
+            AdaptiveSpeculationConfig(
+                max_draft_tokens=2,
+                candidate_sizes=(2,),
+                min_token_history=0,
+                min_classic_observations=2,
+                min_verify_observations=2,
+                confidence_level=0.95,
+            )
+        )
+        for _ in range(2):
+            controller.record_classic(
+                latency_seconds=0.3,
+                transferred_bytes=300,
+            )
+            controller.record_verification(
+                proposed_tokens=2,
+                accepted_tokens=2,
+                latency_seconds=0.2,
+                transferred_bytes=200,
+            )
+
+        engine = DistributedPipelineEngine.__new__(DistributedPipelineEngine)
+        engine.speculation_controller = controller
+        engine._speculation_controllers = {"load-1": controller}
+        engine._speculation_lock = threading.Lock()
+        engine._speculation_enabled_decisions = 1
+        engine._speculation_disabled_decisions = 0
+        engine._speculation_probe_waves = 0
+        engine._speculation_decision_reasons = {"speedup_lower_bound": 1}
+        engine._speculation_selected_sizes = {2: 1}
+        engine.tree_draft_provider = None
+
+        candidate = engine.speculation_stats["profiles"]["load-1"]["candidates"][0]
+        self.assertEqual(candidate["confidence_level"], 0.95)
+        self.assertIsNotNone(candidate["predicted_speedup"])
+        self.assertIsNotNone(candidate["predicted_speedup_lower_bound"])
+        self.assertLessEqual(
+            candidate["predicted_speedup_lower_bound"],
+            candidate["predicted_speedup"],
+        )
+
     def test_decode_preparation_uses_width_one_macro_wave_and_preserves_probe_metrics(self) -> None:
         engine = _root_batch_test_engine(prefill_chunk_tokens=0)
         engine.config.speculative_max_draft_tokens = 2
@@ -937,6 +1143,149 @@ class EngineUnitTests(unittest.TestCase):
             root.close()
             child.close()
 
+    def test_kv_valid_advances_on_remote_commit_not_root_dispatch(self) -> None:
+        engine = _root_batch_test_engine(
+            prefill_chunk_tokens=2,
+            prefill_inflight_chunks=2,
+        )
+        runner = _FakeRootBatchRunner()
+        root, child = socket.socketpair()
+        active: dict[int, _GenerationJob] = {}
+        job = _GenerationJob(
+            GenerationInput(101, torch.tensor([[1, 2, 3, 4, 5]]), 2),
+            None,
+        )
+        try:
+            engine._admit_batch([job], active, runner, root, LinkEmulator())
+            self.assertEqual(recv_frame(child).frame_type, FrameType.BEGIN)
+            first = recv_frame(child)
+            self.assertEqual(first.frame_type, FrameType.PREFILL)
+            self.assertEqual(job.kv_valid, 0)
+
+            self.assertIsNone(
+                engine._handle_return_value(
+                    (
+                        Frame(FrameType.PREFILL_ACK, 0, 1, first.step, 0, 0, b""),
+                        time.perf_counter(),
+                    ),
+                    active,
+                    runner,
+                    root,
+                )
+            )
+            self.assertEqual(job.kv_valid, 2)
+
+            prepared = engine._prepare_decode_wave(
+                _GenerationJob(
+                    GenerationInput(202, torch.tensor([[1, 2, 3]]), 3),
+                    None,
+                    wire_id=2,
+                    step=1,
+                    next_step=1,
+                    token_ids=[10],
+                    prefill_offset=3,
+                    prefill_acked_offset=3,
+                    kv_valid=3,
+                ),
+                runner,
+                active_sequences=1,
+            )
+            self.assertIsInstance(prepared, _PreparedRootWave)
+            decode_job = prepared.job
+            runner.active[2] = 3
+            engine._dispatch_root_waves([prepared], runner, root, LinkEmulator())
+            activation = recv_frame(child)
+            self.assertEqual(activation.frame_type, FrameType.ACTIVATION)
+            self.assertEqual(decode_job.kv_valid, 3)
+            decode_active = {2: decode_job}
+            next_wave = engine._handle_return_value(
+                (
+                    Frame(
+                        FrameType.TOKEN,
+                        0,
+                        2,
+                        activation.step,
+                        0,
+                        0,
+                        token_payload(11),
+                    ),
+                    time.perf_counter(),
+                ),
+                decode_active,
+                runner,
+                root,
+            )
+            self.assertIsInstance(next_wave, _PreparedRootWave)
+            self.assertEqual(decode_job.kv_valid, 4)
+        finally:
+            root.close()
+            child.close()
+
+    def test_verified_kv_valid_counts_only_committed_base_and_draft_prefix(self) -> None:
+        engine = _root_batch_test_engine(prefill_chunk_tokens=0)
+        engine.speculation_controller = AdaptiveSpeculationController(
+            AdaptiveSpeculationConfig(
+                max_draft_tokens=2,
+                candidate_sizes=(2,),
+                min_token_history=0,
+                min_classic_observations=1,
+                min_verify_observations=1,
+            )
+        )
+        engine._speculation_controllers = {"load-1": engine.speculation_controller}
+        engine._speculation_lock = threading.Lock()
+        proposal = linear_draft_to_macro_wave(
+            (20, 21),
+            request_id=1,
+            ordinal=1,
+            base_prefix_tokens=(1, 2, 3, 10),
+            parent_kv_version=KVVersion(3),
+        )
+        job = _GenerationJob(
+            GenerationInput(101, torch.tensor([[1, 2, 3]]), 8),
+            None,
+            wire_id=1,
+            step=1,
+            next_step=2,
+            token_ids=[10],
+            prefill_offset=3,
+            prefill_acked_offset=3,
+            kv_valid=3,
+            verify_proposal=proposal,
+            verify_base_tokens=3,
+        )
+        _seed_inflight_wave(engine, job, FrameType.VERIFY)
+        runner = _FakeRootBatchRunner()
+        runner.active = {1: 6}
+        root, child = socket.socketpair()
+        try:
+            next_wave = engine._handle_return_value(
+                (
+                    Frame(
+                        FrameType.VERIFY_RESULT,
+                        0,
+                        1,
+                        1,
+                        3,
+                        0,
+                        verify_result_payload((20, 99, 77)),
+                    ),
+                    time.perf_counter(),
+                ),
+                {1: job},
+                runner,
+                root,
+            )
+            self.assertIsInstance(next_wave, _PreparedRootWave)
+            self.assertEqual(job.token_ids, [10, 20, 99])
+            self.assertEqual(job.kv_valid, 5)
+            truncate = recv_frame(child)
+            self.assertEqual(truncate.frame_type, FrameType.TRUNCATE)
+            self.assertEqual(truncate.token_count, 5)
+        finally:
+            root.close()
+            child.close()
+
     def test_prefill_timeout_uses_oldest_outstanding_chunk(self) -> None:
         engine = _root_batch_test_engine(
             prefill_chunk_tokens=2,
@@ -1506,6 +1855,11 @@ class EngineUnitTests(unittest.TestCase):
             self.assertEqual(streamed, [(901, 20), (901, 99)])
             self.assertEqual(job.step, 2)
             self.assertEqual(job.next_step, 2)
+            self.assertEqual(
+                job.kv_valid,
+                5,
+                "tree KV becomes valid only at exact commit: base + pending + accepted",
+            )
             self.assertEqual(job.future.result(timeout=0).token_ids, (10, 20, 99))
             self.assertEqual(engine._leaf_routes, {})
             self.assertEqual(engine._physical_tree_live_children, set())
@@ -2610,6 +2964,18 @@ def _root_batch_test_engine(
     engine.draft_provider = None
     engine.tree_draft_provider = None
     engine.speculation_controller = None
+    engine._speculation_controllers = {}
+    engine._speculation_lock = threading.Lock()
+    engine._speculation_enabled_decisions = 0
+    engine._speculation_disabled_decisions = 0
+    engine._speculation_probe_waves = 0
+    engine._speculation_decision_reasons = {}
+    engine._speculation_selected_sizes = {}
+    engine._tree_gate_enabled_decisions = 0
+    engine._tree_gate_disabled_decisions = 0
+    engine._tree_gate_probe_waves = 0
+    engine._tree_gate_measured_waves = 0
+    engine._tree_gate_decision_reasons = {}
     engine._root_ready_items = 0
     engine._root_model_forward_calls = 0
     engine._root_physical_batch_calls = 0

@@ -105,7 +105,7 @@ const config: ForgeConfig = {
       "build/icons",
       "mobile-dist",
       "landing-dist",
-      "python",
+      "build/python",
       ...(includePortableRuntime
         ? [portableRuntimeArchive]
         : []),

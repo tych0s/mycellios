@@ -1,11 +1,21 @@
 import {
   createHash,
   createPublicKey,
+  randomUUID,
   sign as signBytes,
   verify as verifyBytes,
   type KeyObject,
   type KeyLike,
 } from "node:crypto";
+import { createReadStream } from "node:fs";
+import {
+  mkdir,
+  open,
+  rename,
+  rm,
+  stat,
+} from "node:fs/promises";
+import { basename, dirname, resolve } from "node:path";
 
 export const ARTIFACT_SWARM_SCHEMA = "mycellios-artifact-swarm/1" as const;
 
@@ -70,6 +80,78 @@ export interface ArtifactChunkRequest {
     score: number;
     expiresAt: number;
   }>;
+}
+
+/**
+ * Structural copy of the pinned-artifact contract used by the desktop
+ * provisioner. Keeping it here prevents the model-fabric layer from depending
+ * on Electron while still allowing the production downloader to use it
+ * directly.
+ */
+export interface ArtifactSwarmPinnedArtifact {
+  label: string;
+  url: string;
+  sha256: string;
+  sizeBytes: number;
+}
+
+export interface ArtifactSwarmTransfer {
+  bytesDownloaded: number;
+  bytesTotal: number;
+  bytesPerSecond: number | null;
+  etaSeconds: number | null;
+  resumed: boolean;
+}
+
+export interface ArtifactPeerChunkFetch {
+  peerId: string;
+  packageId: string;
+  blobSha256: string;
+  chunkId: string;
+  offset: number;
+  sizeBytes: number;
+}
+
+export interface ArtifactPeerChunkResponse {
+  /**
+   * A streaming body keeps malicious or unexpectedly large responses from
+   * being buffered in RAM before the declared chunk limit is enforced.
+   */
+  body: AsyncIterable<Uint8Array>;
+  contentLength?: number | undefined;
+}
+
+/**
+ * Real transports (the native direct channel, HTTPS, or a local test peer)
+ * implement this narrow byte interface. Peer inventory is deliberately not
+ * coupled to transport: an announcement never proves possession.
+ */
+export interface ArtifactPeerChunkClient {
+  fetchChunk(request: ArtifactPeerChunkFetch): Promise<ArtifactPeerChunkResponse>;
+}
+
+export type ArtifactOriginDownloader = (
+  artifact: ArtifactSwarmPinnedArtifact,
+  cacheRoot: string,
+  onProgress: (progress: ArtifactSwarmTransfer) => void,
+) => Promise<string>;
+
+export interface ArtifactSwarmDownloaderOptions {
+  registry: ArtifactSwarmRegistry;
+  manifestId: string;
+  requesterPeerId: string;
+  peerClient: ArtifactPeerChunkClient;
+  originDownloader: ArtifactOriginDownloader;
+  /**
+   * Optional explicit package mapping. Without it, the signed manifest must
+   * contain exactly one package with a blob matching the pinned artifact.
+   */
+  packageIdForArtifact?:
+    | ((artifact: ArtifactSwarmPinnedArtifact) => string | null | undefined)
+    | undefined;
+  maximumSourcesPerChunk?: number | undefined;
+  maximumParallelChunks?: number | undefined;
+  now?: (() => number) | undefined;
 }
 
 interface StoredPeer {
@@ -311,6 +393,170 @@ export class ArtifactSwarmRegistry {
   }
 }
 
+/**
+ * Build a production-compatible downloader that opportunistically consumes
+ * verified chunks from Mycellios peers and retains the existing pinned origin
+ * downloader as the authoritative fallback.
+ */
+export function createArtifactSwarmDownloader(
+  options: ArtifactSwarmDownloaderOptions,
+): ArtifactOriginDownloader {
+  const maximumSources = boundedInteger(
+    options.maximumSourcesPerChunk ?? 3,
+    1,
+    16,
+    "artifact_swarm_source_limit_is_invalid",
+  );
+  const maximumParallel = boundedInteger(
+    options.maximumParallelChunks ?? 4,
+    1,
+    32,
+    "artifact_swarm_parallelism_is_invalid",
+  );
+  const requesterPeerId = text(
+    options.requesterPeerId,
+    256,
+    "artifact_peer_id_is_invalid",
+  );
+  const now = options.now ?? Date.now;
+
+  return async (artifact, cacheRoot, onProgress) => {
+    const normalizedArtifact = validatePinnedArtifact(artifact);
+    const cache = artifactCachePaths(normalizedArtifact, cacheRoot);
+    await mkdir(cache.artifactDirectory, { recursive: true });
+
+    if (await verifiedFile(cache.target, normalizedArtifact)) {
+      onProgress(completedSwarmTransfer(normalizedArtifact.sizeBytes, false));
+      return cache.target;
+    }
+    await rm(cache.target, { force: true });
+
+    const selection = selectArtifactBlob(
+      options.registry.getManifest(options.manifestId),
+      normalizedArtifact,
+      options.packageIdForArtifact?.(normalizedArtifact),
+    );
+    if (selection === null) {
+      return verifiedOriginFallback(
+        options.originDownloader,
+        normalizedArtifact,
+        cacheRoot,
+        cache,
+        onProgress,
+        0,
+        false,
+      );
+    }
+
+    await mkdir(cache.chunkDirectory, { recursive: true });
+    const present = await verifyPresentChunks(cache.chunkDirectory, selection.blob);
+    const resumed = present.size > 0;
+    let verifiedBytes = verifiedChunkBytes(selection.blob, present);
+    const startedAt = now();
+    onProgress(swarmTransfer(
+      verifiedBytes,
+      normalizedArtifact.sizeBytes,
+      startedAt,
+      now(),
+      resumed,
+    ));
+
+    const plan = options.registry.planDownload({
+      manifestId: options.manifestId,
+      requesterPeerId,
+      packageIds: [selection.packageId],
+      requesterChunkIds: present,
+      maximumSourcesPerChunk: maximumSources,
+      now: now(),
+    }).filter((request) => request.blobSha256 === selection.blob.sha256);
+
+    let nextIndex = 0;
+    let peerFailure: unknown = null;
+    const workerCount = Math.min(maximumParallel, Math.max(1, plan.length));
+    await Promise.all(Array.from({ length: workerCount }, async () => {
+      while (true) {
+        const requestIndex = nextIndex;
+        nextIndex += 1;
+        const request = plan[requestIndex];
+        if (request === undefined) return;
+
+        let stored = false;
+        for (const source of request.sources) {
+          const peerState = options.registry.peerState(source.peerId);
+          if (
+            peerState === null
+            || peerState.quarantined
+            || source.expiresAt <= now()
+          ) {
+            continue;
+          }
+          try {
+            await fetchVerifiedPeerChunk(
+              options.peerClient,
+              source.peerId,
+              request,
+              cache.chunkDirectory,
+            );
+            options.registry.recordVerifiedChunk(source.peerId);
+            present.add(request.chunkId);
+            verifiedBytes += request.chunk.sizeBytes;
+            onProgress(swarmTransfer(
+              verifiedBytes,
+              normalizedArtifact.sizeBytes,
+              startedAt,
+              now(),
+              resumed,
+            ));
+            stored = true;
+            break;
+          } catch (error) {
+            peerFailure ??= error;
+            if (error instanceof ArtifactPeerCorruptionError) {
+              options.registry.recordCorruptChunk(source.peerId, now());
+            }
+          }
+        }
+        if (!stored) peerFailure ??= new Error("artifact_swarm_chunk_has_no_verified_source");
+      }
+    }));
+
+    if (present.size !== selection.blob.chunks.length) {
+      return verifiedOriginFallback(
+        options.originDownloader,
+        normalizedArtifact,
+        cacheRoot,
+        cache,
+        onProgress,
+        verifiedBytes,
+        resumed,
+        peerFailure,
+      );
+    }
+
+    try {
+      await assembleVerifiedArtifact(
+        cache.chunkDirectory,
+        cache.target,
+        normalizedArtifact,
+        selection.blob,
+      );
+    } catch (error) {
+      return verifiedOriginFallback(
+        options.originDownloader,
+        normalizedArtifact,
+        cacheRoot,
+        cache,
+        onProgress,
+        verifiedBytes,
+        resumed,
+        error,
+      );
+    }
+    onProgress(completedSwarmTransfer(normalizedArtifact.sizeBytes, resumed));
+    return cache.target;
+  };
+}
+
 export function artifactChunkId(blobSha256: string, chunkIndex: number): string {
   const digest = sha256Text(blobSha256, "artifact_swarm_blob_digest_is_invalid");
   const index = boundedInteger(
@@ -523,6 +769,417 @@ function validatePeerAnnouncement(
       "artifact_peer_reliability_is_invalid",
     ),
   };
+}
+
+interface SelectedArtifactBlob {
+  packageId: string;
+  blob: ArtifactBlobDescriptor;
+}
+
+interface ArtifactCachePaths {
+  artifactDirectory: string;
+  chunkDirectory: string;
+  target: string;
+}
+
+class ArtifactPeerCorruptionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ArtifactPeerCorruptionError";
+  }
+}
+
+function validatePinnedArtifact(
+  value: ArtifactSwarmPinnedArtifact,
+): ArtifactSwarmPinnedArtifact {
+  const label = text(value.label, 512, "artifact_swarm_artifact_label_is_invalid");
+  const sha256 = sha256Text(
+    value.sha256,
+    "artifact_swarm_artifact_digest_is_invalid",
+  );
+  const sizeBytes = boundedInteger(
+    value.sizeBytes,
+    1,
+    Number.MAX_SAFE_INTEGER,
+    "artifact_swarm_artifact_size_is_invalid",
+  );
+  let source: URL;
+  try {
+    source = new URL(value.url);
+  } catch {
+    throw new Error("artifact_swarm_artifact_url_is_invalid");
+  }
+  if (
+    source.protocol !== "https:"
+    || source.hash !== `#sha256=${sha256}`
+  ) {
+    throw new Error("artifact_swarm_artifact_url_is_invalid");
+  }
+  return { label, url: source.toString(), sha256, sizeBytes };
+}
+
+function artifactCachePaths(
+  artifact: ArtifactSwarmPinnedArtifact,
+  cacheRoot: string,
+): ArtifactCachePaths {
+  const source = new URL(artifact.url);
+  source.hash = "";
+  let decodedName: string;
+  try {
+    decodedName = decodeURIComponent(basename(source.pathname));
+  } catch {
+    throw new Error("artifact_swarm_artifact_name_is_invalid");
+  }
+  if (!decodedName || decodedName === "." || decodedName === "..") {
+    throw new Error("artifact_swarm_artifact_name_is_invalid");
+  }
+  const root = resolve(cacheRoot);
+  const artifactDirectory = resolve(root, artifact.sha256);
+  assertDirectChild(root, artifactDirectory, "artifact_swarm_cache_path_escaped");
+  const target = resolve(artifactDirectory, decodedName);
+  assertDirectChild(
+    artifactDirectory,
+    target,
+    "artifact_swarm_cache_path_escaped",
+  );
+  const chunkDirectory = resolve(artifactDirectory, ".swarm-chunks");
+  assertDirectChild(
+    artifactDirectory,
+    chunkDirectory,
+    "artifact_swarm_cache_path_escaped",
+  );
+  return { artifactDirectory, chunkDirectory, target };
+}
+
+function selectArtifactBlob(
+  manifest: SignedArtifactSwarmManifest | null,
+  artifact: ArtifactSwarmPinnedArtifact,
+  explicitPackageId: string | null | undefined,
+): SelectedArtifactBlob | null {
+  if (manifest === null) return null;
+  const normalizedPackageId = explicitPackageId === null || explicitPackageId === undefined
+    ? null
+    : sha256Text(
+      explicitPackageId,
+      "artifact_swarm_package_id_is_invalid",
+    );
+  const matches = manifest.packages.flatMap((entry) => {
+    if (normalizedPackageId !== null && entry.packageId !== normalizedPackageId) {
+      return [];
+    }
+    return [entry.manifest, ...entry.blobs]
+      .filter(
+        (blob) =>
+          blob.sha256 === artifact.sha256
+          && blob.sizeBytes === artifact.sizeBytes,
+      )
+      .map((blob) => ({ packageId: entry.packageId, blob }));
+  });
+  return matches.length === 1 ? matches[0]! : null;
+}
+
+async function verifyPresentChunks(
+  chunkDirectory: string,
+  blob: ArtifactBlobDescriptor,
+): Promise<Set<string>> {
+  const present = new Set<string>();
+  for (const chunk of blob.chunks) {
+    const chunkId = artifactChunkId(blob.sha256, chunk.index);
+    const path = chunkPath(chunkDirectory, chunk);
+    if (await verifiedPath(path, chunk.sizeBytes, chunk.sha256)) {
+      present.add(chunkId);
+    } else {
+      await rm(path, { force: true });
+    }
+  }
+  return present;
+}
+
+function verifiedChunkBytes(
+  blob: ArtifactBlobDescriptor,
+  present: ReadonlySet<string>,
+): number {
+  return blob.chunks.reduce(
+    (total, chunk) =>
+      total + (
+        present.has(artifactChunkId(blob.sha256, chunk.index))
+          ? chunk.sizeBytes
+          : 0
+      ),
+    0,
+  );
+}
+
+async function fetchVerifiedPeerChunk(
+  client: ArtifactPeerChunkClient,
+  peerId: string,
+  request: ArtifactChunkRequest,
+  chunkDirectory: string,
+): Promise<void> {
+  const response = await client.fetchChunk({
+    peerId,
+    packageId: request.packageId,
+    blobSha256: request.blobSha256,
+    chunkId: request.chunkId,
+    offset: request.chunk.offset,
+    sizeBytes: request.chunk.sizeBytes,
+  });
+  if (
+    response.contentLength !== undefined
+    && (
+      !Number.isSafeInteger(response.contentLength)
+      || response.contentLength !== request.chunk.sizeBytes
+    )
+  ) {
+    throw new ArtifactPeerCorruptionError(
+      "artifact_swarm_peer_chunk_size_mismatch",
+    );
+  }
+  if (
+    response.body === null
+    || typeof response.body !== "object"
+    || !(Symbol.asyncIterator in response.body)
+  ) {
+    throw new ArtifactPeerCorruptionError(
+      "artifact_swarm_peer_chunk_body_is_invalid",
+    );
+  }
+
+  const target = chunkPath(chunkDirectory, request.chunk);
+  const temporary = resolve(
+    chunkDirectory,
+    `.${basename(target)}.${randomUUID()}.tmp`,
+  );
+  assertDirectChild(
+    chunkDirectory,
+    temporary,
+    "artifact_swarm_cache_path_escaped",
+  );
+  const writer = await open(temporary, "wx");
+  const digest = createHash("sha256");
+  let bytesRead = 0;
+  try {
+    for await (const value of response.body) {
+      if (!(value instanceof Uint8Array)) {
+        throw new ArtifactPeerCorruptionError(
+          "artifact_swarm_peer_chunk_body_is_invalid",
+        );
+      }
+      if (value.byteLength === 0) continue;
+      bytesRead += value.byteLength;
+      if (bytesRead > request.chunk.sizeBytes) {
+        throw new ArtifactPeerCorruptionError(
+          "artifact_swarm_peer_chunk_size_mismatch",
+        );
+      }
+      digest.update(value);
+      await writer.write(value);
+    }
+    await writer.sync();
+  } catch (error) {
+    await writer.close().catch(() => undefined);
+    await rm(temporary, { force: true });
+    throw error;
+  }
+  await writer.close();
+  if (
+    bytesRead !== request.chunk.sizeBytes
+    || digest.digest("hex") !== request.chunk.sha256
+  ) {
+    await rm(temporary, { force: true });
+    throw new ArtifactPeerCorruptionError(
+      "artifact_swarm_peer_chunk_digest_mismatch",
+    );
+  }
+
+  if (await verifiedPath(target, request.chunk.sizeBytes, request.chunk.sha256)) {
+    await rm(temporary, { force: true });
+    return;
+  }
+  await rm(target, { force: true });
+  await rename(temporary, target);
+}
+
+async function assembleVerifiedArtifact(
+  chunkDirectory: string,
+  target: string,
+  artifact: ArtifactSwarmPinnedArtifact,
+  blob: ArtifactBlobDescriptor,
+): Promise<void> {
+  const temporary = resolve(
+    dirname(target),
+    `.${basename(target)}.${randomUUID()}.assembling`,
+  );
+  assertDirectChild(
+    dirname(target),
+    temporary,
+    "artifact_swarm_cache_path_escaped",
+  );
+  const writer = await open(temporary, "wx");
+  const digest = createHash("sha256");
+  let bytesWritten = 0;
+  try {
+    for (const chunk of blob.chunks) {
+      const path = chunkPath(chunkDirectory, chunk);
+      for await (const value of createReadStream(path)) {
+        const bytes = value as Buffer;
+        bytesWritten += bytes.byteLength;
+        if (bytesWritten > artifact.sizeBytes) {
+          throw new Error("artifact_swarm_assembled_size_mismatch");
+        }
+        digest.update(bytes);
+        await writer.write(bytes);
+      }
+    }
+    await writer.sync();
+  } catch (error) {
+    await writer.close().catch(() => undefined);
+    await rm(temporary, { force: true });
+    throw error;
+  }
+  await writer.close();
+  if (
+    bytesWritten !== artifact.sizeBytes
+    || digest.digest("hex") !== artifact.sha256
+  ) {
+    await rm(temporary, { force: true });
+    throw new Error("artifact_swarm_assembled_digest_mismatch");
+  }
+  await rm(target, { force: true });
+  await rename(temporary, target);
+}
+
+async function verifiedOriginFallback(
+  originDownloader: ArtifactOriginDownloader,
+  artifact: ArtifactSwarmPinnedArtifact,
+  cacheRoot: string,
+  cache: ArtifactCachePaths,
+  onProgress: (progress: ArtifactSwarmTransfer) => void,
+  verifiedPeerBytes: number,
+  resumed: boolean,
+  peerFailure?: unknown,
+): Promise<string> {
+  try {
+    const path = await originDownloader(artifact, cacheRoot, (progress) => {
+      onProgress({
+        ...progress,
+        bytesDownloaded: Math.max(
+          Math.min(artifact.sizeBytes, verifiedPeerBytes),
+          progress.bytesDownloaded,
+        ),
+        resumed: resumed || progress.resumed,
+      });
+    });
+    const candidate = resolve(path);
+    if (
+      dirname(candidate) !== cache.artifactDirectory
+      || !(await verifiedFile(candidate, artifact))
+    ) {
+      throw new Error("artifact_swarm_origin_returned_unverified_artifact");
+    }
+    return candidate;
+  } catch (error) {
+    // Preserve the origin's actionable network/integrity error for callers,
+    // while retaining the peer failure as diagnostic context where supported.
+    if (
+      peerFailure !== undefined
+      && error instanceof Error
+      && error.cause === undefined
+    ) {
+      Object.defineProperty(error, "cause", {
+        configurable: true,
+        value: peerFailure,
+      });
+    }
+    throw error;
+  }
+}
+
+function chunkPath(
+  chunkDirectory: string,
+  chunk: ArtifactChunkDescriptor,
+): string {
+  const target = resolve(
+    chunkDirectory,
+    `${chunk.index.toString().padStart(8, "0")}-${chunk.sha256}.chunk`,
+  );
+  assertDirectChild(
+    chunkDirectory,
+    target,
+    "artifact_swarm_cache_path_escaped",
+  );
+  return target;
+}
+
+async function verifiedFile(
+  path: string,
+  artifact: ArtifactSwarmPinnedArtifact,
+): Promise<boolean> {
+  return verifiedPath(path, artifact.sizeBytes, artifact.sha256);
+}
+
+async function verifiedPath(
+  path: string,
+  expectedSize: number,
+  expectedSha256: string,
+): Promise<boolean> {
+  let info;
+  try {
+    info = await stat(path);
+  } catch {
+    return false;
+  }
+  if (!info.isFile() || info.size !== expectedSize) return false;
+  const digest = createHash("sha256");
+  try {
+    for await (const value of createReadStream(path)) {
+      digest.update(value as Buffer);
+    }
+  } catch {
+    return false;
+  }
+  return digest.digest("hex") === expectedSha256;
+}
+
+function swarmTransfer(
+  bytesDownloaded: number,
+  bytesTotal: number,
+  startedAt: number,
+  currentTime: number,
+  resumed: boolean,
+): ArtifactSwarmTransfer {
+  const elapsedSeconds = Math.max(0, currentTime - startedAt) / 1_000;
+  const bytesPerSecond = elapsedSeconds > 0 && bytesDownloaded > 0
+    ? bytesDownloaded / elapsedSeconds
+    : null;
+  return {
+    bytesDownloaded: Math.min(bytesTotal, bytesDownloaded),
+    bytesTotal,
+    bytesPerSecond,
+    etaSeconds: bytesPerSecond === null
+      ? null
+      : Math.max(0, Math.ceil((bytesTotal - bytesDownloaded) / bytesPerSecond)),
+    resumed,
+  };
+}
+
+function completedSwarmTransfer(
+  bytes: number,
+  resumed: boolean,
+): ArtifactSwarmTransfer {
+  return {
+    bytesDownloaded: bytes,
+    bytesTotal: bytes,
+    bytesPerSecond: null,
+    etaSeconds: 0,
+    resumed,
+  };
+}
+
+function assertDirectChild(parent: string, child: string, code: string): void {
+  if (dirname(resolve(child)) !== resolve(parent) || basename(child) === "") {
+    throw new Error(code);
+  }
 }
 
 function packageChunks(
