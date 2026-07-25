@@ -2,8 +2,15 @@ import websocket from "@fastify/websocket";
 import staticFiles from "@fastify/static";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { createHash, timingSafeEqual } from "node:crypto";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { resolve } from "node:path";
+import {
+  createReadStream,
+  existsSync,
+  lstatSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+} from "node:fs";
+import { dirname, resolve, sep } from "node:path";
 import { z, ZodError } from "zod";
 import {
   StableBenchmarkActivationTracker,
@@ -56,8 +63,11 @@ import {
   type ModelActivationProgressEvent,
 } from "./model-catalog.js";
 import {
+  MAX_RELEASE_CHUNK_SIZE_BYTES,
+  NativeReleaseTransactionStore,
   parseReleaseChunkMetadata,
-  storeReleaseChunk,
+  parseReleaseTransactionIdentity,
+  validateReleaseAssetName,
   type ReleaseAssetChannel,
 } from "./release-upload.js";
 import { WorkerHub } from "./worker-hub.js";
@@ -149,6 +159,7 @@ export async function createCoordinator(
     buildIdentity?: NativeBuildIdentity | null;
     runtimeMetadata?: NativeRuntimeBuildMetadata;
     benchmarkStorageRoot?: string;
+    releaseTransactionRoot?: string;
   } = {},
 ): Promise<CoordinatorRuntime> {
   const runtimeMetadata = options.runtimeMetadata
@@ -308,28 +319,70 @@ export async function createCoordinator(
     runtimeMetadata.root,
   );
   const publicAssetVersion = runtimeVersion;
-  if (desktopUpdatesPath) {
-    await app.register(staticFiles, {
-      root: desktopUpdatesPath,
-      prefix: "/updates/win32/x64/",
-      decorateReply: false,
-      cacheControl: false,
-      setHeaders: setPublicAssetCacheHeaders,
-    });
-    app.get("/downloads/windows", async (_request, reply) => {
-      reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
-      return reply.redirect(`/updates/win32/x64/mycellios-setup.exe?v=${publicAssetVersion}`);
-    });
-  }
-  if (releaseDownloadsPath) {
-    await app.register(staticFiles, {
-      root: releaseDownloadsPath,
-      prefix: "/downloads/",
-      decorateReply: false,
-      cacheControl: false,
-      setHeaders: setPublicAssetCacheHeaders,
-    });
-  }
+  const uploadUpdatesRoot = releaseAssetRoot(
+    "updates",
+    config.desktopUpdatesPath,
+    config.releaseDownloadsPath,
+    config.landingAssetsPath,
+    runtimeMetadata.root,
+  );
+  const uploadDownloadsRoot = releaseAssetRoot(
+    "downloads",
+    config.desktopUpdatesPath,
+    config.releaseDownloadsPath,
+    config.landingAssetsPath,
+    runtimeMetadata.root,
+  );
+  const releaseTransactions = coordinatorBuildIdentity && runtimeRevision
+    ? new NativeReleaseTransactionStore({
+      storageRoot: options.releaseTransactionRoot
+        ?? releaseTransactionStorageRoot(
+          uploadUpdatesRoot,
+          uploadDownloadsRoot,
+          runtimeMetadata.root,
+        ),
+      legacyUpdatesRoot: desktopUpdatesPath,
+      legacyDownloadsRoot: releaseDownloadsPath,
+      sourceId: coordinatorBuildIdentity.sourceId,
+      revision: runtimeRevision,
+      version: runtimeVersion,
+    })
+    : null;
+  await releaseTransactions?.initialize();
+  app.get("/updates/win32/x64/:fileName", async (request, reply) => {
+    const { fileName } = z.object({
+      fileName: z.string().min(1).max(160),
+    }).parse(request.params);
+    return serveReleaseAsset(
+      request,
+      reply,
+      await releasePublicAssetPath(
+        releaseTransactions,
+        "updates",
+        fileName,
+        desktopUpdatesPath,
+      ),
+    );
+  });
+  app.get("/downloads/:fileName", async (request, reply) => {
+    const { fileName } = z.object({
+      fileName: z.string().min(1).max(160),
+    }).parse(request.params);
+    return serveReleaseAsset(
+      request,
+      reply,
+      await releasePublicAssetPath(
+        releaseTransactions,
+        "downloads",
+        fileName,
+        releaseDownloadsPath,
+      ),
+    );
+  });
+  app.get("/downloads/windows", async (_request, reply) => {
+    reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
+    return reply.redirect(`/updates/win32/x64/mycellios-setup.exe?v=${publicAssetVersion}`);
+  });
   const hub = new WorkerHub(store);
   hub.attach(app);
   const scheduler = new Scheduler(store, {
@@ -1740,27 +1793,51 @@ export async function createCoordinator(
     runtimeMetadata.root,
   );
   const releaseTokenVerifier = options.releaseTokenVerifier ?? verifyGitHubReleaseUploadToken;
-  app.put("/internal/v1/releases/:channel/:fileName", async (request, reply) => {
+  const authorizeReleaseMutation = async (
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ): Promise<GitHubReleaseClaims | null> => {
     const authorization = parseBearerToken(request.headers.authorization);
     if (!authorization) {
-      return reply.code(401).send({ error: { code: "release_upload_token_missing" } });
+      void reply.code(401).send({ error: { code: "release_upload_token_missing" } });
+      return null;
     }
-    let releaseClaims: GitHubReleaseClaims;
+    let claims: GitHubReleaseClaims;
     try {
-      releaseClaims = await releaseTokenVerifier(authorization);
+      claims = await releaseTokenVerifier(authorization);
     } catch {
-      return reply.code(401).send({ error: { code: "release_upload_token_invalid" } });
+      void reply.code(401).send({ error: { code: "release_upload_token_invalid" } });
+      return null;
     }
     if (runtimeRevision === null) {
-      return reply.code(503).send({
+      void reply.code(503).send({
         error: { code: "release_upload_runtime_revision_unavailable" },
       });
+      return null;
     }
-    if (releaseClaims.sha !== runtimeRevision) {
-      return reply.code(409).send({
+    if (!coordinatorBuildIdentity || !releaseTransactions) {
+      void reply.code(503).send({
+        error: { code: "release_upload_runtime_source_unavailable" },
+      });
+      return null;
+    }
+    if (claims.sha !== runtimeRevision) {
+      void reply.code(409).send({
         error: { code: "release_upload_revision_mismatch" },
       });
+      return null;
     }
+    return claims;
+  };
+  app.addHook("onRequest", async (request, reply) => {
+    const path = request.url.split("?", 1)[0] ?? request.url;
+    if (!path.startsWith("/internal/v1/releases/")) return;
+    if (!await authorizeReleaseMutation(request, reply)) return reply;
+  });
+  app.put(
+    "/internal/v1/releases/:channel/:fileName",
+    { bodyLimit: MAX_RELEASE_CHUNK_SIZE_BYTES },
+    async (request, reply) => {
     const params = z.object({
       channel: z.enum(["updates", "downloads"]),
       fileName: z.string().min(1).max(160),
@@ -1769,15 +1846,8 @@ export async function createCoordinator(
       return reply.code(400).send({ error: { code: "release_chunk_body_invalid" } });
     }
     try {
-      const root = releaseAssetRoot(
-        params.channel,
-        config.desktopUpdatesPath,
-        config.releaseDownloadsPath,
-        config.landingAssetsPath,
-        runtimeMetadata.root,
-      );
-      const result = await storeReleaseChunk({
-        root,
+      const result = await releaseTransactions!.storeChunk({
+        identity: parseReleaseTransactionIdentity(request.headers),
         channel: params.channel as ReleaseAssetChannel,
         fileName: params.fileName,
         metadata: parseReleaseChunkMetadata(request.headers),
@@ -1792,25 +1862,89 @@ export async function createCoordinator(
         },
       });
     }
+    },
+  );
+  app.post(
+    "/internal/v1/releases/transactions/:transactionId/commit",
+    { bodyLimit: 64 * 1024 },
+    async (request, reply) => {
+      const { transactionId } = z.object({
+        transactionId: z.string().min(16).max(128),
+      }).parse(request.params);
+      const bodyIdentity = z.object({
+        transactionId: z.string(),
+      }).passthrough().parse(request.body);
+      if (bodyIdentity.transactionId !== transactionId) {
+        return reply.code(400).send({
+          error: { code: "release_transaction_path_mismatch" },
+        });
+      }
+      try {
+        return reply.code(201).send(
+          await releaseTransactions!.commit(request.body),
+        );
+      } catch (error) {
+        return reply.code(409).send({
+          error: {
+            code: "release_commit_rejected",
+            message: error instanceof Error ? error.message : "release_commit_rejected",
+          },
+        });
+      }
+    },
+  );
+  app.post(
+    "/internal/v1/releases/transactions/:transactionId/rollback",
+    async (request, reply) => {
+      const { transactionId } = z.object({
+        transactionId: z.string().min(16).max(128),
+      }).parse(request.params);
+      try {
+        return reply.send(await releaseTransactions!.rollback(transactionId));
+      } catch (error) {
+        return reply.code(409).send({
+          error: {
+            code: "release_rollback_rejected",
+            message: error instanceof Error ? error.message : "release_rollback_rejected",
+          },
+        });
+      }
+    },
+  );
+  app.post(
+    "/internal/v1/releases/transactions/:transactionId/abort",
+    async (request, reply) => {
+      const { transactionId } = z.object({
+        transactionId: z.string().min(16).max(128),
+      }).parse(request.params);
+      try {
+        return reply.send(await releaseTransactions!.abort(transactionId));
+      } catch (error) {
+        return reply.code(409).send({
+          error: {
+            code: "release_abort_rejected",
+            message: error instanceof Error ? error.message : "release_abort_rejected",
+          },
+        });
+      }
+    },
+  );
+  app.get("/downloads/macos-arm64", async (_request, reply) => {
+    reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
+    return reply.redirect(`/downloads/mycellios-macos-arm64.dmg?v=${publicAssetVersion}`);
   });
-  if (releaseDownloadsPath) {
-    app.get("/downloads/macos-arm64", async (_request, reply) => {
-      reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
-      return reply.redirect(`/downloads/mycellios-macos-arm64.dmg?v=${publicAssetVersion}`);
-    });
-    app.get("/downloads/macos-x64", async (_request, reply) => {
-      reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
-      return reply.redirect(`/downloads/mycellios-macos-x64.dmg?v=${publicAssetVersion}`);
-    });
-    app.get("/downloads/linux-deb", async (_request, reply) => {
-      reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
-      return reply.redirect(`/downloads/mycellios-linux-x64.deb?v=${publicAssetVersion}`);
-    });
-    app.get("/downloads/linux-rpm", async (_request, reply) => {
-      reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
-      return reply.redirect(`/downloads/mycellios-linux-x64.rpm?v=${publicAssetVersion}`);
-    });
-  }
+  app.get("/downloads/macos-x64", async (_request, reply) => {
+    reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
+    return reply.redirect(`/downloads/mycellios-macos-x64.dmg?v=${publicAssetVersion}`);
+  });
+  app.get("/downloads/linux-deb", async (_request, reply) => {
+    reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
+    return reply.redirect(`/downloads/mycellios-linux-x64.deb?v=${publicAssetVersion}`);
+  });
+  app.get("/downloads/linux-rpm", async (_request, reply) => {
+    reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
+    return reply.redirect(`/downloads/mycellios-linux-x64.rpm?v=${publicAssetVersion}`);
+  });
   const contentHubClient = config.contentHubApiUrl
     ? new ContentHubClient({ baseUrl: config.contentHubApiUrl })
     : null;
@@ -2017,6 +2151,135 @@ function releaseAssetRoot(
     configuredLanding ?? resolve(runtimeRoot, "landing-dist"),
     "downloads",
   );
+}
+
+function releaseTransactionStorageRoot(
+  updatesRoot: string,
+  downloadsRoot: string,
+  runtimeRoot: string,
+): string {
+  let common = dirname(resolve(updatesRoot));
+  const downloadsParent = dirname(resolve(downloadsRoot));
+  while (
+    downloadsParent !== common
+    && !downloadsParent.startsWith(`${common}${sep}`)
+  ) {
+    const parent = dirname(common);
+    if (parent === common) {
+      return resolve(runtimeRoot, "release-transactions");
+    }
+    common = parent;
+  }
+  if (dirname(common) === common) {
+    return resolve(runtimeRoot, "release-transactions");
+  }
+  return resolve(common, "release-transactions");
+}
+
+async function releasePublicAssetPath(
+  transactions: NativeReleaseTransactionStore | null,
+  channel: ReleaseAssetChannel,
+  fileName: string,
+  legacyRoot: string | null,
+): Promise<string | null> {
+  if (transactions) return transactions.publicAssetPath(channel, fileName);
+  try {
+    validateReleaseAssetName(channel, fileName);
+  } catch {
+    return null;
+  }
+  return legacyRoot ? resolve(legacyRoot, fileName) : null;
+}
+
+function serveReleaseAsset(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  filePath: string | null,
+): FastifyReply {
+  if (!filePath || !existsSync(filePath)) return reply.code(404).send();
+  const details = lstatSync(filePath);
+  if (!details.isFile() || details.isSymbolicLink()) {
+    return reply.code(404).send();
+  }
+  setPublicAssetCacheHeaders(reply, filePath);
+  const entityTag = `"${createHash("sha256")
+    .update(`${filePath}\n${details.size}\n${details.mtimeMs}`)
+    .digest("base64url")}"`;
+  const lastModified = details.mtime.toUTCString();
+  reply.header("Accept-Ranges", "bytes");
+  reply.header("ETag", entityTag);
+  reply.header("Last-Modified", lastModified);
+  if (filePath.endsWith(".json")) reply.type("application/json; charset=utf-8");
+  else if (filePath.endsWith(".dmg")) reply.type("application/x-apple-diskimage");
+  else if (filePath.endsWith(".deb")) reply.type("application/vnd.debian.binary-package");
+  else if (filePath.endsWith(".rpm")) reply.type("application/x-rpm");
+  else reply.type("application/octet-stream");
+
+  const rangeHeader = request.headers.range;
+  const ifRangeHeader = request.headers["if-range"];
+  if (
+    typeof rangeHeader === "string"
+    && (
+      typeof ifRangeHeader !== "string"
+      || ifRangeMatches(ifRangeHeader, entityTag, details.mtimeMs)
+    )
+  ) {
+    const range = parseSingleByteRange(rangeHeader, details.size);
+    if (!range) {
+      reply.header("Content-Range", `bytes */${details.size}`);
+      reply.header("Content-Length", 0);
+      return reply.code(416).send();
+    }
+    reply.header("Content-Range", `bytes ${range.start}-${range.end}/${details.size}`);
+    reply.header("Content-Length", range.end - range.start + 1);
+    reply.code(206);
+    return reply.send(createReadStream(filePath, range));
+  }
+
+  reply.header("Content-Length", details.size);
+  return reply.send(createReadStream(filePath));
+}
+
+export function parseSingleByteRange(
+  value: string,
+  size: number,
+): { start: number; end: number } | null {
+  if (!Number.isSafeInteger(size) || size < 1) return null;
+  const match = /^bytes=(\d*)-(\d*)$/i.exec(value.trim());
+  if (!match || (!match[1] && !match[2])) return null;
+  if (!match[1]) {
+    const suffixLength = Number(match[2]);
+    if (!Number.isSafeInteger(suffixLength) || suffixLength < 1) return null;
+    return {
+      start: Math.max(0, size - suffixLength),
+      end: size - 1,
+    };
+  }
+  const start = Number(match[1]);
+  if (!Number.isSafeInteger(start) || start < 0 || start >= size) return null;
+  const requestedEnd = match[2] ? Number(match[2]) : size - 1;
+  if (
+    !Number.isSafeInteger(requestedEnd)
+    || requestedEnd < start
+  ) return null;
+  return {
+    start,
+    end: Math.min(requestedEnd, size - 1),
+  };
+}
+
+function ifRangeMatches(
+  value: string,
+  entityTag: string,
+  modifiedAtMs: number,
+): boolean {
+  const candidate = value.trim();
+  if (candidate.startsWith("\"") || candidate.startsWith("W/")) {
+    return candidate === entityTag;
+  }
+  const timestamp = Date.parse(candidate);
+  return Number.isFinite(timestamp)
+    && Math.floor(modifiedAtMs / 1_000) * 1_000 <= timestamp;
 }
 
 function resolveReleaseDownloadsPath(
