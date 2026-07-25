@@ -114,6 +114,22 @@ export interface StoredActivationEvent {
   details?: readonly string[];
 }
 
+export interface StoredNetworkTelemetrySample {
+  capturedAt: number;
+  registeredNodes: number;
+  connectedNodes: number;
+  onlineNodes: number;
+  browserNodes: number;
+  activeModels: number;
+  modelReplicas: number;
+  modelPipelines: number;
+  offeredVramMb: number;
+  freeVramMb: number;
+  inflightJobs: number;
+  runningJobs: number;
+  completedJobs: number;
+}
+
 interface RequestedModelRow {
   id: string;
   source: string;
@@ -966,6 +982,95 @@ export class MeshStore {
       ...(row.device ? { device: row.device } : {}),
       ...(row.details_json ? { details: JSON.parse(row.details_json) as string[] } : {}),
     }));
+  }
+
+  recordNetworkTelemetrySample(sample: StoredNetworkTelemetrySample): void {
+    this.database.raw.prepare(
+      `INSERT INTO network_telemetry_history(
+         captured_at, registered_nodes, connected_nodes, online_nodes, browser_nodes,
+         active_models, model_replicas, model_pipelines, offered_vram_mb, free_vram_mb,
+         inflight_jobs, running_jobs, completed_jobs
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(captured_at) DO UPDATE SET
+         registered_nodes=excluded.registered_nodes,
+         connected_nodes=excluded.connected_nodes,
+         online_nodes=excluded.online_nodes,
+         browser_nodes=excluded.browser_nodes,
+         active_models=excluded.active_models,
+         model_replicas=excluded.model_replicas,
+         model_pipelines=excluded.model_pipelines,
+         offered_vram_mb=excluded.offered_vram_mb,
+         free_vram_mb=excluded.free_vram_mb,
+         inflight_jobs=excluded.inflight_jobs,
+         running_jobs=excluded.running_jobs,
+         completed_jobs=excluded.completed_jobs`,
+    ).run(
+      sample.capturedAt,
+      sample.registeredNodes,
+      sample.connectedNodes,
+      sample.onlineNodes,
+      sample.browserNodes,
+      sample.activeModels,
+      sample.modelReplicas,
+      sample.modelPipelines,
+      sample.offeredVramMb,
+      sample.freeVramMb,
+      sample.inflightJobs,
+      sample.runningJobs,
+      sample.completedJobs,
+    );
+  }
+
+  listNetworkTelemetrySamples(since: number, limit = 13_000): StoredNetworkTelemetrySample[] {
+    const boundedLimit = Math.max(1, Math.min(13_000, Math.trunc(limit)));
+    const rows = this.database.raw.prepare(
+      `SELECT * FROM (
+         SELECT captured_at, registered_nodes, connected_nodes, online_nodes, browser_nodes,
+                active_models, model_replicas, model_pipelines, offered_vram_mb, free_vram_mb,
+                inflight_jobs, running_jobs, completed_jobs
+         FROM network_telemetry_history
+         WHERE captured_at >= ?
+         ORDER BY captured_at DESC
+         LIMIT ?
+       ) ORDER BY captured_at ASC`,
+    ).all(since, boundedLimit) as unknown as Array<{
+      captured_at: number;
+      registered_nodes: number;
+      connected_nodes: number;
+      online_nodes: number;
+      browser_nodes: number;
+      active_models: number;
+      model_replicas: number;
+      model_pipelines: number;
+      offered_vram_mb: number;
+      free_vram_mb: number;
+      inflight_jobs: number;
+      running_jobs: number;
+      completed_jobs: number;
+    }>;
+    return rows.map((row) => ({
+      capturedAt: Number(row.captured_at),
+      registeredNodes: Number(row.registered_nodes),
+      connectedNodes: Number(row.connected_nodes),
+      onlineNodes: Number(row.online_nodes),
+      browserNodes: Number(row.browser_nodes),
+      activeModels: Number(row.active_models),
+      modelReplicas: Number(row.model_replicas),
+      modelPipelines: Number(row.model_pipelines),
+      offeredVramMb: Number(row.offered_vram_mb),
+      freeVramMb: Number(row.free_vram_mb),
+      inflightJobs: Number(row.inflight_jobs),
+      runningJobs: Number(row.running_jobs),
+      completedJobs: Number(row.completed_jobs),
+    }));
+  }
+
+  pruneNetworkTelemetrySamples(before: number): number {
+    return Number(
+      this.database.raw.prepare(
+        "DELETE FROM network_telemetry_history WHERE captured_at < ?",
+      ).run(before).changes,
+    );
   }
 
   private queueWorker(workerId: string): void {

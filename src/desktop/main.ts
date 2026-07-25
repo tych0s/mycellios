@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
 import { cpus, release } from "node:os";
 import { spawn } from "node:child_process";
@@ -52,6 +52,8 @@ import type {
   SupportAssistantAdminSettings,
   SupportAssistantChatRequest,
   SupportAssistantPublicConfig,
+  SystemLogEntry,
+  SystemLogSnapshot,
 } from "./contracts.js";
 import type {
   HubCatalogPage,
@@ -192,6 +194,10 @@ function modelAdminTokenPath(): string {
   return join(app.getPath("userData"), "model-admin-token.enc");
 }
 
+function desktopLogPath(): string {
+  return join(app.getPath("userData"), "mycellios.log");
+}
+
 function loadModelAdminToken(): string {
   if (!safeStorage.isEncryptionAvailable() || !existsSync(modelAdminTokenPath())) return "";
   try {
@@ -218,13 +224,147 @@ function persistModelAdminToken(token: string): void {
 function writeDesktopLog(event: string, details: unknown): void {
   try {
     appendFileSync(
-      join(app.getPath("userData"), "mycellios.log"),
+      desktopLogPath(),
       `${new Date().toISOString()} ${event} ${JSON.stringify(details)}\n`,
       "utf8",
     );
   } catch {
     // Diagnostics must never prevent the app from starting.
   }
+}
+
+const DESKTOP_LOG_TAIL_BYTES = 512 * 1_024;
+const DESKTOP_LOG_ENTRY_LIMIT = 400;
+const SENSITIVE_LOG_KEY = /(authorization|cookie|credential|password|secret|token|api[-_]?key)/i;
+
+function readSystemLogs(): SystemLogSnapshot {
+  const capturedAt = new Date().toISOString();
+  const path = desktopLogPath();
+  if (!existsSync(path)) {
+    return { capturedAt, entries: [], truncated: false, source: "desktop-file" };
+  }
+
+  try {
+    const size = statSync(path).size;
+    const start = Math.max(0, size - DESKTOP_LOG_TAIL_BYTES);
+    const length = size - start;
+    const buffer = Buffer.alloc(length);
+    const handle = openSync(path, "r");
+    try {
+      readSync(handle, buffer, 0, length, start);
+    } finally {
+      closeSync(handle);
+    }
+
+    const lines = buffer.toString("utf8").split(/\r?\n/);
+    if (start > 0) lines.shift();
+    const parsed = lines
+      .filter((line) => line.trim().length > 0)
+      .slice(-DESKTOP_LOG_ENTRY_LIMIT)
+      .map(parseSystemLogLine)
+      .filter((entry): entry is SystemLogEntry => entry !== null)
+      .reverse();
+    return {
+      capturedAt,
+      entries: parsed,
+      truncated: start > 0 || lines.length > DESKTOP_LOG_ENTRY_LIMIT,
+      source: "desktop-file",
+    };
+  } catch (error) {
+    return {
+      capturedAt,
+      entries: [{
+        id: `log-read-failed-${capturedAt}`,
+        at: capturedAt,
+        level: "error",
+        source: "desktop",
+        event: "log-read-failed",
+        message: redactLogString(errorText(error)),
+      }],
+      truncated: false,
+      source: "desktop-file",
+    };
+  }
+}
+
+function parseSystemLogLine(line: string, index: number): SystemLogEntry | null {
+  const match = line.match(/^(\S+)\s+([a-zA-Z0-9._:-]+)\s*(.*)$/);
+  if (!match) return null;
+  const rawAt = match[1]!;
+  const event = match[2]!;
+  const rawDetails = match[3]!;
+  const at = Number.isNaN(Date.parse(rawAt)) ? new Date().toISOString() : rawAt;
+  let details: unknown = rawDetails;
+  if (rawDetails) {
+    try {
+      details = JSON.parse(rawDetails);
+    } catch {
+      details = rawDetails;
+    }
+  }
+  const safeDetails = redactLogValue(details);
+  const serializedDetails = safeLogDetails(safeDetails);
+  return {
+    id: `${at}-${index}-${event}`,
+    at,
+    level: systemLogLevel(event, safeDetails),
+    source: systemLogSource(event),
+    event,
+    message: systemLogMessage(event, safeDetails),
+    ...(serializedDetails ? { details: serializedDetails } : {}),
+  };
+}
+
+function redactLogValue(value: unknown, key = "", depth = 0): unknown {
+  if (SENSITIVE_LOG_KEY.test(key)) return "[REDACTED]";
+  if (typeof value === "string") return redactLogString(value).slice(0, 1_200);
+  if (value === null || typeof value !== "object") return value;
+  if (depth >= 4) return "[TRUNCATED]";
+  if (Array.isArray(value)) return value.slice(0, 24).map((item) => redactLogValue(item, "", depth + 1));
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .slice(0, 32)
+      .map(([entryKey, entryValue]) => [entryKey, redactLogValue(entryValue, entryKey, depth + 1)]),
+  );
+}
+
+function redactLogString(value: string): string {
+  return value
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1[REDACTED]")
+    .replace(/\b(authorization|credential|password|secret|token|api[-_ ]?key)\s*[:=]\s*["']?[^"',}\s]+/gi, "$1=[REDACTED]")
+    .replace(/([?&](?:authorization|credential|password|secret|token|api[-_]?key)=)[^&\s]+/gi, "$1[REDACTED]");
+}
+
+function systemLogLevel(event: string, details: unknown): SystemLogEntry["level"] {
+  const text = `${event} ${typeof details === "string" ? details : JSON.stringify(details)}`.toLowerCase();
+  if (/(error|failed|fatal|gone|crash|unavailable)/.test(text)) return "error";
+  if (/(warn|retry|degraded|drain|fallback|unsupported)/.test(text)) return "warning";
+  return "info";
+}
+
+function systemLogSource(event: string): SystemLogEntry["source"] {
+  if (event.startsWith("worker-")) return "worker";
+  if (event.startsWith("renderer-") || event === "preload-error") return "renderer";
+  if (event.includes("coordinator")) return "coordinator";
+  if (/(accelerator|runtime|distribution)/.test(event)) return "runtime";
+  return "desktop";
+}
+
+function systemLogMessage(event: string, details: unknown): string {
+  if (details && typeof details === "object") {
+    const record = details as Record<string, unknown>;
+    for (const key of ["message", "error", "description", "state"]) {
+      if (typeof record[key] === "string" && record[key]) return redactLogString(record[key]);
+    }
+  }
+  if (typeof details === "string" && details.trim()) return redactLogString(details.trim());
+  return event.replace(/[-_.]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function safeLogDetails(details: unknown): string | undefined {
+  if (details === undefined || details === null || details === "") return undefined;
+  const serialized = typeof details === "string" ? details : JSON.stringify(details);
+  return serialized.length > 2_000 ? `${serialized.slice(0, 2_000)}…` : serialized;
 }
 
 function setUpdateStatus(next: Partial<DesktopUpdateStatus>): void {
@@ -980,6 +1120,7 @@ function normalizeDesktopChatMessages(messages: ChatRequest["messages"]): ChatRe
 
 function registerIpc(): void {
   ipcMain.handle("dashboard:read", () => readSnapshot());
+  ipcMain.handle("logs:read", () => readSystemLogs());
   ipcMain.handle("settings:save", async (_event, next: DesktopSettings) => {
     persistSettings(next);
     await restartRuntime();

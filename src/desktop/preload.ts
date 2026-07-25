@@ -15,6 +15,7 @@ let chatStreamSequence = 0;
 
 const bridge: DesktopBridge = Object.freeze({
   getSnapshot: () => ipcRenderer.invoke("dashboard:read"),
+  getSystemLogs: () => ipcRenderer.invoke("logs:read"),
   saveSettings: (settings: DesktopSettings) => ipcRenderer.invoke("settings:save", settings),
   setContribution: (enabled: boolean) => ipcRenderer.invoke("contribution:set", enabled),
   sendChat: (request: ChatRequest) => ipcRenderer.invoke("chat:send", request),
