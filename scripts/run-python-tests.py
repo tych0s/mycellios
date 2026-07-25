@@ -37,18 +37,30 @@ PYTHON_DIR = REPO / "python"
 # nadie veía porque la suite no corría en CI.
 #
 # CADA ENTRADA NECESITA: por qué falla y qué haría falta para quitarla.
-KNOWN_FAILURES = {
-    "test_protocol.DeflateCodecTests.test_deflate_frame_survives_the_wire":
-        "Códec DEFLATE (INT8_GROUPED/HADAMARD). Falla idéntico en el árbol sin "
-        "tocar. Sin diagnosticar: el códec deflate no está en la ruta de "
-        "servicio por defecto, así que no bloquea, pero es un fallo real.",
-    "test_protocol.DeflateCodecTests.test_gaussian_activations_compress_below_unity":
-        "Mismo códec: la compresión no baja de 1,0 en activaciones gaussianas. "
-        "Puede ser una expectativa del test, no del códec. Sin diagnosticar.",
-    "test_packed_tree_wave.PackedTreeWaveBenchmarkTests"
-    ".test_bandwidth_sweep_reuses_one_codec_measurement_and_never_claims_tps":
-        "El barrido devuelve selected_mode='NONE'. Preexistente.",
+# ⚠️ SON ESPECÍFICOS DE WINDOWS, no bugs del código. La primera corrida en CI
+# (runner limpio de Linux, PR #19) los pasó LOS TRES. Se documentaron como
+# "fallos preexistentes" a partir de corridas en Windows, dando a entender que
+# el códec deflate estaba roto; no lo está.
+#
+# Por eso la lista va por plataforma: fingir que un fallo es universal cuando es
+# de una sola plataforma es tan engañoso como no declararlo. En Linux la lista
+# está VACÍA, así que allí cualquier fallo rompe.
+KNOWN_FAILURES_BY_PLATFORM = {
+    "win32": {
+        "test_protocol.DeflateCodecTests.test_deflate_frame_survives_the_wire":
+            "Falla en Windows, PASA en Linux (CI). Probablemente zlib/CRLF o "
+            "alineación del buffer; sin diagnosticar porque no afecta a la "
+            "plataforma de despliegue.",
+        "test_protocol.DeflateCodecTests.test_gaussian_activations_compress_below_unity":
+            "Ratio de compresión 1,06 en Windows y <1,0 en Linux. Mismo códec, "
+            "distinta zlib.",
+        "test_packed_tree_wave.PackedTreeWaveBenchmarkTests"
+        ".test_bandwidth_sweep_reuses_one_codec_measurement_and_never_claims_tps":
+            "selected_mode='NONE' en Windows; en Linux selecciona bien.",
+    },
 }
+
+KNOWN_FAILURES = KNOWN_FAILURES_BY_PLATFORM.get(sys.platform, {})
 
 # INTERMITENTES: pueden pasar o fallar en la misma máquina sin que cambie nada.
 # Todos levantan procesos o sockets de verdad, así que dependen de puertos, de
@@ -57,11 +69,15 @@ KNOWN_FAILURES = {
 # la señal se perdería. Aquí no rompen la construcción en ningún sentido, pero
 # se cuentan y se anuncian, para que una racha rara sea visible.
 #
-# En el host de desarrollo la causa está diagnosticada: `torch.distributed`
-# (c10d) intenta ligar a `kubernetes.docker.internal` —entrada que Docker
-# Desktop mete en el fichero `hosts`— y falla con WinError 10049. En un runner
-# limpio de CI no deberían fallar; si nunca fallan durante un tiempo, hay que
-# ascenderlos a normales y quitarlos de aquí.
+# En Windows la causa está diagnosticada: `torch.distributed` (c10d) intenta
+# ligar a `kubernetes.docker.internal` —entrada que Docker Desktop mete en el
+# fichero `hosts`— y falla con WinError 10049.
+#
+# ⚠️ Pero en Linux TAMBIÉN fallan a veces: la primera corrida en CI (PR #19)
+# tumbó dos de estas clases. O sea que no era sólo Docker Desktop — levantar
+# ranks reales es intermitente de por sí. Se quedan como intermitentes en TODAS
+# las plataformas hasta que alguien los estabilice (puertos fijos, esperas
+# explícitas) en vez de esperar a que el entorno mejore solo.
 # Se listan por PREFIJO (clase o módulo), no test a test. La causa es común a
 # todo el grupo —levantar ranks o procesos de verdad—, así que enumerarlos uno a
 # uno sólo garantiza que la lista se quede corta: en esta misma sesión aparecieron
