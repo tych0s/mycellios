@@ -1448,6 +1448,7 @@ function RequestedModelCard({ model, onRemove }: { model: RequestedModelCapacity
   return <article className={`model-request-card ${model.status}`}>
     <div className="model-request-head"><div className="model-request-icon"><Boxes /></div><div><span>{model.source}</span><h2>{model.id}</h2><small>{model.adapterId ?? "Checking architecture"}</small></div><ModelStatus status={model.status} /></div>
     <p className="model-request-message">{model.message}</p>
+    {model.activationIncident && <ActivationIncidentPanel incident={model.activationIncident} />}
     {(model.status === "activating" || model.status === "failed" || (model.activationProgress?.length ?? 0) > 0) && <ActivationProgressLog model={model} />}
     <div className="model-capacity-bar"><i style={{ width: `${progress}%` }} /></div>
     <div className="model-capacity-grid">
@@ -1471,6 +1472,38 @@ function ModelStatus({ status }: { status: RequestedModelCapacity["status"] }) {
     failed: "Needs attention",
   };
   return <b className={`model-request-status ${status}`}>{status === "profiling" || status === "activating" ? <LoaderCircle className="spin" /> : status === "active" || status === "ready" ? <CheckCircle2 /> : <CircleAlert />}{labels[status]}</b>;
+}
+
+function ActivationIncidentPanel({
+  incident,
+}: {
+  incident: NonNullable<RequestedModelCapacity["activationIncident"]>;
+}) {
+  const repairLabels: Record<typeof incident.repairState, string> = {
+    scheduled: "Automatic retry scheduled",
+    retrying: "Automatic recovery running",
+    exhausted: "Safe retry limit reached",
+    manual_required: "Verified change required",
+  };
+  const automatic = incident.repairState === "scheduled"
+    || incident.repairState === "retrying";
+  return <aside className={`activation-incident ${incident.repairState}`}>
+    <header>
+      <span>{automatic ? <RefreshCw className="spin-slow" /> : <ShieldCheck />}</span>
+      <div><small>{automatic ? "AUTONOMOUS RECOVERY" : "FAIL-CLOSED DIAGNOSIS"}</small><strong>{incident.title}</strong></div>
+      <b>{repairLabels[incident.repairState]}</b>
+    </header>
+    <p>{incident.summary}</p>
+    <div className="activation-incident-grid">
+      <span><small>Scope</small><strong>{incident.scope}</strong></span>
+      <span><small>Equipment</small><strong>{incident.nodeId ? shortId(incident.nodeId) : "Not isolated"}</strong></span>
+      <span><small>Stage</small><strong>{incident.stageId ? shortId(incident.stageId) : "—"}</strong></span>
+      <span><small>Attempt</small><strong>{incident.attempt > 0 ? `${incident.attempt} / ${incident.maximumAttempts}` : "Not retrying"}</strong></span>
+    </div>
+    <div className="activation-incident-remedy"><Zap /><span><small>SAFE REMEDY</small><strong>{incident.remedy}</strong></span></div>
+    <ol>{incident.steps.map((step, index) => <li key={step}><b>{String(index + 1).padStart(2, "0")}</b>{step}</li>)}</ol>
+    {incident.nextRetryAt && <footer><Timer />Next bounded attempt: {new Date(incident.nextRetryAt).toLocaleString()}</footer>}
+  </aside>;
 }
 
 function Jobs({ snapshot }: { snapshot: PublicSnapshot }) {

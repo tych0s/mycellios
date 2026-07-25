@@ -75,20 +75,14 @@ import {
   type DeploymentOperation,
 } from "./deployment-control-plane.js";
 import { stripWorkerDeclaredEvidence } from "./evidence-authority.js";
+import {
+  activationFailureIsTransient,
+  classifyActivationIncident,
+  type ActivationIncident,
+} from "./activation-incident.js";
 
 export function automaticActivationFailureIsTransient(message: string): boolean {
-  const normalized = message.toLowerCase();
-  if (normalized.startsWith("automatic_activation_retries_exhausted:")) return false;
-  return [
-    "distributed_worker_disconnected:",
-    "distributed_worker_not_connected:",
-    "managed_launch_agent_is_unavailable:",
-    "worker_tunnel_prepare_timeout",
-    "gpu_only_runtime_not_ready",
-    "gpu_model_stage_unavailable_after_retries:",
-    "launch_readiness_timeout:",
-    "coordinator_worker_registration_timeout",
-  ].some((marker) => normalized.includes(marker));
+  return activationFailureIsTransient(message);
 }
 
 export const DEFAULT_AUTOMATIC_ACTIVATION_RETRY_DELAYS_MS = [
@@ -619,6 +613,25 @@ export async function createCoordinator(
       ? `A node disconnected during startup. Automatic retry ${retryNumber} of ${automaticActivationRetryDelaysMs.length} starts in ${secondsRemaining}s.`
       : `Automatic retry ${retryNumber} of ${automaticActivationRetryDelaysMs.length} is ready and waiting for healthy capacity and a free activation slot.`;
   };
+  const activationIncidentForModel = (
+    modelId: string,
+  ): ActivationIncident | null => {
+    const retry = automaticActivationRetryState.get(modelId);
+    const stored = store.getRequestedModel(modelId);
+    const message = retry?.lastError ?? stored?.activationError;
+    if (!message) return null;
+    return classifyActivationIncident({
+      message,
+      ...(retry
+        ? {
+            retryCount: retry.retryCount,
+            retryLaunching: retry.launching,
+          }
+        : {}),
+      nextRetryAt: retry?.nextAttemptAt ?? null,
+      maximumAttempts: automaticActivationRetryDelaysMs.length,
+    });
+  };
   const handleRequestedModelActivationFailure = (
     modelId: string,
     error: unknown,
@@ -861,6 +874,7 @@ export async function createCoordinator(
             activationStatusMessageForModel,
           }
         : {}),
+      activationIncidentForModel,
       activationAvailable: activationManager !== undefined,
     });
     for (const view of views) {
@@ -1028,6 +1042,7 @@ export async function createCoordinator(
     return publicSnapshot(store, scheduler, hub, mobileHub, activationManager, {
       activationProgressForModel,
       activationStatusMessageForModel,
+      activationIncidentForModel,
     }, runtimeVersion, coordinatorBuildIdentity);
   });
 
@@ -1130,6 +1145,7 @@ export async function createCoordinator(
       const snapshot = publicSnapshot(store, scheduler, hub, mobileHub, activationManager, {
         activationProgressForModel,
         activationStatusMessageForModel,
+        activationIncidentForModel,
       }, runtimeVersion, coordinatorBuildIdentity);
       const parsed: ChatCompletionRequest = {
         model: selectedModel,
@@ -1290,6 +1306,7 @@ export async function createCoordinator(
     const snapshot = publicSnapshot(store, scheduler, hub, mobileHub, activationManager, {
       activationProgressForModel,
       activationStatusMessageForModel,
+      activationIncidentForModel,
     }, runtimeVersion, coordinatorBuildIdentity);
     return reply.code(201).send({
       model: snapshot.requestedModels.find((model) => model.id === stored.id),
@@ -2078,6 +2095,7 @@ function publicSnapshot(
   activationPresentation: {
     activationProgressForModel(modelId: string): readonly ModelActivationProgressEvent[];
     activationStatusMessageForModel(modelId: string): string | null;
+    activationIncidentForModel(modelId: string): ActivationIncident | null;
   } | undefined,
   version: string,
   buildIdentity: NativeBuildIdentity | null = null,
@@ -2096,6 +2114,7 @@ function publicSnapshot(
       ? {
           activationProgressForModel: activationPresentation.activationProgressForModel,
           activationStatusMessageForModel: activationPresentation.activationStatusMessageForModel,
+          activationIncidentForModel: activationPresentation.activationIncidentForModel,
         }
       : activationManager?.activationProgressForModel
         ? { activationProgressForModel: (modelId: string) => activationManager.activationProgressForModel!(modelId) }

@@ -168,6 +168,17 @@ describe("requested model API activation flow", () => {
     );
     expect(model.status).toBe("activating");
     expect(model.message).toContain("Automatic retry 1 of 1");
+    expect(model.activationIncident).toMatchObject({
+      schema: "mycellios-activation-incident/1",
+      code: "launch_agent_unavailable",
+      scope: "node",
+      repairState: "retrying",
+      automatic: true,
+      automaticAction: "reconnect_node",
+      attempt: 1,
+      maximumAttempts: 1,
+      nodeId: "desktop-a",
+    });
     expect(model.activationProgress).toEqual(expect.arrayContaining([
       expect.objectContaining({ phase: "retrying", state: "running" }),
     ]));
@@ -227,6 +238,12 @@ describe("requested model API activation flow", () => {
       (entry: { id: string }) => entry.id === "retry-live",
     );
     expect(model.status).toBe("activating");
+    expect(model.activationIncident).toMatchObject({
+      code: "launch_agent_unavailable",
+      repairState: "retrying",
+      automatic: true,
+      nodeId: "desktop-a",
+    });
     expect(model.activationProgress).toEqual(expect.arrayContaining([
       expect.objectContaining({ phase: "retrying", state: "running" }),
     ]));

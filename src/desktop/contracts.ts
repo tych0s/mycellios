@@ -9,6 +9,7 @@ import type {
   WorkerAcceleratorDiagnostics,
 } from "../contracts/types.js";
 import type { NativeBuildIdentity } from "../contracts/build-identity.js";
+import type { ActivationIncident } from "../coordinator/activation-incident.js";
 export type { ComputeMode } from "../contracts/types.js";
 export type { HubCatalogModel, HubCatalogPage, HubCatalogSearchInput, HubCatalogSort } from "../contracts/types.js";
 
@@ -132,6 +133,7 @@ export interface RequestedModelCapacity {
   weightBytes: number | null;
   contextTokens: number;
   message: string;
+  activationIncident: ActivationIncident | null;
   activationProgress: Array<{
     phase: string;
     message: string;

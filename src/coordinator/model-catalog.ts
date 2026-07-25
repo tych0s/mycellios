@@ -5,6 +5,7 @@ import {
   MODEL_ADAPTER_REGISTRY_ID,
   resolveModelAdapterContract,
 } from "../contracts/model-adapter-registry.js";
+import type { ActivationIncident } from "./activation-incident.js";
 
 const MIB = 1024 * 1024;
 const MAX_SAFETENSORS_HEADER_BYTES = 64 * MIB;
@@ -172,6 +173,7 @@ export interface RequestedModelCapacityView {
   weightBytes: number | null;
   contextTokens: number;
   message: string;
+  activationIncident: ActivationIncident | null;
   activationProgress: readonly ModelActivationProgressEvent[];
   activationRequestedAt: string | null;
   createdAt: string;
@@ -258,6 +260,7 @@ export function requestedModelCapacityViews(input: {
   executionNodesForModel?: (modelId: string) => readonly ModelExecutionCapacityNode[];
   activationProgressForModel?: (modelId: string) => readonly ModelActivationProgressEvent[];
   activationStatusMessageForModel?: (modelId: string) => string | null;
+  activationIncidentForModel?: (modelId: string) => ActivationIncident | null;
   activationAvailable?: boolean;
 }): RequestedModelCapacityView[] {
   const workerCapacity = input.workers
@@ -336,6 +339,7 @@ export function requestedModelCapacityViews(input: {
       weightBytes: profile?.weightBytes ?? null,
       contextTokens: request.contextTokens,
       message,
+      activationIncident: input.activationIncidentForModel?.(request.id) ?? null,
       activationProgress: input.activationProgressForModel?.(request.id) ?? [],
       activationRequestedAt: request.activationRequestedAt === null
         ? null
