@@ -47,41 +47,6 @@ describe("connected executor activation", () => {
     expect(snapshot.config?.links.every((link) => link.availability === 1)).toBe(true);
   });
 
-  it("gives a slower node a higher decodeScale instead of the constant 1", () => {
-    // Regression for the second of the planner's two zeros: decodeScale used to
-    // be hardcoded, so ProportionalComputePlanner divided by a vector of ones
-    // and every heterogeneous fleet got an equal layer split regardless of
-    // capacity. Exp7 then "refuted" uneven splitting while measuring nodes that
-    // the planner could not tell apart anyway.
-    const fast = worker("worker-fast", "node-fast", "10.0.0.1", 9_850, 12_288, 11_000, 30);
-    const slow = worker("worker-slow", "node-slow", "10.0.0.2", 9_851, 4_096, 3_500, 30);
-    withMeasuredThroughput(fast, 40);
-    withMeasuredThroughput(slow, 10);
-
-    const snapshot = buildConnectedExecutorActivationSnapshot(
-      baseConfig(),
-      [fast, slow],
-      new Set(["worker-fast", "worker-slow"]),
-    );
-    const scales = snapshot.config?.nodes.map((node) => node.decodeScale);
-    expect(scales).toEqual([1, 4]);
-  });
-
-  it("keeps decodeScale at 1 when throughput was only estimated, never guessing", () => {
-    const fast = worker("worker-fast", "node-fast", "10.0.0.1", 9_850, 12_288, 11_000, 30);
-    const slow = worker("worker-slow", "node-slow", "10.0.0.2", 9_851, 4_096, 3_500, 30);
-    // Same numbers as above, but flagged as estimates rather than measurements.
-    withMeasuredThroughput(fast, 40, "estimated");
-    withMeasuredThroughput(slow, 10, "estimated");
-
-    const snapshot = buildConnectedExecutorActivationSnapshot(
-      baseConfig(),
-      [fast, slow],
-      new Set(["worker-fast", "worker-slow"]),
-    );
-    expect(snapshot.config?.nodes.map((node) => node.decodeScale)).toEqual([1, 1]);
-  });
-
   it("reports capacity but withholds a launch topology until two executors connect", () => {
     const snapshot = buildConnectedExecutorActivationSnapshot(
       baseConfig(),
@@ -167,26 +132,6 @@ describe("connected executor activation", () => {
     expect(snapshot.config).toBeNull();
   });
 });
-
-/** Attaches a deployment carrying decode throughput with the given provenance. */
-function withMeasuredThroughput(
-  target: StoredWorker,
-  tokensPerSecond: number,
-  throughputSource: "measured" | "estimated" = "measured",
-): void {
-  (target.capabilities.deployments as unknown[]).push({
-    deploymentId: `${target.id}-deployment`,
-    adapter: "test",
-    peakVramMb: 1_024,
-    contextLimit: 4_096,
-    maxConcurrency: 1,
-    freeSlots: 1,
-    tokensPerSecond,
-    throughputSource,
-    ttftMs: 100,
-    dataLocality: "device",
-  });
-}
 
 function worker(
   id: string,

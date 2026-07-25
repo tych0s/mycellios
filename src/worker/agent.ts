@@ -25,7 +25,6 @@ import {
   type HardwareProbe,
   type VerifiedGpuRuntimeEvidence,
 } from "./hardware.js";
-import { CoordinatorRttTracker } from "./link-telemetry.js";
 import { llmfitHardwareFallback, probeLlmfit } from "./llmfit.js";
 import {
   LaunchProcessExitedError,
@@ -205,12 +204,6 @@ export class WorkerAgent {
   private registeredWorkerId: string | undefined;
   private capabilities: WorkerCapabilities | null = null;
   private socket: WebSocket | null = null;
-  /**
-   * Measures the coordinator round trip so `capabilities.network.coordinatorRttMs`
-   * stops being the constant 0 that every placement consumer downstream was
-   * planning on. See `link-telemetry.ts` for why this is not cosmetic.
-   */
-  private readonly rttTracker = new CoordinatorRttTracker();
   private stopped = false;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private readonly activeJobs = new Map<string, AbortController>();
@@ -610,16 +603,7 @@ export class WorkerAgent {
       this.socket = socket;
       socket.on("open", () => {
         opened = true;
-        // A reconnect must not let a pong from the previous socket pair with a
-        // ping sent on this one.
-        this.rttTracker.reset();
         this.sendMessage("worker.hello", {});
-      });
-      // WebSocket-level ping/pong: the peer's `ws` answers automatically, so
-      // this measures the real control-plane round trip without adding a
-      // message type or any coordinator-side work.
-      socket.on("pong", () => {
-        this.rttTracker.markPongReceived(Date.now());
       });
       socket.on("message", (raw) => {
         let decoded: unknown;
@@ -644,7 +628,6 @@ export class WorkerAgent {
         if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
         this.heartbeatTimer = null;
         this.socket = null;
-        this.rttTracker.reset();
         void this.abortActiveJobs("Coordinator disconnected");
         void this.resetDistributedRuntime("coordinator_disconnected").finally(() => {
           if (opened) resolve();
@@ -977,24 +960,6 @@ export class WorkerAgent {
 
   private async sendHeartbeat(): Promise<void> {
     if (!this.capabilities || !this.socket || this.socket.readyState !== WebSocket.OPEN) return;
-    // Publish the RTT measured since the previous heartbeat, then start the
-    // next probe. Reporting before pinging keeps this heartbeat carrying a
-    // completed measurement instead of racing an in-flight one.
-    const measuredRtt = this.rttTracker.publishedRttMs();
-    if (measuredRtt !== null && measuredRtt !== this.capabilities.network.coordinatorRttMs) {
-      this.capabilities = {
-        ...this.capabilities,
-        network: { ...this.capabilities.network, coordinatorRttMs: measuredRtt },
-      };
-    }
-    try {
-      this.rttTracker.markPingSent(Date.now());
-      this.socket.ping();
-    } catch {
-      // A ping that cannot be sent is not a heartbeat failure: drop the pending
-      // sample so no pong can pair with it and carry on reporting.
-      this.rttTracker.reset();
-    }
     const [metrics, liveHardware] = await Promise.all([
       this.adapter.metrics(),
       this.config.capacityScope === "host"
