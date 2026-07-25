@@ -16,7 +16,9 @@ from torch import nn
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from transformers.cache_utils import DynamicLayer
 
+from .decode_attention import apply_to as apply_grouped_prefix_attention
 from .device import TorchExecutionDevice, resolve_torch_execution_device
+from .kv_arena import ArenaCache, ArenaLayer, stack_into_arena
 from .model_adapters import (
     SelectiveStageAdapter,
     resolve_selective_stage_adapter,
@@ -37,6 +39,40 @@ class ModelArtifactReference:
 
 STAGE_QUANTIZE_MODES = (None, "dynamic-int8")
 STAGE_COMPILE_MODES = (None, "default", "reduce-overhead")
+# ``arena`` appends KV in place; ``dynamic`` keeps Transformers' concatenating
+# cache.  Both are token-exact: the mode exists so the A/B can be run in one
+# interleaved campaign, not because the results differ.
+STAGE_KV_CACHE_MODES = ("arena", "dynamic")
+# Decode attention. ``grouped-prefix`` regroups the query into its KV groups and
+# reads the cache in place, instead of expanding the cached keys/values by the
+# group factor on every token. It computes the same function; because it reaches
+# it through a different GEMM shape, floating point reduction order differs and
+# the result is arithmetically equivalent rather than bit-identical (measured
+# max deviation 1.6e-7 in FP32 -- four orders of magnitude below the perturbation
+# the default FP16 activation codec already introduces on the wire). Token
+# equality against the FP32 reference is asserted by the benchmark on every run.
+STAGE_DECODE_ATTENTION_MODES = ("grouped-prefix", "stock")
+
+
+def _new_request_cache(config: Any, mode: str) -> DynamicCache:
+    """Build the per-request KV cache for a stage."""
+
+    if mode == "arena":
+        return ArenaCache(config=config)
+    return DynamicCache(config=config)
+
+
+def _is_batchable_layer(layer: Any) -> bool:
+    """Whether a cache layer exposes a complete, losslessly splittable KV tensor.
+
+    ``DynamicLayer`` stores every position in ``keys``/``values``.  ``ArenaLayer``
+    exposes exactly the same view over its arena, so both can be merged into a
+    physical batch and split back without losing state.  Sliding, hybrid, static
+    and offload layers carry extra cursor/window state and stay on the
+    sequential path.
+    """
+
+    return type(layer) is DynamicLayer or type(layer) is ArenaLayer
 
 
 @dataclass(frozen=True)
@@ -55,6 +91,12 @@ class StageModelSpec:
     # APPROXIMATE mode: it may change greedy tokens versus the FP32 reference.
     quantize: str | None = None
     compile_mode: str | None = None
+    # KV cache layout. ``arena`` appends new positions into preallocated storage
+    # instead of concatenating the whole history per step; it is token-exact and
+    # is the default. ``dynamic`` restores Transformers' concatenating cache so
+    # the two can be compared in one interleaved A/B campaign.
+    kv_cache: str = "arena"
+    decode_attention: str = "grouped-prefix"
 
     def __post_init__(self) -> None:
         if not self.model_name.strip():
@@ -73,6 +115,12 @@ class StageModelSpec:
             raise ValueError(f"quantize must be one of {STAGE_QUANTIZE_MODES}")
         if self.compile_mode not in STAGE_COMPILE_MODES:
             raise ValueError(f"compile_mode must be one of {STAGE_COMPILE_MODES}")
+        if self.kv_cache not in STAGE_KV_CACHE_MODES:
+            raise ValueError(f"kv_cache must be one of {STAGE_KV_CACHE_MODES}")
+        if self.decode_attention not in STAGE_DECODE_ATTENTION_MODES:
+            raise ValueError(
+                f"decode_attention must be one of {STAGE_DECODE_ATTENTION_MODES}"
+            )
         for name, value in (
             ("artifact_identity", self.artifact_identity),
             ("canonical_model_source", self.canonical_model_source),
@@ -217,6 +265,10 @@ class StageRunner:
         self.compute_device = execution_device.device
         self.compute_dtype = compute_dtype
         self.hidden_size = int(model.config.hidden_size)
+        self._grouped_prefix_attention = bool(
+            spec.decode_attention == "grouped-prefix"
+            and apply_grouped_prefix_attention(self.base)
+        )
         self.parameter_bytes = _unique_parameter_bytes(self.base, self.head)
         self.loader = loader
         self.spec = spec
@@ -287,6 +339,12 @@ class StageRunner:
                     if self._physical_batch_cache_supported
                     else ()
                 ),
+                *(
+                    ("grouped-prefix-decode-attention",)
+                    if self._grouped_prefix_attention
+                    else ()
+                ),
+                *(("append-in-place-kv",) if spec.kv_cache == "arena" else ()),
             ),
         )
         # Opt-in spike variants. Applied after the manifest so the default
@@ -322,7 +380,12 @@ class StageRunner:
     def begin(self, request_id: int) -> None:
         if request_id in self.active_requests:
             raise ValueError(f"request {request_id} is already active")
-        self.caches.pop(request_id, None)
+        # The cache is created here rather than left to Transformers so the
+        # stage owns its KV layout; an absent entry would silently fall back to
+        # the concatenating default on the first forward.
+        self.caches[request_id] = _new_request_cache(
+            self.base.config, self.spec.kv_cache
+        )
         self.tokens_seen[request_id] = 0
         self.active_requests.add(request_id)
 
@@ -626,7 +689,7 @@ class StageRunner:
             expected_hidden_size=None,
             integer=True,
         )
-        cache = self._merge_dynamic_caches(ids)
+        cache = self._merge_dynamic_caches(ids, headroom=token_count)
         prepared = torch.cat(tensors, dim=0).to(
             device=self._effective_compute_device()
         )
@@ -758,7 +821,7 @@ class StageRunner:
             raise ValueError(
                 "physical batching requires equal cache length, token count and cache layout"
             )
-        cache = self._merge_dynamic_caches(ids)
+        cache = self._merge_dynamic_caches(ids, headroom=token_count)
         prepared = torch.cat(tensors, dim=0).to(
             device=self._effective_compute_device(),
             dtype=self._effective_compute_dtype(),
@@ -844,7 +907,9 @@ class StageRunner:
             )
         return ids, values, token_count
 
-    def _merge_dynamic_caches(self, request_ids: tuple[int, ...]) -> DynamicCache:
+    def _merge_dynamic_caches(
+        self, request_ids: tuple[int, ...], *, headroom: int = 0
+    ) -> DynamicCache:
         if not self._physical_batch_cache_supported:
             raise ValueError("this model cache layout cannot be physically batched")
         caches = tuple(self.caches.get(request_id) for request_id in request_ids)
@@ -852,7 +917,7 @@ class StageRunner:
         if any(self.tokens_seen[request_id] != current for request_id in request_ids):
             raise ValueError("physical batching requires equal cache lengths")
 
-        merged = DynamicCache(config=self.base.config)
+        merged = _new_request_cache(self.base.config, self.spec.kv_cache)
         if current == 0:
             if any(
                 cache is not None
@@ -872,8 +937,8 @@ class StageRunner:
 
         for layer_index, target in enumerate(merged.layers):
             sources = tuple(cache.layers[layer_index] for cache in dynamic_caches)
-            if type(target) is not DynamicLayer or any(
-                type(source) is not DynamicLayer for source in sources
+            if not _is_batchable_layer(target) or any(
+                not _is_batchable_layer(source) for source in sources
             ):
                 raise ValueError("physical batching only supports plain DynamicCache layers")
             if any(
@@ -890,11 +955,76 @@ class StageRunner:
             value_shapes = {tuple(source.values.shape[1:]) for source in sources}
             if len(key_shapes) != 1 or len(value_shapes) != 1:
                 raise ValueError("physical batch cache tensor shapes differ")
-            target.update(
-                torch.cat([source.keys for source in sources], dim=0),
-                torch.cat([source.values for source in sources], dim=0),
-            )
+            if type(target) is ArenaLayer:
+                # One copy per request straight into the batch arena. The generic
+                # path pays two: `torch.cat` materialises the batch, and the layer
+                # then concatenates that result onto its empty tensor.
+                stack_into_arena(
+                    target,
+                    [source.keys for source in sources],
+                    [source.values for source in sources],
+                    headroom=headroom,
+                )
+            else:
+                target.update(
+                    torch.cat([source.keys for source in sources], dim=0),
+                    torch.cat([source.values for source in sources], dim=0),
+                )
         return merged
+
+    def _append_physical_batch_tail(
+        self,
+        request_ids: tuple[int, ...],
+        cache: Any,
+        token_count: int,
+    ) -> bool:
+        """Hand the batched forward's new positions back without recopying history.
+
+        The merged batch was built *from* these caches and the model only appends,
+        so positions ``[0, current)`` of the batched cache are byte-identical to what
+        each request already owns.  Only ``[current, current + token_count)`` is new.
+        Copying just that tail turns the per-token split from O(batch x history) into
+        O(batch x token_count), which is the dominant cost of batched decode once the
+        conversation is more than a few hundred tokens long.
+
+        Returns ``False`` (and changes nothing) whenever the fast path cannot prove
+        the precondition, so the caller falls back to the full split.
+        """
+
+        if token_count < 1:
+            return False
+        current = self.tokens_seen[request_ids[0]]
+        targets = []
+        for request_id in request_ids:
+            request_cache = self.caches.get(request_id)
+            if (
+                request_cache is None
+                or not isinstance(request_cache, DynamicCache)
+                or self.tokens_seen[request_id] != current
+                or len(request_cache.layers) < len(cache.layers)
+            ):
+                return False
+            for layer in request_cache.layers[: len(cache.layers)]:
+                if not _is_batchable_layer(layer):
+                    return False
+                if layer.is_initialized and layer.get_seq_length() != current:
+                    return False
+                if not layer.is_initialized and current != 0:
+                    return False
+            targets.append(request_cache)
+        for source in cache.layers:
+            if int(source.keys.shape[-2]) != current + token_count:
+                return False
+
+        for layer_index, source in enumerate(cache.layers):
+            tail_keys = source.keys[..., current:, :]
+            tail_values = source.values[..., current:, :]
+            for batch_index, request_cache in enumerate(targets):
+                request_cache.layers[layer_index].update(
+                    tail_keys[batch_index : batch_index + 1],
+                    tail_values[batch_index : batch_index + 1],
+                )
+        return True
 
     def _commit_physical_batch(
         self,
@@ -905,7 +1035,7 @@ class StageRunner:
         if not isinstance(cache, DynamicCache):
             raise TypeError("physical model forward did not return DynamicCache")
         if len(cache.layers) == 0 or any(
-            type(layer) is not DynamicLayer
+            not _is_batchable_layer(layer)
             or not layer.is_initialized
             or layer.keys is None
             or layer.values is None
@@ -915,18 +1045,24 @@ class StageRunner:
         ):
             raise TypeError("physical model forward returned an unsupported cache layout")
 
-        split = [DynamicCache(config=self.base.config) for _ in request_ids]
-        for layer_index, source in enumerate(cache.layers):
-            for batch_index, target_cache in enumerate(split):
-                target = target_cache.layers[layer_index]
-                if type(target) is not DynamicLayer:
-                    raise TypeError("physical cache split changed the cache layout")
-                target.update(
-                    source.keys[batch_index : batch_index + 1].clone(),
-                    source.values[batch_index : batch_index + 1].clone(),
-                )
-        for request_id, request_cache in zip(request_ids, split, strict=True):
-            self.caches[request_id] = request_cache
+        appended = self._append_physical_batch_tail(request_ids, cache, token_count)
+        if not appended:
+            split = [
+                _new_request_cache(self.base.config, self.spec.kv_cache)
+                for _ in request_ids
+            ]
+            for layer_index, source in enumerate(cache.layers):
+                for batch_index, target_cache in enumerate(split):
+                    target = target_cache.layers[layer_index]
+                    if not _is_batchable_layer(target):
+                        raise TypeError("physical cache split changed the cache layout")
+                    target.update(
+                        source.keys[batch_index : batch_index + 1].clone(),
+                        source.values[batch_index : batch_index + 1].clone(),
+                    )
+            for request_id, request_cache in zip(request_ids, split, strict=True):
+                self.caches[request_id] = request_cache
+        for request_id in request_ids:
             self.tokens_seen[request_id] += token_count
         self.model_forward_calls += 1
         self.physical_batch_calls += 1
@@ -1000,7 +1136,7 @@ def _supports_dynamic_tensor_batching(config: Any) -> bool:
         cache = DynamicCache(config=config)
     except (AttributeError, TypeError, ValueError):
         return False
-    return bool(cache.layers) and all(type(layer) is DynamicLayer for layer in cache.layers)
+    return bool(cache.layers) and all(_is_batchable_layer(layer) for layer in cache.layers)
 
 
 def _apply_dynamic_int8(
