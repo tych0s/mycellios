@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum
 import math
+import queue
 import socket
 import struct
+import threading
 import time
 import zlib
 
@@ -184,15 +186,128 @@ class EncodedTensorPayload:
 
 @dataclass(frozen=True)
 class LinkEmulator:
+    """Emula un enlace WAN separando sus DOS costes, que son físicamente distintos.
+
+    - **Serialización** (`bytes / ancho_de_banda`): el emisor no puede empujar el
+      frame siguiente hasta que éste ha salido por el cable. Es serial de verdad,
+      así que se cobra bloqueando al emisor.
+    - **Propagación** (`one_way_delay_ms`): el tiempo que el frame tarda en llegar.
+      **NO es serial**: varios frames viajan a la vez. Cobrarla bloqueando al
+      emisor convierte el retardo en serialización y multiplica por W (ventanas en
+      vuelo) un coste que la red paga UNA vez.
+
+    Esa confusión era el bug: con W=4 ventanas y 65 ms, el emulador cobraba 260 ms
+    en serie donde la red cobra 65, así que cualquier medida de la cinta
+    especulativa daba un falso negativo GARANTIZADO — parecía que solapar no
+    servía de nada aunque la implementación fuese perfecta.
+
+    Ahora la propagación la aplica un hilo de entrega por enlace (ver
+    `_EmulatedLink`), que preserva el orden y deja al emisor libre.
+    """
+
     one_way_delay_ms: float = 0.0
     bandwidth_mbps: float = 0.0
 
+    @property
+    def propagation_seconds(self) -> float:
+        """Coste que la red paga en paralelo para todos los frames en vuelo."""
+        return max(0.0, self.one_way_delay_ms) / 1_000
+
+    def serialization_seconds(self, payload_bytes: int) -> float:
+        """Coste que el emisor paga en serie, frame a frame."""
+        if self.bandwidth_mbps <= 0:
+            return 0.0
+        return (payload_bytes * 8) / (self.bandwidth_mbps * 1_000_000)
+
     def wait_before_send(self, payload_bytes: int) -> None:
-        seconds = max(0.0, self.one_way_delay_ms) / 1_000
-        if self.bandwidth_mbps > 0:
-            seconds += (payload_bytes * 8) / (self.bandwidth_mbps * 1_000_000)
+        """Modelo antiguo: cobra AMBOS costes en serie al emisor.
+
+        Se conserva sólo para código que aún no pasa por `send_frame`. Es el
+        modelo incorrecto para más de un frame en vuelo; no usar en camino nuevo.
+        """
+        seconds = self.propagation_seconds + self.serialization_seconds(payload_bytes)
         if seconds > 0:
             time.sleep(seconds)
+
+
+class _EmulatedLink:
+    """Cola FIFO + hilo de entrega para un socket con propagación emulada.
+
+    Un solo hilo por enlace garantiza que el orden de llegada es el orden de
+    envío: sin eso, dos frames con el mismo instante de entrega podrían cruzarse
+    y corromper el stream.
+    """
+
+    __slots__ = ("_sock", "_queue", "_thread", "_error", "_stop")
+
+    def __init__(self, sock: socket.socket) -> None:
+        self._sock = sock
+        self._queue: "queue.Queue[tuple[float, bytes] | None]" = queue.Queue()
+        self._error: BaseException | None = None
+        self._stop = False
+        self._thread = threading.Thread(
+            target=self._deliver_loop,
+            name="gdlp-link-emulator",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def send(self, blob: bytes, propagation_seconds: float) -> None:
+        # Un fallo del hilo de entrega tiene que salir por la cara del emisor:
+        # si se tragase, el llamante creería que envió y se quedaría esperando
+        # una respuesta que nunca sale.
+        if self._error is not None:
+            raise self._error
+        self._queue.put((time.monotonic() + propagation_seconds, blob))
+
+    def _deliver_loop(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            release_at, blob = item
+            remaining = release_at - time.monotonic()
+            if remaining > 0:
+                time.sleep(remaining)
+            try:
+                self._sock.sendall(blob)
+            except BaseException as error:  # noqa: BLE001 - se reexpone al emisor
+                self._error = error
+                return
+
+    def close(self, timeout: float = 5.0) -> None:
+        """Vacía lo pendiente con un plazo acotado y para el hilo."""
+        self._queue.put(None)
+        self._thread.join(timeout)
+
+
+_EMULATED_LINKS: dict[socket.socket, _EmulatedLink] = {}
+_EMULATED_LINKS_LOCK = threading.Lock()
+
+
+def _emulated_link(sock: socket.socket) -> _EmulatedLink:
+    with _EMULATED_LINKS_LOCK:
+        link = _EMULATED_LINKS.get(sock)
+        if link is None:
+            link = _EmulatedLink(sock)
+            _EMULATED_LINKS[sock] = link
+        return link
+
+
+def _existing_emulated_link(sock: socket.socket) -> _EmulatedLink | None:
+    """Devuelve el enlace emulado de `sock` SIN crearlo."""
+    if not _EMULATED_LINKS:
+        return None  # camino de producción: ni un lock que tomar
+    with _EMULATED_LINKS_LOCK:
+        return _EMULATED_LINKS.get(sock)
+
+
+def close_emulated_link(sock: socket.socket, timeout: float = 5.0) -> None:
+    """Cierra el enlace emulado de `sock` si lo tenía. Idempotente."""
+    with _EMULATED_LINKS_LOCK:
+        link = _EMULATED_LINKS.pop(sock, None)
+    if link is not None:
+        link.close(timeout)
 
 
 def configure_socket(sock: socket.socket) -> None:
@@ -251,12 +366,28 @@ def send_frame(
         hidden_size,
         payload_size,
     )
+    frame_bytes = len(header) + payload_size
+    # La serialización SÍ es serial: el emisor no puede empujar el frame
+    # siguiente hasta que éste ha salido. Se cobra bloqueando aquí.
     if emulator is not None:
-        emulator.wait_before_send(len(header) + payload_size)
+        serialization = emulator.serialization_seconds(frame_bytes)
+        if serialization > 0:
+            time.sleep(serialization)
+    # La propagación NO es serial. Si este enlace la emula, la entrega la hace
+    # un hilo con cola FIFO. Una vez que un socket tiene enlace emulado, TODO
+    # envío debe pasar por él: un `sendall` directo en paralelo se intercalaría
+    # con el hilo de entrega y partiría el stream por la mitad.
+    link = _existing_emulated_link(sock)
+    if link is None and emulator is not None and emulator.propagation_seconds > 0:
+        link = _emulated_link(sock)
+    if link is not None:
+        propagation = emulator.propagation_seconds if emulator is not None else 0.0
+        link.send(header + payload if payload else bytes(header), propagation)
+        return frame_bytes
     sock.sendall(header)
     if payload:
         sock.sendall(payload)
-    return len(header) + payload_size
+    return frame_bytes
 
 
 def recv_frame(sock: socket.socket) -> Frame:

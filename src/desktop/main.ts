@@ -20,6 +20,7 @@ import { workerConfigSchema, type WorkerConfig } from "../contracts/schemas.js";
 import type { CoordinatorRuntime } from "../coordinator/server.js";
 import { createCoordinator } from "../coordinator/server.js";
 import { DynamicModelActivationManager } from "../coordinator/model-activation-manager.js";
+import { estimateLinkLatencyMs } from "../coordinator/connected-executor-activation.js";
 import { parseAutoDistributionConfig } from "../distribution/auto-distribute.js";
 import {
   LocalProcessAgent,
@@ -1963,7 +1964,10 @@ function buildDesktopActivationSnapshot(
     .map((to) => ({
       from: from.executor.nodeId,
       to: to.executor.nodeId,
-      oneWayLatencyMs: Math.max(0.1, (from.worker.capabilities.network.coordinatorRttMs + to.worker.capabilities.network.coordinatorRttMs) / 2),
+      oneWayLatencyMs: estimateLinkLatencyMs(
+        from.worker.capabilities.network.coordinatorRttMs,
+        to.worker.capabilities.network.coordinatorRttMs,
+      ),
       jitterP95Ms: 0,
       bandwidthMbps: Math.max(1, Math.min(from.worker.capabilities.network.uplinkMbps, to.worker.capabilities.network.downlinkMbps)),
       lossRate: 0,

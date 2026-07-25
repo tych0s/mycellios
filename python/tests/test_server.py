@@ -165,6 +165,56 @@ class OutputTokenDigestTests(unittest.TestCase):
         self.assertEqual(payload["distribution_metrics"], metrics)
 
 
+class HealthStatusCodeTests(unittest.IsolatedAsyncioTestCase):
+    """Un motor muerto tiene que decirlo en el CÓDIGO, no sólo en el cuerpo.
+
+    Antes, `/health` devolvía siempre 200 y metía la palabra `degraded` dentro
+    del JSON. Todo supervisor, balanceador y sonda mira el código de estado, así
+    que un motor con error fatal —que no va a servir ni una petición más— pasaba
+    por sano. Y en el despliegue real (GpuCloud) la recuperación automática está
+    prohibida, así que nadie se enteraba nunca: outage silencioso.
+    """
+
+    async def _health(self, engine):
+        server = DistributedOpenAIServer(
+            engine,
+            _HttpTokenizer(),
+            public_model_name="distributed-test",
+            max_batch_size=2,
+            batch_window_ms=0,
+            max_output_tokens=8,
+        )
+        async with TestClient(TestServer(server.create_app())) as client:
+            response = await client.get("/health")
+            return response.status, await response.json()
+
+    async def test_a_healthy_engine_answers_200_ready(self) -> None:
+        status, body = await self._health(_HttpEngine())
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "ready")
+
+    async def test_a_dead_engine_answers_503_not_200(self) -> None:
+        engine = _HttpEngine()
+        engine.closed = True          # `healthy` pasa a False
+        status, body = await self._health(engine)
+        self.assertEqual(body["status"], "degraded")
+        self.assertEqual(
+            status, 503,
+            "un motor degradado devolvía 200: el outage era invisible para "
+            "cualquier supervisor que mire el código de estado",
+        )
+
+    async def test_a_recovering_engine_stays_200(self) -> None:
+        # Recuperarse NO es estar caído: el motor está trabajando en volver, y
+        # sacarlo del balanceador por eso alargaría el corte en vez de acortarlo.
+        engine = _HttpEngine()
+        engine.closed = True
+        engine.recovery_stats = {"configured": True, "state": "recovering"}
+        status, body = await self._health(engine)
+        self.assertEqual(body["status"], "recovering")
+        self.assertEqual(status, 200)
+
+
 class HttpInferenceEvidenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_real_http_health_non_stream_and_sse_expose_sealed_evidence(self) -> None:
         engine = _HttpEngine()

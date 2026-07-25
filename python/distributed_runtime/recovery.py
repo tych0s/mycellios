@@ -21,6 +21,7 @@ from .engine import (
     GenerationInput,
     GenerationOutput,
     PipelineRecoveryIdentity,
+    QueueFullError,
     TokenCallback,
 )
 
@@ -276,7 +277,11 @@ class RecoveringPipelineEngine:
             if duplicate is not None:
                 raise ValueError(f"client_id already active: {duplicate}")
             if len(self._jobs_by_client) + len(jobs) > self.config.max_pending_requests:
-                raise RuntimeError("pipeline request queue is full")
+                raise QueueFullError(
+                    "pipeline request queue is full",
+                    pending=len(self._jobs_by_client),
+                    capacity=self.config.max_pending_requests,
+                )
             for job in jobs:
                 self._jobs_by_client[job.request.client_id] = job
 
