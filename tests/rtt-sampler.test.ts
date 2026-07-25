@@ -1,61 +1,39 @@
 import { describe, expect, it } from "vitest";
-import { UNMEASURED_RTT_MS, derivedOneWayLatencyMs } from "../src/core/rtt.js";
+import { UNMEASURED_RTT_MS } from "../src/core/rtt.js";
 
 /**
- * Política de "sin medir" para el RTT.
+ * Política de aristas sin medir en `auto-distribute`.
  *
- * RECONCILIACIÓN (25-jul-2026): dos sesiones atacaron este cero a la vez y las
- * dos mitades son complementarias, no rivales.
+ * RECONCILIACIÓN (25-jul-2026): `main` ya resolvió el cero del RTT en la sonda
+ * y en `estimateLinkLatencyMs`, con `UNMEASURED_LINK_LATENCY_MS = 65` — la
+ * mediana medida de Exp15 — como prior informado. Lo que `main` NO tocó es el
+ * relleno por defecto de `auto-distribute`, que seguía en `sameRegion ? 1 : 35`.
  *
- * - La **mecánica de la sonda** viene de `main`: etiqueta cada ping con
- *   `RTT_PROBE_PAYLOAD` (porque `ws` emite pongs no solicitados por su propio
- *   keepalive y emparejar cualquiera corrompe la estimación), usa
- *   `process.hrtime.bigint()` monotónico, y suaviza con EMA α=0,2.
- * - La **política de ausencia** viene de aquí: mientras no haya muestra se
- *   publica el centinela, no un cero. Un cero es indistinguible de "enlace
- *   perfecto" aguas abajo, y ése era el defecto original.
- *
- * Este fichero fija la segunda mitad, que es la que no está en `main`.
+ * Este fichero fija esa mitad, alineada a la misma constante: dos convenciones
+ * distintas de "sin medir" en el mismo repositorio se contradicen en silencio.
  */
-describe("política de RTT sin medir", () => {
-  it("el centinela es mucho más caro que cualquier enlace medido plausible", () => {
-    // De esta propiedad depende toda la política: medir tiene que ser la única
-    // forma de que un nodo entre en un plan. Si alguien bajase el centinela por
-    // debajo de un RTT transcontinental real, se invierte en silencio.
-    const peorEnlaceRealista = 500;
-    expect(UNMEASURED_RTT_MS).toBeGreaterThan(peorEnlaceRealista * 10);
+describe("prior de arista sin medir", () => {
+  it("no premia al enlace desconocido, que era el defecto", () => {
+    // El relleno viejo daba 1 ms a dos nodos que compartían etiqueta de región.
+    // La etiqueta no es una medición: dos nodos `us` midieron 65 y 132 ms.
+    expect(UNMEASURED_RTT_MS).toBeGreaterThan(35);
   });
 
-  it("nunca es cero: un cero se lee aguas abajo como enlace perfecto", () => {
-    expect(UNMEASURED_RTT_MS).toBeGreaterThan(0);
+  it("es un prior plausible, no un castigo que excluya al nodo", () => {
+    // Un centinela enorme haría que un plan sin medidas fuese incomparable y
+    // que ningún nodo nuevo pudiese entrar jamás. 65 ms es un enlace típico.
+    expect(UNMEASURED_RTT_MS).toBeLessThan(500);
   });
 
-  it("es finito, para que un plan sin medidas siga siendo comparable", () => {
-    // Con `Infinity` la aritmética de comparación de planes se rompe y el
-    // planificador no puede ordenar candidatos: preferimos "carísimo" a "NaN".
+  it("coincide con el prior que ya usa el coordinador", () => {
+    // `UNMEASURED_LINK_LATENCY_MS` en `connected-executor-activation.ts`.
+    // Si alguien mueve uno sin el otro, los dos caminos de planificación
+    // empiezan a discrepar sobre qué vale un enlace desconocido.
+    expect(UNMEASURED_RTT_MS).toBe(65);
+  });
+
+  it("es finito y positivo", () => {
     expect(Number.isFinite(UNMEASURED_RTT_MS)).toBe(true);
-  });
-});
-
-describe("derivedOneWayLatencyMs", () => {
-  it("preserva la aritmética de la ruta relevada", () => {
-    // (RTT_A + RTT_B) / 2 modela A->coordinador->B, que es lo que corremos hoy.
-    expect(derivedOneWayLatencyMs(40, 60)).toBe(50);
-  });
-
-  it("propaga 'sin medir' si CUALQUIERA de los extremos no ha medido", () => {
-    // El caso que importa: un extremo desconocido no puede quedar enmascarado
-    // por promediarlo con un extremo rápido.
-    expect(derivedOneWayLatencyMs(UNMEASURED_RTT_MS, 1)).toBe(UNMEASURED_RTT_MS);
-    expect(derivedOneWayLatencyMs(1, UNMEASURED_RTT_MS)).toBe(UNMEASURED_RTT_MS);
-  });
-
-  it("una arista sin medir sale más cara que cualquiera medida", () => {
-    const peorMedida = derivedOneWayLatencyMs(500, 500);
-    expect(derivedOneWayLatencyMs(UNMEASURED_RTT_MS, 10)).toBeGreaterThan(peorMedida);
-  });
-
-  it("nunca devuelve cero ni negativo", () => {
-    expect(derivedOneWayLatencyMs(0, 0)).toBeGreaterThan(0);
+    expect(UNMEASURED_RTT_MS).toBeGreaterThan(0);
   });
 });

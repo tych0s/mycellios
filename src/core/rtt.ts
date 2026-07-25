@@ -16,36 +16,16 @@
  */
 
 /**
- * Coste asignado a un enlace del que no tenemos ninguna muestra.
+ * Coste one-way asignado a una arista de la que no tenemos ninguna muestra.
  *
- * 10 s no pretende estimar nada: es un centinela lo bastante grande como para
- * que cualquier arista medida gane siempre, y lo bastante finito como para que
- * un plan compuesto solo por enlaces desconocidos siga siendo representable en
- * vez de convertirse en `Infinity` y romper la aritmética de comparación.
+ * 65 ms es la MEDIANA MEDIDA de Exp15, no un castigo: un enlace desconocido se
+ * trata como un enlace típico de esta flota. Es la misma constante y el mismo
+ * criterio que `estimateLinkLatencyMs` en `coordinator/connected-executor-activation.ts`,
+ * y mantenerlos alineados importa — dos convenciones distintas de "sin medir"
+ * en el mismo repositorio se contradicen en silencio.
+ *
+ * Lo que sí se corrige aquí es el relleno ANTIGUO de `auto-distribute`
+ * (`sameRegion ? 1 : 35`), que premiaba al enlace del que no sabemos nada: la
+ * etiqueta de región no es una medición, y dos nodos `us` midieron 65 y 132 ms.
  */
-export const UNMEASURED_RTT_MS = 10_000;
-
-/**
- * Coste one-way de una arista derivado de dos RTT extremo-a-coordinador.
- *
- * Modela la ruta **relevada** A→coordinador→B, que es la que corremos hoy:
- * `RTT_A/2 + RTT_B/2 = (RTT_A + RTT_B)/2`. Es deliberadamente la misma
- * aritmética que ya usaban `connected-executor-activation.ts` y
- * `desktop/main.ts`; aquí solo se centraliza y se le añade la propagación de
- * "sin medir". Bajar este coste para modelar un camino directo A→B sería una
- * decisión distinta y necesita la matriz nodo↔nodo real: sin ella, dividir más
- * solo produce planes que se ven mejor sobre el papel.
- *
- * La degradación es la parte importante: si CUALQUIERA de los dos extremos está
- * sin medir, la arista entera queda sin medir. Un extremo desconocido no puede
- * quedar enmascarado por promediarlo con un extremo rápido.
- */
-export function derivedOneWayLatencyMs(
-  fromRttMs: number,
-  toRttMs: number,
-): number {
-  if (fromRttMs >= UNMEASURED_RTT_MS || toRttMs >= UNMEASURED_RTT_MS) {
-    return UNMEASURED_RTT_MS;
-  }
-  return Math.max(0.1, (fromRttMs + toRttMs) / 2);
-}
+export const UNMEASURED_RTT_MS = 65;

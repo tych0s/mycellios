@@ -62,13 +62,17 @@ describe("centinela de aristas sin medir", () => {
     expect(elegidos).not.toContain("node-unknown");
   });
 
-  it("el centinela es más caro que cualquier enlace medido plausible", () => {
-    // Propiedad de la que depende toda la política: medir tiene que ser la
-    // única forma de que un nodo entre en un plan. Si alguien bajase el
-    // centinela por debajo de un RTT transcontinental real, la política se
-    // invierte en silencio y volvemos al defecto original.
-    const peorEnlaceRealista = 500;
-    expect(UNMEASURED_RTT_MS).toBeGreaterThan(peorEnlaceRealista * 10);
+  it("el prior de 'sin medir' no premia al enlace desconocido", () => {
+    // Propiedad de la que depende la política. Tras reconciliar con `main`, el
+    // valor NO es un castigo sino la mediana medida de Exp15 (65 ms): un enlace
+    // desconocido se trata como un enlace típico de la flota, no como el mejor
+    // posible. Lo que no puede volver a pasar es que valga menos que el relleno
+    // viejo (`sameRegion ? 1 : 35`), que era el defecto.
+    expect(UNMEASURED_RTT_MS).toBeGreaterThan(35);
+    // Y tampoco puede ser tan alto que excluya de por vida a un nodo nuevo:
+    // entonces medir dejaría de ser un incentivo y pasaría a ser un requisito
+    // imposible de cumplir para quien acaba de entrar.
+    expect(UNMEASURED_RTT_MS).toBeLessThan(500);
   });
 });
 
