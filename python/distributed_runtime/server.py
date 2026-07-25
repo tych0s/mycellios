@@ -1033,6 +1033,22 @@ def build_server(args: argparse.Namespace) -> DistributedMycelliosServer:
             "sealed-wave-tokens and max-prefill-chunk-tokens must be supplied together"
         )
     ram_backed_moe = ram_backed_moe_config_from_args(args)
+    if (
+        getattr(args, "paged_kv", False)
+        and getattr(args, "paged_max_active_requests", None) is None
+        and args.max_active_sequences > 0
+        and args.max_speculative_branches >= 0
+        and args.max_retained_sessions >= 0
+    ):
+        # The product CLI is automatic: when the operator does not seal a
+        # stricter value, reserve every live, speculative and retained logical
+        # request slot instead of inheriting the lower standalone-runner
+        # default.
+        args.paged_max_active_requests = (
+            args.max_active_sequences
+            + args.max_speculative_branches
+            + args.max_retained_sessions
+        )
     paged_kv = paged_kv_config_from_args(args)
     native_gguf = native_gguf_runtime_from_args(args)
     if sum(
@@ -1176,6 +1192,26 @@ def build_server(args: argparse.Namespace) -> DistributedMycelliosServer:
         or args.retained_session_ttl_seconds <= 0
     ):
         raise ValueError("retained-session-ttl-seconds must be finite and positive")
+    if paged_kv is not None:
+        required_request_slots = (
+            args.max_active_sequences
+            + args.max_speculative_branches
+            + args.max_retained_sessions
+        )
+        if paged_kv.max_active_requests < required_request_slots:
+            raise ValueError(
+                "paged max-active-requests cannot hold all active sequences, "
+                "sealed speculative branches and retained sessions"
+            )
+        if (
+            args.max_speculative_branch_tokens > 0
+            and paged_kv.max_sequence_tokens
+            < args.max_speculative_branch_tokens
+        ):
+            raise ValueError(
+                "paged max-sequence-tokens is smaller than the sealed "
+                "speculative branch token ceiling"
+            )
     if args.recovery_max_retries < 0:
         raise ValueError("recovery-max-retries must be non-negative")
     standby_routes = parse_remote_recovery_standby_routes(
@@ -1277,24 +1313,6 @@ def build_server(args: argparse.Namespace) -> DistributedMycelliosServer:
             "server CLI native GGUF requires remote child stages with their "
             "own authenticated Mycellios packages"
         )
-    if paged_kv is not None:
-        required_request_slots = (
-            args.max_active_sequences + args.max_speculative_branches
-        )
-        if paged_kv.max_active_requests < required_request_slots:
-            raise ValueError(
-                "paged max-active-requests cannot hold all active sequences and "
-                "sealed speculative branches"
-            )
-        if (
-            args.max_speculative_branch_tokens > 0
-            and paged_kv.max_sequence_tokens
-            < args.max_speculative_branch_tokens
-        ):
-            raise ValueError(
-                "paged max-sequence-tokens is smaller than the sealed "
-                "speculative branch token ceiling"
-            )
     codec = {
         "fp32": TensorCodec.FP32,
         "fp16": TensorCodec.FP16,

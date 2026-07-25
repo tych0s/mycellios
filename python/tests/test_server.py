@@ -5,6 +5,7 @@ from concurrent.futures import Future
 import json
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from aiohttp.test_utils import TestClient, TestServer
 import torch
@@ -172,6 +173,31 @@ class EngineConfigurationTests(unittest.TestCase):
         args = parse_server_args(["--sealed-wave-tokens", "1"])
         with self.assertRaisesRegex(ValueError, "must be supplied together"):
             build_server(args)
+
+    def test_paged_slots_are_derived_or_rejected_before_model_loading(self) -> None:
+        automatic = parse_server_args(["--paged-kv"])
+        with patch(
+            "distributed_runtime.server.resolve_model_snapshot",
+            side_effect=RuntimeError("model resolution reached"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "model resolution reached"):
+                build_server(automatic)
+        self.assertEqual(automatic.paged_max_active_requests, 36)
+
+        explicit_shortfall = parse_server_args(
+            [
+                "--paged-kv",
+                "--paged-max-active-requests",
+                "35",
+            ]
+        )
+        with patch("distributed_runtime.server.resolve_model_snapshot") as resolve:
+            with self.assertRaisesRegex(
+                ValueError,
+                "active sequences, sealed speculative branches and retained sessions",
+            ):
+                build_server(explicit_shortfall)
+        resolve.assert_not_called()
 
     def test_native_draft_tree_cli_preserves_every_sealed_limit(self) -> None:
         args = parse_server_args(

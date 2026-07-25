@@ -377,6 +377,32 @@ function pagedKvOptions(
   };
 }
 
+function pagedRuntimeManifest(
+  overrides: {
+    engine?: string;
+    modelFormats?: string[];
+    executionModes?: string[];
+    deviceKinds?: string[];
+    computeApis?: string[];
+  } = {},
+): RuntimePipelineManifestV2 {
+  const input = request();
+  for (const node of input.topology.nodes) {
+    node.backend = {
+      ...node.backend,
+      engine: overrides.engine ?? "python-transformers",
+      modelFormats: overrides.modelFormats ?? ["safetensors"],
+      executionModes: overrides.executionModes ?? ["layer-range"],
+    };
+    node.capabilities = {
+      ...node.capabilities,
+      deviceKinds: overrides.deviceKinds ?? ["gpu"],
+      computeApis: overrides.computeApis ?? ["cuda"],
+    };
+  }
+  return buildRuntimePipelineManifest(input);
+}
+
 function addCooperativeMember(stage: RuntimeVirtualStageManifest): void {
   const original = stage.members[0]!;
   const assigned = Math.floor(original.assignedMemoryBytes / 2);
@@ -710,10 +736,10 @@ describe("GDLP/2 Python launch compiler", () => {
       ),
     ).toThrow("python_paged_kv_sequence_exceeds_pool");
     expect(() =>
-      compile(current, pagedKvOptions(current, { maxActiveRequests: 1 })),
+      compile(current, pagedKvOptions(current, { maxActiveRequests: 5 })),
     ).toThrow("python_paged_kv_active_request_capacity_is_too_small");
     expect(() =>
-      compile(current, pagedKvOptions(current, { maxBatchTokens: 8 })),
+      compile(current, pagedKvOptions(current, { maxBatchTokens: 7 })),
     ).toThrow("python_paged_kv_batch_token_capacity_is_too_small");
 
     expect(() =>
@@ -721,7 +747,7 @@ describe("GDLP/2 Python launch compiler", () => {
         ...nativeGgufOptions(current),
         ...pagedKvOptions(current),
       }),
-    ).toThrow("python_stage_backend_is_not_exclusive");
+    ).toThrow("python_paged_kv_stage_backend_is_not_exclusive");
 
     const cell = certifyTensorParallelCell(
       materializeTensorParallelCell(current),
@@ -729,6 +755,102 @@ describe("GDLP/2 Python launch compiler", () => {
     expect(() => compile(cell, pagedKvOptions(cell))).toThrow(
       "python_paged_kv_stage_has_conflicting_execution",
     );
+  });
+
+  it("binds paged-KV only to a compatible, verified native member", () => {
+    const gpu = pagedRuntimeManifest();
+    expect(() => compile(gpu, pagedKvOptions(gpu))).not.toThrow();
+    expect(() =>
+      compile(gpu, pagedKvOptions(gpu, { device: "cuda:1" })),
+    ).toThrow("python_paged_kv_device_index_is_not_verified");
+    expect(() =>
+      compile(
+        gpu,
+        pagedKvOptions(gpu, { device: "cpu", cpuSpillBytes: 0 }),
+      ),
+    ).toThrow("python_paged_kv_stage_lacks_cpu_capability");
+
+    const cpu = pagedRuntimeManifest({
+      deviceKinds: ["cpu"],
+      computeApis: ["torch"],
+    });
+    expect(() =>
+      compile(
+        cpu,
+        pagedKvOptions(cpu, { device: "cpu", cpuSpillBytes: 0 }),
+      ),
+    ).not.toThrow();
+    expect(() => compile(cpu, pagedKvOptions(cpu))).toThrow(
+      "python_paged_kv_stage_lacks_gpu_capability",
+    );
+
+    const rocm = pagedRuntimeManifest({ computeApis: ["rocm"] });
+    expect(() => compile(rocm, pagedKvOptions(rocm))).not.toThrow();
+    const noGpuRuntime = pagedRuntimeManifest({ computeApis: ["torch"] });
+    expect(() => compile(noGpuRuntime, pagedKvOptions(noGpuRuntime))).toThrow(
+      "python_paged_kv_stage_lacks_gpu_capability",
+    );
+  });
+
+  it("rejects paged-KV workers with an incompatible engine or artifact contract", () => {
+    const foreignEngine = pagedRuntimeManifest({ engine: "foreign-runtime" });
+    expect(() =>
+      compile(foreignEngine, pagedKvOptions(foreignEngine)),
+    ).toThrow("python_paged_kv_stage_engine_is_not_supported");
+
+    const wrongFormat = pagedRuntimeManifest({ modelFormats: ["gguf"] });
+    expect(() => compile(wrongFormat, pagedKvOptions(wrongFormat))).toThrow(
+      "python_paged_kv_stage_model_format_is_not_supported",
+    );
+
+    const wrongMode = pagedRuntimeManifest({
+      executionModes: ["tensor-parallel-cell"],
+    });
+    expect(() => compile(wrongMode, pagedKvOptions(wrongMode))).toThrow(
+      "python_paged_kv_stage_execution_mode_is_not_supported",
+    );
+  });
+
+  it("includes the sealed speculative wave in paged-KV query capacity", () => {
+    const input = request();
+    input.speculation = {
+      mode: "adaptive",
+      controller: "acceptance-adaptive",
+      defaultStrategyId: "ngram",
+      fallbackStrategyId: "autoregressive",
+      acceptanceWindowTokens: 64,
+      strategies: [
+        {
+          id: "ngram",
+          kind: "ngram",
+          maxDraftTokens: 9,
+          minAcceptanceRate: 0.5,
+          maxWasteRatio: 0.4,
+          priority: 10,
+        },
+        {
+          id: "autoregressive",
+          kind: "autoregressive",
+          maxDraftTokens: 1,
+          minAcceptanceRate: 1,
+          maxWasteRatio: 0,
+          priority: 0,
+        },
+      ],
+    };
+    const current = buildRuntimePipelineManifest(input);
+    expect(() =>
+      compile(current, {
+        ...pagedKvOptions(current, { maxBatchTokens: 9 }),
+        maxRetainedSessions: 0,
+      }),
+    ).toThrow("python_paged_kv_batch_token_capacity_is_too_small");
+    expect(() =>
+      compile(current, {
+        ...pagedKvOptions(current, { maxBatchTokens: 10 }),
+        maxRetainedSessions: 0,
+      }),
+    ).not.toThrow();
   });
 
   it("proves logical stage zero never invokes stage_cli", () => {

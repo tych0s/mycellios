@@ -1908,6 +1908,9 @@ function normalizePagedKvStages(
     if (!/^(?:cpu|cuda(?::(?:0|[1-9]\d*))?)$/.test(device)) {
       throw new Error(`python_paged_kv_device_is_invalid:${stageId}`);
     }
+    if (device.startsWith("cuda") && device !== "cuda" && device !== "cuda:0") {
+      throw new Error(`python_paged_kv_device_index_is_not_verified:${stageId}`);
+    }
     if (input.attentionBackend !== "eager" && input.attentionBackend !== "sdpa") {
       throw new Error(`python_paged_kv_attention_backend_is_invalid:${stageId}`);
     }
@@ -1967,8 +1970,22 @@ function normalizePagedKvStages(
       if (phaseStage.members.length !== 1) {
         throw new Error(`python_paged_kv_stage_requires_single_member:${stageId}`);
       }
-      if (device.startsWith("cuda")) {
-        const capabilities = phaseStage.members[0]!.capabilities;
+      const member = phaseStage.members[0]!;
+      if (member.backend.engine !== "python-transformers") {
+        throw new Error(`python_paged_kv_stage_engine_is_not_supported:${stageId}`);
+      }
+      if (!member.backend.modelFormats.includes("safetensors")) {
+        throw new Error(`python_paged_kv_stage_model_format_is_not_supported:${stageId}`);
+      }
+      if (!member.backend.executionModes.includes("layer-range")) {
+        throw new Error(`python_paged_kv_stage_execution_mode_is_not_supported:${stageId}`);
+      }
+      if (device === "cpu") {
+        if (!member.capabilities.deviceKinds.includes("cpu")) {
+          throw new Error(`python_paged_kv_stage_lacks_cpu_capability:${stageId}`);
+        }
+      } else {
+        const capabilities = member.capabilities;
         if (
           !capabilities.deviceKinds.includes("gpu")
           || !capabilities.computeApis.some(
@@ -2042,13 +2059,18 @@ function validateExclusiveStageBindings(
     ...Object.keys(ramBackedMoeStages),
     ...Object.keys(pagedKvStages),
   ])) {
-    const bindingCount = [
-      nativeGgufStages,
-      ramBackedMoeStages,
-      pagedKvStages,
-    ].filter((bindings) => Object.hasOwn(bindings, stageId)).length;
-    if (bindingCount > 1) {
-      throw new Error(`python_stage_backend_is_not_exclusive:${stageId}`);
+    const hasNativeGguf = Object.hasOwn(nativeGgufStages, stageId);
+    const hasRamBackedMoe = Object.hasOwn(ramBackedMoeStages, stageId);
+    const hasPagedKv = Object.hasOwn(pagedKvStages, stageId);
+    if (hasNativeGguf && hasRamBackedMoe) {
+      throw new Error(
+        `python_native_gguf_stage_backend_is_not_exclusive:${stageId}`,
+      );
+    }
+    if (hasPagedKv && (hasNativeGguf || hasRamBackedMoe)) {
+      throw new Error(
+        `python_paged_kv_stage_backend_is_not_exclusive:${stageId}`,
+      );
     }
   }
 }
