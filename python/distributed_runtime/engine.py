@@ -5,10 +5,8 @@ from collections import deque
 from collections.abc import Sequence
 import copy
 from dataclasses import dataclass, field
-import json
 import math
 import multiprocessing as mp
-import os
 import queue
 import select
 import socket
@@ -134,39 +132,6 @@ def _hadamard_quantization_block_count(hidden_size: int) -> int:
         remaining -= size
         blocks += 1
     return blocks
-
-
-_BATCH_DEBUG_PATH = os.environ.get("GDLP_BATCH_DEBUG")
-
-
-def _ragged_grouping_enabled() -> bool:
-    """Opt-in switch for length-agnostic (ragged) physical batching.
-
-    Checked at call time so tests and deployments can toggle it via the
-    environment without reloading modules. Default OFF: the strict equal-length
-    grouping stays the production default until ragged fusion is re-measured at
-    saturation on a weight-bound model (checklist 2.6; the 135M/CPU testbed
-    regressed, larger models measure fusion-efficient — see
-    docs/benchmarks/ragged-batching-integration-2026-07-23/).
-    """
-
-    return os.environ.get("GDLP_RAGGED_GROUPING") == "1"
-
-
-def _batch_debug(record: dict[str, Any]) -> None:
-    """Append one JSON line of root-batching diagnostics when GDLP_BATCH_DEBUG is set.
-
-    Zero-cost when the environment variable is absent; failures to write are
-    swallowed so instrumentation can never break the serving path.
-    """
-
-    if not _BATCH_DEBUG_PATH:
-        return
-    try:
-        with open(_BATCH_DEBUG_PATH, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record) + "\n")
-    except (OSError, TypeError, ValueError):
-        pass
 
 
 def _prefill_frame_byte_reservation(
@@ -2032,7 +1997,7 @@ class DistributedPipelineEngine:
                         self._admit_batch(batch, active, runner, downstream, emulator)
                         decode_since_admission = 0
                     continue
-                ready_values = self._collect_ready_return_values(value, len(active))
+                ready_values = self._collect_ready_return_values(value)
                 prepared: list[
                     _PreparedRootWave
                     | _PreparedPhysicalTreeWave
@@ -2101,26 +2066,12 @@ class DistributedPipelineEngine:
     def _collect_ready_return_values(
         self,
         first: tuple[Any, float] | BaseException,
-        active_count: int | None = None,
     ) -> tuple[tuple[Any, float] | BaseException, ...]:
-        """Reconstruct one downstream completion wave without blocking fairness.
-
-        Adaptive collection window: the window only pays when more than one
-        sequence is in flight (else no wave can form and the wait is pure
-        latency). With <=1 in flight the effective window is zero, so a
-        low-load or single-stream workload never eats the coalescing delay;
-        the window opens only when there is a real backlog to fuse. This is
-        what makes ragged batching (checklist 2.6) safe to enable without a
-        low-load latency penalty.
-        """
+        """Reconstruct one downstream completion wave without blocking fairness."""
 
         values: list[tuple[Any, float] | BaseException] = [first]
         limit = max(1, self.config.max_active_sequences)
-        if active_count is not None:
-            limit = max(1, min(limit, int(active_count)))
-        window_ms = self.config.root_batch_window_ms if limit >= 2 else 0.0
-        collect_started = time.monotonic()
-        deadline = collect_started + window_ms / 1_000
+        deadline = time.monotonic() + self.config.root_batch_window_ms / 1_000
         while len(values) < limit:
             try:
                 values.append(self._received_frames.get_nowait())
@@ -2134,16 +2085,6 @@ class DistributedPipelineEngine:
                 values.append(self._received_frames.get(timeout=remaining))
             except queue.Empty:
                 break
-        _batch_debug(
-            {
-                "ev": "collect",
-                "n": len(values),
-                "wait_ms": (time.monotonic() - collect_started) * 1_000,
-                "qsize_after": self._received_frames.qsize(),
-                "limit": limit,
-                "window_ms": window_ms,
-            }
-        )
         return tuple(values)
 
     def _admit_batch(
@@ -4850,16 +4791,7 @@ class DistributedPipelineEngine:
         self._root_ready_items += len(waves)
 
         batch_forward = getattr(runner, "forward_ids_batch", None)
-        # Strict equal-length grouping by default; GDLP_RAGGED_GROUPING=1 opts in
-        # to the length-agnostic key (ragged fusion, checklist 2.6 — token-exact,
-        # pending saturation re-measurement on a weight-bound model/GPU; see
-        # REGISTRO_VERIFICACIONES.md §8).
-        if _ragged_grouping_enabled():
-            batch_key = getattr(runner, "physical_batch_group_key", None) or getattr(
-                runner, "physical_batch_key", None
-            )
-        else:
-            batch_key = getattr(runner, "physical_batch_key", None)
+        batch_key = getattr(runner, "physical_batch_key", None)
         maximum = getattr(runner, "MAX_PHYSICAL_BATCH_SIZE", 1)
         if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 2:
             maximum = 1
@@ -4891,33 +4823,6 @@ class DistributedPipelineEngine:
             # preserving its position relative to the first compatible group.
             group_key = key if key is not None else ("sequential", index)
             groups.setdefault(group_key, []).append(wave)
-
-        if _BATCH_DEBUG_PATH:
-            keyed = [
-                key
-                for key in groups
-                if not (
-                    isinstance(key, tuple) and len(key) == 2 and key[0] == "sequential"
-                )
-            ]
-            kv_lengths: list[int] = []
-            for key in keyed:
-                try:
-                    kv_lengths.append(int(key[4][0]))
-                except (IndexError, TypeError, ValueError):
-                    pass
-            _batch_debug(
-                {
-                    "ev": "dispatch",
-                    "waves": len(waves),
-                    "group_sizes": sorted(
-                        (len(group) for group in groups.values()), reverse=True
-                    ),
-                    "keyed_groups": len(keyed),
-                    "keyless_groups": len(groups) - len(keyed),
-                    "kv_lengths": kv_lengths,
-                }
-            )
 
         for group in groups.values():
             for offset in range(0, len(group), max(1, maximum)):
