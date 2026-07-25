@@ -264,6 +264,11 @@ export interface AutoDistributionRunOptions {
     launch: PythonPipelineLaunchDescription,
   ) => LaunchAgent | undefined;
   onProgress?: (event: AutoDistributionProgressEvent) => void;
+  /**
+   * Atomic publication hook. It runs after health and real inference canary
+   * succeed, but before the model is announced as active.
+   */
+  onActivated?: (result: AutoDistributionRunResult) => void | Promise<void>;
 }
 
 export interface AutoDistributionProgressEvent {
@@ -490,6 +495,7 @@ export async function runAutoDistribution(
       canaryMetrics: canary.metrics,
       workerId: worker?.workerId ?? null,
     };
+    await options.onActivated?.(result);
     await writeRuntimeStatus(config, result, cwd, "running");
     options.onProgress?.({
       phase: "active",

@@ -3,7 +3,9 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { sha256Text } from "../core/json.js";
 import { probeHardware, type HardwareProbe } from "../worker/hardware.js";
+import { sealBenchmarkScenario } from "./scenario.js";
 import {
   BENCHMARK_RUN_SCHEMA,
   emptyComparison,
@@ -73,6 +75,7 @@ export interface ApiBenchmarkDocument {
     output_tokens: number;
     warm_batches_per_scenario: number;
     measured_batches_per_scenario: number;
+    prompt_digest?: string;
   };
   rows: ApiBenchmarkRow[];
   server_after_measurement: RuntimeHealth;
@@ -124,7 +127,7 @@ export function buildRealBenchmarkRun(
 ): BenchmarkRun {
   validateBenchmarkDocument(benchmark);
   const health = benchmark.server_after_measurement;
-  const profiles = realDeviceProfiles(hardware);
+  const profiles = realDeviceProfiles(hardware, health.codec);
   const remoteConnected = coordinator?.summary.connected ?? 0;
   const measurements = benchmark.rows.map((row) =>
     rowToMeasurement(row, benchmark, health, profiles, hardware, coordinator, remoteConnected),
@@ -180,7 +183,11 @@ async function executeApiBenchmark(options: RealRuntimeOptions & {
       },
     },
   );
-  return JSON.parse(stdout) as ApiBenchmarkDocument;
+  const document = JSON.parse(stdout) as ApiBenchmarkDocument;
+  document.configuration.prompt_digest = sha256Text(
+    options.prompt ?? "Explica en una frase que hace una GPU. Muestra {request}.",
+  );
+  return document;
 }
 
 async function discoverRuntimeUrl(cwd: string): Promise<string> {
@@ -265,7 +272,7 @@ function rowToMeasurement(
   const samples = row.request_samples;
   const successful = row.nonempty === row.measured_requests && row.measured_requests > 0;
   const requestTps = samples.map((sample) => sample.completion_tokens / (sample.response_ms / 1_000));
-  return {
+  return sealBenchmarkScenario({
     id: `runtime-${health.artifact_identity.slice(0, 18)}-c${row.concurrency}`,
     title: `${health.model} real · concurrencia ${row.concurrency}`,
     description: "Peticiones reales por la API OpenAI-compatible y el pipeline GDLP/2 activo.",
@@ -275,6 +282,7 @@ function rowToMeasurement(
       id: health.canonical_model_source,
       label: health.model,
       revision: health.canonical_model_revision,
+      digest: health.artifact_identity,
       precision: health.codec,
     },
     inventory: {
@@ -283,10 +291,19 @@ function rowToMeasurement(
       selectedDevices: 1,
       profiles,
     },
+    topology: {
+      digest: health.pipeline_snapshot_identity,
+      stageCount: health.stages,
+      boundaries: health.boundaries.slice(),
+      nodeIds: [hardware.hostname || hostname()],
+      routeClasses: [],
+    },
     workload: {
       promptTokens: Math.round(median(samples.map((sample) => sample.prompt_tokens))),
-      outputTokens: row.actual_completion_tokens,
+      outputTokens: benchmark.configuration.output_tokens,
       concurrentSequences: row.concurrency,
+      promptDigest: benchmark.configuration.prompt_digest ?? null,
+      requests: row.measured_requests,
     },
     metrics: {
       tokensPerSecond: round(row.per_request_actual_tok_s_mean, 3),
@@ -308,16 +325,18 @@ function rowToMeasurement(
       `Coordinador: ${coordinator?.summary.connected ?? 0} workers remotos conectados de ${coordinator?.summary.registered ?? 0} registrados.`,
       `Artefacto ${health.artifact_identity}; snapshot ${health.pipeline_snapshot_identity}.`,
     ],
-  };
+  });
 }
 
-function realDeviceProfiles(hardware: HardwareProbe): BenchmarkDeviceProfile[] {
+function realDeviceProfiles(hardware: HardwareProbe, precision: string): BenchmarkDeviceProfile[] {
   return [
     {
       label: `CPU host activo · ${hardware.hostname}`,
       kind: "cpu",
       count: 1,
       memoryGb: round(hardware.ramMb / 1024, 1),
+      backend: "pytorch-cpu",
+      precision,
     },
     ...hardware.gpus.map((gpu) => ({
       label: `GPU detectada, no usada · ${gpu.model}`,

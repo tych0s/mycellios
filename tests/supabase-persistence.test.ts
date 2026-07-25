@@ -7,6 +7,7 @@ import { MeshDatabase } from "../src/storage/database.js";
 import { MeshStore } from "../src/storage/store.js";
 import { SupabasePersistence } from "../src/storage/supabase-sync.js";
 import { addWorker } from "./helpers.js";
+import { DeploymentControlPlane } from "../src/coordinator/deployment-control-plane.js";
 
 describe("Supabase durable persistence", () => {
   const databases: MeshDatabase[] = [];
@@ -59,6 +60,17 @@ describe("Supabase durable persistence", () => {
       at: new Date().toISOString(),
       nodeId: worker.id,
     });
+    const deployments = new DeploymentControlPlane(store, "test-controller");
+    deployments.initialize();
+    const operation = deployments.claimOperation("qwen-test", "activate")!;
+    deployments.prepareRoute(operation.id, [{
+      nodeId: "persisted-worker",
+      stageIndex: 0,
+      layerStart: 0,
+      layerEnd: 8,
+      memoryMiB: 512,
+      capacityMiB: 4_096,
+    }]);
 
     const postedTables: string[] = [];
     const sync = new SupabasePersistence(store, {
@@ -85,6 +97,10 @@ describe("Supabase durable persistence", () => {
       "inference_conversations",
       "inference_messages",
       "activation_events",
+      "deployment_states",
+      "deployment_operations",
+      "route_reservations",
+      "deployment_stage_leases",
     ]));
     expect(sync.status()).toMatchObject({
       connected: true,

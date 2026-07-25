@@ -9,6 +9,7 @@ import {
   writeAutoDistributionArtifacts,
   type AutoDistributionConfig,
   type AutoDistributionProgressEvent,
+  type AutoDistributionRunResult,
 } from "../distribution/auto-distribute.js";
 import { HttpLaunchAgent } from "../distribution/launch-agent-rpc.js";
 import type { ModelActivationProgressEvent, ModelExecutionCapacityNode } from "./model-catalog.js";
@@ -35,6 +36,15 @@ export interface DynamicActivationSnapshot {
   config: AutoDistributionConfig | null;
 }
 
+export interface DynamicActivationRouteStage {
+  nodeId: string;
+  stageIndex: number;
+  layerStart: number;
+  layerEnd: number;
+  memoryMiB: number;
+  capacityMiB: number;
+}
+
 export interface DynamicModelActivationManagerOptions {
   snapshot(): DynamicActivationSnapshot;
   resolveManagedAgent(
@@ -45,6 +55,15 @@ export interface DynamicModelActivationManagerOptions {
   environment?: NodeJS.ProcessEnv;
   loadProgress?(modelId: string): readonly ModelActivationProgressEvent[];
   onProgress?(modelId: string, event: ModelActivationProgressEvent): void;
+  onPlanPrepared?(
+    modelId: string,
+    stages: readonly DynamicActivationRouteStage[],
+  ): string | Promise<string>;
+  onActivated?(
+    modelId: string,
+    reservationId: string | null,
+    result: AutoDistributionRunResult,
+  ): void | Promise<void>;
 }
 
 export class AutomaticModelActivationManager implements ModelActivationManager {
@@ -286,6 +305,12 @@ export class DynamicModelActivationManager implements ModelActivationManager {
         compilation = compileAutoDistribution(config, profile);
       }
       await writeAutoDistributionArtifacts(config, compilation, cwd);
+      const routeReservationId = this.options.onPlanPrepared
+        ? await this.options.onPlanPrepared(
+            model.id,
+            routeStagesForReservation(config, compilation),
+          )
+        : null;
       this.appendProgress(
         model.id,
         "plan_ready",
@@ -303,6 +328,12 @@ export class DynamicModelActivationManager implements ModelActivationManager {
       await runAutoDistribution(config, compilation, cwd, environment, controller.signal, {
         resolveManagedAgent: (nodeId, launch) => this.options.resolveManagedAgent(nodeId, launch),
         onProgress: (event) => this.appendRuntimeProgress(model.id, event),
+        ...(this.options.onActivated
+          ? {
+              onActivated: (result: AutoDistributionRunResult) =>
+                this.options.onActivated!(model.id, routeReservationId, result),
+            }
+          : {}),
       });
     })().catch((error: unknown) => {
       this.failProgress(model.id, error instanceof Error ? error.message : String(error));
@@ -375,6 +406,27 @@ export class DynamicModelActivationManager implements ModelActivationManager {
   async close(): Promise<void> {
     if (this.activeModelId) await this.deactivate(this.activeModelId);
   }
+}
+
+function routeStagesForReservation(
+  config: AutoDistributionConfig,
+  compilation: ReturnType<typeof compileAutoDistribution>,
+): DynamicActivationRouteStage[] {
+  const nodes = new Map(config.nodes.map((node) => [node.id, node]));
+  return compilation.manifest.plans.decode.stages.flatMap((stage) =>
+    stage.members.map((member) => {
+      const node = nodes.get(member.nodeId);
+      if (!node) throw new Error(`distribution_plan_references_unknown_node:${member.nodeId}`);
+      return {
+        nodeId: member.nodeId,
+        stageIndex: stage.index,
+        layerStart: stage.layerStart,
+        layerEnd: stage.layerEnd,
+        memoryMiB: Math.ceil(member.assignedMemoryBytes / (1024 * 1024)),
+        capacityMiB: Math.max(0, node.memoryMiB - node.reserveMiB),
+      };
+    })
+  );
 }
 
 function modelArtifactsDirectory(base: AutoDistributionConfig, modelId: string): string {

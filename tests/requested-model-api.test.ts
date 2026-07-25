@@ -65,6 +65,22 @@ describe("requested model API activation flow", () => {
     const stored = runtime.store.getRequestedModel("qwen-ui")!;
     expect(stored.activationRequestedAt).not.toBeNull();
     expect(stored.activationError).toBeNull();
+    const timeline = await runtime.app.inject({
+      method: "GET",
+      url: "/public/v1/requested-models/qwen-ui/timeline",
+    });
+    expect(timeline.statusCode).toBe(200);
+    expect(timeline.json().data.state).toMatchObject({
+      modelId: "qwen-ui",
+      desiredState: "active",
+      observedState: "preparing",
+      generation: 1,
+    });
+    expect(timeline.json().data.operations).toHaveLength(1);
+    expect(timeline.json().data.operations[0]).toMatchObject({
+      kind: "activate",
+      status: "running",
+    });
   });
 
   it("returns an actionable authorization error for protected model changes", async () => {

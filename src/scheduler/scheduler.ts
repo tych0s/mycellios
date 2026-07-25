@@ -9,6 +9,7 @@ import type {
 import { estimateInputTokens } from "../core/request.js";
 import { safeVramBudget } from "../core/tiers.js";
 import type { MeshStore, StoredWorker } from "../storage/store.js";
+import type { RuntimeLinkObservation } from "../coordinator/runtime-link-observations.js";
 
 export interface SchedulerOptions {
   connectedWorkerIds?: ReadonlySet<string>;
@@ -19,6 +20,16 @@ export interface SchedulerOptions {
 
 export interface RoutePlanOptions extends SchedulerOptions {
   maxStandbyRoutes?: number;
+}
+
+export interface SchedulerEvidenceOptions {
+  /**
+   * Current observations for the exact worker-to-worker data path. Production
+   * enables strict mode so coordinator RTT and advertised uplink never stand
+   * in for a link that has not actually carried a probe.
+   */
+  runtimeLinkObservations?: (() => readonly RuntimeLinkObservation[]) | undefined;
+  strictRuntimeLinks?: boolean | undefined;
 }
 
 interface Candidate {
@@ -44,7 +55,10 @@ export interface AvailableModel {
 }
 
 export class Scheduler {
-  constructor(private readonly store: MeshStore) {}
+  constructor(
+    private readonly store: MeshStore,
+    private readonly evidence: SchedulerEvidenceOptions = {},
+  ) {}
 
   selectRoute(
     request: ChatCompletionRequest,
@@ -58,7 +72,11 @@ export class Scheduler {
       .filter((worker) => !options.excludeWorkerIds?.has(worker.id));
 
     const affinity = this.store.getSessionRoute(sessionId, request.model);
-    if (affinity && this.routeStillValid(affinity, request, workers)) {
+    if (
+      affinity
+      && this.routeStillValid(affinity, request, workers)
+      && !this.routeIsSaturated(affinity, workers)
+    ) {
       return { ...affinity, affinityHit: true };
     }
 
@@ -175,19 +193,37 @@ export class Scheduler {
     const estimatedMs = deployment.ttftMs + generationMs;
     const deadline = request.deadline_ms ?? 120_000;
     const slaRisk = Math.min(1, estimatedMs / deadline);
-    const serviceTime = Math.min(1, estimatedMs / 120_000);
+    const workloadClass = request.workload_class ?? "interactive";
+    const interactive = workloadClass === "interactive";
+    const firstTokenRisk = Math.min(1, deployment.ttftMs / Math.max(250, deadline * 0.2));
+    const throughputServiceTime = Math.min(1, generationMs / 120_000);
+    const interactiveServiceTime = Math.min(1, estimatedMs / 120_000);
     const failure = 1 - Math.max(0, Math.min(1, worker.reliability));
     const rtt = Math.min(1, worker.capabilities.network.coordinatorRttMs / 250);
     const regionPenalty =
       request.preferred_region && request.preferred_region !== worker.capabilities.region ? 0.35 : 0;
     const llmfitPenalty = this.llmfitReplicaPenalty(worker, deployment);
+    if (interactive) {
+      return (
+        0.3 * slaRisk
+        + 0.24 * firstTokenRisk
+        + 0.14 * interactiveServiceTime
+        + 0.18 * queueRatio
+        + 0.08 * failure
+        + 0.06 * Math.min(1, rtt + regionPenalty)
+        + llmfitPenalty
+      );
+    }
+    // Batch and benchmark traffic optimize the sustained bottleneck. TTFT is
+    // deliberately almost absent so a high-throughput route can differ from
+    // the interactive route for the same model and prompt.
     return (
-      0.4 * slaRisk +
-      0.25 * serviceTime +
-      0.15 * queueRatio +
-      0.1 * failure +
-      0.1 * Math.min(1, rtt + regionPenalty) +
-      llmfitPenalty
+      0.14 * slaRisk
+      + 0.46 * throughputServiceTime
+      + 0.26 * queueRatio
+      + 0.08 * failure
+      + 0.06 * Math.min(1, rtt + regionPenalty)
+      + llmfitPenalty
     );
   }
 
@@ -236,6 +272,7 @@ export class Scheduler {
             if (request.workload_class === "interactive" && !sameRegion) continue;
             const previous = path.stages.at(-1)!;
             const linkPenalty = this.linkPenalty(previous.worker, candidate.worker);
+            if (!Number.isFinite(linkPenalty)) continue;
             next.push({
               stages: [...path.stages, candidate],
               cost: path.cost + candidate.score + linkPenalty,
@@ -249,12 +286,17 @@ export class Scheduler {
 
       const path = paths.sort((left, right) => left.cost - right.cost)[0];
       if (!path || path.stages.length !== total) continue;
+      const returnPenalty = this.linkPenalty(
+        path.stages.at(-1)!.worker,
+        path.stages[0]!.worker,
+      );
+      if (!Number.isFinite(returnPenalty)) continue;
       const route: ScheduledRoute = {
         routeClass: "pipeline",
         model: request.model,
         region: path.region,
         stages: path.stages.map((candidate, index) => this.toRouteStage(candidate, index)),
-        score: path.cost,
+        score: path.cost + returnPenalty,
         affinityHit: false,
       };
       if (!best || route.score < best.score) best = route;
@@ -400,6 +442,35 @@ export class Scheduler {
   }
 
   private linkPenalty(left: StoredWorker, right: StoredWorker): number {
+    const observations = this.evidence.runtimeLinkObservations?.();
+    if (observations) {
+      const leftNodeId = left.capabilities.distributedExecutor?.nodeId;
+      const rightNodeId = right.capabilities.distributedExecutor?.nodeId;
+      if (leftNodeId && rightNodeId) {
+        const observation = observations.find(
+          (candidate) =>
+            candidate.fromNodeId === leftNodeId
+            && candidate.toNodeId === rightNodeId,
+        );
+        if (
+          observation
+          && observation.successfulSamples > 0
+          && observation.availability > 0
+        ) {
+          const latencyPenalty = Math.min(1, observation.rttP95Ms / 500);
+          const bandwidthPenalty = Math.min(1, 20 / observation.goodputMbpsP50);
+          const availabilityPenalty = 1 - Math.min(1, observation.availability);
+          return (
+            0.55 * latencyPenalty
+            + 0.25 * bandwidthPenalty
+            + 0.2 * availabilityPenalty
+          );
+        }
+      }
+      if (this.evidence.strictRuntimeLinks) return Number.POSITIVE_INFINITY;
+    } else if (this.evidence.strictRuntimeLinks) {
+      return Number.POSITIVE_INFINITY;
+    }
     const regionPenalty =
       left.capabilities.region === right.capabilities.region ? 0.01 : 0.5;
     const weakestUplink = Math.min(
@@ -414,6 +485,25 @@ export class Scheduler {
         500,
     );
     return regionPenalty + 0.15 * bandwidthPenalty + 0.1 * rttPenalty;
+  }
+
+  private routeIsSaturated(
+    route: ScheduledRoute,
+    workers: readonly StoredWorker[],
+  ): boolean {
+    const workerById = new Map(workers.map((worker) => [worker.id, worker]));
+    return route.stages.some((stage) => {
+      const worker = workerById.get(stage.workerId);
+      const deployment = worker?.capabilities.deployments.find(
+        (candidate) => candidate.deploymentId === stage.deploymentId,
+      );
+      if (!worker || !deployment) return true;
+      const capacity = Math.max(
+        1,
+        Math.min(worker.capabilities.limits.maxConcurrency, deployment.maxConcurrency),
+      );
+      return this.store.countActiveJobs(worker.id) / capacity >= 0.75;
+    });
   }
 
   private countCompletePipelines(stages: Set<string>): number {

@@ -51,6 +51,40 @@ describe("worker boundary hardening", () => {
     ).toThrow(/Invalid coordinator message/);
   });
 
+  it("strictly validates coordinator-issued direct grants and candidates", () => {
+    const grant = {
+      protocol: "mycellios-direct/1",
+      connectionId: "direct-stream",
+      sourceNodeId: "node-a",
+      destinationNodeId: "node-b",
+      targetPort: 9_850,
+      expiresAt: Date.now() + 10_000,
+      secret: Buffer.alloc(32, 9).toString("base64url"),
+    };
+    expect(parseServerMessage({
+      v: 1,
+      type: "runtime.direct.connect",
+      payload: {
+        streamId: "direct-stream",
+        destinationNodeId: "node-b",
+        grant,
+        candidates: [{ host: "127.0.0.1", port: 50_001, scope: "configured" }],
+        timeoutMs: 1_000,
+      },
+    }).type).toBe("runtime.direct.connect");
+    expect(() => parseServerMessage({
+      v: 1,
+      type: "runtime.direct.connect",
+      payload: {
+        streamId: "direct-stream",
+        destinationNodeId: "node-b",
+        grant: { ...grant, debugSecret: grant.secret },
+        candidates: [{ host: "127.0.0.1", port: 50_001, scope: "configured" }],
+        timeoutMs: 1_000,
+      },
+    })).toThrow(/Invalid coordinator message/);
+  });
+
   it("requires HTTPS whenever an OpenAI-compatible API key is present", () => {
     expect(
       () =>

@@ -5,6 +5,7 @@ const MAX_IDENTIFIER_LENGTH = 256;
 const MAX_TOKEN_CHUNK_BYTES = 64 * 1024;
 const MAX_COMPLETION_BYTES = 2 * 1024 * 1024;
 export const MAX_RUNTIME_STREAM_CHUNK_BYTES = 48 * 1024;
+const MAX_RUNTIME_LINK_RTT_MS = 60_000;
 
 const identifierSchema = z.string().min(1).max(MAX_IDENTIFIER_LENGTH);
 const boundedText = (maximum: number) =>
@@ -196,6 +197,12 @@ export const taskFailEnvelopeSchema = envelopeSchema(
 
 const runtimeRequestIdSchema = z.string().min(1).max(MAX_IDENTIFIER_LENGTH);
 const runtimeStreamIdSchema = z.string().min(1).max(MAX_IDENTIFIER_LENGTH);
+const runtimeStreamRecoveryTokenSchema = z.string()
+  .min(16)
+  .max(128)
+  .regex(/^[A-Za-z0-9_-]+$/);
+const runtimeStreamGenerationSchema = z.number().int().nonnegative().max(1_000_000);
+const runtimeStreamOffsetSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const runtimeStreamDataSchema = z.string().min(1).max(Math.ceil(MAX_RUNTIME_STREAM_CHUNK_BYTES / 3) * 4)
   .refine((value) => /^[A-Za-z0-9+/]+={0,2}$/.test(value), "Runtime stream data must be base64")
   .refine(
@@ -229,31 +236,188 @@ export const runtimeExitedEnvelopeSchema = envelopeSchema(
 
 export const runtimeStreamOpenEnvelopeSchema = envelopeSchema(
   "runtime.stream.open",
-  z.object({
-    streamId: runtimeStreamIdSchema,
-    destinationNodeId: identifierSchema,
-    targetPort: z.number().int().min(1).max(65_535),
-  }).strict(),
+  z.union([
+    z.object({
+      streamId: runtimeStreamIdSchema,
+      destinationNodeId: identifierSchema,
+      targetPort: z.number().int().min(1).max(65_535),
+    }).strict(),
+    z.object({
+      streamId: runtimeStreamIdSchema,
+      destinationNodeId: identifierSchema,
+      targetPort: z.number().int().min(1).max(65_535),
+      generation: runtimeStreamGenerationSchema,
+      recoveryToken: runtimeStreamRecoveryTokenSchema,
+    }).strict(),
+  ]),
 );
 export const runtimeStreamOpenedEnvelopeSchema = envelopeSchema(
   "runtime.stream.opened",
-  z.object({ streamId: runtimeStreamIdSchema }).strict(),
+  z.union([
+    z.object({ streamId: runtimeStreamIdSchema }).strict(),
+    z.object({
+      streamId: runtimeStreamIdSchema,
+      generation: runtimeStreamGenerationSchema,
+      recoveryToken: runtimeStreamRecoveryTokenSchema,
+    }).strict(),
+  ]),
 );
 export const runtimeStreamDataEnvelopeSchema = envelopeSchema(
   "runtime.stream.data",
-  z.object({
-    streamId: runtimeStreamIdSchema,
-    sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-    data: runtimeStreamDataSchema,
-  }).strict(),
+  z.union([
+    z.object({
+      streamId: runtimeStreamIdSchema,
+      sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+      data: runtimeStreamDataSchema,
+    }).strict(),
+    z.object({
+      streamId: runtimeStreamIdSchema,
+      sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+      generation: runtimeStreamGenerationSchema,
+      recoveryToken: runtimeStreamRecoveryTokenSchema,
+      offset: runtimeStreamOffsetSchema,
+      data: runtimeStreamDataSchema,
+    }).strict(),
+  ]),
 );
 export const runtimeStreamEndEnvelopeSchema = envelopeSchema(
   "runtime.stream.end",
-  z.object({ streamId: runtimeStreamIdSchema }).strict(),
+  z.union([
+    z.object({ streamId: runtimeStreamIdSchema }).strict(),
+    z.object({
+      streamId: runtimeStreamIdSchema,
+      generation: runtimeStreamGenerationSchema,
+      recoveryToken: runtimeStreamRecoveryTokenSchema,
+      finalOffset: runtimeStreamOffsetSchema,
+    }).strict(),
+  ]),
 );
 export const runtimeStreamErrorEnvelopeSchema = envelopeSchema(
   "runtime.stream.error",
-  z.object({ streamId: runtimeStreamIdSchema, message: boundedText(1_024) }).strict(),
+  z.union([
+    z.object({ streamId: runtimeStreamIdSchema, message: boundedText(1_024) }).strict(),
+    z.object({
+      streamId: runtimeStreamIdSchema,
+      generation: runtimeStreamGenerationSchema,
+      recoveryToken: runtimeStreamRecoveryTokenSchema,
+      message: boundedText(1_024),
+    }).strict(),
+  ]),
+);
+
+export const runtimeStreamAckEnvelopeSchema = envelopeSchema(
+  "runtime.stream.ack",
+  z.object({
+    streamId: runtimeStreamIdSchema,
+    generation: runtimeStreamGenerationSchema,
+    recoveryToken: runtimeStreamRecoveryTokenSchema,
+    acknowledgedOffset: runtimeStreamOffsetSchema,
+  }).strict(),
+);
+
+export const runtimeStreamResumeEnvelopeSchema = envelopeSchema(
+  "runtime.stream.resume",
+  z.object({
+    streamId: runtimeStreamIdSchema,
+    generation: runtimeStreamGenerationSchema,
+    recoveryToken: runtimeStreamRecoveryTokenSchema,
+    sendOffset: runtimeStreamOffsetSchema,
+    acknowledgedOffset: runtimeStreamOffsetSchema,
+    receiveOffset: runtimeStreamOffsetSchema,
+    bufferedFromOffset: runtimeStreamOffsetSchema,
+  }).strict().superRefine((value, context) => {
+    if (value.acknowledgedOffset > value.sendOffset) {
+      context.addIssue({
+        code: "custom",
+        message: "Acknowledged offset cannot exceed sent offset",
+        path: ["acknowledgedOffset"],
+      });
+    }
+    if (
+      value.bufferedFromOffset > value.acknowledgedOffset
+      || value.bufferedFromOffset > value.sendOffset
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Replay buffer cannot start after the acknowledged offset",
+        path: ["bufferedFromOffset"],
+      });
+    }
+  }),
+);
+
+export const runtimeDirectReadyEnvelopeSchema = envelopeSchema(
+  "runtime.direct.ready",
+  z.object({
+    streamId: runtimeStreamIdSchema,
+    connectionId: runtimeStreamIdSchema,
+  }).strict(),
+);
+
+export const runtimeDirectFallbackEnvelopeSchema = envelopeSchema(
+  "runtime.direct.fallback",
+  z.object({
+    streamId: runtimeStreamIdSchema,
+    connectionId: runtimeStreamIdSchema,
+    reason: boundedText(256),
+  }).strict(),
+);
+
+export const runtimeDirectEstablishedEnvelopeSchema = envelopeSchema(
+  "runtime.direct.established",
+  z.object({
+    streamId: runtimeStreamIdSchema,
+    connectionId: runtimeStreamIdSchema,
+    connectRttMs: z.number().positive().max(60_000),
+  }).strict(),
+);
+
+export const runtimeDirectClosedEnvelopeSchema = envelopeSchema(
+  "runtime.direct.closed",
+  z.object({
+    streamId: runtimeStreamIdSchema,
+    connectionId: runtimeStreamIdSchema,
+    bytesTx: runtimeStreamOffsetSchema,
+    bytesRx: runtimeStreamOffsetSchema,
+    reason: boundedText(256).optional(),
+  }).strict(),
+);
+
+export const runtimeDirectTelemetryEnvelopeSchema = envelopeSchema(
+  "runtime.direct.telemetry",
+  z.object({
+    streamId: runtimeStreamIdSchema,
+    connectionId: runtimeStreamIdSchema,
+    bytesTx: runtimeStreamOffsetSchema,
+    bytesRx: runtimeStreamOffsetSchema,
+  }).strict(),
+);
+
+export const runtimeLinkProbePingEnvelopeSchema = envelopeSchema(
+  "runtime.link.probe.ping",
+  z.object({
+    probeId: runtimeRequestIdSchema,
+    destinationNodeId: identifierSchema,
+    data: runtimeStreamDataSchema,
+  }).strict(),
+);
+
+export const runtimeLinkProbePongEnvelopeSchema = envelopeSchema(
+  "runtime.link.probe.pong",
+  z.object({
+    probeId: runtimeRequestIdSchema,
+    data: runtimeStreamDataSchema,
+  }).strict(),
+);
+
+export const runtimeLinkProbeResultEnvelopeSchema = envelopeSchema(
+  "runtime.link.probe.result",
+  z.object({
+    probeId: runtimeRequestIdSchema,
+    destinationNodeId: identifierSchema,
+    rttMs: z.number().positive().max(MAX_RUNTIME_LINK_RTT_MS).nullable(),
+    goodputMbps: z.number().positive().max(10_000_000).nullable(),
+  }).strict(),
 );
 
 export const workerEnvelopeSchema = z.discriminatedUnion("type", [
@@ -273,6 +437,16 @@ export const workerEnvelopeSchema = z.discriminatedUnion("type", [
   runtimeStreamDataEnvelopeSchema,
   runtimeStreamEndEnvelopeSchema,
   runtimeStreamErrorEnvelopeSchema,
+  runtimeStreamAckEnvelopeSchema,
+  runtimeStreamResumeEnvelopeSchema,
+  runtimeDirectReadyEnvelopeSchema,
+  runtimeDirectFallbackEnvelopeSchema,
+  runtimeDirectEstablishedEnvelopeSchema,
+  runtimeDirectClosedEnvelopeSchema,
+  runtimeDirectTelemetryEnvelopeSchema,
+  runtimeLinkProbePingEnvelopeSchema,
+  runtimeLinkProbePongEnvelopeSchema,
+  runtimeLinkProbeResultEnvelopeSchema,
 ]);
 
 export type ValidatedWorkerEnvelope = z.infer<typeof workerEnvelopeSchema>;

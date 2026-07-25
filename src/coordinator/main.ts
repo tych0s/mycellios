@@ -29,11 +29,12 @@ const runtime = await createCoordinator(config, {
   ...(activationManager ? { activationManager } : {}),
   ...(baseActivationConfig && dynamicWorkerActivation
     ? {
-        activationManagerFactory: ({ store, hub }) => new DynamicModelActivationManager({
+        activationManagerFactory: ({ store, hub, deploymentController }) => new DynamicModelActivationManager({
           snapshot: () => buildConnectedExecutorActivationSnapshot(
             baseActivationConfig,
             store.listWorkers(),
             hub.connectedWorkerIds(),
+            hub.runtimeLinkObservations(),
           ),
           resolveManagedAgent: (nodeId, launch) => resolveConnectedExecutorAgent(
             store.listWorkers(),
@@ -43,7 +44,32 @@ const runtime = await createCoordinator(config, {
             launch,
           ),
           loadProgress: (modelId) => store.listActivationEvents(modelId),
-          onProgress: (modelId, event) => store.appendActivationEvent(modelId, event),
+          onProgress: (modelId, event) => {
+            store.appendActivationEvent(modelId, event);
+            if (event.phase === "running_canary") {
+              const operation = deploymentController.activeOperationForModel(modelId);
+              if (operation) deploymentController.markCanary(operation.id);
+            }
+          },
+          onPlanPrepared: (modelId, stages) => {
+            const operation = deploymentController.activeOperationForModel(modelId);
+            if (!operation) throw new Error(`deployment_operation_missing:${modelId}`);
+            return deploymentController.prepareRoute(operation.id, stages).id;
+          },
+          onActivated: (modelId, reservationId, result) => {
+            const canary = {
+              passed: true,
+              text: result.canaryText,
+              ...result.canaryMetrics,
+              workerId: result.workerId,
+            };
+            if (reservationId) {
+              deploymentController.commitRoute(reservationId, canary);
+              return;
+            }
+            const operation = deploymentController.activeOperationForModel(modelId);
+            if (operation) deploymentController.completeOperation(operation.id, "active", { canary });
+          },
         }),
       }
     : {}),

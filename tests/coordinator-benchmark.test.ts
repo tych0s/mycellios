@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildCoordinatorBenchmarkTelemetrySnapshot,
   buildCoordinatorBenchmarkInventory,
+  coordinatorBenchmarkActivations,
+  coordinatorBenchmarkModelIdentity,
   detectNewActiveModels,
   runCoordinatorModelSuite,
 } from "../src/benchlab/coordinator-suite.js";
@@ -14,6 +17,12 @@ const IDENTITY: RunIdentity = {
   gitCommit: "0123456789abcdef",
   gitBranch: "main",
   gitDirty: false,
+  build: {
+    release: "0.2.19",
+    releaseSource: "override",
+    revision: "0123456789abcdef",
+    revisionSource: "git",
+  },
 };
 
 describe("automatic coordinator benchmark", () => {
@@ -23,6 +32,82 @@ describe("automatic coordinator benchmark", () => {
     expect(detectNewActiveModels(new Set(["qwen"]), observed)).toEqual([]);
     expect(detectNewActiveModels(new Set(), observed)).toEqual([]);
     expect(detectNewActiveModels(new Set(["qwen"]), observed)).toEqual(["qwen"]);
+  });
+
+  it("propagates one real deployment digest and fails closed on conflicts", () => {
+    const workers = distributedWorkers();
+    const connected = new Set(workers.map((worker) => worker.id));
+    const identity = coordinatorBenchmarkModelIdentity(
+      { id: "qwen3-0.6b", source: "Qwen/Qwen3-0.6B", revision: "rev-1" },
+      workers,
+      connected,
+    );
+    expect(identity.digest).toBe("sha256:model");
+
+    const conflicting = structuredClone(workers);
+    conflicting[1]!.capabilities.deployments = [{
+      ...conflicting[0]!.capabilities.deployments[0]!,
+      deploymentId: "qwen-conflict",
+      modelDigest: "sha256:other",
+    }];
+    expect(coordinatorBenchmarkModelIdentity(
+      { id: "qwen3-0.6b", source: "Qwen/Qwen3-0.6B", revision: "rev-1" },
+      conflicting,
+      connected,
+    ).digest).toBeNull();
+  });
+
+  it("seals a concrete activation from deployment generation and stage ranges", () => {
+    const workers = distributedWorkers();
+    const connected = new Set(workers.map((worker) => worker.id));
+    const [activation] = coordinatorBenchmarkActivations(
+      new Set(["qwen3-0.6b"]),
+      workers,
+      connected,
+    );
+    expect(activation).toMatchObject({
+      modelId: "qwen3-0.6b",
+      modelDigest: "sha256:model",
+      participants: [{
+        workerId: "worker-a",
+        deploymentId: "qwen-pipeline",
+        nodeIds: ["node-a", "node-b"],
+      }],
+    });
+    expect(activation?.activationId).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(activation?.topologyDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
+
+    const replacement = structuredClone(workers);
+    replacement[0]!.capabilities.deployments[0]!.deploymentId = "qwen-pipeline-2";
+    expect(coordinatorBenchmarkActivations(
+      new Set(["qwen3-0.6b"]),
+      replacement,
+      connected,
+    )[0]?.activationId).not.toBe(activation?.activationId);
+  });
+
+  it("samples live power and free memory without using configured limits", () => {
+    const workers = distributedWorkers();
+    const snapshot = buildCoordinatorBenchmarkTelemetrySnapshot(
+      workers,
+      new Set(workers.map((worker) => worker.id)),
+      10_000,
+    );
+    expect(snapshot.atMs).toBe(10_000);
+    expect(snapshot.nodes).toEqual([
+      expect.objectContaining({
+        nodeId: "node-a",
+        powerWatts: 70,
+        offeredMemoryGb: 4,
+        freeOfferedMemoryGb: 4,
+      }),
+      expect.objectContaining({
+        nodeId: "node-b",
+        powerWatts: 80,
+        offeredMemoryGb: 6,
+        freeOfferedMemoryGb: 6,
+      }),
+    ]);
   });
 
   it("records real coordinator inference with routed nodes, VRAM, power and latency", async () => {
@@ -45,7 +130,12 @@ describe("automatic coordinator benchmark", () => {
     const run = await runCoordinatorModelSuite(IDENTITY, {
       cwd: ".",
       coordinatorUrl: "http://127.0.0.1:4180",
-      model: { id: "qwen3-0.6b", source: "Qwen/Qwen3-0.6B", revision: "rev-1" },
+      model: {
+        id: "qwen3-0.6b",
+        source: "Qwen/Qwen3-0.6B",
+        revision: "rev-1",
+        digest: "sha256:rev-1",
+      },
       inventory: (routed) =>
         buildCoordinatorBenchmarkInventory("qwen3-0.6b", workers, connected, routed),
       resolveWorkerId: () => "worker-a",
@@ -67,6 +157,8 @@ describe("automatic coordinator benchmark", () => {
     expect(measurement.metrics.ttftMsP95).toBe(420);
     expect(measurement.workload.successfulRequests).toBe(3);
     expect(measurement.workload.routeClasses).toEqual(["pipeline"]);
+    expect(measurement.model.digest).toBe("sha256:rev-1");
+    expect(measurement.scenarioFingerprint).toMatch(/^sha256:[0-9a-f]{64}$/);
     expect(measurement.notes.join(" ")).toContain("no hay datos simulados");
   });
 
@@ -74,7 +166,7 @@ describe("automatic coordinator benchmark", () => {
     const run = await runCoordinatorModelSuite(IDENTITY, {
       cwd: ".",
       coordinatorUrl: "http://127.0.0.1:4180",
-      model: { id: "missing", source: "missing", revision: null },
+      model: { id: "missing", source: "missing", revision: null, digest: null },
       inventory: () => ({
         totalDevices: 0,
         connectedDevices: 0,
@@ -85,6 +177,8 @@ describe("automatic coordinator benchmark", () => {
         error: { message: "No model route is active" },
       }), { status: 503 }),
       samples: 2,
+      warmupSamples: 0,
+      retryDelayMs: 0,
     });
 
     const measurement = run.measurements[0]!;
@@ -93,6 +187,7 @@ describe("automatic coordinator benchmark", () => {
     expect(measurement.metrics.ttftMsP95).toBeNull();
     expect(measurement.workload.successfulRequests).toBe(0);
     expect(measurement.notes.join(" ")).toContain("No model route is active");
+    expect(measurement.comparison.baselineRunId).toBeNull();
   });
 });
 

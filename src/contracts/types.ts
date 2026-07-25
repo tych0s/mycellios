@@ -1,3 +1,5 @@
+import type { RuntimePerformanceProfile } from "../performance/runtime-profile.js";
+
 export type WorkloadClass = "interactive" | "batch" | "benchmark";
 export type AdapterKind = "mock" | "local-model-runtime" | "externalggufruntime" | "openai-compatible";
 export type ExecutionMode = "replica" | "pipeline";
@@ -258,6 +260,11 @@ export interface WorkerCapabilities {
   /** A node-local shard executor controlled through the existing worker tunnel. */
   distributedExecutor?: {
     protocol: "gdlp-worker-tunnel/1" | "gdlp-worker-tunnel/2";
+    /**
+     * Optional, negotiated recovery extension for the authenticated relay.
+     * Legacy v2 workers omit it and remain fail-closed on any disconnect.
+     */
+    streamRecovery?: "offset-ack-v1" | undefined;
     nodeId: string;
     stageHost: string;
     stagePort: number;
@@ -268,6 +275,22 @@ export interface WorkerCapabilities {
     cpuEligible?: boolean | undefined;
     /** Sanitized self-repair state; absent on legacy and non-desktop workers. */
     acceleration?: WorkerAcceleratorDiagnostics | undefined;
+    /** Sealed physical calibration consumed by optimized placement. */
+    performanceProfile?: RuntimePerformanceProfile | undefined;
+    /**
+     * Native peer listener candidates. These are reachability hints only:
+     * every session still requires a coordinator-issued, one-time grant.
+     */
+    directTransport?: {
+      protocol: "mycellios-direct/1";
+      candidates: Array<{
+        host: string;
+        port: number;
+        scope: "lan" | "configured";
+      }>;
+      maxSessions: number;
+      maxSessionBytes: number;
+    } | undefined;
   } | undefined;
 }
 

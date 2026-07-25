@@ -11,7 +11,7 @@ import select
 import socket
 import threading
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -48,6 +48,9 @@ from .ram_backed_moe_runtime import (
     build_ram_backed_moe_stage_runner,
     validate_ram_backed_moe_binding,
 )
+
+if TYPE_CHECKING:
+    from .paged_stage import HFPagedStageRuntimeConfig
 
 MAX_SPECULATIVE_BRANCHES = 64
 MAX_SPECULATIVE_BRANCH_TOKENS = 1_048_576
@@ -211,6 +214,7 @@ class StageProcessConfig:
     max_speculative_branch_tokens: int = 0
     max_speculative_kv_bytes: int = 0
     ram_backed_moe: RamBackedMoeRuntimeConfig | None = None
+    paged_kv: HFPagedStageRuntimeConfig | None = None
     native_stage_package: str | None = None
     native_stage_package_id: str | None = None
     native_stage_manifest_sha256: str | None = None
@@ -2051,6 +2055,10 @@ def activation_token_mode(frame_type: FrameType) -> str:
 def build_stage_runner(config: StageProcessConfig) -> StageRunnerContract:
     """Construct the single-member runner or a logical local TP cell."""
 
+    if config.paged_kv is not None:
+        from .paged_stage import HFPagedStageRunner
+
+        return HFPagedStageRunner.from_runtime_config(config.spec, config.paged_kv)
     if config.ram_backed_moe is not None:
         return build_ram_backed_moe_stage_runner(
             config.spec,
@@ -2278,17 +2286,21 @@ def validate_stage_config(config: StageProcessConfig) -> None:
         )
     has_native_stage = config.native_stage_package is not None
     has_ram_backed_moe = config.ram_backed_moe is not None
+    has_paged_kv = config.paged_kv is not None
     if normalized_device != "auto" and (
-        has_ram_backed_moe or has_native_stage or config.cell_fixture is not None
+        has_ram_backed_moe
+        or has_paged_kv
+        or has_native_stage
+        or config.cell_fixture is not None
     ):
         raise ValueError(
             "device applies only to the dense Torch stage backend; specialised "
             "backends have their own sealed device settings"
         )
     if has_ram_backed_moe:
-        if has_native_stage or config.cell_fixture is not None:
+        if has_paged_kv or has_native_stage or config.cell_fixture is not None:
             raise ValueError(
-                "RAM-backed MoE, NativeStage and tensor-parallel cell backends "
+                "paged KV, RAM-backed MoE, NativeStage and tensor-parallel cell backends "
                 "are mutually exclusive"
             )
         validate_ram_backed_moe_binding(
@@ -2300,6 +2312,31 @@ def validate_stage_config(config: StageProcessConfig) -> None:
         if config.spec.artifact_identity != config.ram_backed_moe.artifact_identity:
             raise ValueError(
                 "stage spec and RAM-backed MoE artifact identities do not match"
+            )
+    if has_paged_kv:
+        from .paged_stage import HFPagedStageRuntimeConfig
+
+        if not isinstance(config.paged_kv, HFPagedStageRuntimeConfig):
+            raise TypeError("paged_kv must be HFPagedStageRuntimeConfig")
+        if has_native_stage or config.cell_fixture is not None:
+            raise ValueError(
+                "paged KV, RAM-backed MoE, NativeStage and tensor-parallel cell backends "
+                "are mutually exclusive"
+            )
+        required_request_slots = 1 + config.max_speculative_branches
+        if config.paged_kv.max_active_requests < required_request_slots:
+            raise ValueError(
+                "paged max_active_requests cannot hold the root request and all "
+                "sealed speculative branches"
+            )
+        if (
+            config.max_speculative_branch_tokens > 0
+            and config.paged_kv.max_sequence_tokens
+            < config.max_speculative_branch_tokens
+        ):
+            raise ValueError(
+                "paged max_sequence_tokens is smaller than the sealed "
+                "speculative branch token ceiling"
             )
     if has_native_stage:
         if not isinstance(config.native_stage_package, str) or not config.native_stage_package.strip():

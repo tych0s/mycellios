@@ -34,6 +34,7 @@ from .model import (
     ragged_grouping_enabled,
     resolve_model_snapshot,
 )
+from .paged_stage import HFPagedStageRunner, HFPagedStageRuntimeConfig
 from .protocol import (
     HEADER_BYTES,
     FrameType,
@@ -203,6 +204,10 @@ class PipelineEngineConfig:
     # the root slot may be configured here; each child process receives its own
     # independently sealed host-local binding from stage_cli.
     ram_backed_moe_stages: tuple[RamBackedMoeRuntimeConfig | None, ...] | None = None
+    # Native bounded paged KV/COW settings for root + every local child. In
+    # remote mode only the root slot belongs here; child bindings are sealed by
+    # stage_cli on their own hosts.
+    paged_kv_stages: tuple[HFPagedStageRuntimeConfig | None, ...] | None = None
     # Ordered executor ids for root + every child stage. Remote recovery must
     # receive this sealed route contract from its launcher because the root
     # process cannot infer a remote cell/GGUF/quantized backend from boundaries.
@@ -323,6 +328,42 @@ class PipelineEngineConfig:
                         "RAM-backed MoE identity cannot be combined with standard "
                         "model identity fields"
                     )
+        stage_count = len(self.boundaries) - 1
+        if self.paged_kv_stages is not None:
+            if len(self.paged_kv_stages) != stage_count:
+                raise ValueError("paged_kv_stages must contain one entry per stage")
+            configured_paged = tuple(
+                entry for entry in self.paged_kv_stages if entry is not None
+            )
+            if any(
+                not isinstance(entry, HFPagedStageRuntimeConfig)
+                for entry in configured_paged
+            ):
+                raise TypeError(
+                    "paged_kv_stages entries must be HFPagedStageRuntimeConfig"
+                )
+            ram_stages = self.ram_backed_moe_stages or (None,) * stage_count
+            if any(
+                paged is not None and ram is not None
+                for paged, ram in zip(self.paged_kv_stages, ram_stages)
+            ):
+                raise ValueError(
+                    "paged KV and RAM-backed MoE bindings are mutually exclusive"
+                )
+            if not self.spawn_local_stages and any(
+                entry is not None for entry in self.paged_kv_stages[1:]
+            ):
+                raise ValueError(
+                    "remote child paged KV bindings belong to stage_cli"
+                )
+            if (
+                configured_paged
+                and normalize_torch_device_request(self.device) != "auto"
+            ):
+                raise ValueError(
+                    "device applies only to dense Torch stages; paged KV has a "
+                    "sealed per-stage device"
+                )
         if self.stage_executor_ids is not None:
             if len(self.stage_executor_ids) != len(self.boundaries) - 1:
                 raise ValueError("stage_executor_ids must contain one id per stage")
@@ -400,6 +441,26 @@ class PipelineEngineConfig:
                 "speculative branch count, tokens and KV bytes must all be zero "
                 "or all be positive"
             )
+        for entry in self.paged_kv_stages or ():
+            if entry is None:
+                continue
+            required_request_slots = (
+                self.max_active_sequences + self.max_speculative_branches
+            )
+            if entry.max_active_requests < required_request_slots:
+                raise ValueError(
+                    "paged max_active_requests cannot hold all active sequences "
+                    "and sealed speculative branches"
+                )
+            if (
+                self.max_speculative_branch_tokens > 0
+                and entry.max_sequence_tokens
+                < self.max_speculative_branch_tokens
+            ):
+                raise ValueError(
+                    "paged max_sequence_tokens is smaller than the sealed "
+                    "speculative branch token ceiling"
+                )
         if (self.sealed_wave_tokens is None) != (
             self.max_prefill_chunk_tokens is None
         ):
@@ -982,6 +1043,15 @@ class DistributedPipelineEngine:
                 f"boundaries end at {config.boundaries[-1]}, model has {self.total_layers} layers"
             )
         self.maximum_context = int(getattr(model_config, "max_position_embeddings", 0) or 0)
+        for paged in config.paged_kv_stages or ():
+            if (
+                paged is not None
+                and self.maximum_context > 0
+                and paged.max_sequence_tokens > self.maximum_context
+            ):
+                raise ValueError(
+                    "paged max_sequence_tokens exceeds the model context limit"
+                )
         if root_ram_config is not None:
             self.model_artifact = model_artifact_reference(
                 self.model_snapshot,
@@ -1694,6 +1764,9 @@ class DistributedPipelineEngine:
         ram_stage_configs = config.ram_backed_moe_stages or tuple(
             None for _ in range(self.stages)
         )
+        paged_stage_configs = config.paged_kv_stages or tuple(
+            None for _ in range(self.stages)
+        )
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind((config.return_bind_host, config.return_port))
@@ -1715,6 +1788,7 @@ class DistributedPipelineEngine:
                 stage_index = child_index + 1
                 has_next = stage_index + 1 < self.stages
                 ram_stage_config = ram_stage_configs[stage_index]
+                paged_stage_config = paged_stage_configs[stage_index]
                 stage_artifact_identity = (
                     ram_stage_config.artifact_identity
                     if ram_stage_config is not None
@@ -1762,6 +1836,7 @@ class DistributedPipelineEngine:
                         ),
                         max_speculative_kv_bytes=config.max_speculative_kv_bytes,
                         ram_backed_moe=ram_stage_config,
+                        paged_kv=paged_stage_config,
                     )
                 )
             for child_config in reversed(child_configs):
@@ -1778,6 +1853,7 @@ class DistributedPipelineEngine:
         if first_stage_port is None:
             raise RuntimeError("first stage port was not resolved")
         root_ram_config = ram_stage_configs[0]
+        root_paged_config = paged_stage_configs[0]
         root_spec = StageModelSpec(
             self.model_snapshot,
             0,
@@ -1788,15 +1864,19 @@ class DistributedPipelineEngine:
             canonical_model_source=self.model_artifact.canonical_source,
             canonical_model_revision=self.model_artifact.canonical_revision,
         )
-        self._runner = (
-            StageRunner(root_spec, device=config.device)
-            if root_ram_config is None
-            else build_ram_backed_moe_stage_runner(
+        if root_ram_config is not None:
+            self._runner = build_ram_backed_moe_stage_runner(
                 root_spec,
                 root_ram_config,
                 pipeline_snapshot_identity=self.pipeline_id,
             )
-        )
+        elif root_paged_config is not None:
+            self._runner = HFPagedStageRunner.from_runtime_config(
+                root_spec,
+                root_paged_config,
+            )
+        else:
+            self._runner = StageRunner(root_spec, device=config.device)
         if self._runner.hidden_size != self.hidden_size:
             raise RuntimeError("root stage hidden size differs from the model configuration")
         validate_speculative_runner(config, self._runner)

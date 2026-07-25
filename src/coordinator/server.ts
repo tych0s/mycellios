@@ -5,10 +5,16 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { z, ZodError } from "zod";
+import {
+  StableBenchmarkActivationTracker,
+  type BenchmarkActivation,
+} from "../benchlab/activation-tracker.js";
 import { loadBenchmarkRuns } from "../benchlab/history.js";
 import {
+  buildCoordinatorBenchmarkTelemetrySnapshot,
   buildCoordinatorBenchmarkInventory,
-  detectNewActiveModels,
+  coordinatorBenchmarkActivations,
+  coordinatorBenchmarkModelIdentity,
   runAndPersistCoordinatorSuite,
   type CoordinatorBenchmarkModel,
 } from "../benchlab/coordinator-suite.js";
@@ -54,6 +60,10 @@ import {
   registerContentHubRoutes,
 } from "./content-hub.js";
 import { SupabaseAuthService } from "./supabase-auth.js";
+import {
+  DeploymentControlPlane,
+  type DeploymentOperation,
+} from "./deployment-control-plane.js";
 
 export function automaticActivationFailureIsTransient(message: string): boolean {
   const normalized = message.toLowerCase();
@@ -112,12 +122,14 @@ export interface CoordinatorRuntime {
   mobileHub: MobileComputeHub;
   service: MeshService;
   persistence: SupabasePersistence | null;
+  deploymentController: DeploymentControlPlane;
   close(): Promise<void>;
 }
 
 export interface CoordinatorActivationContext {
   store: MeshStore;
   hub: WorkerHub;
+  deploymentController: DeploymentControlPlane;
 }
 
 export async function createCoordinator(
@@ -245,7 +257,8 @@ export async function createCoordinator(
       })
     : null;
   await persistence?.initialize();
-  const scheduler = new Scheduler(store);
+  const deploymentController = new DeploymentControlPlane(store);
+  deploymentController.initialize();
   await app.register(websocket, { options: { maxPayload: 10 * 1024 * 1024 } });
   const mobileAssetsPath = resolveMobileAssetsPath(config.mobileAssetsPath);
   if (mobileAssetsPath) {
@@ -289,6 +302,10 @@ export async function createCoordinator(
   }
   const hub = new WorkerHub(store);
   hub.attach(app);
+  const scheduler = new Scheduler(store, {
+    runtimeLinkObservations: () => hub.runtimeLinkObservations(),
+    strictRuntimeLinks: true,
+  });
   const mobileHub = new MobileComputeHub({
     joinToken: config.mobileJoinToken,
     expertArtifactsPath: config.mobileExpertArtifactsPath,
@@ -305,7 +322,11 @@ export async function createCoordinator(
   const service = new MeshService(store, scheduler, hub, config.requestTimeoutMs);
   const supportAssistantRateLimits = new Map<string, SupportAssistantRateState>();
   let activeSupportAssistantRequests = 0;
-  const activationManager = options.activationManager ?? options.activationManagerFactory?.({ store, hub });
+  const activationManager = options.activationManager ?? options.activationManagerFactory?.({
+    store,
+    hub,
+    deploymentController,
+  });
   await activationManager?.initialize();
   const benchmarkWorkspace = process.cwd();
   const benchmarkStorageRoot = process.env.MYCELLIOS_BENCHMARK_ROOT?.trim();
@@ -317,17 +338,28 @@ export async function createCoordinator(
   }
   void persistence?.flush();
   type PersistedBenchmark = Awaited<ReturnType<typeof runAndPersistCoordinatorSuite>>;
+  interface QueuedAutomaticBenchmark {
+    model: CoordinatorBenchmarkModel;
+    activation: BenchmarkActivation;
+  }
   let benchmarkRunInFlight: Promise<PersistedBenchmark> | null = null;
-  const automaticBenchmarkQueue: CoordinatorBenchmarkModel[] = [];
-  const queuedAutomaticBenchmarkModels = new Set<string>();
-  const observedActiveBenchmarkModels = new Set<string>();
+  const automaticBenchmarkQueue: QueuedAutomaticBenchmark[] = [];
+  const queuedAutomaticBenchmarkActivations = new Set<string>();
+  const benchmarkActivationTracker = new StableBenchmarkActivationTracker(3, 12_000);
+  const automaticBenchmarkRetryAttempts = new Map<string, number>();
+  const automaticBenchmarkRetryTimers = new Set<NodeJS.Timeout>();
   const benchmarkTargetForModel = (modelId: string): CoordinatorBenchmarkModel => {
     const requested = store.getRequestedModel(modelId);
-    return {
-      id: modelId,
-      source: requested?.source ?? modelId,
-      revision: requested?.revision ?? null,
-    };
+    const connectedWorkerIds = hub.connectedWorkerIds();
+    return coordinatorBenchmarkModelIdentity(
+      {
+        id: modelId,
+        source: requested?.source ?? modelId,
+        revision: requested?.revision ?? null,
+      },
+      store.listWorkers(),
+      connectedWorkerIds,
+    );
   };
   const benchmarkableActiveModelIds = (): string[] => {
     const connectedWorkerIds = hub.connectedWorkerIds();
@@ -343,10 +375,20 @@ export async function createCoordinator(
       .map((model) => model.id)
       .filter((modelId) => realDeploymentModels.has(modelId));
   };
+  const currentBenchmarkActivations = (): BenchmarkActivation[] =>
+    coordinatorBenchmarkActivations(
+      new Set(benchmarkableActiveModelIds()),
+      store.listWorkers(),
+      hub.connectedWorkerIds(),
+    );
   const startCoordinatorBenchmark = (
     model: CoordinatorBenchmarkModel,
     trigger: "automatic-model-start" | "manual",
-    metadata: { label?: string; version?: string } = {},
+    metadata: {
+      label?: string;
+      version?: string;
+      activation?: BenchmarkActivation;
+    } = {},
   ): Promise<PersistedBenchmark> => runAndPersistCoordinatorSuite({
     cwd: benchmarkWorkspace,
     ...(benchmarkHistoryDirectory ? { historyDirectory: benchmarkHistoryDirectory } : {}),
@@ -358,10 +400,15 @@ export async function createCoordinator(
       hub.connectedWorkerIds(),
       routedWorkerIds,
     ),
+    telemetrySnapshot: () => buildCoordinatorBenchmarkTelemetrySnapshot(
+      store.listWorkers(),
+      hub.connectedWorkerIds(),
+    ),
     resolveWorkerId: (jobId) => store.getJob(jobId)?.workerId ?? null,
     ...(config.networkToken ? { networkToken: config.networkToken } : {}),
     ...(metadata.label ? { label: metadata.label } : {}),
     ...(metadata.version ? { version: metadata.version } : {}),
+    ...(metadata.activation ? { activation: metadata.activation } : {}),
     trigger,
   }).then((result) => {
     store.queueBenchmarkRun(result.run);
@@ -370,34 +417,75 @@ export async function createCoordinator(
   });
   const drainAutomaticBenchmarkQueue = (): void => {
     if (benchmarkRunInFlight) return;
-    const model = automaticBenchmarkQueue.shift();
-    if (!model) return;
-    benchmarkRunInFlight = startCoordinatorBenchmark(model, "automatic-model-start");
+    const queued = automaticBenchmarkQueue.shift();
+    if (!queued) return;
+    const { model, activation } = queued;
+    benchmarkRunInFlight = startCoordinatorBenchmark(
+      model,
+      "automatic-model-start",
+      { activation },
+    );
     void benchmarkRunInFlight
       .then(({ run }) => {
         app.log.info(
           { modelId: model.id, benchmarkRunId: run.runId, status: run.status },
           "automatic model-start benchmark saved",
         );
+        if (run.status === "failed") {
+          scheduleAutomaticBenchmarkRetry(queued);
+        } else {
+          automaticBenchmarkRetryAttempts.delete(activation.activationId);
+        }
       })
       .catch((error: unknown) => {
         app.log.error(
           { modelId: model.id, error: error instanceof Error ? error.message : String(error) },
           "automatic model-start benchmark could not be saved",
         );
+        scheduleAutomaticBenchmarkRetry(queued);
       })
       .finally(() => {
-        queuedAutomaticBenchmarkModels.delete(model.id);
+        queuedAutomaticBenchmarkActivations.delete(activation.activationId);
         benchmarkRunInFlight = null;
         drainAutomaticBenchmarkQueue();
       });
   };
-  const queueAutomaticBenchmark = (modelId: string): void => {
-    if (queuedAutomaticBenchmarkModels.has(modelId)) return;
-    queuedAutomaticBenchmarkModels.add(modelId);
-    automaticBenchmarkQueue.push(benchmarkTargetForModel(modelId));
+  const queueAutomaticBenchmark = (activation: BenchmarkActivation): void => {
+    if (queuedAutomaticBenchmarkActivations.has(activation.activationId)) return;
+    const model = benchmarkTargetForModel(activation.modelId);
+    if (model.digest !== activation.modelDigest) {
+      app.log.warn(
+        {
+          modelId: activation.modelId,
+          activationId: activation.activationId,
+          observedDigest: model.digest,
+          activationDigest: activation.modelDigest,
+        },
+        "automatic benchmark skipped because model identity changed before queueing",
+      );
+      return;
+    }
+    queuedAutomaticBenchmarkActivations.add(activation.activationId);
+    automaticBenchmarkQueue.push({ model, activation });
     drainAutomaticBenchmarkQueue();
   };
+  function scheduleAutomaticBenchmarkRetry(queued: QueuedAutomaticBenchmark): void {
+    const attempts = automaticBenchmarkRetryAttempts.get(
+      queued.activation.activationId,
+    ) ?? 0;
+    if (attempts >= 2) return;
+    automaticBenchmarkRetryAttempts.set(queued.activation.activationId, attempts + 1);
+    const delayMs = attempts === 0 ? 30_000 : 120_000;
+    const timer = setTimeout(() => {
+      automaticBenchmarkRetryTimers.delete(timer);
+      const current = currentBenchmarkActivations().find(
+        (activation) => activation.activationId === queued.activation.activationId,
+      );
+      if (current) queueAutomaticBenchmark(current);
+    }, delayMs);
+    timer.unref();
+    automaticBenchmarkRetryTimers.add(timer);
+  }
   const automaticRepairState = new Map<string, { attempts: number; nextAttemptAt: number }>();
   const automaticRepairInFlight = new Set<string>();
   const inferenceRouteFailures = new Map<string, { count: number; lastAt: number }>();
@@ -405,7 +493,20 @@ export async function createCoordinator(
     options.automaticActivationRetryDelaysMs
     ?? DEFAULT_AUTOMATIC_ACTIVATION_RETRY_DELAYS_MS
   ).map((delay) => Math.max(0, Math.round(delay)));
-  const automaticActivationRetryState = new Map<string, AutomaticActivationRetryState>();
+  const automaticActivationRetryState = new Map<string, AutomaticActivationRetryState>(
+    deploymentController.listStates()
+      .filter((state) => state.nextRetryAt !== null && state.lastError !== null)
+      .map((state) => [
+        state.modelId,
+        {
+          retryCount: Math.max(0, state.retryCount - 1),
+          nextAttemptAt: state.nextRetryAt!,
+          lastError: state.lastError!,
+          updatedAt: state.updatedAt,
+          launching: false,
+        },
+      ]),
+  );
   const automaticActivationRetryProgressForModel = (
     modelId: string,
   ): readonly ModelActivationProgressEvent[] => {
@@ -456,12 +557,21 @@ export async function createCoordinator(
   const handleRequestedModelActivationFailure = (
     modelId: string,
     error: unknown,
+    operation: DeploymentOperation | null = deploymentController.activeOperationForModel(modelId),
   ): void => {
     if (!store.getRequestedModel(modelId)) return;
     const message = error instanceof Error ? error.message : String(error);
     if (!automaticActivationFailureIsTransient(message)) {
       automaticActivationRetryState.delete(modelId);
       store.setRequestedModelActivationError(modelId, message);
+      if (operation) {
+        deploymentController.failOperation(
+          operation.id,
+          "activation_failed",
+          message,
+          { retryAt: null },
+        );
+      }
       return;
     }
     const previous = automaticActivationRetryState.get(modelId);
@@ -476,30 +586,60 @@ export async function createCoordinator(
     );
     if (!nextRetry) {
       automaticActivationRetryState.delete(modelId);
-      store.setRequestedModelActivationError(
-        modelId,
-        `automatic_activation_retries_exhausted:${retriesStarted}:${message}`,
-      );
+      const exhausted = `automatic_activation_retries_exhausted:${retriesStarted}:${message}`;
+      store.setRequestedModelActivationError(modelId, exhausted);
+      if (operation) {
+        deploymentController.failOperation(
+          operation.id,
+          "activation_retries_exhausted",
+          exhausted,
+          { retryAt: null },
+        );
+      }
       return;
     }
     automaticActivationRetryState.set(modelId, nextRetry);
     store.setRequestedModelActivation(modelId, false);
+    if (operation) {
+      deploymentController.failOperation(
+        operation.id,
+        "transient_activation_failure",
+        message,
+        { retryAt: nextRetry.nextAttemptAt },
+      );
+    }
   };
   const launchRequestedModel = (model: StoredRequestedModel): boolean => {
     if (!activationManager || activationManager.isManaging(model.id) || activationManager.isBusy()) {
       return false;
     }
+    deploymentController.ensureModel(model);
+    deploymentController.setDesiredState(
+      model.id,
+      model.autoActivate ? "active" : "inactive",
+    );
+    const state = deploymentController.getState(model.id);
+    const operation = deploymentController.claimOperation(
+      model.id,
+      state?.observedState === "active" || state?.observedState === "degraded"
+        ? "repair"
+        : "activate",
+      { leaseMs: 90_000 },
+    );
+    if (!operation) return false;
     try {
       void activationManager.activate(model)
         .then(() => {
-          automaticActivationRetryState.delete(model.id);
+          if (deploymentController.getState(model.id)?.observedState === "active") {
+            automaticActivationRetryState.delete(model.id);
+          }
         })
         .catch((error: unknown) => {
-          handleRequestedModelActivationFailure(model.id, error);
+          handleRequestedModelActivationFailure(model.id, error, operation);
         });
       return true;
     } catch (error) {
-      handleRequestedModelActivationFailure(model.id, error);
+      handleRequestedModelActivationFailure(model.id, error, operation);
       return true;
     }
   };
@@ -536,6 +676,8 @@ export async function createCoordinator(
       // health check and real inference canary before publishing it again.
       const stopped = await activationManager.deactivate(model.id);
       if (!stopped) return;
+      deploymentController.releaseRoutesForModel(model.id);
+      deploymentController.adoptObservedState(model.id, "degraded");
       const latest = store.getRequestedModel(model.id);
       if (!latest?.autoActivate) return;
       store.setRequestedModelActivation(model.id, true);
@@ -559,6 +701,8 @@ export async function createCoordinator(
       app.log.warn({ modelId, reason }, "rebuilding an unresponsive distributed model route");
       const stopped = await activationManager.deactivate(modelId);
       if (!stopped) return;
+      deploymentController.releaseRoutesForModel(modelId);
+      deploymentController.adoptObservedState(modelId, "degraded");
       const latest = store.getRequestedModel(modelId);
       if (!latest?.autoActivate) return;
       store.setRequestedModelActivation(modelId, true);
@@ -588,6 +732,7 @@ export async function createCoordinator(
   const reconcileRequestedModels = () => {
     const workers = store.listWorkers();
     const connectedWorkerIds = hub.connectedWorkerIds();
+    const now = Date.now();
     const activeModelIds = new Set(
       scheduler
         .listAvailableModels({ connectedWorkerIds })
@@ -597,11 +742,27 @@ export async function createCoordinator(
     const benchmarkableModelIds = new Set(
       [...activeModelIds].filter((modelId) => benchmarkableRoutes.has(modelId)),
     );
-    for (const modelId of detectNewActiveModels(benchmarkableModelIds, observedActiveBenchmarkModels)) {
-      queueAutomaticBenchmark(modelId);
+    const activations = coordinatorBenchmarkActivations(
+      benchmarkableModelIds,
+      workers,
+      connectedWorkerIds,
+    );
+    for (const activation of benchmarkActivationTracker.observe(activations, now)) {
+      queueAutomaticBenchmark(activation);
     }
     let requests = store.listRequestedModels();
-    const now = Date.now();
+    for (const request of requests) {
+      deploymentController.ensureModel(request, now);
+      deploymentController.setDesiredState(
+        request.id,
+        request.autoActivate ? "active" : "inactive",
+        now,
+      );
+      const operation = deploymentController.activeOperationForModel(request.id);
+      if (operation && activationManager?.isManaging(request.id)) {
+        deploymentController.renewOperation(operation.id, 90_000, now);
+      }
+    }
     for (const request of requests) {
       if (
         request.autoActivate
@@ -641,6 +802,23 @@ export async function createCoordinator(
       const stored = requests.find((request) => request.id === view.id)!;
       if (view.status === "active") {
         automaticActivationRetryState.delete(view.id);
+        const operation = deploymentController.activeOperationForModel(view.id);
+        if (operation) {
+          deploymentController.completeOperation(
+            operation.id,
+            "active",
+            { publication: "scheduler-observed-active" },
+            now,
+          );
+        } else {
+          deploymentController.adoptObservedState(view.id, "active", now);
+        }
+        deploymentController.renewCommittedRoutesForModel(view.id, 90_000, now);
+      } else if (
+        view.status === "waiting_capacity"
+        && !deploymentController.activeOperationForModel(view.id)
+      ) {
+        deploymentController.markWaitingCapacity(view.id, view.message, now);
       }
       if (shouldQueueAutomaticActivation(view)) {
         const retry = automaticActivationRetryState.get(view.id);
@@ -1022,6 +1200,11 @@ export async function createCoordinator(
       minimumNodes: body.minimumNodes,
       autoActivate: body.autoActivate,
     });
+    deploymentController.ensureModel(stored);
+    deploymentController.setDesiredState(
+      stored.id,
+      stored.autoActivate ? "active" : "inactive",
+    );
     try {
       const profile = await inspectHubModelCapacity({
         source: stored.source,
@@ -1050,14 +1233,30 @@ export async function createCoordinator(
   app.delete("/public/v1/requested-models/:modelId", async (request, reply) => {
     if (!await authorizeModelMutation(request, reply)) return;
     const { modelId } = requestedModelParamsSchema.parse(request.params);
-    await activationManager?.deactivate(modelId);
-    if (!store.removeRequestedModel(modelId)) {
+    if (!store.getRequestedModel(modelId)) {
       return reply.code(404).send({ error: { code: "requested_model_not_found" } });
     }
+    deploymentController.setDesiredState(modelId, "inactive");
+    const deactivation = deploymentController.claimOperation(modelId, "deactivate", {
+      leaseMs: 60_000,
+    });
+    await activationManager?.deactivate(modelId);
+    deploymentController.releaseRoutesForModel(modelId);
+    if (deactivation) deploymentController.completeOperation(deactivation.id, "inactive");
+    store.removeRequestedModel(modelId);
     automaticActivationRetryState.delete(modelId);
     automaticRepairState.delete(modelId);
     automaticRepairInFlight.delete(modelId);
     return { removed: true, modelId };
+  });
+
+  app.get("/public/v1/requested-models/:modelId/timeline", async (request, reply) => {
+    const { modelId } = requestedModelParamsSchema.parse(request.params);
+    const timeline = deploymentController.timeline(modelId);
+    if (!timeline) {
+      return reply.code(404).send({ error: { code: "requested_model_not_found" } });
+    }
+    return { data: timeline };
   });
 
   app.get("/internal/v1/model-activation-requests", async () => {
@@ -1543,8 +1742,11 @@ export async function createCoordinator(
     mobileHub,
     service,
     persistence,
+    deploymentController,
     async close() {
       clearInterval(staleTimer);
+      for (const timer of automaticBenchmarkRetryTimers) clearTimeout(timer);
+      automaticBenchmarkRetryTimers.clear();
       hub.close();
       mobileHub.close();
       await activationManager?.close();

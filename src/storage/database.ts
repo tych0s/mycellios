@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-const SCHEMA_VERSION = 12;
+const SCHEMA_VERSION = 13;
 
 export interface PersistenceOutboxRow {
   id: number;
@@ -208,6 +208,88 @@ export class MeshDatabase {
 
       CREATE INDEX IF NOT EXISTS activation_events_model_occurred
       ON activation_events(model_id, occurred_at DESC);
+
+      CREATE TABLE IF NOT EXISTS deployment_states (
+        model_id TEXT PRIMARY KEY REFERENCES requested_models(id) ON DELETE CASCADE,
+        desired_state TEXT NOT NULL CHECK(desired_state IN ('active', 'inactive')),
+        observed_state TEXT NOT NULL CHECK(observed_state IN (
+          'inactive', 'waiting_capacity', 'preparing', 'canary', 'active',
+          'degraded', 'failed', 'stopping'
+        )),
+        generation INTEGER NOT NULL DEFAULT 1,
+        observed_generation INTEGER NOT NULL DEFAULT 0,
+        retry_count INTEGER NOT NULL DEFAULT 0,
+        next_retry_at INTEGER,
+        last_error TEXT,
+        active_operation_id TEXT,
+        controller_owner TEXT,
+        controller_lease_until INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS deployment_states_reconcile
+      ON deployment_states(desired_state, observed_state, next_retry_at, controller_lease_until);
+
+      CREATE TABLE IF NOT EXISTS deployment_operations (
+        id TEXT PRIMARY KEY,
+        model_id TEXT NOT NULL REFERENCES requested_models(id) ON DELETE CASCADE,
+        generation INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('activate', 'deactivate', 'repair', 'replan')),
+        status TEXT NOT NULL CHECK(status IN (
+          'pending', 'running', 'succeeded', 'failed', 'cancelled', 'interrupted'
+        )),
+        attempt INTEGER NOT NULL DEFAULT 1,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        error_code TEXT,
+        error_message TEXT,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        started_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        finished_at INTEGER
+      );
+
+      CREATE INDEX IF NOT EXISTS deployment_operations_model_started
+      ON deployment_operations(model_id, started_at DESC);
+
+      CREATE TABLE IF NOT EXISTS route_reservations (
+        id TEXT PRIMARY KEY,
+        model_id TEXT NOT NULL REFERENCES requested_models(id) ON DELETE CASCADE,
+        operation_id TEXT NOT NULL REFERENCES deployment_operations(id) ON DELETE CASCADE,
+        generation INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK(status IN (
+          'prepared', 'committed', 'released', 'expired', 'failed'
+        )),
+        route_digest TEXT NOT NULL,
+        stages_json TEXT NOT NULL,
+        canary_json TEXT,
+        expires_at INTEGER NOT NULL,
+        committed_at INTEGER,
+        released_at INTEGER,
+        error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS route_reservations_model_status
+      ON route_reservations(model_id, status, expires_at);
+
+      CREATE TABLE IF NOT EXISTS deployment_stage_leases (
+        id TEXT PRIMARY KEY,
+        reservation_id TEXT NOT NULL REFERENCES route_reservations(id) ON DELETE CASCADE,
+        model_id TEXT NOT NULL REFERENCES requested_models(id) ON DELETE CASCADE,
+        node_id TEXT NOT NULL,
+        stage_index INTEGER NOT NULL,
+        memory_mib INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('prepared', 'committed', 'released', 'expired')),
+        expires_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(reservation_id, node_id, stage_index)
+      );
+
+      CREATE INDEX IF NOT EXISTS deployment_stage_leases_node_status
+      ON deployment_stage_leases(node_id, status, expires_at);
 
       CREATE TABLE IF NOT EXISTS artifact_backup_outbox (
         id TEXT PRIMARY KEY,

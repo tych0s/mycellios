@@ -40,7 +40,16 @@ import { MAX_RUNTIME_STREAM_CHUNK_BYTES } from "../contracts/worker-protocol.js"
 import {
   RuntimeStreamTunnel,
   type RuntimeStreamServerMessage,
+  type RuntimeStreamTransportSnapshot,
 } from "./runtime-stream-tunnel.js";
+import type {
+  DirectTransportAdvertisement,
+  RuntimeDirectTransportOptions,
+} from "./runtime-direct-transport.js";
+import {
+  runtimePerformanceProfileSchema,
+  type RuntimePerformanceProfile,
+} from "../performance/runtime-profile.js";
 
 export interface WorkerAgentOptions {
   coordinatorUrl: string;
@@ -83,7 +92,12 @@ export interface WorkerAgentOptions {
     computeMode?: ComputeMode;
     cpuEligible?: boolean;
     acceleration?: WorkerAcceleratorDiagnostics;
+    /** Native peer transport. Enabled by default; options can pin listener/candidates. */
+    directTransport?: RuntimeDirectTransportOptions;
   };
+  /** Runs the packaged, physical runtime calibration for this exact node. */
+  runtimePerformanceProfileProbe?: () =>
+    Promise<RuntimePerformanceProfile | null | undefined>;
   logger?: Pick<Console, "info" | "warn" | "error">;
 }
 
@@ -106,6 +120,27 @@ const runtimeStreamDataSchema = z.string()
     (value) => Buffer.from(value, "base64").byteLength <= MAX_RUNTIME_STREAM_CHUNK_BYTES,
     `Runtime stream chunks cannot exceed ${MAX_RUNTIME_STREAM_CHUNK_BYTES} bytes`,
   );
+const runtimeStreamIdSchema = z.string().min(1).max(256);
+const runtimeStreamRecoveryTokenSchema = z.string()
+  .min(16)
+  .max(128)
+  .regex(/^[A-Za-z0-9_-]+$/);
+const runtimeStreamGenerationSchema = z.number().int().nonnegative().max(1_000_000);
+const runtimeStreamOffsetSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+const directGrantSchema = z.object({
+  protocol: z.literal("mycellios-direct/1"),
+  connectionId: runtimeStreamIdSchema,
+  sourceNodeId: runtimeStreamIdSchema,
+  destinationNodeId: runtimeStreamIdSchema,
+  targetPort: z.number().int().min(1).max(65_535),
+  expiresAt: z.number().int().positive(),
+  secret: z.string().length(43).regex(/^[A-Za-z0-9_-]+$/),
+}).strict();
+const directCandidateSchema = z.object({
+  host: z.string().min(1).max(253),
+  port: z.number().int().min(1).max(65_535),
+  scope: z.enum(["lan", "configured"]),
+}).strict();
 
 const serverMessageSchema = z.discriminatedUnion("type", [
   z
@@ -155,36 +190,169 @@ const serverMessageSchema = z.discriminatedUnion("type", [
   z.object({
     ...envelopeFields,
     type: z.literal("runtime.stream.open"),
+    payload: z.union([
+      z.object({
+        streamId: runtimeStreamIdSchema,
+        targetPort: z.number().int().min(1).max(65_535),
+      }).strict(),
+      z.object({
+        streamId: runtimeStreamIdSchema,
+        targetPort: z.number().int().min(1).max(65_535),
+        generation: runtimeStreamGenerationSchema,
+        recoveryToken: runtimeStreamRecoveryTokenSchema,
+      }).strict(),
+    ]),
+  }).strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.direct.offer"),
     payload: z.object({
-      streamId: z.string().min(1).max(256),
-      targetPort: z.number().int().min(1).max(65_535),
+      streamId: runtimeStreamIdSchema,
+      grant: directGrantSchema,
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.direct.connect"),
+    payload: z.object({
+      streamId: runtimeStreamIdSchema,
+      destinationNodeId: runtimeStreamIdSchema,
+      grant: directGrantSchema,
+      candidates: z.array(directCandidateSchema).min(1).max(8),
+      timeoutMs: z.number().int().min(250).max(15_000),
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.direct.commit"),
+    payload: z.object({
+      streamId: runtimeStreamIdSchema,
+      connectionId: runtimeStreamIdSchema,
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.direct.cancel"),
+    payload: z.object({
+      streamId: runtimeStreamIdSchema,
+      connectionId: runtimeStreamIdSchema,
     }).strict(),
   }).strict(),
   z.object({
     ...envelopeFields,
     type: z.literal("runtime.stream.opened"),
-    payload: z.object({ streamId: z.string().min(1).max(256) }).strict(),
+    payload: z.union([
+      z.object({ streamId: runtimeStreamIdSchema }).strict(),
+      z.object({
+        streamId: runtimeStreamIdSchema,
+        generation: runtimeStreamGenerationSchema,
+        recoveryToken: runtimeStreamRecoveryTokenSchema,
+      }).strict(),
+    ]),
   }).strict(),
   z.object({
     ...envelopeFields,
     type: z.literal("runtime.stream.data"),
+    payload: z.union([
+      z.object({
+        streamId: runtimeStreamIdSchema,
+        sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+        data: runtimeStreamDataSchema,
+      }).strict(),
+      z.object({
+        streamId: runtimeStreamIdSchema,
+        sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+        generation: runtimeStreamGenerationSchema,
+        recoveryToken: runtimeStreamRecoveryTokenSchema,
+        offset: runtimeStreamOffsetSchema,
+        data: runtimeStreamDataSchema,
+      }).strict(),
+    ]),
+  }).strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.stream.ack"),
     payload: z.object({
-      streamId: z.string().min(1).max(256),
-      sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-      data: runtimeStreamDataSchema,
+      streamId: runtimeStreamIdSchema,
+      generation: runtimeStreamGenerationSchema,
+      recoveryToken: runtimeStreamRecoveryTokenSchema,
+      acknowledgedOffset: runtimeStreamOffsetSchema,
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.stream.suspend"),
+    payload: z.object({
+      streamId: runtimeStreamIdSchema,
+      generation: runtimeStreamGenerationSchema,
+      recoveryToken: runtimeStreamRecoveryTokenSchema,
+      deadlineAt: z.number().int().positive(),
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.stream.resumed"),
+    payload: z.object({
+      streamId: runtimeStreamIdSchema,
+      previousGeneration: runtimeStreamGenerationSchema,
+      generation: runtimeStreamGenerationSchema,
+      recoveryToken: runtimeStreamRecoveryTokenSchema,
+      sendFromOffset: runtimeStreamOffsetSchema,
     }).strict(),
   }).strict(),
   z.object({
     ...envelopeFields,
     type: z.literal("runtime.stream.end"),
-    payload: z.object({ streamId: z.string().min(1).max(256) }).strict(),
+    payload: z.union([
+      z.object({ streamId: runtimeStreamIdSchema }).strict(),
+      z.object({
+        streamId: runtimeStreamIdSchema,
+        generation: runtimeStreamGenerationSchema,
+        recoveryToken: runtimeStreamRecoveryTokenSchema,
+        finalOffset: runtimeStreamOffsetSchema,
+      }).strict(),
+    ]),
   }).strict(),
   z.object({
     ...envelopeFields,
     type: z.literal("runtime.stream.error"),
+    payload: z.union([
+      z.object({
+        streamId: runtimeStreamIdSchema,
+        message: z.string().min(1).max(1_024),
+      }).strict(),
+      z.object({
+        streamId: runtimeStreamIdSchema,
+        generation: runtimeStreamGenerationSchema,
+        recoveryToken: runtimeStreamRecoveryTokenSchema,
+        message: z.string().min(1).max(1_024),
+      }).strict(),
+    ]),
+  }).strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.link.probe.start"),
     payload: z.object({
-      streamId: z.string().min(1).max(256),
-      message: z.string().min(1).max(1_024),
+      probeId: z.string().min(1).max(256),
+      destinationNodeId: z.string().min(1).max(256),
+      timeoutMs: z.number().int().min(100).max(60_000),
+      payloadBytes: z.number().int().min(1).max(16 * 1024),
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.link.probe.ping"),
+    payload: z.object({
+      probeId: z.string().min(1).max(256),
+      data: runtimeStreamDataSchema,
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.link.probe.pong"),
+    payload: z.object({
+      probeId: z.string().min(1).max(256),
+      data: runtimeStreamDataSchema,
     }).strict(),
   }).strict(),
 ]);
@@ -198,6 +366,16 @@ const registrationResponseSchema = z
 
 type ValidatedServerMessage = z.infer<typeof serverMessageSchema>;
 
+interface PendingRuntimeLinkProbe {
+  destinationNodeId: string;
+  payloadBytes: number;
+  startedAt: bigint;
+  timeout: NodeJS.Timeout;
+}
+
+const MAX_PENDING_RUNTIME_LINK_PROBES = 64;
+const RUNTIME_RECONNECT_GRACE_MS = 45_000;
+
 export class WorkerAgent {
   private readonly adapter: InferenceAdapter;
   private readonly coordinatorBaseUrl: URL;
@@ -210,9 +388,12 @@ export class WorkerAgent {
   private readonly recentJobs = new Map<string, number>();
   private readonly authorizedRuntimeProcesses = new Map<string, string>();
   private readonly runtimeProcesses = new Map<string, LaunchProcessHandle>();
+  private readonly runtimeLinkProbes = new Map<string, PendingRuntimeLinkProbe>();
   private readonly runtimeTunnel: RuntimeStreamTunnel | null;
+  private directTransportAdvertisement: DirectTransportAdvertisement | null = null;
   private readonly logger: Pick<Console, "info" | "warn" | "error">;
   private runtimeCapacityGeneration = 0;
+  private runtimeDisconnectTimer: NodeJS.Timeout | null = null;
 
   constructor(
     private readonly config: WorkerConfig,
@@ -225,11 +406,17 @@ export class WorkerAgent {
       ? new RuntimeStreamTunnel(
           options.distributedExecutor.nodeId,
           (type, payload) => this.sendMessage(type, payload),
+          {
+            ...(options.distributedExecutor.directTransport
+              ? { directTransport: options.distributedExecutor.directTransport }
+              : {}),
+          },
         )
       : null;
   }
 
   async start(): Promise<void> {
+    this.directTransportAdvertisement = await this.runtimeTunnel?.startDirectTransport() ?? null;
     this.capabilities = await this.buildCapabilities();
     await this.register();
     let delayMs = 500;
@@ -249,8 +436,11 @@ export class WorkerAgent {
   async stop(): Promise<void> {
     this.stopped = true;
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    this.clearRuntimeDisconnectTimer();
+    this.clearRuntimeLinkProbes();
     await this.abortActiveJobs("Worker shutting down");
     await this.resetDistributedRuntime("worker_shutting_down");
+    await this.runtimeTunnel?.close();
     await this.sendGoodbye("user_requested");
     await this.closeSocket();
   }
@@ -284,6 +474,8 @@ export class WorkerAgent {
 
     const hardware = await (this.options.hardwareProbe?.() ?? probeHardware());
     if (generation !== this.runtimeCapacityGeneration) return;
+    const performanceProfile = await this.measureRuntimePerformanceProfile();
+    if (generation !== this.runtimeCapacityGeneration) return;
     const selectedHardwareGpu = selectHardwareGpu(hardware.gpus, this.options.preferredHardwareGpu)
       ?? hardware.gpus[0];
     const primary = this.options.hardwareCapacityOverride
@@ -301,6 +493,13 @@ export class WorkerAgent {
     const defaultPeakVramMb = Math.max(512, Math.floor(safeVramBudget(offeredVramMb) * 0.9));
     const publicPrimary = publicHardwareGpu(primary);
 
+    const existingExecutor = this.capabilities.distributedExecutor;
+    const executorWithoutProfile = existingExecutor
+      ? (() => {
+          const { performanceProfile: _previousProfile, ...rest } = existingExecutor;
+          return rest;
+        })()
+      : undefined;
     this.capabilities = {
       ...this.capabilities,
       gpus: [{
@@ -312,14 +511,17 @@ export class WorkerAgent {
         ...deployment,
         peakVramMb: this.config.deployment.peakVramMb ?? defaultPeakVramMb,
       })),
-      ...(this.capabilities.distributedExecutor
+      ...(executorWithoutProfile
         ? {
             distributedExecutor: {
-              ...this.capabilities.distributedExecutor,
+              ...executorWithoutProfile,
               computeMode: this.options.distributedExecutor?.computeMode ?? "automatic",
               cpuEligible: this.options.distributedExecutor?.cpuEligible === true,
               ...(this.options.distributedExecutor?.acceleration
                 ? { acceleration: structuredClone(this.options.distributedExecutor.acceleration) }
+                : {}),
+              ...(performanceProfile
+                ? { performanceProfile: structuredClone(performanceProfile) }
                 : {}),
             },
           }
@@ -348,6 +550,10 @@ export class WorkerAgent {
 
   get activeJobCount(): number {
     return this.activeJobs.size;
+  }
+
+  runtimeTransportSnapshot(): RuntimeStreamTransportSnapshot[] {
+    return this.runtimeTunnel?.transportSnapshot() ?? [];
   }
 
   private async sendGoodbye(reason: "user_requested" | "shutdown"): Promise<void> {
@@ -394,10 +600,11 @@ export class WorkerAgent {
   }
 
   private async buildCapabilities(): Promise<WorkerCapabilities> {
-    const [hardware, adapter, llmfit] = await Promise.all([
+    const [hardware, adapter, llmfit, performanceProfile] = await Promise.all([
       this.options.hardwareProbe?.() ?? probeHardware(),
       this.adapter.probe(),
       this.inspectWithLlmfit(),
+      this.measureRuntimePerformanceProfile(),
     ]);
     const selectedHardwareGpu = selectHardwareGpu(hardware.gpus, this.options.preferredHardwareGpu)
       ?? hardware.gpus[0];
@@ -495,6 +702,7 @@ export class WorkerAgent {
         ? {
             distributedExecutor: {
               protocol: "gdlp-worker-tunnel/2" as const,
+              streamRecovery: "offset-ack-v1" as const,
               nodeId: this.options.distributedExecutor.nodeId,
               stageHost: this.options.distributedExecutor.stageHost,
               stagePort: this.options.distributedExecutor.stagePort,
@@ -504,10 +712,47 @@ export class WorkerAgent {
               ...(this.options.distributedExecutor.acceleration
                 ? { acceleration: structuredClone(this.options.distributedExecutor.acceleration) }
                 : {}),
+              ...(performanceProfile
+                ? { performanceProfile: structuredClone(performanceProfile) }
+                : {}),
+              ...(this.directTransportAdvertisement
+                ? { directTransport: structuredClone(this.directTransportAdvertisement) }
+                : {}),
             },
           }
         : {}),
     };
+  }
+
+  private async measureRuntimePerformanceProfile(): Promise<RuntimePerformanceProfile | undefined> {
+    const probe = this.options.runtimePerformanceProfileProbe;
+    if (!this.options.distributedExecutor || !probe) return undefined;
+    try {
+      const measured = await probe();
+      if (!measured) return undefined;
+      const profile = runtimePerformanceProfileSchema.parse(measured);
+      const expectedBackend = this.options.verifiedGpuRuntime?.backend ?? "cpu";
+      const expectedPrecision = expectedBackend === "cpu" ? "float32" : "float16";
+      if (profile.backend !== expectedBackend) {
+        throw new Error("runtime_performance_profile_backend_does_not_match_capacity");
+      }
+      if (profile.precision !== expectedPrecision) {
+        throw new Error("runtime_performance_profile_precision_does_not_match_capacity");
+      }
+      if (
+        this.options.verifiedGpuRuntime
+        && normalizeDeviceName(profile.deviceName)
+          !== normalizeDeviceName(this.options.verifiedGpuRuntime.deviceName)
+      ) {
+        throw new Error("runtime_performance_profile_device_does_not_match_capacity");
+      }
+      return profile;
+    } catch (error) {
+      this.logger.warn(
+        `Native runtime performance calibration unavailable: ${errorText(error)}`,
+      );
+      return undefined;
+    }
   }
 
   private async inspectWithLlmfit(): Promise<WorkerCapabilities["llmfit"] | null> {
@@ -628,11 +873,23 @@ export class WorkerAgent {
         if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
         this.heartbeatTimer = null;
         this.socket = null;
+        this.clearRuntimeLinkProbes();
+        this.runtimeTunnel?.transportDisconnected();
         void this.abortActiveJobs("Coordinator disconnected");
-        void this.resetDistributedRuntime("coordinator_disconnected").finally(() => {
-          if (opened) resolve();
-          else reject(new Error("Coordinator connection closed before it became ready"));
-        });
+        if (
+          opened
+          && !this.stopped
+          && this.options.reconnect !== false
+          && this.runtimeTunnel
+        ) {
+          this.scheduleRuntimeDisconnectReset();
+          resolve();
+        } else {
+          void this.resetDistributedRuntime("coordinator_disconnected").finally(() => {
+            if (opened) resolve();
+            else reject(new Error("Coordinator connection closed before it became ready"));
+          });
+        }
       });
     });
   }
@@ -651,7 +908,9 @@ export class WorkerAgent {
         }
         this.logger.info(`Worker ${this.registeredWorkerId ?? "unknown"} connected`);
         if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+        this.clearRuntimeDisconnectTimer();
         await this.sendHeartbeat();
+        this.runtimeTunnel?.transportConnected();
         this.heartbeatTimer = setInterval(
           () => void this.sendHeartbeat(),
           this.options.heartbeatIntervalMs ?? 5_000,
@@ -681,11 +940,103 @@ export class WorkerAgent {
       case "runtime.stream.open":
       case "runtime.stream.opened":
       case "runtime.stream.data":
+      case "runtime.stream.ack":
+      case "runtime.stream.suspend":
+      case "runtime.stream.resumed":
       case "runtime.stream.end":
       case "runtime.stream.error":
+      case "runtime.direct.offer":
+      case "runtime.direct.connect":
+      case "runtime.direct.commit":
+      case "runtime.direct.cancel":
         await this.runtimeTunnel?.handle(message as RuntimeStreamServerMessage);
         break;
+      case "runtime.link.probe.start":
+        this.startRuntimeLinkProbe(
+          message.payload.probeId,
+          message.payload.destinationNodeId,
+          message.payload.timeoutMs,
+          message.payload.payloadBytes,
+        );
+        break;
+      case "runtime.link.probe.ping":
+        this.sendMessage("runtime.link.probe.pong", {
+          probeId: message.payload.probeId,
+          data: message.payload.data,
+        });
+        break;
+      case "runtime.link.probe.pong":
+        this.completeRuntimeLinkProbe(message.payload.probeId, message.payload.data);
+        break;
     }
+  }
+
+  private startRuntimeLinkProbe(
+    probeId: string,
+    destinationNodeId: string,
+    timeoutMs: number,
+    payloadBytes: number,
+  ): void {
+    if (this.runtimeLinkProbes.has(probeId)) return;
+    if (this.runtimeLinkProbes.size >= MAX_PENDING_RUNTIME_LINK_PROBES) {
+      this.sendMessage("runtime.link.probe.result", {
+        probeId,
+        destinationNodeId,
+        rttMs: null,
+        goodputMbps: null,
+      });
+      return;
+    }
+    const timeout = setTimeout(() => {
+      const pending = this.runtimeLinkProbes.get(probeId);
+      if (!pending || !this.runtimeLinkProbes.delete(probeId)) return;
+      this.sendMessage("runtime.link.probe.result", {
+        probeId,
+        destinationNodeId: pending.destinationNodeId,
+        rttMs: null,
+        goodputMbps: null,
+      });
+    }, timeoutMs);
+    timeout.unref();
+    this.runtimeLinkProbes.set(probeId, {
+      destinationNodeId,
+      payloadBytes,
+      startedAt: process.hrtime.bigint(),
+      timeout,
+    });
+    const fill = probeId.charCodeAt(probeId.length - 1) || 1;
+    const data = Buffer.alloc(payloadBytes, fill).toString("base64");
+    this.sendMessage("runtime.link.probe.ping", { probeId, destinationNodeId, data });
+  }
+
+  private completeRuntimeLinkProbe(probeId: string, data: string): void {
+    const pending = this.runtimeLinkProbes.get(probeId);
+    if (!pending || !this.runtimeLinkProbes.delete(probeId)) return;
+    clearTimeout(pending.timeout);
+    const receivedBytes = Buffer.from(data, "base64").byteLength;
+    if (receivedBytes !== pending.payloadBytes) {
+      this.sendMessage("runtime.link.probe.result", {
+        probeId,
+        destinationNodeId: pending.destinationNodeId,
+        rttMs: null,
+        goodputMbps: null,
+      });
+      return;
+    }
+    const elapsedNs = process.hrtime.bigint() - pending.startedAt;
+    const rttMs = Number(elapsedNs) / 1_000_000;
+    const goodputMbps = (2 * pending.payloadBytes * 8) / (rttMs * 1_000);
+    this.sendMessage("runtime.link.probe.result", {
+      probeId,
+      destinationNodeId: pending.destinationNodeId,
+      rttMs: Math.min(60_000, Math.max(Number.EPSILON, rttMs)),
+      goodputMbps: Math.min(10_000_000, Math.max(Number.EPSILON, goodputMbps)),
+    });
+  }
+
+  private clearRuntimeLinkProbes(): void {
+    for (const probe of this.runtimeLinkProbes.values()) clearTimeout(probe.timeout);
+    this.runtimeLinkProbes.clear();
   }
 
   private async prepareDistributedRuntime(requestId: string, input: unknown): Promise<void> {
@@ -763,11 +1114,29 @@ export class WorkerAgent {
   }
 
   private async resetDistributedRuntime(reason: string): Promise<void> {
+    this.clearRuntimeDisconnectTimer();
     const handles = [...this.runtimeProcesses.values()];
     this.runtimeProcesses.clear();
     this.authorizedRuntimeProcesses.clear();
     await Promise.all(handles.map((handle) => handle.stop(reason).catch(() => undefined)));
-    await this.runtimeTunnel?.close();
+    await this.runtimeTunnel?.reset();
+  }
+
+  private scheduleRuntimeDisconnectReset(): void {
+    this.clearRuntimeDisconnectTimer();
+    const timer = setTimeout(() => {
+      if (this.runtimeDisconnectTimer !== timer) return;
+      this.runtimeDisconnectTimer = null;
+      void this.resetDistributedRuntime("coordinator_reconnect_timeout");
+    }, RUNTIME_RECONNECT_GRACE_MS);
+    timer.unref();
+    this.runtimeDisconnectTimer = timer;
+  }
+
+  private clearRuntimeDisconnectTimer(): void {
+    if (!this.runtimeDisconnectTimer) return;
+    clearTimeout(this.runtimeDisconnectTimer);
+    this.runtimeDisconnectTimer = null;
   }
 
   private sendRuntimeExit(
@@ -1023,11 +1392,13 @@ export class WorkerAgent {
     };
   }
 
-  private sendMessage(type: string, payload: unknown): void {
-    if (!this.registeredWorkerId || !this.socket || this.socket.readyState !== WebSocket.OPEN) return;
+  private sendMessage(type: string, payload: unknown): boolean {
+    if (!this.registeredWorkerId || !this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      return false;
+    }
     if (this.socket.bufferedAmount > MAX_WEBSOCKET_BUFFERED_BYTES) {
       this.socket.close(4429, "runtime stream backpressure exceeded");
-      return;
+      return false;
     }
     const envelope: WorkerEnvelope = {
       v: 1,
@@ -1036,6 +1407,7 @@ export class WorkerAgent {
       payload,
     };
     this.socket.send(JSON.stringify(envelope));
+    return true;
   }
 }
 
@@ -1122,6 +1494,10 @@ function delay(milliseconds: number): Promise<void> {
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function normalizeDeviceName(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
 function isLaunchAgentStartRequest(value: unknown): value is LaunchAgentStartRequest {

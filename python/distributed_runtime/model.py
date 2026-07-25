@@ -1655,6 +1655,35 @@ def _load_selective_stage_model(spec: StageModelSpec):
         layer_end=spec.layer_end,
         total_layers=spec.total_layers,
     )
+    # A native Mycellios stage package is authenticated before Transformers is
+    # allowed to construct or copy a single resident parameter. Arbitrary local
+    # Hugging Face checkpoints remain supported for development, while the
+    # presence of our manifest makes verification mandatory and fail-closed.
+    from .stage_artifact import (
+        STAGE_ARTIFACT_MANIFEST,
+        STAGE_ARTIFACT_WEIGHTS,
+        verify_stage_artifact,
+    )
+
+    artifact_root = Path(snapshot_name)
+    if any(
+        (artifact_root / name).exists()
+        for name in (STAGE_ARTIFACT_MANIFEST, STAGE_ARTIFACT_WEIGHTS)
+    ):
+        expected_package_id = None
+        if (
+            spec.artifact_identity is not None
+            and spec.artifact_identity.startswith("sha256:")
+            and len(spec.artifact_identity) == 71
+        ):
+            expected_package_id = spec.artifact_identity.removeprefix("sha256:")
+        verify_stage_artifact(
+            snapshot_name,
+            expected_layer_start=spec.layer_start,
+            expected_layer_end=spec.layer_end,
+            expected_total_layers=spec.total_layers,
+            expected_package_id=expected_package_id,
+        )
     resolved_spec = replace(spec, model_name=snapshot_name, revision=None)
     config = AutoConfig.from_pretrained(snapshot_name)
     adapter = resolve_selective_stage_adapter(config)

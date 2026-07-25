@@ -1,9 +1,10 @@
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   compareRunWithHistory,
+  createRunIdentity,
   loadBenchmarkRuns,
   saveBenchmarkRun,
   type RunIdentity,
@@ -21,6 +22,12 @@ const IDENTITY: RunIdentity = {
   gitCommit: "0123456789abcdef",
   gitBranch: "test",
   gitDirty: false,
+  build: {
+    release: "1.0.0",
+    releaseSource: "override",
+    revision: "0123456789abcdef",
+    revisionSource: "git",
+  },
 };
 
 describe("benchmark lab", () => {
@@ -56,8 +63,60 @@ describe("benchmark lab", () => {
     const cwd = mkdtempSync(join(tmpdir(), "mycellios-benchlab-"));
     const run = realRun(IDENTITY);
     const path = saveBenchmarkRun(cwd, run);
-    expect(JSON.parse(readFileSync(path, "utf8")).schema).toBe("mycellios-benchmark-run/1");
+    expect(JSON.parse(readFileSync(path, "utf8")).schema).toBe("mycellios-benchmark-run/2");
     expect(loadBenchmarkRuns(cwd)).toHaveLength(1);
+  });
+
+  it("uses deployment release and revision without a .git directory", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "mycellios-release-"));
+    writeFileSync(join(cwd, "package.json"), JSON.stringify({ version: "0.2.19" }));
+    writeFileSync(join(cwd, "REVISION"), `${"a".repeat(40)}\n`);
+
+    const fromFile = createRunIdentity(cwd, undefined, undefined, {});
+    expect(fromFile.version).toBe("0.2.19");
+    expect(fromFile.gitCommit).toBe("a".repeat(40));
+    expect(fromFile.gitDirty).toBeNull();
+    expect(fromFile.build).toEqual({
+      release: "0.2.19",
+      releaseSource: "package",
+      revision: "a".repeat(40),
+      revisionSource: "revision-file",
+    });
+
+    const fromEnvironment = createRunIdentity(cwd, undefined, undefined, {
+      MYCELLIOS_RELEASE: "0.3.0",
+      MYCELLIOS_REVISION: "b".repeat(40),
+    });
+    expect(fromEnvironment.version).toBe("0.3.0");
+    expect(fromEnvironment.gitCommit).toBe("b".repeat(40));
+    expect(fromEnvironment.build.releaseSource).toBe("environment");
+    expect(fromEnvironment.build.revisionSource).toBe("environment");
+  });
+
+  it("migrates schema v1 explicitly and blocks comparisons without a model digest", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "mycellios-benchlab-v1-"));
+    const current = realRun(IDENTITY);
+    const legacy = structuredClone(current) as unknown as Record<string, unknown>;
+    legacy.schema = "mycellios-benchmark-run/1";
+    legacy.gitCommit = null;
+    legacy.gitBranch = null;
+    legacy.gitDirty = false;
+    delete legacy.build;
+    for (const measurement of legacy.measurements as Array<Record<string, unknown>>) {
+      delete measurement.scenarioFingerprint;
+      delete measurement.topology;
+      delete (measurement.model as Record<string, unknown>).digest;
+    }
+    writeFileSync(join(cwd, "legacy.json"), JSON.stringify(legacy));
+
+    const [migrated] = loadBenchmarkRuns(cwd, ".");
+    expect(migrated?.schema).toBe("mycellios-benchmark-run/2");
+    expect(migrated?.gitDirty).toBeNull();
+    expect(migrated?.measurements[0]?.model.digest).toBeNull();
+    expect(migrated?.measurements[0]?.scenarioFingerprint).toMatch(/^sha256:[0-9a-f]{64}$/);
+
+    const compared = compareRunWithHistory(current, [migrated!]);
+    expect(compared.measurements[0]?.comparison.baselineRunId).toBeNull();
   });
 
   it("imports real campaign metrics without relabelling them as simulated", () => {
@@ -80,9 +139,13 @@ describe("benchmark lab", () => {
         passed: true,
         apiHealth: {
           model: "physical-model",
+          artifactIdentity: `sha256:${"c".repeat(64)}`,
+          canonicalModelSource: "hf://physical/model",
           canonicalModelRevision: "revision-1",
+          pipelineSnapshotIdentity: "pipeline-snapshot-1",
           codec: "fp16",
           stages: 2,
+          boundaries: [0, 14, 28],
         },
         samples: [
           {
@@ -105,7 +168,7 @@ describe("benchmark lab", () => {
     const config = {
       schema: "gdlp-physical-gpu-campaign-config/1",
       networkScope: "lan",
-      hosts: [{}, {}],
+      hosts: [{ rankNodeId: "node-a" }, { rankNodeId: "node-b" }],
     };
     const run = importPhysicalCampaign(IDENTITY, observation, config);
     expect(run.suite).toBe("physical-import");

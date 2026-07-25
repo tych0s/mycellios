@@ -2,6 +2,7 @@ import type {
   PhysicalGpuCampaignCliConfig,
   PhysicalGpuCampaignCliObservationV1,
 } from "../distribution/physical-gpu-campaign-cli.js";
+import { sha256CanonicalEvidence } from "../core/json.js";
 import {
   BENCHMARK_RUN_SCHEMA,
   emptyComparison,
@@ -10,6 +11,7 @@ import {
   type BenchmarkRun,
 } from "./types.js";
 import type { RunIdentity } from "./history.js";
+import { sealBenchmarkScenario } from "./scenario.js";
 
 const OBSERVATION_SCHEMA = "gdlp-physical-gpu-campaign-cli-observation/1";
 const CONFIG_SCHEMA = "gdlp-physical-gpu-campaign-config/1";
@@ -27,7 +29,7 @@ export function importPhysicalCampaign(
     throw new Error("La campaña física no terminó correctamente y no se importará como resultado válido.");
   }
   const health = campaign.apiHealth;
-  const profiles = physicalProfiles(observation);
+  const profiles = physicalProfiles(observation, health.codec);
   const connectedDevices = profiles.reduce((total, profile) => total + profile.count, 0);
   const measurements = campaign.summary.byConcurrency.map((summary) => {
     const samples = campaign.samples.filter(
@@ -67,16 +69,17 @@ function physicalMeasurement(
 ): BenchmarkMeasurement {
   const campaign = observation.campaign!;
   const health = campaign.apiHealth!;
-  return {
+  return sealBenchmarkScenario({
     id: `physical-${config.networkScope}-${health.model}-c${concurrency}`,
     title: `${health.model} físico · concurrencia ${concurrency}`,
     description: `Campaña certificada sobre ${config.networkScope.toUpperCase()} con canarios antes y después.`,
     evidence: "physical",
     environment: config.networkScope,
     model: {
-      id: health.model,
+      id: health.canonicalModelSource,
       label: health.model,
       revision: health.canonicalModelRevision,
+      digest: health.artifactIdentity,
       precision: health.codec,
     },
     inventory: {
@@ -84,6 +87,13 @@ function physicalMeasurement(
       connectedDevices,
       selectedDevices: config.hosts.length,
       profiles,
+    },
+    topology: {
+      digest: health.pipelineSnapshotIdentity || observation.pipelineId,
+      stageCount: health.stages,
+      boundaries: health.boundaries?.slice() ?? [],
+      nodeIds: config.hosts.map((host) => host.rankNodeId),
+      routeClasses: ["pipeline"],
     },
     workload: {
       promptTokens: median(
@@ -99,6 +109,13 @@ function physicalMeasurement(
           .filter((value): value is number => value !== null),
       ),
       concurrentSequences: concurrency,
+      promptDigest: Array.isArray(config.canaries) && config.canaries.length > 0
+        ? sha256CanonicalEvidence(config.canaries)
+        : null,
+      requests: campaign.samples.filter(
+        (sample) => sample.phase === "measure" && sample.concurrency === concurrency,
+      ).length,
+      routeClasses: ["pipeline"],
     },
     metrics: {
       tokensPerSecond,
@@ -117,24 +134,28 @@ function physicalMeasurement(
       "MEDICIÓN FÍSICA: importada de la campaña GPU con paridad y limpieza verificadas.",
       `Pipeline ${observation.pipelineId ?? "desconocido"}; ${health.stages} etapas; codec ${health.codec}.`,
     ],
-  };
+  });
 }
 
-function physicalProfiles(observation: PhysicalGpuCampaignCliObservationV1): BenchmarkDeviceProfile[] {
-  const counts = new Map<string, { label: string; memoryGb: number; count: number }>();
-  for (const probe of observation.probes) {
-    for (const device of probe.probe.devices) {
-      const memoryGb = Math.round((device.totalMemoryBytes / 1024 ** 3) * 10) / 10;
-      const key = `${device.name}\u0000${memoryGb}`;
-      const current = counts.get(key);
-      counts.set(key, {
-        label: device.name,
-        memoryGb,
-        count: (current?.count ?? 0) + 1,
-      });
-    }
-  }
-  return [...counts.values()].map((entry) => ({ ...entry, kind: "gpu" }));
+function physicalProfiles(
+  observation: PhysicalGpuCampaignCliObservationV1,
+  precision: string,
+): BenchmarkDeviceProfile[] {
+  return observation.probes.flatMap((probe) => {
+    const backend = probe.probe.runtime?.cudaApiAvailable
+      ? probe.probe.runtime.rocmVersion ? "rocm" : "cuda"
+      : null;
+    return probe.probe.devices.map((device) => ({
+      nodeId: probe.rankNodeId,
+      label: device.name,
+      kind: "gpu" as const,
+      count: 1,
+      memoryGb: Math.round((device.totalMemoryBytes / 1024 ** 3) * 10) / 10,
+      backend,
+      precision,
+      physicalMemoryGb: Math.round((device.totalMemoryBytes / 1024 ** 3) * 10) / 10,
+    }));
+  });
 }
 
 function assertPhysicalInput(

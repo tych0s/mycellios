@@ -1,0 +1,431 @@
+import { createHash } from "node:crypto";
+import {
+  distributionObjective,
+  evaluateDistributionPlan,
+} from "./cost-model.js";
+import {
+  DEFAULT_SEARCH_OPTIONS,
+  ExhaustiveTopologyPlanner,
+  FleetTopologyPlanner,
+  TopologyBeamPlanner,
+} from "./planners.js";
+import type {
+  DistributionMetrics,
+  DistributionPlan,
+  DistributionTopology,
+  DistributionWorkload,
+  DistributedModelProfile,
+  SearchOptions,
+} from "./types.js";
+
+export type NativeRouteWorkloadClass = "interactive" | "throughput";
+
+export interface NativeFleetNodeState {
+  nodeId: string;
+  /** Processes on one physical machine share this identifier. */
+  physicalHostId: string;
+  /** Independent power/network/failure boundary, normally a home or site. */
+  failureDomainId: string;
+  queuedRequests: number;
+  activeRequests: number;
+  capacity: number;
+  freeSlots: number;
+  observedP95ServiceMs: number | null;
+  kvSessionIds: readonly string[];
+}
+
+export interface NativeRouteRequest {
+  workloadClass: NativeRouteWorkloadClass;
+  sessionId: string | null;
+  kvMissPenaltyMs: number;
+}
+
+export interface NativeRouteScore {
+  total: number;
+  computeMs: number;
+  queueMs: number;
+  p95Ms: number;
+  kvPenaltyMs: number;
+  physicalBoundaryMs: number;
+  physicalBoundaryCount: number;
+  failureRisk: number;
+}
+
+export interface NativeCompleteChain {
+  chainId: string;
+  plan: DistributionPlan;
+  metrics: DistributionMetrics;
+  score: NativeRouteScore;
+  nodeIds: string[];
+  failureDomainIds: string[];
+}
+
+export interface NativeFleetPlacement {
+  requestedReplicas: number;
+  chains: NativeCompleteChain[];
+  complete: boolean;
+  reason: string | null;
+}
+
+export interface NativeFleetPlacementOptions {
+  desiredReplicas: number;
+  searchOptions?: SearchOptions;
+}
+
+export interface PlannerOracleResult {
+  plannerObjective: number;
+  oracleObjective: number;
+  relativeGap: number;
+  withinTolerance: boolean;
+  plannerPlan: DistributionPlan;
+  oraclePlan: DistributionPlan;
+}
+
+/**
+ * Two-phase native placement.
+ *
+ * Phase one creates complete, short chains. Phase two repeats the placement on
+ * disjoint failure domains so every result is independently executable. A
+ * partial stage set is never published as a replica.
+ */
+export function planNativeReplicaChains(
+  model: DistributedModelProfile,
+  topology: DistributionTopology,
+  workload: DistributionWorkload,
+  nodeStates: readonly NativeFleetNodeState[],
+  request: NativeRouteRequest,
+  options: NativeFleetPlacementOptions,
+): NativeFleetPlacement {
+  if (
+    !Number.isInteger(options.desiredReplicas)
+    || options.desiredReplicas < 1
+    || options.desiredReplicas > 64
+  ) {
+    throw new Error("native_replica_count_is_invalid");
+  }
+  const stateByNode = validateNodeStates(topology, nodeStates);
+  const searchOptions = options.searchOptions ?? DEFAULT_SEARCH_OPTIONS;
+  const excludedNodes = new Set<string>();
+  const excludedFailureDomains = new Set<string>();
+  const chains: NativeCompleteChain[] = [];
+
+  for (let replica = 0; replica < options.desiredReplicas; replica += 1) {
+    const nodes = topology.nodes.filter((node) => {
+      const state = stateByNode.get(node.id)!;
+      return (
+        state.freeSlots > 0
+        && !excludedNodes.has(node.id)
+        && !excludedFailureDomains.has(state.failureDomainId)
+      );
+    });
+    if (nodes.length === 0) break;
+    const ids = new Set(nodes.map((node) => node.id));
+    const candidateTopology: DistributionTopology = {
+      nodes: nodes.map((node) => congestionAdjustedNode(node, stateByNode.get(node.id)!)),
+      links: topology.links.filter((link) => ids.has(link.from) && ids.has(link.to)),
+    };
+    const planner = candidateTopology.nodes.length > 64
+      ? new FleetTopologyPlanner(searchOptions)
+      : new TopologyBeamPlanner(searchOptions);
+    const plan = planner.plan(model, candidateTopology, workload);
+    if (!plan) break;
+    const metrics = evaluateDistributionPlan(model, candidateTopology, workload, plan);
+    if (!metrics.feasible) break;
+    const score = scoreNativeRoute(
+      plan,
+      metrics,
+      candidateTopology,
+      stateByNode,
+      request,
+    );
+    if (!Number.isFinite(score.total)) break;
+    const nodeIds = plan.stages.map((stage) => stage.nodeId);
+    const failureDomainIds = [
+      ...new Set(nodeIds.map((nodeId) => stateByNode.get(nodeId)!.failureDomainId)),
+    ].sort();
+    const chainId = chainDigest(plan, failureDomainIds);
+    chains.push({
+      chainId,
+      plan: { ...plan, algorithm: "native-two-phase" },
+      metrics,
+      score,
+      nodeIds,
+      failureDomainIds,
+    });
+    for (const nodeId of nodeIds) excludedNodes.add(nodeId);
+    for (const domainId of failureDomainIds) excludedFailureDomains.add(domainId);
+  }
+
+  return {
+    requestedReplicas: options.desiredReplicas,
+    chains,
+    complete: chains.length === options.desiredReplicas,
+    reason:
+      chains.length === options.desiredReplicas
+        ? null
+        : `independent_complete_chains_unavailable:${chains.length}:${options.desiredReplicas}`,
+  };
+}
+
+/**
+ * Per-request route selection. Interactive traffic pays the sum along the
+ * critical path; throughput traffic pays the slowest pipeline service.
+ */
+export function selectNativeChain(
+  chains: readonly NativeCompleteChain[],
+  request: NativeRouteRequest,
+  topology: DistributionTopology,
+  nodeStates: readonly NativeFleetNodeState[],
+): NativeCompleteChain | null {
+  const stateByNode = validateNodeStates(topology, nodeStates);
+  return chains
+    .map((chain) => ({
+      ...chain,
+      score: scoreNativeRoute(
+        chain.plan,
+        chain.metrics,
+        topology,
+        stateByNode,
+        request,
+      ),
+    }))
+    .filter((chain) => Number.isFinite(chain.score.total))
+    .sort(
+      (left, right) =>
+        left.score.total - right.score.total
+        || left.chainId.localeCompare(right.chainId),
+    )[0] ?? null;
+}
+
+export function scoreNativeRoute(
+  plan: DistributionPlan,
+  metrics: DistributionMetrics,
+  topology: DistributionTopology,
+  stateByNode: ReadonlyMap<string, NativeFleetNodeState>,
+  request: NativeRouteRequest,
+): NativeRouteScore {
+  if (!metrics.feasible) return infiniteRouteScore();
+  const states = plan.stages.map((stage) => stateByNode.get(stage.nodeId));
+  if (states.some((state) => !state || state.freeSlots < 1)) return infiniteRouteScore();
+  const concreteStates = states as NativeFleetNodeState[];
+  const queueCosts = concreteStates.map((state) => {
+    const service = state.observedP95ServiceMs;
+    if (service === null || !Number.isFinite(service) || service <= 0) {
+      return Number.POSITIVE_INFINITY;
+    }
+    return (state.queuedRequests * service) / Math.max(1, state.capacity);
+  });
+  if (queueCosts.some((cost) => !Number.isFinite(cost))) return infiniteRouteScore();
+  const p95Costs = concreteStates.map((state) => state.observedP95ServiceMs!);
+  const affinityHit = request.sessionId !== null
+    && concreteStates.every((state) => state.kvSessionIds.includes(request.sessionId!));
+  const kvPenaltyMs = affinityHit ? 0 : finiteNonNegative(request.kvMissPenaltyMs);
+  const boundary = physicalBoundaryCost(plan, topology, stateByNode);
+  if (!Number.isFinite(boundary.ms)) return infiniteRouteScore();
+  const failureRisk = plan.stages.reduce((risk, stage) => {
+    const node = topology.nodes.find((candidate) => candidate.id === stage.nodeId);
+    return risk + (node ? 1 - clampProbability(node.availability) : 1);
+  }, 0);
+  const interactive = request.workloadClass === "interactive";
+  const computeMs = interactive ? metrics.pathDecodeMs : metrics.pipelineCycleMs;
+  const queueMs = interactive ? sum(queueCosts) : Math.max(...queueCosts);
+  const p95Ms = interactive ? sum(p95Costs) : Math.max(...p95Costs);
+  return {
+    total:
+      computeMs
+      + queueMs
+      + p95Ms
+      + kvPenaltyMs
+      + boundary.ms
+      + failureRisk * 1_000,
+    computeMs,
+    queueMs,
+    p95Ms,
+    kvPenaltyMs,
+    physicalBoundaryMs: boundary.ms,
+    physicalBoundaryCount: boundary.count,
+    failureRisk,
+  };
+}
+
+/**
+ * Exact small-instance oracle used only in tests/offline validation. It blocks
+ * a fast-planner change whose objective drifts farther from the exhaustive
+ * optimum than the declared tolerance.
+ */
+export function comparePlannerWithExhaustiveOracle(
+  model: DistributedModelProfile,
+  topology: DistributionTopology,
+  workload: DistributionWorkload,
+  searchOptions: SearchOptions,
+  maximumRelativeGap = 0.1,
+): PlannerOracleResult {
+  if (
+    !Number.isFinite(maximumRelativeGap)
+    || maximumRelativeGap < 0
+    || maximumRelativeGap > 10
+  ) {
+    throw new Error("planner_oracle_tolerance_is_invalid");
+  }
+  const fast = new TopologyBeamPlanner(searchOptions).plan(model, topology, workload);
+  const oracle = new ExhaustiveTopologyPlanner(searchOptions).plan(model, topology, workload);
+  if (!fast || !oracle) throw new Error("planner_oracle_requires_feasible_plans");
+  const fastMetrics = evaluateDistributionPlan(model, topology, workload, fast);
+  const oracleMetrics = evaluateDistributionPlan(model, topology, workload, oracle);
+  const plannerObjective = distributionObjective(
+    fastMetrics,
+    searchOptions.objectiveWeights,
+  );
+  const oracleObjective = distributionObjective(
+    oracleMetrics,
+    searchOptions.objectiveWeights,
+  );
+  if (!Number.isFinite(plannerObjective) || !Number.isFinite(oracleObjective)) {
+    throw new Error("planner_oracle_objective_is_invalid");
+  }
+  const relativeGap = oracleObjective === 0
+    ? (plannerObjective === 0 ? 0 : Number.POSITIVE_INFINITY)
+    : Math.max(0, (plannerObjective - oracleObjective) / oracleObjective);
+  return {
+    plannerObjective,
+    oracleObjective,
+    relativeGap,
+    withinTolerance: relativeGap <= maximumRelativeGap,
+    plannerPlan: fast,
+    oraclePlan: oracle,
+  };
+}
+
+export function requirePlannerWithinOracleTolerance(
+  result: PlannerOracleResult,
+): void {
+  if (!result.withinTolerance) {
+    throw new Error(
+      `native_planner_oracle_regression:${result.relativeGap.toFixed(6)}`,
+    );
+  }
+}
+
+function validateNodeStates(
+  topology: DistributionTopology,
+  nodeStates: readonly NativeFleetNodeState[],
+): Map<string, NativeFleetNodeState> {
+  const result = new Map<string, NativeFleetNodeState>();
+  for (const state of nodeStates) {
+    if (
+      !state.nodeId
+      || !state.physicalHostId
+      || !state.failureDomainId
+      || !Number.isInteger(state.queuedRequests)
+      || state.queuedRequests < 0
+      || !Number.isInteger(state.activeRequests)
+      || state.activeRequests < 0
+      || !Number.isInteger(state.capacity)
+      || state.capacity < 1
+      || !Number.isInteger(state.freeSlots)
+      || state.freeSlots < 0
+      || state.freeSlots > state.capacity
+    ) {
+      throw new Error(`native_node_state_is_invalid:${state.nodeId}`);
+    }
+    if (result.has(state.nodeId)) {
+      throw new Error(`native_node_state_is_duplicate:${state.nodeId}`);
+    }
+    result.set(state.nodeId, {
+      ...state,
+      kvSessionIds: [...new Set(state.kvSessionIds)].sort(),
+    });
+  }
+  for (const node of topology.nodes) {
+    if (!result.has(node.id)) {
+      throw new Error(`native_node_state_is_missing:${node.id}`);
+    }
+  }
+  return result;
+}
+
+function congestionAdjustedNode(
+  node: DistributionTopology["nodes"][number],
+  state: NativeFleetNodeState,
+): DistributionTopology["nodes"][number] {
+  const occupied = state.activeRequests / Math.max(1, state.capacity);
+  const queued = state.queuedRequests / Math.max(1, state.capacity);
+  const congestion = 1 + occupied + queued * 2;
+  return {
+    ...node,
+    decodeScale: node.decodeScale * congestion,
+    prefillScale: node.prefillScale * congestion,
+  };
+}
+
+function physicalBoundaryCost(
+  plan: DistributionPlan,
+  topology: DistributionTopology,
+  stateByNode: ReadonlyMap<string, NativeFleetNodeState>,
+): { count: number; ms: number } {
+  if (plan.stages.length <= 1) return { count: 0, ms: 0 };
+  let count = 0;
+  let ms = 0;
+  const cycle = [
+    ...plan.stages,
+    plan.stages[0]!,
+  ];
+  for (let index = 0; index < cycle.length - 1; index += 1) {
+    const from = cycle[index]!.nodeId;
+    const to = cycle[index + 1]!.nodeId;
+    const fromState = stateByNode.get(from);
+    const toState = stateByNode.get(to);
+    if (!fromState || !toState) return { count, ms: Number.POSITIVE_INFINITY };
+    if (fromState.physicalHostId === toState.physicalHostId) continue;
+    const link = topology.links.find(
+      (candidate) => candidate.from === from && candidate.to === to,
+    );
+    if (!link) return { count, ms: Number.POSITIVE_INFINITY };
+    count += 1;
+    ms += link.oneWayLatencyMs + link.jitterP95Ms;
+  }
+  return { count, ms };
+}
+
+function chainDigest(plan: DistributionPlan, failureDomains: readonly string[]): string {
+  const payload = JSON.stringify({
+    codec: plan.codec,
+    microBatchSize: plan.microBatchSize,
+    prefillChunkTokens: plan.prefillChunkTokens,
+    stages: plan.stages.map(({ nodeId, layerStart, layerEnd }) => ({
+      nodeId,
+      layerStart,
+      layerEnd,
+    })),
+    failureDomains,
+  });
+  return `sha256:${createHash("sha256").update(payload).digest("hex")}`;
+}
+
+function infiniteRouteScore(): NativeRouteScore {
+  return {
+    total: Number.POSITIVE_INFINITY,
+    computeMs: Number.POSITIVE_INFINITY,
+    queueMs: Number.POSITIVE_INFINITY,
+    p95Ms: Number.POSITIVE_INFINITY,
+    kvPenaltyMs: Number.POSITIVE_INFINITY,
+    physicalBoundaryMs: Number.POSITIVE_INFINITY,
+    physicalBoundaryCount: 0,
+    failureRisk: Number.POSITIVE_INFINITY,
+  };
+}
+
+function finiteNonNegative(value: number): number {
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error("native_route_penalty_is_invalid");
+  }
+  return value;
+}
+
+function clampProbability(value: number): number {
+  return Math.max(0, Math.min(1, value));
+}
+
+function sum(values: readonly number[]): number {
+  return values.reduce((total, value) => total + value, 0);
+}

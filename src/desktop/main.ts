@@ -20,6 +20,7 @@ import { workerConfigSchema, type WorkerConfig } from "../contracts/schemas.js";
 import type { CoordinatorRuntime } from "../coordinator/server.js";
 import { createCoordinator } from "../coordinator/server.js";
 import { DynamicModelActivationManager } from "../coordinator/model-activation-manager.js";
+import { buildConnectedExecutorActivationSnapshot } from "../coordinator/connected-executor-activation.js";
 import { parseAutoDistributionConfig } from "../distribution/auto-distribute.js";
 import {
   LocalProcessAgent,
@@ -95,6 +96,7 @@ import {
   summarizeAutomaticUpdateError,
 } from "./update-recovery.js";
 import { SingleFlight } from "./single-flight.js";
+import { probeRuntimePerformanceProfile } from "../performance/runtime-profile-probe.js";
 
 if (started) app.quit();
 
@@ -535,10 +537,42 @@ async function startCoordinatorIfNeeded(): Promise<void> {
     },
     {
       logger: false,
-      activationManagerFactory: ({ store, hub }) => new DynamicModelActivationManager({
+      activationManagerFactory: ({ store, hub, deploymentController }) => new DynamicModelActivationManager({
         cwd: app.getAppPath(),
-        snapshot: () => buildDesktopActivationSnapshot(store.listWorkers(), hub.connectedWorkerIds()),
+        snapshot: () => buildConnectedExecutorActivationSnapshot(
+          desktopActivationBaseConfig(),
+          store.listWorkers(),
+          hub.connectedWorkerIds(),
+          hub.runtimeLinkObservations(),
+        ),
         resolveManagedAgent: (nodeId, launch) => resolveDesktopTunnelAgent(store.listWorkers(), hub, nodeId, launch),
+        loadProgress: (modelId) => store.listActivationEvents(modelId),
+        onProgress: (modelId, event) => {
+          store.appendActivationEvent(modelId, event);
+          if (event.phase === "running_canary") {
+            const operation = deploymentController.activeOperationForModel(modelId);
+            if (operation) deploymentController.markCanary(operation.id);
+          }
+        },
+        onPlanPrepared: (modelId, stages) => {
+          const operation = deploymentController.activeOperationForModel(modelId);
+          if (!operation) throw new Error(`deployment_operation_missing:${modelId}`);
+          return deploymentController.prepareRoute(operation.id, stages).id;
+        },
+        onActivated: (modelId, reservationId, result) => {
+          const canary = {
+            passed: true,
+            text: result.canaryText,
+            ...result.canaryMetrics,
+            workerId: result.workerId,
+          };
+          if (reservationId) {
+            deploymentController.commitRoute(reservationId, canary);
+            return;
+          }
+          const operation = deploymentController.activeOperationForModel(modelId);
+          if (operation) deploymentController.completeOperation(operation.id, "active", { canary });
+        },
       }),
     },
   );
@@ -688,6 +722,7 @@ async function initializeWorker(): Promise<void> {
       ...currentDesktopExecutorPolicy(),
       acceleration: currentAccelerationDiagnostics(),
     },
+    runtimePerformanceProfileProbe: measureDesktopRuntimePerformanceProfile,
     logger: {
       info: (message) => {
         console.info(`[agent] ${message}`);
@@ -715,6 +750,41 @@ async function initializeWorker(): Promise<void> {
     runtimeError = errorText(error);
     writeDesktopLog("worker-start-failed", { error: runtimeError });
     if (worker === nextWorker) worker = null;
+  });
+}
+
+async function measureDesktopRuntimePerformanceProfile() {
+  const runtimeRoot = acceleratorRuntimeRoot;
+  if (!runtimeRoot) throw new Error("distribution_runtime_is_not_ready");
+  const runtime = settings.computeMode === "cpu-only"
+    ? await prepareDesktopCpuRuntime(runtimeRoot)
+    : await selectImmediateRuntime(
+        () => resolvedAcceleratorRuntime,
+        () => prepareDesktopCpuRuntime(runtimeRoot),
+      );
+  if (settings.computeMode === "gpu-only" && runtime.deviceType !== "gpu") {
+    return null;
+  }
+  const pythonPath = resourcePath("python");
+  const hfHome = join(app.getPath("userData"), "model-shards");
+  mkdirSync(hfHome, { recursive: true });
+  return probeRuntimePerformanceProfile({
+    pythonExecutable: runtime.pythonExecutable,
+    pythonPath: [...runtime.pythonPathAdditions, pythonPath],
+    pathAdditions: [
+      ...runtime.pathAdditions,
+      dirname(runtime.pythonExecutable),
+    ],
+    backend: runtime.effectiveBackend,
+    device: runtime.launchDevice,
+    precision: runtime.precision,
+    ...(runtime.deviceType === "gpu"
+      ? { expectedDeviceName: runtime.deviceName }
+      : {}),
+    cwd: app.isPackaged ? dirname(app.getAppPath()) : app.getAppPath(),
+    env: {
+      HF_HOME: hfHome,
+    },
   });
 }
 
@@ -1927,55 +1997,47 @@ function persistentDistributedNodeId(): string {
   return nodeId;
 }
 
-function buildDesktopActivationSnapshot(
-  workers: readonly StoredWorker[],
-  connectedWorkerIds: ReadonlySet<string>,
-): import("../coordinator/model-activation-manager.js").DynamicActivationSnapshot {
-  const executors = workers
-    .filter((worker) => connectedWorkerIds.has(worker.id) && worker.capabilities.distributedExecutor)
-    .map((worker) => ({ worker, executor: worker.capabilities.distributedExecutor! }))
-    .filter(({ executor }) => executor.protocol === "gdlp-worker-tunnel/2")
-    .filter((entry, index, all) => all.findIndex((candidate) => candidate.executor.nodeId === entry.executor.nodeId) === index);
-  const capacityNodes = executors.map(({ worker, executor }) => ({
-    id: executor.nodeId,
-    availableVramMiB: worker.capabilities.gpus.reduce((sum, gpu) => sum + gpu.freeOfferedVramMb, 0),
-  }));
-  if (executors.length < 2) return { capacityNodes, config: null };
-  const nodes = executors.map(({ worker, executor }) => {
-    const memoryMiB = worker.capabilities.gpus.reduce((sum, gpu) => sum + gpu.offeredVramMb, 0);
-    const measuredPower = worker.capabilities.gpus.reduce((sum, gpu) => sum + (gpu.powerW ?? 0), 0);
-    return {
-      id: executor.nodeId,
-      region: worker.capabilities.region,
-      endpoint: { host: executor.stageHost, port: executor.stagePort },
-      memoryMiB,
-      reserveMiB: Math.min(256, Math.max(0, memoryMiB - 1)),
-      decodeScale: 1,
-      prefillScale: 1,
-      codecScale: 1,
-      powerWatts: measuredPower > 0 ? measuredPower : 1,
-      availability: Math.max(0.01, Math.min(1, worker.reliability)),
-      agent: { kind: "managed" as const },
-    };
-  });
-  const links = executors.flatMap((from) => executors
-    .filter((to) => to.executor.nodeId !== from.executor.nodeId)
-    .map((to) => ({
-      from: from.executor.nodeId,
-      to: to.executor.nodeId,
-      oneWayLatencyMs: Math.max(0.1, (from.worker.capabilities.network.coordinatorRttMs + to.worker.capabilities.network.coordinatorRttMs) / 2),
-      jitterP95Ms: 0,
-      bandwidthMbps: Math.max(1, Math.min(from.worker.capabilities.network.uplinkMbps, to.worker.capabilities.network.downlinkMbps)),
-      lossRate: 0,
-      availability: Math.max(0.01, Math.min(from.worker.reliability, to.worker.reliability)),
-    })));
-  const rootHost = nodes[0]!.endpoint.host;
-  const config = parseAutoDistributionConfig({
+function desktopActivationBaseConfig() {
+  return parseAutoDistributionConfig({
     schema: "gdlp-auto-distribute/1",
     model: { source: "HuggingFaceTB/SmolLM2-135M-Instruct", revision: null, publicName: "pending-model" },
-    nodes,
-    links,
-    distribution: { minimumStages: 2, maximumStages: Math.min(8, nodes.length), allowLossyActivation: false },
+    nodes: [
+      {
+        id: "dynamic-slot-a",
+        region: settings.region,
+        endpoint: { host: "127.0.0.1", port: 9_850 },
+        memoryMiB: 512,
+        reserveMiB: 0,
+        agent: { kind: "managed" },
+      },
+      {
+        id: "dynamic-slot-b",
+        region: settings.region,
+        endpoint: { host: "127.0.0.1", port: 9_851 },
+        memoryMiB: 512,
+        reserveMiB: 0,
+        agent: { kind: "managed" },
+      },
+    ],
+    links: [
+      {
+        from: "dynamic-slot-a",
+        to: "dynamic-slot-b",
+        oneWayLatencyMs: 1,
+        jitterP95Ms: 0,
+        bandwidthMbps: 1,
+        lossRate: 0,
+      },
+      {
+        from: "dynamic-slot-b",
+        to: "dynamic-slot-a",
+        oneWayLatencyMs: 1,
+        jitterP95Ms: 0,
+        bandwidthMbps: 1,
+        lossRate: 0,
+      },
+    ],
+    distribution: { minimumStages: 2, maximumStages: 8, allowLossyActivation: false },
     workload: { promptTokens: 128, outputTokens: 128, contextTokens: 4_096, concurrentSequences: 1, minRouteAvailability: 0.9, batchWindowMs: 2, p95: true },
     runtime: {
       pythonExecutable: distributionPythonExecutable(),
@@ -1983,8 +2045,8 @@ function buildDesktopActivationSnapshot(
       pythonPath: resourcePath("python"),
       hfHome: join(app.getPath("userData"), "coordinator-model-cache"),
       apiEndpoint: { host: "0.0.0.0", port: 9_860 },
-      apiAdvertiseHost: rootHost,
-      returnEndpoint: { host: rootHost, port: 9_861 },
+      apiAdvertiseHost: "127.0.0.1",
+      returnEndpoint: { host: "127.0.0.1", port: 9_861 },
       returnBindHost: "0.0.0.0",
       threadsPerStage: 1,
       connectTimeoutSeconds: 300,
@@ -1996,7 +2058,6 @@ function buildDesktopActivationSnapshot(
     canary: { prompt: "Reply with only OK. /no_think", maxTokens: 16, timeoutMs: 300_000 },
     coordinator: { url: LOCAL_DASHBOARD_COORDINATOR_URL, region: settings.region, maxConcurrency: 1 },
   });
-  return { capacityNodes, config };
 }
 
 function resolveDesktopTunnelAgent(

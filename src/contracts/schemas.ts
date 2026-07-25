@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { runtimePerformanceProfileSchema } from "../performance/runtime-profile.js";
 
 const adapterKind = z.enum(["mock", "local-model-runtime", "externalggufruntime", "openai-compatible"]);
 const executionBackend = z.enum(["cpu", "cuda", "rocm", "directml", "mps", "xpu", "vulkan", "webgpu"]);
@@ -234,6 +235,7 @@ export const workerCapabilitiesSchema = z.object({
   distributedExecutor: z
     .object({
       protocol: z.enum(["gdlp-worker-tunnel/1", "gdlp-worker-tunnel/2"]),
+      streamRecovery: z.literal("offset-ack-v1").optional(),
       nodeId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
       stageHost: z.string().min(1).max(253),
       stagePort: z.number().int().min(1).max(65_535),
@@ -279,6 +281,24 @@ export const workerCapabilitiesSchema = z.object({
             level: z.enum(["info", "success", "warning", "error"]),
             message: z.string().min(1).max(500),
           }).strict()).max(12),
+        })
+        .strict()
+        .optional(),
+      /**
+       * Physical, node-local calibration of the exact native runtime. Capacity
+       * remains visible without it, but optimized placement fails closed.
+       */
+      performanceProfile: runtimePerformanceProfileSchema.optional(),
+      directTransport: z
+        .object({
+          protocol: z.literal("mycellios-direct/1"),
+          candidates: z.array(z.object({
+            host: z.string().min(1).max(253),
+            port: z.number().int().min(1).max(65_535),
+            scope: z.enum(["lan", "configured"]),
+          }).strict()).min(1).max(8),
+          maxSessions: z.number().int().min(1).max(256),
+          maxSessionBytes: z.number().int().min(1024 * 1024).max(16 * 1024 * 1024 * 1024),
         })
         .strict()
         .optional(),

@@ -71,10 +71,16 @@ import { Contribute } from "./Contribute";
 import { SupportAssistant } from "./SupportAssistant";
 import brandIcon from "./assets/mycellios-app-icon-v2.png";
 import {
-  benchmarkRunHasModel,
   benchmarkRunSnapshot,
+  benchmarkFilterValues,
+  benchmarkComparisonNarrative,
+  benchmarkTrendRuns,
   compareBenchmarkRuns,
   defaultBenchmarkBaseline,
+  EMPTY_BENCHMARK_FILTERS,
+  filterBenchmarkRuns,
+  measurementBackends,
+  type BenchmarkFilters,
   type BenchmarkRunComparison,
   type BenchmarkRunSnapshot,
 } from "./benchmark-comparison";
@@ -1472,6 +1478,7 @@ function Tests({ bridge }: { bridge: DesktopBridge | undefined }) {
   const [runs, setRuns] = useState<BenchmarkRun[]>([]);
   const [selectedRunId, setSelectedRunId] = useState("");
   const [comparisonRunId, setComparisonRunId] = useState("");
+  const [filters, setFilters] = useState<BenchmarkFilters>(EMPTY_BENCHMARK_FILTERS);
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1516,18 +1523,34 @@ function Tests({ bridge }: { bridge: DesktopBridge | undefined }) {
     setComparisonRunId("");
   }
 
-  const selected = runs.find((run) => run.runId === selectedRunId) ?? runs[0] ?? null;
+  function updateFilter<Key extends keyof BenchmarkFilters>(
+    key: Key,
+    value: BenchmarkFilters[Key],
+  ) {
+    const nextFilters = { ...filters, [key]: value };
+    const nextRuns = filterBenchmarkRuns(runs, nextFilters);
+    setFilters(nextFilters);
+    setSelectedRunId((current) =>
+      nextRuns.some((run) => run.runId === current) ? current : nextRuns[0]?.runId ?? ""
+    );
+    setComparisonRunId("");
+  }
+
+  const filterValues = benchmarkFilterValues(runs);
+  const filteredRuns = filterBenchmarkRuns(runs, filters);
+  const selected = filteredRuns.find((run) => run.runId === selectedRunId)
+    ?? filteredRuns[0]
+    ?? null;
   const selectedSnapshot = benchmarkRunSnapshot(selected);
-  const selectedModelKey = selectedSnapshot?.modelKey ?? "";
-  const trendRuns = selectedModelKey
-    ? runs.filter((run) => benchmarkRunHasModel(run, selectedModelKey)
-      && benchmarkRunSnapshot(run)?.measurement.evidence === selectedSnapshot?.measurement.evidence)
-    : runs;
+  const trendRuns = benchmarkTrendRuns(selected, filteredRuns);
   const comparableMeasurements = trendRuns
     .flatMap((run) => run.measurements)
-    .filter((measurement) => !selectedSnapshot || measurement.evidence === selectedSnapshot.measurement.evidence);
+    .filter((measurement) =>
+      !selectedSnapshot
+      || measurement.scenarioFingerprint === selectedSnapshot.scenarioFingerprint
+    );
   const bestThroughput = comparableMeasurements.reduce<number | null>((best, item) => {
-    const value = item.metrics.tokensPerSecond;
+    const value = item.metrics.tokensPerSecondP50 ?? item.metrics.tokensPerSecond;
     return value === null ? best : best === null ? value : Math.max(best, value);
   }, null);
   const selectedMeasurement = selectedSnapshot?.measurement ?? null;
@@ -1537,15 +1560,16 @@ function Tests({ bridge }: { bridge: DesktopBridge | undefined }) {
     ?? nullableBenchmarkSum(selectedInventory?.profiles
       .filter((profile) => profile.kind === "gpu")
       .map((profile) => profile.offeredMemoryGb ?? profile.memoryGb) ?? []);
-  const selectedPower = selectedInventory?.observedPowerWatts
+  const selectedPower = selectedMeasurement?.metrics.powerWattsP50
+    ?? selectedInventory?.observedPowerWatts
     ?? nullableBenchmarkSum(selectedInventory?.profiles.map((profile) => profile.observedPowerWatts) ?? []);
   const selectedPowerLimit = selectedInventory?.powerLimitWatts
     ?? nullableBenchmarkSum(selectedInventory?.profiles.map((profile) => profile.powerLimitWatts) ?? []);
-  const automaticBaseline = defaultBenchmarkBaseline(selected, runs);
-  const comparisonRun = runs.find((run) => run.runId === comparisonRunId && run.runId !== selected?.runId)
+  const automaticBaseline = defaultBenchmarkBaseline(selected, filteredRuns);
+  const comparisonRun = filteredRuns.find((run) => run.runId === comparisonRunId && run.runId !== selected?.runId)
     ?? automaticBaseline;
   const comparison = compareBenchmarkRuns(selected, comparisonRun);
-  const runOptions = runs.map((run) => {
+  const runOptions = filteredRuns.map((run) => {
     const snapshot = benchmarkRunSnapshot(run);
     return {
       value: run.runId,
@@ -1554,32 +1578,48 @@ function Tests({ bridge }: { bridge: DesktopBridge | undefined }) {
   });
   const comparisonOptions = [
     { value: "", label: "Sin referencia comparable" },
-    ...runs.filter((run) => run.runId !== selected?.runId).map((run) => {
+    ...filteredRuns.filter((run) => run.runId !== selected?.runId).map((run) => {
       const snapshot = benchmarkRunSnapshot(run);
+      const comparable = snapshot?.scenarioFingerprint === selectedSnapshot?.scenarioFingerprint
+        && snapshot?.scenarioComparable === true;
       return {
         value: run.runId,
-        label: `${snapshot?.measurement.model.label ?? "modelo"} · ${snapshot?.nodes ?? 0} nodos · v${run.version} · ${formatBenchmarkDate(run.finishedAt)}`,
+        label: `${comparable ? "Comparable" : "Configuración distinta"} · ${snapshot?.measurement.model.label ?? "modelo"} · ${snapshot ? snapshot.nodes : "Sin lectura"} nodos · v${run.version}`,
       };
     }),
   ];
 
   return <section className="tests-page">
-    <PageTitle eyebrow="PRUEBAS REALES AUTOMÁTICAS" title="Rendimiento por versión" copy="Cada arranque de un modelo ejecuta una prueba corta sobre la ruta real y guarda el hardware y las métricas para compararlas." actions={<button disabled={running} onClick={() => void runNow()}>{running ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}{running ? "Midiendo…" : "Repetir prueba ahora"}</button>} />
-    <div className="benchmark-auto-notice"><Activity size={17} /><span><strong>Automático al arrancar</strong>Al detectar un modelo activo se miden 3 respuestas reales. Si no hay modelo o nodos, no se inventa ningún resultado.</span></div>
+    <PageTitle eyebrow="PRUEBAS REALES AUTOMÁTICAS" title="¿Mycellios mejora de verdad?" copy="Compara velocidad, latencia y eficiencia sin mezclar modelos, capacidad, rutas o hardware diferentes." actions={<button disabled={running} onClick={() => void runNow()}>{running ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}{running ? "Midiendo…" : "Repetir prueba ahora"}</button>} />
+    <div className="benchmark-auto-notice"><Activity size={19} /><span><strong>Medición automática con evidencia real</strong>El banco calienta el modelo, repite peticiones y guarda su variación. Una lectura ausente aparece como “Sin lectura”; nunca se estima para rellenar la pantalla.</span></div>
     {error && <div className="benchmark-error"><CircleAlert size={17} /><span><strong>No se pudo ejecutar la prueba</strong>{error}</span></div>}
     <div className="panel-stat-grid benchmark-stats">
-      <Stat icon={Activity} label="Pruebas guardadas" value={String(runs.length)} detail="Solo ejecuciones reales" />
-      <Stat icon={Boxes} label="Modelo seleccionado" value={selectedMeasurement?.model.label ?? "—"} detail={selected ? `v${selected.version} · ${formatBenchmarkDate(selected.finishedAt)}` : "Sin mediciones"} />
-      <Stat icon={Server} label="Nodos del modelo" value={selectedNodes > 0 ? String(selectedNodes) : "—"} detail={selectedInventory ? `${selectedInventory.connectedDevices}/${selectedInventory.totalDevices} nodos conectados` : "Sin inventario"} />
-      <Stat icon={Gauge} label="Mejor velocidad del modelo" value={formatBenchmark(bestThroughput, " tok/s")} detail={selectedMeasurement ? `${selectedMeasurement.model.label} · misma evidencia` : "Medida con inferencia real"} tone="purple" />
+      <Stat icon={Activity} label="Pruebas visibles" value={String(filteredRuns.length)} detail={`${runs.length} guardadas en total`} />
+      <Stat icon={Boxes} label="Modelo seleccionado" value={selectedMeasurement?.model.label ?? "Sin lectura"} detail={selected ? `v${selected.version} · ${formatBenchmarkDate(selected.finishedAt)}` : "Sin mediciones"} />
+      <Stat icon={Server} label="Nodos usados" value={selectedInventory ? String(selectedNodes) : "Sin lectura"} detail={selectedInventory ? `${selectedInventory.connectedDevices}/${selectedInventory.totalDevices} conectados` : "Sin inventario"} />
+      <Stat icon={Gauge} label="Mejor P50 comparable" value={formatBenchmark(bestThroughput, " tok/s")} detail={selectedMeasurement ? `${trendRuns.length} prueba${trendRuns.length === 1 ? "" : "s"} con el mismo fingerprint` : "Sin escenario seleccionado"} tone="purple" />
     </div>
     {selectedMeasurement && <div className="benchmark-capacity-strip">
       <BenchmarkMetric icon={MemoryStick} label="Memoria ofrecida" value={formatBenchmark(selectedOfferedGb, " GB")} detail={formatBenchmark(selectedInventory?.physicalMemoryGb ?? null, " GB físicos")} />
-      <BenchmarkMetric icon={Zap} label="Potencia observada" value={selectedPower === null ? "Sin lectura" : formatPower(selectedPower)} detail={selectedPower === null ? selectedPowerLimit === null ? "El controlador no reportó vatios" : `Límite ofrecido ${formatPower(selectedPowerLimit)}` : selectedPowerLimit === null ? "Heartbeat físico de los nodos" : `Límite ofrecido ${formatPower(selectedPowerLimit)}`} />
-      <BenchmarkMetric icon={Gauge} label="Velocidad" value={formatBenchmark(selectedMeasurement.metrics.tokensPerSecond, " tok/s")} detail={`P95 ${formatBenchmark(selectedMeasurement.metrics.tokensPerSecondP95, " tok/s")}`} />
+      <BenchmarkMetric icon={Zap} label="Potencia P50" value={selectedPower === null ? "Sin lectura" : formatPower(selectedPower)} detail={`P95 ${formatPowerReading(selectedMeasurement.metrics.powerWattsP95 ?? null)} · pico ${formatPowerReading(selectedMeasurement.metrics.powerWattsPeak ?? null)}`} />
+      <BenchmarkMetric icon={Gauge} label="Velocidad P50" value={formatBenchmark(selectedMeasurement.metrics.tokensPerSecondP50 ?? selectedMeasurement.metrics.tokensPerSecond, " tok/s")} detail={`P5 ${formatBenchmark(selectedMeasurement.metrics.tokensPerSecondP5 ?? null, " tok/s")} · P95 ${formatBenchmark(selectedMeasurement.metrics.tokensPerSecondP95, " tok/s")}`} />
       <BenchmarkMetric icon={Timer} label="Primer token P95" value={formatBenchmark(selectedMeasurement.metrics.ttftMsP95, " ms")} detail={`P50 ${formatBenchmark(selectedMeasurement.metrics.ttftMsP50, " ms")}`} />
+      <BenchmarkMetric icon={ShieldCheck} label="Confianza estadística" value={benchmarkStabilityLabel(selectedMeasurement)} detail={`CV ${formatBenchmark(selectedMeasurement.metrics.coefficientOfVariationPct ?? null, "%")} · ±${formatBenchmark(selectedMeasurement.metrics.confidenceHalfWidthPct ?? null, "%")}`} />
+      <BenchmarkMetric icon={Activity} label="Energía medida" value={formatBenchmark(selectedMeasurement.metrics.energyWh ?? null, " Wh")} detail={`Cobertura ${formatBenchmark(selectedMeasurement.metrics.energyCoveragePct ?? null, "%")}`} />
     </div>}
     {loading && runs.length === 0 ? <div className="benchmark-loading"><LoaderCircle className="spin" /><span>Cargando el historial real…</span></div> : runs.length === 0 ? <Empty icon={Gauge} title="Todavía no hay pruebas reales" copy="Arranca un modelo. La primera medición se guardará automáticamente cuando tenga una ruta física disponible." /> : <>
+      <BenchmarkFiltersPanel
+        filters={filters}
+        values={filterValues}
+        visibleCount={filteredRuns.length}
+        onChange={updateFilter}
+        onClear={() => {
+          setFilters(EMPTY_BENCHMARK_FILTERS);
+          setSelectedRunId(runs[0]?.runId ?? "");
+          setComparisonRunId("");
+        }}
+      />
+      {filteredRuns.length === 0 ? <Empty icon={Search} title="No hay pruebas con esos filtros" copy="Cambia uno de los filtros para volver a ver el historial real guardado." /> : <>
       <div className="benchmark-toolbar">
         <div className="benchmark-toolbar-selects">
           <label>RESULTADO ACTUAL<AppSelect ariaLabel="Resultado actual" value={selected?.runId ?? ""} onChange={selectRun} options={runOptions} /></label>
@@ -1589,14 +1629,44 @@ function Tests({ bridge }: { bridge: DesktopBridge | undefined }) {
       </div>
       <BenchmarkComparisonPanel comparison={comparison} />
       <div className="benchmark-chart-grid">
-        <BenchmarkTrend runs={trendRuns} metric="tokensPerSecond" label="Velocidad por versión" unit="tok/s" tone="blue" />
+        <BenchmarkTrend runs={trendRuns} metric="tokensPerSecond" label="Velocidad P50 e intervalo P5–P95" unit="tok/s" tone="blue" />
         <BenchmarkTrend runs={trendRuns} metric="ttftMsP95" label="Primer token P95" unit="ms" tone="purple" />
         <BenchmarkTrend runs={trendRuns} metric="nodes" label="Nodos usados" unit=" nodos" tone="green" />
         <BenchmarkTrend runs={trendRuns} metric="tokensPerSecondPerNode" label="Eficiencia por nodo" unit=" tok/s/nodo" tone="orange" />
       </div>
-      <BenchmarkHistory runs={runs} selectedRunId={selected?.runId ?? ""} onSelect={selectRun} />
+      <BenchmarkHistory runs={filteredRuns} selectedRunId={selected?.runId ?? ""} onSelect={selectRun} />
       {selected && <BenchmarkRunDetails run={selected} />}
+      </>}
     </>}
+  </section>;
+}
+
+function BenchmarkFiltersPanel({
+  filters,
+  values,
+  visibleCount,
+  onChange,
+  onClear,
+}: {
+  filters: BenchmarkFilters;
+  values: ReturnType<typeof benchmarkFilterValues>;
+  visibleCount: number;
+  onChange: (key: keyof BenchmarkFilters, value: string) => void;
+  onClear: () => void;
+}) {
+  const activeFilters = Object.values(filters).filter(Boolean).length;
+  return <section className="benchmark-filters" aria-label="Filtros del banco de pruebas">
+    <div className="benchmark-filters-heading">
+      <div><SlidersHorizontal size={19} /><span><strong>Filtrar pruebas</strong><small>{visibleCount} resultado{visibleCount === 1 ? "" : "s"} visible{visibleCount === 1 ? "" : "s"}</small></span></div>
+      <button type="button" className="benchmark-clear-filters" disabled={activeFilters === 0} onClick={onClear}>Limpiar filtros{activeFilters > 0 ? ` (${activeFilters})` : ""}</button>
+    </div>
+    <div className="benchmark-filter-grid">
+      <label>MODELO<AppSelect ariaLabel="Filtrar por modelo" value={filters.model} onChange={(value) => onChange("model", value)} options={[{ value: "", label: "Todos los modelos" }, ...values.models]} /></label>
+      <label>VERSIÓN<AppSelect ariaLabel="Filtrar por versión" value={filters.version} onChange={(value) => onChange("version", value)} options={[{ value: "", label: "Todas las versiones" }, ...values.versions.map((version) => ({ value: version, label: `v${version}` }))]} /></label>
+      <label>ESTADO<AppSelect ariaLabel="Filtrar por estado" value={filters.status} onChange={(value) => onChange("status", value)} options={[{ value: "", label: "Todos los estados" }, ...values.statuses.map((status) => ({ value: status, label: benchmarkStatusLabel(status) }))]} /></label>
+      <label>BACKEND<AppSelect ariaLabel="Filtrar por backend" value={filters.backend} onChange={(value) => onChange("backend", value)} options={[{ value: "", label: "Todos los backends" }, ...values.backends.map((backend) => ({ value: backend, label: backend === "__without_reading__" ? "Sin lectura" : backend.toUpperCase() }))]} /></label>
+      <label>EVIDENCIA<AppSelect ariaLabel="Filtrar por evidencia" value={filters.evidence} onChange={(value) => onChange("evidence", value)} options={[{ value: "", label: "Toda la evidencia" }, ...values.evidence.map((evidence) => ({ value: evidence, label: evidence === "physical" ? "Física real" : "Loopback local" }))]} /></label>
+    </div>
   </section>;
 }
 
@@ -1608,21 +1678,45 @@ function BenchmarkTrend({ runs, metric, label, unit, tone }: { runs: BenchmarkRu
     const snapshot = benchmarkRunSnapshot(run);
     if (!snapshot) return null;
     const value = benchmarkSnapshotMetric(snapshot, metric);
-    return value === null ? null : { run, snapshot, value };
+    if (value === null) return null;
+    const low = metric === "tokensPerSecond" ? snapshot.tokensPerSecondP5 : null;
+    const high = metric === "tokensPerSecond" ? snapshot.tokensPerSecondP95 : null;
+    return { run, snapshot, value, low, high };
   }).filter((point): point is NonNullable<typeof point> => point !== null);
-  const values = points.map((point) => point.value);
+  const values = points.flatMap((point) => [
+    point.value,
+    point.low ?? point.value,
+    point.high ?? point.value,
+  ]);
   const width = 720; const height = 240; const left = 52; const right = 30; const top = 28; const bottom = 50;
   const ceiling = Math.max(...values, 1);
   const x = (index: number) => points.length === 1 ? (left + width - right) / 2 : left + (index / Math.max(points.length - 1, 1)) * (width - left - right);
   const y = (value: number) => top + (1 - value / ceiling) * (height - top - bottom);
   return <article className="benchmark-chart">
-    <div><span>EVOLUCIÓN REAL · {points[0]?.snapshot.measurement.model.label ?? "SIN DATOS"}</span><h2>{label}</h2></div>
+    <div><span>MISMO FINGERPRINT · {points[0]?.snapshot.measurement.model.label ?? "SIN DATOS"}</span><h2>{label}</h2></div>
     <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${label}. ${points.length} pruebas reales.`}>
       <line className="benchmark-axis" x1={left} y1={height - bottom} x2={width - right} y2={height - bottom} />
       {[0, 0.5, 1].map((ratio) => <g key={ratio}><line className="benchmark-grid-line" x1={left} y1={top + ratio * (height - top - bottom)} x2={width - right} y2={top + ratio * (height - top - bottom)} /><text x={left - 8} y={top + ratio * (height - top - bottom) + 4} textAnchor="end">{formatBenchmark(ceiling * (1 - ratio), "")}</text></g>)}
+      {metric === "tokensPerSecond" && points.length > 1 && points.every((point) => point.low !== null && point.high !== null) && <polygon
+        className="benchmark-confidence-band"
+        points={[
+          ...points.map((point, index) => `${x(index)},${y(point.high ?? point.value)}`),
+          ...[...points].reverse().map((point, reverseIndex) => `${x(points.length - 1 - reverseIndex)},${y(point.low ?? point.value)}`),
+        ].join(" ")}
+      />}
       <g className={`benchmark-series tone-${tone}`}>
         {points.length > 1 && <polyline points={points.map((point, index) => `${x(index)},${y(point.value)}`).join(" ")} />}
-        {points.map((point, index) => <circle key={point.run.runId} cx={x(index)} cy={y(point.value)} r="5"><title>{`v${point.run.version} · ${formatBenchmarkDate(point.run.finishedAt)}: ${formatBenchmark(point.value, ` ${unit}`)}`}</title></circle>)}
+        {metric === "tokensPerSecond" && points.map((point, index) =>
+          point.low === null || point.high === null ? null : <line
+            className="benchmark-range"
+            key={`range-${point.run.runId}`}
+            x1={x(index)}
+            x2={x(index)}
+            y1={y(point.low)}
+            y2={y(point.high)}
+          />
+        )}
+        {points.map((point, index) => <circle key={point.run.runId} cx={x(index)} cy={y(point.value)} r="5"><title>{`v${point.run.version} · ${formatBenchmarkDate(point.run.finishedAt)}: ${formatBenchmark(point.value, ` ${unit}`)}${point.low === null || point.high === null ? " · intervalo Sin lectura" : ` · P5 ${formatBenchmark(point.low, ` ${unit}`)} · P95 ${formatBenchmark(point.high, ` ${unit}`)}`}`}</title></circle>)}
       </g>
       {points.map((point, index) => {
         const labelEvery = Math.max(1, Math.ceil(points.length / 6));
@@ -1633,19 +1727,19 @@ function BenchmarkTrend({ runs, metric, label, unit, tone }: { runs: BenchmarkRu
         </text>;
       })}
     </svg>
-    <div className="benchmark-chart-summary"><span>{points.length} mediciones</span><strong>{formatBenchmark(points.at(-1)?.value ?? null, ` ${unit}`)}</strong></div>
+    <div className="benchmark-chart-summary"><span>{points.length} mediciones estrictamente comparables{metric === "tokensPerSecond" ? " · banda P5–P95" : ""}</span><strong>{formatBenchmark(points.at(-1)?.value ?? null, ` ${unit}`)}</strong></div>
   </article>;
 }
 
 function BenchmarkComparisonPanel({ comparison }: { comparison: BenchmarkRunComparison }) {
-  const copy = benchmarkComparisonCopy(comparison);
-  return <article className={`benchmark-comparison ${comparison.mode}`}>
+  const copy = benchmarkComparisonNarrative(comparison);
+  return <article className={`benchmark-comparison ${comparison.mode} ${comparison.verdict}`}>
     <div className="benchmark-comparison-heading">
       <div><span>{copy.eyebrow}</span><h2>{copy.title}</h2><p>{copy.description}</p></div>
       {comparison.current && comparison.baseline && <div className="benchmark-comparison-versions">
-        <span><small>REFERENCIA</small><strong>v{comparison.baseline.run.version}</strong><em>{formatBenchmarkDate(comparison.baseline.run.finishedAt)}</em></span>
+        <span><small>REFERENCIA</small><strong>v{comparison.baseline.run.version}</strong><em>rev {benchmarkBuildRevision(comparison.baseline.run)}</em></span>
         <ArrowRight size={17} />
-        <span><small>ACTUAL</small><strong>v{comparison.current.run.version}</strong><em>{formatBenchmarkDate(comparison.current.run.finishedAt)}</em></span>
+        <span><small>ACTUAL</small><strong>v{comparison.current.run.version}</strong><em>rev {benchmarkBuildRevision(comparison.current.run)}</em></span>
       </div>}
     </div>
     <div className="benchmark-comparison-grid">
@@ -1653,7 +1747,10 @@ function BenchmarkComparisonPanel({ comparison }: { comparison: BenchmarkRunComp
         label="Velocidad"
         baseline={formatBenchmark(comparison.baseline?.tokensPerSecond ?? null, " tok/s")}
         current={formatBenchmark(comparison.current?.tokensPerSecond ?? null, " tok/s")}
+        baselineDetail={formatBenchmarkRange(comparison.baseline)}
+        currentDetail={formatBenchmarkRange(comparison.current)}
         delta={comparison.speedChangePct}
+        claim={comparison.verdict === "faster-code-signal" || comparison.verdict === "slower-code-signal"}
       />
       <BenchmarkComparisonMetric
         label="Primer token P95"
@@ -1663,8 +1760,8 @@ function BenchmarkComparisonPanel({ comparison }: { comparison: BenchmarkRunComp
       />
       <BenchmarkComparisonMetric
         label="Nodos usados"
-        baseline={comparison.baseline ? String(comparison.baseline.nodes) : "—"}
-        current={comparison.current ? String(comparison.current.nodes) : "—"}
+        baseline={comparison.baseline ? String(comparison.baseline.nodes) : "Sin lectura"}
+        current={comparison.current ? String(comparison.current.nodes) : "Sin lectura"}
         rawDelta={formatSignedBenchmark(comparison.nodesDelta, "")}
         neutral
       />
@@ -1690,19 +1787,30 @@ function BenchmarkComparisonPanel({ comparison }: { comparison: BenchmarkRunComp
   </article>;
 }
 
-function BenchmarkComparisonMetric({ label, baseline, current, delta = null, rawDelta, neutral = false }: {
+function BenchmarkComparisonMetric({ label, baseline, current, baselineDetail, currentDetail, delta = null, rawDelta, neutral = false, claim = false }: {
   label: string;
   baseline: string;
   current: string;
+  baselineDetail?: string;
+  currentDetail?: string;
   delta?: number | null;
   rawDelta?: string;
   neutral?: boolean;
+  claim?: boolean;
 }) {
-  const tone = neutral ? "neutral" : delta === null ? "unavailable" : delta >= 0 ? "positive" : "negative";
-  const deltaLabel = rawDelta ?? (delta === null ? "Sin comparación" : delta >= 0 ? `+${delta.toFixed(1)}% mejor` : `${delta.toFixed(1)}% peor`);
+  const tone = delta === null && rawDelta === undefined
+    ? "unavailable"
+    : neutral || !claim
+      ? "neutral"
+      : (delta ?? 0) >= 0 ? "positive" : "negative";
+  const deltaLabel = rawDelta ?? (delta === null
+    ? "Sin comparación"
+    : claim
+      ? delta >= 0 ? `+${delta.toFixed(1)}% mejor` : `${delta.toFixed(1)}% peor`
+      : `${delta > 0 ? "+" : ""}${delta.toFixed(1)}% observado`);
   return <div className="benchmark-comparison-metric">
     <small>{label}</small>
-    <div><span><em>Antes</em><strong>{baseline}</strong></span><ArrowRight size={14} /><span><em>Ahora</em><strong>{current}</strong></span></div>
+    <div><span><em>Antes</em><strong>{baseline}</strong>{baselineDetail && <small>{baselineDetail}</small>}</span><ArrowRight size={14} /><span><em>Ahora</em><strong>{current}</strong>{currentDetail && <small>{currentDetail}</small>}</span></div>
     <b className={tone}>{deltaLabel}</b>
   </div>;
 }
@@ -1711,17 +1819,17 @@ function BenchmarkHistory({ runs, selectedRunId, onSelect }: { runs: BenchmarkRu
   return <article className="benchmark-history">
     <div className="card-heading"><div><span>HISTORIAL DE EVOLUCIÓN</span><h2>Todas las pruebas reales</h2></div><small>Selecciona una fila para analizarla</small></div>
     <div className="benchmark-history-table">
-      <div className="benchmark-history-head"><span>Versión</span><span>Modelo</span><span>Nodos</span><span>VRAM ofrecida</span><span>Velocidad</span><span>Primer token</span><span>Estado</span></div>
+      <div className="benchmark-history-head"><span>Versión / build</span><span>Modelo / evidencia</span><span>Nodos / topología</span><span>Capacidad</span><span>Velocidad P50</span><span>Confianza</span><span>Estado</span></div>
       {runs.map((run) => {
         const snapshot = benchmarkRunSnapshot(run);
         if (!snapshot) return null;
         return <button className={`benchmark-history-row ${run.runId === selectedRunId ? "selected" : ""}`} aria-pressed={run.runId === selectedRunId} key={run.runId} onClick={() => onSelect(run.runId)}>
-          <span><strong>v{run.version}</strong><small>{formatBenchmarkDate(run.finishedAt)}</small></span>
-          <span><strong>{snapshot.measurement.model.label}</strong><small>{snapshot.measurement.evidence === "physical" ? "Física" : "Loopback"} · {run.trigger === "automatic-model-start" ? "Auto" : "Manual"}</small></span>
-          <span><strong>{snapshot.nodes}</strong><small>{snapshot.measurement.inventory.connectedDevices} conectados</small></span>
-          <span><strong>{formatBenchmark(snapshot.offeredMemoryGb, " GB")}</strong><small>capacidad aportada</small></span>
-          <span><strong>{formatBenchmark(snapshot.tokensPerSecond, " tok/s")}</strong><small>{formatBenchmark(snapshot.tokensPerSecondPerNode, " por nodo")}</small></span>
-          <span><strong>{formatBenchmark(snapshot.ttftMsP95, " ms")}</strong><small>P95</small></span>
+          <span><strong>v{run.version}</strong><small>rev {benchmarkBuildRevision(run)} · {formatBenchmarkDate(run.finishedAt)}</small></span>
+          <span><strong>{snapshot.measurement.model.label}</strong><small>{snapshot.measurement.evidence === "physical" ? "Física real" : "Loopback"} · {formatBenchmarkBackend(snapshot.measurement)}</small></span>
+          <span><strong>{snapshot.nodes}</strong><small>{formatTopologyDigest(snapshot.measurement.topology.digest)}</small></span>
+          <span><strong>{formatBenchmark(snapshot.offeredMemoryGb, " GB")}</strong><small>{formatBenchmark(snapshot.measurement.inventory.physicalMemoryGb ?? null, " GB físicos")}</small></span>
+          <span><strong>{formatBenchmark(snapshot.tokensPerSecondP50, " tok/s")}</strong><small>{formatBenchmarkRange(snapshot)}</small></span>
+          <span><strong>{benchmarkStabilityLabel(snapshot.measurement)}</strong><small>CV {formatBenchmark(snapshot.coefficientOfVariationPct, "%")} · TTFT {formatBenchmark(snapshot.ttftMsP95, " ms")}</small></span>
           <span><b className={run.status}><i />{benchmarkStatusLabel(run.status)}</b><ChevronRight size={15} /></span>
         </button>;
       })}
@@ -1731,14 +1839,14 @@ function BenchmarkHistory({ runs, selectedRunId, onSelect }: { runs: BenchmarkRu
 
 function BenchmarkRunDetails({ run }: { run: BenchmarkRun }) {
   return <div className="benchmark-results">
-    <div className="card-heading"><div><span>RESULTADO SELECCIONADO</span><h2>{run.triggerModelId ?? run.label}</h2></div><small>v{run.version} · {run.gitCommit ? run.gitCommit.slice(0, 8) : "sin commit"}{run.gitDirty ? " · código con cambios" : ""}</small></div>
+    <div className="card-heading"><div><span>RESULTADO SELECCIONADO</span><h2>{run.triggerModelId ?? run.label}</h2></div><small>v{run.version} · revisión {benchmarkBuildRevision(run)} · {benchmarkDirtyLabel(run.gitDirty)}</small></div>
     <div className="benchmark-result-list">
-      {run.measurements.map((measurement) => <BenchmarkResultCard measurement={measurement} key={measurement.id} />)}
+      {run.measurements.map((measurement) => <BenchmarkResultCard measurement={measurement} run={run} key={measurement.id} />)}
     </div>
   </div>;
 }
 
-function BenchmarkResultCard({ measurement }: { measurement: BenchmarkMeasurement }) {
+function BenchmarkResultCard({ measurement, run }: { measurement: BenchmarkMeasurement; run: BenchmarkRun }) {
   const delta = measurement.comparison.tokensPerSecondPct;
   const physicalMemory = measurement.inventory.physicalMemoryGb
     ?? nullableBenchmarkSum(measurement.inventory.profiles
@@ -1748,33 +1856,53 @@ function BenchmarkResultCard({ measurement }: { measurement: BenchmarkMeasuremen
     ?? nullableBenchmarkSum(measurement.inventory.profiles
       .filter((profile) => profile.kind === "gpu")
       .map((profile) => profile.offeredMemoryGb ?? profile.memoryGb));
-  const power = measurement.inventory.observedPowerWatts
+  const power = measurement.metrics.powerWattsP50
+    ?? measurement.inventory.observedPowerWatts
     ?? nullableBenchmarkSum(measurement.inventory.profiles.map((profile) => profile.observedPowerWatts));
   const powerLimit = measurement.inventory.powerLimitWatts
     ?? nullableBenchmarkSum(measurement.inventory.profiles.map((profile) => profile.powerLimitWatts));
+  const temperaturePeak = measurement.metrics.temperatureCPeak
+    ?? nullableBenchmarkMax(measurement.inventory.profiles.map((profile) => profile.temperatureC));
   return <article className="benchmark-result-card">
     <div className="benchmark-result-heading">
-      <div><span className="benchmark-result-icon"><Gauge size={18} /></span><span><small>{measurement.evidence === "physical" ? "EVIDENCIA FÍSICA REAL" : "RUNTIME LOCAL REAL"}</small><strong>{measurement.model.label}</strong><em>{measurement.model.precision} · rev {measurement.model.revision?.slice(0, 12) ?? "sin revisión"}</em></span></div>
+      <div><span className="benchmark-result-icon"><Gauge size={18} /></span><span><small>{measurement.evidence === "physical" ? "EVIDENCIA FÍSICA REAL" : "RUNTIME LOCAL REAL"}</small><strong>{measurement.model.label}</strong><em>{measurement.model.precision} · modelo rev {measurement.model.revision?.slice(0, 12) ?? "Sin lectura"} · build rev {benchmarkBuildRevision(run)}</em></span></div>
       <b className={measurement.status}><i />{benchmarkStatusLabel(measurement.status)}</b>
     </div>
     <div className="benchmark-result-metrics">
       <BenchmarkValue label="Nodos usados" value={String(measurement.inventory.selectedDevices)} detail={`${measurement.inventory.connectedDevices}/${measurement.inventory.totalDevices} conectados`} />
       <BenchmarkValue label="VRAM ofrecida" value={formatBenchmark(offeredMemory, " GB")} detail={formatBenchmark(physicalMemory, " GB físicos")} />
-      <BenchmarkValue label="Potencia real" value={power === null ? "Sin lectura" : formatPower(power)} detail={powerLimit === null ? power === null ? "No estimada" : "Último heartbeat" : `Límite ${formatPower(powerLimit)}`} />
-      <BenchmarkValue label="Tokens / segundo" value={formatBenchmark(measurement.metrics.tokensPerSecond, " tok/s")} detail={`P95 ${formatBenchmark(measurement.metrics.tokensPerSecondP95, " tok/s")}`} accent />
+      <BenchmarkValue label="Potencia P50" value={formatPowerReading(power)} detail={`P95 ${formatPowerReading(measurement.metrics.powerWattsP95 ?? null)} · pico ${formatPowerReading(measurement.metrics.powerWattsPeak ?? null)}${powerLimit === null ? "" : ` · límite ${formatPower(powerLimit)}`}`} />
+      <BenchmarkValue label="Tokens / segundo P50" value={formatBenchmark(measurement.metrics.tokensPerSecondP50 ?? measurement.metrics.tokensPerSecond, " tok/s")} detail={`P5 ${formatBenchmark(measurement.metrics.tokensPerSecondP5 ?? null, " tok/s")} · P95 ${formatBenchmark(measurement.metrics.tokensPerSecondP95, " tok/s")}`} accent />
       <BenchmarkValue label="Primer token" value={formatBenchmark(measurement.metrics.ttftMsP95, " ms")} detail={`P50 ${formatBenchmark(measurement.metrics.ttftMsP50, " ms")}`} />
-      <BenchmarkValue label="Cambio guardado" value={delta === null ? "Primera base" : `${delta >= 0 ? "+" : ""}${delta.toFixed(2)}%`} detail={measurement.comparison.baselineRunId ? "Base automática del banco" : "Sin ejecución comparable"} tone={delta !== null && delta < 0 ? "negative" : "positive"} />
+      <BenchmarkValue label="Estabilidad" value={benchmarkStabilityLabel(measurement)} detail={`CV ${formatBenchmark(measurement.metrics.coefficientOfVariationPct ?? null, "%")} · IC ±${formatBenchmark(measurement.metrics.confidenceHalfWidthPct ?? null, "%")}`} tone={measurement.workload.statisticallyStable === false ? "negative" : measurement.workload.statisticallyStable === true ? "positive" : ""} />
+      <BenchmarkValue label="Energía" value={formatBenchmark(measurement.metrics.energyWh ?? null, " Wh")} detail={`Cobertura ${formatBenchmark(measurement.metrics.energyCoveragePct ?? null, "%")} · ${formatBenchmark(measurement.metrics.energyWhPerToken, " Wh/token")}`} />
+      <BenchmarkValue label="Temperatura pico" value={formatBenchmark(temperaturePeak, " °C")} detail={`Memoria usada pico ${formatBenchmark(measurement.metrics.usedMemoryGbPeak ?? null, " GB")}`} />
+      <BenchmarkValue label="Cambio guardado" value={delta === null ? "Sin comparación" : `${delta >= 0 ? "+" : ""}${delta.toFixed(2)}%`} detail={measurement.comparison.baselineRunId ? "Sólo válido con fingerprint idéntico" : "Sin ejecución comparable"} tone={delta === null ? "" : delta < 0 ? "negative" : "positive"} />
     </div>
     <div className="benchmark-node-list">
-      {measurement.inventory.profiles.map((profile) => <span key={profile.nodeId ?? profile.label}><Server size={14} /><strong>{profile.label}</strong><small>{profile.backend ?? profile.kind} · {formatBenchmark(profile.offeredMemoryGb ?? profile.memoryGb, " GB")}{profile.utilizationPct === null || profile.utilizationPct === undefined ? "" : ` · ${profile.utilizationPct.toFixed(0)}% GPU`}</small></span>)}
+      {measurement.inventory.profiles.map((profile) => <span key={profile.nodeId ?? profile.label}><Server size={16} /><strong>{profile.label}</strong><small>{profile.backend ?? "Sin lectura"} · {formatBenchmark(profile.offeredMemoryGb ?? profile.memoryGb, " GB")} · GPU {formatBenchmark(profile.utilizationPct ?? null, "%")} · {formatPowerReading(profile.observedPowerWatts ?? null)} · {formatBenchmark(profile.temperatureC ?? null, " °C")}</small></span>)}
+    </div>
+    <div className="benchmark-topology-summary">
+      <div><Network size={18} /><span><small>TOPOLOGÍA OBSERVADA</small><strong>{measurement.topology.stageCount === null ? "Sin lectura" : `${measurement.topology.stageCount} etapas`} · {formatTopologyDigest(measurement.topology.digest)}</strong></span></div>
+      <dl>
+        <div><dt>Nodos de la ruta</dt><dd>{measurement.topology.nodeIds.length > 0 ? measurement.topology.nodeIds.map(shortId).join(" → ") : "Sin lectura"}</dd></div>
+        <div><dt>Límites de capas</dt><dd>{measurement.topology.boundaries.length > 0 ? measurement.topology.boundaries.join(" · ") : "Sin lectura"}</dd></div>
+        <div><dt>Clases de ruta</dt><dd>{measurement.topology.routeClasses.length > 0 ? measurement.topology.routeClasses.join(" · ") : "Sin lectura"}</dd></div>
+      </dl>
     </div>
     <details className="benchmark-technical-details">
       <summary>Ver todas las métricas de esta prueba</summary>
       <div>
-        <BenchmarkValue label="Peticiones" value={`${measurement.workload.successfulRequests ?? "—"} / ${measurement.workload.requests ?? "—"}`} detail={`${measurement.workload.outputTokens} tokens generados`} />
+        <BenchmarkValue label="Peticiones válidas" value={`${formatCountReading(measurement.workload.successfulRequests)} / ${formatCountReading(measurement.workload.requests)}`} detail={`Éxito ${formatRate(measurement.metrics.requestSuccessRate ?? null)}`} />
+        <BenchmarkValue label="Calentamiento" value={formatCountReading(measurement.workload.warmupRequests)} detail={`${formatCountReading(measurement.workload.recoveredFailures)} fallos recuperados`} />
+        <BenchmarkValue label="Tokens observados" value={formatCountReading(measurement.workload.observedOutputTokens)} detail={`${measurement.workload.outputTokens} solicitados por petición`} />
         <BenchmarkValue label="Duración total" value={formatBenchmark(measurement.workload.durationMs ?? null, " ms")} detail={`Latencia P95 ${formatBenchmark(measurement.metrics.latencyMsP95 ?? null, " ms")}`} />
         <BenchmarkValue label="Tiempo por token" value={formatBenchmark(measurement.metrics.tpotMsP95, " ms")} detail={`P50 ${formatBenchmark(measurement.metrics.tpotMsP50, " ms")}`} />
         <BenchmarkValue label="Velocidad agregada" value={formatBenchmark(measurement.metrics.aggregateTokensPerSecond, " tok/s")} detail={(measurement.workload.routeClasses ?? []).join(", ") || "Sin ruta completada"} />
+        <BenchmarkValue label="Exactitud" value={formatRate(measurement.metrics.exactnessRate ?? null)} detail={`Consistencia ${formatRate(measurement.metrics.deterministicConsistencyRate ?? null)}`} />
+        <BenchmarkValue label="Especulación aceptada" value={formatRate(measurement.metrics.speculativeAcceptanceRate ?? null)} detail={`Aceptación heredada ${formatRate(measurement.metrics.acceptanceRate)}`} />
+        <BenchmarkValue label="Uso GPU P50" value={formatBenchmark(measurement.metrics.utilizationPctP50 ?? null, "%")} detail={`P95 ${formatBenchmark(measurement.metrics.utilizationPctP95 ?? null, "%")}`} />
+        <BenchmarkValue label="Fin de campaña" value={benchmarkCampaignStopLabel(measurement.workload.campaignStopReason)} detail={measurement.scenarioFingerprint ? measurement.scenarioFingerprint.slice(0, 19) : "Sin lectura"} />
       </div>
       <ul>{measurement.notes.map((note) => <li key={note}>{note}</li>)}</ul>
     </details>
@@ -2981,50 +3109,83 @@ function benchmarkSnapshotMetric(snapshot: BenchmarkRunSnapshot, metric: Benchma
   return snapshot.tokensPerSecondPerNode;
 }
 
-function benchmarkComparisonCopy(comparison: BenchmarkRunComparison): { eyebrow: string; title: string; description: string } {
-  if (comparison.mode === "same-scenario") {
-    return {
-      eyebrow: "COMPARACIÓN LIMPIA",
-      title: "Mismo modelo, hardware y carga",
-      description: "La configuración es equivalente y permite vigilar rendimiento. Repetir varias veces ayuda a separar una mejora real de la variación normal.",
-    };
-  }
-  if (comparison.mode === "capacity-change") {
-    return {
-      eyebrow: "CAMBIO DE CAPACIDAD",
-      title: "Ha cambiado el hardware o la carga",
-      description: "La velocidad total permite estudiar el escalado. Mira también tok/s por nodo y por GB: no se atribuye al código como mejora limpia.",
-    };
-  }
-  if (comparison.mode === "different-evidence") {
-    return {
-      eyebrow: "EVIDENCIA DISTINTA",
-      title: "Físico y loopback no se mezclan",
-      description: "Se muestran los valores reales de cada ejecución, pero no se calcula una mejora entre entornos diferentes.",
-    };
-  }
-  if (comparison.mode === "different-model") {
-    return {
-      eyebrow: "MODELOS DISTINTOS",
-      title: "Esta selección no es comparable",
-      description: "Selecciona una referencia del mismo modelo para medir evolución de velocidad y eficiencia.",
-    };
-  }
-  return {
-    eyebrow: "SIN REFERENCIA",
-    title: "Hace falta una segunda ejecución",
-    description: "Cuando haya otra prueba real podrás comparar versiones, nodos, VRAM, latencia y eficiencia.",
-  };
-}
-
 function formatSignedBenchmark(value: number | null, suffix: string): string {
   if (value === null || !Number.isFinite(value)) return "Sin comparación";
   return `${value > 0 ? "+" : ""}${value.toLocaleString("es-ES", { maximumFractionDigits: 2 })}${suffix}`;
 }
 
 function formatBenchmark(value: number | null, suffix: string): string {
-  if (value === null || !Number.isFinite(value)) return "—";
+  if (value === null || !Number.isFinite(value)) return "Sin lectura";
   return `${value.toLocaleString("en-US", { maximumFractionDigits: 2 })}${suffix}`;
+}
+
+function formatBenchmarkRange(snapshot: BenchmarkRunSnapshot | null | undefined): string {
+  if (!snapshot || snapshot.tokensPerSecondP5 === null || snapshot.tokensPerSecondP95 === null) {
+    return "P5–P95 Sin lectura";
+  }
+  return `P5 ${formatBenchmark(snapshot.tokensPerSecondP5, " tok/s")} · P95 ${formatBenchmark(snapshot.tokensPerSecondP95, " tok/s")}`;
+}
+
+function formatPowerReading(value: number | null): string {
+  return value === null || !Number.isFinite(value) ? "Sin lectura" : formatPower(value);
+}
+
+function benchmarkStabilityLabel(measurement: BenchmarkMeasurement): string {
+  if (measurement.workload.statisticallyStable === true) return "Estable";
+  if (measurement.workload.statisticallyStable === false) return "Inconclusa";
+  return "Sin lectura";
+}
+
+function benchmarkBuildRevision(run: BenchmarkRun): string {
+  const revision = run.build.revision ?? run.gitCommit;
+  return revision?.trim() ? revision.trim().slice(0, 12) : "Sin lectura";
+}
+
+function benchmarkDirtyLabel(dirty: boolean | null): string {
+  if (dirty === true) return "código con cambios locales";
+  if (dirty === false) return "build limpio";
+  return "limpieza del build Sin lectura";
+}
+
+function formatTopologyDigest(digest: string | null): string {
+  if (!digest?.trim()) return "topología Sin lectura";
+  const normalizedDigest = digest.trim().replace(/^sha256:/i, "");
+  return `topología ${normalizedDigest.slice(0, 12)}`;
+}
+
+function formatBenchmarkBackend(measurement: BenchmarkMeasurement): string {
+  const backends = measurementBackends(measurement);
+  return backends[0] === "__without_reading__"
+    ? "Backend Sin lectura"
+    : backends.map((backend) => backend.toUpperCase()).join(" + ");
+}
+
+function nullableBenchmarkMax(values: Array<number | null | undefined>): number | null {
+  const present = values.filter((value): value is number =>
+    value !== null && value !== undefined && Number.isFinite(value)
+  );
+  return present.length > 0 ? Math.max(...present) : null;
+}
+
+function formatCountReading(value: number | null | undefined): string {
+  return value === null || value === undefined || !Number.isFinite(value)
+    ? "Sin lectura"
+    : Math.round(value).toLocaleString("es-ES");
+}
+
+function formatRate(value: number | null): string {
+  return value === null || !Number.isFinite(value)
+    ? "Sin lectura"
+    : `${(value * 100).toLocaleString("es-ES", { maximumFractionDigits: 2 })}%`;
+}
+
+function benchmarkCampaignStopLabel(
+  reason: BenchmarkMeasurement["workload"]["campaignStopReason"],
+): string {
+  if (reason === "confidence_reached") return "Confianza alcanzada";
+  if (reason === "maximum_samples") return "Máximo de muestras";
+  if (reason === "insufficient_samples") return "Muestras insuficientes";
+  return "Sin lectura";
 }
 
 function nullableBenchmarkSum(values: Array<number | null | undefined>): number | null {
@@ -3043,9 +3204,10 @@ function formatBenchmarkChartTime(value: string): string {
 }
 
 function benchmarkStatusLabel(status: BenchmarkRun["status"]): string {
-  if (status === "baseline") return "Baseline";
-  if (status === "passed") return "Mejora / estable";
+  if (status === "baseline") return "Referencia";
+  if (status === "passed") return "Válida";
   if (status === "regression") return "Regresión";
+  if (status === "inconclusive") return "Inconcluso";
   return "Fallido";
 }
 

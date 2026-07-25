@@ -8,7 +8,11 @@ from concurrent.futures import (
     Future,
     wait,
 )
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+import hashlib
+import json
+import re
+import struct
 import threading
 import time
 from typing import Any
@@ -26,6 +30,10 @@ from .engine import (
 
 
 EngineFactory = Callable[[], DistributedPipelineEngine]
+REMOTE_RECOVERY_STANDBY_SCHEMA = "gdlp-recovery-standby-route/1"
+RECOVERY_IDENTITY_DIGEST_DOMAIN = b"gdlp-pipeline-recovery-identity-v1\0"
+VISIBLE_PREFIX_CHECKPOINT_DOMAIN = b"gdlp-visible-prefix-recompute-v1\0"
+_ROUTE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
 
 class PipelineRecoveryError(RuntimeError):
@@ -34,6 +42,125 @@ class PipelineRecoveryError(RuntimeError):
 
 class RecoveryCompatibilityError(PipelineRecoveryError):
     """A proposed standby does not run the identical immutable execution plan."""
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteRecoveryStandbyRoute:
+    """Sealed, idle remote route that may replace a failed active route.
+
+    This is a route contract, not a KV checkpoint.  The stage processes remain
+    idle until promotion.  On promotion a new root engine connects to the first
+    stage and reconstructs request state from the exact visible token prefix.
+    """
+
+    route_id: str
+    first_stage_host: str
+    first_stage_port: int
+    stage_executor_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.route_id, str)
+            or not _ROUTE_ID.fullmatch(self.route_id)
+        ):
+            raise ValueError(
+                "recovery standby routeId must contain 1-128 safe characters"
+            )
+        if (
+            not isinstance(self.first_stage_host, str)
+            or not self.first_stage_host.strip()
+            or len(self.first_stage_host) > 253
+        ):
+            raise ValueError("recovery standby first-stage host is invalid")
+        if (
+            not isinstance(self.first_stage_port, int)
+            or isinstance(self.first_stage_port, bool)
+            or not 1 <= self.first_stage_port <= 65_535
+        ):
+            raise ValueError("recovery standby first-stage port is invalid")
+        if not self.stage_executor_ids:
+            raise ValueError("recovery standby requires stageExecutorIds")
+        for executor_id in self.stage_executor_ids:
+            _validate_executor_id(executor_id)
+
+    def to_document(self) -> dict[str, Any]:
+        return {
+            "schema": REMOTE_RECOVERY_STANDBY_SCHEMA,
+            "routeId": self.route_id,
+            "firstStage": {
+                "host": self.first_stage_host,
+                "port": self.first_stage_port,
+            },
+            "stageExecutorIds": list(self.stage_executor_ids),
+        }
+
+    @property
+    def contract_sha256(self) -> str:
+        return _sha256_document(self.to_document())
+
+    @classmethod
+    def parse_json(cls, value: str) -> "RemoteRecoveryStandbyRoute":
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("recovery standby route must be a non-empty JSON object")
+        try:
+            document = json.loads(value)
+        except json.JSONDecodeError as error:
+            raise ValueError("recovery standby route is not valid JSON") from error
+        if not isinstance(document, dict):
+            raise ValueError("recovery standby route must be a JSON object")
+        if set(document) != {
+            "schema",
+            "routeId",
+            "firstStage",
+            "stageExecutorIds",
+        }:
+            raise ValueError("recovery standby route has unknown or missing fields")
+        if document["schema"] != REMOTE_RECOVERY_STANDBY_SCHEMA:
+            raise ValueError("unsupported recovery standby route schema")
+        first_stage = document["firstStage"]
+        if not isinstance(first_stage, dict) or set(first_stage) != {"host", "port"}:
+            raise ValueError("recovery standby firstStage must contain host and port")
+        executor_ids = document["stageExecutorIds"]
+        if not isinstance(executor_ids, list) or any(
+            not isinstance(executor_id, str) for executor_id in executor_ids
+        ):
+            raise ValueError("recovery standby stageExecutorIds must be strings")
+        return cls(
+            route_id=document["routeId"],
+            first_stage_host=first_stage["host"],
+            first_stage_port=first_stage["port"],
+            stage_executor_ids=tuple(executor_ids),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteRecoveryStandbyEngineFactory:
+    """Callable engine factory carrying its statically verifiable route contract."""
+
+    route: RemoteRecoveryStandbyRoute
+    engine_factory: EngineFactory = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if not callable(self.engine_factory):
+            raise TypeError("remote recovery standby engine_factory must be callable")
+
+    def __call__(self) -> DistributedPipelineEngine:
+        return self.engine_factory()
+
+
+@dataclass
+class _RecoveryCandidate:
+    route_id: str
+    factory: EngineFactory
+    contract_sha256: str | None
+    first_stage_host: str | None
+    first_stage_port: int | None
+    stage_executor_ids: tuple[str, ...] | None
+    statically_prevalidated: bool
+    promotion_attempts: int = 0
+    promotions: int = 0
+    validation_failures: int = 0
+    last_error: str | None = None
 
 
 @dataclass
@@ -99,6 +226,55 @@ class RecoveringPipelineEngine:
             raise RecoveryCompatibilityError(
                 f"pipeline route has no usable recovery execution contract: {error}"
             ) from error
+        expected_identity_sha256 = recovery_identity_sha256(expected_identity)
+
+        candidates: list[_RecoveryCandidate] = []
+        try:
+            for index, factory in enumerate(standbys):
+                if isinstance(factory, RemoteRecoveryStandbyEngineFactory):
+                    route = factory.route
+                    if route.stage_executor_ids != expected_identity.stage_executor_ids:
+                        raise RecoveryCompatibilityError(
+                            f"standby route {route.route_id!r} executor contract "
+                            "does not match the active recovery identity"
+                        )
+                    candidates.append(
+                        _RecoveryCandidate(
+                            route_id=route.route_id,
+                            factory=factory,
+                            contract_sha256=route.contract_sha256,
+                            first_stage_host=route.first_stage_host,
+                            first_stage_port=route.first_stage_port,
+                            stage_executor_ids=route.stage_executor_ids,
+                            statically_prevalidated=True,
+                        )
+                    )
+                else:
+                    candidates.append(
+                        _RecoveryCandidate(
+                            route_id=f"programmatic-standby-{index}",
+                            factory=factory,
+                            contract_sha256=None,
+                            first_stage_host=None,
+                            first_stage_port=None,
+                            stage_executor_ids=None,
+                            statically_prevalidated=False,
+                        )
+                    )
+        except BaseException:
+            engine.close()
+            raise
+        candidates.append(
+            _RecoveryCandidate(
+                route_id="primary-recreated",
+                factory=engine_factory,
+                contract_sha256=expected_identity_sha256,
+                first_stage_host=getattr(engine.config, "first_stage_host", None),
+                first_stage_port=getattr(engine.config, "first_stage_port", None),
+                stage_executor_ids=expected_identity.stage_executor_ids,
+                statically_prevalidated=True,
+            )
+        )
 
         self.config = engine.config
         self.maximum_context = engine.maximum_context
@@ -108,11 +284,12 @@ class RecoveringPipelineEngine:
         self.model_artifact = engine.model_artifact
         self.pipeline_id = engine.pipeline_id
         self._expected_identity = expected_identity
+        self._expected_identity_sha256 = expected_identity_sha256
         self._root_parameter_bytes = engine.root_parameter_bytes
         self._engine_factory = engine_factory
         # Prefer a pre-provisioned standby after a fault; the primary factory is
         # always the final fallback and recreates the original route.
-        self._replacement_factories = (*standbys, engine_factory)
+        self._replacement_candidates = candidates
         self._factory_cursor = 0
         self.max_retries = max_retries
 
@@ -136,6 +313,17 @@ class RecoveringPipelineEngine:
         self._replayed_prompt_tokens = 0
         self._last_recovery_error: str | None = None
         self._last_recovery_duration_ms: float | None = None
+        self._active_route_id = "primary"
+        self._standby_prevalidations = sum(
+            candidate.statically_prevalidated for candidate in candidates[:-1]
+        )
+        self._route_promotions = 0
+        self._last_promoted_route_id: str | None = None
+        self._last_promotion_at_unix_ms: int | None = None
+        self._visible_prefix_checkpoints = 0
+        self._duplicate_tokens_suppressed = 0
+        self._last_visible_prefix_sha256: str | None = None
+        self._last_visible_prefix_tokens = 0
 
     @property
     def stages(self) -> int:
@@ -205,10 +393,17 @@ class RecoveringPipelineEngine:
                 state = "route-failed"
             return {
                 "configured": True,
-                "mode": "greedy-prefix-recompute",
+                "mode": "greedy-visible-prefix-recompute",
+                "checkpoint_kind": "visible-token-prefix-not-kv",
                 "state": state,
+                "recovery_identity_sha256": self._expected_identity_sha256,
                 "max_retries_per_request": self.max_retries,
                 "route_epoch": self._epoch,
+                "active_route_id": self._active_route_id,
+                "standby_prevalidations": self._standby_prevalidations,
+                "route_promotions": self._route_promotions,
+                "last_promoted_route_id": self._last_promoted_route_id,
+                "last_promotion_at_unix_ms": self._last_promotion_at_unix_ms,
                 "route_recovery_attempts": self._route_recovery_attempts,
                 "route_recovery_successes": self._route_recovery_successes,
                 "route_recovery_failures": self._route_recovery_failures,
@@ -217,9 +412,27 @@ class RecoveringPipelineEngine:
                 "recovered_requests": self._recovered_requests,
                 "replayed_output_tokens": self._replayed_output_tokens,
                 "replayed_prompt_tokens": self._replayed_prompt_tokens,
+                "visible_prefix_checkpoints": self._visible_prefix_checkpoints,
+                "duplicate_tokens_suppressed": self._duplicate_tokens_suppressed,
+                "last_visible_prefix_sha256": self._last_visible_prefix_sha256,
+                "last_visible_prefix_tokens": self._last_visible_prefix_tokens,
                 "active_requests": len(self._jobs_by_client),
                 "last_recovery_error": self._last_recovery_error,
                 "last_recovery_duration_ms": self._last_recovery_duration_ms,
+                "standby_routes": [
+                    {
+                        "route_id": candidate.route_id,
+                        "contract_sha256": candidate.contract_sha256,
+                        "first_stage_host": candidate.first_stage_host,
+                        "first_stage_port": candidate.first_stage_port,
+                        "statically_prevalidated": candidate.statically_prevalidated,
+                        "promotion_attempts": candidate.promotion_attempts,
+                        "promotions": candidate.promotions,
+                        "validation_failures": candidate.validation_failures,
+                        "last_error": candidate.last_error,
+                    }
+                    for candidate in self._replacement_candidates[:-1]
+                ],
             }
 
     def generate(
@@ -511,18 +724,24 @@ class RecoveringPipelineEngine:
 
             candidate: DistributedPipelineEngine | None = None
             failures: list[str] = []
-            factory_count = len(self._replacement_factories)
+            factory_count = len(self._replacement_candidates)
             for offset in range(factory_count):
                 with self._condition:
                     index = (self._factory_cursor + offset) % factory_count
                     self._route_recovery_attempts += 1
-                factory = self._replacement_factories[index]
+                    candidate_route = self._replacement_candidates[index]
+                    candidate_route.promotion_attempts += 1
                 proposed: DistributedPipelineEngine | None = None
                 try:
-                    proposed = factory()
+                    proposed = candidate_route.factory()
                     self._validate_replacement(proposed)
                 except BaseException as error:
-                    failures.append(f"factory[{index}]: {error}")
+                    failures.append(
+                        f"route[{candidate_route.route_id}]: {error}"
+                    )
+                    with self._condition:
+                        candidate_route.validation_failures += 1
+                        candidate_route.last_error = str(error)
                     try:
                         if proposed is not None:
                             proposed.close()
@@ -534,6 +753,8 @@ class RecoveringPipelineEngine:
                 candidate = proposed
                 with self._condition:
                     self._factory_cursor = (index + 1) % factory_count
+                    candidate_route.promotions += 1
+                    candidate_route.last_error = None
                 break
 
             if candidate is None:
@@ -549,6 +770,10 @@ class RecoveringPipelineEngine:
                 self._engine = candidate
                 self._epoch += 1
                 self._route_recovery_successes += 1
+                self._route_promotions += 1
+                self._active_route_id = candidate_route.route_id
+                self._last_promoted_route_id = candidate_route.route_id
+                self._last_promotion_at_unix_ms = int(time.time() * 1_000)
         except BaseException as error:
             with self._condition:
                 self._route_recovery_failures += 1
@@ -596,6 +821,10 @@ class RecoveringPipelineEngine:
     def _replay_input_locked(self, job: _ReplayJob) -> GenerationInput:
         original = job.request.input_ids
         if job.emitted:
+            checkpoint_sha256 = visible_prefix_checkpoint_sha256(
+                original,
+                job.emitted,
+            )
             replayed = torch.tensor(
                 [job.emitted],
                 dtype=original.dtype,
@@ -605,6 +834,12 @@ class RecoveringPipelineEngine:
             with self._condition:
                 self._replayed_output_tokens += len(job.emitted)
                 self._replayed_prompt_tokens += int(original.shape[1])
+                self._visible_prefix_checkpoints += 1
+                # The already-visible prefix is fed back as prompt state, never
+                # forwarded to the callback a second time.
+                self._duplicate_tokens_suppressed += len(job.emitted)
+                self._last_visible_prefix_sha256 = checkpoint_sha256
+                self._last_visible_prefix_tokens = len(job.emitted)
         else:
             input_ids = original
         return GenerationInput(
@@ -690,3 +925,66 @@ class RecoveringPipelineEngine:
             raise PipelineRecoveryError(
                 f"pipeline recovery is degraded: {self._terminal_error}"
             ) from self._terminal_error
+
+
+def recovery_identity_sha256(identity: PipelineRecoveryIdentity) -> str:
+    """Seal the complete route-independent recovery identity."""
+
+    digest = hashlib.sha256()
+    digest.update(RECOVERY_IDENTITY_DIGEST_DOMAIN)
+    digest.update(_canonical_json(asdict(identity)))
+    return f"sha256:{digest.hexdigest()}"
+
+
+def visible_prefix_checkpoint_sha256(
+    prompt_input_ids: torch.Tensor,
+    visible_output_ids: Iterable[int],
+) -> str:
+    """Seal the lightweight replay checkpoint used for exact recomputation.
+
+    This digest describes prompt tokens plus output tokens already delivered to
+    the user.  It deliberately contains no KV bytes and makes no claim that KV
+    state was transferred between machines.
+    """
+
+    if prompt_input_ids.ndim != 2 or prompt_input_ids.shape[0] != 1:
+        raise ValueError("recovery prompt must contain exactly one token row")
+    prompt = tuple(int(token) for token in prompt_input_ids[0].tolist())
+    visible = tuple(visible_output_ids)
+    digest = hashlib.sha256()
+    digest.update(VISIBLE_PREFIX_CHECKPOINT_DOMAIN)
+    digest.update(struct.pack(">QQ", len(prompt), len(visible)))
+    for token_id in (*prompt, *visible):
+        if (
+            not isinstance(token_id, int)
+            or isinstance(token_id, bool)
+            or not 0 <= token_id <= 0xFFFFFFFF
+        ):
+            raise ValueError("recovery checkpoint token ids must be uint32")
+        digest.update(struct.pack(">I", token_id))
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _validate_executor_id(executor_id: str) -> None:
+    if (
+        not isinstance(executor_id, str)
+        or len(executor_id) != 32
+        or executor_id != executor_id.lower()
+        or any(character not in "0123456789abcdef" for character in executor_id)
+    ):
+        raise ValueError(
+            "recovery standby executor ids must be 32 lowercase hex characters"
+        )
+
+
+def _canonical_json(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _sha256_document(value: Any) -> str:
+    return f"sha256:{hashlib.sha256(_canonical_json(value)).hexdigest()}"

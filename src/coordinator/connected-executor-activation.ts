@@ -6,10 +6,19 @@ import { WorkerTunnelLaunchAgent } from "../distribution/worker-tunnel-launch-ag
 import type { StoredRequestedModel, StoredWorker } from "../storage/store.js";
 import type { WorkerHub } from "./worker-hub.js";
 import type { DynamicActivationSnapshot } from "./model-activation-manager.js";
+import type { RuntimeLinkObservation } from "./runtime-link-observations.js";
+import {
+  plannerScalesFromProfile,
+  type PlannerPerformanceScales,
+} from "../performance/runtime-profile.js";
 
 interface ConnectedExecutor {
   worker: StoredWorker;
   executor: NonNullable<StoredWorker["capabilities"]["distributedExecutor"]>;
+}
+
+interface ProfiledConnectedExecutor extends ConnectedExecutor {
+  performance: PlannerPerformanceScales;
 }
 
 /**
@@ -20,6 +29,7 @@ export function buildConnectedExecutorActivationSnapshot(
   baseConfig: AutoDistributionConfig,
   workers: readonly StoredWorker[],
   connectedWorkerIds: ReadonlySet<string>,
+  runtimeLinkObservations: readonly RuntimeLinkObservation[] = [],
 ): DynamicActivationSnapshot {
   const executors = connectedExecutors(workers, connectedWorkerIds);
   const capacityNodes = executors.map(({ worker, executor }) => ({
@@ -29,9 +39,13 @@ export function buildConnectedExecutorActivationSnapshot(
       0,
     ),
   }));
-  if (executors.length < 2) return { capacityNodes, config: null };
+  const profiledExecutors = executors.flatMap((entry) => {
+    const performance = eligiblePlannerPerformance(entry);
+    return performance ? [{ ...entry, performance }] : [];
+  });
+  if (profiledExecutors.length < 2) return { capacityNodes, config: null };
 
-  const nodes = executors.map(({ worker, executor }) => {
+  const nodes = profiledExecutors.map(({ worker, executor, performance }) => {
     const memoryMiB = worker.capabilities.gpus.reduce(
       (sum, gpu) => sum + gpu.offeredVramMb,
       0,
@@ -46,47 +60,58 @@ export function buildConnectedExecutorActivationSnapshot(
       endpoint: { host: executor.stageHost, port: executor.stagePort },
       memoryMiB,
       reserveMiB: Math.min(256, Math.max(0, memoryMiB - 1)),
-      decodeScale: 1,
-      prefillScale: 1,
-      codecScale: 1,
+      decodeScale: performance.decodeScale,
+      prefillScale: performance.prefillScale,
+      codecScale: performance.codecScale,
       powerWatts: measuredPower > 0 ? measuredPower : 1,
       availability: Math.max(0.01, Math.min(1, worker.reliability)),
       agent: { kind: "managed" as const },
     };
   });
-  const links = executors.flatMap((from) => executors
+  const observationByLink = new Map(runtimeLinkObservations.map((observation) => [
+    linkKey(observation.fromNodeId, observation.toNodeId),
+    observation,
+  ]));
+  const measuredLinks = profiledExecutors.flatMap((from) => profiledExecutors
     .filter((to) => to.executor.nodeId !== from.executor.nodeId)
-    .map((to) => ({
-      from: from.executor.nodeId,
-      to: to.executor.nodeId,
-      oneWayLatencyMs: Math.max(
-        0.1,
-        (from.worker.capabilities.network.coordinatorRttMs
-          + to.worker.capabilities.network.coordinatorRttMs) / 2,
-      ),
-      jitterP95Ms: 0,
-      bandwidthMbps: Math.max(
-        1,
-        Math.min(
-          from.worker.capabilities.network.uplinkMbps,
-          to.worker.capabilities.network.downlinkMbps,
-        ),
-      ),
-      lossRate: 0,
-      // Worker reliability is already represented on both endpoint nodes.
-      // Reusing it here would count the same failures again for the forward
-      // and return links, making two 95% reliable workers look <90% reliable.
-      availability: 1,
-    })));
-  const rootHost = nodes[0]!.endpoint.host;
+    .flatMap((to) => {
+      const observation = observationByLink.get(
+        linkKey(from.executor.nodeId, to.executor.nodeId),
+      );
+      if (!observation) return [];
+      return [{
+        from: from.executor.nodeId,
+        to: to.executor.nodeId,
+        oneWayLatencyMs: Math.max(0.05, observation.rttP50Ms / 2),
+        jitterP95Ms: Math.max(0, (observation.rttP95Ms - observation.rttP50Ms) / 2),
+        bandwidthMbps: observation.goodputMbpsP50,
+        // Probe failures are modeled as reachability below. Treating them as
+        // both loss and unavailability would charge the same failure twice.
+        lossRate: 0,
+        availability: observation.availability,
+      }];
+    }));
+  const reciprocalNodeIds = new Set(measuredLinks.flatMap((link) => (
+    measuredLinks.some((candidate) =>
+      candidate.from === link.to && candidate.to === link.from
+    )
+      ? [link.from, link.to]
+      : []
+  )));
+  const routableNodes = nodes.filter((node) => reciprocalNodeIds.has(node.id));
+  if (routableNodes.length < 2) return { capacityNodes, config: null };
+  const links = measuredLinks.filter(
+    (link) => reciprocalNodeIds.has(link.from) && reciprocalNodeIds.has(link.to),
+  );
+  const rootHost = routableNodes[0]!.endpoint.host;
   const config = parseAutoDistributionConfig({
     ...structuredClone(baseConfig),
-    nodes,
+    nodes: routableNodes,
     links,
     distribution: {
       ...baseConfig.distribution,
-      minimumStages: Math.min(baseConfig.distribution.minimumStages, nodes.length),
-      maximumStages: Math.min(baseConfig.distribution.maximumStages, nodes.length),
+      minimumStages: Math.min(baseConfig.distribution.minimumStages, routableNodes.length),
+      maximumStages: Math.min(baseConfig.distribution.maximumStages, routableNodes.length),
     },
     runtime: {
       ...baseConfig.runtime,
@@ -188,4 +213,54 @@ function executorCapacityIsEligible(worker: StoredWorker): boolean {
   // after a current desktop client explicitly announces that fallback is
   // allowed; old clients remain GPU-only by default.
   return hasVerifiedGpu || executor.cpuEligible === true;
+}
+
+function linkKey(fromNodeId: string, toNodeId: string): string {
+  return `${fromNodeId}\u0000${toNodeId}`;
+}
+
+function eligiblePlannerPerformance(
+  entry: ConnectedExecutor,
+): PlannerPerformanceScales | null {
+  const profile = entry.executor.performanceProfile;
+  if (!profile) return null;
+  try {
+    const scales = plannerScalesFromProfile(profile);
+    const mode = entry.executor.computeMode ?? "automatic";
+    if (profile.backend === "cpu") {
+      if (entry.executor.cpuEligible !== true || mode === "gpu-only") return null;
+      return scales;
+    }
+    if (mode === "cpu-only") return null;
+    const acceleration = entry.executor.acceleration;
+    if (
+      acceleration?.state !== "gpu-ready"
+      || acceleration.backend !== profile.backend
+      || !acceleration.deviceName
+      || normalizeDeviceName(acceleration.deviceName)
+        !== normalizeDeviceName(profile.deviceName)
+    ) {
+      return null;
+    }
+    const expectedVendor = {
+      cuda: "nvidia",
+      rocm: "amd",
+      mps: "apple",
+      xpu: "intel",
+    }[profile.backend];
+    if (!entry.worker.capabilities.gpus.some(
+      (gpu) => gpu.vendor.trim().toLowerCase() === expectedVendor,
+    )) {
+      return null;
+    }
+    return scales;
+  } catch {
+    // Capacity remains visible, but stale, noisy, tampered, mismatched or
+    // otherwise unverifiable performance evidence cannot enter a route.
+    return null;
+  }
+}
+
+function normalizeDeviceName(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
 }

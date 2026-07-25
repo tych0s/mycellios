@@ -26,10 +26,133 @@ from distributed_runtime.server import (
     chunk_payload,
     output_token_ids_sha256,
     parse_args as parse_server_args,
+    parse_remote_recovery_standby_routes,
 )
 
 
 class EngineConfigurationTests(unittest.TestCase):
+    def test_remote_recovery_cli_accepts_only_complete_unique_standby_contracts(
+        self,
+    ) -> None:
+        executor_ids = ["1" * 32, "2" * 32]
+        document = {
+            "schema": "gdlp-recovery-standby-route/1",
+            "routeId": "standby-one",
+            "firstStage": {"host": "10.0.0.8", "port": 20_001},
+            "stageExecutorIds": executor_ids,
+        }
+        raw = json.dumps(document, separators=(",", ":"), sort_keys=True)
+        args = parse_server_args(
+            [
+                "--first-stage-host",
+                "10.0.0.7",
+                "--first-stage-port",
+                "20000",
+                "--return-port",
+                "20002",
+                "--recovery-max-retries",
+                "2",
+                "--stage-executor-id",
+                executor_ids[0],
+                "--stage-executor-id",
+                executor_ids[1],
+                "--recovery-standby-route",
+                raw,
+            ]
+        )
+        routes = parse_remote_recovery_standby_routes(
+            args.recovery_standby_route
+        )
+        self.assertEqual(len(routes), 1)
+        self.assertEqual(routes[0].route_id, "standby-one")
+        self.assertEqual(routes[0].stage_executor_ids, tuple(executor_ids))
+
+        with self.assertRaisesRegex(ValueError, "routeId values must be unique"):
+            parse_remote_recovery_standby_routes([raw, raw])
+
+        same_endpoint = {
+            **document,
+            "routeId": "standby-two",
+        }
+        with self.assertRaisesRegex(
+            ValueError,
+            "first-stage endpoints must be unique",
+        ):
+            parse_remote_recovery_standby_routes(
+                [raw, json.dumps(same_endpoint)]
+            )
+
+    def test_remote_recovery_cli_rejects_unknown_fields_and_weak_ids(self) -> None:
+        base = {
+            "schema": "gdlp-recovery-standby-route/1",
+            "routeId": "standby-one",
+            "firstStage": {"host": "127.0.0.1", "port": 20_001},
+            "stageExecutorIds": ["1" * 32, "2" * 32],
+        }
+        with self.assertRaisesRegex(ValueError, "unknown or missing fields"):
+            parse_remote_recovery_standby_routes(
+                [json.dumps({**base, "ignored": True})]
+            )
+        with self.assertRaisesRegex(ValueError, "32 lowercase hex"):
+            parse_remote_recovery_standby_routes(
+                [json.dumps({**base, "stageExecutorIds": ["weak"]})]
+            )
+
+    def test_remote_recovery_fails_before_model_loading_without_independent_contract(
+        self,
+    ) -> None:
+        primary_ids = ["1" * 32, "2" * 32]
+        base_arguments = [
+            "--first-stage-host",
+            "127.0.0.1",
+            "--first-stage-port",
+            "20001",
+            "--return-port",
+            "20002",
+            "--recovery-max-retries",
+            "1",
+            "--stage-executor-id",
+            primary_ids[0],
+            "--stage-executor-id",
+            primary_ids[1],
+        ]
+        mismatched = {
+            "schema": "gdlp-recovery-standby-route/1",
+            "routeId": "mismatched",
+            "firstStage": {"host": "127.0.0.1", "port": 20_003},
+            "stageExecutorIds": [primary_ids[0], "9" * 32],
+        }
+        with self.assertRaisesRegex(
+            ValueError,
+            "does not match the configured active route",
+        ):
+            build_server(
+                parse_server_args(
+                    [
+                        *base_arguments,
+                        "--recovery-standby-route",
+                        json.dumps(mismatched),
+                    ]
+                )
+            )
+
+        reused = {
+            **mismatched,
+            "routeId": "reused",
+            "firstStage": {"host": "127.0.0.1", "port": 20_001},
+            "stageExecutorIds": primary_ids,
+        }
+        with self.assertRaisesRegex(ValueError, "reuses the primary endpoint"):
+            build_server(
+                parse_server_args(
+                    [
+                        *base_arguments,
+                        "--recovery-standby-route",
+                        json.dumps(reused),
+                    ]
+                )
+            )
+
     def test_server_rejects_partial_wave_limits_before_model_loading(self) -> None:
         args = parse_server_args(["--sealed-wave-tokens", "1"])
         with self.assertRaisesRegex(ValueError, "must be supplied together"):

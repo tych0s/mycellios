@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import codecs
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import math
@@ -29,12 +29,17 @@ from .engine import (
     parse_boundaries,
 )
 from .model import load_tokenizer, resolve_model_snapshot
+from .paged_stage import add_paged_kv_arguments, paged_kv_config_from_args
 from .protocol import TensorCodec
 from .ram_backed_moe_runtime import (
     add_ram_backed_moe_arguments,
     ram_backed_moe_config_from_args,
 )
-from .recovery import RecoveringPipelineEngine
+from .recovery import (
+    RecoveringPipelineEngine,
+    RemoteRecoveryStandbyEngineFactory,
+    RemoteRecoveryStandbyRoute,
+)
 from .stage import (
     MAX_SPECULATIVE_BRANCHES,
     MAX_SPECULATIVE_BRANCH_TOKENS,
@@ -799,6 +804,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model-canonical-revision")
     parser.add_argument("--pipeline-snapshot-identity", type=int)
     add_ram_backed_moe_arguments(parser)
+    add_paged_kv_arguments(parser)
     parser.add_argument(
         "--stage-executor-id",
         action="append",
@@ -955,9 +961,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=0,
         help=(
-            "Recreate a failed local route and exactly replay the visible greedy "
-            "prefix; zero disables recovery. Remote routes require programmatic "
-            "standby factories."
+            "Recreate a failed route and exactly recompute the visible greedy "
+            "token prefix; zero disables recovery. This is a lightweight token "
+            "checkpoint, not KV transfer."
+        ),
+    )
+    parser.add_argument(
+        "--recovery-standby-route",
+        action="append",
+        default=[],
+        help=(
+            "Repeatable sealed remote standby JSON using schema "
+            "gdlp-recovery-standby-route/1 with routeId, firstStage "
+            "{host,port}, and the complete ordered stageExecutorIds contract."
         ),
     )
     parser.add_argument("--first-stage-host")
@@ -985,6 +1001,9 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
             "sealed-wave-tokens and max-prefill-chunk-tokens must be supplied together"
         )
     ram_backed_moe = ram_backed_moe_config_from_args(args)
+    paged_kv = paged_kv_config_from_args(args)
+    if ram_backed_moe is not None and paged_kv is not None:
+        raise ValueError("paged KV and RAM-backed MoE backends are mutually exclusive")
     if not 1 <= args.port <= 65_535:
         raise ValueError("port must be between 1 and 65535")
     if not args.public_model_name.strip():
@@ -1105,6 +1124,44 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
         raise ValueError("retained-session-ttl-seconds must be finite and positive")
     if args.recovery_max_retries < 0:
         raise ValueError("recovery-max-retries must be non-negative")
+    standby_routes = parse_remote_recovery_standby_routes(
+        getattr(args, "recovery_standby_route", ())
+    )
+    remote_requested = (
+        args.first_stage_host is not None or args.first_stage_port is not None
+    )
+    if standby_routes and args.recovery_max_retries == 0:
+        raise ValueError(
+            "recovery standby routes require a positive recovery-max-retries"
+        )
+    if standby_routes and not remote_requested:
+        raise ValueError("recovery standby routes require a remote primary route")
+    if remote_requested and args.recovery_max_retries > 0:
+        if not getattr(args, "stage_executor_id", ()):
+            raise ValueError(
+                "remote recovery requires the complete ordered stage-executor-id contract"
+            )
+        if not standby_routes:
+            raise ValueError(
+                "remote recovery requires at least one sealed recovery-standby-route"
+            )
+        primary_executor_ids = tuple(args.stage_executor_id)
+        for route in standby_routes:
+            if route.stage_executor_ids != primary_executor_ids:
+                raise ValueError(
+                    f"recovery standby {route.route_id!r} executor contract "
+                    "does not match the configured active route"
+                )
+            if (
+                args.first_stage_host is not None
+                and args.first_stage_port is not None
+                and route.first_stage_host.casefold()
+                == args.first_stage_host.casefold()
+                and route.first_stage_port == args.first_stage_port
+            ):
+                raise ValueError(
+                    f"recovery standby {route.route_id!r} reuses the primary endpoint"
+                )
     if ram_backed_moe is not None:
         snapshot = str(Path(args.model).expanduser().resolve())
         model_config = AutoConfig.from_pretrained(
@@ -1121,18 +1178,32 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
         if args.boundaries
         else balanced_boundaries(total_layers, args.stages)
     )
-    remote = args.first_stage_host is not None or args.first_stage_port is not None
+    remote = remote_requested
     if remote and (args.first_stage_host is None or args.first_stage_port is None):
         raise ValueError("remote mode requires both first-stage-host and first-stage-port")
-    if remote and args.recovery_max_retries > 0:
-        raise ValueError(
-            "remote recovery requires programmatic immutable-compatible standby factories"
-        )
     if ram_backed_moe is not None and not remote:
         raise ValueError(
             "server CLI RAM-backed MoE requires remote child stages with their "
             "own sealed bindings"
         )
+    if paged_kv is not None:
+        required_request_slots = (
+            args.max_active_sequences + args.max_speculative_branches
+        )
+        if paged_kv.max_active_requests < required_request_slots:
+            raise ValueError(
+                "paged max-active-requests cannot hold all active sequences and "
+                "sealed speculative branches"
+            )
+        if (
+            args.max_speculative_branch_tokens > 0
+            and paged_kv.max_sequence_tokens
+            < args.max_speculative_branch_tokens
+        ):
+            raise ValueError(
+                "paged max-sequence-tokens is smaller than the sealed "
+                "speculative branch token ceiling"
+            )
     codec = {
         "fp32": TensorCodec.FP32,
         "fp16": TensorCodec.FP16,
@@ -1165,6 +1236,15 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
                 if ram_backed_moe is None
                 else (ram_backed_moe,) + (None,) * (len(boundaries) - 2)
             ),
+            paged_kv_stages=(
+                None
+                if paged_kv is None
+                else (
+                    ((paged_kv,) * (len(boundaries) - 1))
+                    if not remote
+                    else (paged_kv,) + (None,) * (len(boundaries) - 2)
+                )
+            ),
             stage_executor_ids=(
                 tuple(args.stage_executor_id) if args.stage_executor_id else None
             ),
@@ -1196,10 +1276,40 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
     initial_engine = engine_factory()
     engine: DistributedPipelineEngine | RecoveringPipelineEngine
     if args.recovery_max_retries > 0:
+        expected_executor_ids = initial_engine.recovery_identity.stage_executor_ids
+        standby_factories: list[RemoteRecoveryStandbyEngineFactory] = []
+        for route in standby_routes:
+            if len(route.stage_executor_ids) != len(boundaries) - 1:
+                initial_engine.close()
+                raise ValueError(
+                    f"recovery standby {route.route_id!r} must contain one "
+                    "stageExecutorId per stage"
+                )
+            if route.stage_executor_ids != expected_executor_ids:
+                initial_engine.close()
+                raise ValueError(
+                    f"recovery standby {route.route_id!r} executor contract "
+                    "does not match the active route"
+                )
+            standby_config = replace(
+                engine_config,
+                first_stage_host=route.first_stage_host,
+                first_stage_port=route.first_stage_port,
+                stage_executor_ids=route.stage_executor_ids,
+            )
+            standby_factories.append(
+                RemoteRecoveryStandbyEngineFactory(
+                    route=route,
+                    engine_factory=(
+                        lambda config=standby_config: DistributedPipelineEngine(config)
+                    ),
+                )
+            )
         engine = RecoveringPipelineEngine(
             engine_factory,
             max_retries=args.recovery_max_retries,
             initial_engine=initial_engine,
+            standby_factories=standby_factories,
         )
     else:
         engine = initial_engine
@@ -1216,6 +1326,28 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
     except BaseException:
         engine.close()
         raise
+
+
+def parse_remote_recovery_standby_routes(
+    values: Any,
+) -> tuple[RemoteRecoveryStandbyRoute, ...]:
+    """Parse and deduplicate repeatable CLI standby route contracts."""
+
+    if values is None:
+        return ()
+    if not isinstance(values, (list, tuple)):
+        raise ValueError("recovery standby routes must be a list")
+    routes = tuple(RemoteRecoveryStandbyRoute.parse_json(value) for value in values)
+    route_ids = [route.route_id for route in routes]
+    if len(route_ids) != len(set(route_ids)):
+        raise ValueError("recovery standby routeId values must be unique")
+    endpoints = [
+        (route.first_stage_host.casefold(), route.first_stage_port)
+        for route in routes
+    ]
+    if len(endpoints) != len(set(endpoints)):
+        raise ValueError("recovery standby first-stage endpoints must be unique")
+    return routes
 
 
 def main(argv: list[str] | None = None) -> int:

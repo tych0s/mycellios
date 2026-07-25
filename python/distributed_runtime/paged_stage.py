@@ -31,11 +31,14 @@ expected manager shape before accepting work.
 
 from __future__ import annotations
 
+import argparse
 from collections import Counter
 from collections.abc import Sequence
 import copy
 from dataclasses import dataclass
 import gc
+import hashlib
+import json
 from math import ceil
 from typing import Any
 
@@ -62,6 +65,214 @@ SUPPORTED_TRANSFORMERS_VERSION = "5.14.1"
 SUPPORTED_ATTENTION_BACKENDS = frozenset(("eager", "sdpa"))
 MAX_REQUEST_ID = 2**63 - 1
 MAX_OPAQUE_CACHE_KEY = 2**31 - 1
+PAGED_STAGE_RUNTIME_SCHEMA = "mycellios-hf-paged-stage/1"
+DEFAULT_PAGED_BLOCK_SIZE = 16
+DEFAULT_PAGED_NUM_BLOCKS = 256
+DEFAULT_PAGED_MAX_BATCH_TOKENS = 256
+DEFAULT_PAGED_MAX_ACTIVE_REQUESTS = 8
+DEFAULT_PAGED_MAX_SEQUENCE_TOKENS = 2048
+MAX_PAGED_BLOCK_SIZE = 256
+MAX_PAGED_NUM_BLOCKS = 1_048_576
+MAX_PAGED_BATCH_TOKENS = 65_536
+MAX_PAGED_ACTIVE_REQUESTS = 4_096
+MAX_PAGED_SEQUENCE_TOKENS = 1_048_576
+
+
+@dataclass(frozen=True)
+class HFPagedStageRuntimeConfig:
+    """Closed, content-sealed settings for the native paged KV backend.
+
+    ``cpu_spill_bytes`` is deliberately present in the contract even though it
+    must currently be zero. Transformers 5.14.1 exposes neither an atomic block
+    eviction/restore operation nor a way to replace a live request's block
+    table after restoring device KV. Pretending that ordinary tensor copies are
+    a spill implementation could publish half-restored cache state, so any
+    positive request fails before model or KV allocation.
+    """
+
+    schema: str = PAGED_STAGE_RUNTIME_SCHEMA
+    device: str = "cpu"
+    attention_backend: str = "eager"
+    block_size: int = DEFAULT_PAGED_BLOCK_SIZE
+    num_blocks: int = DEFAULT_PAGED_NUM_BLOCKS
+    max_batch_tokens: int = DEFAULT_PAGED_MAX_BATCH_TOKENS
+    max_active_requests: int = DEFAULT_PAGED_MAX_ACTIVE_REQUESTS
+    max_sequence_tokens: int = DEFAULT_PAGED_MAX_SEQUENCE_TOKENS
+    cpu_spill_bytes: int = 0
+
+    def __post_init__(self) -> None:
+        if self.schema != PAGED_STAGE_RUNTIME_SCHEMA:
+            raise ValueError(
+                f"paged runtime schema must be {PAGED_STAGE_RUNTIME_SCHEMA}"
+            )
+        try:
+            device = torch.device(self.device)
+        except (TypeError, RuntimeError) as error:
+            raise ValueError("paged device must be cpu or cuda[:index]") from error
+        if device.type not in ("cpu", "cuda") or (
+            device.type == "cpu" and device.index is not None
+        ):
+            raise ValueError("paged device must be cpu or cuda[:index]")
+        if self.device != str(device):
+            raise ValueError("paged device must use its canonical torch spelling")
+        if self.attention_backend not in SUPPORTED_ATTENTION_BACKENDS:
+            raise ValueError(
+                "paged attention backend must be one of "
+                f"{sorted(SUPPORTED_ATTENTION_BACKENDS)}"
+            )
+        for name, value, minimum, maximum in (
+            ("block_size", self.block_size, 4, MAX_PAGED_BLOCK_SIZE),
+            ("num_blocks", self.num_blocks, 1, MAX_PAGED_NUM_BLOCKS),
+            (
+                "max_batch_tokens",
+                self.max_batch_tokens,
+                1,
+                MAX_PAGED_BATCH_TOKENS,
+            ),
+            (
+                "max_active_requests",
+                self.max_active_requests,
+                1,
+                MAX_PAGED_ACTIVE_REQUESTS,
+            ),
+            (
+                "max_sequence_tokens",
+                self.max_sequence_tokens,
+                1,
+                MAX_PAGED_SEQUENCE_TOKENS,
+            ),
+        ):
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or not minimum <= value <= maximum
+            ):
+                raise ValueError(
+                    f"{name} must be an integer between {minimum} and {maximum}"
+                )
+        if ceil(self.max_sequence_tokens / self.block_size) > self.num_blocks:
+            raise ValueError(
+                "paged num_blocks cannot hold one maximum-length request"
+            )
+        if (
+            not isinstance(self.cpu_spill_bytes, int)
+            or isinstance(self.cpu_spill_bytes, bool)
+            or self.cpu_spill_bytes < 0
+        ):
+            raise ValueError("paged cpu_spill_bytes must be a non-negative integer")
+        if self.cpu_spill_bytes != 0:
+            raise ValueError(
+                "paged CPU spill is unavailable: Transformers 5.14.1 has no "
+                "atomic live block eviction/restore ABI; cpu_spill_bytes must be zero"
+            )
+
+    def to_document(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "device": self.device,
+            "attentionBackend": self.attention_backend,
+            "blockSize": self.block_size,
+            "numBlocks": self.num_blocks,
+            "maxBatchTokens": self.max_batch_tokens,
+            "maxActiveRequests": self.max_active_requests,
+            "maxSequenceTokens": self.max_sequence_tokens,
+            "cpuSpillBytes": self.cpu_spill_bytes,
+            "cpuSpill": {
+                "supported": False,
+                "reason": "transformers-5.14.1-no-atomic-block-eviction-restore",
+            },
+        }
+
+    @property
+    def configuration_id(self) -> str:
+        encoded = json.dumps(
+            self.to_document(),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+
+def add_paged_kv_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add an explicit all-or-nothing paged backend contract to a CLI."""
+
+    parser.add_argument(
+        "--paged-kv",
+        action="store_true",
+        help="Use Mycellios' native Transformers paged KV/COW stage backend.",
+    )
+    parser.add_argument("--paged-device")
+    parser.add_argument(
+        "--paged-attention-backend",
+        choices=tuple(sorted(SUPPORTED_ATTENTION_BACKENDS)),
+    )
+    parser.add_argument("--paged-block-size", type=int)
+    parser.add_argument("--paged-num-blocks", type=int)
+    parser.add_argument("--paged-max-batch-tokens", type=int)
+    parser.add_argument("--paged-max-active-requests", type=int)
+    parser.add_argument("--paged-max-sequence-tokens", type=int)
+    parser.add_argument(
+        "--paged-cpu-spill-bytes",
+        type=int,
+        help=(
+            "Reserved contract field. Must be zero until the pinned Transformers "
+            "cache exposes atomic live block eviction/restore."
+        ),
+    )
+
+
+def paged_kv_config_from_args(
+    args: argparse.Namespace,
+) -> HFPagedStageRuntimeConfig | None:
+    """Parse a closed paged contract without silently enabling partial flags."""
+
+    values = {
+        "device": getattr(args, "paged_device", None),
+        "attention_backend": getattr(args, "paged_attention_backend", None),
+        "block_size": getattr(args, "paged_block_size", None),
+        "num_blocks": getattr(args, "paged_num_blocks", None),
+        "max_batch_tokens": getattr(args, "paged_max_batch_tokens", None),
+        "max_active_requests": getattr(args, "paged_max_active_requests", None),
+        "max_sequence_tokens": getattr(args, "paged_max_sequence_tokens", None),
+        "cpu_spill_bytes": getattr(args, "paged_cpu_spill_bytes", None),
+    }
+    enabled = bool(getattr(args, "paged_kv", False))
+    if not enabled:
+        if any(value is not None for value in values.values()):
+            raise ValueError("paged KV settings require --paged-kv")
+        return None
+    return HFPagedStageRuntimeConfig(
+        device=values["device"] or "cpu",
+        attention_backend=values["attention_backend"] or "eager",
+        block_size=(
+            DEFAULT_PAGED_BLOCK_SIZE
+            if values["block_size"] is None
+            else values["block_size"]
+        ),
+        num_blocks=(
+            DEFAULT_PAGED_NUM_BLOCKS
+            if values["num_blocks"] is None
+            else values["num_blocks"]
+        ),
+        max_batch_tokens=(
+            DEFAULT_PAGED_MAX_BATCH_TOKENS
+            if values["max_batch_tokens"] is None
+            else values["max_batch_tokens"]
+        ),
+        max_active_requests=(
+            DEFAULT_PAGED_MAX_ACTIVE_REQUESTS
+            if values["max_active_requests"] is None
+            else values["max_active_requests"]
+        ),
+        max_sequence_tokens=(
+            DEFAULT_PAGED_MAX_SEQUENCE_TOKENS
+            if values["max_sequence_tokens"] is None
+            else values["max_sequence_tokens"]
+        ),
+        cpu_spill_bytes=(
+            0 if values["cpu_spill_bytes"] is None else values["cpu_spill_bytes"]
+        ),
+    )
 
 
 class PagedStageCorruptionError(RuntimeError):
@@ -1006,8 +1217,7 @@ class HFPagedStageCache:
 class HFPagedStageRunner:
     """Opt-in selective stage runner backed by real paged COW KV.
 
-    The runner is intentionally not wired into the server/CLI yet. It fulfills
-    the sequential ``StageRunnerContract`` surface and the optional
+    It fulfills the sequential ``StageRunnerContract`` surface and the optional
     ``StageKVPhysicalAccounting`` ABI. Packed tree verification remains a
     separate certification task and is not advertised in the manifest.
     """
@@ -1026,7 +1236,17 @@ class HFPagedStageRunner:
         max_active_requests: int = 8,
         max_sequence_tokens: int = 2048,
     ) -> None:
-        resolved_device = torch.device(device)
+        runtime_config = HFPagedStageRuntimeConfig(
+            device=str(torch.device(device)),
+            attention_backend=attention_backend,
+            block_size=block_size,
+            num_blocks=num_blocks,
+            max_batch_tokens=max_batch_tokens,
+            max_active_requests=max_active_requests,
+            max_sequence_tokens=max_sequence_tokens,
+            cpu_spill_bytes=0,
+        )
+        resolved_device = torch.device(runtime_config.device)
         if resolved_device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA paged runner requested but CUDA is unavailable")
         if resolved_device.type not in ("cpu", "cuda"):
@@ -1061,16 +1281,17 @@ class HFPagedStageRunner:
         self.physical_batch_items = 0
         self.max_observed_physical_batch_size = 1
         self._last_fork_report: StageKVForkReport | None = None
+        self.runtime_config = runtime_config
 
         self.paged_cache = HFPagedStageCache.for_model(
             self.base,
-            attention_backend=attention_backend,
+            attention_backend=runtime_config.attention_backend,
             cache_vocab_size=None if self.head is not None else 1,
-            block_size=block_size,
-            num_blocks=num_blocks,
-            max_batch_tokens=max_batch_tokens,
-            max_active_requests=max_active_requests,
-            max_sequence_tokens=max_sequence_tokens,
+            block_size=runtime_config.block_size,
+            num_blocks=runtime_config.num_blocks,
+            max_batch_tokens=runtime_config.max_batch_tokens,
+            max_active_requests=runtime_config.max_active_requests,
+            max_sequence_tokens=runtime_config.max_sequence_tokens,
         )
 
         artifact = model_artifact_reference(
@@ -1140,6 +1361,48 @@ class HFPagedStageRunner:
         )
         del model
         gc.collect()
+
+    @classmethod
+    def from_runtime_config(
+        cls,
+        spec: StageModelSpec,
+        runtime: HFPagedStageRuntimeConfig,
+    ) -> HFPagedStageRunner:
+        if not isinstance(runtime, HFPagedStageRuntimeConfig):
+            raise TypeError("paged runtime must be HFPagedStageRuntimeConfig")
+        return cls(
+            spec,
+            device=runtime.device,
+            attention_backend=runtime.attention_backend,
+            block_size=runtime.block_size,
+            num_blocks=runtime.num_blocks,
+            max_batch_tokens=runtime.max_batch_tokens,
+            max_active_requests=runtime.max_active_requests,
+            max_sequence_tokens=runtime.max_sequence_tokens,
+        )
+
+    def execution_snapshot(self) -> dict[str, Any]:
+        """Publish observed bounded pool state and the honest spill contract."""
+
+        runtime = self.runtime_config.to_document()
+        return {
+            "backend": "hf-paged-cow",
+            "configurationId": self.runtime_config.configuration_id,
+            "device": str(self.device),
+            "attentionBackend": self.runtime_config.attention_backend,
+            "kvPool": {
+                "blockSize": self.paged_cache.block_size,
+                "numBlocks": self.paged_cache.num_blocks,
+                "reservedBytes": self.paged_cache.pool_reserved_bytes,
+                "freeBlocks": self.paged_cache.cache.get_num_free_blocks(),
+            },
+            "limits": {
+                "maxBatchTokens": self.runtime_config.max_batch_tokens,
+                "maxActiveRequests": self.runtime_config.max_active_requests,
+                "maxSequenceTokens": self.runtime_config.max_sequence_tokens,
+            },
+            "cpuSpill": runtime["cpuSpill"],
+        }
 
     def begin(self, request_id: int) -> None:
         self.paged_cache.begin(request_id)
@@ -1322,11 +1585,15 @@ class HFPagedStageRunner:
 
 
 __all__ = [
+    "HFPagedStageRuntimeConfig",
     "HFPagedStageCache",
     "HFPagedStageRunner",
+    "PAGED_STAGE_RUNTIME_SCHEMA",
     "PagedCacheMetrics",
     "PagedCacheSnapshot",
     "PagedForwardResult",
     "PagedRequestSnapshot",
     "PagedStageCorruptionError",
+    "add_paged_kv_arguments",
+    "paged_kv_config_from_args",
 ]

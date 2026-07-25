@@ -4808,7 +4808,8 @@
   border-radius: 12px;
   color: #ffafb8;
   background: rgba(116, 24, 38, 0.12);
-  font-size: 12px;
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .public-panel .benchmark-auto-notice {
@@ -4831,7 +4832,7 @@
 .public-panel .benchmark-auto-notice strong {
   margin-bottom: 3px;
   color: var(--text-primary);
-  font-size: 13px;
+  font-size: 15px;
 }
 
 .public-panel .benchmark-error span,
@@ -4859,7 +4860,7 @@
 
 .public-panel .benchmark-capacity-strip {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 1px;
   margin-bottom: 20px;
   overflow: hidden;
@@ -4892,7 +4893,7 @@
 
 .public-panel .benchmark-capacity-metric small {
   color: var(--text-tertiary);
-  font-size: 11px;
+  font-size: 12px;
   text-transform: uppercase;
   letter-spacing: 0.09em;
 }
@@ -4916,6 +4917,82 @@
   font-style: normal;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.public-panel .benchmark-filters {
+  margin-bottom: 20px;
+  padding: 18px 20px 20px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: linear-gradient(135deg, rgba(20, 42, 78, 0.7), rgba(8, 23, 50, 0.72));
+  box-shadow: var(--shadow-card);
+}
+
+.public-panel .benchmark-filters-heading,
+.public-panel .benchmark-filters-heading > div {
+  display: flex;
+  align-items: center;
+}
+
+.public-panel .benchmark-filters-heading {
+  justify-content: space-between;
+  gap: 20px;
+  margin-bottom: 15px;
+}
+
+.public-panel .benchmark-filters-heading > div {
+  gap: 11px;
+  color: var(--blue-300);
+}
+
+.public-panel .benchmark-filters-heading span,
+.public-panel .benchmark-filters-heading strong,
+.public-panel .benchmark-filters-heading small {
+  display: block;
+}
+
+.public-panel .benchmark-filters-heading strong {
+  color: var(--text-primary);
+  font-size: 15px;
+  font-weight: 580;
+}
+
+.public-panel .benchmark-filters-heading small {
+  margin-top: 2px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.public-panel .benchmark-clear-filters {
+  min-height: 36px;
+  padding: 0 13px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 9px;
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.025);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.public-panel .benchmark-clear-filters:hover:not(:disabled) {
+  color: var(--text-primary);
+  border-color: var(--border-strong);
+}
+
+.public-panel .benchmark-filter-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(150px, 1fr));
+  gap: 12px;
+}
+
+.public-panel .benchmark-filter-grid label {
+  min-width: 0;
+  display: grid;
+  gap: 7px;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.11em;
 }
 
 .public-panel .benchmark-toolbar {
@@ -4944,7 +5021,7 @@
   display: grid;
   gap: 7px;
   color: var(--text-tertiary);
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 500;
   letter-spacing: 0.13em;
 }
@@ -4971,6 +5048,10 @@
 .public-panel .benchmark-run-state.regression,
 .public-panel .benchmark-run-state.failed {
   color: var(--danger);
+}
+
+.public-panel .benchmark-run-state.inconclusive {
+  color: var(--warning);
 }
 
 .public-panel .benchmark-run-state.baseline {
@@ -5006,6 +5087,18 @@
   background: linear-gradient(140deg, rgba(94, 59, 18, 0.34), rgba(9, 25, 54, 0.82) 52%);
 }
 
+.public-panel .benchmark-comparison.configuration-change,
+.public-panel .benchmark-comparison.insufficient-confidence,
+.public-panel .benchmark-comparison.within-variation {
+  border-color: rgba(255, 184, 76, 0.23);
+  background: linear-gradient(140deg, rgba(80, 59, 23, 0.32), rgba(9, 25, 54, 0.82) 52%);
+}
+
+.public-panel .benchmark-comparison.slower-code-signal {
+  border-color: rgba(255, 107, 122, 0.25);
+  background: linear-gradient(140deg, rgba(91, 29, 42, 0.38), rgba(9, 25, 54, 0.82) 52%);
+}
+
 .public-panel .benchmark-comparison.different-evidence,
 .public-panel .benchmark-comparison.different-model,
 .public-panel .benchmark-comparison.unavailable {
@@ -5037,6 +5130,16 @@
   color: var(--warning);
 }
 
+.public-panel .benchmark-comparison.configuration-change .benchmark-comparison-heading > div:first-child > span,
+.public-panel .benchmark-comparison.insufficient-confidence .benchmark-comparison-heading > div:first-child > span,
+.public-panel .benchmark-comparison.within-variation .benchmark-comparison-heading > div:first-child > span {
+  color: var(--warning);
+}
+
+.public-panel .benchmark-comparison.slower-code-signal .benchmark-comparison-heading > div:first-child > span {
+  color: var(--danger);
+}
+
 .public-panel .benchmark-comparison.different-evidence .benchmark-comparison-heading > div:first-child > span,
 .public-panel .benchmark-comparison.different-model .benchmark-comparison-heading > div:first-child > span,
 .public-panel .benchmark-comparison.unavailable .benchmark-comparison-heading > div:first-child > span {
@@ -5054,7 +5157,7 @@
   max-width: 720px;
   margin: 0;
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: 13px;
   line-height: 1.55;
 }
 
@@ -5135,7 +5238,8 @@
 }
 
 .public-panel .benchmark-comparison-metric > div em,
-.public-panel .benchmark-comparison-metric > div strong {
+.public-panel .benchmark-comparison-metric > div strong,
+.public-panel .benchmark-comparison-metric > div small {
   display: block;
 }
 
@@ -5154,6 +5258,14 @@
   font-variant-numeric: tabular-nums;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.public-panel .benchmark-comparison-metric > div small {
+  min-height: 31px;
+  margin-top: 4px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.35;
 }
 
 .public-panel .benchmark-comparison-metric > b {
@@ -5252,6 +5364,26 @@
   stroke-width: 2;
 }
 
+.public-panel .benchmark-confidence-band {
+  fill: rgba(78, 143, 255, 0.13);
+  stroke: rgba(96, 156, 255, 0.28);
+  stroke-width: 1;
+}
+
+.public-panel .benchmark-series .benchmark-range {
+  stroke: currentColor;
+  stroke-width: 2;
+  opacity: 0.7;
+}
+
+.public-panel .benchmark-series.tone-blue {
+  color: var(--blue-400);
+}
+
+.public-panel .benchmark-series.tone-purple { color: var(--purple-400); }
+.public-panel .benchmark-series.tone-green { color: var(--success); }
+.public-panel .benchmark-series.tone-orange { color: var(--warning); }
+
 .public-panel .benchmark-series.series-1 polyline { stroke: var(--purple-400); }
 .public-panel .benchmark-series.series-1 circle { fill: var(--purple-400); }
 .public-panel .benchmark-series.series-2 polyline { stroke: var(--success); }
@@ -5272,7 +5404,7 @@
   justify-content: space-between;
   gap: 12px;
   color: var(--text-secondary);
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .public-panel .benchmark-chart-summary strong {
@@ -5328,9 +5460,9 @@
 
 .public-panel .benchmark-history-head,
 .public-panel .benchmark-history-row {
-  min-width: 1020px;
+  min-width: 1240px;
   display: grid;
-  grid-template-columns: 1.05fr 1.6fr 0.7fr 1fr 1fr 1fr 1.15fr;
+  grid-template-columns: 1.25fr 1.45fr 1fr 0.9fr 1.2fr 1.3fr 1.05fr;
   align-items: center;
   gap: 14px;
   padding: 0 20px;
@@ -5389,7 +5521,7 @@
 .public-panel .benchmark-history-row small {
   margin-top: 4px;
   color: var(--text-tertiary);
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .public-panel .benchmark-history-row > span:last-child {
@@ -5412,6 +5544,7 @@
 .public-panel .benchmark-history-row b.baseline { color: var(--blue-300); }
 .public-panel .benchmark-history-row b.regression,
 .public-panel .benchmark-history-row b.failed { color: var(--danger); }
+.public-panel .benchmark-history-row b.inconclusive { color: var(--warning); }
 
 .public-panel .benchmark-history-row b i {
   width: 6px;
@@ -5483,7 +5616,7 @@
 
 .public-panel .benchmark-result-heading small {
   color: var(--success);
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.11em;
 }
@@ -5501,7 +5634,7 @@
 .public-panel .benchmark-result-heading em {
   margin-top: 3px;
   color: var(--text-secondary);
-  font-size: 11px;
+  font-size: 12px;
   font-style: normal;
 }
 
@@ -5519,10 +5652,11 @@
 .public-panel .benchmark-result-heading > b.baseline { color: var(--blue-300); }
 .public-panel .benchmark-result-heading > b.regression,
 .public-panel .benchmark-result-heading > b.failed { color: var(--danger); }
+.public-panel .benchmark-result-heading > b.inconclusive { color: var(--warning); }
 
 .public-panel .benchmark-result-metrics {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 10px;
   margin-top: 20px;
 }
@@ -5543,7 +5677,7 @@
 
 .public-panel .benchmark-value small {
   color: var(--text-tertiary);
-  font-size: 10px;
+  font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.07em;
 }
@@ -5563,7 +5697,7 @@
   margin-top: 4px;
   overflow: hidden;
   color: var(--text-secondary);
-  font-size: 10px;
+  font-size: 11px;
   font-style: normal;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -5586,7 +5720,7 @@
 }
 
 .public-panel .benchmark-node-list > span {
-  min-width: 220px;
+  min-width: 280px;
   display: grid;
   grid-template-columns: auto 1fr;
   column-gap: 8px;
@@ -5601,12 +5735,76 @@
 .public-panel .benchmark-node-list strong {
   overflow: hidden;
   color: var(--text-primary);
-  font-size: 11px;
+  font-size: 13px;
   font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.public-panel .benchmark-node-list small { color: var(--text-secondary); font-size: 10px; }
+.public-panel .benchmark-node-list small {
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.public-panel .benchmark-topology-summary {
+  margin-top: 16px;
+  padding: 16px;
+  border: 1px solid rgba(103, 145, 224, 0.15);
+  border-radius: 11px;
+  background: rgba(13, 34, 69, 0.52);
+}
+
+.public-panel .benchmark-topology-summary > div:first-child {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  color: var(--blue-300);
+}
+
+.public-panel .benchmark-topology-summary > div:first-child span,
+.public-panel .benchmark-topology-summary > div:first-child small,
+.public-panel .benchmark-topology-summary > div:first-child strong {
+  display: block;
+}
+
+.public-panel .benchmark-topology-summary > div:first-child small {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+}
+
+.public-panel .benchmark-topology-summary > div:first-child strong {
+  margin-top: 3px;
+  color: var(--text-primary);
+  font-size: 14px;
+}
+
+.public-panel .benchmark-topology-summary dl {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin: 15px 0 0;
+}
+
+.public-panel .benchmark-topology-summary dl > div {
+  min-width: 0;
+  padding: 11px 12px;
+  border-radius: 9px;
+  background: rgba(4, 15, 35, 0.35);
+}
+
+.public-panel .benchmark-topology-summary dt {
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+
+.public-panel .benchmark-topology-summary dd {
+  margin: 5px 0 0;
+  overflow-wrap: anywhere;
+  color: var(--text-primary);
+  font-size: 13px;
+  line-height: 1.45;
+}
 
 .public-panel .benchmark-technical-details {
   margin-top: 16px;
@@ -5616,13 +5814,13 @@
 .public-panel .benchmark-technical-details summary {
   padding: 15px 0 0;
   color: var(--blue-300);
-  font-size: 11px;
+  font-size: 13px;
   cursor: pointer;
 }
 
 .public-panel .benchmark-technical-details > div {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 10px;
   margin-top: 14px;
 }
@@ -5635,7 +5833,7 @@
   border-radius: 9px;
   color: var(--text-secondary);
   background: rgba(4, 15, 35, 0.34);
-  font-size: 10px;
+  font-size: 12px;
   line-height: 1.5;
 }
 
@@ -5764,6 +5962,14 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .public-panel .benchmark-filter-grid {
+    grid-template-columns: repeat(3, minmax(160px, 1fr));
+  }
+
+  .public-panel .benchmark-topology-summary dl {
+    grid-template-columns: 1fr;
+  }
+
   .public-panel .overview-grid {
     grid-template-columns: 1fr;
   }
@@ -5877,6 +6083,10 @@
     grid-template-columns: 1fr;
   }
 
+  .public-panel .benchmark-filter-grid {
+    grid-template-columns: repeat(2, minmax(160px, 1fr));
+  }
+
   .public-panel .inference-toolbar {
     align-items: stretch;
     flex-direction: column;
@@ -5963,6 +6173,15 @@
     flex-direction: column;
   }
 
+  .public-panel .benchmark-filters-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .public-panel .benchmark-filter-grid {
+    grid-template-columns: 1fr;
+  }
+
   .public-panel .benchmark-toolbar-selects {
     width: 100%;
     grid-template-columns: 1fr;
@@ -5994,6 +6213,10 @@
   .public-panel .benchmark-result-metrics,
   .public-panel .benchmark-comparison-grid,
   .public-panel .benchmark-technical-details > div {
+    grid-template-columns: 1fr;
+  }
+
+  .public-panel .benchmark-topology-summary dl {
     grid-template-columns: 1fr;
   }
 

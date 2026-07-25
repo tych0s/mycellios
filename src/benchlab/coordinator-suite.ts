@@ -1,5 +1,20 @@
 import type { ModelDeployment } from "../contracts/types.js";
+import { sha256Text } from "../core/json.js";
 import type { StoredWorker } from "../storage/store.js";
+import {
+  sealBenchmarkActivation,
+  type BenchmarkActivation,
+} from "./activation-tracker.js";
+import {
+  runAdaptiveBenchmarkCampaign,
+  type AdaptiveBenchmarkCampaignResult,
+} from "./campaign.js";
+import {
+  PhysicalTelemetryWindow,
+  type BenchmarkPhysicalTelemetrySummary,
+  type BenchmarkTelemetrySnapshot,
+} from "./physical-telemetry.js";
+import { sealBenchmarkScenario } from "./scenario.js";
 import {
   BENCHMARK_RUN_SCHEMA,
   emptyComparison,
@@ -20,6 +35,79 @@ export interface CoordinatorBenchmarkModel {
   id: string;
   source: string;
   revision: string | null;
+  digest: string | null;
+}
+
+export function coordinatorBenchmarkModelIdentity(
+  model: Omit<CoordinatorBenchmarkModel, "digest">,
+  workers: readonly StoredWorker[],
+  connectedWorkerIds: ReadonlySet<string>,
+): CoordinatorBenchmarkModel {
+  const digests = new Set(
+    workers
+      .filter((worker) => connectedWorkerIds.has(worker.id))
+      .flatMap((worker) => worker.capabilities.deployments)
+      .filter((deployment) => deployment.model === model.id && deployment.adapter !== "mock")
+      .map((deployment) => deployment.modelDigest.trim())
+      .filter(Boolean),
+  );
+  return {
+    ...model,
+    // Conflicting or absent declarations are not a model identity.
+    digest: digests.size === 1 ? [...digests][0]! : null,
+  };
+}
+
+export function coordinatorBenchmarkActivations(
+  modelIds: ReadonlySet<string>,
+  workers: readonly StoredWorker[],
+  connectedWorkerIds: ReadonlySet<string>,
+): BenchmarkActivation[] {
+  const connectedWorkers = workers.filter((worker) =>
+    connectedWorkerIds.has(worker.id) && worker.status === "online"
+  );
+  const activations: BenchmarkActivation[] = [];
+  for (const modelId of [...modelIds].sort()) {
+    const participants = connectedWorkers.flatMap((worker) =>
+      worker.capabilities.deployments
+        .filter((deployment) =>
+          deployment.model === modelId && deployment.adapter !== "mock"
+        )
+        .map((deployment) => {
+          const stageRanges = deployment.execution?.stages?.map((stage) => ({
+            nodeId: stage.nodeId,
+            stageIndex: stage.stageIndex,
+            layerStart: stage.layerStart,
+            layerEnd: stage.layerEnd,
+          })) ?? (deployment.stage
+            ? [{
+                nodeId: worker.capabilities.distributedExecutor?.nodeId ?? worker.id,
+                stageIndex: deployment.stage.index,
+                layerStart: deployment.stage.layerStart,
+                layerEnd: deployment.stage.layerEnd,
+              }]
+            : []);
+          return {
+            workerId: worker.id,
+            agentVersion: worker.capabilities.agentVersion,
+            deploymentId: deployment.deploymentId,
+            modelDigest: deployment.modelDigest,
+            nodeIds: stageRanges.length > 0
+              ? stageRanges.map((stage) => stage.nodeId)
+              : [worker.capabilities.distributedExecutor?.nodeId ?? worker.id],
+            stageRanges,
+          };
+        })
+    );
+    if (participants.length === 0) continue;
+    try {
+      activations.push(sealBenchmarkActivation(modelId, participants));
+    } catch {
+      // Conflicting digests, invalid layer ranges or incomplete physical
+      // identity must not produce a benchmark activation.
+    }
+  }
+  return activations;
 }
 
 export interface CoordinatorBenchmarkOptions {
@@ -29,7 +117,13 @@ export interface CoordinatorBenchmarkOptions {
   inventory(routedWorkerIds: ReadonlySet<string>): BenchmarkInventory;
   resolveWorkerId?(jobId: string): string | null;
   networkToken?: string;
+  activation?: BenchmarkActivation;
   samples?: number;
+  maximumSamples?: number;
+  warmupSamples?: number;
+  retriesPerSample?: number;
+  retryDelayMs?: number;
+  targetConfidenceHalfWidthPct?: number;
   outputTokens?: number;
   timeoutMs?: number;
   prompt?: string;
@@ -37,6 +131,8 @@ export interface CoordinatorBenchmarkOptions {
   label?: string;
   historyDirectory?: string;
   trigger?: "automatic-model-start" | "manual";
+  telemetrySnapshot?(): BenchmarkTelemetrySnapshot;
+  telemetryIntervalMs?: number;
   fetchImpl?: typeof fetch;
 }
 
@@ -59,8 +155,10 @@ interface CoordinatorCompletion {
 }
 
 interface CoordinatorSample {
+  sampleIndex: number;
   promptTokens: number;
   outputTokens: number;
+  outputDigest: string;
   ttftMs: number;
   activeMs: number;
   latencyMs: number;
@@ -86,42 +184,95 @@ export async function runCoordinatorModelSuite(
   options: CoordinatorBenchmarkOptions,
 ): Promise<BenchmarkRun> {
   const startedAt = new Date().toISOString();
-  const sampleCount = boundedInteger(options.samples, 3, 1, 10);
-  const outputTokens = boundedInteger(options.outputTokens, 24, 4, 256);
+  const minimumSamples = boundedInteger(options.samples, 7, 1, 100);
+  const maximumSamples = boundedInteger(
+    options.maximumSamples,
+    options.samples === undefined ? 15 : minimumSamples,
+    minimumSamples,
+    250,
+  );
+  const warmupSamples = boundedInteger(options.warmupSamples, 1, 0, 10);
+  const outputTokens = boundedInteger(options.outputTokens, 64, 4, 256);
   const timeoutMs = boundedInteger(options.timeoutMs, 120_000, 1_000, 3_600_000);
   const fetchImpl = options.fetchImpl ?? fetch;
-  const samples: CoordinatorSample[] = [];
-  const failures: string[] = [];
   const routedWorkerIds = new Set<string>();
-
-  for (let index = 0; index < sampleCount; index += 1) {
+  const prompt = options.prompt ?? defaultPrompt(outputTokens);
+  const telemetry = new PhysicalTelemetryWindow();
+  const telemetryErrors: string[] = [];
+  const observeTelemetry = (): void => {
+    if (!options.telemetrySnapshot) return;
     try {
-      const sample = await requestCoordinatorSample({
-        fetchImpl,
-        coordinatorUrl: options.coordinatorUrl,
-        modelId: options.model.id,
-        outputTokens,
-        timeoutMs,
-        prompt: options.prompt ?? defaultPrompt(outputTokens),
-        sampleIndex: index,
-        ...(options.networkToken ? { networkToken: options.networkToken } : {}),
-        ...(options.resolveWorkerId ? { resolveWorkerId: options.resolveWorkerId } : {}),
-      });
-      samples.push(sample);
-      if (sample.workerId) routedWorkerIds.add(sample.workerId);
+      telemetry.observe(options.telemetrySnapshot());
     } catch (error) {
-      failures.push(error instanceof Error ? error.message : String(error));
+      telemetryErrors.push(error instanceof Error ? error.message : String(error));
     }
+  };
+  observeTelemetry();
+  const telemetryTimer = options.telemetrySnapshot
+    ? setInterval(
+        observeTelemetry,
+        boundedInteger(options.telemetryIntervalMs, 1_000, 250, 30_000),
+      )
+    : null;
+  telemetryTimer?.unref();
+
+  let campaign: AdaptiveBenchmarkCampaignResult<CoordinatorSample>;
+  try {
+    campaign = await runAdaptiveBenchmarkCampaign({
+      warmupSamples,
+      minimumSamples,
+      maximumSamples,
+      retriesPerSample: boundedInteger(options.retriesPerSample, 2, 0, 10),
+      retryDelayMs: boundedInteger(options.retryDelayMs, 5_000, 0, 60_000),
+      targetConfidenceHalfWidthPct:
+        finitePositive(options.targetConfidenceHalfWidthPct, 8),
+      measure: async ({ phase, sampleIndex, attempt }) => {
+        const sample = await requestCoordinatorSample({
+          fetchImpl,
+          coordinatorUrl: options.coordinatorUrl,
+          modelId: options.model.id,
+          outputTokens,
+          timeoutMs,
+          prompt,
+          sampleIndex,
+          phase,
+          attempt,
+          ...(options.networkToken ? { networkToken: options.networkToken } : {}),
+          ...(options.resolveWorkerId ? { resolveWorkerId: options.resolveWorkerId } : {}),
+        });
+        return sample;
+      },
+      score: sampleTokensPerSecond,
+      retryable: isRetryableBenchmarkAvailabilityError,
+    });
+  } finally {
+    if (telemetryTimer) clearInterval(telemetryTimer);
+    observeTelemetry();
+  }
+  for (const sample of campaign.samples) {
+    if (sample.workerId) routedWorkerIds.add(sample.workerId);
   }
 
   const inventory = options.inventory(routedWorkerIds);
+  const selectedNodeIds = new Set(
+    inventory.profiles
+      .map((profile) => profile.nodeId)
+      .filter((nodeId): nodeId is string => Boolean(nodeId)),
+  );
+  const physicalTelemetry = telemetry.summarize(
+    selectedNodeIds,
+    campaign.samples.reduce((sum, sample) => sum + sample.outputTokens, 0),
+  );
   const measurement = buildCoordinatorMeasurement(
     options.model,
     inventory,
-    samples,
-    failures,
-    sampleCount,
+    campaign,
+    physicalTelemetry,
+    telemetryErrors,
+    minimumSamples,
     outputTokens,
+    sha256Text(prompt),
+    options.activation,
   );
   return {
     schema: BENCHMARK_RUN_SCHEMA,
@@ -178,6 +329,42 @@ export function buildCoordinatorBenchmarkInventory(
     observedPowerWatts: nullableSum(profiles.map((profile) => profile.observedPowerWatts)),
     powerLimitWatts: nullableSum(profiles.map((profile) => profile.powerLimitWatts)),
   };
+}
+
+export function buildCoordinatorBenchmarkTelemetrySnapshot(
+  workers: readonly StoredWorker[],
+  connectedWorkerIds: ReadonlySet<string>,
+  atMs = Date.now(),
+): BenchmarkTelemetrySnapshot {
+  const nodes = new Map<string, BenchmarkTelemetrySnapshot["nodes"][number]>();
+  for (const worker of workers) {
+    if (!connectedWorkerIds.has(worker.id) || worker.status !== "online") continue;
+    const nodeId = worker.capabilities.distributedExecutor?.nodeId ?? worker.id;
+    if (nodes.has(nodeId)) continue;
+    const gpus = worker.capabilities.gpus;
+    const powers = gpus.map((gpu) => gpu.powerW);
+    const utilizations = gpus.map((gpu) => gpu.utilizationPct);
+    const temperatures = gpus
+      .map((gpu) => gpu.temperatureC)
+      .filter((value): value is number => value !== undefined && Number.isFinite(value));
+    nodes.set(nodeId, {
+      nodeId,
+      powerWatts: powers.length > 0 && powers.every(isFiniteNumber)
+        ? powers.reduce((sum, value) => sum + value, 0)
+        : null,
+      utilizationPct: utilizations.length > 0 && utilizations.every(isFiniteNumber)
+        ? utilizations.reduce((sum, value) => sum + value, 0) / utilizations.length
+        : null,
+      temperatureC: temperatures.length > 0 ? Math.max(...temperatures) : null,
+      offeredMemoryGb: gpus.length > 0
+        ? gpus.reduce((sum, gpu) => sum + gpu.offeredVramMb, 0) / 1_024
+        : null,
+      freeOfferedMemoryGb: gpus.length > 0
+        ? gpus.reduce((sum, gpu) => sum + gpu.freeOfferedVramMb, 0) / 1_024
+        : null,
+    });
+  }
+  return { atMs, nodes: [...nodes.values()] };
 }
 
 function participantProfiles(
@@ -297,6 +484,8 @@ async function requestCoordinatorSample(input: {
   timeoutMs: number;
   prompt: string;
   sampleIndex: number;
+  phase: "warmup" | "measurement";
+  attempt: number;
   resolveWorkerId?: (jobId: string) => string | null;
 }): Promise<CoordinatorSample> {
   const started = performance.now();
@@ -315,8 +504,9 @@ async function requestCoordinatorSample(input: {
         max_tokens: input.outputTokens,
         temperature: 0,
         top_p: 1,
-        seed: 10_000 + input.sampleIndex,
-        session_id: `benchmark-${Date.now()}-${input.sampleIndex}`,
+        seed: 10_000,
+        session_id:
+          `benchmark-${input.phase}-${input.sampleIndex}-${input.attempt}-${Date.now()}`,
         workload_class: "benchmark",
         deadline_ms: input.timeoutMs,
       }),
@@ -329,9 +519,23 @@ async function requestCoordinatorSample(input: {
     throw new Error(`HTTP ${response.status}: ${errorMessage(raw)}`);
   }
   const completion = parseCoordinatorCompletion(raw);
+  if (completion.model !== input.modelId) {
+    throw new Error(
+      `El runtime respondió como ${completion.model}; se esperaba ${input.modelId}.`,
+    );
+  }
+  const outputText = completion.choices
+    .map((choice) => choice.message?.content ?? "")
+    .join("")
+    .trim();
+  if (!outputText || completion.usage.completion_tokens < 1) {
+    throw new Error("El runtime no produjo una salida física verificable.");
+  }
   return {
+    sampleIndex: input.sampleIndex,
     promptTokens: completion.usage.prompt_tokens,
     outputTokens: completion.usage.completion_tokens,
+    outputDigest: sha256Text(outputText),
     ttftMs: completion.x_network.ttft_ms,
     activeMs: completion.x_network.active_ms,
     latencyMs,
@@ -343,15 +547,17 @@ async function requestCoordinatorSample(input: {
 function buildCoordinatorMeasurement(
   model: CoordinatorBenchmarkModel,
   inventory: BenchmarkInventory,
-  samples: CoordinatorSample[],
-  failures: string[],
-  requestedSamples: number,
+  campaign: AdaptiveBenchmarkCampaignResult<CoordinatorSample>,
+  physicalTelemetry: BenchmarkPhysicalTelemetrySummary,
+  telemetryErrors: readonly string[],
+  minimumSamples: number,
   requestedOutputTokens: number,
+  promptDigest: string,
+  activation: BenchmarkActivation | undefined,
 ): BenchmarkMeasurement {
+  const samples = campaign.samples;
   const throughput = samples.map((sample) =>
-    sample.outputTokens > 0 && sample.activeMs > 0
-      ? sample.outputTokens / (sample.activeMs / 1_000)
-      : 0
+    sampleTokensPerSecond(sample)
   );
   const tpot = samples.map((sample) =>
     Math.max(0, sample.activeMs - sample.ttftMs) / Math.max(1, sample.outputTokens - 1)
@@ -361,32 +567,90 @@ function buildCoordinatorMeasurement(
     inventory.profiles.map((profile) => profile.precision).filter((value): value is string => Boolean(value)),
   )].join(" + ") || "runtime";
   const successful = samples.length;
+  const failedMeasurementSlots = new Set(
+    campaign.failures
+      .filter((failure) => failure.phase === "measurement" && !failure.recovered)
+      .map((failure) => failure.sampleIndex),
+  ).size;
+  const measurementSlotsAttempted = successful + failedMeasurementSlots;
+  const recoveredFailures = campaign.failures.filter((failure) => failure.recovered).length;
   const durationMs = samples.reduce((sum, sample) => sum + sample.latencyMs, 0);
-  const status = successful === requestedSamples && successful > 0 ? "baseline" : "failed";
-  return {
+  const status = successful < minimumSamples
+    ? "failed"
+    : campaign.stable
+      ? "baseline"
+      : "inconclusive";
+  const inventoryNodeIds = inventory.profiles
+    .map((profile) => profile.nodeId)
+    .filter((nodeId): nodeId is string => Boolean(nodeId));
+  const topologyNodeIds = activation?.participants
+    .flatMap((participant) => participant.nodeIds)
+    ?? inventoryNodeIds;
+  const stageRanges = activation?.participants.flatMap(
+    (participant) => participant.stageRanges,
+  ) ?? [];
+  const topologyBoundaries = [...new Set(
+    stageRanges
+      .flatMap((stage) => [stage.layerStart, stage.layerEnd])
+      .filter((boundary) => boundary > 0),
+  )].sort((left, right) => left - right);
+  const deterministicConsistencyRate = modalDigestRate(
+    samples.map((sample) => sample.outputDigest),
+  );
+  const requestSuccessRate = measurementSlotsAttempted > 0
+    ? successful / measurementSlotsAttempted
+    : 0;
+  const environment = inventory.selectedDevices <= 1
+    ? "local-loopback" as const
+    : "unknown" as const;
+  return sealBenchmarkScenario({
     id: `startup-${safeId(model.id)}-n${inventory.selectedDevices}-o${requestedOutputTokens}`,
     title: `${model.id} · arranque real`,
-    description: "Prueba automática sobre la ruta OpenAI-compatible del coordinador y el modelo recién activado.",
+    description:
+      "Campaña automática sobre la ruta real del coordinador, con warmup separado, reintentos registrados y control estadístico.",
     evidence: "physical",
-    environment: "lan",
+    environment,
     model: {
       id: model.source,
       label: model.id,
       revision: model.revision,
+      digest: model.digest,
       precision,
     },
     inventory,
+    topology: {
+      digest: activation?.topologyDigest ?? null,
+      stageCount: stageRanges.length > 0
+        ? new Set(stageRanges.map((stage) => stage.stageIndex)).size
+        : topologyNodeIds.length > 0
+          ? topologyNodeIds.length
+          : null,
+      boundaries: topologyBoundaries,
+      nodeIds: [...new Set(topologyNodeIds)].sort(),
+      routeClasses,
+    },
     workload: {
       promptTokens: Math.round(median(samples.map((sample) => sample.promptTokens))),
-      outputTokens: samples.reduce((sum, sample) => sum + sample.outputTokens, 0),
+      outputTokens: requestedOutputTokens,
       concurrentSequences: 1,
-      requests: requestedSamples,
+      promptDigest,
+      requests: minimumSamples,
       successfulRequests: successful,
+      warmupRequests: campaign.warmups.length,
+      recoveredFailures,
+      observedOutputTokens: samples.reduce((sum, sample) => sum + sample.outputTokens, 0),
+      statisticallyStable: campaign.stable,
+      campaignStopReason: campaign.stoppedBecause,
       durationMs: round(durationMs, 1),
       routeClasses,
     },
     metrics: {
-      tokensPerSecond: samples.length > 0 ? round(mean(throughput), 3) : null,
+      tokensPerSecond:
+        campaign.summary !== null ? round(campaign.summary.p50, 3) : null,
+      tokensPerSecondP5:
+        campaign.summary !== null ? round(campaign.summary.p5, 3) : null,
+      tokensPerSecondP50:
+        campaign.summary !== null ? round(campaign.summary.p50, 3) : null,
       tokensPerSecondP95: samples.length > 0 ? round(percentile(throughput, 0.95), 3) : null,
       aggregateTokensPerSecond:
         samples.length > 0 && durationMs > 0
@@ -398,21 +662,52 @@ function buildCoordinatorMeasurement(
       tpotMsP95: samples.length > 0 ? round(percentile(tpot, 0.95), 2) : null,
       latencyMsP50: samples.length > 0 ? round(percentile(samples.map((sample) => sample.latencyMs), 0.5), 2) : null,
       latencyMsP95: samples.length > 0 ? round(percentile(samples.map((sample) => sample.latencyMs), 0.95), 2) : null,
-      acceptanceRate: requestedSamples === 0 ? 0 : successful / requestedSamples,
-      energyWhPerToken: null,
+      coefficientOfVariationPct:
+        campaign.summary !== null
+          ? round(campaign.summary.coefficientOfVariationPct ?? 0, 3)
+          : null,
+      confidenceHalfWidthPct:
+        campaign.summary !== null
+          ? round(campaign.summary.confidenceHalfWidthPct ?? 0, 3)
+          : null,
+      requestSuccessRate,
+      // A deterministic reference token sequence is not yet available for
+      // every certified model. Keep exactness unknown instead of equating
+      // HTTP success or repeated output with correctness.
+      exactnessRate: null,
+      deterministicConsistencyRate,
+      speculativeAcceptanceRate: null,
+      powerWattsP50: physicalTelemetry.powerWattsP50,
+      powerWattsP95: physicalTelemetry.powerWattsP95,
+      powerWattsPeak: physicalTelemetry.powerWattsPeak,
+      energyWh: physicalTelemetry.energyWh,
+      energyCoveragePct: physicalTelemetry.energyCoveragePct,
+      utilizationPctP50: physicalTelemetry.utilizationPctP50,
+      utilizationPctP95: physicalTelemetry.utilizationPctP95,
+      temperatureCPeak: physicalTelemetry.temperatureCPeak,
+      usedMemoryGbPeak: physicalTelemetry.usedMemoryGbPeak,
+      acceptanceRate: requestSuccessRate,
+      energyWhPerToken: physicalTelemetry.energyWhPerToken,
     },
     status,
     comparison: emptyComparison(),
     notes: [
-      "PRUEBA FÍSICA REAL: las peticiones atravesaron el coordinador y un runtime conectado; no hay datos simulados.",
-      `${successful}/${requestedSamples} peticiones completadas; ${routeClasses.length > 0 ? `rutas ${routeClasses.join(", ")}` : "sin ruta completada"}.`,
-      `${inventory.selectedDevices} nodos usados o integrantes del pipeline; ${inventory.connectedDevices}/${inventory.totalDevices} conectados al iniciar la prueba.`,
-      inventory.observedPowerWatts === null || inventory.observedPowerWatts === undefined
-        ? "La potencia no fue reportada por el controlador; no se ha estimado."
-        : `${round(inventory.observedPowerWatts, 1)} W observados en el último heartbeat físico de los nodos participantes.`,
-      ...failures.map((failure) => `Fallo real: ${failure}`),
+      "PRUEBA FÍSICA REAL: las peticiones atravesaron el coordinador y un runtime conectado; no hay datos simulados y las muestras de warmup no cuentan como rendimiento.",
+      `${successful} muestras calientes válidas (mínimo ${minimumSamples}); ${campaign.stable ? "intervalo de confianza suficiente" : "resultado demasiado variable para afirmar una mejora"}.`,
+      `${campaign.warmups.length} warmups completados y ${recoveredFailures} fallos temporales recuperados sin ocultarlos.`,
+      `${inventory.selectedDevices} nodos integrantes de la ruta observada; ${inventory.connectedDevices}/${inventory.totalDevices} conectados durante la campaña.`,
+      activation
+        ? `Activación ${activation.activationId}; topología ${activation.topologyDigest}.`
+        : "Ejecución manual sin activation ID sellado; la comparación exige el resto del fingerprint exacto.",
+      physicalTelemetry.energyWh === null
+        ? "La ventana no tuvo suficientes muestras físicas continuas para calcular energía; no se ha estimado."
+        : `${round(physicalTelemetry.energyWh, 6)} Wh integrados con ${round(physicalTelemetry.energyCoveragePct, 1)}% de cobertura temporal.`,
+      ...campaign.failures.map((failure) =>
+        `${failure.recovered ? "Fallo recuperado" : "Fallo real"} (${failure.phase} ${failure.sampleIndex + 1}, intento ${failure.attempt + 1}): ${failure.message}`
+      ),
+      ...telemetryErrors.map((failure) => `Telemetría física rechazada: ${failure}`),
     ],
-  };
+  });
 }
 
 function parseCoordinatorCompletion(raw: string): CoordinatorCompletion {
@@ -426,8 +721,11 @@ function parseCoordinatorCompletion(raw: string): CoordinatorCompletion {
   const completion = value as Partial<CoordinatorCompletion>;
   if (
     typeof completion.id !== "string"
+    || typeof completion.model !== "string"
+    || !Array.isArray(completion.choices)
     || !completion.usage
     || !completion.x_network
+    || !Number.isFinite(completion.usage.prompt_tokens)
     || !Number.isFinite(completion.usage.completion_tokens)
     || !Number.isFinite(completion.x_network.ttft_ms)
     || !Number.isFinite(completion.x_network.active_ms)
@@ -459,8 +757,37 @@ function nullableSum(values: Array<number | null | undefined>): number | null {
   return present.length > 0 ? round(present.reduce((sum, value) => sum + value, 0), 2) : null;
 }
 
-function mean(values: number[]): number {
-  return values.length === 0 ? 0 : values.reduce((sum, value) => sum + value, 0) / values.length;
+function sampleTokensPerSecond(sample: CoordinatorSample): number {
+  return sample.outputTokens > 0 && sample.activeMs > 0
+    ? sample.outputTokens / (sample.activeMs / 1_000)
+    : 0;
+}
+
+function modalDigestRate(digests: readonly string[]): number | null {
+  if (digests.length === 0) return null;
+  const counts = new Map<string, number>();
+  for (const digest of digests) counts.set(digest, (counts.get(digest) ?? 0) + 1);
+  return Math.max(...counts.values()) / digests.length;
+}
+
+function isRetryableBenchmarkAvailabilityError(error: unknown): boolean {
+  const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  return /http (409|429|502|503|504)\b/.test(message)
+    || message.includes("no_capacity")
+    || message.includes("no model route")
+    || message.includes("route warming")
+    || message.includes("worker shutting down")
+    || message.includes("worker disconnected");
+}
+
+function isFiniteNumber(value: number | undefined): value is number {
+  return value !== undefined && Number.isFinite(value) && value >= 0;
+}
+
+function finitePositive(value: number | undefined, fallback: number): number {
+  return value !== undefined && Number.isFinite(value) && value > 0
+    ? value
+    : fallback;
 }
 
 function median(values: number[]): number {

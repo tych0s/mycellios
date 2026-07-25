@@ -7,6 +7,7 @@ import sys
 from typing import Any
 
 from .model import StageModelSpec, model_artifact_reference, resolve_model_snapshot
+from .paged_stage import add_paged_kv_arguments, paged_kv_config_from_args
 from .protocol import TensorCodec
 from .ram_backed_moe_runtime import (
     add_ram_backed_moe_arguments,
@@ -62,6 +63,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model-canonical-revision")
     parser.add_argument("--pipeline-snapshot-identity", type=_uint64_argument)
     add_ram_backed_moe_arguments(parser)
+    add_paged_kv_arguments(parser)
     parser.add_argument("--layer-start", type=int, required=True)
     parser.add_argument("--layer-end", type=int, required=True)
     parser.add_argument("--total-layers", type=int, required=True)
@@ -179,6 +181,7 @@ def build_config(args: argparse.Namespace) -> StageProcessConfig:
             "sealed-wave-tokens and max-prefill-chunk-tokens must be supplied together"
         )
     ram_backed_moe = ram_backed_moe_config_from_args(args)
+    paged_kv = paged_kv_config_from_args(args)
     downstream_values = (args.next_host, args.next_port, args.next_layer_end)
     if any(value is not None for value in downstream_values) and not all(
         value is not None for value in downstream_values
@@ -204,7 +207,7 @@ def build_config(args: argparse.Namespace) -> StageProcessConfig:
         args.native_stage_context_tokens,
     )
     if ram_backed_moe is not None:
-        if args.native_stage_package is not None or any(
+        if paged_kv is not None or args.native_stage_package is not None or any(
             value is not None
             for value in (
                 args.native_stage_daemon_bin,
@@ -217,7 +220,7 @@ def build_config(args: argparse.Namespace) -> StageProcessConfig:
             )
         ):
             raise ValueError(
-                "RAM-backed MoE, NativeStage and tensor-parallel cell backends "
+                "paged KV, RAM-backed MoE, NativeStage and tensor-parallel cell backends "
                 "are mutually exclusive"
             )
         snapshot = str(Path(args.model).expanduser().resolve())
@@ -234,6 +237,11 @@ def build_config(args: argparse.Namespace) -> StageProcessConfig:
             ),
         )
     elif args.native_stage_package is not None:
+        if paged_kv is not None:
+            raise ValueError(
+                "paged KV, RAM-backed MoE, NativeStage and tensor-parallel cell backends "
+                "are mutually exclusive"
+            )
         if any(value is None for value in native_stage_required):
             raise ValueError(
                 "NativeStage package requires daemon-bin, pipeline-id and context-tokens"
@@ -295,6 +303,13 @@ def build_config(args: argparse.Namespace) -> StageProcessConfig:
             canonical_model_source=artifact.canonical_source,
             canonical_model_revision=artifact.canonical_revision,
         )
+    if paged_kv is not None and any(
+        value is not None for value in (args.cell_fixture, args.cell_world_size)
+    ):
+        raise ValueError(
+            "paged KV, RAM-backed MoE, NativeStage and tensor-parallel cell backends "
+            "are mutually exclusive"
+        )
     return StageProcessConfig(
         spec=spec,
         pipeline_id=pipeline_id,
@@ -332,6 +347,7 @@ def build_config(args: argparse.Namespace) -> StageProcessConfig:
         max_speculative_branch_tokens=args.max_speculative_branch_tokens,
         max_speculative_kv_bytes=args.max_speculative_kv_bytes,
         ram_backed_moe=ram_backed_moe,
+        paged_kv=paged_kv,
         native_stage_package=args.native_stage_package,
         native_stage_package_id=args.native_stage_package_id,
         native_stage_manifest_sha256=args.native_stage_manifest_sha256,
@@ -363,6 +379,14 @@ def main(argv: list[str] | None = None) -> int:
                 "return": [config.return_host, config.return_port],
                 "codec": config.codec.name.lower(),
                 "requested_device": config.device,
+                "pagedKv": (
+                    None
+                    if config.paged_kv is None
+                    else {
+                        **config.paged_kv.to_document(),
+                        "configurationId": config.paged_kv.configuration_id,
+                    }
+                ),
                 "cell": (
                     None
                     if config.cell_fixture is None

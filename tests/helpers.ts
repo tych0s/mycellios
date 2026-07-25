@@ -16,6 +16,7 @@ export function addWorker(
     peakVramMb?: number;
     tokensPerSecond?: number;
     ttftMs?: number;
+    maxConcurrency?: number;
     contextLimit?: number;
     modelDigest?: string;
     mode?: ExecutionMode;
@@ -49,7 +50,10 @@ export function addWorker(
           freeOfferedVramMb: input.offeredVramMb ?? 8_192,
         },
       ],
-      limits: { maxConcurrency: 2, pauseWhenForeground: true },
+      limits: {
+        maxConcurrency: input.maxConcurrency ?? 2,
+        pauseWhenForeground: true,
+      },
       deployments: [
         {
           deploymentId: `dep-${input.id}`,
@@ -59,8 +63,8 @@ export function addWorker(
           adapter: "mock",
           peakVramMb: input.peakVramMb ?? 3_000,
           contextLimit: input.contextLimit ?? 8_192,
-          maxConcurrency: 2,
-          freeSlots: 2,
+          maxConcurrency: input.maxConcurrency ?? 2,
+          freeSlots: input.maxConcurrency ?? 2,
           tokensPerSecond: input.tokensPerSecond ?? 10,
           ttftMs: input.ttftMs ?? 1_000,
           dataLocality: "local",

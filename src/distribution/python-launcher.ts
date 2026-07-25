@@ -25,6 +25,7 @@ const MAX_SPECULATIVE_KV_BYTES = 2 ** 40;
 const DEFAULT_RETAINED_SESSIONS = 4;
 const DEFAULT_RETAINED_SESSION_TOKENS = 8_192;
 const DEFAULT_RETAINED_SESSION_TTL_SECONDS = 10 * 60;
+const RECOVERY_STANDBY_SCHEMA = "gdlp-recovery-standby-route/1";
 
 export type PythonLaunchPhase = "prefill" | "decode";
 
@@ -159,6 +160,11 @@ export interface PythonLaunchCompilerOptions {
   /** Aggregate idle KV token ceiling across retained chats. */
   maxRetainedSessionTokens?: number;
   retainedSessionTtlSeconds?: number;
+  /**
+   * Exact greedy midstream recovery. Executor identities are supplied by the
+   * physical launcher; the compiler never guesses them from a backend label.
+   */
+  recovery?: PythonRecoveryInput | PythonRecoveryConfiguration | null;
   /** Explicit host-local sub-GGUF bindings. A generic backend never enables these. */
   native_stageStages?: Record<string, PythonNativeStageStageInput>;
   /**
@@ -166,6 +172,37 @@ export interface PythonLaunchCompilerOptions {
    * complete coverage and seals them to the stage budgets before execution.
    */
   ramBackedMoeStages?: Record<string, PythonRamBackedMoeStageInput>;
+}
+
+export interface PythonRecoveryStandbyRouteInput {
+  /** Present on normalized descriptions; otherwise derived from the contract. */
+  schema?: typeof RECOVERY_STANDBY_SCHEMA;
+  /** Present on normalized descriptions and verified against the derived id. */
+  routeId?: string;
+  firstStage: RuntimeEndpoint;
+  /** Root first, followed by every remote stage in logical model order. */
+  stageExecutorIds: string[];
+}
+
+export interface PythonRecoveryInput {
+  maxRetries: number;
+  /** Complete active route contract, root first. */
+  stageExecutorIds: string[];
+  /** One or more idle, independently launched physical routes. */
+  standbyRoutes: PythonRecoveryStandbyRouteInput[];
+}
+
+export interface PythonRecoveryStandbyRouteConfiguration {
+  schema: typeof RECOVERY_STANDBY_SCHEMA;
+  routeId: string;
+  firstStage: RuntimeEndpoint;
+  stageExecutorIds: string[];
+}
+
+export interface PythonRecoveryConfiguration {
+  maxRetries: number;
+  stageExecutorIds: string[];
+  standbyRoutes: PythonRecoveryStandbyRouteConfiguration[];
 }
 
 export type PythonNativeStageComputeApi = "cpu" | "cuda" | "rocm" | "metal" | "vulkan";
@@ -292,6 +329,7 @@ export interface PythonLaunchConfiguration {
   maxRetainedSessions: number;
   maxRetainedSessionTokens: number;
   retainedSessionTtlSeconds: number;
+  recovery: PythonRecoveryConfiguration | null;
   /** Sorted by stageId so hashing and transport are deterministic. */
   native_stageStages: Record<string, PythonNativeStageStageConfiguration>;
   /** Sorted, host-local bindings for the certified physical RAM-backed runner. */
@@ -509,6 +547,7 @@ function buildDescription(
     codec,
     configuration.native_stageStages,
     configuration.ramBackedMoeStages,
+    configuration.recovery,
   );
   const planIds: [string, string] = [prefill.planId, decode.planId];
   const boundaries = [0, ...stages.map((stage) => stage.layerEnd)];
@@ -1117,6 +1156,18 @@ function renderRootEngineArguments(
     "--socket-timeout-seconds",
     finiteNumber(configuration.connectTimeoutSeconds),
   );
+  if (configuration.recovery) {
+    args.push(
+      "--recovery-max-retries",
+      String(configuration.recovery.maxRetries),
+    );
+    for (const executorId of configuration.recovery.stageExecutorIds) {
+      args.push("--stage-executor-id", executorId);
+    }
+    for (const route of configuration.recovery.standbyRoutes) {
+      args.push("--recovery-standby-route", canonicalJson(route));
+    }
+  }
   if (!ramBackedMoe) args.push("--device", "auto");
   return args;
 }
@@ -1257,6 +1308,7 @@ function normalizeConfiguration(
   ) {
     throw new Error("python_speculative_tree_limits_must_be_disabled_or_complete");
   }
+  const recovery = normalizeRecoveryConfiguration(manifest, value.recovery);
   const normalized: PythonLaunchConfiguration = {
     apiEndpoint: { ...value.apiEndpoint },
     returnEndpoint: { ...value.returnEndpoint },
@@ -1329,6 +1381,7 @@ function normalizeConfiguration(
       value.retainedSessionTtlSeconds ?? DEFAULT_RETAINED_SESSION_TTL_SECONDS,
       "python_retained_session_ttl_is_invalid",
     ),
+    recovery,
     native_stageStages,
     ramBackedMoeStages,
   };
@@ -1336,6 +1389,123 @@ function normalizeConfiguration(
     throw new Error("python_launch_configuration_is_not_normalized");
   }
   return normalized;
+}
+
+function normalizeRecoveryConfiguration(
+  manifest: RuntimePipelineManifestV2,
+  value: unknown,
+): PythonRecoveryConfiguration | null {
+  if (value === undefined || value === null) return null;
+  if (!isRecord(value)) {
+    throw new Error("python_recovery_configuration_is_invalid");
+  }
+  assertExactKeys(
+    value,
+    ["maxRetries", "stageExecutorIds", "standbyRoutes"],
+    [],
+    "python_recovery_configuration_keys_are_invalid",
+  );
+  const stageCount = manifest.plans.prefill.stages.length;
+  const stageExecutorIds = recoveryExecutorIds(
+    value.stageExecutorIds,
+    stageCount,
+    "python_recovery_primary_executor_contract_is_invalid",
+  );
+  const maxRetries = boundedInteger(
+    value.maxRetries,
+    1,
+    100,
+    "python_recovery_max_retries_is_invalid",
+  );
+  if (!Array.isArray(value.standbyRoutes) || value.standbyRoutes.length === 0) {
+    throw new Error("python_recovery_requires_at_least_one_standby_route");
+  }
+
+  const primaryFirstStage = manifest.plans.prefill.stages[1]!.anchor.endpoint;
+  const standbyRoutes: PythonRecoveryStandbyRouteConfiguration[] =
+    value.standbyRoutes.map((candidate, index) => {
+    if (!isRecord(candidate)) {
+      throw new Error(`python_recovery_standby_is_invalid:${index}`);
+    }
+    assertExactKeys(
+      candidate,
+      ["firstStage", "stageExecutorIds"],
+      ["schema", "routeId"],
+      `python_recovery_standby_keys_are_invalid:${index}`,
+    );
+    if (
+      candidate.schema !== undefined &&
+      candidate.schema !== RECOVERY_STANDBY_SCHEMA
+    ) {
+      throw new Error(`python_recovery_standby_schema_is_invalid:${index}`);
+    }
+    validateEndpoint(
+      candidate.firstStage,
+      `python_recovery_standby_endpoint_is_invalid:${index}`,
+    );
+    const firstStage = { ...candidate.firstStage };
+    if (endpointKey(firstStage) === endpointKey(primaryFirstStage)) {
+      throw new Error(`python_recovery_standby_reuses_primary_endpoint:${index}`);
+    }
+    const executorIds = recoveryExecutorIds(
+      candidate.stageExecutorIds,
+      stageCount,
+      `python_recovery_standby_executor_contract_is_invalid:${index}`,
+    );
+    if (canonicalJson(executorIds) !== canonicalJson(stageExecutorIds)) {
+      throw new Error(`python_recovery_standby_executor_contract_mismatch:${index}`);
+    }
+    const routeId = `standby-${digest(
+      canonicalJson({
+        schema: RECOVERY_STANDBY_SCHEMA,
+        firstStage,
+        stageExecutorIds: executorIds,
+      }),
+      24,
+    )}`;
+    if (
+      candidate.routeId !== undefined &&
+      safeString(
+        candidate.routeId,
+        `python_recovery_standby_route_id_is_invalid:${index}`,
+      ) !== routeId
+    ) {
+      throw new Error(`python_recovery_standby_route_id_mismatch:${index}`);
+    }
+    return {
+      schema: RECOVERY_STANDBY_SCHEMA,
+      routeId,
+      firstStage,
+      stageExecutorIds: executorIds,
+    };
+  });
+
+  if (
+    new Set(standbyRoutes.map((route) => endpointKey(route.firstStage))).size !==
+    standbyRoutes.length
+  ) {
+    throw new Error("python_recovery_standby_endpoints_must_be_unique");
+  }
+  return { maxRetries, stageExecutorIds, standbyRoutes };
+}
+
+function recoveryExecutorIds(
+  value: unknown,
+  stageCount: number,
+  error: string,
+): string[] {
+  if (!Array.isArray(value) || value.length !== stageCount) {
+    throw new Error(error);
+  }
+  return value.map((executorId) => {
+    if (
+      typeof executorId !== "string" ||
+      !/^[0-9a-f]{32}$/.test(executorId)
+    ) {
+      throw new Error(error);
+    }
+    return executorId;
+  });
 }
 
 function normalizeNativeStageStages(
@@ -1877,6 +2047,7 @@ function routeIdentity(
   codec: RuntimeActivationCodec,
   native_stageStages: Record<string, PythonNativeStageStageConfiguration>,
   ramBackedMoeStages: Record<string, PythonRamBackedMoeStageConfiguration>,
+  recovery: PythonRecoveryConfiguration | null,
 ): string {
   return `route-${digest(
     canonicalJson({
@@ -1885,6 +2056,7 @@ function routeIdentity(
       codec,
       native_stageStages,
       ramBackedMoeStages,
+      recovery,
       stages: stages.map((stage) => ({
         stageId: stage.stageId,
         index: stage.index,

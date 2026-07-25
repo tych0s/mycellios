@@ -6,13 +6,24 @@ import {
   runtimeExitedEnvelopeSchema,
   runtimePreparedEnvelopeSchema,
   runtimeReadyEnvelopeSchema,
+  runtimeLinkProbePingEnvelopeSchema,
+  runtimeLinkProbePongEnvelopeSchema,
+  runtimeLinkProbeResultEnvelopeSchema,
+  runtimeDirectClosedEnvelopeSchema,
+  runtimeDirectEstablishedEnvelopeSchema,
+  runtimeDirectFallbackEnvelopeSchema,
+  runtimeDirectReadyEnvelopeSchema,
+  runtimeDirectTelemetryEnvelopeSchema,
+  runtimeStreamAckEnvelopeSchema,
   runtimeStreamDataEnvelopeSchema,
   runtimeStreamOpenEnvelopeSchema,
+  runtimeStreamResumeEnvelopeSchema,
   workerGoodbyeEnvelopeSchema,
   workerEnvelopeSchema,
   workerHeartbeatEnvelopeSchema,
   workerHelloEnvelopeSchema,
 } from "../src/contracts/worker-protocol.js";
+import { sealRuntimePerformanceProfile } from "../src/performance/runtime-profile.js";
 
 const baseEnvelope = {
   v: 1 as const,
@@ -170,6 +181,49 @@ describe("worker protocol schemas", () => {
       computeMode: "automatic",
       cpuEligible: false,
     });
+    const physicalProfile = sealRuntimePerformanceProfile({
+      measuredAt: new Date().toISOString(),
+      backend: "cuda",
+      deviceName: "NVIDIA test-gpu",
+      precision: "float16",
+      source: "physical-microbenchmark",
+      activationCodecId: "fp16",
+      decodeMemory: profileSeries("GB/s", 400),
+      prefillCompute: profileSeries("TFLOP/s", 20),
+      activationCodec: profileSeries("GB/s", 2),
+    });
+    const calibratedHeartbeat = workerHeartbeatEnvelopeSchema.parse({
+      ...heartbeat,
+      payload: {
+        ...heartbeat.payload,
+        capabilities: {
+          ...heartbeat.payload.capabilities,
+          distributedExecutor: {
+            ...heartbeat.payload.capabilities.distributedExecutor,
+            performanceProfile: physicalProfile,
+          },
+        },
+      },
+    });
+    expect(
+      calibratedHeartbeat.payload.capabilities.distributedExecutor?.performanceProfile,
+    ).toEqual(physicalProfile);
+    expect(workerHeartbeatEnvelopeSchema.safeParse({
+      ...heartbeat,
+      payload: {
+        ...heartbeat.payload,
+        capabilities: {
+          ...heartbeat.payload.capabilities,
+          distributedExecutor: {
+            ...heartbeat.payload.capabilities.distributedExecutor,
+            performanceProfile: {
+              ...physicalProfile,
+              decodeMemory: { ...physicalProfile.decodeMemory, p50: 999 },
+            },
+          },
+        },
+      },
+    }).success).toBe(false);
 
     const cpuAuthorizedHeartbeat = workerHeartbeatEnvelopeSchema.parse({
       ...heartbeat,
@@ -291,10 +345,173 @@ describe("worker protocol schemas", () => {
       type: "runtime.stream.data",
       payload: { streamId: "stream-1", sequence: 0, data: Buffer.from("hello").toString("base64") },
     }).success).toBe(true);
+    const recoveryToken = "recovery_token_0123456789";
+    expect(runtimeStreamOpenEnvelopeSchema.safeParse({
+      ...baseEnvelope,
+      type: "runtime.stream.open",
+      payload: {
+        streamId: "stream-recovery",
+        destinationNodeId: "desktop-b",
+        targetPort: 9_850,
+        generation: 0,
+        recoveryToken,
+      },
+    }).success).toBe(true);
+    expect(runtimeStreamDataEnvelopeSchema.safeParse({
+      ...baseEnvelope,
+      type: "runtime.stream.data",
+      payload: {
+        streamId: "stream-recovery",
+        sequence: 0,
+        generation: 0,
+        recoveryToken,
+        offset: 0,
+        data: Buffer.from("hello").toString("base64"),
+      },
+    }).success).toBe(true);
+    // Recovery metadata is atomic. A partially upgraded or truncated envelope
+    // must never be interpreted as either a legacy or a recoverable chunk.
+    expect(runtimeStreamDataEnvelopeSchema.safeParse({
+      ...baseEnvelope,
+      type: "runtime.stream.data",
+      payload: {
+        streamId: "stream-recovery",
+        sequence: 0,
+        generation: 0,
+        data: Buffer.from("hello").toString("base64"),
+      },
+    }).success).toBe(false);
+    expect(runtimeStreamAckEnvelopeSchema.safeParse({
+      ...baseEnvelope,
+      type: "runtime.stream.ack",
+      payload: {
+        streamId: "stream-recovery",
+        generation: 0,
+        recoveryToken,
+        acknowledgedOffset: 5,
+      },
+    }).success).toBe(true);
+    expect(runtimeStreamResumeEnvelopeSchema.safeParse({
+      ...baseEnvelope,
+      type: "runtime.stream.resume",
+      payload: {
+        streamId: "stream-recovery",
+        generation: 0,
+        recoveryToken,
+        sendOffset: 5,
+        acknowledgedOffset: 0,
+        receiveOffset: 0,
+        bufferedFromOffset: 0,
+      },
+    }).success).toBe(true);
+    expect(runtimeStreamResumeEnvelopeSchema.safeParse({
+      ...baseEnvelope,
+      type: "runtime.stream.resume",
+      payload: {
+        streamId: "stream-recovery",
+        generation: 0,
+        recoveryToken,
+        sendOffset: 5,
+        acknowledgedOffset: 6,
+        receiveOffset: 0,
+        bufferedFromOffset: 0,
+      },
+    }).success).toBe(false);
+    expect(runtimeDirectReadyEnvelopeSchema.safeParse({
+      ...baseEnvelope,
+      type: "runtime.direct.ready",
+      payload: { streamId: "stream-direct", connectionId: "stream-direct" },
+    }).success).toBe(true);
+    expect(runtimeDirectEstablishedEnvelopeSchema.safeParse({
+      ...baseEnvelope,
+      type: "runtime.direct.established",
+      payload: {
+        streamId: "stream-direct",
+        connectionId: "stream-direct",
+        connectRttMs: 2.4,
+      },
+    }).success).toBe(true);
+    expect(runtimeDirectFallbackEnvelopeSchema.safeParse({
+      ...baseEnvelope,
+      type: "runtime.direct.fallback",
+      payload: {
+        streamId: "stream-direct",
+        connectionId: "stream-direct",
+        reason: "candidate_unreachable",
+      },
+    }).success).toBe(true);
+    expect(runtimeDirectClosedEnvelopeSchema.safeParse({
+      ...baseEnvelope,
+      type: "runtime.direct.closed",
+      payload: {
+        streamId: "stream-direct",
+        connectionId: "stream-direct",
+        bytesTx: 12,
+        bytesRx: 8,
+        secret: "must_not_cross_the_protocol",
+      },
+    }).success).toBe(false);
+    expect(runtimeDirectTelemetryEnvelopeSchema.safeParse({
+      ...baseEnvelope,
+      type: "runtime.direct.telemetry",
+      payload: {
+        streamId: "stream-direct",
+        connectionId: "stream-direct",
+        bytesTx: 12,
+        bytesRx: 8,
+      },
+    }).success).toBe(true);
     expect(runtimeStreamDataEnvelopeSchema.safeParse({
       ...baseEnvelope,
       type: "runtime.stream.data",
       payload: { streamId: "stream-1", sequence: 0, data: Buffer.alloc(48 * 1024 + 1).toString("base64") },
     }).success).toBe(false);
+    const probeData = Buffer.alloc(16 * 1024, 7).toString("base64");
+    expect(runtimeLinkProbePingEnvelopeSchema.safeParse({
+      ...baseEnvelope,
+      type: "runtime.link.probe.ping",
+      payload: {
+        probeId: "probe-1",
+        destinationNodeId: "desktop-b",
+        data: probeData,
+      },
+    }).success).toBe(true);
+    expect(runtimeLinkProbePongEnvelopeSchema.safeParse({
+      ...baseEnvelope,
+      type: "runtime.link.probe.pong",
+      payload: { probeId: "probe-1", data: probeData },
+    }).success).toBe(true);
+    expect(runtimeLinkProbeResultEnvelopeSchema.safeParse({
+      ...baseEnvelope,
+      type: "runtime.link.probe.result",
+      payload: {
+        probeId: "probe-1",
+        destinationNodeId: "desktop-b",
+        rttMs: 42.5,
+        goodputMbps: 6.2,
+      },
+    }).success).toBe(true);
+    expect(runtimeLinkProbeResultEnvelopeSchema.safeParse({
+      ...baseEnvelope,
+      type: "runtime.link.probe.result",
+      payload: {
+        probeId: "probe-1",
+        destinationNodeId: "desktop-b",
+        rttMs: null,
+        goodputMbps: null,
+      },
+    }).success).toBe(true);
   });
 });
+
+function profileSeries(unit: "GB/s" | "TFLOP/s", median: number) {
+  return {
+    unit,
+    warmupSamples: 2,
+    samples: 7,
+    p5: median * 0.9,
+    p50: median,
+    p95: median * 1.1,
+    confidenceHalfWidthPct: 5,
+  };
+}

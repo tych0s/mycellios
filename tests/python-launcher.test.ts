@@ -490,6 +490,122 @@ describe("GDLP/2 Python launch compiler", () => {
     expect(argumentValue(rootLaunch.command.args, "--return-port")).toBe("30000");
   });
 
+  it("seals remote standby recovery contracts into the root CLI", () => {
+    const current = manifest();
+    const stageExecutorIds = current.plans.decode.stages.map((_stage, index) =>
+      String(index + 1).repeat(32),
+    );
+    const description = compile(current, {
+      recovery: {
+        maxRetries: 2,
+        stageExecutorIds,
+        standbyRoutes: [
+          {
+            firstStage: { host: "standby-a.internal", port: 40_001 },
+            stageExecutorIds,
+          },
+          {
+            firstStage: { host: "standby-b.internal", port: 40_002 },
+            stageExecutorIds,
+          },
+        ],
+      },
+    });
+    const recovery = description.configuration.recovery!;
+    const args = root(description).command.args;
+
+    expect(recovery.maxRetries).toBe(2);
+    expect(recovery.standbyRoutes).toHaveLength(2);
+    expect(recovery.standbyRoutes[0]!.schema).toBe(
+      "gdlp-recovery-standby-route/1",
+    );
+    expect(recovery.standbyRoutes[0]!.routeId).toMatch(
+      /^standby-[0-9a-f]{24}$/,
+    );
+    expect(argumentValue(args, "--recovery-max-retries")).toBe("2");
+    expect(argumentValues(args, "--stage-executor-id")).toEqual(
+      stageExecutorIds,
+    );
+    expect(
+      argumentValues(args, "--recovery-standby-route").map((value) =>
+        JSON.parse(value),
+      ),
+    ).toEqual(recovery.standbyRoutes);
+    expect(() => validatePythonLaunchDescription(description)).not.toThrow();
+
+    const withoutRecovery = compile(current);
+    expect(withoutRecovery.configuration.recovery).toBeNull();
+    expect(root(withoutRecovery).command.args).not.toContain(
+      "--recovery-max-retries",
+    );
+    expect(withoutRecovery.route.routeId).not.toBe(description.route.routeId);
+  });
+
+  it("rejects incomplete, mismatched or non-independent recovery routes", () => {
+    const current = manifest();
+    const primary = current.plans.decode.stages[1]!.anchor.endpoint;
+    const stageExecutorIds = current.plans.decode.stages.map((_stage, index) =>
+      String(index + 1).repeat(32),
+    );
+    const standby = {
+      firstStage: { host: "standby.internal", port: 40_001 },
+      stageExecutorIds,
+    };
+
+    expect(() =>
+      compile(current, {
+        recovery: { maxRetries: 1, stageExecutorIds, standbyRoutes: [] },
+      }),
+    ).toThrow("python_recovery_requires_at_least_one_standby_route");
+    expect(() =>
+      compile(current, {
+        recovery: {
+          maxRetries: 1,
+          stageExecutorIds: stageExecutorIds.slice(1),
+          standbyRoutes: [standby],
+        },
+      }),
+    ).toThrow("python_recovery_primary_executor_contract_is_invalid");
+    expect(() =>
+      compile(current, {
+        recovery: {
+          maxRetries: 1,
+          stageExecutorIds,
+          standbyRoutes: [
+            {
+              ...standby,
+              stageExecutorIds: [
+                stageExecutorIds[0]!,
+                "f".repeat(32),
+                stageExecutorIds[2]!,
+              ],
+            },
+          ],
+        },
+      }),
+    ).toThrow("python_recovery_standby_executor_contract_mismatch");
+    expect(() =>
+      compile(current, {
+        recovery: {
+          maxRetries: 1,
+          stageExecutorIds,
+          standbyRoutes: [
+            { firstStage: primary, stageExecutorIds },
+          ],
+        },
+      }),
+    ).toThrow("python_recovery_standby_reuses_primary_endpoint");
+    expect(() =>
+      compile(current, {
+        recovery: {
+          maxRetries: 1,
+          stageExecutorIds,
+          standbyRoutes: [standby, structuredClone(standby)],
+        },
+      }),
+    ).toThrow("python_recovery_standby_endpoints_must_be_unique");
+  });
+
   it("places prefill, batching and disabled speculation on the root server argv", () => {
     const args = root(compile()).command.args;
     expect(argumentValue(args, "--prefill-chunk-tokens")).toBe("8");
