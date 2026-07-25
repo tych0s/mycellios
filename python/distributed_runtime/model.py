@@ -1384,8 +1384,33 @@ def load_tokenizer(model_name: str):
     return AutoTokenizer.from_pretrained(model_name)
 
 
+# Todo lo que NO son pesos: arquitectura, tokenizador e índice de safetensors.
+# Son kilobytes. Una sola definición porque tres resolutores la comparten y una
+# copia divergente haría que una etapa bajase metadatos distintos que otra.
+_METADATA_PATTERNS: tuple[str, ...] = (
+    "*.safetensors.index.json",
+    "config.json",
+    "generation_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "*.model",
+    "*.tiktoken",
+    "chat_template*",
+    "merges.txt",
+    "vocab.json",
+    "vocab.txt",
+)
+
+
 def resolve_model_snapshot(model_name: str, revision: str | None = None) -> str:
-    """Resolve one immutable local snapshot before child processes are spawned."""
+    """Resolve one immutable local snapshot before child processes are spawned.
+
+    Descarga el checkpoint COMPLETO. Para una etapa que sólo necesita sus capas,
+    usa `resolve_stage_model_snapshot`; para calcular la identidad del artefacto
+    sin arrastrar los pesos, `resolve_model_metadata_snapshot`.
+    """
     local = Path(model_name)
     if local.is_dir():
         return str(local.resolve())
@@ -1395,22 +1420,39 @@ def resolve_model_snapshot(model_name: str, revision: str | None = None) -> str:
         snapshot_download(
             repo_id=model_name,
             revision=revision,
-            allow_patterns=[
-                "*.safetensors",
-                "*.safetensors.index.json",
-                "config.json",
-                "generation_config.json",
-                "tokenizer.json",
-                "tokenizer_config.json",
-                "special_tokens_map.json",
-                "added_tokens.json",
-                "*.model",
-                "*.tiktoken",
-                "chat_template*",
-                "merges.txt",
-                "vocab.json",
-                "vocab.txt",
-            ],
+            allow_patterns=["*.safetensors", *_METADATA_PATTERNS],
+        )
+    )
+
+
+def resolve_model_metadata_snapshot(model_name: str, revision: str | None = None) -> str:
+    """Fetch only a checkpoint's metadata, never its weights.
+
+    Enough to read the architecture, the tokenizer and the safetensors index —
+    kilobytes instead of gigabytes. Two callers need exactly this:
+
+    - the selective stage loader, to decide which shards it actually wants;
+    - anything computing the artifact identity, because for a Hub snapshot the
+      identity is derived from the commit in the cache path (see
+      `_model_snapshot_digest`), not from the weight bytes. So a process that
+      downloaded only metadata reports the SAME identity as one that downloaded
+      everything, which is what lets stages agree without each holding the whole
+      model.
+
+    A local directory is returned untouched: it is already resolved.
+    """
+    local = Path(model_name)
+    if local.is_dir():
+        return str(local.resolve())
+    if local.is_absolute():
+        raise FileNotFoundError(f"local model directory does not exist: {local}")
+    return str(
+        Path(
+            snapshot_download(
+                repo_id=model_name,
+                revision=revision,
+                allow_patterns=list(_METADATA_PATTERNS),
+            )
         )
     )
 
@@ -1429,33 +1471,12 @@ def resolve_stage_model_snapshot(
     layers, but an indexed model no longer causes every contributor to fetch
     every safetensors shard. Unsharded checkpoints necessarily remain one file.
     """
-    local = Path(model_name)
-    if local.is_dir():
-        return str(local.resolve())
-    if local.is_absolute():
-        raise FileNotFoundError(f"local model directory does not exist: {local}")
-    metadata_patterns = [
-        "*.safetensors.index.json",
-        "config.json",
-        "generation_config.json",
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "special_tokens_map.json",
-        "added_tokens.json",
-        "*.model",
-        "*.tiktoken",
-        "chat_template*",
-        "merges.txt",
-        "vocab.json",
-        "vocab.txt",
-    ]
-    snapshot = Path(
-        snapshot_download(
-            repo_id=model_name,
-            revision=revision,
-            allow_patterns=metadata_patterns,
-        )
-    )
+    metadata_patterns = list(_METADATA_PATTERNS)
+    resolved = resolve_model_metadata_snapshot(model_name, revision)
+    snapshot = Path(resolved)
+    if Path(model_name).is_dir():
+        # Already a local checkpoint: nothing to download selectively.
+        return resolved
     indexes = sorted(snapshot.glob("*.safetensors.index.json"))
     if not indexes:
         return resolve_model_snapshot(model_name, revision)

@@ -79,7 +79,7 @@ class StageCliRamBackedMoeContractTests(unittest.TestCase):
 
     def test_complete_contract_builds_ram_runner_config_without_standard_resolution(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, patch(
-            "distributed_runtime.stage_cli.resolve_model_snapshot",
+            "distributed_runtime.stage_cli.resolve_model_metadata_snapshot",
             side_effect=AssertionError("ordinary loader must remain unreachable"),
         ) as resolve:
             snapshot = Path(temporary).resolve()
@@ -101,7 +101,7 @@ class StageCliRamBackedMoeContractTests(unittest.TestCase):
 
     def test_partial_contract_never_falls_through_to_the_standard_loader(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, patch(
-            "distributed_runtime.stage_cli.resolve_model_snapshot",
+            "distributed_runtime.stage_cli.resolve_model_metadata_snapshot",
             side_effect=AssertionError("ordinary loader must remain unreachable"),
         ) as resolve:
             snapshot = Path(temporary).resolve()
@@ -115,7 +115,7 @@ class StageCliRamBackedMoeContractTests(unittest.TestCase):
 
     def test_partial_wave_limits_fail_before_model_resolution(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, patch(
-            "distributed_runtime.stage_cli.resolve_model_snapshot",
+            "distributed_runtime.stage_cli.resolve_model_metadata_snapshot",
             side_effect=AssertionError("model resolution must remain unreachable"),
         ) as resolve:
             snapshot = Path(temporary).resolve()
