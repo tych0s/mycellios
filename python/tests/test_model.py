@@ -673,6 +673,106 @@ class _CroppableCache:
         self.crops.append(token_count)
 
 
+class RaggedPhysicalBatchTests(unittest.TestCase):
+    """Fusing requests whose caches hold DIFFERENT lengths must stay token-exact.
+
+    Equal-length batching is the conservative default; the ragged path left-pads the
+    batch and masks the gap, so the whole point is that it changes throughput and
+    nothing else. These tests fail loudly if it ever changes a token.
+    """
+
+    def _prime_unequal(self, runner: StageRunner) -> tuple[torch.Tensor, torch.Tensor]:
+        """Leave request 1 with a longer cache than request 2."""
+
+        torch.manual_seed(91)
+        long_prompt = torch.randn(1, 4, runner.hidden_size)
+        short_prompt = torch.randn(1, 2, runner.hidden_size)
+        runner.begin(1)
+        runner.begin(2)
+        runner.forward_hidden(1, long_prompt, token_mode="none")
+        runner.forward_hidden(2, short_prompt, token_mode="none")
+        self.assertNotEqual(runner.tokens_seen[1], runner.tokens_seen[2])
+        return (
+            torch.randn(1, 1, runner.hidden_size),
+            torch.randn(1, 1, runner.hidden_size),
+        )
+
+    def test_ragged_batch_matches_sequential_token_for_token(self) -> None:
+        reference = _tiny_stage_runner()
+        first, second = self._prime_unequal(reference)
+        expected = (
+            reference.forward_hidden(1, first, token_mode="last"),
+            reference.forward_hidden(2, second, token_mode="last"),
+        )
+
+        runner = _tiny_stage_runner()
+        self._prime_unequal(runner)
+        before = runner.model_forward_calls
+        with patch.dict(os.environ, {"GDLP_RAGGED_GROUPING": "1"}):
+            batched = runner.forward_hidden_batch((1, 2), (first, second), token_mode="last")
+
+        # One forward for both requests is the entire point of fusing them.
+        self.assertEqual(runner.model_forward_calls - before, 1)
+        for (hidden, token), (expected_hidden, expected_token) in zip(
+            batched, expected, strict=True
+        ):
+            torch.testing.assert_close(hidden, expected_hidden, rtol=1e-4, atol=1e-5)
+            self.assertEqual(token, expected_token)
+
+    def test_ragged_batch_leaves_each_cache_at_its_own_length(self) -> None:
+        """The left padding must never be committed into a request's own cache."""
+
+        runner = _tiny_stage_runner()
+        first, second = self._prime_unequal(runner)
+        long_before = runner.tokens_seen[1]
+        short_before = runner.tokens_seen[2]
+        with patch.dict(os.environ, {"GDLP_RAGGED_GROUPING": "1"}):
+            runner.forward_hidden_batch((1, 2), (first, second), token_mode="last")
+
+        self.assertEqual(runner.tokens_seen[1], long_before + 1)
+        self.assertEqual(runner.tokens_seen[2], short_before + 1)
+        for request_id, expected in ((1, long_before + 1), (2, short_before + 1)):
+            for layer in runner.caches[request_id].layers:
+                self.assertEqual(layer.get_seq_length(), expected)
+
+    def test_unequal_lengths_still_refused_when_flag_is_off(self) -> None:
+        """Default stays conservative: no silent behaviour change."""
+
+        runner = _tiny_stage_runner()
+        first, second = self._prime_unequal(runner)
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GDLP_RAGGED_GROUPING", None)
+            with self.assertRaisesRegex(ValueError, "equal cache length"):
+                runner.forward_hidden_batch((1, 2), (first, second), token_mode="last")
+
+    def test_equal_lengths_take_the_unpadded_path_even_with_the_flag_on(self) -> None:
+        """Turning ragged on must not perturb the equal-length case at all."""
+
+        torch.manual_seed(5)
+        prompt = torch.randn(1, 3, 16)
+        step_a = torch.randn(1, 1, 16)
+        step_b = torch.randn(1, 1, 16)
+
+        plain = _tiny_stage_runner()
+        for rid in (1, 2):
+            plain.begin(rid)
+            plain.forward_hidden(rid, prompt, token_mode="none")
+        expected = plain.forward_hidden_batch((1, 2), (step_a, step_b), token_mode="last")
+
+        ragged = _tiny_stage_runner()
+        for rid in (1, 2):
+            ragged.begin(rid)
+            ragged.forward_hidden(rid, prompt, token_mode="none")
+        with patch.dict(os.environ, {"GDLP_RAGGED_GROUPING": "1"}):
+            actual = ragged.forward_hidden_batch((1, 2), (step_a, step_b), token_mode="last")
+
+        for (hidden, token), (expected_hidden, expected_token) in zip(
+            actual, expected, strict=True
+        ):
+            torch.testing.assert_close(hidden, expected_hidden, rtol=0, atol=0)
+            self.assertEqual(token, expected_token)
+
+
 def _tiny_stage_runner() -> StageRunner:
     torch.manual_seed(67)
     config = LlamaConfig(

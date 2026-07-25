@@ -21,6 +21,7 @@ from .model import (
     StageModelSpec,
     StageRunner,
     StageRunnerContract,
+    ragged_grouping_enabled,
 )
 from .protocol import (
     Frame,
@@ -1761,7 +1762,14 @@ def collect_compatible_activation_frames(
     """
 
     batch_forward = getattr(runner, "forward_hidden_batch", None)
-    batch_key = getattr(runner, "physical_batch_key", None)
+    # With ragged grouping on, requests are keyed WITHOUT their cache length, so two
+    # sequences a token out of phase still fuse. Without it the exact-length key is
+    # used, which is what keeps the default byte-identical to sequential decode.
+    batch_key = getattr(
+        runner,
+        "physical_batch_group_key" if ragged_grouping_enabled() else "physical_batch_key",
+        None,
+    )
     first_is_tree_leaf = (
         branch_parents is not None and first.request_id in branch_parents
     )

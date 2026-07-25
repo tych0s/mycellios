@@ -246,6 +246,59 @@ class ArenaCache(DynamicCache):
             Cache.__init__(self, layer_class_to_replicate=ArenaLayer)
 
 
+def stack_ragged_into_arena(
+    layer: ArenaLayer,
+    key_slices: list[torch.Tensor],
+    value_slices: list[torch.Tensor],
+    *,
+    headroom: int = 0,
+) -> list[int]:
+    """Stack requests of DIFFERENT history lengths, left-padded, with one copy each.
+
+    Requests whose caches hold different numbers of tokens cannot be stacked into a
+    rectangle as-is.  Left-padding each row to the batch maximum makes them
+    rectangular: row ``i`` holds its history in ``[max_len - len_i, max_len)`` and
+    leaves ``[0, max_len - len_i)`` unused.  The caller must build an attention mask
+    from the returned pad amounts so the model never attends to that gap.
+
+    Left- rather than right-padding is what keeps the rest of the fast path intact:
+    every row's *new* positions then land at the same absolute offset ``max_len``, so
+    the tail-append that avoids recopying history works unchanged.
+
+    The pad region is zeroed rather than left as uninitialised arena memory: masked
+    positions contribute nothing mathematically, but a stray NaN in the key would
+    still poison the QK product before the mask is applied.
+
+    Returns the per-request pad amounts, in the same order as the inputs.
+    """
+
+    if not key_slices:
+        raise ValueError("cannot stack an empty physical batch")
+    if headroom < 0:
+        raise ValueError("headroom cannot be negative")
+    lengths = [int(keys.shape[-2]) for keys in key_slices]
+    max_len = max(lengths)
+    pads = [max_len - length for length in lengths]
+    first = key_slices[0]
+    batch = len(key_slices)
+    if not layer.is_initialized:
+        layer.lazy_initialization(first, value_slices[0])
+    template = first.new_empty((batch, int(first.shape[1]), 0, int(first.shape[3])))
+    layer._length = 0
+    layer._reserve(template, max_len + headroom, exact=True)
+    for index, (keys, values, pad) in enumerate(
+        zip(key_slices, value_slices, pads, strict=True)
+    ):
+        if pad:
+            layer._key_arena[index : index + 1, :, :pad, :].zero_()
+            layer._value_arena[index : index + 1, :, :pad, :].zero_()
+        layer._key_arena[index : index + 1, :, pad:max_len, :] = keys
+        layer._value_arena[index : index + 1, :, pad:max_len, :] = values
+    layer._length = max_len
+    layer._publish()
+    return pads
+
+
 def stack_into_arena(
     layer: ArenaLayer,
     key_slices: list[torch.Tensor],

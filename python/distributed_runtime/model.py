@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 import gc
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 
@@ -18,13 +19,32 @@ from transformers.cache_utils import DynamicLayer
 
 from .decode_attention import apply_to as apply_grouped_prefix_attention
 from .device import TorchExecutionDevice, resolve_torch_execution_device
-from .kv_arena import ArenaCache, ArenaLayer, stack_into_arena
+from .kv_arena import (
+    ArenaCache,
+    ArenaLayer,
+    stack_into_arena,
+    stack_ragged_into_arena,
+)
 from .model_adapters import (
     SelectiveStageAdapter,
     resolve_selective_stage_adapter,
 )
 
 MAX_PHYSICAL_STAGE_BATCH_SIZE = 8
+
+RAGGED_GROUPING_ENV = "GDLP_RAGGED_GROUPING"
+
+
+def ragged_grouping_enabled() -> bool:
+    """Whether decode may fuse requests whose caches hold different lengths.
+
+    Off by default: the equal-length path is byte-identical to sequential decode
+    and needs no mask, so it stays the conservative default until the ragged path
+    has been measured on the target hardware. Read per call rather than cached so
+    a stage process can be flipped without a restart.
+    """
+
+    return os.environ.get(RAGGED_GROUPING_ENV) == "1"
 
 
 @dataclass(frozen=True)
@@ -689,16 +709,39 @@ class StageRunner:
             expected_hidden_size=None,
             integer=True,
         )
-        cache = self._merge_dynamic_caches(ids, headroom=token_count)
+        lengths = {self.tokens_seen[request_id] for request_id in ids}
+        ragged = ragged_grouping_enabled() and len(lengths) > 1
+        pad_amounts: tuple[int, ...] | None = None
+        history_len: int | None = None
+        if ragged:
+            cache, pad_amounts, history_len = self._merge_dynamic_caches_ragged(
+                ids, headroom=token_count
+            )
+        else:
+            cache = self._merge_dynamic_caches(ids, headroom=token_count)
         prepared = torch.cat(tensors, dim=0).to(
             device=self._effective_compute_device()
+        )
+        extra = (
+            self._ragged_forward_kwargs(
+                pad_amounts, history_len, token_count, prepared.device
+            )
+            if ragged
+            else {}
         )
         output = self.base(
             input_ids=prepared,
             past_key_values=cache,
             use_cache=True,
+            **extra,
         )
-        self._commit_physical_batch(ids, output.past_key_values, token_count)
+        self._commit_physical_batch(
+            ids,
+            output.past_key_values,
+            token_count,
+            pad_amounts=pad_amounts,
+            history_len=history_len,
+        )
         return tuple(
             output.last_hidden_state[index : index + 1].contiguous()
             for index in range(len(ids))
@@ -788,6 +831,33 @@ class StageRunner:
             return None
         return current, token_count, token_mode
 
+    def physical_batch_group_key(
+        self,
+        request_id: int,
+        *,
+        token_count: int,
+        token_mode: str,
+    ) -> tuple[int, str] | None:
+        """Length-AGNOSTIC batching key, for the ragged path.
+
+        ``physical_batch_key`` includes the cache length, so two requests one token
+        out of phase never fuse -- which is why measured fusion sits near 1,0 under
+        open load.  Dropping the length from the key lets them fuse; the cost is that
+        the batch must then be left-padded and masked (see
+        ``_merge_dynamic_caches_ragged``).
+
+        Returns ``None`` for the same layouts ``physical_batch_key`` refuses, so the
+        caller still falls back to the sequential path.
+        """
+
+        key = self.physical_batch_key(
+            request_id, token_count=token_count, token_mode=token_mode
+        )
+        if key is None:
+            return None
+        _current, count, mode = key
+        return count, mode
+
     @torch.inference_mode()
     def forward_hidden_batch(
         self,
@@ -809,29 +879,49 @@ class StageRunner:
             expected_hidden_size=self.hidden_size,
             integer=False,
         )
+        lengths = {self.tokens_seen[request_id] for request_id in ids}
+        ragged = ragged_grouping_enabled() and len(lengths) > 1
+        key_fn = self.physical_batch_group_key if ragged else self.physical_batch_key
         keys = {
-            self.physical_batch_key(
-                request_id,
-                token_count=token_count,
-                token_mode=token_mode,
-            )
+            key_fn(request_id, token_count=token_count, token_mode=token_mode)
             for request_id in ids
         }
         if None in keys or len(keys) != 1:
             raise ValueError(
                 "physical batching requires equal cache length, token count and cache layout"
             )
-        cache = self._merge_dynamic_caches(ids, headroom=token_count)
+        pad_amounts: tuple[int, ...] | None = None
+        history_len: int | None = None
+        if ragged:
+            cache, pad_amounts, history_len = self._merge_dynamic_caches_ragged(
+                ids, headroom=token_count
+            )
+        else:
+            cache = self._merge_dynamic_caches(ids, headroom=token_count)
         prepared = torch.cat(tensors, dim=0).to(
             device=self._effective_compute_device(),
             dtype=self._effective_compute_dtype(),
+        )
+        extra = (
+            self._ragged_forward_kwargs(
+                pad_amounts, history_len, token_count, prepared.device
+            )
+            if ragged
+            else {}
         )
         output = self.base(
             inputs_embeds=prepared,
             past_key_values=cache,
             use_cache=True,
+            **extra,
         )
-        self._commit_physical_batch(ids, output.past_key_values, token_count)
+        self._commit_physical_batch(
+            ids,
+            output.past_key_values,
+            token_count,
+            pad_amounts=pad_amounts,
+            history_len=history_len,
+        )
 
         token_rows: list[int | tuple[int, ...] | None]
         if self.head is None or token_mode == "none":
@@ -972,11 +1062,123 @@ class StageRunner:
                 )
         return merged
 
+    def _merge_dynamic_caches_ragged(
+        self, request_ids: tuple[int, ...], *, headroom: int = 0
+    ) -> tuple[DynamicCache, tuple[int, ...], int]:
+        """Merge caches of DIFFERENT lengths by left-padding into the arena.
+
+        Same one-copy-per-request cost as the equal-length path; the only change is
+        where each row starts.  Returns ``(cache, pad_amounts, max_len)``; the caller
+        turns ``pad_amounts`` into the attention mask and position ids, and uses
+        ``max_len`` as the history offset when splitting the result back out.
+
+        Falls back by raising when the layout is not plain-arena, so callers keep
+        the sequential path rather than silently producing wrong tokens.
+        """
+
+        if not self._physical_batch_cache_supported:
+            raise ValueError("this model cache layout cannot be physically batched")
+        caches = tuple(self.caches.get(request_id) for request_id in request_ids)
+        lengths = tuple(int(self.tokens_seen[request_id]) for request_id in request_ids)
+        max_len = max(lengths)
+        merged = _new_request_cache(self.base.config, self.spec.kv_cache)
+        if max_len == 0:
+            if any(
+                cache is not None
+                and (not isinstance(cache, DynamicCache) or cache.get_seq_length() != 0)
+                for cache in caches
+            ):
+                raise ValueError("empty physical batch has inconsistent caches")
+            return merged, tuple(0 for _ in request_ids), 0
+        if any(
+            length > 0 and not isinstance(cache, DynamicCache)
+            for cache, length in zip(caches, lengths)
+        ):
+            raise ValueError("physical batching requires DynamicCache request state")
+
+        for layer_index, target in enumerate(merged.layers):
+            if type(target) is not ArenaLayer:
+                # The ragged path exists to avoid rebuilding history every step; the
+                # generic concatenating layer would reintroduce exactly that cost.
+                raise ValueError("ragged physical batching requires arena cache layers")
+            key_slices: list[torch.Tensor] = []
+            value_slices: list[torch.Tensor] = []
+            reference: Any = None
+            for cache, length in zip(caches, lengths):
+                if length == 0:
+                    key_slices.append(None)  # type: ignore[arg-type]
+                    value_slices.append(None)  # type: ignore[arg-type]
+                    continue
+                source = cache.layers[layer_index]
+                if (
+                    not _is_batchable_layer(source)
+                    or not source.is_initialized
+                    or source.keys is None
+                    or source.values is None
+                    or int(source.keys.shape[0]) != 1
+                    or source.get_seq_length() != length
+                ):
+                    raise ValueError("physical batch cache tensors are inconsistent")
+                reference = source
+                key_slices.append(source.keys)
+                value_slices.append(source.values)
+            if reference is None:
+                raise ValueError("physical batch cache tensors are inconsistent")
+            empty_key = reference.keys.new_empty(
+                (1, reference.keys.shape[1], 0, reference.keys.shape[3])
+            )
+            empty_value = reference.values.new_empty(
+                (1, reference.values.shape[1], 0, reference.values.shape[3])
+            )
+            key_slices = [k if k is not None else empty_key for k in key_slices]
+            value_slices = [v if v is not None else empty_value for v in value_slices]
+            shapes = {tuple(k.shape[1:3:2]) for k in key_slices}
+            if len(shapes) != 1:
+                raise ValueError("physical batch cache tensor shapes differ")
+            pads = stack_ragged_into_arena(
+                target, key_slices, value_slices, headroom=headroom
+            )
+        return merged, tuple(pads), max_len
+
+    def _ragged_forward_kwargs(
+        self,
+        pad_amounts: tuple[int, ...],
+        max_len: int,
+        token_count: int,
+        device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        """Attention mask and position ids that hide the left padding.
+
+        Returns an empty dict when nothing is padded, so the equal-length case stays
+        byte-identical to the non-ragged path -- the exactness of the common case
+        must not depend on this code being right.
+        """
+
+        if not any(pad_amounts):
+            return {}
+        batch = len(pad_amounts)
+        total = max_len + token_count
+        mask = torch.ones((batch, total), dtype=torch.long, device=device)
+        for index, pad in enumerate(pad_amounts):
+            if pad:
+                mask[index, :pad] = 0
+        # Positions must count from each request's own first real token, not from the
+        # padded start, or RoPE would rotate the shorter requests wrongly.
+        positions = torch.empty((batch, token_count), dtype=torch.long, device=device)
+        for index, pad in enumerate(pad_amounts):
+            start = max_len - pad
+            positions[index] = torch.arange(
+                start, start + token_count, dtype=torch.long, device=device
+            )
+        return {"attention_mask": mask, "position_ids": positions}
+
     def _append_physical_batch_tail(
         self,
         request_ids: tuple[int, ...],
         cache: Any,
         token_count: int,
+        *,
+        history_len: int | None = None,
     ) -> bool:
         """Hand the batched forward's new positions back without recopying history.
 
@@ -993,23 +1195,30 @@ class StageRunner:
 
         if token_count < 1:
             return False
-        current = self.tokens_seen[request_ids[0]]
+        # ``history_len`` is where the new positions start inside the BATCHED cache.
+        # With equal lengths that is everyone's own length; with ragged left-padding
+        # every row was padded up to the batch maximum, so the tail sits at the same
+        # absolute offset for all of them -- which is precisely why left-padding keeps
+        # this fast path usable instead of forcing a full recopy.
+        ragged = history_len is not None
+        current = history_len if ragged else self.tokens_seen[request_ids[0]]
         targets = []
         for request_id in request_ids:
             request_cache = self.caches.get(request_id)
+            own = self.tokens_seen[request_id]
             if (
                 request_cache is None
                 or not isinstance(request_cache, DynamicCache)
-                or self.tokens_seen[request_id] != current
+                or (not ragged and own != current)
                 or len(request_cache.layers) < len(cache.layers)
             ):
                 return False
             for layer in request_cache.layers[: len(cache.layers)]:
                 if not _is_batchable_layer(layer):
                     return False
-                if layer.is_initialized and layer.get_seq_length() != current:
+                if layer.is_initialized and layer.get_seq_length() != own:
                     return False
-                if not layer.is_initialized and current != 0:
+                if not layer.is_initialized and own != 0:
                     return False
             targets.append(request_cache)
         for source in cache.layers:
@@ -1031,6 +1240,9 @@ class StageRunner:
         request_ids: tuple[int, ...],
         cache: Any,
         token_count: int,
+        *,
+        pad_amounts: tuple[int, ...] | None = None,
+        history_len: int | None = None,
     ) -> None:
         if not isinstance(cache, DynamicCache):
             raise TypeError("physical model forward did not return DynamicCache")
@@ -1045,20 +1257,27 @@ class StageRunner:
         ):
             raise TypeError("physical model forward returned an unsupported cache layout")
 
-        appended = self._append_physical_batch_tail(request_ids, cache, token_count)
+        appended = self._append_physical_batch_tail(
+            request_ids, cache, token_count, history_len=history_len
+        )
         if not appended:
             split = [
                 _new_request_cache(self.base.config, self.spec.kv_cache)
                 for _ in request_ids
             ]
+            # In the ragged path each row carries `pad_amounts[i]` leading pad
+            # positions that are not part of that request's history. Copying them
+            # back would corrupt the request's cache, so they are trimmed here.
+            pads = pad_amounts if pad_amounts is not None else (0,) * len(request_ids)
             for layer_index, source in enumerate(cache.layers):
                 for batch_index, target_cache in enumerate(split):
                     target = target_cache.layers[layer_index]
                     if not _is_batchable_layer(target):
                         raise TypeError("physical cache split changed the cache layout")
+                    pad = pads[batch_index]
                     target.update(
-                        source.keys[batch_index : batch_index + 1].clone(),
-                        source.values[batch_index : batch_index + 1].clone(),
+                        source.keys[batch_index : batch_index + 1, :, pad:, :].clone(),
+                        source.values[batch_index : batch_index + 1, :, pad:, :].clone(),
                     )
             for request_id, request_cache in zip(request_ids, split, strict=True):
                 self.caches[request_id] = request_cache

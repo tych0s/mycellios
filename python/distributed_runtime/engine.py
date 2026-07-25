@@ -31,6 +31,7 @@ from .model import (
     StageRunner,
     StageRunnerContract,
     model_artifact_reference,
+    ragged_grouping_enabled,
     resolve_model_snapshot,
 )
 from .protocol import (
@@ -4478,7 +4479,17 @@ class DistributedPipelineEngine:
         batch_forward = (
             getattr(runner, "forward_ids_batch", None) if batch_exact else None
         )
-        batch_key = getattr(runner, "physical_batch_key", None) if batch_exact else None
+        batch_key = (
+            getattr(
+                runner,
+                "physical_batch_group_key"
+                if ragged_grouping_enabled()
+                else "physical_batch_key",
+                None,
+            )
+            if batch_exact
+            else None
+        )
         maximum = getattr(runner, "MAX_PHYSICAL_BATCH_SIZE", 1)
         if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 2:
             maximum = 1
@@ -4791,7 +4802,15 @@ class DistributedPipelineEngine:
         self._root_ready_items += len(waves)
 
         batch_forward = getattr(runner, "forward_ids_batch", None)
-        batch_key = getattr(runner, "physical_batch_key", None)
+        # Length-agnostic key when ragged grouping is on: that is what lets waves
+        # whose KV lengths differ by a token or two fuse instead of splitting.
+        batch_key = getattr(
+            runner,
+            "physical_batch_group_key"
+            if ragged_grouping_enabled()
+            else "physical_batch_key",
+            None,
+        )
         maximum = getattr(runner, "MAX_PHYSICAL_BATCH_SIZE", 1)
         if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 2:
             maximum = 1
