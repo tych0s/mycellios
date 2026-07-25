@@ -20,7 +20,7 @@ import {
 } from "../model-fabric/artifact-swarm.js";
 import { gpuModelsMatch } from "../worker/hardware.js";
 
-export const PORTABLE_RUNTIME_SCHEMA = "mycellios-distribution-runtime/3" as const;
+export const PORTABLE_RUNTIME_SCHEMA = "mycellios-distribution-runtime/4" as const;
 export const ACCELERATOR_RUNTIME_SCHEMA = "mycellios-accelerator-runtime/1" as const;
 
 const GIB = 1024 ** 3;
@@ -140,6 +140,7 @@ export interface PortableRuntimeManifest {
   pythonAbi: string;
   executable: string;
   pythonArtifact: PortablePythonArtifactManifest;
+  wheelLock: PortableRuntimeWheelLockManifest;
   torchVersion: string;
   transformersVersion: string;
   accelerateVersion: string;
@@ -148,6 +149,12 @@ export interface PortableRuntimeManifest {
   sentencepieceVersion: string;
   numpyVersion: string;
   backend: "cpu";
+  bundledAccelerators: string[];
+}
+
+export interface PortableRuntimeWheelLockManifest {
+  path: string;
+  sha256: string;
 }
 
 export interface PortablePythonArtifactManifest {
@@ -321,10 +328,29 @@ const CERTIFIED_PORTABLE_PYTHON = {
 } as const;
 
 const CERTIFIED_PORTABLE_RUNTIME = {
-  "win32/x64": { executable: "python.exe", torchVersion: "2.13.0+cpu", transformersVersion: "5.14.1" },
-  "linux/x64": { executable: "bin/python3", torchVersion: "2.13.0+cpu", transformersVersion: "5.14.1" },
-  "darwin/arm64": { executable: "bin/python3", torchVersion: "2.13.0", transformersVersion: "5.14.1" },
-  "darwin/x64": { executable: "bin/python3", torchVersion: "2.2.2", transformersVersion: "4.57.3" },
+  "win32/x64": { executable: "python.exe", torchVersion: "2.13.0+cpu", transformersVersion: "5.14.1", bundledAccelerators: [] },
+  "linux/x64": { executable: "bin/python3", torchVersion: "2.13.0+cpu", transformersVersion: "5.14.1", bundledAccelerators: [] },
+  "darwin/arm64": { executable: "bin/python3", torchVersion: "2.11.0", transformersVersion: "5.14.1", bundledAccelerators: ["mps"] },
+  "darwin/x64": { executable: "bin/python3", torchVersion: "2.2.2", transformersVersion: "4.57.3", bundledAccelerators: [] },
+} as const;
+
+const CERTIFIED_PORTABLE_WHEEL_LOCKS = {
+  "win32/x64": {
+    path: "scripts/wheel-locks/win32-x64-cp312.txt",
+    sha256: "2a5de3d3f2e3ba4ebac91e1efe068159e81263d3ccd6a3d93333078e753c6c65",
+  },
+  "linux/x64": {
+    path: "scripts/wheel-locks/linux-x64-cp312.txt",
+    sha256: "090355535c96e7202ae761a18dadc5d66c9e98493a148eba16ae3c3e7c95c59d",
+  },
+  "darwin/arm64": {
+    path: "scripts/wheel-locks/darwin-arm64-cp312.txt",
+    sha256: "75c84302540edc1b7f6c1620c3474b7ccbf431dd6df881717f74ebf419c56348",
+  },
+  "darwin/x64": {
+    path: "scripts/wheel-locks/darwin-x64-cp312.txt",
+    sha256: "808a7fd6894862abf2ed704eef036bf0b6290c6cce4f618682e831d67bf2b5eb",
+  },
 } as const;
 
 const CERTIFIED_PORTABLE_PACKAGES = {
@@ -366,13 +392,13 @@ export const WINDOWS_ACCELERATOR_PACKS: Readonly<Record<"cuda" | "rocm", Acceler
 
 /** Apple ships Metal with macOS, so the native arm64 PyTorch wheel needs no device-side download. */
 export const MACOS_MPS_PACK: Readonly<AcceleratorPack> = {
-  id: "macos-arm64-py312-torch213-mps-v1",
+  id: "macos-arm64-py312-torch211-mps-v1",
   backend: "mps",
   platform: "darwin",
   arch: "arm64",
   strategy: "bundled",
   launchDevice: "mps",
-  torchVersion: "2.13.0",
+  torchVersion: "2.11.0",
   minimumFreeBytes: 0,
   installGroups: [],
 };
@@ -811,10 +837,10 @@ export async function readPortableRuntimeManifest(
   try {
     raw = JSON.parse(await readFile(path, "utf8"));
   } catch (error) {
-    throw new Error(`portable runtime v3 manifest is missing or invalid: ${shortError(error)}`);
+    throw new Error(`portable runtime v4 manifest is missing or invalid: ${shortError(error)}`);
   }
   if (!isRecord(raw) || raw.schema !== PORTABLE_RUNTIME_SCHEMA) {
-    throw new Error("portable runtime does not use the v3 manifest schema");
+    throw new Error("portable runtime does not use the v4 manifest schema");
   }
   for (const key of [
     "platform",
@@ -849,11 +875,17 @@ export async function readPortableRuntimeManifest(
     raw.executable !== certified.executable ||
     raw.torchVersion !== certified.torchVersion ||
     raw.transformersVersion !== certified.transformersVersion ||
+    !stringArray(raw.bundledAccelerators) ||
+    raw.bundledAccelerators.length !== certified.bundledAccelerators.length ||
+    raw.bundledAccelerators.some(
+      (value, index) => value !== certified.bundledAccelerators[index],
+    ) ||
     Object.entries(CERTIFIED_PORTABLE_PACKAGES).some(([key, version]) => raw[key] !== version)
   ) {
     throw new Error(`portable runtime package versions do not match ${platform}/${arch}`);
   }
   validatePortablePythonArtifact(raw.pythonArtifact, platform, arch);
+  validatePortableWheelLock(raw.wheelLock, platform, arch);
   if (raw.backend !== "cpu") throw new Error("portable base runtime must be CPU-only");
   if (expected && (raw.platform !== expected.platform || raw.arch !== expected.arch)) {
     throw new Error(
@@ -927,6 +959,21 @@ function portableRuntimeProbeScript(): string {
     "payload = {'prefix': sys.prefix, 'basePrefix': sys.base_prefix, 'pythonVersion': '.'.join(map(str, sys.version_info[:3])), 'torchVersion': versions['torch'], 'transformersVersion': versions['transformers'], 'accelerateVersion': versions['accelerate'], 'safetensorsVersion': versions['safetensors'], 'aiohttpVersion': versions['aiohttp'], 'sentencepieceVersion': versions['sentencepiece'], 'numpyVersion': versions['numpy']}",
     `print('${PORTABLE_RUNTIME_PROBE_MARKER}' + json.dumps(payload, separators=(',', ':')), flush=True)`,
   ].join("\n");
+}
+
+function validatePortableWheelLock(value: unknown, platform: string, arch: string): void {
+  if (!isRecord(value)) throw new Error("portable runtime has no sealed wheel lock");
+  const expected = CERTIFIED_PORTABLE_WHEEL_LOCKS[
+    `${platform}/${arch}` as keyof typeof CERTIFIED_PORTABLE_WHEEL_LOCKS
+  ];
+  if (!expected) throw new Error(`portable runtime has no certified wheel lock for ${platform}/${arch}`);
+  if (
+    Object.keys(value).sort().join(",") !== "path,sha256"
+    || value.path !== expected.path
+    || value.sha256 !== expected.sha256
+  ) {
+    throw new Error(`portable runtime wheel lock does not match ${platform}/${arch}`);
+  }
 }
 
 function validatePortablePythonArtifact(value: unknown, platform: string, arch: string): void {

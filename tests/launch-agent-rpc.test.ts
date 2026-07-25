@@ -35,6 +35,11 @@ import type {
 } from "../src/distribution/types.js";
 
 const MIB = 1024 * 1024;
+const TEST_BUILD_IDENTITY = {
+  schema: "mycellios-native-build-provenance/1" as const,
+  version: "0.2.38",
+  sourceId: `sha256:${"1".repeat(64)}` as const,
+};
 const servers: LaunchAgentRpcServer[] = [];
 const rawServers: Server[] = [];
 
@@ -55,7 +60,10 @@ describe("HTTP LaunchAgent RPC", () => {
     const request = fixtureRequest();
     const token = "rpc-control-secret-0123456789012345";
     const fake = new FakeAgent("fake:authenticated");
-    const { address } = await serve(fake, request.nodeId, { authToken: token });
+    const { address } = await serve(fake, request.nodeId, {
+      authToken: token,
+      buildIdentity: TEST_BUILD_IDENTITY,
+    });
 
     const unauthenticatedHealth = await fetch(`${address.url}/healthz`);
     expect(unauthenticatedHealth.status).toBe(401);
@@ -85,9 +93,10 @@ describe("HTTP LaunchAgent RPC", () => {
     expect(authenticatedHealth.status).toBe(200);
 
     await expect(rpcClient(address, { authToken: token }).health()).resolves.toEqual({
-      schema: "gdlp-launch-agent-health/2",
+      schema: "gdlp-launch-agent-health/3",
       agentId: fake.id,
       nodeId: request.nodeId,
+      buildIdentity: TEST_BUILD_IDENTITY,
       activeProcesses: 0,
       retainedTombstones: 0,
     });

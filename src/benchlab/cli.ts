@@ -30,14 +30,17 @@ export async function runAndPersistRealSuite(options: BenchmarkRunOptions): Prom
 
 function importAndPersistPhysicalSuite(
   options: BenchmarkRunOptions,
-  observationPath: string,
-  configPath: string,
+  reportPath: string,
 ): { run: BenchmarkRun; path: string } {
   const history = loadBenchmarkRuns(options.cwd, options.historyDirectory);
   const identity = createRunIdentity(options.cwd, options.version, options.label);
-  const observation = JSON.parse(readFileSync(resolve(options.cwd, observationPath), "utf8")) as unknown;
-  const config = JSON.parse(readFileSync(resolve(options.cwd, configPath), "utf8")) as unknown;
-  const run = compareRunWithHistory(importPhysicalCampaign(identity, observation, config), history);
+  const report = JSON.parse(
+    readFileSync(resolve(options.cwd, reportPath), "utf8"),
+  ) as unknown;
+  const run = compareRunWithHistory(
+    importPhysicalCampaign(identity, report),
+    history,
+  );
   const path = saveBenchmarkRun(options.cwd, run, options.historyDirectory);
   return { run, path };
 }
@@ -47,7 +50,7 @@ if (isEntryPoint()) {
     try {
       const args = parseArguments(process.argv.slice(2));
       const result = args.command === "import-physical"
-        ? importAndPersistPhysicalSuite(args, args.observationPath!, args.configPath!)
+        ? importAndPersistPhysicalSuite(args, args.reportPath!)
         : await runAndPersistRealSuite(args);
       if (args.json) console.log(JSON.stringify(result.run, null, 2));
       else printSummary(result.run, result.path);
@@ -64,8 +67,7 @@ if (isEntryPoint()) {
 interface ParsedArguments extends BenchmarkRunOptions {
   command: "run" | "import-physical";
   json: boolean;
-  observationPath: string | null;
-  configPath: string | null;
+  reportPath: string | null;
 }
 
 function parseArguments(values: string[]): ParsedArguments {
@@ -74,8 +76,7 @@ function parseArguments(values: string[]): ParsedArguments {
     command,
     cwd: process.cwd(),
     json: false,
-    observationPath: null,
-    configPath: null,
+    reportPath: null,
   };
   const start = command === "run" && values[0] === "run" ? 1 : command === "import-physical" ? 1 : 0;
   for (let index = start; index < values.length; index += 1) {
@@ -90,8 +91,7 @@ function parseArguments(values: string[]): ParsedArguments {
     else if (value === "--iterations" && next) args.iterations = positiveInteger(next, "iterations");
     else if (value === "--warmups" && next) args.warmups = nonnegativeInteger(next, "warmups");
     else if (value === "--output-tokens" && next) args.outputTokens = positiveInteger(next, "output-tokens");
-    else if (value === "--observation" && next) args.observationPath = next;
-    else if (value === "--config" && next) args.configPath = next;
+    else if (value === "--report" && next) args.reportPath = next;
     else if (value === "--json") {
       args.json = true;
       continue;
@@ -100,8 +100,8 @@ function parseArguments(values: string[]): ParsedArguments {
     }
     index += 1;
   }
-  if (command === "import-physical" && (!args.observationPath || !args.configPath)) {
-    throw new Error("import-physical requiere --observation y --config.");
+  if (command === "import-physical" && !args.reportPath) {
+    throw new Error("import-physical requiere --report con la puerta física sellada.");
   }
   return args;
 }

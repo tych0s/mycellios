@@ -1,0 +1,21 @@
+* text=auto eol=lf
+
+*.7z binary
+*.dmg binary
+*.exe binary
+*.gif binary
+*.gz binary
+*.ico binary
+*.icns binary
+*.jpeg binary
+*.jpg binary
+*.nupkg binary
+*.pdf binary
+*.pfx binary
+*.png binary
+*.rpm binary
+*.tar binary
+*.webm binary
+*.woff binary
+*.woff2 binary
+*.zip binary

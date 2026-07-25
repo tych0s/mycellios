@@ -4,6 +4,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type WebSocket from "ws";
 import { z } from "zod";
+import { nativeBuildIdentitySchema, type NativeBuildIdentity } from "../contracts/build-identity.js";
 
 const LEVELS = ["low", "balanced", "maximum"] as const;
 const BACKENDS = ["webgpu", "cpu"] as const;
@@ -42,6 +43,7 @@ export const mobileRegistrationSchema = z
     name: z.string().min(1).max(80),
     region: z.string().min(1).max(80).default("auto"),
     platform: z.string().min(1).max(120),
+    buildIdentity: nativeBuildIdentitySchema.optional(),
     backend: z.enum(BACKENDS),
     performanceLevel: z.enum(LEVELS),
     joinToken: z.string().max(512).optional(),
@@ -178,6 +180,7 @@ export interface MobileWorkerSnapshot {
   name: string;
   region: string;
   platform: string;
+  buildIdentity?: NativeBuildIdentity;
   backend: MobileBackend;
   performanceLevel: PerformanceLevel;
   connected: boolean;
@@ -485,6 +488,9 @@ export class MobileComputeHub {
         name: worker.registration.name,
         region: worker.registration.region,
         platform: worker.registration.platform,
+        ...(worker.registration.buildIdentity
+          ? { buildIdentity: worker.registration.buildIdentity }
+          : {}),
         backend: worker.registration.backend,
         performanceLevel: worker.registration.performanceLevel,
         connected: worker.connected,

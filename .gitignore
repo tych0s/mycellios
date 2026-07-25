@@ -5,6 +5,8 @@ build/distribution-runtime/
 build/distribution-runtime.tar.gz
 build/python/
 build/coordinator-release/
+build/mycellios-coordinator-output-receipt.json
+build/mycellios-*-lock-report.json
 build/validation-logs/
 .vite/
 landing-dist/

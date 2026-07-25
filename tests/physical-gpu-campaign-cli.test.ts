@@ -563,9 +563,14 @@ function fakeAgent(
     },
     async health() {
       return {
-        schema: "gdlp-launch-agent-health/2",
+        schema: "gdlp-launch-agent-health/3",
         agentId: id,
         nodeId: id.slice("local-process:".length),
+        buildIdentity: {
+          schema: "mycellios-native-build-provenance/1",
+          version: "0.2.38",
+          sourceId: `sha256:${"1".repeat(64)}`,
+        },
         activeProcesses: 0,
         retainedTombstones: 0,
       };
@@ -739,9 +744,14 @@ function successfulCampaign(
       expectedAgentId: `local-process:${nodeId}`,
       expectedNodeId: nodeId,
       health: {
-        schema: "gdlp-launch-agent-health/2" as const,
+        schema: "gdlp-launch-agent-health/3" as const,
         agentId: `local-process:${nodeId}`,
         nodeId,
+        buildIdentity: {
+          schema: "mycellios-native-build-provenance/1" as const,
+          version: "0.2.38",
+          sourceId: `sha256:${"1".repeat(64)}` as const,
+        },
         activeProcesses: 0,
         retainedTombstones: 0,
       },

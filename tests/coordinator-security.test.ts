@@ -98,6 +98,41 @@ describe("public coordinator security boundaries", () => {
     expect(response.headers["x-content-type-options"]).toBe("nosniff");
   });
 
+  it("publishes one exact coordinator build identity on health and public snapshot", async () => {
+    const buildIdentity = {
+      schema: "mycellios-native-build-provenance/1" as const,
+      version: "0.2.19",
+      sourceId: `sha256:${"a".repeat(64)}` as const,
+    };
+    const runtime = await createCoordinator({
+      host: "127.0.0.1",
+      port: 0,
+      databasePath: ":memory:",
+      requestTimeoutMs: 1_000,
+    }, {
+      logger: false,
+      buildIdentity,
+      runtimeMetadata: {
+        root: process.cwd(),
+        version: buildIdentity.version,
+        revision: "b".repeat(40),
+        buildIdentity,
+      },
+    });
+    runtimes.push(runtime);
+
+    const health = await runtime.app.inject({ method: "GET", url: "/health" });
+    const snapshot = await runtime.app.inject({ method: "GET", url: "/public/v1/snapshot" });
+
+    expect(health.statusCode).toBe(200);
+    expect(snapshot.statusCode).toBe(200);
+    expect(health.json().version).toBe(buildIdentity.version);
+    expect(health.json().revision).toBe("b".repeat(40));
+    expect(health.json().buildIdentity).toEqual(buildIdentity);
+    expect(snapshot.json().version).toBe(buildIdentity.version);
+    expect(snapshot.json().buildIdentity).toEqual(buildIdentity);
+  });
+
   it("rejects development mock deployments on the production coordinator boundary", async () => {
     const runtime = await coordinator();
     const payload = validWorkerRegistration();

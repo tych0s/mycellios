@@ -6,6 +6,7 @@ import {
   deploymentCanaryEvidenceSchema,
   deploymentMetricsFromCanaryEvidence,
 } from "./deployment-canary.js";
+import { nativeBuildIdentitySchema } from "./build-identity.js";
 
 const adapterKind = z.enum([
   "mycellios-native",
@@ -262,6 +263,7 @@ export const gpuSchema = z
 export const workerCapabilitiesSchema = z.object({
   region: z.string().min(1),
   agentVersion: z.string().min(1),
+  buildIdentity: nativeBuildIdentitySchema.optional(),
   gpus: z.array(gpuSchema).min(1),
   limits: z.object({
     maxConcurrency: z.number().int().positive(),
@@ -349,9 +351,20 @@ export const workerCapabilitiesSchema = z.object({
         .strict()
         .optional(),
     })
-    .strict()
-    .optional(),
-}).strict();
+      .strict()
+      .optional(),
+}).strict().superRefine((capabilities, context) => {
+  if (
+    capabilities.buildIdentity
+    && capabilities.buildIdentity.version !== capabilities.agentVersion
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["buildIdentity", "version"],
+      message: "buildIdentity.version must match agentVersion",
+    });
+  }
+});
 
 export const workerRegistrationSchema = z.object({
   identity: z

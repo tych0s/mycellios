@@ -10,11 +10,15 @@ import {
   type PythonPipelineLaunchDescription,
   type PythonRootEngineLaunch,
 } from "./python-launcher.js";
+import {
+  nativeBuildIdentitySchema,
+  type NativeBuildIdentity,
+} from "../contracts/build-identity.js";
 
 export const PHYSICAL_GPU_CAMPAIGN_SCHEMA = "gdlp-physical-gpu-campaign-observation/1" as const;
 export const OUTPUT_TOKEN_HASH_SCHEME = "gdlp-output-token-ids-v1" as const;
 
-const AGENT_HEALTH_SCHEMA = "gdlp-launch-agent-health/2";
+const AGENT_HEALTH_SCHEMA = "gdlp-launch-agent-health/3";
 const SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/;
 const DECIMAL_UINT64_PATTERN = /^(?:0|[1-9][0-9]{0,19})$/;
 const MAX_UINT64 = (1n << 64n) - 1n;
@@ -74,6 +78,7 @@ export interface PhysicalGpuCampaignAgentHealth {
   schema: typeof AGENT_HEALTH_SCHEMA;
   agentId: string;
   nodeId: string | null;
+  buildIdentity: NativeBuildIdentity;
   activeProcesses: number;
   retainedTombstones: number;
 }
@@ -330,6 +335,7 @@ export async function runPhysicalGpuCampaign(
   let eventSequence = 0;
   let supervisor: PhysicalGpuCampaignSupervisor | null = null;
   let corePassed = false;
+  let expectedAgentSourceId: string | null = null;
   const agentByNode = new Map(input.agents.map((binding) => [binding.nodeId, binding.agent]));
   const recordEvent = (
     phase: PhysicalGpuCampaignLifecycleEvent["phase"],
@@ -356,6 +362,9 @@ export async function runPhysicalGpuCampaign(
       preflightPassed ? "all_launch_agents_inactive" : "launch_agent_preflight_failed",
     );
     if (!preflightPassed) throw new Error("physical_gpu_campaign_agent_preflight_failed");
+    expectedAgentSourceId = singleAgentBuildSourceId(
+      lifecycle.agentHealthBefore,
+    );
 
     supervisor = supervisorFactory(input.launch, {
       resolveAgent: (nodeId) => agentByNode.get(nodeId),
@@ -475,7 +484,17 @@ export async function runPhysicalGpuCampaign(
       healthReader,
       timeouts.agentHealthMs,
     );
-    const agentsClean = lifecycle.agentHealthAfter.every((item) => item.passed);
+    let agentsClean = lifecycle.agentHealthAfter.every((item) => item.passed);
+    if (agentsClean) {
+      try {
+        agentsClean = expectedAgentSourceId !== null
+          && singleAgentBuildSourceId(lifecycle.agentHealthAfter)
+            === expectedAgentSourceId;
+      } catch (error) {
+        agentsClean = false;
+        recordFailure("agent_cleanup_build_identity", error);
+      }
+    }
     recordEvent(
       "agent_cleanup",
       agentsClean,
@@ -717,7 +736,7 @@ function validateAgentHealth(value: unknown): PhysicalGpuCampaignAgentHealth {
   const health = object(value, "physical_gpu_campaign_agent_health");
   exactKeys(
     health,
-    ["schema", "agentId", "nodeId", "activeProcesses", "retainedTombstones"],
+    ["schema", "agentId", "nodeId", "buildIdentity", "activeProcesses", "retainedTombstones"],
     "physical_gpu_campaign_agent_health",
   );
   if (health.schema !== AGENT_HEALTH_SCHEMA) {
@@ -728,6 +747,14 @@ function validateAgentHealth(value: unknown): PhysicalGpuCampaignAgentHealth {
     health.nodeId === null
       ? null
       : identifier(health.nodeId, "physical_gpu_campaign_agent_health_node_id");
+  const parsedBuildIdentity = nativeBuildIdentitySchema.safeParse(
+    health.buildIdentity,
+  );
+  if (!parsedBuildIdentity.success) {
+    throw new Error(
+      "physical_gpu_campaign_agent_health_build_identity_is_invalid",
+    );
+  }
   const activeProcesses = integer(
     health.activeProcesses,
     0,
@@ -744,9 +771,33 @@ function validateAgentHealth(value: unknown): PhysicalGpuCampaignAgentHealth {
     schema: AGENT_HEALTH_SCHEMA,
     agentId,
     nodeId,
+    buildIdentity: parsedBuildIdentity.data,
     activeProcesses,
     retainedTombstones,
   };
+}
+
+function singleAgentBuildSourceId(
+  observations: readonly PhysicalGpuCampaignAgentHealthObservation[],
+): string {
+  const sourceIds = new Set(
+    observations.flatMap((observation) =>
+      observation.passed && observation.health
+        ? [observation.health.buildIdentity.sourceId]
+        : []
+    ),
+  );
+  if (sourceIds.size !== 1) {
+    throw new Error("physical_gpu_campaign_agent_build_cohort_is_inconsistent");
+  }
+  if (
+    observations.some(
+      (observation) => !observation.passed || observation.health === null,
+    )
+  ) {
+    throw new Error("physical_gpu_campaign_agent_build_cohort_is_incomplete");
+  }
+  return [...sourceIds][0]!;
 }
 
 async function observeApiHealth(

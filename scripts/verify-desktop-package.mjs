@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join, posix, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { extractFile, listPackage } from "@electron/asar";
@@ -10,6 +10,11 @@ import {
   portableRuntimeSpec,
 } from "./portable-runtime-policy.mjs";
 import { assertNativePythonProductMatchesSource } from "./native-python-product-policy.mjs";
+import {
+  NATIVE_BUILD_PROVENANCE_FILE,
+  assertNativeSourceProvenanceMatches,
+} from "./native-build-provenance.mjs";
+import { readPortableRuntimeWheelLock } from "./portable-runtime-wheel-lock.mjs";
 
 function readArgument(name, fallback) {
   const prefix = `--${name}=`;
@@ -40,6 +45,7 @@ const requiredEntries = [
   "/.vite/build/main.cjs",
   "/.vite/build/preload.cjs",
   "/.vite/renderer/main_window/index.html",
+  `/${NATIVE_BUILD_PROVENANCE_FILE}`,
 ];
 
 for (const entry of requiredEntries) {
@@ -47,6 +53,12 @@ for (const entry of requiredEntries) {
 }
 
 const packagedMetadata = JSON.parse(extractFile(asarPath, "package.json").toString("utf8"));
+const sourceMetadata = JSON.parse(readFileSync(resolve("package.json"), "utf8"));
+if (packagedMetadata.version !== sourceMetadata.version) {
+  throw new Error(
+    `La versión empaquetada ${packagedMetadata.version} no coincide con package.json ${sourceMetadata.version}.`,
+  );
+}
 if (packagedMetadata.main !== ".vite/build/main.cjs") {
   throw new Error(`El entrypoint empaquetado es incorrecto: ${packagedMetadata.main}`);
 }
@@ -67,6 +79,11 @@ for (const dependency of forbiddenRuntimeImports) {
     throw new Error(`Dependencia de runtime no incluida en el bundle: ${dependency}`);
   }
 }
+
+const packagedProvenance = JSON.parse(
+  extractFile(asarPath, NATIVE_BUILD_PROVENANCE_FILE).toString("utf8"),
+);
+assertNativeSourceProvenanceMatches(resolve("."), packagedProvenance);
 
 for (const forbiddenProductRoute of [
   "local model runtimeAdapter",
@@ -107,6 +124,7 @@ if (platform === "win32") {
 
 const runtimeSpec = portableRuntimeSpec(platform, arch);
 if (runtimeSpec.supported) {
+  const wheelLock = readPortableRuntimeWheelLock(resolve("."), runtimeSpec);
   if (!existsSync(runtimeArchive)) {
     throw new Error(`El paquete ${platform}/${arch} no contiene ${runtimeArchive}.`);
   }
@@ -145,6 +163,9 @@ if (runtimeSpec.supported) {
     manifest.pythonAbi !== "cp312" ||
     manifest.executable !== runtimeSpec.pythonExecutable ||
     !matchesPinnedPythonArtifact(manifest.pythonArtifact, runtimeSpec.pythonArtifact) ||
+    manifest.wheelLock?.path !== wheelLock.path ||
+    manifest.wheelLock?.sha256 !== wheelLock.sha256 ||
+    Object.keys(manifest.wheelLock ?? {}).sort().join(",") !== "path,sha256" ||
     manifest.torchVersion !== runtimeSpec.torchVersion ||
     manifest.transformersVersion !== runtimeSpec.packageVersions.transformers ||
     manifest.accelerateVersion !== runtimeSpec.packageVersions.accelerate ||

@@ -16,6 +16,10 @@ import {
   Tray,
 } from "electron";
 import started from "electron-squirrel-startup";
+import {
+  NATIVE_BUILD_PROVENANCE_FILE,
+  type NativeBuildIdentity,
+} from "../contracts/build-identity.js";
 import { workerConfigSchema, type WorkerConfig } from "../contracts/schemas.js";
 import type { CoordinatorRuntime } from "../coordinator/server.js";
 import { createCoordinator } from "../coordinator/server.js";
@@ -97,6 +101,7 @@ import {
   summarizeAutomaticUpdateError,
 } from "./update-recovery.js";
 import { SingleFlight } from "./single-flight.js";
+import { readNativeBuildIdentity } from "../core/native-build-identity.js";
 import { probeRuntimePerformanceProfile } from "../performance/runtime-profile-probe.js";
 import {
   DEFAULT_DESKTOP_SETTINGS as DEFAULT_SETTINGS,
@@ -142,6 +147,8 @@ let settings: DesktopSettings = DEFAULT_SETTINGS;
 let modelAdminToken = "";
 let isQuitting = false;
 let runtimeError: string | null = null;
+let nativeBuildIdentity: NativeBuildIdentity | null = null;
+let nativeBuildIdentityError: string | null = null;
 let accelerationStatus: DashboardSnapshot["acceleration"] = createInitialAccelerationStatus();
 let updateCheckTimer: NodeJS.Timeout | null = null;
 let updateRetryTimer: NodeJS.Timeout | null = null;
@@ -489,8 +496,18 @@ async function startCoordinatorIfNeeded(): Promise<void> {
     },
     {
       logger: false,
+      buildIdentity: nativeBuildIdentity,
+      runtimeMetadata: {
+        root: app.getAppPath(),
+        version: app.getVersion(),
+        revision: null,
+        buildIdentity: nativeBuildIdentity,
+      },
+      benchmarkStorageRoot: join(app.getPath("userData"), "benchmarks"),
       activationManagerFactory: ({ store, hub, deploymentController }) => new DynamicModelActivationManager({
         cwd: app.getAppPath(),
+        workerAgentVersion: app.getVersion(),
+        ...(nativeBuildIdentity ? { workerBuildIdentity: nativeBuildIdentity } : {}),
         snapshot: () => buildConnectedExecutorActivationSnapshot(
           desktopActivationBaseConfig(),
           store.listWorkers(),
@@ -609,6 +626,11 @@ async function startWorkerIfEnabled(): Promise<void> {
 
 async function initializeWorker(): Promise<void> {
   if (!settings.contributionEnabled || worker || isQuitting) return;
+  if (app.isPackaged && !nativeBuildIdentity) {
+    throw new Error(
+      `native_build_identity_unverified:${nativeBuildIdentityError ?? "missing_provenance"}`,
+    );
+  }
   writeDesktopLog("worker-start-requested", { coordinatorUrl, contributionEnabled: settings.contributionEnabled });
   try {
     distributedExecutor ??= await createDesktopDistributedExecutor();
@@ -645,6 +667,7 @@ async function initializeWorker(): Promise<void> {
   const nextWorker = new WorkerAgent(config, {
     coordinatorUrl,
     agentVersion: app.getVersion(),
+    ...(nativeBuildIdentity ? { buildIdentity: nativeBuildIdentity } : {}),
     ...(settings.coordinatorMode === "remote" && settings.remoteCoordinatorToken
       ? { networkToken: settings.remoteCoordinatorToken }
       : {}),
@@ -827,6 +850,7 @@ async function readSnapshot(): Promise<DashboardSnapshot> {
     capturedAt: new Date().toISOString(),
     coordinatorUrl,
     appVersion: app.getVersion(),
+    buildIdentity: nativeBuildIdentity,
     platform: process.platform,
     connectionError,
     runtimeError,
@@ -1902,7 +1926,7 @@ function applyDesktopAcceleratorProgress(event: AcceleratorProgressEvent): void 
 }
 
 function distributionPythonExecutable(root = app.isPackaged
-  ? join(app.getPath("userData"), "distribution-runtime-v3")
+  ? join(app.getPath("userData"), "distribution-runtime-v4")
   : join(app.getAppPath(), "runtime", "distribution-venv")): string {
   if (process.platform === "win32") {
     const portable = join(root, "python.exe");
@@ -1924,8 +1948,8 @@ function ensureDistributionRuntime(): Promise<string> {
 async function ensureDistributionRuntimeOnce(): Promise<string> {
   if (!app.isPackaged) return join(app.getAppPath(), "runtime", "distribution-venv");
   const userData = app.getPath("userData");
-  const root = join(userData, "distribution-runtime-v3");
-  const staging = join(userData, "distribution-runtime-v3.staging");
+  const root = join(userData, "distribution-runtime-v4");
+  const staging = join(userData, "distribution-runtime-v4.staging");
   if (dirname(root) !== userData || dirname(staging) !== userData) {
     throw new Error("The shard runtime escaped its managed application directory.");
   }
@@ -1938,7 +1962,7 @@ async function ensureDistributionRuntimeOnce(): Promise<string> {
       rmSync(staging, { recursive: true, force: true });
       return root;
     } catch (error) {
-      writeDesktopLog("distribution-runtime-v3-invalid", { error: errorText(error) });
+      writeDesktopLog("distribution-runtime-v4-invalid", { error: errorText(error) });
       rmSync(root, { recursive: true, force: true });
     }
   }
@@ -2074,6 +2098,23 @@ else {
 }
 
 app.whenReady().then(async () => {
+  if (app.isPackaged) {
+    try {
+      nativeBuildIdentity = readNativeBuildIdentity(
+        join(app.getAppPath(), NATIVE_BUILD_PROVENANCE_FILE),
+        app.getVersion(),
+      );
+      writeDesktopLog("native-build-identity-verified", {
+        sourceId: nativeBuildIdentity.sourceId,
+        version: nativeBuildIdentity.version,
+      });
+    } catch (error) {
+      nativeBuildIdentityError = errorText(error);
+      writeDesktopLog("native-build-identity-rejected", {
+        error: nativeBuildIdentityError,
+      });
+    }
+  }
   settings = loadSettings();
   modelAdminToken = loadModelAdminToken();
   registerIpc();

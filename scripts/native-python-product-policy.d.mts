@@ -15,6 +15,7 @@ export const NATIVE_PYTHON_PRODUCT_SCHEMA:
   "mycellios-native-python-product/1";
 export const NATIVE_PYTHON_PRODUCT_MANIFEST:
   "mycellios-native-python-manifest.json";
+export const NATIVE_PYTHON_PRODUCT_POLICY_ID: `sha256:${string}`;
 export const NATIVE_PYTHON_ENTRY_MODULES: readonly string[];
 export const NATIVE_PYTHON_PRODUCT_FILES: readonly string[];
 export const NATIVE_PYTHON_IMPORT_SMOKE_MODULES: readonly string[];
@@ -34,3 +35,4 @@ export function assertNativePythonProductMatchesSource(
 export function buildNativePythonProductManifest(
   sourceRoot: string,
 ): NativePythonProductManifest;
+export function analyzeNativePythonImports(source: string): string[];

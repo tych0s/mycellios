@@ -60,6 +60,25 @@ describe("stable benchmark activation tracker", () => {
     ])).toThrow("benchmark_activation_model_digest_is_inconsistent");
   });
 
+  it("fails closed when one physical route mixes runtime builds", () => {
+    expect(() => sealBenchmarkActivation("qwen", [
+      participant(),
+      {
+        ...participant(),
+        workerId: "worker-b",
+        buildSourceId: `sha256:${"2".repeat(64)}`,
+      },
+    ])).toThrow("benchmark_activation_build_source_id_is_inconsistent");
+    expect(() => sealBenchmarkActivation("qwen", [
+      participant(),
+      {
+        ...participant(),
+        workerId: "worker-b",
+        agentVersion: "0.3.1",
+      },
+    ])).toThrow("benchmark_activation_agent_version_is_inconsistent");
+  });
+
   it("detects a tampered activation seal", () => {
     const activation = sealBenchmarkActivation("qwen", [participant()]);
     const tracker = new StableBenchmarkActivationTracker(1);
@@ -74,6 +93,7 @@ function participant(): BenchmarkActivationParticipant {
   return {
     workerId: "worker-a",
     agentVersion: "0.3.0",
+    buildSourceId: `sha256:${"1".repeat(64)}`,
     deploymentId: "deployment-1",
     modelDigest: "sha256:model",
     nodeIds: ["node-a"],

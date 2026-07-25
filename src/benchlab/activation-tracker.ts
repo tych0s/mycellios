@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 export interface BenchmarkActivationParticipant {
   workerId: string;
   agentVersion: string;
+  buildSourceId: `sha256:${string}`;
   deploymentId: string;
   modelDigest: string;
   nodeIds: string[];
@@ -103,6 +104,18 @@ export function sealBenchmarkActivation(
   if (modelDigests.length !== 1) {
     throw new Error("benchmark_activation_model_digest_is_inconsistent");
   }
+  const agentVersions = [
+    ...new Set(normalizedParticipants.map((item) => item.agentVersion)),
+  ];
+  if (agentVersions.length !== 1) {
+    throw new Error("benchmark_activation_agent_version_is_inconsistent");
+  }
+  const buildSourceIds = [
+    ...new Set(normalizedParticipants.map((item) => item.buildSourceId)),
+  ];
+  if (buildSourceIds.length !== 1) {
+    throw new Error("benchmark_activation_build_source_id_is_inconsistent");
+  }
   const topologyDocument = normalizedParticipants.map((participant) => ({
     workerId: participant.workerId,
     deploymentId: participant.deploymentId,
@@ -163,6 +176,10 @@ function normalizeParticipant(
       participant.agentVersion,
       "benchmark_activation_agent_version_is_invalid",
     ),
+    buildSourceId: requiredSha256(
+      participant.buildSourceId,
+      "benchmark_activation_build_source_id_is_invalid",
+    ),
     deploymentId: requiredText(
       participant.deploymentId,
       "benchmark_activation_deployment_id_is_invalid",
@@ -195,4 +212,13 @@ function requiredText(value: string, code: string): string {
   const normalized = value.trim();
   if (!normalized) throw new Error(code);
   return normalized;
+}
+
+function requiredSha256(
+  value: string,
+  code: string,
+): `sha256:${string}` {
+  const normalized = value.trim().toLowerCase();
+  if (!/^sha256:[0-9a-f]{64}$/.test(normalized)) throw new Error(code);
+  return normalized as `sha256:${string}`;
 }

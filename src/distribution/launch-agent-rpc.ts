@@ -29,11 +29,15 @@ import {
   type PhysicalProbeCollector,
   type PhysicalProbeV1,
 } from "./physical-probe.js";
+import {
+  nativeBuildIdentitySchema,
+  type NativeBuildIdentity,
+} from "../contracts/build-identity.js";
 
 const START_SCHEMA = "gdlp-launch-agent-start/1";
 const STOP_SCHEMA = "gdlp-launch-agent-stop/1";
 const SNAPSHOT_SCHEMA = "gdlp-launch-agent-process/1";
-const HEALTH_SCHEMA = "gdlp-launch-agent-health/2";
+const HEALTH_SCHEMA = "gdlp-launch-agent-health/3";
 const ERROR_SCHEMA = "gdlp-launch-agent-error/1";
 
 type RpcProcessState = "starting" | "ready" | "exited";
@@ -53,6 +57,7 @@ export interface LaunchAgentRpcHealth {
   schema: typeof HEALTH_SCHEMA;
   agentId: string;
   nodeId: string | null;
+  buildIdentity: NativeBuildIdentity | null;
   /** Processes that are still starting or running. */
   activeProcesses: number;
   /** Completed idempotency records retained to prevent duplicate launches. */
@@ -505,6 +510,8 @@ class HttpLaunchProcessHandle implements LaunchProcessHandle {
 export interface LaunchAgentRpcServerOptions {
   agent: LaunchAgent;
   nodeId?: string;
+  /** Exact sealed runtime source. Null keeps the daemon usable but unverified. */
+  buildIdentity?: NativeBuildIdentity | null;
   /** Optional bearer credential required on every HTTP route. */
   authToken?: string;
   /**
@@ -552,6 +559,7 @@ interface ServerEntry {
 export class LaunchAgentRpcServer {
   private readonly agent: LaunchAgent;
   private readonly nodeId: string | undefined;
+  private readonly buildIdentity: NativeBuildIdentity | null;
   private readonly authTokenDigest: Buffer | undefined;
   private readonly allowedStartFingerprints: ReadonlyMap<string, string> | undefined;
   private readonly physicalProbe: PhysicalProbeCollector | undefined;
@@ -571,6 +579,9 @@ export class LaunchAgentRpcServer {
     this.agent = options.agent;
     if (options.nodeId !== undefined) assertIdentifier(options.nodeId, "nodeId");
     this.nodeId = options.nodeId;
+    this.buildIdentity = options.buildIdentity === undefined
+      ? null
+      : nativeBuildIdentitySchema.parse(options.buildIdentity);
     const authToken = normalizeOptionalAuthToken(options.authToken);
     this.authTokenDigest =
       authToken === undefined ? undefined : launchAgentAuthTokenDigest(authToken);
@@ -720,6 +731,7 @@ export class LaunchAgentRpcServer {
           schema: HEALTH_SCHEMA,
           agentId: this.agent.id,
           nodeId: this.nodeId ?? null,
+          buildIdentity: this.buildIdentity,
           activeProcesses,
           retainedTombstones: this.entries.size - activeProcesses,
         });
@@ -2152,7 +2164,7 @@ function validateHealth(value: unknown): LaunchAgentRpcHealth {
   assertRecord(value, "launch_agent_rpc_health");
   assertExactKeys(
     value,
-    ["schema", "agentId", "nodeId", "activeProcesses", "retainedTombstones"],
+    ["schema", "agentId", "nodeId", "buildIdentity", "activeProcesses", "retainedTombstones"],
     [],
     "launch_agent_rpc_health",
   );
@@ -2163,6 +2175,9 @@ function validateHealth(value: unknown): LaunchAgentRpcHealth {
   if (value.nodeId !== null) {
     assertIdentifier(value.nodeId, "launch_agent_rpc_health_node_id");
   }
+  const buildIdentity = value.buildIdentity === null
+    ? null
+    : nativeBuildIdentitySchema.parse(value.buildIdentity);
   if (
     !Number.isSafeInteger(value.activeProcesses) ||
     (value.activeProcesses as number) < 0
@@ -2175,7 +2190,14 @@ function validateHealth(value: unknown): LaunchAgentRpcHealth {
   ) {
     throw new Error("launch_agent_rpc_health_tombstone_count_is_invalid");
   }
-  return value as unknown as LaunchAgentRpcHealth;
+  return {
+    schema: HEALTH_SCHEMA,
+    agentId: value.agentId as string,
+    nodeId: value.nodeId as string | null,
+    buildIdentity,
+    activeProcesses: value.activeProcesses as number,
+    retainedTombstones: value.retainedTombstones as number,
+  };
 }
 
 function validateOutput(value: unknown, maxBytes: number): LaunchCapturedOutput {

@@ -66,6 +66,7 @@ import type {
 } from "../../src/desktop/contracts";
 import { consumeChatCompletionStreamWithRecovery } from "../../src/desktop/chat-stream";
 import type { ChatMessage, NetworkExecutionTrace } from "../../src/contracts/types";
+import type { NativeBuildIdentity } from "../../src/contracts/build-identity";
 import type { BenchmarkMeasurement, BenchmarkRun } from "../../src/benchlab/types";
 import { Contribute } from "./Contribute";
 import { SupportAssistant } from "./SupportAssistant";
@@ -152,6 +153,7 @@ interface PublicWorker {
   executionNodeId?: string;
   computeMode?: DesktopSettings["computeMode"];
   agentVersion?: string;
+  buildIdentity?: NativeBuildIdentity;
   acceleration?: DashboardSnapshot["workers"][number]["acceleration"];
   mobile?: {
     platform: string;
@@ -178,6 +180,7 @@ interface PublicJob {
 interface PublicSnapshot {
   capturedAt: string;
   version: string;
+  buildIdentity: NativeBuildIdentity | null;
   summary: {
     registered: number;
     connected: number;
@@ -195,6 +198,7 @@ interface PublicSnapshot {
 const EMPTY: PublicSnapshot = {
   capturedAt: new Date(0).toISOString(),
   version: "—",
+  buildIdentity: null,
   summary: { registered: 0, connected: 0, online: 0, mobile: 0, offeredVramMb: 0, completedJobs: 0 },
   workers: [],
   models: [],
@@ -512,7 +516,9 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
             </div>
             {desktopSnapshot?.update.state === "ready" && <button className="panel-update-ready" onClick={() => void desktopBridge?.installUpdate()} title="Restart and install update"><Download size={15} /></button>}
             {desktopSnapshot && <span>v{desktopSnapshot.appVersion}</span>}
+            {desktopSnapshot && <span title={buildIdentityTitle(desktopSnapshot.buildIdentity)}>App {shortBuildIdentity(desktopSnapshot.buildIdentity)}</span>}
             <span>API {snapshot.version}</span>
+            <span title={buildIdentityTitle(snapshot.buildIdentity)}>API {shortBuildIdentity(snapshot.buildIdentity)}</span>
             {!desktop && authConfig.enabled && (
               networkIdentity
                 ? <button className="panel-account-button signed-in" onClick={() => setAuthOpen(true)} title={networkIdentity.email ?? "Mycellios account"}><UserRound size={16} /><span>{networkIdentity.role ?? "member"}</span></button>
@@ -1175,6 +1181,7 @@ function NodeTopologyInspector({ worker, snapshot }: { worker: PublicWorker; sna
       <Metric label="Última señal" value={relativeTimeEs(worker.lastSeenAt)} />
       <Metric label="Fiabilidad" value={`${Math.round(Math.max(0, Math.min(1, worker.reliability)) * 100)}%`} />
       <Metric label="Versión" value={worker.agentVersion ? `v${worker.agentVersion}` : "Legacy"} />
+      <Metric label="Build declarado" value={shortBuildIdentity(worker.buildIdentity)} />
       <Metric label={worker.kind === "cell" ? "Capacidad agregada" : "VRAM física"} value={physicalVram > 0 ? formatMemory(physicalVram) : "Sin datos"} />
       <Metric label="Memoria ofrecida" value={formatMemory(worker.offeredVramMb)} />
       <Metric label="Memoria libre" value={formatMemory(free)} />
@@ -1824,7 +1831,7 @@ function BenchmarkHistory({ runs, selectedRunId, onSelect }: { runs: BenchmarkRu
         const snapshot = benchmarkRunSnapshot(run);
         if (!snapshot) return null;
         return <button className={`benchmark-history-row ${run.runId === selectedRunId ? "selected" : ""}`} aria-pressed={run.runId === selectedRunId} key={run.runId} onClick={() => onSelect(run.runId)}>
-          <span><strong>v{run.version}</strong><small>rev {benchmarkBuildRevision(run)} · {formatBenchmarkDate(run.finishedAt)}</small></span>
+          <span><strong>v{run.version}</strong><small>rev {benchmarkBuildRevision(run)} · src {shortSourceId(run.build.sourceId)} · {formatBenchmarkDate(run.finishedAt)}</small></span>
           <span><strong>{snapshot.measurement.model.label}</strong><small>{snapshot.measurement.evidence === "physical" ? "Física real" : "Loopback"} · {formatBenchmarkBackend(snapshot.measurement)}</small></span>
           <span><strong>{snapshot.nodes}</strong><small>{formatTopologyDigest(snapshot.measurement.topology.digest)}</small></span>
           <span><strong>{formatBenchmark(snapshot.offeredMemoryGb, " GB")}</strong><small>{formatBenchmark(snapshot.measurement.inventory.physicalMemoryGb ?? null, " GB físicos")}</small></span>
@@ -1839,7 +1846,7 @@ function BenchmarkHistory({ runs, selectedRunId, onSelect }: { runs: BenchmarkRu
 
 function BenchmarkRunDetails({ run }: { run: BenchmarkRun }) {
   return <div className="benchmark-results">
-    <div className="card-heading"><div><span>RESULTADO SELECCIONADO</span><h2>{run.triggerModelId ?? run.label}</h2></div><small>v{run.version} · revisión {benchmarkBuildRevision(run)} · {benchmarkDirtyLabel(run.gitDirty)}</small></div>
+    <div className="card-heading"><div><span>RESULTADO SELECCIONADO</span><h2>{run.triggerModelId ?? run.label}</h2></div><small>v{run.version} · revisión {benchmarkBuildRevision(run)} · fuente local {shortSourceId(run.build.sourceId)} · fuentes declaradas por nodos {run.build.participantSourceIds.map(shortSourceId).join(", ") || "sin declarar"} · {benchmarkDirtyLabel(run.gitDirty)}</small></div>
     <div className="benchmark-result-list">
       {run.measurements.map((measurement) => <BenchmarkResultCard measurement={measurement} run={run} key={measurement.id} />)}
     </div>
@@ -2505,7 +2512,7 @@ function DesktopSettingsView({ snapshot, bridge, onSnapshot }: { snapshot: Dashb
       </div>
     </div>
     <div className="settings-section compact-settings"><div><SlidersHorizontal size={20} /><div><h3>Application</h3><p>Startup and background contribution.</p></div></div><div className="toggle-list"><Toggle label="Start with the system" checked={draft.launchAtLogin} onChange={(value) => update("launchAtLogin", value)} /><Toggle label="Keep running in the tray" checked={draft.closeToTray} onChange={(value) => update("closeToTray", value)} /><Toggle label="Contribute resources" checked={draft.contributionEnabled} onChange={(value) => update("contributionEnabled", value)} /></div></div>
-    <div className="settings-section"><div><Download size={20} /><div><h3>Automatic updates</h3><p>Desktop releases download in the background and install automatically as soon as active inference is idle.</p></div></div><div className="update-settings"><div><span className={`update-state ${snapshot.update.state}`}>{updateStateLabel(snapshot.update.state)}</span><strong>Version {snapshot.appVersion}</strong><p>{snapshot.update.message}</p></div><div className="update-actions"><button className="secondary-button" disabled={checkingUpdate || snapshot.update.state === "checking" || snapshot.update.state === "downloading"} onClick={() => void checkUpdate()}><RefreshCw className={checkingUpdate ? "spin" : ""} size={15} />Check now</button>{snapshot.update.state === "ready" && <button className="primary-button" onClick={() => void bridge.installUpdate()}><Download size={15} />Restart now</button>}</div></div></div>
+    <div className="settings-section"><div><Download size={20} /><div><h3>Automatic updates</h3><p>Desktop releases download in the background and install automatically as soon as active inference is idle.</p></div></div><div className="update-settings"><div><span className={`update-state ${snapshot.update.state}`}>{updateStateLabel(snapshot.update.state)}</span><strong>Version {snapshot.appVersion}</strong><p>{snapshot.update.message}</p><p title={buildIdentityTitle(snapshot.buildIdentity)}>Exact build: {shortBuildIdentity(snapshot.buildIdentity)}</p></div><div className="update-actions"><button className="secondary-button" disabled={checkingUpdate || snapshot.update.state === "checking" || snapshot.update.state === "downloading"} onClick={() => void checkUpdate()}><RefreshCw className={checkingUpdate ? "spin" : ""} size={15} />Check now</button>{snapshot.update.state === "ready" && <button className="primary-button" onClick={() => void bridge.installUpdate()}><Download size={15} />Restart now</button>}</div></div></div>
     <div className="settings-footer"><button className="primary-button" disabled={saving} onClick={() => void save()}>{saving ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}Save and reconnect</button></div>
   </section>;
 }
@@ -2527,6 +2534,7 @@ function desktopToPublicSnapshot(snapshot: DashboardSnapshot): PublicSnapshot {
   return {
     capturedAt: snapshot.capturedAt,
     version: snapshot.health?.version ?? "—",
+    buildIdentity: snapshot.health?.buildIdentity ?? null,
     summary: {
       registered: snapshot.health?.workers.registered ?? snapshot.workers.length,
       connected: snapshot.health?.workers.connected ?? snapshot.workers.filter((worker) => worker.connected).length,
@@ -3072,6 +3080,26 @@ function inferenceModelOption(snapshot: PublicSnapshot, model: PublicSnapshot["m
     ? `${model.pipelines} pipeline${model.pipelines === 1 ? "" : "s"}`
     : `${model.replicas} réplica${model.replicas === 1 ? "" : "s"}`;
   return { ...model, legacyExternalRuntime, freeSlots, routeLabel, execution: summarizeDeploymentExecution(deployments) };
+}
+
+function shortBuildIdentity(
+  identity: NativeBuildIdentity | null | undefined,
+): string {
+  return shortSourceId(identity?.sourceId);
+}
+
+function shortSourceId(sourceId: string | null | undefined): string {
+  return sourceId
+    ? sourceId.slice("sha256:".length, "sha256:".length + 12)
+    : "sin declarar";
+}
+
+function buildIdentityTitle(
+  identity: NativeBuildIdentity | null | undefined,
+): string {
+  return identity
+    ? `Fuente exacta ${identity.sourceId} · versión ${identity.version}`
+    : "Este runtime no ha publicado una identidad de fuente sellada.";
 }
 
 function formatDuration(milliseconds: number): string {

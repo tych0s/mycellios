@@ -1,8 +1,14 @@
 import { describe, expect, it } from "vitest";
+import {
+  createCoordinatorDeploymentCanaryEvidence,
+} from "../src/contracts/deployment-canary.js";
 import type {
   WorkerCapabilities,
   WorkerEnvelope,
 } from "../src/contracts/types.js";
+import {
+  mergeCurrentSessionEvidence,
+} from "../src/coordinator/evidence-authority.js";
 import { WorkerHub } from "../src/coordinator/worker-hub.js";
 import type { MeshStore, StoredWorker } from "../src/storage/store.js";
 import {
@@ -149,7 +155,71 @@ describe("coordinator evidence authority", () => {
       .toBeUndefined();
     hub.close();
   });
+
+  it("revokes coordinator observations when the executable source changes", () => {
+    const current = pipelineCapabilities();
+    current.buildIdentity = buildIdentity("a");
+    current.deployments[0] = {
+      ...current.deployments[0]!,
+      verificationState: "verified",
+      throughputSource: "measured",
+      tokensPerSecond: 12,
+      ttftMs: 250,
+      canaryEvidence: deploymentEvidence(),
+    };
+    const incoming = structuredClone(current);
+    incoming.buildIdentity = buildIdentity("b");
+
+    const merged = mergeCurrentSessionEvidence(
+      "worker-test",
+      "session-test",
+      incoming,
+      current,
+    );
+
+    expect(merged.deployments[0]).toMatchObject({
+      verificationState: "pending",
+      throughputSource: "default",
+      tokensPerSecond: 1,
+      ttftMs: 60_000,
+    });
+    expect(merged.deployments[0]?.canaryEvidence).toBeUndefined();
+  });
 });
+
+function buildIdentity(seed: string): NonNullable<WorkerCapabilities["buildIdentity"]> {
+  return {
+    schema: "mycellios-native-build-provenance/1",
+    version: "0.2.99",
+    sourceId: `sha256:${seed.repeat(64)}`,
+  };
+}
+
+function deploymentEvidence() {
+  const observedAt = Date.now();
+  return createCoordinatorDeploymentCanaryEvidence({
+    challengeId: "challenge-build-change",
+    nonce: Buffer.alloc(32, 7).toString("base64url"),
+    workerId: "worker-test",
+    sessionId: "session-test",
+    issuedAt: new Date(observedAt - 1_000).toISOString(),
+    expiresAt: new Date(observedAt + 60_000).toISOString(),
+    model: "qwen-test",
+    modelDigest: `sha256:${"a".repeat(64)}`,
+    activationId: "activation-test",
+    promptDigest: `sha256:${"c".repeat(64)}`,
+    maxOutputTokens: 4,
+    observedAt: new Date(observedAt).toISOString(),
+    warmupSamples: 1,
+    samples: [0, 1, 2].map((sampleIndex) => ({
+      sampleId: `sample-${sampleIndex}`,
+      outputTokens: 4,
+      activeMs: 1_000,
+      ttftMs: 250,
+      completed: true as const,
+    })),
+  });
+}
 
 function pipelineCapabilities(): WorkerCapabilities {
   return {

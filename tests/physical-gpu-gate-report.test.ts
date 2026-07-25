@@ -178,6 +178,14 @@ describe("gdlp-physical-two-host-gpu-gate/1", () => {
       },
     ],
     [
+      "different declared native build",
+      "single_build_cohort" as const,
+      (evidence: PhysicalTwoHostGpuGateEvidenceV1) => {
+        evidence.hosts[1]!.buildIdentity.sourceId =
+          `sha256:${"8".repeat(64)}`;
+      },
+    ],
+    [
       "duplicate GPU",
       "two_distinct_gpus" as const,
       (evidence: PhysicalTwoHostGpuGateEvidenceV1) => {
@@ -277,6 +285,11 @@ function passingEvidence(mode: "gpu" | "cpu" = "gpu"): PhysicalTwoHostGpuGateEvi
       agentId: "agent-a",
       agentEndpoint: "http://10.20.0.11:9750",
       rankNodeId: rankZeroNode,
+      buildIdentity: {
+        schema: "mycellios-native-build-provenance/1" as const,
+        version: "0.2.19",
+        sourceId: `sha256:${"9".repeat(64)}` as const,
+      },
       gpu: {
         deviceFingerprintSha256: `sha256:${"a".repeat(64)}`,
         device: rankZeroDevice,
@@ -295,6 +308,11 @@ function passingEvidence(mode: "gpu" | "cpu" = "gpu"): PhysicalTwoHostGpuGateEvi
       agentId: "agent-b",
       agentEndpoint: "http://10.20.0.12:9750",
       rankNodeId: rankOneNode,
+      buildIdentity: {
+        schema: "mycellios-native-build-provenance/1" as const,
+        version: "0.2.19",
+        sourceId: `sha256:${"9".repeat(64)}` as const,
+      },
       gpu: {
         deviceFingerprintSha256: `sha256:${"b".repeat(64)}`,
         device: rankOneDevice,

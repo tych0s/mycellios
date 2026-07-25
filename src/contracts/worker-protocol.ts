@@ -30,7 +30,7 @@ const strictWireGpuSchema = gpuSchema
     return capability;
   });
 const strictCapabilitiesSchema = workerCapabilitiesSchema
-  .extend({
+  .safeExtend({
     gpus: z.array(strictWireGpuSchema).min(1).max(16),
     limits: z
       .object({

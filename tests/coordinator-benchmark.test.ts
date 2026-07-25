@@ -1,3 +1,6 @@
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   buildCoordinatorBenchmarkTelemetrySnapshot,
@@ -5,8 +8,10 @@ import {
   coordinatorBenchmarkActivations,
   coordinatorBenchmarkModelIdentity,
   detectNewActiveModels,
+  runAndPersistCoordinatorSuite,
   runCoordinatorModelSuite,
 } from "../src/benchlab/coordinator-suite.js";
+import { workerCapabilitiesSchema } from "../src/contracts/schemas.js";
 import type { RunIdentity } from "../src/benchlab/history.js";
 import type { StoredWorker } from "../src/storage/store.js";
 
@@ -22,6 +27,9 @@ const IDENTITY: RunIdentity = {
     releaseSource: "override",
     revision: "0123456789abcdef",
     revisionSource: "git",
+    sourceId: null,
+    sourceIdSource: "unknown",
+    participantSourceIds: [],
   },
 };
 
@@ -65,6 +73,7 @@ describe("automatic coordinator benchmark", () => {
       workers,
       connected,
     );
+    if (!activation) throw new Error("expected benchmark activation");
     expect(activation).toMatchObject({
       modelId: "qwen3-0.6b",
       modelDigest: "sha256:model",
@@ -84,6 +93,27 @@ describe("automatic coordinator benchmark", () => {
       replacement,
       connected,
     )[0]?.activationId).not.toBe(activation?.activationId);
+
+    const mismatchedBuild = structuredClone(workers);
+    mismatchedBuild[0]!.capabilities.buildIdentity!.version = "0.2.20";
+    expect(
+      workerCapabilitiesSchema.safeParse(
+        mismatchedBuild[0]!.capabilities,
+      ).success,
+    ).toBe(false);
+    expect(coordinatorBenchmarkActivations(
+      new Set(["qwen3-0.6b"]),
+      mismatchedBuild,
+      connected,
+    )).toEqual([]);
+
+    const unverifiedBuild = structuredClone(workers);
+    delete unverifiedBuild[0]!.capabilities.buildIdentity;
+    expect(coordinatorBenchmarkActivations(
+      new Set(["qwen3-0.6b"]),
+      unverifiedBuild,
+      connected,
+    )).toEqual([]);
   });
 
   it("samples live power and free memory without using configured limits", () => {
@@ -175,6 +205,92 @@ describe("automatic coordinator benchmark", () => {
     });
     expect(measurement.topology.digest).toMatch(/^sha256:[0-9a-f]{64}$/);
     expect(measurement.notes.join(" ")).toContain("no hay datos simulados");
+  });
+
+  it("binds an automatic run to coordinator and participant source identities", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "mycellios-coordinator-build-"));
+    writeFileSync(
+      join(cwd, "package.json"),
+      JSON.stringify({ version: "0.2.19" }),
+      "utf8",
+    );
+    const workers = distributedWorkers();
+    const connected = new Set(workers.map((worker) => worker.id));
+    const [activation] = coordinatorBenchmarkActivations(
+      new Set(["qwen3-0.6b"]),
+      workers,
+      connected,
+    );
+    if (!activation) throw new Error("expected build-bound benchmark activation");
+    const result = await runAndPersistCoordinatorSuite({
+      cwd,
+      coordinatorUrl: "http://127.0.0.1:4180",
+      buildIdentity: {
+        schema: "mycellios-native-build-provenance/1",
+        version: "0.2.19",
+        sourceId: `sha256:${"c".repeat(64)}`,
+      },
+      model: {
+        id: "qwen3-0.6b",
+        source: "Qwen/Qwen3-0.6B",
+        revision: "rev-1",
+        digest: "sha256:rev-1",
+      },
+      inventory: () => buildCoordinatorBenchmarkInventory(
+        "qwen3-0.6b",
+        workers,
+        connected,
+        new Set(["worker-a"]),
+      ),
+      fetchImpl: async () => new Response(JSON.stringify({
+        id: "job-build",
+        model: "qwen3-0.6b",
+        choices: [{ message: { content: "ok" } }],
+        usage: { prompt_tokens: 2, completion_tokens: 4, total_tokens: 6 },
+        x_network: {
+          route_class: "pipeline",
+          affinity_hit: false,
+          reused_kv_tokens: 0,
+          ttft_ms: 10,
+          active_ms: 100,
+          execution_trace: benchmarkTrace("job-build"),
+        },
+      }), { status: 200, headers: { "content-type": "application/json" } }),
+      activation,
+      samples: 1,
+      warmupSamples: 0,
+      outputTokens: 4,
+    });
+
+    expect(result.run.build).toMatchObject({
+      sourceId: `sha256:${"c".repeat(64)}`,
+      sourceIdSource: "runtime-local",
+      participantSourceIds: [`sha256:${"1".repeat(64)}`],
+    });
+    await expect(
+      runAndPersistCoordinatorSuite({
+        cwd,
+        coordinatorUrl: "http://127.0.0.1:4180",
+        version: "0.2.20",
+        buildIdentity: {
+          schema: "mycellios-native-build-provenance/1",
+          version: "0.2.19",
+          sourceId: `sha256:${"c".repeat(64)}`,
+        },
+        model: {
+          id: "qwen3-0.6b",
+          source: "Qwen/Qwen3-0.6B",
+          revision: "rev-1",
+          digest: "sha256:rev-1",
+        },
+        inventory: () => ({
+          totalDevices: 0,
+          connectedDevices: 0,
+          selectedDevices: 0,
+          profiles: [],
+        }),
+      }),
+    ).rejects.toThrow("benchmark_build_version_mismatch");
   });
 
   it("keeps a failed real test without manufacturing performance numbers", async () => {
@@ -310,6 +426,11 @@ function worker(
     capabilities: {
       region: "local",
       agentVersion: "0.2.19",
+      buildIdentity: {
+        schema: "mycellios-native-build-provenance/1",
+        version: "0.2.19",
+        sourceId: `sha256:${"1".repeat(64)}`,
+      },
       gpus: [{
         id: `${id}-gpu`,
         vendor: gpuModel.startsWith("NVIDIA") ? "nvidia" : "amd",

@@ -1,9 +1,12 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { z } from "zod";
+import type { NativeBuildIdentity } from "../contracts/build-identity.js";
 import { workerConfigSchema, type WorkerConfig } from "../contracts/schemas.js";
+import { readNativeRuntimeBuildMetadata } from "../core/native-build-identity.js";
 import { WorkerAgent } from "../worker/agent.js";
 import { evaluateDistributionPlan, stageMemoryBytes } from "./cost-model.js";
 import { HttpLaunchAgent } from "./launch-agent-rpc.js";
@@ -283,6 +286,10 @@ export interface AutoDistributionRunOptions {
    * succeed, but before the model is announced as active.
    */
   onActivated?: (result: AutoDistributionRunResult) => void | Promise<void>;
+  /** Exact native release cohort announced by the generated cell worker. */
+  workerBuildIdentity?: NativeBuildIdentity;
+  /** Runtime version paired with workerBuildIdentity. */
+  workerAgentVersion?: string;
 }
 
 export interface AutoDistributionProgressEvent {
@@ -401,6 +408,23 @@ export async function runAutoDistribution(
   options: AutoDistributionRunOptions = {},
 ): Promise<AutoDistributionRunResult> {
   const config = parseAutoDistributionConfig(configValue);
+  const runtimeMetadata = existsSync(resolve(cwd, "package.json"))
+    ? readNativeRuntimeBuildMetadata(cwd)
+    : null;
+  const workerBuildIdentity =
+    options.workerBuildIdentity ?? runtimeMetadata?.buildIdentity ?? undefined;
+  const workerAgentVersion =
+    options.workerAgentVersion
+    ?? workerBuildIdentity?.version
+    ?? runtimeMetadata?.version;
+  if (
+    workerBuildIdentity
+    && workerAgentVersion !== workerBuildIdentity.version
+  ) {
+    throw new Error(
+      `cell_build_version_mismatch:${workerBuildIdentity.version}:${workerAgentVersion ?? "missing"}`,
+    );
+  }
   options.onProgress?.({
     phase: "preparing_nodes",
     message: `Preparing ${config.nodes.length} network nodes.`,
@@ -517,6 +541,8 @@ export async function runAutoDistribution(
       const token = optionalSecret(environment, config.coordinator.networkTokenEnv);
       worker = new WorkerAgent(workerConfig, {
         coordinatorUrl: config.coordinator.url,
+        ...(workerAgentVersion ? { agentVersion: workerAgentVersion } : {}),
+        ...(workerBuildIdentity ? { buildIdentity: workerBuildIdentity } : {}),
         ...(token ? { networkToken: token } : {}),
         identity: {
           kind: "cell",

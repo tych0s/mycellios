@@ -88,6 +88,8 @@ export interface WorkerAgentOptions {
   verifiedGpuRuntime?: VerifiedGpuRuntimeEvidence | undefined;
   /** Desktop application version reported to the coordinator. */
   agentVersion?: string | undefined;
+  /** Exact sealed source identity reported to the coordinator. */
+  buildIdentity?: import("../contracts/build-identity.js").NativeBuildIdentity | undefined;
   distributedExecutor?: {
     nodeId: string;
     stageHost: string;
@@ -681,6 +683,9 @@ export class WorkerAgent {
     return {
       region: this.config.region,
       agentVersion: this.options.agentVersion?.trim() || "0.1.0",
+      ...(this.options.buildIdentity
+        ? { buildIdentity: this.options.buildIdentity }
+        : {}),
       gpus: [
         {
           ...(this.config.capacityScope === "cell"

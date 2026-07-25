@@ -45,6 +45,12 @@ export function mergeCurrentSessionEvidence(
 ): WorkerCapabilities {
   const sanitized = stripWorkerDeclaredEvidence(incoming);
   if (!current) return sanitized;
+  if (!sameBuildIdentity(sanitized, current)) {
+    // A build-cohort change is a new executable claim even when the transport
+    // session and deployment identifiers were reused. Coordinator-observed
+    // canaries and performance profiles must be challenged again.
+    return sanitized;
+  }
   sanitized.deployments = sanitized.deployments.map((claim) => {
     if (claim.adapter !== "mycellios-pipeline") return claim;
     const verified = current.deployments.find(
@@ -85,6 +91,18 @@ export function mergeCurrentSessionEvidence(
     incomingExecutor.performanceEvidence = structuredClone(evidence);
   }
   return sanitized;
+}
+
+function sameBuildIdentity(
+  left: WorkerCapabilities,
+  right: WorkerCapabilities,
+): boolean {
+  const leftIdentity = left.buildIdentity;
+  const rightIdentity = right.buildIdentity;
+  if (!leftIdentity || !rightIdentity) return leftIdentity === rightIdentity;
+  return leftIdentity.schema === rightIdentity.schema
+    && leftIdentity.version === rightIdentity.version
+    && leftIdentity.sourceId === rightIdentity.sourceId;
 }
 
 function runtimeIdentityMatches(

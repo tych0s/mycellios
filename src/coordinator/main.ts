@@ -11,7 +11,10 @@ import {
   DynamicModelActivationManager,
 } from "./model-activation-manager.js";
 import { createCoordinator } from "./server.js";
+import { readNativeRuntimeBuildMetadata } from "../core/native-build-identity.js";
 
+const runtimeRoot = resolve(import.meta.dirname, "../..");
+const runtimeMetadata = readNativeRuntimeBuildMetadata(runtimeRoot);
 const config = loadCoordinatorConfig();
 const activationConfigPath = process.env.MYCELLIOS_AUTO_DISTRIBUTE_CONFIG?.trim();
 const dynamicWorkerActivation = process.env.MYCELLIOS_DYNAMIC_WORKER_ACTIVATION?.trim() === "1";
@@ -22,14 +25,24 @@ const baseActivationConfig = absoluteActivationConfigPath
   ? parseAutoDistributionConfig(JSON.parse(await readFile(absoluteActivationConfigPath, "utf8")) as unknown)
   : undefined;
 const activationManager = baseActivationConfig && !dynamicWorkerActivation
-  ? new AutomaticModelActivationManager(baseActivationConfig)
+  ? new AutomaticModelActivationManager(
+      baseActivationConfig,
+      runtimeRoot,
+      process.env,
+    )
   : undefined;
 const runtime = await createCoordinator(config, {
   logger: true,
+  runtimeMetadata,
   ...(activationManager ? { activationManager } : {}),
   ...(baseActivationConfig && dynamicWorkerActivation
     ? {
         activationManagerFactory: ({ store, hub, deploymentController }) => new DynamicModelActivationManager({
+          cwd: runtimeRoot,
+          workerAgentVersion: runtimeMetadata.version,
+          ...(runtimeMetadata.buildIdentity
+            ? { workerBuildIdentity: runtimeMetadata.buildIdentity }
+            : {}),
           snapshot: () => buildConnectedExecutorActivationSnapshot(
             baseActivationConfig,
             store.listWorkers(),

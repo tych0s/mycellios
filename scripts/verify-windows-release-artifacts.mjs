@@ -7,7 +7,17 @@ import {
   readdir,
 } from "node:fs/promises";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { TextDecoder } from "node:util";
+import * as PELibrary from "pe-library";
+import yauzl from "yauzl";
+import {
+  NATIVE_PYTHON_ENTRY_MODULES,
+  NATIVE_PYTHON_PRODUCT_FILES,
+  NATIVE_PYTHON_PRODUCT_MANIFEST,
+  NATIVE_PYTHON_PRODUCT_POLICY_ID,
+  NATIVE_PYTHON_PRODUCT_SCHEMA,
+} from "./native-python-product-policy.mjs";
 
 const MAX_MANIFEST_BYTES = 16n * 1024n * 1024n;
 const MAX_TAR_LIST_BYTES = 32 * 1024 * 1024;
@@ -19,18 +29,26 @@ const REQUIRED_NUPKG_ENTRIES = Object.freeze({
   runtimeArchive: "lib/net45/resources/distribution-runtime.tar.gz",
   pythonManifest:
     "lib/net45/resources/python/mycellios-native-python-manifest.json",
+  executable: "lib/net45/mycellios.exe",
+  nuspec: "mycellios.nuspec",
 });
+const NUPKG_PYTHON_PREFIX = "lib/net45/resources/python/";
 
-try {
-  const root = parseRootArgument(process.argv.slice(2));
-  await verifyWindowsRelease(root);
-} catch (error) {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error(`Verificación del release Windows fallida: ${message}`);
-  process.exitCode = 1;
+if (
+  process.argv[1]
+  && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+) {
+  try {
+    const root = parseRootArgument(process.argv.slice(2));
+    await verifyWindowsRelease(root);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`Verificación del release Windows fallida: ${message}`);
+    process.exitCode = 1;
+  }
 }
 
-async function verifyWindowsRelease(workspaceRoot) {
+export async function verifyWindowsRelease(workspaceRoot) {
   await requireDirectory(workspaceRoot, "La raíz indicada");
 
   const packageJsonPath = resolve(workspaceRoot, "package.json");
@@ -90,10 +108,8 @@ async function verifyWindowsRelease(workspaceRoot) {
     );
   }
 
-  const releaseRecord = parseReleases(
-    await readFile(releasesPath),
-    releasesPath,
-  );
+  const releasesBytes = await readFile(releasesPath);
+  const releaseRecord = parseReleases(releasesBytes, releasesPath);
   if (releaseRecord.name !== nupkgName) {
     throw new Error(
       `RELEASES anuncia ${releaseRecord.name}, pero package.json ${version} exige ${nupkgName}.`,
@@ -117,6 +133,11 @@ async function verifyWindowsRelease(workspaceRoot) {
       `El SHA-1 real de ${nupkgName} es ${nupkgDigest.hashes.sha1.toUpperCase()}, pero RELEASES anuncia ${releaseRecord.sha1}.`,
     );
   }
+  await verifySetupPayload(setupPath, {
+    nupkgName,
+    nupkgDigest,
+    releasesBytes,
+  });
 
   const archiveEntries = listNupkgSafely(nupkgPath);
   for (const requiredEntry of Object.values(REQUIRED_NUPKG_ENTRIES)) {
@@ -149,6 +170,12 @@ async function verifyWindowsRelease(workspaceRoot) {
     "build",
     "python",
     "mycellios-native-python-manifest.json",
+  );
+  const currentExecutablePath = resolve(
+    workspaceRoot,
+    "out",
+    "mycellios-win32-x64",
+    "mycellios.exe",
   );
 
   const [
@@ -191,10 +218,19 @@ async function verifyWindowsRelease(workspaceRoot) {
       }),
     ]);
 
-  parseJsonObject(buildManifestBytes, buildManifestPath);
-  parseJsonObject(currentManifestBytes, currentManifestPath);
-  parseJsonObject(
+  const buildManifest = parseJsonObject(buildManifestBytes, buildManifestPath);
+  const currentManifest = parseJsonObject(
+    currentManifestBytes,
+    currentManifestPath,
+  );
+  const archivedManifest = parseJsonObject(
     nupkgManifest.buffer,
+    `${nupkgName}:${REQUIRED_NUPKG_ENTRIES.pythonManifest}`,
+  );
+  assertNativePythonManifest(buildManifest, buildManifestPath);
+  assertNativePythonManifest(currentManifest, currentManifestPath);
+  assertNativePythonManifest(
+    archivedManifest,
     `${nupkgName}:${REQUIRED_NUPKG_ENTRIES.pythonManifest}`,
   );
 
@@ -204,6 +240,12 @@ async function verifyWindowsRelease(workspaceRoot) {
     "el manifiesto Python de build",
     buildManifestBytes,
   );
+  await verifyNativePythonTrees({
+    workspaceRoot,
+    nupkgPath,
+    archiveEntries,
+    manifest: buildManifest,
+  });
   assertBufferMatches(
     "El manifiesto Python del paquete Windows actual",
     currentManifestBytes,
@@ -235,6 +277,41 @@ async function verifyWindowsRelease(workspaceRoot) {
     currentRuntimeFile,
     currentRuntimeDigest,
   );
+
+  const currentExecutableFile = await requireRegularFile(
+    currentExecutablePath,
+    "ejecutable Windows actual",
+    { nonEmpty: true },
+  );
+  const [currentExecutableDigest, nupkgExecutable] = await Promise.all([
+    hashFile(currentExecutablePath, ["sha256"]),
+    hashTarEntry(nupkgPath, REQUIRED_NUPKG_ENTRIES.executable),
+  ]);
+  assertHashedExpectedSize(
+    currentExecutablePath,
+    currentExecutableFile,
+    currentExecutableDigest,
+  );
+  assertEntryMatchesFile(
+    "mycellios.exe",
+    nupkgExecutable,
+    currentExecutableDigest,
+  );
+
+  const nupkgNuspec = await readTarEntry(
+    nupkgPath,
+    REQUIRED_NUPKG_ENTRIES.nuspec,
+    { captureLimit: Number(MAX_MANIFEST_BYTES) },
+  );
+  const nuspec = parseNuspec(
+    nupkgNuspec.buffer,
+    `${nupkgName}:${REQUIRED_NUPKG_ENTRIES.nuspec}`,
+  );
+  if (nuspec.id !== "mycellios" || nuspec.version !== version) {
+    throw new Error(
+      `El NUSPEC anuncia ${nuspec.id}@${nuspec.version}, pero se exige mycellios@${version}.`,
+    );
+  }
   assertEntryMatchesFile(
     "distribution-runtime.tar.gz",
     nupkgRuntime,
@@ -253,11 +330,317 @@ async function verifyWindowsRelease(workspaceRoot) {
     `RELEASES: nombre, tamaño y SHA-1 coinciden con ${nupkgName}.`,
   );
   console.log(
-    "Contenido: app.asar, distribution-runtime.tar.gz y manifiesto Python coinciden byte a byte con el paquete Windows actual.",
+    "Contenido: app.asar, runtime, ejecutable y los 45 ficheros Python coinciden byte a byte con el paquete Windows actual.",
   );
   console.log(
     "Authenticode: no se comprueba en este verificador; debe validarse por separado.",
   );
+}
+
+async function verifyNativePythonTrees({
+  workspaceRoot,
+  nupkgPath,
+  archiveEntries,
+  manifest,
+}) {
+  const expectedFiles = new Set([
+    ...NATIVE_PYTHON_PRODUCT_FILES,
+    NATIVE_PYTHON_PRODUCT_MANIFEST,
+  ]);
+  const expectedDirectories = new Set([""]);
+  for (const portable of expectedFiles) {
+    const segments = portable.split("/");
+    for (let index = 1; index < segments.length; index += 1) {
+      expectedDirectories.add(segments.slice(0, index).join("/"));
+    }
+  }
+
+  for (const entry of archiveEntries.values()) {
+    if (
+      entry.path !== NUPKG_PYTHON_PREFIX.slice(0, -1)
+      && !entry.path.startsWith(NUPKG_PYTHON_PREFIX)
+    ) {
+      continue;
+    }
+    const portable =
+      entry.path === NUPKG_PYTHON_PREFIX.slice(0, -1)
+        ? ""
+        : entry.path.slice(NUPKG_PYTHON_PREFIX.length);
+    const allowed = entry.directory
+      ? expectedDirectories.has(portable)
+      : expectedFiles.has(portable);
+    if (!allowed) {
+      throw new Error(
+        `El NUPKG contiene un archivo Python fuera del producto nativo: ${entry.path}.`,
+      );
+    }
+  }
+
+  for (const portable of expectedFiles) {
+    const archivedPath = `${NUPKG_PYTHON_PREFIX}${portable}`;
+    const archived = archiveEntries.get(archivedPath.toLowerCase());
+    if (!archived || archived.path !== archivedPath || archived.directory) {
+      throw new Error(
+        `El NUPKG no contiene el fichero Python exacto ${archivedPath}.`,
+      );
+    }
+  }
+
+  for (const evidence of manifest.files) {
+    const buildPath = resolve(
+      workspaceRoot,
+      "build",
+      "python",
+      ...evidence.path.split("/"),
+    );
+    const packagedPath = resolve(
+      workspaceRoot,
+      "out",
+      "mycellios-win32-x64",
+      "resources",
+      "python",
+      ...evidence.path.split("/"),
+    );
+    const archivedPath = `${NUPKG_PYTHON_PREFIX}${evidence.path}`;
+    const [buildFile, packagedFile] = await Promise.all([
+      requireRegularFile(buildPath, `Python build ${evidence.path}`, {
+        nonEmpty: true,
+      }),
+      requireRegularFile(packagedPath, `Python empaquetado ${evidence.path}`, {
+        nonEmpty: true,
+      }),
+    ]);
+    const [buildDigest, packagedDigest, archivedDigest] = await Promise.all([
+      hashFile(buildPath, ["sha256"]),
+      hashFile(packagedPath, ["sha256"]),
+      hashTarEntry(nupkgPath, archivedPath),
+    ]);
+    assertHashedExpectedSize(buildPath, buildFile, buildDigest);
+    assertHashedExpectedSize(packagedPath, packagedFile, packagedDigest);
+    for (const [label, digest] of [
+      ["build", buildDigest],
+      ["paquete Windows", packagedDigest],
+    ]) {
+      if (
+        digest.bytes !== BigInt(evidence.bytes)
+        || digest.hashes.sha256 !== evidence.sha256
+      ) {
+        throw new Error(
+          `${evidence.path} en ${label} no coincide con el manifiesto Python sellado.`,
+        );
+      }
+    }
+    if (
+      archivedDigest.bytes !== BigInt(evidence.bytes)
+      || archivedDigest.sha256 !== evidence.sha256
+    ) {
+      throw new Error(
+        `${archivedPath} no coincide con el manifiesto Python sellado.`,
+      );
+    }
+  }
+}
+
+export function assertNativePythonManifest(manifest, source) {
+  if (
+    manifest === null
+    || typeof manifest !== "object"
+    || Array.isArray(manifest)
+    || JSON.stringify(Object.keys(manifest).sort())
+      !== JSON.stringify(["entryModules", "files", "policyId", "schema"])
+    || manifest.schema !== NATIVE_PYTHON_PRODUCT_SCHEMA
+    || manifest.policyId !== NATIVE_PYTHON_PRODUCT_POLICY_ID
+    || JSON.stringify(manifest.entryModules)
+      !== JSON.stringify(NATIVE_PYTHON_ENTRY_MODULES)
+    || !Array.isArray(manifest.files)
+    || JSON.stringify(manifest.files.map((entry) => entry?.path))
+      !== JSON.stringify(NATIVE_PYTHON_PRODUCT_FILES)
+  ) {
+    throw new Error(`${source} no coincide con la allowlist Python nativa.`);
+  }
+  for (const entry of manifest.files) {
+    if (
+      entry === null
+      || typeof entry !== "object"
+      || Array.isArray(entry)
+      || JSON.stringify(Object.keys(entry).sort())
+        !== JSON.stringify(["bytes", "path", "sha256"])
+      || !Number.isSafeInteger(entry.bytes)
+      || entry.bytes < 1
+      || typeof entry.sha256 !== "string"
+      || !/^[0-9a-f]{64}$/.test(entry.sha256)
+    ) {
+      throw new Error(`${source} contiene evidencia de fichero inválida.`);
+    }
+  }
+}
+
+export function parseNuspec(bytes, source) {
+  let text;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch (error) {
+    throw new Error(`${source} no es XML UTF-8 válido: ${error.message}`);
+  }
+  if (/<!DOCTYPE|<!ENTITY/i.test(text)) {
+    throw new Error(`${source} contiene declaraciones XML no permitidas.`);
+  }
+  const ids = [...text.matchAll(/<id>\s*([^<]+?)\s*<\/id>/gi)];
+  const versions = [...text.matchAll(/<version>\s*([^<]+?)\s*<\/version>/gi)];
+  if (ids.length !== 1 || versions.length !== 1) {
+    throw new Error(`${source} no contiene un id y una versión NUSPEC únicos.`);
+  }
+  return {
+    id: ids[0][1],
+    version: versions[0][1],
+  };
+}
+
+async function verifySetupPayload(
+  setupPath,
+  { nupkgName, nupkgDigest, releasesBytes },
+) {
+  const setupBytes = await readFile(setupPath);
+  let executable;
+  try {
+    executable = PELibrary.NtExecutable.from(setupBytes, { ignoreCert: true });
+  } catch (error) {
+    throw new Error(`Setup.exe no es un PE válido: ${error.message}`);
+  }
+  const resources = PELibrary.NtExecutableResource.from(executable);
+  const payloads = resources.entries.filter(
+    (entry) => entry.type === "DATA" && entry.id === 131,
+  );
+  if (payloads.length !== 1 || !payloads[0].bin) {
+    throw new Error(
+      "Setup.exe no contiene exactamente un payload Squirrel DATA/131.",
+    );
+  }
+  const payload = Buffer.from(payloads[0].bin);
+  const embedded = await readZipEvidence(payload, new Set([
+    "background.gif",
+    nupkgName,
+    "RELEASES",
+    "setupIcon.ico",
+    "Update.exe",
+  ]));
+  const embeddedNupkg = embedded.get(nupkgName);
+  const embeddedReleases = embedded.get("RELEASES");
+  if (
+    !embeddedNupkg
+    || embeddedNupkg.bytes !== nupkgDigest.bytes
+    || embeddedNupkg.sha256 !== nupkgDigest.hashes.sha256
+  ) {
+    throw new Error(
+      `Setup.exe no contiene exactamente el NUPKG verificado ${nupkgName}.`,
+    );
+  }
+  if (
+    !embeddedReleases
+    || !embeddedReleases.buffer.equals(releasesBytes)
+  ) {
+    throw new Error("Setup.exe no contiene exactamente el RELEASES verificado.");
+  }
+}
+
+export function readZipEvidence(buffer, expectedNames) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    yauzl.fromBuffer(buffer, { lazyEntries: true }, (openError, zip) => {
+      if (openError || !zip) {
+        rejectPromise(
+          new Error(`No se pudo abrir el payload ZIP de Setup.exe: ${openError?.message}`),
+        );
+        return;
+      }
+      const observed = new Map();
+      let settled = false;
+      const rejectOnce = (error) => {
+        if (settled) return;
+        settled = true;
+        zip.close();
+        rejectPromise(error);
+      };
+      zip.on("error", (error) => {
+        rejectOnce(new Error(`Payload ZIP de Setup.exe inválido: ${error.message}`));
+      });
+      zip.on("entry", (entry) => {
+        let archivePath;
+        try {
+          archivePath = validateArchivePath(entry.fileName);
+        } catch (error) {
+          rejectOnce(error);
+          return;
+        }
+        if (
+          archivePath.directory
+          || archivePath.path !== entry.fileName
+          || !expectedNames.has(entry.fileName)
+          || observed.has(entry.fileName)
+        ) {
+          rejectOnce(
+            new Error(`Setup.exe contiene una entrada inesperada: ${entry.fileName}.`),
+          );
+          return;
+        }
+        zip.openReadStream(entry, (streamError, stream) => {
+          if (streamError || !stream) {
+            rejectOnce(
+              new Error(
+                `No se pudo leer ${entry.fileName} de Setup.exe: ${streamError?.message}`,
+              ),
+            );
+            return;
+          }
+          const hash = createHash("sha256");
+          const chunks = [];
+          let bytes = 0n;
+          stream.on("data", (chunk) => {
+            bytes += BigInt(chunk.length);
+            hash.update(chunk);
+            if (entry.fileName === "RELEASES") chunks.push(chunk);
+          });
+          stream.on("error", (error) => {
+            rejectOnce(
+              new Error(
+                `No se pudo leer ${entry.fileName} de Setup.exe: ${error.message}`,
+              ),
+            );
+          });
+          stream.on("end", () => {
+            if (settled) return;
+            observed.set(entry.fileName, {
+              bytes,
+              sha256: hash.digest("hex"),
+              buffer:
+                entry.fileName === "RELEASES"
+                  ? Buffer.concat(chunks)
+                  : undefined,
+            });
+            zip.readEntry();
+          });
+        });
+      });
+      zip.on("end", () => {
+        if (settled) return;
+        settled = true;
+        if (
+          observed.size !== expectedNames.size
+          || [...expectedNames].some((name) => !observed.has(name))
+        ) {
+          rejectPromise(
+            new Error(
+              `Setup.exe no contiene el conjunto Squirrel esperado: ${[
+                ...expectedNames,
+              ].join(", ")}.`,
+            ),
+          );
+          return;
+        }
+        resolvePromise(observed);
+      });
+      zip.readEntry();
+    });
+  });
 }
 
 function parseRootArgument(args) {
@@ -357,7 +740,7 @@ function parseJsonObject(bytes, source) {
   return value;
 }
 
-function parseReleases(bytes, releasesPath) {
+export function parseReleases(bytes, releasesPath) {
   let text;
   try {
     text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
@@ -452,7 +835,7 @@ function listNupkgSafely(nupkgPath) {
   return entries;
 }
 
-function validateArchivePath(rawEntry) {
+export function validateArchivePath(rawEntry) {
   if (
     typeof rawEntry !== "string" ||
     rawEntry.length === 0 ||

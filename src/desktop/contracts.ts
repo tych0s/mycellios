@@ -8,6 +8,7 @@ import type {
   HubCatalogSort,
   WorkerAcceleratorDiagnostics,
 } from "../contracts/types.js";
+import type { NativeBuildIdentity } from "../contracts/build-identity.js";
 export type { ComputeMode } from "../contracts/types.js";
 export type { HubCatalogModel, HubCatalogPage, HubCatalogSearchInput, HubCatalogSort } from "../contracts/types.js";
 
@@ -87,6 +88,7 @@ export interface DashboardWorker {
   executionNodeId?: string;
   computeMode?: ComputeMode;
   agentVersion?: string;
+  buildIdentity?: NativeBuildIdentity;
   acceleration?: WorkerAcceleratorDiagnostics;
   mobile?: {
     platform: string;
@@ -282,12 +284,14 @@ export interface DashboardSnapshot {
   capturedAt: string;
   coordinatorUrl: string;
   appVersion: string;
+  buildIdentity: NativeBuildIdentity | null;
   platform: string;
   connectionError: string | null;
   runtimeError: string | null;
   health: {
     status: string;
     version: string;
+    buildIdentity: NativeBuildIdentity | null;
     workers: { registered: number; connected: number; online: number };
   } | null;
   workers: DashboardWorker[];

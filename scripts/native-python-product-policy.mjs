@@ -8,6 +8,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { dirname, join, relative, resolve, sep } from "node:path";
 
 export const NATIVE_PYTHON_PRODUCT_SCHEMA =
@@ -99,7 +100,7 @@ const allowedModules = new Set(
     .filter((path) => path.endsWith(".py"))
     .map(pathToModule),
 );
-const policyId = `sha256:${sha256(Buffer.from(JSON.stringify({
+export const NATIVE_PYTHON_PRODUCT_POLICY_ID = `sha256:${sha256(Buffer.from(JSON.stringify({
   schema: NATIVE_PYTHON_PRODUCT_SCHEMA,
   entryModules: NATIVE_PYTHON_ENTRY_MODULES,
   files: NATIVE_PYTHON_PRODUCT_FILES,
@@ -132,14 +133,25 @@ export function prepareNativePythonProductSource(sourceRoot, destinationRoot) {
 export function assertNativePythonSourceClosure(sourceRoot) {
   const root = resolve(sourceRoot);
   const graph = new Map();
+  const pythonSources = [];
   for (const portable of NATIVE_PYTHON_PRODUCT_FILES) {
     const absolute = resolveInside(root, portable);
     if (!existsSync(absolute) || !lstatSync(absolute).isFile()) {
       throw new Error(`Native Python product source is missing: ${portable}.`);
     }
     if (!portable.endsWith(".py")) continue;
-    const module = pathToModule(portable);
-    const dependencies = internalImports(readFileSync(absolute, "utf8"));
+    pythonSources.push({
+      path: portable,
+      module: pathToModule(portable),
+      source: readFileSync(absolute, "utf8"),
+    });
+  }
+  const analyzedSources = analyzeNativePythonImportSources(
+    pythonSources.map(({ path, source }) => ({ path, source })),
+  );
+  for (const [index, analyzed] of analyzedSources.entries()) {
+    const module = pythonSources[index].module;
+    const dependencies = analyzed.imports;
     for (const dependency of dependencies) {
       if (!allowedModules.has(dependency)) {
         throw new Error(
@@ -183,7 +195,7 @@ export function verifyNativePythonProductSource(sourceRoot) {
   const expectedPaths = [...NATIVE_PYTHON_PRODUCT_FILES];
   if (
     manifest?.schema !== NATIVE_PYTHON_PRODUCT_SCHEMA
-    || manifest?.policyId !== policyId
+    || manifest?.policyId !== NATIVE_PYTHON_PRODUCT_POLICY_ID
     || JSON.stringify(manifest?.entryModules) !== JSON.stringify(NATIVE_PYTHON_ENTRY_MODULES)
     || !Array.isArray(manifest?.files)
     || JSON.stringify(manifest.files.map((entry) => entry?.path)) !== JSON.stringify(expectedPaths)
@@ -239,7 +251,7 @@ export function buildNativePythonProductManifest(sourceRoot) {
   const root = resolve(sourceRoot);
   return {
     schema: NATIVE_PYTHON_PRODUCT_SCHEMA,
-    policyId,
+    policyId: NATIVE_PYTHON_PRODUCT_POLICY_ID,
     entryModules: [...NATIVE_PYTHON_ENTRY_MODULES],
     files: NATIVE_PYTHON_PRODUCT_FILES.map((portable) => {
       const bytes = readFileSync(resolveInside(root, portable));
@@ -252,21 +264,148 @@ export function buildNativePythonProductManifest(sourceRoot) {
   };
 }
 
-function internalImports(source) {
-  const imports = new Set();
-  const patterns = [
-    /^\s*from\s+\.(?!\.)([A-Za-z_][A-Za-z0-9_]*)/gm,
-    /^\s*from\s+distributed_runtime\.([A-Za-z_][A-Za-z0-9_]*)/gm,
-    /^\s*import\s+distributed_runtime\.([A-Za-z_][A-Za-z0-9_]*)/gm,
-    /(?:import_module|run_module)\(\s*["']distributed_runtime\.([A-Za-z_][A-Za-z0-9_]*)/g,
-  ];
-  for (const pattern of patterns) {
-    let match;
-    while ((match = pattern.exec(source)) !== null) {
-      imports.add(`distributed_runtime.${match[1]}`);
+export function analyzeNativePythonImports(source) {
+  if (typeof source !== "string") {
+    throw new TypeError("Native Python source must be a string.");
+  }
+  return analyzeNativePythonImportSources([{
+    path: "<native-python-source>",
+    source,
+  }])[0].imports;
+}
+
+const PYTHON_IMPORT_AST_SCHEMA =
+  "mycellios-native-python-import-ast/1";
+const PYTHON_IMPORT_ANALYZER = join(
+  import.meta.dirname,
+  "native-python-import-analyzer.py",
+);
+
+function analyzeNativePythonImportSources(sources) {
+  const request = JSON.stringify({
+    schema: PYTHON_IMPORT_AST_SCHEMA,
+    sources,
+  });
+  const stdout = runNativePythonImportAnalyzer(request);
+  let response;
+  try {
+    response = JSON.parse(stdout);
+  } catch {
+    throw new Error("Native Python AST analyzer returned invalid JSON.");
+  }
+  if (
+    !isPlainObject(response)
+    || !hasExactKeys(response, ["pythonVersion", "schema", "sources"])
+    || response.schema !== PYTHON_IMPORT_AST_SCHEMA
+    || !Array.isArray(response.pythonVersion)
+    || response.pythonVersion.length !== 2
+    || response.pythonVersion[0] !== 3
+    || !Number.isInteger(response.pythonVersion[1])
+    || response.pythonVersion[1] < 12
+    || !Array.isArray(response.sources)
+    || response.sources.length !== sources.length
+  ) {
+    throw new Error("Native Python AST analyzer returned an invalid response.");
+  }
+  for (const [index, analyzed] of response.sources.entries()) {
+    if (
+      !isPlainObject(analyzed)
+      || !hasExactKeys(analyzed, ["imports", "path"])
+      || analyzed.path !== sources[index].path
+      || !Array.isArray(analyzed.imports)
+      || analyzed.imports.some(
+        (module) =>
+          typeof module !== "string"
+          || !/^distributed_runtime(?:\.[A-Za-z_][A-Za-z0-9_]*)+$/.test(module),
+      )
+      || JSON.stringify(analyzed.imports)
+        !== JSON.stringify([...new Set(analyzed.imports)].sort())
+    ) {
+      throw new Error("Native Python AST analyzer returned invalid source evidence.");
     }
   }
-  return [...imports].sort();
+  return response.sources;
+}
+
+function runNativePythonImportAnalyzer(request) {
+  const commands = process.platform === "win32"
+    ? [
+        { executable: "python", prefix: [] },
+        { executable: "py", prefix: ["-3.12"] },
+      ]
+    : [
+        { executable: "python", prefix: [] },
+        { executable: "python3", prefix: [] },
+      ];
+  const missing = [];
+  for (const command of commands) {
+    const result = spawnSync(
+      command.executable,
+      [
+        ...command.prefix,
+        "-I",
+        "-B",
+        PYTHON_IMPORT_ANALYZER,
+      ],
+      {
+        encoding: "utf8",
+        input: request,
+        maxBuffer: 16 * 1024 * 1024,
+        shell: false,
+        timeout: 30_000,
+        windowsHide: true,
+      },
+    );
+    if (result.error?.code === "ENOENT") {
+      missing.push(command.executable);
+      continue;
+    }
+    if (result.error) {
+      throw new Error(
+        `Native Python AST analyzer process failed: ${result.error.message}.`,
+        { cause: result.error },
+      );
+    }
+    const stderr = typeof result.stderr === "string"
+      ? result.stderr.trim()
+      : "";
+    if (result.status !== 0 || result.signal !== null) {
+      throw new Error(
+        `Native Python AST analyzer failed via ${command.executable} ` +
+        `(exit ${result.status ?? "none"}, signal ${result.signal ?? "none"}): ` +
+        `${stderr || "no diagnostic output"}.`,
+      );
+    }
+    if (
+      typeof result.stdout !== "string"
+      || typeof result.stderr !== "string"
+    ) {
+      throw new Error("Native Python AST analyzer returned invalid process streams.");
+    }
+    if (stderr) {
+      throw new Error(
+        `Native Python AST analyzer emitted unexpected diagnostics: ${stderr}.`,
+      );
+    }
+    return result.stdout.trim();
+  }
+  throw new Error(
+    `Python 3.12 is required for native Python AST analysis; commands not found: ${missing.join(", ")}.`,
+  );
+}
+
+function isPlainObject(value) {
+  return (
+    value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Object.getPrototypeOf(value) === Object.prototype
+  );
+}
+
+function hasExactKeys(value, expected) {
+  return JSON.stringify(Object.keys(value).sort())
+    === JSON.stringify([...expected].sort());
 }
 
 function listRegularFiles(root) {

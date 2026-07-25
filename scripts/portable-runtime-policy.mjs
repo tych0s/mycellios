@@ -1,4 +1,4 @@
-export const PORTABLE_RUNTIME_SCHEMA = "mycellios-distribution-runtime/3";
+export const PORTABLE_RUNTIME_SCHEMA = "mycellios-distribution-runtime/4";
 export const PORTABLE_PYTHON_MINOR = "3.12";
 export const PORTABLE_PYTHON_VERSION = "3.12.13";
 export const PORTABLE_PYTHON_RELEASE = "20260510";
@@ -22,8 +22,6 @@ const MACOS_X64_PACKAGE_VERSIONS = Object.freeze({
   transformers: "4.57.3",
 });
 
-const CPU_TORCH_INDEX = "https://download.pytorch.org/whl/cpu";
-const PYPI_INDEX = "https://pypi.org/simple";
 const PYTHON_RELEASE_URL =
   `https://github.com/${PORTABLE_PYTHON_SOURCE}/releases/download/${PORTABLE_PYTHON_RELEASE}`;
 
@@ -61,6 +59,23 @@ const MACOS_X64_PYTHON = pythonArtifact(
   "6bab7fa97d4f2ddba86da0e05acff66c53b5edaca1df8edcf00ddca785a9c59b",
 );
 
+const WINDOWS_X64_WHEEL_LOCK = wheelLock(
+  "win32-x64-cp312.txt",
+  "2a5de3d3f2e3ba4ebac91e1efe068159e81263d3ccd6a3d93333078e753c6c65",
+);
+const LINUX_X64_WHEEL_LOCK = wheelLock(
+  "linux-x64-cp312.txt",
+  "090355535c96e7202ae761a18dadc5d66c9e98493a148eba16ae3c3e7c95c59d",
+);
+const MACOS_ARM64_WHEEL_LOCK = wheelLock(
+  "darwin-arm64-cp312.txt",
+  "75c84302540edc1b7f6c1620c3474b7ccbf431dd6df881717f74ebf419c56348",
+);
+const MACOS_X64_WHEEL_LOCK = wheelLock(
+  "darwin-x64-cp312.txt",
+  "808a7fd6894862abf2ed704eef036bf0b6290c6cce4f618682e831d67bf2b5eb",
+);
+
 /**
  * Return the release policy for a platform-native Python runtime.
  */
@@ -73,10 +88,9 @@ export function portableRuntimeSpec(platform, arch) {
       pythonVersion: PORTABLE_PYTHON_VERSION,
       pythonExecutable: "python.exe",
       pythonArtifact: WINDOWS_X64_PYTHON,
+      wheelLock: WINDOWS_X64_WHEEL_LOCK,
       packageVersions: DISTRIBUTION_PACKAGE_VERSIONS,
-      torchRequirement: "torch==2.13.0+cpu",
       torchVersion: "2.13.0+cpu",
-      torchIndex: CPU_TORCH_INDEX,
       bundledAccelerators: Object.freeze([]),
     });
   }
@@ -88,10 +102,9 @@ export function portableRuntimeSpec(platform, arch) {
       pythonVersion: PORTABLE_PYTHON_VERSION,
       pythonExecutable: "bin/python3",
       pythonArtifact: LINUX_X64_PYTHON,
+      wheelLock: LINUX_X64_WHEEL_LOCK,
       packageVersions: DISTRIBUTION_PACKAGE_VERSIONS,
-      torchRequirement: "torch==2.13.0+cpu",
       torchVersion: "2.13.0+cpu",
-      torchIndex: CPU_TORCH_INDEX,
       bundledAccelerators: Object.freeze([]),
     });
   }
@@ -103,12 +116,11 @@ export function portableRuntimeSpec(platform, arch) {
       pythonVersion: PORTABLE_PYTHON_VERSION,
       pythonExecutable: "bin/python3",
       pythonArtifact: MACOS_ARM64_PYTHON,
+      wheelLock: MACOS_ARM64_WHEEL_LOCK,
       packageVersions: DISTRIBUTION_PACKAGE_VERSIONS,
       // The official macOS arm64 wheel contains the MPS backend. It is built
       // into the signed application runtime; the client performs no pip install.
-      torchRequirement: "torch==2.13.0",
-      torchVersion: "2.13.0",
-      torchIndex: PYPI_INDEX,
+      torchVersion: "2.11.0",
       bundledAccelerators: Object.freeze(["mps"]),
     });
   }
@@ -120,14 +132,13 @@ export function portableRuntimeSpec(platform, arch) {
       pythonVersion: PORTABLE_PYTHON_VERSION,
       pythonExecutable: "bin/python3",
       pythonArtifact: MACOS_X64_PYTHON,
+      wheelLock: MACOS_X64_WHEEL_LOCK,
       packageVersions: MACOS_X64_PACKAGE_VERSIONS,
       // Intel Macs receive the same self-contained inference stack, but the
       // release makes no native Metal/MPS claim for this architecture.
       // PyTorch 2.2.2 is the final official macOS x86_64 wheel supporting
       // CPython 3.12. Newer PyPI releases publish macOS arm64 only.
-      torchRequirement: "torch==2.2.2",
       torchVersion: "2.2.2",
-      torchIndex: PYPI_INDEX,
       bundledAccelerators: Object.freeze([]),
     });
   }
@@ -159,4 +170,12 @@ export function matchesPinnedPythonArtifact(actual, expected) {
     actual.size === expected.size &&
     actual.sha256 === expected.sha256
   );
+}
+
+function wheelLock(filename, sha256) {
+  return Object.freeze({
+    schema: "mycellios-python-wheel-lock/1",
+    path: `scripts/wheel-locks/${filename}`,
+    sha256,
+  });
 }

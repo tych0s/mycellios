@@ -1,4 +1,5 @@
 import type { ModelDeployment } from "../contracts/types.js";
+import type { NativeBuildIdentity } from "../contracts/build-identity.js";
 import { sha256CanonicalEvidence, sha256Text } from "../core/json.js";
 import type { StoredWorker } from "../storage/store.js";
 import {
@@ -64,13 +65,26 @@ export function coordinatorBenchmarkActivations(
   modelIds: ReadonlySet<string>,
   workers: readonly StoredWorker[],
   connectedWorkerIds: ReadonlySet<string>,
+  expectedBuildIdentity?: NativeBuildIdentity | null,
 ): BenchmarkActivation[] {
+  if (expectedBuildIdentity === null) return [];
   const connectedWorkers = workers.filter((worker) =>
     connectedWorkerIds.has(worker.id) && worker.status === "online"
   );
   const activations: BenchmarkActivation[] = [];
   for (const modelId of [...modelIds].sort()) {
     const participants = connectedWorkers.flatMap((worker) =>
+      worker.capabilities.buildIdentity?.version
+        === worker.capabilities.agentVersion
+        && (
+          expectedBuildIdentity === undefined
+          || (
+            worker.capabilities.buildIdentity.schema === expectedBuildIdentity.schema
+            && worker.capabilities.buildIdentity.version === expectedBuildIdentity.version
+            && worker.capabilities.buildIdentity.sourceId === expectedBuildIdentity.sourceId
+          )
+        )
+        ?
       worker.capabilities.deployments
         .filter((deployment) =>
           deployment.model === modelId && deployment.adapter !== "mock"
@@ -92,6 +106,7 @@ export function coordinatorBenchmarkActivations(
           return {
             workerId: worker.id,
             agentVersion: worker.capabilities.agentVersion,
+            buildSourceId: worker.capabilities.buildIdentity!.sourceId,
             deploymentId: deployment.deploymentId,
             modelDigest: deployment.modelDigest,
             nodeIds: stageRanges.length > 0
@@ -100,6 +115,7 @@ export function coordinatorBenchmarkActivations(
             stageRanges,
           };
         })
+        : []
     );
     if (participants.length === 0) continue;
     try {
@@ -119,7 +135,12 @@ export interface CoordinatorBenchmarkOptions {
   inventory(routedWorkerIds: ReadonlySet<string>): BenchmarkInventory;
   resolveWorkerId?(jobId: string): string | null;
   networkToken?: string;
+  buildIdentity?: NativeBuildIdentity | null;
   activation?: BenchmarkActivation;
+  validateActivation?(
+    activation: BenchmarkActivation,
+    routedWorkerIds: ReadonlySet<string>,
+  ): void;
   samples?: number;
   maximumSamples?: number;
   warmupSamples?: number;
@@ -175,6 +196,15 @@ export async function runAndPersistCoordinatorSuite(
 ): Promise<{ run: BenchmarkRun; path: string }> {
   const history = loadBenchmarkRuns(options.cwd, options.historyDirectory);
   const identity = createRunIdentity(options.cwd, options.version, options.label);
+  if (options.buildIdentity) {
+    if (options.buildIdentity.version !== identity.version) {
+      throw new Error(
+        `benchmark_build_version_mismatch:${options.buildIdentity.version}:${identity.version}`,
+      );
+    }
+    identity.build.sourceId = options.buildIdentity.sourceId;
+    identity.build.sourceIdSource = "runtime-local";
+  }
   const run = compareRunWithHistory(
     await runCoordinatorModelSuite(identity, options),
     history,
@@ -256,6 +286,19 @@ export async function runCoordinatorModelSuite(
   for (const sample of campaign.samples) {
     if (sample.workerId) routedWorkerIds.add(sample.workerId);
   }
+  if (options.activation) {
+    const participantWorkerIds = new Set(
+      options.activation.participants.map((participant) => participant.workerId),
+    );
+    for (const workerId of routedWorkerIds) {
+      if (!participantWorkerIds.has(workerId)) {
+        throw new Error(
+          `benchmark_routed_outside_activation:${workerId}:${options.activation.activationId}`,
+        );
+      }
+    }
+    options.validateActivation?.(options.activation, routedWorkerIds);
+  }
 
   const inventory = options.inventory(routedWorkerIds);
   const selectedNodeIds = new Set(
@@ -281,6 +324,14 @@ export async function runCoordinatorModelSuite(
   return {
     schema: BENCHMARK_RUN_SCHEMA,
     ...identity,
+    build: {
+      ...identity.build,
+      participantSourceIds: [...new Set(
+        options.activation?.participants.map(
+          (participant) => participant.buildSourceId,
+        ) ?? identity.build.participantSourceIds,
+      )].sort(),
+    },
     startedAt,
     finishedAt: new Date().toISOString(),
     suite: "real-runtime",
@@ -726,7 +777,7 @@ function buildCoordinatorMeasurement(
       `${campaign.warmups.length} warmups completados y ${recoveredFailures} fallos temporales recuperados sin ocultarlos.`,
       `${inventory.selectedDevices} nodos integrantes de la ruta observada; ${inventory.connectedDevices}/${inventory.totalDevices} conectados durante la campaña.`,
       activation
-        ? `Activación ${activation.activationId}; topología ${activation.topologyDigest}.`
+        ? `Activación ${activation.activationId}; topología ${activation.topologyDigest}; builds ${activation.participants.map((participant) => participant.buildSourceId).join(", ")}.`
         : "Ejecución manual sin activation ID sellado; la comparación exige el resto del fingerprint exacto.",
       networkTraces.length > 0
         ? `${networkTraces.length} trazas de ruta ligadas a peticiones completadas; transporte y bytes sólo aparecen cuando hubo evidencia efectiva no ambigua.`

@@ -1,7 +1,8 @@
 import type { NetworkExecutionTrace } from "../contracts/types.js";
 
 export const LEGACY_BENCHMARK_RUN_SCHEMA = "mycellios-benchmark-run/1" as const;
-export const BENCHMARK_RUN_SCHEMA = "mycellios-benchmark-run/2" as const;
+export const PREVIOUS_BENCHMARK_RUN_SCHEMA = "mycellios-benchmark-run/2" as const;
+export const BENCHMARK_RUN_SCHEMA = "mycellios-benchmark-run/3" as const;
 
 export type BenchmarkEvidence = "physical" | "loopback";
 export type BenchmarkStatus =
@@ -143,6 +144,13 @@ export interface BenchmarkRun {
     releaseSource: "override" | "environment" | "package" | "unknown";
     revision: string | null;
     revisionSource: "environment" | "revision-file" | "git" | "unknown";
+    sourceId: `sha256:${string}` | null;
+    sourceIdSource: "provenance-file" | "runtime-local" | "unknown";
+    /**
+     * Build IDs declared by participating remote runtimes. They identify a
+     * cohort for drift detection but are not hardware or binary attestation.
+     */
+    participantSourceIds: Array<`sha256:${string}`>;
   };
   startedAt: string;
   finishedAt: string;

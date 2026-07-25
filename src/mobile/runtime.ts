@@ -7,6 +7,9 @@ import {
   runWithMobileBackendFallback,
   throwIfMobileExecutionCancelled,
 } from "./backend-state";
+import type { NativeBuildIdentity } from "../contracts/build-identity";
+
+declare const __MYCELLIOS_BUILD_IDENTITY__: NativeBuildIdentity;
 
 export type MobileWorkerBackend = "webgpu" | "cpu";
 export type MobileWorkerLevel = "low" | "balanced" | "maximum";
@@ -352,6 +355,7 @@ async function registerWorker(
     name: mobileName(),
     region: query.get("region")?.trim() || "auto",
     platform: navigator.userAgent.slice(0, 120),
+    buildIdentity: __MYCELLIOS_BUILD_IDENTITY__,
     backend: state.backend,
     performanceLevel: state.level,
     ...(joinToken ? { joinToken } : {}),

@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
+import type { NativeBuildIdentity } from "../contracts/build-identity.js";
 import type { StoredRequestedModel } from "../storage/store.js";
 import {
   compileAutoDistribution,
@@ -53,6 +54,8 @@ export interface DynamicModelActivationManagerOptions {
   ): import("../distribution/launch-supervisor.js").LaunchAgent | undefined;
   cwd?: string;
   environment?: NodeJS.ProcessEnv;
+  workerBuildIdentity?: NativeBuildIdentity;
+  workerAgentVersion?: string;
   loadProgress?(modelId: string): readonly ModelActivationProgressEvent[];
   onProgress?(modelId: string, event: ModelActivationProgressEvent): void;
   onPlanPrepared?(
@@ -328,6 +331,12 @@ export class DynamicModelActivationManager implements ModelActivationManager {
       await runAutoDistribution(config, compilation, cwd, environment, controller.signal, {
         resolveManagedAgent: (nodeId, launch) => this.options.resolveManagedAgent(nodeId, launch),
         onProgress: (event) => this.appendRuntimeProgress(model.id, event),
+        ...(this.options.workerBuildIdentity
+          ? { workerBuildIdentity: this.options.workerBuildIdentity }
+          : {}),
+        ...(this.options.workerAgentVersion
+          ? { workerAgentVersion: this.options.workerAgentVersion }
+          : {}),
         ...(this.options.onActivated
           ? {
               onActivated: (result: AutoDistributionRunResult) =>

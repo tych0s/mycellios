@@ -3,13 +3,18 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { validateGitHubReleaseClaims } from "../src/coordinator/github-oidc.js";
+import {
+  validateGitHubReleaseClaims,
+  type GitHubReleaseClaims,
+} from "../src/coordinator/github-oidc.js";
+import type { NativeRuntimeBuildMetadata } from "../src/core/native-build-identity.js";
 import type { CoordinatorRuntime } from "../src/coordinator/server.js";
 import { createCoordinator } from "../src/coordinator/server.js";
 import { storeReleaseChunk } from "../src/coordinator/release-upload.js";
 
 const directories: string[] = [];
 const runtimes: CoordinatorRuntime[] = [];
+const RUNTIME_REVISION = "a".repeat(40);
 
 afterEach(async () => {
   await Promise.all(runtimes.splice(0).map((runtime) => runtime.close()));
@@ -77,8 +82,10 @@ describe("release uploads", () => {
       },
       {
         logger: false,
+        runtimeMetadata: releaseRuntimeMetadata(root, RUNTIME_REVISION),
         releaseTokenVerifier: async (token) => {
           expect(token).toBe("actions-token");
+          return releaseClaims(RUNTIME_REVISION);
         },
       },
     );
@@ -137,7 +144,11 @@ describe("release uploads", () => {
       workflow_ref: "tych0s/mycellios/.github/workflows/desktop-build.yml@refs/heads/main",
       event_name: "push",
       environment: "production",
-    })).toMatchObject({ ref: "refs/heads/main", sha: "a".repeat(40) });
+    })).toMatchObject({
+      ref: "refs/heads/main",
+      sha: "a".repeat(40),
+      eventName: "push",
+    });
 
     expect(() => validateGitHubReleaseClaims({
       repository: "attacker/fork",
@@ -156,7 +167,49 @@ describe("release uploads", () => {
         "tych0s/mycellios/.github/workflows/publish-existing-release.yml@refs/heads/main",
       event_name: "workflow_dispatch",
       environment: "production",
-    })).toMatchObject({ ref: "refs/heads/main", sha: "b".repeat(40) });
+    })).toMatchObject({
+      ref: "refs/heads/main",
+      sha: "b".repeat(40),
+      eventName: "workflow_dispatch",
+    });
+
+    expect(() => validateGitHubReleaseClaims({
+      repository: "tych0s/mycellios",
+      ref: "refs/tags/v0.2.19",
+      sha: "b".repeat(40),
+      workflow_ref: "tych0s/mycellios/.github/workflows/desktop-build.yml@refs/heads/main",
+      event_name: "push",
+      environment: "production",
+    })).toThrow("release_ref_not_allowed");
+
+    expect(() => validateGitHubReleaseClaims({
+      repository: "tych0s/mycellios",
+      ref: "refs/heads/main",
+      sha: "b".repeat(40),
+      workflow_ref:
+        "tych0s/mycellios/.github/workflows/desktop-build.yml@refs/heads/main-evil",
+      event_name: "push",
+      environment: "production",
+    })).toThrow("release_workflow_not_allowed");
+
+    expect(() => validateGitHubReleaseClaims({
+      repository: "tych0s/mycellios",
+      ref: "refs/heads/main",
+      sha: "b".repeat(40),
+      workflow_ref: "tych0s/mycellios/.github/workflows/desktop-build.yml@refs/heads/main",
+      event_name: "workflow_dispatch",
+      environment: "production",
+    })).toThrow("release_event_not_allowed");
+
+    expect(() => validateGitHubReleaseClaims({
+      repository: "tych0s/mycellios",
+      ref: "refs/heads/main",
+      sha: "b".repeat(40),
+      workflow_ref:
+        "tych0s/mycellios/.github/workflows/publish-existing-release.yml@refs/heads/main",
+      event_name: "push",
+      environment: "production",
+    })).toThrow("release_event_not_allowed");
 
     expect(() => validateGitHubReleaseClaims({
       repository: "tych0s/mycellios",
@@ -166,6 +219,62 @@ describe("release uploads", () => {
       event_name: "push",
       environment: "attestation",
     })).toThrow("release_environment_not_allowed");
+  });
+
+  it("rejects a valid Actions token when its SHA is not the running revision", async () => {
+    const root = temporaryDirectory();
+    const content = Buffer.from('{"version":"0.2.19"}\n');
+    const digest = sha256(content);
+    const runtime = await createCoordinator(
+      {
+        host: "127.0.0.1",
+        port: 0,
+        databasePath: ":memory:",
+        requestTimeoutMs: 1_000,
+        desktopUpdatesPath: join(root, "updates"),
+      },
+      {
+        logger: false,
+        runtimeMetadata: releaseRuntimeMetadata(root, RUNTIME_REVISION),
+        releaseTokenVerifier: async () => releaseClaims("b".repeat(40)),
+      },
+    );
+    runtimes.push(runtime);
+
+    const response = await uploadLatest(runtime, content, digest);
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({
+      error: { code: "release_upload_revision_mismatch" },
+    });
+  });
+
+  it("rejects release uploads when the running revision is not sealed", async () => {
+    const root = temporaryDirectory();
+    const content = Buffer.from('{"version":"0.2.19"}\n');
+    const digest = sha256(content);
+    const runtime = await createCoordinator(
+      {
+        host: "127.0.0.1",
+        port: 0,
+        databasePath: ":memory:",
+        requestTimeoutMs: 1_000,
+        desktopUpdatesPath: join(root, "updates"),
+      },
+      {
+        logger: false,
+        runtimeMetadata: releaseRuntimeMetadata(root, null),
+        releaseTokenVerifier: async () => releaseClaims(RUNTIME_REVISION),
+      },
+    );
+    runtimes.push(runtime);
+
+    const response = await uploadLatest(runtime, content, digest);
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toEqual({
+      error: { code: "release_upload_runtime_revision_unavailable" },
+    });
   });
 });
 
@@ -177,4 +286,49 @@ function temporaryDirectory(): string {
 
 function sha256(value: Buffer): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function releaseRuntimeMetadata(
+  root: string,
+  revision: string | null,
+): NativeRuntimeBuildMetadata {
+  return {
+    root,
+    version: "0.2.19",
+    revision,
+    buildIdentity: null,
+  };
+}
+
+function releaseClaims(sha: string): GitHubReleaseClaims {
+  return {
+    repository: "tych0s/mycellios",
+    ref: "refs/heads/main",
+    sha,
+    workflowRef:
+      "tych0s/mycellios/.github/workflows/desktop-build.yml@refs/heads/main",
+    eventName: "push",
+    environment: "production",
+  };
+}
+
+async function uploadLatest(
+  runtime: CoordinatorRuntime,
+  content: Buffer,
+  digest: string,
+) {
+  return runtime.app.inject({
+    method: "PUT",
+    url: "/internal/v1/releases/updates/latest.json",
+    headers: {
+      authorization: "Bearer actions-token",
+      "content-type": "application/octet-stream",
+      "x-chunk-index": "0",
+      "x-chunk-count": "1",
+      "x-chunk-sha256": digest,
+      "x-file-sha256": digest,
+      "x-file-size": String(content.length),
+    },
+    payload: content,
+  });
 }

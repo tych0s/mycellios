@@ -14,6 +14,7 @@ import {
   NATIVE_PYTHON_IMPORT_SMOKE_MODULES,
   NATIVE_PYTHON_PRODUCT_FILES,
   NATIVE_PYTHON_PRODUCT_MANIFEST,
+  analyzeNativePythonImports,
   assertNativePythonProductMatchesSource,
   assertNativePythonSourceClosure,
   prepareNativePythonProductSource,
@@ -61,6 +62,96 @@ describe("native Python product package", () => {
     ]) {
       expect(NATIVE_PYTHON_PRODUCT_FILES).not.toContain(forbidden);
     }
+  });
+
+  it("closes imports with the Python 3.12 AST across aliases and multiline forms", () => {
+    const source = `
+DECOY = """
+from . import string_decoy
+import distributed_runtime.string_decoy
+"""
+# importlib.import_module("distributed_runtime.comment_decoy")
+
+from . import (
+    benchmark as relative_alias,
+    gpu_cloud_probe,
+)
+from .native_stage import run as run_native_stage
+from distributed_runtime import (
+    external_gguf_runtime as llama,
+    resident_expert_mesh_cli,
+)
+import distributed_runtime.cell_fixture_compiler as compiler, distributed_runtime.benchmark as benchmark_module
+
+import importlib as imports, runpy as runner
+from importlib import import_module as load_module, invalidate_caches
+from runpy import run_module as execute_module
+from builtins import __import__ as builtin_import
+
+assigned_loader = imports.import_module
+assigned_runner, assigned_builtin = runner.run_module, builtin_import
+
+imports.import_module("distributed_runtime.dynamic_one")
+runner.run_module(mod_name="distributed_runtime.dynamic_two")
+__import__("distributed_runtime.dynamic_three")
+load_module("distributed_runtime.dynamic_four")
+execute_module("distributed_runtime.dynamic_five")
+builtin_import("distributed_runtime.dynamic_six")
+assigned_loader("distributed_runtime." + "dynamic_seven")
+assigned_runner("distributed_runtime.dynamic_eight")
+assigned_builtin("distributed_runtime.dynamic_nine")
+`;
+    expect(analyzeNativePythonImports(source)).toEqual([
+      "distributed_runtime.benchmark",
+      "distributed_runtime.cell_fixture_compiler",
+      "distributed_runtime.dynamic_eight",
+      "distributed_runtime.dynamic_five",
+      "distributed_runtime.dynamic_four",
+      "distributed_runtime.dynamic_nine",
+      "distributed_runtime.dynamic_one",
+      "distributed_runtime.dynamic_seven",
+      "distributed_runtime.dynamic_six",
+      "distributed_runtime.dynamic_three",
+      "distributed_runtime.dynamic_two",
+      "distributed_runtime.external_gguf_runtime",
+      "distributed_runtime.native_stage",
+      "distributed_runtime.resident_expert_mesh_cli",
+      "distributed_runtime.gpu_cloud_probe",
+    ]);
+  });
+
+  it("fails closed when product Python is not valid Python 3.12 syntax", () => {
+    expect(() =>
+      analyzeNativePythonImports("def invalid(:\n    pass\n"),
+    ).toThrow(/AST analyzer failed.*invalid syntax/i);
+  });
+
+  it("fails closed when a dynamic import target cannot be proven statically", () => {
+    expect(() =>
+      analyzeNativePythonImports(`
+import importlib
+module_name = input()
+importlib.import_module(module_name)
+`),
+    ).toThrow(/target must be a statically known string/i);
+  });
+
+  it("rejects AST-discovered imports that escape the product allowlist", () => {
+    const root = temporaryDirectory();
+    const source = join(root, "python");
+    prepareNativePythonProductSource(resolve("python"), source);
+    const server = join(source, "distributed_runtime", "server.py");
+    writeFileSync(
+      server,
+      `${readFileSync(server, "utf8")}
+if False:
+    from distributed_runtime import benchmark as hidden_benchmark, gpu_cloud_probe
+`,
+      "utf8",
+    );
+    expect(() => assertNativePythonSourceClosure(source)).toThrow(
+      "distributed_runtime.server -> distributed_runtime.benchmark",
+    );
   });
 
   it("copies only admitted files and seals their exact bytes", () => {

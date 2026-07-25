@@ -329,6 +329,26 @@ class LocalDraftModelProviderTests(unittest.TestCase):
         provider.release_request(7)
         self.assertEqual(provider.stats().cached_kv_bytes, 0)
 
+    def test_request_cache_compacts_last_logits_storage(self) -> None:
+        provider = LocalDraftModelProvider(
+            _config(max_draft_tokens=1),
+            target_tokenizer=_Tokenizer(),
+            draft_tokenizer=_Tokenizer(),
+            model=_CachedGreedyModel(),
+            actual_artifact_identity=ARTIFACT_IDENTITY,
+            resolved_device=torch.device("cpu"),
+        )
+
+        self.assertEqual(
+            provider.draft_for_request(7, (0, 1, 2, 3, 0, 1), max_tokens=1),
+            (2,),
+        )
+        cached_logits = provider._draft_cache[7].next_logits
+        self.assertEqual(
+            cached_logits.untyped_storage().nbytes(),
+            cached_logits.numel() * cached_logits.element_size(),
+        )
+
     def test_incompatible_tokenizer_or_artifact_fails_closed(self) -> None:
         with self.assertRaisesRegex(ValueError, "artifact identity"):
             LocalDraftModelProvider(

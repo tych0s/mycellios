@@ -77,6 +77,11 @@ describe("worker capacity truth", () => {
       coordinatorUrl: "http://127.0.0.1:9999",
       reconnect: false,
       agentVersion: "0.2.26",
+      buildIdentity: {
+        schema: "mycellios-native-build-provenance/1",
+        version: "0.2.26",
+        sourceId: `sha256:${"a".repeat(64)}`,
+      },
       hardwareProbe,
       distributedExecutor: {
         nodeId: "desktop-test",
@@ -91,9 +96,19 @@ describe("worker capacity truth", () => {
     });
     const capabilities = await (agent as unknown as { buildCapabilities(): Promise<{
       agentVersion: string;
+      buildIdentity?: {
+        schema: string;
+        version: string;
+        sourceId: string;
+      };
       distributedExecutor?: { acceleration?: WorkerAcceleratorDiagnostics };
     }> }).buildCapabilities();
     expect(capabilities.agentVersion).toBe("0.2.26");
+    expect(capabilities.buildIdentity).toEqual({
+      schema: "mycellios-native-build-provenance/1",
+      version: "0.2.26",
+      sourceId: `sha256:${"a".repeat(64)}`,
+    });
     expect(capabilities.distributedExecutor?.acceleration).toEqual(acceleration);
   });
 

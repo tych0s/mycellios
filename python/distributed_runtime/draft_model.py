@@ -524,7 +524,11 @@ class LocalDraftModelProvider:
     ) -> None:
         if request_id is None or past_key_values is None:
             return
-        detached_logits = next_logits.detach()
+        # ``_last_model_logits`` returns a view into the model's full
+        # [batch, sequence, vocabulary] logits tensor.  A detached view still
+        # owns that complete backing storage, so keeping it per request can
+        # retain far more memory than ``_tensor_tree_bytes`` accounts for.
+        detached_logits = next_logits.detach().clone()
         tensor_bytes = _tensor_tree_bytes(past_key_values) + _tensor_tree_bytes(
             detached_logits
         )

@@ -2,6 +2,7 @@ import type {
   CoordinatorRuntimePerformanceEvidence,
 } from "../performance/runtime-profile.js";
 import type { DeploymentCanaryEvidence } from "./deployment-canary.js";
+import type { NativeBuildIdentity } from "./build-identity.js";
 
 export type WorkloadClass = "interactive" | "batch" | "benchmark";
 export type AdapterKind =
@@ -231,6 +232,8 @@ export interface WorkerAcceleratorDiagnostics {
 export interface WorkerCapabilities {
   region: string;
   agentVersion: string;
+  /** Exact sealed source identity. Missing only on legacy or development nodes. */
+  buildIdentity?: NativeBuildIdentity | undefined;
   gpus: GpuCapability[];
   limits: WorkerLimits;
   deployments: ModelDeployment[];

@@ -310,7 +310,15 @@ describe("physical GPU campaign collector", () => {
         fixture.launch.launchOrder.map((process) => process.anchor.memberId),
       )) {
         const backing = new ImmediateRpcCampaignAgent(`local-process:${nodeId}`);
-        const server = new LaunchAgentRpcServer({ agent: backing, nodeId });
+        const server = new LaunchAgentRpcServer({
+          agent: backing,
+          nodeId,
+          buildIdentity: {
+            schema: "mycellios-native-build-provenance/1",
+            version: "0.2.38",
+            sourceId: `sha256:${"1".repeat(64)}`,
+          },
+        });
         servers.push(server);
         const address = await server.listen(0, "127.0.0.1");
         bindings.push({
@@ -338,6 +346,33 @@ describe("physical GPU campaign collector", () => {
     } finally {
       await Promise.all(servers.map((server) => server.close("campaign_rpc_test_complete")));
     }
+  });
+
+  it("rejects a physical campaign before launch when agents do not share one exact build", async () => {
+    const fixture = campaignFixture();
+    const observation = await runPhysicalGpuCampaign(fixture.input, {
+      now: incrementalClock(),
+      fetch: apiFetch(fixture, []),
+      health: async (binding) => ({
+        ...agentHealth(binding, 0),
+        buildIdentity: {
+          schema: "mycellios-native-build-provenance/1",
+          version: "0.2.38",
+          sourceId: binding.nodeId.endsWith("a")
+            ? `sha256:${"1".repeat(64)}`
+            : `sha256:${"2".repeat(64)}`,
+        },
+      }),
+    });
+
+    expect(observation.passed).toBe(false);
+    expect(observation.lifecycle.supervisorStarted).toBeNull();
+    expect(observation.failures).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        phase: "campaign",
+        message: "physical_gpu_campaign_agent_build_cohort_is_inconsistent",
+      }),
+    ]));
   });
 });
 
@@ -504,9 +539,14 @@ function inertAgent(id: string): LaunchAgent {
 
 function agentHealth(binding: PhysicalGpuCampaignAgentBinding, processes: number) {
   return {
-    schema: "gdlp-launch-agent-health/2",
+    schema: "gdlp-launch-agent-health/3",
     agentId: binding.agent.id,
     nodeId: binding.nodeId,
+    buildIdentity: {
+      schema: "mycellios-native-build-provenance/1",
+      version: "0.2.38",
+      sourceId: `sha256:${"1".repeat(64)}`,
+    },
     activeProcesses: processes,
     retainedTombstones: 0,
   };
