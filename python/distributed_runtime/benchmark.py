@@ -115,7 +115,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "cached keys/values by the group factor as Transformers does."
         ),
     )
-    parser.add_argument("--one-way-delay-ms", type=nonnegative_float, default=0.0)
+    parser.add_argument(
+        "--one-way-delay-ms",
+        type=link_delays,
+        default=(0.0,),
+        help=(
+            "One-way delay in ms. A single value applies to every link; a comma-separated "
+            "list sets each link separately, so co-located stages can carry a LAN delay "
+            "while the boundary between homes carries a WAN one (e.g. '30,0.5,0.5,30')."
+        ),
+    )
     parser.add_argument("--bandwidth-mbps", type=nonnegative_float, default=0.0)
     parser.add_argument("--startup-timeout-seconds", type=positive_float, default=180.0)
     parser.add_argument("--socket-timeout-seconds", type=positive_float, default=180.0)
@@ -156,6 +165,31 @@ def nonnegative_float(value: str) -> float:
     if not math.isfinite(parsed) or parsed < 0:
         raise argparse.ArgumentTypeError("must be a finite number at least 0")
     return parsed
+
+
+def link_delays(value: str) -> tuple[float, ...]:
+    """One delay for every link, or a single delay applied to all of them.
+
+    A swarm's links are not uniform: several stages can share a house, where the hop is
+    a LAN round-trip, while the boundary between houses crosses the WAN. Expressing that
+    needs a delay per link, not one number for the whole chain.
+    """
+    parts = [part.strip() for part in value.split(",") if part.strip()]
+    if not parts:
+        raise argparse.ArgumentTypeError("expected at least one delay")
+    return tuple(nonnegative_float(part) for part in parts)
+
+
+def delay_for_link(delays: tuple[float, ...], index: int) -> float:
+    """A single value covers every link; a list is indexed, and must be long enough."""
+    if len(delays) == 1:
+        return delays[0]
+    if index >= len(delays):
+        raise ValueError(
+            f"--one-way-delay-ms lists {len(delays)} links but the pipeline uses more; "
+            "pass one delay per link or a single value for all of them"
+        )
+    return delays[index]
 
 
 def codec_from_name(name: str) -> TensorCodec:
@@ -489,7 +523,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     return_host=HOST,
                     return_port=return_port,
                     codec=codec,
-                    one_way_delay_ms=args.one_way_delay_ms,
+                    one_way_delay_ms=delay_for_link(args.one_way_delay_ms, child_index + 1),
                     bandwidth_mbps=args.bandwidth_mbps,
                     connect_timeout_seconds=args.startup_timeout_seconds,
                 )
@@ -562,7 +596,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         return_socket, _ = return_listener.accept()
         configure_socket(return_socket)
         return_socket.settimeout(args.socket_timeout_seconds)
-        emulator = LinkEmulator(args.one_way_delay_ms, args.bandwidth_mbps)
+        emulator = LinkEmulator(delay_for_link(args.one_way_delay_ms, 0), args.bandwidth_mbps)
 
         total_batches = args.warmups + args.iterations
         for batch_offset in range(total_batches):
@@ -677,7 +711,11 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "token_equivalence_mode": (
                 "approximate" if stage_quantize is not None else "exact-reference"
             ),
-            "one_way_delay_ms": args.one_way_delay_ms,
+            "one_way_delay_ms": (
+                args.one_way_delay_ms[0]
+                if len(args.one_way_delay_ms) == 1
+                else list(args.one_way_delay_ms)
+            ),
             "bandwidth_mbps": args.bandwidth_mbps,
             "persistent_tcp": True,
             "direct_token_return": True,
