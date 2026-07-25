@@ -32,7 +32,11 @@ export type {
 export const DEFAULT_SEARCH_OPTIONS: SearchOptions = {
   beamWidth: 512,
   candidateCodecs: ["fp16", "int8", "q4"],
-  candidateMicroBatchSizes: [1, 2, 4, 8],
+  // Measured on separate GPUs over WAN (docs/benchmarks/gpu_cloud-exp1-maxactive-2026-07-24):
+  // capping admission at 8 halves aggregate throughput under load (52,7 vs 102,6 tok/s)
+  // and collapses under overload (18,8 tok/s, 177 errors); 32 fixes both, and 64 measured
+  // no better. The search still picks by the cost model — this only lets it reach the knee.
+  candidateMicroBatchSizes: [1, 2, 4, 8, 16, 32],
   candidatePrefillChunks: [16, 32, 64, 128, 256],
   objectiveWeights: {
     tpot: 1,

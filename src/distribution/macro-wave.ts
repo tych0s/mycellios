@@ -1387,7 +1387,9 @@ function normalizeOptions(options: MacroWavePlannerOptions): NormalizedMacroWave
   const normalized: NormalizedMacroWaveOptions = {
     beamWidth: options.beamWidth ?? 256,
     candidateCodecs: options.candidateCodecs ?? ["fp16"],
-    candidateMicroBatchSizes: options.candidateMicroBatchSizes ?? [1, 2, 4, 8],
+    // See planners.ts DEFAULT_SEARCH_OPTIONS: admission capped at 8 halves measured
+    // aggregate throughput on separate GPUs; 32 is the measured knee.
+    candidateMicroBatchSizes: options.candidateMicroBatchSizes ?? [1, 2, 4, 8, 16, 32],
     candidatePrefillChunks: options.candidatePrefillChunks ?? [32, 64, 128],
     waveTokens: options.waveTokens ?? 1,
     expectedCommittedTokensPerWave: options.expectedCommittedTokensPerWave ?? 1,

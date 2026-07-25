@@ -831,7 +831,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--max-batch-size", type=int, default=8)
-    parser.add_argument("--max-active-sequences", type=int, default=8)
+    parser.add_argument(
+        "--max-active-sequences",
+        type=int,
+        default=32,
+        help=(
+            "Sequences admitted into decode at once. Measured on separate GPUs over "
+            "WAN (docs/benchmarks/gpu_cloud-exp1-maxactive-2026-07-24): 8 caps aggregate "
+            "throughput at roughly half of what the hardware sustains (52,7 vs 102,6 "
+            "tok/s under load) and collapses under overload (18,8 tok/s, 177 errors); "
+            "32 fixes both and also drains the queue faster at low load. 64 measured "
+            "no better than 32, so 32 is the knee, not a ceiling to raise blindly."
+        ),
+    )
     parser.add_argument("--max-pending-requests", type=int, default=128)
     parser.add_argument("--batch-window-ms", type=float, default=2.0)
     parser.add_argument(
