@@ -21,7 +21,6 @@ import type { CoordinatorRuntime } from "../src/coordinator/server.js";
 import { createCoordinator } from "../src/coordinator/server.js";
 import {
   buildReleaseTransactionManifest,
-  MAX_RELEASE_CHUNK_SIZE_BYTES,
   NativeReleaseTransactionStore,
   storeReleaseChunk,
   type ReleaseAssetChannel,
@@ -874,10 +873,11 @@ describe("release uploads", () => {
         logger: false,
         runtimeMetadata: releaseRuntimeMetadata(root, RUNTIME_REVISION),
         releaseTokenVerifier: async () => releaseClaims(RUNTIME_REVISION),
+        releaseChunkBodyLimitBytes: 1_024,
       },
     );
     runtimes.push(runtime);
-    const oversized = Buffer.alloc(MAX_RELEASE_CHUNK_SIZE_BYTES + 1);
+    const oversized = Buffer.alloc(1_025);
 
     const unauthenticated = await runtime.app.inject({
       method: "PUT",

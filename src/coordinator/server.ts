@@ -160,6 +160,7 @@ export async function createCoordinator(
     runtimeMetadata?: NativeRuntimeBuildMetadata;
     benchmarkStorageRoot?: string;
     releaseTransactionRoot?: string;
+    releaseChunkBodyLimitBytes?: number;
   } = {},
 ): Promise<CoordinatorRuntime> {
   const runtimeMetadata = options.runtimeMetadata
@@ -1793,6 +1794,15 @@ export async function createCoordinator(
     runtimeMetadata.root,
   );
   const releaseTokenVerifier = options.releaseTokenVerifier ?? verifyGitHubReleaseUploadToken;
+  const releaseChunkBodyLimitBytes = options.releaseChunkBodyLimitBytes
+    ?? MAX_RELEASE_CHUNK_SIZE_BYTES;
+  if (
+    !Number.isSafeInteger(releaseChunkBodyLimitBytes)
+    || releaseChunkBodyLimitBytes < 1
+    || releaseChunkBodyLimitBytes > MAX_RELEASE_CHUNK_SIZE_BYTES
+  ) {
+    throw new Error("release_chunk_body_limit_invalid");
+  }
   const authorizeReleaseMutation = async (
     request: FastifyRequest,
     reply: FastifyReply,
@@ -1836,7 +1846,7 @@ export async function createCoordinator(
   });
   app.put(
     "/internal/v1/releases/:channel/:fileName",
-    { bodyLimit: MAX_RELEASE_CHUNK_SIZE_BYTES },
+    { bodyLimit: releaseChunkBodyLimitBytes },
     async (request, reply) => {
     const params = z.object({
       channel: z.enum(["updates", "downloads"]),
