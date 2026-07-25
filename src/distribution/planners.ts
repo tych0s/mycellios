@@ -6,6 +6,7 @@ import {
   stageMemoryBytes,
 } from "./cost-model.js";
 import { activationCodec } from "./codecs.js";
+import { UNMEASURED_RTT_MS } from "../core/rtt.js";
 import type {
   ActivationCodecId,
   ComputeNodeProfile,
@@ -875,6 +876,11 @@ function optimisticRemainingCompute(
 
 function nodeLatencyScore(node: ComputeNodeProfile, topology: DistributionTopology): number {
   const outgoing = topology.links.filter((link) => link.from === node.id);
+  // Un nodo sin aristas salientes ya costaba el centinela. Lo que faltaba es
+  // que una arista concreta sin medir cueste lo mismo: antes, un nodo con una
+  // sola arista medida y nueve desconocidas promediaba barato y entraba en el
+  // plan. `oneWayLatencyMs` ya llega con el centinela desde `auto-distribute`,
+  // así que aquí basta con no diluirlo — el promedio lo hace por sí solo.
   const meanLink =
     outgoing.length > 0
       ? outgoing.reduce(
@@ -882,7 +888,7 @@ function nodeLatencyScore(node: ComputeNodeProfile, topology: DistributionTopolo
             total + link.oneWayLatencyMs + link.jitterP95Ms + 10 / link.bandwidthMbps,
           0,
         ) / outgoing.length
-      : 10_000;
+      : UNMEASURED_RTT_MS;
   return node.decodeScale + node.prefillScale * 0.25 + meanLink * 0.08;
 }
 
