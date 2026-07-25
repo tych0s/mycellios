@@ -38,6 +38,7 @@ export interface InstalledStageCanaryOptions {
 export interface InstalledStageCanaryDependencies {
   existsSync?: (path: string) => boolean;
   readFileSync?: (path: string, encoding: "utf8") => string;
+  verifyNativePythonProductSource?: (path: string) => unknown;
   spawnSync?: (
     executable: string,
     args: readonly string[],

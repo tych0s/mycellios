@@ -7,7 +7,6 @@ import {
   type AutoDistributionConfig,
   type CompiledModelProfile,
 } from "../src/distribution/auto-distribute.js";
-import { deploymentMetricsFromCanaryEvidence } from "../src/contracts/deployment-canary.js";
 import type { DistributedModelProfile } from "../src/distribution/types.js";
 
 const MIB = 1024 * 1024;
@@ -58,7 +57,7 @@ describe("automatic compatible-model distribution", () => {
     expect(() => parseAutoDistributionConfig(value)).toThrow();
   });
 
-  it("seals the activation canary instead of configuring measured TPS manually", () => {
+  it("leaves performance pending for a coordinator-issued live challenge", () => {
     const input = configFixture();
     input.coordinator = {
       url: "http://127.0.0.1:8080",
@@ -71,35 +70,15 @@ describe("automatic compatible-model distribution", () => {
       config,
       compilation,
       "http://127.0.0.1:8088",
-      [1, 2, 3].map((index) => ({
-        sampleId: `canary-${index}`,
-        outputTokens: 8,
-        activeMs: 1_000,
-        ttftMs: 250 + index,
-        completed: true as const,
-      })),
       "pipeline-activation-123",
     );
 
     expect(worker.deployment.tokensPerSecond).toBeUndefined();
     expect(worker.deployment.ttftMs).toBeUndefined();
-    expect(worker.deployment.canaryEvidence).toMatchObject({
-      model: config.model.publicName,
-      modelDigest: ARTIFACT_IDENTITY,
+    expect(worker.deployment).toMatchObject({
       activationId: "pipeline-activation-123",
-      warmupSamples: 1,
     });
-    expect(deploymentMetricsFromCanaryEvidence(
-      worker.deployment.canaryEvidence!,
-      {
-        model: config.model.publicName,
-        modelDigest: ARTIFACT_IDENTITY,
-        activationId: "pipeline-activation-123",
-      },
-    )).toMatchObject({
-      tokensPerSecond: 8,
-      ttftMs: 252,
-    });
+    expect("canaryEvidence" in worker.deployment).toBe(false);
   });
 });
 

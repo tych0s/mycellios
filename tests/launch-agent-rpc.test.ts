@@ -718,6 +718,37 @@ describe("HTTP LaunchAgent RPC", () => {
     expect(fake.starts).toHaveLength(0);
   });
 
+  it("rejects Python code and non-native module entrypoints before launch", async () => {
+    for (const [name, prefix] of [
+      ["inline-code", ["-u", "-c", "print('not mycellios')"]],
+      ["foreign-module", ["-u", "-m", "third_party.runtime"]],
+    ] as const) {
+      const request = fixtureRequest();
+      request.process.command.args.splice(0, 3, ...prefix);
+      const fake = new FakeAgent(`fake:${name}`);
+      const { address } = await serve(fake, request.nodeId);
+
+      await expect(
+        rpcClient(address).start(request, new AbortController().signal),
+      ).rejects.toThrow(
+        `command_entrypoint_must_be_mycellios_native:${request.process.kind}`,
+      );
+      expect(fake.starts).toHaveLength(0);
+    }
+  });
+
+  it("rejects a non-Python executable before launch", async () => {
+    const request = fixtureRequest();
+    request.process.command.executable = "node.exe";
+    const fake = new FakeAgent("fake:non-python");
+    const { address } = await serve(fake, request.nodeId);
+
+    await expect(
+      rpcClient(address).start(request, new AbortController().signal),
+    ).rejects.toThrow("command_executable_must_be_python");
+    expect(fake.starts).toHaveLength(0);
+  });
+
   it("preserves and revalidates a sealed native GGUF stage through RPC", async () => {
     const request = fixtureRequest();
     if (request.process.kind !== "remote-stage") {

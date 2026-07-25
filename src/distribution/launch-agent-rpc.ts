@@ -15,6 +15,9 @@ import {
   type LaunchProcessHandle,
 } from "./launch-supervisor.js";
 import {
+  MYCELLIOS_CELL_MEMBER_MODULE,
+  MYCELLIOS_SERVER_MODULE,
+  MYCELLIOS_STAGE_MODULE,
   validatePythonLaunchDescription,
   type PythonLaunchProcess,
   type PythonPipelineLaunchDescription,
@@ -1047,6 +1050,7 @@ function validatePythonLaunchProcess(value: unknown, nodeId: string): asserts va
   if (!(["cell-member", "remote-stage", "root-engine"] as unknown[]).includes(value.kind)) {
     throw new Error("python_launch_process_kind_is_invalid");
   }
+  const processKind = value.kind as PythonLaunchProcess["kind"];
   const common = [
     "kind",
     "launchIndex",
@@ -1123,7 +1127,7 @@ function validatePythonLaunchProcess(value: unknown, nodeId: string): asserts va
   }
   validateMembers(value.members);
   validateMacroWaveStage(value.macroWave);
-  validateCommand(value.command);
+  validateCommand(value.command, processKind);
   if (value.kind === "root-engine") validateRootEngineCommand(value.command);
   if (value.kind === "remote-stage") {
     validateSpeculativeTreeCommand(value.command, "remote_stage");
@@ -1329,12 +1333,40 @@ function macroWavePlanExecutionIdentity(value: unknown): string {
   });
 }
 
-function validateCommand(value: unknown): void {
+function validateCommand(
+  value: unknown,
+  kind: PythonLaunchProcess["kind"],
+): void {
   assertRecord(value, "command");
   assertExactKeys(value, ["executable", "args"], [], "command");
   assertPath(value.executable, "command.executable");
-  if (!Array.isArray(value.args) || value.args.length > 2_048) {
+  const executableLeaf = value.executable
+    .replaceAll("\\", "/")
+    .split("/")
+    .at(-1)!
+    .toLowerCase();
+  if (!/^python(?:3(?:\.\d+)?)?(?:\.exe)?$/.test(executableLeaf)) {
+    throw new Error("command_executable_must_be_python");
+  }
+  if (
+    !Array.isArray(value.args) ||
+    value.args.length < 3 ||
+    value.args.length > 2_048
+  ) {
     throw new Error("command_args_are_invalid");
+  }
+  const expectedModule =
+    kind === "cell-member"
+      ? MYCELLIOS_CELL_MEMBER_MODULE
+      : kind === "remote-stage"
+        ? MYCELLIOS_STAGE_MODULE
+        : MYCELLIOS_SERVER_MODULE;
+  if (
+    value.args[0] !== "-u" ||
+    value.args[1] !== "-m" ||
+    value.args[2] !== expectedModule
+  ) {
+    throw new Error(`command_entrypoint_must_be_mycellios_native:${kind}`);
   }
   for (const argument of value.args) {
     assertArgument(argument);

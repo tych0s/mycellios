@@ -9,6 +9,7 @@ import { estimateInputTokens } from "../core/request.js";
 import { safeVramBudget } from "../core/tiers.js";
 import type { MeshStore, StoredWorker } from "../storage/store.js";
 import type { RuntimeLinkObservation } from "../coordinator/runtime-link-observations.js";
+import { deploymentMetricsFromCanaryEvidence } from "../contracts/deployment-canary.js";
 
 export interface SchedulerOptions {
   connectedWorkerIds?: ReadonlySet<string>;
@@ -135,6 +136,7 @@ export class Scheduler {
     >();
     for (const worker of workers) {
       for (const deployment of worker.capabilities.deployments) {
+        if (!this.deploymentEvidenceIsEligible(worker, deployment, now)) continue;
         if (!this.internalPipelineDependenciesConnected(deployment, workers)) continue;
         const entry = models.get(deployment.model) ?? {
           replicas: 0,
@@ -306,6 +308,7 @@ export class Scheduler {
     request: ChatCompletionRequest,
   ): boolean {
     if (worker.status !== "online" || deployment.freeSlots < 1) return false;
+    if (!this.deploymentEvidenceIsEligible(worker, deployment)) return false;
     if (estimateInputTokens(request) + (request.max_tokens ?? 256) > deployment.contextLimit) {
       return false;
     }
@@ -438,6 +441,38 @@ export class Scheduler {
         500,
     );
     return regionPenalty + 0.15 * bandwidthPenalty + 0.1 * rttPenalty;
+  }
+
+  private deploymentEvidenceIsEligible(
+    worker: StoredWorker,
+    deployment: ModelDeployment,
+    now = Date.now(),
+  ): boolean {
+    if (deployment.adapter !== "mycellios-pipeline") return true;
+    if (
+      deployment.verificationState !== "verified"
+      || deployment.throughputSource !== "measured"
+      || !deployment.activationId
+      || !deployment.canaryEvidence
+    ) {
+      return false;
+    }
+    try {
+      const metrics = deploymentMetricsFromCanaryEvidence(
+        deployment.canaryEvidence,
+        {
+          model: deployment.model,
+          modelDigest: deployment.modelDigest,
+          activationId: deployment.activationId,
+          workerId: worker.id,
+          now,
+        },
+      );
+      return metrics.tokensPerSecond === deployment.tokensPerSecond
+        && metrics.ttftMs === deployment.ttftMs;
+    } catch {
+      return false;
+    }
   }
 
   private routeIsSaturated(

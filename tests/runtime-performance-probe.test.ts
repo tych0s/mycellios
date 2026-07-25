@@ -79,8 +79,9 @@ describe("physical runtime performance probe", () => {
     }), expected)).toThrow();
   });
 
-  it("publishes the sealed profile in worker capabilities only when it matches capacity", async () => {
-    const profile = sealRuntimePerformanceProfile(input());
+  it("publishes a physical profile only in response to a coordinator challenge", async () => {
+    const now = Date.now();
+    const profile = sealRuntimePerformanceProfile(input(new Date(now).toISOString()));
     const launchAgent: LaunchAgent = {
       id: "profile-test",
       async start() {
@@ -133,10 +134,46 @@ describe("physical runtime performance probe", () => {
 
     const capabilities = await (agent as unknown as {
       buildCapabilities(): Promise<{
-        distributedExecutor?: { performanceProfile?: typeof profile };
+        distributedExecutor?: { performanceEvidence?: unknown };
       }>;
     }).buildCapabilities();
-    expect(capabilities.distributedExecutor?.performanceProfile).toEqual(profile);
+    expect(capabilities.distributedExecutor?.performanceEvidence).toBeUndefined();
+
+    const sent: Array<{ type: string; payload: unknown }> = [];
+    const harness = agent as unknown as {
+      registeredWorkerId: string;
+      socket: { readyState: number; send(serialized: string): void };
+      handleEvidenceChallenge(challenge: unknown): Promise<void>;
+    };
+    harness.registeredWorkerId = "worker-profile";
+    harness.socket = {
+      readyState: 1,
+      send(serialized) {
+        sent.push(JSON.parse(serialized) as { type: string; payload: unknown });
+      },
+    };
+    await harness.handleEvidenceChallenge({
+      schema: "mycellios-evidence-challenge/1",
+      kind: "runtime-performance",
+      challengeId: "challenge-profile",
+      nonce: Buffer.alloc(32, 4).toString("base64url"),
+      sessionId: "session-profile",
+      workerId: "worker-profile",
+      issuedAt: new Date(now - 1_000).toISOString(),
+      expiresAt: new Date(now + 60_000).toISOString(),
+      nodeId: "profile-node",
+      backend: "cuda",
+      deviceName: "NVIDIA RTX 2060",
+      precision: "float16",
+      source: "physical-microbenchmark",
+      activationCodecId: "fp16",
+      minimumWarmupSamples: 1,
+      minimumSamples: 7,
+    });
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: "evidence.runtime.complete",
+      payload: expect.objectContaining({ profile }),
+    }));
   });
 
   it.skip("requires the packaged Mycellios runtime and a physical accelerator", () => {

@@ -36,6 +36,23 @@ export interface RuntimePerformanceProfile extends RuntimePerformanceProfileInpu
   profileId: string;
 }
 
+export const COORDINATOR_RUNTIME_PERFORMANCE_EVIDENCE_SCHEMA =
+  "mycellios-coordinator-runtime-performance/1" as const;
+
+export interface CoordinatorRuntimePerformanceEvidence {
+  schema: typeof COORDINATOR_RUNTIME_PERFORMANCE_EVIDENCE_SCHEMA;
+  evidenceId: string;
+  challengeId: string;
+  nonce: string;
+  workerId: string;
+  sessionId: string;
+  nodeId: string;
+  issuedAt: string;
+  expiresAt: string;
+  observedAt: string;
+  profile: RuntimePerformanceProfile;
+}
+
 export interface PlannerPerformanceScales {
   decodeScale: number;
   prefillScale: number;
@@ -49,6 +66,12 @@ export interface PlannerProfilePolicy {
   maximumConfidenceHalfWidthPct?: number;
   requiredSource?: RuntimePerformanceProfileInput["source"];
   now?: number;
+}
+
+export interface CoordinatorPlannerProfilePolicy extends PlannerProfilePolicy {
+  workerId?: string;
+  nodeId?: string;
+  sessionId?: string;
 }
 
 // Unit anchors make profiles from different machines comparable. They are not
@@ -118,6 +141,62 @@ export function plannerScalesFromProfile(
     profileId: profile.profileId,
     measuredAt: profile.measuredAt,
   };
+}
+
+/**
+ * Placement consumes only coordinator-owned observations. The nested profile
+ * hash protects content integrity; the outer evidence proves that the profile
+ * arrived in response to a fresh challenge on one authenticated worker
+ * session. It deliberately does not pretend to be hardware attestation.
+ */
+export function plannerScalesFromCoordinatorEvidence(
+  evidence: CoordinatorRuntimePerformanceEvidence,
+  policy: CoordinatorPlannerProfilePolicy = {},
+): PlannerPerformanceScales {
+  validateCoordinatorRuntimePerformanceEvidence(evidence);
+  if (policy.workerId && evidence.workerId !== policy.workerId) {
+    throw new Error("runtime_performance_evidence_worker_mismatch");
+  }
+  if (policy.nodeId && evidence.nodeId !== policy.nodeId) {
+    throw new Error("runtime_performance_evidence_node_mismatch");
+  }
+  if (policy.sessionId && evidence.sessionId !== policy.sessionId) {
+    throw new Error("runtime_performance_evidence_session_mismatch");
+  }
+  return plannerScalesFromProfile(evidence.profile, policy);
+}
+
+export function createCoordinatorRuntimePerformanceEvidence(
+  input: Omit<CoordinatorRuntimePerformanceEvidence, "schema" | "evidenceId">,
+): CoordinatorRuntimePerformanceEvidence {
+  const normalized = normalizeCoordinatorEvidence(input);
+  return {
+    schema: COORDINATOR_RUNTIME_PERFORMANCE_EVIDENCE_SCHEMA,
+    evidenceId: coordinatorEvidenceDigest(normalized),
+    ...normalized,
+  };
+}
+
+export function validateCoordinatorRuntimePerformanceEvidence(
+  evidence: CoordinatorRuntimePerformanceEvidence,
+): void {
+  if (evidence.schema !== COORDINATOR_RUNTIME_PERFORMANCE_EVIDENCE_SCHEMA) {
+    throw new Error("runtime_performance_evidence_schema_is_invalid");
+  }
+  const normalized = normalizeCoordinatorEvidence({
+    challengeId: evidence.challengeId,
+    nonce: evidence.nonce,
+    workerId: evidence.workerId,
+    sessionId: evidence.sessionId,
+    nodeId: evidence.nodeId,
+    issuedAt: evidence.issuedAt,
+    expiresAt: evidence.expiresAt,
+    observedAt: evidence.observedAt,
+    profile: evidence.profile,
+  });
+  if (evidence.evidenceId !== coordinatorEvidenceDigest(normalized)) {
+    throw new Error("runtime_performance_evidence_integrity_is_invalid");
+  }
 }
 
 export function validateRuntimePerformanceProfile(
@@ -269,3 +348,81 @@ export const runtimePerformanceProfileSchema = runtimePerformanceProfileInputSch
     });
   }
 });
+
+const coordinatorEvidenceInputSchema = z.object({
+  challengeId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/),
+  nonce: z.string().length(43).regex(/^[A-Za-z0-9_-]+$/),
+  workerId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/),
+  sessionId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/),
+  nodeId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
+  issuedAt: z.string().datetime({ offset: true }),
+  expiresAt: z.string().datetime({ offset: true }),
+  observedAt: z.string().datetime({ offset: true }),
+  profile: runtimePerformanceProfileSchema,
+}).strict().superRefine((input, context) => {
+  const issuedAt = Date.parse(input.issuedAt);
+  const expiresAt = Date.parse(input.expiresAt);
+  const observedAt = Date.parse(input.observedAt);
+  if (expiresAt <= issuedAt) {
+    context.addIssue({
+      code: "custom",
+      message: "runtime_performance_challenge_expiry_is_invalid",
+      path: ["expiresAt"],
+    });
+  }
+  if (observedAt < issuedAt || observedAt > expiresAt) {
+    context.addIssue({
+      code: "custom",
+      message: "runtime_performance_observation_is_outside_challenge",
+      path: ["observedAt"],
+    });
+  }
+  const measuredAt = Date.parse(input.profile.measuredAt);
+  if (measuredAt < issuedAt - 5_000 || measuredAt > observedAt + 5_000) {
+    context.addIssue({
+      code: "custom",
+      message: "runtime_performance_profile_was_not_measured_for_challenge",
+      path: ["profile", "measuredAt"],
+    });
+  }
+});
+
+export const coordinatorRuntimePerformanceEvidenceSchema =
+  coordinatorEvidenceInputSchema.extend({
+    schema: z.literal(COORDINATOR_RUNTIME_PERFORMANCE_EVIDENCE_SCHEMA),
+    evidenceId: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+  }).strict().superRefine((evidence, context) => {
+    try {
+      validateCoordinatorRuntimePerformanceEvidence(evidence);
+    } catch (error) {
+      context.addIssue({
+        code: "custom",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+function normalizeCoordinatorEvidence(
+  input: Omit<CoordinatorRuntimePerformanceEvidence, "schema" | "evidenceId">,
+): Omit<CoordinatorRuntimePerformanceEvidence, "schema" | "evidenceId"> {
+  const parsed = coordinatorEvidenceInputSchema.parse(input);
+  return {
+    challengeId: parsed.challengeId,
+    nonce: parsed.nonce,
+    workerId: parsed.workerId,
+    sessionId: parsed.sessionId,
+    nodeId: parsed.nodeId,
+    issuedAt: new Date(Date.parse(parsed.issuedAt)).toISOString(),
+    expiresAt: new Date(Date.parse(parsed.expiresAt)).toISOString(),
+    observedAt: new Date(Date.parse(parsed.observedAt)).toISOString(),
+    profile: structuredClone(parsed.profile),
+  };
+}
+
+function coordinatorEvidenceDigest(
+  input: Omit<CoordinatorRuntimePerformanceEvidence, "schema" | "evidenceId">,
+): string {
+  return `sha256:${createHash("sha256")
+    .update(JSON.stringify(input))
+    .digest("hex")}`;
+}

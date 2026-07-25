@@ -37,6 +37,7 @@ const adapterRegistrySource = readFileSync(
   "python/distributed_runtime/model_adapter_registry.json",
   "utf8",
 );
+const acceptProductSource = () => ({});
 
 describe("installed stage canary gate", () => {
   it("accepts only the exact runtime and parity contract", () => {
@@ -101,6 +102,7 @@ describe("installed stage canary gate", () => {
         {
           existsSync: () => true,
           readFileSync: () => adapterRegistrySource,
+          verifyNativePythonProductSource: acceptProductSource,
           spawnSync: () => ({
             status: 1,
             stdout: "looks healthy",
@@ -109,6 +111,38 @@ describe("installed stage canary gate", () => {
         },
       ),
     ).toThrow("KV parity failed");
+  });
+
+  it("imports every native product entrypoint before running parity", () => {
+    let processArguments: readonly string[] = [];
+    runInstalledStageCanary(
+      {
+        pythonExecutable: "C:\\runtime\\python.exe",
+        pythonSourceRoot: "C:\\resources\\python",
+      },
+      {
+        existsSync: () => true,
+        readFileSync: () => adapterRegistrySource,
+        verifyNativePythonProductSource: acceptProductSource,
+        spawnSync: (_executable, args) => {
+          processArguments = args;
+          return {
+            status: 0,
+            stdout:
+              INSTALLED_STAGE_CANARY_MARKER + JSON.stringify(validEvidence),
+            stderr: "",
+          };
+        },
+      },
+    );
+    const modules = JSON.parse(processArguments.at(-1) ?? "[]") as string[];
+    expect(modules).toEqual(expect.arrayContaining([
+      "distributed_runtime.server",
+      "distributed_runtime.stage_cli",
+      "distributed_runtime.native_gguf_runtime",
+      "distributed_runtime.native_gguf_disk_tiering",
+      "distributed_runtime.dense_tiering",
+    ]));
   });
 
   it("rejects a subprocess that reports a passing shell but failed parity", () => {
@@ -127,6 +161,7 @@ describe("installed stage canary gate", () => {
         {
           existsSync: () => true,
           readFileSync: () => adapterRegistrySource,
+          verifyNativePythonProductSource: acceptProductSource,
           spawnSync: () => ({
             status: 0,
             stdout,
@@ -147,6 +182,7 @@ describe("installed stage canary gate", () => {
         {
           existsSync: () => true,
           readFileSync: () => adapterRegistrySource,
+          verifyNativePythonProductSource: acceptProductSource,
           spawnSync: () => ({
             status: 0,
             stdout,

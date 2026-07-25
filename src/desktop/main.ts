@@ -1538,6 +1538,7 @@ class DesktopAcceleratedLaunchAgent implements LaunchAgent {
     const executor = new LocalProcessAgent({
       id: this.id,
       cwd: app.isPackaged ? dirname(app.getAppPath()) : app.getAppPath(),
+      allowedExecutables: [runtime.pythonExecutable],
       env: {
         PYTHONPATH: [...runtime.pythonPathAdditions, pythonPath].join(delimiter),
         HF_HOME: hfHome,

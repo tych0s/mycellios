@@ -8,7 +8,7 @@ import type { WorkerHub } from "./worker-hub.js";
 import type { DynamicActivationSnapshot } from "./model-activation-manager.js";
 import type { RuntimeLinkObservation } from "./runtime-link-observations.js";
 import {
-  plannerScalesFromProfile,
+  plannerScalesFromCoordinatorEvidence,
   type PlannerPerformanceScales,
 } from "../performance/runtime-profile.js";
 
@@ -231,10 +231,14 @@ function linkKey(fromNodeId: string, toNodeId: string): string {
 function eligiblePlannerPerformance(
   entry: ConnectedExecutor,
 ): PlannerPerformanceScales | null {
-  const profile = entry.executor.performanceProfile;
-  if (!profile) return null;
+  const evidence = entry.executor.performanceEvidence;
+  if (!evidence) return null;
+  const profile = evidence.profile;
   try {
-    const scales = plannerScalesFromProfile(profile);
+    const scales = plannerScalesFromCoordinatorEvidence(evidence, {
+      workerId: entry.worker.id,
+      nodeId: entry.executor.nodeId,
+    });
     const mode = entry.executor.computeMode ?? "automatic";
     if (profile.backend === "cpu") {
       if (entry.executor.cpuEligible !== true || mode === "gpu-only") return null;

@@ -2,7 +2,11 @@ import { describe, expect, it } from "vitest";
 import { buildConnectedExecutorActivationSnapshot } from "../src/coordinator/connected-executor-activation.js";
 import { parseAutoDistributionConfig } from "../src/distribution/auto-distribute.js";
 import type { StoredWorker } from "../src/storage/store.js";
-import { sealRuntimePerformanceProfile } from "../src/performance/runtime-profile.js";
+import {
+  createCoordinatorRuntimePerformanceEvidence,
+  sealRuntimePerformanceProfile,
+  type RuntimePerformanceProfile,
+} from "../src/performance/runtime-profile.js";
 
 describe("connected executor activation", () => {
   it("uses only connected unique desktop executors as model capacity", () => {
@@ -102,7 +106,11 @@ describe("connected executor activation", () => {
     Object.assign(cpuWorker.capabilities.distributedExecutor!, {
       computeMode: "cpu-only",
       cpuEligible: true,
-      performanceProfile: performanceProfile("cpu", "Intel CPU"),
+      performanceEvidence: performanceEvidence(
+        cpuWorker.id,
+        "node-cpu",
+        performanceProfile("cpu", "Intel CPU"),
+      ),
     });
 
     const snapshot = buildConnectedExecutorActivationSnapshot(
@@ -141,11 +149,11 @@ describe("connected executor activation", () => {
   it("keeps capacity visible but rejects stale or low-confidence node profiles", () => {
     const first = worker("worker-a", "node-a", "node-a.relay", 9_850, 4_096, 3_500, 10);
     const second = worker("worker-b", "node-b", "node-b.relay", 9_850, 4_096, 3_500, 10);
-    second.capabilities.distributedExecutor!.performanceProfile =
-      sealRuntimePerformanceProfile({
+    second.capabilities.distributedExecutor!.performanceEvidence =
+      performanceEvidence(second.id, "node-b", sealRuntimePerformanceProfile({
         ...profileInput("cuda", "NVIDIA Test GPU"),
         measuredAt: "2020-01-01T00:00:00.000Z",
-      });
+      }));
     const stale = buildConnectedExecutorActivationSnapshot(
       baseConfig(),
       [first, second],
@@ -155,14 +163,14 @@ describe("connected executor activation", () => {
     expect(stale.capacityNodes).toHaveLength(2);
     expect(stale.config).toBeNull();
 
-    second.capabilities.distributedExecutor!.performanceProfile =
-      sealRuntimePerformanceProfile({
+    second.capabilities.distributedExecutor!.performanceEvidence =
+      performanceEvidence(second.id, "node-b", sealRuntimePerformanceProfile({
         ...profileInput("cuda", "NVIDIA Test GPU"),
         activationCodec: {
           ...series("GB/s", 1.8, 2, 2.1),
           confidenceHalfWidthPct: 25,
         },
-      });
+      }));
     const noisy = buildConnectedExecutorActivationSnapshot(
       baseConfig(),
       [first, second],
@@ -175,7 +183,7 @@ describe("connected executor activation", () => {
   it("does not optimize a node without a matching physical profile", () => {
     const first = worker("worker-a", "node-a", "node-a.relay", 9_850, 4_096, 3_500, 10);
     const second = worker("worker-b", "node-b", "node-b.relay", 9_850, 4_096, 3_500, 10);
-    delete second.capabilities.distributedExecutor!.performanceProfile;
+    delete second.capabilities.distributedExecutor!.performanceEvidence;
     const missing = buildConnectedExecutorActivationSnapshot(
       baseConfig(),
       [first, second],
@@ -185,8 +193,12 @@ describe("connected executor activation", () => {
     expect(missing.capacityNodes).toHaveLength(2);
     expect(missing.config).toBeNull();
 
-    second.capabilities.distributedExecutor!.performanceProfile =
-      performanceProfile("cuda", "A different physical GPU");
+    second.capabilities.distributedExecutor!.performanceEvidence =
+      performanceEvidence(
+        second.id,
+        "node-b",
+        performanceProfile("cuda", "A different physical GPU"),
+      );
     const mismatched = buildConnectedExecutorActivationSnapshot(
       baseConfig(),
       [first, second],
@@ -286,7 +298,11 @@ function worker(
           updatedAt: new Date().toISOString(),
           recentEvents: [],
         },
-        performanceProfile: performanceProfile("cuda", "NVIDIA Test GPU"),
+        performanceEvidence: performanceEvidence(
+          id,
+          nodeId,
+          performanceProfile("cuda", "NVIDIA Test GPU"),
+        ),
       },
     },
   } as StoredWorker;
@@ -325,6 +341,25 @@ function performanceProfile(
   deviceName: string,
 ) {
   return sealRuntimePerformanceProfile(profileInput(backend, deviceName));
+}
+
+function performanceEvidence(
+  workerId: string,
+  nodeId: string,
+  profile: RuntimePerformanceProfile,
+) {
+  const measuredAt = Date.parse(profile.measuredAt);
+  return createCoordinatorRuntimePerformanceEvidence({
+    challengeId: `challenge-${workerId}`,
+    nonce: Buffer.alloc(32, workerId.length).toString("base64url"),
+    workerId,
+    sessionId: `session-${workerId}`,
+    nodeId,
+    issuedAt: new Date(measuredAt - 1_000).toISOString(),
+    expiresAt: new Date(measuredAt + 60_000).toISOString(),
+    observedAt: new Date(measuredAt + 1_000).toISOString(),
+    profile,
+  });
 }
 
 function profileInput(

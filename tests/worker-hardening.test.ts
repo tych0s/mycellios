@@ -13,7 +13,6 @@ import {
   validateCoordinatorUrl,
   WorkerAgent,
 } from "../src/worker/agent.js";
-import { sealDeploymentCanaryEvidence } from "../src/contracts/deployment-canary.js";
 import { sha256Text } from "../src/core/json.js";
 
 const CELL_MODEL_DIGEST = `sha256:${"b".repeat(64)}`;
@@ -53,6 +52,38 @@ describe("worker boundary hardening", () => {
         payload: { workerId: "x".repeat(257) },
       }),
     ).toThrow(/Invalid coordinator message/);
+  });
+
+  it("accepts only an exact coordinator evidence challenge contract", () => {
+    const challenge = {
+      schema: "mycellios-evidence-challenge/1",
+      kind: "deployment-canary",
+      challengeId: "challenge-1",
+      nonce: Buffer.alloc(32, 2).toString("base64url"),
+      sessionId: "session-1",
+      workerId: "worker-1",
+      issuedAt: "2026-07-25T10:00:00.000Z",
+      expiresAt: "2026-07-25T10:10:00.000Z",
+      deploymentId: "deployment-1",
+      model: "model",
+      modelDigest: `sha256:${"a".repeat(64)}`,
+      activationId: "activation-1",
+      prompt: "measure",
+      promptDigest: `sha256:${"b".repeat(64)}`,
+      maxOutputTokens: 64,
+      warmupSamples: 1,
+      samples: 3,
+    } as const;
+    expect(parseServerMessage({
+      v: 1,
+      type: "evidence.challenge",
+      payload: challenge,
+    }).type).toBe("evidence.challenge");
+    expect(() => parseServerMessage({
+      v: 1,
+      type: "evidence.challenge",
+      payload: { ...challenge, workerPerformanceOverride: 1_000_000 },
+    })).toThrow(/Invalid coordinator message/);
   });
 
   it("strictly validates coordinator-issued direct grants and candidates", () => {
@@ -124,7 +155,7 @@ describe("worker boundary hardening", () => {
   });
 
   it("represents a native pipeline as aggregate capacity without claiming one huge GPU", async () => {
-    const canaryEvidence = cellCanaryEvidence();
+    const evidenceSessionIds: string[] = [];
     const baseUrl = await listen(servers, (request, response) => {
       if (request.url === "/health") {
         response.setHeader("content-type", "application/json");
@@ -138,6 +169,8 @@ describe("worker boundary hardening", () => {
         }));
         return;
       }
+      const evidenceSessionId = request.headers["x-session-id"];
+      if (typeof evidenceSessionId === "string") evidenceSessionIds.push(evidenceSessionId);
       response.setHeader("content-type", "text/event-stream");
       response.write('data: {"choices":[{"delta":{"content":"ok"}}]}\n\n');
       response.write('data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":1,"completion_tokens":1},"distribution_metrics":{"ttft_ms":1,"pipeline_ms":1}}\n\n');
@@ -158,7 +191,6 @@ describe("worker boundary hardening", () => {
         activationId: CELL_ACTIVATION_ID,
         peakVramMb: 72_000,
         contextLimit: 32_768,
-        canaryEvidence,
       },
     });
     const agent = new WorkerAgent(config, {
@@ -184,20 +216,17 @@ describe("worker boundary hardening", () => {
         CELL_ACTIVATION_ID,
       ].join(":")).slice(-12)}`,
       activationId: CELL_ACTIVATION_ID,
-      tokensPerSecond: 16,
-      throughputSource: "measured",
-      ttftMs: 310,
-      canaryEvidence: {
-        modelDigest: CELL_MODEL_DIGEST,
-        activationId: CELL_ACTIVATION_ID,
-      },
+      tokensPerSecond: 1,
+      throughputSource: "default",
+      ttftMs: 60_000,
+      verificationState: "pending",
     });
 
     expect(workerConfigSchema.safeParse({
       ...config,
       deployment: {
         ...config.deployment,
-        canaryEvidence: undefined,
+        canaryEvidence: { workerDeclared: true },
         tokensPerSecond: 99_999,
         ttftMs: 0,
       },
@@ -213,6 +242,35 @@ describe("worker boundary hardening", () => {
         sent.push(JSON.parse(serialized) as WorkerEnvelope);
       },
     };
+    const challengeNow = Date.now();
+    await harness.handleEvidenceChallenge({
+      schema: "mycellios-evidence-challenge/1",
+      kind: "deployment-canary",
+      challengeId: "challenge-session-isolation",
+      nonce: Buffer.alloc(32, 7).toString("base64url"),
+      sessionId: "coordinator-session",
+      workerId: "worker-cell",
+      issuedAt: new Date(challengeNow - 1_000).toISOString(),
+      expiresAt: new Date(challengeNow + 60_000).toISOString(),
+      deploymentId: capabilities.deployments[0]!.deploymentId,
+      model: "regional-large",
+      modelDigest: CELL_MODEL_DIGEST,
+      activationId: CELL_ACTIVATION_ID,
+      prompt: "measure",
+      promptDigest: `sha256:${"c".repeat(64)}`,
+      maxOutputTokens: 8,
+      warmupSamples: 1,
+      samples: 3,
+    });
+    expect(evidenceSessionIds).toHaveLength(4);
+    expect(new Set(evidenceSessionIds).size).toBe(4);
+    expect(evidenceSessionIds[0]).toContain("-warmup-0");
+    expect(evidenceSessionIds.slice(1)).toEqual([
+      expect.stringContaining("-sample-0"),
+      expect.stringContaining("-sample-1"),
+      expect.stringContaining("-sample-2"),
+    ]);
+    sent.length = 0;
     await harness.execute(payload({
       jobId: "cell-job",
       modelDigest: CELL_MODEL_DIGEST,
@@ -224,9 +282,10 @@ describe("worker boundary hardening", () => {
     }));
     expect(messagePayload(sent, "task.complete")).toBeDefined();
     expect(harness.capabilities.deployments[0]).toMatchObject({
-      tokensPerSecond: 16,
-      ttftMs: 310,
-      canaryEvidence: { evidenceId: canaryEvidence.evidenceId },
+      tokensPerSecond: 1,
+      throughputSource: "default",
+      ttftMs: 60_000,
+      verificationState: "pending",
     });
 
     expect(
@@ -310,6 +369,7 @@ interface AgentHarness {
   adapter: InferenceAdapter;
   execute(payload: JobPayload): Promise<void>;
   buildCapabilities(): Promise<WorkerCapabilities>;
+  handleEvidenceChallenge(challenge: unknown): Promise<void>;
 }
 
 function baseConfig() {
@@ -420,41 +480,6 @@ async function collect(adapter: InferenceAdapter): Promise<string> {
     output += chunk.text;
   }
   return output;
-}
-
-function cellCanaryEvidence() {
-  return sealDeploymentCanaryEvidence({
-    model: "regional-large",
-    modelDigest: CELL_MODEL_DIGEST,
-    activationId: CELL_ACTIVATION_ID,
-    promptDigest: `sha256:${"e".repeat(64)}`,
-    maxOutputTokens: 16,
-    measuredAt: new Date().toISOString(),
-    warmupSamples: 1,
-    samples: [
-      {
-        sampleId: "canary-1",
-        outputTokens: 16,
-        activeMs: 1_000,
-        ttftMs: 320,
-        completed: true,
-      },
-      {
-        sampleId: "canary-2",
-        outputTokens: 16,
-        activeMs: 1_000,
-        ttftMs: 300,
-        completed: true,
-      },
-      {
-        sampleId: "canary-3",
-        outputTokens: 16,
-        activeMs: 1_000,
-        ttftMs: 310,
-        completed: true,
-      },
-    ],
-  });
 }
 
 async function listen(servers: Server[], handler: RequestListener): Promise<string> {

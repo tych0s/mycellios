@@ -356,16 +356,42 @@ describe("Python launch supervisor", () => {
   it("allows constructing the local opt-in agent without starting a process", () => {
     const local = new LocalProcessAgent({
       id: "explicit-local",
+      allowedExecutables: [process.execPath],
       maxOutputBytesPerStream: 2_048,
       stopGraceMs: 10,
     });
     expect(local.id).toBe("explicit-local");
   });
 
+  it("pins the exact prepared interpreter before spawning a local process", async () => {
+    const local = new LocalProcessAgent({
+      id: "pinned-local",
+      allowedExecutables: [process.execPath],
+    });
+    const request = {
+      launchId: "pinned-launch",
+      pipelineId: "pinned-pipeline",
+      nodeId: "local-node",
+      process: {
+        processId: "pinned-process",
+        kind: "root-engine",
+        command: {
+          executable: `${process.execPath}.untrusted`,
+          args: ["-e", "process.exit(0)"],
+        },
+      },
+    } as unknown as LaunchAgentStartRequest;
+
+    await expect(
+      local.start(request, new AbortController().signal),
+    ).rejects.toThrow("local_process_executable_is_not_authorized");
+  });
+
   it("retains a final readiness marker when bounded process output is truncated", async () => {
     const marker = "FINAL_EXECUTION_MARKER";
     const local = new LocalProcessAgent({
       id: "tail-capture-local",
+      allowedExecutables: [process.execPath],
       maxOutputBytesPerStream: 1_024,
       stopGraceMs: 1_000,
       readyWhen: ({ recentStdout }) => recentStdout.includes(marker),

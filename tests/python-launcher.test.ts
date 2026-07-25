@@ -2115,6 +2115,16 @@ describe("GDLP/2 Python launch compiler", () => {
     expect(() => compile(manifest(), { maxPendingRequests: 1 })).toThrow(
       "python_max_pending_requests_is_too_small",
     );
+    expect(() =>
+      compile(manifest(), {
+        stageModule: "third_party.stage",
+      } as unknown as Partial<PythonLaunchCompilerOptions>),
+    ).toThrow("python_stage_module_must_be_mycellios_native");
+    expect(() =>
+      compile(manifest(), {
+        serverModule: "third_party.server",
+      } as unknown as Partial<PythonLaunchCompilerOptions>),
+    ).toThrow("python_server_module_must_be_mycellios_native");
   });
 
   it("rejects duplicate remote listeners and collisions with root listeners", () => {

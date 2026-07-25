@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { createServer, type AddressInfo, type Server, type Socket } from "node:net";
 import type { FastifyInstance } from "fastify";
 import type WebSocket from "ws";
@@ -11,6 +11,30 @@ import {
   type WorkerHeartbeatPayload,
 } from "../contracts/worker-protocol.js";
 import type { MeshStore } from "../storage/store.js";
+import type {
+  ModelDeployment,
+  WorkerCapabilities,
+} from "../contracts/types.js";
+import {
+  createCoordinatorDeploymentCanaryEvidence,
+  deploymentMetricsFromCanaryEvidence,
+  type DeploymentCanarySample,
+} from "../contracts/deployment-canary.js";
+import {
+  DEPLOYMENT_CANARY_CHALLENGE_MAX_OUTPUT_TOKENS,
+  DEPLOYMENT_CANARY_CHALLENGE_PROMPT,
+  DEPLOYMENT_CANARY_CHALLENGE_SAMPLES,
+  DEPLOYMENT_CANARY_CHALLENGE_WARMUPS,
+  EVIDENCE_CHALLENGE_SCHEMA,
+  EVIDENCE_CHALLENGE_TTL_MS,
+  type DeploymentCanaryChallenge,
+  type RuntimePerformanceChallenge,
+} from "../contracts/evidence-challenge.js";
+import { sha256Text } from "../core/json.js";
+import {
+  createCoordinatorRuntimePerformanceEvidence,
+  runtimePerformanceProfileSchema,
+} from "../performance/runtime-profile.js";
 import {
   RuntimeLinkObservationStore,
   type RuntimeLinkObservation,
@@ -19,6 +43,9 @@ import {
   createDirectSessionGrant,
   type DirectSessionGrant,
 } from "../transport/direct-secure-channel.js";
+import {
+  mergeCurrentSessionEvidence,
+} from "./evidence-authority.js";
 
 interface HubEvents {
   envelope: [WorkerEnvelope];
@@ -33,7 +60,32 @@ interface ConnectionState {
   pending: boolean;
   messageWindowStartedAt: number;
   messagesInWindow: number;
+  sessionId: string;
 }
+
+interface PendingCanarySample {
+  startedAt: number;
+  firstTokenAt: number | null;
+  completedAt: number | null;
+  nextTokenIndex: number;
+  outputBytes: number;
+  outputTokens: number | null;
+}
+
+interface PendingDeploymentCanary {
+  kind: "deployment-canary";
+  challenge: DeploymentCanaryChallenge;
+  timeout: NodeJS.Timeout;
+  samples: Map<number, PendingCanarySample>;
+}
+
+interface PendingRuntimePerformance {
+  kind: "runtime-performance";
+  challenge: RuntimePerformanceChallenge;
+  timeout: NodeJS.Timeout;
+}
+
+type PendingEvidenceChallenge = PendingDeploymentCanary | PendingRuntimePerformance;
 
 interface RuntimeStreamSession {
   streamId: string;
@@ -121,6 +173,8 @@ const RUNTIME_STREAM_RECOVERY_GRACE_MS = 45_000;
 const DIRECT_NEGOTIATION_TIMEOUT_MS = 7_500;
 const DIRECT_GRANT_TTL_MS = 10_000;
 const DIRECT_ROUTE_MAX_LIFETIME_MS = 4 * 60 * 60 * 1_000;
+const EVIDENCE_RETRY_AFTER_MS = 60_000;
+const MAX_PENDING_EVIDENCE_CHALLENGES = 1_024;
 
 export class WorkerHub extends EventEmitter<HubEvents> {
   private readonly connections = new Map<string, ConnectionState>();
@@ -135,6 +189,8 @@ export class WorkerHub extends EventEmitter<HubEvents> {
   private readonly runtimeLinkLastStartedAt = new Map<string, number>();
   private runtimeLinkProbeTimer: NodeJS.Timeout | null = null;
   private runtimeLinkProbeCursor = 0;
+  private readonly evidenceChallenges = new Map<string, PendingEvidenceChallenge>();
+  private readonly evidenceRetryAfter = new Map<string, number>();
 
   constructor(private readonly store: MeshStore) {
     super();
@@ -155,6 +211,7 @@ export class WorkerHub extends EventEmitter<HubEvents> {
         pending: true,
         messageWindowStartedAt: Date.now(),
         messagesInWindow: 0,
+        sessionId: `session-${randomUUID()}`,
       };
       this.pendingConnections += 1;
       this.allConnections.add(state);
@@ -356,6 +413,9 @@ export class WorkerHub extends EventEmitter<HubEvents> {
     for (const probe of [...this.runtimeLinkProbes.values()]) {
       this.finishRuntimeLinkProbe(probe, null, null);
     }
+    for (const pending of this.evidenceChallenges.values()) clearTimeout(pending.timeout);
+    this.evidenceChallenges.clear();
+    this.evidenceRetryAfter.clear();
     for (const server of this.runtimeProxyServers) server.close();
     this.runtimeProxyServers.clear();
   }
@@ -444,8 +504,9 @@ export class WorkerHub extends EventEmitter<HubEvents> {
       }
       if (envelope.type === "worker.heartbeat") {
         const wasReady = state.ready;
-        this.applyHeartbeat(envelope.workerId, envelope.payload);
         state.ready = true;
+        this.applyHeartbeat(state, envelope.payload);
+        this.ensureEvidenceChallenges(state, envelope.payload.capabilities);
         if (!wasReady) queueMicrotask(() => this.sampleRuntimeLinks());
       }
       if (envelope.type === "worker.goodbye") {
@@ -488,6 +549,10 @@ export class WorkerHub extends EventEmitter<HubEvents> {
         this.handleRuntimeLinkProbeEnvelope(envelope);
         return;
       }
+      if (envelope.type.startsWith("evidence.")) {
+        this.handleEvidenceEnvelope(state, envelope);
+        return;
+      }
       this.emit("envelope", envelope);
     } catch (error) {
       this.logger?.warn({
@@ -498,9 +563,15 @@ export class WorkerHub extends EventEmitter<HubEvents> {
     }
   }
 
-  private applyHeartbeat(workerId: string, payload: WorkerHeartbeatPayload): void {
+  private applyHeartbeat(state: ConnectionState, payload: WorkerHeartbeatPayload): void {
+    const workerId = state.workerId!;
     const status = payload.heartbeat.draining ? "draining" : "online";
-    this.store.updateWorkerHeartbeat(workerId, payload.capabilities, status);
+    const current = this.store.getWorker(workerId)?.capabilities ?? null;
+    this.store.updateWorkerHeartbeat(
+      workerId,
+      mergeCurrentSessionEvidence(workerId, state.sessionId, payload.capabilities, current),
+      status,
+    );
   }
 
   private closeInvalid(state: ConnectionState, reason: string, code = 4400): void {
@@ -520,6 +591,7 @@ export class WorkerHub extends EventEmitter<HubEvents> {
     }
     if (state.workerId && this.connections.get(state.workerId) === state) {
       const disconnectedWorkerId = state.workerId;
+      this.clearEvidenceChallengesForSession(disconnectedWorkerId, state.sessionId);
       this.connections.delete(state.workerId);
       this.store.setWorkerStatus(state.workerId, "offline");
       this.emit("disconnect", state.workerId);
@@ -549,6 +621,438 @@ export class WorkerHub extends EventEmitter<HubEvents> {
         ) {
           this.finishRuntimeLinkProbe(probe, null, null);
         }
+      }
+    }
+  }
+
+  private ensureEvidenceChallenges(
+    state: ConnectionState,
+    claims: WorkerCapabilities,
+    now = Date.now(),
+  ): void {
+    const workerId = state.workerId;
+    if (!workerId || !state.ready || this.connections.get(workerId) !== state) return;
+    const stored = this.store.getWorker(workerId);
+    if (!stored) return;
+
+    for (const claim of claims.deployments
+      .filter((deployment) => deployment.adapter === "mycellios-pipeline")
+      .slice(0, 4)) {
+      const current = stored.capabilities.deployments.find(
+        (deployment) =>
+          deployment.deploymentId === claim.deploymentId
+          && deployment.modelDigest === claim.modelDigest
+          && deployment.activationId === claim.activationId,
+      );
+      if (
+        !claim.activationId
+        || current?.verificationState === "verified"
+        || !this.challengeMayStart(
+          evidenceChallengeKey(workerId, "deployment-canary", claim.deploymentId),
+          now,
+        )
+      ) {
+        continue;
+      }
+      this.startDeploymentCanaryChallenge(state, claim, now);
+    }
+
+    const executor = claims.distributedExecutor;
+    const currentExecutor = stored.capabilities.distributedExecutor;
+    if (
+      executor
+      && currentExecutor?.nodeId === executor.nodeId
+      && !currentExecutor.performanceEvidence
+      && this.challengeMayStart(
+        evidenceChallengeKey(workerId, "runtime-performance", executor.nodeId),
+        now,
+      )
+    ) {
+      const identity = runtimeChallengeIdentity(claims);
+      if (identity) this.startRuntimePerformanceChallenge(state, identity, now);
+    }
+  }
+
+  private challengeMayStart(key: string, now: number): boolean {
+    if (this.evidenceChallenges.size >= MAX_PENDING_EVIDENCE_CHALLENGES) return false;
+    if (now < (this.evidenceRetryAfter.get(key) ?? 0)) return false;
+    return ![...this.evidenceChallenges.values()].some(
+      (pending) => evidenceChallengeKey(
+        pending.challenge.workerId,
+        pending.kind,
+        pending.kind === "deployment-canary"
+          ? pending.challenge.deploymentId
+          : pending.challenge.nodeId,
+      ) === key,
+    );
+  }
+
+  private startDeploymentCanaryChallenge(
+    state: ConnectionState,
+    deployment: ModelDeployment,
+    now: number,
+  ): void {
+    const workerId = state.workerId!;
+    const challenge = {
+      ...this.challengeBinding(state, now),
+      kind: "deployment-canary" as const,
+      deploymentId: deployment.deploymentId,
+      model: deployment.model,
+      modelDigest: deployment.modelDigest,
+      activationId: deployment.activationId!,
+      prompt: DEPLOYMENT_CANARY_CHALLENGE_PROMPT,
+      promptDigest: sha256Text(DEPLOYMENT_CANARY_CHALLENGE_PROMPT),
+      maxOutputTokens: DEPLOYMENT_CANARY_CHALLENGE_MAX_OUTPUT_TOKENS,
+      warmupSamples: DEPLOYMENT_CANARY_CHALLENGE_WARMUPS,
+      samples: DEPLOYMENT_CANARY_CHALLENGE_SAMPLES,
+    } satisfies DeploymentCanaryChallenge;
+    const pending: PendingDeploymentCanary = {
+      kind: "deployment-canary",
+      challenge,
+      timeout: this.evidenceChallengeTimeout(challenge),
+      samples: new Map(),
+    };
+    this.evidenceChallenges.set(challenge.challengeId, pending);
+    if (!this.sendSocket(state.socket, "evidence.challenge", challenge)) {
+      this.finishEvidenceChallenge(pending, false);
+      this.evidenceRetryAfter.set(
+        evidenceChallengeKey(workerId, pending.kind, deployment.deploymentId),
+        now + EVIDENCE_RETRY_AFTER_MS,
+      );
+    }
+  }
+
+  private startRuntimePerformanceChallenge(
+    state: ConnectionState,
+    identity: {
+      nodeId: string;
+      backend: RuntimePerformanceChallenge["backend"];
+      deviceName: string;
+      precision: RuntimePerformanceChallenge["precision"];
+    },
+    now: number,
+  ): void {
+    const challenge = {
+      ...this.challengeBinding(state, now),
+      kind: "runtime-performance" as const,
+      ...identity,
+      source: "physical-microbenchmark" as const,
+      activationCodecId: "fp16" as const,
+      minimumWarmupSamples: 1,
+      minimumSamples: 7,
+    } satisfies RuntimePerformanceChallenge;
+    const pending: PendingRuntimePerformance = {
+      kind: "runtime-performance",
+      challenge,
+      timeout: this.evidenceChallengeTimeout(challenge),
+    };
+    this.evidenceChallenges.set(challenge.challengeId, pending);
+    if (!this.sendSocket(state.socket, "evidence.challenge", challenge)) {
+      this.finishEvidenceChallenge(pending, false);
+    }
+  }
+
+  private challengeBinding(
+    state: ConnectionState,
+    now: number,
+  ): Pick<
+    DeploymentCanaryChallenge,
+    "schema" | "challengeId" | "nonce" | "sessionId" | "workerId" | "issuedAt" | "expiresAt"
+  > {
+    return {
+      schema: EVIDENCE_CHALLENGE_SCHEMA,
+      challengeId: `challenge-${randomUUID()}`,
+      nonce: randomBytes(32).toString("base64url"),
+      sessionId: state.sessionId,
+      workerId: state.workerId!,
+      issuedAt: new Date(now).toISOString(),
+      expiresAt: new Date(now + EVIDENCE_CHALLENGE_TTL_MS).toISOString(),
+    };
+  }
+
+  private evidenceChallengeTimeout(
+    challenge: DeploymentCanaryChallenge | RuntimePerformanceChallenge,
+  ): NodeJS.Timeout {
+    const timeout = setTimeout(() => {
+      const pending = this.evidenceChallenges.get(challenge.challengeId);
+      if (pending) this.finishEvidenceChallenge(pending, false);
+    }, Math.max(1, Date.parse(challenge.expiresAt) - Date.now()));
+    timeout.unref();
+    return timeout;
+  }
+
+  private handleEvidenceEnvelope(
+    state: ConnectionState,
+    envelope: WorkerEnvelope,
+  ): void {
+    const payload = envelope.payload as Record<string, unknown>;
+    const challengeId = payload.challengeId as string;
+    const pending = this.evidenceChallenges.get(challengeId);
+    if (!pending || !this.evidenceResponseMatches(state, pending, payload)) {
+      this.closeInvalid(state, "invalid or replayed evidence response", 4403);
+      return;
+    }
+    const now = Date.now();
+    if (now > Date.parse(pending.challenge.expiresAt)) {
+      this.finishEvidenceChallenge(pending, false);
+      this.closeInvalid(state, "expired evidence response", 4403);
+      return;
+    }
+
+    if (envelope.type === "evidence.challenge.failed") {
+      this.finishEvidenceChallenge(pending, false);
+      return;
+    }
+    if (pending.kind === "runtime-performance") {
+      if (envelope.type !== "evidence.runtime.complete") {
+        this.closeInvalid(state, "evidence response kind mismatch", 4403);
+        return;
+      }
+      this.completeRuntimePerformanceChallenge(state, pending, payload.profile, now);
+      return;
+    }
+    this.handleDeploymentCanaryEnvelope(state, pending, envelope.type, payload, now);
+  }
+
+  private evidenceResponseMatches(
+    state: ConnectionState,
+    pending: PendingEvidenceChallenge,
+    payload: Record<string, unknown>,
+  ): boolean {
+    return state.workerId === pending.challenge.workerId
+      && state.sessionId === pending.challenge.sessionId
+      && payload.sessionId === pending.challenge.sessionId
+      && payload.nonce === pending.challenge.nonce
+      && this.connections.get(pending.challenge.workerId) === state;
+  }
+
+  private handleDeploymentCanaryEnvelope(
+    state: ConnectionState,
+    pending: PendingDeploymentCanary,
+    type: string,
+    payload: Record<string, unknown>,
+    now: number,
+  ): void {
+    const sampleIndex = payload.sampleIndex as number;
+    if (
+      !Number.isInteger(sampleIndex)
+      || sampleIndex < 0
+      || sampleIndex >= pending.challenge.samples
+    ) {
+      this.closeInvalid(state, "invalid canary sample index", 4403);
+      return;
+    }
+    if (type === "evidence.canary.started") {
+      if (pending.samples.has(sampleIndex)) {
+        this.closeInvalid(state, "duplicate canary sample", 4403);
+        return;
+      }
+      pending.samples.set(sampleIndex, {
+        startedAt: now,
+        firstTokenAt: null,
+        completedAt: null,
+        nextTokenIndex: 0,
+        outputBytes: 0,
+        outputTokens: null,
+      });
+      return;
+    }
+    const sample = pending.samples.get(sampleIndex);
+    if (!sample || sample.completedAt !== null) {
+      this.closeInvalid(state, "canary sample was not started", 4403);
+      return;
+    }
+    if (type === "evidence.canary.token") {
+      const text = payload.text as string;
+      const index = payload.index as number;
+      const bytes = Buffer.byteLength(text, "utf8");
+      if (
+        !text
+        || index !== sample.nextTokenIndex
+        || sample.outputBytes + bytes > pending.challenge.maxOutputTokens * 64
+      ) {
+        this.closeInvalid(state, "invalid canary token sequence", 4403);
+        return;
+      }
+      sample.firstTokenAt ??= now;
+      sample.nextTokenIndex += 1;
+      sample.outputBytes += bytes;
+      return;
+    }
+    if (type !== "evidence.canary.complete") {
+      this.closeInvalid(state, "evidence response kind mismatch", 4403);
+      return;
+    }
+    const outputTokens = payload.outputTokens as number;
+    if (
+      sample.firstTokenAt === null
+      || sample.outputBytes < 1
+      || !Number.isInteger(outputTokens)
+      || outputTokens < 1
+      || outputTokens > pending.challenge.maxOutputTokens
+    ) {
+      this.closeInvalid(state, "invalid completed canary sample", 4403);
+      return;
+    }
+    sample.completedAt = now;
+    sample.outputTokens = outputTokens;
+    if (
+      pending.samples.size === pending.challenge.samples
+      && [...pending.samples.values()].every((candidate) => candidate.completedAt !== null)
+    ) {
+      this.publishDeploymentCanaryEvidence(state, pending, now);
+    }
+  }
+
+  private publishDeploymentCanaryEvidence(
+    state: ConnectionState,
+    pending: PendingDeploymentCanary,
+    now: number,
+  ): void {
+    const worker = this.store.getWorker(pending.challenge.workerId);
+    const deployment = worker?.capabilities.deployments.find(
+      (candidate) =>
+        candidate.deploymentId === pending.challenge.deploymentId
+        && candidate.model === pending.challenge.model
+        && candidate.modelDigest === pending.challenge.modelDigest
+        && candidate.activationId === pending.challenge.activationId,
+    );
+    if (!worker || !deployment || this.connections.get(worker.id) !== state) {
+      this.finishEvidenceChallenge(pending, false);
+      return;
+    }
+    const samples = [...pending.samples.entries()]
+      .sort(([left], [right]) => left - right)
+      .map(([index, sample]): DeploymentCanarySample => ({
+        sampleId: `sample-${index}`,
+        outputTokens: sample.outputTokens!,
+        activeMs: Math.max(1, sample.completedAt! - sample.startedAt),
+        ttftMs: Math.max(0, sample.firstTokenAt! - sample.startedAt),
+        completed: true,
+      }));
+    const evidence = createCoordinatorDeploymentCanaryEvidence({
+      challengeId: pending.challenge.challengeId,
+      nonce: pending.challenge.nonce,
+      workerId: pending.challenge.workerId,
+      sessionId: pending.challenge.sessionId,
+      issuedAt: pending.challenge.issuedAt,
+      expiresAt: pending.challenge.expiresAt,
+      model: pending.challenge.model,
+      modelDigest: pending.challenge.modelDigest,
+      activationId: pending.challenge.activationId,
+      promptDigest: pending.challenge.promptDigest,
+      maxOutputTokens: pending.challenge.maxOutputTokens,
+      observedAt: new Date(now).toISOString(),
+      warmupSamples: pending.challenge.warmupSamples,
+      samples,
+    });
+    const metrics = deploymentMetricsFromCanaryEvidence(evidence, {
+      model: deployment.model,
+      modelDigest: deployment.modelDigest,
+      activationId: deployment.activationId!,
+      workerId: worker.id,
+      sessionId: state.sessionId,
+      now,
+    });
+    const capabilities = structuredClone(worker.capabilities);
+    capabilities.deployments = capabilities.deployments.map((candidate) =>
+      candidate.deploymentId === deployment.deploymentId
+        ? {
+            ...candidate,
+            verificationState: "verified",
+            throughputSource: "measured",
+            tokensPerSecond: metrics.tokensPerSecond,
+            ttftMs: metrics.ttftMs,
+            canaryEvidence: evidence,
+          }
+        : candidate
+    );
+    this.store.updateWorkerHeartbeat(worker.id, capabilities, worker.status);
+    this.finishEvidenceChallenge(pending, true);
+  }
+
+  private completeRuntimePerformanceChallenge(
+    state: ConnectionState,
+    pending: PendingRuntimePerformance,
+    input: unknown,
+    now: number,
+  ): void {
+    try {
+      const profile = runtimePerformanceProfileSchema.parse(input);
+      const challenge = pending.challenge;
+      if (
+        profile.backend !== challenge.backend
+        || normalizeDeviceName(profile.deviceName) !== normalizeDeviceName(challenge.deviceName)
+        || profile.precision !== challenge.precision
+        || profile.source !== challenge.source
+        || profile.activationCodecId !== challenge.activationCodecId
+        || [
+          profile.decodeMemory,
+          profile.prefillCompute,
+          profile.activationCodec,
+        ].some((series) =>
+          series.warmupSamples < challenge.minimumWarmupSamples
+          || series.samples < challenge.minimumSamples
+        )
+      ) {
+        throw new Error("runtime_performance_profile_does_not_match_challenge");
+      }
+      const worker = this.store.getWorker(challenge.workerId);
+      const executor = worker?.capabilities.distributedExecutor;
+      if (
+        !worker
+        || !executor
+        || executor.nodeId !== challenge.nodeId
+        || this.connections.get(worker.id) !== state
+      ) {
+        throw new Error("runtime_performance_target_changed");
+      }
+      const evidence = createCoordinatorRuntimePerformanceEvidence({
+        challengeId: challenge.challengeId,
+        nonce: challenge.nonce,
+        workerId: challenge.workerId,
+        sessionId: challenge.sessionId,
+        nodeId: challenge.nodeId,
+        issuedAt: challenge.issuedAt,
+        expiresAt: challenge.expiresAt,
+        observedAt: new Date(now).toISOString(),
+        profile,
+      });
+      const capabilities = structuredClone(worker.capabilities);
+      capabilities.distributedExecutor!.performanceEvidence = evidence;
+      this.store.updateWorkerHeartbeat(worker.id, capabilities, worker.status);
+      this.finishEvidenceChallenge(pending, true);
+    } catch (error) {
+      this.logger?.warn({
+        workerId: state.workerId,
+        challengeId: pending.challenge.challengeId,
+        error: error instanceof Error ? error.message : String(error),
+      }, "runtime performance evidence rejected");
+      this.finishEvidenceChallenge(pending, false);
+    }
+  }
+
+  private finishEvidenceChallenge(
+    pending: PendingEvidenceChallenge,
+    succeeded: boolean,
+  ): void {
+    clearTimeout(pending.timeout);
+    this.evidenceChallenges.delete(pending.challenge.challengeId);
+    const target = pending.kind === "deployment-canary"
+      ? pending.challenge.deploymentId
+      : pending.challenge.nodeId;
+    const key = evidenceChallengeKey(pending.challenge.workerId, pending.kind, target);
+    if (succeeded) this.evidenceRetryAfter.delete(key);
+    else this.evidenceRetryAfter.set(key, Date.now() + EVIDENCE_RETRY_AFTER_MS);
+  }
+
+  private clearEvidenceChallengesForSession(workerId: string, sessionId: string): void {
+    for (const pending of [...this.evidenceChallenges.values()]) {
+      if (
+        pending.challenge.workerId === workerId
+        && pending.challenge.sessionId === sessionId
+      ) {
+        this.finishEvidenceChallenge(pending, false);
       }
     }
   }
@@ -1428,6 +1932,59 @@ function messageType(input: unknown): string | null {
 
 function runtimeLinkKey(fromNodeId: string, toNodeId: string): string {
   return `${fromNodeId}\u0000${toNodeId}`;
+}
+
+function evidenceChallengeKey(
+  workerId: string,
+  kind: PendingEvidenceChallenge["kind"],
+  target: string,
+): string {
+  return `${workerId}\u0000${kind}\u0000${target}`;
+}
+
+function runtimeChallengeIdentity(
+  capabilities: WorkerCapabilities,
+): {
+  nodeId: string;
+  backend: RuntimePerformanceChallenge["backend"];
+  deviceName: string;
+  precision: RuntimePerformanceChallenge["precision"];
+} | null {
+  const executor = capabilities.distributedExecutor;
+  if (!executor) return null;
+  const acceleration = executor.acceleration;
+  if (
+    acceleration?.state === "gpu-ready"
+    && acceleration.backend
+    && acceleration.backend !== "cpu"
+    && acceleration.deviceName
+    && executor.computeMode !== "cpu-only"
+  ) {
+    return {
+      nodeId: executor.nodeId,
+      backend: acceleration.backend,
+      deviceName: acceleration.deviceName,
+      precision: "float16",
+    };
+  }
+  if (
+    executor.cpuEligible === true
+    && executor.computeMode !== "gpu-only"
+    && acceleration?.backend === "cpu"
+    && acceleration.deviceName
+  ) {
+    return {
+      nodeId: executor.nodeId,
+      backend: "cpu",
+      deviceName: acceleration.deviceName,
+      precision: "float32",
+    };
+  }
+  return null;
+}
+
+function normalizeDeviceName(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
 function runtimeStreamReportEquals(

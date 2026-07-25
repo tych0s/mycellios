@@ -64,6 +64,7 @@ import {
   DeploymentControlPlane,
   type DeploymentOperation,
 } from "./deployment-control-plane.js";
+import { stripWorkerDeclaredEvidence } from "./evidence-authority.js";
 
 export function automaticActivationFailureIsTransient(message: string): boolean {
   const normalized = message.toLowerCase();
@@ -1381,7 +1382,10 @@ export async function createCoordinator(
         },
       });
     }
-    const worker = store.registerWorker(registration);
+    const worker = store.registerWorker({
+      ...(registration.identity ? { identity: registration.identity } : {}),
+      capabilities: stripWorkerDeclaredEvidence(registration.capabilities),
+    });
     return reply.code(201).send({ workerId: worker.id, protocolVersion: 1 });
   });
 

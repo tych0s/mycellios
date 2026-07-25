@@ -4,10 +4,6 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { z } from "zod";
 import { workerConfigSchema, type WorkerConfig } from "../contracts/schemas.js";
-import {
-  sealDeploymentCanaryEvidence,
-  type DeploymentCanarySample,
-} from "../contracts/deployment-canary.js";
 import { WorkerAgent } from "../worker/agent.js";
 import { evaluateDistributionPlan, stageMemoryBytes } from "./cost-model.js";
 import { HttpLaunchAgent } from "./launch-agent-rpc.js";
@@ -515,7 +511,6 @@ export async function runAutoDistribution(
         config,
         compilation,
         apiBaseUrl,
-        canary.evidenceSamples,
         health.pipeline_snapshot_identity as string,
         collectExecutionTelemetry(compilation, runningSnapshot),
       );
@@ -874,6 +869,7 @@ async function createLaunchAgents(
   const local = new LocalProcessAgent({
     id: "auto-distribute-local",
     cwd,
+    allowedExecutables: [launch.configuration.pythonExecutable],
     env: {
       PYTHONPATH: absoluteFrom(cwd, config.runtime.pythonPath),
       HF_HOME: absoluteFrom(cwd, config.runtime.hfHome),
@@ -939,7 +935,13 @@ async function runCanary(
 ): Promise<{
   text: string;
   metrics: AutoDistributionCanaryMetrics;
-  evidenceSamples: DeploymentCanarySample[];
+  evidenceSamples: Array<{
+    sampleId: string;
+    outputTokens: number;
+    activeMs: number;
+    ttftMs: number;
+    completed: true;
+  }>;
 }> {
   await runCanarySample(apiBaseUrl, config);
   const measured = [];
@@ -1020,7 +1022,6 @@ export function buildCellWorkerConfig(
   config: AutoDistributionConfig,
   compilation: AutoDistributionCompilation,
   apiBaseUrl: string,
-  evidenceSamples: DeploymentCanarySample[],
   activationId: string,
   execution?: NonNullable<ModelDeployment["execution"]>,
 ): WorkerConfig {
@@ -1030,18 +1031,6 @@ export function buildCellWorkerConfig(
     peakMiB,
     Math.floor(config.nodes.reduce((sum, node) => sum + node.memoryMiB - node.reserveMiB, 0)),
   );
-  const canaryEvidence = sealDeploymentCanaryEvidence({
-    model: config.model.publicName,
-    modelDigest: compilation.profile.source.artifactIdentity,
-    activationId,
-    promptDigest: `sha256:${createHash("sha256")
-      .update(config.canary.prompt)
-      .digest("hex")}`,
-    maxOutputTokens: config.canary.maxTokens,
-    measuredAt: new Date().toISOString(),
-    warmupSamples: 1,
-    samples: evidenceSamples,
-  });
   return workerConfigSchema.parse({
     region: config.coordinator!.region,
     capacityScope: "cell",
@@ -1060,7 +1049,6 @@ export function buildCellWorkerConfig(
       activationId,
       peakVramMb: peakMiB,
       contextLimit: config.workload.contextTokens,
-      canaryEvidence,
       internalPipeline: {
         stageCount: stages.length,
         boundaries: [...compilation.boundaries],

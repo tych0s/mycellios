@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it } from "vitest";
+import { createCoordinatorDeploymentCanaryEvidence } from "../src/contracts/deployment-canary.js";
 import type {
   CompletionResult,
   ModelDeployment,
@@ -192,7 +193,37 @@ describe("MeshService route evidence", () => {
     )!;
     // The scheduler-selected deployment must use the IDs assigned by storage.
     workerA.capabilities.deployments[0]!.deploymentId = `dep-${workerA.id}`;
-    workerA.capabilities.deployments[0]!.modelDigest = "sha256:model";
+    workerA.capabilities.deployments[0]!.modelDigest = `sha256:${"a".repeat(64)}`;
+    const observedAt = Date.now();
+    Object.assign(workerA.capabilities.deployments[0]!, {
+      activationId: "activation-network-trace",
+      verificationState: "verified",
+      throughputSource: "measured",
+      tokensPerSecond: 10,
+      ttftMs: 10,
+      canaryEvidence: createCoordinatorDeploymentCanaryEvidence({
+        challengeId: "challenge-network-trace",
+        nonce: Buffer.alloc(32, 6).toString("base64url"),
+        workerId: workerA.id,
+        sessionId: "session-network-trace",
+        issuedAt: new Date(observedAt - 1_000).toISOString(),
+        expiresAt: new Date(observedAt + 60_000).toISOString(),
+        model: "distributed-small",
+        modelDigest: `sha256:${"a".repeat(64)}`,
+        activationId: "activation-network-trace",
+        promptDigest: `sha256:${"c".repeat(64)}`,
+        maxOutputTokens: 10,
+        observedAt: new Date(observedAt).toISOString(),
+        warmupSamples: 1,
+        samples: [0, 1, 2].map((index) => ({
+          sampleId: `sample-${index}`,
+          outputTokens: 10,
+          activeMs: 1_000,
+          ttftMs: 10,
+          completed: true as const,
+        })),
+      }),
+    });
     store.updateWorkerHeartbeat(workerA.id, workerA.capabilities, "online");
     store.updateWorkerHeartbeat(workerB.id, workerB.capabilities, "online");
 

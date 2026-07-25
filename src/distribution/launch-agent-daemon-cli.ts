@@ -51,6 +51,10 @@ async function main(): Promise<void> {
   const local = new LocalProcessAgent({
     id: `local-process:${options.nodeId}`,
     ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+    allowedExecutables: [
+      allowedLaunch?.configuration.pythonExecutable ??
+        options.physicalProbePython,
+    ],
     maxOutputBytesPerStream: options.maxOutputBytes,
     stopGraceMs: options.stopGraceMs,
   });

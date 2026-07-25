@@ -9,6 +9,7 @@ import {
   matchesPinnedPythonArtifact,
   portableRuntimeSpec,
 } from "./portable-runtime-policy.mjs";
+import { verifyNativePythonProductSource } from "./native-python-product-policy.mjs";
 
 function readArgument(name, fallback) {
   const prefix = `--${name}=`;
@@ -114,22 +115,7 @@ if (runtimeSpec.supported) {
       `El paquete ${platform}/${arch} no contiene el runtime Mycellios en ${packagedPythonSource}.`,
     );
   }
-  for (const forbidden of [
-    "external_gguf_runtime.py",
-    "external_gguf_runtime_probe_cli.py",
-    "external_gguf_runtime_rpc.py",
-    "native_stage.py",
-    "native_stage_package.py",
-    "native_stage_package_cli.py",
-    "gpu_cloud_probe.py",
-  ]) {
-    const path = resolve(packagedPythonSource, "distributed_runtime", forbidden);
-    if (existsSync(path)) {
-      throw new Error(
-        `El paquete contiene un backend externo de investigación: ${path}.`,
-      );
-    }
-  }
+  verifyNativePythonProductSource(packagedPythonSource);
   const archiveEntries = tar(["-tzf", runtimeArchive])
     .split(/\r?\n/)
     .map((entry) => entry.trim())

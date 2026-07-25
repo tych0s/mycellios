@@ -2,13 +2,13 @@ import { describe, expect, it } from "vitest";
 import {
   deploymentCanaryEvidenceSchema,
   deploymentMetricsFromCanaryEvidence,
-  sealDeploymentCanaryEvidence,
+  createCoordinatorDeploymentCanaryEvidence,
 } from "../src/contracts/deployment-canary.js";
 
 const MODEL_DIGEST = `sha256:${"d".repeat(64)}`;
 const ACTIVATION_ID = "activation-17";
 
-describe("sealed deployment canary evidence", () => {
+describe("coordinator-observed deployment canary evidence", () => {
   it("derives throughput and median TTFT from completed physical samples", () => {
     const evidence = fixture();
 
@@ -17,7 +17,9 @@ describe("sealed deployment canary evidence", () => {
       model: "qwen",
       modelDigest: MODEL_DIGEST,
       activationId: ACTIVATION_ID,
-      now: Date.parse(evidence.measuredAt) + 1_000,
+      workerId: "worker-17",
+      sessionId: "session-17",
+      now: Date.parse(evidence.observedAt) + 1_000,
     })).toMatchObject({
       tokensPerSecond: 20,
       ttftMs: 300,
@@ -33,30 +35,36 @@ describe("sealed deployment canary evidence", () => {
       samples: evidence.samples.map((sample, index) =>
         index === 0 ? { ...sample, activeMs: 1 } : sample
       ),
-    })).toThrow(/deployment_canary_seal_is_invalid/);
+    })).toThrow(/deployment_canary_integrity_is_invalid/);
     expect(() => deploymentMetricsFromCanaryEvidence(evidence, {
       model: "other",
       modelDigest: MODEL_DIGEST,
       activationId: ACTIVATION_ID,
-      now: Date.parse(evidence.measuredAt),
+      now: Date.parse(evidence.observedAt),
     })).toThrow("deployment_canary_model_mismatch");
     expect(() => deploymentMetricsFromCanaryEvidence(evidence, {
       model: "qwen",
       modelDigest: MODEL_DIGEST,
       activationId: "other-activation",
-      now: Date.parse(evidence.measuredAt),
+      now: Date.parse(evidence.observedAt),
     })).toThrow("deployment_canary_activation_mismatch");
   });
 });
 
 function fixture() {
-  return sealDeploymentCanaryEvidence({
+  return createCoordinatorDeploymentCanaryEvidence({
+    challengeId: "challenge-17",
+    nonce: Buffer.alloc(32, 7).toString("base64url"),
+    workerId: "worker-17",
+    sessionId: "session-17",
+    issuedAt: "2026-07-25T15:59:00.000Z",
+    expiresAt: "2026-07-25T16:10:00.000Z",
     model: "qwen",
     modelDigest: MODEL_DIGEST,
     activationId: ACTIVATION_ID,
     promptDigest: `sha256:${"e".repeat(64)}`,
     maxOutputTokens: 20,
-    measuredAt: "2026-07-25T16:00:00.000Z",
+    observedAt: "2026-07-25T16:00:00.000Z",
     warmupSamples: 2,
     samples: [
       {

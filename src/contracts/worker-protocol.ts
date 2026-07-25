@@ -1,5 +1,7 @@
 import { z } from "zod";
 import { deploymentSchema, gpuSchema, workerCapabilitiesSchema } from "./schemas.js";
+import { evidenceResponseBindingSchema } from "./evidence-challenge.js";
+import { runtimePerformanceProfileSchema } from "../performance/runtime-profile.js";
 
 const MAX_IDENTIFIER_LENGTH = 256;
 const MAX_TOKEN_CHUNK_BYTES = 64 * 1024;
@@ -251,6 +253,45 @@ export const runtimeStreamOpenEnvelopeSchema = envelopeSchema(
     }).strict(),
   ]),
 );
+
+const canaryResponseBinding = evidenceResponseBindingSchema.extend({
+  sampleIndex: z.number().int().min(0).max(15),
+}).strict();
+
+export const evidenceCanaryStartedEnvelopeSchema = envelopeSchema(
+  "evidence.canary.started",
+  canaryResponseBinding,
+);
+
+export const evidenceCanaryTokenEnvelopeSchema = envelopeSchema(
+  "evidence.canary.token",
+  canaryResponseBinding.extend({
+    index: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    text: boundedText(MAX_TOKEN_CHUNK_BYTES),
+  }).strict(),
+);
+
+export const evidenceCanaryCompleteEnvelopeSchema = envelopeSchema(
+  "evidence.canary.complete",
+  canaryResponseBinding.extend({
+    outputTokens: z.number().int().min(1).max(32_768),
+    finishReason: z.enum(["stop", "length"]),
+  }).strict(),
+);
+
+export const evidenceRuntimeCompleteEnvelopeSchema = envelopeSchema(
+  "evidence.runtime.complete",
+  evidenceResponseBindingSchema.extend({
+    profile: runtimePerformanceProfileSchema,
+  }).strict(),
+);
+
+export const evidenceChallengeFailedEnvelopeSchema = envelopeSchema(
+  "evidence.challenge.failed",
+  evidenceResponseBindingSchema.extend({
+    reason: boundedText(512),
+  }).strict(),
+);
 export const runtimePrepareProgressEnvelopeSchema = envelopeSchema(
   "runtime.prepare.progress",
   z.object({
@@ -441,6 +482,11 @@ export const workerEnvelopeSchema = z.discriminatedUnion("type", [
   taskTokenEnvelopeSchema,
   taskCompleteEnvelopeSchema,
   taskFailEnvelopeSchema,
+  evidenceCanaryStartedEnvelopeSchema,
+  evidenceCanaryTokenEnvelopeSchema,
+  evidenceCanaryCompleteEnvelopeSchema,
+  evidenceRuntimeCompleteEnvelopeSchema,
+  evidenceChallengeFailedEnvelopeSchema,
   runtimePrepareProgressEnvelopeSchema,
   runtimePreparedEnvelopeSchema,
   runtimeReadyEnvelopeSchema,

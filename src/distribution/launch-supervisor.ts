@@ -484,6 +484,12 @@ export interface LocalProcessAgentOptions {
   id?: string;
   cwd?: string;
   env?: NodeJS.ProcessEnv;
+  /**
+   * Exact executable identities accepted by this product-facing agent.
+   * Tests of the generic process harness may omit it; every production
+   * construction site pins the prepared Mycellios Python interpreter.
+   */
+  allowedExecutables: readonly string[];
   maxOutputBytesPerStream?: number;
   stopGraceMs?: number;
   readyWhen?: (observation: LocalProcessReadinessObservation) => boolean;
@@ -497,14 +503,23 @@ export class LocalProcessAgent implements LaunchAgent {
   readonly id: string;
   private readonly cwd: string | undefined;
   private readonly env: NodeJS.ProcessEnv | undefined;
+  private readonly allowedExecutables: ReadonlySet<string>;
   private readonly maxOutputBytes: number;
   private readonly stopGraceMs: number;
   private readonly readyWhen: (observation: LocalProcessReadinessObservation) => boolean;
 
-  constructor(options: LocalProcessAgentOptions = {}) {
+  constructor(options: LocalProcessAgentOptions) {
     this.id = options.id ?? "local-process";
     this.cwd = options.cwd;
     this.env = options.env;
+    this.allowedExecutables = new Set(
+      options.allowedExecutables.map((value) =>
+        localExecutableIdentity(value),
+      ),
+    );
+    if (this.allowedExecutables.size === 0) {
+      throw new Error("local_process_allowed_executables_are_empty");
+    }
     this.maxOutputBytes = boundedInteger(
       options.maxOutputBytesPerStream ?? 64 * 1024,
       1_024,
@@ -526,6 +541,11 @@ export class LocalProcessAgent implements LaunchAgent {
   ): Promise<LaunchProcessHandle> {
     if (signal.aborted) throw cancellationFromSignal(signal);
     const command = request.process.command;
+    if (
+      !this.allowedExecutables.has(localExecutableIdentity(command.executable))
+    ) {
+      throw new Error("local_process_executable_is_not_authorized");
+    }
     const spawnOptions = {
       shell: false,
       windowsHide: true,
@@ -789,6 +809,19 @@ function renderExit(exit: LaunchProcessExit): string {
 
 function normalizeError(value: unknown): Error {
   return value instanceof Error ? value : new Error(String(value));
+}
+
+function localExecutableIdentity(value: string): string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value !== value.trim() ||
+    /[\0\r\n]/.test(value)
+  ) {
+    throw new Error("local_process_executable_identity_is_invalid");
+  }
+  const normalized = value.replaceAll("\\", "/");
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
 function boundedInteger(value: unknown, min: number, max: number, error: string): number {

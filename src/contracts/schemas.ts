@@ -1,5 +1,7 @@
 import { z } from "zod";
-import { runtimePerformanceProfileSchema } from "../performance/runtime-profile.js";
+import {
+  coordinatorRuntimePerformanceEvidenceSchema,
+} from "../performance/runtime-profile.js";
 import {
   deploymentCanaryEvidenceSchema,
   deploymentMetricsFromCanaryEvidence,
@@ -105,6 +107,7 @@ export const deploymentSchema = z
     tokensPerSecond: z.number().positive(),
     throughputSource: z.enum(["measured", "estimated", "configured", "default"]).optional(),
     ttftMs: z.number().nonnegative(),
+    verificationState: z.enum(["pending", "verified"]).optional(),
     canaryEvidence: deploymentCanaryEvidenceSchema.optional(),
     dataLocality: z.literal("local"),
     stage: z
@@ -156,12 +159,31 @@ export const deploymentSchema = z
     if (deployment.adapter === "mycellios-pipeline") {
       if (
         !deployment.activationId
-        || !deployment.canaryEvidence
+        || !deployment.verificationState
+      ) {
+        context.addIssue({
+          code: "custom",
+          message: "A native pipeline deployment requires an explicit verification state",
+          path: ["verificationState"],
+        });
+      } else if (deployment.verificationState === "pending") {
+        if (
+          deployment.canaryEvidence
+          || deployment.throughputSource !== "default"
+        ) {
+          context.addIssue({
+            code: "custom",
+            message: "A pending native pipeline cannot publish measured evidence",
+            path: ["canaryEvidence"],
+          });
+        }
+      } else if (
+        !deployment.canaryEvidence
         || deployment.throughputSource !== "measured"
       ) {
         context.addIssue({
           code: "custom",
-          message: "A native pipeline deployment requires bound measured canary evidence",
+          message: "A verified native pipeline requires coordinator-observed canary evidence",
           path: ["canaryEvidence"],
         });
       } else {
@@ -192,7 +214,11 @@ export const deploymentSchema = z
           });
         }
       }
-    } else if (deployment.canaryEvidence || deployment.activationId) {
+    } else if (
+      deployment.canaryEvidence
+      || deployment.activationId
+      || deployment.verificationState
+    ) {
       context.addIssue({
         code: "custom",
         message: "Canary activation evidence is reserved for native pipelines",
@@ -305,10 +331,10 @@ export const workerCapabilitiesSchema = z.object({
         .strict()
         .optional(),
       /**
-       * Physical, node-local calibration of the exact native runtime. Capacity
-       * remains visible without it, but optimized placement fails closed.
+       * Coordinator-observed calibration produced only after a directed probe
+       * challenge on the current authenticated worker session.
        */
-      performanceProfile: runtimePerformanceProfileSchema.optional(),
+      performanceEvidence: coordinatorRuntimePerformanceEvidenceSchema.optional(),
       directTransport: z
         .object({
           protocol: z.literal("mycellios-direct/1"),
@@ -402,7 +428,6 @@ export const workerConfigSchema = z.object({
       contextLimit: z.number().int().positive().default(8_192),
       tokensPerSecond: z.number().positive().optional(),
       ttftMs: z.number().nonnegative().optional(),
-      canaryEvidence: deploymentCanaryEvidenceSchema.optional(),
       internalPipeline: z
         .object({
           stageCount: z.number().int().min(2).max(64),
@@ -433,16 +458,6 @@ export const workerConfigSchema = z.object({
   }
   if (
     config.adapter.kind === "mycellios-pipeline"
-    && !config.deployment.canaryEvidence
-  ) {
-    context.addIssue({
-      code: "custom",
-      message: "mycellios-pipeline requires sealed canary evidence",
-      path: ["deployment", "canaryEvidence"],
-    });
-  }
-  if (
-    config.adapter.kind === "mycellios-pipeline"
     && !config.deployment.activationId
   ) {
     context.addIssue({
@@ -462,23 +477,6 @@ export const workerConfigSchema = z.object({
       code: "custom",
       message: "mycellios-pipeline performance cannot be configured manually",
       path: ["deployment"],
-    });
-  }
-  if (
-    config.adapter.kind === "mycellios-pipeline"
-    && config.deployment.canaryEvidence
-    && (
-      config.deployment.canaryEvidence.model !== config.adapter.model
-      || config.deployment.canaryEvidence.modelDigest
-        !== config.deployment.modelDigest
-      || config.deployment.canaryEvidence.activationId
-        !== config.deployment.activationId
-    )
-  ) {
-    context.addIssue({
-      code: "custom",
-      message: "mycellios-pipeline canary evidence does not match the deployment",
-      path: ["deployment", "canaryEvidence"],
     });
   }
 });

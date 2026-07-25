@@ -1,4 +1,6 @@
-import type { RuntimePerformanceProfile } from "../performance/runtime-profile.js";
+import type {
+  CoordinatorRuntimePerformanceEvidence,
+} from "../performance/runtime-profile.js";
 import type { DeploymentCanaryEvidence } from "./deployment-canary.js";
 
 export type WorkloadClass = "interactive" | "batch" | "benchmark";
@@ -105,6 +107,11 @@ export interface ModelDeployment {
    */
   throughputSource?: "measured" | "estimated" | "configured" | "default" | undefined;
   ttftMs: number;
+  /**
+   * Native pipeline deployments remain invisible to scheduling until the
+   * coordinator has completed a live activation challenge.
+   */
+  verificationState?: "pending" | "verified" | undefined;
   /**
    * Content-addressed physical canary bound to the exact model artifact and
    * active native pipeline from which measured throughput was derived.
@@ -250,8 +257,8 @@ export interface WorkerCapabilities {
     cpuEligible?: boolean | undefined;
     /** Sanitized self-repair state; absent on legacy and non-desktop workers. */
     acceleration?: WorkerAcceleratorDiagnostics | undefined;
-    /** Sealed physical calibration consumed by optimized placement. */
-    performanceProfile?: RuntimePerformanceProfile | undefined;
+    /** Coordinator-observed physical calibration consumed by placement. */
+    performanceEvidence?: CoordinatorRuntimePerformanceEvidence | undefined;
     /**
      * Native peer listener candidates. These are reachability hints only:
      * every session still requires a coordinator-issued, one-time grant.

@@ -4,6 +4,8 @@ out/
 build/distribution-runtime/
 build/distribution-runtime.tar.gz
 build/python/
+build/coordinator-release/
+build/validation-logs/
 .vite/
 landing-dist/
 mobile-dist/

@@ -2,6 +2,12 @@ import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import {
+  NATIVE_PYTHON_IMPORT_SMOKE_MODULES,
+  NATIVE_PYTHON_PRODUCT_FILES,
+  NATIVE_PYTHON_PRODUCT_MANIFEST,
+  verifyNativePythonProductSource,
+} from "./native-python-product-policy.mjs";
 
 export const INSTALLED_STAGE_CANARY_SCHEMA =
   "mycellios-installed-stage-canary/1";
@@ -9,14 +15,9 @@ export const INSTALLED_STAGE_CANARY_MARKER =
   "MYCELLIOS_INSTALLED_STAGE_CANARY=";
 
 const REQUIRED_SOURCE_FILES = [
-  ["distributed_runtime", "__init__.py"],
-  ["distributed_runtime", "installed_stage_canary.py"],
-  ["distributed_runtime", "batching.py"],
-  ["distributed_runtime", "executor_abi.py"],
-  ["distributed_runtime", "model.py"],
-  ["distributed_runtime", "model_adapters.py"],
-  ["distributed_runtime", "model_adapter_registry.json"],
-];
+  ...NATIVE_PYTHON_PRODUCT_FILES,
+  NATIVE_PYTHON_PRODUCT_MANIFEST,
+].map((path) => path.split("/"));
 
 /**
  * Execute the ABI canary with the exact interpreter and source tree that will
@@ -27,6 +28,9 @@ export function runInstalledStageCanary(options, dependencies = {}) {
   const spawn = dependencies.spawnSync ?? spawnSync;
   const fileExists = dependencies.existsSync ?? existsSync;
   const readFile = dependencies.readFileSync ?? readFileSync;
+  const verifyProductSource =
+    dependencies.verifyNativePythonProductSource
+    ?? verifyNativePythonProductSource;
   const pythonExecutable = resolveRequiredPath(
     options?.pythonExecutable,
     "installed canary Python executable",
@@ -44,18 +48,28 @@ export function runInstalledStageCanary(options, dependencies = {}) {
       throw new Error(`Installed stage canary source is missing: ${required}.`);
     }
   }
+  verifyProductSource(pythonSourceRoot);
   const registryContract = readAdapterRegistryContract(pythonSourceRoot, readFile);
 
   const bootstrap = [
-    "import runpy,sys",
+    "import importlib,json,runpy,sys",
     "source=sys.argv[1]",
     "sys.path.insert(0,source)",
+    "modules=json.loads(sys.argv[2])",
+    "[importlib.import_module(module) for module in modules]",
     "sys.argv=['mycellios-installed-stage-canary']",
     "runpy.run_module('distributed_runtime.installed_stage_canary',run_name='__main__')",
   ].join("; ");
   const result = spawn(
     pythonExecutable,
-    ["-I", "-c", bootstrap, pythonSourceRoot],
+    [
+      "-I",
+      "-B",
+      "-c",
+      bootstrap,
+      pythonSourceRoot,
+      JSON.stringify(NATIVE_PYTHON_IMPORT_SMOKE_MODULES),
+    ],
     {
       cwd: dirname(pythonSourceRoot),
       encoding: "utf8",
@@ -66,6 +80,7 @@ export function runInstalledStageCanary(options, dependencies = {}) {
         HF_DATASETS_OFFLINE: "1",
         TOKENIZERS_PARALLELISM: "false",
         PYTHONNOUSERSITE: "1",
+        PYTHONDONTWRITEBYTECODE: "1",
         OMP_NUM_THREADS: "1",
         MKL_NUM_THREADS: "1",
       },
@@ -102,6 +117,7 @@ export function runInstalledStageCanary(options, dependencies = {}) {
     expectedAdapterRegistryId: registryContract.registryId,
     expectedAdapterContractId: registryContract.adapterContractId,
   });
+  verifyProductSource(pythonSourceRoot);
   return evidence;
 }
 

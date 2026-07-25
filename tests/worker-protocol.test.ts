@@ -23,7 +23,10 @@ import {
   workerHeartbeatEnvelopeSchema,
   workerHelloEnvelopeSchema,
 } from "../src/contracts/worker-protocol.js";
-import { sealRuntimePerformanceProfile } from "../src/performance/runtime-profile.js";
+import {
+  createCoordinatorRuntimePerformanceEvidence,
+  sealRuntimePerformanceProfile,
+} from "../src/performance/runtime-profile.js";
 
 const baseEnvelope = {
   v: 1 as const,
@@ -192,6 +195,18 @@ describe("worker protocol schemas", () => {
       prefillCompute: profileSeries("TFLOP/s", 20),
       activationCodec: profileSeries("GB/s", 2),
     });
+    const measuredAt = Date.parse(physicalProfile.measuredAt);
+    const performanceEvidence = createCoordinatorRuntimePerformanceEvidence({
+      challengeId: "challenge-profile",
+      nonce: Buffer.alloc(32, 8).toString("base64url"),
+      workerId: "desktop-worker",
+      sessionId: "session-profile",
+      nodeId: "desktop-test",
+      issuedAt: new Date(measuredAt - 1_000).toISOString(),
+      expiresAt: new Date(measuredAt + 60_000).toISOString(),
+      observedAt: new Date(measuredAt + 1_000).toISOString(),
+      profile: physicalProfile,
+    });
     const calibratedHeartbeat = workerHeartbeatEnvelopeSchema.parse({
       ...heartbeat,
       payload: {
@@ -200,14 +215,14 @@ describe("worker protocol schemas", () => {
           ...heartbeat.payload.capabilities,
           distributedExecutor: {
             ...heartbeat.payload.capabilities.distributedExecutor,
-            performanceProfile: physicalProfile,
+            performanceEvidence,
           },
         },
       },
     });
     expect(
-      calibratedHeartbeat.payload.capabilities.distributedExecutor?.performanceProfile,
-    ).toEqual(physicalProfile);
+      calibratedHeartbeat.payload.capabilities.distributedExecutor?.performanceEvidence,
+    ).toEqual(performanceEvidence);
     expect(workerHeartbeatEnvelopeSchema.safeParse({
       ...heartbeat,
       payload: {
@@ -216,9 +231,12 @@ describe("worker protocol schemas", () => {
           ...heartbeat.payload.capabilities,
           distributedExecutor: {
             ...heartbeat.payload.capabilities.distributedExecutor,
-            performanceProfile: {
-              ...physicalProfile,
-              decodeMemory: { ...physicalProfile.decodeMemory, p50: 999 },
+            performanceEvidence: {
+              ...performanceEvidence,
+              profile: {
+                ...physicalProfile,
+                decodeMemory: { ...physicalProfile.decodeMemory, p50: 999 },
+              },
             },
           },
         },

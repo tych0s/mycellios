@@ -26,6 +26,10 @@ const DEFAULT_RETAINED_SESSIONS = 4;
 const DEFAULT_RETAINED_SESSION_TOKENS = 8_192;
 const DEFAULT_RETAINED_SESSION_TTL_SECONDS = 10 * 60;
 const RECOVERY_STANDBY_SCHEMA = "gdlp-recovery-standby-route/1";
+export const MYCELLIOS_STAGE_MODULE = "distributed_runtime.stage_cli";
+export const MYCELLIOS_SERVER_MODULE = "distributed_runtime.server";
+export const MYCELLIOS_CELL_MEMBER_MODULE =
+  "distributed_runtime.cell_member_cli";
 
 export type PythonLaunchPhase = "prefill" | "decode";
 
@@ -137,8 +141,10 @@ export interface PythonLaunchCompilerOptions {
   runtimeModel?: PythonRuntimeModelInput;
   publicModelName?: string;
   pythonExecutable?: string;
-  stageModule?: string;
-  serverModule?: string;
+  /** Fixed native entrypoint; exposed only for normalized-description validation. */
+  stageModule?: typeof MYCELLIOS_STAGE_MODULE;
+  /** Fixed native entrypoint; exposed only for normalized-description validation. */
+  serverModule?: typeof MYCELLIOS_SERVER_MODULE;
   threadsPerStage?: number;
   connectTimeoutSeconds?: number;
   batchWindowMs?: number;
@@ -302,8 +308,8 @@ export interface PythonLaunchConfiguration {
   runtimeModel: PythonRuntimeModelSource;
   publicModelName: string;
   pythonExecutable: string;
-  stageModule: string;
-  serverModule: string;
+  stageModule: typeof MYCELLIOS_STAGE_MODULE;
+  serverModule: typeof MYCELLIOS_SERVER_MODULE;
   threadsPerStage: number;
   connectTimeoutSeconds: number;
   batchWindowMs: number;
@@ -1022,7 +1028,7 @@ function renderCellMemberArguments(
   configuration: PythonLaunchConfiguration,
 ): string[] {
   return [
-    ...pythonModulePrefix("distributed_runtime.cell_member_cli"),
+    ...pythonModulePrefix(MYCELLIOS_CELL_MEMBER_MODULE),
     "--fixture",
     launch.fixturePath,
     "--rank",
@@ -1447,13 +1453,15 @@ function normalizeConfiguration(
       value.pythonExecutable ?? "python",
       "python_executable_is_invalid",
     ),
-    stageModule: pythonModule(
-      value.stageModule ?? "distributed_runtime.stage_cli",
-      "python_stage_module_is_invalid",
+    stageModule: nativePythonModule(
+      value.stageModule,
+      MYCELLIOS_STAGE_MODULE,
+      "python_stage_module_must_be_mycellios_native",
     ),
-    serverModule: pythonModule(
-      value.serverModule ?? "distributed_runtime.server",
-      "python_server_module_is_invalid",
+    serverModule: nativePythonModule(
+      value.serverModule,
+      MYCELLIOS_SERVER_MODULE,
+      "python_server_module_must_be_mycellios_native",
     ),
     threadsPerStage: boundedInteger(
       value.threadsPerStage ?? 1,
@@ -2439,6 +2447,16 @@ function pythonModule(value: unknown, error: string): string {
   const result = safeString(value, error);
   if (!/^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$/.test(result)) throw new Error(error);
   return result;
+}
+
+function nativePythonModule<const T extends string>(
+  value: unknown,
+  expected: T,
+  error: string,
+): T {
+  const result = pythonModule(value ?? expected, error);
+  if (result !== expected) throw new Error(error);
+  return expected;
 }
 
 function safeString(value: unknown, error: string): string {

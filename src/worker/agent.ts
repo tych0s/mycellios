@@ -49,7 +49,12 @@ import {
   runtimePerformanceProfileSchema,
   type RuntimePerformanceProfile,
 } from "../performance/runtime-profile.js";
-import { deploymentMetricsFromCanaryEvidence } from "../contracts/deployment-canary.js";
+import {
+  evidenceChallengeSchema,
+  type DeploymentCanaryChallenge,
+  type EvidenceChallenge,
+  type RuntimePerformanceChallenge,
+} from "../contracts/evidence-challenge.js";
 
 export interface WorkerAgentOptions {
   coordinatorUrl: string;
@@ -96,7 +101,7 @@ export interface WorkerAgentOptions {
     directTransport?: RuntimeDirectTransportOptions;
   };
   /** Runs the packaged, physical runtime calibration for this exact node. */
-  runtimePerformanceProfileProbe?: () =>
+  runtimePerformanceProfileProbe?: (challenge: RuntimePerformanceChallenge) =>
     Promise<RuntimePerformanceProfile | null | undefined>;
   logger?: Pick<Console, "info" | "warn" | "error">;
 }
@@ -150,6 +155,11 @@ const serverMessageSchema = z.discriminatedUnion("type", [
       payload: z.object({ workerId: z.string().min(1).max(256) }).strict(),
     })
     .strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("evidence.challenge"),
+    payload: evidenceChallengeSchema,
+  }).strict(),
   z
     .object({
       ...envelopeFields,
@@ -390,6 +400,7 @@ export class WorkerAgent {
   private readonly preparedRuntimeProcesses = new Map<string, import("../distribution/python-launcher.js").PythonLaunchProcess>();
   private readonly runtimeProcesses = new Map<string, LaunchProcessHandle>();
   private readonly runtimeLinkProbes = new Map<string, PendingRuntimeLinkProbe>();
+  private readonly activeEvidenceChallenges = new Set<string>();
   private readonly runtimeTunnel: RuntimeStreamTunnel | null;
   private directTransportAdvertisement: DirectTransportAdvertisement | null = null;
   private readonly logger: Pick<Console, "info" | "warn" | "error">;
@@ -486,8 +497,6 @@ export class WorkerAgent {
 
     const hardware = await (this.options.hardwareProbe?.() ?? probeHardware());
     if (generation !== this.runtimeCapacityGeneration) return;
-    const performanceProfile = await this.measureRuntimePerformanceProfile();
-    if (generation !== this.runtimeCapacityGeneration) return;
     const selectedHardwareGpu = selectHardwareGpu(hardware.gpus, this.options.preferredHardwareGpu)
       ?? hardware.gpus[0];
     const primary = this.options.hardwareCapacityOverride
@@ -506,9 +515,9 @@ export class WorkerAgent {
     const publicPrimary = publicHardwareGpu(primary);
 
     const existingExecutor = this.capabilities.distributedExecutor;
-    const executorWithoutProfile = existingExecutor
+    const executorWithoutEvidence = existingExecutor
       ? (() => {
-          const { performanceProfile: _previousProfile, ...rest } = existingExecutor;
+          const { performanceEvidence: _previousEvidence, ...rest } = existingExecutor;
           return rest;
         })()
       : undefined;
@@ -523,17 +532,14 @@ export class WorkerAgent {
         ...deployment,
         peakVramMb: this.config.deployment.peakVramMb ?? defaultPeakVramMb,
       })),
-      ...(executorWithoutProfile
+      ...(executorWithoutEvidence
         ? {
             distributedExecutor: {
-              ...executorWithoutProfile,
+              ...executorWithoutEvidence,
               computeMode: this.options.distributedExecutor?.computeMode ?? "automatic",
               cpuEligible: this.options.distributedExecutor?.cpuEligible === true,
               ...(this.options.distributedExecutor?.acceleration
                 ? { acceleration: structuredClone(this.options.distributedExecutor.acceleration) }
-                : {}),
-              ...(performanceProfile
-                ? { performanceProfile: structuredClone(performanceProfile) }
                 : {}),
             },
           }
@@ -629,10 +635,9 @@ export class WorkerAgent {
   }
 
   private async buildCapabilities(): Promise<WorkerCapabilities> {
-    const [hardware, adapter, performanceProfile] = await Promise.all([
+    const [hardware, adapter] = await Promise.all([
       this.options.hardwareProbe?.() ?? probeHardware(),
       this.adapter.probe(),
-      this.measureRuntimePerformanceProfile(),
     ]);
     const selectedHardwareGpu = selectHardwareGpu(hardware.gpus, this.options.preferredHardwareGpu)
       ?? hardware.gpus[0];
@@ -659,20 +664,9 @@ export class WorkerAgent {
       this.config.deployment.modelDigest ?? "",
       this.config.deployment.activationId ?? "",
     ].join(":")).slice(-12)}`;
-    const canaryEvidence =
-      this.config.adapter.kind === "mycellios-pipeline"
-        ? this.config.deployment.canaryEvidence!
-        : undefined;
-    const canaryPerformance = canaryEvidence
-      ? deploymentMetricsFromCanaryEvidence(canaryEvidence, {
-          model,
-          modelDigest: this.config.deployment.modelDigest!,
-          activationId: this.config.deployment.activationId!,
-        })
-      : undefined;
     const throughputSource =
       this.config.adapter.kind === "mycellios-pipeline"
-        ? "measured"
+        ? "default"
         : this.config.deployment.tokensPerSecond !== undefined
         ? "configured"
         : this.config.adapter.kind === "mock"
@@ -721,17 +715,15 @@ export class WorkerAgent {
           contextLimit: this.config.deployment.contextLimit,
           maxConcurrency: this.config.limits.maxConcurrency,
           freeSlots: this.config.limits.maxConcurrency,
-          tokensPerSecond:
-            canaryPerformance?.tokensPerSecond
-            ?? this.config.deployment.tokensPerSecond
-            ?? defaultTokensPerSecond,
+          tokensPerSecond: this.config.adapter.kind === "mycellios-pipeline"
+            ? 1
+            : this.config.deployment.tokensPerSecond ?? defaultTokensPerSecond,
           throughputSource,
-          ttftMs:
-            canaryPerformance?.ttftMs
-            ?? this.config.deployment.ttftMs
-            ?? defaultTtft,
-          ...(canaryEvidence
-            ? { canaryEvidence: structuredClone(canaryEvidence) }
+          ttftMs: this.config.adapter.kind === "mycellios-pipeline"
+            ? 60_000
+            : this.config.deployment.ttftMs ?? defaultTtft,
+          ...(this.config.adapter.kind === "mycellios-pipeline"
+            ? { verificationState: "pending" as const }
             : {}),
           dataLocality: "local",
           ...(this.config.deployment.internalPipeline
@@ -760,9 +752,6 @@ export class WorkerAgent {
               ...(this.options.distributedExecutor.acceleration
                 ? { acceleration: structuredClone(this.options.distributedExecutor.acceleration) }
                 : {}),
-              ...(performanceProfile
-                ? { performanceProfile: structuredClone(performanceProfile) }
-                : {}),
               ...(this.directTransportAdvertisement
                 ? { directTransport: structuredClone(this.directTransportAdvertisement) }
                 : {}),
@@ -772,11 +761,13 @@ export class WorkerAgent {
     };
   }
 
-  private async measureRuntimePerformanceProfile(): Promise<RuntimePerformanceProfile | undefined> {
+  private async measureRuntimePerformanceProfile(
+    challenge: RuntimePerformanceChallenge,
+  ): Promise<RuntimePerformanceProfile | undefined> {
     const probe = this.options.runtimePerformanceProfileProbe;
     if (!this.options.distributedExecutor || !probe) return undefined;
     try {
-      const measured = await probe();
+      const measured = await probe(challenge);
       if (!measured) return undefined;
       const profile = runtimePerformanceProfileSchema.parse(measured);
       const expectedBackend = this.options.verifiedGpuRuntime?.backend ?? "cpu";
@@ -943,6 +934,9 @@ export class WorkerAgent {
         await this.adapter.cancel(jobId);
         break;
       }
+      case "evidence.challenge":
+        void this.handleEvidenceChallenge(message.payload);
+        break;
       case "runtime.prepare":
         await this.prepareDistributedRuntime(message.payload.requestId, message.payload.description);
         break;
@@ -1052,6 +1046,143 @@ export class WorkerAgent {
   private clearRuntimeLinkProbes(): void {
     for (const probe of this.runtimeLinkProbes.values()) clearTimeout(probe.timeout);
     this.runtimeLinkProbes.clear();
+  }
+
+  private async handleEvidenceChallenge(challenge: EvidenceChallenge): Promise<void> {
+    if (
+      challenge.workerId !== this.registeredWorkerId
+      || Date.now() > Date.parse(challenge.expiresAt)
+      || this.activeEvidenceChallenges.has(challenge.challengeId)
+    ) {
+      return;
+    }
+    this.activeEvidenceChallenges.add(challenge.challengeId);
+    try {
+      if (challenge.kind === "deployment-canary") {
+        await this.runDeploymentCanaryChallenge(challenge);
+      } else {
+        const profile = await this.measureRuntimePerformanceProfile(challenge);
+        if (!profile) throw new Error("runtime_performance_probe_unavailable");
+        this.sendMessage("evidence.runtime.complete", {
+          challengeId: challenge.challengeId,
+          nonce: challenge.nonce,
+          sessionId: challenge.sessionId,
+          profile,
+        });
+      }
+    } catch (error) {
+      this.sendMessage("evidence.challenge.failed", {
+        challengeId: challenge.challengeId,
+        nonce: challenge.nonce,
+        sessionId: challenge.sessionId,
+        reason: errorText(error).slice(0, 512),
+      });
+    } finally {
+      this.activeEvidenceChallenges.delete(challenge.challengeId);
+    }
+  }
+
+  private async runDeploymentCanaryChallenge(
+    challenge: DeploymentCanaryChallenge,
+  ): Promise<void> {
+    const deployment = this.capabilities?.deployments.find(
+      (candidate) =>
+        candidate.deploymentId === challenge.deploymentId
+        && candidate.model === challenge.model
+        && candidate.modelDigest === challenge.modelDigest
+        && candidate.activationId === challenge.activationId,
+    );
+    if (!deployment || this.config.adapter.kind !== "mycellios-pipeline") {
+      throw new Error("deployment_canary_target_is_not_local");
+    }
+    const deadlineAt = Date.parse(challenge.expiresAt);
+    const runSample = async (sampleIndex: number, publish: boolean): Promise<void> => {
+      const remainingMs = deadlineAt - Date.now();
+      if (remainingMs <= 0) throw new Error("evidence_challenge_expired");
+      const controller = new AbortController();
+      const timeout = setTimeout(
+        () => controller.abort(new Error("evidence_challenge_expired")),
+        remainingMs,
+      );
+      let output = "";
+      let backendMetrics: AdapterChunk["metrics"] | undefined;
+      let nextObservedIndex = 0;
+      try {
+        if (publish) {
+          this.sendMessage("evidence.canary.started", {
+            challengeId: challenge.challengeId,
+            nonce: challenge.nonce,
+            sessionId: challenge.sessionId,
+            sampleIndex,
+          });
+        }
+        for await (const chunk of this.adapter.generate({
+          jobId: `evidence-${challenge.challengeId}-${publish ? sampleIndex : `warmup-${sampleIndex}`}`,
+          request: {
+            model: challenge.model,
+            messages: [{ role: "user", content: challenge.prompt }],
+            max_tokens: challenge.maxOutputTokens,
+            temperature: 0,
+            top_p: 1,
+            seed: 20_260_725,
+            workload_class: "benchmark",
+            // Warmups and measured samples must never share a KV/session key:
+            // reuse would make sample 0 look faster than a cold independent
+            // request and would corrupt the coordinator-observed comparison.
+            session_id:
+              `evidence-${challenge.challengeId}-${publish ? "sample" : "warmup"}-${sampleIndex}`,
+            deadline_ms: Math.max(1_000, remainingMs),
+          },
+        }, controller.signal)) {
+          if (chunk.metrics) backendMetrics = { ...backendMetrics, ...chunk.metrics };
+          if (!chunk.text) continue;
+          const chunkBytes = Buffer.byteLength(chunk.text, "utf8");
+          if (
+            chunkBytes > MAX_OUTPUT_CHUNK_BYTES
+            || Buffer.byteLength(output, "utf8") + chunkBytes > MAX_OUTPUT_BYTES
+          ) {
+            throw new Error("deployment_canary_output_limit_exceeded");
+          }
+          output += chunk.text;
+          if (publish) {
+            this.sendMessage("evidence.canary.token", {
+              challengeId: challenge.challengeId,
+              nonce: challenge.nonce,
+              sessionId: challenge.sessionId,
+              sampleIndex,
+              index: nextObservedIndex++,
+              text: chunk.text,
+            });
+          }
+        }
+        if (!output) throw new Error("deployment_canary_returned_empty_output");
+        if (publish) {
+          const outputTokens = Math.max(
+            1,
+            Math.min(
+              challenge.maxOutputTokens,
+              Math.round(backendMetrics?.outputTokens ?? Math.ceil(output.length / 4)),
+            ),
+          );
+          this.sendMessage("evidence.canary.complete", {
+            challengeId: challenge.challengeId,
+            nonce: challenge.nonce,
+            sessionId: challenge.sessionId,
+            sampleIndex,
+            outputTokens,
+            finishReason: outputTokens >= challenge.maxOutputTokens ? "length" : "stop",
+          });
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+    };
+    for (let index = 0; index < challenge.warmupSamples; index += 1) {
+      await runSample(index, false);
+    }
+    for (let index = 0; index < challenge.samples; index += 1) {
+      await runSample(index, true);
+    }
   }
 
   private async prepareDistributedRuntime(requestId: string, input: unknown): Promise<void> {
