@@ -4,12 +4,28 @@ import type { LaunchAgent } from "../distribution/launch-supervisor.js";
 import type { PythonPipelineLaunchDescription } from "../distribution/python-launcher.js";
 import { WorkerTunnelLaunchAgent } from "../distribution/worker-tunnel-launch-agent.js";
 import type { StoredRequestedModel, StoredWorker } from "../storage/store.js";
+import { deriveDecodeScales } from "../distribution/node-scale.js";
 import type { WorkerHub } from "./worker-hub.js";
 import type { DynamicActivationSnapshot } from "./model-activation-manager.js";
 
 interface ConnectedExecutor {
   worker: StoredWorker;
   executor: NonNullable<StoredWorker["capabilities"]["distributedExecutor"]>;
+}
+
+/**
+ * Decode throughput this worker actually measured, or null.
+ *
+ * Only `measured` counts. An estimated or configured number is a guess about
+ * hardware, and planning a layer split on a guess is how the planner ended up
+ * trusting a constant in the first place.
+ */
+function measuredDecodeThroughput(worker: StoredWorker): number | null {
+  const measured = worker.capabilities.deployments
+    .filter((deployment) => deployment.throughputSource === "measured")
+    .map((deployment) => deployment.tokensPerSecond)
+    .filter((value) => Number.isFinite(value) && value > 0);
+  return measured.length === 0 ? null : Math.max(...measured);
 }
 
 /**
@@ -65,6 +81,23 @@ export function buildConnectedExecutorActivationSnapshot(
   }));
   if (executors.length < 2) return { capacityNodes, config: null };
 
+  // El SEGUNDO cero del planificador. `coordinatorRttMs` ya se mide, pero
+  // `decodeScale` seguía fijado a 1 aquí, así que `ProportionalComputePlanner`
+  // dividía por un vector de unos y **el reparto proporcional degeneraba a
+  // reparto igual**: el planificador no podía distinguir una 4090 de una
+  // 1050 Ti. El planificador proporcional ya estaba escrito; lo tenía apagado
+  // la telemetría que faltaba, no el diseño.
+  //
+  // Un nodo sin medida conserva 1 y se declara NO medido, en vez de pasar por
+  // informado en silencio — el mismo criterio que `estimateLinkLatencyMs`.
+  const decodeScales = deriveDecodeScales(executors.map(({ executor, worker }) => ({
+    nodeId: executor.nodeId,
+    measuredTokensPerSecond: measuredDecodeThroughput(worker),
+  })));
+  const decodeScaleById = new Map(
+    decodeScales.scales.map((scale) => [scale.nodeId, scale.decodeScale]),
+  );
+
   const nodes = executors.map(({ worker, executor }) => {
     const memoryMiB = worker.capabilities.gpus.reduce(
       (sum, gpu) => sum + gpu.offeredVramMb,
@@ -80,7 +113,7 @@ export function buildConnectedExecutorActivationSnapshot(
       endpoint: { host: executor.stageHost, port: executor.stagePort },
       memoryMiB,
       reserveMiB: Math.min(256, Math.max(0, memoryMiB - 1)),
-      decodeScale: 1,
+      decodeScale: decodeScaleById.get(executor.nodeId) ?? 1,
       prefillScale: 1,
       codecScale: 1,
       powerWatts: measuredPower > 0 ? measuredPower : 1,
