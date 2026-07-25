@@ -54,6 +54,16 @@ import {
   registerContentHubRoutes,
 } from "./content-hub.js";
 import { SupabaseAuthService } from "./supabase-auth.js";
+import type { AuthenticatedNetworkUser } from "./supabase-auth.js";
+import {
+  API_KEY_PREFIX,
+  ApiAccessError,
+  ApiAccessManager,
+  apiAccountJson,
+  apiKeyJson,
+  apiUsageJson,
+  type ApiKeyPrincipal,
+} from "./api-access.js";
 
 export function automaticActivationFailureIsTransient(message: string): boolean {
   const normalized = message.toLowerCase();
@@ -111,6 +121,7 @@ export interface CoordinatorRuntime {
   hub: WorkerHub;
   mobileHub: MobileComputeHub;
   service: MeshService;
+  apiAccess: ApiAccessManager;
   persistence: SupabasePersistence | null;
   close(): Promise<void>;
 }
@@ -129,10 +140,12 @@ export async function createCoordinator(
     releaseTokenVerifier?: (token: string) => Promise<unknown>;
     mobileDisconnectedRetentionMs?: number;
     automaticActivationRetryDelaysMs?: readonly number[];
+    supabaseAuthService?: SupabaseAuthService;
   } = {},
 ): Promise<CoordinatorRuntime> {
   const app = Fastify({ logger: options.logger ?? false, bodyLimit: 2 * 1024 * 1024 });
-  app.addHook("onRequest", async (_request, reply) => {
+  const apiAccessEnabled = config.apiAccessEnabled ?? false;
+  app.addHook("onRequest", async (request, reply) => {
     // The public UI and mobile worker must never be embeddable as drive-by
     // compute. Apply the policy to static and dynamic responses so it remains
     // true even when a reverse proxy does not add security headers.
@@ -140,6 +153,22 @@ export async function createCoordinator(
     reply.header("X-Frame-Options", "DENY");
     reply.header("X-Content-Type-Options", "nosniff");
     reply.header("Referrer-Policy", "strict-origin-when-cross-origin");
+    const path = request.url.split("?", 1)[0] ?? request.url;
+    if (path.startsWith("/v1/")) {
+      reply.header("Access-Control-Allow-Origin", "*");
+      reply.header("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
+      reply.header(
+        "Access-Control-Allow-Headers",
+        "Authorization,Content-Type,Idempotency-Key",
+      );
+      reply.header(
+        "Access-Control-Expose-Headers",
+        "X-Network-Request-Id,X-Network-Session-Id,X-RateLimit-Limit,"
+        + "X-RateLimit-Remaining,X-RateLimit-Reset,X-Token-Balance",
+      );
+      reply.header("Vary", "Origin");
+      if (request.method === "OPTIONS") return reply.code(204).send();
+    }
   });
   const internalToken = config.internalToken ?? config.modelAdminToken ?? config.networkToken;
   app.addHook("onRequest", async (request, reply) => {
@@ -162,7 +191,10 @@ export async function createCoordinator(
     const expectedToken = config.networkToken;
     app.addHook("onRequest", async (request, reply) => {
       const path = request.url.split("?", 1)[0] ?? request.url;
-      if (!path.startsWith("/internal/v1/") && !path.startsWith("/v1/")) return;
+      if (
+        !path.startsWith("/internal/v1/")
+        && !(path.startsWith("/v1/") && !apiAccessEnabled)
+      ) return;
       if (path.startsWith("/internal/v1/releases/")) return;
       if (path === "/v1/auth/me") return;
       // Mobile expert administration has its own stronger control-plane
@@ -175,9 +207,9 @@ export async function createCoordinator(
       }
     });
   }
-  const supabaseAuth = config.supabaseUrl && config.supabaseServiceRoleKey
+  const supabaseAuth = options.supabaseAuthService ?? (config.supabaseUrl && config.supabaseServiceRoleKey
     ? new SupabaseAuthService(config.supabaseUrl, config.supabaseServiceRoleKey)
-    : null;
+    : null);
   const authorizeModelMutation = async (
     request: FastifyRequest,
     reply: FastifyReply,
@@ -236,6 +268,89 @@ export async function createCoordinator(
     (_request, body, done) => done(null, body),
   );
   const database = new MeshDatabase(config.databasePath);
+  const apiAccess = new ApiAccessManager(database, {
+    starterTokens: config.apiStarterTokens ?? 25_000,
+    requestsPerMinute: config.apiRequestsPerMinute ?? 30,
+    maxConcurrent: config.apiMaxConcurrent ?? 2,
+    maxActiveKeys: config.apiMaxActiveKeys ?? 10,
+  });
+  type ApiRequestPrincipal =
+    | { kind: "system" }
+    | {
+        kind: "user";
+        userId: string;
+        role: AuthenticatedNetworkUser["role"];
+      }
+    | ApiKeyPrincipal;
+  const apiPrincipals = new WeakMap<FastifyRequest, ApiRequestPrincipal>();
+  const principalFor = (request: FastifyRequest): ApiRequestPrincipal => {
+    const principal = apiPrincipals.get(request);
+    if (!principal) {
+      throw new ApiAccessError(
+        "authentication_required",
+        "Sign in or provide a Mycellios API key.",
+        401,
+      );
+    }
+    return principal;
+  };
+  app.addHook("preHandler", async (request, reply) => {
+    if (!apiAccessEnabled || request.method === "OPTIONS") return;
+    const path = request.url.split("?", 1)[0] ?? request.url;
+    if (!path.startsWith("/v1/") || path === "/v1/auth/me") return;
+    const token = parseBearerToken(request.headers.authorization);
+    if (!token) {
+      return reply.code(401).send({
+        error: {
+          code: "authentication_required",
+          message: "Sign in or provide a Mycellios API key.",
+        },
+      });
+    }
+    if (config.networkToken && constantTimeEqual(token, config.networkToken)) {
+      apiPrincipals.set(request, { kind: "system" });
+      return;
+    }
+    if (token.startsWith(API_KEY_PREFIX)) {
+      const principal = apiAccess.authenticateKey(token);
+      if (!principal) {
+        return reply.code(401).send({
+          error: { code: "invalid_api_key", message: "The Mycellios API key is invalid or revoked." },
+        });
+      }
+      apiPrincipals.set(request, principal);
+      return;
+    }
+    if (!supabaseAuth) {
+      return reply.code(503).send({
+        error: {
+          code: "account_authentication_unavailable",
+          message: "Account authentication is not configured on this coordinator.",
+        },
+      });
+    }
+    try {
+      const user = await supabaseAuth.authenticate(token);
+      if (!user) {
+        return reply.code(401).send({
+          error: { code: "invalid_access_token", message: "The account session is invalid or expired." },
+        });
+      }
+      apiAccess.getOrCreateAccount(user.id);
+      apiPrincipals.set(request, { kind: "user", userId: user.id, role: user.role });
+    } catch (error) {
+      app.log.warn(
+        { error: error instanceof Error ? error.message : String(error) },
+        "Account authentication lookup failed",
+      );
+      return reply.code(503).send({
+        error: {
+          code: "account_authentication_unavailable",
+          message: "The account service could not validate this request.",
+        },
+      });
+    }
+  });
   const store = new MeshStore(database);
   const persistence = config.supabaseUrl && config.supabaseServiceRoleKey
     ? new SupabasePersistence(store, {
@@ -749,7 +864,10 @@ export async function createCoordinator(
       landing: config.landingAssetsPath ? "/" : null,
       desktopUpdates: desktopUpdatesPath ? "/updates/win32/x64/" : null,
       downloads: releaseDownloadsPath ? "/downloads/" : null,
-      features: { distributedActivation: activationManager !== undefined },
+      features: {
+        distributedActivation: activationManager !== undefined,
+        apiAccess: apiAccessEnabled,
+      },
       persistence: persistence?.status() ?? {
         configured: false,
         connected: false,
@@ -764,6 +882,14 @@ export async function createCoordinator(
 
   app.get("/public/v1/auth-config", async () => ({
     enabled: Boolean(config.supabaseUrl && config.supabaseAnonKey),
+    apiAccessEnabled,
+    publicApiBaseUrl: config.publicApiBaseUrl ?? "/v1",
+    starterTokens: apiAccess.limits.starterTokens,
+    limits: {
+      requestsPerMinute: apiAccess.limits.requestsPerMinute,
+      maxConcurrent: apiAccess.limits.maxConcurrent,
+      maxActiveKeys: apiAccess.limits.maxActiveKeys,
+    },
     ...(config.supabaseUrl && config.supabaseAnonKey
       ? { url: config.supabaseUrl, anonKey: config.supabaseAnonKey }
       : {}),
@@ -776,7 +902,113 @@ export async function createCoordinator(
     }
     const user = await supabaseAuth.authenticate(token);
     if (!user) return reply.code(401).send({ error: { code: "invalid_access_token" } });
-    return { user };
+    const account = apiAccess.getOrCreateAccount(user.id);
+    return { user, account: apiAccountJson(account, apiAccess.limits) };
+  });
+
+  app.get("/v1/account", async (request, reply) => {
+    const principal = principalFor(request);
+    if (principal.kind === "system") {
+      return reply.code(403).send({
+        error: {
+          code: "account_identity_required",
+          message: "Use an account session or account API key to inspect a balance.",
+        },
+      });
+    }
+    return { object: "account", ...apiAccountJson(
+      apiAccess.getOrCreateAccount(principal.userId),
+      apiAccess.limits,
+    ) };
+  });
+
+  app.get("/v1/account/usage", async (request) => {
+    const principal = principalFor(request);
+    if (principal.kind === "system") return { object: "list", data: [] };
+    const query = z.object({
+      limit: z.coerce.number().int().min(1).max(100).default(25),
+    }).parse(request.query);
+    return {
+      object: "list",
+      data: apiAccess.listUsage(principal.userId, query.limit).map(apiUsageJson),
+    };
+  });
+
+  app.get("/v1/api-keys", async (request, reply) => {
+    const principal = principalFor(request);
+    if (principal.kind !== "user") {
+      return reply.code(403).send({
+        error: {
+          code: "account_session_required",
+          message: "API keys can only be managed from a signed-in account session.",
+        },
+      });
+    }
+    return {
+      object: "list",
+      data: apiAccess.listKeys(principal.userId).map(apiKeyJson),
+    };
+  });
+
+  app.post("/v1/api-keys", async (request, reply) => {
+    const principal = principalFor(request);
+    if (principal.kind !== "user") {
+      return reply.code(403).send({
+        error: {
+          code: "account_session_required",
+          message: "API keys can only be managed from a signed-in account session.",
+        },
+      });
+    }
+    const body = z.object({
+      name: z.string().trim().min(1).max(80),
+    }).parse(request.body);
+    const created = apiAccess.createKey(principal.userId, body.name);
+    return reply.code(201).send({
+      object: "api_key",
+      ...apiKeyJson(created),
+      secret: created.secret,
+    });
+  });
+
+  app.delete("/v1/api-keys/:keyId", async (request, reply) => {
+    const principal = principalFor(request);
+    if (principal.kind !== "user") {
+      return reply.code(403).send({
+        error: {
+          code: "account_session_required",
+          message: "API keys can only be managed from a signed-in account session.",
+        },
+      });
+    }
+    const { keyId } = z.object({ keyId: z.string().min(1).max(100) }).parse(request.params);
+    if (!apiAccess.revokeKey(principal.userId, keyId)) {
+      return reply.code(404).send({ error: { code: "api_key_not_found" } });
+    }
+    return reply.code(204).send();
+  });
+
+  app.post("/v1/admin/accounts/:userId/tokens", async (request, reply) => {
+    const principal = principalFor(request);
+    if (
+      principal.kind !== "user"
+      || (principal.role !== "owner" && principal.role !== "admin")
+    ) {
+      return reply.code(403).send({
+        error: {
+          code: "insufficient_network_role",
+          message: "Only a network owner or administrator can grant account tokens.",
+        },
+      });
+    }
+    const { userId } = z.object({ userId: z.string().uuid() }).parse(request.params);
+    const { amount } = z.object({
+      amount: z.number().int().positive().max(10_000_000),
+    }).parse(request.body);
+    return {
+      object: "account",
+      ...apiAccountJson(apiAccess.grantTokens(userId, amount), apiAccess.limits),
+    };
   });
 
   app.get("/public/v1/snapshot", async () => {
@@ -1234,6 +1466,9 @@ export async function createCoordinator(
 
   app.post("/v1/chat/completions", async (request, reply) => {
     const parsed = chatCompletionRequestSchema.parse(request.body) as ChatCompletionRequest;
+    const principal: ApiRequestPrincipal = apiAccessEnabled
+      ? principalFor(request)
+      : { kind: "system" };
     const idempotencyKey = parseIdempotencyKey(request.headers["idempotency-key"]);
     const supersededJobId = service.cancelMatchingActiveSession(parsed, parsed.session_id);
     if (supersededJobId) {
@@ -1252,7 +1487,27 @@ export async function createCoordinator(
       // making the installed desktop surface a transient 503.
       await waitForChatCapacity(service, parsed, parsed.session_id, 45_000);
     }
-    const handle = service.submit(parsed, parsed.session_id, idempotencyKey);
+    const usage = principal.kind === "system"
+      ? null
+      : apiAccess.beginUsage(
+          principal.userId,
+          principal.kind === "api_key" ? principal.apiKeyId : null,
+          parsed,
+        );
+    if (usage) {
+      reply.header("x-ratelimit-limit", usage.rateLimit.limit);
+      reply.header("x-ratelimit-remaining", usage.rateLimit.remaining);
+      reply.header("x-ratelimit-reset", Math.ceil(usage.rateLimit.resetAt / 1_000));
+      reply.header("x-token-balance", usage.remainingTokens);
+    }
+    let handle: ReturnType<MeshService["submit"]>;
+    try {
+      handle = service.submit(parsed, parsed.session_id, idempotencyKey);
+    } catch (error) {
+      if (usage) apiAccess.failUsage(usage.id, "submission_failed");
+      throw error;
+    }
+    if (usage) apiAccess.attachJob(usage.id, handle.jobId, handle.sessionId);
     const conversationId = store.startInferenceConversation(
       handle.sessionId,
       parsed.model,
@@ -1276,6 +1531,7 @@ export async function createCoordinator(
       let streamedRouteClass = "replica";
       let streamedResult: Extract<JobStreamEvent, { type: "completed" }> | null = null;
       let streamedFailure: Extract<JobStreamEvent, { type: "failed" }> | null = null;
+      let streamError: unknown = null;
       reply.raw.once("close", () => {
         if (!finished) service.cancel(handle.jobId);
       });
@@ -1293,25 +1549,54 @@ export async function createCoordinator(
           if (event.type === "failed") streamedFailure = event;
           writeOpenAiEvent(reply.raw, event, parsed.model, handle.jobId);
         }
+      } catch (error) {
+        streamError = error;
       } finally {
         clearInterval(heartbeatTimer);
       }
       finished = true;
+      if (usage) {
+        if (streamedResult) {
+          const account = apiAccess.completeUsage(
+            usage.id,
+            streamedResult.result.metrics.inputTokens,
+            streamedResult.result.metrics.outputTokens,
+          );
+          void account;
+        } else {
+          apiAccess.failUsage(
+            usage.id,
+            streamedFailure?.code ?? (streamError ? "stream_failed" : "missing_result"),
+          );
+        }
+      }
       store.appendInferenceMessage({
         conversationId,
         jobId: handle.jobId,
         role: "assistant",
         content: streamedResult?.result.text ?? streamedText,
-        status: streamedFailure ? "failed" : "completed",
+        status: streamedFailure || streamError || !streamedResult ? "failed" : "completed",
         inputTokens: streamedResult?.result.metrics.inputTokens ?? null,
         outputTokens: streamedResult?.result.metrics.outputTokens ?? null,
         routeClass: streamedRouteClass,
         latencyMs: streamedResult?.result.metrics.activeMs ?? null,
-        metadata: streamedFailure
-          ? { failure_code: streamedFailure.code, failure_message: streamedFailure.message }
+        metadata: streamedFailure || streamError
+          ? {
+              failure_code: streamedFailure?.code ?? "stream_failed",
+              failure_message: streamedFailure?.message
+                ?? (streamError instanceof Error ? streamError.message : String(streamError)),
+            }
           : { finish_reason: streamedResult?.result.finishReason ?? null },
       });
       void persistence?.flush();
+      if (streamError && !reply.raw.destroyed && !reply.raw.writableEnded) {
+        reply.raw.write(`data: ${JSON.stringify({
+          error: {
+            code: "stream_failed",
+            message: streamError instanceof Error ? streamError.message : String(streamError),
+          },
+        })}\n\n`);
+      }
       reply.raw.write("data: [DONE]\n\n");
       reply.raw.end();
       return;
@@ -1320,18 +1605,36 @@ export async function createCoordinator(
     let result: Extract<JobStreamEvent, { type: "completed" }> | null = null;
     let routeClass = "replica";
     let affinityHit = false;
-    for await (const event of handle.events) {
-      if (event.type === "accepted") {
-        routeClass = event.route.routeClass;
-        affinityHit = event.route.affinityHit;
+    try {
+      for await (const event of handle.events) {
+        if (event.type === "accepted") {
+          routeClass = event.route.routeClass;
+          affinityHit = event.route.affinityHit;
+        }
+        if (event.type === "failed") {
+          throw new MeshServiceError(event.code, event.message, 502);
+        }
+        if (event.type === "completed") result = event;
       }
-      if (event.type === "failed") {
-        throw new MeshServiceError(event.code, event.message, 502);
+      if (!result) {
+        throw new MeshServiceError("missing_result", "Worker stream ended without a result", 502);
       }
-      if (event.type === "completed") result = event;
+    } catch (error) {
+      if (usage) {
+        apiAccess.failUsage(
+          usage.id,
+          error instanceof MeshServiceError ? error.code : "inference_failed",
+        );
+      }
+      throw error;
     }
-    if (!result) {
-      throw new MeshServiceError("missing_result", "Worker stream ended without a result", 502);
+    if (usage) {
+      const account = apiAccess.completeUsage(
+        usage.id,
+        result.result.metrics.inputTokens,
+        result.result.metrics.outputTokens,
+      );
+      if (account) reply.header("x-token-balance", account.tokenBalance);
     }
     reply.header("x-route-class", routeClass);
     store.appendInferenceMessage({
@@ -1382,6 +1685,13 @@ export async function createCoordinator(
 
   app.get("/v1/requests/:jobId", async (request, reply) => {
     const { jobId } = jobIdParamsSchema.parse(request.params);
+    const principal = apiAccessEnabled ? principalFor(request) : { kind: "system" as const };
+    if (
+      principal.kind !== "system"
+      && !apiAccess.userOwnsJob(principal.userId, jobId)
+    ) {
+      return reply.code(404).send({ error: { code: "not_found" } });
+    }
     const job = store.getJob(jobId);
     if (!job) return reply.code(404).send({ error: { code: "not_found" } });
     return {
@@ -1398,8 +1708,15 @@ export async function createCoordinator(
     };
   });
 
-  app.get("/v1/conversations/:sessionId/messages", async (request) => {
+  app.get("/v1/conversations/:sessionId/messages", async (request, reply) => {
     const { sessionId } = z.object({ sessionId: z.string().min(1).max(200) }).parse(request.params);
+    const principal = apiAccessEnabled ? principalFor(request) : { kind: "system" as const };
+    if (
+      principal.kind !== "system"
+      && !apiAccess.userOwnsSession(principal.userId, sessionId)
+    ) {
+      return reply.code(404).send({ error: { code: "not_found" } });
+    }
     return {
       data: store.listInferenceMessages(sessionId).map((message) => ({
         id: message.id,
@@ -1419,6 +1736,13 @@ export async function createCoordinator(
 
   app.post("/v1/requests/:jobId/cancel", async (request, reply) => {
     const { jobId } = jobIdParamsSchema.parse(request.params);
+    const principal = apiAccessEnabled ? principalFor(request) : { kind: "system" as const };
+    if (
+      principal.kind !== "system"
+      && !apiAccess.userOwnsJob(principal.userId, jobId)
+    ) {
+      return reply.code(404).send({ error: { code: "not_found_or_terminal" } });
+    }
     if (!service.cancel(jobId)) {
       return reply.code(404).send({ error: { code: "not_found_or_terminal" } });
     }
@@ -1528,6 +1852,14 @@ export async function createCoordinator(
     if (error instanceof MeshServiceError) {
       return reply.code(error.statusCode).send({ error: { code: error.code, message: error.message } });
     }
+    if (error instanceof ApiAccessError) {
+      if (error.retryAfterSeconds !== undefined) {
+        reply.header("retry-after", error.retryAfterSeconds);
+      }
+      return reply.code(error.statusCode).send({
+        error: { code: error.code, message: error.message },
+      });
+    }
     app.log.error(error);
     return reply.code(500).send({
       error: { code: "internal_error", message: "The coordinator could not process the request" },
@@ -1542,6 +1874,7 @@ export async function createCoordinator(
     hub,
     mobileHub,
     service,
+    apiAccess,
     persistence,
     async close() {
       clearInterval(staleTimer);
