@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-const SCHEMA_VERSION = 11;
+const SCHEMA_VERSION = 12;
 
 export interface PersistenceOutboxRow {
   id: number;
