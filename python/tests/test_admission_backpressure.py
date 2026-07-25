@@ -78,5 +78,42 @@ class EngineRaisesQueueFullTests(unittest.TestCase):
             )
 
 
+class ErrorPathMapsQueueFullTests(unittest.TestCase):
+    """La cola llena NO llega por `submit()`, y ahí estaba el fallo.
+
+    `ContinuousMicroBatcher.submit()` sólo hace `put_nowait` en una
+    `asyncio.Queue` **sin límite**, así que nunca puede levantar `QueueFullError`.
+    La levanta `engine.submit()` dentro del bucle de despacho, y viaja como
+    evento `("error", ...)` del pending. Mapearla sólo en el borde de entrada
+    dejaba la contrapresión SIN EFECTO: el cliente recibía un 500 genérico y no
+    sabía que debía reintentar.
+    """
+
+    def test_submit_cannot_raise_queue_full_because_its_queue_is_unbounded(self):
+        import inspect
+
+        from distributed_runtime.server import ContinuousMicroBatcher
+
+        source = inspect.getsource(ContinuousMicroBatcher.submit)
+        self.assertIn("put_nowait", source)
+        self.assertNotIn(
+            "engine.submit", source,
+            "si `submit` llamara al motor, el catch del borde bastaría; "
+            "como no lo hace, la cola llena tiene que mapearse en la ruta de eventos",
+        )
+
+    def test_the_event_path_maps_queue_full_to_the_overload_response(self):
+        import inspect
+
+        from distributed_runtime import server
+
+        source = inspect.getsource(server)
+        self.assertIn(
+            "isinstance(payload, QueueFullError)", source,
+            "la ruta de eventos debe distinguir la cola llena del fallo genérico",
+        )
+        self.assertIn("overloaded_response(payload)", source)
+
+
 if __name__ == "__main__":
     unittest.main()

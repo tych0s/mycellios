@@ -354,14 +354,44 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     }
   }
 
+  /**
+   * Credenciales para las mutaciones de estado compartido.
+   *
+   * Expulsar un worker saca capacidad de la red, así que el coordinador exige
+   * autorización para ello igual que para publicar un modelo. Antes esas dos
+   * rutas no tenían guard y estas llamadas iban sin credencial; al cerrarlas,
+   * mandarlas desnudas devuelve 401.
+   *
+   * La sesión de cuenta manda si existe; el token de administrador vale como
+   * alternativa y también como refuerzo cuando hay sesión, que es el mismo
+   * orden que usa `requestModel`.
+   */
+  function mutationHeaders(): Record<string, string> {
+    const token = modelAdminToken.trim();
+    if (authSession) {
+      return {
+        authorization: `Bearer ${authSession.accessToken}`,
+        ...(token ? { "x-mycellios-admin-token": token } : {}),
+      };
+    }
+    return token ? { authorization: `Bearer ${token}` } : {};
+  }
+
   async function removeWorker(workerId: string) {
     if (desktopBridge) {
       const next = await desktopBridge.removeWorker(workerId);
       applyDesktopSnapshot(next);
       return;
     }
-    const response = await fetch(`/public/v1/workers/${encodeURIComponent(workerId)}`, { method: "DELETE" });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const response = await fetch(`/public/v1/workers/${encodeURIComponent(workerId)}`, {
+      method: "DELETE",
+      headers: mutationHeaders(),
+    });
+    if (!response.ok) {
+      throw new Error(response.status === 401
+        ? "Inicia sesión o introduce el token de administrador para expulsar nodos."
+        : `HTTP ${response.status}`);
+    }
     await refresh();
   }
 
@@ -371,8 +401,15 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
       applyDesktopSnapshot(next);
       return;
     }
-    const response = await fetch("/public/v1/workers/clear-offline", { method: "POST" });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const response = await fetch("/public/v1/workers/clear-offline", {
+      method: "POST",
+      headers: mutationHeaders(),
+    });
+    if (!response.ok) {
+      throw new Error(response.status === 401
+        ? "Inicia sesión o introduce el token de administrador para limpiar nodos."
+        : `HTTP ${response.status}`);
+    }
     await refresh();
   }
 

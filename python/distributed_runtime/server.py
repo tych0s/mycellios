@@ -439,7 +439,7 @@ class DistributedOpenAIServer:
             return error_response(str(error), "invalid_request", 400)
         try:
             await self.batcher.submit(pending)
-        except QueueFullError as error:
+        except QueueFullError as error:  # pragma: no cover - defensa, ver nota
             # Backpressure, not failure. A 503 tells a client (and any load
             # balancer in front) that this node is broken and should be taken
             # out; a 429 with Retry-After tells it to slow down and come back,
@@ -683,6 +683,14 @@ class DistributedOpenAIServer:
                 if kind == "token":
                     token_ids.append(int(payload[0]))
                 elif kind == "error":
+                    # La cola llena NO llega por `submit()` —que sólo encola en
+                    # una `asyncio.Queue` sin límite— sino por aquí: la levanta
+                    # `engine.submit()` dentro del bucle de despacho y viaja como
+                    # evento del pending. Mapearla sólo en el borde de entrada
+                    # dejaba la contrapresión sin efecto: el cliente recibía un
+                    # 500 genérico y no sabía que debía reintentar.
+                    if isinstance(payload, QueueFullError):
+                        return overloaded_response(payload)
                     return error_response(str(payload), "pipeline_error", 500)
                 elif kind == "done":
                     output: GenerationOutput = payload

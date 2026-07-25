@@ -265,6 +265,11 @@ class _EmulatedLink:
             item = self._queue.get()
             if item is None:
                 return
+            if item[0] == "flush":
+                # Todo lo anterior ya se escribió: la cola es FIFO y un solo
+                # hilo la consume, así que llegar aquí ES la prueba de drenaje.
+                item[1].set()
+                continue
             release_at, blob = item
             remaining = release_at - time.monotonic()
             if remaining > 0:
@@ -275,11 +280,30 @@ class _EmulatedLink:
                 self._error = error
                 return
 
+    def flush(self, timeout: float = 5.0) -> None:
+        """Espera a que lo encolado llegue al socket, con plazo acotado.
+
+        Hace falta antes de cerrar o medio-cerrar el socket: un frame TERMINAL
+        (SHUTDOWN) también se encola —una vez que el socket tiene enlace
+        emulado, todo envío pasa por él— y cerrar sin drenar lo pierde en
+        silencio. El par se queda esperando un cierre que nunca llega.
+        """
+        drained = threading.Event()
+        self._queue.put(("flush", drained))
+        drained.wait(timeout)
+        if self._error is not None:
+            raise self._error
+
     def close(self, timeout: float = 5.0) -> None:
         """Vacía lo pendiente con un plazo acotado y para el hilo."""
         self._queue.put(None)
         self._thread.join(timeout)
 
+
+# Frames tras los cuales el emisor CIERRA el socket. Sólo SHUTDOWN lo es:
+# END y ERROR terminan una PETICIÓN, no la conexión, y drenar en ellos
+# serializaría el enlace justo en el caso que el emulador existe para medir.
+_TERMINAL_FRAME_TYPES = frozenset({FrameType.SHUTDOWN})
 
 _EMULATED_LINKS: dict[socket.socket, _EmulatedLink] = {}
 _EMULATED_LINKS_LOCK = threading.Lock()
@@ -300,6 +324,13 @@ def _existing_emulated_link(sock: socket.socket) -> _EmulatedLink | None:
         return None  # camino de producción: ni un lock que tomar
     with _EMULATED_LINKS_LOCK:
         return _EMULATED_LINKS.get(sock)
+
+
+def flush_emulated_link(sock: socket.socket, timeout: float = 5.0) -> None:
+    """Drena el enlace emulado de `sock` si lo tiene. No-op si no."""
+    link = _existing_emulated_link(sock)
+    if link is not None:
+        link.flush(timeout)
 
 
 def close_emulated_link(sock: socket.socket, timeout: float = 5.0) -> None:
@@ -383,6 +414,11 @@ def send_frame(
     if link is not None:
         propagation = emulator.propagation_seconds if emulator is not None else 0.0
         link.send(header + payload if payload else bytes(header), propagation)
+        # Un frame TERMINAL se drena antes de devolver el control: quien manda
+        # SHUTDOWN cierra el socket a continuación, y cerrar con la cola sin
+        # vaciar lo perdería en silencio dejando al par esperando.
+        if normalized_type in _TERMINAL_FRAME_TYPES:
+            link.flush()
         return frame_bytes
     sock.sendall(header)
     if payload:

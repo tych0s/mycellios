@@ -165,6 +165,48 @@ class PropagationIsNotSerialTests(unittest.TestCase):
         self.assertEqual([frame.step for _, frame in self.link.received], [0, 1, 2])
 
 
+class TerminalFrameIsDrainedTests(unittest.TestCase):
+    """Quien manda SHUTDOWN cierra el socket justo después.
+
+    Como una vez que el socket tiene enlace emulado TODO envío se encola —incluido
+    el SHUTDOWN, que va sin emulador—, cerrar sin drenar lo perdería en silencio y
+    el par se quedaría esperando un cierre que nunca llega.
+    """
+
+    def setUp(self):
+        self.link = _Link()
+        self.addCleanup(self.link.close)
+
+    def test_shutdown_reaches_the_peer_even_if_the_socket_closes_right_after(self):
+        emulator = LinkEmulator(one_way_delay_ms=DELAY_MS)
+        reader = self.link.read_frames(3)
+        _send(self.link, emulator, step=0)
+        _send(self.link, emulator, step=1)
+        send_frame(self.link.client, FrameType.SHUTDOWN, request_id=0, emulator=None)
+        # Cerrar inmediatamente: es lo que hace el llamante real.
+        self.link.client.close()
+        reader.join(timeout=10)
+        kinds = [frame.frame_type for _, frame in self.link.received]
+        self.assertEqual(len(self.link.received), 3, f"se perdió algún frame: {kinds}")
+        self.assertEqual(kinds[-1], FrameType.SHUTDOWN)
+
+    def test_a_non_terminal_frame_does_not_drain(self):
+        # Drenar en END o ERROR serializaría el enlace justo en el caso que el
+        # emulador existe para medir. Sólo SHUTDOWN cierra la conexión.
+        emulator = LinkEmulator(one_way_delay_ms=DELAY_MS)
+        reader = self.link.read_frames(4)
+        started = time.monotonic()
+        for step in range(4):
+            _send(self.link, emulator, step=step)   # ERROR, no terminal
+        elapsed = time.monotonic() - started
+        self.assertLess(
+            elapsed, DELAY_S * 2,
+            f"enviar 4 frames no terminales bloqueó {elapsed * 1000:.0f} ms: "
+            "se están drenando y eso destruye el solape",
+        )
+        reader.join(timeout=10)
+
+
 class WithoutEmulationNothingChangesTests(unittest.TestCase):
     """El camino de producción (sin retardo configurado) queda intacto."""
 
