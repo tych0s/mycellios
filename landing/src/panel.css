@@ -6585,34 +6585,378 @@
 .public-panel .inference-input textarea:disabled { color: var(--text-disabled); border-color: rgba(125,151,230,.1); background: rgba(5,16,37,.5); cursor: not-allowed; }
 
 .public-panel.theme-light {
-  --bg-canvas: #f3f6fb;
+  --bg-canvas: #f4f7fb;
   --bg-sidebar: #fff;
   --bg-elevated: #fff;
   --bg-card: rgba(255,255,255,.98);
-  --bg-card-hover: #f8faff;
-  --bg-input: rgba(32,53,89,.045);
+  --bg-card-hover: #f7faff;
+  --bg-input: #f5f7fb;
   --bg-overlay: rgba(24,34,55,.28);
-  --blue-300: #356ed2;
+  --blue-200: #497bd0;
+  --blue-300: #2e67c7;
   --blue-400: #2f68da;
-  --blue-500: #2f68e8;
+  --blue-500: #316ee8;
   --blue-600: #2459c8;
-  --blue-glow: rgba(47,104,232,.09);
-  --success: #12805c;
-  --warning: #9b6400;
-  --danger: #c9384b;
-  --text-primary: #17213a;
-  --text-secondary: #56627a;
-  --text-tertiary: #78839a;
-  --text-disabled: #a4adbd;
-  --border-subtle: rgba(28,48,82,.11);
-  --border-strong: rgba(47,104,232,.24);
-  --shadow-card: 0 14px 34px rgba(29,49,82,.08);
+  --blue-glow: rgba(47,104,232,.1);
+  --purple-300: #6952c9;
+  --purple-400: #694fe2;
+  --purple-500: #5638dc;
+  --purple-glow: rgba(89,62,254,.09);
+  --success: #087657;
+  --warning: #956000;
+  --danger: #c7344a;
+  --text-primary: #15213a;
+  --text-secondary: #536179;
+  --text-tertiary: #627089;
+  --text-disabled: #7d899e;
+  --border-subtle: #dce4ef;
+  --border-strong: #b8c9e4;
+  --shadow-card: 0 12px 30px rgba(31,50,83,.075), 0 1px 2px rgba(31,50,83,.035);
+  --shadow-hover: 0 16px 38px rgba(31,50,83,.11), 0 2px 4px rgba(31,50,83,.04);
   color-scheme: light;
 }
-.public-panel-viewport:has(.public-panel.theme-light) { background: #f3f6fb; }
-.public-panel.theme-light .panel-sidebar { border-right-color: var(--border-subtle); background: linear-gradient(180deg,#fff,#f7f9fd); }
-.public-panel.theme-light .panel-main { background: radial-gradient(ellipse at 14% -12%,rgba(72,116,210,.08),transparent 48%),linear-gradient(135deg,#f7f9fd,#f3f6fb 56%,#eef2f8); }
-.public-panel.theme-light .panel-topbar { border-bottom-color: var(--border-subtle); background: rgba(255,255,255,.92); }
+.public-panel-viewport:has(.public-panel.theme-light) { background: #f4f7fb; }
+.public-panel.theme-light .panel-sidebar {
+  border-right-color: var(--border-subtle);
+  background: linear-gradient(180deg,#fff 0%,#fbfcfe 72%,#f7f9fc 100%);
+  box-shadow: 8px 0 28px rgba(37,57,89,.035);
+}
+.public-panel.theme-light .panel-main {
+  background:
+    radial-gradient(ellipse at 14% -12%,rgba(72,116,210,.085),transparent 48%),
+    linear-gradient(135deg,#f8fafd,#f4f7fb 56%,#eef3f9);
+}
+.public-panel.theme-light .panel-topbar {
+  border-bottom-color: var(--border-subtle);
+  background: rgba(255,255,255,.94);
+  box-shadow: 0 4px 18px rgba(37,57,89,.035);
+}
+.public-panel.theme-light .panel-sidebar nav button:hover,
+.public-panel.theme-light .panel-sidebar-links a:hover { background: #f0f4fa; }
+.public-panel.theme-light .panel-sidebar nav button.active {
+  color: #1f4f9d;
+  border-color: #c8d8f1;
+  background: linear-gradient(135deg,#e8f0ff,#edf2fb);
+  box-shadow: inset 0 1px 0 #fff, 0 5px 14px rgba(49,104,216,.08);
+}
+.public-panel.theme-light .panel-sidebar nav button b {
+  color: #2459ad;
+  background: #e6efff;
+}
+.public-panel.theme-light .panel-sidebar-status {
+  border-color: #cfe6dc;
+  background: linear-gradient(145deg,#effaf5,#f7fcf9);
+  box-shadow: inset 0 1px 0 #fff;
+}
+.public-panel.theme-light .panel-sidebar-status.degraded {
+  border-color: #ead9b9;
+  background: linear-gradient(145deg,#fff8e9,#fffbf3);
+}
+.public-panel.theme-light .panel-sidebar-status span { color: #536179; }
+.public-panel.theme-light .panel-sidebar-status small { color: #728097; }
+.public-panel.theme-light .panel-sidebar-version small { color: #5f6e86; }
+.public-panel.theme-light .panel-sidebar-version strong { color: #5d6b83; }
+
+.public-panel.theme-light .app-select-trigger,
+.public-panel.theme-light .page-actions button,
+.public-panel.theme-light .secondary-button,
+.public-panel.theme-light .card-heading button,
+.public-panel.theme-light .canvas-link,
+.public-panel.theme-light .panel-account-button,
+.public-panel.theme-light input,
+.public-panel.theme-light select,
+.public-panel.theme-light textarea {
+  color: var(--text-primary);
+  border-color: var(--border-subtle);
+  background: #f6f8fb;
+  box-shadow: inset 0 1px 0 #fff;
+}
+.public-panel.theme-light .app-select-trigger:hover,
+.public-panel.theme-light .page-actions button:hover,
+.public-panel.theme-light .secondary-button:hover,
+.public-panel.theme-light .card-heading button:hover,
+.public-panel.theme-light .canvas-link:hover { background: #eef3fa; }
+.public-panel.theme-light .app-select-menu {
+  border-color: #cbd7e8;
+  background: #fff;
+  box-shadow: 0 18px 38px rgba(28,47,79,.14);
+}
+.public-panel.theme-light .app-select-menu button:hover,
+.public-panel.theme-light .app-select-menu button.selected { background: #edf3ff; }
+
+/* Primary surfaces. The dark theme uses literal gradients in these components,
+   so light mode must replace the full background rather than only its tokens. */
+.public-panel.theme-light .global-capacity-card {
+  border-color: #ccdaef;
+  background:
+    radial-gradient(circle at 8% 0%,rgba(62,120,230,.11),transparent 42%),
+    linear-gradient(145deg,#fff,#f7faff);
+}
+.public-panel.theme-light .execution-overview,
+.public-panel.theme-light .global-capacity-metric {
+  border-color: #dce5f1;
+  background: #f2f6fc;
+}
+.public-panel.theme-light .execution-badge.unknown { color: #5b6981; }
+.public-panel.theme-light .execution-badge.cpu { color: var(--blue-300); }
+.public-panel.theme-light .execution-badge.gpu { color: var(--success); }
+.public-panel.theme-light .execution-badge.mixed { color: var(--purple-300); }
+.public-panel.theme-light .execution-badge.fallback { color: #945814; }
+.public-panel.theme-light .global-capacity-bar { background: #e1e8f2; }
+.public-panel.theme-light .panel-stat,
+.public-panel.theme-light .panel-stat.purple,
+.public-panel.theme-light .network-canvas,
+.public-panel.theme-light .activity-card,
+.public-panel.theme-light .panel-table,
+.public-panel.theme-light .inference-console,
+.public-panel.theme-light .inference-unavailable,
+.public-panel.theme-light .api-access-panel,
+.public-panel.theme-light .node-card,
+.public-panel.theme-light .join-card,
+.public-panel.theme-light .download-card,
+.public-panel.theme-light .hardware-card,
+.public-panel.theme-light .settings-section {
+  border-color: var(--border-subtle);
+  background: linear-gradient(145deg,#fff,#f8fafd);
+}
+.public-panel.theme-light .panel-stat.purple {
+  background: linear-gradient(145deg,#fff,#faf8ff);
+}
+.public-panel.theme-light .panel-stat:hover,
+.public-panel.theme-light .download-card:hover { border-color: #becde2; }
+.public-panel.theme-light .activity-list > div:not(.panel-empty),
+.public-panel.theme-light .contribute-activity-card li { border-bottom-color: #e8edf4; }
+.public-panel.theme-light .panel-table-head {
+  color: #66758e;
+  background: #f1f5fa;
+}
+.public-panel.theme-light .overview-announcement {
+  border-color: #d7e0ee;
+  background: linear-gradient(110deg,#fff,#f5f3ff);
+}
+
+/* The network diagrams become light canvases instead of retaining dark islands
+   with dark text inherited from the light palette. */
+.public-panel.theme-light .network-orbit {
+  background:
+    radial-gradient(circle at 50% 48%,rgba(62,116,215,.14),transparent 22%),
+    linear-gradient(145deg,#f4f8fe,#eaf1fb);
+}
+.public-panel.theme-light .network-orbit::after {
+  background: radial-gradient(circle,transparent 45%,rgba(87,111,151,.08) 100%);
+}
+.public-panel.theme-light .orbit-grid {
+  background-image:
+    linear-gradient(rgba(67,104,167,.075) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(67,104,167,.075) 1px,transparent 1px);
+}
+.public-panel.theme-light .network-core,
+.public-panel.theme-light .node-network-hub {
+  color: var(--blue-500);
+  border-color: #b8cae7;
+  background: radial-gradient(circle at 40% 30%,#fff,#e7effc 58%,#d9e5f6);
+  box-shadow: 0 10px 30px rgba(45,86,157,.15);
+}
+.public-panel.theme-light .network-core img,
+.public-panel.theme-light .node-network-hub img { box-shadow: 0 5px 14px rgba(38,78,145,.14); }
+
+/* Nodes and topology. */
+.public-panel.theme-light .node-overview-stat,
+.public-panel.theme-light .node-topology-card {
+  border-color: var(--border-subtle);
+  background: linear-gradient(145deg,#fff,#f8fafd);
+}
+.public-panel.theme-light .node-topology-map {
+  background-color: #f3f7fc;
+  background-image:
+    radial-gradient(circle at 50% 52%,rgba(63,124,255,.12),transparent 22%),
+    radial-gradient(circle at 50% 52%,rgba(63,124,255,.04),transparent 52%),
+    linear-gradient(rgba(77,111,170,.06) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(77,111,170,.06) 1px,transparent 1px);
+}
+.public-panel.theme-light .topology-node,
+.public-panel.theme-light .node-topology-empty,
+.public-panel.theme-light .node-topology-inspector,
+.public-panel.theme-light .node-inspector-metrics > div,
+.public-panel.theme-light .wide-empty {
+  border-color: #d8e1ed;
+  background: rgba(255,255,255,.92);
+  box-shadow: 0 8px 22px rgba(31,50,83,.06);
+}
+.public-panel.theme-light .topology-node:hover,
+.public-panel.theme-light .topology-node.selected { background: #edf3fd; }
+.public-panel.theme-light .topology-node > div > i { border-color: #fff; }
+
+/* Models and activation. */
+.public-panel.theme-light .model-request-form,
+.public-panel.theme-light .model-request-card,
+.public-panel.theme-light .hub-model-card,
+.public-panel.theme-light .model-activation-log {
+  border-color: var(--border-subtle);
+  background: linear-gradient(145deg,#fff,#f7faff);
+}
+.public-panel.theme-light .hub-model-search,
+.public-panel.theme-light .hub-catalog-toolbar .app-select-trigger,
+.public-panel.theme-light .model-advanced,
+.public-panel.theme-light .model-admin-auth,
+.public-panel.theme-light .model-admin-auth input,
+.public-panel.theme-light .model-activation-current {
+  color: var(--text-primary);
+  border-color: #d1ddec;
+  background: #f2f6fb;
+}
+.public-panel.theme-light .hub-model-table-wrap { background: #fff; }
+.public-panel.theme-light .hub-model-table th {
+  color: #586780;
+  background: #eef3f8;
+}
+.public-panel.theme-light .hub-model-table td { border-bottom-color: #e6ebf2; }
+.public-panel.theme-light .hub-table-memory,
+.public-panel.theme-light .hub-model-card-memory b { color: #5c49b5; }
+.public-panel.theme-light .hub-model-card.compatible:hover { background: #f1f6ff; }
+.public-panel.theme-light .hub-model-card.selected {
+  border-color: #7ea6e8;
+  background: #eaf2ff;
+}
+.public-panel.theme-light .hub-table-select,
+.public-panel.theme-light .hub-catalog-pagination button { color: var(--blue-300); }
+.public-panel.theme-light .model-activation-log code,
+.public-panel.theme-light .model-activation-log pre { color: #43516a; }
+
+/* Device contribution, hardware and accelerator diagnostics. */
+.public-panel.theme-light .hardware-hero,
+.public-panel.theme-light .contribute-metrics article,
+.public-panel.theme-light .contribute-settings-card,
+.public-panel.theme-light .contribute-activity-card,
+.public-panel.theme-light .accelerator-progress-panel {
+  border-color: var(--border-subtle);
+  background:
+    radial-gradient(circle at 92% 0%,rgba(89,62,254,.055),transparent 34%),
+    linear-gradient(145deg,#fff,#f8fafd);
+}
+.public-panel.theme-light .contribute-levels,
+.public-panel.theme-light .accelerator-engine-card,
+.public-panel.theme-light .accelerator-preparation,
+.public-panel.theme-light .accelerator-progress-meta > span,
+.public-panel.theme-light .accelerator-log,
+.public-panel.theme-light .accelerator-log-body,
+.public-panel.theme-light .node-runtime-state,
+.public-panel.theme-light .remote-accelerator-diagnostics,
+.public-panel.theme-light .remote-accelerator-grid > div,
+.public-panel.theme-light .execution-stage,
+.public-panel.theme-light .node-card-metrics > div,
+.public-panel.theme-light .hardware-metrics > div {
+  border-color: #dce4ef;
+  background: #f3f6fb;
+}
+.public-panel.theme-light .accelerator-engine-card.cpu.active,
+.public-panel.theme-light .accelerator-engine-card.gpu.ready {
+  background: linear-gradient(135deg,#eefaf5,#f7fbfa);
+}
+.public-panel.theme-light .accelerator-engine-card.cpu.connection-error,
+.public-panel.theme-light .accelerator-engine-card.cpu.unavailable,
+.public-panel.theme-light .accelerator-engine-card.gpu.error,
+.public-panel.theme-light .accelerator-engine-card.gpu.fallback {
+  background: linear-gradient(135deg,#fff2f4,#fffafa);
+}
+.public-panel.theme-light .accelerator-engine-card.gpu.checking,
+.public-panel.theme-light .accelerator-engine-card.gpu.downloading,
+.public-panel.theme-light .accelerator-engine-card.gpu.installing,
+.public-panel.theme-light .accelerator-engine-card.gpu.verifying {
+  background: linear-gradient(135deg,#f3f0ff,#faf9ff);
+}
+.public-panel.theme-light .accelerator-engine-foot,
+.public-panel.theme-light .accelerator-log-body,
+.public-panel.theme-light .remote-accelerator-body,
+.public-panel.theme-light .contribute-activity-card li { border-color: #e2e8f1; }
+.public-panel.theme-light .accelerator-requirement strong { color: #9d2e43; }
+.public-panel.theme-light .accelerator-browser-fallback { color: #5e49ba; }
+.public-panel.theme-light .remote-accelerator-body > p { color: var(--text-secondary); }
+
+/* Benchmark lab. */
+.public-panel.theme-light .benchmark-capacity-metric,
+.public-panel.theme-light .benchmark-toolbar,
+.public-panel.theme-light .benchmark-comparison,
+.public-panel.theme-light .benchmark-comparison.capacity-change,
+.public-panel.theme-light .benchmark-comparison.different-evidence,
+.public-panel.theme-light .benchmark-comparison.different-model,
+.public-panel.theme-light .benchmark-comparison.unavailable,
+.public-panel.theme-light .benchmark-chart,
+.public-panel.theme-light .benchmark-history,
+.public-panel.theme-light .benchmark-results {
+  border-color: var(--border-subtle);
+  background: linear-gradient(145deg,#fff,#f8fafd);
+}
+.public-panel.theme-light .benchmark-comparison { background: linear-gradient(140deg,#effaf5,#fff 52%); }
+.public-panel.theme-light .benchmark-comparison.capacity-change { background: linear-gradient(140deg,#fff7e8,#fff 52%); }
+.public-panel.theme-light .benchmark-comparison.different-evidence,
+.public-panel.theme-light .benchmark-comparison.different-model,
+.public-panel.theme-light .benchmark-comparison.unavailable { background: linear-gradient(140deg,#f1f5fb,#fff 52%); }
+.public-panel.theme-light .benchmark-comparison-metric,
+.public-panel.theme-light .benchmark-history-head,
+.public-panel.theme-light .benchmark-value,
+.public-panel.theme-light .benchmark-results .benchmark-technical-details ul,
+.public-panel.theme-light .benchmark-node-list > span {
+  border-color: #dce4ef;
+  background: #f2f6fb;
+}
+.public-panel.theme-light .benchmark-value.accent { background: #edf9f4; }
+.public-panel.theme-light .benchmark-axis,
+.public-panel.theme-light .benchmark-grid-line { stroke: #d9e2ef; }
+
+/* Admin and account dialogs use their own literal dark palette. */
+.public-panel.theme-light .assistant-admin-auth,
+.public-panel.theme-light .assistant-admin-status-grid article,
+.public-panel.theme-light .assistant-admin-section,
+.public-panel.theme-light .assistant-admin-primary,
+.public-panel.theme-light .assistant-admin-loading,
+.public-panel.theme-light .assistant-admin-locked,
+.public-panel.theme-light .assistant-admin-savebar {
+  border-color: #d5e0ef;
+  background: linear-gradient(145deg,#fff,#f6f9fd);
+  box-shadow: var(--shadow-card);
+}
+.public-panel.theme-light .assistant-admin-auth-control input,
+.public-panel.theme-light .assistant-admin-form input,
+.public-panel.theme-light .assistant-admin-form textarea,
+.public-panel.theme-light .assistant-admin-toggle-stack .toggle-row {
+  color: var(--text-primary);
+  border-color: #d6e0ec;
+  background: #f3f6fa;
+}
+.public-panel.theme-light .assistant-admin-auth-copy strong,
+.public-panel.theme-light .assistant-admin-section-heading strong,
+.public-panel.theme-light .assistant-admin-status-grid strong,
+.public-panel.theme-light .assistant-admin-locked strong { color: var(--text-primary); }
+.public-panel.theme-light .assistant-admin-auth-copy small,
+.public-panel.theme-light .assistant-admin-section-heading small,
+.public-panel.theme-light .assistant-admin-status-grid small,
+.public-panel.theme-light .assistant-admin-locked,
+.public-panel.theme-light .assistant-admin-locked p,
+.public-panel.theme-light .assistant-admin-savebar > span { color: var(--text-secondary); }
+.public-panel-viewport:has(.public-panel.theme-light) .account-modal {
+  color: var(--text-primary);
+  border-color: #ccd9eb;
+  background: linear-gradient(155deg,#fff,#f5f8fd);
+  box-shadow: 0 34px 80px rgba(31,50,83,.2);
+}
+.public-panel-viewport:has(.public-panel.theme-light) .account-modal-close,
+.public-panel-viewport:has(.public-panel.theme-light) .account-mode-tabs,
+.public-panel-viewport:has(.public-panel.theme-light) .account-modal form input,
+.public-panel-viewport:has(.public-panel.theme-light) .account-signout {
+  color: var(--text-primary);
+  border-color: #d5deeb;
+  background: #f2f5f9;
+}
+.public-panel-viewport:has(.public-panel.theme-light) .account-modal > p,
+.public-panel-viewport:has(.public-panel.theme-light) .account-modal form label,
+.public-panel-viewport:has(.public-panel.theme-light) .account-mode-tabs button { color: var(--text-secondary); }
+.public-panel-viewport:has(.public-panel.theme-light) .account-mode-tabs button.active {
+  color: #fff;
+  background: linear-gradient(135deg,#2f68d8,#5a41d1);
+  box-shadow: 0 7px 18px rgba(55,78,171,.2);
+}
+
 .public-panel.theme-light .network-canvas,
 .public-panel.theme-light .activity-card,
 .public-panel.theme-light .panel-table,
