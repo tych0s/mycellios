@@ -339,14 +339,31 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     }
   }
 
+  function administrativeRequestHeaders(): Record<string, string> {
+    const token = modelAdminToken.trim();
+    if (authSession) {
+      return {
+        authorization: `Bearer ${authSession.accessToken}`,
+        ...(token ? { "x-mycellios-admin-token": token } : {}),
+      };
+    }
+    return token ? { authorization: `Bearer ${token}` } : {};
+  }
+
   async function removeWorker(workerId: string) {
     if (desktopBridge) {
       const next = await desktopBridge.removeWorker(workerId);
       applyDesktopSnapshot(next);
       return;
     }
-    const response = await fetch(`/public/v1/workers/${encodeURIComponent(workerId)}`, { method: "DELETE" });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const response = await fetch(`/public/v1/workers/${encodeURIComponent(workerId)}`, {
+      method: "DELETE",
+      headers: administrativeRequestHeaders(),
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => null) as { error?: { message?: string } } | null;
+      throw new Error(body?.error?.message ?? `HTTP ${response.status}`);
+    }
     await refresh();
   }
 
@@ -356,8 +373,14 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
       applyDesktopSnapshot(next);
       return;
     }
-    const response = await fetch("/public/v1/workers/clear-offline", { method: "POST" });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const response = await fetch("/public/v1/workers/clear-offline", {
+      method: "POST",
+      headers: administrativeRequestHeaders(),
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => null) as { error?: { message?: string } } | null;
+      throw new Error(body?.error?.message ?? `HTTP ${response.status}`);
+    }
     await refresh();
   }
 
@@ -1032,6 +1055,7 @@ function Overview({ snapshot, onNavigate, publicLink, external, localAcceleratio
 
 function Nodes({ snapshot, onRemove, onClearOffline }: { snapshot: PublicSnapshot; onRemove: (workerId: string) => Promise<void>; onClearOffline: () => Promise<void> }) {
   const [busy, setBusy] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [selectedWorkerId, setSelectedWorkerId] = useState("");
   const connectedWorkers = snapshot.workers.filter((worker) => worker.connected);
   const activeWorkers = snapshot.workers.filter((worker) => worker.connected && worker.status === "online");
@@ -1055,16 +1079,22 @@ function Nodes({ snapshot, onRemove, onClearOffline }: { snapshot: PublicSnapsho
   const selectedWorker = snapshot.workers.find((worker) => worker.id === selectedWorkerId) ?? activeWorkers[0] ?? snapshot.workers[0] ?? null;
   async function remove(workerId: string) {
     setBusy(workerId);
+    setActionError(null);
     try {
       await onRemove(workerId);
+    } catch (error) {
+      setActionError(friendlyModelMutationError(error));
     } finally {
       setBusy(null);
     }
   }
   async function clearOffline() {
     setBusy("offline");
+    setActionError(null);
     try {
       await onClearOffline();
+    } catch (error) {
+      setActionError(friendlyModelMutationError(error));
     } finally {
       setBusy(null);
     }
@@ -1072,6 +1102,7 @@ function Nodes({ snapshot, onRemove, onClearOffline }: { snapshot: PublicSnapsho
   return (
     <section className="nodes-page">
       <PageTitle eyebrow="RED DISTRIBUIDA" title="Red de nodos" copy="Dispositivos físicos, navegadores activos y celdas de cómputo conectadas a mycellios." actions={<button disabled={busy !== null} onClick={() => void clearOffline()}><Trash2 size={15} /> Limpiar inactivos</button>} />
+      {actionError && <div className="inline-error" role="alert"><CircleAlert size={17} />{actionError}</div>}
 
       <div className="node-overview-grid">
         <NodeOverviewStat icon={Server} label="Dispositivos activos" value={`${activePhysicalWorkers.length} / ${physicalWorkers.length}`} detail={`${connectedPhysicalWorkers.length} conectados ahora · ${cellWorkers.length} celdas`} progress={physicalWorkers.length > 0 ? activePhysicalWorkers.length / physicalWorkers.length : 0} tone="green" />

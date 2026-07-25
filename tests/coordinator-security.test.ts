@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createCoordinator, type CoordinatorRuntime } from "../src/coordinator/server.js";
 
 const runtimes: CoordinatorRuntime[] = [];
 
 afterEach(async () => {
   await Promise.all(runtimes.splice(0).map((runtime) => runtime.close()));
+  vi.unstubAllGlobals();
 });
 
 describe("public coordinator security boundaries", () => {
@@ -88,6 +89,111 @@ describe("public coordinator security boundaries", () => {
       payload: validWorkerRegistration(),
     });
     expect(worker.statusCode).toBe(201);
+  });
+
+  it("rejects anonymous remote worker administration before revealing worker state", async () => {
+    const runtime = await coordinator(undefined, undefined, "admin-secret");
+
+    const remove = await runtime.app.inject({
+      method: "DELETE",
+      url: "/public/v1/workers/non-existent",
+      remoteAddress: "203.0.113.10",
+    });
+    expect(remove.statusCode).toBe(401);
+    expect(remove.json()).toMatchObject({
+      error: { code: "invalid_model_admin_token" },
+    });
+
+    const clear = await runtime.app.inject({
+      method: "POST",
+      url: "/public/v1/workers/clear-offline",
+      remoteAddress: "203.0.113.10",
+    });
+    expect(clear.statusCode).toBe(401);
+  });
+
+  it("accepts the administrative bearer token for remote worker cleanup", async () => {
+    const runtime = await coordinator(undefined, undefined, "admin-secret");
+    const registration = await runtime.app.inject({
+      method: "POST",
+      url: "/internal/v1/workers/register",
+      payload: validWorkerRegistration(),
+    });
+    expect(registration.statusCode).toBe(201);
+
+    const clear = await runtime.app.inject({
+      method: "POST",
+      url: "/public/v1/workers/clear-offline",
+      headers: { authorization: "Bearer admin-secret" },
+      remoteAddress: "203.0.113.10",
+    });
+    expect(clear.statusCode).toBe(200);
+    expect(clear.json()).toEqual({ removed: 1 });
+  });
+
+  it("keeps loopback worker administration available when no remote admin is configured", async () => {
+    const runtime = await coordinator();
+    const registration = await runtime.app.inject({
+      method: "POST",
+      url: "/internal/v1/workers/register",
+      payload: validWorkerRegistration(),
+    });
+    expect(registration.statusCode).toBe(201);
+
+    const clear = await runtime.app.inject({
+      method: "POST",
+      url: "/public/v1/workers/clear-offline",
+    });
+    expect(clear.statusCode).toBe(200);
+    expect(clear.json()).toEqual({ removed: 1 });
+  });
+
+  it("fails closed for remote worker administration when no authority is configured", async () => {
+    const runtime = await coordinator();
+    const response = await runtime.app.inject({
+      method: "POST",
+      url: "/public/v1/workers/clear-offline",
+      remoteAddress: "203.0.113.10",
+    });
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({
+      error: { code: "model_administration_not_configured" },
+    });
+  });
+
+  it("bounds public Hugging Face catalog amplification per remote client", async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () => Response.json([]));
+    vi.stubGlobal("fetch", fetchMock);
+    const runtime = await coordinator();
+    const request = {
+      method: "GET" as const,
+      url: "/public/v1/huggingface-models?q=qwen&limit=10",
+      headers: { "user-agent": "catalog-rate-test" },
+      remoteAddress: "203.0.113.20",
+    };
+
+    for (let index = 0; index < 120; index += 1) {
+      const response = await runtime.app.inject({
+        ...request,
+        headers: {
+          ...request.headers,
+          "x-forwarded-for": `198.51.100.${(index % 200) + 1}`,
+        },
+      });
+      expect(response.statusCode).toBe(200);
+    }
+    const limited = await runtime.app.inject({
+      ...request,
+      headers: {
+        ...request.headers,
+        "x-forwarded-for": "198.51.100.250",
+      },
+    });
+    expect(limited.statusCode).toBe(429);
+    expect(limited.json()).toMatchObject({
+      error: { code: "catalog_rate_limited" },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(120);
   });
 
   it("sends anti-iframe headers independently of the reverse proxy", async () => {
@@ -212,7 +318,11 @@ describe("public coordinator security boundaries", () => {
   });
 });
 
-async function coordinator(internalToken?: string, networkToken?: string): Promise<CoordinatorRuntime> {
+async function coordinator(
+  internalToken?: string,
+  networkToken?: string,
+  modelAdminToken?: string,
+): Promise<CoordinatorRuntime> {
   const runtime = await createCoordinator({
     host: "127.0.0.1",
     port: 0,
@@ -220,6 +330,7 @@ async function coordinator(internalToken?: string, networkToken?: string): Promi
     requestTimeoutMs: 1_000,
     ...(internalToken ? { internalToken } : {}),
     ...(networkToken ? { networkToken } : {}),
+    ...(modelAdminToken ? { modelAdminToken } : {}),
   }, { logger: false });
   runtimes.push(runtime);
   return runtime;

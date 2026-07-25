@@ -1056,11 +1056,17 @@ function registerIpc(): void {
     ) => supportAssistantAdminRequest("PUT", adminToken, assistantSettings),
   );
   ipcMain.handle("workers:remove", async (_event, workerId: string) => {
-    await fetchJson(`public/v1/workers/${encodeURIComponent(workerId)}`, { method: "DELETE" });
+    await fetchJson(`public/v1/workers/${encodeURIComponent(workerId)}`, {
+      method: "DELETE",
+      ...(modelAdminToken ? { headers: { authorization: `Bearer ${modelAdminToken}` } } : {}),
+    });
     return readSnapshot();
   });
   ipcMain.handle("workers:clear-offline", async () => {
-    await fetchJson("public/v1/workers/clear-offline", { method: "POST" });
+    await fetchJson("public/v1/workers/clear-offline", {
+      method: "POST",
+      ...(modelAdminToken ? { headers: { authorization: `Bearer ${modelAdminToken}` } } : {}),
+    });
     return readSnapshot();
   });
   ipcMain.handle("models:search-hub", async (_event, input: HubCatalogSearchInput) => {

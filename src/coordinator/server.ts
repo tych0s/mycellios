@@ -33,7 +33,10 @@ import {
   type NativeBuildIdentity,
 } from "../contracts/build-identity.js";
 import type { ChatCompletionRequest } from "../contracts/types.js";
-import type { CoordinatorConfig } from "../core/config.js";
+import {
+  assertCoordinatorNetworkSecurity,
+  type CoordinatorConfig,
+} from "../core/config.js";
 import {
   readNativeRuntimeBuildMetadata,
   type NativeRuntimeBuildMetadata,
@@ -163,6 +166,7 @@ export async function createCoordinator(
     releaseChunkBodyLimitBytes?: number;
   } = {},
 ): Promise<CoordinatorRuntime> {
+  assertCoordinatorNetworkSecurity(config);
   const runtimeMetadata = options.runtimeMetadata
     ?? readNativeRuntimeBuildMetadata(resolve(import.meta.dirname, "../.."));
   const coordinatorBuildIdentity = options.buildIdentity === undefined
@@ -225,7 +229,7 @@ export async function createCoordinator(
   const supabaseAuth = config.supabaseUrl && config.supabaseServiceRoleKey
     ? new SupabaseAuthService(config.supabaseUrl, config.supabaseServiceRoleKey)
     : null;
-  const authorizeModelMutation = async (
+  const authorizeAdministrativeMutation = async (
     request: FastifyRequest,
     reply: FastifyReply,
   ): Promise<boolean> => {
@@ -248,7 +252,7 @@ export async function createCoordinator(
           void reply.code(403).send({
             error: {
               code: "insufficient_network_role",
-              message: "Your Mycellios account does not have permission to change shared models.",
+              message: "Your Mycellios account does not have permission to administer the shared network.",
             },
           });
           return false;
@@ -264,7 +268,7 @@ export async function createCoordinator(
       void reply.code(503).send({
         error: {
           code: "model_administration_not_configured",
-          message: "Remote model administration requires Supabase Auth or MYCELLIOS_MODEL_ADMIN_TOKEN.",
+          message: "Remote network administration requires Supabase Auth or MYCELLIOS_MODEL_ADMIN_TOKEN.",
         },
       });
       return false;
@@ -405,7 +409,9 @@ export async function createCoordinator(
   }
   const service = new MeshService(store, scheduler, hub, config.requestTimeoutMs);
   const supportAssistantRateLimits = new Map<string, SupportAssistantRateState>();
+  const publicCatalogRateLimits = new Map<string, PublicCatalogRateState>();
   let activeSupportAssistantRequests = 0;
+  let activePublicCatalogRequests = 0;
   const activationManager = options.activationManager ?? options.activationManagerFactory?.({
     store,
     hub,
@@ -1124,7 +1130,7 @@ export async function createCoordinator(
   app.get("/public/v1/assistant/config", async () => publicSupportAssistantConfig());
 
   app.get("/public/v1/admin/assistant", async (request, reply) => {
-    if (!await authorizeModelMutation(request, reply)) return;
+    if (!await authorizeAdministrativeMutation(request, reply)) return;
     return {
       settings: store.getSupportAssistantSettings(),
       runtime: publicSupportAssistantConfig(),
@@ -1132,7 +1138,7 @@ export async function createCoordinator(
   });
 
   app.put("/public/v1/admin/assistant", async (request, reply) => {
-    if (!await authorizeModelMutation(request, reply)) return;
+    if (!await authorizeAdministrativeMutation(request, reply)) return;
     const body = supportAssistantSettingsUpdateSchema.parse(request.body);
     const availableModels = availableSupportAssistantModels();
     if (body.modelId && !availableModels.includes(body.modelId)) {
@@ -1312,6 +1318,27 @@ export async function createCoordinator(
 
   app.get("/public/v1/huggingface-models", async (request, reply) => {
     const { q, cursor, sort, limit } = huggingFaceModelSearchSchema.parse(request.query);
+    if (activePublicCatalogRequests >= 8) {
+      return reply.code(429).send({
+        error: {
+          code: "catalog_capacity_limited",
+          message: "The public model catalog is busy. Try again shortly.",
+        },
+      });
+    }
+    const releaseRateLimit = claimPublicCatalogRequest(
+      publicCatalogRateLimits,
+      publicCatalogRateKey(request),
+    );
+    if (!releaseRateLimit) {
+      return reply.code(429).send({
+        error: {
+          code: "catalog_rate_limited",
+          message: "Too many model catalog requests. Try again shortly.",
+        },
+      });
+    }
+    activePublicCatalogRequests += 1;
     try {
       return await searchHubModelCatalog(q, fetch, { ...(cursor ? { cursor } : {}), sort, limit });
     } catch (error) {
@@ -1321,11 +1348,14 @@ export async function createCoordinator(
           message: error instanceof Error ? error.message : String(error),
         },
       });
+    } finally {
+      activePublicCatalogRequests = Math.max(0, activePublicCatalogRequests - 1);
+      releaseRateLimit();
     }
   });
 
   app.post("/public/v1/requested-models", async (request, reply) => {
-    if (!await authorizeModelMutation(request, reply)) return;
+    if (!await authorizeAdministrativeMutation(request, reply)) return;
     const body = requestedModelCreateSchema.parse(request.body);
     automaticActivationRetryState.delete(body.id);
     const stored = store.upsertRequestedModel({
@@ -1368,7 +1398,7 @@ export async function createCoordinator(
   });
 
   app.delete("/public/v1/requested-models/:modelId", async (request, reply) => {
-    if (!await authorizeModelMutation(request, reply)) return;
+    if (!await authorizeAdministrativeMutation(request, reply)) return;
     const { modelId } = requestedModelParamsSchema.parse(request.params);
     if (!store.getRequestedModel(modelId)) {
       return reply.code(404).send({ error: { code: "requested_model_not_found" } });
@@ -1514,15 +1544,19 @@ export async function createCoordinator(
   });
 
   app.delete("/public/v1/workers/:workerId", async (request, reply) => {
+    if (!await authorizeAdministrativeMutation(request, reply)) return;
     const { workerId } = workerIdParamsSchema.parse(request.params);
     const removed = hub.removeWorker(workerId) || mobileHub.removeWorker(workerId);
     if (!removed) return reply.code(404).send({ error: { code: "worker_not_found" } });
     return { removed: true, workerId };
   });
 
-  app.post("/public/v1/workers/clear-offline", async () => ({
-    removed: store.deregisterOfflineWorkers() + mobileHub.removeOfflineWorkers(),
-  }));
+  app.post("/public/v1/workers/clear-offline", async (request, reply) => {
+    if (!await authorizeAdministrativeMutation(request, reply)) return;
+    return {
+      removed: store.deregisterOfflineWorkers() + mobileHub.removeOfflineWorkers(),
+    };
+  });
 
   app.post("/internal/v1/workers/register", async (request, reply) => {
     const registration = workerRegistrationSchema.parse(request.body);
@@ -2502,12 +2536,8 @@ interface SupportAssistantRateState {
 
 function supportAssistantRateKey(request: FastifyRequest, sessionId: string): string {
   const userAgent = request.headers["user-agent"] ?? "unknown";
-  const forwardedFor = request.headers["x-forwarded-for"];
-  const address = typeof forwardedFor === "string"
-    ? forwardedFor.split(",", 1)[0]?.trim() || request.ip
-    : request.ip;
   return createHash("sha256")
-    .update(`${address}\n${userAgent}\n${sessionId}`)
+    .update(`${request.ip}\n${userAgent}\n${sessionId}`)
     .digest("hex")
     .slice(0, 24);
 }
@@ -2526,6 +2556,49 @@ function claimSupportAssistantRequest(
   // attempts let the new request supersede the stale job without opening an
   // unlimited parallel-inference path for one browser session.
   if (state.requests >= 24 || state.active >= 2) return null;
+  state.requests += 1;
+  state.active += 1;
+  states.set(key, state);
+  if (states.size > 2_000) {
+    for (const [candidateKey, candidate] of states) {
+      if (now - candidate.windowStartedAt >= windowMs && candidate.active === 0) {
+        states.delete(candidateKey);
+      }
+    }
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    state.active = Math.max(0, state.active - 1);
+  };
+}
+
+interface PublicCatalogRateState {
+  windowStartedAt: number;
+  requests: number;
+  active: number;
+}
+
+function publicCatalogRateKey(request: FastifyRequest): string {
+  const userAgent = request.headers["user-agent"] ?? "unknown";
+  return createHash("sha256")
+    .update(`${request.ip}\n${userAgent}\nmodel-catalog`)
+    .digest("hex")
+    .slice(0, 24);
+}
+
+function claimPublicCatalogRequest(
+  states: Map<string, PublicCatalogRateState>,
+  key: string,
+  now = Date.now(),
+): (() => void) | null {
+  const windowMs = 10 * 60_000;
+  const previous = states.get(key);
+  const state = !previous || now - previous.windowStartedAt >= windowMs
+    ? { windowStartedAt: now, requests: 0, active: 0 }
+    : previous;
+  if (state.requests >= 120 || state.active >= 2) return null;
   state.requests += 1;
   state.active += 1;
   states.set(key, state);
