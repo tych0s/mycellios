@@ -23,6 +23,11 @@ from .dense_tiering import (
     add_dense_tiering_arguments,
     dense_tiering_config_from_args,
 )
+from .draft_model import (
+    add_local_draft_model_arguments,
+    load_local_draft_model_provider,
+    local_draft_model_config_from_args,
+)
 from .engine import (
     DistributedPipelineEngine,
     GenerationCancelledError,
@@ -833,6 +838,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_ram_backed_moe_arguments(parser)
     add_paged_kv_arguments(parser)
     add_native_gguf_arguments(parser)
+    add_local_draft_model_arguments(parser)
     parser.add_argument(
         "--stage-executor-id",
         action="append",
@@ -960,7 +966,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--speculation",
-        choices=("off", "ngram", "draft-tree"),
+        choices=("off", "ngram", "draft-tree", "draft-model"),
         default="off",
         help=(
             "Enable exact adaptive speculative verification with the selected "
@@ -1051,6 +1057,7 @@ def build_server(args: argparse.Namespace) -> DistributedMycelliosServer:
         )
     paged_kv = paged_kv_config_from_args(args)
     native_gguf = native_gguf_runtime_from_args(args)
+    local_draft_model = local_draft_model_config_from_args(args)
     if sum(
         backend is not None
         for backend in (ram_backed_moe, paged_kv, native_gguf)
@@ -1139,8 +1146,13 @@ def build_server(args: argparse.Namespace) -> DistributedMycelliosServer:
             "draft-tree requires sealed positive branch count, branch-token "
             "and KV-byte limits"
         )
-    if args.speculation == "draft-tree" and args.sealed_wave_tokens is None:
-        raise ValueError("draft-tree requires an explicit sealed-wave-tokens limit")
+    if (
+        args.speculation in ("draft-tree", "draft-model")
+        and args.sealed_wave_tokens is None
+    ):
+        raise ValueError(
+            f"{args.speculation} requires an explicit sealed-wave-tokens limit"
+        )
     if args.sealed_wave_tokens is not None and not 1 <= args.sealed_wave_tokens <= 17:
         raise ValueError("sealed-wave-tokens must be between 1 and 17")
     if (
@@ -1160,7 +1172,7 @@ def build_server(args: argparse.Namespace) -> DistributedMycelliosServer:
     if args.sealed_wave_tokens is not None:
         required_wave_tokens = (
             args.speculative_max_draft_tokens + 1
-            if args.speculation in ("ngram", "draft-tree")
+            if args.speculation in ("ngram", "draft-tree", "draft-model")
             else 1
         )
         if args.sealed_wave_tokens < required_wave_tokens:
@@ -1168,11 +1180,11 @@ def build_server(args: argparse.Namespace) -> DistributedMycelliosServer:
                 "sealed-wave-tokens cannot be smaller than the VERIFY input"
             )
         if (
-            args.speculation == "draft-tree"
+            args.speculation in ("draft-tree", "draft-model")
             and args.sealed_wave_tokens != required_wave_tokens
         ):
             raise ValueError(
-                "draft-tree sealed-wave-tokens must equal draft depth plus one"
+                f"{args.speculation} sealed-wave-tokens must equal draft depth plus one"
             )
         if args.speculation == "off" and args.sealed_wave_tokens != 1:
             raise ValueError(
@@ -1252,6 +1264,19 @@ def build_server(args: argparse.Namespace) -> DistributedMycelliosServer:
                 raise ValueError(
                     f"recovery standby {route.route_id!r} reuses the primary endpoint"
                 )
+    remote = remote_requested
+    if remote and (args.first_stage_host is None or args.first_stage_port is None):
+        raise ValueError("remote mode requires both first-stage-host and first-stage-port")
+    if ram_backed_moe is not None and not remote:
+        raise ValueError(
+            "server CLI RAM-backed MoE requires remote child stages with their "
+            "own sealed bindings"
+        )
+    if native_gguf is not None and not remote:
+        raise ValueError(
+            "server CLI native GGUF requires remote child stages with their "
+            "own authenticated Mycellios packages"
+        )
     native_package = (
         None
         if native_gguf is None
@@ -1292,6 +1317,7 @@ def build_server(args: argparse.Namespace) -> DistributedMycelliosServer:
         if args.boundaries
         else balanced_boundaries(total_layers, args.stages)
     )
+    tokenizer = load_tokenizer(snapshot)
     if native_package is not None:
         verify_native_gguf_stage(
             native_package.root,
@@ -1299,19 +1325,6 @@ def build_server(args: argparse.Namespace) -> DistributedMycelliosServer:
             expected_layer_start=boundaries[0],
             expected_layer_end=boundaries[1],
             expected_total_layers=total_layers,
-        )
-    remote = remote_requested
-    if remote and (args.first_stage_host is None or args.first_stage_port is None):
-        raise ValueError("remote mode requires both first-stage-host and first-stage-port")
-    if ram_backed_moe is not None and not remote:
-        raise ValueError(
-            "server CLI RAM-backed MoE requires remote child stages with their "
-            "own sealed bindings"
-        )
-    if native_gguf is not None and not remote:
-        raise ValueError(
-            "server CLI native GGUF requires remote child stages with their "
-            "own authenticated Mycellios packages"
         )
     codec = {
         "fp32": TensorCodec.FP32,
@@ -1376,7 +1389,7 @@ def build_server(args: argparse.Namespace) -> DistributedMycelliosServer:
             max_prefill_chunk_tokens=args.max_prefill_chunk_tokens,
             speculative_max_draft_tokens=(
                 args.speculative_max_draft_tokens
-                if args.speculation in ("ngram", "draft-tree")
+                if args.speculation in ("ngram", "draft-tree", "draft-model")
                 else 0
             ),
             speculation_minimum_speedup=args.speculation_minimum_speedup,
@@ -1388,10 +1401,21 @@ def build_server(args: argparse.Namespace) -> DistributedMycelliosServer:
             max_retained_session_tokens=args.max_retained_session_tokens,
             retained_session_ttl_seconds=args.retained_session_ttl_seconds,
     )
+    draft_provider = (
+        None
+        if local_draft_model is None
+        else load_local_draft_model_provider(
+            local_draft_model,
+            target_tokenizer=tokenizer,
+            max_cached_requests=args.max_active_sequences,
+        )
+    )
+
     def make_engine(config: PipelineEngineConfig = engine_config) -> DistributedPipelineEngine:
         tree_provider = tree_draft_provider_from_args(args)
         return DistributedPipelineEngine(
             config,
+            draft_provider=draft_provider,
             tree_draft_provider=tree_provider,
         )
 
@@ -1437,7 +1461,6 @@ def build_server(args: argparse.Namespace) -> DistributedMycelliosServer:
     else:
         engine = initial_engine
     try:
-        tokenizer = load_tokenizer(engine.model_snapshot)
         return DistributedMycelliosServer(
             engine,
             tokenizer,

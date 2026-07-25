@@ -23,7 +23,9 @@ if (!spec.supported) throw new Error(spec.reason);
 
 const workspace = resolve(import.meta.dirname, "..");
 const archive = resolve(readArgument("archive") ?? join(workspace, "build", "distribution-runtime.tar.gz"));
-const pythonSource = resolve(readArgument("python-source") ?? join(workspace, "python"));
+const pythonSource = resolve(
+  readArgument("python-source") ?? join(workspace, "build", "python"),
+);
 if (!existsSync(archive)) throw new Error(`Portable runtime archive is missing: ${archive}.`);
 
 const entries = tar(["-tzf", archive])

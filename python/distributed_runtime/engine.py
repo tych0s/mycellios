@@ -876,6 +876,9 @@ class _GenerationJob:
     tree_is_probe: bool = False
     tree_outbound_bytes: int = 0
     tree_inbound_bytes: int = 0
+    # Earliest instant this request could start preparing its next decode
+    # continuation. It includes batch-window and sibling-drafter queueing.
+    next_decode_ready_at: float = 0.0
 
     def __post_init__(self) -> None:
         if self.next_step is None:
@@ -912,6 +915,8 @@ class _PreparedRootWave:
     step: int
     prefill_end: int | None = None
     reserved_bytes: int = 0
+    draft_latency_seconds: float = 0.0
+    measurement_started_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -1435,12 +1440,14 @@ class DistributedPipelineEngine:
         controller = self.speculation_controller
         route_rtt_ms, route_probe_count = self._route_probe_snapshot()
         tree_stats = self._physical_tree_stats()
+        provider = self._linear_draft_provider_stats()
         if controller is None:
             return {
                 "configured": False,
                 "enabled": False,
                 "route_rtt_ms": route_rtt_ms,
                 "route_probe_count": route_probe_count,
+                "provider": provider,
                 "physical_tree": tree_stats,
             }
         with self._speculation_lock:
@@ -1481,6 +1488,7 @@ class DistributedPipelineEngine:
                 "acceptance_rate": acceptance_rate,
                 "route_rtt_ms": route_rtt_ms,
                 "route_probe_count": route_probe_count,
+                "provider": provider,
                 "physical_tree": tree_stats,
                 "verification_bytes": sum(
                     value.verification_bytes for value in observations
@@ -1516,6 +1524,24 @@ class DistributedPipelineEngine:
                     for profile, current in controllers
                 },
             }
+
+    def _linear_draft_provider_stats(self) -> dict[str, Any] | None:
+        provider = getattr(self, "draft_provider", None)
+        if provider is None:
+            return None
+        snapshot = getattr(provider, "execution_snapshot", None)
+        if callable(snapshot):
+            value = snapshot()
+            if not isinstance(value, dict):
+                raise TypeError("draft provider execution snapshot must be an object")
+            return copy.deepcopy(value)
+        return {
+            "strategy": getattr(provider, "strategy", None),
+            "maxDraftTokens": int(getattr(provider, "max_draft_tokens", 0)),
+            "deferredUntilSelected": bool(
+                getattr(provider, "defer_until_selected", False)
+            ),
+        }
 
     def _physical_tree_stats(self) -> dict[str, Any]:
         provider = getattr(self, "tree_draft_provider", None)
@@ -2982,6 +3008,8 @@ class DistributedPipelineEngine:
         if job is None:
             raise RuntimeError(f"token for unknown request {frame.request_id}")
         flight = self._consume_inflight_return(job, frame)
+        if frame.frame_type in (FrameType.TOKEN, FrameType.VERIFY_RESULT):
+            job.next_decode_ready_at = arrived
         if job.cancel_requested.is_set():
             if not job.cancel_sent:
                 send_frame(downstream, FrameType.CANCEL, frame.request_id)
@@ -3901,6 +3929,12 @@ class DistributedPipelineEngine:
         controller = self.speculation_controller
         proposal: MacroWaveProposal | None = None
         verify_base_tokens = 0
+        draft_latency_seconds = 0.0
+        measurement_started_at = (
+            job.next_decode_ready_at
+            if job.next_decode_ready_at > 0
+            else time.perf_counter()
+        )
         if provider is not None and controller is not None and remaining > 1:
             prompt_history = [
                 int(token)
@@ -3942,6 +3976,7 @@ class DistributedPipelineEngine:
                         self._speculation_selected_sizes.get(selected, 0) + 1
                     )
                 proposal = preparation.proposal
+                draft_latency_seconds = preparation.draft_latency_seconds
 
         job.verify_proposal = proposal
         if proposal is not None:
@@ -3969,6 +4004,8 @@ class DistributedPipelineEngine:
             input_ids=next_ids,
             frame_type=frame_type,
             step=next_step,
+            draft_latency_seconds=draft_latency_seconds,
+            measurement_started_at=measurement_started_at,
         )
 
     def _prepare_classic_decode_wave(self, job: _GenerationJob) -> _PreparedRootWave:
@@ -4195,6 +4232,18 @@ class DistributedPipelineEngine:
             job.verify_proposal = None
             job.verify_base_tokens = 0
         self._discard_inflight_waves(job)
+        release_draft = getattr(
+            getattr(self, "draft_provider", None),
+            "release_request",
+            None,
+        )
+        if callable(release_draft) and job.wire_id is not None:
+            try:
+                release_draft(job.wire_id)
+            except Exception:
+                # Draft acceleration is optional. Cleanup cannot replace an
+                # otherwise exact generation result with a pipeline failure.
+                pass
         if began and job.wire_id is not None:
             if not retained:
                 # A retained wire keeps its root KV; the session machinery owns
@@ -4694,7 +4743,11 @@ class DistributedPipelineEngine:
             step=wave.step,
             frame_type=wave.frame_type,
             prefill_end=wave.prefill_end,
-            started_at=started_at,
+            started_at=(
+                wave.measurement_started_at
+                if wave.measurement_started_at is not None
+                else max(0.0, started_at - wave.draft_latency_seconds)
+            ),
             sent_at=sent_at,
             outbound_bytes=outbound_bytes,
             reserved_bytes=wave.reserved_bytes,

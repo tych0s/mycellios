@@ -27,6 +27,7 @@ const spec = portableRuntimeSpec(process.platform, process.arch);
 const standalone = resolve(workspace, "runtime", "distribution-venv");
 const output = resolve(workspace, "build", "distribution-runtime");
 const archive = resolve(workspace, "build", "distribution-runtime.tar.gz");
+const packagedPythonSource = resolve(workspace, "build", "python");
 const resolvedBuild = resolve(workspace, "build");
 
 if (!spec.supported) {
@@ -116,6 +117,7 @@ const verified = spawnSync(process.execPath, [
   `--archive=${archive}`,
   `--platform=${spec.platform}`,
   `--arch=${spec.arch}`,
+  `--python-source=${packagedPythonSource}`,
 ], { stdio: "inherit", shell: false, windowsHide: true });
 if (verified.error) throw verified.error;
 if (verified.status !== 0) {

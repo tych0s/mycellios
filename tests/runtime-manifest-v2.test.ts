@@ -835,7 +835,7 @@ describe("GDLP/2 runtime manifest", () => {
           minAcceptanceRate: 0.65,
           maxWasteRatio: 0.25,
           priority: 20,
-          artifactId: "sha256:stage-head-r1",
+          artifactId: `sha256:${"a".repeat(64)}`,
         },
         {
           id: "autoregressive",
@@ -853,6 +853,22 @@ describe("GDLP/2 runtime manifest", () => {
 
     expect(manifest.plans.decode.speculation).toEqual(speculation);
     expect(() => validateRuntimePipelineManifest(manifest)).not.toThrow();
+
+    const missingArtifact = structuredClone(speculation);
+    delete missingArtifact.strategies[1]!.artifactId;
+    const missingRequest = runtimeRequest(1);
+    missingRequest.speculation = missingArtifact;
+    expect(() => buildRuntimePipelineManifest(missingRequest)).toThrow(
+      "runtime_speculation_artifact_is_missing",
+    );
+
+    const weakArtifact = structuredClone(speculation);
+    weakArtifact.strategies[1]!.artifactId = "stage-head-r1";
+    const weakRequest = runtimeRequest(1);
+    weakRequest.speculation = weakArtifact;
+    expect(() => buildRuntimePipelineManifest(weakRequest)).toThrow(
+      "runtime_speculation_artifact_is_invalid",
+    );
   });
 
   it("rejects unknown speculation references and non-autoregressive fallback", () => {

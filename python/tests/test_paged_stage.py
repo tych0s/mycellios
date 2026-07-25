@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+import builtins
 import copy
 import tempfile
 import unittest
@@ -15,6 +17,8 @@ from distributed_runtime.paged_stage import (
     HFPagedStageRunner,
     PagedCacheSnapshot,
     PagedStageCorruptionError,
+    add_paged_kv_arguments,
+    paged_kv_config_from_args,
 )
 from distributed_runtime.model import StageModelSpec, StageRunner
 from distributed_runtime.executor_abi import StageKVPhysicalAccounting
@@ -103,6 +107,66 @@ def _write_tiny_checkpoint(directory: str, seed: int) -> None:
         directory,
         safe_serialization=True,
     )
+
+
+class HFPagedStageImportCompatibilityTests(unittest.TestCase):
+    def test_incompatible_version_rejects_cache_and_runner_before_optional_imports(
+        self,
+    ) -> None:
+        optional_import_attempts: list[str] = []
+        real_import = builtins.__import__
+
+        def guarded_import(
+            name: str,
+            globals: dict[str, object] | None = None,
+            locals: dict[str, object] | None = None,
+            fromlist: tuple[str, ...] = (),
+            level: int = 0,
+        ) -> object:
+            optional_configuration_import = (
+                name == "transformers.generation.configuration_utils"
+                and "ContinuousBatchingConfig" in fromlist
+            )
+            if name.startswith(
+                "transformers.generation.continuous_batching"
+            ) or optional_configuration_import:
+                optional_import_attempts.append(name)
+                raise AssertionError(
+                    "optional continuous-batching import happened before version gate"
+                )
+            return real_import(name, globals, locals, fromlist, level)
+
+        with (
+            patch(
+                "distributed_runtime.paged_stage.transformers.__version__",
+                "4.57.3",
+            ),
+            patch("builtins.__import__", side_effect=guarded_import),
+            patch(
+                "distributed_runtime.paged_stage._load_selective_stage_model"
+            ) as load_model,
+        ):
+            runtime_config = HFPagedStageRuntimeConfig()
+            self.assertEqual(runtime_config.device, "cpu")
+            parser = argparse.ArgumentParser()
+            add_paged_kv_arguments(parser)
+            self.assertIsNone(paged_kv_config_from_args(parser.parse_args([])))
+
+            expected_error = (
+                r"sealed to transformers 5\.14\.1, found 4\.57\.3; "
+                r"continuous-batching symbols were not imported"
+            )
+            with self.assertRaisesRegex(RuntimeError, expected_error):
+                HFPagedStageCache(
+                    LlamaConfig(),
+                    device="cpu",
+                    dtype=torch.float32,
+                )
+            with self.assertRaisesRegex(RuntimeError, expected_error):
+                HFPagedStageRunner(StageModelSpec("unused", 0, 1, 1, 1))
+
+        load_model.assert_not_called()
+        self.assertEqual(optional_import_attempts, [])
 
 
 class HFPagedStageRunnerTests(unittest.TestCase):

@@ -27,6 +27,10 @@ export function assertNativePythonSourceClosure(sourceRoot: string): void;
 export function verifyNativePythonProductSource(
   sourceRoot: string,
 ): NativePythonProductManifest;
+export function assertNativePythonProductMatchesSource(
+  sourceRoot: string,
+  productRoot: string,
+): NativePythonProductManifest;
 export function buildNativePythonProductManifest(
   sourceRoot: string,
 ): NativePythonProductManifest;

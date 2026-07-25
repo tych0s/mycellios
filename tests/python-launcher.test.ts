@@ -1857,6 +1857,154 @@ describe("GDLP/2 Python launch compiler", () => {
     }
   });
 
+  it("maps a sealed sibling drafter only to the native root process", () => {
+    const snapshotIdentity = "54321";
+    const artifactIdentity = strongArtifactIdentity(snapshotIdentity);
+    const input = request();
+    input.speculation = {
+      mode: "adaptive",
+      controller: "acceptance-adaptive",
+      defaultStrategyId: "local-sibling",
+      fallbackStrategyId: "autoregressive",
+      acceptanceWindowTokens: 64,
+      strategies: [
+        {
+          id: "local-sibling",
+          kind: "draft-model",
+          maxDraftTokens: 4,
+          minAcceptanceRate: 0.6,
+          maxWasteRatio: 0.3,
+          priority: 10,
+          artifactId: artifactIdentity,
+          parameterBytes: 16,
+          memoryReservationBytes: 16,
+        },
+        {
+          id: "autoregressive",
+          kind: "autoregressive",
+          maxDraftTokens: 1,
+          minAcceptanceRate: 1,
+          maxWasteRatio: 0,
+          priority: 0,
+        },
+      ],
+    };
+    const current = buildRuntimePipelineManifest(input);
+    const draftModel = {
+      schema: "mycellios-local-draft-model/1" as const,
+      source: "D:\\models\\local-sibling",
+      revision: null,
+      snapshotIdentity,
+      artifactIdentity,
+      canonicalSource: `content-addressed://${artifactIdentity}`,
+      canonicalRevision: null,
+      device: "cpu" as const,
+      dtype: "float32" as const,
+    };
+    const description = compile(current, { draftModel });
+    const args = root(description).command.args;
+
+    expect(argumentValue(args, "--speculation")).toBe("draft-model");
+    expect(argumentValue(args, "--speculative-max-draft-tokens")).toBe("4");
+    expect(argumentValue(args, "--draft-model-source")).toBe(draftModel.source);
+    expect(argumentValue(args, "--draft-model-artifact-identity")).toBe(
+      artifactIdentity,
+    );
+    expect(argumentValue(args, "--draft-model-canonical-source")).toBe(
+      draftModel.canonicalSource,
+    );
+    expect(argumentValue(args, "--draft-model-device")).toBe("cpu");
+    expect(argumentValue(args, "--draft-model-dtype")).toBe("float32");
+    for (const stage of remotes(description)) {
+      expect(stage.command.args).not.toContain("--draft-model-source");
+    }
+    expect(description.configuration.draftModel).toEqual({
+      ...draftModel,
+      parameterBytes: 16,
+      memoryReservationBytes: 16,
+    });
+    expect(() => validatePythonLaunchDescription(description)).not.toThrow();
+
+    const otherPlacement = compile(current, {
+      draftModel: { ...draftModel, device: "cuda:0", dtype: "float16" },
+    });
+    expect(root(otherPlacement).routeId).toBe(root(description).routeId);
+    expect(root(otherPlacement).processId).not.toBe(root(description).processId);
+    expect(remotes(otherPlacement).map((stage) => stage.processId)).toEqual(
+      remotes(description).map((stage) => stage.processId),
+    );
+  });
+
+  it("fails closed when a draft-model strategy is missing or mismatches its model", () => {
+    const snapshotIdentity = "54321";
+    const artifactIdentity = strongArtifactIdentity(snapshotIdentity);
+    const input = request();
+    input.speculation = {
+      mode: "adaptive",
+      controller: "acceptance-adaptive",
+      defaultStrategyId: "local-sibling",
+      fallbackStrategyId: "autoregressive",
+      acceptanceWindowTokens: 64,
+      strategies: [
+        {
+          id: "local-sibling",
+          kind: "draft-model",
+          maxDraftTokens: 4,
+          minAcceptanceRate: 0.6,
+          maxWasteRatio: 0.3,
+          priority: 10,
+          artifactId: artifactIdentity,
+          parameterBytes: 16,
+          memoryReservationBytes: 16,
+        },
+        {
+          id: "autoregressive",
+          kind: "autoregressive",
+          maxDraftTokens: 1,
+          minAcceptanceRate: 1,
+          maxWasteRatio: 0,
+          priority: 0,
+        },
+      ],
+    };
+    const current = buildRuntimePipelineManifest(input);
+    expect(() => compile(current)).toThrow(
+      "python_draft_model_configuration_is_missing",
+    );
+    expect(() =>
+      compile(current, {
+        draftModel: {
+          schema: "mycellios-local-draft-model/1",
+          source: "D:\\models\\local-sibling",
+          revision: null,
+          snapshotIdentity,
+          artifactIdentity: strongArtifactIdentity("54322"),
+          canonicalSource: `content-addressed://${strongArtifactIdentity("54322")}`,
+          canonicalRevision: null,
+          device: "cpu",
+          dtype: "float32",
+        },
+      }),
+    ).toThrow();
+
+    const ngram = manifest();
+    expect(() =>
+      compile(ngram, {
+        draftModel: {
+          schema: "mycellios-local-draft-model/1",
+          source: "D:\\models\\unexpected",
+          revision: null,
+          snapshotIdentity,
+          artifactIdentity,
+          canonicalSource: `content-addressed://${artifactIdentity}`,
+          canonicalRevision: null,
+          device: "cpu",
+          dtype: "float32",
+        },
+      }),
+    ).toThrow("python_draft_model_requires_draft_model_strategy");
+  });
+
   it("maps only manifest-sealed draft-tree limits to every native Python process", () => {
     const input = request();
     input.speculation = {
@@ -1987,6 +2135,7 @@ describe("GDLP/2 Python launch compiler", () => {
           minAcceptanceRate: 0.6,
           maxWasteRatio: 0.3,
           priority: 10,
+          artifactId: `sha256:${"b".repeat(64)}`,
         },
         {
           id: "autoregressive",

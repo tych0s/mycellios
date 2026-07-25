@@ -27,6 +27,7 @@ const DEFAULT_RETAINED_SESSION_TOKENS = 8_192;
 const DEFAULT_RETAINED_SESSION_TTL_SECONDS = 10 * 60;
 const RECOVERY_STANDBY_SCHEMA = "gdlp-recovery-standby-route/1";
 const PAGED_STAGE_RUNTIME_SCHEMA = "mycellios-hf-paged-stage/2";
+const LOCAL_DRAFT_MODEL_SCHEMA = "mycellios-local-draft-model/1";
 const MAX_PAGED_BLOCK_SIZE = 256;
 const MAX_PAGED_NUM_BLOCKS = 1_048_576;
 const MAX_PAGED_BATCH_TOKENS = 65_536;
@@ -137,6 +138,20 @@ export interface PythonRuntimeModelInput {
   canonicalRevision?: string | null;
 }
 
+export type PythonDraftModelDevice =
+  | "cpu"
+  | "cuda"
+  | `cuda:${number}`
+  | "mps"
+  | "xpu"
+  | `xpu:${number}`;
+
+export interface PythonDraftModelInput extends PythonRuntimeModelInput {
+  schema: typeof LOCAL_DRAFT_MODEL_SCHEMA;
+  device: PythonDraftModelDevice;
+  dtype: "float32" | "float16" | "bfloat16";
+}
+
 export interface PythonLaunchCompilerOptions {
   /** Bind address for the Mycellios root server. */
   apiEndpoint: RuntimeEndpoint;
@@ -145,6 +160,8 @@ export interface PythonLaunchCompilerOptions {
   /** Local interface used by the root return listener, e.g. 0.0.0.0. */
   returnBindHost: string;
   runtimeModel?: PythonRuntimeModelInput;
+  /** Sealed local sibling model used only to propose target-verified tokens. */
+  draftModel?: PythonDraftModelInput | null;
   publicModelName?: string;
   pythonExecutable?: string;
   /** Fixed native entrypoint; exposed only for normalized-description validation. */
@@ -333,11 +350,23 @@ export interface PythonRuntimeModelSource {
   canonicalRevision?: string | null;
 }
 
+export interface PythonDraftModelConfiguration extends PythonRuntimeModelSource {
+  schema: typeof LOCAL_DRAFT_MODEL_SCHEMA;
+  artifactIdentity: string;
+  canonicalSource: string;
+  canonicalRevision: string | null;
+  device: PythonDraftModelInput["device"];
+  dtype: PythonDraftModelInput["dtype"];
+  parameterBytes: number;
+  memoryReservationBytes: number;
+}
+
 export interface PythonLaunchConfiguration {
   apiEndpoint: RuntimeEndpoint;
   returnEndpoint: RuntimeEndpoint;
   returnBindHost: string;
   runtimeModel: PythonRuntimeModelSource;
+  draftModel: PythonDraftModelConfiguration | null;
   publicModelName: string;
   pythonExecutable: string;
   stageModule: typeof MYCELLIOS_STAGE_MODULE;
@@ -509,12 +538,15 @@ export interface PythonPipelineLaunchDescription {
 }
 
 interface PythonSpeculationArguments {
-  provider: "off" | "ngram" | "draft-tree";
+  provider: "off" | "ngram" | "draft-tree" | "draft-model";
   maxDraftTokens: number;
   maxBranches: number;
   maxBranchTokens: number;
   maxKvBytes: number;
   maxWaveTokens: number;
+  artifactId: string | null;
+  parameterBytes: number;
+  memoryReservationBytes: number;
 }
 
 /**
@@ -701,7 +733,11 @@ function buildDescription(
   const rootNativeGguf =
     configuration.nativeGgufStages[rootStage.stageId] ?? null;
   const firstRemoteStage = downstreamStage(stages[1]!);
-  const rootProcessId = processIdentity(routeId, "root-engine", rootStage);
+  const rootProcessId = rootProcessIdentity(
+    routeId,
+    rootStage,
+    configuration.draftModel,
+  );
   const rootPartial: Omit<PythonRootEngineLaunch, "launchIndex" | "command"> = {
     kind: "root-engine",
     processId: rootProcessId,
@@ -1132,6 +1168,9 @@ function renderRootEngineArguments(
       );
     }
   }
+  if (configuration.draftModel) {
+    appendDraftModelArguments(args, configuration.draftModel);
+  }
   if (pagedKv) appendPagedKvArguments(args, pagedKv);
   args.push(
     "--public-model-name",
@@ -1276,9 +1315,16 @@ function pythonSpeculation(policy: RuntimeSpeculationPolicy): PythonSpeculationA
       maxBranchTokens: 0,
       maxKvBytes: 0,
       maxWaveTokens: 1,
+      artifactId: null,
+      parameterBytes: 0,
+      memoryReservationBytes: 0,
     };
   }
-  if (selected.kind !== "ngram" && selected.kind !== "draft-tree") {
+  if (
+    selected.kind !== "ngram"
+    && selected.kind !== "draft-tree"
+    && selected.kind !== "draft-model"
+  ) {
     throw new Error(`python_speculation_strategy_not_supported:${selected.kind}`);
   }
   if (selected.maxDraftTokens > 16) {
@@ -1292,6 +1338,35 @@ function pythonSpeculation(policy: RuntimeSpeculationPolicy): PythonSpeculationA
       maxBranchTokens: 0,
       maxKvBytes: 0,
       maxWaveTokens: selected.maxDraftTokens + 1,
+      artifactId: null,
+      parameterBytes: 0,
+      memoryReservationBytes: 0,
+    };
+  }
+  if (selected.kind === "draft-model") {
+    if (selected.artifactId === undefined) {
+      throw new Error("python_draft_model_artifact_is_missing");
+    }
+    return {
+      provider: "draft-model",
+      maxDraftTokens: selected.maxDraftTokens,
+      maxBranches: 0,
+      maxBranchTokens: 0,
+      maxKvBytes: 0,
+      maxWaveTokens: selected.maxDraftTokens + 1,
+      artifactId: selected.artifactId,
+      parameterBytes: boundedInteger(
+        selected.parameterBytes,
+        1,
+        Number.MAX_SAFE_INTEGER,
+        "python_draft_model_parameter_bytes_are_invalid",
+      ),
+      memoryReservationBytes: boundedInteger(
+        selected.memoryReservationBytes,
+        1,
+        Number.MAX_SAFE_INTEGER,
+        "python_draft_model_memory_reservation_is_invalid",
+      ),
     };
   }
   if (
@@ -1312,6 +1387,9 @@ function pythonSpeculation(policy: RuntimeSpeculationPolicy): PythonSpeculationA
     maxBranchTokens: selected.maxBranchTokens,
     maxKvBytes: selected.maxKvBytes,
     maxWaveTokens: selected.maxWaveTokens,
+    artifactId: null,
+    parameterBytes: 0,
+    memoryReservationBytes: 0,
   };
 }
 
@@ -1326,6 +1404,7 @@ function normalizeConfiguration(
     ["apiEndpoint", "returnEndpoint", "returnBindHost"],
     [
       "runtimeModel",
+      "draftModel",
       "publicModelName",
       "pythonExecutable",
       "stageModule",
@@ -1467,6 +1546,12 @@ function normalizeConfiguration(
     );
   }
   const speculation = pythonSpeculation(manifest.plans.decode.speculation);
+  const draftModel = normalizeDraftModel(
+    value.draftModel,
+    speculation,
+    requireNormalized,
+  );
+  assertDraftModelCapacity(manifest, draftModel);
   const requestedMaxSpeculativeBranches = boundedInteger(
     value.maxSpeculativeBranches ?? speculation.maxBranches,
     0,
@@ -1538,6 +1623,7 @@ function normalizeConfiguration(
     returnEndpoint: { ...value.returnEndpoint },
     returnBindHost,
     runtimeModel,
+    draftModel,
     publicModelName: safeString(
       value.publicModelName ?? manifest.modelId,
       "python_public_model_name_is_invalid",
@@ -2452,6 +2538,27 @@ function routeIdentity(
   )}`;
 }
 
+function rootProcessIdentity(
+  routeId: string,
+  stage: RuntimeVirtualStageManifest,
+  draftModel: PythonDraftModelConfiguration | null,
+): string {
+  return `root-${digest(
+    canonicalJson({
+      routeId,
+      kind: "root-engine",
+      stageId: stage.stageId,
+      index: stage.index,
+      layers: [stage.layerStart, stage.layerEnd],
+      anchor: stage.anchor,
+      execution: stage.execution,
+      macroWave: stage.macroWave,
+      draftModel,
+    }),
+    20,
+  )}`;
+}
+
 function processIdentity(
   routeId: string,
   kind: PythonLaunchProcess["kind"],
@@ -2496,6 +2603,34 @@ function appendModelArguments(args: string[], model: PythonRuntimeModelSource): 
   }
   if (model.snapshotIdentity !== undefined) {
     args.push("--pipeline-snapshot-identity", model.snapshotIdentity);
+  }
+}
+
+function appendDraftModelArguments(
+  args: string[],
+  model: PythonDraftModelConfiguration,
+): void {
+  args.push(
+    "--draft-model-source",
+    model.source,
+    "--draft-model-artifact-identity",
+    model.artifactIdentity,
+    "--draft-model-canonical-source",
+    model.canonicalSource,
+    "--draft-model-parameter-bytes",
+    String(model.parameterBytes),
+    "--draft-model-memory-reservation-bytes",
+    String(model.memoryReservationBytes),
+    "--draft-model-device",
+    model.device,
+    "--draft-model-dtype",
+    model.dtype,
+  );
+  if (model.revision !== null) {
+    args.push("--draft-model-revision", model.revision);
+  }
+  if (model.canonicalRevision !== null) {
+    args.push("--draft-model-canonical-revision", model.canonicalRevision);
   }
 }
 
@@ -2556,6 +2691,144 @@ type PythonModelArtifactCoordinates = Pick<
   PythonRuntimeModelSource,
   "artifactIdentity" | "canonicalSource" | "canonicalRevision"
 >;
+
+function normalizeDraftModel(
+  value: unknown,
+  speculation: PythonSpeculationArguments,
+  requireNormalized: boolean,
+): PythonDraftModelConfiguration | null {
+  if (speculation.provider !== "draft-model") {
+    if (value !== undefined && value !== null) {
+      throw new Error("python_draft_model_requires_draft_model_strategy");
+    }
+    return null;
+  }
+  if (!isRecord(value)) {
+    throw new Error("python_draft_model_configuration_is_missing");
+  }
+  assertExactKeys(
+    value,
+    ["schema", "source", "device", "dtype"],
+    [
+      "revision",
+      "snapshotIdentity",
+      "artifactIdentity",
+      "canonicalSource",
+      "canonicalRevision",
+      "parameterBytes",
+      "memoryReservationBytes",
+    ],
+    "python_draft_model_configuration_keys_are_invalid",
+  );
+  if (value.schema !== LOCAL_DRAFT_MODEL_SCHEMA) {
+    throw new Error("python_draft_model_schema_is_invalid");
+  }
+  const source = safeString(
+    value.source,
+    "python_draft_model_source_is_invalid",
+  );
+  const revision =
+    value.revision === undefined || value.revision === null
+      ? null
+      : safeString(
+          value.revision,
+          "python_draft_model_revision_is_invalid",
+        );
+  const derivedSnapshotIdentity = deriveHubSnapshotIdentity(source, revision);
+  const snapshotIdentity =
+    value.snapshotIdentity === undefined
+      ? derivedSnapshotIdentity
+      : uint64String(
+          value.snapshotIdentity,
+          "python_draft_model_snapshot_identity_is_invalid",
+        );
+  if (
+    snapshotIdentity !== undefined
+    && derivedSnapshotIdentity !== undefined
+    && snapshotIdentity !== derivedSnapshotIdentity
+  ) {
+    throw new Error("python_draft_model_snapshot_identity_mismatch");
+  }
+  const coordinates = normalizeModelArtifactCoordinates(
+    value,
+    source,
+    revision,
+    snapshotIdentity,
+    requireNormalized,
+  );
+  if (
+    coordinates.artifactIdentity === undefined
+    || coordinates.canonicalSource === undefined
+    || coordinates.canonicalRevision === undefined
+  ) {
+    throw new Error("python_draft_model_artifact_coordinates_are_missing");
+  }
+  const strategyArtifact = sha256Identity(
+    speculation.artifactId,
+    "python_draft_model_strategy_artifact_is_invalid",
+  );
+  if (coordinates.artifactIdentity !== strategyArtifact) {
+    throw new Error("python_draft_model_artifact_does_not_match_strategy");
+  }
+  for (const [key, expected, error] of [
+    [
+      "parameterBytes",
+      speculation.parameterBytes,
+      "python_draft_model_parameter_bytes_do_not_match_strategy",
+    ],
+    [
+      "memoryReservationBytes",
+      speculation.memoryReservationBytes,
+      "python_draft_model_memory_reservation_does_not_match_strategy",
+    ],
+  ] as const) {
+    const supplied = value[key];
+    if (requireNormalized && supplied === undefined) {
+      throw new Error(error);
+    }
+    if (
+      supplied !== undefined
+      && boundedInteger(supplied, 1, Number.MAX_SAFE_INTEGER, error) !== expected
+    ) {
+      throw new Error(error);
+    }
+  }
+  const device = draftModelDevice(value.device);
+  const dtype = draftModelDtype(value.dtype);
+  if (device === "cpu" && dtype === "float16") {
+    throw new Error("python_draft_model_float16_cpu_is_unsupported");
+  }
+  return {
+    schema: LOCAL_DRAFT_MODEL_SCHEMA,
+    source,
+    revision,
+    ...(snapshotIdentity === undefined ? {} : { snapshotIdentity }),
+    artifactIdentity: coordinates.artifactIdentity,
+    canonicalSource: coordinates.canonicalSource,
+    canonicalRevision: coordinates.canonicalRevision,
+    device,
+    dtype,
+    parameterBytes: speculation.parameterBytes,
+    memoryReservationBytes: speculation.memoryReservationBytes,
+  };
+}
+
+function assertDraftModelCapacity(
+  manifest: RuntimePipelineManifestV2,
+  draftModel: PythonDraftModelConfiguration | null,
+): void {
+  if (draftModel === null) return;
+  for (const phase of ["prefill", "decode"] as const) {
+    const root = manifest.plans[phase].stages.find((stage) => stage.index === 0);
+    if (!root) {
+      throw new Error(`python_draft_model_root_stage_is_missing:${phase}`);
+    }
+    const available = root.memoryLimitBytes - root.memoryBytes;
+    if (draftModel.memoryReservationBytes > available) {
+      throw new Error(`python_draft_model_memory_capacity_is_too_small:${phase}`);
+    }
+  }
+}
 
 function normalizeModelArtifactCoordinates(
   value: unknown,
@@ -2781,6 +3054,31 @@ function sha256Digest(value: unknown, error: string): string {
 function sha256Identity(value: unknown, error: string): string {
   if (typeof value !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value)) {
     throw new Error(error);
+  }
+  return value;
+}
+
+function draftModelDevice(value: unknown): PythonDraftModelDevice {
+  if (
+    typeof value !== "string"
+    || !/^(?:cpu|mps|cuda(?::(?:0|[1-9]\d*))?|xpu(?::(?:0|[1-9]\d*))?)$/.test(
+      value,
+    )
+  ) {
+    throw new Error("python_draft_model_device_is_invalid");
+  }
+  return value as PythonDraftModelDevice;
+}
+
+function draftModelDtype(
+  value: unknown,
+): PythonDraftModelConfiguration["dtype"] {
+  if (
+    value !== "float32"
+    && value !== "float16"
+    && value !== "bfloat16"
+  ) {
+    throw new Error("python_draft_model_dtype_is_invalid");
   }
   return value;
 }

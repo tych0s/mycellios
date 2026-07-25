@@ -264,6 +264,10 @@ export interface RuntimeSpeculationStrategy {
   maxWasteRatio: number;
   priority: number;
   artifactId?: string;
+  /** Exact loaded parameter bytes for an artifact-backed local drafter. */
+  parameterBytes?: number;
+  /** Capacity reserved before loading the optional local drafter. */
+  memoryReservationBytes?: number;
 }
 
 export interface RuntimeSpeculationPolicy {
@@ -2929,8 +2933,43 @@ function validateSpeculationPolicy(value: unknown): void {
       strategy.priority,
       "runtime_speculation_priority_is_invalid",
     );
+    const artifactBacked =
+      strategy.kind === "draft-model"
+      || strategy.kind === "mtp"
+      || strategy.kind === "intermediate-head";
+    if (artifactBacked && strategy.artifactId === undefined) {
+      throw new Error("runtime_speculation_artifact_is_missing");
+    }
     if (strategy.artifactId !== undefined) {
-      asNonEmptyString(strategy.artifactId, "runtime_speculation_artifact_is_invalid");
+      validateSha256Identity(
+        strategy.artifactId,
+        "runtime_speculation_artifact_is_invalid",
+      );
+    }
+    const draftMemory = [
+      strategy.parameterBytes,
+      strategy.memoryReservationBytes,
+    ];
+    if (strategy.kind === "draft-model") {
+      if (draftMemory.some((value) => value === undefined)) {
+        throw new Error("runtime_draft_model_memory_contract_is_missing");
+      }
+      assertPositiveInteger(
+        strategy.parameterBytes,
+        "runtime_draft_model_parameter_bytes_are_invalid",
+      );
+      assertPositiveInteger(
+        strategy.memoryReservationBytes,
+        "runtime_draft_model_memory_reservation_is_invalid",
+      );
+      if (
+        (strategy.memoryReservationBytes as number)
+        < (strategy.parameterBytes as number)
+      ) {
+        throw new Error("runtime_draft_model_memory_reservation_is_too_small");
+      }
+    } else if (draftMemory.some((value) => value !== undefined)) {
+      throw new Error("runtime_draft_model_memory_requires_draft_model_strategy");
     }
     if (strategy.kind === "autoregressive" && strategy.maxDraftTokens !== 1) {
       throw new Error("runtime_autoregressive_draft_length_must_be_one");
@@ -3313,6 +3352,15 @@ function validateSafeHost(value: unknown, error: string): asserts value is strin
 
 function validateSha256(value: unknown, error: string): asserts value is string {
   if (typeof value !== "string" || !/^[0-9a-f]{64}$/i.test(value)) {
+    throw new Error(error);
+  }
+}
+
+function validateSha256Identity(
+  value: unknown,
+  error: string,
+): asserts value is string {
+  if (typeof value !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value)) {
     throw new Error(error);
   }
 }

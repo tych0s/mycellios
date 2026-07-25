@@ -453,6 +453,77 @@ class EngineUnitTests(unittest.TestCase):
         )
         self.assertEqual(engine._speculation_selected_sizes, {2: 1})
 
+    def test_dispatch_measurement_includes_local_drafter_latency(self) -> None:
+        engine = DistributedPipelineEngine.__new__(DistributedPipelineEngine)
+        job = _GenerationJob(
+            GenerationInput(602, torch.tensor([[1, 2, 3]]), 5),
+            None,
+            wire_id=8,
+            step=4,
+            token_ids=[10],
+        )
+        wave = _PreparedRootWave(
+            job=job,
+            input_ids=torch.tensor([[10, 20, 21]]),
+            frame_type=FrameType.VERIFY,
+            step=4,
+            draft_latency_seconds=0.25,
+        )
+        engine._record_dispatched_wave(
+            wave,
+            started_at=10.0,
+            sent_at=10.1,
+            outbound_bytes=200,
+        )
+
+        self.assertEqual(len(job.inflight_waves), 1)
+        self.assertAlmostEqual(job.inflight_waves[0].started_at, 9.75)
+        self.assertEqual(job.next_step, 5)
+
+    def test_dispatch_measurement_includes_wait_behind_sibling_drafters(self) -> None:
+        engine = DistributedPipelineEngine.__new__(DistributedPipelineEngine)
+        job = _GenerationJob(
+            GenerationInput(603, torch.tensor([[1, 2, 3]]), 5),
+            None,
+            wire_id=9,
+            step=4,
+            token_ids=[10],
+        )
+        wave = _PreparedRootWave(
+            job=job,
+            input_ids=torch.tensor([[10, 20, 21]]),
+            frame_type=FrameType.VERIFY,
+            step=4,
+            draft_latency_seconds=0.1,
+            measurement_started_at=9.2,
+        )
+        engine._record_dispatched_wave(
+            wave,
+            started_at=10.0,
+            sent_at=10.1,
+            outbound_bytes=200,
+        )
+
+        self.assertEqual(len(job.inflight_waves), 1)
+        self.assertAlmostEqual(job.inflight_waves[0].started_at, 9.2)
+
+    def test_draft_provider_snapshot_is_exposed_without_mutable_aliases(self) -> None:
+        engine = DistributedPipelineEngine.__new__(DistributedPipelineEngine)
+        source = {
+            "strategy": "draft-model",
+            "artifactIdentity": f"sha256:{'a' * 64}",
+            "draftCalls": 2,
+        }
+        engine.draft_provider = SimpleNamespace(
+            execution_snapshot=lambda: source,
+        )
+
+        snapshot = engine._linear_draft_provider_stats()
+        self.assertEqual(snapshot, source)
+        assert snapshot is not None
+        snapshot["draftCalls"] = 99
+        self.assertEqual(source["draftCalls"], 2)
+
     def test_route_probe_measures_the_full_control_path_and_feeds_speculation(self) -> None:
         engine = DistributedPipelineEngine.__new__(DistributedPipelineEngine)
         engine.config = SimpleNamespace(

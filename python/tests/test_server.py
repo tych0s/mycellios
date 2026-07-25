@@ -267,6 +267,62 @@ class EngineConfigurationTests(unittest.TestCase):
                 )
             )
 
+    def test_native_draft_model_wave_limit_fails_before_model_loading(self) -> None:
+        common = [
+            "--speculation",
+            "draft-model",
+            "--speculative-max-draft-tokens",
+            "4",
+            "--draft-model-source",
+            "local-draft",
+            "--draft-model-artifact-identity",
+            f"sha256:{'a' * 64}",
+            "--draft-model-parameter-bytes",
+            "16",
+            "--draft-model-memory-reservation-bytes",
+            str(64 * 1024 * 1024),
+        ]
+        with patch("distributed_runtime.server.resolve_model_snapshot") as resolve:
+            with self.assertRaisesRegex(ValueError, "explicit sealed-wave-tokens"):
+                build_server(parse_server_args(common))
+        resolve.assert_not_called()
+
+        with patch("distributed_runtime.server.resolve_model_snapshot") as resolve:
+            with self.assertRaisesRegex(
+                ValueError,
+                "cannot be smaller than the VERIFY input",
+            ):
+                build_server(
+                    parse_server_args(
+                        [
+                            *common,
+                            "--sealed-wave-tokens",
+                            "1",
+                            "--max-prefill-chunk-tokens",
+                            "32",
+                        ]
+                    )
+                )
+        resolve.assert_not_called()
+
+        with patch("distributed_runtime.server.resolve_model_snapshot") as resolve:
+            with self.assertRaisesRegex(
+                ValueError,
+                "must equal draft depth plus one",
+            ):
+                build_server(
+                    parse_server_args(
+                        [
+                            *common,
+                            "--sealed-wave-tokens",
+                            "6",
+                            "--max-prefill-chunk-tokens",
+                            "32",
+                        ]
+                    )
+                )
+        resolve.assert_not_called()
+
     def test_server_rejects_invalid_prefill_pipeline_credits_before_model_loading(self) -> None:
         for arguments, message in (
             (["--prefill-inflight-chunks", "0"], "between 1 and 64"),

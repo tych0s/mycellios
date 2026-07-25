@@ -47,6 +47,7 @@ export const NATIVE_PYTHON_PRODUCT_FILES = Object.freeze([
   "distributed_runtime/decode_attention.py",
   "distributed_runtime/dense_tiering.py",
   "distributed_runtime/device.py",
+  "distributed_runtime/draft_model.py",
   "distributed_runtime/engine.py",
   "distributed_runtime/executor_abi.py",
   "distributed_runtime/external_cell.py",
@@ -90,6 +91,7 @@ export const NATIVE_PYTHON_IMPORT_SMOKE_MODULES = Object.freeze([
   "distributed_runtime.native_gguf_runtime",
   "distributed_runtime.native_gguf_disk_tiering",
   "distributed_runtime.dense_tiering",
+  "distributed_runtime.draft_model",
 ]);
 
 const allowedModules = new Set(
@@ -216,6 +218,21 @@ export function verifyNativePythonProductSource(sourceRoot) {
   }
   assertNativePythonSourceClosure(root);
   return manifest;
+}
+
+export function assertNativePythonProductMatchesSource(
+  sourceRoot,
+  productRoot,
+) {
+  assertNativePythonSourceClosure(sourceRoot);
+  const expected = buildNativePythonProductManifest(sourceRoot);
+  const actual = verifyNativePythonProductSource(productRoot);
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error(
+      "Packaged native Python source does not match the current product source.",
+    );
+  }
+  return actual;
 }
 
 export function buildNativePythonProductManifest(sourceRoot) {

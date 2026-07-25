@@ -14,6 +14,7 @@ import {
   NATIVE_PYTHON_IMPORT_SMOKE_MODULES,
   NATIVE_PYTHON_PRODUCT_FILES,
   NATIVE_PYTHON_PRODUCT_MANIFEST,
+  assertNativePythonProductMatchesSource,
   assertNativePythonSourceClosure,
   prepareNativePythonProductSource,
   verifyNativePythonProductSource,
@@ -43,11 +44,13 @@ describe("native Python product package", () => {
       "distributed_runtime.native_gguf_runtime",
       "distributed_runtime.native_gguf_disk_tiering",
       "distributed_runtime.dense_tiering",
+      "distributed_runtime.draft_model",
     ]));
     expect(NATIVE_PYTHON_PRODUCT_FILES).toEqual(expect.arrayContaining([
       "distributed_runtime/native_gguf_runtime.py",
       "distributed_runtime/native_gguf_disk_tiering.py",
       "distributed_runtime/dense_tiering.py",
+      "distributed_runtime/draft_model.py",
     ]));
     for (const forbidden of [
       "distributed_runtime/external_gguf_runtime.py",
@@ -89,6 +92,23 @@ describe("native Python product package", () => {
     expect(() => verifyNativePythonProductSource(destination)).toThrow(
       "outside the allowlist",
     );
+  });
+
+  it("rejects a valid but stale packaged source tree", () => {
+    const root = temporaryDirectory();
+    const source = join(root, "source");
+    const product = join(root, "product");
+    prepareNativePythonProductSource(resolve("python"), source);
+    prepareNativePythonProductSource(source, product);
+    expect(() =>
+      assertNativePythonProductMatchesSource(source, product),
+    ).not.toThrow();
+
+    const server = join(source, "distributed_runtime", "server.py");
+    writeFileSync(server, `${readFileSync(server, "utf8")}\n# newer source\n`, "utf8");
+    expect(() =>
+      assertNativePythonProductMatchesSource(source, product),
+    ).toThrow("does not match the current product source");
   });
 });
 

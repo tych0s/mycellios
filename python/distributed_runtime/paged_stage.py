@@ -47,10 +47,6 @@ import torch
 import transformers
 from torch import nn
 from transformers.configuration_utils import PreTrainedConfig
-from transformers.generation.configuration_utils import ContinuousBatchingConfig
-from transformers.generation.continuous_batching.cache import PagedAttentionCache
-from transformers.generation.continuous_batching.distributed import DistributedHelper
-from transformers.generation.continuous_batching.requests import RequestState
 
 from .executor_abi import StageKVForkReport, build_stage_executor_manifest
 from .model import (
@@ -77,6 +73,52 @@ MAX_PAGED_NUM_BLOCKS = 1_048_576
 MAX_PAGED_BATCH_TOKENS = 65_536
 MAX_PAGED_ACTIVE_REQUESTS = 4_096
 MAX_PAGED_SEQUENCE_TOKENS = 1_048_576
+
+
+@dataclass(frozen=True)
+class _ContinuousBatchingTypes:
+    config: type[Any]
+    cache: type[Any]
+    distributed_helper: type[Any]
+    request_state: type[Any]
+
+
+def _require_supported_transformers_version() -> None:
+    installed_version = transformers.__version__
+    if installed_version != SUPPORTED_TRANSFORMERS_VERSION:
+        raise RuntimeError(
+            "HF paged stage adapter is sealed to transformers "
+            f"{SUPPORTED_TRANSFORMERS_VERSION}, found {installed_version}; "
+            "continuous-batching symbols were not imported"
+        )
+
+
+def _load_continuous_batching_types() -> _ContinuousBatchingTypes:
+    """Load the sealed optional HF API only after its exact version is known."""
+
+    _require_supported_transformers_version()
+    try:
+        from transformers.generation.configuration_utils import (
+            ContinuousBatchingConfig,
+        )
+        from transformers.generation.continuous_batching.cache import (
+            PagedAttentionCache,
+        )
+        from transformers.generation.continuous_batching.distributed import (
+            DistributedHelper,
+        )
+        from transformers.generation.continuous_batching.requests import RequestState
+    except (AttributeError, ImportError) as error:
+        raise RuntimeError(
+            "transformers 5.14.1 is missing the sealed continuous-batching API "
+            "required by the HF paged stage adapter"
+        ) from error
+    return _ContinuousBatchingTypes(
+        config=ContinuousBatchingConfig,
+        cache=PagedAttentionCache,
+        distributed_helper=DistributedHelper,
+        request_state=RequestState,
+    )
 
 
 @dataclass(frozen=True)
@@ -409,11 +451,7 @@ class HFPagedStageCache:
         attention_backend: str = "eager",
         cpu_spill_bytes: int = 0,
     ) -> None:
-        if transformers.__version__ != SUPPORTED_TRANSFORMERS_VERSION:
-            raise RuntimeError(
-                "HF paged stage adapter is sealed to transformers "
-                f"{SUPPORTED_TRANSFORMERS_VERSION}, found {transformers.__version__}"
-            )
+        continuous_batching = _load_continuous_batching_types()
         if attention_backend not in SUPPORTED_ATTENTION_BACKENDS:
             raise ValueError(
                 "attention_backend must be one of "
@@ -447,7 +485,7 @@ class HFPagedStageCache:
         if resolved_device.type not in ("cpu", "cuda"):
             raise ValueError("prototype supports only CPU or CUDA devices")
 
-        cb_config = ContinuousBatchingConfig(
+        cb_config = continuous_batching.config(
             block_size=block_size,
             num_blocks=num_blocks,
             max_batch_tokens=max_batch_tokens,
@@ -458,8 +496,11 @@ class HFPagedStageCache:
             use_async_batching=False,
             use_cuda_graph=False,
         )
-        distributed_helper = DistributedHelper(device_mesh=None, cpu_group_timeout=30.0)
-        cache = PagedAttentionCache(
+        distributed_helper = continuous_batching.distributed_helper(
+            device_mesh=None,
+            cpu_group_timeout=30.0,
+        )
+        cache = continuous_batching.cache(
             config=config,
             continuous_batching_config=cb_config,
             device=resolved_device,
@@ -502,6 +543,7 @@ class HFPagedStageCache:
         self.attention_backend = attention_backend
         self.attention_implementation = f"paged|{attention_backend}"
         self.cache = cache
+        self._request_state_type = continuous_batching.request_state
         self._requests: dict[int, _RequestRecord] = {}
         self._spilled_requests: dict[int, _SpilledRequest] = {}
         self._restore_workspaces: dict[int, _SpilledRequest] = {}
@@ -551,6 +593,7 @@ class HFPagedStageCache:
     ) -> "HFPagedStageCache":
         """Configure one inference model and build a matching cache adapter."""
 
+        _require_supported_transformers_version()
         if attention_backend not in SUPPORTED_ATTENTION_BACKENDS:
             raise ValueError(
                 "attention_backend must be one of "
@@ -1286,7 +1329,7 @@ class HFPagedStageCache:
             new_length // self.block_size - pending.old_length // self.block_size
         )
         if newly_complete:
-            state = RequestState(
+            state = self._request_state_type(
                 request_id=record.backend_id,
                 initial_tokens=record.cache_keys.copy(),
             )
@@ -1926,7 +1969,7 @@ class HFPagedStageCache:
                     torch.cuda.synchronize(self.device)
                 complete_blocks = len(spilled.cache_keys) // self.block_size
                 if complete_blocks:
-                    state = RequestState(
+                    state = self._request_state_type(
                         request_id=spilled.backend_id,
                         initial_tokens=list(spilled.cache_keys),
                     )
@@ -2100,6 +2143,7 @@ class HFPagedStageRunner:
         max_sequence_tokens: int = 2048,
         cpu_spill_bytes: int = 0,
     ) -> None:
+        _require_supported_transformers_version()
         runtime_config = HFPagedStageRuntimeConfig(
             device=str(torch.device(device)),
             attention_backend=attention_backend,

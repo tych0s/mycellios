@@ -9,7 +9,7 @@ import {
   matchesPinnedPythonArtifact,
   portableRuntimeSpec,
 } from "./portable-runtime-policy.mjs";
-import { verifyNativePythonProductSource } from "./native-python-product-policy.mjs";
+import { assertNativePythonProductMatchesSource } from "./native-python-product-policy.mjs";
 
 function readArgument(name, fallback) {
   const prefix = `--${name}=`;
@@ -115,7 +115,10 @@ if (runtimeSpec.supported) {
       `El paquete ${platform}/${arch} no contiene el runtime Mycellios en ${packagedPythonSource}.`,
     );
   }
-  verifyNativePythonProductSource(packagedPythonSource);
+  assertNativePythonProductMatchesSource(
+    resolve("python"),
+    packagedPythonSource,
+  );
   const archiveEntries = tar(["-tzf", runtimeArchive])
     .split(/\r?\n/)
     .map((entry) => entry.trim())

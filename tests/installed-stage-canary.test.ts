@@ -142,6 +142,7 @@ describe("installed stage canary gate", () => {
       "distributed_runtime.native_gguf_runtime",
       "distributed_runtime.native_gguf_disk_tiering",
       "distributed_runtime.dense_tiering",
+      "distributed_runtime.draft_model",
     ]));
   });
 
