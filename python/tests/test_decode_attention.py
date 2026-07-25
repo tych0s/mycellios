@@ -198,8 +198,13 @@ class GroupedPrefixEligibilityTests(unittest.TestCase):
             )
         self.assertEqual((STATS["grouped"], STATS["fallback"]), (0, 1))
 
-    def test_multi_query_grouping_is_handled(self) -> None:
-        """Hq == Hkv (no grouping) must still be exact, with G collapsing to 1."""
+    def test_ungrouped_attention_falls_back(self) -> None:
+        """Hq == Hkv has no expansion to avoid, so the fast path would only lose.
+
+        With nothing to regroup, torch's fused kernel beats two explicit matmuls plus
+        a Python-level softmax -- measured up to 1.7x per layer. The gate closes
+        against losing, not only against being wrong.
+        """
 
         torch.manual_seed(33)
         query = torch.randn(1, KV_HEADS, 1, HEAD_DIM)
@@ -207,8 +212,8 @@ class GroupedPrefixEligibilityTests(unittest.TestCase):
         value = torch.randn(1, KV_HEADS, 200, HEAD_DIM)
         stock = _stock(self.module, query, key, value, None)
         grouped = _grouped(self.module, query, key, value, None)
-        self.assertLess((stock - grouped).abs().max().item(), 1e-5)
-        self.assertEqual(STATS["grouped"], 1)
+        self.assertTrue(torch.equal(stock, grouped))
+        self.assertEqual((STATS["grouped"], STATS["fallback"]), (0, 1))
 
     def test_default_scaling_is_applied_when_absent(self) -> None:
         query, key, value = _inputs(1, 64)

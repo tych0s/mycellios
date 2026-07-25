@@ -123,6 +123,96 @@ class ArenaRuntimeEquivalenceTests(unittest.TestCase):
         self.assertTrue(torch.equal(outputs["dynamic"], outputs["arena"]))
 
 
+class MultiPositionForwardTests(unittest.TestCase):
+    """The shapes that a counter-only test cannot defend.
+
+    A custom attention implementation that transformers does not recognise is treated
+    as a backend that builds its own masks, so `create_causal_mask` returns None and
+    every layer is handed `attention_mask=None`. The stock fallback reacts to a missing
+    mask at q_len > 1 by inferring `is_causal=True` and slicing the cache down to the
+    query length -- silently dropping the KV history.
+
+    Whole-prompt prefill and single-token decode are unaffected, which is exactly what
+    makes it dangerous: only `1 < q_len < kv_len` is corrupted, and that is chunked
+    prefill and the speculative VERIFY wave -- two shapes this architecture depends on.
+    These tests compare hidden states against the stock attention path, because
+    asserting that a fallback merely *happened* is what let the bug through.
+    """
+
+    def _run(self, mode: str, chunks: list[int]) -> torch.Tensor:
+        runner = _tiny_runner("arena")
+        runner.spec = StageModelSpec("tiny", 0, 2, 2, 1, kv_cache="arena", decode_attention=mode)
+        if mode == "grouped-prefix":
+            from distributed_runtime.decode_attention import apply_to
+
+            apply_to(runner.base)
+        else:
+            runner.base.config._attn_implementation = "sdpa"
+        prompt = _prompt(sum(chunks), seed=71)
+        runner.begin(1)
+        offset, hidden = 0, None
+        for size in chunks:
+            hidden = runner.forward_ids(1, prompt[:, offset : offset + size])
+            offset += size
+        return hidden
+
+    def test_chunked_prefill_matches_stock_attention(self) -> None:
+        """Feeding a prompt in chunks must land on the same state as one shot."""
+
+        chunks = [12, 9, 7]
+        stock = self._run("stock", chunks)
+        grouped = self._run("grouped-prefix", chunks)
+        self.assertEqual(stock.shape, grouped.shape)
+        self.assertLess(
+            (stock - grouped).abs().max().item(),
+            1e-4,
+            "chunked prefill diverged: the KV history is being dropped",
+        )
+
+    def test_chunked_prefill_matches_whole_prompt_prefill(self) -> None:
+        whole = self._run("grouped-prefix", [28])
+        chunked = self._run("grouped-prefix", [16, 12])
+        self.assertLess((whole[:, -1:] - chunked[:, -1:]).abs().max().item(), 1e-4)
+
+    def test_speculative_verify_shape_matches_stock_attention(self) -> None:
+        """A VERIFY wave is several draft positions over an existing cache."""
+
+        outputs = {}
+        for mode in ("stock", "grouped-prefix"):
+            runner = _tiny_runner("arena")
+            runner.spec = StageModelSpec("tiny", 0, 2, 2, 1, kv_cache="arena", decode_attention=mode)
+            if mode == "grouped-prefix":
+                from distributed_runtime.decode_attention import apply_to
+
+                apply_to(runner.base)
+            else:
+                runner.base.config._attn_implementation = "sdpa"
+            runner.begin(1)
+            runner.forward_ids(1, _prompt(24, seed=72))
+            outputs[mode] = runner.forward_ids(1, torch.tensor([[3, 5, 8, 2]], dtype=torch.long))
+            self.assertEqual(runner.sequence_length(1), 28)
+        self.assertLess(
+            (outputs["stock"] - outputs["grouped-prefix"]).abs().max().item(),
+            1e-4,
+            "speculative VERIFY diverged: the KV history is being dropped",
+        )
+
+    def test_mask_builder_is_registered_alongside_the_implementation(self) -> None:
+        from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
+
+        from distributed_runtime.decode_attention import (
+            GROUPED_PREFIX_ATTENTION,
+            register_grouped_prefix_attention,
+        )
+
+        register_grouped_prefix_attention()
+        self.assertIn(
+            GROUPED_PREFIX_ATTENTION,
+            ALL_MASK_ATTENTION_FUNCTIONS._global_mapping,
+            "without a mask builder transformers skips mask construction entirely",
+        )
+
+
 class ArenaRuntimeBehaviourTests(unittest.TestCase):
     def test_stage_uses_arena_layers_by_default(self) -> None:
         runner = _tiny_runner("arena")

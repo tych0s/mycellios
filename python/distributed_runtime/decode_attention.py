@@ -55,6 +55,7 @@ from typing import Any
 
 import torch
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
+from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, sdpa_mask
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 GROUPED_PREFIX_ATTENTION = "gdlp-grouped-prefix"
@@ -170,6 +171,12 @@ def _eligible(
         return False
     heads, kv_heads = query.shape[1], key.shape[1]
     if kv_heads < 1 or heads % kv_heads:
+        return False
+    if heads == kv_heads:
+        # Nothing to regroup. With no expansion to avoid, torch's fused kernel beats
+        # two explicit matmuls plus a Python-level softmax -- measured a regression of
+        # up to 1.7x per layer. The gate has to be closed against losing, not only
+        # against being wrong.
         return False
     if key.shape[3] != query.shape[3] or value.shape[3] != query.shape[3]:
         return False
@@ -288,11 +295,24 @@ def grouped_prefix_attention_forward(
 
 
 def register_grouped_prefix_attention() -> str:
-    """Register the implementation and return the name to select it by."""
+    """Register the implementation and return the name to select it by.
+
+    Registering the *mask builder* under the same name is not optional. Transformers
+    treats an attention implementation it does not recognise as a custom backend that
+    builds its own masks, and skips mask construction entirely
+    (``masking_utils.create_causal_mask`` returns ``None``). Every layer would then be
+    handed ``attention_mask=None``, and the stock fallback reacts to that by inferring
+    ``is_causal=True`` and *slicing the cache down to the query length*
+    (``sdpa_attention.py``: ``key = key[:, :, :q_length, :]``) -- silently dropping the
+    KV history. Whole-prompt prefill and single-token decode are unaffected, which is
+    what makes it dangerous: it only corrupts ``1 < q_len < kv_len``, which is exactly
+    chunked prefill and the speculative VERIFY wave.
+    """
 
     ALL_ATTENTION_FUNCTIONS.register(
         GROUPED_PREFIX_ATTENTION, grouped_prefix_attention_forward
     )
+    ALL_MASK_ATTENTION_FUNCTIONS.register(GROUPED_PREFIX_ATTENTION, sdpa_mask)
     return GROUPED_PREFIX_ATTENTION
 
 
