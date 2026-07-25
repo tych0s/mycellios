@@ -4,6 +4,14 @@ export interface PublicAuthConfig {
   enabled: boolean;
   url?: string;
   anonKey?: string;
+  apiAccessEnabled?: boolean;
+  publicApiBaseUrl?: string;
+  starterTokens?: number;
+  limits?: {
+    requestsPerMinute: number;
+    maxConcurrent: number;
+    maxActiveKeys: number;
+  };
 }
 
 export interface AuthSession {
