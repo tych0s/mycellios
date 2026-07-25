@@ -40,6 +40,7 @@ import gc
 import hashlib
 import json
 from math import ceil
+from time import perf_counter_ns
 from typing import Any
 
 import torch
@@ -65,7 +66,7 @@ SUPPORTED_TRANSFORMERS_VERSION = "5.14.1"
 SUPPORTED_ATTENTION_BACKENDS = frozenset(("eager", "sdpa"))
 MAX_REQUEST_ID = 2**63 - 1
 MAX_OPAQUE_CACHE_KEY = 2**31 - 1
-PAGED_STAGE_RUNTIME_SCHEMA = "mycellios-hf-paged-stage/1"
+PAGED_STAGE_RUNTIME_SCHEMA = "mycellios-hf-paged-stage/2"
 DEFAULT_PAGED_BLOCK_SIZE = 16
 DEFAULT_PAGED_NUM_BLOCKS = 256
 DEFAULT_PAGED_MAX_BATCH_TOKENS = 256
@@ -82,12 +83,13 @@ MAX_PAGED_SEQUENCE_TOKENS = 1_048_576
 class HFPagedStageRuntimeConfig:
     """Closed, content-sealed settings for the native paged KV backend.
 
-    ``cpu_spill_bytes`` is deliberately present in the contract even though it
-    must currently be zero. Transformers 5.14.1 exposes neither an atomic block
-    eviction/restore operation nor a way to replace a live request's block
-    table after restoring device KV. Pretending that ordinary tensor copies are
-    a spill implementation could publish half-restored cache state, so any
-    positive request fails before model or KV allocation.
+    ``cpu_spill_bytes`` bounds only the tensor payload retained by the
+    adapter-owned CPU spill tier. It is not an RSS, allocator-overhead or pinned
+    allocator-cache limit. A request is copied completely and integrity-checked
+    before its device block references are released. Restore verifies the CPU
+    source, allocates and fills a private block table, and only then publishes
+    the request. A single target payload can be held as an explicitly measured
+    restore workspace while its persistent spill slot is reused.
     """
 
     schema: str = PAGED_STAGE_RUNTIME_SCHEMA
@@ -160,12 +162,6 @@ class HFPagedStageRuntimeConfig:
             or self.cpu_spill_bytes < 0
         ):
             raise ValueError("paged cpu_spill_bytes must be a non-negative integer")
-        if self.cpu_spill_bytes != 0:
-            raise ValueError(
-                "paged CPU spill is unavailable: Transformers 5.14.1 has no "
-                "atomic live block eviction/restore ABI; cpu_spill_bytes must be zero"
-            )
-
     def to_document(self) -> dict[str, Any]:
         return {
             "schema": self.schema,
@@ -178,8 +174,19 @@ class HFPagedStageRuntimeConfig:
             "maxSequenceTokens": self.max_sequence_tokens,
             "cpuSpillBytes": self.cpu_spill_bytes,
             "cpuSpill": {
-                "supported": False,
-                "reason": "transformers-5.14.1-no-atomic-block-eviction-restore",
+                "supported": True,
+                "enabled": self.cpu_spill_bytes > 0,
+                "maxBytes": self.cpu_spill_bytes,
+                "storedPayloadLimitBytes": self.cpu_spill_bytes,
+                "restoreWorkspaceUpperBoundBytes": self.cpu_spill_bytes,
+                "maxCpuPayloadUpperBoundBytes": 2 * self.cpu_spill_bytes,
+                "budgetScope": "stored-tensor-payload",
+                "rssBounded": False,
+                "allocatorOverheadIncluded": False,
+                "restoreWorkspaceIncluded": False,
+                "transferByteCounters": "successful-full-payloads-only",
+                "policy": "integrity-checked-request-lru",
+                "restore": "verify-source-allocate-copy-publish",
             },
         }
 
@@ -215,8 +222,8 @@ def add_paged_kv_arguments(parser: argparse.ArgumentParser) -> None:
         "--paged-cpu-spill-bytes",
         type=int,
         help=(
-            "Reserved contract field. Must be zero until the pinned Transformers "
-            "cache exposes atomic live block eviction/restore."
+            "Maximum stored tensor-payload bytes in the integrity-checked CPU "
+            "spill tier; this is not an RSS or allocator-overhead limit."
         ),
     )
 
@@ -290,6 +297,11 @@ class PagedCacheMetrics:
     ``copied_bytes`` and ``newly_reserved_bytes`` are deltas for the operation
     that returned this record.  ``peak_workspace`` is optional because the HF
     cache manager does not expose it for eager/SDPA or ``copy_cache``.
+
+    Spill byte counters include only complete successful payload copies.
+    Timings use ``perf_counter_ns`` around each attempted D2H spill or device
+    materialisation. CPU payload fields count tensor storage owned by this
+    adapter, never Python/PyTorch allocator overhead or process RSS.
     """
 
     logical_bytes: int
@@ -300,6 +312,20 @@ class PagedCacheMetrics:
     pool_reserved_bytes: int
     active_requests: int
     free_blocks: int
+    spilled_bytes: int = 0
+    spilled_requests: int = 0
+    spill_count: int = 0
+    restore_count: int = 0
+    spill_failures: int = 0
+    restore_failures: int = 0
+    spill_bytes_transferred: int = 0
+    restore_bytes_transferred: int = 0
+    spill_time_ns: int = 0
+    restore_time_ns: int = 0
+    restore_workspace_bytes: int = 0
+    peak_restore_workspace_bytes: int = 0
+    current_cpu_payload_bytes: int = 0
+    peak_cpu_payload_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -308,6 +334,8 @@ class PagedRequestSnapshot:
     sequence_length: int
     block_ids: tuple[int, ...]
     ref_counts: tuple[int, ...]
+    residency: str = "device"
+    spill_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -316,6 +344,8 @@ class PagedCacheSnapshot:
     free_blocks: int
     total_blocks: int
     block_size: int
+    spilled_bytes: int = 0
+    spill_limit_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -329,6 +359,17 @@ class _RequestRecord:
     request_id: int
     backend_id: str
     cache_keys: list[int]
+
+
+@dataclass(frozen=True)
+class _SpilledRequest:
+    request_id: int
+    backend_id: str
+    cache_keys: tuple[int, ...]
+    key_blocks: tuple[torch.Tensor, ...]
+    value_blocks: tuple[torch.Tensor, ...]
+    byte_count: int
+    digest: str
 
 
 @dataclass(frozen=True)
@@ -366,6 +407,7 @@ class HFPagedStageCache:
         max_active_requests: int = 8,
         max_sequence_tokens: int = 2048,
         attention_backend: str = "eager",
+        cpu_spill_bytes: int = 0,
     ) -> None:
         if transformers.__version__ != SUPPORTED_TRANSFORMERS_VERSION:
             raise RuntimeError(
@@ -383,6 +425,7 @@ class HFPagedStageCache:
             ("max_batch_tokens", max_batch_tokens, 1),
             ("max_active_requests", max_active_requests, 1),
             ("max_sequence_tokens", max_sequence_tokens, 1),
+            ("cpu_spill_bytes", cpu_spill_bytes, 0),
         ):
             if not isinstance(value, int) or isinstance(value, bool):
                 raise TypeError(f"{name} must be an integer")
@@ -455,10 +498,27 @@ class HFPagedStageCache:
         self.max_batch_tokens = max_batch_tokens
         self.max_active_requests = max_active_requests
         self.max_sequence_tokens = max_sequence_tokens
+        self.cpu_spill_limit_bytes = cpu_spill_bytes
         self.attention_backend = attention_backend
         self.attention_implementation = f"paged|{attention_backend}"
         self.cache = cache
         self._requests: dict[int, _RequestRecord] = {}
+        self._spilled_requests: dict[int, _SpilledRequest] = {}
+        self._restore_workspaces: dict[int, _SpilledRequest] = {}
+        self._spilled_bytes = 0
+        self._spill_count = 0
+        self._restore_count = 0
+        self._spill_failures = 0
+        self._restore_failures = 0
+        self._spill_bytes_transferred = 0
+        self._restore_bytes_transferred = 0
+        self._spill_time_ns = 0
+        self._restore_time_ns = 0
+        self._restore_workspace_bytes = 0
+        self._peak_restore_workspace_bytes = 0
+        self._peak_cpu_payload_bytes = 0
+        self._access_clock = 0
+        self._last_access: dict[int, int] = {}
         self._pending: _PendingForward | None = None
         self._next_cache_key = 1
         self._closed = False
@@ -487,6 +547,7 @@ class HFPagedStageCache:
         max_batch_tokens: int = 256,
         max_active_requests: int = 8,
         max_sequence_tokens: int = 2048,
+        cpu_spill_bytes: int = 0,
     ) -> "HFPagedStageCache":
         """Configure one inference model and build a matching cache adapter."""
 
@@ -533,15 +594,20 @@ class HFPagedStageCache:
             max_active_requests=max_active_requests,
             max_sequence_tokens=max_sequence_tokens,
             attention_backend=attention_backend,
+            cpu_spill_bytes=cpu_spill_bytes,
         )
 
     def begin(self, request_id: int) -> PagedCacheMetrics:
         self._guard()
         self._require_idle()
         request_id = self._validate_request_id(request_id)
-        if request_id in self._requests:
+        if (
+            request_id in self._requests
+            or request_id in self._spilled_requests
+            or request_id in self._restore_workspaces
+        ):
             raise ValueError(f"request {request_id} is already active")
-        if len(self._requests) >= self.max_active_requests:
+        if self._active_request_count() >= self.max_active_requests:
             raise ValueError("maximum active request count reached")
         backend_id = self._backend_id(request_id)
         allocated = self.cache.allocate_blocks(0, backend_id, allocated_blocks=0)
@@ -549,15 +615,33 @@ class HFPagedStageCache:
             self._poisoned = True
             raise PagedStageCorruptionError("zero-block BEGIN unexpectedly allocated cache")
         self._requests[request_id] = _RequestRecord(request_id, backend_id, [])
+        self._touch(request_id)
         self._after_mutation()
         return self._metrics()
 
     def end(self, request_id: int) -> PagedCacheMetrics:
         self._guard()
         self._require_idle()
-        record = self._require_request(request_id)
-        self.cache.free_blocks(record.backend_id)
-        del self._requests[record.request_id]
+        request_id = self._validate_request_id(request_id)
+        record = self._requests.get(request_id)
+        if record is not None:
+            try:
+                self.cache.free_blocks(record.backend_id)
+            except BaseException as free_error:
+                manager = self.cache.group_cache_managers[0]
+                if record.backend_id not in manager.block_table:
+                    self._poisoned = True
+                    raise PagedStageCorruptionError(
+                        "request end failed after changing allocator state"
+                    ) from free_error
+                raise
+            del self._requests[record.request_id]
+        else:
+            spilled = self._spilled_requests.pop(request_id, None)
+            if spilled is None:
+                raise ValueError(f"unknown paged request {request_id}")
+            self._spilled_bytes -= spilled.byte_count
+        self._last_access.pop(request_id, None)
         self._after_mutation()
         return self._metrics()
 
@@ -570,12 +654,18 @@ class HFPagedStageCache:
             self.cache.free_all_requests()
         finally:
             self._requests.clear()
+            self._spilled_requests.clear()
+            self._restore_workspaces.clear()
+            self._spilled_bytes = 0
+            self._restore_workspace_bytes = 0
+            self._last_access.clear()
             self._pending = None
             self._closed = True
 
     def sequence_length(self, request_id: int) -> int:
         self._guard()
-        return len(self._require_request(request_id).cache_keys)
+        record = self._require_logical_request(request_id)
+        return len(record.cache_keys)
 
     def metrics(self) -> PagedCacheMetrics:
         self._guard()
@@ -585,11 +675,39 @@ class HFPagedStageCache:
         """Return logical (unrounded, potentially shared) KV for one request."""
 
         self._guard()
-        record = self._require_request(request_id)
+        record = self._require_logical_request(request_id)
         return len(record.cache_keys) * self.bytes_per_token
 
+    def spill(self, request_id: int) -> PagedCacheMetrics:
+        """Move one idle resident request into the integrity-checked CPU tier."""
+
+        self._guard()
+        self._require_idle()
+        request_id = self._validate_request_id(request_id)
+        if request_id in self._spilled_requests:
+            self._touch(request_id)
+            return self._metrics()
+        record = self._require_request(request_id)
+        manager = self.cache.group_cache_managers[0]
+        if not manager.block_table[record.backend_id]:
+            raise ValueError("cannot spill a request without resident KV blocks")
+        self._spill_resident_request(record)
+        return self._metrics()
+
+    def restore(self, request_id: int) -> PagedCacheMetrics:
+        """Restore one spilled request before it resumes model execution."""
+
+        self._guard()
+        self._require_idle()
+        request_id = self._validate_request_id(request_id)
+        if request_id in self._requests:
+            self._touch(request_id)
+            return self._metrics()
+        self._restore_spilled_request(request_id)
+        return self._metrics()
+
     def unique_physical_bytes(self, request_ids: Sequence[int]) -> int:
-        """Return physical block occupancy, deduplicating shared prefixes."""
+        """Return cross-tier physical occupancy, deduplicating resident prefixes."""
 
         self._guard()
         ids = tuple(request_ids)
@@ -597,10 +715,14 @@ class HFPagedStageCache:
             raise ValueError("request_ids must be unique")
         manager = self.cache.group_cache_managers[0]
         blocks: set[int] = set()
+        spilled_bytes = 0
         for request_id in ids:
-            record = self._require_request(request_id)
-            blocks.update(manager.block_table[record.backend_id])
-        return len(blocks) * self.bytes_per_block
+            record = self._require_logical_request(request_id)
+            if isinstance(record, _SpilledRequest):
+                spilled_bytes += record.byte_count
+            else:
+                blocks.update(manager.block_table[record.backend_id])
+        return len(blocks) * self.bytes_per_block + spilled_bytes
 
     def project_incremental_physical_bytes(
         self,
@@ -613,7 +735,7 @@ class HFPagedStageCache:
 
         self._guard()
         self._require_idle()
-        parent = self._require_request(parent_request_id)
+        parent = self._require_logical_request(parent_request_id)
         for name, value in (
             ("new_leaf_count", new_leaf_count),
             ("delta_tokens", delta_tokens),
@@ -624,7 +746,7 @@ class HFPagedStageCache:
                 raise ValueError(f"{name} cannot be negative")
         if new_leaf_count == 0:
             return 0
-        if len(self._requests) + new_leaf_count > self.max_active_requests:
+        if self._active_request_count() + new_leaf_count > self.max_active_requests:
             raise ValueError("projection exceeds maximum active request count")
         parent_length = len(parent.cache_keys)
         projected_length = parent_length + delta_tokens
@@ -641,11 +763,6 @@ class HFPagedStageCache:
             - parent_length // self.block_size
         )
         required_blocks = new_leaf_count * blocks_per_leaf
-        if required_blocks > self.cache.get_num_free_blocks():
-            raise MemoryError(
-                "paged cache has insufficient blocks for projected leaves: "
-                f"{required_blocks} > {self.cache.get_num_free_blocks()}"
-            )
         return required_blocks * self.bytes_per_block
 
     def project_tree_incremental_physical_bytes(
@@ -658,9 +775,9 @@ class HFPagedStageCache:
 
         self._guard()
         self._require_idle()
-        parent = self._require_request(parent_request_id)
+        parent = self._require_logical_request(parent_request_id)
         deltas = tuple(delta_tokens_by_leaf)
-        if len(self._requests) + len(deltas) > self.max_active_requests:
+        if self._active_request_count() + len(deltas) > self.max_active_requests:
             raise ValueError("projection exceeds maximum active request count")
         parent_length = len(parent.cache_keys)
         shared_complete_blocks = parent_length // self.block_size
@@ -690,7 +807,7 @@ class HFPagedStageCache:
 
         self._guard()
         self._require_idle()
-        record = self._require_request(request_id)
+        record = self._require_logical_request(request_id)
         if not isinstance(additional_tokens, int) or isinstance(additional_tokens, bool):
             raise TypeError("additional_tokens must be an integer")
         if additional_tokens < 0:
@@ -707,6 +824,27 @@ class HFPagedStageCache:
             - ceil(current_length / self.block_size)
         )
         return required_blocks * self.bytes_per_block
+
+    def available_physical_bytes(self) -> int:
+        """Return a conservative one-request allocation ceiling.
+
+        The stage ABI asks for capacity without identifying the request that
+        will grow. Therefore this reports free blocks plus only the minimum
+        spill-reclaimable blocks across every possible resident request being
+        protected. It can underestimate a particular request, but it cannot
+        count that same request as an eviction candidate.
+        """
+
+        self._guard()
+        self._require_idle()
+        free_blocks = self.cache.get_num_free_blocks()
+        if not self._requests or self.cpu_spill_limit_bytes <= 0:
+            return free_blocks * self.bytes_per_block
+        guaranteed_reclaimable = min(
+            self._reclaimable_block_count(protected_request_ids={request_id})
+            for request_id in self._requests
+        )
+        return (free_blocks + guaranteed_reclaimable) * self.bytes_per_block
 
     def snapshot(self) -> PagedCacheSnapshot:
         """Return immutable block/refcount observability for tests and benchmarks."""
@@ -729,11 +867,26 @@ class HFPagedStageCache:
                     ref_counts=ref_counts,
                 )
             )
+        for request_id in sorted(self._spilled_requests):
+            record = self._spilled_requests[request_id]
+            requests.append(
+                PagedRequestSnapshot(
+                    request_id=request_id,
+                    sequence_length=len(record.cache_keys),
+                    block_ids=(),
+                    ref_counts=(),
+                    residency="cpu-spill",
+                    spill_bytes=record.byte_count,
+                )
+            )
+        requests.sort(key=lambda request: request.request_id)
         return PagedCacheSnapshot(
             requests=tuple(requests),
             free_blocks=self.cache.get_num_free_blocks(),
             total_blocks=self.num_blocks,
             block_size=self.block_size,
+            spilled_bytes=self._spilled_bytes,
+            spill_limit_bytes=self.cpu_spill_limit_bytes,
         )
 
     def fork(self, child_request_id: int, parent_request_id: int) -> PagedCacheMetrics:
@@ -742,13 +895,23 @@ class HFPagedStageCache:
         self._guard()
         self._require_idle()
         child_request_id = self._validate_request_id(child_request_id)
-        parent = self._require_request(parent_request_id)
+        parent = self._ensure_resident_request(parent_request_id)
         if child_request_id == parent.request_id:
             raise ValueError("fork child and parent request IDs must differ")
-        if child_request_id in self._requests:
+        if (
+            child_request_id in self._requests
+            or child_request_id in self._spilled_requests
+            or child_request_id in self._restore_workspaces
+        ):
             raise ValueError(f"fork child request {child_request_id} is already active")
-        if len(self._requests) >= self.max_active_requests:
+        if self._active_request_count() >= self.max_active_requests:
             raise ValueError("maximum active request count reached")
+        private_tail_blocks = 1 if len(parent.cache_keys) % self.block_size else 0
+        if private_tail_blocks and self.cpu_spill_limit_bytes > 0:
+            self._ensure_free_blocks(
+                private_tail_blocks,
+                protected_request_ids={parent.request_id},
+            )
         if self.cache.compute_max_num_forks(parent.backend_id) < 1:
             raise MemoryError("paged cache has no capacity for a private fork tail")
 
@@ -772,6 +935,8 @@ class HFPagedStageCache:
             child_backend_id,
             parent.cache_keys.copy(),
         )
+        self._touch(parent.request_id)
+        self._touch(child_request_id)
         self._after_mutation()
         copied_bytes = len(source_blocks) * self.bytes_per_block
         newly_reserved = len(destination_blocks) * self.bytes_per_block
@@ -781,27 +946,97 @@ class HFPagedStageCache:
         )
 
     def promote(self, parent_request_id: int, child_request_id: int) -> PagedCacheMetrics:
-        """Replace the parent with a selected child's KV state without copying."""
+        """Replace the parent with a selected child's KV state without copying.
+
+        Promotion is tier-aware: a spilled child remains spilled and a resident
+        child keeps its block table. It never restores parent and child
+        sequentially, which could otherwise evict them back and forth when the
+        device pool is full.
+        """
 
         self._guard()
         self._require_idle()
-        parent = self._require_request(parent_request_id)
-        child = self._require_request(child_request_id)
+        parent_request_id = self._validate_request_id(parent_request_id)
+        child_request_id = self._validate_request_id(child_request_id)
+        parent = self._require_logical_request(parent_request_id)
+        child = self._require_logical_request(child_request_id)
         if parent.request_id == child.request_id:
             raise ValueError("promote parent and child request IDs must differ")
 
         manager = self.cache.group_cache_managers[0]
-        child_blocks = manager.block_table.get(child.backend_id)
-        parent_blocks = manager.block_table.get(parent.backend_id)
-        if child_blocks is None or parent_blocks is None:
-            self._poisoned = True
-            raise PagedStageCorruptionError("promote encountered a missing block table")
-        moved_blocks = child_blocks
-        manager.block_table.pop(child.backend_id)
-        self.cache.free_blocks(parent.backend_id)
-        manager.block_table[parent.backend_id] = moved_blocks
-        parent.cache_keys = child.cache_keys
-        del self._requests[child.request_id]
+        if isinstance(child, _SpilledRequest):
+            self._validate_spilled_request(child)
+            if isinstance(parent, _RequestRecord):
+                if manager.block_table.get(parent.backend_id) is None:
+                    self._poisoned = True
+                    raise PagedStageCorruptionError(
+                        "resident promote parent has no block table"
+                    )
+                try:
+                    self.cache.free_blocks(parent.backend_id)
+                except BaseException as free_error:
+                    if parent.backend_id not in manager.block_table:
+                        self._poisoned = True
+                        raise PagedStageCorruptionError(
+                            "promote parent release changed allocator state "
+                            "before failing"
+                        ) from free_error
+                    raise
+                del self._requests[parent.request_id]
+            else:
+                del self._spilled_requests[parent.request_id]
+                self._spilled_bytes -= parent.byte_count
+
+            del self._spilled_requests[child.request_id]
+            self._spilled_requests[parent.request_id] = _SpilledRequest(
+                request_id=parent.request_id,
+                backend_id=parent.backend_id,
+                cache_keys=child.cache_keys,
+                key_blocks=child.key_blocks,
+                value_blocks=child.value_blocks,
+                byte_count=child.byte_count,
+                digest=child.digest,
+            )
+        else:
+            child_blocks = manager.block_table.get(child.backend_id)
+            if child_blocks is None:
+                self._poisoned = True
+                raise PagedStageCorruptionError(
+                    "resident promote child has no block table"
+                )
+            moved_blocks = child_blocks
+            if isinstance(parent, _RequestRecord):
+                if manager.block_table.get(parent.backend_id) is None:
+                    self._poisoned = True
+                    raise PagedStageCorruptionError(
+                        "resident promote parent has no block table"
+                    )
+                try:
+                    self.cache.free_blocks(parent.backend_id)
+                except BaseException as free_error:
+                    if parent.backend_id not in manager.block_table:
+                        self._poisoned = True
+                        raise PagedStageCorruptionError(
+                            "promote parent release changed allocator state "
+                            "before failing"
+                        ) from free_error
+                    raise
+                parent.cache_keys = child.cache_keys
+            else:
+                del self._spilled_requests[parent.request_id]
+                self._spilled_bytes -= parent.byte_count
+                parent = _RequestRecord(
+                    request_id=parent.request_id,
+                    backend_id=parent.backend_id,
+                    cache_keys=list(child.cache_keys),
+                )
+                self._requests[parent.request_id] = parent
+            manager.block_table.pop(child.backend_id)
+            manager.block_table[parent.backend_id] = moved_blocks
+            del self._requests[child.request_id]
+
+        self._last_access.pop(child.request_id, None)
+        self._touch(parent.request_id)
         self._after_mutation()
         return self._metrics()
 
@@ -810,7 +1045,7 @@ class HFPagedStageCache:
 
         self._guard()
         self._require_idle()
-        record = self._require_request(request_id)
+        record = self._ensure_resident_request(request_id)
         if not isinstance(token_count, int) or isinstance(token_count, bool):
             raise TypeError("token_count must be an integer")
         current_length = len(record.cache_keys)
@@ -837,6 +1072,10 @@ class HFPagedStageCache:
             retained_tail_meta = block_manager._id_to_block[retained_tail]
             if retained_tail_meta.is_complete:
                 parent_block = retained[-2] if len(retained) > 1 else None
+                self._ensure_free_blocks(
+                    1,
+                    protected_request_ids={record.request_id},
+                )
                 replacement = block_manager.get_free_blocks(
                     1,
                     last_block_id=parent_block,
@@ -860,6 +1099,7 @@ class HFPagedStageCache:
         if removed:
             block_manager.free_blocks(removed, shareable=True)
         del record.cache_keys[token_count:]
+        self._touch(record.request_id)
         self._after_mutation()
         return self._metrics(
             copied_bytes=copied_bytes,
@@ -884,7 +1124,7 @@ class HFPagedStageCache:
 
         self._guard()
         self._require_idle()
-        record = self._require_request(request_id)
+        record = self._ensure_resident_request(request_id)
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("provide exactly one of input_ids or inputs_embeds")
         input_tensor = input_ids if input_ids is not None else inputs_embeds
@@ -961,6 +1201,10 @@ class HFPagedStageCache:
         old_blocks = ceil(old_length / self.block_size) if old_length else 0
         new_blocks = ceil(new_length / self.block_size)
         blocks_to_allocate = new_blocks - old_blocks
+        self._ensure_free_blocks(
+            blocks_to_allocate,
+            protected_request_ids={record.request_id},
+        )
         allocated = self.cache.allocate_blocks(
             blocks_to_allocate,
             record.backend_id,
@@ -1048,6 +1292,7 @@ class HFPagedStageCache:
             )
             self.cache.mark_shareable_blocks_as_complete(state, newly_complete)
         self._pending = None
+        self._touch(record.request_id)
         self._after_mutation()
         return self._metrics(
             newly_reserved_bytes=(
@@ -1064,6 +1309,7 @@ class HFPagedStageCache:
         if record is None:
             self._poisoned = True
             return
+        self._last_access.pop(pending.request_id, None)
         try:
             self.cache.free_blocks(record.backend_id)
             self._assert_integrity()
@@ -1101,6 +1347,9 @@ class HFPagedStageCache:
         newly_reserved_bytes: int = 0,
     ) -> PagedCacheMetrics:
         logical_tokens = sum(len(record.cache_keys) for record in self._requests.values())
+        logical_tokens += sum(
+            len(record.cache_keys) for record in self._spilled_requests.values()
+        )
         unique_blocks = len(self._unique_block_ids())
         return PagedCacheMetrics(
             logical_bytes=logical_tokens * self.bytes_per_token,
@@ -1109,8 +1358,24 @@ class HFPagedStageCache:
             newly_reserved_bytes=newly_reserved_bytes,
             peak_workspace=None,
             pool_reserved_bytes=self.pool_reserved_bytes,
-            active_requests=len(self._requests),
+            active_requests=self._active_request_count(),
             free_blocks=self.cache.get_num_free_blocks(),
+            spilled_bytes=self._spilled_bytes,
+            spilled_requests=len(self._spilled_requests),
+            spill_count=self._spill_count,
+            restore_count=self._restore_count,
+            spill_failures=self._spill_failures,
+            restore_failures=self._restore_failures,
+            spill_bytes_transferred=self._spill_bytes_transferred,
+            restore_bytes_transferred=self._restore_bytes_transferred,
+            spill_time_ns=self._spill_time_ns,
+            restore_time_ns=self._restore_time_ns,
+            restore_workspace_bytes=self._restore_workspace_bytes,
+            peak_restore_workspace_bytes=self._peak_restore_workspace_bytes,
+            current_cpu_payload_bytes=(
+                self._spilled_bytes + self._restore_workspace_bytes
+            ),
+            peak_cpu_payload_bytes=self._peak_cpu_payload_bytes,
         )
 
     def _unique_block_ids(self) -> set[int]:
@@ -1145,8 +1410,62 @@ class HFPagedStageCache:
     def _assert_integrity(self) -> None:
         if self._closed:
             return
-        if len(self._requests) > self.max_active_requests:
+        if self._active_request_count() > self.max_active_requests:
             raise PagedStageCorruptionError("active request limit exceeded")
+        request_sets = (
+            set(self._requests),
+            set(self._spilled_requests),
+            set(self._restore_workspaces),
+        )
+        if any(
+            left.intersection(right)
+            for index, left in enumerate(request_sets)
+            for right in request_sets[index + 1 :]
+        ):
+            raise PagedStageCorruptionError(
+                "request appears in more than one KV residency tier"
+            )
+        expected_spilled_bytes = sum(
+            record.byte_count for record in self._spilled_requests.values()
+        )
+        if expected_spilled_bytes != self._spilled_bytes:
+            raise PagedStageCorruptionError(
+                "CPU spill accounting does not match stored requests"
+            )
+        if not 0 <= self._spilled_bytes <= self.cpu_spill_limit_bytes:
+            raise PagedStageCorruptionError("CPU spill tier exceeded its byte limit")
+        expected_workspace_bytes = sum(
+            record.byte_count for record in self._restore_workspaces.values()
+        )
+        if expected_workspace_bytes != self._restore_workspace_bytes:
+            raise PagedStageCorruptionError(
+                "restore workspace accounting does not match transitioning requests"
+            )
+        if self._restore_workspace_bytes < 0:
+            raise PagedStageCorruptionError("restore workspace bytes cannot be negative")
+        if (
+            len(self._restore_workspaces) > 1
+            or self._restore_workspace_bytes > self.cpu_spill_limit_bytes
+        ):
+            raise PagedStageCorruptionError(
+                "restore workspace exceeded its one-target payload bound"
+            )
+        current_cpu_payload = self._spilled_bytes + self._restore_workspace_bytes
+        if current_cpu_payload > 2 * self.cpu_spill_limit_bytes:
+            raise PagedStageCorruptionError(
+                "combined stored and restore-workspace payload exceeded its bound"
+            )
+        if self._peak_cpu_payload_bytes < current_cpu_payload:
+            raise PagedStageCorruptionError(
+                "CPU payload peak accounting moved below current payload"
+            )
+        active_ids = (
+            set(self._requests)
+            .union(self._spilled_requests)
+            .union(self._restore_workspaces)
+        )
+        if set(self._last_access) != active_ids:
+            raise PagedStageCorruptionError("request access ledger differs from active requests")
         expected_backend_ids = {record.backend_id for record in self._requests.values()}
         if len(expected_backend_ids) != len(self._requests):
             raise PagedStageCorruptionError("duplicate backend request IDs")
@@ -1190,6 +1509,529 @@ class HFPagedStageCache:
         if self.cache.get_num_free_blocks() + len(observed_refs) != self.num_blocks:
             raise PagedStageCorruptionError("free and active block counts do not cover the pool")
 
+    def _active_request_count(self) -> int:
+        return (
+            len(self._requests)
+            + len(self._spilled_requests)
+            + len(self._restore_workspaces)
+        )
+
+    def _touch(self, request_id: int) -> None:
+        self._access_clock += 1
+        self._last_access[request_id] = self._access_clock
+
+    def _record_cpu_payload_peak(self) -> None:
+        self._peak_cpu_payload_bytes = max(
+            self._peak_cpu_payload_bytes,
+            self._spilled_bytes + self._restore_workspace_bytes,
+        )
+
+    def _ensure_free_blocks(
+        self,
+        required_blocks: int,
+        *,
+        protected_request_ids: set[int],
+    ) -> None:
+        planned = self._plan_spills(
+            required_blocks,
+            protected_request_ids=protected_request_ids,
+        )
+        self._spill_candidates_atomically(planned)
+
+    def _plan_spills(
+        self,
+        required_blocks: int,
+        *,
+        protected_request_ids: set[int],
+        spill_credit_bytes: int = 0,
+    ) -> tuple[_RequestRecord, ...]:
+        """Return an LRU spill plan without changing residency or refcounts."""
+
+        free_blocks = self.cache.get_num_free_blocks()
+        if required_blocks <= free_blocks:
+            return ()
+        if self.cpu_spill_limit_bytes <= 0:
+            raise MemoryError("paged cache has insufficient free blocks")
+        missing = required_blocks - free_blocks
+        planned, released_blocks = self._select_spill_candidates(
+            protected_request_ids=protected_request_ids,
+            available_spill_bytes=(
+                self.cpu_spill_limit_bytes
+                - self._spilled_bytes
+                + spill_credit_bytes
+            ),
+            stop_after_blocks=missing,
+        )
+        if released_blocks < missing:
+            raise MemoryError(
+                "paged cache cannot free enough blocks within the bounded CPU spill tier"
+            )
+        return planned
+
+    def _reclaimable_block_count(
+        self,
+        *,
+        protected_request_ids: set[int],
+    ) -> int:
+        if self.cpu_spill_limit_bytes <= 0:
+            return 0
+        _, released_blocks = self._select_spill_candidates(
+            protected_request_ids=protected_request_ids,
+            available_spill_bytes=(
+                self.cpu_spill_limit_bytes - self._spilled_bytes
+            ),
+            stop_after_blocks=None,
+        )
+        return released_blocks
+
+    def _select_spill_candidates(
+        self,
+        *,
+        protected_request_ids: set[int],
+        available_spill_bytes: int,
+        stop_after_blocks: int | None,
+    ) -> tuple[tuple[_RequestRecord, ...], int]:
+        """Select candidates and count only blocks whose last ref is released."""
+
+        if available_spill_bytes < 0:
+            raise PagedStageCorruptionError("CPU spill accounting exceeded its limit")
+        manager = self.cache.group_cache_managers[0]
+        block_manager = self.cache._block_manager
+        candidates = sorted(
+            (
+                record
+                for request_id, record in self._requests.items()
+                if request_id not in protected_request_ids
+                and manager.block_table[record.backend_id]
+            ),
+            key=lambda record: (self._last_access[record.request_id], record.request_id),
+        )
+        planned: list[_RequestRecord] = []
+        planned_refs: Counter[int] = Counter()
+        planned_bytes = 0
+        released_blocks = 0
+        for candidate in candidates:
+            block_ids = manager.block_table[candidate.backend_id]
+            candidate_bytes = len(block_ids) * self.bytes_per_block
+            if planned_bytes + candidate_bytes > available_spill_bytes:
+                continue
+            planned.append(candidate)
+            planned_bytes += candidate_bytes
+            planned_refs.update(block_ids)
+            released_blocks = sum(
+                1
+                for block_id, selected_refs in planned_refs.items()
+                if selected_refs == block_manager._id_to_block[block_id].ref_count
+            )
+            if (
+                stop_after_blocks is not None
+                and released_blocks >= stop_after_blocks
+            ):
+                break
+        return tuple(planned), released_blocks
+
+    def _spill_candidates_atomically(
+        self,
+        planned: Sequence[_RequestRecord],
+    ) -> tuple[int, ...]:
+        """Apply a preflighted plan or restore every completed eviction."""
+
+        if not planned:
+            return ()
+        access_before = dict(self._last_access)
+        clock_before = self._access_clock
+        spilled_ids: list[int] = []
+        try:
+            for candidate in planned:
+                self._spill_resident_request(candidate)
+                spilled_ids.append(candidate.request_id)
+        except BaseException as error:
+            try:
+                self._rollback_spilled_candidates(tuple(spilled_ids))
+                self._last_access = access_before
+                self._access_clock = clock_before
+                self._assert_integrity()
+            except BaseException as rollback_error:
+                self._poisoned = True
+                raise PagedStageCorruptionError(
+                    "CPU spill plan failed and residency rollback was incomplete"
+                ) from rollback_error
+            raise error
+        return tuple(spilled_ids)
+
+    def _rollback_spilled_candidates(self, request_ids: Sequence[int]) -> None:
+        for request_id in reversed(tuple(request_ids)):
+            spilled = self._spilled_requests.get(request_id)
+            if spilled is None:
+                raise PagedStageCorruptionError(
+                    f"spill rollback lost request {request_id}"
+                )
+            block_count = self._validate_spilled_request(spilled)
+            if block_count > self.cache.get_num_free_blocks():
+                raise PagedStageCorruptionError(
+                    "spill rollback cannot recover the original device residency"
+                )
+            try:
+                record = self._copy_spilled_to_device(spilled, block_count)
+                self._requests[request_id] = record
+                del self._spilled_requests[request_id]
+                self._spilled_bytes -= spilled.byte_count
+                self._restore_count += 1
+                self._restore_bytes_transferred += spilled.byte_count
+                self._touch(request_id)
+                self._after_mutation()
+            except BaseException:
+                self._restore_failures += 1
+                raise
+
+    def _spill_resident_request(self, record: _RequestRecord) -> None:
+        started_ns = perf_counter_ns()
+        try:
+            manager = self.cache.group_cache_managers[0]
+            block_ids = tuple(manager.block_table[record.backend_id])
+            byte_count = len(block_ids) * self.bytes_per_block
+            if self._spilled_bytes + byte_count > self.cpu_spill_limit_bytes:
+                raise MemoryError(
+                    "request KV exceeds the remaining bounded CPU spill capacity"
+                )
+            key_blocks = tuple(
+                self._copy_blocks_to_cpu(tensor, block_ids)
+                for tensor in self.cache.key_cache
+            )
+            value_blocks = tuple(
+                self._copy_blocks_to_cpu(tensor, block_ids)
+                for tensor in self.cache.value_cache
+            )
+            actual_bytes = sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in (*key_blocks, *value_blocks)
+            )
+            if actual_bytes != byte_count:
+                raise PagedStageCorruptionError(
+                    f"CPU spill copied {actual_bytes} bytes, expected {byte_count}"
+                )
+            cache_keys = tuple(record.cache_keys)
+            digest = self._spill_digest(cache_keys, key_blocks, value_blocks)
+            spilled = _SpilledRequest(
+                request_id=record.request_id,
+                backend_id=record.backend_id,
+                cache_keys=cache_keys,
+                key_blocks=key_blocks,
+                value_blocks=value_blocks,
+                byte_count=byte_count,
+                digest=digest,
+            )
+
+            try:
+                self.cache.free_blocks(record.backend_id)
+            except BaseException as free_error:
+                # HF removes the block table before decrementing its refs. If
+                # an unexpected failure happens after that point, retain the
+                # completed CPU copy as the logical request and poison the
+                # adapter instead of silently publishing a missing resident.
+                if record.backend_id not in manager.block_table:
+                    del self._requests[record.request_id]
+                    self._spilled_requests[record.request_id] = spilled
+                    self._spilled_bytes += byte_count
+                    self._record_cpu_payload_peak()
+                    self._touch(record.request_id)
+                    self._poisoned = True
+                    raise PagedStageCorruptionError(
+                        "device block release failed after changing allocator state"
+                    ) from free_error
+                raise
+            del self._requests[record.request_id]
+            self._spilled_requests[record.request_id] = spilled
+            self._spilled_bytes += byte_count
+            self._record_cpu_payload_peak()
+            self._spill_count += 1
+            self._spill_bytes_transferred += byte_count
+            self._touch(record.request_id)
+            self._after_mutation()
+        except BaseException:
+            self._spill_failures += 1
+            raise
+        finally:
+            self._spill_time_ns += perf_counter_ns() - started_ns
+
+    def _restore_spilled_request(
+        self,
+        request_id: int,
+        *,
+        protected_request_ids: set[int] | None = None,
+    ) -> _RequestRecord:
+        """Restore one request while transactionally reusing its spill slot."""
+
+        request_id = self._validate_request_id(request_id)
+        spilled = self._spilled_requests.get(request_id)
+        if spilled is None:
+            raise ValueError(f"unknown paged request {request_id}")
+        detached = False
+        candidate_ids: tuple[int, ...] = ()
+        access_before = dict(self._last_access)
+        clock_before = self._access_clock
+        try:
+            block_count = self._validate_spilled_request(spilled)
+            protected = set(protected_request_ids or ())
+            protected.add(request_id)
+            planned = self._plan_spills(
+                block_count,
+                protected_request_ids=protected,
+                spill_credit_bytes=spilled.byte_count,
+            )
+
+            del self._spilled_requests[request_id]
+            self._spilled_bytes -= spilled.byte_count
+            self._restore_workspaces[request_id] = spilled
+            self._restore_workspace_bytes += spilled.byte_count
+            self._record_cpu_payload_peak()
+            self._peak_restore_workspace_bytes = max(
+                self._peak_restore_workspace_bytes,
+                self._restore_workspace_bytes,
+            )
+            detached = True
+            self._after_mutation()
+
+            candidate_ids = self._spill_candidates_atomically(planned)
+            record = self._copy_spilled_to_device(spilled, block_count)
+            self._requests[request_id] = record
+            del self._restore_workspaces[request_id]
+            self._restore_workspace_bytes -= spilled.byte_count
+            detached = False
+            self._restore_count += 1
+            self._restore_bytes_transferred += spilled.byte_count
+            self._touch(request_id)
+            self._after_mutation()
+            return record
+        except BaseException as error:
+            self._restore_failures += 1
+            if detached:
+                try:
+                    manager = self.cache.group_cache_managers[0]
+                    self._requests.pop(request_id, None)
+                    if spilled.backend_id in manager.block_table:
+                        self.cache.free_blocks(spilled.backend_id)
+                    self._rollback_spilled_candidates(candidate_ids)
+                    del self._restore_workspaces[request_id]
+                    self._restore_workspace_bytes -= spilled.byte_count
+                    self._spilled_requests[request_id] = spilled
+                    self._spilled_bytes += spilled.byte_count
+                    self._last_access = access_before
+                    self._access_clock = clock_before
+                    self._assert_integrity()
+                except BaseException as rollback_error:
+                    self._poisoned = True
+                    raise PagedStageCorruptionError(
+                        "CPU restore failed and residency rollback was incomplete"
+                    ) from rollback_error
+            raise error
+
+    def _validate_spilled_request(self, spilled: _SpilledRequest) -> int:
+        try:
+            observed_digest = self._spill_digest(
+                spilled.cache_keys,
+                spilled.key_blocks,
+                spilled.value_blocks,
+            )
+        except BaseException:
+            self._poisoned = True
+            raise
+        if observed_digest != spilled.digest:
+            self._poisoned = True
+            raise PagedStageCorruptionError(
+                f"CPU spill integrity check failed for request {spilled.request_id}"
+            )
+        if (
+            len(spilled.key_blocks) != len(self.cache.key_cache)
+            or len(spilled.value_blocks) != len(self.cache.value_cache)
+            or not spilled.key_blocks
+        ):
+            self._poisoned = True
+            raise PagedStageCorruptionError(
+                "CPU spill layer count does not match the device cache"
+            )
+        block_count = len(spilled.key_blocks[0])
+        expected_shape = (
+            block_count,
+            self.block_size,
+            self.cache.num_key_value_heads,
+            self.cache.head_dim,
+        )
+        for source, destination in zip(
+            (*spilled.key_blocks, *spilled.value_blocks),
+            (*self.cache.key_cache, *self.cache.value_cache),
+            strict=True,
+        ):
+            if source.shape != expected_shape or source.dtype != destination.dtype:
+                self._poisoned = True
+                raise PagedStageCorruptionError(
+                    "CPU spill tensor geometry or dtype does not match the device cache"
+                )
+        actual_bytes = sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in (*spilled.key_blocks, *spilled.value_blocks)
+        )
+        if actual_bytes != spilled.byte_count:
+            self._poisoned = True
+            raise PagedStageCorruptionError(
+                f"CPU spill byte count is {actual_bytes}, expected {spilled.byte_count}"
+            )
+        if (
+            block_count * self.bytes_per_block != spilled.byte_count
+            or ceil(len(spilled.cache_keys) / self.block_size) != block_count
+        ):
+            self._poisoned = True
+            raise PagedStageCorruptionError(
+                "CPU spill block geometry does not match its integrity-checked payload"
+            )
+        return block_count
+
+    def _copy_spilled_to_device(
+        self,
+        spilled: _SpilledRequest,
+        block_count: int,
+    ) -> _RequestRecord:
+        started_ns = perf_counter_ns()
+        try:
+            allocated = self.cache.allocate_blocks(
+                block_count,
+                spilled.backend_id,
+                allocated_blocks=0,
+            )
+            if allocated != block_count:
+                if allocated is not None:
+                    self.cache.free_blocks(spilled.backend_id)
+                raise MemoryError(
+                    "paged cache could not allocate all restored KV blocks"
+                )
+
+            manager = self.cache.group_cache_managers[0]
+            try:
+                destination_blocks = tuple(manager.block_table[spilled.backend_id])
+                if len(destination_blocks) != block_count:
+                    raise PagedStageCorruptionError(
+                        "restored request received an unexpected block table"
+                    )
+                self._copy_cpu_blocks_to_device(
+                    spilled.key_blocks,
+                    self.cache.key_cache,
+                    destination_blocks,
+                )
+                self._copy_cpu_blocks_to_device(
+                    spilled.value_blocks,
+                    self.cache.value_cache,
+                    destination_blocks,
+                )
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
+                complete_blocks = len(spilled.cache_keys) // self.block_size
+                if complete_blocks:
+                    state = RequestState(
+                        request_id=spilled.backend_id,
+                        initial_tokens=list(spilled.cache_keys),
+                    )
+                    self.cache.mark_shareable_blocks_as_complete(
+                        state,
+                        complete_blocks,
+                    )
+            except BaseException:
+                self.cache.free_blocks(spilled.backend_id)
+                raise
+            return _RequestRecord(
+                request_id=spilled.request_id,
+                backend_id=spilled.backend_id,
+                cache_keys=list(spilled.cache_keys),
+            )
+        finally:
+            self._restore_time_ns += perf_counter_ns() - started_ns
+
+    def _copy_blocks_to_cpu(
+        self,
+        tensor: torch.Tensor,
+        block_ids: tuple[int, ...],
+    ) -> torch.Tensor:
+        shape = (
+            len(block_ids),
+            self.block_size,
+            self.cache.num_key_value_heads,
+            self.cache.head_dim,
+        )
+        output = torch.empty(
+            shape,
+            dtype=tensor.dtype,
+            device="cpu",
+            pin_memory=self.device.type == "cuda",
+        )
+        source = tensor.view(
+            -1,
+            self.block_size,
+            self.cache.num_key_value_heads,
+            self.cache.head_dim,
+        )
+        for index, block_id in enumerate(block_ids):
+            output[index].copy_(source[block_id], non_blocking=False)
+        return output.contiguous()
+
+    def _copy_cpu_blocks_to_device(
+        self,
+        source_tensors: tuple[torch.Tensor, ...],
+        destination_tensors: list[torch.Tensor],
+        destination_blocks: tuple[int, ...],
+    ) -> None:
+        if len(source_tensors) != len(destination_tensors):
+            raise PagedStageCorruptionError("CPU spill layer count does not match cache")
+        for source, destination in zip(source_tensors, destination_tensors, strict=True):
+            expected_shape = (
+                len(destination_blocks),
+                self.block_size,
+                self.cache.num_key_value_heads,
+                self.cache.head_dim,
+            )
+            if source.shape != expected_shape or source.dtype != destination.dtype:
+                raise PagedStageCorruptionError(
+                    "CPU spill tensor geometry or dtype does not match the device cache"
+                )
+            destination_view = destination.view(
+                -1,
+                self.block_size,
+                self.cache.num_key_value_heads,
+                self.cache.head_dim,
+            )
+            if len(source) != len(destination_blocks):
+                raise PagedStageCorruptionError(
+                    "CPU spill block count does not match restored block table"
+                )
+            for index, block_id in enumerate(destination_blocks):
+                destination_view[block_id].copy_(source[index], non_blocking=False)
+
+    @staticmethod
+    def _spill_digest(
+        cache_keys: tuple[int, ...],
+        key_blocks: tuple[torch.Tensor, ...],
+        value_blocks: tuple[torch.Tensor, ...],
+    ) -> str:
+        digest = hashlib.sha256()
+        digest.update(
+            json.dumps(
+                {
+                    "cacheKeys": cache_keys,
+                    "keyShapes": [tuple(tensor.shape) for tensor in key_blocks],
+                    "valueShapes": [tuple(tensor.shape) for tensor in value_blocks],
+                    "keyDtypes": [str(tensor.dtype) for tensor in key_blocks],
+                    "valueDtypes": [str(tensor.dtype) for tensor in value_blocks],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        for tensor in (*key_blocks, *value_blocks):
+            if tensor.device.type != "cpu" or not tensor.is_contiguous():
+                raise PagedStageCorruptionError(
+                    "CPU spill tensors must remain contiguous CPU storage"
+                )
+            digest.update(memoryview(tensor.view(torch.uint8).numpy()))
+        return digest.hexdigest()
+
     def _require_idle(self) -> None:
         if self._pending is not None:
             raise RuntimeError("another paged forward is still pending")
@@ -1199,6 +2041,27 @@ class HFPagedStageCache:
         record = self._requests.get(request_id)
         if record is None:
             raise ValueError(f"unknown paged request {request_id}")
+        return record
+
+    def _require_logical_request(
+        self,
+        request_id: int,
+    ) -> _RequestRecord | _SpilledRequest:
+        request_id = self._validate_request_id(request_id)
+        record = self._requests.get(request_id)
+        if record is not None:
+            return record
+        spilled = self._spilled_requests.get(request_id)
+        if spilled is not None:
+            return spilled
+        raise ValueError(f"unknown paged request {request_id}")
+
+    def _ensure_resident_request(self, request_id: int) -> _RequestRecord:
+        request_id = self._validate_request_id(request_id)
+        record = self._requests.get(request_id)
+        if record is None:
+            record = self._restore_spilled_request(request_id)
+        self._touch(request_id)
         return record
 
     @staticmethod
@@ -1235,6 +2098,7 @@ class HFPagedStageRunner:
         max_batch_tokens: int = 256,
         max_active_requests: int = 8,
         max_sequence_tokens: int = 2048,
+        cpu_spill_bytes: int = 0,
     ) -> None:
         runtime_config = HFPagedStageRuntimeConfig(
             device=str(torch.device(device)),
@@ -1244,7 +2108,7 @@ class HFPagedStageRunner:
             max_batch_tokens=max_batch_tokens,
             max_active_requests=max_active_requests,
             max_sequence_tokens=max_sequence_tokens,
-            cpu_spill_bytes=0,
+            cpu_spill_bytes=cpu_spill_bytes,
         )
         resolved_device = torch.device(runtime_config.device)
         if resolved_device.type == "cuda" and not torch.cuda.is_available():
@@ -1292,6 +2156,7 @@ class HFPagedStageRunner:
             max_batch_tokens=runtime_config.max_batch_tokens,
             max_active_requests=runtime_config.max_active_requests,
             max_sequence_tokens=runtime_config.max_sequence_tokens,
+            cpu_spill_bytes=runtime_config.cpu_spill_bytes,
         )
 
         artifact = model_artifact_reference(
@@ -1322,6 +2187,8 @@ class HFPagedStageRunner:
                     "paged-kv-shared-prefix",
                     "fork-complete-block-zero-copy",
                     "fork-tail-copy",
+                    "bounded-cpu-kv-spill",
+                    "integrity-checked-atomic-kv-restore",
                     *adapter.semantic_features,
                 )
             )
@@ -1379,12 +2246,14 @@ class HFPagedStageRunner:
             max_batch_tokens=runtime.max_batch_tokens,
             max_active_requests=runtime.max_active_requests,
             max_sequence_tokens=runtime.max_sequence_tokens,
+            cpu_spill_bytes=runtime.cpu_spill_bytes,
         )
 
     def execution_snapshot(self) -> dict[str, Any]:
         """Publish observed bounded pool state and the honest spill contract."""
 
         runtime = self.runtime_config.to_document()
+        metrics = self.paged_cache.metrics()
         return {
             "backend": "hf-paged-cow",
             "configurationId": self.runtime_config.configuration_id,
@@ -1395,6 +2264,7 @@ class HFPagedStageRunner:
                 "numBlocks": self.paged_cache.num_blocks,
                 "reservedBytes": self.paged_cache.pool_reserved_bytes,
                 "freeBlocks": self.paged_cache.cache.get_num_free_blocks(),
+                "residentBytes": metrics.unique_physical_bytes,
             },
             "limits": {
                 "maxBatchTokens": self.runtime_config.max_batch_tokens,
@@ -1402,6 +2272,32 @@ class HFPagedStageRunner:
                 "maxSequenceTokens": self.runtime_config.max_sequence_tokens,
             },
             "cpuSpill": runtime["cpuSpill"],
+            "cpuSpillState": {
+                "usedBytes": metrics.spilled_bytes,
+                "storedPayloadBytes": metrics.spilled_bytes,
+                "requests": metrics.spilled_requests,
+                "spillCount": metrics.spill_count,
+                "restoreCount": metrics.restore_count,
+                "spillFailures": metrics.spill_failures,
+                "restoreFailures": metrics.restore_failures,
+                "spillBytesTransferred": metrics.spill_bytes_transferred,
+                "restoreBytesTransferred": metrics.restore_bytes_transferred,
+                "spillTimeNs": metrics.spill_time_ns,
+                "restoreTimeNs": metrics.restore_time_ns,
+                "restoreWorkspaceBytes": metrics.restore_workspace_bytes,
+                "peakRestoreWorkspaceBytes": metrics.peak_restore_workspace_bytes,
+                "currentCpuPayloadBytes": metrics.current_cpu_payload_bytes,
+                "peakCpuPayloadBytes": metrics.peak_cpu_payload_bytes,
+                "restoreWorkspaceUpperBoundBytes": (
+                    self.runtime_config.cpu_spill_bytes
+                ),
+                "maxCpuPayloadUpperBoundBytes": (
+                    2 * self.runtime_config.cpu_spill_bytes
+                ),
+                "storage": (
+                    "pinned-cpu" if self.device.type == "cuda" else "cpu"
+                ),
+            },
         }
 
     def begin(self, request_id: int) -> None:
@@ -1409,6 +2305,12 @@ class HFPagedStageRunner:
 
     def end(self, request_id: int) -> None:
         self.paged_cache.end(request_id)
+
+    def spill(self, request_id: int) -> None:
+        self.paged_cache.spill(request_id)
+
+    def restore(self, request_id: int) -> None:
+        self.paged_cache.restore(request_id)
 
     def close(self) -> None:
         self.paged_cache.close()
@@ -1482,12 +2384,9 @@ class HFPagedStageRunner:
         )
 
     def available_physical_cache_bytes(self) -> int:
-        """Return allocatable bytes in the runner-owned preallocated KV pool."""
+        """Return free plus conservatively spill-reclaimable KV payload bytes."""
 
-        return (
-            self.paged_cache.cache.get_num_free_blocks()
-            * self.paged_cache.bytes_per_block
-        )
+        return self.paged_cache.available_physical_bytes()
 
     def last_fork_report(self) -> StageKVForkReport | None:
         return self._last_fork_report

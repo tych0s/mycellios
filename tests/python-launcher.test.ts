@@ -6,6 +6,7 @@ import {
   validatePythonLaunchDescription,
   type PythonLaunchCompilerOptions,
   type PythonNativeGgufStageInput,
+  type PythonPagedKvStageInput,
   type PythonCellMemberLaunch,
   type PythonPipelineLaunchDescription,
   type PythonRemoteStageLaunch,
@@ -345,6 +346,37 @@ function nativeGgufOptions(
   };
 }
 
+function pagedKvStage(
+  overrides: Partial<PythonPagedKvStageInput> = {},
+): PythonPagedKvStageInput {
+  return {
+    schema: "mycellios-hf-paged-stage/2",
+    device: "cuda:0",
+    attentionBackend: "eager",
+    blockSize: 16,
+    numBlocks: 4_096,
+    maxBatchTokens: 256,
+    maxActiveRequests: 16,
+    maxSequenceTokens: 4_096,
+    cpuSpillBytes: 64 * MIB,
+    ...overrides,
+  };
+}
+
+function pagedKvOptions(
+  current: RuntimePipelineManifestV2,
+  overrides: Partial<PythonPagedKvStageInput> = {},
+): Partial<PythonLaunchCompilerOptions> {
+  return {
+    pagedKvStages: Object.fromEntries(
+      current.plans.prefill.stages.map((stage) => [
+        stage.stageId,
+        pagedKvStage(overrides),
+      ]),
+    ),
+  };
+}
+
 function addCooperativeMember(stage: RuntimeVirtualStageManifest): void {
   const original = stage.members[0]!;
   const assigned = Math.floor(original.assignedMemoryBytes / 2);
@@ -618,6 +650,85 @@ describe("GDLP/2 Python launch compiler", () => {
       description.launchOrder.map((entry) => entry.processId),
     );
     expect(description.route.rootProcessId).toBe(root(description).processId);
+  });
+
+  it("seals a complete native paged-KV contract into every stage process", () => {
+    const current = manifest();
+    const description = compile(current, pagedKvOptions(current));
+    const stageIds = current.plans.prefill.stages.map((stage) => stage.stageId).sort();
+    expect(Object.keys(description.configuration.pagedKvStages)).toEqual(stageIds);
+    for (const process of description.launchOrder) {
+      expect(process.command.args).toContain("--paged-kv");
+      expect(argumentValue(process.command.args, "--paged-device")).toBe("cuda:0");
+      expect(argumentValue(process.command.args, "--paged-attention-backend")).toBe(
+        "eager",
+      );
+      expect(argumentValue(process.command.args, "--paged-block-size")).toBe("16");
+      expect(argumentValue(process.command.args, "--paged-num-blocks")).toBe("4096");
+      expect(
+        argumentValue(process.command.args, "--paged-max-batch-tokens"),
+      ).toBe("256");
+      expect(
+        argumentValue(process.command.args, "--paged-max-active-requests"),
+      ).toBe("16");
+      expect(
+        argumentValue(process.command.args, "--paged-max-sequence-tokens"),
+      ).toBe("4096");
+      expect(argumentValue(process.command.args, "--paged-cpu-spill-bytes")).toBe(
+        String(64 * MIB),
+      );
+    }
+    expect(() => validatePythonLaunchDescription(description)).not.toThrow();
+
+    const changed = compile(
+      current,
+      pagedKvOptions(current, { cpuSpillBytes: 32 * MIB }),
+    );
+    expect(changed.route.routeId).not.toBe(description.route.routeId);
+    expect(changed.launchId).not.toBe(description.launchId);
+  });
+
+  it("fails closed for partial, unsafe or conflicting paged-KV contracts", () => {
+    const current = manifest();
+    const firstStage = current.plans.prefill.stages[0]!;
+    expect(() =>
+      compile(current, {
+        pagedKvStages: { [firstStage.stageId]: pagedKvStage() },
+      }),
+    ).toThrow("python_paged_kv_stage_binding_is_missing");
+
+    expect(() =>
+      compile(current, pagedKvOptions(current, { device: "cpu" })),
+    ).toThrow("python_paged_kv_cpu_spill_requires_gpu");
+    expect(() =>
+      compile(
+        current,
+        pagedKvOptions(current, {
+          numBlocks: 8,
+          maxSequenceTokens: 4_096,
+        }),
+      ),
+    ).toThrow("python_paged_kv_sequence_exceeds_pool");
+    expect(() =>
+      compile(current, pagedKvOptions(current, { maxActiveRequests: 1 })),
+    ).toThrow("python_paged_kv_active_request_capacity_is_too_small");
+    expect(() =>
+      compile(current, pagedKvOptions(current, { maxBatchTokens: 8 })),
+    ).toThrow("python_paged_kv_batch_token_capacity_is_too_small");
+
+    expect(() =>
+      compile(current, {
+        ...nativeGgufOptions(current),
+        ...pagedKvOptions(current),
+      }),
+    ).toThrow("python_stage_backend_is_not_exclusive");
+
+    const cell = certifyTensorParallelCell(
+      materializeTensorParallelCell(current),
+    );
+    expect(() => compile(cell, pagedKvOptions(cell))).toThrow(
+      "python_paged_kv_stage_has_conflicting_execution",
+    );
   });
 
   it("proves logical stage zero never invokes stage_cli", () => {

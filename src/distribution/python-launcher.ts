@@ -26,6 +26,12 @@ const DEFAULT_RETAINED_SESSIONS = 4;
 const DEFAULT_RETAINED_SESSION_TOKENS = 8_192;
 const DEFAULT_RETAINED_SESSION_TTL_SECONDS = 10 * 60;
 const RECOVERY_STANDBY_SCHEMA = "gdlp-recovery-standby-route/1";
+const PAGED_STAGE_RUNTIME_SCHEMA = "mycellios-hf-paged-stage/2";
+const MAX_PAGED_BLOCK_SIZE = 256;
+const MAX_PAGED_NUM_BLOCKS = 1_048_576;
+const MAX_PAGED_BATCH_TOKENS = 65_536;
+const MAX_PAGED_ACTIVE_REQUESTS = 4_096;
+const MAX_PAGED_SEQUENCE_TOKENS = 1_048_576;
 export const MYCELLIOS_STAGE_MODULE = "distributed_runtime.stage_cli";
 export const MYCELLIOS_SERVER_MODULE = "distributed_runtime.server";
 export const MYCELLIOS_CELL_MEMBER_MODULE =
@@ -181,6 +187,12 @@ export interface PythonLaunchCompilerOptions {
    * complete coverage and seals them to the stage budgets before execution.
    */
   ramBackedMoeStages?: Record<string, PythonRamBackedMoeStageInput>;
+  /**
+   * Complete, per-stage Mycellios paged-KV contracts. Supplying one binding
+   * requires every logical stage so no process silently falls back to an
+   * incompatible cache backend.
+   */
+  pagedKvStages?: Record<string, PythonPagedKvStageInput>;
 }
 
 export interface PythonRecoveryStandbyRouteInput {
@@ -232,6 +244,26 @@ export interface PythonNativeGgufStageInput {
 
 export interface PythonNativeGgufStageConfiguration
   extends PythonNativeGgufStageInput {}
+
+export interface PythonPagedKvStageInput {
+  schema: typeof PAGED_STAGE_RUNTIME_SCHEMA;
+  /** Canonical torch spelling: cpu, cuda or cuda:<index>. */
+  device: string;
+  attentionBackend: "eager" | "sdpa";
+  blockSize: number;
+  numBlocks: number;
+  maxBatchTokens: number;
+  maxActiveRequests: number;
+  maxSequenceTokens: number;
+  /**
+   * Maximum KV tensor payload bytes in the CPU tier. This is not a promise
+   * about total process RSS or pinned-allocator bookkeeping.
+   */
+  cpuSpillBytes: number;
+}
+
+export interface PythonPagedKvStageConfiguration
+  extends PythonPagedKvStageInput {}
 
 export type PythonRamBackedMoeAdapterId =
   | "transformers-qwen3-moe-v1"
@@ -329,6 +361,8 @@ export interface PythonLaunchConfiguration {
   nativeGgufStages: Record<string, PythonNativeGgufStageConfiguration>;
   /** Sorted, host-local bindings for the certified physical RAM-backed runner. */
   ramBackedMoeStages: Record<string, PythonRamBackedMoeStageConfiguration>;
+  /** Sorted, complete bindings for the native paged-KV runner. */
+  pagedKvStages: Record<string, PythonPagedKvStageConfiguration>;
 }
 
 export interface PythonPrefillLaunchSettings {
@@ -548,6 +582,7 @@ function buildDescription(
     codec,
     configuration.nativeGgufStages,
     configuration.ramBackedMoeStages,
+    configuration.pagedKvStages,
     configuration.recovery,
   );
   const planIds: [string, string] = [prefill.planId, decode.planId];
@@ -897,6 +932,7 @@ function renderRemoteStageArguments(
 ): string[] {
   const args = pythonModulePrefix(configuration.stageModule);
   const ramBackedMoe = configuration.ramBackedMoeStages[launch.stageId];
+  const pagedKv = configuration.pagedKvStages[launch.stageId];
   if (ramBackedMoe) {
     appendBasicModelArguments(args, ramBackedMoe.snapshotPath, null);
     args.push(
@@ -915,6 +951,7 @@ function renderRemoteStageArguments(
   } else {
     appendModelArguments(args, configuration.runtimeModel);
   }
+  if (pagedKv) appendPagedKvArguments(args, pagedKv);
   args.push(
     "--layer-start",
     String(launch.layerStart),
@@ -1074,6 +1111,7 @@ function renderRootEngineArguments(
   }
   const args = pythonModulePrefix(configuration.serverModule);
   const ramBackedMoe = configuration.ramBackedMoeStages[launch.stageId];
+  const pagedKv = configuration.pagedKvStages[launch.stageId];
   if (ramBackedMoe) {
     appendBasicModelArguments(args, ramBackedMoe.snapshotPath, null);
     args.push(
@@ -1094,6 +1132,7 @@ function renderRootEngineArguments(
       );
     }
   }
+  if (pagedKv) appendPagedKvArguments(args, pagedKv);
   args.push(
     "--public-model-name",
     configuration.publicModelName,
@@ -1199,6 +1238,31 @@ function appendDenseTieringArguments(
   }
 }
 
+function appendPagedKvArguments(
+  args: string[],
+  contract: PythonPagedKvStageConfiguration,
+): void {
+  args.push(
+    "--paged-kv",
+    "--paged-device",
+    contract.device,
+    "--paged-attention-backend",
+    contract.attentionBackend,
+    "--paged-block-size",
+    String(contract.blockSize),
+    "--paged-num-blocks",
+    String(contract.numBlocks),
+    "--paged-max-batch-tokens",
+    String(contract.maxBatchTokens),
+    "--paged-max-active-requests",
+    String(contract.maxActiveRequests),
+    "--paged-max-sequence-tokens",
+    String(contract.maxSequenceTokens),
+    "--paged-cpu-spill-bytes",
+    String(contract.cpuSpillBytes),
+  );
+}
+
 function pythonSpeculation(policy: RuntimeSpeculationPolicy): PythonSpeculationArguments {
   const selected = policy.strategies.find(
     (strategy) => strategy.id === policy.defaultStrategyId,
@@ -1283,6 +1347,7 @@ function normalizeConfiguration(
       "recovery",
       "nativeGgufStages",
       "ramBackedMoeStages",
+      "pagedKvStages",
     ],
     "python_launch_options_have_unknown_or_missing_fields",
   );
@@ -1369,9 +1434,14 @@ function normalizeConfiguration(
     value.ramBackedMoeStages,
     runtimeModel,
   );
+  const pagedKvStages = normalizePagedKvStages(
+    manifest,
+    value.pagedKvStages,
+  );
   validateExclusiveStageBindings(
     nativeGgufStages,
     ramBackedMoeStages,
+    pagedKvStages,
   );
   const prefillInflightChunks = boundedInteger(
     value.prefillInflightChunks ??
@@ -1428,6 +1498,22 @@ function normalizeConfiguration(
   const maxSpeculativeBranches = requestedMaxSpeculativeBranches;
   const maxSpeculativeBranchTokens = requestedMaxSpeculativeBranchTokens;
   const maxSpeculativeKvBytes = requestedMaxSpeculativeKvBytes;
+  const maxRetainedSessions = boundedInteger(
+    value.maxRetainedSessions ?? DEFAULT_RETAINED_SESSIONS,
+    0,
+    10_000,
+    "python_max_retained_sessions_is_invalid",
+  );
+  const maxRetainedSessionTokens = boundedInteger(
+    value.maxRetainedSessionTokens ?? DEFAULT_RETAINED_SESSION_TOKENS,
+    0,
+    100_000_000,
+    "python_max_retained_session_tokens_is_invalid",
+  );
+  const retainedSessionTtlSeconds = positiveFinite(
+    value.retainedSessionTtlSeconds ?? DEFAULT_RETAINED_SESSION_TTL_SECONDS,
+    "python_retained_session_ttl_is_invalid",
+  );
   const speculativeTreeLimitsEnabled = [
     maxSpeculativeBranches,
     maxSpeculativeBranchTokens,
@@ -1439,6 +1525,13 @@ function normalizeConfiguration(
   ) {
     throw new Error("python_speculative_tree_limits_must_be_disabled_or_complete");
   }
+  validatePagedKvLaunchCapacity(
+    manifest,
+    pagedKvStages,
+    maxSpeculativeBranches,
+    maxSpeculativeBranchTokens,
+    maxRetainedSessions,
+  );
   const recovery = normalizeRecoveryConfiguration(manifest, value.recovery);
   const normalized: PythonLaunchConfiguration = {
     apiEndpoint: { ...value.apiEndpoint },
@@ -1498,25 +1591,13 @@ function normalizeConfiguration(
       value.speculationMinimumSpeedup ?? 1.05,
       "python_speculation_speedup_is_invalid",
     ),
-    maxRetainedSessions: boundedInteger(
-      value.maxRetainedSessions ?? DEFAULT_RETAINED_SESSIONS,
-      0,
-      10_000,
-      "python_max_retained_sessions_is_invalid",
-    ),
-    maxRetainedSessionTokens: boundedInteger(
-      value.maxRetainedSessionTokens ?? DEFAULT_RETAINED_SESSION_TOKENS,
-      0,
-      100_000_000,
-      "python_max_retained_session_tokens_is_invalid",
-    ),
-    retainedSessionTtlSeconds: positiveFinite(
-      value.retainedSessionTtlSeconds ?? DEFAULT_RETAINED_SESSION_TTL_SECONDS,
-      "python_retained_session_ttl_is_invalid",
-    ),
+    maxRetainedSessions,
+    maxRetainedSessionTokens,
+    retainedSessionTtlSeconds,
     recovery,
     nativeGgufStages,
     ramBackedMoeStages,
+    pagedKvStages,
   };
   if (requireNormalized && canonicalJson(value) !== canonicalJson(normalized)) {
     throw new Error("python_launch_configuration_is_not_normalized");
@@ -1771,13 +1852,203 @@ function validateNativeGgufStageBinding(
   }
 }
 
+function normalizePagedKvStages(
+  manifest: RuntimePipelineManifestV2,
+  value: unknown,
+): Record<string, PythonPagedKvStageConfiguration> {
+  if (value === undefined) return {};
+  if (!isRecord(value)) {
+    throw new Error("python_paged_kv_stages_must_be_an_object");
+  }
+  const stages = manifest.plans.prefill.stages;
+  const expectedIds = new Set(stages.map((stage) => stage.stageId));
+  const suppliedIds = Object.keys(value);
+  if (suppliedIds.length === 0) return {};
+  for (const stageId of suppliedIds) {
+    if (!expectedIds.has(stageId)) {
+      throw new Error(`python_paged_kv_stage_binding_is_unexpected:${stageId}`);
+    }
+  }
+  for (const stage of stages) {
+    if (!Object.hasOwn(value, stage.stageId)) {
+      throw new Error(`python_paged_kv_stage_binding_is_missing:${stage.stageId}`);
+    }
+  }
+
+  const entries: Array<[string, PythonPagedKvStageConfiguration]> = [];
+  for (const stage of stages) {
+    const stageId = stage.stageId;
+    const input = value[stageId];
+    if (!isRecord(input)) {
+      throw new Error(`python_paged_kv_stage_configuration_is_invalid:${stageId}`);
+    }
+    assertExactKeys(
+      input,
+      [
+        "schema",
+        "device",
+        "attentionBackend",
+        "blockSize",
+        "numBlocks",
+        "maxBatchTokens",
+        "maxActiveRequests",
+        "maxSequenceTokens",
+        "cpuSpillBytes",
+      ],
+      [],
+      `python_paged_kv_stage_configuration_keys_are_invalid:${stageId}`,
+    );
+    if (input.schema !== PAGED_STAGE_RUNTIME_SCHEMA) {
+      throw new Error(`python_paged_kv_stage_schema_is_invalid:${stageId}`);
+    }
+    const device = safeString(
+      input.device,
+      `python_paged_kv_device_is_invalid:${stageId}`,
+    );
+    if (!/^(?:cpu|cuda(?::(?:0|[1-9]\d*))?)$/.test(device)) {
+      throw new Error(`python_paged_kv_device_is_invalid:${stageId}`);
+    }
+    if (input.attentionBackend !== "eager" && input.attentionBackend !== "sdpa") {
+      throw new Error(`python_paged_kv_attention_backend_is_invalid:${stageId}`);
+    }
+    const blockSize = boundedInteger(
+      input.blockSize,
+      4,
+      MAX_PAGED_BLOCK_SIZE,
+      `python_paged_kv_block_size_is_invalid:${stageId}`,
+    );
+    const numBlocks = boundedInteger(
+      input.numBlocks,
+      1,
+      MAX_PAGED_NUM_BLOCKS,
+      `python_paged_kv_num_blocks_is_invalid:${stageId}`,
+    );
+    const maxBatchTokens = boundedInteger(
+      input.maxBatchTokens,
+      1,
+      MAX_PAGED_BATCH_TOKENS,
+      `python_paged_kv_max_batch_tokens_is_invalid:${stageId}`,
+    );
+    const maxActiveRequests = boundedInteger(
+      input.maxActiveRequests,
+      1,
+      MAX_PAGED_ACTIVE_REQUESTS,
+      `python_paged_kv_max_active_requests_is_invalid:${stageId}`,
+    );
+    const maxSequenceTokens = boundedInteger(
+      input.maxSequenceTokens,
+      1,
+      MAX_PAGED_SEQUENCE_TOKENS,
+      `python_paged_kv_max_sequence_tokens_is_invalid:${stageId}`,
+    );
+    const cpuSpillBytes = boundedInteger(
+      input.cpuSpillBytes,
+      0,
+      MAX_SPECULATIVE_KV_BYTES,
+      `python_paged_kv_cpu_spill_bytes_is_invalid:${stageId}`,
+    );
+    if (Math.ceil(maxSequenceTokens / blockSize) > numBlocks) {
+      throw new Error(`python_paged_kv_sequence_exceeds_pool:${stageId}`);
+    }
+    if (cpuSpillBytes > 0 && device === "cpu") {
+      throw new Error(`python_paged_kv_cpu_spill_requires_gpu:${stageId}`);
+    }
+
+    const phaseStages = [manifest.plans.prefill, manifest.plans.decode].map(
+      (plan) => plan.stages.find((candidate) => candidate.stageId === stageId),
+    );
+    if (phaseStages.some((candidate) => candidate === undefined)) {
+      throw new Error(`python_paged_kv_stage_is_not_in_both_phases:${stageId}`);
+    }
+    for (const phaseStage of phaseStages as RuntimeVirtualStageManifest[]) {
+      if (phaseStage.execution !== undefined || phaseStage.macroWave !== undefined) {
+        throw new Error(`python_paged_kv_stage_has_conflicting_execution:${stageId}`);
+      }
+      if (phaseStage.members.length !== 1) {
+        throw new Error(`python_paged_kv_stage_requires_single_member:${stageId}`);
+      }
+      if (device.startsWith("cuda")) {
+        const capabilities = phaseStage.members[0]!.capabilities;
+        if (
+          !capabilities.deviceKinds.includes("gpu")
+          || !capabilities.computeApis.some(
+            (api) => api === "cuda" || api === "rocm",
+          )
+        ) {
+          throw new Error(`python_paged_kv_stage_lacks_gpu_capability:${stageId}`);
+        }
+      }
+    }
+    entries.push([
+      stageId,
+      {
+        schema: PAGED_STAGE_RUNTIME_SCHEMA,
+        device,
+        attentionBackend: input.attentionBackend,
+        blockSize,
+        numBlocks,
+        maxBatchTokens,
+        maxActiveRequests,
+        maxSequenceTokens,
+        cpuSpillBytes,
+      },
+    ]);
+  }
+  return Object.fromEntries(entries.sort(([left], [right]) => left.localeCompare(right)));
+}
+
+function validatePagedKvLaunchCapacity(
+  manifest: RuntimePipelineManifestV2,
+  stages: Record<string, PythonPagedKvStageConfiguration>,
+  maxSpeculativeBranches: number,
+  maxSpeculativeBranchTokens: number,
+  maxRetainedSessions: number,
+): void {
+  if (Object.keys(stages).length === 0) return;
+  const maxActiveSequences = Math.max(
+    manifest.plans.prefill.microBatchSize,
+    manifest.plans.decode.microBatchSize,
+  );
+  const requiredRequests =
+    maxActiveSequences + maxSpeculativeBranches + maxRetainedSessions;
+  const speculation = pythonSpeculation(manifest.plans.decode.speculation);
+  const requiredBatchTokens = Math.max(
+    manifest.plans.prefill.chunkTokens,
+    speculation.maxWaveTokens,
+  );
+  for (const [stageId, configuration] of Object.entries(stages)) {
+    if (configuration.maxActiveRequests < requiredRequests) {
+      throw new Error(`python_paged_kv_active_request_capacity_is_too_small:${stageId}`);
+    }
+    if (configuration.maxBatchTokens < requiredBatchTokens) {
+      throw new Error(`python_paged_kv_batch_token_capacity_is_too_small:${stageId}`);
+    }
+    if (
+      maxSpeculativeBranchTokens > 0
+      && configuration.maxSequenceTokens < maxSpeculativeBranchTokens
+    ) {
+      throw new Error(`python_paged_kv_sequence_capacity_is_too_small:${stageId}`);
+    }
+  }
+}
+
 function validateExclusiveStageBindings(
   nativeGgufStages: Record<string, PythonNativeGgufStageConfiguration>,
   ramBackedMoeStages: Record<string, PythonRamBackedMoeStageConfiguration>,
+  pagedKvStages: Record<string, PythonPagedKvStageConfiguration>,
 ): void {
-  for (const stageId of Object.keys(nativeGgufStages)) {
-    if (Object.hasOwn(ramBackedMoeStages, stageId)) {
-      throw new Error(`python_native_gguf_stage_backend_is_not_exclusive:${stageId}`);
+  for (const stageId of new Set([
+    ...Object.keys(nativeGgufStages),
+    ...Object.keys(ramBackedMoeStages),
+    ...Object.keys(pagedKvStages),
+  ])) {
+    const bindingCount = [
+      nativeGgufStages,
+      ramBackedMoeStages,
+      pagedKvStages,
+    ].filter((bindings) => Object.hasOwn(bindings, stageId)).length;
+    if (bindingCount > 1) {
+      throw new Error(`python_stage_backend_is_not_exclusive:${stageId}`);
     }
   }
 }
@@ -2128,6 +2399,7 @@ function routeIdentity(
   codec: RuntimeActivationCodec,
   nativeGgufStages: Record<string, PythonNativeGgufStageConfiguration>,
   ramBackedMoeStages: Record<string, PythonRamBackedMoeStageConfiguration>,
+  pagedKvStages: Record<string, PythonPagedKvStageConfiguration>,
   recovery: PythonRecoveryConfiguration | null,
 ): string {
   return `route-${digest(
@@ -2137,6 +2409,7 @@ function routeIdentity(
       codec,
       nativeGgufStages,
       ramBackedMoeStages,
+      pagedKvStages,
       recovery,
       stages: stages.map((stage) => ({
         stageId: stage.stageId,

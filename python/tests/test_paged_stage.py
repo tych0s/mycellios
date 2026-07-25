@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -10,6 +11,7 @@ from transformers import LlamaConfig, LlamaForCausalLM, LlamaModel
 
 from distributed_runtime.paged_stage import (
     HFPagedStageCache,
+    HFPagedStageRuntimeConfig,
     HFPagedStageRunner,
     PagedCacheSnapshot,
     PagedStageCorruptionError,
@@ -45,11 +47,29 @@ def _tiny_llama(seed: int) -> LlamaModel:
     return model
 
 
+def _tiny_llama_causal(seed: int) -> LlamaForCausalLM:
+    torch.manual_seed(seed)
+    config = LlamaConfig(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
+        attention_dropout=0.0,
+    )
+    model = LlamaForCausalLM(config).eval()
+    model.set_attn_implementation("eager")
+    return model
+
+
 def _paged_adapter(
     model: nn.Module,
     *,
     num_blocks: int = 16,
     max_active_requests: int = 4,
+    cpu_spill_bytes: int = 0,
 ) -> HFPagedStageCache:
     return HFPagedStageCache.for_model(
         model,
@@ -59,6 +79,7 @@ def _paged_adapter(
         max_batch_tokens=16,
         max_active_requests=max_active_requests,
         max_sequence_tokens=min(32, num_blocks * 4),
+        cpu_spill_bytes=cpu_spill_bytes,
     )
 
 
@@ -97,6 +118,7 @@ class HFPagedStageRunnerTests(unittest.TestCase):
                 max_batch_tokens=16,
                 max_active_requests=4,
                 max_sequence_tokens=32,
+                cpu_spill_bytes=8192,
             )
             try:
                 classic.base.set_attn_implementation("eager")
@@ -250,6 +272,7 @@ class HFPagedStageRunnerTests(unittest.TestCase):
                 max_batch_tokens=16,
                 max_active_requests=4,
                 max_sequence_tokens=32,
+                cpu_spill_bytes=8192,
             )
             try:
                 classic.base.set_attn_implementation("eager")
@@ -262,6 +285,8 @@ class HFPagedStageRunnerTests(unittest.TestCase):
                         "fork-complete-block-zero-copy",
                         "fork-tail-copy",
                         "physical-kv-accounting",
+                        "bounded-cpu-kv-spill",
+                        "integrity-checked-atomic-kv-restore",
                     }.issubset(features)
                 )
                 self.assertNotIn("exact-tree-verify-batching", features)
@@ -270,6 +295,11 @@ class HFPagedStageRunnerTests(unittest.TestCase):
                     paged.executor_manifest.kv_format,
                     "transformers-paged-cow-v1",
                 )
+                execution = paged.execution_snapshot()
+                self.assertTrue(execution["cpuSpill"]["supported"])
+                self.assertTrue(execution["cpuSpill"]["enabled"])
+                self.assertEqual(execution["cpuSpill"]["maxBytes"], 8192)
+                self.assertEqual(execution["cpuSpillState"]["usedBytes"], 0)
 
                 prompt = torch.tensor([[1, 2, 3, 4, 5, 6]], dtype=torch.long)
                 classic.begin(1)
@@ -491,6 +521,466 @@ class HFPagedStageRunnerTests(unittest.TestCase):
 
 
 class HFPagedStageCacheTests(unittest.TestCase):
+    def test_runtime_config_seals_bounded_integrity_checked_cpu_spill(self) -> None:
+        runtime = HFPagedStageRuntimeConfig(cpu_spill_bytes=4096)
+        document = runtime.to_document()
+
+        self.assertEqual(document["schema"], "mycellios-hf-paged-stage/2")
+        self.assertEqual(document["cpuSpillBytes"], 4096)
+        self.assertEqual(
+            document["cpuSpill"],
+            {
+                "supported": True,
+                "enabled": True,
+                "maxBytes": 4096,
+                "storedPayloadLimitBytes": 4096,
+                "restoreWorkspaceUpperBoundBytes": 4096,
+                "maxCpuPayloadUpperBoundBytes": 8192,
+                "budgetScope": "stored-tensor-payload",
+                "rssBounded": False,
+                "allocatorOverheadIncluded": False,
+                "restoreWorkspaceIncluded": False,
+                "transferByteCounters": "successful-full-payloads-only",
+                "policy": "integrity-checked-request-lru",
+                "restore": "verify-source-allocate-copy-publish",
+            },
+        )
+        self.assertNotEqual(
+            runtime.configuration_id,
+            HFPagedStageRuntimeConfig(cpu_spill_bytes=0).configuration_id,
+        )
+
+    def test_explicit_spill_restore_preserves_exact_continuation(self) -> None:
+        reference = _tiny_llama_causal(691)
+        model = copy.deepcopy(reference)
+        adapter = _paged_adapter(model, cpu_spill_bytes=8192)
+        self.addCleanup(adapter.close)
+        prompt = torch.tensor([[1, 2, 3, 4, 5, 6]], dtype=torch.long)
+        continuation = torch.tensor([[7]], dtype=torch.long)
+
+        adapter.begin(1)
+        adapter.forward_model(model, 1, input_ids=prompt)
+        spill_metrics = adapter.spill(1)
+        spilled = _requests(adapter.snapshot())[1]
+
+        self.assertEqual(spilled.residency, "cpu-spill")
+        self.assertEqual(spilled.block_ids, ())
+        self.assertEqual(spilled.spill_bytes, 2 * adapter.bytes_per_block)
+        self.assertEqual(spill_metrics.spilled_requests, 1)
+        self.assertEqual(spill_metrics.free_blocks, adapter.num_blocks)
+
+        observed = adapter.forward_model(
+            model,
+            1,
+            input_ids=continuation,
+        ).output.logits[:, -1]
+        expected = reference(
+            input_ids=torch.cat((prompt, continuation), dim=1)
+        ).logits[:, -1]
+        metrics = adapter.metrics()
+
+        self.assertTrue(torch.allclose(observed, expected, atol=1e-5, rtol=1e-5))
+        self.assertTrue(torch.equal(observed.argmax(dim=-1), expected.argmax(dim=-1)))
+        self.assertEqual(_requests(adapter.snapshot())[1].residency, "device")
+        self.assertEqual(metrics.spilled_requests, 0)
+        self.assertEqual(metrics.spilled_bytes, 0)
+        self.assertEqual(metrics.spill_count, 1)
+        self.assertEqual(metrics.restore_count, 1)
+
+    def test_spill_restore_rejoins_shared_complete_prefix(self) -> None:
+        model = _tiny_llama(693)
+        adapter = _paged_adapter(model, cpu_spill_bytes=8192)
+        self.addCleanup(adapter.close)
+
+        adapter.begin(1)
+        adapter.forward_model(
+            model,
+            1,
+            input_ids=torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]]),
+        )
+        adapter.fork(2, 1)
+        adapter.spill(2)
+        after_spill = _requests(adapter.snapshot())
+
+        self.assertEqual(after_spill[1].ref_counts, (1, 1))
+        self.assertEqual(after_spill[2].residency, "cpu-spill")
+
+        adapter.restore(2)
+        restored = _requests(adapter.snapshot())
+        self.assertEqual(restored[1].block_ids, restored[2].block_ids)
+        self.assertEqual(restored[1].ref_counts, (2, 2))
+        self.assertEqual(restored[2].ref_counts, (2, 2))
+
+    def test_auto_spill_swaps_lru_requests_within_hard_limit(self) -> None:
+        reference = _tiny_llama_causal(697)
+        model = copy.deepcopy(reference)
+        adapter = _paged_adapter(
+            model,
+            num_blocks=3,
+            max_active_requests=2,
+            cpu_spill_bytes=4096,
+        )
+        self.addCleanup(adapter.close)
+        first_prompt = torch.tensor([[1, 2, 3, 4, 5, 6]], dtype=torch.long)
+
+        adapter.begin(1)
+        adapter.forward_model(model, 1, input_ids=first_prompt)
+        adapter.begin(2)
+        adapter.forward_model(
+            model,
+            2,
+            input_ids=torch.tensor([[11, 12, 13, 14]], dtype=torch.long),
+        )
+        adapter.forward_model(
+            model,
+            2,
+            input_ids=torch.tensor([[15]], dtype=torch.long),
+        )
+        after_first_swap = _requests(adapter.snapshot())
+        self.assertEqual(after_first_swap[1].residency, "cpu-spill")
+        self.assertEqual(after_first_swap[2].residency, "device")
+
+        observed = adapter.forward_model(
+            model,
+            1,
+            input_ids=torch.tensor([[7]], dtype=torch.long),
+        ).output.logits[:, -1]
+        expected = reference(
+            input_ids=torch.tensor([[1, 2, 3, 4, 5, 6, 7]], dtype=torch.long)
+        ).logits[:, -1]
+        after_second_swap = _requests(adapter.snapshot())
+
+        self.assertTrue(torch.allclose(observed, expected, atol=1e-5, rtol=1e-5))
+        self.assertTrue(torch.equal(observed.argmax(dim=-1), expected.argmax(dim=-1)))
+        self.assertEqual(after_second_swap[1].residency, "device")
+        self.assertEqual(after_second_swap[2].residency, "cpu-spill")
+        self.assertLessEqual(
+            adapter.metrics().spilled_bytes,
+            adapter.cpu_spill_limit_bytes,
+        )
+        self.assertEqual(adapter.metrics().spill_count, 2)
+        self.assertEqual(adapter.metrics().restore_count, 1)
+
+    def test_restore_reuses_its_exact_spill_slot_without_deadlock(self) -> None:
+        reference = _tiny_llama_causal(698)
+        model = copy.deepcopy(reference)
+        adapter = _paged_adapter(
+            model,
+            num_blocks=3,
+            max_active_requests=2,
+            cpu_spill_bytes=1024,
+        )
+        self.addCleanup(adapter.close)
+        first_prompt = torch.tensor([[1, 2, 3, 4, 5, 6]], dtype=torch.long)
+
+        adapter.begin(1)
+        adapter.forward_model(model, 1, input_ids=first_prompt)
+        self.assertEqual(2 * adapter.bytes_per_block, adapter.cpu_spill_limit_bytes)
+        adapter.spill(1)
+        adapter.begin(2)
+        adapter.forward_model(
+            model,
+            2,
+            input_ids=torch.tensor([[11, 12, 13, 14, 15, 16]], dtype=torch.long),
+        )
+        before_projection = adapter.snapshot()
+        self.assertEqual(
+            adapter.project_request_incremental_physical_bytes(1, 1),
+            0,
+        )
+        self.assertEqual(adapter.snapshot(), before_projection)
+
+        observed = adapter.forward_model(
+            model,
+            1,
+            input_ids=torch.tensor([[7]], dtype=torch.long),
+        ).output.logits[:, -1]
+        expected = reference(
+            input_ids=torch.tensor([[1, 2, 3, 4, 5, 6, 7]], dtype=torch.long)
+        ).logits[:, -1]
+        requests = _requests(adapter.snapshot())
+        metrics = adapter.metrics()
+
+        self.assertTrue(torch.allclose(observed, expected, atol=1e-5, rtol=1e-5))
+        self.assertTrue(torch.equal(observed.argmax(dim=-1), expected.argmax(dim=-1)))
+        self.assertEqual(requests[1].residency, "device")
+        self.assertEqual(requests[2].residency, "cpu-spill")
+        self.assertEqual(metrics.spilled_bytes, adapter.cpu_spill_limit_bytes)
+        self.assertEqual(metrics.restore_workspace_bytes, 0)
+        self.assertEqual(
+            metrics.peak_restore_workspace_bytes,
+            adapter.cpu_spill_limit_bytes,
+        )
+        self.assertEqual(
+            metrics.current_cpu_payload_bytes,
+            adapter.cpu_spill_limit_bytes,
+        )
+        self.assertEqual(
+            metrics.peak_cpu_payload_bytes,
+            2 * adapter.cpu_spill_limit_bytes,
+        )
+        self.assertEqual(
+            metrics.spill_bytes_transferred,
+            2 * adapter.cpu_spill_limit_bytes,
+        )
+        self.assertEqual(
+            metrics.restore_bytes_transferred,
+            adapter.cpu_spill_limit_bytes,
+        )
+        self.assertGreater(metrics.spill_time_ns, 0)
+        self.assertGreater(metrics.restore_time_ns, 0)
+
+    def test_failed_restore_rolls_back_all_residency_changes(self) -> None:
+        model = _tiny_llama(700)
+        adapter = _paged_adapter(
+            model,
+            num_blocks=3,
+            max_active_requests=2,
+            cpu_spill_bytes=1024,
+        )
+        self.addCleanup(adapter.close)
+
+        adapter.begin(1)
+        adapter.forward_model(
+            model,
+            1,
+            input_ids=torch.tensor([[1, 2, 3, 4, 5, 6]], dtype=torch.long),
+        )
+        adapter.spill(1)
+        adapter.begin(2)
+        adapter.forward_model(
+            model,
+            2,
+            input_ids=torch.tensor([[11, 12, 13, 14, 15, 16]], dtype=torch.long),
+        )
+        before = adapter.snapshot()
+        original_copy = adapter._copy_cpu_blocks_to_device
+        calls = 0
+
+        def fail_once(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("synthetic restore copy failure")
+            return original_copy(*args, **kwargs)
+
+        with patch.object(adapter, "_copy_cpu_blocks_to_device", side_effect=fail_once):
+            with self.assertRaisesRegex(RuntimeError, "synthetic restore copy failure"):
+                adapter.restore(1)
+
+        after = adapter.snapshot()
+        self.assertEqual(
+            {
+                request.request_id: request.residency for request in after.requests
+            },
+            {
+                request.request_id: request.residency for request in before.requests
+            },
+        )
+        self.assertEqual(after.free_blocks, before.free_blocks)
+        self.assertEqual(after.spilled_bytes, before.spilled_bytes)
+        self.assertEqual(adapter.metrics().restore_workspace_bytes, 0)
+        self.assertEqual(adapter.metrics().restore_failures, 1)
+        self.assertFalse(adapter._poisoned)
+
+    def test_available_capacity_counts_only_reclaimable_unprotected_blocks(
+        self,
+    ) -> None:
+        model = _tiny_llama(701)
+        adapter = _paged_adapter(
+            model,
+            num_blocks=3,
+            max_active_requests=2,
+            cpu_spill_bytes=512,
+        )
+        self.addCleanup(adapter.close)
+        self.assertEqual(adapter.bytes_per_block, 512)
+
+        adapter.begin(1)
+        adapter.forward_model(
+            model,
+            1,
+            input_ids=torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
+        )
+        adapter.begin(2)
+        adapter.forward_model(
+            model,
+            2,
+            input_ids=torch.tensor([[11, 12, 13, 14]], dtype=torch.long),
+        )
+        self.assertEqual(adapter.cache.get_num_free_blocks(), 1)
+        access_before_projection = dict(adapter._last_access)
+        available_before_projection = adapter.available_physical_bytes()
+        self.assertEqual(adapter.sequence_length(1), 4)
+        self.assertEqual(
+            adapter.project_request_incremental_physical_bytes(1, 1),
+            adapter.bytes_per_block,
+        )
+        self.assertEqual(adapter._last_access, access_before_projection)
+        self.assertEqual(
+            adapter.available_physical_bytes(),
+            available_before_projection,
+        )
+        self.assertEqual(
+            available_before_projection,
+            2 * adapter.bytes_per_block,
+        )
+
+        adapter.close()
+        shared_model = _tiny_llama(703)
+        shared = _paged_adapter(
+            shared_model,
+            num_blocks=3,
+            max_active_requests=2,
+            cpu_spill_bytes=512,
+        )
+        self.addCleanup(shared.close)
+        shared.begin(10)
+        shared.forward_model(
+            shared_model,
+            10,
+            input_ids=torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
+        )
+        shared.fork(11, 10)
+        self.assertEqual(shared.cache.get_num_free_blocks(), 2)
+        self.assertEqual(
+            shared.available_physical_bytes(),
+            2 * shared.bytes_per_block,
+        )
+
+    def test_promote_resident_child_drops_spilled_parent_without_restore(self) -> None:
+        reference = _tiny_llama_causal(704)
+        model = copy.deepcopy(reference)
+        adapter = _paged_adapter(
+            model,
+            num_blocks=3,
+            max_active_requests=2,
+            cpu_spill_bytes=1024,
+        )
+        self.addCleanup(adapter.close)
+        prompt = torch.tensor([[1, 2, 3, 4, 5, 6]], dtype=torch.long)
+        child_token = torch.tensor([[7]], dtype=torch.long)
+        continuation = torch.tensor([[8]], dtype=torch.long)
+
+        adapter.begin(1)
+        adapter.forward_model(model, 1, input_ids=prompt)
+        adapter.fork(2, 1)
+        adapter.forward_model(model, 2, input_ids=child_token)
+        adapter.spill(1)
+        before_restore_count = adapter.metrics().restore_count
+
+        adapter.promote(1, 2)
+        promoted = _requests(adapter.snapshot())
+        self.assertEqual(set(promoted), {1})
+        self.assertEqual(promoted[1].residency, "device")
+        self.assertEqual(adapter.metrics().restore_count, before_restore_count)
+        self.assertEqual(adapter.metrics().spilled_bytes, 0)
+
+        observed = adapter.forward_model(
+            model,
+            1,
+            input_ids=continuation,
+        ).output.logits[:, -1]
+        expected = reference(
+            input_ids=torch.cat((prompt, child_token, continuation), dim=1)
+        ).logits[:, -1]
+        self.assertTrue(torch.allclose(observed, expected, atol=1e-5, rtol=1e-5))
+        self.assertTrue(torch.equal(observed.argmax(dim=-1), expected.argmax(dim=-1)))
+
+    def test_promote_spilled_child_without_device_residency_ping_pong(self) -> None:
+        reference = _tiny_llama_causal(702)
+        model = copy.deepcopy(reference)
+        adapter = _paged_adapter(model, cpu_spill_bytes=8192)
+        self.addCleanup(adapter.close)
+        prompt = torch.tensor([[1, 2, 3, 4, 5, 6]], dtype=torch.long)
+        child_token = torch.tensor([[7]], dtype=torch.long)
+        continuation = torch.tensor([[8]], dtype=torch.long)
+
+        adapter.begin(1)
+        adapter.forward_model(model, 1, input_ids=prompt)
+        adapter.fork(2, 1)
+        adapter.forward_model(model, 2, input_ids=child_token)
+        adapter.spill(2)
+        restore_count = adapter.metrics().restore_count
+
+        adapter.promote(1, 2)
+        promoted = _requests(adapter.snapshot())
+        self.assertEqual(set(promoted), {1})
+        self.assertEqual(promoted[1].residency, "cpu-spill")
+        self.assertEqual(adapter.metrics().restore_count, restore_count)
+
+        observed = adapter.forward_model(
+            model,
+            1,
+            input_ids=continuation,
+        ).output.logits[:, -1]
+        expected = reference(
+            input_ids=torch.cat((prompt, child_token, continuation), dim=1)
+        ).logits[:, -1]
+        self.assertTrue(torch.allclose(observed, expected, atol=1e-5, rtol=1e-5))
+        self.assertTrue(torch.equal(observed.argmax(dim=-1), expected.argmax(dim=-1)))
+
+    def test_allocator_release_failure_after_mutation_poisons_immediately(
+        self,
+    ) -> None:
+        model = _tiny_llama(706)
+        adapter = _paged_adapter(model, cpu_spill_bytes=8192)
+        self.addCleanup(adapter.close)
+        adapter.begin(1)
+        adapter.forward_model(
+            model,
+            1,
+            input_ids=torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
+        )
+        original_free = adapter.cache.free_blocks
+
+        def free_then_fail(request_id):
+            original_free(request_id)
+            raise RuntimeError("synthetic post-release failure")
+
+        with patch.object(adapter.cache, "free_blocks", side_effect=free_then_fail):
+            with self.assertRaisesRegex(
+                PagedStageCorruptionError,
+                "after changing allocator state",
+            ):
+                adapter.spill(1)
+
+        self.assertTrue(adapter._poisoned)
+        self.assertIn(1, adapter._spilled_requests)
+        self.assertNotIn(1, adapter._requests)
+        with self.assertRaisesRegex(PagedStageCorruptionError, "poisoned"):
+            adapter.metrics()
+
+    def test_spill_limit_and_integrity_check_fail_closed(self) -> None:
+        model = _tiny_llama(699)
+        adapter = _paged_adapter(model, cpu_spill_bytes=512)
+        self.addCleanup(adapter.close)
+        adapter.begin(1)
+        adapter.forward_model(
+            model,
+            1,
+            input_ids=torch.tensor([[1, 2, 3, 4, 5, 6]], dtype=torch.long),
+        )
+
+        with self.assertRaisesRegex(MemoryError, "bounded CPU spill capacity"):
+            adapter.spill(1)
+        unchanged = _requests(adapter.snapshot())[1]
+        self.assertEqual(unchanged.residency, "device")
+        self.assertEqual(adapter.metrics().spilled_bytes, 0)
+
+        adapter.cpu_spill_limit_bytes = 8192
+        adapter.spill(1)
+        spilled = adapter._spilled_requests[1]
+        raw = spilled.key_blocks[0].view(torch.uint8)
+        raw[0] ^= 1
+        with self.assertRaisesRegex(
+            PagedStageCorruptionError,
+            "integrity check failed",
+        ):
+            adapter.restore(1)
+        with self.assertRaisesRegex(PagedStageCorruptionError, "poisoned"):
+            adapter.metrics()
+
     def test_stage_local_hidden_outputs_match_dynamic_cache(self) -> None:
         reference = _tiny_llama(701)
         paged_model = copy.deepcopy(reference)
