@@ -45,6 +45,23 @@ describe("WorkerHub runtime proxy", () => {
     });
     expect((await response).toString("utf8")).toContain("ready");
   });
+
+  it("closes active client sockets instead of blocking route deactivation", async () => {
+    const hub = new WorkerHub({} as MeshStore);
+    vi.spyOn(hub, "isConnected").mockReturnValue(true);
+    vi.spyOn(hub, "send").mockReturnValue(true);
+    const proxy = await hub.createRuntimeProxy("worker-root", 9_860);
+    const client = connect({ host: proxy.host, port: proxy.port });
+    cleanup.push(() => closeSocket(client));
+    await connected(client);
+
+    const clientClosed = new Promise<void>((resolve) => client.once("close", () => resolve()));
+    await expect(Promise.race([
+      proxy.close().then(() => "closed"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("timeout"), 500)),
+    ])).resolves.toBe("closed");
+    await expect(clientClosed).resolves.toBeUndefined();
+  });
 });
 
 function deliver(

@@ -7,6 +7,8 @@ import type {
   DesktopSettings,
   HubCatalogSearchInput,
   RequestModelInput,
+  SupportAssistantAdminSettings,
+  SupportAssistantChatRequest,
 } from "./contracts.js";
 
 let chatStreamSequence = 0;
@@ -28,6 +30,27 @@ const bridge: DesktopBridge = Object.freeze({
         .finally(() => ipcRenderer.removeListener("chat:stream:update", listener));
     });
   },
+  getSupportAssistantConfig: () => ipcRenderer.invoke("assistant:config"),
+  streamSupportAssistant: (
+    request: SupportAssistantChatRequest,
+    onUpdate: (update: ChatStreamUpdate) => void,
+  ) => {
+    const streamId = `support-${Date.now()}-${++chatStreamSequence}`;
+    return new Promise<ChatResponse>((resolve, reject) => {
+      const listener = (_event: IpcRendererEvent, receivedId: string, update: ChatStreamUpdate) => {
+        if (receivedId === streamId) onUpdate(update);
+      };
+      ipcRenderer.on("assistant:stream:update", listener);
+      void ipcRenderer.invoke("assistant:stream", streamId, request)
+        .then((response: ChatResponse) => resolve(response), reject)
+        .finally(() => ipcRenderer.removeListener("assistant:stream:update", listener));
+    });
+  },
+  getSupportAssistantAdmin: (adminToken?: string) => ipcRenderer.invoke("assistant:admin:read", adminToken),
+  saveSupportAssistantAdmin: (
+    assistantSettings: Omit<SupportAssistantAdminSettings, "updatedAt">,
+    adminToken?: string,
+  ) => ipcRenderer.invoke("assistant:admin:save", assistantSettings, adminToken),
   removeWorker: (workerId: string) => ipcRenderer.invoke("workers:remove", workerId),
   clearOfflineWorkers: () => ipcRenderer.invoke("workers:clear-offline"),
   searchHubModels: (input: HubCatalogSearchInput) => ipcRenderer.invoke("models:search-hub", input),

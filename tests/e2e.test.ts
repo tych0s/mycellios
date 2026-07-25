@@ -46,6 +46,16 @@ describe("inference-only coordinator and worker", () => {
     expect(body.x_network.active_ms).toBeGreaterThan(0);
     expect(runtime.store.listJobs()).toHaveLength(1);
     expect(runtime.store.listJobs()[0]?.status).toBe("completed");
+    await waitUntil(
+      () => runtime.store.listWorkers()[0]?.capabilities.deployments[0]?.throughputSource === "measured",
+      2_000,
+    );
+    expect(runtime.store.listWorkers()[0]?.capabilities.deployments[0]).toMatchObject({
+      throughputSource: "measured",
+    });
+    expect(
+      runtime.store.listWorkers()[0]?.capabilities.deployments[0]?.tokensPerSecond,
+    ).toBeGreaterThan(0);
 
     const replay = await fetch(new URL("v1/chat/completions", `${address}/`), {
       method: "POST",

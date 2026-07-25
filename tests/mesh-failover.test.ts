@@ -55,6 +55,77 @@ describe("active-route recovery policy", () => {
 
   afterEach(() => database.close());
 
+  it("supersedes an identical orphaned request after the client reconnects", () => {
+    const primary = addWorker(store, {
+      id: "primary",
+      modelDigest: "sha256:revision-a",
+      tokensPerSecond: 50,
+    });
+    hub.connected.add(primary.id);
+    service = new MeshService(
+      store,
+      new Scheduler(store),
+      hub as unknown as WorkerHub,
+      30_000,
+    );
+    const request: ChatCompletionRequest = {
+      model: "distributed-small",
+      messages: [{ role: "user", content: "mismo mensaje" }],
+      max_tokens: 32,
+      stream: true,
+    };
+    const first = service.submit(request, "reconnected-session");
+
+    expect(service.cancelMatchingActiveSession(
+      structuredClone(request),
+      "reconnected-session",
+    )).toBe(first.jobId);
+    expect(store.getJob(first.jobId)?.status).toBe("cancelled");
+    expect(hub.sent).toContainEqual({
+      workerId: primary.id,
+      type: "task.cancel",
+      payload: { jobId: first.jobId },
+    });
+
+    const replacement = service.submit(structuredClone(request), "reconnected-session");
+    expect(replacement.jobId).not.toBe(first.jobId);
+    expect(service.cancel(replacement.jobId)).toBe(true);
+  });
+
+  it("keeps session_busy protection for a different concurrent message", () => {
+    const primary = addWorker(store, {
+      id: "primary",
+      modelDigest: "sha256:revision-a",
+      tokensPerSecond: 50,
+    });
+    hub.connected.add(primary.id);
+    service = new MeshService(
+      store,
+      new Scheduler(store),
+      hub as unknown as WorkerHub,
+      30_000,
+    );
+    const first = service.submit({
+      model: "distributed-small",
+      messages: [{ role: "user", content: "primer mensaje" }],
+      max_tokens: 32,
+      stream: true,
+    }, "protected-session");
+
+    const different: ChatCompletionRequest = {
+      model: "distributed-small",
+      messages: [{ role: "user", content: "mensaje diferente" }],
+      max_tokens: 32,
+      stream: true,
+    };
+    expect(service.cancelMatchingActiveSession(different, "protected-session")).toBeNull();
+    expect(() => service.submit(different, "protected-session")).toThrow(
+      "Session already has an active request",
+    );
+    expect(store.getJob(first.jobId)?.status).not.toBe("cancelled");
+    expect(service.cancel(first.jobId)).toBe(true);
+  });
+
   it("replays the immutable prompt checkpoint on an exact-revision standby before token zero", () => {
     const primary = addWorker(store, {
       id: "primary",
@@ -193,6 +264,13 @@ describe("active-route recovery policy", () => {
       hub as unknown as WorkerHub,
       30_000,
     );
+    const degradedEvents: Array<{
+      jobId: string;
+      model: string;
+      code: string;
+      workerId: string | null;
+    }> = [];
+    service.on("degraded", (event) => degradedEvents.push(event));
     const handle = service.submit({
       model: "distributed-small",
       messages: [{ role: "user", content: "hola" }],
@@ -225,6 +303,263 @@ describe("active-route recovery policy", () => {
       code: "adapter_error",
       message: "Backend requires greedy temperature=0",
     });
+    expect(degradedEvents).toEqual([expect.objectContaining({
+      jobId: handle.jobId,
+      model: "distributed-small",
+      code: "adapter_error",
+    })]);
+  });
+
+  it("fails fast when an accepted route never emits its first token", async () => {
+    const primary = addWorker(store, {
+      id: "primary",
+      modelDigest: "sha256:revision-a",
+      ttftMs: 1,
+    });
+    hub.connected.add(primary.id);
+    service = new MeshService(
+      store,
+      new Scheduler(store),
+      hub as unknown as WorkerHub,
+      30_000,
+      { firstTokenTimeoutMs: 20 },
+    );
+    const handle = service.submit({
+      model: "distributed-small",
+      messages: [{ role: "user", content: "hola" }],
+      max_tokens: 32,
+    });
+    const offer = leaseOffers(hub)[0]!;
+    hub.workerMessage({
+      v: 1,
+      type: "lease.accept",
+      workerId: primary.id,
+      payload: { jobId: handle.jobId, leaseId: offer.payload.leaseId },
+    });
+
+    const events = [];
+    for await (const event of handle.events) events.push(event);
+
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "progress",
+      phase: "waiting_first_token",
+    }));
+    expect(events.at(-1)).toMatchObject({
+      type: "failed",
+      code: "first_token_timeout",
+    });
+    expect(store.getJob(handle.jobId)?.status).toBe("failed");
+  });
+
+  it("attributes a distributed request failure to the physical stage that disconnected", async () => {
+    const physical = addWorker(store, {
+      id: "physical-amd",
+      model: "unrelated-model",
+      distributedExecutor: {
+        protocol: "gdlp-worker-tunnel/2",
+        nodeId: "desktop-amd",
+        stageHost: "desktop-amd.relay",
+        stagePort: 43110,
+        runtime: "python-safetensors",
+        computeMode: "gpu-only",
+        cpuEligible: false,
+      },
+    });
+    const cell = addWorker(store, {
+      id: "cell",
+      model: "distributed-small",
+      modelDigest: "sha256:revision-a",
+      internalPipeline: { stageCount: 1, boundaries: [0, 14] },
+      execution: {
+        deviceType: "gpu",
+        backend: "rocm",
+        deviceName: "AMD pipeline",
+        precision: "float16",
+        fallback: false,
+        stages: [{
+          nodeId: "desktop-amd",
+          stageIndex: 0,
+          layerStart: 0,
+          layerEnd: 14,
+          deviceType: "gpu",
+          backend: "rocm",
+          deviceName: "AMD Radeon",
+          precision: "float16",
+          fallback: false,
+        }],
+      },
+    });
+    hub.connected.add(physical.id);
+    hub.connected.add(cell.id);
+    service = new MeshService(store, new Scheduler(store), hub as unknown as WorkerHub, 30_000);
+    const handle = service.submit({
+      model: "distributed-small",
+      messages: [{ role: "user", content: "hola" }],
+      max_tokens: 32,
+    });
+    const offer = leaseOffers(hub)[0]!;
+    hub.workerMessage({
+      v: 1,
+      type: "lease.accept",
+      workerId: cell.id,
+      payload: { jobId: handle.jobId, leaseId: offer.payload.leaseId },
+    });
+
+    hub.connected.delete(physical.id);
+    hub.emit("disconnect", physical.id);
+    const events = [];
+    for await (const event of handle.events) events.push(event);
+
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "progress",
+      phase: "recovering",
+      nodeId: "desktop-amd",
+      workerId: physical.id,
+    }));
+    expect(events.at(-1)).toMatchObject({
+      type: "failed",
+      code: "pipeline_stage_disconnected",
+      message: expect.stringContaining("AMD Radeon"),
+    });
+  });
+
+  it("accepts tokenizer-specific chat-template overhead within the certified context", async () => {
+    const primary = addWorker(store, {
+      id: "primary",
+      modelDigest: "sha256:revision-a",
+      contextLimit: 128,
+    });
+    hub.connected.add(primary.id);
+    service = new MeshService(store, new Scheduler(store), hub as unknown as WorkerHub, 30_000);
+    const handle = service.submit({
+      model: "distributed-small",
+      messages: [{ role: "user", content: "Reply with only OK" }],
+      max_tokens: 16,
+    });
+    const offer = leaseOffers(hub)[0]!;
+
+    hub.workerMessage({
+      v: 1,
+      type: "lease.accept",
+      workerId: primary.id,
+      payload: { jobId: handle.jobId, leaseId: offer.payload.leaseId },
+    });
+    hub.workerMessage({
+      v: 1,
+      type: "task.token",
+      workerId: primary.id,
+      payload: { jobId: handle.jobId, leaseId: offer.payload.leaseId, index: 0, text: "OK" },
+    });
+    hub.workerMessage({
+      v: 1,
+      type: "task.complete",
+      workerId: primary.id,
+      payload: {
+        jobId: handle.jobId,
+        leaseId: offer.payload.leaseId,
+        text: "OK",
+        finishReason: "stop",
+        metrics: { inputTokens: 32, outputTokens: 1, ttftMs: 20, activeMs: 40 },
+      },
+    });
+
+    const events = [];
+    for await (const event of handle.events) events.push(event);
+    expect(events.at(-1)).toMatchObject({
+      type: "completed",
+      result: { metrics: { inputTokens: 32, outputTokens: 1 } },
+    });
+    expect(store.getJob(handle.jobId)?.status).toBe("completed");
+  });
+
+  it("accepts real output-token counts that differ from characters divided by four", async () => {
+    const primary = addWorker(store, {
+      id: "primary",
+      modelDigest: "sha256:revision-a",
+      contextLimit: 128,
+    });
+    hub.connected.add(primary.id);
+    service = new MeshService(store, new Scheduler(store), hub as unknown as WorkerHub, 30_000);
+    const handle = service.submit({
+      model: "distributed-small",
+      messages: [{ role: "user", content: "test" }],
+      max_tokens: 16,
+    });
+    const offer = leaseOffers(hub)[0]!;
+    const pieces = Array.from({ length: 16 }, () => "é");
+
+    hub.workerMessage({
+      v: 1,
+      type: "lease.accept",
+      workerId: primary.id,
+      payload: { jobId: handle.jobId, leaseId: offer.payload.leaseId },
+    });
+    for (const [index, text] of pieces.entries()) {
+      hub.workerMessage({
+        v: 1,
+        type: "task.token",
+        workerId: primary.id,
+        payload: { jobId: handle.jobId, leaseId: offer.payload.leaseId, index, text },
+      });
+    }
+    hub.workerMessage({
+      v: 1,
+      type: "task.complete",
+      workerId: primary.id,
+      payload: {
+        jobId: handle.jobId,
+        leaseId: offer.payload.leaseId,
+        text: pieces.join(""),
+        finishReason: "length",
+        metrics: { inputTokens: 9, outputTokens: 16, ttftMs: 20, activeMs: 40 },
+      },
+    });
+
+    const events = [];
+    for await (const event of handle.events) events.push(event);
+    expect(events.at(-1)).toMatchObject({
+      type: "completed",
+      result: { metrics: { inputTokens: 9, outputTokens: 16 } },
+    });
+    expect(store.getJob(handle.jobId)?.status).toBe("completed");
+  });
+
+  it("still rejects reported input tokens beyond the deployment context", async () => {
+    const primary = addWorker(store, {
+      id: "primary",
+      modelDigest: "sha256:revision-a",
+      contextLimit: 128,
+    });
+    hub.connected.add(primary.id);
+    service = new MeshService(store, new Scheduler(store), hub as unknown as WorkerHub, 30_000);
+    const handle = service.submit({
+      model: "distributed-small",
+      messages: [{ role: "user", content: "short prompt" }],
+      max_tokens: 16,
+    });
+    const offer = leaseOffers(hub)[0]!;
+
+    hub.workerMessage({
+      v: 1,
+      type: "task.complete",
+      workerId: primary.id,
+      payload: {
+        jobId: handle.jobId,
+        leaseId: offer.payload.leaseId,
+        text: "",
+        finishReason: "stop",
+        metrics: { inputTokens: 129, outputTokens: 1, ttftMs: 20, activeMs: 40 },
+      },
+    });
+
+    const events = [];
+    for await (const event of handle.events) events.push(event);
+    expect(events.at(-1)).toMatchObject({
+      type: "failed",
+      code: "invalid_completion",
+      message: "Implausible input token count",
+    });
+    expect(store.getJob(handle.jobId)?.status).toBe("failed");
   });
 });
 

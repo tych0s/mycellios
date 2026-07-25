@@ -12,5 +12,5 @@
     "skipLibCheck": true,
     "types": ["@webgpu/types", "vite/client"]
   },
-  "include": ["src/mobile/**/*.ts", "src/mobile/**/*.tsx", "landing/src/Panel.tsx", "landing/src/Contribute.tsx", "vite.mobile.config.ts"]
+  "include": ["src/mobile/**/*.ts", "src/mobile/**/*.tsx", "landing/src/Panel.tsx", "landing/src/Contribute.tsx", "landing/src/seo.ts", "vite.mobile.config.ts"]
 }

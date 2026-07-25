@@ -7,6 +7,7 @@ import type { ServerEnvelope, WorkerEnvelope } from "../contracts/types.js";
 import {
   MAX_RUNTIME_STREAM_CHUNK_BYTES,
   parseWorkerEnvelope,
+  workerEnvelopeValidationIssues,
   type WorkerHeartbeatPayload,
 } from "../contracts/worker-protocol.js";
 import type { MeshStore } from "../storage/store.js";
@@ -49,6 +50,7 @@ const MAX_WEBSOCKET_BUFFERED_BYTES = 8 * 1024 * 1024;
 export class WorkerHub extends EventEmitter<HubEvents> {
   private readonly connections = new Map<string, ConnectionState>();
   private readonly allConnections = new Set<ConnectionState>();
+  private logger: FastifyInstance["log"] | null = null;
   private pendingConnections = 0;
   private readonly runtimeStreams = new Map<string, RuntimeStreamSession>();
   private readonly runtimeProxyServers = new Set<Server>();
@@ -58,6 +60,7 @@ export class WorkerHub extends EventEmitter<HubEvents> {
   }
 
   attach(app: FastifyInstance): void {
+    this.logger = app.log;
     app.get("/internal/v1/workers/connect", { websocket: true }, (socket) => {
       if (this.pendingConnections >= 256) {
         socket.close(4429, "too many pending connections");
@@ -75,8 +78,23 @@ export class WorkerHub extends EventEmitter<HubEvents> {
       this.pendingConnections += 1;
       this.allConnections.add(state);
       socket.on("message", (raw) => this.handleRawMessage(state, raw.toString()));
-      socket.on("close", () => this.handleClose(state));
-      socket.on("error", () => this.handleClose(state));
+      socket.on("close", (code, reason) => {
+        app.log.warn({
+          workerId: state.workerId,
+          code,
+          reason: reason.toString("utf8"),
+          ready: state.ready,
+        }, "worker websocket closed");
+        this.handleClose(state);
+      });
+      socket.on("error", (error) => {
+        app.log.warn({
+          workerId: state.workerId,
+          error: error instanceof Error ? error.message : String(error),
+          ready: state.ready,
+        }, "worker websocket error");
+        this.handleClose(state);
+      });
     });
   }
 
@@ -121,11 +139,12 @@ export class WorkerHub extends EventEmitter<HubEvents> {
     if (!Number.isInteger(targetPort) || targetPort < 1 || targetPort > 65_535) {
       throw new Error("runtime_proxy_target_port_is_invalid");
     }
-    const server = createServer((socket) => this.attachLocalRuntimeStream(
-      socket,
-      destinationWorkerId,
-      targetPort,
-    ));
+    const sockets = new Set<Socket>();
+    const server = createServer((socket) => {
+      sockets.add(socket);
+      socket.once("close", () => sockets.delete(socket));
+      this.attachLocalRuntimeStream(socket, destinationWorkerId, targetPort);
+    });
     this.runtimeProxyServers.add(server);
     await new Promise<void>((resolve, reject) => {
       const onError = (error: Error) => {
@@ -146,7 +165,15 @@ export class WorkerHub extends EventEmitter<HubEvents> {
       port: address.port,
       close: async () => {
         this.runtimeProxyServers.delete(server);
-        await new Promise<void>((resolve) => server.close(() => resolve()));
+        // `server.close()` stops accepting new clients but deliberately waits
+        // for existing TCP connections. A distributed inference request may
+        // leave one of those connections open after a node disappears, which
+        // used to block model deactivation and every later reactivation.
+        // Destroy the proxy-owned sockets so Wi-Fi recovery cannot be held by
+        // a stale HTTP keep-alive or an interrupted streaming response.
+        const closed = new Promise<void>((resolve) => server.close(() => resolve()));
+        for (const socket of sockets) socket.destroy();
+        await closed;
       },
     };
   }
@@ -197,8 +224,14 @@ export class WorkerHub extends EventEmitter<HubEvents> {
         this.closeInvalid(state, "frame too large");
         return;
       }
-      const envelope = parseWorkerEnvelope(JSON.parse(raw));
+      const decoded = JSON.parse(raw) as unknown;
+      const envelope = parseWorkerEnvelope(decoded);
       if (!envelope) {
+        this.logger?.warn({
+          workerId: state.workerId,
+          messageType: messageType(decoded),
+          issues: workerEnvelopeValidationIssues(decoded),
+        }, "worker message validation failed");
         this.closeInvalid(state, "invalid worker message");
         return;
       }
@@ -209,6 +242,18 @@ export class WorkerHub extends EventEmitter<HubEvents> {
           return;
         }
         const previous = this.connections.get(envelope.workerId);
+        if (
+          previous &&
+          previous !== state &&
+          previous.ready &&
+          previous.socket.readyState === previous.socket.OPEN
+        ) {
+          // Two desktop starts can briefly overlap around an application
+          // update. Keep the already-healthy connection authoritative so the
+          // duplicate cannot create an endless mutual-supersession loop.
+          this.closeInvalid(state, "duplicate worker connection", 4409);
+          return;
+        }
         if (previous && previous !== state) previous.socket.close(4409, "superseded connection");
         state.workerId = envelope.workerId;
         state.pending = false;
@@ -252,7 +297,11 @@ export class WorkerHub extends EventEmitter<HubEvents> {
         return;
       }
       this.emit("envelope", envelope);
-    } catch {
+    } catch (error) {
+      this.logger?.warn({
+        workerId: state.workerId,
+        error: error instanceof Error ? error.message : String(error),
+      }, "worker message processing failed");
       this.closeInvalid(state, "invalid worker message");
     }
   }
@@ -489,4 +538,10 @@ export class WorkerHub extends EventEmitter<HubEvents> {
     }
     session.localSocket?.destroy();
   }
+}
+
+function messageType(input: unknown): string | null {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+  const type = (input as Record<string, unknown>).type;
+  return typeof type === "string" ? type : null;
 }

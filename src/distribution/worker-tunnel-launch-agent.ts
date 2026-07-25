@@ -104,6 +104,15 @@ export class WorkerTunnelLaunchAgent implements LaunchAgent {
   async close(): Promise<void> {
     this.hub.off("envelope", this.onEnvelope);
     this.hub.off("disconnect", this.onDisconnect);
+    const error = new Error(`worker_tunnel_closed:${this.workerId}`);
+    for (const preparation of this.preparations.values()) preparation.reject(error);
+    for (const start of this.pending.values()) {
+      start.ready.reject(error);
+      start.exited.reject(error);
+    }
+    this.preparations.clear();
+    this.pending.clear();
+    this.prepared = false;
     const proxies = [...this.runtimeProxies];
     this.runtimeProxies.clear();
     await Promise.all(proxies.map((proxy) => proxy.close().catch(() => undefined)));
@@ -126,9 +135,31 @@ export class WorkerTunnelLaunchAgent implements LaunchAgent {
   }
 
   private async stop(requestId: string, reason: string): Promise<void> {
-    this.hub.send(this.workerId, "runtime.stop", { requestId, reason });
     const start = this.pending.get(requestId);
-    if (start) await start.exited.promise.catch(() => undefined);
+    if (!start) return;
+    if (!this.hub.send(this.workerId, "runtime.stop", { requestId, reason })) {
+      this.pending.delete(requestId);
+      const error = new Error(`distributed_worker_not_connected:${this.workerId}`);
+      start.ready.reject(error);
+      start.exited.reject(error);
+      await start.exited.promise.catch(() => undefined);
+      return;
+    }
+    let timer: NodeJS.Timeout | null = null;
+    const acknowledged = await Promise.race([
+      start.exited.promise.then(() => true, () => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), this.timeoutMs);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (acknowledged) return;
+    if (this.pending.get(requestId) !== start) return;
+    this.pending.delete(requestId);
+    const error = new Error(`worker_tunnel_stop_timeout:${this.workerId}`);
+    start.ready.reject(error);
+    start.exited.reject(error);
+    await start.exited.promise.catch(() => undefined);
   }
 
   private handleEnvelope(envelope: WorkerEnvelope): void {

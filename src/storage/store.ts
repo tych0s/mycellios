@@ -6,7 +6,13 @@ import type {
   WorkerRegistration,
   WorkerStatus,
 } from "../contracts/types.js";
+import type { BenchmarkRun } from "../benchlab/types.js";
 import { newId } from "../core/ids.js";
+import {
+  ASSISTANT_SETTINGS_ID,
+  DEFAULT_SUPPORT_ASSISTANT_SETTINGS,
+  type SupportAssistantSettings,
+} from "../support/assistant.js";
 import { MeshDatabase } from "./database.js";
 
 export interface StoredWorker {
@@ -82,6 +88,32 @@ export interface StoredRequestedModel {
   updatedAt: number;
 }
 
+export interface StoredInferenceMessage {
+  id: string;
+  conversationId: string;
+  jobId: string | null;
+  role: "system" | "developer" | "user" | "assistant" | "tool";
+  content: string;
+  status: "pending" | "completed" | "failed";
+  inputTokens: number | null;
+  outputTokens: number | null;
+  routeClass: string | null;
+  latencyMs: number | null;
+  metadata: Record<string, unknown>;
+  createdAt: number;
+}
+
+export interface StoredActivationEvent {
+  phase: string;
+  message: string;
+  at: string;
+  state: "running" | "completed" | "failed";
+  nodeId?: string;
+  processId?: string;
+  device?: string;
+  details?: readonly string[];
+}
+
 interface RequestedModelRow {
   id: string;
   source: string;
@@ -100,6 +132,80 @@ interface RequestedModelRow {
 export class MeshStore {
   constructor(readonly database: MeshDatabase) {}
 
+  getSupportAssistantSettings(): SupportAssistantSettings {
+    const row = this.database.raw.prepare(
+      `SELECT enabled, model_id, system_prompt, welcome_message, suggestions_json,
+              max_output_tokens, temperature, allow_device_control, updated_at
+       FROM assistant_settings
+       WHERE id = ?`,
+    ).get(ASSISTANT_SETTINGS_ID) as {
+      enabled: number;
+      model_id: string | null;
+      system_prompt: string;
+      welcome_message: string;
+      suggestions_json: string;
+      max_output_tokens: number;
+      temperature: number;
+      allow_device_control: number;
+      updated_at: number;
+    } | undefined;
+    if (!row) return { ...DEFAULT_SUPPORT_ASSISTANT_SETTINGS };
+    let suggestions = DEFAULT_SUPPORT_ASSISTANT_SETTINGS.suggestions;
+    try {
+      const parsed = JSON.parse(row.suggestions_json) as unknown;
+      if (Array.isArray(parsed) && parsed.every((item) => typeof item === "string")) {
+        suggestions = parsed;
+      }
+    } catch {
+      // Keep the safe defaults if a manually edited row is malformed.
+    }
+    return {
+      enabled: Boolean(row.enabled),
+      modelId: row.model_id,
+      systemPrompt: row.system_prompt,
+      welcomeMessage: row.welcome_message,
+      suggestions,
+      maxOutputTokens: Number(row.max_output_tokens),
+      temperature: Number(row.temperature),
+      allowDeviceControl: Boolean(row.allow_device_control),
+      updatedAt: Number(row.updated_at),
+    };
+  }
+
+  saveSupportAssistantSettings(
+    input: Omit<SupportAssistantSettings, "updatedAt">,
+  ): SupportAssistantSettings {
+    const updatedAt = Date.now();
+    this.database.raw.prepare(
+      `INSERT INTO assistant_settings(
+         id, enabled, model_id, system_prompt, welcome_message, suggestions_json,
+         max_output_tokens, temperature, allow_device_control, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         enabled = excluded.enabled,
+         model_id = excluded.model_id,
+         system_prompt = excluded.system_prompt,
+         welcome_message = excluded.welcome_message,
+         suggestions_json = excluded.suggestions_json,
+         max_output_tokens = excluded.max_output_tokens,
+         temperature = excluded.temperature,
+         allow_device_control = excluded.allow_device_control,
+         updated_at = excluded.updated_at`,
+    ).run(
+      ASSISTANT_SETTINGS_ID,
+      input.enabled ? 1 : 0,
+      input.modelId,
+      input.systemPrompt,
+      input.welcomeMessage,
+      JSON.stringify(input.suggestions),
+      input.maxOutputTokens,
+      input.temperature,
+      input.allowDeviceControl ? 1 : 0,
+      updatedAt,
+    );
+    return { ...input, updatedAt };
+  }
+
   registerWorker(registration: WorkerRegistration): StoredWorker {
     return this.database.transaction(() => {
       const now = Date.now();
@@ -112,10 +218,11 @@ export class MeshStore {
       if (existing) {
         this.database.raw.prepare(
           `UPDATE workers
-           SET status = 'offline', capabilities_json = ?, last_seen_at = ?, updated_at = ?,
-               deregistered = 0
+           SET capabilities_json = ?, last_seen_at = ?, updated_at = ?,
+                deregistered = 0
            WHERE id = ?`,
         ).run(JSON.stringify(registration.capabilities), now, now, existing.id);
+        this.queueWorker(existing.id);
         return this.getWorker(existing.id)!;
       }
 
@@ -136,6 +243,7 @@ export class MeshStore {
           identity?.kind ?? null,
           identity?.id ?? null,
         );
+      this.queueWorker(workerId);
       return this.getWorker(workerId)!;
     });
   }
@@ -170,42 +278,57 @@ export class MeshStore {
     capabilities: WorkerCapabilities,
     status: WorkerStatus,
   ): void {
-    const now = Date.now();
-    this.database.raw
-      .prepare(
-        `UPDATE workers
-         SET capabilities_json = ?, status = ?, last_seen_at = ?, updated_at = ?
-         WHERE id = ?`,
-      )
-      .run(JSON.stringify(capabilities), status, now, now, workerId);
+    this.database.transaction(() => {
+      const now = Date.now();
+      this.database.raw
+        .prepare(
+          `UPDATE workers
+           SET capabilities_json = ?, status = ?, last_seen_at = ?, updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(JSON.stringify(capabilities), status, now, now, workerId);
+      this.queueWorker(workerId);
+    });
   }
 
   setWorkerStatus(workerId: string, status: WorkerStatus): void {
-    this.database.raw
-      .prepare("UPDATE workers SET status = ?, updated_at = ? WHERE id = ?")
-      .run(status, Date.now(), workerId);
+    this.database.transaction(() => {
+      this.database.raw
+        .prepare("UPDATE workers SET status = ?, updated_at = ? WHERE id = ?")
+        .run(status, Date.now(), workerId);
+      this.queueWorker(workerId);
+    });
   }
 
   deregisterWorker(workerId: string): boolean {
-    const result = this.database.raw
-      .prepare(
-        `UPDATE workers
-         SET deregistered = 1, status = 'offline', updated_at = ?
-         WHERE id = ? AND deregistered = 0`,
-      )
-      .run(Date.now(), workerId);
-    return Number(result.changes) === 1;
+    return this.database.transaction(() => {
+      const result = this.database.raw
+        .prepare(
+          `UPDATE workers
+           SET deregistered = 1, status = 'offline', updated_at = ?
+           WHERE id = ? AND deregistered = 0`,
+        )
+        .run(Date.now(), workerId);
+      if (Number(result.changes) === 1) this.queueWorker(workerId);
+      return Number(result.changes) === 1;
+    });
   }
 
   deregisterOfflineWorkers(): number {
-    const result = this.database.raw
-      .prepare(
-        `UPDATE workers
-         SET deregistered = 1, updated_at = ?
-         WHERE deregistered = 0 AND status IN ('offline', 'suspect')`,
-      )
-      .run(Date.now());
-    return Number(result.changes);
+    return this.database.transaction(() => {
+      const rows = this.database.raw.prepare(
+        "SELECT id FROM workers WHERE deregistered = 0 AND status IN ('offline', 'suspect')",
+      ).all() as unknown as Array<{ id: string }>;
+      const result = this.database.raw
+        .prepare(
+          `UPDATE workers
+           SET deregistered = 1, updated_at = ?
+           WHERE deregistered = 0 AND status IN ('offline', 'suspect')`,
+        )
+        .run(Date.now());
+      for (const row of rows) this.queueWorker(row.id);
+      return Number(result.changes);
+    });
   }
 
   upsertRequestedModel(input: {
@@ -216,34 +339,37 @@ export class MeshStore {
     minimumNodes: number;
     autoActivate: boolean;
   }): StoredRequestedModel {
-    const now = Date.now();
-    this.database.raw.prepare(
-      `INSERT INTO requested_models(
-         id, source, revision, context_tokens, minimum_nodes, auto_activate,
-         created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET
-         source = excluded.source,
-         revision = excluded.revision,
-         context_tokens = excluded.context_tokens,
-         minimum_nodes = excluded.minimum_nodes,
-         auto_activate = excluded.auto_activate,
-         profile_json = NULL,
-         profile_error = NULL,
-         activation_requested_at = NULL,
-         activation_error = NULL,
-         updated_at = excluded.updated_at`,
-    ).run(
-      input.id,
-      input.source,
-      input.revision,
-      input.contextTokens,
-      input.minimumNodes,
-      input.autoActivate ? 1 : 0,
-      now,
-      now,
-    );
-    return this.getRequestedModel(input.id)!;
+    return this.database.transaction(() => {
+      const now = Date.now();
+      this.database.raw.prepare(
+        `INSERT INTO requested_models(
+           id, source, revision, context_tokens, minimum_nodes, auto_activate,
+           created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           source = excluded.source,
+           revision = excluded.revision,
+           context_tokens = excluded.context_tokens,
+           minimum_nodes = excluded.minimum_nodes,
+           auto_activate = excluded.auto_activate,
+           profile_json = NULL,
+           profile_error = NULL,
+           activation_requested_at = NULL,
+           activation_error = NULL,
+           updated_at = excluded.updated_at`,
+      ).run(
+        input.id,
+        input.source,
+        input.revision,
+        input.contextTokens,
+        input.minimumNodes,
+        input.autoActivate ? 1 : 0,
+        now,
+        now,
+      );
+      this.queueRequestedModel(input.id);
+      return this.getRequestedModel(input.id)!;
+    });
   }
 
   getRequestedModel(id: string): StoredRequestedModel | null {
@@ -265,67 +391,91 @@ export class MeshStore {
     profile: Record<string, unknown> | null,
     error: string | null,
   ): void {
-    this.database.raw.prepare(
-      `UPDATE requested_models
-       SET profile_json = ?, profile_error = ?, activation_requested_at = NULL,
-           activation_error = NULL, updated_at = ?
-       WHERE id = ?`,
-    ).run(profile ? JSON.stringify(profile) : null, error, Date.now(), id);
+    this.database.transaction(() => {
+      this.database.raw.prepare(
+        `UPDATE requested_models
+         SET profile_json = ?, profile_error = ?, activation_requested_at = NULL,
+             activation_error = NULL, updated_at = ?
+         WHERE id = ?`,
+      ).run(profile ? JSON.stringify(profile) : null, error, Date.now(), id);
+      this.queueRequestedModel(id);
+    });
   }
 
   setRequestedModelActivation(id: string, requested: boolean): void {
-    const now = Date.now();
-    if (requested) {
-      this.database.raw.prepare(
-        `UPDATE requested_models
-         SET activation_requested_at = ?, activation_error = NULL, updated_at = ?
-         WHERE id = ?`,
-      ).run(now, now, id);
-      return;
-    }
-    this.database.raw.prepare(
-      `UPDATE requested_models
-       SET activation_requested_at = NULL, updated_at = ?
-       WHERE id = ?`,
-    ).run(now, id);
+    this.database.transaction(() => {
+      const now = Date.now();
+      if (requested) {
+        this.database.raw.prepare(
+          `UPDATE requested_models
+           SET activation_requested_at = ?, activation_error = NULL, updated_at = ?
+           WHERE id = ?`,
+        ).run(now, now, id);
+      } else {
+        this.database.raw.prepare(
+          `UPDATE requested_models
+           SET activation_requested_at = NULL, updated_at = ?
+           WHERE id = ?`,
+        ).run(now, id);
+      }
+      this.queueRequestedModel(id);
+    });
   }
 
   setRequestedModelActivationError(id: string, error: string): void {
-    this.database.raw.prepare(
-      `UPDATE requested_models
-       SET activation_requested_at = NULL, activation_error = ?, updated_at = ?
-       WHERE id = ?`,
-    ).run(error, Date.now(), id);
+    this.database.transaction(() => {
+      this.database.raw.prepare(
+        `UPDATE requested_models
+         SET activation_requested_at = NULL, activation_error = ?, updated_at = ?
+         WHERE id = ?`,
+      ).run(error, Date.now(), id);
+      this.queueRequestedModel(id);
+    });
   }
 
   clearRequestedModelActivationError(id: string): void {
-    this.database.raw.prepare(
-      `UPDATE requested_models
-       SET activation_requested_at = NULL, activation_error = NULL, updated_at = ?
-       WHERE id = ?`,
-    ).run(Date.now(), id);
+    this.database.transaction(() => {
+      this.database.raw.prepare(
+        `UPDATE requested_models
+         SET activation_requested_at = NULL, activation_error = NULL, updated_at = ?
+         WHERE id = ?`,
+      ).run(Date.now(), id);
+      this.queueRequestedModel(id);
+    });
   }
 
   removeRequestedModel(id: string): boolean {
-    return Number(
-      this.database.raw.prepare("DELETE FROM requested_models WHERE id = ?").run(id).changes,
-    ) === 1;
+    return this.database.transaction(() => {
+      const removed = Number(
+        this.database.raw.prepare("DELETE FROM requested_models WHERE id = ?").run(id).changes,
+      ) === 1;
+      if (removed) this.database.enqueueRemoteChange("requested_models", id, "delete", null);
+      return removed;
+    });
   }
 
   markStaleWorkers(now = Date.now()): { suspect: number; offline: number } {
-    const suspect = this.database.raw
-      .prepare(
-        `UPDATE workers SET status = 'suspect', updated_at = ?
-         WHERE status = 'online' AND last_seen_at < ?`,
-      )
-      .run(now, now - 10_000).changes;
-    const offline = this.database.raw
-      .prepare(
-        `UPDATE workers SET status = 'offline', updated_at = ?
-         WHERE status IN ('online', 'suspect') AND last_seen_at < ?`,
-      )
-      .run(now, now - 15_000).changes;
-    return { suspect: Number(suspect), offline: Number(offline) };
+    return this.database.transaction(() => {
+      const candidates = this.database.raw.prepare(
+        `SELECT id FROM workers
+         WHERE (status = 'online' AND last_seen_at < ?)
+            OR (status IN ('online', 'suspect') AND last_seen_at < ?)`,
+      ).all(now - 10_000, now - 15_000) as unknown as Array<{ id: string }>;
+      const suspect = this.database.raw
+        .prepare(
+          `UPDATE workers SET status = 'suspect', updated_at = ?
+           WHERE status = 'online' AND last_seen_at < ?`,
+        )
+        .run(now, now - 10_000).changes;
+      const offline = this.database.raw
+        .prepare(
+          `UPDATE workers SET status = 'offline', updated_at = ?
+           WHERE status IN ('online', 'suspect') AND last_seen_at < ?`,
+        )
+        .run(now, now - 15_000).changes;
+      for (const candidate of candidates) this.queueWorker(candidate.id);
+      return { suspect: Number(suspect), offline: Number(offline) };
+    });
   }
 
   createJob(input: {
@@ -335,23 +485,26 @@ export class MeshStore {
     workloadClass: string;
     deadlineAt: number;
   }): StoredJob {
-    const now = Date.now();
-    this.database.raw
-      .prepare(
-        `INSERT INTO jobs(
-           id, session_id, model, workload_class, status, deadline_at, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)`,
-      )
-      .run(
-        input.id,
-        input.sessionId,
-        input.model,
-        input.workloadClass,
-        input.deadlineAt,
-        now,
-        now,
-      );
-    return this.getJob(input.id)!;
+    return this.database.transaction(() => {
+      const now = Date.now();
+      this.database.raw
+        .prepare(
+          `INSERT INTO jobs(
+             id, session_id, model, workload_class, status, deadline_at, created_at, updated_at
+           ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)`,
+        )
+        .run(
+          input.id,
+          input.sessionId,
+          input.model,
+          input.workloadClass,
+          input.deadlineAt,
+          now,
+          now,
+        );
+      this.queueJob(input.id);
+      return this.getJob(input.id)!;
+    });
   }
 
   getIdempotentJob(idempotencyKey: string): { jobId: string; requestHash: string } | null {
@@ -362,12 +515,21 @@ export class MeshStore {
   }
 
   bindIdempotencyKey(idempotencyKey: string, requestHash: string, jobId: string): void {
-    this.database.raw
-      .prepare(
-        `INSERT INTO idempotency_keys(idempotency_key, request_hash, job_id, created_at)
-         VALUES (?, ?, ?, ?)`,
-      )
-      .run(idempotencyKey, requestHash, jobId, Date.now());
+    this.database.transaction(() => {
+      const createdAt = Date.now();
+      this.database.raw
+        .prepare(
+          `INSERT INTO idempotency_keys(idempotency_key, request_hash, job_id, created_at)
+           VALUES (?, ?, ?, ?)`,
+        )
+        .run(idempotencyKey, requestHash, jobId, createdAt);
+      this.database.enqueueRemoteChange("idempotency_keys", idempotencyKey, "upsert", {
+        idempotency_key: idempotencyKey,
+        request_hash: requestHash,
+        job_id: jobId,
+        created_at: createdAt,
+      });
+    });
   }
 
   getJob(jobId: string): StoredJob | null {
@@ -380,38 +542,47 @@ export class MeshStore {
   setJobRoute(jobId: string, route: ScheduledRoute, leaseId: string): void {
     const first = route.stages[0];
     if (!first) throw new Error("Cannot assign an empty route");
-    this.database.raw
-      .prepare(
-        `UPDATE jobs
-         SET status = 'leasing', worker_id = ?, deployment_id = ?, lease_id = ?,
-             model_digest = ?, updated_at = ?
-         WHERE id = ? AND status = 'queued'`,
-      )
-      .run(
-        first.workerId,
-        first.deploymentId,
-        leaseId,
-        first.modelDigest,
-        Date.now(),
-        jobId,
-      );
+    this.database.transaction(() => {
+      this.database.raw
+        .prepare(
+          `UPDATE jobs
+           SET status = 'leasing', worker_id = ?, deployment_id = ?, lease_id = ?,
+               model_digest = ?, updated_at = ?
+           WHERE id = ? AND status = 'queued'`,
+        )
+        .run(
+          first.workerId,
+          first.deploymentId,
+          leaseId,
+          first.modelDigest,
+          Date.now(),
+          jobId,
+        );
+      this.queueJob(jobId);
+    });
   }
 
   setJobStatus(jobId: string, status: JobStatus, failureCode?: string): void {
-    this.database.raw
-      .prepare("UPDATE jobs SET status = ?, failure_code = ?, updated_at = ? WHERE id = ?")
-      .run(status, failureCode ?? null, Date.now(), jobId);
+    this.database.transaction(() => {
+      this.database.raw
+        .prepare("UPDATE jobs SET status = ?, failure_code = ?, updated_at = ? WHERE id = ?")
+        .run(status, failureCode ?? null, Date.now(), jobId);
+      this.queueJob(jobId);
+    });
   }
 
   requeueJob(jobId: string, failureCode?: string): void {
-    this.database.raw
-      .prepare(
-        `UPDATE jobs
-         SET status = 'queued', worker_id = NULL, deployment_id = NULL,
-             model_digest = NULL, lease_id = NULL, failure_code = ?, updated_at = ?
-         WHERE id = ? AND status NOT IN ('completed', 'cancelled', 'expired')`,
-      )
-      .run(failureCode ?? null, Date.now(), jobId);
+    this.database.transaction(() => {
+      this.database.raw
+        .prepare(
+          `UPDATE jobs
+           SET status = 'queued', worker_id = NULL, deployment_id = NULL,
+               model_digest = NULL, lease_id = NULL, failure_code = ?, updated_at = ?
+           WHERE id = ? AND status NOT IN ('completed', 'cancelled', 'expired')`,
+        )
+        .run(failureCode ?? null, Date.now(), jobId);
+      this.queueJob(jobId);
+    });
   }
 
   completeJob(jobId: string, metrics: CompletionMetrics): void {
@@ -429,6 +600,9 @@ export class MeshStore {
            WHERE id = (SELECT worker_id FROM jobs WHERE id = ?)`,
         )
         .run(Date.now(), jobId);
+      this.queueJob(jobId);
+      const workerId = this.getJob(jobId)?.workerId;
+      if (workerId) this.queueWorker(workerId);
     });
   }
 
@@ -463,19 +637,41 @@ export class MeshStore {
   }
 
   saveSession(sessionId: string, model: string, route: ScheduledRoute, ttlMs = 15 * 60_000): void {
-    const now = Date.now();
-    this.database.raw
-      .prepare(
-        `INSERT INTO sessions(id, model, route_json, expires_at, last_used_at)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET
-           model = excluded.model,
-           route_json = excluded.route_json,
-           expires_at = excluded.expires_at,
-           last_used_at = excluded.last_used_at,
-           version = sessions.version + 1`,
-      )
-      .run(sessionId, model, JSON.stringify(route), now + ttlMs, now);
+    this.database.transaction(() => {
+      const now = Date.now();
+      this.database.raw
+        .prepare(
+          `INSERT INTO sessions(id, model, route_json, expires_at, last_used_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+             model = excluded.model,
+             route_json = excluded.route_json,
+             expires_at = excluded.expires_at,
+             last_used_at = excluded.last_used_at,
+             version = sessions.version + 1`,
+        )
+        .run(sessionId, model, JSON.stringify(route), now + ttlMs, now);
+      const row = this.database.raw.prepare("SELECT * FROM sessions WHERE id = ?").get(sessionId) as
+        | {
+            id: string;
+            model: string;
+            route_json: string;
+            expires_at: number;
+            last_used_at: number;
+            version: number;
+          }
+        | undefined;
+      if (row) {
+        this.database.enqueueRemoteChange("sessions", sessionId, "upsert", {
+          id: row.id,
+          model: row.model,
+          route_json: JSON.parse(row.route_json) as unknown,
+          expires_at: Number(row.expires_at),
+          last_used_at: Number(row.last_used_at),
+          version: Number(row.version),
+        });
+      }
+    });
   }
 
   getSessionRoute(sessionId: string, model: string): ScheduledRoute | null {
@@ -493,6 +689,436 @@ export class MeshStore {
       .prepare("SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?")
       .all(limit) as unknown as JobRow[];
     return rows.map((row) => this.mapJob(row));
+  }
+
+  queueAllForRemotePersistence(): number {
+    return this.database.transaction(() => {
+      let queued = 0;
+      const workers = this.database.raw.prepare("SELECT id FROM workers").all() as unknown as Array<{ id: string }>;
+      for (const worker of workers) {
+        this.queueWorker(worker.id);
+        queued += 1;
+      }
+      const jobs = this.database.raw.prepare("SELECT id FROM jobs").all() as unknown as Array<{ id: string }>;
+      for (const job of jobs) {
+        this.queueJob(job.id);
+        queued += 1;
+      }
+      const models = this.database.raw.prepare("SELECT id FROM requested_models").all() as unknown as Array<{ id: string }>;
+      for (const model of models) {
+        this.queueRequestedModel(model.id);
+        queued += 1;
+      }
+      const sessions = this.database.raw.prepare("SELECT * FROM sessions").all() as unknown as Array<{
+        id: string;
+        model: string;
+        route_json: string;
+        expires_at: number;
+        last_used_at: number;
+        version: number;
+      }>;
+      for (const row of sessions) {
+        this.database.enqueueRemoteChange("sessions", row.id, "upsert", {
+          id: row.id,
+          model: row.model,
+          route_json: JSON.parse(row.route_json) as unknown,
+          expires_at: Number(row.expires_at),
+          last_used_at: Number(row.last_used_at),
+          version: Number(row.version),
+        });
+        queued += 1;
+      }
+      const keys = this.database.raw.prepare("SELECT * FROM idempotency_keys").all() as unknown as Array<{
+        idempotency_key: string;
+        request_hash: string;
+        job_id: string;
+        created_at: number;
+      }>;
+      for (const row of keys) {
+        this.database.enqueueRemoteChange("idempotency_keys", row.idempotency_key, "upsert", {
+          ...row,
+          created_at: Number(row.created_at),
+        });
+        queued += 1;
+      }
+      const conversations = this.database.raw.prepare(
+        "SELECT id FROM inference_conversations",
+      ).all() as unknown as Array<{ id: string }>;
+      for (const row of conversations) {
+        this.queueInferenceConversation(row.id);
+        queued += 1;
+      }
+      const messages = this.database.raw.prepare(
+        "SELECT id FROM inference_messages",
+      ).all() as unknown as Array<{ id: string }>;
+      for (const row of messages) {
+        this.queueInferenceMessage(row.id);
+        queued += 1;
+      }
+      const activationEvents = this.database.raw.prepare(
+        "SELECT id FROM activation_events",
+      ).all() as unknown as Array<{ id: string }>;
+      for (const row of activationEvents) {
+        this.queueActivationEvent(row.id);
+        queued += 1;
+      }
+      return queued;
+    });
+  }
+
+  queueBenchmarkRun(run: BenchmarkRun): void {
+    this.database.enqueueRemoteChange("benchmark_runs", run.runId, "upsert", {
+      run_id: run.runId,
+      version: run.version,
+      label: run.label,
+      status: run.status,
+      trigger: run.trigger ?? null,
+      trigger_model_id: run.triggerModelId ?? null,
+      started_at: run.startedAt,
+      finished_at: run.finishedAt,
+      document: run,
+    });
+  }
+
+  startInferenceConversation(
+    sessionId: string,
+    model: string,
+    messages: ReadonlyArray<{ role: "system" | "developer" | "user" | "assistant" | "tool"; content: string }>,
+  ): string {
+    return this.database.transaction(() => {
+      const now = Date.now();
+      const existing = this.database.raw.prepare(
+        "SELECT id FROM inference_conversations WHERE session_id = ?",
+      ).get(sessionId) as { id: string } | undefined;
+      const conversationId = existing?.id ?? newId("cnv");
+      if (existing) {
+        this.database.raw.prepare(
+          "UPDATE inference_conversations SET model = ?, updated_at = ? WHERE id = ?",
+        ).run(model, now, conversationId);
+      } else {
+        this.database.raw.prepare(
+          `INSERT INTO inference_conversations(id, session_id, model, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?)`,
+        ).run(conversationId, sessionId, model, now, now);
+      }
+      this.queueInferenceConversation(conversationId);
+
+      const messageCount = this.database.raw.prepare(
+        "SELECT COUNT(*) AS count FROM inference_messages WHERE conversation_id = ?",
+      ).get(conversationId) as { count: number };
+      const selected = Number(messageCount.count) === 0
+        ? messages
+        : messages.length > 0 ? [messages.at(-1)!] : [];
+      for (const message of selected) {
+        this.appendInferenceMessage({
+          conversationId,
+          jobId: null,
+          role: message.role,
+          content: message.content,
+          status: "completed",
+        });
+      }
+      return conversationId;
+    });
+  }
+
+  appendInferenceMessage(input: {
+    conversationId: string;
+    jobId: string | null;
+    role: StoredInferenceMessage["role"];
+    content: string;
+    status: StoredInferenceMessage["status"];
+    inputTokens?: number | null;
+    outputTokens?: number | null;
+    routeClass?: string | null;
+    latencyMs?: number | null;
+    metadata?: Record<string, unknown>;
+  }): StoredInferenceMessage {
+    return this.database.transaction(() => {
+      const id = newId("msg");
+      const createdAt = Date.now();
+      this.database.raw.prepare(
+        `INSERT INTO inference_messages(
+           id, conversation_id, job_id, role, content, status, input_tokens,
+           output_tokens, route_class, latency_ms, metadata_json, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        id,
+        input.conversationId,
+        input.jobId,
+        input.role,
+        input.content,
+        input.status,
+        input.inputTokens ?? null,
+        input.outputTokens ?? null,
+        input.routeClass ?? null,
+        input.latencyMs ?? null,
+        JSON.stringify(input.metadata ?? {}),
+        createdAt,
+      );
+      this.database.raw.prepare(
+        "UPDATE inference_conversations SET updated_at = ? WHERE id = ?",
+      ).run(createdAt, input.conversationId);
+      this.queueInferenceConversation(input.conversationId);
+      this.queueInferenceMessage(id);
+      return {
+        id,
+        conversationId: input.conversationId,
+        jobId: input.jobId,
+        role: input.role,
+        content: input.content,
+        status: input.status,
+        inputTokens: input.inputTokens ?? null,
+        outputTokens: input.outputTokens ?? null,
+        routeClass: input.routeClass ?? null,
+        latencyMs: input.latencyMs ?? null,
+        metadata: input.metadata ?? {},
+        createdAt,
+      };
+    });
+  }
+
+  listInferenceMessages(sessionId: string): StoredInferenceMessage[] {
+    const rows = this.database.raw.prepare(
+      `SELECT m.*
+       FROM inference_messages m
+       JOIN inference_conversations c ON c.id = m.conversation_id
+       WHERE c.session_id = ?
+       ORDER BY m.created_at, m.id`,
+    ).all(sessionId) as unknown as Array<{
+      id: string;
+      conversation_id: string;
+      job_id: string | null;
+      role: StoredInferenceMessage["role"];
+      content: string;
+      status: StoredInferenceMessage["status"];
+      input_tokens: number | null;
+      output_tokens: number | null;
+      route_class: string | null;
+      latency_ms: number | null;
+      metadata_json: string;
+      created_at: number;
+    }>;
+    return rows.map((row) => ({
+      id: row.id,
+      conversationId: row.conversation_id,
+      jobId: row.job_id,
+      role: row.role,
+      content: row.content,
+      status: row.status,
+      inputTokens: row.input_tokens === null ? null : Number(row.input_tokens),
+      outputTokens: row.output_tokens === null ? null : Number(row.output_tokens),
+      routeClass: row.route_class,
+      latencyMs: row.latency_ms === null ? null : Number(row.latency_ms),
+      metadata: JSON.parse(row.metadata_json) as Record<string, unknown>,
+      createdAt: Number(row.created_at),
+    }));
+  }
+
+  appendActivationEvent(modelId: string, event: StoredActivationEvent): void {
+    this.database.transaction(() => {
+      const id = newId("act");
+      const occurredAt = Date.parse(event.at);
+      this.database.raw.prepare(
+        `INSERT INTO activation_events(
+           id, model_id, phase, state, message, node_id, process_id, device,
+           details_json, occurred_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        id,
+        modelId,
+        event.phase,
+        event.state,
+        event.message,
+        event.nodeId ?? null,
+        event.processId ?? null,
+        event.device ?? null,
+        event.details ? JSON.stringify(event.details) : null,
+        Number.isFinite(occurredAt) ? occurredAt : Date.now(),
+      );
+      this.queueActivationEvent(id);
+    });
+  }
+
+  listActivationEvents(modelId: string, limit = 100): StoredActivationEvent[] {
+    const rows = this.database.raw.prepare(
+      `SELECT * FROM activation_events
+       WHERE model_id = ?
+       ORDER BY occurred_at DESC
+       LIMIT ?`,
+    ).all(modelId, limit) as unknown as Array<{
+      phase: string;
+      state: StoredActivationEvent["state"];
+      message: string;
+      node_id: string | null;
+      process_id: string | null;
+      device: string | null;
+      details_json: string | null;
+      occurred_at: number;
+    }>;
+    return rows.toReversed().map((row) => ({
+      phase: row.phase,
+      state: row.state,
+      message: row.message,
+      at: new Date(Number(row.occurred_at)).toISOString(),
+      ...(row.node_id ? { nodeId: row.node_id } : {}),
+      ...(row.process_id ? { processId: row.process_id } : {}),
+      ...(row.device ? { device: row.device } : {}),
+      ...(row.details_json ? { details: JSON.parse(row.details_json) as string[] } : {}),
+    }));
+  }
+
+  private queueWorker(workerId: string): void {
+    const row = this.database.raw.prepare("SELECT * FROM workers WHERE id = ?").get(workerId) as
+      | (WorkerRow & {
+          created_at: number;
+          updated_at: number;
+          deregistered: number;
+        })
+      | undefined;
+    if (!row) return;
+    this.database.enqueueRemoteChange("workers", workerId, "upsert", {
+      id: row.id,
+      status: row.status,
+      capabilities_json: JSON.parse(row.capabilities_json) as unknown,
+      reliability: Number(row.reliability),
+      jobs_completed: Number(row.jobs_completed),
+      last_seen_at: Number(row.last_seen_at),
+      created_at: Number(row.created_at),
+      updated_at: Number(row.updated_at),
+      deregistered: row.deregistered === 1,
+      identity_kind: row.identity_kind,
+      identity_id: row.identity_id,
+    });
+  }
+
+  private queueJob(jobId: string): void {
+    const row = this.database.raw.prepare("SELECT * FROM jobs WHERE id = ?").get(jobId) as
+      | JobRow
+      | undefined;
+    if (!row) return;
+    this.database.enqueueRemoteChange("jobs", jobId, "upsert", {
+      id: row.id,
+      session_id: row.session_id,
+      model: row.model,
+      workload_class: row.workload_class,
+      status: row.status,
+      worker_id: row.worker_id,
+      deployment_id: row.deployment_id,
+      model_digest: row.model_digest,
+      lease_id: row.lease_id,
+      input_tokens: Number(row.input_tokens),
+      output_tokens: Number(row.output_tokens),
+      failure_code: row.failure_code,
+      deadline_at: Number(row.deadline_at),
+      created_at: Number(row.created_at),
+      updated_at: Number(row.updated_at),
+    });
+  }
+
+  private queueRequestedModel(modelId: string): void {
+    const row = this.database.raw.prepare("SELECT * FROM requested_models WHERE id = ?").get(modelId) as
+      | RequestedModelRow
+      | undefined;
+    if (!row) return;
+    this.database.enqueueRemoteChange("requested_models", modelId, "upsert", {
+      id: row.id,
+      source: row.source,
+      revision: row.revision,
+      context_tokens: Number(row.context_tokens),
+      minimum_nodes: Number(row.minimum_nodes),
+      auto_activate: row.auto_activate === 1,
+      profile_json: row.profile_json ? JSON.parse(row.profile_json) as unknown : null,
+      profile_error: row.profile_error,
+      activation_requested_at: row.activation_requested_at,
+      activation_error: row.activation_error,
+      created_at: Number(row.created_at),
+      updated_at: Number(row.updated_at),
+    });
+  }
+
+  private queueInferenceConversation(conversationId: string): void {
+    const row = this.database.raw.prepare(
+      "SELECT * FROM inference_conversations WHERE id = ?",
+    ).get(conversationId) as
+      | { id: string; session_id: string; model: string; created_at: number; updated_at: number }
+      | undefined;
+    if (!row) return;
+    this.database.enqueueRemoteChange("inference_conversations", conversationId, "upsert", {
+      id: row.id,
+      session_id: row.session_id,
+      model: row.model,
+      created_at: new Date(Number(row.created_at)).toISOString(),
+      updated_at: new Date(Number(row.updated_at)).toISOString(),
+    });
+  }
+
+  private queueInferenceMessage(messageId: string): void {
+    const row = this.database.raw.prepare(
+      "SELECT * FROM inference_messages WHERE id = ?",
+    ).get(messageId) as
+      | {
+          id: string;
+          conversation_id: string;
+          job_id: string | null;
+          role: string;
+          content: string;
+          status: string;
+          input_tokens: number | null;
+          output_tokens: number | null;
+          route_class: string | null;
+          latency_ms: number | null;
+          metadata_json: string;
+          created_at: number;
+        }
+      | undefined;
+    if (!row) return;
+    this.database.enqueueRemoteChange("inference_messages", messageId, "upsert", {
+      id: row.id,
+      conversation_id: row.conversation_id,
+      job_id: row.job_id,
+      role: row.role,
+      content: row.content,
+      status: row.status,
+      input_tokens: row.input_tokens,
+      output_tokens: row.output_tokens,
+      route_class: row.route_class,
+      latency_ms: row.latency_ms,
+      metadata: JSON.parse(row.metadata_json) as unknown,
+      created_at: new Date(Number(row.created_at)).toISOString(),
+    });
+  }
+
+  private queueActivationEvent(eventId: string): void {
+    const row = this.database.raw.prepare(
+      "SELECT * FROM activation_events WHERE id = ?",
+    ).get(eventId) as
+      | {
+          id: string;
+          model_id: string;
+          phase: string;
+          state: string;
+          message: string;
+          node_id: string | null;
+          process_id: string | null;
+          device: string | null;
+          details_json: string | null;
+          occurred_at: number;
+        }
+      | undefined;
+    if (!row) return;
+    this.database.enqueueRemoteChange("activation_events", eventId, "upsert", {
+      id: row.id,
+      model_id: row.model_id,
+      phase: row.phase,
+      state: row.state,
+      message: row.message,
+      node_id: row.node_id,
+      process_id: row.process_id,
+      device: row.device,
+      details: row.details_json ? JSON.parse(row.details_json) as unknown : null,
+      occurred_at: Number(row.occurred_at),
+    });
   }
 
   private mapWorker(row: WorkerRow): StoredWorker {

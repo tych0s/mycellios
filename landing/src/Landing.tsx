@@ -2,9 +2,11 @@ import {
   ArrowDownRight,
   ArrowRight,
   ArrowUpRight,
+  BookOpen,
   Boxes,
   Check,
   ChevronRight,
+  CirclePlay,
   CircleDot,
   Coins,
   Cpu,
@@ -22,7 +24,8 @@ import {
   Workflow,
   Zap,
 } from "lucide-react";
-import { useEffect, useRef, useState, type CSSProperties, type PointerEvent } from "react";
+import { SupportAssistant } from "./SupportAssistant";
+import { lazy, Suspense, useEffect, useRef, useState, type CSSProperties, type PointerEvent } from "react";
 import brandIcon from "./assets/mycellios-app-icon-v2.png";
 import efficiencyCurve from "./assets/efficiency-curve-ai.webp";
 import myceliumNetwork from "./assets/mycelium-network.jpg";
@@ -30,6 +33,7 @@ import { MyceliumHero } from "./MyceliumHero";
 
 const EMAIL = "hello@mycellios.com";
 const RELEASES_URL = "https://github.com/tych0s/mycellios";
+const ExplainerVideo = lazy(() => import("./ExplainerVideo"));
 
 const downloads = {
   windows: { label: "Windows", detail: "Windows 10/11 · x64", filename: "mycellios-windows-x64.exe" },
@@ -51,7 +55,6 @@ function downloadUrl(key: DownloadKey): string {
 }
 
 const copy = {
-    meta: { title: "mycellios — One model. Many machines.", description: "mycellios coordinates heterogeneous machines to run AI models that do not fit on any single computer." },
     home: "mycellios, home",
     languageLabel: "Change language",
     nav: { aria: "Main navigation", vision: "Vision", architecture: "Architecture", evidence: "Real progress", join: "Download" },
@@ -64,6 +67,20 @@ const copy = {
     },
     visual: { aria: "Visualization of a network of machines forming a single model", model: "MODEL", route: "active route", nodes: "9 nodes", heterogeneous: "heterogeneous", capacity: "Capacity", coordinated: "coordinated", caption: "Concept visualization · network forming" },
     signals: ["LARGE MODELS", "HETEROGENEOUS HARDWARE", "DISTRIBUTED MEMORY", "ADAPTIVE ROUTES", "EXACT MODE", "MoE MODELS"],
+    explainer: {
+      index: "00 / START HERE",
+      eyebrow: "mycellios in 20 seconds",
+      title: "Several devices. One AI model.",
+      copy: "Each computer contributes only the capacity you choose. mycellios connects that capacity, distributes the model, and returns one streamed answer.",
+      loading: "Preparing the explanation…",
+      note: "Conceptual flow · Real capacity and speed are measured in Network and Tests.",
+      steps: [
+        ["01", "Offer capacity", "Choose what each device can contribute."],
+        ["02", "Connect nodes", "Useful machines form one coordinated network."],
+        ["03", "Split the model", "Every node holds only its assigned part."],
+        ["04", "Stream the answer", "One request returns one continuous response."],
+      ],
+    },
     manifesto: { index: "01 / THE IDEA", kicker: "The capacity exists. It is fragmented.", title: "The most powerful AI lives behind walls of silicon. We are building another door.", copy: "Millions of PCs, workstations, and small servers spend much of the day underused. Alone, they are not enough. Coordinated, they can become a new class of infrastructure.", link: "Discover GDLP/2" },
     mycelium: {
       eyebrow: "The inspiration", title: "The network learned how to live before we did.",
@@ -178,7 +195,7 @@ const copy = {
     },
     participate: { eyebrow: "Build the network", title: "There is more than one way to take part.", copy: "We are looking for the first machines, organizations, and people ready to turn a difficult idea into real infrastructure.", contributor: { label: "FOR CONTRIBUTORS", title: "Turn idle capacity into useful capacity.", copy: "Connect a PC, workstation, or server. Decide how much you contribute and pause whenever you want.", bullets: ["Different hardware, one network", "Voluntary contribution", "Verifiable work"] }, organization: { label: "FOR TEAMS AND ORGANIZATIONS", title: "Run open models on infrastructure you control.", copy: "Create private networks for labs, companies, and communities with distributed hardware.", bullets: ["Larger models through pooled memory", "A familiar API for your applications", "Topology adapted to your network"] } },
     closing: { eyebrow: "Founding network", title1: "Many machines.", title2: "One model.", copy: "Join the first mycellios test network and help us prove that the next great machine can be a community.", button: "Request early access", email: "Write to us at", subject: "I want to join mycellios" },
-  footer: { tagline: "Distributed intelligence, built together.", architecture: "Architecture", status: "Status", contact: "Contact" },
+  footer: { tagline: "Distributed intelligence, built together.", architecture: "Architecture", status: "Status" },
 } as const;
 
 const nodes = [
@@ -299,6 +316,62 @@ function NetworkHero({ text }: { text: typeof copy.visual }) {
 
 function SectionHeading({ eyebrow, title, copy }: { eyebrow: string; title: string; copy: string }) {
   return <div className="section-heading reveal"><span className="eyebrow"><i />{eyebrow}</span><h2>{title}</h2><p>{copy}</p></div>;
+}
+
+function ExplainerSection({ text }: { text: typeof copy.explainer }) {
+  const section = useRef<HTMLElement>(null);
+  const [shouldLoad, setShouldLoad] = useState(false);
+
+  useEffect(() => {
+    const target = section.current;
+    if (!target) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (!entry?.isIntersecting) return;
+        setShouldLoad(true);
+        observer.disconnect();
+      },
+      { rootMargin: "420px 0px" },
+    );
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, []);
+
+  return (
+    <section className="explainer-section" id="explainer" ref={section}>
+      <div className="container">
+        <div className="explainer-heading reveal">
+          <span className="explainer-index">{text.index}</span>
+          <div>
+            <span className="eyebrow"><i />{text.eyebrow}</span>
+            <h2>{text.title}</h2>
+          </div>
+          <p>{text.copy}</p>
+        </div>
+
+        <div className="explainer-player-shell reveal">
+          {shouldLoad ? (
+            <Suspense fallback={<div className="explainer-loading"><CirclePlay size={40} /><span>{text.loading}</span></div>}>
+              <ExplainerVideo />
+            </Suspense>
+          ) : (
+            <div className="explainer-loading"><CirclePlay size={40} /><span>{text.loading}</span></div>
+          )}
+        </div>
+
+        <div className="explainer-steps reveal">
+          {text.steps.map(([number, title, detail]) => (
+            <div key={number}>
+              <span>{number}</span>
+              <strong>{title}</strong>
+              <p>{detail}</p>
+            </div>
+          ))}
+        </div>
+        <p className="explainer-note reveal">{text.note}</p>
+      </div>
+    </section>
+  );
 }
 
 function MyceliumStory({ text }: { text: typeof copy.mycelium }) {
@@ -547,14 +620,6 @@ function Landing() {
   const t = copy;
 
   useEffect(() => {
-    document.documentElement.lang = "en";
-    document.title = t.meta.title;
-    document.querySelector('meta[name="description"]')?.setAttribute("content", t.meta.description);
-    document.querySelector('meta[property="og:title"]')?.setAttribute("content", t.meta.title);
-    document.querySelector('meta[property="og:description"]')?.setAttribute("content", t.meta.description);
-  }, [t.meta.description, t.meta.title]);
-
-  useEffect(() => {
     const observer = new IntersectionObserver((entries) => entries.forEach((entry) => entry.isIntersecting && entry.target.classList.add("is-visible")), { threshold: 0.14 });
     page.current?.querySelectorAll(".reveal").forEach((element) => observer.observe(element));
     return () => observer.disconnect();
@@ -569,13 +634,13 @@ function Landing() {
   return (
     <div className="site" id="top" ref={page} onPointerMove={trackPointer}>
       <div className="scroll-progress" aria-hidden="true" /><LivingBackdrop /><div className="ambient-pointer" />
-      <header className="nav-shell"><nav className="nav container" aria-label={t.nav.aria}><Brand homeLabel={t.home} /><div className="nav-links"><a href="/network">Live network</a><a href="/mobile/">Contribute</a><a href="#architecture">{t.nav.architecture}</a><a href="#roadmap">Roadmap</a></div><div className="nav-actions"><a className="nav-cta" href="/join">Join now <Zap size={15} /></a></div></nav></header>
+      <header className="nav-shell"><nav className="nav container" aria-label={t.nav.aria}><Brand homeLabel={t.home} /><div className="nav-links"><a href="/network">Live network</a><a href="/mobile/">Contribute</a><a href="#architecture">{t.nav.architecture}</a><a href="#roadmap">Roadmap</a></div><div className="nav-actions"><a className="nav-blog-link" href="/blog" aria-label="Read the Mycellios blog"><BookOpen size={15} />Blog</a><a className="nav-cta" href="/join">Join now <Zap size={15} /></a></div></nav></header>
 
       <main>
         <section className="hero">
           <MyceliumHero />
           <div className="hero-inner container">
-            <div className="hero-copy"><div className="availability"><span /><strong>EARLY NETWORK</strong><i /> {t.hero.status}</div><h1>{t.hero.line1}<br />{t.hero.line2}<br /><em>{t.hero.line3}</em></h1><p>{t.hero.copy}</p><div className="hero-actions"><a className="button button-primary" href="/join">Join the network <Zap size={17} /></a><a className="button button-secondary" href="/network">Open live panel <Network size={17} /></a></div><div className="hero-readouts" aria-label="Network capabilities"><div><span>01</span><strong>POOL MEMORY</strong><small>BEYOND ONE MACHINE</small></div><div><span>02</span><strong>ROUTE SHARDS</strong><small>THROUGH THE FASTEST CELL</small></div><div><span>03</span><strong>KEEP GROWING</strong><small>AS NEW GPUS APPEAR</small></div></div><div className="hero-footnote"><ShieldCheck size={15} /><span>No account or invitation required during public testing.</span></div></div>
+            <div className="hero-copy"><div className="availability"><span /><strong>EARLY NETWORK</strong><i /> {t.hero.status}</div><h1>{t.hero.line1}<br />{t.hero.line2}<br /><em>{t.hero.line3}</em></h1><p>{t.hero.copy}</p><div className="hero-actions"><a className="button button-primary" href="/join">Join the network <Zap size={17} /></a><a className="button button-secondary" href="#explainer">{t.hero.secondary} <CirclePlay size={17} /></a></div><div className="hero-readouts" aria-label="Network capabilities"><div><span>01</span><strong>POOL MEMORY</strong><small>BEYOND ONE MACHINE</small></div><div><span>02</span><strong>ROUTE SHARDS</strong><small>THROUGH THE FASTEST CELL</small></div><div><span>03</span><strong>KEEP GROWING</strong><small>AS NEW GPUS APPEAR</small></div></div><div className="hero-footnote"><ShieldCheck size={15} /><span>No account or invitation required during public testing.</span></div></div>
           </div>
         </section>
 
@@ -588,6 +653,8 @@ function Landing() {
             ))}
           </div>
         </section>
+
+        <ExplainerSection text={t.explainer} />
 
         <section className="manifesto container" id="vision"><div className="manifesto-index reveal">{t.manifesto.index}</div><div className="manifesto-copy reveal"><span>{t.manifesto.kicker}</span><h2>{t.manifesto.title}</h2></div><div className="manifesto-side reveal"><p>{t.manifesto.copy}</p><a href="#architecture">{t.manifesto.link} <ArrowUpRight size={15} /></a></div></section>
 
@@ -610,7 +677,8 @@ function Landing() {
         <section className="closing" id="join"><div className="closing-grid" /><div className="container closing-inner reveal"><Brand compact homeLabel={t.home} /><span className="eyebrow"><i />{t.closing.eyebrow}</span><h2>{t.closing.title1}<br /><em>{t.closing.title2}</em></h2><p>{t.closing.copy}</p><a className="button button-primary button-large" href="/join">Connect this device <Zap size={18} /></a><small>Public test network · no login required</small></div></section>
       </main>
 
-      <footer className="footer container"><Brand homeLabel={t.home} /><p>{t.footer.tagline}</p><div><a href="/network">Network panel</a><a href="#roadmap">Roadmap</a><a href="/mobile/">Mobile worker</a><a href="/downloads">Downloads</a><a href={`mailto:${EMAIL}`}>{t.footer.contact}</a></div><span>© 2026 mycellios</span></footer>
+      <footer className="footer container"><Brand homeLabel={t.home} /><p>{t.footer.tagline}</p><div><a href="/network">Network panel</a><a href="#roadmap">Roadmap</a><a href="/blog">Blog</a><a href="/mobile/">Mobile worker</a><a href="/downloads">Downloads</a><a href={`mailto:${EMAIL}`}>{EMAIL}</a></div><span>© 2026 mycellios</span></footer>
+      <SupportAssistant surface="landing" />
     </div>
   );
 }

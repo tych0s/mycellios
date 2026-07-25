@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import type {
   ChatCompletionRequest,
   CompletionResult,
@@ -15,6 +16,14 @@ import type { WorkerHub } from "./worker-hub.js";
 
 export type JobStreamEvent =
   | { type: "accepted"; jobId: string; sessionId: string; route: ScheduledRoute }
+  | {
+      type: "progress";
+      phase: "waiting_first_token" | "recovering";
+      message: string;
+      attempt: number;
+      workerId?: string;
+      nodeId?: string;
+    }
   | { type: "token"; token: TokenEvent }
   | { type: "completed"; result: CompletionResult }
   | { type: "failed"; code: string; message: string };
@@ -37,6 +46,8 @@ interface RuntimeJob {
   nextTokenIndex: number;
   timeout: NodeJS.Timeout;
   leaseTimer: NodeJS.Timeout | null;
+  firstTokenTimer: NodeJS.Timeout | null;
+  attempt: number;
 }
 
 interface PromptCheckpoint {
@@ -45,7 +56,25 @@ interface PromptCheckpoint {
   inputTokens: number;
 }
 
-export class MeshService {
+const PRETOKEN_DEGRADATION_CODES = new Set([
+  "adapter_error",
+  "first_token_timeout",
+  "pipeline_stage_disconnected",
+  "worker_disconnected",
+  "worker_unreachable",
+  "lease_accept_timeout",
+]);
+
+export interface MeshServiceOptions {
+  firstTokenTimeoutMs?: number;
+}
+
+interface MeshServiceEvents {
+  degraded: [{ jobId: string; model: string; code: string; workerId: string | null }];
+  healthy: [{ jobId: string; model: string; workerId: string | null }];
+}
+
+export class MeshService extends EventEmitter<MeshServiceEvents> {
   private readonly runtimes = new Map<string, RuntimeJob>();
   private readonly activeSessions = new Map<string, string>();
 
@@ -54,7 +83,9 @@ export class MeshService {
     readonly scheduler: Scheduler,
     readonly hub: WorkerHub,
     private readonly requestTimeoutMs: number,
+    private readonly options: MeshServiceOptions = {},
   ) {
+    super();
     this.recoverOrphanedJobs();
     hub.on("envelope", (envelope) => this.handleWorkerEnvelope(envelope));
     hub.on("disconnect", (workerId) => this.handleWorkerDisconnect(workerId));
@@ -136,6 +167,8 @@ export class MeshService {
       nextTokenIndex: 0,
       timeout,
       leaseTimer: null,
+      firstTokenTimer: null,
+      attempt: 1,
     };
     this.runtimes.set(jobId, runtime);
     this.activeSessions.set(sessionId, jobId);
@@ -143,6 +176,36 @@ export class MeshService {
     this.dispatch(jobId, runtime);
 
     return { jobId, sessionId, events: queue };
+  }
+
+  /**
+   * Cancels an orphaned request only when a reconnect repeats the exact same
+   * immutable prompt in the same session. A genuinely different concurrent
+   * message keeps the normal session_busy protection.
+   */
+  cancelMatchingActiveSession(
+    request: ChatCompletionRequest,
+    requestedSessionId?: string,
+  ): string | null {
+    const sessionId = requestedSessionId ?? request.session_id;
+    if (!sessionId) return null;
+    const activeJobId = this.activeSessions.get(sessionId);
+    if (!activeJobId) return null;
+    const runtime = this.runtimes.get(activeJobId);
+    if (!runtime) return null;
+    if (inputHashForRequest(cloneRequest(request)) !== runtime.promptCheckpoint.requestHash) {
+      return null;
+    }
+    return this.cancel(activeJobId) ? activeJobId : null;
+  }
+
+  hasCapacity(request: ChatCompletionRequest, requestedSessionId?: string): boolean {
+    const sessionId = requestedSessionId ?? request.session_id ?? newId("capacity");
+    return this.scheduler.selectRoutePlan(cloneRequest(request), sessionId, {
+      connectedWorkerIds: this.hub.connectedWorkerIds(),
+      allowPipeline: false,
+      maxStandbyRoutes: 2,
+    }) !== null;
   }
 
   cancel(jobId: string): boolean {
@@ -221,6 +284,26 @@ export class MeshService {
       if (runtime?.leaseTimer) clearTimeout(runtime.leaseTimer);
       if (runtime) runtime.leaseTimer = null;
       this.store.setJobStatus(job.id, "running");
+      if (runtime) {
+        if (runtime.firstTokenTimer) clearTimeout(runtime.firstTokenTimer);
+        const firstTokenTimeoutMs = this.firstTokenTimeoutFor(job.id, runtime);
+        runtime.queue.push({
+          type: "progress",
+          phase: "waiting_first_token",
+          message: "Route accepted. Waiting for the first model token.",
+          attempt: runtime.attempt,
+          workerId: envelope.workerId,
+        });
+        runtime.firstTokenTimer = setTimeout(() => {
+          const active = this.runtimes.get(job.id);
+          if (!active || active.nextTokenIndex > 0) return;
+          this.retryOrFail(
+            job.id,
+            "first_token_timeout",
+            `The selected route produced no first token within ${firstTokenTimeoutMs} ms`,
+          );
+        }, firstTokenTimeoutMs);
+      }
     }
   }
 
@@ -242,6 +325,8 @@ export class MeshService {
     if (!job || !runtime) return;
     if (runtime.leaseTimer) clearTimeout(runtime.leaseTimer);
     runtime.leaseTimer = null;
+    if (runtime.firstTokenTimer) clearTimeout(runtime.firstTokenTimer);
+    runtime.firstTokenTimer = null;
     const chunkBytes = Buffer.byteLength(payload.text, "utf8");
     const maxOutputBytes = Math.min(
       2 * 1024 * 1024,
@@ -285,6 +370,11 @@ export class MeshService {
       type: "completed",
       result: { ...result, text: runtime.output },
     });
+    this.emit("healthy", {
+      jobId: job.id,
+      model: job.model,
+      workerId: job.workerId,
+    });
     this.finishRuntime(job.id);
   }
 
@@ -304,10 +394,42 @@ export class MeshService {
   }
 
   private handleWorkerDisconnect(workerId: string): void {
+    const handledJobs = new Set<string>();
     for (const job of this.store.listActiveJobsForWorker(workerId)) {
+      handledJobs.add(job.id);
       const runtime = this.runtimes.get(job.id);
       if (runtime?.nextTokenIndex === 0) this.retryOrFail(job.id, "worker_disconnected");
       else this.failRuntime(job.id, "worker_lost_midstream", "Worker disconnected after streaming began");
+    }
+    const disconnectedWorker = this.store.getWorker(workerId);
+    const disconnectedNodeId = disconnectedWorker?.capabilities.distributedExecutor?.nodeId;
+    if (!disconnectedNodeId) return;
+    for (const [jobId, runtime] of this.runtimes) {
+      if (handledJobs.has(jobId)) continue;
+      const job = this.store.getJob(jobId);
+      if (!job?.workerId || !job.deploymentId) continue;
+      const routeWorker = this.store.getWorker(job.workerId);
+      const deployment = routeWorker?.capabilities.deployments.find(
+        (candidate) => candidate.deploymentId === job.deploymentId,
+      );
+      const affectedStage = deployment?.execution?.stages?.find(
+        (stage) => stage.nodeId === disconnectedNodeId,
+      );
+      if (!affectedStage) continue;
+      const message = `${affectedStage.deviceName} (${disconnectedNodeId}) disconnected from the distributed pipeline`;
+      runtime.queue.push({
+        type: "progress",
+        phase: "recovering",
+        message,
+        attempt: runtime.attempt,
+        workerId,
+        nodeId: disconnectedNodeId,
+      });
+      if (runtime.nextTokenIndex === 0) {
+        this.retryOrFail(jobId, "pipeline_stage_disconnected", message);
+      } else {
+        this.failRuntime(jobId, "pipeline_stage_lost_midstream", message);
+      }
     }
   }
 
@@ -317,6 +439,8 @@ export class MeshService {
     if (!job || !runtime) return;
     if (runtime.leaseTimer) clearTimeout(runtime.leaseTimer);
     runtime.leaseTimer = null;
+    if (runtime.firstTokenTimer) clearTimeout(runtime.firstTokenTimer);
+    runtime.firstTokenTimer = null;
     if (runtime.nextTokenIndex > 0) {
       this.failRuntime(
         jobId,
@@ -334,6 +458,14 @@ export class MeshService {
       const route = runtime.routePlan[runtime.routeIndex]!;
       if (!route.stages.every((stage) => this.hub.isConnected(stage.workerId))) continue;
       runtime.route = route;
+      runtime.attempt += 1;
+      runtime.queue.push({
+        type: "progress",
+        phase: "recovering",
+        message: "The route failed before token zero. Retrying on an exact-model standby.",
+        attempt: runtime.attempt,
+        ...(previousWorkerId ? { workerId: previousWorkerId } : {}),
+      });
       this.dispatch(jobId, runtime);
       return;
     }
@@ -351,6 +483,14 @@ export class MeshService {
     if (job.workerId) this.hub.send(job.workerId, "task.cancel", { jobId });
     this.store.setJobStatus(jobId, code === "deadline_exceeded" ? "expired" : "failed", code);
     runtime.queue.push({ type: "failed", code, message });
+    if (runtime.nextTokenIndex === 0 && PRETOKEN_DEGRADATION_CODES.has(code)) {
+      this.emit("degraded", {
+        jobId,
+        model: job.model,
+        code,
+        workerId: job.workerId,
+      });
+    }
     this.finishRuntime(jobId);
   }
 
@@ -359,6 +499,7 @@ export class MeshService {
     if (!runtime) return;
     clearTimeout(runtime.timeout);
     if (runtime.leaseTimer) clearTimeout(runtime.leaseTimer);
+    if (runtime.firstTokenTimer) clearTimeout(runtime.firstTokenTimer);
     const job = this.store.getJob(jobId);
     if (job) {
       if (this.activeSessions.get(job.sessionId) === jobId) {
@@ -376,6 +517,22 @@ export class MeshService {
     return job;
   }
 
+  private firstTokenTimeoutFor(jobId: string, runtime: RuntimeJob): number {
+    if (this.options.firstTokenTimeoutMs !== undefined) {
+      return Math.max(10, Math.round(this.options.firstTokenTimeoutMs));
+    }
+    const routeStage = runtime.route.stages[0];
+    const routeWorker = routeStage ? this.store.getWorker(routeStage.workerId) : null;
+    const deployment = routeWorker?.capabilities.deployments.find(
+      (candidate) => candidate.deploymentId === routeStage?.deploymentId,
+    );
+    const expectedTtftMs = deployment?.ttftMs ?? 2_500;
+    const adaptiveTimeoutMs = Math.max(15_000, expectedTtftMs * 6 + 2_000);
+    const job = this.store.getJob(jobId);
+    const remainingMs = job ? Math.max(1_000, job.deadlineAt - Date.now() - 1_000) : 30_000;
+    return Math.max(1_000, Math.min(30_000, adaptiveTimeoutMs, remainingMs));
+  }
+
   private validateCompletion(
     job: StoredJob,
     runtime: RuntimeJob,
@@ -390,15 +547,42 @@ export class MeshService {
       return { ok: false, reason: "Model digest mismatch" };
     }
     const expectedInput = runtime.promptCheckpoint.inputTokens;
-    const expectedOutput = Math.max(1, Math.ceil(runtime.output.length / 4));
-    if (Math.abs(result.metrics.inputTokens - expectedInput) > Math.max(4, expectedInput * 0.1)) {
+    const promptBytes = runtime.promptCheckpoint.request.messages.reduce(
+      (sum, message) => sum + Buffer.byteLength(`${message.role}\n${message.content}`, "utf8"),
+      0,
+    );
+    // The coordinator's characters/4 estimate is useful for scheduling, but
+    // it is not an exact tokenizer. Real chat templates add control tokens and
+    // byte-level tokenizers can legitimately diverge by far more than 10%.
+    // Keep the trust boundary by bounding the worker report against both the
+    // request bytes and the deployment's certified context window.
+    const plausibleInputMaximum = Math.min(
+      deployment.contextLimit,
+      Math.max(
+        64,
+        expectedInput * 8,
+        promptBytes * 2 + 256 + runtime.promptCheckpoint.request.messages.length * 64,
+      ),
+    );
+    if (result.metrics.inputTokens < 1 || result.metrics.inputTokens > plausibleInputMaximum) {
       return { ok: false, reason: "Implausible input token count" };
     }
-    if (Math.abs(result.metrics.outputTokens - expectedOutput) > Math.max(4, expectedOutput * 0.1)) {
+    const maximumOutputTokens = runtime.request.max_tokens ?? 256;
+    const outputBytes = Buffer.byteLength(runtime.output, "utf8");
+    // Output text length is not a tokenizer. Byte-level tokens, Unicode and
+    // model-specific vocabularies can differ dramatically from characters/4,
+    // especially for tiny/random validation models. Keep the trust boundary
+    // against the caller's token ceiling and the actual emitted bytes instead.
+    if (
+      result.metrics.outputTokens < 0 ||
+      result.metrics.outputTokens > maximumOutputTokens ||
+      (runtime.output.length > 0 && result.metrics.outputTokens === 0) ||
+      result.metrics.outputTokens > outputBytes + 16
+    ) {
       return { ok: false, reason: "Implausible output token count" };
     }
     if (result.text !== runtime.output) return { ok: false, reason: "Completion body mismatch" };
-    if (Buffer.byteLength(runtime.output, "utf8") > (runtime.request.max_tokens ?? 256) * 32) {
+    if (outputBytes > maximumOutputTokens * 32) {
       return { ok: false, reason: "Completion exceeds the configured expansion limit" };
     }
     return { ok: true };

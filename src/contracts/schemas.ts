@@ -92,6 +92,7 @@ export const deploymentSchema = z
     maxConcurrency: z.number().int().positive(),
     freeSlots: z.number().int().nonnegative(),
     tokensPerSecond: z.number().positive(),
+    throughputSource: z.enum(["measured", "estimated", "configured", "default"]).optional(),
     ttftMs: z.number().nonnegative(),
     dataLocality: z.enum(["local", "external"]),
     stage: z

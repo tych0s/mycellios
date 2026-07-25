@@ -1,4 +1,10 @@
 User-agent: *
 Allow: /
+Disallow: /internal/
+Disallow: /local/
+Disallow: /mobile/v1/
+Disallow: /public/v1/
+Disallow: /v1/
+Disallow: /updates/
 
-Sitemap: https://mycellios.com/sitemap.xml
+Sitemap: https://www.mycellios.com/sitemap.xml

@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { consumeChatCompletionStream } from "../src/desktop/chat-stream.js";
+import {
+  consumeChatCompletionStream,
+  consumeChatCompletionStreamWithRecovery,
+} from "../src/desktop/chat-stream.js";
 import type { ChatStreamUpdate } from "../src/desktop/contracts.js";
 
 describe("chat completion stream", () => {
@@ -41,6 +44,128 @@ describe("chat completion stream", () => {
       "data: [DONE]\n\n",
     ]);
     await expect(consumeChatCompletionStream(response, "qwen", () => undefined)).rejects.toThrow("El worker perdió el modelo");
+  });
+
+  it("retries once before token zero when a distributed stage disconnects", async () => {
+    let attempts = 0;
+    const updates: ChatStreamUpdate[] = [];
+    const result = await consumeChatCompletionStreamWithRecovery(
+      async () => {
+        attempts += 1;
+        if (attempts === 1) {
+          return streamingResponse([
+            'data: {"id":"job-1","choices":[{"delta":{"role":"assistant"}}],"x_network":{"session_id":"session","route_class":"replica","affinity_hit":false}}\n\n',
+            'data: {"error":{"code":"pipeline_stage_disconnected","message":"AMD stage disconnected"}}\n\n',
+          ]);
+        }
+        return streamingResponse([
+          ": mycellios-heartbeat 1\n\n",
+          'data: {"id":"job-2","model":"qwen","choices":[{"delta":{"role":"assistant"}}],"x_network":{"session_id":"session","route_class":"replica","affinity_hit":false}}\n\n',
+          'data: {"id":"job-2","model":"qwen","choices":[{"delta":{"content":"recuperado"}}],"x_network":{"token_index":0}}\n\n',
+          'data: {"id":"job-2","model":"qwen","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":1,"total_tokens":5},"x_network":{"ttft_ms":80,"active_ms":120}}\n\n',
+          "data: [DONE]\n\n",
+        ]);
+      },
+      "qwen",
+      (update) => updates.push(update),
+      { sessionId: "session", retryDelayMs: 0 },
+    );
+
+    expect(attempts).toBe(2);
+    expect(updates).toContainEqual(expect.objectContaining({
+      phase: "recovering",
+      attempt: 2,
+      outputTokens: 0,
+    }));
+    expect(result.text).toBe("recuperado");
+  });
+
+  it("abandons a half-open connection and resumes after a network change", async () => {
+    let attempts = 0;
+    const updates: ChatStreamUpdate[] = [];
+    const result = await consumeChatCompletionStreamWithRecovery(
+      async (_attempt, signal) => {
+        attempts += 1;
+        if (attempts === 1) {
+          return new Promise<Response>((_resolve, reject) => {
+            signal.addEventListener("abort", () => {
+              reject(new DOMException("The connection was aborted", "AbortError"));
+            }, { once: true });
+          });
+        }
+        return streamingResponse([
+          'data: {"id":"job-vpn","model":"qwen","choices":[{"delta":{"role":"assistant"}}],"x_network":{"session_id":"vpn-session","route_class":"replica","affinity_hit":false}}\n\n',
+          'data: {"id":"job-vpn","model":"qwen","choices":[{"delta":{"content":"reconectado"}}],"x_network":{"token_index":0}}\n\n',
+          'data: {"id":"job-vpn","model":"qwen","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":1,"total_tokens":5},"x_network":{"ttft_ms":20,"active_ms":40}}\n\n',
+          "data: [DONE]\n\n",
+        ]);
+      },
+      "qwen",
+      (update) => updates.push(update),
+      {
+        sessionId: "vpn-session",
+        connectionTimeoutMs: 5,
+        retryDelayMs: 0,
+      },
+    );
+
+    expect(attempts).toBe(2);
+    expect(updates).toContainEqual(expect.objectContaining({
+      phase: "recovering",
+      attempt: 2,
+      maximumAttempts: 8,
+    }));
+    expect(result.text).toBe("reconectado");
+  });
+
+  it("keeps reconnecting through more than one transient network failure", async () => {
+    let attempts = 0;
+    const result = await consumeChatCompletionStreamWithRecovery(
+      async () => {
+        attempts += 1;
+        if (attempts < 4) throw new TypeError("fetch failed");
+        return streamingResponse([
+          'data: {"id":"job-back","model":"qwen","choices":[{"delta":{"content":"online"}}],"x_network":{"session_id":"session","route_class":"replica","token_index":0}}\n\n',
+          'data: {"id":"job-back","model":"qwen","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},"x_network":{"ttft_ms":10,"active_ms":20}}\n\n',
+          "data: [DONE]\n\n",
+        ]);
+      },
+      "qwen",
+      () => undefined,
+      { sessionId: "session", maximumAttempts: 4, retryDelayMs: 0 },
+    );
+
+    expect(attempts).toBe(4);
+    expect(result.text).toBe("online");
+  });
+
+  it("keeps received text visible while replaying after a mid-response disconnect", async () => {
+    let attempts = 0;
+    const updates: ChatStreamUpdate[] = [];
+    const result = await consumeChatCompletionStreamWithRecovery(
+      async () => {
+        attempts += 1;
+        if (attempts === 1) {
+          return streamingResponse([
+            'data: {"id":"job-first","model":"qwen","choices":[{"delta":{"content":"hola "}}],"x_network":{"session_id":"session","route_class":"replica","token_index":0}}\n\n',
+            'data: {"error":{"code":"pipeline_stage_disconnected","message":"route lost"}}\n\n',
+          ]);
+        }
+        return streamingResponse([
+          'data: {"id":"job-replayed","model":"qwen","choices":[{"delta":{"content":"hola "}}],"x_network":{"session_id":"session","route_class":"replica","token_index":0}}\n\n',
+          'data: {"id":"job-replayed","model":"qwen","choices":[{"delta":{"content":"mundo"}}],"x_network":{"session_id":"session","route_class":"replica","token_index":1}}\n\n',
+          'data: {"id":"job-replayed","model":"qwen","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3},"x_network":{"ttft_ms":10,"active_ms":30}}\n\n',
+          "data: [DONE]\n\n",
+        ]);
+      },
+      "qwen",
+      (update) => updates.push(update),
+      { sessionId: "session", retryDelayMs: 0 },
+    );
+
+    const recoveryUpdates = updates.filter((update) => update.phase === "recovering");
+    expect(recoveryUpdates.some((update) => update.text === "hola ")).toBe(true);
+    expect(result.text).toBe("hola mundo");
   });
 });
 

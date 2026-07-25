@@ -1,5 +1,7 @@
 import type {
   ExecutionMode,
+  ModelDeployment,
+  WorkerCapabilities,
   WorkerRegistration,
 } from "../src/contracts/types.js";
 import type { MeshStore, StoredWorker } from "../src/storage/store.js";
@@ -19,6 +21,8 @@ export function addWorker(
     mode?: ExecutionMode;
     stage?: { index: number; total: number; layerStart: number; layerEnd: number };
     internalPipeline?: { stageCount: number; boundaries: number[] };
+    execution?: ModelDeployment["execution"];
+    distributedExecutor?: WorkerCapabilities["distributedExecutor"];
     identity?: WorkerRegistration["identity"];
     llmfit?: {
       fitLevel: string;
@@ -62,9 +66,11 @@ export function addWorker(
           dataLocality: "local",
           ...(input.stage ? { stage: input.stage } : {}),
           ...(input.internalPipeline ? { internalPipeline: input.internalPipeline } : {}),
+          ...(input.execution ? { execution: input.execution } : {}),
         },
       ],
       network: { coordinatorRttMs: 20, uplinkMbps: 100, downlinkMbps: 100 },
+      ...(input.distributedExecutor ? { distributedExecutor: input.distributedExecutor } : {}),
       ...(input.llmfit
         ? {
             llmfit: {

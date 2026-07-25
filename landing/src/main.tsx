@@ -2,12 +2,14 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { Landing } from "./Landing";
 import { Panel } from "./Panel";
+import { applySeoMetadata } from "./seo";
 import "./styles.css";
 
 const root = document.getElementById("root");
 if (!root) throw new Error("Missing landing root element");
 
 const panelRoutes = new Set(["/network", "/admin", "/join", "/downloads"]);
+applySeoMetadata();
 
 createRoot(root).render(
   <StrictMode>

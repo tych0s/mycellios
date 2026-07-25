@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ModelActivationManager } from "../src/coordinator/model-activation-manager.js";
+import type { ModelActivationProgressEvent } from "../src/coordinator/model-catalog.js";
 import {
   automaticActivationFailureIsTransient,
   createCoordinator,
@@ -7,6 +8,7 @@ import {
   type CoordinatorRuntime,
 } from "../src/coordinator/server.js";
 import type { StoredRequestedModel } from "../src/storage/store.js";
+import { addWorker } from "./helpers.js";
 
 describe("requested model API activation flow", () => {
   let runtime: CoordinatorRuntime | null = null;
@@ -91,7 +93,7 @@ describe("requested model API activation flow", () => {
     expect(response.json()).toEqual({
       error: {
         code: "invalid_model_admin_token",
-        message: "The network administrator token is missing or invalid.",
+        message: "Sign in with an authorized Mycellios account or enter the administrator token.",
       },
     });
   });
@@ -151,6 +153,12 @@ describe("requested model API activation flow", () => {
     const manager = new FakeActivationManager([
       "managed_launch_agent_is_unavailable:desktop-a",
     ]);
+    manager.progress.push({
+      phase: "profiling",
+      message: "Existing activation event.",
+      at: "2026-01-01T00:00:00.000Z",
+      state: "completed",
+    });
     runtime = await createCoordinator({
       host: "127.0.0.1",
       port: 8_787,
@@ -195,6 +203,100 @@ describe("requested model API activation flow", () => {
     expect(model.activationProgress).toEqual(expect.arrayContaining([
       expect.objectContaining({ phase: "retrying", state: "running" }),
     ]));
+    const timestamps = model.activationProgress.map(
+      (event: ModelActivationProgressEvent) => Date.parse(event.at),
+    );
+    expect(timestamps).toEqual([...timestamps].sort((left, right) => left - right));
+  });
+
+  it("rebuilds a managed cell immediately when its inference proxy fails before token zero", async () => {
+    const manager = new FakeActivationManager();
+    runtime = await createCoordinator({
+      host: "127.0.0.1",
+      port: 8_787,
+      databasePath: ":memory:",
+      requestTimeoutMs: 30_000,
+    }, { activationManager: manager });
+    const requested = requestedModel(runtime, "repair-adapter");
+    const cell = addWorker(runtime.store, {
+      id: "cell-route",
+      model: requested.id,
+      identity: { kind: "cell", id: "cell-route" },
+    });
+    void manager.activate(requested);
+
+    runtime.service.emit("degraded", {
+      jobId: "job-adapter-failed",
+      model: requested.id,
+      code: "adapter_error",
+      workerId: cell.id,
+    });
+
+    await vi.waitFor(() => {
+      expect(manager.deactivated).toEqual([requested.id]);
+      expect(manager.activated.map((model) => model.id)).toEqual([
+        requested.id,
+        requested.id,
+      ]);
+    });
+  });
+
+  it("unpublishes and rebuilds a managed cell when one physical executor disconnects", async () => {
+    const manager = new FakeActivationManager();
+    runtime = await createCoordinator({
+      host: "127.0.0.1",
+      port: 8_787,
+      databasePath: ":memory:",
+      requestTimeoutMs: 30_000,
+    }, { activationManager: manager });
+    const requested = requestedModel(runtime, "repair-disconnect");
+    const executor = addWorker(runtime.store, {
+      id: "executor-route",
+      identity: { kind: "device", id: "executor-route" },
+      distributedExecutor: {
+        protocol: "gdlp-worker-tunnel/2",
+        nodeId: "desktop-route",
+        stageHost: "127.0.0.1",
+        stagePort: 9_860,
+        runtime: "python-safetensors",
+        computeMode: "automatic",
+        cpuEligible: false,
+      },
+    });
+    addWorker(runtime.store, {
+      id: "cell-route",
+      model: requested.id,
+      identity: { kind: "cell", id: "cell-route" },
+      execution: {
+        deviceType: "gpu",
+        backend: "cuda",
+        deviceName: "Synthetic GPU",
+        precision: "float16",
+        fallback: false,
+        stages: [{
+          nodeId: "desktop-route",
+          stageIndex: 0,
+          layerStart: 0,
+          layerEnd: 14,
+          deviceType: "gpu",
+          backend: "cuda",
+          deviceName: "Synthetic GPU",
+          precision: "float16",
+          fallback: false,
+        }],
+      },
+    });
+    void manager.activate(requested);
+
+    runtime.hub.emit("disconnect", executor.id);
+
+    await vi.waitFor(() => {
+      expect(manager.deactivated).toEqual([requested.id]);
+      expect(manager.activated.map((model) => model.id)).toEqual([
+        requested.id,
+        requested.id,
+      ]);
+    });
   });
 });
 
@@ -231,6 +333,8 @@ describe("automatic activation recovery", () => {
 
 class FakeActivationManager implements ModelActivationManager {
   readonly activated: StoredRequestedModel[] = [];
+  readonly deactivated: string[] = [];
+  readonly progress: ModelActivationProgressEvent[] = [];
   private managing: string | null = null;
 
   constructor(private readonly failures: string[] = []) {}
@@ -255,8 +359,32 @@ class FakeActivationManager implements ModelActivationManager {
   }
   async deactivate(modelId: string): Promise<boolean> {
     if (this.managing !== modelId) return false;
+    this.deactivated.push(modelId);
     this.managing = null;
     return true;
   }
+  activationProgressForModel(): readonly ModelActivationProgressEvent[] {
+    return this.progress;
+  }
   async close(): Promise<void> { this.managing = null; }
+}
+
+function requestedModel(runtime: CoordinatorRuntime, id: string): StoredRequestedModel {
+  runtime.store.upsertRequestedModel({
+    id,
+    source: "Qwen/Qwen3-0.6B",
+    revision: null,
+    contextTokens: 4_096,
+    minimumNodes: 2,
+    autoActivate: true,
+  });
+  runtime.store.setRequestedModelProfile(id, {
+    schema: "mycellios-hub-model-capacity/1",
+    compatible: true,
+    adapterId: "transformers-qwen3-v1",
+    requiredVramMiB: 2_200,
+    minimumStageVramMiB: 512,
+    minimumNodes: 2,
+  }, null);
+  return runtime.store.getRequestedModel(id)!;
 }

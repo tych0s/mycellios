@@ -237,6 +237,15 @@ export interface MobileComputeHubOptions {
   taskTimeoutMs?: number | undefined;
   expertArtifactsPath?: string | undefined;
   disconnectedRetentionMs?: number | undefined;
+  onArtifactStored?(artifact: {
+    id: string;
+    localPath: string;
+    storagePath: string;
+    contentType: string;
+    sha256: string;
+    sizeBytes: number;
+    metadata: Record<string, unknown>;
+  }): void | Promise<void>;
 }
 
 type ExpertManifest = z.infer<typeof expertManifestSchema> & { artifactId: string };
@@ -308,7 +317,17 @@ export class MobileComputeHub {
       if (createHash("sha256").update(body).digest("hex") !== weightsHash) {
         return reply.code(400).send({ error: { code: "weight_hash_mismatch" } });
       }
-      writeFileSync(this.weightPath(weightsHash), body);
+      const localPath = this.weightPath(weightsHash);
+      writeFileSync(localPath, body);
+      await this.options.onArtifactStored?.({
+        id: `mobile-weight-${weightsHash}`,
+        localPath,
+        storagePath: `mobile-experts/weights/${weightsHash}.bin`,
+        contentType: "application/octet-stream",
+        sha256: weightsHash,
+        sizeBytes: body.length,
+        metadata: { kind: "mobile-expert-weights", weightsHash },
+      });
       return reply.code(201).send({ weightsHash, bytes: body.length });
     });
 
@@ -325,7 +344,22 @@ export class MobileComputeHub {
         .digest("hex");
       const stored = { ...manifest, artifactId };
       this.expertManifests.set(artifactId, stored);
-      writeFileSync(this.manifestPath(artifactId), JSON.stringify(stored, null, 2));
+      const manifestBody = Buffer.from(JSON.stringify(stored, null, 2), "utf8");
+      const manifestLocalPath = this.manifestPath(artifactId);
+      writeFileSync(manifestLocalPath, manifestBody);
+      await this.options.onArtifactStored?.({
+        id: `mobile-manifest-${artifactId}`,
+        localPath: manifestLocalPath,
+        storagePath: `mobile-experts/manifests/${artifactId}.json`,
+        contentType: "application/json",
+        sha256: createHash("sha256").update(manifestBody).digest("hex"),
+        sizeBytes: manifestBody.length,
+        metadata: {
+          kind: "mobile-expert-manifest",
+          artifactId,
+          weightsHash: manifest.weightsHash,
+        },
+      });
       return reply.code(201).send({ artifactId });
     });
 

@@ -1,12 +1,17 @@
 import websocket from "@fastify/websocket";
 import staticFiles from "@fastify/static";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
-import { timingSafeEqual } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { createHash, timingSafeEqual } from "node:crypto";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { z, ZodError } from "zod";
-import { runAndPersistRealSuite } from "../benchlab/run.js";
 import { loadBenchmarkRuns } from "../benchlab/history.js";
+import {
+  buildCoordinatorBenchmarkInventory,
+  detectNewActiveModels,
+  runAndPersistCoordinatorSuite,
+  type CoordinatorBenchmarkModel,
+} from "../benchlab/coordinator-suite.js";
 import {
   chatCompletionRequestSchema,
   workerRegistrationSchema,
@@ -16,6 +21,13 @@ import type { CoordinatorConfig } from "../core/config.js";
 import { Scheduler } from "../scheduler/scheduler.js";
 import { MeshDatabase } from "../storage/database.js";
 import { MeshStore, type StoredRequestedModel, type StoredWorker } from "../storage/store.js";
+import { SupabasePersistence } from "../storage/supabase-sync.js";
+import {
+  buildSupportAssistantMessages,
+  resolveSupportAssistantModel,
+  supportAssistantChatRequestSchema,
+  supportAssistantSettingsUpdateSchema,
+} from "../support/assistant.js";
 import { MeshService, MeshServiceError, type JobStreamEvent } from "./mesh-service.js";
 import { MobileComputeHub, type MobileWorkerSnapshot } from "./mobile-compute-hub.js";
 import { verifyGitHubReleaseUploadToken } from "./github-oidc.js";
@@ -37,6 +49,11 @@ import {
   modelHasGpuFallback,
   verifiedGpuCapacityCanRepairModel,
 } from "./connected-executor-activation.js";
+import {
+  ContentHubClient,
+  registerContentHubRoutes,
+} from "./content-hub.js";
+import { SupabaseAuthService } from "./supabase-auth.js";
 
 export function automaticActivationFailureIsTransient(message: string): boolean {
   const normalized = message.toLowerCase();
@@ -94,6 +111,7 @@ export interface CoordinatorRuntime {
   hub: WorkerHub;
   mobileHub: MobileComputeHub;
   service: MeshService;
+  persistence: SupabasePersistence | null;
   close(): Promise<void>;
 }
 
@@ -146,6 +164,7 @@ export async function createCoordinator(
       const path = request.url.split("?", 1)[0] ?? request.url;
       if (!path.startsWith("/internal/v1/") && !path.startsWith("/v1/")) return;
       if (path.startsWith("/internal/v1/releases/")) return;
+      if (path === "/v1/auth/me") return;
       // Mobile expert administration has its own stronger control-plane
       // credential above. Requiring both secrets in one Authorization header
       // would make the route impossible to use when the tokens differ.
@@ -156,24 +175,57 @@ export async function createCoordinator(
       }
     });
   }
-  const authorizeModelMutation = (request: FastifyRequest, reply: FastifyReply): boolean => {
+  const supabaseAuth = config.supabaseUrl && config.supabaseServiceRoleKey
+    ? new SupabaseAuthService(config.supabaseUrl, config.supabaseServiceRoleKey)
+    : null;
+  const authorizeModelMutation = async (
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ): Promise<boolean> => {
     const expected = config.modelAdminToken;
     if (!expected && isLoopbackAddress(request.ip)) return true;
-    if (!expected) {
+    const legacyHeader = request.headers["x-mycellios-admin-token"];
+    const legacyToken = typeof legacyHeader === "string"
+      ? legacyHeader.trim()
+      : Array.isArray(legacyHeader) ? legacyHeader[0]?.trim() : undefined;
+    const bearer = parseBearerToken(request.headers.authorization);
+    if (expected && (
+      (legacyToken && constantTimeEqual(legacyToken, expected))
+      || (bearer && constantTimeEqual(bearer, expected))
+    )) return true;
+    if (bearer && supabaseAuth) {
+      try {
+        const user = await supabaseAuth.authenticate(bearer);
+        if (user && user.role && ["owner", "admin", "operator"].includes(user.role)) return true;
+        if (user) {
+          void reply.code(403).send({
+            error: {
+              code: "insufficient_network_role",
+              message: "Your Mycellios account does not have permission to change shared models.",
+            },
+          });
+          return false;
+        }
+      } catch (error) {
+        app.log.warn(
+          { error: error instanceof Error ? error.message : String(error) },
+          "Supabase authorization lookup failed",
+        );
+      }
+    }
+    if (!expected && !supabaseAuth) {
       void reply.code(503).send({
         error: {
           code: "model_administration_not_configured",
-          message: "Remote model administration requires MYCELLIOS_MODEL_ADMIN_TOKEN.",
+          message: "Remote model administration requires Supabase Auth or MYCELLIOS_MODEL_ADMIN_TOKEN.",
         },
       });
       return false;
     }
-    const received = parseBearerToken(request.headers.authorization);
-    if (received && constantTimeEqual(received, expected)) return true;
     void reply.code(401).send({
       error: {
         code: "invalid_model_admin_token",
-        message: "The network administrator token is missing or invalid.",
+        message: "Sign in with an authorized Mycellios account or enter the administrator token.",
       },
     });
     return false;
@@ -185,6 +237,14 @@ export async function createCoordinator(
   );
   const database = new MeshDatabase(config.databasePath);
   const store = new MeshStore(database);
+  const persistence = config.supabaseUrl && config.supabaseServiceRoleKey
+    ? new SupabasePersistence(store, {
+        url: config.supabaseUrl,
+        serviceRoleKey: config.supabaseServiceRoleKey,
+        required: config.supabasePersistenceRequired ?? false,
+      })
+    : null;
+  await persistence?.initialize();
   const scheduler = new Scheduler(store);
   await app.register(websocket, { options: { maxPayload: 10 * 1024 * 1024 } });
   const mobileAssetsPath = resolveMobileAssetsPath(config.mobileAssetsPath);
@@ -233,13 +293,114 @@ export async function createCoordinator(
     joinToken: config.mobileJoinToken,
     expertArtifactsPath: config.mobileExpertArtifactsPath,
     disconnectedRetentionMs: options.mobileDisconnectedRetentionMs,
+    ...(persistence
+      ? { onArtifactStored: (artifact: Parameters<SupabasePersistence["registerArtifactBackup"]>[0]) =>
+          persistence.registerArtifactBackup(artifact) }
+      : {}),
   });
   mobileHub.attach(app);
+  if (persistence && config.mobileExpertArtifactsPath) {
+    queueExistingMobileArtifacts(persistence, config.mobileExpertArtifactsPath);
+  }
   const service = new MeshService(store, scheduler, hub, config.requestTimeoutMs);
+  const supportAssistantRateLimits = new Map<string, SupportAssistantRateState>();
+  let activeSupportAssistantRequests = 0;
   const activationManager = options.activationManager ?? options.activationManagerFactory?.({ store, hub });
   await activationManager?.initialize();
+  const benchmarkWorkspace = process.cwd();
+  const benchmarkStorageRoot = process.env.MYCELLIOS_BENCHMARK_ROOT?.trim();
+  const benchmarkHistoryDirectory = benchmarkStorageRoot
+    ? resolve(benchmarkStorageRoot, "history")
+    : undefined;
+  for (const run of loadBenchmarkRuns(benchmarkWorkspace, benchmarkHistoryDirectory)) {
+    store.queueBenchmarkRun(run);
+  }
+  void persistence?.flush();
+  type PersistedBenchmark = Awaited<ReturnType<typeof runAndPersistCoordinatorSuite>>;
+  let benchmarkRunInFlight: Promise<PersistedBenchmark> | null = null;
+  const automaticBenchmarkQueue: CoordinatorBenchmarkModel[] = [];
+  const queuedAutomaticBenchmarkModels = new Set<string>();
+  const observedActiveBenchmarkModels = new Set<string>();
+  const benchmarkTargetForModel = (modelId: string): CoordinatorBenchmarkModel => {
+    const requested = store.getRequestedModel(modelId);
+    return {
+      id: modelId,
+      source: requested?.source ?? modelId,
+      revision: requested?.revision ?? null,
+    };
+  };
+  const benchmarkableActiveModelIds = (): string[] => {
+    const connectedWorkerIds = hub.connectedWorkerIds();
+    const realDeploymentModels = new Set(
+      store.listWorkers()
+        .filter((worker) => connectedWorkerIds.has(worker.id))
+        .flatMap((worker) => worker.capabilities.deployments)
+        .filter((deployment) => deployment.adapter !== "mock")
+        .map((deployment) => deployment.model),
+    );
+    return scheduler
+      .listAvailableModels({ connectedWorkerIds })
+      .map((model) => model.id)
+      .filter((modelId) => realDeploymentModels.has(modelId));
+  };
+  const startCoordinatorBenchmark = (
+    model: CoordinatorBenchmarkModel,
+    trigger: "automatic-model-start" | "manual",
+    metadata: { label?: string; version?: string } = {},
+  ): Promise<PersistedBenchmark> => runAndPersistCoordinatorSuite({
+    cwd: benchmarkWorkspace,
+    ...(benchmarkHistoryDirectory ? { historyDirectory: benchmarkHistoryDirectory } : {}),
+    coordinatorUrl: `http://127.0.0.1:${config.port}`,
+    model,
+    inventory: (routedWorkerIds) => buildCoordinatorBenchmarkInventory(
+      model.id,
+      store.listWorkers(),
+      hub.connectedWorkerIds(),
+      routedWorkerIds,
+    ),
+    resolveWorkerId: (jobId) => store.getJob(jobId)?.workerId ?? null,
+    ...(config.networkToken ? { networkToken: config.networkToken } : {}),
+    ...(metadata.label ? { label: metadata.label } : {}),
+    ...(metadata.version ? { version: metadata.version } : {}),
+    trigger,
+  }).then((result) => {
+    store.queueBenchmarkRun(result.run);
+    void persistence?.flush();
+    return result;
+  });
+  const drainAutomaticBenchmarkQueue = (): void => {
+    if (benchmarkRunInFlight) return;
+    const model = automaticBenchmarkQueue.shift();
+    if (!model) return;
+    benchmarkRunInFlight = startCoordinatorBenchmark(model, "automatic-model-start");
+    void benchmarkRunInFlight
+      .then(({ run }) => {
+        app.log.info(
+          { modelId: model.id, benchmarkRunId: run.runId, status: run.status },
+          "automatic model-start benchmark saved",
+        );
+      })
+      .catch((error: unknown) => {
+        app.log.error(
+          { modelId: model.id, error: error instanceof Error ? error.message : String(error) },
+          "automatic model-start benchmark could not be saved",
+        );
+      })
+      .finally(() => {
+        queuedAutomaticBenchmarkModels.delete(model.id);
+        benchmarkRunInFlight = null;
+        drainAutomaticBenchmarkQueue();
+      });
+  };
+  const queueAutomaticBenchmark = (modelId: string): void => {
+    if (queuedAutomaticBenchmarkModels.has(modelId)) return;
+    queuedAutomaticBenchmarkModels.add(modelId);
+    automaticBenchmarkQueue.push(benchmarkTargetForModel(modelId));
+    drainAutomaticBenchmarkQueue();
+  };
   const automaticRepairState = new Map<string, { attempts: number; nextAttemptAt: number }>();
   const automaticRepairInFlight = new Set<string>();
+  const inferenceRouteFailures = new Map<string, { count: number; lastAt: number }>();
   const automaticActivationRetryDelaysMs = (
     options.automaticActivationRetryDelaysMs
     ?? DEFAULT_AUTOMATIC_ACTIVATION_RETRY_DELAYS_MS
@@ -271,9 +432,14 @@ export async function createCoordinator(
     const managerProgress = activationManager?.activationProgressForModel?.(modelId) ?? [];
     const retryProgress = automaticActivationRetryProgressForModel(modelId);
     if (retryProgress.length === 0) return managerProgress;
-    return automaticActivationRetryState.get(modelId)?.launching
-      ? [...retryProgress, ...managerProgress]
-      : [...managerProgress, ...retryProgress];
+    return [...managerProgress, ...retryProgress]
+      .map((event, index) => ({ event, index, at: Date.parse(event.at) }))
+      .sort((left, right) => {
+        const leftAt = Number.isFinite(left.at) ? left.at : Number.MAX_SAFE_INTEGER;
+        const rightAt = Number.isFinite(right.at) ? right.at : Number.MAX_SAFE_INTEGER;
+        return leftAt - rightAt || left.index - right.index;
+      })
+      .map(({ event }) => event);
   };
   const activationStatusMessageForModel = (modelId: string): string | null => {
     const retry = automaticActivationRetryState.get(modelId);
@@ -380,6 +546,45 @@ export async function createCoordinator(
       automaticRepairInFlight.delete(model.id);
     });
   };
+  const startInferenceRouteRepair = (modelId: string, reason: string): void => {
+    const requested = store.getRequestedModel(modelId);
+    if (
+      !activationManager ||
+      !requested?.autoActivate ||
+      automaticRepairInFlight.has(modelId) ||
+      !activationManager.isManaging(modelId)
+    ) return;
+    automaticRepairInFlight.add(modelId);
+    void (async () => {
+      app.log.warn({ modelId, reason }, "rebuilding an unresponsive distributed model route");
+      const stopped = await activationManager.deactivate(modelId);
+      if (!stopped) return;
+      const latest = store.getRequestedModel(modelId);
+      if (!latest?.autoActivate) return;
+      store.setRequestedModelActivation(modelId, true);
+      launchRequestedModel(store.getRequestedModel(modelId)!);
+    })().catch((error: unknown) => {
+      app.log.warn(
+        { modelId, reason, error: error instanceof Error ? error.message : String(error) },
+        "automatic inference route repair could not be started",
+      );
+    }).finally(() => {
+      automaticRepairInFlight.delete(modelId);
+    });
+  };
+  const modelsDependingOnExecutor = (workerId: string): string[] => {
+    const nodeId = store.getWorker(workerId)?.capabilities.distributedExecutor?.nodeId;
+    if (!nodeId) return [];
+    return [...new Set(
+      store.listWorkers()
+        .filter((worker) => worker.identityKind === "cell")
+        .flatMap((worker) => worker.capabilities.deployments)
+        .filter((deployment) => deployment.execution?.stages?.some(
+          (stage) => stage.nodeId === nodeId,
+        ))
+        .map((deployment) => deployment.model),
+    )];
+  };
   const reconcileRequestedModels = () => {
     const workers = store.listWorkers();
     const connectedWorkerIds = hub.connectedWorkerIds();
@@ -388,6 +593,13 @@ export async function createCoordinator(
         .listAvailableModels({ connectedWorkerIds })
         .map((model) => model.id),
     );
+    const benchmarkableRoutes = new Set(benchmarkableActiveModelIds());
+    const benchmarkableModelIds = new Set(
+      [...activeModelIds].filter((modelId) => benchmarkableRoutes.has(modelId)),
+    );
+    for (const modelId of detectNewActiveModels(benchmarkableModelIds, observedActiveBenchmarkModels)) {
+      queueAutomaticBenchmark(modelId);
+    }
     let requests = store.listRequestedModels();
     const now = Date.now();
     for (const request of requests) {
@@ -478,8 +690,37 @@ export async function createCoordinator(
       reconcileAutomaticGpuRepair(model, activeModelIds, workers, connectedWorkerIds);
     }
   };
-  const benchmarkRoot = process.env.MYCELLIOS_BENCHMARK_ROOT?.trim() || process.cwd();
-  let benchmarkRunInFlight: ReturnType<typeof runAndPersistRealSuite> | null = null;
+  hub.on("envelope", (envelope) => {
+    if (envelope.type === "worker.heartbeat") queueMicrotask(reconcileRequestedModels);
+  });
+  hub.on("disconnect", (workerId) => {
+    for (const modelId of modelsDependingOnExecutor(workerId)) {
+      startInferenceRouteRepair(modelId, `pipeline_stage_disconnected:${workerId}`);
+    }
+    queueMicrotask(reconcileRequestedModels);
+  });
+  service.on("healthy", ({ model }) => {
+    inferenceRouteFailures.delete(model);
+  });
+  service.on("degraded", ({ model, code, jobId, workerId }) => {
+    const now = Date.now();
+    const previous = inferenceRouteFailures.get(model);
+    const count = previous && now - previous.lastAt <= 5 * 60_000
+      ? previous.count + 1
+      : 1;
+    inferenceRouteFailures.set(model, { count, lastAt: now });
+    app.log.warn(
+      { modelId: model, code, jobId, workerId, consecutiveFailures: count },
+      "distributed inference route degraded before its first token",
+    );
+    const routeWorker = workerId ? store.getWorker(workerId) : null;
+    const definitelyBrokenCellRoute =
+      code === "adapter_error" && routeWorker?.identityKind === "cell";
+    if (definitelyBrokenCellRoute || count >= 2) {
+      inferenceRouteFailures.delete(model);
+      startInferenceRouteRepair(model, `${code}:${jobId}`);
+    }
+  });
   const staleTimer = setInterval(() => {
     store.markStaleWorkers();
     hub.closeStaleConnections();
@@ -509,7 +750,33 @@ export async function createCoordinator(
       desktopUpdates: desktopUpdatesPath ? "/updates/win32/x64/" : null,
       downloads: releaseDownloadsPath ? "/downloads/" : null,
       features: { distributedActivation: activationManager !== undefined },
+      persistence: persistence?.status() ?? {
+        configured: false,
+        connected: false,
+        required: false,
+        pendingChanges: database.pendingRemoteChangeCount(),
+        pendingArtifacts: database.pendingArtifactBackupCount(),
+        lastSuccessfulSyncAt: null,
+        lastError: null,
+      },
     };
+  });
+
+  app.get("/public/v1/auth-config", async () => ({
+    enabled: Boolean(config.supabaseUrl && config.supabaseAnonKey),
+    ...(config.supabaseUrl && config.supabaseAnonKey
+      ? { url: config.supabaseUrl, anonKey: config.supabaseAnonKey }
+      : {}),
+  }));
+
+  app.get("/v1/auth/me", async (request, reply) => {
+    const token = parseBearerToken(request.headers.authorization);
+    if (!token || !supabaseAuth) {
+      return reply.code(401).send({ error: { code: "authentication_required" } });
+    }
+    const user = await supabaseAuth.authenticate(token);
+    if (!user) return reply.code(401).send({ error: { code: "invalid_access_token" } });
+    return { user };
   });
 
   app.get("/public/v1/snapshot", async () => {
@@ -518,6 +785,215 @@ export async function createCoordinator(
       activationProgressForModel,
       activationStatusMessageForModel,
     });
+  });
+
+  const availableSupportAssistantModels = (): string[] =>
+    benchmarkableActiveModelIds().sort((left, right) => left.localeCompare(right));
+
+  const publicSupportAssistantConfig = () => {
+    const settings = store.getSupportAssistantSettings();
+    const availableModels = availableSupportAssistantModels();
+    const selectedModel = resolveSupportAssistantModel(settings, availableModels);
+    return {
+      enabled: settings.enabled,
+      available: settings.enabled && selectedModel !== null,
+      provider: "mycellios-network" as const,
+      configuredModel: settings.modelId,
+      selectedModel,
+      availableModels,
+      welcomeMessage: settings.welcomeMessage,
+      suggestions: settings.suggestions,
+      allowDeviceControl: settings.allowDeviceControl,
+      updatedAt: settings.updatedAt ? new Date(settings.updatedAt).toISOString() : null,
+    };
+  };
+
+  app.get("/public/v1/assistant/config", async () => publicSupportAssistantConfig());
+
+  app.get("/public/v1/admin/assistant", async (request, reply) => {
+    if (!await authorizeModelMutation(request, reply)) return;
+    return {
+      settings: store.getSupportAssistantSettings(),
+      runtime: publicSupportAssistantConfig(),
+    };
+  });
+
+  app.put("/public/v1/admin/assistant", async (request, reply) => {
+    if (!await authorizeModelMutation(request, reply)) return;
+    const body = supportAssistantSettingsUpdateSchema.parse(request.body);
+    const availableModels = availableSupportAssistantModels();
+    if (body.modelId && !availableModels.includes(body.modelId)) {
+      return reply.code(409).send({
+        error: {
+          code: "assistant_model_not_available",
+          message: `${body.modelId} is not currently announced by a real mycellios inference node.`,
+        },
+      });
+    }
+    const settings = store.saveSupportAssistantSettings(body);
+    return {
+      settings,
+      runtime: publicSupportAssistantConfig(),
+    };
+  });
+
+  app.post("/public/v1/assistant/chat", async (request, reply) => {
+    const body = supportAssistantChatRequestSchema.parse(request.body);
+    if (activeSupportAssistantRequests >= 8) {
+      return reply.code(429).send({
+        error: {
+          code: "assistant_capacity_limited",
+          message: "All support assistant slots are busy. Try again shortly.",
+        },
+      });
+    }
+    const releaseRateLimit = claimSupportAssistantRequest(
+      supportAssistantRateLimits,
+      supportAssistantRateKey(request, body.session_id),
+    );
+    if (!releaseRateLimit) {
+      return reply.code(429).send({
+        error: {
+          code: "assistant_rate_limited",
+          message: "The mycellios assistant is already handling too many requests. Try again shortly.",
+        },
+      });
+    }
+    activeSupportAssistantRequests += 1;
+    try {
+      const settings = store.getSupportAssistantSettings();
+      if (!settings.enabled) {
+        return reply.code(503).send({
+          error: {
+            code: "assistant_disabled",
+            message: "The mycellios assistant is disabled by the network administrator.",
+          },
+        });
+      }
+      const availableModels = availableSupportAssistantModels();
+      const selectedModel = resolveSupportAssistantModel(settings, availableModels);
+      if (!selectedModel) {
+        return reply.code(503).send({
+          error: {
+            code: "assistant_model_unavailable",
+            message: settings.modelId
+              ? `The configured network model ${settings.modelId} is not connected right now.`
+              : "No real mycellios network model is available for support right now.",
+          },
+        });
+      }
+
+      const snapshot = publicSnapshot(store, scheduler, hub, mobileHub, activationManager, {
+        activationProgressForModel,
+        activationStatusMessageForModel,
+      });
+      const parsed: ChatCompletionRequest = {
+        model: selectedModel,
+        messages: buildSupportAssistantMessages(
+          settings,
+          {
+            registeredNodes: snapshot.summary.registered,
+            connectedNodes: snapshot.summary.connected,
+            offeredMemoryGb: snapshot.summary.offeredVramMb / 1_024,
+            availableModels,
+            requestedModels: snapshot.requestedModels.map((model) => ({
+              id: model.id,
+              status: model.status,
+            })),
+          },
+          body.messages,
+          { ...(body.page ? { page: body.page } : {}), ...(body.platform ? { platform: body.platform } : {}) },
+        ),
+        stream: true,
+        max_tokens: settings.maxOutputTokens,
+        temperature: settings.temperature,
+        top_p: 1,
+        workload_class: "interactive",
+        session_id: `support-${body.session_id}`,
+        deadline_ms: Math.min(config.requestTimeoutMs, 180_000),
+      };
+
+      const supersededJobId = service.cancelMatchingActiveSession(parsed, parsed.session_id);
+      if (supersededJobId) {
+        await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 1_000));
+      }
+      if (!service.hasCapacity(parsed, parsed.session_id)) {
+        await waitForChatCapacity(service, parsed, parsed.session_id, 30_000);
+      }
+      const handle = service.submit(parsed, parsed.session_id);
+      const conversationId = store.startInferenceConversation(
+        handle.sessionId,
+        parsed.model,
+        parsed.messages,
+      );
+      reply.header("x-network-request-id", handle.jobId);
+      reply.header("x-network-session-id", handle.sessionId);
+      reply.header("x-mycellios-assistant-provider", "mycellios-network");
+      reply.header("x-mycellios-assistant-model", selectedModel);
+      reply.hijack();
+      reply.raw.writeHead(200, {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache, no-transform",
+        connection: "keep-alive",
+        "x-accel-buffering": "no",
+        "x-network-request-id": handle.jobId,
+        "x-network-session-id": handle.sessionId,
+        "x-mycellios-assistant-provider": "mycellios-network",
+        "x-mycellios-assistant-model": selectedModel,
+      });
+
+      let finished = false;
+      let streamedText = "";
+      let streamedRouteClass = "replica";
+      let streamedResult: Extract<JobStreamEvent, { type: "completed" }> | null = null;
+      let streamedFailure: Extract<JobStreamEvent, { type: "failed" }> | null = null;
+      reply.raw.once("close", () => {
+        if (!finished) service.cancel(handle.jobId);
+      });
+      const heartbeatTimer = setInterval(() => {
+        if (!reply.raw.destroyed && !reply.raw.writableEnded) {
+          reply.raw.write(`: mycellios-assistant-heartbeat ${Date.now()}\n\n`);
+        }
+      }, 10_000);
+      heartbeatTimer.unref();
+      try {
+        for await (const event of handle.events) {
+          if (event.type === "accepted") streamedRouteClass = event.route.routeClass;
+          if (event.type === "token") streamedText += event.token.text;
+          if (event.type === "completed") streamedResult = event;
+          if (event.type === "failed") streamedFailure = event;
+          writeOpenAiEvent(reply.raw, event, parsed.model, handle.jobId);
+        }
+      } finally {
+        clearInterval(heartbeatTimer);
+      }
+      finished = true;
+      store.appendInferenceMessage({
+        conversationId,
+        jobId: handle.jobId,
+        role: "assistant",
+        content: streamedResult?.result.text ?? streamedText,
+        status: streamedFailure ? "failed" : "completed",
+        inputTokens: streamedResult?.result.metrics.inputTokens ?? null,
+        outputTokens: streamedResult?.result.metrics.outputTokens ?? null,
+        routeClass: streamedRouteClass,
+        latencyMs: streamedResult?.result.metrics.activeMs ?? null,
+        metadata: streamedFailure
+          ? { failure_code: streamedFailure.code, failure_message: streamedFailure.message, assistant: true }
+          : {
+              finish_reason: streamedResult?.result.finishReason ?? null,
+              assistant: true,
+              provider: "mycellios-network",
+            },
+      });
+      void persistence?.flush();
+      reply.raw.write("data: [DONE]\n\n");
+      reply.raw.end();
+      return;
+    } finally {
+      activeSupportAssistantRequests = Math.max(0, activeSupportAssistantRequests - 1);
+      releaseRateLimit();
+    }
   });
 
   app.get("/public/v1/huggingface-models", async (request, reply) => {
@@ -535,7 +1011,7 @@ export async function createCoordinator(
   });
 
   app.post("/public/v1/requested-models", async (request, reply) => {
-    if (!authorizeModelMutation(request, reply)) return;
+    if (!await authorizeModelMutation(request, reply)) return;
     const body = requestedModelCreateSchema.parse(request.body);
     automaticActivationRetryState.delete(body.id);
     const stored = store.upsertRequestedModel({
@@ -572,7 +1048,7 @@ export async function createCoordinator(
   });
 
   app.delete("/public/v1/requested-models/:modelId", async (request, reply) => {
-    if (!authorizeModelMutation(request, reply)) return;
+    if (!await authorizeModelMutation(request, reply)) return;
     const { modelId } = requestedModelParamsSchema.parse(request.params);
     await activationManager?.deactivate(modelId);
     if (!store.removeRequestedModel(modelId)) {
@@ -601,13 +1077,35 @@ export async function createCoordinator(
     };
   });
 
+  const benchmarkHistoryResponse = async () => {
+    const localRuns = loadBenchmarkRuns(benchmarkWorkspace, benchmarkHistoryDirectory);
+    let remoteRuns: typeof localRuns = [];
+    if (persistence) {
+      try {
+        remoteRuns = await persistence.readBenchmarkRuns();
+      } catch (error) {
+        app.log.warn(
+          { error: error instanceof Error ? error.message : String(error) },
+          "Supabase benchmark history could not be read; serving the local durable copy",
+        );
+      }
+    }
+    const byId = new Map([...remoteRuns, ...localRuns].map((run) => [run.runId, run]));
+    return {
+      runs: [...byId.values()]
+        .sort((left, right) => right.finishedAt.localeCompare(left.finishedAt)),
+    };
+  };
+
+  app.get("/public/v1/benchmarks", async () => benchmarkHistoryResponse());
+
   app.get("/local/v1/benchmarks", async (request, reply) => {
     if (!isLoopbackAddress(request.ip)) {
       return reply.code(403).send({
         error: { code: "local_access_required", message: "Benchmark history is available on the coordinator host only." },
       });
     }
-    return { runs: loadBenchmarkRuns(benchmarkRoot).toReversed() };
+    return benchmarkHistoryResponse();
   });
 
   app.post("/local/v1/benchmarks/run", async (request, reply) => {
@@ -622,12 +1120,26 @@ export async function createCoordinator(
       });
     }
     const body = benchmarkRunRequestSchema.parse(request.body ?? {});
-    benchmarkRunInFlight = runAndPersistRealSuite({
-      cwd: benchmarkRoot,
-      coordinatorUrl: `http://127.0.0.1:${config.port}`,
-      ...(body.version ? { version: body.version } : {}),
-      ...(body.label ? { label: body.label } : {}),
-    });
+    const activeModelIds = benchmarkableActiveModelIds();
+    const modelId = body.model ?? activeModelIds[0];
+    if (!modelId || !activeModelIds.includes(modelId)) {
+      return reply.code(409).send({
+        error: {
+          code: "benchmark_model_unavailable",
+          message: body.model
+            ? `El modelo ${body.model} no está activo; no se ha generado ningún dato.`
+            : "No hay ningún modelo activo para medir; no se ha generado ningún dato.",
+        },
+      });
+    }
+    benchmarkRunInFlight = startCoordinatorBenchmark(
+      benchmarkTargetForModel(modelId),
+      "manual",
+      {
+        ...(body.label ? { label: body.label } : {}),
+        ...(body.version ? { version: body.version } : {}),
+      },
+    );
     try {
       const result = await benchmarkRunInFlight;
       return { run: result.run };
@@ -640,6 +1152,7 @@ export async function createCoordinator(
       });
     } finally {
       benchmarkRunInFlight = null;
+      drainAutomaticBenchmarkQueue();
     }
   });
 
@@ -722,7 +1235,29 @@ export async function createCoordinator(
   app.post("/v1/chat/completions", async (request, reply) => {
     const parsed = chatCompletionRequestSchema.parse(request.body) as ChatCompletionRequest;
     const idempotencyKey = parseIdempotencyKey(request.headers["idempotency-key"]);
+    const supersededJobId = service.cancelMatchingActiveSession(parsed, parsed.session_id);
+    if (supersededJobId) {
+      app.log.warn({
+        supersededJobId,
+        sessionId: parsed.session_id,
+        model: parsed.model,
+      }, "replacing an interrupted identical chat request after client reconnection");
+      // Give the cell worker time to process task.cancel and publish its freed
+      // slot before the replacement lease is offered on the same socket.
+      await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 1_000));
+    }
+    if (parsed.stream && !service.hasCapacity(parsed, parsed.session_id)) {
+      // A reconnect can race both route rebuilding and the automatic startup
+      // benchmark. Keep the fetch pending while capacity returns instead of
+      // making the installed desktop surface a transient 503.
+      await waitForChatCapacity(service, parsed, parsed.session_id, 45_000);
+    }
     const handle = service.submit(parsed, parsed.session_id, idempotencyKey);
+    const conversationId = store.startInferenceConversation(
+      handle.sessionId,
+      parsed.model,
+      parsed.messages,
+    );
     reply.header("x-network-request-id", handle.jobId);
     reply.header("x-network-session-id", handle.sessionId);
 
@@ -737,13 +1272,46 @@ export async function createCoordinator(
         "x-network-session-id": handle.sessionId,
       });
       let finished = false;
+      let streamedText = "";
+      let streamedRouteClass = "replica";
+      let streamedResult: Extract<JobStreamEvent, { type: "completed" }> | null = null;
+      let streamedFailure: Extract<JobStreamEvent, { type: "failed" }> | null = null;
       reply.raw.once("close", () => {
         if (!finished) service.cancel(handle.jobId);
       });
-      for await (const event of handle.events) {
-        writeOpenAiEvent(reply.raw, event, parsed.model, handle.jobId);
+      const heartbeatTimer = setInterval(() => {
+        if (!reply.raw.destroyed && !reply.raw.writableEnded) {
+          reply.raw.write(`: mycellios-heartbeat ${Date.now()}\n\n`);
+        }
+      }, 10_000);
+      heartbeatTimer.unref();
+      try {
+        for await (const event of handle.events) {
+          if (event.type === "accepted") streamedRouteClass = event.route.routeClass;
+          if (event.type === "token") streamedText += event.token.text;
+          if (event.type === "completed") streamedResult = event;
+          if (event.type === "failed") streamedFailure = event;
+          writeOpenAiEvent(reply.raw, event, parsed.model, handle.jobId);
+        }
+      } finally {
+        clearInterval(heartbeatTimer);
       }
       finished = true;
+      store.appendInferenceMessage({
+        conversationId,
+        jobId: handle.jobId,
+        role: "assistant",
+        content: streamedResult?.result.text ?? streamedText,
+        status: streamedFailure ? "failed" : "completed",
+        inputTokens: streamedResult?.result.metrics.inputTokens ?? null,
+        outputTokens: streamedResult?.result.metrics.outputTokens ?? null,
+        routeClass: streamedRouteClass,
+        latencyMs: streamedResult?.result.metrics.activeMs ?? null,
+        metadata: streamedFailure
+          ? { failure_code: streamedFailure.code, failure_message: streamedFailure.message }
+          : { finish_reason: streamedResult?.result.finishReason ?? null },
+      });
+      void persistence?.flush();
       reply.raw.write("data: [DONE]\n\n");
       reply.raw.end();
       return;
@@ -766,6 +1334,24 @@ export async function createCoordinator(
       throw new MeshServiceError("missing_result", "Worker stream ended without a result", 502);
     }
     reply.header("x-route-class", routeClass);
+    store.appendInferenceMessage({
+      conversationId,
+      jobId: handle.jobId,
+      role: "assistant",
+      content: result.result.text,
+      status: "completed",
+      inputTokens: result.result.metrics.inputTokens,
+      outputTokens: result.result.metrics.outputTokens,
+      routeClass,
+      latencyMs: result.result.metrics.activeMs,
+      metadata: {
+        finish_reason: result.result.finishReason,
+        affinity_hit: affinityHit,
+        ttft_ms: result.result.metrics.ttftMs,
+        reused_kv_tokens: result.result.metrics.reusedKvTokens ?? 0,
+      },
+    });
+    void persistence?.flush();
     return {
       id: handle.jobId,
       object: "chat.completion",
@@ -809,6 +1395,25 @@ export async function createCoordinator(
       deadline_at: new Date(job.deadlineAt).toISOString(),
       created_at: new Date(job.createdAt).toISOString(),
       updated_at: new Date(job.updatedAt).toISOString(),
+    };
+  });
+
+  app.get("/v1/conversations/:sessionId/messages", async (request) => {
+    const { sessionId } = z.object({ sessionId: z.string().min(1).max(200) }).parse(request.params);
+    return {
+      data: store.listInferenceMessages(sessionId).map((message) => ({
+        id: message.id,
+        job_id: message.jobId,
+        role: message.role,
+        content: message.content,
+        status: message.status,
+        input_tokens: message.inputTokens,
+        output_tokens: message.outputTokens,
+        route_class: message.routeClass,
+        latency_ms: message.latencyMs,
+        metadata: message.metadata,
+        created_at: new Date(message.createdAt).toISOString(),
+      })),
     };
   });
 
@@ -881,6 +1486,16 @@ export async function createCoordinator(
       return reply.redirect(`/downloads/mycellios-linux-x64.rpm?v=${publicAssetVersion}`);
     });
   }
+  const contentHubClient = config.contentHubApiUrl
+    ? new ContentHubClient({ baseUrl: config.contentHubApiUrl })
+    : null;
+  await registerContentHubRoutes(app, {
+    client: contentHubClient,
+    publicationWebhookSecret: config.publicationWebhookSecret,
+    ...(landingAssetsPath
+      ? { fallbackSitemapPath: resolve(landingAssetsPath, "sitemap.xml") }
+      : {}),
+  });
   if (landingAssetsPath) {
     await app.register(staticFiles, {
       root: landingAssetsPath,
@@ -890,8 +1505,17 @@ export async function createCoordinator(
       cacheControl: false,
       setHeaders: setPublicAssetCacheHeaders,
     });
-    for (const path of ["/network", "/admin", "/join", "/downloads"] as const) {
-      app.get(path, async (_request, reply) => reply.sendFile("index.html"));
+    const landingRouteDocuments = {
+      "/network": "network/index.html",
+      "/admin": "admin/index.html",
+      "/join": "join/index.html",
+      "/downloads": "downloads/index.html",
+    } as const;
+    for (const [path, routeDocument] of Object.entries(landingRouteDocuments)) {
+      const document = existsSync(resolve(landingAssetsPath, routeDocument))
+        ? routeDocument
+        : "index.html";
+      app.get(path, async (_request, reply) => reply.sendFile(document));
     }
   }
 
@@ -918,18 +1542,64 @@ export async function createCoordinator(
     hub,
     mobileHub,
     service,
+    persistence,
     async close() {
       clearInterval(staleTimer);
       hub.close();
       mobileHub.close();
       await activationManager?.close();
       await app.close();
+      await persistence?.close();
       database.close();
     },
   };
 }
 
+function queueExistingMobileArtifacts(
+  persistence: SupabasePersistence,
+  directory: string,
+): void {
+  let files: string[];
+  try {
+    files = readdirSync(directory);
+  } catch {
+    return;
+  }
+  for (const file of files) {
+    const path = resolve(directory, file);
+    if (file.endsWith(".bin")) {
+      const weightsHash = file.slice(0, -4);
+      if (!/^[a-f0-9]{64}$/.test(weightsHash)) continue;
+      const sizeBytes = statSync(path).size;
+      persistence.registerArtifactBackup({
+        id: `mobile-weight-${weightsHash}`,
+        localPath: path,
+        storagePath: `mobile-experts/weights/${file}`,
+        contentType: "application/octet-stream",
+        sha256: weightsHash,
+        sizeBytes,
+        metadata: { kind: "mobile-expert-weights", weightsHash },
+      });
+      continue;
+    }
+    if (!file.endsWith(".json")) continue;
+    const artifactId = file.slice(0, -5);
+    if (!/^[a-f0-9]{64}$/.test(artifactId)) continue;
+    const body = readFileSync(path);
+    persistence.registerArtifactBackup({
+      id: `mobile-manifest-${artifactId}`,
+      localPath: path,
+      storagePath: `mobile-experts/manifests/${file}`,
+      contentType: "application/json",
+      sha256: createHash("sha256").update(body).digest("hex"),
+      sizeBytes: body.length,
+      metadata: { kind: "mobile-expert-manifest", artifactId },
+    });
+  }
+}
+
 const benchmarkRunRequestSchema = z.object({
+  model: z.string().trim().min(1).max(200).optional(),
   version: z.string().trim().min(1).max(80).optional(),
   label: z.string().trim().min(1).max(160).optional(),
 });
@@ -969,6 +1639,7 @@ function setPublicAssetCacheHeaders(
   const normalized = filePath.replaceAll("\\", "/");
   if (
     normalized.endsWith("/index.html") ||
+    normalized.endsWith("/blog.css") ||
     normalized.endsWith("/sw.js") ||
     normalized.endsWith("/manifest.webmanifest") ||
     normalized.includes("/downloads/") ||
@@ -1210,6 +1881,18 @@ function mobileDashboardWorker(worker: MobileWorkerSnapshot) {
   };
 }
 
+async function waitForChatCapacity(
+  service: MeshService,
+  request: ChatCompletionRequest,
+  sessionId: string | undefined,
+  timeoutMs: number,
+): Promise<void> {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  while (!service.hasCapacity(request, sessionId) && Date.now() < deadline) {
+    await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 250));
+  }
+}
+
 function parseIdempotencyKey(received: string | string[] | undefined): string | undefined {
   const value = Array.isArray(received) ? received[0] : received;
   if (value === undefined) return undefined;
@@ -1221,6 +1904,56 @@ function parseIdempotencyKey(received: string | string[] | undefined): string | 
     );
   }
   return value;
+}
+
+interface SupportAssistantRateState {
+  windowStartedAt: number;
+  requests: number;
+  active: number;
+}
+
+function supportAssistantRateKey(request: FastifyRequest, sessionId: string): string {
+  const userAgent = request.headers["user-agent"] ?? "unknown";
+  const forwardedFor = request.headers["x-forwarded-for"];
+  const address = typeof forwardedFor === "string"
+    ? forwardedFor.split(",", 1)[0]?.trim() || request.ip
+    : request.ip;
+  return createHash("sha256")
+    .update(`${address}\n${userAgent}\n${sessionId}`)
+    .digest("hex")
+    .slice(0, 24);
+}
+
+function claimSupportAssistantRequest(
+  states: Map<string, SupportAssistantRateState>,
+  key: string,
+  now = Date.now(),
+): (() => void) | null {
+  const windowMs = 10 * 60_000;
+  const previous = states.get(key);
+  const state = !previous || now - previous.windowStartedAt >= windowMs
+    ? { windowStartedAt: now, requests: 0, active: 0 }
+    : previous;
+  // A reconnect can overlap briefly with the abandoned socket. Two active
+  // attempts let the new request supersede the stale job without opening an
+  // unlimited parallel-inference path for one browser session.
+  if (state.requests >= 24 || state.active >= 2) return null;
+  state.requests += 1;
+  state.active += 1;
+  states.set(key, state);
+  if (states.size > 2_000) {
+    for (const [candidateKey, candidate] of states) {
+      if (now - candidate.windowStartedAt >= windowMs && candidate.active === 0) {
+        states.delete(candidateKey);
+      }
+    }
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    state.active = Math.max(0, state.active - 1);
+  };
 }
 
 const jobIdParamsSchema = z.object({ jobId: z.string().min(1).max(128) }).strict();
@@ -1258,6 +1991,23 @@ function writeOpenAiEvent(
           session_id: event.sessionId,
           route_class: event.route.routeClass,
           affinity_hit: event.route.affinityHit,
+        },
+      })}\n\n`,
+    );
+  } else if (event.type === "progress") {
+    stream.write(
+      `data: ${JSON.stringify({
+        id: jobId,
+        object: "chat.completion.chunk",
+        created: Math.floor(Date.now() / 1_000),
+        model,
+        choices: [{ index: 0, delta: {}, finish_reason: null }],
+        x_network: {
+          phase: event.phase,
+          status_message: event.message,
+          attempt: event.attempt,
+          ...(event.workerId ? { affected_worker_id: event.workerId } : {}),
+          ...(event.nodeId ? { affected_node_id: event.nodeId } : {}),
         },
       })}\n\n`,
     );

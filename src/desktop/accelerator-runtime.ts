@@ -24,6 +24,13 @@ const PROBE_MARKER = "MYCELLIOS_RUNTIME_PROBE=";
 export const PORTABLE_RUNTIME_PROBE_MARKER = "MYCELLIOS_PORTABLE_RUNTIME_PROBE=";
 const ACCELERATOR_DIRECTORY = "accelerator-runtimes-v1";
 const ACCELERATOR_MANIFEST = "accelerator-runtime.json";
+const WINDOWS_CUDA_RUNTIME_DIRECTORY = "mcg";
+const WINDOWS_CUDA_RUNTIME_TARGET = "cuda";
+// Keep provisioning paths short enough for Python wheels on Windows systems
+// where Win32 long-path support is not enabled. Some PyTorch headers are more
+// than 120 characters below site-packages, so repeating the full pack id and a
+// UUID in the staging directory can cross MAX_PATH.
+const ACCELERATOR_STAGING_PREFIX = "stg-";
 const PORTABLE_MANIFEST = "runtime-manifest.json";
 
 export type AcceleratorBackend = "cuda" | "rocm" | "mps" | "xpu";
@@ -503,8 +510,15 @@ export async function prepareAcceleratorRuntime(
     }
   }
 
-  const acceleratorRoot = resolve(options.userDataPath, ACCELERATOR_DIRECTORY);
-  const target = resolve(acceleratorRoot, pack.id);
+  const acceleratorRoot = acceleratorRuntimeRootPath(
+    options.userDataPath,
+    pack,
+    pack.platform,
+  );
+  const target = resolve(
+    acceleratorRoot,
+    acceleratorRuntimeTargetName(pack, pack.platform),
+  );
   assertDirectChild(acceleratorRoot, target);
   const downloader = options.artifactDownloader ?? downloadPinnedArtifact;
   await mkdir(acceleratorRoot, { recursive: true });
@@ -568,11 +582,21 @@ export async function prepareAcceleratorRuntime(
     );
   }
 
-  const staging = resolve(acceleratorRoot, `${pack.id}.staging-${randomUUID()}`);
+  const staging = resolve(
+    acceleratorRoot,
+    `${ACCELERATOR_STAGING_PREFIX}${randomUUID().replaceAll("-", "").slice(0, 12)}`,
+  );
   assertDirectChild(acceleratorRoot, staging);
   let failurePhase: AcceleratorProgressPhase = "checking-prerequisites";
   try {
     await removeAbandonedAcceleratorStaging(acceleratorRoot, pack.id);
+    const legacyAcceleratorRoot = resolve(options.userDataPath, ACCELERATOR_DIRECTORY);
+    if (
+      legacyAcceleratorRoot !== acceleratorRoot
+      && existsSync(legacyAcceleratorRoot)
+    ) {
+      await removeAbandonedAcceleratorStaging(legacyAcceleratorRoot, pack.id);
+    }
     emit("checking-prerequisites", 8, `Checking free space for the ${pack.backend.toUpperCase()} runtime.`);
     const availableBytes = await requireFreeSpace(acceleratorRoot, pack.minimumFreeBytes);
     emit(
@@ -583,7 +607,10 @@ export async function prepareAcceleratorRuntime(
 
     const artifacts = pack.installGroups.flatMap((group) => [...group]);
     const aggregateTotal = artifacts.reduce((sum, artifact) => sum + artifact.sizeBytes, 0);
-    const cacheRoot = resolve(acceleratorRoot, "package-cache");
+    // Keep the content-addressed package cache in its existing managed
+    // location. Windows CUDA only shortens the installed runtime root, so
+    // upgrades reuse the already verified multi-gigabyte wheel.
+    const cacheRoot = resolve(options.userDataPath, ACCELERATOR_DIRECTORY, "package-cache");
     await mkdir(cacheRoot, { recursive: true });
     const downloadedPaths = new Map<string, string>();
     let completedBytes = 0;
@@ -647,14 +674,12 @@ export async function prepareAcceleratorRuntime(
     const python = runtimePythonExecutable(staging, baseManifest.executable);
     const initialEnvironment = runtimeEnvironmentAdditions(staging);
     failurePhase = "installing";
-    emit("installing", 74, "Removing the CPU-only PyTorch wheel from the isolated GPU runtime.");
-    await runChecked(
-      runner,
-      python,
-      ["-m", "pip", "uninstall", "--yes", "torch"],
-      commandEnvironment(initialEnvironment),
-      "remove the CPU torch wheel",
-    );
+    // The certified portable base deliberately omits wheel RECORD files. A
+    // regular uninstall/reinstall therefore cannot remove its CPU-only torch
+    // package and pip aborts with `uninstall-no-record-file`. The accelerator
+    // runtime is an isolated copy, so overwrite that package in place and rely
+    // on the mandatory physical probe below before activating the runtime.
+    emit("installing", 74, "Replacing CPU-only PyTorch inside the isolated GPU runtime.");
     for (const [index, group] of pack.installGroups.entries()) {
       const installPercent = 76 + 16 * (index / pack.installGroups.length);
       emit(
@@ -674,6 +699,7 @@ export async function prepareAcceleratorRuntime(
           "--no-cache-dir",
           "--no-index",
           "--no-deps",
+          "--ignore-installed",
           // ROCm's signed SDK bootstrap is distributed as a source archive.
           // Reuse the certified runtime's pinned setuptools instead of asking
           // pip to create an isolated build environment that would require an
@@ -739,10 +765,13 @@ async function removeAbandonedAcceleratorStaging(
   acceleratorRoot: string,
   packId: string,
 ): Promise<void> {
-  const prefix = `${packId}.staging-`;
+  const legacyPrefix = `${packId}.staging-`;
   const entries = await readdir(acceleratorRoot, { withFileTypes: true });
   await Promise.all(entries
-    .filter((entry) => entry.isDirectory() && entry.name.startsWith(prefix))
+    .filter((entry) => entry.isDirectory() && (
+      entry.name.startsWith(legacyPrefix)
+      || entry.name.startsWith(ACCELERATOR_STAGING_PREFIX)
+    ))
     .map(async (entry) => {
       const candidate = resolve(acceleratorRoot, entry.name);
       assertDirectChild(acceleratorRoot, candidate);
@@ -939,10 +968,37 @@ export async function probeAcceleratorRuntime(
 export function acceleratorRuntimeTargetPath(
   userDataPath: string,
   backend: AcceleratorBackend,
+  platform = process.platform,
 ): string {
   const pack = CERTIFIED_ACCELERATOR_PACKS.find((candidate) => candidate.backend === backend);
   if (!pack) throw new Error(`No certified ${backend} runtime pack is registered`);
-  return resolve(userDataPath, ACCELERATOR_DIRECTORY, pack.id);
+  return resolve(
+    acceleratorRuntimeRootPath(userDataPath, pack, platform),
+    acceleratorRuntimeTargetName(pack, platform),
+  );
+}
+
+function acceleratorRuntimeRootPath(
+  userDataPath: string,
+  pack: AcceleratorPack,
+  platform: string,
+): string {
+  if (platform === "win32" && pack.backend === "cuda") {
+    // PyTorch ships nested headers and license trees that can exceed MAX_PATH
+    // even with a short staging name. A compact per-user sibling remains
+    // writable without elevation and leaves enough room for the full wheel.
+    return resolve(dirname(resolve(userDataPath)), WINDOWS_CUDA_RUNTIME_DIRECTORY);
+  }
+  return resolve(userDataPath, ACCELERATOR_DIRECTORY);
+}
+
+function acceleratorRuntimeTargetName(
+  pack: AcceleratorPack,
+  platform: string,
+): string {
+  return platform === "win32" && pack.backend === "cuda"
+    ? WINDOWS_CUDA_RUNTIME_TARGET
+    : pack.id;
 }
 
 function acceleratorProbeScript(): string {

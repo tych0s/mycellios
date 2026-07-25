@@ -232,7 +232,8 @@ async function probeWindowsGpu(systemRamMb: number): Promise<HardwareProbe["gpus
     "  $match = $registry | Where-Object { $vendorDevice = [regex]::Match($_.MatchingDeviceId, '^PCI\\\\VEN_[^&]+&DEV_[^&]+').Value; ($vendorDevice -and $pnpId.StartsWith($vendorDevice, [StringComparison]::OrdinalIgnoreCase)) -or (-not $vendorDevice -and $_.Name -eq $deviceName) } | Sort-Object DedicatedBytes -Descending | Select-Object -First 1",
     "  [pscustomobject]@{ Name = $deviceName; PNPDeviceID = $pnpId; AdapterRAM = $_.AdapterRAM; DedicatedBytes = if ($match) { [uint64]$match.DedicatedBytes } else { [uint64]0 } }",
     "})",
-    "$devices | ConvertTo-Json -Compress",
+    "$engineSamples = @(Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Name = [string]$_.Name; UtilizationPercentage = [double]$_.UtilizationPercentage } })",
+    "[pscustomobject]@{ Devices = $devices; EngineSamples = $engineSamples } | ConvertTo-Json -Compress -Depth 3",
   ].join("; ");
   try {
     const { stdout } = await execFileAsync("powershell.exe", [
@@ -241,10 +242,27 @@ async function probeWindowsGpu(systemRamMb: number): Promise<HardwareProbe["gpus
       "-Command",
       script,
     ]);
-    const raw = JSON.parse(stdout.trim()) as
-      | { Name?: string; AdapterRAM?: number; DedicatedBytes?: number }
-      | Array<{ Name?: string; AdapterRAM?: number; DedicatedBytes?: number }>;
-    const devices = Array.isArray(raw) ? raw : [raw];
+    const raw = JSON.parse(stdout.trim()) as {
+      Devices?: WindowsGpuDevice | WindowsGpuDevice[];
+      EngineSamples?: WindowsGpuEngineSample | WindowsGpuEngineSample[];
+    };
+    const devices = raw.Devices === undefined
+      ? []
+      : Array.isArray(raw.Devices)
+        ? raw.Devices
+        : [raw.Devices];
+    const engineSamples = raw.EngineSamples === undefined
+      ? []
+      : Array.isArray(raw.EngineSamples)
+        ? raw.EngineSamples
+        : [raw.EngineSamples];
+    // The Windows counter identifies adapters with a DirectX LUID that
+    // Win32_VideoController does not expose. Assign aggregate utilization only
+    // when there is a single physical adapter, avoiding telemetry leakage
+    // between GPUs on hybrid systems. NVIDIA remains covered by nvidia-smi.
+    const utilizationPct = devices.length === 1
+      ? windowsGpuEngineUtilizationPct(engineSamples)
+      : undefined;
     return devices.map((device, index) => {
       const model = device.Name ?? "Windows GPU";
       const vendor = classifyVendor(model);
@@ -255,6 +273,7 @@ async function probeWindowsGpu(systemRamMb: number): Promise<HardwareProbe["gpus
         vendor,
         model,
         physicalVramMb,
+        ...(utilizationPct === undefined ? {} : { utilizationPct }),
         ...(unifiedMemory
           ? {
               unifiedMemory: true,
@@ -270,6 +289,39 @@ async function probeWindowsGpu(systemRamMb: number): Promise<HardwareProbe["gpus
   } catch {
     return [];
   }
+}
+
+interface WindowsGpuDevice {
+  Name?: string | undefined;
+  AdapterRAM?: number | undefined;
+  DedicatedBytes?: number | undefined;
+}
+
+export interface WindowsGpuEngineSample {
+  Name?: string | undefined;
+  UtilizationPercentage?: number | undefined;
+}
+
+/**
+ * Windows reports one utilization row per process and GPU engine. Task
+ * Manager-style device load is the busiest engine after summing its processes,
+ * not the sum of every engine (which can exceed 100%).
+ */
+export function windowsGpuEngineUtilizationPct(
+  samples: readonly WindowsGpuEngineSample[],
+): number | undefined {
+  const engineTotals = new Map<string, number>();
+  for (const sample of samples) {
+    const name = sample.Name?.trim();
+    const value = Number(sample.UtilizationPercentage);
+    if (!name || !Number.isFinite(value) || value < 0) continue;
+    const engine = name.match(/luid_[^_]+_[^_]+_phys_\d+_eng_\d+_engtype_.+$/i)?.[0];
+    if (!engine) continue;
+    const key = engine.toLowerCase();
+    engineTotals.set(key, (engineTotals.get(key) ?? 0) + value);
+  }
+  if (engineTotals.size === 0) return undefined;
+  return Math.min(100, Math.max(0, ...engineTotals.values()));
 }
 
 export function windowsGpuPhysicalVramMb(device: {

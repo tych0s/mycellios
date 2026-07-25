@@ -48,6 +48,10 @@ import type {
   DashboardWorker,
   DesktopSettings,
   DesktopUpdateStatus,
+  SupportAssistantAdminResponse,
+  SupportAssistantAdminSettings,
+  SupportAssistantChatRequest,
+  SupportAssistantPublicConfig,
 } from "./contracts.js";
 import type {
   HubCatalogPage,
@@ -67,7 +71,7 @@ import {
   gpuPreparationRetryDelayMs,
   readVerifiedAccelerationUsage,
 } from "./acceleration-evidence.js";
-import { consumeChatCompletionStream } from "./chat-stream.js";
+import { consumeChatCompletionStreamWithRecovery } from "./chat-stream.js";
 import { desktopExecutorPolicy, normalizeComputeMode } from "./compute-mode.js";
 import {
   selectDesktopHardwareGpu,
@@ -83,10 +87,14 @@ import {
 } from "./accelerator-runtime.js";
 import { buildWorkerAccelerationDiagnostics } from "./acceleration-diagnostics.js";
 import {
+  AUTOMATIC_UPDATE_CHECK_INTERVAL_MS,
   AUTOMATIC_UPDATE_GRACE_MS,
   AUTOMATIC_UPDATE_IDLE_RECHECK_MS,
+  automaticUpdateRetryDelayMs,
   canInstallAutomaticUpdate,
+  summarizeAutomaticUpdateError,
 } from "./update-recovery.js";
+import { SingleFlight } from "./single-flight.js";
 
 if (started) app.quit();
 
@@ -115,7 +123,6 @@ const DEFAULT_SETTINGS: DesktopSettings = {
 };
 
 const UPDATE_FEED_URL = "https://www.mycellios.com/updates/win32/x64/";
-const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1_000;
 const LEGACY_PUBLIC_COORDINATOR_URLS = new Set([
   "https://www.mycellios.com",
   "https://mycellios.com",
@@ -127,6 +134,7 @@ let tray: Tray | null = null;
 let coordinator: CoordinatorRuntime | null = null;
 let coordinatorUrl = "";
 let worker: WorkerAgent | null = null;
+const workerStartFlight = new SingleFlight();
 let distributedExecutor: Awaited<ReturnType<typeof createDesktopDistributedExecutor>> | null = null;
 let distributionRuntimePromise: Promise<string> | null = null;
 let cpuRuntimePromise: Promise<AcceleratorRuntimeResult> | null = null;
@@ -150,6 +158,8 @@ let isQuitting = false;
 let runtimeError: string | null = null;
 let accelerationStatus: DashboardSnapshot["acceleration"] = createInitialAccelerationStatus();
 let updateCheckTimer: NodeJS.Timeout | null = null;
+let updateRetryTimer: NodeJS.Timeout | null = null;
+let updateRetryAttempt = 0;
 let updateCheckInFlight = false;
 let automaticUpdateInstallTimer: NodeJS.Timeout | null = null;
 let automaticUpdateInstallInFlight = false;
@@ -241,6 +251,7 @@ function configureAutomaticUpdates(): void {
     setUpdateStatus({ state: "checking", message: "Checking for a new version…" });
   });
   autoUpdater.on("update-available", () => {
+    resetAutomaticUpdateRetry();
     if (updateStatus.state === "ready") return;
     setUpdateStatus({
       state: "downloading",
@@ -248,6 +259,7 @@ function configureAutomaticUpdates(): void {
     });
   });
   autoUpdater.on("update-not-available", () => {
+    resetAutomaticUpdateRetry();
     if (updateStatus.state === "ready") return;
     setUpdateStatus({
       state: "up-to-date",
@@ -257,6 +269,7 @@ function configureAutomaticUpdates(): void {
     });
   });
   autoUpdater.on("update-downloaded", (_event, _releaseNotes, releaseName) => {
+    resetAutomaticUpdateRetry();
     setUpdateStatus({
       state: "ready",
       availableVersion: releaseName || null,
@@ -270,17 +283,19 @@ function configureAutomaticUpdates(): void {
   });
   autoUpdater.on("error", (error) => {
     if (updateStatus.state === "ready") return;
+    const summary = summarizeAutomaticUpdateError(error.message);
     setUpdateStatus({
       state: "error",
-      message: `Could not check for updates: ${error.message}`,
+      message: `Could not check for updates: ${summary}`,
       checkedAt: new Date().toISOString(),
     });
+    scheduleAutomaticUpdateRetry(summary);
   });
 
   // Squirrel holds a file lock for a few seconds after first install.
   const initialDelayMs = process.argv.includes("--squirrel-firstrun") ? 15_000 : 10_000;
   setTimeout(() => void checkForUpdates(), initialDelayMs).unref();
-  updateCheckTimer = setInterval(() => void checkForUpdates(), UPDATE_CHECK_INTERVAL_MS);
+  updateCheckTimer = setInterval(() => void checkForUpdates(), AUTOMATIC_UPDATE_CHECK_INTERVAL_MS);
   updateCheckTimer.unref();
 }
 
@@ -292,15 +307,50 @@ async function checkForUpdates(): Promise<DesktopUpdateStatus> {
   try {
     await autoUpdater.checkForUpdates();
   } catch (error) {
+    const summary = summarizeAutomaticUpdateError(errorText(error));
     setUpdateStatus({
       state: "error",
-      message: `Could not check for updates: ${errorText(error)}`,
+      message: `Could not check for updates: ${summary}`,
       checkedAt: new Date().toISOString(),
     });
+    scheduleAutomaticUpdateRetry(summary);
   } finally {
     updateCheckInFlight = false;
   }
   return updateStatus;
+}
+
+function resetAutomaticUpdateRetry(): void {
+  updateRetryAttempt = 0;
+  if (!updateRetryTimer) return;
+  clearTimeout(updateRetryTimer);
+  updateRetryTimer = null;
+}
+
+function scheduleAutomaticUpdateRetry(reason: string): void {
+  if (
+    process.platform !== "win32"
+    || !app.isPackaged
+    || updateStatus.state === "ready"
+    || isQuitting
+    || updateRetryTimer
+  ) return;
+  const attempt = updateRetryAttempt;
+  const delayMs = automaticUpdateRetryDelayMs(attempt);
+  updateRetryAttempt += 1;
+  writeDesktopLog("automatic-update-retry-scheduled", {
+    attempt: attempt + 1,
+    delayMs,
+    reason,
+  });
+  setUpdateStatus({
+    message: `Update check will retry automatically in ${Math.ceil(delayMs / 60_000)} minute${delayMs > 60_000 ? "s" : ""}. ${reason}`,
+  });
+  updateRetryTimer = setTimeout(() => {
+    updateRetryTimer = null;
+    void checkForUpdates();
+  }, delayMs);
+  updateRetryTimer.unref();
 }
 
 function clearAutomaticUpdateInstallTimer(): void {
@@ -581,6 +631,11 @@ async function buildWorkerConfig(
 
 async function startWorkerIfEnabled(): Promise<void> {
   if (!settings.contributionEnabled || worker) return;
+  await workerStartFlight.run(initializeWorker);
+}
+
+async function initializeWorker(): Promise<void> {
+  if (!settings.contributionEnabled || worker || isQuitting) return;
   writeDesktopLog("worker-start-requested", { coordinatorUrl, contributionEnabled: settings.contributionEnabled });
   try {
     distributedExecutor ??= await createDesktopDistributedExecutor();
@@ -664,6 +719,7 @@ async function startWorkerIfEnabled(): Promise<void> {
 }
 
 async function stopWorker(): Promise<void> {
+  await workerStartFlight.wait().catch(() => undefined);
   const activeWorker = worker;
   worker = null;
   if (activeWorker) await activeWorker.stop();
@@ -828,27 +884,89 @@ async function sendChat(request: ChatRequest): Promise<ChatResponse> {
 
 async function streamChat(request: ChatRequest, onUpdate: (update: ChatStreamUpdate) => void): Promise<ChatResponse> {
   const messages = normalizeDesktopChatMessages(request.messages);
-  const headers = new Headers({ accept: "text/event-stream", "content-type": "application/json" });
-  if (settings.coordinatorMode === "remote" && settings.remoteCoordinatorToken) {
-    headers.set("authorization", `Bearer ${settings.remoteCoordinatorToken}`);
-  }
-  const startedAt = Date.now();
-  const response = await fetch(new URL("v1/chat/completions", `${coordinatorUrl}/`), {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      model: request.model,
-      messages,
-      session_id: request.sessionId,
-      stream: true,
-      max_tokens: Math.max(1, Math.min(2_048, request.maxTokens ?? 128)),
-      temperature: 0,
-      top_p: 1,
+  return consumeChatCompletionStreamWithRecovery(
+    async (_attempt, signal) => {
+      const headers = new Headers({ accept: "text/event-stream", "content-type": "application/json" });
+      if (settings.coordinatorMode === "remote" && settings.remoteCoordinatorToken) {
+        headers.set("authorization", `Bearer ${settings.remoteCoordinatorToken}`);
+      }
+      return fetch(new URL("v1/chat/completions", `${coordinatorUrl}/`), {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: request.model,
+          messages,
+          session_id: request.sessionId,
+          stream: true,
+          max_tokens: Math.max(1, Math.min(2_048, request.maxTokens ?? 128)),
+          temperature: 0,
+          top_p: 1,
+        }),
+        signal,
+        redirect: "error",
+      });
+    },
+    request.model,
+    onUpdate,
+    { sessionId: request.sessionId },
+  );
+}
+
+async function getSupportAssistantConfig(): Promise<SupportAssistantPublicConfig> {
+  return fetchJson<SupportAssistantPublicConfig>("public/v1/assistant/config");
+}
+
+async function streamSupportAssistant(
+  request: SupportAssistantChatRequest,
+  onUpdate: (update: ChatStreamUpdate) => void,
+): Promise<ChatResponse> {
+  const messages = request.messages
+    .map((message) => ({ role: message.role, content: message.content.trim() }))
+    .filter((message) => message.content);
+  const last = messages.at(-1);
+  if (!last || last.role !== "user") throw new Error("Escribe un mensaje antes de enviarlo.");
+  return consumeChatCompletionStreamWithRecovery(
+    (_attempt, signal) => fetch(new URL("public/v1/assistant/chat", `${coordinatorUrl}/`), {
+      method: "POST",
+      headers: { accept: "text/event-stream", "content-type": "application/json" },
+      body: JSON.stringify({
+        session_id: request.sessionId,
+        messages,
+        ...(request.page ? { page: request.page } : {}),
+        ...(request.platform ? { platform: request.platform } : {}),
+      }),
+      signal,
+      redirect: "error",
     }),
-    signal: AbortSignal.timeout(3 * 60_000),
-    redirect: "error",
+    "mycellios-network",
+    onUpdate,
+    {
+      sessionId: request.sessionId,
+      maximumAttempts: 4,
+      retryDelayMs: 900,
+      connectionTimeoutMs: 15_000,
+      streamIdleTimeoutMs: 35_000,
+    },
+  );
+}
+
+async function supportAssistantAdminRequest(
+  method: "GET" | "PUT",
+  providedAdminToken: string | undefined,
+  assistantSettings?: Omit<SupportAssistantAdminSettings, "updatedAt">,
+): Promise<SupportAssistantAdminResponse> {
+  const providedToken = providedAdminToken?.trim() ?? "";
+  const token = providedToken || modelAdminToken;
+  const response = await fetchJson<SupportAssistantAdminResponse>("public/v1/admin/assistant", {
+    method,
+    headers: {
+      ...(assistantSettings ? { "content-type": "application/json" } : {}),
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+    },
+    ...(assistantSettings ? { body: JSON.stringify(assistantSettings) } : {}),
   });
-  return consumeChatCompletionStream(response, request.model, onUpdate, startedAt);
+  if (providedToken && providedToken !== modelAdminToken) persistModelAdminToken(providedToken);
+  return response;
 }
 
 function normalizeDesktopChatMessages(messages: ChatRequest["messages"]): ChatRequest["messages"] {
@@ -884,6 +1002,26 @@ function registerIpc(): void {
   ipcMain.handle("chat:stream", (event, streamId: string, request: ChatRequest) => streamChat(request, (update) => {
     if (!event.sender.isDestroyed()) event.sender.send("chat:stream:update", streamId, update);
   }));
+  ipcMain.handle("assistant:config", () => getSupportAssistantConfig());
+  ipcMain.handle(
+    "assistant:stream",
+    (event, streamId: string, request: SupportAssistantChatRequest) =>
+      streamSupportAssistant(request, (update) => {
+        if (!event.sender.isDestroyed()) event.sender.send("assistant:stream:update", streamId, update);
+      }),
+  );
+  ipcMain.handle(
+    "assistant:admin:read",
+    (_event, adminToken?: string) => supportAssistantAdminRequest("GET", adminToken),
+  );
+  ipcMain.handle(
+    "assistant:admin:save",
+    (
+      _event,
+      assistantSettings: Omit<SupportAssistantAdminSettings, "updatedAt">,
+      adminToken?: string,
+    ) => supportAssistantAdminRequest("PUT", adminToken, assistantSettings),
+  );
   ipcMain.handle("workers:remove", async (_event, workerId: string) => {
     await fetchJson(`public/v1/workers/${encodeURIComponent(workerId)}`, { method: "DELETE" });
     return readSnapshot();
@@ -926,7 +1064,7 @@ function registerIpc(): void {
     return readSnapshot();
   });
   ipcMain.handle("benchmarks:read", async () => {
-    const result = await fetchJson<{ runs: import("../benchlab/types.js").BenchmarkRun[] }>("local/v1/benchmarks");
+    const result = await fetchJson<{ runs: import("../benchlab/types.js").BenchmarkRun[] }>("public/v1/benchmarks");
     return result.runs;
   });
   ipcMain.handle("benchmarks:run", async () => {
@@ -1212,9 +1350,10 @@ function scheduleDesktopAcceleratorRetry(runtimeRoot: string, issueCode: string)
     message: `GPU self-repair attempt ${issueAttempts + 1} will run automatically in ${seconds} seconds. The CPU runtime remains available.`,
   });
   scheduleAccelerationDiagnosticsPublish();
-  if ((issueAttempts + 1) % 4 === 0) {
-    void checkForUpdates();
-  }
+  // A failed GPU setup is often repaired by a newer certified pack or desktop
+  // build. Check immediately on every failure so an unattended node does not
+  // repeat a known-bad installer until the general update interval elapses.
+  void checkForUpdates();
   acceleratorRetryTimer = setTimeout(() => {
     acceleratorRetryTimer = null;
     acceleratorNextRetryAt = null;
@@ -1913,6 +2052,7 @@ app.on("window-all-closed", () => {
 
 app.on("will-quit", () => {
   if (updateCheckTimer) clearInterval(updateCheckTimer);
+  resetAutomaticUpdateRetry();
   clearAutomaticUpdateInstallTimer();
   if (accelerationDiagnosticsPublishTimer) {
     clearTimeout(accelerationDiagnosticsPublishTimer);

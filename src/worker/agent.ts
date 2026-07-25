@@ -299,11 +299,12 @@ export class WorkerAgent {
       : 0;
     const freeOfferedVramMb = Math.max(0, offeredVramMb - usedVramMb);
     const defaultPeakVramMb = Math.max(512, Math.floor(safeVramBudget(offeredVramMb) * 0.9));
+    const publicPrimary = publicHardwareGpu(primary);
 
     this.capabilities = {
       ...this.capabilities,
       gpus: [{
-        ...primary,
+        ...publicPrimary,
         offeredVramMb,
         freeOfferedVramMb,
       }],
@@ -339,7 +340,10 @@ export class WorkerAgent {
         acceleration: structuredClone(acceleration),
       },
     };
-    if (this.registeredWorkerId) await this.register();
+    if (this.registeredWorkerId) {
+      await this.register();
+      await this.sendHeartbeat();
+    }
   }
 
   get activeJobCount(): number {
@@ -419,11 +423,22 @@ export class WorkerAgent {
       ? (llmfit?.model?.measuredTokensPerSecond ??
         llmfit?.model?.estimatedTokensPerSecond)
       : undefined;
+    const throughputSource =
+      this.config.deployment.tokensPerSecond !== undefined
+        ? "configured"
+        : this.config.llmfit.applyPerformanceEstimate && llmfit?.model?.measuredTokensPerSecond !== undefined
+          ? "measured"
+          : this.config.llmfit.applyPerformanceEstimate && llmfit?.model?.estimatedTokensPerSecond !== undefined
+            ? "estimated"
+            : this.config.adapter.kind === "mock"
+              ? "configured"
+              : "default";
     const defaultTokensPerSecond =
       this.config.adapter.kind === "mock"
         ? this.config.adapter.tokensPerSecond
         : (llmfitTokensPerSecond ?? 5);
     const defaultTtft = this.config.adapter.kind === "mock" ? this.config.adapter.ttftMs : 2_000;
+    const publicPrimary = publicHardwareGpu(primary);
     return {
       region: this.config.region,
       agentVersion: this.options.agentVersion?.trim() || "0.1.0",
@@ -438,7 +453,7 @@ export class WorkerAgent {
                 // below represents the independently measured whole cell.
                 physicalVramMb: 0,
               }
-            : primary),
+            : publicPrimary),
           offeredVramMb,
           freeOfferedVramMb: offeredVramMb,
         },
@@ -460,6 +475,7 @@ export class WorkerAgent {
           freeSlots: this.config.limits.maxConcurrency,
           tokensPerSecond:
             this.config.deployment.tokensPerSecond ?? defaultTokensPerSecond,
+          throughputSource,
           ttftMs: this.config.deployment.ttftMs ?? defaultTtft,
           dataLocality: adapterDataLocality(this.config),
           ...(this.config.deployment.internalPipeline
@@ -869,6 +885,24 @@ export class WorkerAgent {
           ? (this.config.limits.maxPowerW * activeMs) / 3_600_000
           : undefined,
       };
+      const measuredTokensPerSecond = metrics.outputTokens > 0
+        ? metrics.outputTokens / (metrics.activeMs / 1_000)
+        : 0;
+      if (this.capabilities && measuredTokensPerSecond > 0) {
+        this.capabilities = {
+          ...this.capabilities,
+          deployments: this.capabilities.deployments.map((deployment) =>
+            deployment.model === payload.request.model && deployment.modelDigest === payload.modelDigest
+              ? {
+                  ...deployment,
+                  tokensPerSecond: Math.max(0.001, Number(measuredTokensPerSecond.toFixed(3))),
+                  throughputSource: "measured",
+                  ttftMs: metrics.ttftMs,
+                }
+              : deployment
+          ),
+        };
+      }
       const result: CompletionResult = {
         jobId: payload.jobId,
         leaseId: payload.leaseId,
@@ -1003,6 +1037,12 @@ export class WorkerAgent {
     };
     this.socket.send(JSON.stringify(envelope));
   }
+}
+
+function publicHardwareGpu(gpu: HardwareProbe["gpus"][number]): Omit<HardwareProbe["gpus"][number], "runtimeDeviceIndex"> {
+  const { runtimeDeviceIndex, ...capability } = gpu;
+  void runtimeDeviceIndex;
+  return capability;
 }
 
 class WorkerOutputLimitError extends Error {

@@ -212,6 +212,20 @@ describe("worker protocol schemas", () => {
         retryAttempt: 2,
       },
     });
+    const nvidiaOrdinalHeartbeat = workerHeartbeatEnvelopeSchema.parse({
+      ...heartbeat,
+      payload: {
+        ...heartbeat.payload,
+        capabilities: {
+          ...heartbeat.payload.capabilities,
+          gpus: [{
+            ...heartbeat.payload.capabilities.gpus[0],
+            runtimeDeviceIndex: 0,
+          }],
+        },
+      },
+    });
+    expect(nvidiaOrdinalHeartbeat.payload.capabilities.gpus[0]).not.toHaveProperty("runtimeDeviceIndex");
     expect(workerHeartbeatEnvelopeSchema.safeParse({
       ...heartbeat,
       payload: {
