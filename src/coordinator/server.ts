@@ -183,7 +183,7 @@ export async function createCoordinator(
     reply: FastifyReply,
   ): Promise<boolean> => {
     const expected = config.modelAdminToken;
-    if (!expected && isLoopbackAddress(request.ip)) return true;
+    if (!expected && isTrustedLocalRequest(request)) return true;
     const legacyHeader = request.headers["x-mycellios-admin-token"];
     const legacyToken = typeof legacyHeader === "string"
       ? legacyHeader.trim()
@@ -1100,7 +1100,7 @@ export async function createCoordinator(
   app.get("/public/v1/benchmarks", async () => benchmarkHistoryResponse());
 
   app.get("/local/v1/benchmarks", async (request, reply) => {
-    if (!isLoopbackAddress(request.ip)) {
+    if (!isTrustedLocalRequest(request)) {
       return reply.code(403).send({
         error: { code: "local_access_required", message: "Benchmark history is available on the coordinator host only." },
       });
@@ -1109,7 +1109,7 @@ export async function createCoordinator(
   });
 
   app.post("/local/v1/benchmarks/run", async (request, reply) => {
-    if (!isLoopbackAddress(request.ip)) {
+    if (!isTrustedLocalRequest(request)) {
       return reply.code(403).send({
         error: { code: "local_access_required", message: "Benchmarks can only be started on the coordinator host." },
       });
@@ -1157,15 +1157,19 @@ export async function createCoordinator(
   });
 
   app.delete("/public/v1/workers/:workerId", async (request, reply) => {
+    // Evicting a worker takes capacity out of the shared network, so it needs
+    // the same authorization as any other mutation of shared state.
+    if (!await authorizeModelMutation(request, reply)) return;
     const { workerId } = workerIdParamsSchema.parse(request.params);
     const removed = hub.removeWorker(workerId) || mobileHub.removeWorker(workerId);
     if (!removed) return reply.code(404).send({ error: { code: "worker_not_found" } });
     return { removed: true, workerId };
   });
 
-  app.post("/public/v1/workers/clear-offline", async () => ({
-    removed: store.deregisterOfflineWorkers() + mobileHub.removeOfflineWorkers(),
-  }));
+  app.post("/public/v1/workers/clear-offline", async (request, reply) => {
+    if (!await authorizeModelMutation(request, reply)) return;
+    return { removed: store.deregisterOfflineWorkers() + mobileHub.removeOfflineWorkers() };
+  });
 
   app.post("/internal/v1/workers/register", async (request, reply) => {
     const registration = workerRegistrationSchema.parse(request.body);
@@ -1623,6 +1627,26 @@ const requestedModelCreateSchema = z.object({
 export function isLoopbackAddress(address: string): boolean {
   const normalized = address.toLowerCase();
   return normalized === "::1" || normalized === "127.0.0.1" || normalized.startsWith("127.") || normalized.startsWith("::ffff:127.");
+}
+
+const PROXY_FORWARD_HEADERS = [
+  "x-forwarded-for",
+  "x-forwarded-host",
+  "x-forwarded-proto",
+  "x-real-ip",
+  "forwarded",
+] as const;
+
+/**
+ * A loopback `request.ip` only proves the request came from this host when
+ * nothing is proxying on our behalf. Fastify runs with `trustProxy` disabled,
+ * so a reverse proxy terminating on 127.0.0.1 makes *every* remote request
+ * look local. Any forwarding header means we cannot tell who is really
+ * calling, so local-only routes must refuse rather than guess.
+ */
+export function isTrustedLocalRequest(request: FastifyRequest): boolean {
+  if (!isLoopbackAddress(request.ip)) return false;
+  return !PROXY_FORWARD_HEADERS.some((header) => request.headers[header] !== undefined);
 }
 
 function resolveMobileAssetsPath(configured: string | undefined): string | null {
