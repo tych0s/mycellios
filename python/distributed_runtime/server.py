@@ -43,6 +43,11 @@ from .stage import (
 
 
 DEFAULT_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
+
+# Backlog depth per decode slot. Four keeps the pipeline fed across a wave boundary
+# without letting the queue grow into work that will only ever time out; measured
+# overload with an unrelated flat queue drained to zero completions.
+PENDING_PER_ACTIVE_SLOT = 4
 OUTPUT_TOKEN_HASH_SCHEME = "gdlp-output-token-ids-v1"
 OUTPUT_TOKEN_DIGEST_DOMAIN = OUTPUT_TOKEN_HASH_SCHEME.encode("ascii") + b"\0"
 
@@ -844,7 +849,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "no better than 32, so 32 is the knee, not a ceiling to raise blindly."
         ),
     )
-    parser.add_argument("--max-pending-requests", type=int, default=128)
+    parser.add_argument(
+        "--max-pending-requests",
+        type=int,
+        default=None,
+        help=(
+            "Requests allowed to wait for a decode slot. Defaults to "
+            f"{PENDING_PER_ACTIVE_SLOT}x --max-active-sequences, because a backlog "
+            "must be sized against what the pipeline can actually drain, not set as "
+            "a flat number: measured under overload with 8 active slots and a flat "
+            "128-deep queue, every admitted request timed out and goodput fell to "
+            "ZERO (docs/benchmarks/gpu_cloud-exp10-salida-larga-2026-07-24). Accepting "
+            "work that provably cannot be served turns a slowdown into an outage."
+        ),
+    )
     parser.add_argument("--batch-window-ms", type=float, default=2.0)
     parser.add_argument(
         "--root-batch-window-ms",
@@ -949,7 +967,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--return-port", type=int, default=0)
     parser.add_argument("--startup-timeout-seconds", type=float, default=180.0)
     parser.add_argument("--socket-timeout-seconds", type=float, default=180.0)
-    return parser.parse_args(argv)
+    parsed = parser.parse_args(argv)
+    if parsed.max_pending_requests is None:
+        # Resolved here rather than at build time so every caller sees a complete
+        # namespace; the backlog is tied to serving capacity, not to a constant.
+        parsed.max_pending_requests = (
+            PENDING_PER_ACTIVE_SLOT * parsed.max_active_sequences
+        )
+    return parsed
 
 
 def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
@@ -972,6 +997,10 @@ def build_server(args: argparse.Namespace) -> DistributedOpenAIServer:
         raise ValueError("max-active-sequences must be positive")
     if args.max_batch_size > args.max_active_sequences:
         raise ValueError("max-batch-size cannot exceed max-active-sequences")
+    if args.max_pending_requests is None:
+        # Callers that build a namespace by hand (tests, embedders) never went
+        # through parse_args, so the same default is applied here too.
+        args.max_pending_requests = PENDING_PER_ACTIVE_SLOT * args.max_active_sequences
     if args.max_pending_requests < args.max_active_sequences:
         raise ValueError("max-pending-requests must be at least max-active-sequences")
     if not math.isfinite(args.batch_window_ms) or args.batch_window_ms < 0:
