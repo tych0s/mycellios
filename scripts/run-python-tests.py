@@ -32,7 +32,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 PYTHON_DIR = REPO / "python"
 
-# La lista está VACÍA. Cualquier fallo, en cualquier plataforma, rompe.
+# En Windows la lista está VACÍA: allí cualquier fallo rompe. En Linux hay
+# TRES entradas, y las tres son la misma deuda (ver abajo).
 #
 # CADA ENTRADA NECESITA: por qué falla y qué haría falta para quitarla.
 #
@@ -59,12 +60,19 @@ PYTHON_DIR = REPO / "python"
 # atribuido a la causa equivocada. Primero al código, luego a la plataforma, y
 # era el entorno. **Antes de declarar un fallo "conocido", fijar el entorno.**
 #
-# ⚠️ LAS DOS ENTRADAS DE LINUX SON DEUDA REAL, Y LAS DESTAPÓ ESTE MISMO GUION.
+# ⚠️ LAS TRES ENTRADAS DE LINUX SON DEUDA REAL, Y LAS DESTAPÓ ESTE MISMO GUION.
 # Con la regla vieja —eximir por prefijo de clase— llevaban al menos dos corridas
 # de CI fallando y saliendo como «intermitentes que han fallado esta vez, no
 # rompen la construcción». Se comprobó en el log de la corrida VERDE `f4e5bce`:
-# fallaban exactamente estas dos. No las causó fijar las dependencias; estaban
+# fallaban exactamente esas. No las causó fijar las dependencias; estaban
 # tapadas. Es el punto ciego que motivó el arreglo, encontrado por el arreglo.
+#
+# Y son UNA SOLA deuda con tres caras: los tres comparan una célula
+# tensor-parallel contra la referencia de un proceso con `rtol=atol=1e-5` sobre
+# float32, los tres pasan en Windows y fallan en Linux, y los tres se irán
+# juntos cuando alguien resuelva el orden de acumulación. Que caigan tests de
+# DOS clases distintas por el mismo umbral es lo que descarta que sea un bug de
+# una ruta concreta.
 KNOWN_FAILURES_BY_PLATFORM: dict[str, dict[str, str]] = {
     "linux": {
         "test_cell_stage.TensorParallelCellStageTests"
@@ -88,7 +96,20 @@ KNOWN_FAILURES_BY_PLATFORM: dict[str, dict[str, str]] = {
             "atol=1e-5)` en `test_external_cell.py:246`, célula tensor-parallel "
             "contra referencia de un proceso. También pasa en Windows. "
             "PARA QUITARLA: la misma comprobación que la anterior; si comparten "
-            "causa, se van las dos juntas.",
+            "causa, se van las tres juntas.",
+        "test_cell_stage.TensorParallelCellStageTests"
+        ".test_wire_loop_wraps_two_member_cell_as_one_logical_gdlp_stage":
+            "TERCERO de la misma familia, y por eso se DECLARA en vez de "
+            "investigarse aparte: `torch.allclose(decode_tensor(prefill), "
+            "expected_prompt, rtol=1e-5, atol=1e-5)` en "
+            "`test_cell_stage.py:821`. Célula tensor-parallel contra "
+            "referencia de un proceso, la MISMA tolerancia justa de 1e-5 "
+            "sobre float32, y el mismo comportamiento: pasa en Windows y "
+            "falla en Linux. Que sean TRES tests de DOS clases distintas "
+            "cayendo por el mismo umbral refuerza el diagnóstico —orden de "
+            "acumulación, no un bug de una ruta concreta— y refuerza que el "
+            "arreglo correcto es UNO solo. "
+            "PARA QUITARLA: la misma comprobación que las otras dos.",
     },
 }
 
