@@ -631,7 +631,7 @@ function Landing() {
   return (
     <div className="site" id="top" ref={page} onPointerMove={trackPointer}>
       <div className="scroll-progress" aria-hidden="true" /><LivingBackdrop /><div className="ambient-pointer" />
-      <header className="nav-shell"><nav className="nav container" aria-label={t.nav.aria}><Brand homeLabel={t.home} /><div className="nav-links"><a href="/network">Live network</a><a href="/mobile/">Contribute</a><a href="#architecture">{t.nav.architecture}</a><a href="#roadmap">Roadmap</a></div><div className="nav-actions"><a className="nav-blog-link" href="/blog" aria-label="Read the Mycellios blog"><BookOpen size={15} />Blog</a><a className="nav-cta" href="/join">Join now <Zap size={15} /></a></div></nav></header>
+      <header className="nav-shell"><nav className="nav container" aria-label={t.nav.aria}><Brand homeLabel={t.home} /><div className="nav-links"><a href="/network">Live network</a><a href="/mobile/">Contribute</a><a href="#architecture">{t.nav.architecture}</a><a href="#roadmap">Roadmap</a></div><div className="nav-actions"><a className="nav-blog-link" href="/docs/">Docs</a><a className="nav-blog-link" href="/blog" aria-label="Read the Mycellios blog"><BookOpen size={15} />Blog</a><a className="nav-cta" href="/join">Join now <Zap size={15} /></a></div></nav></header>
 
       <main>
         <section className="hero">
