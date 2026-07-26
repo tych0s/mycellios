@@ -505,6 +505,81 @@ describe("HTTP LaunchAgent RPC", () => {
     );
   });
 
+  it("accepts an omitted conveyor or a complete bounded linear VERIFY opt-in", () => {
+    const historical = fixtureDescription();
+    const historicalRoot = historical.launchOrder.find(
+      (process) => process.kind === "root-engine",
+    )!;
+    expect(historicalRoot.command.args).not.toContain(
+      "--speculative-inflight-waves",
+    );
+    expect(() =>
+      validateLaunchAgentRpcStartRequest({
+        launchId: historical.launchId,
+        pipelineId: historical.pipelineId,
+        nodeId: historicalRoot.anchor.memberId,
+        process: structuredClone(historicalRoot),
+      }),
+    ).not.toThrow();
+
+    const description = fixtureDescription("sha256:rpc-r1", {
+      waves: 3,
+      bytes: 64 * 1024 * 1024,
+    });
+    const root = description.launchOrder.find(
+      (process) => process.kind === "root-engine",
+    )!;
+    const request: LaunchAgentStartRequest = {
+      launchId: description.launchId,
+      pipelineId: description.pipelineId,
+      nodeId: root.anchor.memberId,
+      process: structuredClone(root),
+    };
+    expect(() => validateLaunchAgentRpcStartRequest(request)).not.toThrow();
+
+    const setFlag = (target: LaunchAgentStartRequest, flag: string, value: string): void => {
+      const index = target.process.command.args.indexOf(flag);
+      expect(index).toBeGreaterThanOrEqual(0);
+      target.process.command.args[index + 1] = value;
+    };
+    const removeFlag = (target: LaunchAgentStartRequest, flag: string): void => {
+      const index = target.process.command.args.indexOf(flag);
+      expect(index).toBeGreaterThanOrEqual(0);
+      target.process.command.args.splice(index, 2);
+    };
+
+    const incomplete = structuredClone(request);
+    removeFlag(incomplete, "--speculative-inflight-bytes");
+    expect(() => validateLaunchAgentRpcStartRequest(incomplete)).toThrow(
+      "root_engine_speculative_conveyor_flags_are_incomplete",
+    );
+
+    const unsafeWaves = structuredClone(request);
+    setFlag(unsafeWaves, "--speculative-inflight-waves", "17");
+    expect(() => validateLaunchAgentRpcStartRequest(unsafeWaves)).toThrow(
+      "root_engine_speculative_inflight_waves_is_invalid",
+    );
+
+    const disabledPair = structuredClone(request);
+    setFlag(disabledPair, "--speculative-inflight-waves", "1");
+    setFlag(disabledPair, "--speculative-inflight-bytes", "0");
+    expect(() => validateLaunchAgentRpcStartRequest(disabledPair)).toThrow(
+      "root_engine_speculative_conveyor_limits_must_be_disabled_or_complete",
+    );
+
+    const wrongProvider = structuredClone(request);
+    setFlag(wrongProvider, "--speculation", "off");
+    expect(() => validateLaunchAgentRpcStartRequest(wrongProvider)).toThrow(
+      "root_engine_speculative_conveyor_requires_linear_speculation",
+    );
+
+    const concurrent = structuredClone(request);
+    setFlag(concurrent, "--max-active-sequences", "2");
+    expect(() => validateLaunchAgentRpcStartRequest(concurrent)).toThrow(
+      "root_engine_speculative_conveyor_requires_single_active_sequence",
+    );
+  });
+
   it("preserves an exact resident MacroWave stage contract and rejects extensions", async () => {
     const request = fixtureRequest();
     request.process.macroWave = residentMacroWaveStage();
@@ -1243,6 +1318,7 @@ function residentMacroWaveStage(): MacroWaveStageExecutionContractV1 {
 
 function fixtureDescription(
   modelRevision = "sha256:rpc-r1",
+  conveyor: { waves: number; bytes: number } | null = null,
 ): PythonPipelineLaunchDescription {
   const model: DistributedModelProfile = {
     id: "rpc-model",
@@ -1276,7 +1352,7 @@ function fixtureDescription(
   const plan: DistributionPlan = {
     algorithm: "rpc-fixture",
     codec: "fp16",
-    microBatchSize: 2,
+    microBatchSize: conveyor === null ? 2 : 1,
     prefillChunkTokens: 8,
     stages: Array.from({ length: 3 }, (_, index) => ({
       nodeId: `node-${index}`,
@@ -1319,11 +1395,46 @@ function fixtureDescription(
     topology: { nodes, links },
     workload,
     phasePlans: { prefill: plan, decode: plan },
+    ...(conveyor === null
+      ? {}
+      : {
+          speculation: {
+            mode: "adaptive" as const,
+            controller: "acceptance-adaptive" as const,
+            defaultStrategyId: "ngram",
+            fallbackStrategyId: "autoregressive",
+            acceptanceWindowTokens: 64,
+            strategies: [
+              {
+                id: "ngram",
+                kind: "ngram" as const,
+                maxDraftTokens: 2,
+                minAcceptanceRate: 0.5,
+                maxWasteRatio: 0.4,
+                priority: 10,
+              },
+              {
+                id: "autoregressive",
+                kind: "autoregressive" as const,
+                maxDraftTokens: 1,
+                minAcceptanceRate: 1,
+                maxWasteRatio: 0,
+                priority: 0,
+              },
+            ],
+          },
+        }),
   };
   const options: PythonLaunchCompilerOptions = {
     apiEndpoint: { host: "0.0.0.0", port: 8_081 },
     returnEndpoint: { host: "root.internal", port: 30_000 },
     returnBindHost: "0.0.0.0",
+    ...(conveyor === null
+      ? {}
+      : {
+          speculativeInflightWaves: conveyor.waves,
+          speculativeInflightBytes: conveyor.bytes,
+        }),
   };
   return compilePythonLaunchDescription(buildRuntimePipelineManifest(request), options);
 }

@@ -1421,10 +1421,70 @@ function validateRootEngineCommand(value: unknown): void {
     1024 * 1024 * 1024,
     "root_engine_prefill_inflight_bytes",
   );
-  validateSpeculativeTreeCommand(value, "root_engine");
+  const physicalSpeculativeTreeEnabled = validateSpeculativeTreeCommand(
+    value,
+    "root_engine",
+  );
+  const speculativeInflightWaves = assertOptionalCommandIntegerFlag(
+    value.args,
+    "--speculative-inflight-waves",
+    1,
+    16,
+    "root_engine_speculative_inflight_waves",
+  );
+  const speculativeInflightBytes = assertOptionalCommandIntegerFlag(
+    value.args,
+    "--speculative-inflight-bytes",
+    0,
+    1024 * 1024 * 1024,
+    "root_engine_speculative_inflight_bytes",
+  );
+  if (
+    (speculativeInflightWaves === undefined)
+    !== (speculativeInflightBytes === undefined)
+  ) {
+    throw new Error("root_engine_speculative_conveyor_flags_are_incomplete");
+  }
+  if (
+    speculativeInflightWaves !== undefined
+    && speculativeInflightBytes !== undefined
+  ) {
+    if (speculativeInflightWaves <= 1 || speculativeInflightBytes <= 0) {
+      throw new Error(
+        "root_engine_speculative_conveyor_limits_must_be_disabled_or_complete",
+      );
+    }
+    const speculation = assertCommandStringFlag(
+      value.args,
+      "--speculation",
+      "root_engine_speculation",
+    );
+    if (speculation !== "ngram" && speculation !== "draft-model") {
+      throw new Error(
+        "root_engine_speculative_conveyor_requires_linear_speculation",
+      );
+    }
+    if (physicalSpeculativeTreeEnabled) {
+      throw new Error(
+        "root_engine_speculative_conveyor_cannot_use_physical_tree_limits",
+      );
+    }
+    const maxActiveSequences = assertCommandIntegerFlag(
+      value.args,
+      "--max-active-sequences",
+      1,
+      1_000_000,
+      "root_engine_max_active_sequences",
+    );
+    if (maxActiveSequences !== 1) {
+      throw new Error(
+        "root_engine_speculative_conveyor_requires_single_active_sequence",
+      );
+    }
+  }
 }
 
-function validateSpeculativeTreeCommand(value: unknown, prefix: string): void {
+function validateSpeculativeTreeCommand(value: unknown, prefix: string): boolean {
   assertRecord(value, `${prefix}_command`);
   if (!Array.isArray(value.args)) throw new Error(`${prefix}_command_args_are_invalid`);
   const branches = assertCommandIntegerFlag(
@@ -1452,6 +1512,7 @@ function validateSpeculativeTreeCommand(value: unknown, prefix: string): void {
   if (enabled.some(Boolean) && !enabled.every(Boolean)) {
     throw new Error(`${prefix}_speculative_tree_limits_are_incomplete`);
   }
+  return enabled.every(Boolean);
 }
 
 function assertCommandIntegerFlag(
@@ -1470,6 +1531,39 @@ function assertCommandIntegerFlag(
   const parsed = Number(raw);
   assertInteger(parsed, minimum, maximum, name);
   return parsed;
+}
+
+function assertOptionalCommandIntegerFlag(
+  args: unknown[],
+  flag: string,
+  minimum: number,
+  maximum: number,
+  name: string,
+): number | undefined {
+  const positions = args.flatMap((argument, index) => argument === flag ? [index] : []);
+  if (positions.length === 0) return undefined;
+  if (positions.length !== 1) throw new Error(`${name}_flag_is_invalid`);
+  const raw = args[positions[0]! + 1];
+  if (typeof raw !== "string" || !/^(?:0|[1-9][0-9]*)$/.test(raw)) {
+    throw new Error(`${name}_is_invalid`);
+  }
+  const parsed = Number(raw);
+  assertInteger(parsed, minimum, maximum, name);
+  return parsed;
+}
+
+function assertCommandStringFlag(
+  args: unknown[],
+  flag: string,
+  name: string,
+): string {
+  const positions = args.flatMap((argument, index) => argument === flag ? [index] : []);
+  if (positions.length !== 1) throw new Error(`${name}_flag_is_invalid`);
+  const raw = args[positions[0]! + 1];
+  if (typeof raw !== "string" || raw.length < 1 || raw.length > 256) {
+    throw new Error(`${name}_is_invalid`);
+  }
+  return raw;
 }
 
 function assertExactCommandStringFlag(

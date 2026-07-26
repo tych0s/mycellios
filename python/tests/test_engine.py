@@ -33,6 +33,7 @@ from distributed_runtime.model import load_tokenizer, reference_generate
 from distributed_runtime.protocol import (
     Frame,
     FrameType,
+    HEADER_BYTES,
     LinkEmulator,
     TensorCodec,
     TreePrepareRejection,
@@ -51,6 +52,7 @@ from distributed_runtime.speculation import (
     AdaptiveSpeculationConfig,
     AdaptiveSpeculationController,
     NgramTreeDraftProvider,
+    SpeculationDecision,
 )
 
 
@@ -85,6 +87,8 @@ class EngineUnitTests(unittest.TestCase):
         self.assertEqual(configured.prefill_inflight_chunks, 1)
         self.assertEqual(configured.prefill_inflight_bytes, 0)
         self.assertEqual(configured.speculative_max_draft_tokens, 8)
+        self.assertEqual(configured.speculative_inflight_waves, 1)
+        self.assertEqual(configured.speculative_inflight_bytes, 0)
         self.assertEqual(configured.sealed_wave_token_limit, 9)
         self.assertEqual(configured.prefill_token_limit, 32)
         self.assertEqual(configured.root_batch_window_ms, 0.5)
@@ -114,6 +118,51 @@ class EngineUnitTests(unittest.TestCase):
                     **common,
                     speculative_max_draft_tokens=invalid,
                 )
+        conveyor = PipelineEngineConfig(
+            **common,
+            max_active_sequences=1,
+            speculative_max_draft_tokens=2,
+            speculative_inflight_waves=3,
+            speculative_inflight_bytes=4096,
+        )
+        self.assertEqual(conveyor.speculative_inflight_waves, 3)
+        self.assertEqual(conveyor.speculative_inflight_bytes, 4096)
+        for invalid in (0, 17, True):
+            with self.subTest(speculative_inflight_waves=invalid), self.assertRaises(
+                ValueError
+            ):
+                PipelineEngineConfig(
+                    **common,
+                    speculative_inflight_waves=invalid,
+                )
+        for invalid in (-1, (1 << 30) + 1, True):
+            with self.subTest(speculative_inflight_bytes=invalid), self.assertRaises(
+                ValueError
+            ):
+                PipelineEngineConfig(
+                    **common,
+                    speculative_inflight_bytes=invalid,
+                )
+        for partial in (
+            {"speculative_inflight_waves": 2},
+            {"speculative_inflight_bytes": 4096},
+        ):
+            with self.subTest(partial=partial), self.assertRaisesRegex(
+                ValueError,
+                "more than one in-flight wave and a positive byte ceiling",
+            ):
+                PipelineEngineConfig(
+                    **common,
+                    speculative_max_draft_tokens=2,
+                    **partial,
+                )
+        with self.assertRaisesRegex(ValueError, "max_active_sequences=1"):
+            PipelineEngineConfig(
+                **common,
+                speculative_max_draft_tokens=2,
+                speculative_inflight_waves=2,
+                speculative_inflight_bytes=4096,
+            )
         with self.assertRaisesRegex(ValueError, "must be supplied together"):
             PipelineEngineConfig(**common, sealed_wave_tokens=1)
         with self.assertRaisesRegex(ValueError, "smaller than the VERIFY"):
@@ -1386,6 +1435,62 @@ class EngineUnitTests(unittest.TestCase):
         with self.assertRaisesRegex(TimeoutError, "request 101"):
             engine._check_pipeline_timeouts({1: job})
 
+    def test_fifo_timeout_starts_when_successor_becomes_head(self) -> None:
+        engine = _root_batch_test_engine(prefill_chunk_tokens=0)
+        engine.config.socket_timeout_seconds = 10.0
+        job = _GenerationJob(
+            GenerationInput(102, torch.tensor([[1, 2, 3]]), 8),
+            None,
+            wire_id=1,
+            step=1,
+            next_step=3,
+        )
+        sent_long_ago = time.monotonic() - 20.0
+        job.inflight_waves.extend(
+            (
+                _InflightWave(
+                    1,
+                    FrameType.VERIFY,
+                    None,
+                    time.perf_counter(),
+                    sent_long_ago,
+                    64,
+                    64,
+                ),
+                _InflightWave(
+                    2,
+                    FrameType.VERIFY,
+                    None,
+                    time.perf_counter(),
+                    sent_long_ago,
+                    64,
+                    64,
+                ),
+            )
+        )
+        job.inflight_head_started_at = sent_long_ago
+
+        engine._consume_inflight_return(
+            job,
+            Frame(
+                FrameType.VERIFY_RESULT,
+                0,
+                1,
+                1,
+                1,
+                0,
+                verify_result_payload((99,)),
+            ),
+        )
+
+        self.assertEqual(job.inflight_waves[0].sent_at, sent_long_ago)
+        self.assertGreater(job.inflight_head_started_at, sent_long_ago)
+        engine._check_pipeline_timeouts({1: job})
+
+        job.inflight_head_started_at = time.monotonic() - 20.0
+        with self.assertRaisesRegex(TimeoutError, "request 102"):
+            engine._check_pipeline_timeouts({1: job})
+
     def test_cancelled_window_drains_all_fifo_tombstones_before_retirement(self) -> None:
         engine = _root_batch_test_engine(
             prefill_chunk_tokens=2,
@@ -1810,6 +1915,359 @@ class EngineUnitTests(unittest.TestCase):
             self.assertEqual(proposal.tree.state, MacroWaveState.ROLLED_BACK)
             cancel = recv_frame(child)
             self.assertEqual(cancel.frame_type, FrameType.CANCEL)
+        finally:
+            root.close()
+            child.close()
+
+    def test_verify_conveyor_fills_three_fifo_waves_and_preserves_exact_tokens(
+        self,
+    ) -> None:
+        engine, runner, job, active, root, child, outbound = _conveyor_test_case()
+        streamed: list[int] = []
+        job.callback = lambda _client, token, _index, _arrived: streamed.append(token)
+        try:
+            self.assertEqual(
+                [(frame.frame_type, frame.step, frame.token_count) for frame in outbound],
+                [
+                    (FrameType.VERIFY, 1, 3),
+                    (FrameType.VERIFY, 2, 2),
+                    (FrameType.VERIFY, 3, 2),
+                ],
+            )
+            self.assertEqual(runner.sequential_calls, [(1, 3), (1, 2), (1, 2)])
+            self.assertEqual([flight.step for flight in job.inflight_waves], [1, 2, 3])
+            self.assertEqual(engine.speculative_window_stats["high_water_waves"], 3)
+
+            returned = (
+                (1, (20, 21, 30)),
+                (2, (31, 40)),
+                (3, (41, 50)),
+            )
+            continuations = []
+            for step, targets in returned:
+                continuations.append(
+                    engine._handle_return_value(
+                        (
+                            Frame(
+                                FrameType.VERIFY_RESULT,
+                                0,
+                                1,
+                                step,
+                                len(targets),
+                                0,
+                                verify_result_payload(targets),
+                            ),
+                            time.perf_counter(),
+                        ),
+                        active,
+                        runner,
+                        root,
+                    )
+                )
+
+            self.assertIsNone(continuations[0])
+            self.assertIsNone(continuations[1])
+            self.assertIsNotNone(continuations[2])
+            self.assertEqual(job.token_ids, [10, 20, 21, 30, 31, 40, 41, 50])
+            self.assertEqual(streamed, [20, 21, 30, 31, 40, 41, 50])
+            self.assertEqual(job.kv_valid, 10)
+            self.assertEqual(runner.active[1], 10)
+            self.assertEqual(runner.truncations, [])
+            self.assertEqual(len(job.inflight_waves), 0)
+            self.assertEqual(engine.speculative_window_stats["current_waves"], 0)
+            self.assertEqual(engine.speculative_window_stats["committed_waves"], 3)
+            self.assertEqual(
+                engine.speculation_controller.verifications,
+                [(2, 2), (2, 2), (2, 2)],
+            )
+        finally:
+            root.close()
+            child.close()
+
+    def test_verify_conveyor_bonus_seed_mismatch_truncates_once_and_drains(
+        self,
+    ) -> None:
+        engine, runner, job, active, root, child, _outbound = _conveyor_test_case()
+        streamed: list[int] = []
+        job.callback = lambda _client, token, _index, _arrived: streamed.append(token)
+        try:
+            first = engine._handle_return_value(
+                (
+                    Frame(
+                        FrameType.VERIFY_RESULT,
+                        0,
+                        1,
+                        1,
+                        3,
+                        0,
+                        verify_result_payload((20, 21, 99)),
+                    ),
+                    time.perf_counter(),
+                ),
+                active,
+                runner,
+                root,
+            )
+            self.assertIsNone(first)
+            second_flight = job.inflight_waves[0]
+            third_flight = job.inflight_waves[1]
+            condemned = job.inflight_waves[1].verify_proposal
+            self.assertIsNotNone(condemned)
+            second_payload = verify_result_payload((31, 40))
+            rejected_wave_bytes = (
+                second_flight.outbound_bytes + HEADER_BYTES + len(second_payload)
+            )
+
+            second = engine._handle_return_value(
+                (
+                    Frame(
+                        FrameType.VERIFY_RESULT,
+                        0,
+                        1,
+                        2,
+                        2,
+                        0,
+                        second_payload,
+                    ),
+                    time.perf_counter(),
+                ),
+                active,
+                runner,
+                root,
+            )
+            self.assertIsNone(second)
+            truncate = recv_frame(child)
+            self.assertEqual(truncate.frame_type, FrameType.TRUNCATE)
+            self.assertEqual(truncate.token_count, 6)
+            self.assertEqual(runner.truncations, [(1, 6)])
+            self.assertTrue(job.verify_collapse_pending)
+            self.assertEqual(job.token_ids, [10, 20, 21, 99])
+            self.assertEqual(streamed, [20, 21, 99])
+            self.assertEqual(job.kv_valid, 6)
+            assert condemned is not None
+            self.assertEqual(condemned.tree.state, MacroWaveState.ROLLED_BACK)
+            rejected_stats = engine.speculative_window_stats
+            self.assertEqual(rejected_stats["rejected_proposed_tokens"], 2)
+            self.assertEqual(rejected_stats["condemned_proposed_tokens"], 2)
+            self.assertEqual(rejected_stats["discarded_proposed_tokens"], 4)
+            self.assertEqual(
+                rejected_stats["rejected_wave_bytes"],
+                rejected_wave_bytes,
+            )
+            self.assertEqual(rejected_stats["tombstone_bytes"], 0)
+            self.assertEqual(rejected_stats["discarded_bytes"], rejected_wave_bytes)
+
+            third_payload = verify_result_payload((41, 50))
+            restart = engine._handle_return_value(
+                (
+                    Frame(
+                        FrameType.VERIFY_RESULT,
+                        0,
+                        1,
+                        3,
+                        2,
+                        0,
+                        third_payload,
+                    ),
+                    time.perf_counter(),
+                ),
+                active,
+                runner,
+                root,
+            )
+            self.assertIsNotNone(restart)
+            assert isinstance(restart, _PreparedRootWave)
+            self.assertEqual(restart.frame_type, FrameType.ACTIVATION)
+            self.assertEqual(restart.input_ids.tolist(), [[99]])
+            self.assertFalse(job.verify_collapse_pending)
+            self.assertEqual(runner.truncations, [(1, 6)])
+            self.assertEqual(engine.speculative_window_stats["condemned_waves"], 1)
+            self.assertEqual(engine.speculative_window_stats["drained_waves"], 1)
+            self.assertEqual(
+                engine.speculation_controller.verifications,
+                [(2, 2), (2, 0)],
+            )
+            self.assertEqual(streamed, [20, 21, 99])
+            tombstone_bytes = (
+                third_flight.outbound_bytes + HEADER_BYTES + len(third_payload)
+            )
+            drained_stats = engine.speculative_window_stats
+            self.assertEqual(drained_stats["tombstone_bytes"], tombstone_bytes)
+            self.assertEqual(
+                drained_stats["discarded_bytes"],
+                rejected_wave_bytes + tombstone_bytes,
+            )
+        finally:
+            root.close()
+            child.close()
+
+    def test_verify_conveyor_defers_terminal_end_until_tombstones_drain(
+        self,
+    ) -> None:
+        engine, runner, job, active, root, child, _outbound = _conveyor_test_case()
+        job.request = GenerationInput(
+            job.request.client_id,
+            job.request.input_ids,
+            job.request.max_new_tokens,
+            frozenset({99}),
+        )
+        try:
+            first = engine._handle_return_value(
+                (
+                    Frame(
+                        FrameType.VERIFY_RESULT,
+                        0,
+                        1,
+                        1,
+                        3,
+                        0,
+                        verify_result_payload((99, 21, 30)),
+                    ),
+                    time.perf_counter(),
+                ),
+                active,
+                runner,
+                root,
+            )
+            self.assertIsNone(first)
+            self.assertIn(1, active)
+            self.assertFalse(job.future.done())
+            self.assertEqual(recv_frame(child).frame_type, FrameType.TRUNCATE)
+
+            for step in (2, 3):
+                engine._handle_return_value(
+                    (
+                        Frame(
+                            FrameType.VERIFY_RESULT,
+                            0,
+                            1,
+                            step,
+                            2,
+                            0,
+                            verify_result_payload((31, 40)),
+                        ),
+                        time.perf_counter(),
+                    ),
+                    active,
+                    runner,
+                    root,
+                )
+                if step == 2:
+                    self.assertIn(1, active)
+                    self.assertFalse(job.future.done())
+
+            self.assertEqual(active, {})
+            self.assertEqual(job.future.result(timeout=0).token_ids, (10, 99))
+            terminal = recv_frame(child)
+            self.assertEqual(terminal.frame_type, FrameType.END)
+            self.assertEqual(runner.truncations, [(1, 4)])
+        finally:
+            root.close()
+            child.close()
+
+    def test_verify_conveyor_byte_credit_blocks_before_root_kv_mutation(self) -> None:
+        engine = _root_batch_test_engine(
+            prefill_chunk_tokens=0,
+            speculative_max_draft_tokens=2,
+            speculative_inflight_waves=3,
+            speculative_inflight_bytes=_prefill_frame_byte_reservation(
+                TensorCodec.FP32,
+                3,
+                4,
+            ),
+        )
+        engine.draft_provider = _MappedDraftProvider()
+        engine.speculation_controller = _AlwaysSpeculationController()
+        engine._speculation_controllers = {}
+        runner = _FakeRootBatchRunner()
+        runner.active = {1: 3}
+        job = _GenerationJob(
+            GenerationInput(951, torch.tensor([[1, 2, 3]]), 16),
+            None,
+            wire_id=1,
+            step=1,
+            token_ids=[10],
+            prefill_offset=3,
+            prefill_acked_offset=3,
+            kv_valid=3,
+        )
+        active = {1: job}
+        root, child = socket.socketpair()
+        try:
+            first = engine._prepare_linear_or_classic_decode_wave(
+                job,
+                runner,
+                active_sequences=1,
+            )
+            engine._dispatch_root_waves([first], runner, root, LinkEmulator())
+            recv_frame(child)
+            self.assertEqual(runner.active[1], 6)
+            self.assertEqual(
+                engine._dispatch_speculative_credit_round(
+                    active,
+                    runner,
+                    root,
+                    LinkEmulator(),
+                ),
+                0,
+            )
+            self.assertEqual(runner.active[1], 6)
+            self.assertEqual(len(job.inflight_waves), 1)
+            self.assertEqual(engine.speculative_window_stats["high_water_waves"], 1)
+        finally:
+            root.close()
+            child.close()
+
+    def test_verify_conveyor_cancellation_rolls_back_and_drains_every_flight(
+        self,
+    ) -> None:
+        engine, _runner, job, active, root, child, _outbound = _conveyor_test_case()
+        proposals = tuple(
+            flight.verify_proposal for flight in job.inflight_waves
+        )
+        job.cancel_requested.set()
+        try:
+            for index, step in enumerate((1, 2, 3)):
+                engine._handle_return_value(
+                    (
+                        Frame(
+                            FrameType.VERIFY_RESULT,
+                            0,
+                            1,
+                            step,
+                            3 if step == 1 else 2,
+                            0,
+                            verify_result_payload(
+                                (20, 21, 30) if step == 1 else (31, 40)
+                            ),
+                        ),
+                        time.perf_counter(),
+                    ),
+                    active,
+                    _runner,
+                    root,
+                )
+                if index < 2:
+                    self.assertIn(1, active)
+                    self.assertFalse(job.future.done())
+
+            cancel = recv_frame(child)
+            self.assertEqual(cancel.frame_type, FrameType.CANCEL)
+            self.assertEqual(active, {})
+            self.assertTrue(job.future.cancelled())
+            self.assertEqual(job.token_ids, [10])
+            self.assertTrue(
+                all(
+                    proposal is not None
+                    and proposal.tree.state is MacroWaveState.ROLLED_BACK
+                    for proposal in proposals
+                )
+            )
+            self.assertEqual(engine.speculative_window_stats["current_waves"], 0)
+            self.assertEqual(
+                engine.speculative_window_stats["current_reserved_bytes"],
+                0,
+            )
         finally:
             root.close()
             child.close()
@@ -2998,6 +3456,8 @@ def _root_batch_test_engine(
     prefill_inflight_chunks: int = 1,
     prefill_inflight_bytes: int = 0,
     speculative_max_draft_tokens: int = 0,
+    speculative_inflight_waves: int = 1,
+    speculative_inflight_bytes: int = 0,
     max_speculative_branches: int = 0,
     max_speculative_branch_tokens: int = 0,
     max_speculative_kv_bytes: int = 0,
@@ -3010,6 +3470,8 @@ def _root_batch_test_engine(
         prefill_inflight_chunks=prefill_inflight_chunks,
         prefill_inflight_bytes=prefill_inflight_bytes,
         speculative_max_draft_tokens=speculative_max_draft_tokens,
+        speculative_inflight_waves=speculative_inflight_waves,
+        speculative_inflight_bytes=speculative_inflight_bytes,
         max_speculative_branches=max_speculative_branches,
         max_speculative_branch_tokens=max_speculative_branch_tokens,
         max_speculative_kv_bytes=max_speculative_kv_bytes,
@@ -3042,6 +3504,27 @@ def _root_batch_test_engine(
     engine._speculation_probe_waves = 0
     engine._speculation_decision_reasons = {}
     engine._speculation_selected_sizes = {}
+    engine._speculative_current_waves = 0
+    engine._speculative_current_bytes = 0
+    engine._speculative_current_reserved_bytes = 0
+    engine._speculative_high_water_waves = 0
+    engine._speculative_high_water_bytes = 0
+    engine._speculative_high_water_reserved_bytes = 0
+    engine._speculative_max_request_waves = 0
+    engine._speculative_max_request_bytes = 0
+    engine._speculative_max_request_reserved_bytes = 0
+    engine._speculative_dispatched_waves = 0
+    engine._speculative_completed_waves = 0
+    engine._speculative_committed_waves = 0
+    engine._speculative_condemned_waves = 0
+    engine._speculative_drained_waves = 0
+    engine._speculative_rejection_collapses = 0
+    engine._speculative_rejected_tokens = 0
+    engine._speculative_condemned_tokens = 0
+    engine._speculative_discarded_tokens = 0
+    engine._speculative_rejected_wave_bytes = 0
+    engine._speculative_tombstone_bytes = 0
+    engine._speculative_discarded_bytes = 0
     engine._tree_gate_enabled_decisions = 0
     engine._tree_gate_disabled_decisions = 0
     engine._tree_gate_probe_waves = 0
@@ -3086,6 +3569,65 @@ def _root_batch_test_engine(
     engine._prefill_completed_chunks = 0
     engine._prefill_acknowledged_chunks = 0
     return engine
+
+
+def _conveyor_test_case() -> tuple[
+    DistributedPipelineEngine,
+    "_FakeRootBatchRunner",
+    _GenerationJob,
+    dict[int, _GenerationJob],
+    socket.socket,
+    socket.socket,
+    tuple[Frame, Frame, Frame],
+]:
+    engine = _root_batch_test_engine(
+        prefill_chunk_tokens=0,
+        speculative_max_draft_tokens=2,
+        speculative_inflight_waves=3,
+        speculative_inflight_bytes=1 << 20,
+    )
+    engine.draft_provider = _MappedDraftProvider()
+    engine.speculation_controller = _AlwaysSpeculationController()
+    engine._speculation_controllers = {}
+    runner = _FakeRootBatchRunner()
+    runner.active = {1: 3}
+    job = _GenerationJob(
+        GenerationInput(950, torch.tensor([[1, 2, 3]]), 16),
+        None,
+        wire_id=1,
+        step=1,
+        started_at=time.perf_counter() - 1,
+        token_ids=[10],
+        arrivals=[time.perf_counter() - 0.5],
+        prefill_offset=3,
+        prefill_acked_offset=3,
+        kv_valid=3,
+    )
+    engine._jobs_by_client = {job.request.client_id: job}
+    active = {1: job}
+    root, child = socket.socketpair()
+    first = engine._prepare_linear_or_classic_decode_wave(
+        job,
+        runner,
+        active_sequences=1,
+    )
+    engine._dispatch_root_waves([first], runner, root, LinkEmulator())
+    if engine._dispatch_speculative_credit_round(
+        active,
+        runner,
+        root,
+        LinkEmulator(),
+    ) != 1:
+        raise AssertionError("second VERIFY conveyor credit was not dispatched")
+    if engine._dispatch_speculative_credit_round(
+        active,
+        runner,
+        root,
+        LinkEmulator(),
+    ) != 1:
+        raise AssertionError("third VERIFY conveyor credit was not dispatched")
+    frames = (recv_frame(child), recv_frame(child), recv_frame(child))
+    return engine, runner, job, active, root, child, frames
 
 
 def _prepared_tree_test_case(
@@ -3367,6 +3909,48 @@ class _FixedDraftProvider:
         del token_history
         limit = self.max_draft_tokens if max_tokens is None else max_tokens
         return self.tokens[:limit]
+
+
+class _MappedDraftProvider:
+    strategy = "mapped-conveyor-test"
+    max_draft_tokens = 2
+
+    def __init__(self) -> None:
+        self._drafts = {
+            (1, 2, 3, 10): (20, 21),
+            (1, 2, 3, 10, 20, 21): (30, 31),
+            (1, 2, 3, 10, 20, 21, 30, 31): (40, 41),
+        }
+
+    def draft(
+        self,
+        token_history: tuple[int, ...],
+        max_tokens: int | None = None,
+    ) -> tuple[int, ...]:
+        available = self._drafts.get(tuple(int(token) for token in token_history), ())
+        limit = self.max_draft_tokens if max_tokens is None else max_tokens
+        return available[:limit]
+
+
+class _AlwaysSpeculationController(_RecordingSpeculationController):
+    def decide(
+        self,
+        *,
+        history_tokens: int,
+        available_draft_tokens: int,
+    ) -> SpeculationDecision:
+        del history_tokens
+        selected = min(2, available_draft_tokens)
+        return SpeculationDecision(
+            enabled=selected > 0,
+            candidate_size=selected,
+            predicted_speedup=2.0 if selected else None,
+            predicted_speedup_lower_bound=1.5 if selected else None,
+            predicted_latency_speedup=2.0 if selected else None,
+            predicted_byte_efficiency=1.0 if selected else None,
+            expected_emitted_tokens=float(selected + 1) if selected else None,
+            reason="test-beneficial" if selected else "no_draft_tokens",
+        )
 
 
 class _FixedTreeDraftProvider:

@@ -143,6 +143,43 @@ function manifest(): RuntimePipelineManifestV2 {
   return buildRuntimePipelineManifest(request());
 }
 
+function speculativeConveyorManifest(
+  microBatchSize = 1,
+): RuntimePipelineManifestV2 {
+  const input = request();
+  if (!input.phasePlans?.prefill || !input.phasePlans.decode) {
+    throw new Error("speculative_conveyor_fixture_requires_both_phase_plans");
+  }
+  input.phasePlans.prefill.microBatchSize = microBatchSize;
+  input.phasePlans.decode.microBatchSize = microBatchSize;
+  input.speculation = {
+    mode: "adaptive",
+    controller: "acceptance-adaptive",
+    defaultStrategyId: "ngram",
+    fallbackStrategyId: "autoregressive",
+    acceptanceWindowTokens: 64,
+    strategies: [
+      {
+        id: "ngram",
+        kind: "ngram",
+        maxDraftTokens: 2,
+        minAcceptanceRate: 0.5,
+        maxWasteRatio: 0.4,
+        priority: 10,
+      },
+      {
+        id: "autoregressive",
+        kind: "autoregressive",
+        maxDraftTokens: 1,
+        minAcceptanceRate: 1,
+        maxWasteRatio: 0,
+        priority: 0,
+      },
+    ],
+  };
+  return buildRuntimePipelineManifest(input);
+}
+
 function options(overrides: Partial<PythonLaunchCompilerOptions> = {}): PythonLaunchCompilerOptions {
   return {
     apiEndpoint: { host: "0.0.0.0", port: 8_081 },
@@ -1005,7 +1042,8 @@ describe("GDLP/2 Python launch compiler", () => {
   });
 
   it("places prefill, batching and disabled speculation on the root server argv", () => {
-    const args = root(compile()).command.args;
+    const description = compile();
+    const args = root(description).command.args;
     expect(argumentValue(args, "--prefill-chunk-tokens")).toBe("8");
     expect(argumentValue(args, "--prefill-inflight-chunks")).toBe("3");
     expect(argumentValue(args, "--prefill-inflight-bytes")).toBe(
@@ -1017,6 +1055,28 @@ describe("GDLP/2 Python launch compiler", () => {
     expect(argumentValue(args, "--max-active-sequences")).toBe("2");
     expect(argumentValue(args, "--speculation")).toBe("off");
     expect(argumentValue(args, "--speculative-max-draft-tokens")).toBe("1");
+    expect(args).not.toContain("--speculative-inflight-waves");
+    expect(args).not.toContain("--speculative-inflight-bytes");
+    expect(
+      Object.prototype.hasOwnProperty.call(
+        description.configuration,
+        "speculativeInflightWaves",
+      ),
+    ).toBe(false);
+    expect(
+      Object.prototype.hasOwnProperty.call(
+        description.configuration,
+        "speculativeInflightBytes",
+      ),
+    ).toBe(false);
+    const explicitDefaults = compile(manifest(), {
+      speculativeInflightWaves: 1,
+      speculativeInflightBytes: 0,
+    });
+    expect(explicitDefaults.launchId).toBe(description.launchId);
+    expect(root(explicitDefaults).command.args).not.toContain(
+      "--speculative-inflight-waves",
+    );
   });
 
   it("seals explicit bounded prefill pipeline credits into configuration and argv", () => {
@@ -1032,6 +1092,81 @@ describe("GDLP/2 Python launch compiler", () => {
       String(96 * 1024 * 1024),
     );
     expect(() => validatePythonLaunchDescription(description)).not.toThrow();
+  });
+
+  it("adds both bounded VERIFY conveyor credits only on explicit linear opt-in", () => {
+    const current = speculativeConveyorManifest();
+    const historical = compile(current);
+    const description = compile(current, {
+      speculativeInflightWaves: 3,
+      speculativeInflightBytes: 64 * 1024 * 1024,
+    });
+    const args = root(description).command.args;
+
+    expect(description.schema).toBe("gdlp-python-launch/2");
+    expect(description.launchId).not.toBe(historical.launchId);
+    expect(description.configuration.speculativeInflightWaves).toBe(3);
+    expect(description.configuration.speculativeInflightBytes).toBe(
+      64 * 1024 * 1024,
+    );
+    expect(argumentValue(args, "--speculative-inflight-waves")).toBe("3");
+    expect(argumentValue(args, "--speculative-inflight-bytes")).toBe(
+      String(64 * 1024 * 1024),
+    );
+    for (const stage of remotes(description)) {
+      expect(stage.command.args).not.toContain("--speculative-inflight-waves");
+      expect(stage.command.args).not.toContain("--speculative-inflight-bytes");
+    }
+    expect(() => validatePythonLaunchDescription(description)).not.toThrow();
+  });
+
+  it("rejects incomplete, unsafe or incompatible VERIFY conveyor credits", () => {
+    const current = speculativeConveyorManifest();
+    expect(() =>
+      compile(current, { speculativeInflightWaves: 0 }),
+    ).toThrow("python_speculative_inflight_waves_is_invalid");
+    expect(() =>
+      compile(current, { speculativeInflightWaves: 17 }),
+    ).toThrow("python_speculative_inflight_waves_is_invalid");
+    expect(() =>
+      compile(current, {
+        speculativeInflightWaves: 2,
+        speculativeInflightBytes: 1024 * 1024 * 1024 + 1,
+      }),
+    ).toThrow("python_speculative_inflight_bytes_is_invalid");
+    expect(() =>
+      compile(current, { speculativeInflightWaves: 2 }),
+    ).toThrow("python_speculative_conveyor_limits_must_be_disabled_or_complete");
+    expect(() =>
+      compile(current, { speculativeInflightBytes: 4096 }),
+    ).toThrow("python_speculative_conveyor_limits_must_be_disabled_or_complete");
+    expect(() =>
+      compile(manifest(), {
+        speculativeInflightWaves: 2,
+        speculativeInflightBytes: 4096,
+      }),
+    ).toThrow("python_speculative_conveyor_requires_linear_speculation");
+    expect(() =>
+      compile(speculativeConveyorManifest(2), {
+        speculativeInflightWaves: 2,
+        speculativeInflightBytes: 4096,
+      }),
+    ).toThrow("python_speculative_conveyor_requires_single_active_sequence");
+    expect(() =>
+      compile(current, {
+        speculativeInflightWaves: 2,
+        speculativeInflightBytes: 1,
+      }),
+    ).toThrow("python_speculative_inflight_bytes_below_frame_reservation");
+    expect(() =>
+      compile(current, {
+        speculativeInflightWaves: 2,
+        speculativeInflightBytes: 4096,
+        maxSpeculativeBranches: 2,
+        maxSpeculativeBranchTokens: 128,
+        maxSpeculativeKvBytes: 4096,
+      }),
+    ).toThrow("python_speculative_conveyor_cannot_use_physical_tree_limits");
   });
 
   it("seals disabled or complete physical tree limits into every pipeline process", () => {

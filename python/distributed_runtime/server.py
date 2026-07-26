@@ -33,6 +33,8 @@ from .engine import (
     GenerationCancelledError,
     GenerationInput,
     GenerationOutput,
+    MAX_SPECULATIVE_INFLIGHT_BYTES,
+    MAX_SPECULATIVE_INFLIGHT_WAVES,
     PipelineEngineConfig,
     QueueFullError,
     balanced_boundaries,
@@ -410,6 +412,16 @@ class DistributedMycelliosServer:
                     self.engine.config.max_speculative_branch_tokens
                 ),
                 "max_speculative_kv_bytes": self.engine.config.max_speculative_kv_bytes,
+                "speculative_inflight_waves": getattr(
+                    self.engine.config,
+                    "speculative_inflight_waves",
+                    1,
+                ),
+                "speculative_inflight_bytes": getattr(
+                    self.engine.config,
+                    "speculative_inflight_bytes",
+                    0,
+                ),
                 "sealed_wave_tokens": self.engine.config.sealed_wave_token_limit,
                 "max_prefill_chunk_tokens": (
                     self.engine.config.prefill_token_limit or 0
@@ -421,6 +433,15 @@ class DistributedMycelliosServer:
                     {"configured": False, "retained_sessions": 0},
                 ),
                 "prefill_window": self.engine.prefill_window_stats,
+                "speculative_window": getattr(
+                    self.engine,
+                    "speculative_window_stats",
+                    {
+                        "configured": False,
+                        "configured_waves_per_request": 1,
+                        "configured_bytes_per_request": 0,
+                    },
+                ),
                 "root_batching": self.engine.root_batch_stats,
                 "recovery": recovery,
                 "root_parameter_bytes": self.engine.root_parameter_bytes,
@@ -1011,6 +1032,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--speculative-max-draft-tokens", type=int, default=4)
+    parser.add_argument(
+        "--speculative-inflight-waves",
+        type=int,
+        default=1,
+        help=(
+            "Maximum ordered linear VERIFY waves allowed on the route at once; "
+            "one preserves the historical exact path."
+        ),
+    )
+    parser.add_argument(
+        "--speculative-inflight-bytes",
+        type=int,
+        default=0,
+        help=(
+            "Per-request maximum encoded VERIFY bytes in flight; zero is valid "
+            "only with one historical in-flight wave."
+        ),
+    )
     parser.add_argument("--speculation-minimum-speedup", type=float, default=1.05)
     parser.add_argument("--no-speculation-probes", action="store_true")
     parser.add_argument(
@@ -1206,6 +1245,47 @@ def build_server(args: argparse.Namespace) -> DistributedMycelliosServer:
         )
     if not 1 <= args.speculative_max_draft_tokens <= 16:
         raise ValueError("speculative-max-draft-tokens must be between 1 and 16")
+    if not 1 <= args.speculative_inflight_waves <= MAX_SPECULATIVE_INFLIGHT_WAVES:
+        raise ValueError(
+            "speculative-inflight-waves must be between 1 and "
+            f"{MAX_SPECULATIVE_INFLIGHT_WAVES}"
+        )
+    if not (
+        0
+        <= args.speculative_inflight_bytes
+        <= MAX_SPECULATIVE_INFLIGHT_BYTES
+    ):
+        raise ValueError(
+            "speculative-inflight-bytes must be between 0 and 1 GiB"
+        )
+    speculative_conveyor_enabled = (
+        args.speculative_inflight_waves > 1
+        or args.speculative_inflight_bytes > 0
+    )
+    if speculative_conveyor_enabled and (
+        args.speculative_inflight_waves <= 1
+        or args.speculative_inflight_bytes <= 0
+    ):
+        raise ValueError(
+            "speculative conveyor requires more than one in-flight wave and "
+            "a positive byte ceiling"
+        )
+    if speculative_conveyor_enabled and args.speculation not in (
+        "ngram",
+        "draft-model",
+    ):
+        raise ValueError(
+            "speculative conveyor requires linear ngram or draft-model speculation"
+        )
+    if speculative_conveyor_enabled and any(speculative_tree_limits_enabled):
+        raise ValueError(
+            "speculative conveyor cannot be combined with physical "
+            "speculative-tree limits"
+        )
+    if speculative_conveyor_enabled and args.max_active_sequences != 1:
+        raise ValueError(
+            "speculative conveyor currently requires max-active-sequences=1"
+        )
     if args.sealed_wave_tokens is not None:
         required_wave_tokens = (
             args.speculative_max_draft_tokens + 1
@@ -1429,6 +1509,8 @@ def build_server(args: argparse.Namespace) -> DistributedMycelliosServer:
                 if args.speculation in ("ngram", "draft-tree", "draft-model")
                 else 0
             ),
+            speculative_inflight_waves=args.speculative_inflight_waves,
+            speculative_inflight_bytes=args.speculative_inflight_bytes,
             speculation_minimum_speedup=args.speculation_minimum_speedup,
             speculation_probe=not args.no_speculation_probes,
             root_batch_window_ms=args.root_batch_window_ms,

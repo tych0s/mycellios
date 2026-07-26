@@ -22,6 +22,10 @@ const MAX_PREFILL_INFLIGHT_BYTES = 1024 * 1024 * 1024;
 const MAX_SPECULATIVE_BRANCHES = 64;
 const MAX_SPECULATIVE_BRANCH_TOKENS = 1_048_576;
 const MAX_SPECULATIVE_KV_BYTES = 2 ** 40;
+const DEFAULT_SPECULATIVE_INFLIGHT_WAVES = 1;
+const DEFAULT_SPECULATIVE_INFLIGHT_BYTES = 0;
+const MAX_SPECULATIVE_INFLIGHT_WAVES = 16;
+const MAX_SPECULATIVE_INFLIGHT_BYTES = 1024 * 1024 * 1024;
 const DEFAULT_RETAINED_SESSIONS = 4;
 const DEFAULT_RETAINED_SESSION_TOKENS = 8_192;
 const DEFAULT_RETAINED_SESSION_TTL_SECONDS = 10 * 60;
@@ -181,6 +185,16 @@ export interface PythonLaunchCompilerOptions {
   maxSpeculativeBranchTokens?: number;
   /** Aggregate stage-local byte ceiling for all physical child KV caches. */
   maxSpeculativeKvBytes?: number;
+  /**
+   * Ordered linear VERIFY waves. Omitted (and treated as one) preserves the
+   * canonical launch/2 identity and historical synchronous path.
+   */
+  speculativeInflightWaves?: number;
+  /**
+   * Per-request encoded VERIFY bytes in flight. Omitted (and treated as zero)
+   * with one wave preserves the canonical launch/2 identity.
+   */
+  speculativeInflightBytes?: number;
   maxPendingRequests?: number;
   maxOutputTokens?: number;
   speculationMinimumSpeedup?: number;
@@ -379,6 +393,10 @@ export interface PythonLaunchConfiguration {
   maxSpeculativeBranches: number;
   maxSpeculativeBranchTokens: number;
   maxSpeculativeKvBytes: number;
+  /** Present only when the native linear VERIFY conveyor is explicitly enabled. */
+  speculativeInflightWaves?: number;
+  /** Present only together with speculativeInflightWaves. */
+  speculativeInflightBytes?: number;
   maxPendingRequests: number;
   maxOutputTokens: number;
   speculationMinimumSpeedup: number;
@@ -1238,6 +1256,14 @@ function renderRootEngineArguments(
     "--socket-timeout-seconds",
     finiteNumber(configuration.connectTimeoutSeconds),
   );
+  if (configuration.speculativeInflightWaves !== undefined) {
+    args.push(
+      "--speculative-inflight-waves",
+      String(configuration.speculativeInflightWaves),
+      "--speculative-inflight-bytes",
+      String(configuration.speculativeInflightBytes),
+    );
+  }
   if (configuration.recovery) {
     args.push(
       "--recovery-max-retries",
@@ -1417,6 +1443,8 @@ function normalizeConfiguration(
       "maxSpeculativeBranches",
       "maxSpeculativeBranchTokens",
       "maxSpeculativeKvBytes",
+      "speculativeInflightWaves",
+      "speculativeInflightBytes",
       "maxPendingRequests",
       "maxOutputTokens",
       "speculationMinimumSpeedup",
@@ -1583,6 +1611,76 @@ function normalizeConfiguration(
   const maxSpeculativeBranches = requestedMaxSpeculativeBranches;
   const maxSpeculativeBranchTokens = requestedMaxSpeculativeBranchTokens;
   const maxSpeculativeKvBytes = requestedMaxSpeculativeKvBytes;
+  const speculativeInflightWaves = boundedInteger(
+    value.speculativeInflightWaves ?? DEFAULT_SPECULATIVE_INFLIGHT_WAVES,
+    1,
+    MAX_SPECULATIVE_INFLIGHT_WAVES,
+    "python_speculative_inflight_waves_is_invalid",
+  );
+  const speculativeInflightBytes = boundedInteger(
+    value.speculativeInflightBytes ?? DEFAULT_SPECULATIVE_INFLIGHT_BYTES,
+    0,
+    MAX_SPECULATIVE_INFLIGHT_BYTES,
+    "python_speculative_inflight_bytes_is_invalid",
+  );
+  const speculativeConveyorEnabled =
+    speculativeInflightWaves > DEFAULT_SPECULATIVE_INFLIGHT_WAVES
+    || speculativeInflightBytes > DEFAULT_SPECULATIVE_INFLIGHT_BYTES;
+  if (
+    speculativeConveyorEnabled
+    && (
+      speculativeInflightWaves <= DEFAULT_SPECULATIVE_INFLIGHT_WAVES
+      || speculativeInflightBytes <= DEFAULT_SPECULATIVE_INFLIGHT_BYTES
+    )
+  ) {
+    throw new Error(
+      "python_speculative_conveyor_limits_must_be_disabled_or_complete",
+    );
+  }
+  if (
+    speculativeConveyorEnabled
+    && speculation.provider !== "ngram"
+    && speculation.provider !== "draft-model"
+  ) {
+    throw new Error(
+      "python_speculative_conveyor_requires_linear_speculation",
+    );
+  }
+  if (
+    speculativeConveyorEnabled
+    && (
+      maxSpeculativeBranches > 0
+      || maxSpeculativeBranchTokens > 0
+      || maxSpeculativeKvBytes > 0
+    )
+  ) {
+    throw new Error(
+      "python_speculative_conveyor_cannot_use_physical_tree_limits",
+    );
+  }
+  if (
+    speculativeConveyorEnabled
+    && Math.max(
+      manifest.plans.prefill.microBatchSize,
+      manifest.plans.decode.microBatchSize,
+    ) !== 1
+  ) {
+    throw new Error(
+      "python_speculative_conveyor_requires_single_active_sequence",
+    );
+  }
+  if (speculativeConveyorEnabled) {
+    const minimumVerifyFrameBytes = pythonPrefillFrameByteReservation(
+      manifest.plans.decode.activationCodec,
+      speculation.maxDraftTokens + 1,
+      manifest.hiddenSize,
+    );
+    if (BigInt(speculativeInflightBytes) < minimumVerifyFrameBytes) {
+      throw new Error(
+        `python_speculative_inflight_bytes_below_frame_reservation:${minimumVerifyFrameBytes}`,
+      );
+    }
+  }
   const maxRetainedSessions = boundedInteger(
     value.maxRetainedSessions ?? DEFAULT_RETAINED_SESSIONS,
     0,
@@ -1661,6 +1759,9 @@ function normalizeConfiguration(
     maxSpeculativeBranches,
     maxSpeculativeBranchTokens,
     maxSpeculativeKvBytes,
+    ...(speculativeConveyorEnabled
+      ? { speculativeInflightWaves, speculativeInflightBytes }
+      : {}),
     maxPendingRequests: boundedInteger(
       value.maxPendingRequests ?? 128,
       1,

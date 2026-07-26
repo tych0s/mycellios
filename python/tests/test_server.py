@@ -338,6 +338,79 @@ class EngineConfigurationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     build_server(args)
 
+    def test_speculative_conveyor_cli_is_bounded_and_opt_in(self) -> None:
+        defaults = parse_server_args([])
+        self.assertEqual(defaults.speculative_inflight_waves, 1)
+        self.assertEqual(defaults.speculative_inflight_bytes, 0)
+
+        invalid_cases = (
+            (["--speculative-inflight-waves", "0"], "between 1 and 16"),
+            (["--speculative-inflight-waves", "17"], "between 1 and 16"),
+            (["--speculative-inflight-bytes", "-1"], "between 0 and 1 GiB"),
+            (
+                [
+                    "--speculative-inflight-bytes",
+                    str(1024 * 1024 * 1024 + 1),
+                ],
+                "between 0 and 1 GiB",
+            ),
+            (
+                ["--speculative-inflight-waves", "2"],
+                "more than one in-flight wave and a positive byte ceiling",
+            ),
+            (
+                ["--speculative-inflight-bytes", "4096"],
+                "more than one in-flight wave and a positive byte ceiling",
+            ),
+            (
+                [
+                    "--speculative-inflight-waves",
+                    "2",
+                    "--speculative-inflight-bytes",
+                    "4096",
+                ],
+                "requires linear ngram or draft-model speculation",
+            ),
+            (
+                [
+                    "--speculation",
+                    "ngram",
+                    "--speculative-inflight-waves",
+                    "2",
+                    "--speculative-inflight-bytes",
+                    "4096",
+                ],
+                "requires max-active-sequences=1",
+            ),
+        )
+        for arguments, message in invalid_cases:
+            with self.subTest(arguments=arguments):
+                with patch("distributed_runtime.server.resolve_model_snapshot") as resolve:
+                    with self.assertRaisesRegex(ValueError, message):
+                        build_server(parse_server_args(arguments))
+                resolve.assert_not_called()
+
+        valid = parse_server_args(
+            [
+                "--max-batch-size",
+                "1",
+                "--max-active-sequences",
+                "1",
+                "--speculation",
+                "ngram",
+                "--speculative-inflight-waves",
+                "3",
+                "--speculative-inflight-bytes",
+                str(64 * 1024 * 1024),
+            ]
+        )
+        with patch(
+            "distributed_runtime.server.resolve_model_snapshot",
+            side_effect=RuntimeError("model resolution reached"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "model resolution reached"):
+                build_server(valid)
+
     def test_server_rejects_partial_or_unbounded_tree_limits_before_model_loading(self) -> None:
         for arguments, message in (
             (["--max-speculative-branches", "1"], "must all be zero"),
@@ -542,6 +615,12 @@ class HttpInferenceEvidenceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(health["max_speculative_branches"], 0)
             self.assertEqual(health["max_speculative_branch_tokens"], 0)
             self.assertEqual(health["max_speculative_kv_bytes"], 0)
+            self.assertEqual(health["speculative_inflight_waves"], 3)
+            self.assertEqual(health["speculative_inflight_bytes"], 8192)
+            self.assertEqual(
+                health["speculative_window"]["high_water_waves"],
+                2,
+            )
             self.assertEqual(health["prefill_window"]["high_water_chunks"], 2)
 
             non_stream_response = await client.post(
@@ -798,6 +877,8 @@ class _HttpEngine:
             max_speculative_branches=0,
             max_speculative_branch_tokens=0,
             max_speculative_kv_bytes=0,
+            speculative_inflight_waves=3,
+            speculative_inflight_bytes=8192,
             sealed_wave_token_limit=4,
             prefill_token_limit=64,
         )
@@ -808,6 +889,12 @@ class _HttpEngine:
         )
         self.pipeline_id = self.PIPELINE_ID
         self.speculation_stats = {"configured": False}
+        self.speculative_window_stats = {
+            "configured": True,
+            "configured_waves_per_request": 3,
+            "configured_bytes_per_request": 8192,
+            "high_water_waves": 2,
+        }
         self.prefill_window_stats = {
             "configured_chunks": 3,
             "configured_bytes": 4096,

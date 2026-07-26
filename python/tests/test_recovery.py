@@ -66,16 +66,27 @@ class RecoveringPipelineEngineTests(unittest.TestCase):
             visible_prefix_checkpoint_sha256(torch.tensor([[1, 3]]), (10, 11)),
         )
 
-    def test_physical_tree_limits_are_part_of_recovery_identity_v4(self) -> None:
+    def test_speculative_execution_limits_are_part_of_recovery_identity_v5(self) -> None:
         disabled = _identity()
-        enabled = replace(
+        tree_enabled = replace(
             disabled,
             max_speculative_branches=2,
             max_speculative_branch_tokens=128,
             max_speculative_kv_bytes=4096,
         )
-        self.assertEqual(disabled.schema_version, 4)
-        self.assertNotEqual(disabled, enabled)
+        conveyor_enabled = replace(
+            disabled,
+            speculative_max_draft_tokens=2,
+            speculative_inflight_waves=3,
+            speculative_inflight_bytes=4096,
+        )
+        self.assertEqual(disabled.schema_version, 5)
+        self.assertNotEqual(disabled, tree_enabled)
+        self.assertNotEqual(disabled, conveyor_enabled)
+        self.assertNotEqual(
+            recovery_identity_sha256(disabled),
+            recovery_identity_sha256(conveyor_enabled),
+        )
 
     def test_executor_contract_requires_one_sealed_id_per_stage(self) -> None:
         common = {"model_name": "fixture", "boundaries": (0, 2, 4)}
@@ -611,7 +622,7 @@ def _identity(
     stage_executor_ids: tuple[str, ...] = ("1" * 32, "2" * 32),
 ) -> PipelineRecoveryIdentity:
     return PipelineRecoveryIdentity(
-        schema_version=4,
+        schema_version=5,
         artifact_identity=artifact_identity,
         canonical_model_source="hf://fixture/model",
         canonical_model_revision="a" * 40,
@@ -633,6 +644,8 @@ def _identity(
         sealed_wave_tokens=1,
         max_prefill_chunk_tokens=0,
         speculative_max_draft_tokens=0,
+        speculative_inflight_waves=1,
+        speculative_inflight_bytes=0,
         speculation_minimum_speedup=1.05,
         speculation_probe=True,
     )
