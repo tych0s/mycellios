@@ -1,7 +1,13 @@
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { WorkerCapabilities } from "../src/contracts/types.js";
 import { createCoordinator, type CoordinatorRuntime } from "../src/coordinator/server.js";
 import { SupabaseAuthService } from "../src/coordinator/supabase-auth.js";
+import { workerRegistrationDigest } from "../src/core/worker-admission-digest.js";
+import {
+  generateWorkerAdmissionCredential,
+  workerAdmissionSigner,
+} from "../src/worker/admission-credential.js";
 
 const runtimes: CoordinatorRuntime[] = [];
 
@@ -90,6 +96,100 @@ describe("public coordinator security boundaries", () => {
       payload: validWorkerRegistration(),
     });
     expect(worker.statusCode).toBe(201);
+  });
+
+  it("requires and verifies one-shot signed admission for remote workers", async () => {
+    const runtime = await coordinator(undefined, "network-secret");
+    const registration = validWorkerRegistration();
+    const protocol = { min: 1, max: 1 };
+    const unsigned = await runtime.app.inject({
+      method: "POST",
+      url: "/internal/v1/workers/register",
+      headers: { authorization: "Bearer network-secret" },
+      remoteAddress: "203.0.113.44",
+      payload: { ...registration, protocol },
+    });
+    expect(unsigned.statusCode).toBe(401);
+    expect(unsigned.json()).toMatchObject({
+      error: { code: "worker_admission_required" },
+    });
+
+    const signer = workerAdmissionSigner(generateWorkerAdmissionCredential());
+    const registrationDigest = workerRegistrationDigest({
+      identity: registration.identity!,
+      capabilities: registration.capabilities,
+      protocol,
+    });
+    const challenge = await runtime.app.inject({
+      method: "POST",
+      url: "/internal/v1/workers/admission-challenge",
+      headers: { authorization: "Bearer network-secret" },
+      remoteAddress: "203.0.113.44",
+      payload: {
+        identity: registration.identity,
+        publicKey: signer.publicKey,
+        protocol,
+        registrationDigest,
+      },
+    });
+    expect(challenge.statusCode).toBe(200);
+    const issued = challenge.json() as {
+      challengeId: string;
+      signingPayload: string;
+    };
+    const proof = {
+      challengeId: issued.challengeId,
+      publicKey: signer.publicKey,
+      protocol,
+      registrationDigest,
+      signature: signer.sign(issued.signingPayload),
+    };
+    const accepted = await runtime.app.inject({
+      method: "POST",
+      url: "/internal/v1/workers/register",
+      headers: { authorization: "Bearer network-secret" },
+      remoteAddress: "203.0.113.44",
+      payload: { ...registration, protocol, admission: proof },
+    });
+    expect(accepted.statusCode).toBe(201);
+    expect(accepted.json()).toMatchObject({
+      protocolVersion: 1,
+      enrollment: "enrolled",
+      credentialFingerprint: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+    });
+
+    const replay = await runtime.app.inject({
+      method: "POST",
+      url: "/internal/v1/workers/register",
+      headers: { authorization: "Bearer network-secret" },
+      remoteAddress: "203.0.113.44",
+      payload: { ...registration, protocol, admission: proof },
+    });
+    expect(replay.statusCode).toBe(401);
+    expect(replay.json()).toMatchObject({
+      error: { code: "worker_admission_challenge_unknown" },
+    });
+  });
+
+  it("rejects worker protocol downgrade or unsupported upgrade before enrollment", async () => {
+    const runtime = await coordinator(undefined, "network-secret");
+    const signer = workerAdmissionSigner(generateWorkerAdmissionCredential());
+    const response = await runtime.app.inject({
+      method: "POST",
+      url: "/internal/v1/workers/admission-challenge",
+      headers: { authorization: "Bearer network-secret" },
+      remoteAddress: "203.0.113.45",
+      payload: {
+        identity: { kind: "device", id: "future-worker" },
+        publicKey: signer.publicKey,
+        protocol: { min: 2, max: 3 },
+        registrationDigest: `sha256:${"a".repeat(64)}`,
+      },
+    });
+    expect(response.statusCode).toBe(426);
+    expect(response.json()).toMatchObject({
+      error: { code: "worker_protocol_incompatible" },
+    });
   });
 
   it("rejects anonymous remote worker administration before revealing worker state", async () => {
@@ -323,7 +423,7 @@ describe("public coordinator security boundaries", () => {
   it("rejects development mock deployments on the production coordinator boundary", async () => {
     const runtime = await coordinator();
     const payload = validWorkerRegistration();
-    (payload.capabilities.deployments as Array<Record<string, unknown>>).push({
+    (payload.capabilities.deployments as unknown as Array<Record<string, unknown>>).push({
       deploymentId: "dep-mock",
       model: "fixture",
       modelDigest: "sha256:fixture",
@@ -499,27 +599,7 @@ async function coordinator(
 
 function validWorkerRegistration(): {
   identity: { kind: "device"; id: string };
-  capabilities: {
-    region: string;
-    agentVersion: string;
-    gpus: Array<{
-      id: string;
-      vendor: string;
-      model: string;
-      physicalVramMb: number;
-      offeredVramMb: number;
-      freeOfferedVramMb: number;
-    }>;
-    deployments: never[];
-    limits: {
-      maxConcurrency: number;
-      maxTemperatureC: number;
-      maxPowerW: number;
-      pauseWhenForeground: boolean;
-    };
-    network: { coordinatorRttMs: number; uplinkMbps: number; downlinkMbps: number };
-    distributedExecutor?: Record<string, unknown>;
-  };
+  capabilities: WorkerCapabilities;
 } {
   return {
     identity: { kind: "device", id: "public-worker" },

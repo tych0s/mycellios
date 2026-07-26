@@ -7,6 +7,10 @@ import {
   deploymentMetricsFromCanaryEvidence,
 } from "./deployment-canary.js";
 import { nativeBuildIdentitySchema } from "./build-identity.js";
+import {
+  workerAdmissionProofSchema,
+  workerProtocolRangeSchema,
+} from "./worker-admission.js";
 
 const adapterKind = z.enum([
   "mycellios-native",
@@ -375,6 +379,8 @@ export const workerRegistrationSchema = z.object({
     .strict()
     .optional(),
   capabilities: workerCapabilitiesSchema,
+  protocol: workerProtocolRangeSchema.optional(),
+  admission: workerAdmissionProofSchema.optional(),
 }).strict();
 
 export const workerConfigSchema = z.object({

@@ -350,6 +350,7 @@ async function registerWorker(
   const query = new URLSearchParams(window.location.search);
   const invitationFromUrl = query.get("join")?.trim();
   const joinToken = persistentJoinToken(invitationFromUrl);
+  const protocol = { min: 1, max: 1 };
   const body = {
     clientId,
     name: mobileName(),
@@ -372,11 +373,65 @@ async function registerWorker(
       estimatedGflops: state.estimatedGflops,
       matrixSize,
     },
+    protocol,
   };
+  const identity = { kind: "browser" as const, id: clientId };
+  const admissionCredential = await persistentBrowserAdmissionCredential();
+  const registrationDigest = await sha256CanonicalBrowserEvidence({
+    schema: "mycellios-mobile-registration/1",
+    identity,
+    registration: body,
+  });
+  const challengeResponse = await abortable(fetch("/mobile/v1/admission-challenge", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      identity,
+      publicKey: {
+        algorithm: "ecdsa-p256-sha256",
+        spki: admissionCredential.publicKeySpki,
+      },
+      protocol,
+      registrationDigest,
+      ...(joinToken ? { joinToken } : {}),
+    }),
+    signal,
+  }), signal);
+  if (!challengeResponse.ok) {
+    throw new Error(
+      `The coordinator rejected the device identity challenge (HTTP ${challengeResponse.status}).`,
+    );
+  }
+  const challenge = await challengeResponse.json() as {
+    challengeId?: unknown;
+    signingPayload?: unknown;
+  };
+  if (
+    typeof challenge.challengeId !== "string"
+    || typeof challenge.signingPayload !== "string"
+  ) {
+    throw new Error("The coordinator returned an invalid device identity challenge.");
+  }
+  const signature = await signBrowserAdmissionPayload(
+    admissionCredential.privateKey,
+    challenge.signingPayload,
+  );
   const response = await abortable(fetch("/mobile/v1/register", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      ...body,
+      admission: {
+        challengeId: challenge.challengeId,
+        publicKey: {
+          algorithm: "ecdsa-p256-sha256",
+          spki: admissionCredential.publicKeySpki,
+        },
+        protocol,
+        registrationDigest,
+        signature,
+      },
+    }),
     signal,
   }), signal);
   if (!response.ok) {
@@ -1272,6 +1327,120 @@ async function persistentClientId(): Promise<string> {
   }
 }
 
+interface BrowserAdmissionCredential {
+  schema: "mycellios-browser-credential/1";
+  publicKeySpki: string;
+  privateKey: CryptoKey;
+}
+
+async function persistentBrowserAdmissionCredential(): Promise<BrowserAdmissionCredential> {
+  if (!crypto.subtle) throw new Error("WebCrypto is required for secure network admission.");
+  const database = await openIdentityDatabase();
+  try {
+    const stored = await readIdentityRecord(database, "mycellios.mobile.admission-key");
+    if (isBrowserAdmissionCredential(stored)) return stored;
+    const generated = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"],
+    ) as CryptoKeyPair;
+    const publicKeySpki = base64UrlFromBytes(
+      new Uint8Array(await crypto.subtle.exportKey("spki", generated.publicKey)),
+    );
+    const privatePkcs8 = await crypto.subtle.exportKey("pkcs8", generated.privateKey);
+    const privateKey = await crypto.subtle.importKey(
+      "pkcs8",
+      privatePkcs8,
+      { name: "ECDSA", namedCurve: "P-256" },
+      false,
+      ["sign"],
+    );
+    const credential: BrowserAdmissionCredential = {
+      schema: "mycellios-browser-credential/1",
+      publicKeySpki,
+      privateKey,
+    };
+    await writeIdentityRecord(database, "mycellios.mobile.admission-key", credential);
+    return credential;
+  } finally {
+    database.close();
+  }
+}
+
+function isBrowserAdmissionCredential(value: unknown): value is BrowserAdmissionCredential {
+  if (!value || typeof value !== "object") return false;
+  const credential = value as Partial<BrowserAdmissionCredential>;
+  return (
+    credential.schema === "mycellios-browser-credential/1"
+    && typeof credential.publicKeySpki === "string"
+    && /^[A-Za-z0-9_-]{40,256}$/.test(credential.publicKeySpki)
+    && typeof CryptoKey !== "undefined"
+    && credential.privateKey instanceof CryptoKey
+    && credential.privateKey.type === "private"
+    && credential.privateKey.algorithm.name === "ECDSA"
+  );
+}
+
+async function signBrowserAdmissionPayload(
+  privateKey: CryptoKey,
+  payload: string,
+): Promise<string> {
+  const signature = await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" },
+    privateKey,
+    new TextEncoder().encode(payload),
+  );
+  return base64UrlFromBytes(new Uint8Array(signature));
+}
+
+async function sha256CanonicalBrowserEvidence(value: unknown): Promise<string> {
+  const canonical = canonicalBrowserEvidence(value, "$", new Set<object>());
+  const digest = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical)),
+  );
+  return `sha256:${[...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+}
+
+function canonicalBrowserEvidence(
+  value: unknown,
+  path: string,
+  ancestors: Set<object>,
+): string {
+  if (value === null) return "null";
+  if (typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error(`non_finite_registration_value:${path}`);
+    return JSON.stringify(value);
+  }
+  if (typeof value !== "object") {
+    throw new Error(`unsupported_registration_value:${path}`);
+  }
+  if (ancestors.has(value)) throw new Error(`cyclic_registration_value:${path}`);
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return `[${value.map((item, index) =>
+        canonicalBrowserEvidence(item, `${path}[${index}]`, ancestors)).join(",")}]`;
+    }
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record).filter((key) => record[key] !== undefined).sort();
+    return `{${keys.map((key) =>
+      `${JSON.stringify(key)}:${canonicalBrowserEvidence(
+        record[key],
+        `${path}.${key}`,
+        ancestors,
+      )}`).join(",")}}`;
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
+function base64UrlFromBytes(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
 async function requestPersistentBrowserStorage(): Promise<boolean> {
   try {
     if (!navigator.storage?.persist) return false;
@@ -1300,14 +1469,24 @@ function openIdentityDatabase(): Promise<IDBDatabase> {
 }
 
 function readIdentityValue(database: IDBDatabase, key: string): Promise<string | null> {
+  return readIdentityRecord(database, key).then(
+    (value) => typeof value === "string" ? value : null,
+  );
+}
+
+function readIdentityRecord(database: IDBDatabase, key: string): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const request = database.transaction("identity", "readonly").objectStore("identity").get(key);
-    request.addEventListener("success", () => resolve(typeof request.result === "string" ? request.result : null));
+    request.addEventListener("success", () => resolve(request.result as unknown));
     request.addEventListener("error", () => reject(request.error ?? new Error("Could not read browser identity")));
   });
 }
 
 function writeIdentityValue(database: IDBDatabase, key: string, value: string): Promise<void> {
+  return writeIdentityRecord(database, key, value);
+}
+
+function writeIdentityRecord(database: IDBDatabase, key: string, value: unknown): Promise<void> {
   return new Promise((resolve, reject) => {
     const transaction = database.transaction("identity", "readwrite");
     transaction.objectStore("identity").put(value, key);

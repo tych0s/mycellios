@@ -30,6 +30,11 @@ import {
   workerRegistrationSchema,
 } from "../contracts/schemas.js";
 import {
+  WORKER_PROTOCOL_MAX,
+  WORKER_PROTOCOL_MIN,
+  workerAdmissionChallengeRequestSchema,
+} from "../contracts/worker-admission.js";
+import {
   type NativeBuildIdentity,
 } from "../contracts/build-identity.js";
 import type { ChatCompletionRequest } from "../contracts/types.js";
@@ -41,6 +46,7 @@ import {
   readNativeRuntimeBuildMetadata,
   type NativeRuntimeBuildMetadata,
 } from "../core/native-build-identity.js";
+import { workerRegistrationDigest } from "../core/worker-admission-digest.js";
 import { Scheduler } from "../scheduler/scheduler.js";
 import { MeshDatabase } from "../storage/database.js";
 import { MeshStore, type StoredRequestedModel, type StoredWorker } from "../storage/store.js";
@@ -103,6 +109,11 @@ import {
   apiUsageJson,
   type ApiKeyPrincipal,
 } from "./api-access.js";
+import {
+  WorkerAdmissionAuthority,
+  WorkerAdmissionError,
+  selectWorkerProtocolVersion,
+} from "./worker-admission.js";
 
 export function automaticActivationFailureIsTransient(message: string): boolean {
   return activationFailureIsTransient(message);
@@ -319,6 +330,7 @@ export async function createCoordinator(
     (_request, body, done) => done(null, body),
   );
   const database = new MeshDatabase(config.databasePath);
+  const workerAdmission = new WorkerAdmissionAuthority(database);
   const apiAccess = new ApiAccessManager(database, {
     starterTokens: config.apiStarterTokens ?? 25_000,
     requestsPerMinute: config.apiRequestsPerMinute ?? 30,
@@ -513,6 +525,8 @@ export async function createCoordinator(
     joinToken: config.mobileJoinToken,
     expertArtifactsPath: config.mobileExpertArtifactsPath,
     disconnectedRetentionMs: options.mobileDisconnectedRetentionMs,
+    admissionAuthority: workerAdmission,
+    isTrustedLocalRequest,
     ...(persistence
       ? { onArtifactStored: (artifact: Parameters<SupabasePersistence["registerArtifactBackup"]>[0]) =>
           persistence.registerArtifactBackup(artifact) }
@@ -1792,6 +1806,18 @@ export async function createCoordinator(
     };
   });
 
+  app.post("/internal/v1/workers/admission-challenge", async (request, reply) => {
+    const challenge = workerAdmissionChallengeRequestSchema.parse(request.body);
+    try {
+      return workerAdmission.issue(challenge);
+    } catch (error) {
+      if (!(error instanceof WorkerAdmissionError)) throw error;
+      return reply.code(error.statusCode).send({
+        error: { code: error.code, message: error.message },
+      });
+    }
+  });
+
   app.post("/internal/v1/workers/register", async (request, reply) => {
     const registration = workerRegistrationSchema.parse(request.body);
     if (
@@ -1807,11 +1833,73 @@ export async function createCoordinator(
         },
       });
     }
+    const protocol = registration.protocol ?? {
+      min: WORKER_PROTOCOL_MIN,
+      max: WORKER_PROTOCOL_MAX,
+    };
+    let admission:
+      | {
+        protocolVersion: number;
+        credentialFingerprint?: string;
+        enrollment: "enrolled" | "accepted" | "local-legacy";
+      };
+    if (registration.admission) {
+      if (!registration.identity) {
+        return reply.code(400).send({
+          error: {
+            code: "worker_admission_identity_required",
+            message: "Signed worker admission requires a stable device identity.",
+          },
+        });
+      }
+      let verified;
+      try {
+        verified = workerAdmission.verify({
+          identity: registration.identity,
+          registrationDigest: workerRegistrationDigest({
+            identity: registration.identity,
+            capabilities: registration.capabilities,
+            protocol,
+          }),
+          proof: registration.admission,
+        });
+      } catch (error) {
+        if (!(error instanceof WorkerAdmissionError)) throw error;
+        return reply.code(error.statusCode).send({
+          error: { code: error.code, message: error.message },
+        });
+      }
+      admission = {
+        protocolVersion: verified.protocolVersion,
+        credentialFingerprint: verified.credentialFingerprint,
+        enrollment: verified.enrollment,
+      };
+    } else {
+      if (!isTrustedLocalRequest(request)) {
+        return reply.code(401).send({
+          error: {
+            code: "worker_admission_required",
+            message: "Remote workers must prove a stable signed device identity.",
+          },
+        });
+      }
+      admission = {
+        protocolVersion: selectWorkerProtocolVersion(protocol),
+        enrollment: "local-legacy",
+      };
+    }
     const worker = store.registerWorker({
       ...(registration.identity ? { identity: registration.identity } : {}),
       capabilities: stripWorkerDeclaredEvidence(registration.capabilities),
     });
-    return reply.code(201).send({ workerId: worker.id, protocolVersion: 1 });
+    return reply.code(201).send({
+      workerId: worker.id,
+      protocolVersion: admission.protocolVersion,
+      ...(admission.credentialFingerprint
+        ? { credentialFingerprint: admission.credentialFingerprint }
+        : {}),
+      enrollment: admission.enrollment,
+    });
   });
 
   app.get("/internal/v1/workers", async () => ({
@@ -2361,6 +2449,11 @@ export async function createCoordinator(
       if (error.retryAfterSeconds !== undefined) {
         reply.header("retry-after", error.retryAfterSeconds);
       }
+      return reply.code(error.statusCode).send({
+        error: { code: error.code, message: error.message },
+      });
+    }
+    if (error instanceof WorkerAdmissionError) {
       return reply.code(error.statusCode).send({
         error: { code: error.code, message: error.message },
       });

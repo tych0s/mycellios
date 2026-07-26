@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-const SCHEMA_VERSION = 13;
+const SCHEMA_VERSION = 14;
 
 export interface PersistenceOutboxRow {
   id: number;
@@ -27,6 +27,25 @@ export interface ArtifactBackupOutboxRow {
   attempts: number;
   lastError: string | null;
 }
+
+export interface WorkerAdmissionCredentialRow {
+  identityKind: "device" | "cell" | "browser";
+  identityId: string;
+  algorithm: "ed25519" | "ecdsa-p256-sha256";
+  publicKey: string;
+  fingerprint: string;
+  status: "active" | "revoked";
+  protocolVersion: number;
+  createdAt: number;
+  updatedAt: number;
+  lastSeenAt: number;
+  revokedAt: number | null;
+  revocationReason: string | null;
+}
+
+export type WorkerAdmissionResult =
+  | { state: "enrolled" | "accepted"; credential: WorkerAdmissionCredentialRow }
+  | { state: "revoked" | "key_mismatch" | "fingerprint_in_use"; credential: WorkerAdmissionCredentialRow };
 
 export class MeshDatabase {
   readonly raw: DatabaseSync;
@@ -369,6 +388,25 @@ export class MeshDatabase {
       ON api_usage(job_id)
       WHERE job_id IS NOT NULL;
 
+      CREATE TABLE IF NOT EXISTS worker_admission_credentials (
+        identity_kind TEXT NOT NULL CHECK(identity_kind IN ('device', 'cell', 'browser')),
+        identity_id TEXT NOT NULL,
+        algorithm TEXT NOT NULL CHECK(algorithm IN ('ed25519', 'ecdsa-p256-sha256')),
+        public_key TEXT NOT NULL,
+        fingerprint TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL CHECK(status IN ('active', 'revoked')),
+        protocol_version INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL,
+        revoked_at INTEGER,
+        revocation_reason TEXT,
+        PRIMARY KEY(identity_kind, identity_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS worker_admission_credentials_status
+      ON worker_admission_credentials(status, last_seen_at);
+
     `);
     if (currentVersion >= 2 && currentVersion < 3) {
       const columns = this.raw.prepare("PRAGMA table_info(workers)").all() as Array<{
@@ -394,6 +432,135 @@ export class MeshDatabase {
       WHERE identity_kind IS NOT NULL AND identity_id IS NOT NULL;
     `);
     this.raw.prepare("UPDATE schema_meta SET version = ?").run(SCHEMA_VERSION);
+  }
+
+  admitWorkerCredential(input: {
+    identityKind: WorkerAdmissionCredentialRow["identityKind"];
+    identityId: string;
+    algorithm: WorkerAdmissionCredentialRow["algorithm"];
+    publicKey: string;
+    fingerprint: string;
+    protocolVersion: number;
+  }): WorkerAdmissionResult {
+    return this.transaction(() => {
+      const existing = this.readWorkerAdmissionCredential(
+        this.raw.prepare(
+          `SELECT identity_kind, identity_id, algorithm, public_key, fingerprint,
+                  status, protocol_version, created_at, updated_at, last_seen_at,
+                  revoked_at, revocation_reason
+           FROM worker_admission_credentials
+           WHERE identity_kind = ? AND identity_id = ?`,
+        ).get(input.identityKind, input.identityId),
+      );
+      if (existing) {
+        if (existing.status === "revoked") {
+          return { state: "revoked", credential: existing };
+        }
+        if (
+          existing.algorithm !== input.algorithm
+          || existing.publicKey !== input.publicKey
+          || existing.fingerprint !== input.fingerprint
+        ) {
+          return { state: "key_mismatch", credential: existing };
+        }
+        const now = Date.now();
+        this.raw.prepare(
+          `UPDATE worker_admission_credentials
+           SET protocol_version = ?, updated_at = ?, last_seen_at = ?
+           WHERE identity_kind = ? AND identity_id = ?`,
+        ).run(
+          input.protocolVersion,
+          now,
+          now,
+          input.identityKind,
+          input.identityId,
+        );
+        return {
+          state: "accepted",
+          credential: {
+            ...existing,
+            protocolVersion: input.protocolVersion,
+            updatedAt: now,
+            lastSeenAt: now,
+          },
+        };
+      }
+
+      const reused = this.readWorkerAdmissionCredential(
+        this.raw.prepare(
+          `SELECT identity_kind, identity_id, algorithm, public_key, fingerprint,
+                  status, protocol_version, created_at, updated_at, last_seen_at,
+                  revoked_at, revocation_reason
+           FROM worker_admission_credentials
+           WHERE fingerprint = ?`,
+        ).get(input.fingerprint),
+      );
+      if (reused) {
+        return { state: "fingerprint_in_use", credential: reused };
+      }
+
+      const now = Date.now();
+      this.raw.prepare(
+        `INSERT INTO worker_admission_credentials(
+           identity_kind, identity_id, algorithm, public_key, fingerprint,
+           status, protocol_version, created_at, updated_at, last_seen_at
+         ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)`,
+      ).run(
+        input.identityKind,
+        input.identityId,
+        input.algorithm,
+        input.publicKey,
+        input.fingerprint,
+        input.protocolVersion,
+        now,
+        now,
+        now,
+      );
+      return {
+        state: "enrolled",
+        credential: {
+          ...input,
+          status: "active",
+          createdAt: now,
+          updatedAt: now,
+          lastSeenAt: now,
+          revokedAt: null,
+          revocationReason: null,
+        },
+      };
+    });
+  }
+
+  private readWorkerAdmissionCredential(value: unknown): WorkerAdmissionCredentialRow | null {
+    if (!value || typeof value !== "object") return null;
+    const row = value as {
+      identity_kind: WorkerAdmissionCredentialRow["identityKind"];
+      identity_id: string;
+      algorithm: WorkerAdmissionCredentialRow["algorithm"];
+      public_key: string;
+      fingerprint: string;
+      status: WorkerAdmissionCredentialRow["status"];
+      protocol_version: number;
+      created_at: number;
+      updated_at: number;
+      last_seen_at: number;
+      revoked_at: number | null;
+      revocation_reason: string | null;
+    };
+    return {
+      identityKind: row.identity_kind,
+      identityId: row.identity_id,
+      algorithm: row.algorithm,
+      publicKey: row.public_key,
+      fingerprint: row.fingerprint,
+      status: row.status,
+      protocolVersion: Number(row.protocol_version),
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+      lastSeenAt: Number(row.last_seen_at),
+      revokedAt: row.revoked_at === null ? null : Number(row.revoked_at),
+      revocationReason: row.revocation_reason,
+    };
   }
 
   enqueueRemoteChange(

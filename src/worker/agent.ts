@@ -55,6 +55,13 @@ import {
   type EvidenceChallenge,
   type RuntimePerformanceChallenge,
 } from "../contracts/evidence-challenge.js";
+import {
+  WORKER_PROTOCOL_MAX,
+  WORKER_PROTOCOL_MIN,
+  workerAdmissionChallengeResponseSchema,
+} from "../contracts/worker-admission.js";
+import { workerRegistrationDigest } from "../core/worker-admission-digest.js";
+import type { WorkerAdmissionSigner } from "./admission-credential.js";
 
 export interface WorkerAgentOptions {
   coordinatorUrl: string;
@@ -67,6 +74,11 @@ export interface WorkerAgentOptions {
     kind: "device" | "cell";
     id: string;
   };
+  /**
+   * Stable device proof used by remote coordinators. The private key never
+   * leaves the worker; only one-time challenge signatures are transmitted.
+   */
+  admissionSigner?: WorkerAdmissionSigner | undefined;
   /** Register the physical node without claiming that a model runtime exists. */
   advertiseDeployment?: boolean;
   /** Deterministic hardware source for embedded agents and tests. */
@@ -383,6 +395,8 @@ const registrationResponseSchema = z
   .object({
     workerId: z.string().min(1).max(256),
     protocolVersion: z.literal(1),
+    credentialFingerprint: z.string().regex(/^sha256:[a-f0-9]{64}$/).optional(),
+    enrollment: z.enum(["enrolled", "accepted", "local-legacy"]).optional(),
   })
   .strict();
 
@@ -814,14 +828,78 @@ export class WorkerAgent {
 
   private async register(): Promise<void> {
     const identity = this.options.identity ?? this.defaultIdentity();
+    if (!this.capabilities) throw new Error("Worker capabilities are not initialized");
+    const protocol = { min: WORKER_PROTOCOL_MIN, max: WORKER_PROTOCOL_MAX };
+    const registration = {
+      ...(identity ? { identity } : {}),
+      capabilities: this.capabilities,
+      protocol,
+    };
+    let admission:
+      | {
+        challengeId: string;
+        publicKey: WorkerAdmissionSigner["publicKey"];
+        protocol: typeof protocol;
+        registrationDigest: string;
+        signature: string;
+      }
+      | undefined;
+    if (this.options.admissionSigner) {
+      if (!identity) {
+        throw new Error("A stable worker identity is required for signed admission");
+      }
+      const registrationDigest = workerRegistrationDigest({
+        identity,
+        capabilities: this.capabilities,
+        protocol,
+      });
+      const challengeResponse = await fetch(
+        coordinatorHttpUrl(
+          this.coordinatorBaseUrl,
+          "internal/v1/workers/admission-challenge",
+        ),
+        {
+          method: "POST",
+          headers: this.requestHeaders({ "content-type": "application/json" }),
+          body: JSON.stringify({
+            identity,
+            publicKey: this.options.admissionSigner.publicKey,
+            protocol,
+            registrationDigest,
+          }),
+          signal: AbortSignal.timeout(10_000),
+          redirect: "manual",
+        },
+      );
+      if (!challengeResponse.ok) {
+        throw new Error(
+          `Worker admission challenge failed with HTTP ${challengeResponse.status}`,
+        );
+      }
+      const challengeText = await readResponseTextLimited(challengeResponse, 16 * 1024);
+      let challengeJson: unknown;
+      try {
+        challengeJson = JSON.parse(challengeText) as unknown;
+      } catch {
+        throw new Error("Worker admission challenge returned invalid JSON");
+      }
+      const challenge = workerAdmissionChallengeResponseSchema.parse(challengeJson);
+      admission = {
+        challengeId: challenge.challengeId,
+        publicKey: this.options.admissionSigner.publicKey,
+        protocol,
+        registrationDigest,
+        signature: this.options.admissionSigner.sign(challenge.signingPayload),
+      };
+    }
     const response = await fetch(
       coordinatorHttpUrl(this.coordinatorBaseUrl, "internal/v1/workers/register"),
       {
         method: "POST",
         headers: this.requestHeaders({ "content-type": "application/json" }),
         body: JSON.stringify({
-          ...(identity ? { identity } : {}),
-          capabilities: this.capabilities,
+          ...registration,
+          ...(admission ? { admission } : {}),
         }),
         signal: AbortSignal.timeout(10_000),
         redirect: "manual",

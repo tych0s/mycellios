@@ -38,6 +38,11 @@ import { WorkerTunnelLaunchAgent } from "../distribution/worker-tunnel-launch-ag
 import type { StoredWorker } from "../storage/store.js";
 import type { WorkerHub } from "../coordinator/worker-hub.js";
 import { WorkerAgent, validateCoordinatorUrl } from "../worker/agent.js";
+import {
+  generateWorkerAdmissionCredential,
+  parseWorkerAdmissionCredential,
+  workerAdmissionSigner,
+} from "../worker/admission-credential.js";
 import { prepareNodeStageArtifacts } from "../worker/stage-artifact-preparer.js";
 import {
   probeHardware,
@@ -183,6 +188,43 @@ function settingsPath(): string {
 
 function modelAdminTokenPath(): string {
   return join(app.getPath("userData"), "model-admin-token.enc");
+}
+
+function workerAdmissionCredentialPath(): string {
+  return join(app.getPath("userData"), "worker-admission-credential.enc");
+}
+
+function loadOrCreateDesktopAdmissionSigner() {
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error(
+      "Secure operating-system storage is unavailable. This device cannot join a remote network safely.",
+    );
+  }
+  const path = workerAdmissionCredentialPath();
+  if (existsSync(path)) {
+    try {
+      const decoded = safeStorage.decryptString(readFileSync(path));
+      return workerAdmissionSigner(
+        parseWorkerAdmissionCredential(JSON.parse(decoded) as unknown),
+      );
+    } catch (error) {
+      writeDesktopLog("worker-admission-credential-load-failed", {
+        error: errorText(error),
+      });
+      throw new Error(
+        "The protected device identity could not be read. Rotate or recover this device from network settings.",
+      );
+    }
+  }
+  const credential = generateWorkerAdmissionCredential();
+  const temporary = `${path}.tmp`;
+  writeFileSync(
+    temporary,
+    safeStorage.encryptString(JSON.stringify(credential)),
+    { flag: "wx" },
+  );
+  renameSync(temporary, path);
+  return workerAdmissionSigner(credential);
 }
 
 function loadModelAdminToken(): string {
@@ -670,6 +712,9 @@ async function initializeWorker(): Promise<void> {
     ...(nativeBuildIdentity ? { buildIdentity: nativeBuildIdentity } : {}),
     ...(settings.coordinatorMode === "remote" && settings.remoteCoordinatorToken
       ? { networkToken: settings.remoteCoordinatorToken }
+      : {}),
+    ...(settings.coordinatorMode === "remote"
+      ? { admissionSigner: loadOrCreateDesktopAdmissionSigner() }
       : {}),
     reconnect: true,
     // This worker contributes hardware and the authenticated distributed

@@ -285,6 +285,23 @@ export interface WorkerRegistration {
     id: string;
   } | undefined;
   capabilities: WorkerCapabilities;
+  protocol?: {
+    min: number;
+    max: number;
+  } | undefined;
+  admission?: {
+    challengeId: string;
+    publicKey: {
+      algorithm: "ed25519" | "ecdsa-p256-sha256";
+      spki: string;
+    };
+    protocol: {
+      min: number;
+      max: number;
+    };
+    registrationDigest: string;
+    signature: string;
+  } | undefined;
 }
 
 export interface WorkerHeartbeat {
