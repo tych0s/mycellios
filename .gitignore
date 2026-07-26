@@ -12,6 +12,7 @@ build/windows-job-broker/
 native-helpers/**/bin/
 native-helpers/**/obj/
 .vite/
+docs-site/.docusaurus/
 landing-dist/
 mobile-dist/
 coverage/

@@ -8,3 +8,4 @@ Disallow: /v1/
 Disallow: /updates/
 
 Sitemap: https://www.mycellios.com/sitemap.xml
+Sitemap: https://www.mycellios.com/docs/sitemap.xml
