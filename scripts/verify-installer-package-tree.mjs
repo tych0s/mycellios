@@ -517,16 +517,36 @@ export async function assertInstallerPackageTreeMatches(
       }; extra: ${extra.join(", ") || "none"}.`,
     );
   }
+  // Se acumulan TODAS las diferencias antes de fallar, en vez de abortar en la
+  // primera. Con el aborto temprano, cada diferencia costaba una vuelta entera
+  // de CI —construir los instaladores de tres plataformas— para enterarse de la
+  // siguiente, y las diferencias de este arbol vienen en racimo: son
+  // divergencias sistematicas entre como copia el empaquetador y como reconstruye
+  // el workflow, no fallos independientes. Enterarse de una cada diez minutos
+  // convierte un diagnostico de una tarde en uno de varios dias.
+  //
+  // No se relaja nada: sigue fallando si hay una sola diferencia, y el primer
+  // mensaje es identico al de antes para no romper a quien lo busque en un log.
+  const differences = [];
   for (const path of expectedPaths) {
     const left = expectedEntries.get(path);
     const right = actualEntries.get(path);
     if (canonicalJson(left) !== canonicalJson(right)) {
-      throw new Error(
+      differences.push(
         `Installer tree entry differs at ${path}: ${
           canonicalJson(right)
         } instead of ${canonicalJson(left)}.`,
       );
     }
+  }
+  if (differences.length > 0) {
+    throw new Error(
+      differences.length === 1
+        ? differences[0]
+        : `${differences.length} installer tree entries differ:\n  ${
+          differences.join("\n  ")
+        }`,
+    );
   }
 }
 
