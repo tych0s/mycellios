@@ -66,6 +66,7 @@ import type {
   HubCatalogSort,
   RequestModelInput,
   RequestedModelCapacity,
+  WorkerCredentialSummary,
 } from "../../src/desktop/contracts";
 import { consumeChatCompletionStreamWithRecovery } from "../../src/desktop/chat-stream";
 import type { ChatMessage, NetworkExecutionTrace } from "../../src/contracts/types";
@@ -409,6 +410,59 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     await refresh();
   }
 
+  async function listWorkerCredentials(): Promise<WorkerCredentialSummary[]> {
+    if (desktopBridge) {
+      return desktopBridge.listWorkerCredentials(modelAdminToken.trim() || undefined);
+    }
+    const response = await fetch("/public/v1/worker-credentials", {
+      cache: "no-store",
+      headers: administrativeRequestHeaders(),
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => null) as {
+        error?: { message?: string };
+      } | null;
+      throw new Error(body?.error?.message ?? `HTTP ${response.status}`);
+    }
+    const body = await response.json() as { data: WorkerCredentialSummary[] };
+    return body.data;
+  }
+
+  async function revokeWorkerCredential(
+    credential: Pick<WorkerCredentialSummary, "identityKind" | "identityId" | "fingerprint">,
+    reason: string,
+  ): Promise<void> {
+    if (desktopBridge) {
+      await desktopBridge.revokeWorkerCredential(
+        credential,
+        reason,
+        modelAdminToken.trim() || undefined,
+      );
+    } else {
+      const response = await fetch(
+        `/public/v1/worker-credentials/${encodeURIComponent(credential.identityKind)}/${encodeURIComponent(credential.identityId)}/revoke`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            ...administrativeRequestHeaders(),
+          },
+          body: JSON.stringify({
+            expectedFingerprint: credential.fingerprint,
+            reason,
+          }),
+        },
+      );
+      if (!response.ok) {
+        const body = await response.json().catch(() => null) as {
+          error?: { message?: string };
+        } | null;
+        throw new Error(body?.error?.message ?? `HTTP ${response.status}`);
+      }
+    }
+    await refresh();
+  }
+
   async function requestModel(input: RequestModelInput, adminToken: string) {
     const token = adminToken.trim();
     if (requiresModelAdminToken && !token) throw new Error("Enter the network administrator token.");
@@ -609,7 +663,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
             {loading && snapshot.capturedAt === EMPTY.capturedAt ? <PanelLoading /> : (
               <>
               {view === "overview" && <Overview snapshot={snapshot} onNavigate={navigate} publicLink={publicLink} external={desktop} localAcceleration={desktopSnapshot?.acceleration} localContributionState={desktopSnapshot?.contribution.state} localComputeMode={desktopSnapshot?.settings.computeMode} />}
-              {view === "nodes" && <Nodes snapshot={snapshot} onRemove={removeWorker} onClearOffline={clearOfflineWorkers} />}
+              {view === "nodes" && <Nodes snapshot={snapshot} onRemove={removeWorker} onClearOffline={clearOfflineWorkers} onListCredentials={listWorkerCredentials} onRevokeCredential={revokeWorkerCredential} />}
               {view === "models" && <Models snapshot={snapshot} onSearch={searchHubModels} onRequest={requestModel} onRemove={removeRequestedModel} adminToken={modelAdminToken} requiresAdminToken={requiresModelAdminToken} secureTokenStorage={desktop} />}
               {view === "jobs" && <Jobs snapshot={snapshot} />}
               {view === "tests" && <Tests bridge={desktopBridge} />}
@@ -1106,10 +1160,27 @@ function Overview({ snapshot, onNavigate, publicLink, external, localAcceleratio
   );
 }
 
-function Nodes({ snapshot, onRemove, onClearOffline }: { snapshot: PublicSnapshot; onRemove: (workerId: string) => Promise<void>; onClearOffline: () => Promise<void> }) {
+function Nodes({
+  snapshot,
+  onRemove,
+  onClearOffline,
+  onListCredentials,
+  onRevokeCredential,
+}: {
+  snapshot: PublicSnapshot;
+  onRemove: (workerId: string) => Promise<void>;
+  onClearOffline: () => Promise<void>;
+  onListCredentials: () => Promise<WorkerCredentialSummary[]>;
+  onRevokeCredential: (
+    credential: Pick<WorkerCredentialSummary, "identityKind" | "identityId" | "fingerprint">,
+    reason: string,
+  ) => Promise<void>;
+}) {
   const [busy, setBusy] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [selectedWorkerId, setSelectedWorkerId] = useState("");
+  const [credentials, setCredentials] = useState<WorkerCredentialSummary[] | null>(null);
+  const [credentialError, setCredentialError] = useState<string | null>(null);
   const connectedWorkers = snapshot.workers.filter((worker) => worker.connected);
   const activeWorkers = snapshot.workers.filter((worker) => worker.connected && worker.status === "online");
   const physicalWorkers = snapshot.workers.filter((worker) => worker.kind !== "cell");
@@ -1148,6 +1219,37 @@ function Nodes({ snapshot, onRemove, onClearOffline }: { snapshot: PublicSnapsho
       await onClearOffline();
     } catch (error) {
       setActionError(friendlyModelMutationError(error));
+    } finally {
+      setBusy(null);
+    }
+  }
+  async function loadCredentials() {
+    setBusy("credentials");
+    setCredentialError(null);
+    try {
+      setCredentials(await onListCredentials());
+    } catch (error) {
+      setCredentialError(friendlyModelMutationError(error));
+    } finally {
+      setBusy(null);
+    }
+  }
+  async function revokeCredential(credential: WorkerCredentialSummary) {
+    if (
+      !window.confirm(
+        `Revocar el acceso de ${credential.identityId}? El dispositivo se desconectará y no podrá volver a entrar con esta clave.`,
+      )
+    ) return;
+    setBusy(`credential:${credential.fingerprint}`);
+    setCredentialError(null);
+    try {
+      await onRevokeCredential(
+        credential,
+        "Revocada manualmente desde el panel de red",
+      );
+      setCredentials(await onListCredentials());
+    } catch (error) {
+      setCredentialError(friendlyModelMutationError(error));
     } finally {
       setBusy(null);
     }
@@ -1196,6 +1298,71 @@ function Nodes({ snapshot, onRemove, onClearOffline }: { snapshot: PublicSnapsho
           {snapshot.workers.length === 0 && <div className="node-topology-empty"><Server /><strong>Aún no hay nodos</strong><span>Conecta una máquina para verla aparecer en la red.</span></div>}
         </div>
         {selectedWorker && <NodeTopologyInspector worker={selectedWorker} snapshot={snapshot} />}
+      </section>
+
+      <section className="device-trust-card">
+        <header>
+          <div>
+            <span>CONFIANZA DE DISPOSITIVOS</span>
+            <h2>Identidades firmadas</h2>
+            <p>Inventario administrativo de claves enroladas. Revocar corta la sesión activa y bloquea nuevos registros.</p>
+          </div>
+          <button
+            type="button"
+            disabled={busy !== null}
+            onClick={() => void loadCredentials()}
+          >
+            {busy === "credentials" ? <LoaderCircle className="spin" /> : <ShieldCheck />}
+            {credentials === null ? "Cargar identidades" : "Actualizar"}
+          </button>
+        </header>
+        {credentialError && <div className="inline-error" role="alert"><CircleAlert size={17} />{credentialError}</div>}
+        {credentials !== null && credentials.length === 0 && (
+          <div className="device-trust-empty">
+            <ShieldCheck />
+            <strong>Aún no hay credenciales enroladas</strong>
+            <span>Los dispositivos aparecerán aquí después de completar su primer reto firmado.</span>
+          </div>
+        )}
+        {credentials !== null && credentials.length > 0 && (
+          <div className="device-trust-list">
+            {credentials.map((credential) => (
+              <article key={`${credential.identityKind}:${credential.identityId}`}>
+                <div className="device-trust-identity">
+                  <div><LockKeyhole /></div>
+                  <span>
+                    <small>{credentialKindLabel(credential.identityKind)}</small>
+                    <strong>{credential.identityId}</strong>
+                    <em title={credential.fingerprint}>{shortFingerprint(credential.fingerprint)}</em>
+                  </span>
+                </div>
+                <div className="device-trust-meta">
+                  <span><small>Protocolo</small><strong>v{credential.protocolVersion}</strong></span>
+                  <span><small>Última prueba</small><strong>{relativeTimeEs(credential.lastSeenAt)}</strong></span>
+                  <span><small>Estado</small><strong className={credential.status}>{credential.status === "active" ? "Activa" : "Revocada"}</strong></span>
+                </div>
+                <div className="device-trust-action">
+                  {credential.status === "active" ? (
+                    <button
+                      type="button"
+                      disabled={busy !== null}
+                      onClick={() => void revokeCredential(credential)}
+                    >
+                      {busy === `credential:${credential.fingerprint}`
+                        ? <LoaderCircle className="spin" />
+                        : <CircleAlert />}
+                      Revocar acceso
+                    </button>
+                  ) : (
+                    <span title={credential.revocationReason ?? undefined}>
+                      {credential.revokedAt ? `Revocada ${relativeTimeEs(credential.revokedAt)}` : "Revocada"}
+                    </span>
+                  )}
+                </div>
+              </article>
+            ))}
+          </div>
+        )}
       </section>
 
       <NodeInventorySection eyebrow="DISPOSITIVOS INSTALADOS" title="Equipos físicos" workers={installedWorkers} snapshot={snapshot} busy={busy} onRemove={remove} />
@@ -2852,6 +3019,17 @@ function formatCompactTokens(value: number): string {
 }
 function formatPower(watts: number): string { return watts >= 1_000 ? `${(watts / 1_000).toFixed(1)} kW` : `${Math.round(watts)} W`; }
 function shortId(value: string) { return value.length <= 10 ? value : `${value.slice(0, 6)}…${value.slice(-4)}`; }
+function shortFingerprint(value: string) {
+  const digest = value.replace(/^sha256:/, "");
+  return digest.length <= 20 ? digest : `${digest.slice(0, 10)}…${digest.slice(-8)}`;
+}
+function credentialKindLabel(kind: WorkerCredentialSummary["identityKind"]) {
+  return kind === "browser"
+    ? "NAVEGADOR PWA"
+    : kind === "cell"
+      ? "CELDA DISTRIBUIDA"
+      : "DISPOSITIVO INSTALADO";
+}
 function formatMemory(value: number) { return value >= 1_024 ? `${(value / 1_024).toFixed(value >= 10_240 ? 0 : 1)} GB` : `${Math.round(value)} MB`; }
 function shouldShowAccelerationBanner(acceleration: AcceleratorProgressSnapshot): boolean {
   return acceleration.state !== "idle"

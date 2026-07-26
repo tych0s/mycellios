@@ -386,6 +386,25 @@ export interface SupportAssistantAdminResponse {
   runtime: SupportAssistantPublicConfig;
 }
 
+export interface WorkerCredentialSummary {
+  identityKind: "device" | "cell" | "browser";
+  identityId: string;
+  fingerprint: string;
+  status: "active" | "revoked";
+  protocolVersion: number;
+  createdAt: string;
+  updatedAt: string;
+  lastSeenAt: string;
+  revokedAt: string | null;
+  revocationReason: string | null;
+}
+
+export interface WorkerCredentialRevocationResponse {
+  state: "revoked" | "already_revoked";
+  disconnected: number;
+  credential: WorkerCredentialSummary;
+}
+
 export interface SupportAssistantChatRequest {
   sessionId: string;
   messages: Array<{ role: "user" | "assistant"; content: string }>;
@@ -411,6 +430,12 @@ export interface DesktopBridge {
   ): Promise<SupportAssistantAdminResponse>;
   removeWorker(workerId: string): Promise<DashboardSnapshot>;
   clearOfflineWorkers(): Promise<DashboardSnapshot>;
+  listWorkerCredentials(adminToken?: string): Promise<WorkerCredentialSummary[]>;
+  revokeWorkerCredential(
+    credential: Pick<WorkerCredentialSummary, "identityKind" | "identityId" | "fingerprint">,
+    reason: string,
+    adminToken?: string,
+  ): Promise<WorkerCredentialRevocationResponse>;
   searchHubModels(input: HubCatalogSearchInput): Promise<HubCatalogPage>;
   requestModel(input: RequestModelInput, adminToken?: string): Promise<DashboardSnapshot>;
   removeRequestedModel(modelId: string, adminToken?: string): Promise<DashboardSnapshot>;

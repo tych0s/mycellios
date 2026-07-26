@@ -63,6 +63,8 @@ import type {
   SupportAssistantAdminSettings,
   SupportAssistantChatRequest,
   SupportAssistantPublicConfig,
+  WorkerCredentialRevocationResponse,
+  WorkerCredentialSummary,
 } from "./contracts.js";
 import type {
   HubCatalogPage,
@@ -1114,6 +1116,39 @@ function registerIpc(): void {
     });
     return readSnapshot();
   });
+  ipcMain.handle("workers:credentials:list", async (_event, adminToken?: string) => {
+    const token = adminToken?.trim() || modelAdminToken;
+    const response = await fetchJson<{ data: WorkerCredentialSummary[] }>(
+      "public/v1/worker-credentials",
+      token ? { headers: { authorization: `Bearer ${token}` } } : undefined,
+    );
+    return response.data;
+  });
+  ipcMain.handle(
+    "workers:credentials:revoke",
+    async (
+      _event,
+      credential: Pick<WorkerCredentialSummary, "identityKind" | "identityId" | "fingerprint">,
+      reason: string,
+      adminToken?: string,
+    ) => {
+      const token = adminToken?.trim() || modelAdminToken;
+      return fetchJson<WorkerCredentialRevocationResponse>(
+        `public/v1/worker-credentials/${encodeURIComponent(credential.identityKind)}/${encodeURIComponent(credential.identityId)}/revoke`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            ...(token ? { authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify({
+            expectedFingerprint: credential.fingerprint,
+            reason,
+          }),
+        },
+      );
+    },
+  );
   ipcMain.handle("models:search-hub", async (_event, input: HubCatalogSearchInput) => {
     const parameters = new URLSearchParams({
       q: input.query,
