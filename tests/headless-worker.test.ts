@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { resolve } from "node:path";
 import type { PhysicalProbeV1 } from "../src/distribution/physical-probe.js";
 import {
   buildPhysicalIdentity,
@@ -57,7 +58,7 @@ describe("headless GpuCloud worker", () => {
     expect(environment.nodeId).not.toContain(machineId);
     expect(environment.provider).toBe("gpu_cloud");
     expect(environment.configPath).toBe(
-      "/opt/mycellios/config/worker.gpu_cloud.example.json",
+      resolve("/opt/mycellios", "./config/worker.gpu_cloud.example.json"),
     );
   });
 
