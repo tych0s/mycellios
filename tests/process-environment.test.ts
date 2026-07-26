@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   buildIsolatedProcessEnvironment,
   ISOLATED_PROCESS_INHERITED_ENVIRONMENT_KEYS,
+  normalizeExecutorIsolationPolicy,
+  validateExecutorIsolationPolicy,
 } from "../src/distribution/process-environment.js";
 
 describe("isolated process environment", () => {
@@ -58,6 +60,50 @@ describe("isolated process environment", () => {
     );
     expect(ISOLATED_PROCESS_INHERITED_ENVIRONMENT_KEYS).not.toContain(
       "HTTPS_PROXY",
+    );
+  });
+
+  it("normalizes an honest versioned executor policy", () => {
+    const policy = normalizeExecutorIsolationPolicy({
+      maxOutputBytesPerStream: 128 * 1024,
+      stopGraceMs: 12_000,
+    });
+
+    expect(policy).toMatchObject({
+      schema: "gdlp-executor-isolation/1",
+      environmentPolicy:
+        "inherit-reviewed-system-keys-plus-trusted-overrides",
+      executablePolicy: "exact-prepared-command",
+      workspacePolicy: "shared-read-write",
+      processTreePolicy: "direct-child-only",
+      resourceLimitPolicy: "not-enforced",
+      maxOutputBytesPerStream: 128 * 1024,
+      stopGraceMs: 12_000,
+    });
+    expect(policy.inheritedEnvironmentKeys).toEqual(
+      ISOLATED_PROCESS_INHERITED_ENVIRONMENT_KEYS,
+    );
+    expect(() => validateExecutorIsolationPolicy(policy)).not.toThrow();
+  });
+
+  it("rejects claims for controls the executor cannot enforce yet", () => {
+    const policy = normalizeExecutorIsolationPolicy();
+    const falseClaim = {
+      ...policy,
+      resourceLimitPolicy: "os-enforced",
+    };
+
+    expect(() => validateExecutorIsolationPolicy(falseClaim)).toThrow(
+      "executor_isolation_resource_limit_policy_is_unsupported",
+    );
+  });
+
+  it("rejects changes to the reviewed inherited environment", () => {
+    const policy = normalizeExecutorIsolationPolicy();
+    policy.inheritedEnvironmentKeys.push("MYCELLIOS_NETWORK_TOKEN");
+
+    expect(() => validateExecutorIsolationPolicy(policy)).toThrow(
+      "executor_isolation_environment_allowlist_mismatch",
     );
   });
 });

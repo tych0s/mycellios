@@ -15,6 +15,11 @@ import type {
   MacroWavePlanContractV1,
   MacroWaveStageExecutionContractV1,
 } from "./types.js";
+import {
+  normalizeExecutorIsolationPolicy,
+  type ExecutorIsolationPolicyOptions,
+  type ExecutorIsolationPolicyV1,
+} from "./process-environment.js";
 
 const GDLP_FRAME_HEADER_BYTES = 32n;
 const DEFAULT_PREFILL_INFLIGHT_BYTES = 64 * 1024 * 1024;
@@ -224,6 +229,13 @@ export interface PythonLaunchCompilerOptions {
    * incompatible cache backend.
    */
   pagedKvStages?: Record<string, PythonPagedKvStageInput>;
+  /**
+   * Process-boundary controls sealed into every physical launch request.
+   * The compact form is expanded to an honest, versioned policy.
+   */
+  executorIsolation?:
+    | ExecutorIsolationPolicyOptions
+    | ExecutorIsolationPolicyV1;
 }
 
 export interface PythonRecoveryStandbyRouteInput {
@@ -410,6 +422,8 @@ export interface PythonLaunchConfiguration {
   ramBackedMoeStages: Record<string, PythonRamBackedMoeStageConfiguration>;
   /** Sorted, complete bindings for the native paged-KV runner. */
   pagedKvStages: Record<string, PythonPagedKvStageConfiguration>;
+  /** Versioned controls enforced by the worker before spawning a process. */
+  executorIsolation: ExecutorIsolationPolicyV1;
 }
 
 export interface PythonPrefillLaunchSettings {
@@ -471,6 +485,8 @@ interface PythonLaunchBase {
   members: RuntimeStageMemberManifest[];
   /** Preserved contract; null is the unchanged resident layer-range path. */
   macroWave: MacroWaveStageExecutionContractV1 | null;
+  /** Sealed process-boundary controls; remote workers reject mismatches. */
+  isolation: ExecutorIsolationPolicyV1;
   command: PythonStageCommand;
 }
 
@@ -688,6 +704,7 @@ function buildDescription(
           },
           members: structuredClone(stage.members),
           macroWave: null,
+          isolation: structuredClone(configuration.executorIsolation),
           rank,
           fixturePath: external.rankFixturePaths[rank]!,
           pipelineSnapshotIdentity,
@@ -732,6 +749,7 @@ function buildDescription(
       anchor: structuredClone(stage.anchor),
       members: structuredClone(stage.members),
       macroWave: macroWave ? structuredClone(macroWave) : null,
+      isolation: structuredClone(configuration.executorIsolation),
       downstream,
       returnEndpoint: { ...configuration.returnEndpoint },
       cell: cell ? structuredClone(cell) : null,
@@ -775,6 +793,7 @@ function buildDescription(
     macroWave: rootStage.macroWave
       ? structuredClone(rootStage.macroWave)
       : null,
+    isolation: structuredClone(configuration.executorIsolation),
     boundaries,
     firstRemoteStage,
     apiEndpoint: { ...configuration.apiEndpoint },
@@ -1455,6 +1474,7 @@ function normalizeConfiguration(
       "nativeGgufStages",
       "ramBackedMoeStages",
       "pagedKvStages",
+      "executorIsolation",
     ],
     "python_launch_options_have_unknown_or_missing_fields",
   );
@@ -1716,6 +1736,9 @@ function normalizeConfiguration(
     maxRetainedSessions,
   );
   const recovery = normalizeRecoveryConfiguration(manifest, value.recovery);
+  const executorIsolation = normalizeExecutorIsolationPolicy(
+    value.executorIsolation,
+  );
   const normalized: PythonLaunchConfiguration = {
     apiEndpoint: { ...value.apiEndpoint },
     returnEndpoint: { ...value.returnEndpoint },
@@ -1785,6 +1808,7 @@ function normalizeConfiguration(
     nativeGgufStages,
     ramBackedMoeStages,
     pagedKvStages,
+    executorIsolation,
   };
   if (requireNormalized && canonicalJson(value) !== canonicalJson(normalized)) {
     throw new Error("python_launch_configuration_is_not_normalized");

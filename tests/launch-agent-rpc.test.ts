@@ -408,6 +408,16 @@ describe("HTTP LaunchAgent RPC", () => {
     );
   });
 
+  it("rejects an executor isolation claim the worker cannot enforce", () => {
+    const request = fixtureRequest();
+    request.process.isolation.resourceLimitPolicy =
+      "os-enforced" as "not-enforced";
+
+    expect(() => validateLaunchAgentRpcStartRequest(request)).toThrow(
+      "executor_isolation_resource_limit_policy_is_unsupported",
+    );
+  });
+
   it("validates a native GGUF binding and exact argv on the root engine", () => {
     const description = fixtureDescription();
     const root = description.launchOrder.find((process) => process.kind === "root-engine")!;

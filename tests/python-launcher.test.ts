@@ -700,6 +700,41 @@ describe("GDLP/2 Python launch compiler", () => {
     expect(() => validatePythonLaunchDescription(first)).not.toThrow();
   });
 
+  it("seals the executor isolation policy into every process and launch identity", () => {
+    const defaultLaunch = compile();
+    const stricterDiagnostics = compile(manifest(), {
+      executorIsolation: {
+        maxOutputBytesPerStream: 32 * 1024,
+        stopGraceMs: 4_000,
+      },
+    });
+
+    expect(defaultLaunch.configuration.executorIsolation).toMatchObject({
+      schema: "gdlp-executor-isolation/1",
+      workspacePolicy: "shared-read-write",
+      processTreePolicy: "direct-child-only",
+      resourceLimitPolicy: "not-enforced",
+    });
+    for (const process of defaultLaunch.launchOrder) {
+      expect(process.isolation).toEqual(
+        defaultLaunch.configuration.executorIsolation,
+      );
+    }
+    expect(stricterDiagnostics.launchId).not.toBe(defaultLaunch.launchId);
+    expect(stricterDiagnostics.configuration.executorIsolation).toMatchObject({
+      maxOutputBytesPerStream: 32 * 1024,
+      stopGraceMs: 4_000,
+    });
+    expect(() => validatePythonLaunchDescription(stricterDiagnostics)).not.toThrow();
+
+    const tampered = structuredClone(defaultLaunch);
+    tampered.launchOrder[0]!.isolation.resourceLimitPolicy =
+      "os-enforced" as "not-enforced";
+    expect(() => validatePythonLaunchDescription(tampered)).toThrow(
+      "python_launch_description_mismatch",
+    );
+  });
+
   it("launches stages N-1..1 downstream-first and the root engine last", () => {
     const description = compile();
     expect(description.launchOrder.map((entry) => entry.stageIndex)).toEqual([2, 1, 0]);

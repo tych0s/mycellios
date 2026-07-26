@@ -35,6 +35,7 @@ import {
   validatePythonLaunchDescription,
   type PythonPipelineLaunchDescription,
 } from "../distribution/python-launcher.js";
+import { validateExecutorIsolationPolicy } from "../distribution/process-environment.js";
 import { MAX_RUNTIME_STREAM_CHUNK_BYTES } from "../contracts/worker-protocol.js";
 import {
   RuntimeStreamTunnel,
@@ -1861,6 +1862,19 @@ function isLaunchAgentStartRequest(value: unknown): value is LaunchAgentStartReq
   ) return false;
   const process = request.process as Record<string, unknown>;
   const anchor = process.anchor;
-  return typeof process.processId === "string" && !!anchor && typeof anchor === "object" &&
-    !Array.isArray(anchor) && (anchor as Record<string, unknown>).memberId === request.nodeId;
+  if (
+    typeof process.processId !== "string"
+    || !anchor
+    || typeof anchor !== "object"
+    || Array.isArray(anchor)
+    || (anchor as Record<string, unknown>).memberId !== request.nodeId
+  ) {
+    return false;
+  }
+  try {
+    validateExecutorIsolationPolicy(process.isolation);
+    return true;
+  } catch {
+    return false;
+  }
 }

@@ -33,6 +33,7 @@ import {
   nativeBuildIdentitySchema,
   type NativeBuildIdentity,
 } from "../contracts/build-identity.js";
+import { validateExecutorIsolationPolicy } from "./process-environment.js";
 
 const START_SCHEMA = "gdlp-launch-agent-start/1";
 const STOP_SCHEMA = "gdlp-launch-agent-stop/1";
@@ -1081,6 +1082,7 @@ function validatePythonLaunchProcess(value: unknown, nodeId: string): asserts va
     "anchor",
     "members",
     "macroWave",
+    "isolation",
     "command",
   ];
   const variant =
@@ -1110,6 +1112,7 @@ function validatePythonLaunchProcess(value: unknown, nodeId: string): asserts va
             "decode",
           ];
   assertExactKeys(value, [...common, ...variant], [], "python_launch_process");
+  validateExecutorIsolationPolicy(value.isolation);
   for (const name of ["launchIndex", "stageIndex", "layerStart", "layerEnd", "totalLayers"] as const) {
     assertInteger(value[name], 0, Number.MAX_SAFE_INTEGER, `python_launch_${name}`);
   }

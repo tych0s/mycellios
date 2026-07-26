@@ -25,6 +25,7 @@ import type {
   DistributionPlan,
   DistributionWorkload,
 } from "../src/distribution/types.js";
+import { normalizeExecutorIsolationPolicy } from "../src/distribution/process-environment.js";
 
 const MIB = 1024 * 1024;
 
@@ -363,6 +364,31 @@ describe("Python launch supervisor", () => {
     expect(local.id).toBe("explicit-local");
   });
 
+  it("rejects a sealed process policy above the local agent ceilings", async () => {
+    const description = fixtureDescription();
+    const process = structuredClone(description.launchOrder[0]!);
+    process.isolation = normalizeExecutorIsolationPolicy({
+      maxOutputBytesPerStream: 128 * 1024,
+    });
+    const local = new LocalProcessAgent({
+      id: "bounded-local",
+      allowedExecutables: [process.command.executable],
+      maxOutputBytesPerStream: 64 * 1024,
+    });
+
+    await expect(
+      local.start(
+        {
+          launchId: description.launchId,
+          pipelineId: description.pipelineId,
+          nodeId: process.anchor.memberId,
+          process,
+        },
+        new AbortController().signal,
+      ),
+    ).rejects.toThrow("local_process_output_limit_exceeds_agent_ceiling");
+  });
+
   it("pins the exact prepared interpreter before spawning a local process", async () => {
     const local = new LocalProcessAgent({
       id: "pinned-local",
@@ -375,6 +401,7 @@ describe("Python launch supervisor", () => {
       process: {
         processId: "pinned-process",
         kind: "root-engine",
+        isolation: normalizeExecutorIsolationPolicy(),
         command: {
           executable: `${process.execPath}.untrusted`,
           args: ["-e", "process.exit(0)"],
@@ -403,6 +430,10 @@ describe("Python launch supervisor", () => {
       process: {
         processId: "tail-capture-process",
         kind: "root-engine",
+        isolation: normalizeExecutorIsolationPolicy({
+          maxOutputBytesPerStream: 1_024,
+          stopGraceMs: 1_000,
+        }),
         command: {
           executable: process.execPath,
           args: [
@@ -444,6 +475,7 @@ describe("Python launch supervisor", () => {
         process: {
           processId: "isolated-environment-process",
           kind: "root-engine",
+          isolation: normalizeExecutorIsolationPolicy(),
           command: {
             executable: process.execPath,
             args: [

@@ -6,7 +6,10 @@ import {
   type PythonLaunchProcess,
   type PythonPipelineLaunchDescription,
 } from "./python-launcher.js";
-import { buildIsolatedProcessEnvironment } from "./process-environment.js";
+import {
+  buildIsolatedProcessEnvironment,
+  validateExecutorIsolationPolicy,
+} from "./process-environment.js";
 
 export type LaunchSupervisorState =
   | "idle"
@@ -541,6 +544,15 @@ export class LocalProcessAgent implements LaunchAgent {
     signal: AbortSignal,
   ): Promise<LaunchProcessHandle> {
     if (signal.aborted) throw cancellationFromSignal(signal);
+    validateExecutorIsolationPolicy(request.process.isolation);
+    if (
+      request.process.isolation.maxOutputBytesPerStream > this.maxOutputBytes
+    ) {
+      throw new Error("local_process_output_limit_exceeds_agent_ceiling");
+    }
+    if (request.process.isolation.stopGraceMs > this.stopGraceMs) {
+      throw new Error("local_process_stop_grace_exceeds_agent_ceiling");
+    }
     const command = request.process.command;
     if (
       !this.allowedExecutables.has(localExecutableIdentity(command.executable))
@@ -560,8 +572,8 @@ export class LocalProcessAgent implements LaunchAgent {
     const handle = new LocalProcessHandle(
       child,
       request.process,
-      this.maxOutputBytes,
-      this.stopGraceMs,
+      request.process.isolation.maxOutputBytesPerStream,
+      request.process.isolation.stopGraceMs,
       this.readyWhen,
     );
     const abort = () => {
