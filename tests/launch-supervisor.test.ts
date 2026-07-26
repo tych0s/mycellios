@@ -455,6 +455,51 @@ describe("Python launch supervisor", () => {
     await handle.exited;
   });
 
+  it("terminates the ordinary descendant process tree", async () => {
+    const marker = "PROCESS_TREE_READY";
+    const local = new LocalProcessAgent({
+      id: "process-tree-local",
+      allowedExecutables: [process.execPath],
+      stopGraceMs: 2_000,
+      readyWhen: ({ recentStdout }) => recentStdout.includes(marker),
+    });
+    const request = {
+      launchId: "process-tree-launch",
+      pipelineId: "process-tree-pipeline",
+      nodeId: "local-node",
+      process: {
+        processId: "process-tree-root",
+        kind: "root-engine",
+        isolation: normalizeExecutorIsolationPolicy({
+          stopGraceMs: 1_000,
+        }),
+        command: {
+          executable: process.execPath,
+          args: [
+            "-e",
+            `const { spawn } = require("node:child_process"); const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" }); process.stdout.write("${marker}:" + JSON.stringify({ root: process.pid, descendant: descendant.pid }) + "\\n"); setInterval(() => {}, 1000);`,
+          ],
+        },
+      },
+    } as unknown as LaunchAgentStartRequest;
+
+    const handle = await local.start(request, new AbortController().signal);
+    await handle.ready;
+    const output = handle.output?.().stdout ?? "";
+    const encoded = output.split(`${marker}:`)[1]?.trim();
+    const pids = JSON.parse(encoded ?? "{}") as {
+      root: number;
+      descendant: number;
+    };
+    expect(isProcessAlive(pids.root)).toBe(true);
+    expect(isProcessAlive(pids.descendant)).toBe(true);
+
+    await handle.stop("tree_test_complete");
+    await handle.exited;
+    expect(await processBecomesDead(pids.root, 3_000)).toBe(true);
+    expect(await processBecomesDead(pids.descendant, 3_000)).toBe(true);
+  }, 15_000);
+
   it("does not leak an ungranted parent secret into the executor", async () => {
     const inheritedSecretName = "MYCELLIOS_TEST_PARENT_SECRET_DO_NOT_INHERIT";
     const previous = process.env[inheritedSecretName];
@@ -521,6 +566,28 @@ describe("Python launch supervisor", () => {
     expect(setup.trace.stops).toEqual([]);
   });
 });
+
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid < 1) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function processBecomesDead(
+  pid: number,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(pid)) return true;
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  }
+  return !isProcessAlive(pid);
+}
 
 function deferred<T>(): {
   promise: Promise<T>;

@@ -70,12 +70,12 @@ describe("isolated process environment", () => {
     });
 
     expect(policy).toMatchObject({
-      schema: "gdlp-executor-isolation/2",
+      schema: "gdlp-executor-isolation/3",
       environmentPolicy:
         "inherit-reviewed-system-keys-plus-trusted-overrides",
       executablePolicy: "exact-prepared-command",
       workspacePolicy: "private-temp-shared-runtime",
-      processTreePolicy: "direct-child-only",
+      processTreePolicy: "best-effort-process-tree",
       resourceLimitPolicy: "not-enforced",
       maxOutputBytesPerStream: 128 * 1024,
       stopGraceMs: 12_000,

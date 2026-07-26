@@ -38,7 +38,7 @@ export const ISOLATED_PROCESS_INHERITED_ENVIRONMENT_KEYS = Object.freeze([
   "HIP_PATH",
 ] as const);
 
-export const EXECUTOR_ISOLATION_SCHEMA = "gdlp-executor-isolation/2" as const;
+export const EXECUTOR_ISOLATION_SCHEMA = "gdlp-executor-isolation/3" as const;
 
 export interface ExecutorIsolationPolicyOptions {
   maxOutputBytesPerStream?: number;
@@ -52,13 +52,13 @@ export interface ExecutorIsolationPolicyOptions {
  * yet. A launch cannot claim an OS sandbox, a process-tree boundary or resource
  * quotas until the corresponding native backend can enforce them.
  */
-export interface ExecutorIsolationPolicyV2 {
+export interface ExecutorIsolationPolicyV3 {
   schema: typeof EXECUTOR_ISOLATION_SCHEMA;
   environmentPolicy: "inherit-reviewed-system-keys-plus-trusted-overrides";
   inheritedEnvironmentKeys: string[];
   executablePolicy: "exact-prepared-command";
   workspacePolicy: "private-temp-shared-runtime";
-  processTreePolicy: "direct-child-only";
+  processTreePolicy: "best-effort-process-tree";
   resourceLimitPolicy: "not-enforced";
   maxOutputBytesPerStream: number;
   stopGraceMs: number;
@@ -106,8 +106,8 @@ export function buildIsolatedProcessEnvironment(
  * time; normalized launch descriptions always carry the complete contract.
  */
 export function normalizeExecutorIsolationPolicy(
-  value?: ExecutorIsolationPolicyOptions | ExecutorIsolationPolicyV2 | null,
-): ExecutorIsolationPolicyV2 {
+  value?: ExecutorIsolationPolicyOptions | ExecutorIsolationPolicyV3 | null,
+): ExecutorIsolationPolicyV3 {
   if (value !== undefined && value !== null && !isRecord(value)) {
     throw new Error("executor_isolation_policy_must_be_an_object");
   }
@@ -140,7 +140,7 @@ export function normalizeExecutorIsolationPolicy(
     if (source.workspacePolicy !== "private-temp-shared-runtime") {
       throw new Error("executor_isolation_workspace_policy_is_unsupported");
     }
-    if (source.processTreePolicy !== "direct-child-only") {
+    if (source.processTreePolicy !== "best-effort-process-tree") {
       throw new Error("executor_isolation_process_tree_policy_is_unsupported");
     }
     if (source.resourceLimitPolicy !== "not-enforced") {
@@ -156,7 +156,7 @@ export function normalizeExecutorIsolationPolicy(
     inheritedEnvironmentKeys: [...ISOLATED_PROCESS_INHERITED_ENVIRONMENT_KEYS],
     executablePolicy: "exact-prepared-command",
     workspacePolicy: "private-temp-shared-runtime",
-    processTreePolicy: "direct-child-only",
+    processTreePolicy: "best-effort-process-tree",
     resourceLimitPolicy: "not-enforced",
     maxOutputBytesPerStream: boundedInteger(
       source.maxOutputBytesPerStream ?? 64 * 1024,
@@ -175,12 +175,12 @@ export function normalizeExecutorIsolationPolicy(
 
 export function validateExecutorIsolationPolicy(
   value: unknown,
-): asserts value is ExecutorIsolationPolicyV2 {
+): asserts value is ExecutorIsolationPolicyV3 {
   if (!isRecord(value) || value.schema === undefined) {
     throw new Error("executor_isolation_policy_is_not_normalized");
   }
   normalizeExecutorIsolationPolicy(
-    value as unknown as ExecutorIsolationPolicyV2,
+    value as unknown as ExecutorIsolationPolicyV3,
   );
 }
 

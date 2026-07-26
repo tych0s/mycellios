@@ -710,9 +710,9 @@ describe("GDLP/2 Python launch compiler", () => {
     });
 
     expect(defaultLaunch.configuration.executorIsolation).toMatchObject({
-      schema: "gdlp-executor-isolation/2",
+      schema: "gdlp-executor-isolation/3",
       workspacePolicy: "private-temp-shared-runtime",
-      processTreePolicy: "direct-child-only",
+      processTreePolicy: "best-effort-process-tree",
       resourceLimitPolicy: "not-enforced",
     });
     for (const process of defaultLaunch.launchOrder) {

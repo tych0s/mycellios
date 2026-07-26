@@ -14,6 +14,10 @@ import {
   createExecutorWorkspace,
   type ExecutorWorkspaceLease,
 } from "./executor-workspace.js";
+import {
+  processTreeSpawnOptions,
+  terminateProcessTree,
+} from "./process-tree.js";
 
 export type LaunchSupervisorState =
   | "idle"
@@ -578,6 +582,7 @@ export class LocalProcessAgent implements LaunchAgent {
       shell: false,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"] as ["ignore", "pipe", "pipe"],
+      ...processTreeSpawnOptions(),
       ...(this.cwd ? { cwd: this.cwd } : {}),
       env: buildIsolatedProcessEnvironment(
         {
@@ -724,9 +729,11 @@ class LocalProcessHandle implements LaunchProcessHandle {
 
   private async stopInternal(): Promise<void> {
     if (this.didExit) return;
-    this.child.kill("SIGTERM");
+    await terminateProcessTree(this.child, false, this.stopGraceMs);
     if (await settlesWithin(this.exited, this.stopGraceMs)) return;
-    if (!this.didExit) this.child.kill("SIGKILL");
+    if (!this.didExit) {
+      await terminateProcessTree(this.child, true, this.stopGraceMs);
+    }
     if (!(await settlesWithin(this.exited, this.stopGraceMs))) {
       throw new Error(`local_process_did_not_exit:${this.process.processId}`);
     }
