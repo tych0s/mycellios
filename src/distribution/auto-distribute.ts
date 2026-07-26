@@ -32,6 +32,7 @@ import type {
   DistributionWorkload,
   StagePlacement,
 } from "./types.js";
+import { UNMEASURED_RTT_MS } from "../core/rtt.js";
 
 export const AUTO_DISTRIBUTE_SCHEMA = "gdlp-auto-distribute/1";
 export const MODEL_PROFILE_SCHEMA = "gdlp-model-profile/1";
@@ -663,11 +664,16 @@ function runtimeTopology(config: AutoDistributionConfig): RuntimeTopology {
       if (override) {
         links.push({ ...override });
       } else {
+        // Arista sin medir. Antes se rellenaba con `sameRegion ? 1 : 35`, que
+        // premiaba justo al enlace del que no sabemos nada: un nodo sin sonda
+        // entraba en el plan por delante de uno medido a 40 ms. La etiqueta de
+        // región tampoco autoriza el optimismo — dos nodos etiquetados `us`
+        // midieron 65 y 132 ms en Exp15. Sin muestra, se cobra el centinela.
         const sameRegion = from.region === to.region;
         links.push({
           from: from.id,
           to: to.id,
-          oneWayLatencyMs: sameRegion ? 1 : 35,
+          oneWayLatencyMs: UNMEASURED_RTT_MS,
           jitterP95Ms: sameRegion ? 0.25 : 5,
           bandwidthMbps: sameRegion ? 1_000 : 100,
           lossRate: 0,
@@ -697,6 +703,13 @@ function exactStagePlan(request: RuntimePlanRequest, count: number): Distributio
     .map((node) => node.id);
   const orders = uniqueOrders([
     [...preferred, ...remaining].slice(0, count),
+    // Orden por LATENCIA de la cadena. Sin este candidato, los otros cuatro
+    // órdenes se derivan solo de `decodeScale` y `memoryBytes`, de modo que con
+    // nodos de cómputo parecido todos degeneran en orden de declaración y un
+    // nodo cercano no llega a enumerarse nunca. `evaluateDistributionPlan` sí
+    // puntúa `tpotMs`, pero no puede rescatar una opción que nadie propuso: la
+    // enumeración es la que decide, no la puntuación.
+    latencyGreedyOrder(request, preferred[0], count),
     request.topology.nodes.map((node) => node.id).slice(0, count),
     request.topology.nodes
       .slice()
@@ -732,6 +745,56 @@ function exactStagePlan(request: RuntimePlanRequest, count: number): Distributio
   }
   if (!best) throw new Error(`no_feasible_automatic_${count}_stage_pipeline`);
   return best.plan;
+}
+
+/**
+ * Encadena los nodos por vecino más cercano según el RTT medido de la arista.
+ *
+ * Una tubería de etapas paga cada frontera en serie, así que el orden importa
+ * tanto como el conjunto: los mismos tres nodos en distinto orden dan TPOT muy
+ * distintos. Esto es un heurístico de vecino más cercano, no un óptimo — el
+ * óptimo es un camino hamiltoniano mínimo y no compensa resolverlo aquí, porque
+ * el candidato solo tiene que ser lo bastante bueno para que
+ * `evaluateDistributionPlan` lo puntúe frente a los órdenes por cómputo.
+ *
+ * Arranca en el nodo raíz preferido, porque la etapa 0 es la que habla con la
+ * API y moverla tiene otros costes que este heurístico no ve.
+ */
+function latencyGreedyOrder(
+  request: RuntimePlanRequest,
+  root: string | undefined,
+  count: number,
+): string[] {
+  const ids = request.topology.nodes.map((node) => node.id);
+  if (ids.length === 0) return [];
+  const cost = new Map<string, number>();
+  for (const link of request.topology.links) {
+    cost.set(`${link.from} ${link.to}`, link.oneWayLatencyMs);
+  }
+  const linkMs = (from: string, to: string): number =>
+    // Una arista no declarada se cobra como no medida, igual que en
+    // `runtimeTopology`. No declarar un enlace no puede salir barato.
+    cost.get(`${from} ${to}`) ?? UNMEASURED_RTT_MS;
+
+  const start = root && ids.includes(root) ? root : ids[0]!;
+  const ordered = [start];
+  const pending = new Set(ids.filter((id) => id !== start));
+  while (pending.size > 0 && ordered.length < count) {
+    const tail = ordered.at(-1)!;
+    let best: string | null = null;
+    let bestMs = Number.POSITIVE_INFINITY;
+    for (const candidate of pending) {
+      const ms = linkMs(tail, candidate);
+      if (ms < bestMs) {
+        bestMs = ms;
+        best = candidate;
+      }
+    }
+    if (best === null) break;
+    ordered.push(best);
+    pending.delete(best);
+  }
+  return ordered.slice(0, count);
 }
 
 function planningNodes(topology: RuntimeTopology): ComputeNodeProfile[] {

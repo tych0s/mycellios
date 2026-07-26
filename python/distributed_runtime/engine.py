@@ -2257,6 +2257,30 @@ class DistributedPipelineEngine:
             int(token) for token in job.request.input_ids.reshape(-1).tolist()
         )
         served = prompt_ids + tuple(job.token_ids)
+        # `kv_valid` se adelanta en el DESPACHO de la ola (ver los dos `+=` del
+        # bucle de despacho raíz). En la ruta secuencial es sólido: la ola de
+        # decode reenvía un token ya emitido. Con varias olas en vuelo deja de
+        # serlo — una ola despachada tras una divergencia adelanta posiciones
+        # que nunca se comprometen.
+        #
+        # Aquí es donde ese error se vuelve DURABLE: `kv_valid` se persiste en
+        # la sesión retenida y gobierna la reutilización de prefijo del turno
+        # siguiente. Un valor inflado haría reutilizar KV que no codifica la
+        # secuencia servida, y eso rompe la exactitud de tokens en silencio, en
+        # otro turno y sin traza.
+        #
+        # No se corrige el valor: se hace cumplir la invariante que el propio
+        # tipo declara. Un fallo ruidoso aquí es infinitamente preferible a una
+        # campaña de medición cuyos tokens divergen por una causa invisible.
+        if job.kv_valid > len(served):
+            raise RuntimeError(
+                "kv_valid invariant violated: "
+                f"{job.kv_valid} valid positions > {len(served)} served tokens "
+                f"(prompt {len(prompt_ids)} + emitted {len(job.token_ids)}) "
+                f"on wire {job.wire_id}. El KV afirma codificar más secuencia de "
+                f"la que se ha comprometido; retener esta sesión corrompería la "
+                f"reutilización de prefijo del siguiente turno."
+            )
         kv_tokens = runner.sequence_length(job.wire_id)
         now = time.monotonic()
         if session is None:

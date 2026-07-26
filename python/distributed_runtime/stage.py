@@ -15,6 +15,7 @@ from typing import Any
 
 import torch
 
+from .compute_timing import ComputeTimer
 from .device import normalize_torch_device_request
 from .model import (
     MAX_PHYSICAL_STAGE_BATCH_SIZE,
@@ -681,7 +682,14 @@ def begin_stage_request(
         **executor_metric_fields(runner),
         "execution": execution_metric_snapshot(runner),
         "frames": 0,
+        # Los dos acumuladores existen siempre y solo uno se llena, según el
+        # régimen de medida. Un `compute_ms` a cero con
+        # `compute_timing_mode="dispatch"` se lee como "no medido en kernel
+        # time", que es visiblemente distinto de un número plausible pero mal
+        # medido. El fallo ruidoso es el que queremos.
         "compute_ms": 0,
+        "compute_dispatch_ms": 0,
+        "compute_timing_mode": None,
         "bytes_out": 0,
         "tokens": 0,
         "model_forward_calls": 0,
@@ -1376,6 +1384,8 @@ def fork_physical_stage_request(
         child_metrics.update(
             {
                 "compute_ms": 0,
+                "compute_dispatch_ms": 0,
+                "compute_timing_mode": None,
                 "bytes_out": 0,
                 "tokens": source_tokens,
                 "model_forward_calls": 0,
@@ -1917,32 +1927,38 @@ def process_activation_frames(
     token_mode = activation_token_mode(frames[0].frame_type)
     hidden_states = tuple(decode_tensor(frame) for frame in frames)
     timings_ms: tuple[float, ...]
+    # El régimen de medida viaja con el dato. Sin `GDLP_COMPUTE_TIMING=sync`
+    # esto cronometra el DESPACHO del forward, no su ejecución en el
+    # dispositivo, y por eso se publica bajo `compute_dispatch_ms`. Ver
+    # `compute_timing.py`: publicar un tiempo sin sincronizar bajo el nombre
+    # `compute_ms` es lo que convertiría el término C en otro número fantasma.
+    timer = ComputeTimer()
     if len(frames) > 1:
         batch_forward = getattr(runner, "forward_hidden_batch", None)
         if not callable(batch_forward):
             raise TypeError("runner advertised a physical batch key without a batch forward")
-        started = time.perf_counter()
-        results = tuple(
-            batch_forward(
-                tuple(frame.request_id for frame in frames),
-                hidden_states,
-                token_mode=token_mode,
+        with timer.measure() as measurement:
+            results = tuple(
+                batch_forward(
+                    tuple(frame.request_id for frame in frames),
+                    hidden_states,
+                    token_mode=token_mode,
+                )
             )
-        )
-        elapsed_ms = (time.perf_counter() - started) * 1_000
         if len(results) != len(frames):
             raise RuntimeError("physical batch returned the wrong number of results")
-        timings_ms = (elapsed_ms,) * len(frames)
+        timings_ms = (measurement.elapsed_ms,) * len(frames)
     else:
-        started = time.perf_counter()
-        results = (
-            runner.forward_hidden(
-                frames[0].request_id,
-                hidden_states[0],
-                token_mode=token_mode,
-            ),
-        )
-        timings_ms = ((time.perf_counter() - started) * 1_000,)
+        with timer.measure() as measurement:
+            results = (
+                runner.forward_hidden(
+                    frames[0].request_id,
+                    hidden_states[0],
+                    token_mode=token_mode,
+                ),
+            )
+        timings_ms = (measurement.elapsed_ms,)
+    compute_metric_key = measurement.metric_key()
 
     physical_size = len(frames)
     for frame, result, compute_ms in zip(frames, results, timings_ms, strict=True):
@@ -1952,7 +1968,8 @@ def process_activation_frames(
         if not isinstance(output, torch.Tensor):
             raise TypeError("stage runner output must be a tensor")
         metrics = request_metrics[frame.request_id]
-        metrics["compute_ms"] += compute_ms
+        metrics[compute_metric_key] = metrics.get(compute_metric_key, 0) + compute_ms
+        metrics["compute_timing_mode"] = timer.mode
         metrics["frames"] += 1
         metrics["tokens"] += frame.token_count
         metrics["model_forward_calls"] += 1
