@@ -411,7 +411,7 @@ describe("HTTP LaunchAgent RPC", () => {
   it("rejects an executor isolation claim the worker cannot enforce", () => {
     const request = fixtureRequest();
     request.process.isolation.resourceLimitPolicy =
-      "os-enforced" as "not-enforced";
+      "os-enforced" as "workspace-watchdog-only";
 
     expect(() => validateLaunchAgentRpcStartRequest(request)).toThrow(
       "executor_isolation_resource_limit_policy_is_unsupported",

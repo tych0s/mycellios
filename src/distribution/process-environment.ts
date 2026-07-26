@@ -38,11 +38,14 @@ export const ISOLATED_PROCESS_INHERITED_ENVIRONMENT_KEYS = Object.freeze([
   "HIP_PATH",
 ] as const);
 
-export const EXECUTOR_ISOLATION_SCHEMA = "gdlp-executor-isolation/3" as const;
+export const EXECUTOR_ISOLATION_SCHEMA = "gdlp-executor-isolation/4" as const;
 
 export interface ExecutorIsolationPolicyOptions {
   maxOutputBytesPerStream?: number;
   stopGraceMs?: number;
+  maxWorkspaceBytes?: number;
+  maxWorkspaceEntries?: number;
+  workspaceCheckIntervalMs?: number;
 }
 
 /**
@@ -52,16 +55,19 @@ export interface ExecutorIsolationPolicyOptions {
  * yet. A launch cannot claim an OS sandbox, a process-tree boundary or resource
  * quotas until the corresponding native backend can enforce them.
  */
-export interface ExecutorIsolationPolicyV3 {
+export interface ExecutorIsolationPolicyV4 {
   schema: typeof EXECUTOR_ISOLATION_SCHEMA;
   environmentPolicy: "inherit-reviewed-system-keys-plus-trusted-overrides";
   inheritedEnvironmentKeys: string[];
   executablePolicy: "exact-prepared-command";
   workspacePolicy: "private-temp-shared-runtime";
   processTreePolicy: "best-effort-process-tree";
-  resourceLimitPolicy: "not-enforced";
+  resourceLimitPolicy: "workspace-watchdog-only";
   maxOutputBytesPerStream: number;
   stopGraceMs: number;
+  maxWorkspaceBytes: number;
+  maxWorkspaceEntries: number;
+  workspaceCheckIntervalMs: number;
 }
 
 export interface IsolatedProcessEnvironmentOptions {
@@ -106,8 +112,8 @@ export function buildIsolatedProcessEnvironment(
  * time; normalized launch descriptions always carry the complete contract.
  */
 export function normalizeExecutorIsolationPolicy(
-  value?: ExecutorIsolationPolicyOptions | ExecutorIsolationPolicyV3 | null,
-): ExecutorIsolationPolicyV3 {
+  value?: ExecutorIsolationPolicyOptions | ExecutorIsolationPolicyV4 | null,
+): ExecutorIsolationPolicyV4 {
   if (value !== undefined && value !== null && !isRecord(value)) {
     throw new Error("executor_isolation_policy_must_be_an_object");
   }
@@ -143,7 +149,7 @@ export function normalizeExecutorIsolationPolicy(
     if (source.processTreePolicy !== "best-effort-process-tree") {
       throw new Error("executor_isolation_process_tree_policy_is_unsupported");
     }
-    if (source.resourceLimitPolicy !== "not-enforced") {
+    if (source.resourceLimitPolicy !== "workspace-watchdog-only") {
       throw new Error("executor_isolation_resource_limit_policy_is_unsupported");
     }
   } else {
@@ -157,7 +163,7 @@ export function normalizeExecutorIsolationPolicy(
     executablePolicy: "exact-prepared-command",
     workspacePolicy: "private-temp-shared-runtime",
     processTreePolicy: "best-effort-process-tree",
-    resourceLimitPolicy: "not-enforced",
+    resourceLimitPolicy: "workspace-watchdog-only",
     maxOutputBytesPerStream: boundedInteger(
       source.maxOutputBytesPerStream ?? 64 * 1024,
       1_024,
@@ -170,17 +176,35 @@ export function normalizeExecutorIsolationPolicy(
       300_000,
       "executor_isolation_stop_grace_is_invalid",
     ),
+    maxWorkspaceBytes: boundedInteger(
+      source.maxWorkspaceBytes ?? 512 * 1024 * 1024,
+      64 * 1024,
+      64 * 1024 * 1024 * 1024,
+      "executor_isolation_workspace_byte_limit_is_invalid",
+    ),
+    maxWorkspaceEntries: boundedInteger(
+      source.maxWorkspaceEntries ?? 10_000,
+      16,
+      1_000_000,
+      "executor_isolation_workspace_entry_limit_is_invalid",
+    ),
+    workspaceCheckIntervalMs: boundedInteger(
+      source.workspaceCheckIntervalMs ?? 1_000,
+      25,
+      60_000,
+      "executor_isolation_workspace_check_interval_is_invalid",
+    ),
   };
 }
 
 export function validateExecutorIsolationPolicy(
   value: unknown,
-): asserts value is ExecutorIsolationPolicyV3 {
+): asserts value is ExecutorIsolationPolicyV4 {
   if (!isRecord(value) || value.schema === undefined) {
     throw new Error("executor_isolation_policy_is_not_normalized");
   }
   normalizeExecutorIsolationPolicy(
-    value as unknown as ExecutorIsolationPolicyV3,
+    value as unknown as ExecutorIsolationPolicyV4,
   );
 }
 
@@ -195,6 +219,9 @@ function assertExactPolicyKeys(value: Record<string, unknown>): void {
     "resourceLimitPolicy",
     "maxOutputBytesPerStream",
     "stopGraceMs",
+    "maxWorkspaceBytes",
+    "maxWorkspaceEntries",
+    "workspaceCheckIntervalMs",
   ];
   if (!sameStrings(Object.keys(value).sort(), [...expected].sort())) {
     throw new Error("executor_isolation_policy_has_unknown_or_missing_fields");
@@ -202,7 +229,13 @@ function assertExactPolicyKeys(value: Record<string, unknown>): void {
 }
 
 function assertExactOptionKeys(value: Record<string, unknown>): void {
-  const allowed = new Set(["maxOutputBytesPerStream", "stopGraceMs"]);
+  const allowed = new Set([
+    "maxOutputBytesPerStream",
+    "stopGraceMs",
+    "maxWorkspaceBytes",
+    "maxWorkspaceEntries",
+    "workspaceCheckIntervalMs",
+  ]);
   if (Object.keys(value).some((key) => !allowed.has(key))) {
     throw new Error("executor_isolation_options_have_unknown_fields");
   }

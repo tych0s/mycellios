@@ -29,6 +29,11 @@ describe("executor workspace", () => {
 
       writeFileSync(join(first.path, "owned.tmp"), "one", "utf8");
       writeFileSync(join(second.path, "owned.tmp"), "two", "utf8");
+      expect(first.measure(16)).toEqual({
+        bytes: 3,
+        entries: 1,
+        entryLimitExceeded: false,
+      });
       first.cleanup();
       expect(existsSync(first.path)).toBe(false);
       expect(existsSync(second.path)).toBe(true);

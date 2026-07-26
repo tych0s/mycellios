@@ -70,15 +70,18 @@ describe("isolated process environment", () => {
     });
 
     expect(policy).toMatchObject({
-      schema: "gdlp-executor-isolation/3",
+      schema: "gdlp-executor-isolation/4",
       environmentPolicy:
         "inherit-reviewed-system-keys-plus-trusted-overrides",
       executablePolicy: "exact-prepared-command",
       workspacePolicy: "private-temp-shared-runtime",
       processTreePolicy: "best-effort-process-tree",
-      resourceLimitPolicy: "not-enforced",
+      resourceLimitPolicy: "workspace-watchdog-only",
       maxOutputBytesPerStream: 128 * 1024,
       stopGraceMs: 12_000,
+      maxWorkspaceBytes: 512 * 1024 * 1024,
+      maxWorkspaceEntries: 10_000,
+      workspaceCheckIntervalMs: 1_000,
     });
     expect(policy.inheritedEnvironmentKeys).toEqual(
       ISOLATED_PROCESS_INHERITED_ENVIRONMENT_KEYS,

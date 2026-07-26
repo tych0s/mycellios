@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
 import {
+  lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   realpathSync,
   rmSync,
 } from "node:fs";
@@ -15,7 +17,14 @@ import {
 
 export interface ExecutorWorkspaceLease {
   readonly path: string;
+  measure(maxEntries: number): ExecutorWorkspaceUsage;
   cleanup(): void;
+}
+
+export interface ExecutorWorkspaceUsage {
+  bytes: number;
+  entries: number;
+  entryLimitExceeded: boolean;
 }
 
 export interface CreateExecutorWorkspaceOptions {
@@ -53,6 +62,17 @@ export function createExecutorWorkspace(
 
   return {
     path,
+    measure(maxEntries: number): ExecutorWorkspaceUsage {
+      if (
+        !Number.isSafeInteger(maxEntries)
+        || maxEntries < 1
+        || maxEntries > 1_000_000
+      ) {
+        throw new Error("executor_workspace_entry_limit_is_invalid");
+      }
+      assertContainedPath(root, path);
+      return measureWorkspace(path, maxEntries);
+    },
     cleanup(): void {
       if (cleaned) return;
       assertContainedPath(root, path);
@@ -65,6 +85,46 @@ export function createExecutorWorkspace(
       cleaned = true;
     },
   };
+}
+
+function measureWorkspace(
+  root: string,
+  maxEntries: number,
+): ExecutorWorkspaceUsage {
+  const directories = [root];
+  let bytes = 0;
+  let entries = 0;
+  while (directories.length > 0) {
+    const directory = directories.pop()!;
+    let children;
+    try {
+      children = readdirSync(directory, { withFileTypes: true });
+    } catch (error) {
+      if (isMissingPath(error)) continue;
+      throw error;
+    }
+    for (const child of children) {
+      entries += 1;
+      if (entries > maxEntries) {
+        return { bytes, entries, entryLimitExceeded: true };
+      }
+      const childPath = join(directory, child.name);
+      if (child.isDirectory()) {
+        directories.push(childPath);
+        continue;
+      }
+      try {
+        // lstat deliberately does not follow symlinks outside the lease.
+        bytes += lstatSync(childPath).size;
+      } catch (error) {
+        if (!isMissingPath(error)) throw error;
+      }
+      if (!Number.isSafeInteger(bytes)) {
+        throw new Error("executor_workspace_usage_is_not_a_safe_integer");
+      }
+    }
+  }
+  return { bytes, entries, entryLimitExceeded: false };
 }
 
 function assertContainedPath(root: string, target: string): void {
@@ -89,4 +149,16 @@ function safeIdentity(value: unknown, name: string): string {
     throw new Error(`${name}_is_invalid`);
   }
   return value;
+}
+
+function isMissingPath(error: unknown): boolean {
+  return (
+    !!error
+    && typeof error === "object"
+    && "code" in error
+    && (
+      (error as { code?: unknown }).code === "ENOENT"
+      || (error as { code?: unknown }).code === "ENOTDIR"
+    )
+  );
 }

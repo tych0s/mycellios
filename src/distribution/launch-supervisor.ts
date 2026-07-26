@@ -9,6 +9,7 @@ import {
 import {
   buildIsolatedProcessEnvironment,
   validateExecutorIsolationPolicy,
+  type ExecutorIsolationPolicyV4,
 } from "./process-environment.js";
 import {
   createExecutorWorkspace,
@@ -504,6 +505,8 @@ export interface LocalProcessAgentOptions {
   allowedExecutables: readonly string[];
   /** Parent directory for per-process private temporary workspaces. */
   workspaceRoot?: string;
+  /** Hard ceiling for any sealed workspace watchdog allowance. */
+  maxWorkspaceBytes?: number;
   maxOutputBytesPerStream?: number;
   stopGraceMs?: number;
   readyWhen?: (observation: LocalProcessReadinessObservation) => boolean;
@@ -518,6 +521,7 @@ export class LocalProcessAgent implements LaunchAgent {
   private readonly cwd: string | undefined;
   private readonly env: NodeJS.ProcessEnv | undefined;
   private readonly workspaceRoot: string | undefined;
+  private readonly maxWorkspaceBytes: number;
   private readonly allowedExecutables: ReadonlySet<string>;
   private readonly maxOutputBytes: number;
   private readonly stopGraceMs: number;
@@ -528,6 +532,12 @@ export class LocalProcessAgent implements LaunchAgent {
     this.cwd = options.cwd;
     this.env = options.env;
     this.workspaceRoot = options.workspaceRoot;
+    this.maxWorkspaceBytes = boundedInteger(
+      options.maxWorkspaceBytes ?? 4 * 1024 * 1024 * 1024,
+      64 * 1024,
+      64 * 1024 * 1024 * 1024,
+      "local_process_workspace_limit_is_invalid",
+    );
     this.allowedExecutables = new Set(
       options.allowedExecutables.map((value) =>
         localExecutableIdentity(value),
@@ -564,6 +574,11 @@ export class LocalProcessAgent implements LaunchAgent {
     }
     if (request.process.isolation.stopGraceMs > this.stopGraceMs) {
       throw new Error("local_process_stop_grace_exceeds_agent_ceiling");
+    }
+    if (
+      request.process.isolation.maxWorkspaceBytes > this.maxWorkspaceBytes
+    ) {
+      throw new Error("local_process_workspace_limit_exceeds_agent_ceiling");
     }
     const command = request.process.command;
     if (
@@ -610,7 +625,11 @@ export class LocalProcessAgent implements LaunchAgent {
       workspace.cleanup();
       throw error;
     }
-    const handle = new WorkspaceBoundProcessHandle(localHandle, workspace);
+    const handle = new WorkspaceBoundProcessHandle(
+      localHandle,
+      workspace,
+      request.process.isolation,
+    );
     const abort = () => {
       void handle.stop("launch_aborted");
     };
@@ -623,15 +642,47 @@ export class LocalProcessAgent implements LaunchAgent {
 class WorkspaceBoundProcessHandle implements LaunchProcessHandle {
   readonly ready: Promise<void>;
   readonly exited: Promise<LaunchProcessExit>;
+  private readonly watchdog: NodeJS.Timeout;
+  private violation: string | null = null;
 
   constructor(
     private readonly inner: LocalProcessHandle,
     workspace: ExecutorWorkspaceLease,
+    policy: ExecutorIsolationPolicyV4,
   ) {
     this.ready = inner.ready;
+    this.watchdog = setInterval(() => {
+      if (this.violation !== null) return;
+      try {
+        const usage = workspace.measure(policy.maxWorkspaceEntries);
+        if (usage.entryLimitExceeded) {
+          this.violation =
+            `executor_workspace_entry_limit_exceeded:${usage.entries}:${policy.maxWorkspaceEntries}`;
+        } else if (usage.bytes > policy.maxWorkspaceBytes) {
+          this.violation =
+            `executor_workspace_byte_limit_exceeded:${usage.bytes}:${policy.maxWorkspaceBytes}`;
+        }
+      } catch (error) {
+        this.violation =
+          `executor_workspace_measurement_failed:${normalizeError(error).message}`;
+      }
+      if (this.violation !== null) {
+        void this.inner.stop(this.violation).catch(() => undefined);
+      }
+    }, policy.workspaceCheckIntervalMs);
+    this.watchdog.unref?.();
     this.exited = inner.exited.then(
-      (exit) => cleanupWorkspace(workspace, exit),
+      (exit) => {
+        clearInterval(this.watchdog);
+        return cleanupWorkspace(
+          workspace,
+          this.violation === null
+            ? exit
+            : { ...exit, error: this.violation },
+        );
+      },
       (error) => {
+        clearInterval(this.watchdog);
         try {
           workspace.cleanup();
         } catch (cleanupError) {

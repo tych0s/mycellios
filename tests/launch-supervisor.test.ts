@@ -500,6 +500,48 @@ describe("Python launch supervisor", () => {
     expect(await processBecomesDead(pids.descendant, 3_000)).toBe(true);
   }, 15_000);
 
+  it("terminates a process that exceeds its sealed private workspace quota", async () => {
+    const marker = "WORKSPACE_QUOTA_READY";
+    const local = new LocalProcessAgent({
+      id: "workspace-quota-local",
+      allowedExecutables: [process.execPath],
+      stopGraceMs: 2_000,
+      readyWhen: ({ recentStdout }) => recentStdout.includes(marker),
+    });
+    const request = {
+      launchId: "workspace-quota-launch",
+      pipelineId: "workspace-quota-pipeline",
+      nodeId: "local-node",
+      process: {
+        processId: "workspace-quota-process",
+        kind: "root-engine",
+        isolation: normalizeExecutorIsolationPolicy({
+          stopGraceMs: 1_000,
+          maxWorkspaceBytes: 64 * 1024,
+          maxWorkspaceEntries: 32,
+          workspaceCheckIntervalMs: 25,
+        }),
+        command: {
+          executable: process.execPath,
+          args: [
+            "-e",
+            `const { writeFileSync } = require("node:fs"); const { join } = require("node:path"); const workspace = process.env.MYCELLIOS_EXECUTOR_WORKSPACE; process.stdout.write("${marker}:" + workspace + "\\n"); setTimeout(() => writeFileSync(join(workspace, "quota.bin"), Buffer.alloc(128 * 1024)), 10); setInterval(() => {}, 1000);`,
+          ],
+        },
+      },
+    } as unknown as LaunchAgentStartRequest;
+
+    const handle = await local.start(request, new AbortController().signal);
+    await handle.ready;
+    const workspace = (handle.output?.().stdout ?? "")
+      .split(`${marker}:`)[1]
+      ?.trim();
+    expect(workspace).toBeTruthy();
+    const exit = await handle.exited;
+    expect(exit.error).toContain("executor_workspace_byte_limit_exceeded");
+    expect(existsSync(workspace!)).toBe(false);
+  }, 15_000);
+
   it("does not leak an ungranted parent secret into the executor", async () => {
     const inheritedSecretName = "MYCELLIOS_TEST_PARENT_SECRET_DO_NOT_INHERIT";
     const previous = process.env[inheritedSecretName];

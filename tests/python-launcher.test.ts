@@ -710,10 +710,10 @@ describe("GDLP/2 Python launch compiler", () => {
     });
 
     expect(defaultLaunch.configuration.executorIsolation).toMatchObject({
-      schema: "gdlp-executor-isolation/3",
+      schema: "gdlp-executor-isolation/4",
       workspacePolicy: "private-temp-shared-runtime",
       processTreePolicy: "best-effort-process-tree",
-      resourceLimitPolicy: "not-enforced",
+      resourceLimitPolicy: "workspace-watchdog-only",
     });
     for (const process of defaultLaunch.launchOrder) {
       expect(process.isolation).toEqual(
@@ -729,7 +729,7 @@ describe("GDLP/2 Python launch compiler", () => {
 
     const tampered = structuredClone(defaultLaunch);
     tampered.launchOrder[0]!.isolation.resourceLimitPolicy =
-      "os-enforced" as "not-enforced";
+      "os-enforced" as "workspace-watchdog-only";
     expect(() => validatePythonLaunchDescription(tampered)).toThrow(
       "python_launch_description_mismatch",
     );

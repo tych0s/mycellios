@@ -18,7 +18,7 @@ import type {
 import {
   normalizeExecutorIsolationPolicy,
   type ExecutorIsolationPolicyOptions,
-  type ExecutorIsolationPolicyV3,
+  type ExecutorIsolationPolicyV4,
 } from "./process-environment.js";
 
 const GDLP_FRAME_HEADER_BYTES = 32n;
@@ -235,7 +235,7 @@ export interface PythonLaunchCompilerOptions {
    */
   executorIsolation?:
     | ExecutorIsolationPolicyOptions
-    | ExecutorIsolationPolicyV3;
+    | ExecutorIsolationPolicyV4;
 }
 
 export interface PythonRecoveryStandbyRouteInput {
@@ -423,7 +423,7 @@ export interface PythonLaunchConfiguration {
   /** Sorted, complete bindings for the native paged-KV runner. */
   pagedKvStages: Record<string, PythonPagedKvStageConfiguration>;
   /** Versioned controls enforced by the worker before spawning a process. */
-  executorIsolation: ExecutorIsolationPolicyV3;
+  executorIsolation: ExecutorIsolationPolicyV4;
 }
 
 export interface PythonPrefillLaunchSettings {
@@ -486,7 +486,7 @@ interface PythonLaunchBase {
   /** Preserved contract; null is the unchanged resident layer-range path. */
   macroWave: MacroWaveStageExecutionContractV1 | null;
   /** Sealed process-boundary controls; remote workers reject mismatches. */
-  isolation: ExecutorIsolationPolicyV3;
+  isolation: ExecutorIsolationPolicyV4;
   command: PythonStageCommand;
 }
 
