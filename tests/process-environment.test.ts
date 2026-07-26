@@ -135,4 +135,19 @@ describe("isolated process environment", () => {
       workspaceCheckIntervalMs: 750,
     });
   });
+
+  it("advertises Windows Job Object closure without claiming a sandbox or hard quotas", () => {
+    const capability = executorIsolationCapabilityFromPolicy(
+      normalizeExecutorIsolationPolicy(),
+      "windows-job-object",
+    );
+
+    expect(capability).toMatchObject({
+      processTree: "windows-job-object",
+      killOnClose: "windows-job-object",
+      resourceLimits: "workspace-watchdog-only",
+      osSandbox: "not-enforced",
+      hardResourceQuotas: "not-enforced",
+    });
+  });
 });

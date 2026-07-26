@@ -216,6 +216,45 @@ describe("worker protocol schemas", () => {
       osSandbox: "not-enforced",
       hardResourceQuotas: "not-enforced",
     });
+    const windowsJobHeartbeat = workerHeartbeatEnvelopeSchema.parse({
+      ...isolatedHeartbeat,
+      payload: {
+        ...isolatedHeartbeat.payload,
+        capabilities: {
+          ...isolatedHeartbeat.payload.capabilities,
+          distributedExecutor: {
+            ...isolatedHeartbeat.payload.capabilities.distributedExecutor,
+            isolation: {
+              ...isolatedHeartbeat.payload.capabilities.distributedExecutor?.isolation,
+              processTree: "windows-job-object",
+              killOnClose: "windows-job-object",
+            },
+          },
+        },
+      },
+    });
+    expect(
+      windowsJobHeartbeat.payload.capabilities.distributedExecutor?.isolation,
+    ).toMatchObject({
+      processTree: "windows-job-object",
+      killOnClose: "windows-job-object",
+    });
+    expect(workerHeartbeatEnvelopeSchema.safeParse({
+      ...windowsJobHeartbeat,
+      payload: {
+        ...windowsJobHeartbeat.payload,
+        capabilities: {
+          ...windowsJobHeartbeat.payload.capabilities,
+          distributedExecutor: {
+            ...windowsJobHeartbeat.payload.capabilities.distributedExecutor,
+            isolation: {
+              ...windowsJobHeartbeat.payload.capabilities.distributedExecutor?.isolation,
+              killOnClose: "not-enforced",
+            },
+          },
+        },
+      },
+    }).success).toBe(false);
     expect(workerHeartbeatEnvelopeSchema.safeParse({
       ...isolatedHeartbeat,
       payload: {

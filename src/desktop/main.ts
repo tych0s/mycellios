@@ -27,6 +27,7 @@ import { DynamicModelActivationManager } from "../coordinator/model-activation-m
 import { buildConnectedExecutorActivationSnapshot } from "../coordinator/connected-executor-activation.js";
 import { parseAutoDistributionConfig } from "../distribution/auto-distribute.js";
 import { executorIsolationCapabilityFromPolicy } from "../distribution/process-environment.js";
+import { probeWindowsJobBroker } from "../distribution/windows-job-broker.js";
 import {
   LocalProcessAgent,
   type LaunchAgent,
@@ -1491,7 +1492,12 @@ async function createDesktopDistributedExecutor() {
     throw new Error("The packaged shard runtime is missing. Reinstall mycellios to contribute this device.");
   }
   const nodeId = persistentDistributedNodeId();
-  const launchAgent = new DesktopAcceleratedLaunchAgent(runtimeRoot, nodeId);
+  const windowsJobBroker = await desktopWindowsJobBrokerExecutable();
+  const launchAgent = new DesktopAcceleratedLaunchAgent(
+    runtimeRoot,
+    nodeId,
+    windowsJobBroker,
+  );
   // The small certified CPU runtime ships with the app and becomes available
   // before registration. GPU provisioning always happens beside it in an
   // isolated app-data directory, so a multi-gigabyte download never blocks
@@ -1508,7 +1514,12 @@ async function createDesktopDistributedExecutor() {
     stagePort: 9_850,
     pythonExecutable,
     launchAgent,
-    isolation: executorIsolationCapabilityFromPolicy(),
+    isolation: executorIsolationCapabilityFromPolicy(
+      undefined,
+      windowsJobBroker === undefined
+        ? "portable-best-effort"
+        : "windows-job-object",
+    ),
     directTransport: {
       enabled: true,
       listenHost: "0.0.0.0",
@@ -1518,12 +1529,28 @@ async function createDesktopDistributedExecutor() {
   };
 }
 
+async function desktopWindowsJobBrokerExecutable(): Promise<string | undefined> {
+  if (process.platform !== "win32" || process.arch !== "x64") return undefined;
+  const executable = app.isPackaged
+    ? resourcePath("windows-job-broker", "mycellios-job-broker.exe")
+    : resourcePath("build", "windows-job-broker", "mycellios-job-broker.exe");
+  if (!existsSync(executable)) {
+    if (app.isPackaged) {
+      throw new Error("The packaged Windows Job Object broker is missing. Reinstall mycellios.");
+    }
+    return undefined;
+  }
+  await probeWindowsJobBroker(executable);
+  return executable;
+}
+
 class DesktopAcceleratedLaunchAgent implements LaunchAgent {
   readonly id: string;
 
   constructor(
     private readonly baseRuntimeRoot: string,
     private readonly nodeId: string,
+    private readonly windowsJobBrokerExecutable: string | undefined,
   ) {
     this.id = `desktop-shard-executor:${nodeId}`;
   }
@@ -1651,6 +1678,12 @@ class DesktopAcceleratedLaunchAgent implements LaunchAgent {
       id: this.id,
       cwd: app.isPackaged ? dirname(app.getAppPath()) : app.getAppPath(),
       allowedExecutables: [runtime.pythonExecutable],
+      ...(this.windowsJobBrokerExecutable === undefined
+        ? {}
+        : {
+            windowsJobBrokerExecutable:
+              this.windowsJobBrokerExecutable,
+          }),
       env: {
         PYTHONPATH: [...runtime.pythonPathAdditions, pythonPath].join(delimiter),
         HF_HOME: hfHome,

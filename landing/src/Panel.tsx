@@ -1457,28 +1457,30 @@ function ExecutorIsolationDiagnostics({
 }: {
   isolation: NonNullable<PublicWorker["isolation"]>;
 }) {
+  const jobObject = isolation.killOnClose === "windows-job-object";
   return <details className="executor-isolation-diagnostics">
     <summary>
       <span><ShieldCheck />Aislamiento del ejecutor</span>
-      <strong>PARCIAL · POLÍTICA SELLADA</strong>
+      <strong>{jobObject ? "PARCIAL · JOB OBJECT" : "PARCIAL · POLÍTICA SELLADA"}</strong>
       <ChevronDown />
     </summary>
     <div className="executor-isolation-body">
       <p className="executor-isolation-summary">
         <ShieldCheck />
-        <span><strong>Controles activos y verificables.</strong> El proceso recibe un entorno filtrado, un directorio temporal privado y un watchdog que detiene la ruta si supera sus límites.</span>
+        <span><strong>Controles activos y verificables.</strong> El proceso recibe un entorno filtrado, un directorio temporal privado y un watchdog que detiene la ruta si supera sus límites.{jobObject ? " Windows además lo incorpora suspendido a un Job Object antes de ejecutarlo y cierra todo el árbol si muere la aplicación." : ""}</span>
       </p>
       <div className="executor-isolation-grid">
         <Metric label="Entorno" value="Variables filtradas" />
         <Metric label="Temporal privado" value={`Máx. ${formatMemory(isolation.maxWorkspaceBytes / (1024 * 1024))}`} />
         <Metric label="Archivos temporales" value={`Máx. ${isolation.maxWorkspaceEntries.toLocaleString("es-ES")}`} />
         <Metric label="Vigilancia" value={`Cada ${isolation.workspaceCheckIntervalMs} ms`} />
-        <Metric label="Árbol de procesos" value="Cierre best effort" />
+        <Metric label="Árbol de procesos" value={jobObject ? "Job Object de Windows" : "Cierre best effort"} />
+        <Metric label="Al cerrar" value={jobObject ? "Terminación garantizada" : "Sin garantía del SO"} />
         <Metric label="Política" value={isolation.launchPolicySchema.replace("gdlp-executor-isolation/", "v")} />
       </div>
       <div className="executor-isolation-pending">
         <CircleAlert />
-        <span><strong>Aislamiento fuerte aún pendiente.</strong> Este nodo todavía no anuncia sandbox del sistema operativo, cuotas duras de CPU/RAM/GPU ni garantía kill-on-close.</span>
+        <span><strong>Aislamiento fuerte aún pendiente.</strong> Este nodo todavía no anuncia sandbox del sistema operativo ni cuotas duras de CPU/RAM/GPU{jobObject ? "." : " ni garantía kill-on-close."}</span>
       </div>
     </div>
   </details>;

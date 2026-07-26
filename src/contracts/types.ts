@@ -29,11 +29,11 @@ export interface WorkerExecutorIsolationCapability {
   launchPolicySchema: "gdlp-executor-isolation/4";
   environment: "filtered";
   workspace: "private-temp-watchdog";
-  processTree: "best-effort";
+  processTree: "best-effort" | "windows-job-object";
   resourceLimits: "workspace-watchdog-only";
   osSandbox: "not-enforced";
   hardResourceQuotas: "not-enforced";
-  killOnClose: "not-enforced";
+  killOnClose: "not-enforced" | "windows-job-object";
   maxWorkspaceBytes: number;
   maxWorkspaceEntries: number;
   workspaceCheckIntervalMs: number;

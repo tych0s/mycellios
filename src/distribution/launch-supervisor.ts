@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessByStdio } from "node:child_process";
+import { resolve } from "node:path";
 import type { Readable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import {
@@ -19,6 +20,10 @@ import {
   processTreeSpawnOptions,
   terminateProcessTree,
 } from "./process-tree.js";
+import {
+  normalizeWindowsJobBrokerExecutable,
+  writeWindowsJobBrokerRequest,
+} from "./windows-job-broker.js";
 
 export type LaunchSupervisorState =
   | "idle"
@@ -507,6 +512,11 @@ export interface LocalProcessAgentOptions {
   workspaceRoot?: string;
   /** Hard ceiling for any sealed workspace watchdog allowance. */
   maxWorkspaceBytes?: number;
+  /**
+   * Native Windows broker that assigns the target to a kill-on-close Job
+   * Object before resuming it. Omit on hosts without that packaged guarantee.
+   */
+  windowsJobBrokerExecutable?: string;
   maxOutputBytesPerStream?: number;
   stopGraceMs?: number;
   readyWhen?: (observation: LocalProcessReadinessObservation) => boolean;
@@ -522,6 +532,7 @@ export class LocalProcessAgent implements LaunchAgent {
   private readonly env: NodeJS.ProcessEnv | undefined;
   private readonly workspaceRoot: string | undefined;
   private readonly maxWorkspaceBytes: number;
+  private readonly windowsJobBrokerExecutable: string | undefined;
   private readonly allowedExecutables: ReadonlySet<string>;
   private readonly maxOutputBytes: number;
   private readonly stopGraceMs: number;
@@ -532,6 +543,18 @@ export class LocalProcessAgent implements LaunchAgent {
     this.cwd = options.cwd;
     this.env = options.env;
     this.workspaceRoot = options.workspaceRoot;
+    this.windowsJobBrokerExecutable =
+      options.windowsJobBrokerExecutable === undefined
+        ? undefined
+        : normalizeWindowsJobBrokerExecutable(
+            options.windowsJobBrokerExecutable,
+          );
+    if (
+      this.windowsJobBrokerExecutable !== undefined
+      && process.platform !== "win32"
+    ) {
+      throw new Error("windows_job_broker_is_only_supported_on_windows");
+    }
     this.maxWorkspaceBytes = boundedInteger(
       options.maxWorkspaceBytes ?? 4 * 1024 * 1024 * 1024,
       64 * 1024,
@@ -613,7 +636,19 @@ export class LocalProcessAgent implements LaunchAgent {
     };
     let localHandle: LocalProcessHandle;
     try {
-      const child = spawn(command.executable, command.args, spawnOptions);
+      const brokerRequest =
+        this.windowsJobBrokerExecutable === undefined
+          ? undefined
+          : writeWindowsJobBrokerRequest(
+              workspace.path,
+              command,
+              resolveLocalWorkingDirectory(this.cwd),
+            );
+      const child = spawn(
+        this.windowsJobBrokerExecutable ?? command.executable,
+        brokerRequest === undefined ? command.args : [brokerRequest],
+        spawnOptions,
+      );
       localHandle = new LocalProcessHandle(
         child,
         request.process,
@@ -975,6 +1010,10 @@ function localExecutableIdentity(value: string): string {
   }
   const normalized = value.replaceAll("\\", "/");
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function resolveLocalWorkingDirectory(value: string | undefined): string {
+  return value === undefined ? process.cwd() : resolve(value);
 }
 
 function boundedInteger(value: unknown, min: number, max: number, error: string): number {

@@ -212,6 +212,7 @@ export function validateExecutorIsolationPolicy(
 
 export function executorIsolationCapabilityFromPolicy(
   policyValue: ExecutorIsolationPolicyV4 = normalizeExecutorIsolationPolicy(),
+  enforcement: "portable-best-effort" | "windows-job-object" = "portable-best-effort",
 ): WorkerExecutorIsolationCapability {
   validateExecutorIsolationPolicy(policyValue);
   return {
@@ -219,11 +220,17 @@ export function executorIsolationCapabilityFromPolicy(
     launchPolicySchema: policyValue.schema,
     environment: "filtered",
     workspace: "private-temp-watchdog",
-    processTree: "best-effort",
+    processTree:
+      enforcement === "windows-job-object"
+        ? "windows-job-object"
+        : "best-effort",
     resourceLimits: "workspace-watchdog-only",
     osSandbox: "not-enforced",
     hardResourceQuotas: "not-enforced",
-    killOnClose: "not-enforced",
+    killOnClose:
+      enforcement === "windows-job-object"
+        ? "windows-job-object"
+        : "not-enforced",
     maxWorkspaceBytes: policyValue.maxWorkspaceBytes,
     maxWorkspaceEntries: policyValue.maxWorkspaceEntries,
     workspaceCheckIntervalMs: policyValue.workspaceCheckIntervalMs,

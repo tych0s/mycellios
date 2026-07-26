@@ -111,8 +111,35 @@ if (
 const expectedUpdateFeed = "https://www.mycellios.com/updates/win32/x64/";
 if (platform === "win32") {
   const trayIconPath = resolve(resourcesDirectory, "icons", "app-icon-v2.ico");
+  const jobBrokerPath = resolve(
+    resourcesDirectory,
+    "windows-job-broker",
+    "mycellios-job-broker.exe",
+  );
   if (!existsSync(trayIconPath)) {
     throw new Error(`El paquete no contiene el icono de bandeja de Windows: ${trayIconPath}`);
+  }
+  if (!existsSync(jobBrokerPath)) {
+    throw new Error(
+      `El paquete no contiene el broker Job Object de Windows: ${jobBrokerPath}`,
+    );
+  }
+  const jobBrokerProbe = spawnSync(jobBrokerPath, ["--probe"], {
+    encoding: "utf8",
+    shell: false,
+    windowsHide: true,
+    timeout: 5_000,
+  });
+  if (
+    jobBrokerProbe.error
+    || jobBrokerProbe.status !== 0
+    || jobBrokerProbe.stdout.trim() !== "mycellios-windows-job-broker/1:ready"
+  ) {
+    throw jobBrokerProbe.error
+      ?? new Error(
+        jobBrokerProbe.stderr?.trim()
+          || "El broker Job Object empaquetado no supera su canary.",
+      );
   }
   if (!mainBundle.includes(expectedUpdateFeed)) {
     throw new Error(`El paquete no contiene el canal de actualización: ${expectedUpdateFeed}`);

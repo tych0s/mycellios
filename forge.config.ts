@@ -27,6 +27,7 @@ const windowsSign = process.env.WINDOWS_CERTIFICATE_FILE
   : undefined;
 
 const portableRuntimeArchive = "build/distribution-runtime.tar.gz";
+const windowsJobBrokerDirectory = "build/windows-job-broker";
 
 function commandLineOption(name: string): string | undefined {
   const equalsPrefix = `--${name}=`;
@@ -122,6 +123,11 @@ const config: ForgeConfig = {
       "mobile-dist",
       "landing-dist",
       "build/python",
+      ...(targetPlatform === "win32"
+        && targetArch === "x64"
+        && existsSync(windowsJobBrokerDirectory)
+        ? [windowsJobBrokerDirectory]
+        : []),
       ...(includePortableRuntime
         ? [portableRuntimeArchive]
         : []),

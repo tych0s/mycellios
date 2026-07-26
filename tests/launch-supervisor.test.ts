@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { existsSync } from "node:fs";
+import { resolve } from "node:path";
 import {
   LaunchCancelledError,
   LaunchProcessExitedError,
@@ -363,6 +364,52 @@ describe("Python launch supervisor", () => {
       stopGraceMs: 10,
     });
     expect(local.id).toBe("explicit-local");
+  });
+
+  it("routes an authorized Windows target through the packaged Job Object broker", async () => {
+    const broker = resolve(
+      "build",
+      "windows-job-broker",
+      "mycellios-job-broker.exe",
+    );
+    if (process.platform !== "win32" || !existsSync(broker)) return;
+    const description = fixtureDescription();
+    const launchProcess = structuredClone(
+      description.launchOrder.find((candidate) => candidate.kind === "remote-stage")!,
+    );
+    launchProcess.command = {
+      executable: process.execPath,
+      args: [
+        "-e",
+        "console.error('stage_ready');setInterval(() => undefined, 1000);",
+      ],
+    };
+    launchProcess.isolation = normalizeExecutorIsolationPolicy({
+      stopGraceMs: 1_000,
+    });
+    const local = new LocalProcessAgent({
+      id: "windows-job-local",
+      cwd: resolve("."),
+      allowedExecutables: [process.execPath],
+      windowsJobBrokerExecutable: broker,
+      stopGraceMs: 1_000,
+    });
+
+    const handle = await local.start(
+      {
+        launchId: description.launchId,
+        pipelineId: description.pipelineId,
+        nodeId: launchProcess.anchor.memberId,
+        process: launchProcess,
+      },
+      new AbortController().signal,
+    );
+    await handle.ready;
+    expect(handle.output?.().stderr).toContain("stage_ready");
+    await handle.stop("test_complete");
+    await expect(handle.exited).resolves.toMatchObject({
+      code: expect.anything(),
+    });
   });
 
   it("rejects a sealed process policy above the local agent ceilings", async () => {

@@ -347,16 +347,25 @@ export const workerCapabilitiesSchema = z.object({
           launchPolicySchema: z.literal("gdlp-executor-isolation/4"),
           environment: z.literal("filtered"),
           workspace: z.literal("private-temp-watchdog"),
-          processTree: z.literal("best-effort"),
+          processTree: z.enum(["best-effort", "windows-job-object"]),
           resourceLimits: z.literal("workspace-watchdog-only"),
           osSandbox: z.literal("not-enforced"),
           hardResourceQuotas: z.literal("not-enforced"),
-          killOnClose: z.literal("not-enforced"),
+          killOnClose: z.enum(["not-enforced", "windows-job-object"]),
           maxWorkspaceBytes: z.number().int().min(64 * 1024).max(64 * 1024 * 1024 * 1024),
           maxWorkspaceEntries: z.number().int().min(16).max(1_000_000),
           workspaceCheckIntervalMs: z.number().int().min(25).max(60_000),
         })
         .strict()
+        .refine(
+          (value) =>
+            (value.processTree === "best-effort" && value.killOnClose === "not-enforced")
+            || (
+              value.processTree === "windows-job-object"
+              && value.killOnClose === "windows-job-object"
+            ),
+          { message: "executor isolation process-tree guarantees are inconsistent" },
+        )
         .optional(),
       directTransport: z
         .object({
