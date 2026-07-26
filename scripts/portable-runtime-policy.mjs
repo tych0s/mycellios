@@ -15,12 +15,6 @@ export const DISTRIBUTION_PACKAGE_VERSIONS = Object.freeze({
   safetensors: "0.8.0",
   sentencepiece: "0.2.2",
 });
-const MACOS_X64_PACKAGE_VERSIONS = Object.freeze({
-  ...DISTRIBUTION_PACKAGE_VERSIONS,
-  // Transformers 5 requires PyTorch >=2.4 and disables the last official
-  // macOS Intel wheel. 4.57.3 retains Qwen3 support with PyTorch 2.2.2.
-  transformers: "4.57.3",
-});
 
 const PYTHON_RELEASE_URL =
   `https://github.com/${PORTABLE_PYTHON_SOURCE}/releases/download/${PORTABLE_PYTHON_RELEASE}`;
@@ -53,11 +47,6 @@ const MACOS_ARM64_PYTHON = pythonArtifact(
   24_942_229,
   "55bc1a5edbc8ac4da0081f4f5731ed2d1ed10c57cb37a820b2a0dbc7cad742e9",
 );
-const MACOS_X64_PYTHON = pythonArtifact(
-  "cpython-3.12.13+20260510-x86_64-apple-darwin-install_only_stripped.tar.gz",
-  24_639_521,
-  "6bab7fa97d4f2ddba86da0e05acff66c53b5edaca1df8edcf00ddca785a9c59b",
-);
 
 const WINDOWS_X64_WHEEL_LOCK = wheelLock(
   "win32-x64-cp312.txt",
@@ -70,10 +59,6 @@ const LINUX_X64_WHEEL_LOCK = wheelLock(
 const MACOS_ARM64_WHEEL_LOCK = wheelLock(
   "darwin-arm64-cp312.txt",
   "75c84302540edc1b7f6c1620c3474b7ccbf431dd6df881717f74ebf419c56348",
-);
-const MACOS_X64_WHEEL_LOCK = wheelLock(
-  "darwin-x64-cp312.txt",
-  "891ccb84593d7e20296da529a72fb73775f9bc22bcf49de69b326c6d9ecabc46",
 );
 
 /**
@@ -125,26 +110,31 @@ export function portableRuntimeSpec(platform, arch) {
     });
   }
   if (platform === "darwin" && arch === "x64") {
+    // macOS Intel RETIRADO el 26-07-2026, y no por decision nuestra.
+    //
+    // PyTorch dejo de publicar ruedas para macOS x86_64 en la version 2.3.0
+    // (24-04-2024). La ultima con soporte fue la 2.2.2 (27-03-2024), asi que
+    // esta plataforma quedaba clavada a marzo de 2024 mientras el resto va por
+    // la 2.13.0.
+    //
+    // Eso arrastraba el resto: `transformers` 5 exige torch >=2.4, de modo que
+    // Intel tenia que quedarse en la 4.57.3 — una segunda pila sellada, con su
+    // propio lock de ruedas y su propio conjunto de versiones. Y aun asi NO
+    // FUNCIONABA: `kv_arena.py` importa `DYNAMIC_LAYER_TYPE_MAPPING` de
+    // `transformers.cache_utils` a nivel de modulo, simbolo que solo existe en
+    // la 5. Verificado en CI: el runtime ni se importa.
+    //
+    // O sea que no se retira soporte que funcionaba; se deja de ofrecer una
+    // descarga que no podia arrancar. Y como no hay CUDA ni MPS ahi, aunque
+    // alguien lo arreglara seria un nodo de solo CPU.
     return Object.freeze({
-      supported: true,
+      supported: false,
       platform,
       arch,
-      pythonVersion: PORTABLE_PYTHON_VERSION,
-      pythonExecutable: "bin/python3",
-      pythonArtifact: MACOS_X64_PYTHON,
-      wheelLock: MACOS_X64_WHEEL_LOCK,
-      packageVersions: MACOS_X64_PACKAGE_VERSIONS,
-      // Intel Macs receive the same self-contained inference stack, but the
-      // release makes no native Metal/MPS claim for this architecture.
-      // PyTorch 2.2.2 is the final official macOS x86_64 wheel supporting
-      // CPython 3.12. Newer PyPI releases publish macOS arm64 only.
-      //
-      // Confirmado contra PyPI el 26-07-2026: la ultima version de torch con
-      // rueda macOS x86_64 es la 2.2.2, mientras arm64 llega hasta la 2.13.0.
-      // No es una eleccion revisable: subir esta plataforma al sellado del
-      // resto es imposible porque la rueda no existe.
-      torchVersion: "2.2.2",
-      bundledAccelerators: Object.freeze([]),
+      reason:
+        "PyTorch published its last macOS x86_64 wheel in 2.2.2 (March 2024); "
+        + "transformers 5 requires torch >=2.4, so this architecture cannot run "
+        + "the sealed inference stack.",
     });
   }
   return Object.freeze({

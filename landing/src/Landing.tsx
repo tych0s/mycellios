@@ -38,7 +38,6 @@ const ExplainerVideo = lazy(() => import("./ExplainerVideo"));
 const downloads = {
   windows: { label: "Windows", detail: "Windows 10/11 · x64", filename: "mycellios-windows-x64.exe" },
   "mac-arm64": { label: "macOS", detail: "Apple Silicon", filename: "mycellios-macos-arm64.dmg" },
-  "mac-x64": { label: "macOS", detail: "Intel", filename: "mycellios-macos-x64.dmg" },
   "linux-deb": { label: "Linux", detail: "Ubuntu / Debian · x64", filename: "mycellios-linux-x64.deb" },
   "linux-rpm": { label: "Linux", detail: "Fedora / RHEL · x64", filename: "mycellios-linux-x64.rpm" },
 } as const;
@@ -48,7 +47,6 @@ type DownloadKey = keyof typeof downloads;
 function downloadUrl(key: DownloadKey): string {
   if (key === "windows") return "/downloads/windows";
   if (key === "mac-arm64") return "/downloads/macos-arm64";
-  if (key === "mac-x64") return "/downloads/macos-x64";
   if (key === "linux-deb") return "/downloads/linux-deb";
   if (key === "linux-rpm") return "/downloads/linux-rpm";
   throw new Error(`Unsupported download target: ${String(key)}`);
@@ -597,7 +595,6 @@ function InstallSection({ text }: { text: typeof copy.install }) {
               </div>
               <div className="mac-test-downloads">
                 <a href={downloadUrl("mac-arm64")}><Cpu size={15} /><span><strong>Apple Silicon</strong><small>M1 · M2 · M3 · M4</small></span><Download size={14} /></a>
-                <a href={downloadUrl("mac-x64")}><Cpu size={15} /><span><strong>Intel</strong><small>Intel processor</small></span><Download size={14} /></a>
               </div>
             </div>
             <ol>

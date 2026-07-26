@@ -389,12 +389,17 @@ describe("desktop accelerator runtime", () => {
     )).rejects.toThrow("No module named 'encodings'");
   });
 
-  it("accepts the certified CPU runtime for macOS Intel", async () => {
+  // macOS Intel se RETIRO el 26-07-2026. PyTorch publico su ultima rueda para
+  // macOS x86_64 en la 2.2.2 (marzo de 2024) y `transformers` 5 exige torch
+  // >=2.4, asi que esa arquitectura no puede ejecutar la pila sellada — de
+  // hecho `kv_arena` ni se importa alli. El test invierte su sentido: lo que
+  // hay que garantizar es que ya NO se acepte un runtime para esa plataforma.
+  it("refuses a portable runtime for macOS Intel, which is no longer supported", async () => {
     const root = temporaryRoot();
     const base = createMacIntelBaseRuntime(root);
 
     await expect(readPortableRuntimeManifest(base, { platform: "darwin", arch: "x64" }))
-      .resolves.toMatchObject({ platform: "darwin", arch: "x64", torchVersion: "2.2.2" });
+      .rejects.toThrow();
   });
 
   it("falls back explicitly without downloading when provisioning is disabled", async () => {

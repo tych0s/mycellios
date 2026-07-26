@@ -76,7 +76,7 @@ const ACTIVE_SCHEMA = "mycellios-native-release-active/1";
 const ROLLBACK_SCHEMA = "mycellios-native-release-rollback/1";
 
 const UPDATE_FILE = /^(?:RELEASES|latest\.json|mycellios-setup\.exe|mycellios-\d+\.\d+\.\d+-full\.nupkg)$/;
-const DOWNLOAD_FILE = /^mycellios-(?:windows-x64\.exe|macos-(?:arm64|x64)\.dmg|linux-x64\.(?:deb|rpm))$/;
+const DOWNLOAD_FILE = /^mycellios-(?:windows-x64\.exe|macos-arm64\.dmg|linux-x64\.(?:deb|rpm))$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const MAX_RELEASE_FILE_SIZE = 1_500_000_000;
 const MAX_RELEASE_CHUNKS = 2_048;
@@ -896,7 +896,6 @@ export function expectedPublicReleaseAssets(version: string): Array<{
     { channel: "downloads", fileName: "mycellios-linux-x64.deb" },
     { channel: "downloads", fileName: "mycellios-linux-x64.rpm" },
     { channel: "downloads", fileName: "mycellios-macos-arm64.dmg" },
-    { channel: "downloads", fileName: "mycellios-macos-x64.dmg" },
     { channel: "downloads", fileName: "mycellios-windows-x64.exe" },
     { channel: "updates", fileName: "RELEASES" },
     { channel: "updates", fileName: "latest.json" },

@@ -30,7 +30,6 @@ describe("portable runtime wheel lock", () => {
       ["win32", "x64", "2.13.0+cpu", "win32-x64-cp312.txt", "2a5de3d3f2e3ba4ebac91e1efe068159e81263d3ccd6a3d93333078e753c6c65"],
       ["linux", "x64", "2.13.0+cpu", "linux-x64-cp312.txt", "090355535c96e7202ae761a18dadc5d66c9e98493a148eba16ae3c3e7c95c59d"],
       ["darwin", "arm64", "2.11.0", "darwin-arm64-cp312.txt", "75c84302540edc1b7f6c1620c3474b7ccbf431dd6df881717f74ebf419c56348"],
-      ["darwin", "x64", "2.2.2", "darwin-x64-cp312.txt", "891ccb84593d7e20296da529a72fb73775f9bc22bcf49de69b326c6d9ecabc46"],
     ] as const) {
       const [platform, arch, torchVersion, filename, sha256] = target;
       const lock = readPortableRuntimeWheelLock(WORKSPACE, {
@@ -42,7 +41,7 @@ describe("portable runtime wheel lock", () => {
           numpy: "1.26.4",
           aiohttp: "3.14.1",
           accelerate: "1.14.0",
-          transformers: platform === "darwin" && arch === "x64" ? "4.57.3" : "5.14.1",
+          transformers: "5.14.1",
           safetensors: "0.8.0",
           sentencepiece: "0.2.2",
         },

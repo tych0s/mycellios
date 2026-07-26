@@ -2558,10 +2558,6 @@ export async function createCoordinator(
     reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
     return reply.redirect(`/downloads/mycellios-macos-arm64.dmg?v=${publicAssetVersion}`);
   });
-  app.get("/downloads/macos-x64", async (_request, reply) => {
-    reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
-    return reply.redirect(`/downloads/mycellios-macos-x64.dmg?v=${publicAssetVersion}`);
-  });
   app.get("/downloads/linux-deb", async (_request, reply) => {
     reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
     return reply.redirect(`/downloads/mycellios-linux-x64.deb?v=${publicAssetVersion}`);
