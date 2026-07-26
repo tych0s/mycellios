@@ -42,6 +42,8 @@ const SOURCE_INPUTS = Object.freeze([
   ...NATIVE_PYTHON_PRODUCT_FILES.map((portable) => `python/${portable}`),
 ]);
 
+const GENERATED_DIRECTORY_NAMES = new Set([".vite", "node_modules"]);
+
 export function buildNativeSourceProvenance(workspaceRoot) {
   const root = resolve(workspaceRoot);
   const packageMetadata = parsePackageJson(root);
@@ -172,6 +174,7 @@ function collectFiles(root, directory, output, observedPaths) {
       );
     }
     if (entry.isDirectory()) {
+      if (GENERATED_DIRECTORY_NAMES.has(entry.name)) continue;
       collectFiles(root, absolute, output, observedPaths);
     } else if (entry.isFile()) {
       addFileEvidence(root, absolute, output, observedPaths);
