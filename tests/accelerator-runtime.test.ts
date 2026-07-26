@@ -1105,7 +1105,7 @@ function portableWheelLock(platform: "win32/x64" | "darwin/arm64" | "darwin/x64"
   }
   return {
     path: "scripts/wheel-locks/darwin-x64-cp312.txt",
-    sha256: "808a7fd6894862abf2ed704eef036bf0b6290c6cce4f618682e831d67bf2b5eb",
+    sha256: "891ccb84593d7e20296da529a72fb73775f9bc22bcf49de69b326c6d9ecabc46",
   };
 }
 

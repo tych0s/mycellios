@@ -73,7 +73,7 @@ const MACOS_ARM64_WHEEL_LOCK = wheelLock(
 );
 const MACOS_X64_WHEEL_LOCK = wheelLock(
   "darwin-x64-cp312.txt",
-  "808a7fd6894862abf2ed704eef036bf0b6290c6cce4f618682e831d67bf2b5eb",
+  "891ccb84593d7e20296da529a72fb73775f9bc22bcf49de69b326c6d9ecabc46",
 );
 
 /**
@@ -138,6 +138,11 @@ export function portableRuntimeSpec(platform, arch) {
       // release makes no native Metal/MPS claim for this architecture.
       // PyTorch 2.2.2 is the final official macOS x86_64 wheel supporting
       // CPython 3.12. Newer PyPI releases publish macOS arm64 only.
+      //
+      // Confirmado contra PyPI el 26-07-2026: la ultima version de torch con
+      // rueda macOS x86_64 es la 2.2.2, mientras arm64 llega hasta la 2.13.0.
+      // No es una eleccion revisable: subir esta plataforma al sellado del
+      // resto es imposible porque la rueda no existe.
       torchVersion: "2.2.2",
       bundledAccelerators: Object.freeze([]),
     });

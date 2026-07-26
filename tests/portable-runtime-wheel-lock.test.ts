@@ -30,7 +30,7 @@ describe("portable runtime wheel lock", () => {
       ["win32", "x64", "2.13.0+cpu", "win32-x64-cp312.txt", "2a5de3d3f2e3ba4ebac91e1efe068159e81263d3ccd6a3d93333078e753c6c65"],
       ["linux", "x64", "2.13.0+cpu", "linux-x64-cp312.txt", "090355535c96e7202ae761a18dadc5d66c9e98493a148eba16ae3c3e7c95c59d"],
       ["darwin", "arm64", "2.11.0", "darwin-arm64-cp312.txt", "75c84302540edc1b7f6c1620c3474b7ccbf431dd6df881717f74ebf419c56348"],
-      ["darwin", "x64", "2.2.2", "darwin-x64-cp312.txt", "808a7fd6894862abf2ed704eef036bf0b6290c6cce4f618682e831d67bf2b5eb"],
+      ["darwin", "x64", "2.2.2", "darwin-x64-cp312.txt", "891ccb84593d7e20296da529a72fb73775f9bc22bcf49de69b326c6d9ecabc46"],
     ] as const) {
       const [platform, arch, torchVersion, filename, sha256] = target;
       const lock = readPortableRuntimeWheelLock(WORKSPACE, {
