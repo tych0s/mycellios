@@ -32,23 +32,10 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 PYTHON_DIR = REPO / "python"
 
-# Fallos preexistentes al 25-07-2026, verificados uno a uno contra el árbol sin
-# tocar (`git stash` + re-correr). NO son deuda nueva: son deuda que hasta ahora
-# nadie veía porque la suite no corría en CI.
-#
-# CADA ENTRADA NECESITA: por qué falla y qué haría falta para quitarla.
-KNOWN_FAILURES = {
-    "test_protocol.DeflateCodecTests.test_deflate_frame_survives_the_wire":
-        "Códec DEFLATE (INT8_GROUPED/HADAMARD). Falla idéntico en el árbol sin "
-        "tocar. Sin diagnosticar: el códec deflate no está en la ruta de "
-        "servicio por defecto, así que no bloquea, pero es un fallo real.",
-    "test_protocol.DeflateCodecTests.test_gaussian_activations_compress_below_unity":
-        "Mismo códec: la compresión no baja de 1,0 en activaciones gaussianas. "
-        "Puede ser una expectativa del test, no del códec. Sin diagnosticar.",
-    "test_packed_tree_wave.PackedTreeWaveBenchmarkTests"
-    ".test_bandwidth_sweep_reuses_one_codec_measurement_and_never_claims_tps":
-        "El barrido devuelve selected_mode='NONE'. Preexistente.",
-}
+# El trinquete llegó a cero el 26-07-2026: la suite completa pasó sin fallos.
+# La estructura se conserva para que cualquier excepción futura tenga que
+# documentarse explícitamente y, cuando se arregle, vuelva a obligar a podarla.
+KNOWN_FAILURES: dict[str, str] = {}
 
 # INTERMITENTES: pueden pasar o fallar en la misma máquina sin que cambie nada.
 # Todos levantan procesos o sockets de verdad, así que dependen de puertos, de
