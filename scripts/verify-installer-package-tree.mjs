@@ -452,13 +452,14 @@ export function assertRpmMetadataEvidence({
     // El mensaje dice CUAL de las cuatro condiciones ha fallado y con que valor.
     // Sin eso, "privileged metadata is not permitted" no distingue un fichero
     // que se instala como un usuario que no es root —peligroso— de un simple
-    // marcador `%doc` o `%license`, que en RPM es semantico y perfectamente
-    // normal en /usr/share/doc. Son cosas muy distintas y merecen mirarse
-    // distinto; con el mensaje mudo hacian falta vueltas de CI para saber cual.
+    // marcador `%doc`, que es semantico y normal. Con el mensaje mudo hacian
+    // falta vueltas de CI para saber cual, y cada vuelta construye instaladores
+    // de tres plataformas.
+    const unexpectedFlags = actual.flags & ~INFORMATIONAL_RPM_FILE_FLAGS;
     const offending = [
       actual.user !== "root" ? `user=${actual.user}` : null,
       actual.group !== "root" ? `group=${actual.group}` : null,
-      actual.flags !== 0 ? `flags=${actual.flags}` : null,
+      unexpectedFlags !== 0 ? `flags=${actual.flags}` : null,
       isEmptyRpmValue(actual.capabilities)
         ? null
         : `capabilities=${actual.capabilities}`,
@@ -804,6 +805,26 @@ function parseExactOctal(value, label) {
   }
   return parsed;
 }
+
+/**
+ * Marcas de fichero de RPM que son puramente informativas.
+ *
+ * Los `flags` de RPM NO son permisos: son marcadores semanticos del `%files`.
+ * Meterlos en el mismo saco que el propietario y las capacidades hacia que un
+ * `%doc` perfectamente normal se denunciara como «privileged metadata», que es
+ * exactamente lo que pasaba con /usr/share/doc/mycellios/copyright (`flags=2`,
+ * o sea `RPMFILE_DOC`) — el fichero de copyright que el propio empaquetador
+ * marca como documentacion, como manda la practica habitual.
+ *
+ * Se permiten SOLO estas tres. Las demas siguen rechazandose y con razon:
+ * `%ghost` (64) declara un fichero que no viaja en el paquete, y `%config` (1)
+ * y `%noreplace` (16) cambian el comportamiento en actualizaciones. Ninguna
+ * deberia aparecer en este producto sin que alguien lo mire.
+ */
+const RPMFILE_DOC = 1 << 1;       // 2
+const RPMFILE_LICENSE = 1 << 7;   // 128
+const RPMFILE_README = 1 << 8;    // 256
+const INFORMATIONAL_RPM_FILE_FLAGS = RPMFILE_DOC | RPMFILE_LICENSE | RPMFILE_README;
 
 function rpmModeKind(mode) {
   const fileType = mode & 0o170000;

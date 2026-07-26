@@ -282,6 +282,22 @@ describe("installer package tree binding", () => {
       ...exact,
       headerOutput: "mycellios\t9.9.9\t1\tx86_64\t8\n",
     })).toThrow("identity differs");
+
+    // `%doc` (2) es un marcador SEMANTICO del `%files`, no un permiso. El
+    // fichero de copyright que genera el propio empaquetador lo lleva —CI
+    // fallaba con `flags=2` en /usr/share/doc/mycellios/copyright—, asi que
+    // rechazarlo tumbaba la verificacion del RPM entera por algo normal.
+    expect(() => assertRpmMetadataEvidence({
+      ...exact,
+      fileOutput: `${exactRow.replace("\t0\t(none)", "\t2\t(none)")}\n`,
+    })).not.toThrow();
+    // Pero un flag informativo NO puede colar uno que si importa:
+    // %doc|%ghost = 2|64 = 66 sigue rechazandose. Sin la mascara, permitir
+    // `%doc` habria abierto la puerta a cualquier combinacion que lo incluyera.
+    expect(() => assertRpmMetadataEvidence({
+      ...exact,
+      fileOutput: `${exactRow.replace("\t0\t(none)", "\t66\t(none)")}\n`,
+    })).toThrow("privileged metadata");
   });
 
   it.runIf(process.platform !== "win32")(
