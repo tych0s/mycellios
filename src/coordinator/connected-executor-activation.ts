@@ -25,14 +25,23 @@ interface ProfiledConnectedExecutor extends ConnectedExecutor {
 const RUNTIME_LINK_EVIDENCE_TTL_MS = 5 * 60_000;
 
 /**
- * Decode throughput this worker actually measured, or null.
+ * Decode throughput this worker actually measured **for this model**, or null.
  *
  * Only `measured` counts. An estimated or configured number is a guess about
  * hardware, and planning a layer split on a guess is how the planner ended up
  * trusting a constant in the first place.
+ *
+ * El filtro por modelo no es cosmético: los tokens por segundo dependen del
+ * modelo, así que un `Math.max` sobre TODOS los despliegues del worker compara
+ * medidas incomparables. Un nodo que aún conserva la medida de un modelo
+ * pequeño declara un caudal altísimo, y `deriveDecodeScales` le adjudica más
+ * capas del modelo grande que se está planificando. El sesgo va justo en la
+ * dirección mala: premia al que midió con la carga más ligera, que es lo
+ * contrario de lo que el reparto proporcional pretende.
  */
-function measuredDecodeThroughput(worker: StoredWorker): number | null {
+function measuredDecodeThroughput(worker: StoredWorker, modelName: string): number | null {
   const measured = worker.capabilities.deployments
+    .filter((deployment) => deployment.model === modelName)
     .filter((deployment) => deployment.throughputSource === "measured")
     .map((deployment) => deployment.tokensPerSecond)
     .filter((value) => Number.isFinite(value) && value > 0);
@@ -108,7 +117,7 @@ export function buildConnectedExecutorActivationSnapshot(
   // informado en silencio — el mismo criterio que `estimateLinkLatencyMs`.
   const decodeScales = deriveDecodeScales(profiledExecutors.map(({ executor, worker }) => ({
     nodeId: executor.nodeId,
-    measuredTokensPerSecond: measuredDecodeThroughput(worker),
+    measuredTokensPerSecond: measuredDecodeThroughput(worker, baseConfig.model.publicName),
   })));
   const decodeScaleById = new Map(
     decodeScales.scales.map((scale) => [scale.nodeId, scale]),

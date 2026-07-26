@@ -9,6 +9,7 @@ import {
   TopologyBeamPlanner,
   defaultDistributionPlanners,
   evaluatePlanner,
+  evictFarNodes,
 } from "../src/distribution/planners.js";
 import {
   fixedDistributionScenarios,
@@ -294,6 +295,63 @@ describe("distribution optimization laboratory", () => {
     expect(new Set(evaluated!.plan.stages.map((stage) => stage.nodeId)).size).toBe(
       evaluated!.plan.stages.length,
     );
+  });
+
+  // La poda de nodos lejanos es una heurística de LATENCIA: no comprueba que el
+  // modelo siga cabiendo en lo que deja. Si se lleva por delante justo los nodos
+  // con memoria, devolver `null` sería declarar imposible un plan que sí existe
+  // — la flota entera tenía sitio, y lo que lo quitó fue un descarte de atípicos.
+  it("retries with the full topology when pruning leaves no feasible plan", () => {
+    const scenario = fixedDistributionScenarios()[3]!;
+    const template = scenario.topology.nodes[0]!;
+    // Cuatro nodos cercanos sin memoria para el modelo, y dos lejanos que sí la
+    // tienen. La poda quita exactamente a los dos que hacen falta.
+    const near = Array.from({ length: 4 }, (_, index) => ({
+      ...template,
+      id: `near-${index}`,
+      region: "near",
+      memoryBytes: 32 * 1024 * 1024,
+      reserveBytes: 0,
+    }));
+    const far = Array.from({ length: 2 }, (_, index) => ({
+      ...template,
+      id: `far-${index}`,
+      region: "far",
+      memoryBytes: 64 * 1024 ** 3,
+      reserveBytes: 0,
+    }));
+    const nodes = [...near, ...far];
+    const latencyOf = (id: string) => (id.startsWith("far") ? 400 : 10);
+    const links = [];
+    for (const from of nodes) {
+      for (const to of nodes) {
+        if (from.id === to.id) continue;
+        links.push({
+          from: from.id,
+          to: to.id,
+          oneWayLatencyMs: Math.max(latencyOf(from.id), latencyOf(to.id)),
+          jitterP95Ms: 0,
+          bandwidthMbps: 500,
+          lossRate: 0,
+        });
+      }
+    }
+    const topology = { nodes, links };
+
+    // Premisa del test: la poda se lleva a los únicos nodos con memoria.
+    const { topology: pruned } = evictFarNodes(topology);
+    expect([...evictFarNodes(topology).evicted].sort()).toEqual(["far-0", "far-1"]);
+    // Y sobre lo que queda NO hay plan. (Aquí no reentra el reintento: los cuatro
+    // cercanos están todos a 10 ms, así que no hay atípico que podar y `evicted`
+    // sale vacío.) Sin esta comprobación, el test pasaría aunque la poda no
+    // hubiera roto nada y no estaría probando el reintento.
+    expect(new FleetTopologyPlanner().plan(scenario.model, pruned, scenario.workload)).toBeNull();
+
+    const plan = new FleetTopologyPlanner().plan(scenario.model, topology, scenario.workload);
+    expect(plan).not.toBeNull();
+    // La prueba de que el reintento corrió: el plan coloca etapas en nodos que la
+    // poda había descartado. Sin el reintento, aquí había `null`.
+    expect(plan!.stages.some((stage) => stage.nodeId.startsWith("far"))).toBe(true);
   });
 
   it("turns the winning plan into an executable contiguous runtime manifest", () => {

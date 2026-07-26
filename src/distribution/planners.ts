@@ -373,8 +373,30 @@ export class FleetTopologyPlanner implements DistributionPlanner {
   ): DistributionPlan | null {
     // Antes de gastar la búsqueda combinatoria, quitar de en medio los nodos
     // cuya posición de red arruina cualquier ruta que los cruce.
-    const { topology } = evictFarNodes(fullTopology);
+    const { topology, evicted } = evictFarNodes(fullTopology);
+    const pruned = this.planWithin(model, topology, workload);
+    if (pruned) return pruned;
 
+    // La poda es una heurística de LATENCIA, no una comprobación de viabilidad.
+    // `evictFarNodes` sólo se compromete a conservar dos nodos: no mira las
+    // capas del modelo, ni la memoria por nodo, ni el agregado de la flota. En
+    // una flota de más de 64 nodos —el único caso que llega hasta aquí— puede
+    // dejar un subconjunto donde el modelo ya no cabe, y entonces devolver
+    // `null` sería declarar imposible un plan que sí existe: la flota entera
+    // tenía sitio, y lo que lo quitó fue un descarte de valores atípicos.
+    //
+    // Reintentar con la topología completa cuesta una segunda búsqueda sólo en
+    // el camino donde la primera ya fracasó, así que el caso normal no paga
+    // nada. Preferir un plan lento a ningún plan.
+    if (evicted.length === 0) return null;
+    return this.planWithin(model, fullTopology, workload);
+  }
+
+  private planWithin(
+    model: DistributedModelProfile,
+    topology: DistributionTopology,
+    workload: DistributionWorkload,
+  ): DistributionPlan | null {
     if (topology.nodes.length <= this.fleetOptions.candidateLimit) {
       const direct = new TopologyBeamPlanner(this.searchOptions).plan(model, topology, workload);
       return direct ? { ...direct, algorithm: this.id } : null;

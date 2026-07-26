@@ -238,7 +238,76 @@ describe("connected executor activation", () => {
     expect(snapshot.capacityNodes).toEqual([{ id: "node-relay", availableVramMiB: 3_500 }]);
     expect(snapshot.config).toBeNull();
   });
+
+  // Los tokens por segundo dependen del MODELO. Tomar el máximo sobre todos los
+  // despliegues del worker comparaba medidas incomparables: el nodo que aún
+  // conservaba la medida de un modelo pequeño parecía el más rápido y se llevaba
+  // más capas del modelo grande. El sesgo premiaba justo al que midió con la
+  // carga más ligera.
+  it("scales decode only by throughput measured for the model being planned", () => {
+    const slowOnThisModel = worker("worker-a", "node-a", "192.168.1.10", 9_850, 4_096, 3_500, 12);
+    const fastOnThisModel = worker("worker-b", "node-b", "192.168.1.11", 9_851, 6_144, 5_000, 20);
+    // node-a es LENTO en "base" (10 tok/s) pero conserva una medida antigua de un
+    // modelo diminuto a 1.000 tok/s. Esa segunda medida no debe contar aquí.
+    slowOnThisModel.capabilities.deployments = [
+      deployment("dep-a-base", "base", 10),
+      deployment("dep-a-tiny", "modelo-diminuto-de-otra-activacion", 1_000),
+    ];
+    fastOnThisModel.capabilities.deployments = [deployment("dep-b-base", "base", 20)];
+
+    const snapshot = buildConnectedExecutorActivationSnapshot(
+      baseConfig(),
+      [slowOnThisModel, fastOnThisModel],
+      new Set(["worker-a", "worker-b"]),
+      measuredLinks("node-a", "node-b"),
+    );
+
+    // `decodeScale` es un multiplicador de COSTE normalizado al más rápido, así
+    // que el rápido vale 1 y el que va a la mitad vale 2. Con el máximo sobre
+    // todos los despliegues salía al revés: node-a 1 y node-b 20 (tope).
+    const scaleById = new Map(
+      (snapshot.config?.nodes ?? []).map((node) => [node.id, node.decodeScale]),
+    );
+    expect(scaleById.get("node-a")).toBeCloseTo(2, 5);
+    expect(scaleById.get("node-b")).toBeCloseTo(1, 5);
+  });
+
+  // Sin ninguna medida DEL MODELO planificado, el reparto vuelve a declararse no
+  // medido en vez de colarse por informado usando la medida de otro modelo.
+  it("falls back to unmeasured when only other models were measured", () => {
+    const workerA = worker("worker-a", "node-a", "192.168.1.10", 9_850, 4_096, 3_500, 12);
+    const workerB = worker("worker-b", "node-b", "192.168.1.11", 9_851, 6_144, 5_000, 20);
+    workerA.capabilities.deployments = [deployment("dep-a-otro", "otro-modelo", 10)];
+    workerB.capabilities.deployments = [deployment("dep-b-otro", "otro-modelo", 20)];
+
+    const snapshot = buildConnectedExecutorActivationSnapshot(
+      baseConfig(),
+      [workerA, workerB],
+      new Set(["worker-a", "worker-b"]),
+      measuredLinks("node-a", "node-b"),
+    );
+
+    // Cae al perfil de rendimiento, que es el mismo 0,5 del primer test.
+    expect(snapshot.config?.nodes.every((node) => node.decodeScale === 0.5)).toBe(true);
+  });
 });
+
+function deployment(deploymentId: string, model: string, tokensPerSecond: number) {
+  return {
+    deploymentId,
+    model,
+    modelDigest: `digest-${deploymentId}`,
+    mode: "replica" as const,
+    adapter: "mycellios-pipeline" as const,
+    peakVramMb: 2_600,
+    contextLimit: 4_096,
+    maxConcurrency: 1,
+    freeSlots: 1,
+    tokensPerSecond,
+    throughputSource: "measured" as const,
+    ttftMs: 800,
+  };
+}
 
 function worker(
   id: string,
