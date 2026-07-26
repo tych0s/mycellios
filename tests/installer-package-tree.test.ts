@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -10,6 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   assertInstallerPackageTreeMatches,
@@ -273,6 +275,39 @@ describe("installer package tree binding", () => {
       await expect(collectTreeEvidence(root)).rejects.toThrow("escapes");
     },
   );
+
+  // El punto de entrada del guion usa `await` de nivel superior, así que se
+  // ejecuta donde esté escrito. Estuvo ARRIBA del fichero, antes de que los
+  // `const` del módulo se inicializaran: las funciones se elevan, `const
+  // EXPECTED_DEBIAN_CONTROL_VALUES` no. Resultado, «Cannot access ... before
+  // initialization» y el instalador de Linux en rojo.
+  //
+  // Este test tiene que INVOCAR el guion como proceso: importarlo no basta,
+  // porque el bloque de entrada comprueba `process.argv[1]` y no se ejecuta al
+  // importar. Por eso ni el typecheck ni los tests de las funciones exportadas
+  // lo vieron — sólo CI, y sólo en la rama de `deb`.
+  it("runs its entry point after the module constants are initialised", () => {
+    const controlRoot = temporaryDirectory("mycellios-installer-entry-");
+    writeFileSync(join(controlRoot, "control"), "Package: mycellios\n");
+    writeFileSync(join(controlRoot, "md5sums"), "");
+    const script = fileURLToPath(
+      new URL("../scripts/verify-installer-package-tree.mjs", import.meta.url),
+    );
+    const result = spawnSync(process.execPath, [
+      script,
+      `--deb-control-root=${controlRoot}`,
+      `--deb-payload-root=${temporaryDirectory("mycellios-installer-payload-")}`,
+      `--deb-source-app=${temporaryDirectory("mycellios-installer-app-")}`,
+      "--expected-version=1.2.3",
+      "--expected-arch=amd64",
+    ], { encoding: "utf8" });
+
+    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+    expect(output).not.toContain("before initialization");
+    // Y llega hasta la comparación real de campos, que es la prueba de que pasó
+    // de la constante en vez de morir antes por otro motivo.
+    expect(output).toContain("DEB control fields differ");
+  });
 });
 
 function packageTreePair(): [string, string] {

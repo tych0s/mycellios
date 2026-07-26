@@ -10,40 +10,6 @@ import {
 import { basename, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
-if (
-  process.argv[1]
-  && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
-) {
-  try {
-    const command = parseCommandLine(process.argv.slice(2));
-    if (command.kind === "tree") {
-      await assertInstallerPackageTreeMatches(
-        command.expected,
-        command.actual,
-      );
-      console.log(`Installer package tree verified: ${command.actual}`);
-    } else if (command.kind === "dmg") {
-      await assertExactDmgInstallerPayload(
-        command.expectedApp,
-        command.dmgRoot,
-      );
-      console.log(`Exact DMG payload verified: ${command.dmgRoot}`);
-    } else if (command.kind === "deb") {
-      await assertDebianPackageMetadata(command);
-      console.log(`Exact DEB metadata verified: ${command.controlRoot}`);
-    } else {
-      await assertRpmPackageMetadata(command);
-      console.log(`Exact RPM metadata verified: ${command.rpmPackage}`);
-    }
-  } catch (error) {
-    console.error(
-      `Installer package tree verification failed: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    );
-    process.exitCode = 1;
-  }
-}
 
 export async function assertExactDmgInstallerPayload(
   expectedAppRoot,
@@ -948,4 +914,49 @@ function canonicalJson(value) {
       .join(",")}}`;
   }
   return JSON.stringify(value);
+}
+
+// PUNTO DE ENTRADA. Va AL FINAL a propósito, y no es cuestión de estilo.
+//
+// Este bloque usa `await` de nivel superior, así que se EJECUTA en el punto
+// del fichero donde esté escrito. Arriba se ejecutaba antes de que los
+// `const` del módulo estuviesen inicializados: las funciones se elevan, pero
+// `const EXPECTED_DEBIAN_CONTROL_VALUES` no, y cualquier camino que lo tocara
+// moría con «Cannot access ... before initialization». Sólo reventaba la rama
+// de `deb`, así que las de `tree` y `dmg` lo tapaban.
+//
+// Al final del módulo, todo lo que el punto de entrada usa ya existe.
+if (
+  process.argv[1]
+  && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+) {
+  try {
+    const command = parseCommandLine(process.argv.slice(2));
+    if (command.kind === "tree") {
+      await assertInstallerPackageTreeMatches(
+        command.expected,
+        command.actual,
+      );
+      console.log(`Installer package tree verified: ${command.actual}`);
+    } else if (command.kind === "dmg") {
+      await assertExactDmgInstallerPayload(
+        command.expectedApp,
+        command.dmgRoot,
+      );
+      console.log(`Exact DMG payload verified: ${command.dmgRoot}`);
+    } else if (command.kind === "deb") {
+      await assertDebianPackageMetadata(command);
+      console.log(`Exact DEB metadata verified: ${command.controlRoot}`);
+    } else {
+      await assertRpmPackageMetadata(command);
+      console.log(`Exact RPM metadata verified: ${command.rpmPackage}`);
+    }
+  } catch (error) {
+    console.error(
+      `Installer package tree verification failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    process.exitCode = 1;
+  }
 }
