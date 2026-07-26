@@ -306,6 +306,7 @@ function deployment(deploymentId: string, model: string, tokensPerSecond: number
     tokensPerSecond,
     throughputSource: "measured" as const,
     ttftMs: 800,
+    dataLocality: "local" as const,
   };
 }
 
