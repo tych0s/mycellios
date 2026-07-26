@@ -6,16 +6,22 @@ import {
   Check,
   CheckCircle2,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   CircleAlert,
   CirclePower,
+  Code2,
   Coins,
+  Copy,
   Cpu,
   Download,
   ExternalLink,
+  FileText,
   Gauge,
+  GitFork,
   Globe2,
   HardDrive,
+  History,
   House,
   Laptop,
   LayoutDashboard,
@@ -28,6 +34,7 @@ import {
   MessageSquareText,
   Minus,
   Network,
+  Paperclip,
   Play,
   Plus,
   Radio,
@@ -36,8 +43,10 @@ import {
   Send,
   Server,
   Settings,
+  Share2,
   ShieldCheck,
   SlidersHorizontal,
+  ScrollText,
   Sparkles,
   Smartphone,
   SunMoon,
@@ -66,6 +75,8 @@ import type {
   HubCatalogSort,
   RequestModelInput,
   RequestedModelCapacity,
+  SystemLogEntry,
+  SystemLogSnapshot,
 } from "../../src/desktop/contracts";
 import { consumeChatCompletionStreamWithRecovery } from "../../src/desktop/chat-stream";
 import type { ChatMessage } from "../../src/contracts/types";
@@ -95,14 +106,18 @@ import {
   type PublicAuthConfig,
 } from "./auth";
 import { ApiAccessPanel } from "./ApiAccessPanel";
-import { loadApiAccount, type ApiAccount } from "./api-access";
+import {
+  loadApiAccount,
+  type ApiAccount,
+} from "./api-access";
 import "./panel.css";
 
 const PUBLIC_COORDINATOR_URL = "https://www.mycellios.com";
 import "./panel-downloads.css";
 import "./panel-desktop.css";
 
-type PanelView = "overview" | "nodes" | "models" | "jobs" | "tests" | "inference" | "contribute" | "join" | "downloads" | "machine" | "settings" | "admin";
+type PanelView = "overview" | "history" | "nodes" | "models" | "jobs" | "tests" | "logs" | "inference" | "contribute" | "join" | "downloads" | "machine" | "settings" | "admin";
+type PanelMode = "simple" | "developer";
 
 interface PanelProps {
   desktopBridge?: DesktopBridge;
@@ -191,6 +206,32 @@ interface PublicSnapshot {
   jobs: PublicJob[];
 }
 
+type NetworkHistoryRange = "24h" | "7d" | "30d" | "90d";
+
+interface NetworkTelemetrySample {
+  capturedAt: string;
+  registeredNodes: number;
+  connectedNodes: number;
+  onlineNodes: number;
+  browserNodes: number;
+  activeModels: number;
+  modelReplicas: number;
+  modelPipelines: number;
+  offeredVramMb: number;
+  freeVramMb: number;
+  inflightJobs: number;
+  runningJobs: number;
+  completedJobs: number;
+}
+
+interface NetworkTelemetryHistory {
+  capturedAt: string;
+  intervalMinutes: number;
+  retentionDays: number;
+  range: NetworkHistoryRange;
+  samples: NetworkTelemetrySample[];
+}
+
 const EMPTY: PublicSnapshot = {
   capturedAt: new Date(0).toISOString(),
   version: "—",
@@ -203,15 +244,26 @@ const EMPTY: PublicSnapshot = {
 
 const sharedNavItems: Array<{ id: PanelView; label: string; icon: typeof Network }> = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
+  { id: "history", label: "Histórico", icon: History },
   { id: "nodes", label: "Nodes", icon: Server },
   { id: "jobs", label: "Tasks", icon: Activity },
   { id: "tests", label: "Tests", icon: Gauge },
+  { id: "logs", label: "Logs", icon: ScrollText },
   { id: "models", label: "Models", icon: Boxes },
   { id: "inference", label: "Chat", icon: MessageSquareText },
   { id: "contribute", label: "This device", icon: Zap },
   { id: "downloads", label: "Downloads", icon: Download },
   { id: "admin", label: "Admin", icon: ShieldCheck },
 ];
+
+const simplePanelViews = new Set<PanelView>(["overview", "history", "inference", "contribute", "downloads", "machine", "settings"]);
+const developerPanelViews = new Set<PanelView>(["nodes", "jobs", "tests", "logs", "models"]);
+
+function initialPanelMode(): PanelMode {
+  const requested = new URLSearchParams(window.location.search).get("view") as PanelView | null;
+  if (requested && developerPanelViews.has(requested)) return "developer";
+  return window.localStorage.getItem("mycellios.panel-mode") === "developer" ? "developer" : "simple";
+}
 
 function initialView(desktop: boolean, mobileEntry: boolean): PanelView {
   if (desktop) return "overview";
@@ -228,16 +280,21 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   const desktop = desktopBridge !== undefined;
   const localBrowser = !desktop && ["localhost", "127.0.0.1", "::1", "[::1]"].includes(window.location.hostname);
   const localProductionProxy = localBrowser && window.location.port === "4174";
+  const [panelMode, setPanelMode] = useState<PanelMode>(initialPanelMode);
   const navItems = useMemo(() => {
-    if (!desktop) return sharedNavItems;
     const desktopItems = sharedNavItems.filter((item) => item.id !== "contribute");
-    return [
+    const allItems = !desktop
+      ? sharedNavItems
+      : [
         ...desktopItems.slice(0, 1),
         { id: "machine" as const, label: "This device", icon: Cpu },
         ...desktopItems.slice(1),
         { id: "settings" as const, label: "Settings", icon: Settings },
       ];
-  }, [desktop]);
+    return panelMode === "developer"
+      ? allItems
+      : allItems.filter((item) => simplePanelViews.has(item.id));
+  }, [desktop, panelMode]);
   const [view, setView] = useState<PanelView>(() => initialView(desktop, mobileEntry));
   const [snapshot, setSnapshot] = useState<PublicSnapshot>(EMPTY);
   const [desktopSnapshot, setDesktopSnapshot] = useState<DashboardSnapshot | null>(null);
@@ -331,6 +388,12 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
       window.localStorage.setItem("mycellios.content-scale", String(next));
       return next;
     });
+  }
+
+  function changePanelMode(next: PanelMode) {
+    setPanelMode(next);
+    window.localStorage.setItem("mycellios.panel-mode", next);
+    if (next === "simple" && developerPanelViews.has(view)) navigate("overview");
   }
 
   function toggleTheme() {
@@ -533,7 +596,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   return (
     <div className="public-panel-viewport">
       <div
-        className={`public-panel theme-${theme} ${desktop ? `desktop-panel platform-${desktopSnapshot?.platform ?? "loading"}` : ""}`}
+        className={`public-panel theme-${theme} panel-mode-${panelMode} ${desktop ? `desktop-panel platform-${desktopSnapshot?.platform ?? "loading"}` : ""}`}
         style={{
           width: `${100 / contentScale}%`,
           height: `${100 / contentScale}vh`,
@@ -546,13 +609,24 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
         <button className="panel-sidebar-close" aria-label="Close navigation" onClick={() => setMenuOpen(false)}><X size={18} /></button>
         <a className="panel-brand" href={publicLink("/")} {...externalProps}><img src={brandIcon} alt="" /><div><strong>mycellios</strong><span>network control</span></div></a>
         <nav>
-          <span className="panel-nav-label">CONTROL CENTER</span>
+          <span className="panel-nav-label">{panelMode === "developer" ? "DEVELOPER TOOLS" : "MYCELLIOS"}</span>
           {navItems.map(({ id, label, icon: Icon }) => (
             <button key={id} className={view === id ? "active" : ""} title={label} aria-label={label} onClick={() => navigate(id)}>
               <Icon size={18} /><span>{label}</span>{id === "nodes" && <b>{snapshot.summary.connected}</b>}
             </button>
           ))}
         </nav>
+        <button
+          type="button"
+          className={`panel-mode-toggle ${panelMode === "developer" ? "active" : ""}`}
+          aria-pressed={panelMode === "developer"}
+          title={panelMode === "developer" ? "Switch to the simple panel" : "Show developer tools"}
+          onClick={() => changePanelMode(panelMode === "developer" ? "simple" : "developer")}
+        >
+          <Code2 size={18} />
+          <span><strong>Developer mode</strong><small>{panelMode === "developer" ? "Advanced tools visible" : "Simple panel active"}</small></span>
+          <i aria-hidden="true" />
+        </button>
         <div className="panel-sidebar-links">
           <a href={publicLink("/mobile/")} {...externalProps}><Smartphone size={17} /><span>Mobile app</span><ExternalLink size={13} /></a>
           <a href={publicLink("/")} {...externalProps}><House size={17} /><span>Landing</span><ExternalLink size={13} /></a>
@@ -599,6 +673,13 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
                 ? <button className="panel-account-button signed-in" onClick={() => setAuthOpen(true)} title={networkIdentity.email ?? "Mycellios account"}><UserRound size={16} /><span>{networkIdentity.role ?? "member"}</span></button>
                 : <button className="panel-account-button" onClick={() => setAuthOpen(true)}><UserRound size={16} /><span>Sign in</span></button>
             )}
+            <JoinQuickMenu
+              inviteUrl={desktop ? publicLink("/join") : `${window.location.origin}/join`}
+              browserUrl={publicLink("/mobile/?autostart=1")}
+              downloadsUrl={publicLink("/downloads")}
+              external={desktop}
+              onOpenJoin={() => navigate("join")}
+            />
             <button onClick={() => void refresh()} aria-label="Refresh"><RefreshCw className={loading ? "spin" : ""} size={17} /></button>
             {!desktop && <a href={mobileEntry ? "/mobile/" : "/network?view=contribute"}>This device <Zap size={15} /></a>}
             {desktopBridge && <div className="panel-window-controls"><button onClick={() => void desktopBridge.minimizeWindow()} aria-label="Minimize"><Minus size={16} /></button><button onClick={() => void desktopBridge.toggleMaximizeWindow()} aria-label="Maximize"><Maximize2 size={15} /></button><button className="close" onClick={() => void desktopBridge.closeWindow()} aria-label="Close"><X size={16} /></button></div>}
@@ -610,12 +691,14 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
           <div className="panel-content-scale">
             {loading && snapshot.capturedAt === EMPTY.capturedAt ? <PanelLoading /> : (
               <>
-              {view === "overview" && <Overview snapshot={snapshot} onNavigate={navigate} publicLink={publicLink} external={desktop} localAcceleration={desktopSnapshot?.acceleration} localContributionState={desktopSnapshot?.contribution.state} localComputeMode={desktopSnapshot?.settings.computeMode} />}
+              {view === "overview" && <Overview snapshot={snapshot} onNavigate={navigate} publicLink={publicLink} external={desktop} apiBaseUrl={apiBaseUrl} joinUrl={desktop ? publicLink("/join") : `${window.location.origin}/join`} localAcceleration={desktopSnapshot?.acceleration} localContributionState={desktopSnapshot?.contribution.state} localComputeMode={desktopSnapshot?.settings.computeMode} developerMode={panelMode === "developer"} />}
+              {view === "history" && <NetworkHistory endpoint={desktop ? `${publicOrigin}/public/v1/history` : "/public/v1/history"} />}
               {view === "nodes" && <Nodes snapshot={snapshot} onRemove={removeWorker} onClearOffline={clearOfflineWorkers} />}
               {view === "models" && <Models snapshot={snapshot} onSearch={searchHubModels} onRequest={requestModel} onRemove={removeRequestedModel} adminToken={modelAdminToken} requiresAdminToken={requiresModelAdminToken} secureTokenStorage={desktop} />}
               {view === "jobs" && <Jobs snapshot={snapshot} />}
               {view === "tests" && <Tests bridge={desktopBridge} />}
-              {view === "inference" && <Inference snapshot={snapshot} onSend={sendPrompt} onNavigate={navigate} accountAuthenticated={desktop || !authConfig.apiAccessEnabled || authSession !== null} onSignIn={() => setAuthOpen(true)} apiAccessEnabled={authConfig.apiAccessEnabled ?? false} apiBaseUrl={apiBaseUrl} accessToken={authSession?.accessToken ?? null} apiAccount={apiAccount} />}
+              {view === "logs" && <SystemLogs snapshot={snapshot} bridge={desktopBridge} connectionError={error} />}
+              {view === "inference" && <Inference snapshot={snapshot} onSend={sendPrompt} onNavigate={navigate} developerMode={panelMode === "developer"} accountAuthenticated={desktop || !authConfig.apiAccessEnabled || authSession !== null} onSignIn={() => setAuthOpen(true)} apiAccessEnabled={authConfig.apiAccessEnabled ?? false} apiBaseUrl={apiBaseUrl} accessToken={authSession?.accessToken ?? null} apiAccount={apiAccount} />}
               {view === "contribute" && <Contribute />}
               {view === "join" && <JoinNetwork publicLink={publicLink} external={desktop} />}
               {view === "downloads" && <Downloads publicLink={publicLink} external={desktop} />}
@@ -631,7 +714,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
                 }}
               />}
               {view === "machine" && desktopSnapshot && desktopBridge && <Machine snapshot={desktopSnapshot} bridge={desktopBridge} onSnapshot={applyDesktopSnapshot} />}
-              {view === "settings" && desktopSnapshot && desktopBridge && <DesktopSettingsView snapshot={desktopSnapshot} bridge={desktopBridge} onSnapshot={applyDesktopSnapshot} />}
+              {view === "settings" && desktopSnapshot && desktopBridge && <DesktopSettingsView snapshot={desktopSnapshot} bridge={desktopBridge} onSnapshot={applyDesktopSnapshot} developerMode={panelMode === "developer"} />}
               </>
             )}
           </div>
@@ -673,6 +756,116 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
           },
         } : {})}
       />
+    </div>
+  );
+}
+
+function JoinQuickMenu({
+  inviteUrl,
+  browserUrl,
+  downloadsUrl,
+  external,
+  onOpenJoin,
+}: {
+  inviteUrl: string;
+  browserUrl: string;
+  downloadsUrl: string;
+  external: boolean;
+  onOpenJoin: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "error">("idle");
+  const menuId = useId();
+  const rootRef = useRef<HTMLDivElement>(null);
+  const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const externalProps = external ? { target: "_blank", rel: "noreferrer" } as const : {};
+
+  useEffect(() => {
+    if (!open) return;
+    const closeOnOutsidePress = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePress);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePress);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [open]);
+
+  useEffect(() => () => {
+    if (copyResetRef.current) clearTimeout(copyResetRef.current);
+  }, []);
+
+  async function copyInvite() {
+    try {
+      await navigator.clipboard.writeText(inviteUrl);
+      setCopyState("copied");
+    } catch {
+      setCopyState("error");
+    }
+    if (copyResetRef.current) clearTimeout(copyResetRef.current);
+    copyResetRef.current = setTimeout(() => setCopyState("idle"), 2200);
+  }
+
+  return (
+    <div className={`panel-join-menu ${open ? "open" : ""}`} ref={rootRef}>
+      <button
+        type="button"
+        className="panel-join-trigger"
+        aria-label="Join"
+        aria-haspopup="dialog"
+        aria-controls={menuId}
+        aria-expanded={open}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <Share2 size={15} />
+        <span>Join</span>
+        <ChevronDown className="panel-join-chevron" size={13} />
+      </button>
+      {open && (
+        <section className="panel-join-popover" id={menuId} role="dialog" aria-label="Join or invite">
+          <div className="panel-join-popover-intro">
+            <span>MESH ACCESS</span>
+            <strong>Join or invite</strong>
+            <p>Connect a node in seconds or share this public access with someone who wants to contribute compute.</p>
+          </div>
+          <div className="panel-join-invite">
+            <div className="panel-join-invite-head">
+              <span>PUBLIC JOIN LINK</span>
+              <button type="button" className={copyState} onClick={() => void copyInvite()} aria-live="polite">
+                {copyState === "copied" ? <Check size={14} /> : <Copy size={14} />}
+                {copyState === "copied" ? "Copied" : copyState === "error" ? "Try again" : "Copy"}
+              </button>
+            </div>
+            <code><span>$</span>{inviteUrl}</code>
+            <small>Anyone with this link can choose a browser node or install the desktop client.</small>
+          </div>
+          <div className="panel-join-quick-actions">
+            <button type="button" onClick={() => { setOpen(false); onOpenJoin(); }}>
+              <Network size={16} />
+              <span><strong>Open Join</strong><small>See every connection option</small></span>
+              <ChevronRight size={15} />
+            </button>
+            <a href={browserUrl} {...externalProps}>
+              <Smartphone size={16} />
+              <span><strong>Browser node</strong><small>Connect without installing</small></span>
+              <ExternalLink size={14} />
+            </a>
+            <a href={downloadsUrl} {...externalProps}>
+              <Download size={16} />
+              <span><strong>Install client</strong><small>Windows, macOS or Linux</small></span>
+              <ChevronRight size={15} />
+            </a>
+          </div>
+          <a className="panel-join-guide" href="https://github.com/tych0s/mycellios" target="_blank" rel="noreferrer">
+            <GitFork size={14} /> Setup &amp; contribute on GitHub <ExternalLink size={12} />
+          </a>
+        </section>
+      )}
     </div>
   );
 }
@@ -1026,7 +1219,453 @@ function AssistantAdmin({
   );
 }
 
-function Overview({ snapshot, onNavigate, publicLink, external, localAcceleration, localContributionState, localComputeMode }: { snapshot: PublicSnapshot; onNavigate: (view: PanelView) => void; publicLink: (path: string) => string; external: boolean; localAcceleration: AcceleratorProgressSnapshot | undefined; localContributionState: DashboardSnapshot["contribution"]["state"] | undefined; localComputeMode: DesktopSettings["computeMode"] | undefined }) {
+export function LiveNetworkTelemetry({ snapshot }: { snapshot: PublicSnapshot }) {
+  const onlineWorkers = snapshot.workers.filter((worker) => worker.connected && worker.status === "online");
+  const activeVramMb = onlineWorkers.reduce((total, worker) => total + worker.offeredVramMb, 0);
+  const activeGpus = onlineWorkers.flatMap((worker) => worker.gpus);
+  const freeVramMb = activeGpus.reduce((total, gpu) => total + gpu.freeOfferedVramMb, 0);
+  const freeRatio = activeVramMb > 0 ? Math.min(1, freeVramMb / activeVramMb) : 0;
+  const replicas = snapshot.models.reduce((total, model) => total + model.replicas, 0);
+  const pipelines = snapshot.models.reduce((total, model) => total + model.pipelines, 0);
+  const inflightJobs = snapshot.jobs.filter((job) => ["queued", "leasing", "running", "streaming"].includes(job.status));
+  const runningJobs = inflightJobs.filter((job) => job.status === "running" || job.status === "streaming").length;
+  const queuedJobs = inflightJobs.length - runningJobs;
+  const snapshotReady = snapshot.capturedAt !== EMPTY.capturedAt;
+
+  return (
+    <section className="live-network-telemetry" aria-label="Current live network data" aria-live="polite">
+      <div className="snapshot">
+        <span><Radio size={12} />Snapshot</span>
+        <strong><i />{snapshotReady ? "LIVE" : "WAITING"}</strong>
+        <small>{snapshotReady ? `Updated ${relativeTime(snapshot.capturedAt)}` : "Waiting for coordinator"}</small>
+      </div>
+      <div>
+        <span><Network size={12} />Coordinator</span>
+        <strong>mycellios</strong>
+        <small>Public API · v{snapshot.version}</small>
+      </div>
+      <div>
+        <span><GitFork size={12} />Connected peers</span>
+        <strong>{snapshot.summary.connected}</strong>
+        <small>{snapshot.summary.online} online · {snapshot.summary.mobile} browser</small>
+      </div>
+      <div>
+        <span><Boxes size={12} />Active models</span>
+        <strong>{snapshot.models.length}</strong>
+        <small>{replicas} replicas · {pipelines} pipelines</small>
+      </div>
+      <div className="vram">
+        <span><MemoryStick size={12} />Mesh VRAM</span>
+        <strong>{formatMemory(activeVramMb)}</strong>
+        <small>{formatMemory(freeVramMb)} free · {onlineWorkers.length} peers</small>
+        <i className="live-telemetry-meter" aria-label={`${Math.round(freeRatio * 100)}% free`}><b style={{ width: `${freeRatio * 100}%` }} /></i>
+      </div>
+      <div className="inflight">
+        <span><Activity size={12} />Inflight</span>
+        <strong>{inflightJobs.length}</strong>
+        <small>{runningJobs} running · {queuedJobs} queued</small>
+        <i className={inflightJobs.length > 0 ? "active" : ""} />
+      </div>
+    </section>
+  );
+}
+
+const historyRangeLabels: Record<NetworkHistoryRange, string> = {
+  "24h": "24 horas",
+  "7d": "7 días",
+  "30d": "30 días",
+  "90d": "90 días",
+};
+
+export function NetworkHistory({ endpoint }: { endpoint: string }) {
+  const [range, setRange] = useState<NetworkHistoryRange>("24h");
+  const [history, setHistory] = useState<NetworkTelemetryHistory | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  const load = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
+    try {
+      const separator = endpoint.includes("?") ? "&" : "?";
+      const response = await fetch(`${endpoint}${separator}range=${range}`, { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      setHistory(await response.json() as NetworkTelemetryHistory);
+      setLoadError(null);
+    } catch (caught) {
+      setLoadError(errorText(caught));
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  }, [endpoint, range]);
+
+  useEffect(() => {
+    void load();
+    const timer = window.setInterval(() => void load(true), 60_000);
+    return () => window.clearInterval(timer);
+  }, [load]);
+
+  return <section className="network-history-page">
+    <PageTitle
+      eyebrow="TELEMETRÍA PERSISTENTE"
+      title="Histórico de la red"
+      copy="Evolución real de la capacidad compartida, los nodos, los modelos y las tareas. El coordinador guarda una muestra cada diez minutos."
+      actions={<button type="button" disabled={loading} onClick={() => void load()}>{loading ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}Actualizar</button>}
+    />
+    <div className="network-history-toolbar">
+      <div className="network-history-ranges" role="group" aria-label="Rango del histórico">
+        {(Object.keys(historyRangeLabels) as NetworkHistoryRange[]).map((value) => (
+          <button
+            type="button"
+            className={range === value ? "active" : ""}
+            aria-pressed={range === value}
+            onClick={() => setRange(value)}
+            key={value}
+          >{historyRangeLabels[value]}</button>
+        ))}
+      </div>
+      <span><History size={15} />Cada {history?.intervalMinutes ?? 10} min · conservación {history?.retentionDays ?? 90} días</span>
+    </div>
+    {loadError && <div className="network-history-error"><CircleAlert size={17} /><span><strong>No se pudo cargar el histórico</strong>{loadError}</span></div>}
+    {loading && !history ? <div className="network-history-loading"><LoaderCircle className="spin" /><span>Leyendo las muestras guardadas…</span></div> : history && <NetworkHistoryReport history={history} />}
+  </section>;
+}
+
+export function NetworkHistoryReport({ history }: { history: NetworkTelemetryHistory }) {
+  const latest = history.samples.at(-1);
+  const first = history.samples[0];
+  if (!latest) {
+    return <Empty icon={History} title="Todavía no hay muestras" copy="El coordinador guardará automáticamente la primera lectura y añadirá otra cada diez minutos." />;
+  }
+  return <>
+    <div className="network-history-summary" aria-label="Última muestra guardada">
+      <HistorySummaryCard
+        icon={MemoryStick}
+        label="VRAM total activa"
+        value={formatMemory(latest.offeredVramMb)}
+        detail={`${formatMemory(latest.freeVramMb)} libres ahora`}
+        delta={historyDelta(latest.offeredVramMb, first?.offeredVramMb)}
+        tone="blue"
+      />
+      <HistorySummaryCard
+        icon={Server}
+        label="Nodos conectados"
+        value={String(latest.connectedNodes)}
+        detail={`${latest.onlineNodes} online · ${latest.browserNodes} browser`}
+        delta={historyDelta(latest.connectedNodes, first?.connectedNodes)}
+        tone="green"
+      />
+      <HistorySummaryCard
+        icon={Boxes}
+        label="Modelos activos"
+        value={String(latest.activeModels)}
+        detail={`${latest.modelReplicas} réplicas · ${latest.modelPipelines} pipelines`}
+        delta={historyDelta(latest.activeModels, first?.activeModels)}
+        tone="purple"
+      />
+      <HistorySummaryCard
+        icon={Activity}
+        label="Trabajos en curso"
+        value={String(latest.inflightJobs)}
+        detail={`${latest.runningJobs} ejecutándose`}
+        delta={historyDelta(latest.inflightJobs, first?.inflightJobs)}
+        tone="orange"
+      />
+    </div>
+    <div className="network-history-meta">
+      <span><Radio />Última muestra <strong>{formatHistoryDate(latest.capturedAt)}</strong></span>
+      <span><ShieldCheck />Datos del coordinador, sin estimaciones</span>
+      <span><History />{history.samples.length} muestras en {historyRangeLabels[history.range]}</span>
+    </div>
+    <div className="network-history-charts">
+      <NetworkHistoryChart
+        title="Capacidad de la red"
+        eyebrow="VRAM ACTIVA"
+        samples={history.samples}
+        unit=""
+        valueFormatter={formatMemory}
+        series={[
+          { key: "offeredVramMb", label: "Total activa", tone: "blue" },
+          { key: "freeVramMb", label: "Libre", tone: "green" },
+        ]}
+      />
+      <NetworkHistoryChart
+        title="Disponibilidad de nodos"
+        eyebrow="PEERS"
+        samples={history.samples}
+        unit="nodos"
+        valueFormatter={(value) => String(Math.round(value))}
+        series={[
+          { key: "connectedNodes", label: "Conectados", tone: "blue" },
+          { key: "onlineNodes", label: "Online", tone: "green" },
+          { key: "browserNodes", label: "Browser", tone: "purple" },
+        ]}
+      />
+      <NetworkHistoryChart
+        title="Modelos disponibles"
+        eyebrow="MODEL FABRIC"
+        samples={history.samples}
+        unit="modelos"
+        valueFormatter={(value) => String(Math.round(value))}
+        series={[
+          { key: "activeModels", label: "Modelos", tone: "purple" },
+          { key: "modelReplicas", label: "Réplicas", tone: "blue" },
+          { key: "modelPipelines", label: "Pipelines", tone: "green" },
+        ]}
+      />
+      <NetworkHistoryChart
+        title="Carga de inferencia"
+        eyebrow="ACTIVIDAD"
+        samples={history.samples}
+        unit="trabajos"
+        valueFormatter={(value) => String(Math.round(value))}
+        series={[
+          { key: "inflightJobs", label: "En curso", tone: "orange" },
+          { key: "runningJobs", label: "Ejecutándose", tone: "green" },
+        ]}
+      />
+    </div>
+    <NetworkHistoryTable samples={history.samples} />
+  </>;
+}
+
+type HistoryMetricKey =
+  | "offeredVramMb"
+  | "freeVramMb"
+  | "connectedNodes"
+  | "onlineNodes"
+  | "browserNodes"
+  | "activeModels"
+  | "modelReplicas"
+  | "modelPipelines"
+  | "inflightJobs"
+  | "runningJobs";
+
+interface HistoryChartSeries {
+  key: HistoryMetricKey;
+  label: string;
+  tone: "blue" | "green" | "purple" | "orange";
+}
+
+function NetworkHistoryChart({
+  title,
+  eyebrow,
+  samples,
+  series,
+  unit,
+  valueFormatter,
+}: {
+  title: string;
+  eyebrow: string;
+  samples: NetworkTelemetrySample[];
+  series: HistoryChartSeries[];
+  unit: string;
+  valueFormatter: (value: number) => string;
+}) {
+  const points = downsampleNetworkHistory(samples, 720);
+  const width = 760;
+  const height = 250;
+  const left = 52;
+  const right = 24;
+  const top = 24;
+  const bottom = 44;
+  const ceiling = Math.max(
+    1,
+    ...points.flatMap((sample) => series.map(({ key }) => sample[key])),
+  );
+  const x = (index: number) => points.length === 1
+    ? (left + width - right) / 2
+    : left + (index / Math.max(points.length - 1, 1)) * (width - left - right);
+  const y = (value: number) => top + (1 - value / ceiling) * (height - top - bottom);
+  const labelEvery = Math.max(1, Math.ceil(points.length / 5));
+  return <article className="network-history-chart">
+    <header><div><span>{eyebrow}</span><h2>{title}</h2></div><div className="network-history-legend">{series.map((item) => <span className={item.tone} key={item.key}><i />{item.label}</span>)}</div></header>
+    <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${title}. ${samples.length} muestras reales.`}>
+      {[0, 0.5, 1].map((ratio) => <g key={ratio}>
+        <line className="history-grid-line" x1={left} y1={top + ratio * (height - top - bottom)} x2={width - right} y2={top + ratio * (height - top - bottom)} />
+        <text x={left - 8} y={top + ratio * (height - top - bottom) + 4} textAnchor="end">{valueFormatter(ceiling * (1 - ratio))}</text>
+      </g>)}
+      {series.map((item) => <g className={`network-history-series ${item.tone}`} key={item.key}>
+        {points.length > 1 && <polyline points={points.map((sample, index) => `${x(index)},${y(sample[item.key])}`).join(" ")} />}
+        {points.length === 1 && <circle cx={x(0)} cy={y(points[0]![item.key])} r="5"><title>{`${item.label}: ${valueFormatter(points[0]![item.key])}`}</title></circle>}
+      </g>)}
+      {points.map((sample, index) => {
+        if (index % labelEvery !== 0 && index !== points.length - 1) return null;
+        return <text className="history-x-label" x={x(index)} y={height - 13} textAnchor="middle" key={sample.capturedAt}>{formatHistoryChartTime(sample.capturedAt)}</text>;
+      })}
+    </svg>
+    <footer><span>{samples.length} muestras · cada 10 min</span>{series.map((item) => <strong key={item.key}>{item.label} {valueFormatter(points.at(-1)?.[item.key] ?? 0)} {unit && <small>{unit}</small>}</strong>)}</footer>
+  </article>;
+}
+
+function HistorySummaryCard({
+  icon: Icon,
+  label,
+  value,
+  detail,
+  delta,
+  tone,
+}: {
+  icon: typeof Network;
+  label: string;
+  value: string;
+  detail: string;
+  delta: number;
+  tone: "blue" | "green" | "purple" | "orange";
+}) {
+  return <article className={`network-history-summary-card ${tone}`}>
+    <Icon />
+    <span><small>{label}</small><strong>{value}</strong><em>{detail}</em></span>
+    <b className={delta > 0 ? "positive" : delta < 0 ? "negative" : "neutral"}>{delta > 0 ? "+" : ""}{delta} desde el inicio</b>
+  </article>;
+}
+
+function NetworkHistoryTable({ samples }: { samples: NetworkTelemetrySample[] }) {
+  const visible = samples.slice(-24).toReversed();
+  return <article className="network-history-table-card">
+    <header><div><span>MUESTRAS EXACTAS</span><h2>Últimas lecturas guardadas</h2></div><small>Se muestran las 24 más recientes</small></header>
+    <div className="network-history-table-scroll">
+      <table>
+        <thead><tr><th>Momento</th><th>VRAM activa</th><th>VRAM libre</th><th>Nodos</th><th>Online</th><th>Modelos</th><th>Inflight</th><th>Completadas</th></tr></thead>
+        <tbody>{visible.map((sample) => <tr key={sample.capturedAt}>
+          <td><strong>{formatHistoryDate(sample.capturedAt)}</strong></td>
+          <td>{formatMemory(sample.offeredVramMb)}</td>
+          <td>{formatMemory(sample.freeVramMb)}</td>
+          <td>{sample.connectedNodes}</td>
+          <td>{sample.onlineNodes}</td>
+          <td>{sample.activeModels}</td>
+          <td>{sample.inflightJobs}</td>
+          <td>{sample.completedJobs}</td>
+        </tr>)}</tbody>
+      </table>
+    </div>
+  </article>;
+}
+
+function downsampleNetworkHistory(
+  samples: NetworkTelemetrySample[],
+  maximum: number,
+): NetworkTelemetrySample[] {
+  if (samples.length <= maximum) return samples;
+  const indexes = new Set<number>([0, samples.length - 1]);
+  const step = (samples.length - 1) / (maximum - 1);
+  for (let index = 1; index < maximum - 1; index += 1) {
+    indexes.add(Math.round(index * step));
+  }
+  return [...indexes].sort((left, right) => left - right).map((index) => samples[index]!);
+}
+
+function historyDelta(current: number, initial: number | undefined): number {
+  return initial === undefined ? 0 : Math.round(current - initial);
+}
+
+function formatHistoryDate(value: string): string {
+  return new Intl.DateTimeFormat("es-ES", {
+    day: "2-digit",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(value));
+}
+
+function formatHistoryChartTime(value: string): string {
+  return new Intl.DateTimeFormat("es-ES", {
+    day: "2-digit",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(value)).replace(",", "");
+}
+
+function DashboardConnect({
+  apiBaseUrl,
+  joinUrl,
+  downloadsUrl,
+  browserUrl,
+  external,
+  onOpenJoin,
+}: {
+  apiBaseUrl: string;
+  joinUrl: string;
+  downloadsUrl: string;
+  browserUrl: string;
+  external: boolean;
+  onOpenJoin: () => void;
+}) {
+  const titleId = useId();
+  const [copied, setCopied] = useState<"api" | "join" | null>(null);
+  const [copyError, setCopyError] = useState<"api" | "join" | null>(null);
+  const resetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const externalProps = external ? { target: "_blank", rel: "noreferrer" } as const : {};
+
+  useEffect(() => () => {
+    if (resetRef.current) clearTimeout(resetRef.current);
+  }, []);
+
+  async function copyValue(kind: "api" | "join", value: string) {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(kind);
+      setCopyError(null);
+    } catch {
+      setCopied(null);
+      setCopyError(kind);
+    }
+    if (resetRef.current) clearTimeout(resetRef.current);
+    resetRef.current = setTimeout(() => {
+      setCopied(null);
+      setCopyError(null);
+    }, 2200);
+  }
+
+  const copyLabel = (kind: "api" | "join") => copied === kind ? "Copied" : copyError === kind ? "Try again" : "Copy";
+
+  return (
+    <article className="dashboard-connect" aria-labelledby={titleId}>
+      <header>
+        <div><strong id={titleId}>Connect</strong><span>· join the public mycellios network</span></div>
+        <a href="https://github.com/tych0s/mycellios#readme" target="_blank" rel="noreferrer">Full docs <ArrowRight size={13} /></a>
+      </header>
+      <div className="dashboard-connect-grid">
+        <section>
+          <span>1 · INSTALL</span>
+          <a className="dashboard-connect-field install" href={downloadsUrl} {...externalProps}>
+            <Download size={15} />
+            <code>Download mycellios</code>
+            <b>open</b>
+          </a>
+        </section>
+        <section>
+          <span>API ENDPOINT</span>
+          <div className="dashboard-connect-field endpoint">
+            <Globe2 size={15} />
+            <code>{apiBaseUrl}</code>
+            <button type="button" onClick={() => void copyValue("api", apiBaseUrl)} aria-label={`${copyLabel("api")} API endpoint`}>
+              {copied === "api" ? <Check size={13} /> : <Copy size={13} />}
+              <span>{copied === "api" ? "copied" : "configured target"}</span>
+            </button>
+          </div>
+        </section>
+        <section className="dashboard-connect-join">
+          <span>2 · JOIN</span>
+          <div className="dashboard-connect-command">
+            <code><i>$</i>{joinUrl}</code>
+            <button type="button" className={copyError === "join" ? "error" : copied === "join" ? "copied" : ""} onClick={() => void copyValue("join", joinUrl)}>
+              {copied === "join" ? <Check size={14} /> : <Copy size={14} />}
+              {copyLabel("join")}
+            </button>
+          </div>
+          <p>Share the public link, connect in a browser, or install the desktop client. The configured API uses the OpenAI-compatible <code>/v1</code> interface.</p>
+        </section>
+      </div>
+      <footer>
+        <a href={browserUrl} {...externalProps}><Smartphone size={14} />Start a browser node <ExternalLink size={12} /></a>
+        <button type="button" onClick={onOpenJoin}>View every option <ChevronRight size={13} /></button>
+      </footer>
+    </article>
+  );
+}
+
+function Overview({ snapshot, onNavigate, publicLink, external, apiBaseUrl, joinUrl, localAcceleration, localContributionState, localComputeMode, developerMode }: { snapshot: PublicSnapshot; onNavigate: (view: PanelView) => void; publicLink: (path: string) => string; external: boolean; apiBaseUrl: string; joinUrl: string; localAcceleration: AcceleratorProgressSnapshot | undefined; localContributionState: DashboardSnapshot["contribution"]["state"] | undefined; localComputeMode: DesktopSettings["computeMode"] | undefined; developerMode: boolean }) {
   const active = snapshot.workers.filter((worker) => worker.connected);
   const operational = active.filter((worker) => worker.status === "online");
   const activeGpus = operational.flatMap((worker) => worker.gpus);
@@ -1049,8 +1688,25 @@ function Overview({ snapshot, onNavigate, publicLink, external, localAcceleratio
   const cellNodes = operational.filter((worker) => worker.kind === "cell").length;
   return (
     <section className="overview-page">
-      <PageTitle eyebrow="NETWORK CONTROL" title="Distributed AI network" copy="A live view of the capacity, models and tasks connected to your mycellios network." actions={<><button onClick={() => onNavigate("nodes")}>Manage nodes</button><a href={publicLink("/mobile/")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}>Add this device <ArrowRight size={16} /></a></>} />
+      <PageTitle eyebrow="NETWORK CONTROL" title="Distributed AI network" copy="A live view of the capacity, models and tasks connected to your mycellios network." actions={developerMode ? <button onClick={() => onNavigate("nodes")}>Manage nodes</button> : undefined} />
+      <aside className="overview-announcement" aria-label="Contribute to the public mycellios network">
+        <div className="announcement-icon"><Network size={21} /></div>
+        <div><strong>Welcome to the public mesh</strong><span>Run open models with shared community capacity. Contribute from this browser or install a local node; you choose the resources and can pause at any time.</span></div>
+        <div className="overview-announcement-actions">
+          <button onClick={() => onNavigate(external ? "machine" : "contribute")}>Contribute now <ArrowRight size={15} /></button>
+          <a href="https://github.com/tych0s/mycellios" target="_blank" rel="noreferrer"><GitFork size={15} />GitHub</a>
+        </div>
+      </aside>
+      <LiveNetworkTelemetry snapshot={snapshot} />
       {localAcceleration && shouldShowAccelerationBanner(localAcceleration) && <AcceleratorCompactBanner acceleration={localAcceleration} contributionState={localContributionState} computeMode={localComputeMode} onOpen={() => onNavigate("machine")} />}
+      <DashboardConnect
+        apiBaseUrl={apiBaseUrl}
+        joinUrl={joinUrl}
+        downloadsUrl={publicLink("/downloads")}
+        browserUrl={publicLink("/mobile/?autostart=1")}
+        external={external}
+        onOpenJoin={() => onNavigate("join")}
+      />
       <article className="global-capacity-card">
         <div className="global-capacity-main">
           <div className="global-capacity-heading"><span>GLOBAL NODE CAPACITY</span><b><i /> LIVE</b></div>
@@ -1072,40 +1728,558 @@ function Overview({ snapshot, onNavigate, publicLink, external, localAcceleratio
         <Stat icon={Boxes} label="Available models" value={String(snapshot.models.length)} detail="Announced by live nodes" />
         <Stat icon={CheckCircle2} label="Tasks completed" value={String(snapshot.summary.completedJobs)} detail="Current coordinator history" />
       </div>
-      <div className="overview-grid">
+      <ConnectedPeersTable workers={snapshot.workers} />
+      <div className="overview-grid overview-grid-interactive">
+        <InteractiveMesh
+          workers={active}
+          registeredWorkers={snapshot.summary.registered}
+          sharedVramMb={activeOfferedVramMb}
+          publicLink={publicLink}
+          external={external}
+          developerMode={developerMode}
+          onNavigate={onNavigate}
+        />
+        <NetworkModelCatalog snapshot={snapshot} developerMode={developerMode} onNavigate={onNavigate} />
         <article className="activity-card">
-          <div className="card-heading"><div><span>RECENT ACTIVITY</span><h2>Network tasks</h2></div><button onClick={() => onNavigate("jobs")}>View all</button></div>
+          <div className="card-heading"><div><span>RECENT ACTIVITY</span><h2>Network tasks</h2></div>{developerMode && <button onClick={() => onNavigate("jobs")}>View all</button>}</div>
           <div className="activity-list">
             {snapshot.jobs.slice(0, 5).map((job) => <div key={job.id}><i className={job.status} /><div><strong>{job.model}</strong><span>{shortId(job.id)} · {relativeTime(job.updatedAt)}</span></div><b>{job.status}</b></div>)}
             {snapshot.jobs.length === 0 && <Empty icon={Activity} title="No tasks yet" copy="Tasks will appear here when you test a connected model." />}
           </div>
         </article>
-        <article className="network-canvas">
-          <div className="canvas-head"><div><span>LIVE TOPOLOGY</span><strong>Network</strong></div><button className="canvas-link" onClick={() => onNavigate("nodes")}>View nodes</button></div>
-          <div className="network-orbit">
-            <div className="orbit-grid" />
-            <div className="network-core"><img src={brandIcon} alt="" /><span>mycellios</span><small>coordinator</small></div>
-            {active.slice(0, 14).map((worker, index) => {
-              const angle = (index / Math.max(active.length, 1)) * Math.PI * 2 - Math.PI / 2;
-              const radius = active.length < 5 ? 34 : 40;
-              const style = { "--node-x": `${50 + Math.cos(angle) * radius}%`, "--node-y": `${50 + Math.sin(angle) * radius}%`, "--line-angle": `${angle}rad` } as CSSProperties;
-              return <div className={`orbit-node ${worker.kind}`} style={style} key={worker.id}><i /><span>{workerLabel(worker)}</span><small>{worker.gpus[0]?.model ?? worker.kind}</small></div>;
-            })}
-            {active.length === 0 && <div className="network-empty"><Wifi size={28} /><strong>Waiting for the first node</strong><a href={publicLink("/mobile/")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}>Connect this device</a></div>}
-          </div>
-          <div className="network-summary">
-            <div><span>Nodes online</span><strong>{snapshot.summary.connected} / {snapshot.summary.registered}</strong></div>
-            <div><span>Shared VRAM</span><strong>{formatMemory(activeOfferedVramMb)}</strong></div>
-          </div>
-        </article>
-      </div>
-      <div className="overview-announcement">
-        <div className="announcement-icon"><Sparkles size={21} /></div>
-        <div><strong>Public network validation</strong><span>Connect a device to help validate physical multi-node inference with real hardware.</span></div>
-        <button onClick={() => onNavigate("join")}>Join network <ArrowRight size={16} /></button>
       </div>
     </section>
   );
+}
+
+type PeerSortKey = "id" | "hosted" | "version" | "vram" | "share" | "seen" | "role" | "status";
+type PeerFilter = "all" | "serving" | "connected" | "offline";
+
+interface ConnectedPeerRow {
+  worker: PublicWorker;
+  hosted: string;
+  hostedCount: number;
+  version: string;
+  vramMb: number;
+  sharePercent: number;
+  seenAt: number;
+  role: "Host" | "Worker" | "Browser";
+  status: "serving" | "connected" | "attention" | "offline";
+}
+
+function workerPeerStatus(worker: PublicWorker): ConnectedPeerRow["status"] {
+  if (!worker.connected || worker.status === "offline") return "offline";
+  if (worker.status === "suspect" || worker.status === "draining") return "attention";
+  return worker.deployments.length > 0 ? "serving" : "connected";
+}
+
+function workerPeerRole(worker: PublicWorker): ConnectedPeerRow["role"] {
+  return worker.kind === "cell" ? "Host" : worker.kind === "browser" ? "Browser" : "Worker";
+}
+
+function ConnectedPeersTable({ workers }: { workers: PublicWorker[] }) {
+  const pageSize = 10;
+  const [filter, setFilter] = useState<PeerFilter>("all");
+  const [sortKey, setSortKey] = useState<PeerSortKey>("status");
+  const [sortDirection, setSortDirection] = useState<"asc" | "desc">("asc");
+  const [page, setPage] = useState(0);
+  const connectedVramMb = workers.filter((worker) => worker.connected).reduce((total, worker) => total + worker.offeredVramMb, 0);
+  const rows = useMemo<ConnectedPeerRow[]>(() => workers.map((worker) => {
+    const models = [...new Set(worker.deployments.map((deployment) => deployment.model))];
+    return {
+      worker,
+      hosted: models[0] ?? "—",
+      hostedCount: models.length,
+      version: worker.agentVersion ? `v${worker.agentVersion}` : "Legacy",
+      vramMb: worker.offeredVramMb,
+      sharePercent: connectedVramMb > 0 && worker.connected ? worker.offeredVramMb / connectedVramMb * 100 : 0,
+      seenAt: Date.parse(worker.lastSeenAt) || 0,
+      role: workerPeerRole(worker),
+      status: workerPeerStatus(worker),
+    };
+  }), [connectedVramMb, workers]);
+  const filteredRows = useMemo(() => {
+    const filtered = rows.filter((row) => filter === "all"
+      || filter === "serving" && row.status === "serving"
+      || filter === "connected" && row.status === "connected"
+      || filter === "offline" && (row.status === "offline" || row.status === "attention"));
+    return filtered.sort((left, right) => {
+      const leftValue = peerSortValue(left, sortKey);
+      const rightValue = peerSortValue(right, sortKey);
+      const comparison = typeof leftValue === "number" && typeof rightValue === "number"
+        ? leftValue - rightValue
+        : String(leftValue).localeCompare(String(rightValue));
+      return sortDirection === "asc" ? comparison : -comparison;
+    });
+  }, [filter, rows, sortDirection, sortKey]);
+  const pageCount = Math.max(1, Math.ceil(filteredRows.length / pageSize));
+  const visiblePage = Math.min(page, pageCount - 1);
+  const visibleRows = filteredRows.slice(visiblePage * pageSize, visiblePage * pageSize + pageSize);
+  const rangeStart = filteredRows.length === 0 ? 0 : visiblePage * pageSize + 1;
+  const rangeEnd = Math.min(filteredRows.length, (visiblePage + 1) * pageSize);
+
+  useEffect(() => {
+    if (page >= pageCount) setPage(pageCount - 1);
+  }, [page, pageCount]);
+
+  function toggleSort(nextKey: PeerSortKey) {
+    if (sortKey === nextKey) {
+      setSortDirection((current) => current === "asc" ? "desc" : "asc");
+    } else {
+      setSortKey(nextKey);
+      setSortDirection("asc");
+    }
+    setPage(0);
+  }
+
+  const sortableHeader = (label: string, key: PeerSortKey) => (
+    <button type="button" className={sortKey === key ? `active ${sortDirection}` : ""} onClick={() => toggleSort(key)}>
+      {label}<ChevronDown size={11} />
+    </button>
+  );
+
+  return (
+    <article className="connected-peers-card" aria-labelledby="connected-peers-title">
+      <header>
+        <strong id="connected-peers-title">Connected peers</strong>
+        <div className="connected-peers-controls">
+          <span>{rangeStart}–{rangeEnd}</span>
+          <div className="connected-peers-pagination" aria-label="Peer pages">
+            <button type="button" aria-label="Previous peer page" disabled={visiblePage === 0} onClick={() => setPage((current) => Math.max(0, current - 1))}><ChevronLeft size={13} /></button>
+            <button type="button" aria-label="Next peer page" disabled={visiblePage >= pageCount - 1} onClick={() => setPage((current) => Math.min(pageCount - 1, current + 1))}><ChevronRight size={13} /></button>
+          </div>
+          <span>· {filteredRows.length} total</span>
+          <label><SlidersHorizontal size={12} /><span>Filter</span><select aria-label="Filter peers" value={filter} onChange={(event) => { setFilter(event.target.value as PeerFilter); setPage(0); }}><option value="all">All peers</option><option value="serving">Serving</option><option value="connected">Connected</option><option value="offline">Needs attention</option></select></label>
+        </div>
+      </header>
+      <div className="connected-peers-scroll">
+        <table>
+          <thead><tr>
+            <th aria-sort={sortKey === "id" ? sortDirection === "asc" ? "ascending" : "descending" : "none"}>{sortableHeader("ID", "id")}</th>
+            <th aria-sort={sortKey === "hosted" ? sortDirection === "asc" ? "ascending" : "descending" : "none"}>{sortableHeader("Hosted", "hosted")}</th>
+            <th aria-sort={sortKey === "version" ? sortDirection === "asc" ? "ascending" : "descending" : "none"}>{sortableHeader("Version", "version")}</th>
+            <th aria-sort={sortKey === "vram" ? sortDirection === "asc" ? "ascending" : "descending" : "none"}>{sortableHeader("VRAM", "vram")}</th>
+            <th aria-sort={sortKey === "share" ? sortDirection === "asc" ? "ascending" : "descending" : "none"}>{sortableHeader("Share", "share")}</th>
+            <th aria-sort={sortKey === "seen" ? sortDirection === "asc" ? "ascending" : "descending" : "none"}>{sortableHeader("Last seen", "seen")}</th>
+            <th aria-sort={sortKey === "role" ? sortDirection === "asc" ? "ascending" : "descending" : "none"}>{sortableHeader("Role", "role")}</th>
+            <th aria-sort={sortKey === "status" ? sortDirection === "asc" ? "ascending" : "descending" : "none"}>{sortableHeader("Status", "status")}</th>
+          </tr></thead>
+          <tbody>
+            {visibleRows.map((row) => (
+              <tr key={row.worker.id}>
+                <td><strong>{shortId(row.worker.id)}</strong><small>{workerLabel(row.worker)}</small></td>
+                <td><code>{row.hosted}</code>{row.hostedCount > 1 && <small>+{row.hostedCount - 1} more</small>}</td>
+                <td><code>{row.version}</code></td>
+                <td><strong>{formatMemory(row.vramMb)}</strong></td>
+                <td><div className="peer-share"><i><b style={{ width: `${Math.min(100, row.sharePercent)}%` }} /></i><span>{Math.round(row.sharePercent)}%</span></div></td>
+                <td><code>{relativeTime(row.worker.lastSeenAt)}</code></td>
+                <td><span className={`peer-role ${row.role.toLowerCase()}`}>{row.role}</span></td>
+                <td><span className={`peer-state ${row.status}`}><i />{peerStatusLabel(row.status)}</span></td>
+              </tr>
+            ))}
+            {visibleRows.length === 0 && <tr><td className="connected-peers-empty" colSpan={8}><Server size={18} /><span><strong>No peers in this view</strong><small>Change the filter or connect a new device.</small></span></td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </article>
+  );
+}
+
+function peerSortValue(row: ConnectedPeerRow, key: PeerSortKey): string | number {
+  switch (key) {
+    case "id": return row.worker.id;
+    case "hosted": return row.hosted;
+    case "version": return row.version;
+    case "vram": return row.vramMb;
+    case "share": return row.sharePercent;
+    case "seen": return row.seenAt;
+    case "role": return row.role;
+    case "status": return { serving: 0, connected: 1, attention: 2, offline: 3 }[row.status];
+  }
+}
+
+function peerStatusLabel(status: ConnectedPeerRow["status"]): string {
+  if (status === "serving") return "Serving";
+  if (status === "connected") return "Connected";
+  if (status === "attention") return "Attention";
+  return "Offline";
+}
+
+interface NetworkCatalogEntry {
+  id: string;
+  state: "active" | "queued";
+  replicas: number;
+  pipelines: number;
+  request: RequestedModelCapacity | null;
+}
+
+function NetworkModelCatalog({ snapshot, developerMode, onNavigate }: {
+  snapshot: PublicSnapshot;
+  developerMode: boolean;
+  onNavigate: (view: PanelView) => void;
+}) {
+  const [selectedModelId, setSelectedModelId] = useState("");
+  const drawerTitleId = useId();
+  const entries = useMemo<NetworkCatalogEntry[]>(() => {
+    const active = snapshot.models.map((model) => ({
+      id: model.id,
+      state: "active" as const,
+      replicas: model.replicas,
+      pipelines: model.pipelines,
+      request: snapshot.requestedModels.find((request) => request.id === model.id) ?? null,
+    }));
+    const activeIds = new Set(active.map((model) => model.id.toLowerCase()));
+    const queued = snapshot.requestedModels
+      .filter((request) => !activeIds.has(request.id.toLowerCase()))
+      .map((request) => ({
+        id: request.id,
+        state: "queued" as const,
+        replicas: 0,
+        pipelines: 0,
+        request,
+      }));
+    return [...active, ...queued];
+  }, [snapshot.models, snapshot.requestedModels]);
+  const selectedEntry = entries.find((entry) => entry.id === selectedModelId) ?? null;
+
+  useEffect(() => {
+    if (!selectedEntry) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setSelectedModelId("");
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [selectedEntry]);
+
+  return <>
+    <article className="network-model-catalog">
+      <header className="network-model-catalog-head">
+        <div><span>MODEL & TOKEN CATALOG</span><h2>Available intelligence</h2><p>Inspect each model, its real token activity and the peers currently serving it.</p></div>
+        <div><b><i /> LIVE DATA</b>{developerMode && <button type="button" onClick={() => onNavigate("models")}>Manage models</button>}</div>
+      </header>
+      <div className="network-model-table-wrap">
+        <table className="network-model-table">
+          <thead><tr><th>Model</th><th>Status</th><th>Availability</th><th>Peer memory</th><th>Measured speed</th><th>Processed tokens</th><th><span className="sr-only">Details</span></th></tr></thead>
+          <tbody>{entries.map((entry) => {
+            const telemetry = networkModelTelemetry(snapshot, entry.id);
+            return <tr key={entry.id} className={selectedModelId === entry.id ? "selected" : ""}>
+              <td><button type="button" className="network-model-name" onClick={() => setSelectedModelId(entry.id)}><i><Boxes /></i><span><strong>{entry.id}</strong><small>{networkModelRuntimeLabel(telemetry.deployments)}</small></span></button></td>
+              <td><span className={`network-model-state ${entry.state}`}>{entry.state === "active" ? "Active" : modelRequestStatusLabel(entry.request?.status)}</span></td>
+              <td><strong>{telemetry.peers.length} node{telemetry.peers.length === 1 ? "" : "s"}</strong><small>{entry.replicas} replicas · {entry.pipelines} pipelines</small></td>
+              <td>{telemetry.peerMemoryMb > 0 ? formatMemory(telemetry.peerMemoryMb) : "Not reported"}</td>
+              <td>{telemetry.measuredThroughput > 0 ? `${formatCompactNumber(telemetry.measuredThroughput)} tok/s` : "Not measured"}</td>
+              <td>{telemetry.processedTokens > 0 ? formatCompactTokens(telemetry.processedTokens) : "No activity"}</td>
+              <td><button type="button" className="network-model-open" onClick={() => setSelectedModelId(entry.id)} aria-label={`View details for ${entry.id}`}><ChevronRight /></button></td>
+            </tr>;
+          })}</tbody>
+        </table>
+        {entries.length === 0 && <div className="network-model-empty"><Boxes /><strong>No models are active yet</strong><span>Models and their token activity will appear here as soon as a node publishes one.</span>{developerMode && <button type="button" onClick={() => onNavigate("models")}>Open model catalog</button>}</div>}
+      </div>
+    </article>
+    {selectedEntry && createPortal(
+      <NetworkModelDrawer entry={selectedEntry} snapshot={snapshot} titleId={drawerTitleId} onClose={() => setSelectedModelId("")} />,
+      document.body,
+    )}
+  </>;
+}
+
+function NetworkModelDrawer({ entry, snapshot, titleId, onClose }: {
+  entry: NetworkCatalogEntry;
+  snapshot: PublicSnapshot;
+  titleId: string;
+  onClose: () => void;
+}) {
+  const telemetry = networkModelTelemetry(snapshot, entry.id);
+  const execution = modelExecutionSummary(snapshot, entry.id);
+  const inputTokens = telemetry.jobs.reduce((total, job) => total + job.inputTokens, 0);
+  const outputTokens = telemetry.jobs.reduce((total, job) => total + job.outputTokens, 0);
+  const completedRequests = telemetry.jobs.filter((job) => job.status === "completed").length;
+  return <div className="model-detail-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) onClose(); }}>
+    <aside className="model-detail-drawer" role="dialog" aria-modal="true" aria-labelledby={titleId}>
+      <header className="model-detail-head">
+        <div className="model-detail-icon"><Boxes /></div>
+        <div><span>NETWORK MODEL</span><h2 id={titleId}>{entry.id}</h2><small>{networkModelRuntimeLabel(telemetry.deployments)}</small></div>
+        <button type="button" onClick={onClose} aria-label="Close model details"><X /></button>
+      </header>
+      <div className="model-detail-badges"><span className={entry.state}><i />{entry.state === "active" ? "Active now" : modelRequestStatusLabel(entry.request?.status)}</span><span className={`execution ${execution.deviceType}`}><Cpu />{executionShortLabel(execution)}</span></div>
+      <section className="model-detail-metrics" aria-label="Model telemetry">
+        <ModelDetailMetric icon={Network} label="Availability" value={`${telemetry.peers.length} node${telemetry.peers.length === 1 ? "" : "s"}`} />
+        <ModelDetailMetric icon={MemoryStick} label="Peer memory" value={telemetry.peerMemoryMb > 0 ? formatMemory(telemetry.peerMemoryMb) : "Not reported"} />
+        <ModelDetailMetric icon={Coins} label="Processed tokens" value={telemetry.processedTokens > 0 ? formatCompactTokens(telemetry.processedTokens) : "No activity"} />
+        <ModelDetailMetric icon={Gauge} label="Measured speed" value={telemetry.measuredThroughput > 0 ? `${formatCompactNumber(telemetry.measuredThroughput)} tok/s` : "Not measured"} />
+      </section>
+      <section className="model-detail-section">
+        <div className="model-detail-section-title"><Activity /><h3>Token activity</h3></div>
+        <div className="model-token-breakdown">
+          <div><span>Input tokens</span><strong>{formatCompactTokens(inputTokens)}</strong></div>
+          <div><span>Output tokens</span><strong>{formatCompactTokens(outputTokens)}</strong></div>
+          <div><span>Completed requests</span><strong>{completedRequests}</strong></div>
+        </div>
+      </section>
+      <section className="model-detail-section">
+        <div className="model-detail-section-title"><Code2 /><h3>Runtime identity</h3></div>
+        <div className="model-runtime-identity"><span><small>MODEL ID</small><code>{entry.id}</code></span><span><small>RUNTIME MODES</small><code>{networkModelRuntimeLabel(telemetry.deployments)}</code></span></div>
+      </section>
+      <section className="model-detail-section model-peer-section">
+        <div className="model-detail-section-title"><Network /><h3>Active peers</h3><span>{telemetry.peers.length}</span></div>
+        <div className="model-peer-table-wrap">
+          <table className="model-peer-table">
+            <thead><tr><th>Node</th><th>Region</th><th>Device</th><th>Memory</th><th>Speed</th></tr></thead>
+            <tbody>{telemetry.peers.map(({ worker, deployments }) => {
+              const measured = deployments.filter(isMeasuredDeployment).reduce((total, deployment) => total + deployment.tokensPerSecond, 0);
+              return <tr key={worker.id}><td><strong><i />{shortId(worker.id)}</strong></td><td>{worker.region}</td><td>{worker.gpus[0]?.model ?? worker.kind}</td><td>{formatMemory(worker.offeredVramMb)}</td><td>{measured > 0 ? `${formatCompactNumber(measured)} tok/s` : "Not measured"}</td></tr>;
+            })}</tbody>
+          </table>
+          {telemetry.peers.length === 0 && <div className="model-peer-empty"><Server /><span>No active peer is advertising this model right now.</span></div>}
+        </div>
+      </section>
+    </aside>
+  </div>;
+}
+
+function ModelDetailMetric({ icon: Icon, label, value }: { icon: typeof Network; label: string; value: string }) {
+  return <div><Icon /><span><small>{label}</small><strong>{value}</strong></span></div>;
+}
+
+function networkModelTelemetry(snapshot: PublicSnapshot, modelId: string) {
+  const normalizedModelId = modelId.toLowerCase();
+  const peers = snapshot.workers.flatMap((worker) => {
+    const deployments = worker.deployments.filter((deployment) => deployment.model.toLowerCase() === normalizedModelId);
+    return deployments.length > 0 && worker.connected ? [{ worker, deployments }] : [];
+  });
+  const deployments = peers.flatMap((peer) => peer.deployments);
+  const jobs = snapshot.jobs.filter((job) => job.model.toLowerCase() === normalizedModelId);
+  return {
+    peers,
+    deployments,
+    jobs,
+    peerMemoryMb: peers.reduce((total, peer) => total + peer.worker.offeredVramMb, 0),
+    measuredThroughput: deployments.filter(isMeasuredDeployment).reduce((total, deployment) => total + deployment.tokensPerSecond, 0),
+    processedTokens: jobs.reduce((total, job) => total + job.inputTokens + job.outputTokens, 0),
+  };
+}
+
+function networkModelRuntimeLabel(deployments: PublicDeployment[]): string {
+  const labels = [...new Set(deployments.map((deployment) => deployment.adapter ?? deployment.mode).filter(Boolean))];
+  return labels.length > 0 ? labels.join(" · ") : "Runtime not reported";
+}
+
+function modelRequestStatusLabel(status: RequestedModelCapacity["status"] | undefined): string {
+  if (!status) return "Queued";
+  const labels: Record<RequestedModelCapacity["status"], string> = {
+    profiling: "Profiling",
+    waiting_capacity: "Waiting for capacity",
+    ready: "Ready",
+    activating: "Activating",
+    active: "Active",
+    incompatible: "Incompatible",
+    failed: "Needs attention",
+  };
+  return labels[status];
+}
+
+const MESH_OVERVIEW_POSITIONS = [
+  { x: 10, y: 24 }, { x: 19, y: 70 }, { x: 31, y: 42 }, { x: 38, y: 82 },
+  { x: 62, y: 20 }, { x: 70, y: 58 }, { x: 82, y: 30 }, { x: 89, y: 73 },
+  { x: 59, y: 84 }, { x: 28, y: 14 }, { x: 75, y: 86 }, { x: 92, y: 48 },
+  { x: 8, y: 51 }, { x: 47, y: 16 },
+] as const;
+
+const MESH_AMBIENT_SPORES = [
+  { x: 15, y: 35 }, { x: 24, y: 84 }, { x: 36, y: 18 }, { x: 43, y: 67 },
+  { x: 57, y: 31 }, { x: 66, y: 76 }, { x: 78, y: 16 }, { x: 88, y: 58 },
+  { x: 94, y: 28 }, { x: 7, y: 77 },
+] as const;
+
+function InteractiveMesh({ workers, registeredWorkers, sharedVramMb, publicLink, external, developerMode, onNavigate }: {
+  workers: PublicWorker[];
+  registeredWorkers: number;
+  sharedVramMb: number;
+  publicLink: (path: string) => string;
+  external: boolean;
+  developerMode: boolean;
+  onNavigate: (view: PanelView) => void;
+}) {
+  const [zoom, setZoom] = useState(1);
+  const [selectedWorkerId, setSelectedWorkerId] = useState("");
+  const [fullscreen, setFullscreen] = useState(false);
+  const cardRef = useRef<HTMLElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
+  const visibleWorkers = workers.slice(0, MESH_OVERVIEW_POSITIONS.length);
+  const selectedWorker = visibleWorkers.find((worker) => worker.id === selectedWorkerId) ?? null;
+  const selectedWorkerIndex = selectedWorker ? visibleWorkers.findIndex((worker) => worker.id === selectedWorker.id) : -1;
+  const selectedWorkerPosition = selectedWorkerIndex >= 0 ? MESH_OVERVIEW_POSITIONS[selectedWorkerIndex] ?? { x: 50, y: 50 } : null;
+  const visibleOfferedVramMb = visibleWorkers.reduce((total, worker) => total + worker.offeredVramMb, 0);
+  const selectedSharePercent = selectedWorker && visibleOfferedVramMb > 0 ? selectedWorker.offeredVramMb / visibleOfferedVramMb * 100 : 0;
+  const links = visibleWorkers.map((worker, index) => {
+    const target = MESH_OVERVIEW_POSITIONS[index] ?? { x: 50, y: 50 };
+    if (index < 2) return { worker, target, source: { x: 50, y: 50 } };
+    const parentIndex = Math.floor((index - 2) / 2);
+    return { worker, target, source: MESH_OVERVIEW_POSITIONS[parentIndex] ?? { x: 50, y: 50 } };
+  });
+
+  useEffect(() => {
+    const updateFullscreen = () => setFullscreen(document.fullscreenElement === cardRef.current);
+    document.addEventListener("fullscreenchange", updateFullscreen);
+    return () => document.removeEventListener("fullscreenchange", updateFullscreen);
+  }, []);
+
+  function updatePointerGlow(event: React.PointerEvent<HTMLDivElement>) {
+    const rect = event.currentTarget.getBoundingClientRect();
+    event.currentTarget.style.setProperty("--mesh-pointer-x", `${((event.clientX - rect.left) / rect.width) * 100}%`);
+    event.currentTarget.style.setProperty("--mesh-pointer-y", `${((event.clientY - rect.top) / rect.height) * 100}%`);
+  }
+
+  async function toggleFullscreen() {
+    if (!cardRef.current) return;
+    if (document.fullscreenElement === cardRef.current) await document.exitFullscreen();
+    else await cardRef.current.requestFullscreen();
+  }
+
+  function resetView() {
+    setZoom(1);
+    setSelectedWorkerId("");
+    stageRef.current?.style.setProperty("--mesh-pointer-x", "50%");
+    stageRef.current?.style.setProperty("--mesh-pointer-y", "45%");
+  }
+
+  return (
+    <article className={`network-canvas interactive-mesh${fullscreen ? " fullscreen" : ""}`} ref={cardRef}>
+      <div className="canvas-head mesh-canvas-head">
+        <div><span>LIVE TOPOLOGY</span><strong>Explore the network</strong></div>
+        <div className="mesh-head-status" aria-label={`${visibleWorkers.length} live nodes and ${links.length} active links`}>
+          <b><i /> LIVE</b>
+          <span>{visibleWorkers.length} NODES</span>
+          <span>{links.length} LINKS</span>
+        </div>
+        <div className="mesh-head-actions">
+          {developerMode && <button className="canvas-link" onClick={() => onNavigate("nodes")}>Node details</button>}
+          <button className="mesh-icon-button" onClick={resetView} title="Reset network view" aria-label="Reset network view"><RefreshCw /></button>
+          <button className="mesh-fullscreen-button" onClick={() => void toggleFullscreen()}><Maximize2 />{fullscreen ? "Exit fullscreen" : "Fullscreen"}</button>
+        </div>
+      </div>
+      <div
+        className="interactive-mesh-stage"
+        ref={stageRef}
+        onPointerMove={updatePointerGlow}
+        onPointerLeave={(event) => {
+          event.currentTarget.style.setProperty("--mesh-pointer-x", "50%");
+          event.currentTarget.style.setProperty("--mesh-pointer-y", "45%");
+        }}
+      >
+        <div className="mesh-ambient mesh-ambient-one" />
+        <div className="mesh-ambient mesh-ambient-two" />
+        <div className="mesh-scene" style={{ "--mesh-zoom": zoom } as CSSProperties}>
+          <div className="mesh-grid" />
+          <div className="mesh-spores" aria-hidden="true">
+            {MESH_AMBIENT_SPORES.map((spore, index) => <i key={`${spore.x}-${spore.y}`} style={{ "--spore-x": `${spore.x}%`, "--spore-y": `${spore.y}%`, "--spore-delay": `${index * -0.83}s` } as CSSProperties} />)}
+          </div>
+          <svg className="mesh-links" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+            <defs>
+              <linearGradient id="mesh-link-gradient" x1="0%" y1="0%" x2="100%" y2="0%">
+                <stop offset="0%" stopColor="#3e79d8" stopOpacity=".24" />
+                <stop offset="48%" stopColor="#65b7ff" stopOpacity=".78" />
+                <stop offset="100%" stopColor="#7c67ff" stopOpacity=".28" />
+              </linearGradient>
+              <filter id="mesh-packet-glow" x="-200%" y="-200%" width="500%" height="500%">
+                <feGaussianBlur stdDeviation=".8" result="blur" />
+                <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
+              </filter>
+            </defs>
+            {links.map(({ worker, source, target }, index) => {
+              const path = `M ${source.x} ${source.y} L ${target.x} ${target.y}`;
+              return <g key={worker.id} className={selectedWorkerId === worker.id ? "selected" : ""}>
+                <path d={path} pathLength="1" />
+                <circle className="mesh-packet" r=".62" filter="url(#mesh-packet-glow)">
+                  <animateMotion dur={`${3.6 + (index % 4) * 0.7}s`} begin={`${index * -0.73}s`} path={path} repeatCount="indefinite" />
+                </circle>
+              </g>;
+            })}
+          </svg>
+          <button className="mesh-core" onClick={resetView} aria-label="Focus mycellios coordinator">
+            <span><img src={brandIcon} alt="" /></span>
+            <strong>mycellios</strong>
+            <small>coordinator</small>
+            <i />
+          </button>
+          {visibleWorkers.map((worker, index) => {
+            const position = MESH_OVERVIEW_POSITIONS[index] ?? { x: 50, y: 50 };
+            const selected = selectedWorkerId === worker.id;
+            return (
+              <button
+                className={`mesh-node ${worker.kind}${selected ? " selected" : ""}`}
+                style={{ "--node-x": `${position.x}%`, "--node-y": `${position.y}%`, "--node-delay": `${index * -0.41}s` } as CSSProperties}
+                key={worker.id}
+                onClick={() => setSelectedWorkerId(selected ? "" : worker.id)}
+                aria-pressed={selected}
+                aria-label={`${workerLabel(worker)}, ${worker.gpus[0]?.model ?? worker.kind}`}
+              >
+                <span><WorkerKindIcon worker={worker} /><i /></span>
+                <strong>{workerLabel(worker)}</strong>
+                <small>{worker.gpus[0]?.model ?? worker.kind}</small>
+              </button>
+            );
+          })}
+        </div>
+        {visibleWorkers.length === 0 && <div className="network-empty interactive-empty"><Wifi size={28} /><strong>The mesh is ready for its first node</strong><span>Every connected device becomes part of the live topology.</span><a href={publicLink("/mobile/")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}>Connect this device <ArrowRight size={13} /></a></div>}
+        <div className="mesh-stage-legend"><b><i /> LIVE</b><span>{visibleWorkers.length} nodes</span><span>Encrypted peer links</span></div>
+        {selectedWorker && selectedWorkerPosition && <MeshNodePopover worker={selectedWorker} position={selectedWorkerPosition} sharePercent={selectedSharePercent} onClose={() => setSelectedWorkerId("")} />}
+        {visibleWorkers.length > 0 && <div className="mesh-zoom-controls" aria-label="Network zoom controls">
+          <button onClick={() => setZoom((value) => Math.min(1.35, value + 0.12))} disabled={zoom >= 1.35} aria-label="Zoom in"><Plus /></button>
+          <output>{Math.round(zoom * 100)}%</output>
+          <button onClick={() => setZoom((value) => Math.max(0.76, value - 0.12))} disabled={zoom <= 0.76} aria-label="Zoom out"><Minus /></button>
+        </div>}
+      </div>
+      <div className="network-summary mesh-network-summary">
+        <div><span>Nodes online</span><strong>{workers.length} / {registeredWorkers}</strong></div>
+        <div><span>Active links</span><strong>{links.length}</strong></div>
+        <div><span>Shared VRAM</span><strong>{formatMemory(sharedVramMb)}</strong></div>
+      </div>
+    </article>
+  );
+}
+
+export function MeshNodePopover({ worker, position, sharePercent, onClose }: {
+  worker: PublicWorker;
+  position: { x: number; y: number };
+  sharePercent: number;
+  onClose: () => void;
+}) {
+  const models = [...new Set(worker.deployments.map((deployment) => deployment.model))];
+  const status = workerPeerStatus(worker);
+  const role = workerPeerRole(worker);
+  return <aside
+    className={`mesh-node-popover ${position.y < 44 ? "below" : "above"}`}
+    role="dialog"
+    aria-label={`Node details for ${workerLabel(worker)}`}
+    style={{
+      "--mesh-popover-x": `${Math.max(18, Math.min(82, position.x))}%`,
+      "--mesh-popover-y": `${position.y}%`,
+    } as CSSProperties}
+  >
+    <button className="mesh-node-popover-close" onClick={onClose} aria-label="Close node details"><X /></button>
+    <header>
+      <div><strong>{workerLabel(worker)}</strong><small>{shortId(worker.id)}</small></div>
+      <span className={`peer-state ${status}`}><i />{peerStatusLabel(status)}</span>
+    </header>
+    <div className="mesh-node-popover-meta">
+      <span className={`peer-role ${role.toLowerCase()}`}>{role}</span>
+      <span><Timer size={12} />Seen {relativeTime(worker.lastSeenAt)}</span>
+    </div>
+    <div className="mesh-node-popover-grid">
+      <small><span><Boxes size={11} />Model</span><b title={models[0] ?? "No model hosted"}>{models[0] ?? "No model hosted"}</b></small>
+      <small><span><Code2 size={11} />Version</span><b>{worker.agentVersion ? `v${worker.agentVersion}` : "Legacy"}</b></small>
+      <small><span><MemoryStick size={11} />Shared VRAM</span><b>{formatMemory(worker.offeredVramMb)}</b></small>
+      <small><span><Activity size={11} />Reliability</span><b>{Math.round(Math.max(0, Math.min(1, worker.reliability)) * 100)}%</b></small>
+    </div>
+    <footer>
+      <span><Network size={12} />{Math.round(sharePercent)}% mesh share</span>
+      <i />
+      <span>{models.length} model{models.length === 1 ? "" : "s"}</span>
+      <i />
+      <span>{worker.region}</span>
+    </footer>
+  </aside>;
 }
 
 function Nodes({ snapshot, onRemove, onClearOffline }: { snapshot: PublicSnapshot; onRemove: (workerId: string) => Promise<void>; onClearOffline: () => Promise<void> }) {
@@ -1558,6 +2732,194 @@ function Jobs({ snapshot }: { snapshot: PublicSnapshot }) {
     </div></section>;
 }
 
+type SystemLogFilter = "important" | "errors" | "all";
+
+function SystemLogs({ snapshot, bridge, connectionError }: { snapshot: PublicSnapshot; bridge: DesktopBridge | undefined; connectionError: string | null }) {
+  const [desktopLogs, setDesktopLogs] = useState<SystemLogSnapshot | null>(null);
+  const [filter, setFilter] = useState<SystemLogFilter>("important");
+  const [query, setQuery] = useState("");
+  const [loading, setLoading] = useState(Boolean(bridge));
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  const load = useCallback(async (silent = false) => {
+    if (!bridge) return;
+    if (!silent) setLoading(true);
+    try {
+      setDesktopLogs(await bridge.getSystemLogs());
+      setLoadError(null);
+    } catch (caught) {
+      if (!silent) setLoadError(errorText(caught));
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  }, [bridge]);
+
+  useEffect(() => {
+    if (!bridge) return;
+    void load();
+    const timer = window.setInterval(() => void load(true), 5_000);
+    return () => window.clearInterval(timer);
+  }, [bridge, load]);
+
+  const networkLogs = useMemo(
+    () => networkSnapshotLogs(snapshot, connectionError),
+    [connectionError, snapshot],
+  );
+  const logSnapshot = desktopLogs ?? networkLogs;
+  const normalizedQuery = query.trim().toLowerCase();
+  const visibleEntries = logSnapshot.entries.filter((entry) => {
+    if (filter === "errors" && entry.level !== "error") return false;
+    if (filter === "important" && !importantSystemLog(entry)) return false;
+    if (!normalizedQuery) return true;
+    return `${entry.event} ${entry.message} ${entry.details ?? ""} ${entry.source}`.toLowerCase().includes(normalizedQuery);
+  });
+  const warningCount = logSnapshot.entries.filter((entry) => entry.level === "warning").length;
+  const errorCount = logSnapshot.entries.filter((entry) => entry.level === "error").length;
+
+  return <section className="system-logs-page">
+    <PageTitle
+      eyebrow="SYSTEM DIAGNOSTICS"
+      title="Logs importantes"
+      copy={bridge ? "Eventos reales y saneados de la aplicación, el runtime, los workers y las actualizaciones." : "Actividad importante observable desde el coordinador, los nodos, los modelos y las tareas."}
+      actions={<button disabled={loading} onClick={() => void load()}>{loading ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}Actualizar</button>}
+    />
+    <div className="system-log-summary">
+      <article><ScrollText /><span><small>ENTRADAS CARGADAS</small><strong>{logSnapshot.entries.length}</strong><em>{bridge ? "Registro local seguro" : "Estado actual de la red"}</em></span></article>
+      <article className="warning"><CircleAlert /><span><small>AVISOS</small><strong>{warningCount}</strong><em>Reintentos y degradaciones</em></span></article>
+      <article className="error"><X /><span><small>ERRORES</small><strong>{errorCount}</strong><em>Eventos que requieren atención</em></span></article>
+    </div>
+    <div className="system-log-toolbar">
+      <div className="system-log-filters" role="group" aria-label="Filtrar logs">
+        <button className={filter === "important" ? "active" : ""} onClick={() => setFilter("important")}>Importantes</button>
+        <button className={filter === "errors" ? "active" : ""} onClick={() => setFilter("errors")}>Solo errores</button>
+        <button className={filter === "all" ? "active" : ""} onClick={() => setFilter("all")}>Todos</button>
+      </div>
+      <label className="system-log-search"><Search /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Buscar evento, origen o mensaje…" /></label>
+    </div>
+    {loadError && <div className="inline-error"><CircleAlert size={17} />No se pudieron leer los logs locales: {loadError}</div>}
+    {logSnapshot.truncated && <div className="system-log-notice"><CircleAlert />Se muestran únicamente las entradas más recientes para mantener el panel rápido y seguro.</div>}
+    <div className="system-log-list" aria-live="polite">
+      {loading && !desktopLogs ? <div className="system-log-loading"><LoaderCircle className="spin" /><span>Leyendo los eventos importantes…</span></div> : visibleEntries.map((entry) => <SystemLogRow entry={entry} key={entry.id} />)}
+      {!loading && visibleEntries.length === 0 && <Empty icon={ScrollText} title="No hay logs para este filtro" copy={normalizedQuery ? "Prueba otra búsqueda o muestra todos los niveles." : "No se han registrado eventos de este nivel."} />}
+    </div>
+    <footer className="system-log-safety"><ShieldCheck /><span><strong>Lectura segura y limitada</strong><small>Las credenciales, tokens, contraseñas y secretos se ocultan antes de llegar a esta pantalla.</small></span></footer>
+  </section>;
+}
+
+function SystemLogRow({ entry }: { entry: SystemLogEntry }) {
+  return <article className={`system-log-row ${entry.level}`}>
+    <div className="system-log-row-marker"><i /></div>
+    <div className="system-log-row-content">
+      <header><time dateTime={entry.at}>{formatSystemLogTime(entry.at)}</time><span className={`system-log-level ${entry.level}`}>{systemLogLevelLabel(entry.level)}</span><span className="system-log-source">{systemLogSourceLabel(entry.source)}</span></header>
+      <div><strong>{humanizeSystemLogEvent(entry.event)}</strong><p>{entry.message}</p></div>
+      {entry.details && <details><summary>Detalles técnicos <ChevronDown /></summary><code>{entry.details}</code></details>}
+    </div>
+  </article>;
+}
+
+function networkSnapshotLogs(snapshot: PublicSnapshot, connectionError: string | null): SystemLogSnapshot {
+  const entries: SystemLogEntry[] = [];
+  const capturedAt = snapshot.capturedAt === EMPTY.capturedAt ? new Date().toISOString() : snapshot.capturedAt;
+  if (connectionError) {
+    entries.push({
+      id: `network-error-${capturedAt}`,
+      at: capturedAt,
+      level: "error",
+      source: "coordinator",
+      event: "coordinator-unavailable",
+      message: redactVisibleLogText(connectionError),
+    });
+  } else {
+    entries.push({
+      id: `network-snapshot-${capturedAt}`,
+      at: capturedAt,
+      level: "info",
+      source: "coordinator",
+      event: "coordinator-snapshot-ready",
+      message: `${snapshot.summary.connected} nodos conectados, ${snapshot.models.length} modelos disponibles y ${snapshot.summary.completedJobs} tareas completadas.`,
+    });
+  }
+  for (const worker of snapshot.workers) {
+    const state = nodeVisualState(worker);
+    entries.push({
+      id: `worker-${worker.id}-${worker.lastSeenAt}`,
+      at: worker.lastSeenAt,
+      level: state === "active" ? "info" : state === "warning" ? "warning" : "error",
+      source: "worker",
+      event: `worker-${state}`,
+      message: `${workerLabel(worker)} · ${nodeStatusLabel(worker)} · ${worker.region}`,
+      details: `id=${shortId(worker.id)} · memoria=${formatMemory(worker.offeredVramMb)} · tareas=${worker.jobsCompleted}`,
+    });
+  }
+  for (const model of snapshot.requestedModels) {
+    entries.push({
+      id: `model-${model.id}-${model.status}`,
+      at: capturedAt,
+      level: model.status === "failed" || model.status === "incompatible" ? "error" : model.status === "waiting_capacity" ? "warning" : "info",
+      source: "runtime",
+      event: `model-${model.status}`,
+      message: redactVisibleLogText(model.message),
+      details: model.id,
+    });
+  }
+  for (const job of snapshot.jobs) {
+    entries.push({
+      id: `job-${job.id}-${job.updatedAt}`,
+      at: job.updatedAt,
+      level: job.status === "failed" ? "error" : job.failureCode ? "warning" : "info",
+      source: "network",
+      event: `job-${job.status}`,
+      message: `${job.model} · ${job.inputTokens + job.outputTokens} tokens`,
+      details: job.failureCode ? redactVisibleLogText(job.failureCode) : `request=${shortId(job.id)}`,
+    });
+  }
+  return {
+    capturedAt: new Date().toISOString(),
+    entries: entries.sort((left, right) => Date.parse(right.at) - Date.parse(left.at)).slice(0, 300),
+    truncated: entries.length > 300,
+    source: "network-snapshot",
+  };
+}
+
+function importantSystemLog(entry: SystemLogEntry): boolean {
+  return entry.level !== "info" || /(start|ready|status|update|runtime|coordinator|connected|model|contribution)/i.test(entry.event);
+}
+
+function redactVisibleLogText(value: string): string {
+  return value
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1[REDACTED]")
+    .replace(/\b(authorization|credential|password|secret|token|api[-_ ]?key)\s*[:=]\s*["']?[^"',}\s]+/gi, "$1=[REDACTED]")
+    .replace(/([?&](?:authorization|credential|password|secret|token|api[-_]?key)=)[^&\s]+/gi, "$1[REDACTED]");
+}
+
+function formatSystemLogTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "Hora desconocida";
+  return new Intl.DateTimeFormat("es-ES", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(date);
+}
+
+function systemLogLevelLabel(level: SystemLogEntry["level"]): string {
+  if (level === "error") return "ERROR";
+  if (level === "warning") return "AVISO";
+  return "INFO";
+}
+
+function systemLogSourceLabel(source: SystemLogEntry["source"]): string {
+  const labels: Record<SystemLogEntry["source"], string> = {
+    desktop: "Aplicación",
+    coordinator: "Coordinador",
+    worker: "Worker",
+    runtime: "Runtime",
+    renderer: "Interfaz",
+    network: "Red",
+  };
+  return labels[source];
+}
+
+function humanizeSystemLogEvent(event: string): string {
+  return event.replace(/[-_.]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
 function Tests({ bridge }: { bridge: DesktopBridge | undefined }) {
   const [runs, setRuns] = useState<BenchmarkRun[]>([]);
   const [selectedRunId, setSelectedRunId] = useState("");
@@ -1882,17 +3244,43 @@ function BenchmarkValue({ label, value, detail, accent = false, tone = "" }: { l
 interface InferenceTurn {
   id: string;
   prompt: string;
+  messageContent: string;
+  attachments: InferenceAttachmentSummary[];
   response: ChatResponse;
 }
 
 interface InferencePendingTurn extends ChatStreamUpdate {
   prompt: string;
+  attachments: InferenceAttachmentSummary[];
 }
 
-function Inference({ snapshot, onSend, onNavigate, accountAuthenticated, onSignIn, apiAccessEnabled, apiBaseUrl, accessToken, apiAccount }: {
+interface InferenceAttachmentSummary {
+  id: string;
+  name: string;
+  size: number;
+  kind: "pdf" | "docx" | "text";
+  truncated: boolean;
+}
+
+interface InferenceAttachment extends InferenceAttachmentSummary {
+  text: string;
+}
+
+const MAX_INFERENCE_FILES = 5;
+const MAX_INFERENCE_FILE_BYTES = 10 * 1024 * 1024;
+const MAX_INFERENCE_FILE_CHARS = 18_000;
+const MAX_INFERENCE_TOTAL_CHARS = 36_000;
+const INFERENCE_FILE_ACCEPT = [
+  ".pdf", ".docx", ".txt", ".md", ".csv", ".json", ".xml", ".yaml", ".yml", ".toml",
+  ".html", ".css", ".js", ".jsx", ".ts", ".tsx", ".py", ".java", ".c", ".cpp", ".h",
+  ".sql", ".log", ".ini", ".env",
+].join(",");
+
+function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthenticated, onSignIn, apiAccessEnabled, apiBaseUrl, accessToken, apiAccount }: {
   snapshot: PublicSnapshot;
   onSend: (model: string, messages: ChatMessage[], sessionId: string, onUpdate?: (update: ChatStreamUpdate) => void) => Promise<ChatResponse>;
   onNavigate: (view: PanelView) => void;
+  developerMode: boolean;
   accountAuthenticated: boolean;
   onSignIn: () => void;
   apiAccessEnabled: boolean;
@@ -1905,12 +3293,16 @@ function Inference({ snapshot, onSend, onNavigate, accountAuthenticated, onSignI
   const connectivityModel = options.find((item) => item.connectivityOnly) ?? null;
   const [model, setModel] = useState("");
   const [prompt, setPrompt] = useState("");
+  const [attachments, setAttachments] = useState<InferenceAttachment[]>([]);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  const [filesBusy, setFilesBusy] = useState(false);
   const [turns, setTurns] = useState<InferenceTurn[]>([]);
   const [sessionId, setSessionId] = useState(() => newInferenceSessionId());
   const [error, setError] = useState<string | null>(null);
   const [pendingTurn, setPendingTurn] = useState<InferencePendingTurn | null>(null);
   const [diagnostic, setDiagnostic] = useState<"idle" | "running" | "ok" | "failed">("idle");
   const outputRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const modelAvailable = realModels.length > 0;
   const inferenceAvailable = modelAvailable && accountAuthenticated;
   const selectedModel = realModels.some((item) => item.id === model) ? model : realModels[0]?.id ?? "";
@@ -1932,11 +3324,44 @@ function Inference({ snapshot, onSend, onNavigate, accountAuthenticated, onSignI
     return () => window.clearInterval(timer);
   }, [pendingTurn !== null]);
 
+  async function addFiles(fileList: FileList | null) {
+    if (!fileList || fileList.length === 0 || filesBusy) return;
+    const availableSlots = Math.max(0, MAX_INFERENCE_FILES - attachments.length);
+    if (availableSlots === 0) {
+      setAttachmentError(`Puedes adjuntar hasta ${MAX_INFERENCE_FILES} archivos por mensaje.`);
+      return;
+    }
+    setFilesBusy(true);
+    setAttachmentError(null);
+    try {
+      const next: InferenceAttachment[] = [];
+      let remainingChars = Math.max(0, MAX_INFERENCE_TOTAL_CHARS - attachments.reduce((total, attachment) => total + attachment.text.length, 0));
+      for (const file of Array.from(fileList).slice(0, availableSlots)) {
+        if (remainingChars === 0) throw new Error("Los documentos adjuntos ya ocupan todo el contexto permitido para este mensaje.");
+        const attachment = await readInferenceAttachment(file, remainingChars);
+        next.push(attachment);
+        remainingChars -= attachment.text.length;
+      }
+      setAttachments((current) => [...current, ...next]);
+      if (fileList.length > availableSlots) setAttachmentError(`Solo se añadieron ${availableSlots} archivos; el límite es ${MAX_INFERENCE_FILES}.`);
+    } catch (caught) {
+      setAttachmentError(errorText(caught));
+    } finally {
+      setFilesBusy(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  }
+
   async function send() {
     const cleanPrompt = prompt.trim();
-    if (!selectedModel || !cleanPrompt || pendingTurn) return;
+    const attachedFiles = attachments;
+    if (!selectedModel || (!cleanPrompt && attachedFiles.length === 0) || pendingTurn || filesBusy) return;
+    const displayPrompt = cleanPrompt || "Analiza los archivos adjuntos.";
+    const messageContent = inferenceMessageWithAttachments(displayPrompt, attachedFiles);
+    const attachmentSummaries = attachedFiles.map(({ id, name, size, kind, truncated }) => ({ id, name, size, kind, truncated }));
     setPendingTurn({
-      prompt: cleanPrompt,
+      prompt: displayPrompt,
+      attachments: attachmentSummaries,
       requestId: "pending",
       model: selectedModel,
       delta: "",
@@ -1950,22 +3375,25 @@ function Inference({ snapshot, onSend, onNavigate, accountAuthenticated, onSignI
       elapsedMs: 0,
     });
     setPrompt("");
+    setAttachments([]);
+    setAttachmentError(null);
     setError(null);
     try {
       const messages: ChatMessage[] = [
         ...turns.flatMap((turn): ChatMessage[] => [
-          { role: "user", content: turn.prompt },
+          { role: "user", content: turn.messageContent },
           { role: "assistant", content: turn.response.text },
         ]),
-        { role: "user", content: cleanPrompt },
+        { role: "user", content: messageContent },
       ];
       const response = await onSend(selectedModel, messages, sessionId, (update) => {
         setPendingTurn((current) => current ? { ...current, ...update } : current);
       });
       if (!response.text.trim()) throw new Error("El modelo terminó sin devolver texto.");
-      setTurns((current) => [...current, { id: response.requestId, prompt: cleanPrompt, response }]);
+      setTurns((current) => [...current, { id: response.requestId, prompt: displayPrompt, messageContent, attachments: attachmentSummaries, response }]);
     } catch (caught) {
       setPrompt(cleanPrompt);
+      setAttachments(attachedFiles);
       setError(errorText(caught));
     } finally {
       setPendingTurn(null);
@@ -1987,6 +3415,8 @@ function Inference({ snapshot, onSend, onNavigate, accountAuthenticated, onSignI
     if (nextModel !== undefined) setModel(nextModel);
     setTurns([]);
     setPrompt("");
+    setAttachments([]);
+    setAttachmentError(null);
     setError(null);
     setPendingTurn(null);
     setSessionId(newInferenceSessionId());
@@ -1999,7 +3429,7 @@ function Inference({ snapshot, onSend, onNavigate, accountAuthenticated, onSignI
       <div className="inference-unavailable-icon"><MessageSquareText /></div>
       <div className="inference-unavailable-copy"><span>NO HAY MODELOS DE IA DISPONIBLES</span><h2>Ahora mismo no se puede hacer una inferencia real</h2><p>La red no tiene ningún runtime de IA real conectado. Un PC puede aparecer como nodo disponible sin inventar un modelo ni respuestas.</p>
         {snapshot.requestedModels[0] && <div className="inference-request-state"><LoaderCircle className={snapshot.requestedModels[0].status === "active" ? "" : "spin"} /><span><strong>{snapshot.requestedModels[0].id}</strong>{snapshot.requestedModels[0].message}</span></div>}
-        <div className="inference-unavailable-actions"><button className="primary-button" onClick={() => onNavigate("models")}><Boxes size={16} />Ver y activar modelos</button>{connectivityModel && <button className="secondary-button" disabled={diagnostic === "running"} onClick={() => void checkConnection()}>{diagnostic === "running" ? <LoaderCircle className="spin" size={16} /> : diagnostic === "ok" ? <CheckCircle2 size={16} /> : <Wifi size={16} />}{diagnostic === "idle" ? "Comprobar conexión" : diagnostic === "running" ? "Comprobando…" : diagnostic === "ok" ? "Conexión correcta" : "Reintentar conexión"}</button>}</div>
+        <div className="inference-unavailable-actions">{developerMode && <button className="primary-button" onClick={() => onNavigate("models")}><Boxes size={16} />Ver y activar modelos</button>}{connectivityModel && <button className="secondary-button" disabled={diagnostic === "running"} onClick={() => void checkConnection()}>{diagnostic === "running" ? <LoaderCircle className="spin" size={16} /> : diagnostic === "ok" ? <CheckCircle2 size={16} /> : <Wifi size={16} />}{diagnostic === "idle" ? "Comprobar conexión" : diagnostic === "running" ? "Comprobando…" : diagnostic === "ok" ? "Conexión correcta" : "Reintentar conexión"}</button>}</div>
         {diagnostic === "failed" && <div className="inference-diagnostic-error"><CircleAlert size={15} />El coordinador no ha completado la prueba de conexión.</div>}
       </div>
     </div>}
@@ -2009,7 +3439,14 @@ function Inference({ snapshot, onSend, onNavigate, accountAuthenticated, onSignI
     </div>}
     <div className={`inference-console${inferenceAvailable ? "" : " is-unavailable"}`} aria-disabled={!inferenceAvailable}>
       <div className="inference-toolbar">
-        <label><span>MODELO REAL</span><AppSelect ariaLabel="Modelo real" value={selectedModel} onChange={(nextModel) => resetConversation(nextModel)} options={realModels.map((item) => ({ value: item.id, label: item.id }))} placeholder="Esperando un modelo conectado…" /></label>
+        <div className="inference-toolbar-title"><MessageSquareText /><span><strong>Chat</strong><small>Inferencia distribuida en tiempo real</small></span></div>
+        <div className="inference-toolbar-controls">
+          <span className="inference-toolbar-stat"><Network /><b>{selectedOption?.nodeCount ?? 0}</b> nodo{selectedOption?.nodeCount === 1 ? "" : "s"}</span>
+          <span className="inference-toolbar-stat"><MemoryStick /><b>{selectedOption && selectedOption.peerMemoryMb > 0 ? formatMemory(selectedOption.peerMemoryMb) : "—"}</b> memoria</span>
+          <InferenceModelPicker options={realModels} value={model} onChange={(nextModel) => resetConversation(nextModel)} />
+        </div>
+      </div>
+      <div className="inference-route-strip">
         {inferenceAvailable
           ? <div className="inference-model-summary"><ExecutionBadge execution={selectedOption?.execution ?? unknownExecutionSummary()} workers={snapshot.workers} large /><span className="inference-live"><i />DISPONIBLE</span><span>{selectedOption?.routeLabel}</span><span>{selectedOption?.freeSlots ?? 0} hueco{selectedOption?.freeSlots === 1 ? "" : "s"} libre{selectedOption?.freeSlots === 1 ? "" : "s"}</span></div>
           : <div className="inference-model-summary inference-offline"><LockKeyhole size={14} /><span>{modelAvailable ? "INICIA SESIÓN" : "SIN CONEXIÓN REAL"}</span></div>}
@@ -2023,8 +3460,14 @@ function Inference({ snapshot, onSend, onNavigate, accountAuthenticated, onSignI
         {error && <div className="inference-error"><CircleAlert /><div><strong>No se pudo completar la inferencia</strong><span>{friendlyInferenceError(error)}</span></div></div>}
       </div>
       <div className="inference-input">
-        <textarea aria-label="Mensaje" value={prompt} disabled={!inferenceAvailable || pendingTurn !== null} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder={inferenceAvailable ? `Escribe a ${selectedModel}…` : modelAvailable ? "Inicia sesión para empezar a escribir…" : "Conecta un modelo real para empezar a escribir…"} />
-        <div className="inference-input-foot"><span>{inferenceAvailable ? <><kbd>Enter</kbd> enviar · <kbd>Shift</kbd> + <kbd>Enter</kbd> nueva línea</> : <><LockKeyhole size={12} />{modelAvailable ? "El envío se activará al iniciar sesión" : "El envío se activará cuando haya una conexión real"}</>}</span><div>{turns.length > 0 && <button className="inference-clear" onClick={() => resetConversation()}><Trash2 size={14} />Nueva conversación</button>}<button className="inference-send" disabled={!inferenceAvailable || !prompt.trim() || pendingTurn !== null} onClick={() => void send()}>{pendingTurn ? <LoaderCircle className="spin" /> : <Send />}<span>Enviar</span></button></div></div>
+        {attachments.length > 0 && <div className="inference-attachments" aria-label="Archivos adjuntos">{attachments.map((attachment) => <div key={attachment.id}><FileText /><span><strong>{attachment.name}</strong><small>{formatFileSize(attachment.size)} · {attachment.kind.toUpperCase()}{attachment.truncated ? " · contenido recortado" : ""}</small></span><button type="button" onClick={() => setAttachments((current) => current.filter((item) => item.id !== attachment.id))} aria-label={`Quitar ${attachment.name}`}><X /></button></div>)}</div>}
+        {attachmentError && <div className="inference-attachment-error"><CircleAlert />{attachmentError}</div>}
+        <div className="inference-composer-row">
+          <input ref={fileInputRef} hidden type="file" multiple accept={INFERENCE_FILE_ACCEPT} onChange={(event) => void addFiles(event.target.files)} />
+          <button type="button" className="inference-attach" disabled={!inferenceAvailable || pendingTurn !== null || filesBusy || attachments.length >= MAX_INFERENCE_FILES} onClick={() => fileInputRef.current?.click()} aria-label="Adjuntar documentos" title="PDF, DOCX, texto, código, CSV o JSON">{filesBusy ? <LoaderCircle className="spin" /> : <Paperclip />}</button>
+          <textarea aria-label="Mensaje" value={prompt} disabled={!inferenceAvailable || pendingTurn !== null} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder={inferenceAvailable ? `Escribe a ${model ? selectedModel : "la malla automática"}…` : modelAvailable ? "Inicia sesión para empezar a escribir…" : "Conecta un modelo real para empezar a escribir…"} />
+        </div>
+        <div className="inference-input-foot"><span>{inferenceAvailable ? <><Paperclip size={12} />PDF, DOCX, texto y código · extracción local · <kbd>Enter</kbd> enviar</> : <><LockKeyhole size={12} />{modelAvailable ? "El envío se activará al iniciar sesión" : "El envío se activará cuando haya una conexión real"}</>}</span><div>{turns.length > 0 && <button className="inference-clear" onClick={() => resetConversation()}><Trash2 size={14} />Nueva conversación</button>}<button className="inference-send" disabled={!inferenceAvailable || (!prompt.trim() && attachments.length === 0) || pendingTurn !== null || filesBusy} onClick={() => void send()}>{pendingTurn ? <LoaderCircle className="spin" /> : <Send />}<span>Enviar</span></button></div></div>
       </div>
     </div>
   </section>;
@@ -2034,7 +3477,7 @@ function InferenceStreamingTurn({ turn }: { turn: InferencePendingTurn }) {
   const content = splitStreamingContent(turn.text);
   const waitingStatus = inferenceWaitingStatus(turn);
   return <div className="inference-turn pending">
-    <div className="inference-user-message"><span>TÚ</span><p>{turn.prompt}</p></div>
+    <InferenceUserMessage prompt={turn.prompt} attachments={turn.attachments} />
     {turn.text ? <div className="inference-message streaming"><img src={brandIcon} alt="" /><div>
       <div className="inference-stream-head"><span>{turn.model}</span><b><i />GENERANDO EN VIVO</b></div>
       {turn.phase === "recovering" && <div className="inference-stream-recovery"><LoaderCircle className="spin" size={14} />{turn.statusMessage ?? "Reconectando y recuperando la respuesta…"} <small>intento {turn.attempt ?? 1} de {turn.maximumAttempts ?? 8}</small></div>}
@@ -2048,9 +3491,98 @@ function InferenceStreamingTurn({ turn }: { turn: InferencePendingTurn }) {
 function InferenceCompletedTurn({ turn }: { turn: InferenceTurn }) {
   const content = splitThinkingContent(turn.response.text);
   return <div className="inference-turn">
-    <div className="inference-user-message"><span>TÚ</span><p>{turn.prompt}</p></div>
+    <InferenceUserMessage prompt={turn.prompt} attachments={turn.attachments} />
     <div className="inference-message"><img src={brandIcon} alt="" /><div><span>{turn.response.model}</span>{content.reasoning && <details className="inference-reasoning"><summary>Ver razonamiento del modelo</summary><p>{content.reasoning}</p></details>}<p>{content.answer}</p><div className="inference-response-metrics"><span><b>{formatDuration(turn.response.ttftMs)}</b>primer token</span><span><b>{formatDuration(turn.response.activeMs)}</b>tiempo total</span><span><b>{turn.response.outputTokens}</b>tokens salida</span><span><b>{formatResponseThroughput(turn.response)}</b>tokens/s</span><span><b>{turn.response.routeClass}</b>ruta</span>{turn.response.reusedKvTokens > 0 ? <span><b>{turn.response.reusedKvTokens}</b>tokens KV reutilizados</span> : turn.response.affinityHit ? <span><b>AFÍN</b>misma ruta</span> : null}</div></div></div>
   </div>;
+}
+
+function InferenceUserMessage({ prompt, attachments }: { prompt: string; attachments: InferenceAttachmentSummary[] }) {
+  return <div className="inference-user-message"><span>TÚ</span><p>{prompt}</p>{attachments.length > 0 && <div className="inference-message-files">{attachments.map((attachment) => <span key={attachment.id}><FileText /><b>{attachment.name}</b><small>{formatFileSize(attachment.size)}</small></span>)}</div>}</div>;
+}
+
+type InferenceModelOption = ReturnType<typeof inferenceModelOption>;
+
+function InferenceModelPicker({ options, value, onChange }: { options: InferenceModelOption[]; value: string; onChange: (value: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const selected = options.find((option) => option.id === value) ?? null;
+  const label = selected?.id ?? "Mesh — automático";
+  return <div className={`inference-model-picker${open ? " open" : ""}`} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false); }}>
+    <button ref={triggerRef} type="button" aria-label="Seleccionar modelo de chat" aria-haspopup="listbox" aria-expanded={open} disabled={options.length === 0} onClick={() => setOpen((current) => !current)}>
+      <Cpu /><span><small>MODELO</small><strong>{label}</strong></span><ChevronDown />
+    </button>
+    {open && <div className="inference-model-menu" role="listbox" aria-label="Modelos disponibles">
+      <button type="button" role="option" aria-selected={value === ""} className={value === "" ? "selected" : ""} onMouseDown={(event) => event.preventDefault()} onClick={() => { onChange(""); setOpen(false); triggerRef.current?.focus(); }}>
+        <span><strong>Mesh — automático</strong><small>La red elige la mejor ruta disponible</small></span><b className="auto"><i />AUTO</b>{value === "" && <Check />}
+      </button>
+      {options.map((option) => <button type="button" role="option" aria-selected={option.id === value} className={option.id === value ? "selected" : ""} key={option.id} onMouseDown={(event) => event.preventDefault()} onClick={() => { onChange(option.id); setOpen(false); triggerRef.current?.focus(); }}>
+        <span><strong>{option.id}</strong><small>{option.nodeCount} nodo{option.nodeCount === 1 ? "" : "s"} · {option.peerMemoryMb > 0 ? formatMemory(option.peerMemoryMb) : "memoria no reportada"}</small></span><b className={option.freeSlots > 0 ? "warm" : "ready"}><i />{option.freeSlots > 0 ? "WARM" : "READY"}</b>{option.id === value && <Check />}
+      </button>)}
+    </div>}
+  </div>;
+}
+
+export async function readInferenceAttachment(file: File, remainingChars: number): Promise<InferenceAttachment> {
+  if (file.size === 0) throw new Error(`${file.name} está vacío.`);
+  if (file.size > MAX_INFERENCE_FILE_BYTES) throw new Error(`${file.name} supera el límite de ${formatFileSize(MAX_INFERENCE_FILE_BYTES)}.`);
+  const extension = file.name.split(".").at(-1)?.toLowerCase() ?? "";
+  let text = "";
+  let kind: InferenceAttachment["kind"] = "text";
+  if (extension === "pdf" || file.type === "application/pdf") {
+    kind = "pdf";
+    const pdfjs = await import("pdfjs-dist");
+    pdfjs.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).toString();
+    const document = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
+    const pages: string[] = [];
+    for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
+      const page = await document.getPage(pageNumber);
+      const content = await page.getTextContent();
+      pages.push(`[Página ${pageNumber}]\n${content.items.map((item) => "str" in item ? item.str : "").join(" ")}`);
+      if (pages.join("\n\n").length >= Math.min(MAX_INFERENCE_FILE_CHARS, remainingChars)) break;
+    }
+    text = pages.join("\n\n");
+  } else if (extension === "docx" || file.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
+    kind = "docx";
+    const mammoth = await import("mammoth");
+    const result = await mammoth.extractRawText({ arrayBuffer: await file.arrayBuffer() });
+    text = result.value;
+  } else if (file.type.startsWith("text/") || inferenceTextExtension(extension)) {
+    text = await file.text();
+  } else {
+    throw new Error(`${file.name} no es compatible. Usa PDF, DOCX, texto, Markdown, CSV, JSON o archivos de código.`);
+  }
+  const normalized = text.replace(/\u0000/g, "").replace(/\r\n/g, "\n").trim();
+  if (!normalized) throw new Error(`No se pudo extraer texto de ${file.name}. Los PDF escaneados necesitan OCR antes de adjuntarlos.`);
+  const limit = Math.max(1, Math.min(MAX_INFERENCE_FILE_CHARS, remainingChars));
+  const truncated = normalized.length > limit;
+  return {
+    id: crypto.randomUUID(),
+    name: file.name.replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 180) || "documento",
+    size: file.size,
+    kind,
+    truncated,
+    text: normalized.slice(0, limit),
+  };
+}
+
+function inferenceTextExtension(extension: string): boolean {
+  return new Set(["txt", "md", "csv", "json", "xml", "yaml", "yml", "toml", "html", "css", "js", "jsx", "ts", "tsx", "py", "java", "c", "cpp", "h", "sql", "log", "ini", "env"]).has(extension);
+}
+
+export function inferenceMessageWithAttachments(prompt: string, attachments: InferenceAttachment[]): string {
+  if (attachments.length === 0) return prompt;
+  const documents = attachments.map((attachment, index) => [
+    `--- ARCHIVO ${index + 1}: ${attachment.name} (${formatFileSize(attachment.size)})${attachment.truncated ? " · CONTENIDO RECORTADO" : ""} ---`,
+    attachment.text,
+    `--- FIN DE ${attachment.name} ---`,
+  ].join("\n")).join("\n\n");
+  return `${prompt}\n\nEl usuario ha adjuntado los siguientes documentos como material de referencia. Analiza su contenido y distingue claramente lo que procede de los archivos.\n\n${documents}`;
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function JoinNetwork({ publicLink, external }: { publicLink: (path: string) => string; external: boolean }) {
@@ -2386,7 +3918,7 @@ function AcceleratorProgressPanel({ acceleration, contributionState, computeMode
   </article>;
 }
 
-function DesktopSettingsView({ snapshot, bridge, onSnapshot }: { snapshot: DashboardSnapshot; bridge: DesktopBridge; onSnapshot: (snapshot: DashboardSnapshot) => void }) {
+function DesktopSettingsView({ snapshot, bridge, onSnapshot, developerMode }: { snapshot: DashboardSnapshot; bridge: DesktopBridge; onSnapshot: (snapshot: DashboardSnapshot) => void; developerMode: boolean }) {
   const [draft, setDraft] = useState(snapshot.settings);
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -2429,10 +3961,10 @@ function DesktopSettingsView({ snapshot, bridge, onSnapshot }: { snapshot: Dashb
     finally { setCheckingUpdate(false); }
   }
   return <section className="content-page settings-page">
-    <PageTitle eyebrow="DESKTOP PREFERENCES" title="Settings" copy="Native connection, contribution, background behavior and updates for this computer." />
+    <PageTitle eyebrow={developerMode ? "DEVELOPER PREFERENCES" : "DESKTOP PREFERENCES"} title="Settings" copy={developerMode ? "Coordinator, runtime, contribution, background behavior and updates for this computer." : "The everyday application and update preferences for this computer."} />
     {error && <div className="inline-error"><CircleAlert size={17} />{error}</div>}
-    <div className="settings-section"><div><Globe2 size={20} /><div><h3>Coordinator</h3><p>Use the public network or host an isolated local coordinator.</p></div></div><div className="settings-fields"><label>Mode<AppSelect ariaLabel="Coordinator mode" value={draft.coordinatorMode} onChange={(value) => updateCoordinatorMode(value as DesktopSettings["coordinatorMode"])} options={[{ value: "remote", label: "Public mycellios network" }, { value: "local", label: "Local network on this machine" }]} /></label>{draft.coordinatorMode === "remote" && <label>Coordinator URL<input value={draft.remoteCoordinatorUrl} onChange={(event) => update("remoteCoordinatorUrl", event.target.value)} /></label>}<label>Region<input value={draft.region} onChange={(event) => update("region", event.target.value)} placeholder="auto" /></label></div></div>
-    <div className="settings-section"><div><Gauge size={20} /><div><h3>Contribution</h3><p>Register real hardware only, or expose a model through a verified local runtime.</p></div></div><div className="settings-fields"><label>Compute mode<AppSelect ariaLabel="Compute mode" value={draft.computeMode} onChange={(value) => update("computeMode", value as DesktopSettings["computeMode"])} options={[{ value: "automatic", label: "Automatic · GPU preferred" }, { value: "gpu-only", label: "GPU only · never CPU" }, { value: "cpu-only", label: "CPU only · GPU disabled" }]} /></label><label>Runtime<AppSelect ariaLabel="Contribution runtime" value={draft.adapterMode} onChange={(value) => update("adapterMode", value as DesktopSettings["adapterMode"])} options={[{ value: "connectivity-test", label: "Hardware only (no model)" }, { value: "local-model-runtime", label: "Local local model runtime" }]} /></label><label>Offered memory (GB)<input type="number" min="1" step="1" value={draft.offeredVramMb / 1_024} onChange={(event) => update("offeredVramMb", Math.round(Number(event.target.value) * 1_024))} /></label>{draft.adapterMode === "local-model-runtime" && <><label>local model runtime model<input value={draft.modelName} onChange={(event) => update("modelName", event.target.value)} /></label><label>local model runtime URL<input value={draft.adapterBaseUrl} onChange={(event) => update("adapterBaseUrl", event.target.value)} /></label><label>Pinned digest<input value={draft.modelDigest} onChange={(event) => update("modelDigest", event.target.value)} placeholder="sha256:…" /></label></>}</div></div>
+    {developerMode && <div className="settings-section"><div><Globe2 size={20} /><div><h3>Coordinator</h3><p>Use the public network or host an isolated local coordinator.</p></div></div><div className="settings-fields"><label>Mode<AppSelect ariaLabel="Coordinator mode" value={draft.coordinatorMode} onChange={(value) => updateCoordinatorMode(value as DesktopSettings["coordinatorMode"])} options={[{ value: "remote", label: "Public mycellios network" }, { value: "local", label: "Local network on this machine" }]} /></label>{draft.coordinatorMode === "remote" && <label>Coordinator URL<input value={draft.remoteCoordinatorUrl} onChange={(event) => update("remoteCoordinatorUrl", event.target.value)} /></label>}<label>Region<input value={draft.region} onChange={(event) => update("region", event.target.value)} placeholder="auto" /></label></div></div>}
+    {developerMode && <div className="settings-section"><div><Gauge size={20} /><div><h3>Contribution runtime</h3><p>Register real hardware only, or expose a model through a verified local runtime.</p></div></div><div className="settings-fields"><label>Compute mode<AppSelect ariaLabel="Compute mode" value={draft.computeMode} onChange={(value) => update("computeMode", value as DesktopSettings["computeMode"])} options={[{ value: "automatic", label: "Automatic · GPU preferred" }, { value: "gpu-only", label: "GPU only · never CPU" }, { value: "cpu-only", label: "CPU only · GPU disabled" }]} /></label><label>Runtime<AppSelect ariaLabel="Contribution runtime" value={draft.adapterMode} onChange={(value) => update("adapterMode", value as DesktopSettings["adapterMode"])} options={[{ value: "connectivity-test", label: "Hardware only (no model)" }, { value: "local-model-runtime", label: "Local local model runtime" }]} /></label><label>Offered memory (GB)<input type="number" min="1" step="1" value={draft.offeredVramMb / 1_024} onChange={(event) => update("offeredVramMb", Math.round(Number(event.target.value) * 1_024))} /></label>{draft.adapterMode === "local-model-runtime" && <><label>local model runtime model<input value={draft.modelName} onChange={(event) => update("modelName", event.target.value)} /></label><label>local model runtime URL<input value={draft.adapterBaseUrl} onChange={(event) => update("adapterBaseUrl", event.target.value)} /></label><label>Pinned digest<input value={draft.modelDigest} onChange={(event) => update("modelDigest", event.target.value)} placeholder="sha256:…" /></label></>}</div></div>}
     <div className="settings-section compact-settings"><div><SlidersHorizontal size={20} /><div><h3>Application</h3><p>Startup and background contribution.</p></div></div><div className="toggle-list"><Toggle label="Start with the system" checked={draft.launchAtLogin} onChange={(value) => update("launchAtLogin", value)} /><Toggle label="Keep running in the tray" checked={draft.closeToTray} onChange={(value) => update("closeToTray", value)} /><Toggle label="Contribute resources" checked={draft.contributionEnabled} onChange={(value) => update("contributionEnabled", value)} /></div></div>
     <div className="settings-section"><div><Download size={20} /><div><h3>Automatic updates</h3><p>Desktop releases download in the background and install automatically as soon as active inference is idle.</p></div></div><div className="update-settings"><div><span className={`update-state ${snapshot.update.state}`}>{updateStateLabel(snapshot.update.state)}</span><strong>Version {snapshot.appVersion}</strong><p>{snapshot.update.message}</p></div><div className="update-actions"><button className="secondary-button" disabled={checkingUpdate || snapshot.update.state === "checking" || snapshot.update.state === "downloading"} onClick={() => void checkUpdate()}><RefreshCw className={checkingUpdate ? "spin" : ""} size={15} />Check now</button>{snapshot.update.state === "ready" && <button className="primary-button" onClick={() => void bridge.installUpdate()}><Download size={15} />Restart now</button>}</div></div></div>
     <div className="settings-footer"><button className="primary-button" disabled={saving} onClick={() => void save()}>{saving ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}Save and reconnect</button></div>
@@ -2997,13 +4529,22 @@ function computeModeLabel(mode: NonNullable<PublicWorker["computeMode"]>): strin
 
 function inferenceModelOption(snapshot: PublicSnapshot, model: PublicSnapshot["models"][number]) {
   const deployments = snapshot.workers.flatMap((worker) => worker.deployments).filter((deployment) => deployment.model === model.id);
+  const peers = snapshot.workers.filter((worker) => worker.connected && worker.deployments.some((deployment) => deployment.model === model.id));
   const adapters = deployments.map((deployment) => deployment.adapter).filter((adapter): adapter is NonNullable<PublicDeployment["adapter"]> => adapter !== undefined);
   const connectivityOnly = model.id === "mycellios-connectivity-check" || (adapters.length > 0 && adapters.every((adapter) => adapter === "mock"));
   const freeSlots = deployments.reduce((total, deployment) => total + deployment.freeSlots, 0);
   const routeLabel = model.pipelines > 0
     ? `${model.pipelines} pipeline${model.pipelines === 1 ? "" : "s"}`
     : `${model.replicas} réplica${model.replicas === 1 ? "" : "s"}`;
-  return { ...model, connectivityOnly, freeSlots, routeLabel, execution: summarizeDeploymentExecution(deployments) };
+  return {
+    ...model,
+    connectivityOnly,
+    freeSlots,
+    routeLabel,
+    nodeCount: peers.length,
+    peerMemoryMb: peers.reduce((total, worker) => total + worker.offeredVramMb, 0),
+    execution: summarizeDeploymentExecution(deployments),
+  };
 }
 
 function formatDuration(milliseconds: number): string {

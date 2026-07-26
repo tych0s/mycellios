@@ -79,7 +79,7 @@
   margin: 6px 0 4px;
   overflow: hidden;
   color: var(--text-primary);
-  font-size: 22px;
+  font-size: 23px;
   font-weight: 360;
   letter-spacing: -0.02em;
   text-overflow: ellipsis;
@@ -89,7 +89,7 @@
 .public-panel .hardware-hero p {
   margin: 0;
   color: var(--text-secondary);
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .public-panel .hardware-hero > .state-badge {
@@ -121,7 +121,7 @@
 
 .public-panel .compute-mode-heading span {
   color: var(--blue-300);
-  font-size: 8px;
+  font-size: 9px;
   font-weight: 650;
   letter-spacing: 0.14em;
 }
@@ -129,14 +129,14 @@
 .public-panel .compute-mode-heading h2 {
   margin: 0;
   color: var(--text-primary);
-  font-size: 16px;
+  font-size: 17px;
   font-weight: 520;
 }
 
 .public-panel .compute-mode-heading p {
   margin: 0;
   color: var(--text-tertiary);
-  font-size: 10px;
+  font-size: 11px;
 }
 
 .public-panel .compute-mode-heading > b {
@@ -145,7 +145,7 @@
   border-radius: 999px;
   color: #62e6b9;
   background: rgba(43, 191, 145, 0.08);
-  font-size: 7px;
+  font-size: 8px;
   font-weight: 650;
   letter-spacing: 0.1em;
   white-space: nowrap;
@@ -194,8 +194,8 @@
 }
 
 .public-panel .compute-mode-grid > button > span svg { width: 17px; }
-.public-panel .compute-mode-grid > button > strong { align-self: end; color: var(--text-primary); font-size: 11px; font-weight: 580; }
-.public-panel .compute-mode-grid > button > small { color: var(--text-tertiary); font-size: 8px; line-height: 1.45; }
+.public-panel .compute-mode-grid > button > strong { align-self: end; color: var(--text-primary); font-size: 12px; font-weight: 580; }
+.public-panel .compute-mode-grid > button > small { color: var(--text-tertiary); font-size: 9px; line-height: 1.45; }
 .public-panel .compute-mode-grid > button > svg { position: absolute; top: 11px; right: 11px; width: 14px; color: #62e6b9; }
 
 .public-panel .cards-grid {
@@ -223,7 +223,7 @@
 .public-panel .hardware-card h3 {
   margin: 7px 0 18px;
   color: var(--text-primary);
-  font-size: 19px;
+  font-size: 20px;
   font-weight: 500;
 }
 
@@ -272,14 +272,14 @@
 .public-panel .settings-section h3 {
   margin: 0 0 6px;
   color: var(--text-primary);
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 500;
 }
 
 .public-panel .settings-section p {
   margin: 0;
   color: var(--text-secondary);
-  font-size: 10px;
+  font-size: 11px;
   line-height: 1.55;
 }
 
@@ -293,7 +293,7 @@
   display: grid;
   gap: 7px;
   color: var(--text-secondary);
-  font-size: 10px;
+  font-size: 11px;
 }
 
 .public-panel .settings-fields input,
@@ -318,7 +318,7 @@
   background: transparent;
   border: 0;
   border-bottom: 1px solid rgba(255, 255, 255, 0.055);
-  font-size: 11px;
+  font-size: 12px;
   text-align: left;
   cursor: pointer;
 }
@@ -381,7 +381,7 @@
 
 .public-panel .update-settings strong {
   color: var(--text-primary);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 500;
 }
 
@@ -407,7 +407,7 @@
   color: #fff;
   background: linear-gradient(135deg, #3978ff, #5c91ff);
   box-shadow: 0 10px 28px rgba(35, 92, 220, 0.2);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 500;
   cursor: pointer;
 }
@@ -461,14 +461,14 @@
 
 .public-panel .onboarding-brand span {
   color: var(--blue-300);
-  font-size: 10px;
+  font-size: 11px;
   letter-spacing: 0.16em;
 }
 
 .public-panel .onboarding-card h1 {
   margin: 20px 0 8px;
   color: var(--text-primary);
-  font-size: 29px;
+  font-size: 30px;
   font-weight: 600;
   letter-spacing: -0.03em;
 }
@@ -476,7 +476,7 @@
 .public-panel .onboarding-card > p {
   margin: 0 0 22px;
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: 13px;
 }
 
 .public-panel .mode-grid.single-mode {
@@ -502,13 +502,13 @@
 
 .public-panel .mode-grid button strong {
   color: var(--text-primary);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 500;
 }
 
 .public-panel .mode-grid button span {
   color: var(--text-secondary);
-  font-size: 10px;
+  font-size: 11px;
 }
 
 .public-panel .mode-check {
@@ -534,14 +534,14 @@
 
 .public-panel .contribute-choice strong {
   color: var(--text-primary);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 500;
 }
 
 .public-panel .contribute-choice small {
   margin-top: 5px;
   color: var(--text-secondary);
-  font-size: 10px;
+  font-size: 11px;
 }
 
 .public-panel .onboarding-submit {
@@ -555,7 +555,7 @@
   gap: 7px;
   margin-top: 14px;
   color: var(--text-tertiary);
-  font-size: 10px;
+  font-size: 11px;
 }
 
 @media (max-width: 900px) {

@@ -142,8 +142,8 @@ const copy = {
         unit: "%",
         metricDetail: "OF VERIFIED USEFUL COMPUTE",
         title: "The network improves the network.",
-        copy: "Reserve a strictly bounded share of useful compute for daily agents that inspect failures, run isolated experiments and propose measurable improvements.",
-        steps: ["Observe real bottlenecks", "Experiment inside a sandbox", "Promote only verified gains"],
+        copy: "Reserve a strictly bounded share of useful compute for infrastructure R&D: regression and failure tests, new scheduling algorithms, and candidate routes or topologies evaluated in isolation.",
+        steps: ["Test failures and regressions", "Trial algorithms and routes", "Promote only verified gains"],
         footer: "Bounded budget · auditable history · controlled rollout",
       },
       token: {

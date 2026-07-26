@@ -20,7 +20,12 @@ import type { ChatCompletionRequest } from "../contracts/types.js";
 import type { CoordinatorConfig } from "../core/config.js";
 import { Scheduler } from "../scheduler/scheduler.js";
 import { MeshDatabase } from "../storage/database.js";
-import { MeshStore, type StoredRequestedModel, type StoredWorker } from "../storage/store.js";
+import {
+  MeshStore,
+  type StoredNetworkTelemetrySample,
+  type StoredRequestedModel,
+  type StoredWorker,
+} from "../storage/store.js";
 import { SupabasePersistence } from "../storage/supabase-sync.js";
 import {
   buildSupportAssistantMessages,
@@ -87,6 +92,16 @@ export const DEFAULT_AUTOMATIC_ACTIVATION_RETRY_DELAYS_MS = [
   120_000,
   300_000,
 ] as const;
+
+export const NETWORK_TELEMETRY_INTERVAL_MS = 10 * 60_000;
+export const NETWORK_TELEMETRY_RETENTION_DAYS = 90;
+
+const networkHistoryRanges = {
+  "24h": 24,
+  "7d": 7 * 24,
+  "30d": 30 * 24,
+  "90d": NETWORK_TELEMETRY_RETENTION_DAYS * 24,
+} as const;
 
 export interface AutomaticActivationRetryState {
   retryCount: number;
@@ -844,6 +859,26 @@ export async function createCoordinator(
     reconcileRequestedModels();
   }, 5_000);
   staleTimer.unref();
+  const captureNetworkTelemetry = (now = Date.now()) => {
+    reconcileRequestedModels();
+    const snapshot = publicSnapshot(store, scheduler, hub, mobileHub, activationManager, {
+      activationProgressForModel,
+      activationStatusMessageForModel,
+    });
+    const capturedAt = Math.floor(now / NETWORK_TELEMETRY_INTERVAL_MS)
+      * NETWORK_TELEMETRY_INTERVAL_MS;
+    store.recordNetworkTelemetrySample(networkTelemetrySample(snapshot, capturedAt));
+    store.pruneNetworkTelemetrySamples(
+      now - NETWORK_TELEMETRY_RETENTION_DAYS * 24 * 60 * 60_000,
+    );
+    return snapshot;
+  };
+  captureNetworkTelemetry();
+  const networkTelemetryTimer = setInterval(
+    () => captureNetworkTelemetry(),
+    NETWORK_TELEMETRY_INTERVAL_MS,
+  );
+  networkTelemetryTimer.unref();
 
   app.get("/health", async () => {
     const workers = store.listWorkers();
@@ -1338,6 +1373,26 @@ export async function createCoordinator(
       });
     }
     return benchmarkHistoryResponse();
+  });
+
+  app.get("/public/v1/history", async (request, reply) => {
+    reply.header("Access-Control-Allow-Origin", "*");
+    const { range } = z.object({
+      range: z.enum(["24h", "7d", "30d", "90d"]).default("24h"),
+    }).parse(request.query);
+    const now = Date.now();
+    captureNetworkTelemetry(now);
+    const since = now - networkHistoryRanges[range] * 60 * 60_000;
+    return {
+      capturedAt: new Date(now).toISOString(),
+      intervalMinutes: NETWORK_TELEMETRY_INTERVAL_MS / 60_000,
+      retentionDays: NETWORK_TELEMETRY_RETENTION_DAYS,
+      range,
+      samples: store.listNetworkTelemetrySamples(since).map((sample) => ({
+        ...sample,
+        capturedAt: new Date(sample.capturedAt).toISOString(),
+      })),
+    };
   });
 
   app.post("/local/v1/benchmarks/run", async (request, reply) => {
@@ -1882,6 +1937,7 @@ export async function createCoordinator(
     persistence,
     async close() {
       clearInterval(staleTimer);
+      clearInterval(networkTelemetryTimer);
       hub.close();
       mobileHub.close();
       await activationManager?.close();
@@ -2195,6 +2251,44 @@ function publicSnapshot(
     })),
     requestedModels,
     jobs,
+  };
+}
+
+function networkTelemetrySample(
+  snapshot: ReturnType<typeof publicSnapshot>,
+  capturedAt: number,
+): StoredNetworkTelemetrySample {
+  const onlineWorkers = snapshot.workers.filter(
+    (worker) => worker.connected && worker.status === "online",
+  );
+  const offeredVramMb = onlineWorkers.reduce(
+    (total, worker) => total + worker.offeredVramMb,
+    0,
+  );
+  const freeVramMb = onlineWorkers.reduce(
+    (total, worker) => total
+      + worker.gpus.reduce((gpuTotal, gpu) => gpuTotal + gpu.freeOfferedVramMb, 0),
+    0,
+  );
+  const inflightJobs = snapshot.jobs.filter(
+    (job) => ["queued", "leasing", "running", "streaming"].includes(job.status),
+  );
+  return {
+    capturedAt,
+    registeredNodes: snapshot.summary.registered,
+    connectedNodes: snapshot.summary.connected,
+    onlineNodes: snapshot.summary.online,
+    browserNodes: snapshot.summary.mobile,
+    activeModels: snapshot.models.length,
+    modelReplicas: snapshot.models.reduce((total, model) => total + model.replicas, 0),
+    modelPipelines: snapshot.models.reduce((total, model) => total + model.pipelines, 0),
+    offeredVramMb,
+    freeVramMb: Math.min(offeredVramMb, freeVramMb),
+    inflightJobs: inflightJobs.length,
+    runningJobs: inflightJobs.filter(
+      (job) => job.status === "running" || job.status === "streaming",
+    ).length,
+    completedJobs: snapshot.summary.completedJobs,
   };
 }
 

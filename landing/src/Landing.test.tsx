@@ -24,7 +24,6 @@ describe("Landing navigation", () => {
     expect(html).toContain("Several devices. One AI model.");
     expect(html).toContain('href="#explainer"');
   });
-
   it("renders the network-only support assistant entry point", () => {
     const html = renderToStaticMarkup(<Landing />);
 

@@ -287,6 +287,25 @@ export class MeshDatabase {
       ON api_usage(job_id)
       WHERE job_id IS NOT NULL;
 
+      CREATE TABLE IF NOT EXISTS network_telemetry_history (
+        captured_at INTEGER PRIMARY KEY,
+        registered_nodes INTEGER NOT NULL,
+        connected_nodes INTEGER NOT NULL,
+        online_nodes INTEGER NOT NULL,
+        browser_nodes INTEGER NOT NULL,
+        active_models INTEGER NOT NULL,
+        model_replicas INTEGER NOT NULL,
+        model_pipelines INTEGER NOT NULL,
+        offered_vram_mb INTEGER NOT NULL,
+        free_vram_mb INTEGER NOT NULL,
+        inflight_jobs INTEGER NOT NULL,
+        running_jobs INTEGER NOT NULL,
+        completed_jobs INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS network_telemetry_history_captured
+      ON network_telemetry_history(captured_at DESC);
+
     `);
     if (currentVersion >= 2 && currentVersion < 3) {
       const columns = this.raw.prepare("PRAGMA table_info(workers)").all() as Array<{
