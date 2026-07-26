@@ -306,6 +306,31 @@ class StageArtifactCacheTests(unittest.TestCase):
             )
 
     def test_concurrent_acquisition_deduplicates_payload_downloads(self) -> None:
+        # Este test va sobre DEDUPLICACION, no sobre trocear, asi que usa el
+        # tamano de trozo de PRODUCCION (`transfer_chunk_bytes`, 1 MiB por
+        # defecto en stage_artifact_cache.py) en vez de los dieciseis bytes que
+        # heredaba de `_test_limits()`.
+        #
+        # Con dieciseis bytes hacia 537 escrituras atomicas de estado —cada una
+        # crea, sincroniza, renombra y borra un fichero temporal— para mover
+        # 8.489 bytes. Ese coste es FIJO POR TROZO, y es el 71 % del tiempo del
+        # test. Como este es el unico test del fichero con fecha limite de reloj
+        # (`future.result(timeout=20)`, y ademas `lock_timeout_seconds=10`),
+        # bastaba con que la maquina se cargara para pasar de 4 s a 37-49 s y
+        # fallar. Reproducido exactamente inyectando 60 ms por escritura
+        # atomica: 37,88 s y falla, con las 537 escrituras.
+        #
+        # NO es aflojar el test: no se toca ningun presupuesto de tiempo. Se le
+        # quita un coste que nunca quiso ejercitar. Comprobado por PRUEBA DE
+        # MUTACION que conserva su poder de deteccion: sustituyendo
+        # `_exclusive_file_lock` por un contextmanager que no excluye nada, el
+        # test FALLA igual con 16 B, con 64 KiB y con 1 MiB. Y la carrera se
+        # sigue produciendo, porque la crea el `delay_seconds=0.05` del fixture,
+        # no el tamano de trozo: con 1 MiB varios candados siguen esperandose.
+        #
+        # La cobertura de reanudacion y offsets se queda intacta: los cuatro
+        # tests que asertan sobre ella siguen con los dieciseis bytes por
+        # defecto.
         fixture = _HttpArtifactFixture(
             self.source_files,
             delay_seconds=0.05,
@@ -314,7 +339,10 @@ class StageArtifactCacheTests(unittest.TestCase):
             tempfile.TemporaryDirectory() as directory,
             _serve_fixture(fixture) as manifest_url,
         ):
-            cache = StageArtifactCache(Path(directory) / "cache", limits=_test_limits())
+            cache = StageArtifactCache(
+                Path(directory) / "cache",
+                limits=_test_limits(transfer_chunk_bytes=1024 * 1024),
+            )
             with ThreadPoolExecutor(max_workers=2) as executor:
                 futures = [
                     executor.submit(cache.acquire, manifest_url) for _ in range(2)
@@ -380,12 +408,34 @@ class StageArtifactCacheTests(unittest.TestCase):
             verify_stage_artifact(document["package_directory"])
 
 
-def _test_limits() -> StageArtifactCacheLimits:
+def _test_limits(
+    *, transfer_chunk_bytes: int = 16
+) -> StageArtifactCacheLimits:
+    """Limites compartidos por los tests de la cache.
+
+    `transfer_chunk_bytes=16` es DELIBERADO y por defecto: trocear el payload en
+    pedazos de dieciseis bytes obliga a que haya cientos de confirmaciones
+    parciales, que es lo unico que ejercita de verdad la reanudacion por offset,
+    los cortes a mitad de transferencia y el estado parcial. Cuatro tests
+    asertan sobre eso y lo necesitan.
+
+    Pero es un tamano PATOLOGICO en coste de E/S, y se heredaba sin querer. Cada
+    trozo confirmado hace, en `_commit_partial_chunk`, un `fsync` del `.part` mas
+    una escritura atomica del estado — que crea un fichero temporal nuevo, lo
+    sincroniza, lo renombra y lo borra. Medido en este proyecto: **537
+    escrituras atomicas para 8.489 bytes de payload, el 71 % del tiempo del
+    test**. Ese coste es FIJO POR TROZO, asi que dieciseis bytes lo multiplican
+    por sesenta y cinco mil frente al valor de produccion.
+
+    Por eso el parametro: un test que NO va sobre trocear no debe pagarlo. El
+    unico con fecha limite de reloj —el de adquisicion concurrente— pasaba de
+    4 segundos a 37-49 y fallaba en cuanto la maquina se cargaba.
+    """
     return StageArtifactCacheLimits(
         max_manifest_bytes=1024 * 1024,
         max_payload_bytes=4 * 1024 * 1024,
         max_package_bytes=8 * 1024 * 1024,
-        transfer_chunk_bytes=16,
+        transfer_chunk_bytes=transfer_chunk_bytes,
         http_timeout_seconds=5,
         lock_timeout_seconds=10,
     )
