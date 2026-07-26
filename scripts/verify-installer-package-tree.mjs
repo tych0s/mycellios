@@ -443,16 +443,31 @@ export function assertRpmMetadataEvidence({
       kind !== expected.kind
       || (actual.mode & 0o7777) !== expected.mode
     ) {
-      throw new Error(`RPM type or permissions differ at ${path}.`);
-    }
-    if (
-      actual.user !== "root"
-      || actual.group !== "root"
-      || actual.flags !== 0
-      || !isEmptyRpmValue(actual.capabilities)
-    ) {
       throw new Error(
-        `RPM privileged metadata is not permitted at ${path}.`,
+        `RPM type or permissions differ at ${path}: ${kind} ${
+          (actual.mode & 0o7777).toString(8)
+        } instead of ${expected.kind} ${expected.mode.toString(8)}.`,
+      );
+    }
+    // El mensaje dice CUAL de las cuatro condiciones ha fallado y con que valor.
+    // Sin eso, "privileged metadata is not permitted" no distingue un fichero
+    // que se instala como un usuario que no es root —peligroso— de un simple
+    // marcador `%doc` o `%license`, que en RPM es semantico y perfectamente
+    // normal en /usr/share/doc. Son cosas muy distintas y merecen mirarse
+    // distinto; con el mensaje mudo hacian falta vueltas de CI para saber cual.
+    const offending = [
+      actual.user !== "root" ? `user=${actual.user}` : null,
+      actual.group !== "root" ? `group=${actual.group}` : null,
+      actual.flags !== 0 ? `flags=${actual.flags}` : null,
+      isEmptyRpmValue(actual.capabilities)
+        ? null
+        : `capabilities=${actual.capabilities}`,
+    ].filter((entry) => entry !== null);
+    if (offending.length > 0) {
+      throw new Error(
+        `RPM privileged metadata is not permitted at ${path}: ${
+          offending.join(", ")
+        }.`,
       );
     }
     if (expected.kind === "file") {
