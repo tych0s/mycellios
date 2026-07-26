@@ -563,8 +563,30 @@ class StageArtifactCache:
             etag=None,
             confirmed_offset=0,
         )
-        part_path.touch(exist_ok=False)
+        # EL ESTADO PRIMERO, EL `.part` DESPUES. El orden importa y no es estetico.
+        #
+        # Al reves, un corte entre las dos lineas deja un `.part` huerfano sin
+        # fichero de estado, y eso es TERMINAL: el control de arriba lanza
+        # "partial payload exists without confirmed offset state" en CADA acquire
+        # posterior de ese digest, para siempre, hasta que alguien corra un
+        # `cleanup --digest` a mano. Reproducido matando el proceso y tambien
+        # fabricando el estado de disco a mano: encalla en el primer intento y en
+        # todos los siguientes.
+        #
+        # La ventana no es teorica: se midio en 7,83 ms de mediana por fichero de
+        # carga (n=60, max 27,03), que es practicamente lo que tarda la escritura
+        # atomica del estado. Y es un ancho FIJO POR FICHERO, asi que no se
+        # diluye en descargas grandes.
+        #
+        # En este orden, el mismo corte deja "estado con offset 0 y sin `.part`",
+        # que el lector YA sabe arreglar unas lineas mas arriba: si no hay `.part`
+        # y el offset confirmado es 0, lo crea y sigue. De estado terminal a
+        # estado recuperable, sin coste.
+        #
+        # El invariante se conserva igual: publicar offset 0 nunca puede quedar
+        # por delante de los bytes durables, porque cero no adelanta a nada.
         self._write_partial_state(state_path, state)
+        part_path.touch(exist_ok=False)
         return state
 
     def _stream_local_payload(

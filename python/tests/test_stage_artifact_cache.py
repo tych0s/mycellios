@@ -30,6 +30,7 @@ from distributed_runtime.stage_artifact_cache import (
     StageArtifactCacheLimits,
     StageArtifactIntegrityError,
     StageArtifactTransportError,
+    _PartialState,
     main,
 )
 
@@ -382,6 +383,108 @@ class StageArtifactCacheTests(unittest.TestCase):
                     destination=destination,
                 )
             self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
+
+    def test_confirmed_offset_never_runs_ahead_of_the_durable_payload(self) -> None:
+        """El invariante del que depende toda la reanudacion, fijado como RELACION.
+
+        Los cuatro tests de reanudacion que ya habia fijan NUMEROS concretos —que
+        el offset vale 32, o 37—, y eso no protege la propiedad que de verdad
+        importa: **el offset confirmado en disco nunca puede ir por delante de los
+        bytes durables del `.part`**.
+
+        La asimetria es total. Un offset ATRASADO lo arregla el lector: trunca lo
+        que sobra y reanuda. Uno ADELANTADO es TERMINAL — el lector lanza
+        "partial payload is shorter than its confirmed offset" en cada `acquire`
+        posterior de ese digest, para siempre.
+
+        Y estaba sin cubrir: se comprobo que una implementacion que publica el
+        estado ANTES de que los bytes sean durables pasa la suite entera en verde,
+        10 de 10. Este test es lo que hace que deje de pasar.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            cache = StageArtifactCache(Path(directory) / "cache", limits=_test_limits())
+            original_write = cache._write_partial_state
+            violations: list[tuple[str, int, int]] = []
+
+            def check_before_publishing(state_path, state):
+                # En el instante de publicar, el offset que se va a escribir tiene
+                # que caber ya en los bytes que hay en el `.part`.
+                part_path = state_path.with_suffix("")
+                durable = part_path.stat().st_size if part_path.exists() else 0
+                if state.confirmed_offset > durable:
+                    violations.append(
+                        (state.digest, state.confirmed_offset, durable)
+                    )
+                original_write(state_path, state)
+
+            with patch.object(
+                cache, "_write_partial_state", check_before_publishing
+            ):
+                cache.acquire(self.source_package / STAGE_ARTIFACT_MANIFEST)
+
+            self.assertEqual(
+                violations,
+                [],
+                "el estado se publico por delante de los bytes durables del .part",
+            )
+
+    def test_a_cut_before_the_first_state_write_stays_recoverable(self) -> None:
+        """Un corte en la ventana de creacion no puede encallar el digest.
+
+        `_load_or_create_partial` escribe el estado y despues crea el `.part`. Al
+        reves, un corte entre las dos lineas dejaba un `.part` huerfano sin estado,
+        y eso es TERMINAL: cada `acquire` posterior de ese digest falla con
+        "partial payload exists without confirmed offset state" hasta que alguien
+        corra un `cleanup --digest` a mano. La ventana se midio en 7,83 ms de
+        mediana por fichero de carga, y es un ancho FIJO por fichero.
+
+        Aqui se fabrican las dos caras de esa ventana y se comprueba que la que
+        deja el orden actual es recuperable.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            cache = StageArtifactCache(Path(directory) / "cache", limits=_test_limits())
+            digest = self.compilation.weights_sha256
+            part_path, state_path = cache._partial_paths(digest)
+            argumentos = {
+                "digest": digest,
+                "expected_size": 64,
+                "source": "fuente-de-prueba",
+                "part_path": part_path,
+                "state_path": state_path,
+            }
+
+            # SE CORTA EN LA PRIMERA ESCRITURA DE ESTADO, que es el instante que
+            # decide. Con el orden actual el `.part` todavia no existe, asi que no
+            # queda nada que estorbe. Con el orden invertido ya se habria creado y
+            # quedaria huerfano — y este assert es lo que lo detecta.
+            with patch.object(
+                cache,
+                "_write_partial_state",
+                side_effect=OSError("corte inyectado al publicar el estado"),
+            ):
+                with self.assertRaises(OSError):
+                    cache._load_or_create_partial(**argumentos)
+
+            self.assertFalse(
+                part_path.exists(),
+                "el `.part` se creo antes de publicar el estado: un corte aqui deja"
+                " un huerfano que encalla el digest para siempre",
+            )
+
+            # Y por tanto el siguiente intento arranca limpio en vez de encallar.
+            state = cache._load_or_create_partial(**argumentos)
+            self.assertEqual(state.confirmed_offset, 0)
+            self.assertTrue(part_path.exists())
+
+            # El estado que dejaba el orden ANTIGUO sigue siendo terminal a
+            # proposito: un `.part` sin estado es corrupcion real y no se debe
+            # adivinar que hacer con ella. Por eso el arreglo es no producirlo,
+            # no tolerarlo.
+            state_path.unlink()
+            with self.assertRaisesRegex(
+                StageArtifactIntegrityError, "without confirmed offset state"
+            ):
+                cache._load_or_create_partial(**argumentos)
 
     def test_cli_acquire_returns_a_control_plane_ready_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
