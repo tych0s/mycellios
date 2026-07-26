@@ -12,12 +12,15 @@ import {
   WORKER_PROTOCOL_MAX,
   WORKER_PROTOCOL_MIN,
   workerAdmissionProofSchema,
+  workerCredentialRotationProofSchema,
   type WorkerAdmissionChallengeRequest,
   type WorkerAdmissionChallengeResponse,
   type WorkerAdmissionIdentity,
   type WorkerAdmissionProof,
   type WorkerAdmissionPublicKey,
   type WorkerProtocolRange,
+  type WorkerCredentialRotationChallengeRequest,
+  type WorkerCredentialRotationProof,
 } from "../contracts/worker-admission.js";
 
 const BASE64URL = /^[A-Za-z0-9_-]+$/;
@@ -36,11 +39,24 @@ interface PendingChallenge {
   expiresAt: number;
 }
 
+interface PendingRotationChallenge {
+  identity: WorkerAdmissionIdentity;
+  currentKey: KeyObject;
+  currentAlgorithm: WorkerAdmissionPublicKey["algorithm"];
+  currentFingerprint: string;
+  nextKey: KeyObject;
+  nextPublicKey: WorkerAdmissionPublicKey;
+  nextFingerprint: string;
+  protocolVersion: number;
+  signingPayload: string;
+  expiresAt: number;
+}
+
 export class WorkerAdmissionError extends Error {
   constructor(
     readonly code: string,
     message: string,
-    readonly statusCode: 400 | 401 | 403 | 409 | 426 | 429,
+    readonly statusCode: 400 | 401 | 403 | 404 | 409 | 426 | 429,
   ) {
     super(message);
     this.name = "WorkerAdmissionError";
@@ -49,6 +65,7 @@ export class WorkerAdmissionError extends Error {
 
 export class WorkerAdmissionAuthority {
   private readonly challenges = new Map<string, PendingChallenge>();
+  private readonly rotationChallenges = new Map<string, PendingRotationChallenge>();
 
   constructor(
     private readonly database: MeshDatabase,
@@ -59,7 +76,10 @@ export class WorkerAdmissionAuthority {
     input: WorkerAdmissionChallengeRequest,
   ): WorkerAdmissionChallengeResponse {
     this.pruneExpired();
-    if (this.challenges.size >= MAX_PENDING_WORKER_ADMISSION_CHALLENGES) {
+    if (
+      this.challenges.size + this.rotationChallenges.size
+      >= MAX_PENDING_WORKER_ADMISSION_CHALLENGES
+    ) {
       throw new WorkerAdmissionError(
         "worker_admission_busy",
         "The coordinator has too many pending worker admission challenges.",
@@ -96,6 +116,194 @@ export class WorkerAdmissionAuthority {
       expiresAt: new Date(expiresAt).toISOString(),
       protocolVersion,
       signingPayload,
+    };
+  }
+
+  issueRotation(
+    input: WorkerCredentialRotationChallengeRequest,
+  ): WorkerAdmissionChallengeResponse {
+    this.pruneExpired();
+    if (
+      this.challenges.size + this.rotationChallenges.size
+      >= MAX_PENDING_WORKER_ADMISSION_CHALLENGES
+    ) {
+      throw new WorkerAdmissionError(
+        "worker_admission_busy",
+        "The coordinator has too many pending worker admission challenges.",
+        429,
+      );
+    }
+    const protocolVersion = selectWorkerProtocolVersion(input.protocol);
+    const current = normalizePublicKey(input.currentPublicKey);
+    const next = normalizePublicKey(input.nextPublicKey);
+    if (current.fingerprint === next.fingerprint) {
+      throw new WorkerAdmissionError(
+        "worker_rotation_key_unchanged",
+        "The replacement worker key must be different from the current key.",
+        400,
+      );
+    }
+    const existing = this.database.getWorkerAdmissionCredential(
+      input.identity.kind,
+      input.identity.id,
+    );
+    if (!existing) {
+      throw new WorkerAdmissionError(
+        "worker_credential_unknown",
+        "This worker identity has not been enrolled.",
+        404,
+      );
+    }
+    if (existing.status === "revoked") {
+      throw new WorkerAdmissionError(
+        "worker_credential_revoked",
+        "This worker credential has been revoked.",
+        403,
+      );
+    }
+    if (
+      existing.algorithm !== current.publicKey.algorithm
+      || existing.publicKey !== current.publicKey.spki
+      || existing.fingerprint !== current.fingerprint
+    ) {
+      throw new WorkerAdmissionError(
+        "worker_rotation_current_key_mismatch",
+        "The current worker key does not match the enrolled credential.",
+        409,
+      );
+    }
+    const challengeId = randomUUID();
+    const expiresAt = this.now() + WORKER_ADMISSION_CHALLENGE_TTL_MS;
+    const signingPayload = canonicalEvidenceJson({
+      schema: "mycellios-worker-credential-rotation/1",
+      challengeId,
+      nonce: randomBytes(32).toString("base64url"),
+      identity: input.identity,
+      currentPublicKey: current.publicKey,
+      currentFingerprint: current.fingerprint,
+      nextPublicKey: next.publicKey,
+      nextFingerprint: next.fingerprint,
+      protocol: input.protocol,
+      protocolVersion,
+      expiresAt,
+    });
+    this.rotationChallenges.set(challengeId, {
+      identity: input.identity,
+      currentKey: current.key,
+      currentAlgorithm: current.publicKey.algorithm,
+      currentFingerprint: current.fingerprint,
+      nextKey: next.key,
+      nextPublicKey: next.publicKey,
+      nextFingerprint: next.fingerprint,
+      protocolVersion,
+      signingPayload,
+      expiresAt,
+    });
+    return {
+      challengeId,
+      expiresAt: new Date(expiresAt).toISOString(),
+      protocolVersion,
+      signingPayload,
+    };
+  }
+
+  verifyRotation(input: {
+    identity: WorkerAdmissionIdentity;
+    proof: WorkerCredentialRotationProof;
+  }): {
+    protocolVersion: number;
+    previousFingerprint: string;
+    credentialFingerprint: string;
+  } {
+    const proof = workerCredentialRotationProofSchema.parse(input.proof);
+    const challenge = this.rotationChallenges.get(proof.challengeId);
+    this.rotationChallenges.delete(proof.challengeId);
+    if (!challenge) {
+      throw new WorkerAdmissionError(
+        "worker_rotation_challenge_unknown",
+        "The credential rotation challenge is unknown or was already consumed.",
+        401,
+      );
+    }
+    if (challenge.expiresAt <= this.now()) {
+      throw new WorkerAdmissionError(
+        "worker_rotation_challenge_expired",
+        "The credential rotation challenge expired.",
+        401,
+      );
+    }
+    if (
+      challenge.identity.kind !== input.identity.kind
+      || challenge.identity.id !== input.identity.id
+    ) {
+      throw new WorkerAdmissionError(
+        "worker_admission_identity_mismatch",
+        "The credential rotation identity does not match its challenge.",
+        401,
+      );
+    }
+    if (
+      !verifyAdmissionSignature(
+        challenge.currentKey,
+        challenge.currentAlgorithm,
+        challenge.signingPayload,
+        proof.currentSignature,
+      )
+      || !verifyAdmissionSignature(
+        challenge.nextKey,
+        challenge.nextPublicKey.algorithm,
+        challenge.signingPayload,
+        proof.nextSignature,
+      )
+    ) {
+      throw new WorkerAdmissionError(
+        "worker_rotation_signature_invalid",
+        "Credential rotation requires valid signatures from both keys.",
+        401,
+      );
+    }
+    const rotation = this.database.rotateWorkerAdmissionCredential({
+      identityKind: input.identity.kind,
+      identityId: input.identity.id,
+      expectedFingerprint: challenge.currentFingerprint,
+      algorithm: challenge.nextPublicKey.algorithm,
+      publicKey: challenge.nextPublicKey.spki,
+      fingerprint: challenge.nextFingerprint,
+      protocolVersion: challenge.protocolVersion,
+    });
+    if (rotation.state === "not_found") {
+      throw new WorkerAdmissionError(
+        "worker_credential_unknown",
+        "This worker identity has not been enrolled.",
+        404,
+      );
+    }
+    if (rotation.state === "revoked") {
+      throw new WorkerAdmissionError(
+        "worker_credential_revoked",
+        "This worker credential has been revoked.",
+        403,
+      );
+    }
+    if (rotation.state === "fingerprint_mismatch") {
+      throw new WorkerAdmissionError(
+        "worker_rotation_raced",
+        "The worker credential changed while rotation was pending.",
+        409,
+      );
+    }
+    if (rotation.state === "fingerprint_in_use") {
+      throw new WorkerAdmissionError(
+        "worker_credential_reused",
+        "The replacement key is already bound to another worker identity.",
+        409,
+      );
+    }
+    if (!rotation.credential) throw new Error("worker_rotation_credential_missing");
+    return {
+      protocolVersion: challenge.protocolVersion,
+      previousFingerprint: challenge.currentFingerprint,
+      credentialFingerprint: rotation.credential.fingerprint,
     };
   }
 
@@ -216,6 +424,9 @@ export class WorkerAdmissionAuthority {
     const now = this.now();
     for (const [challengeId, challenge] of this.challenges) {
       if (challenge.expiresAt <= now) this.challenges.delete(challengeId);
+    }
+    for (const [challengeId, challenge] of this.rotationChallenges) {
+      if (challenge.expiresAt <= now) this.rotationChallenges.delete(challengeId);
     }
   }
 }

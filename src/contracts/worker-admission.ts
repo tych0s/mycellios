@@ -51,6 +51,22 @@ export const workerAdmissionChallengeResponseSchema = z.object({
   signingPayload: z.string().min(1).max(4_096),
 }).strict();
 
+export const workerCredentialRotationChallengeRequestSchema = z.object({
+  identity: workerAdmissionIdentitySchema,
+  currentPublicKey: workerAdmissionPublicKeySchema,
+  nextPublicKey: workerAdmissionPublicKeySchema,
+  protocol: workerProtocolRangeSchema,
+}).strict();
+
+export const workerCredentialRotationProofSchema = z.object({
+  challengeId: z.string().uuid(),
+  currentSignature: z.string().min(64).max(256).regex(BASE64URL),
+  nextSignature: z.string().min(64).max(256).regex(BASE64URL),
+}).strict();
+
+export const workerCredentialRotationChallengeResponseSchema =
+  workerAdmissionChallengeResponseSchema;
+
 export type WorkerAdmissionIdentity = z.infer<typeof workerAdmissionIdentitySchema>;
 export type WorkerProtocolRange = z.infer<typeof workerProtocolRangeSchema>;
 export type WorkerAdmissionPublicKey = z.infer<typeof workerAdmissionPublicKeySchema>;
@@ -59,3 +75,7 @@ export type WorkerAdmissionChallengeRequest =
   z.infer<typeof workerAdmissionChallengeRequestSchema>;
 export type WorkerAdmissionChallengeResponse =
   z.infer<typeof workerAdmissionChallengeResponseSchema>;
+export type WorkerCredentialRotationChallengeRequest =
+  z.infer<typeof workerCredentialRotationChallengeRequestSchema>;
+export type WorkerCredentialRotationProof =
+  z.infer<typeof workerCredentialRotationProofSchema>;

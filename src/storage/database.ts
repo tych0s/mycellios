@@ -47,6 +47,17 @@ export type WorkerAdmissionResult =
   | { state: "enrolled" | "accepted"; credential: WorkerAdmissionCredentialRow }
   | { state: "revoked" | "key_mismatch" | "fingerprint_in_use"; credential: WorkerAdmissionCredentialRow };
 
+export type WorkerCredentialRevocationResult =
+  | { state: "revoked" | "already_revoked"; credential: WorkerAdmissionCredentialRow }
+  | { state: "not_found" | "fingerprint_mismatch"; credential?: WorkerAdmissionCredentialRow };
+
+export type WorkerCredentialRotationResult =
+  | { state: "rotated"; credential: WorkerAdmissionCredentialRow }
+  | {
+    state: "not_found" | "revoked" | "fingerprint_mismatch" | "fingerprint_in_use";
+    credential?: WorkerAdmissionCredentialRow;
+  };
+
 export class MeshDatabase {
   readonly raw: DatabaseSync;
   private transactionDepth = 0;
@@ -522,6 +533,143 @@ export class MeshDatabase {
           ...input,
           status: "active",
           createdAt: now,
+          updatedAt: now,
+          lastSeenAt: now,
+          revokedAt: null,
+          revocationReason: null,
+        },
+      };
+    });
+  }
+
+  listWorkerAdmissionCredentials(limit = 1_000): WorkerAdmissionCredentialRow[] {
+    return this.raw.prepare(
+      `SELECT identity_kind, identity_id, algorithm, public_key, fingerprint,
+              status, protocol_version, created_at, updated_at, last_seen_at,
+              revoked_at, revocation_reason
+       FROM worker_admission_credentials
+       ORDER BY last_seen_at DESC, identity_kind ASC, identity_id ASC
+       LIMIT ?`,
+    ).all(Math.max(1, Math.min(10_000, Math.trunc(limit))))
+      .flatMap((row) => {
+        const credential = this.readWorkerAdmissionCredential(row);
+        return credential ? [credential] : [];
+      });
+  }
+
+  getWorkerAdmissionCredential(
+    identityKind: WorkerAdmissionCredentialRow["identityKind"],
+    identityId: string,
+  ): WorkerAdmissionCredentialRow | null {
+    return this.readWorkerAdmissionCredential(
+      this.raw.prepare(
+        `SELECT identity_kind, identity_id, algorithm, public_key, fingerprint,
+                status, protocol_version, created_at, updated_at, last_seen_at,
+                revoked_at, revocation_reason
+         FROM worker_admission_credentials
+         WHERE identity_kind = ? AND identity_id = ?`,
+      ).get(identityKind, identityId),
+    );
+  }
+
+  revokeWorkerAdmissionCredential(input: {
+    identityKind: WorkerAdmissionCredentialRow["identityKind"];
+    identityId: string;
+    expectedFingerprint: string;
+    reason: string;
+  }): WorkerCredentialRevocationResult {
+    return this.transaction(() => {
+      const existing = this.getWorkerAdmissionCredential(input.identityKind, input.identityId);
+      if (!existing) return { state: "not_found" };
+      if (existing.fingerprint !== input.expectedFingerprint) {
+        return { state: "fingerprint_mismatch", credential: existing };
+      }
+      if (existing.status === "revoked") {
+        return { state: "already_revoked", credential: existing };
+      }
+      const now = Date.now();
+      this.raw.prepare(
+        `UPDATE worker_admission_credentials
+         SET status = 'revoked', updated_at = ?, revoked_at = ?, revocation_reason = ?
+         WHERE identity_kind = ? AND identity_id = ? AND fingerprint = ? AND status = 'active'`,
+      ).run(
+        now,
+        now,
+        input.reason,
+        input.identityKind,
+        input.identityId,
+        input.expectedFingerprint,
+      );
+      return {
+        state: "revoked",
+        credential: {
+          ...existing,
+          status: "revoked",
+          updatedAt: now,
+          revokedAt: now,
+          revocationReason: input.reason,
+        },
+      };
+    });
+  }
+
+  rotateWorkerAdmissionCredential(input: {
+    identityKind: WorkerAdmissionCredentialRow["identityKind"];
+    identityId: string;
+    expectedFingerprint: string;
+    algorithm: WorkerAdmissionCredentialRow["algorithm"];
+    publicKey: string;
+    fingerprint: string;
+    protocolVersion: number;
+  }): WorkerCredentialRotationResult {
+    return this.transaction(() => {
+      const existing = this.getWorkerAdmissionCredential(input.identityKind, input.identityId);
+      if (!existing) return { state: "not_found" };
+      if (existing.status === "revoked") return { state: "revoked", credential: existing };
+      if (existing.fingerprint !== input.expectedFingerprint) {
+        return { state: "fingerprint_mismatch", credential: existing };
+      }
+      const reused = this.readWorkerAdmissionCredential(
+        this.raw.prepare(
+          `SELECT identity_kind, identity_id, algorithm, public_key, fingerprint,
+                  status, protocol_version, created_at, updated_at, last_seen_at,
+                  revoked_at, revocation_reason
+           FROM worker_admission_credentials
+           WHERE fingerprint = ?`,
+        ).get(input.fingerprint),
+      );
+      if (reused && (
+        reused.identityKind !== input.identityKind
+        || reused.identityId !== input.identityId
+      )) {
+        return { state: "fingerprint_in_use", credential: reused };
+      }
+      const now = Date.now();
+      this.raw.prepare(
+        `UPDATE worker_admission_credentials
+         SET algorithm = ?, public_key = ?, fingerprint = ?, protocol_version = ?,
+             updated_at = ?, last_seen_at = ?, revoked_at = NULL,
+             revocation_reason = NULL
+         WHERE identity_kind = ? AND identity_id = ? AND fingerprint = ? AND status = 'active'`,
+      ).run(
+        input.algorithm,
+        input.publicKey,
+        input.fingerprint,
+        input.protocolVersion,
+        now,
+        now,
+        input.identityKind,
+        input.identityId,
+        input.expectedFingerprint,
+      );
+      return {
+        state: "rotated",
+        credential: {
+          ...existing,
+          algorithm: input.algorithm,
+          publicKey: input.publicKey,
+          fingerprint: input.fingerprint,
+          protocolVersion: input.protocolVersion,
           updatedAt: now,
           lastSeenAt: now,
           revokedAt: null,

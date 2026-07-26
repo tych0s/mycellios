@@ -9,8 +9,11 @@ import {
   WORKER_PROTOCOL_MAX,
   WORKER_PROTOCOL_MIN,
   workerAdmissionChallengeRequestSchema,
+  workerAdmissionIdentitySchema,
   workerAdmissionProofSchema,
   workerProtocolRangeSchema,
+  workerCredentialRotationChallengeRequestSchema,
+  workerCredentialRotationProofSchema,
 } from "../contracts/worker-admission.js";
 import { sha256CanonicalEvidence } from "../core/json.js";
 import {
@@ -83,6 +86,17 @@ export const mobileRegistrationSchema = z
   .strict();
 
 const mobileAdmissionChallengeSchema = workerAdmissionChallengeRequestSchema.extend({
+  joinToken: z.string().max(512).optional(),
+}).strict();
+
+const mobileCredentialRotationChallengeSchema =
+  workerCredentialRotationChallengeRequestSchema.extend({
+    joinToken: z.string().max(512).optional(),
+  }).strict();
+
+const mobileCredentialRotationSchema = z.object({
+  identity: workerAdmissionIdentitySchema,
+  proof: workerCredentialRotationProofSchema,
   joinToken: z.string().max(512).optional(),
 }).strict();
 
@@ -331,6 +345,60 @@ export class MobileComputeHub {
       }
       try {
         return this.options.admissionAuthority.issue(challenge);
+      } catch (error) {
+        if (!(error instanceof WorkerAdmissionError)) throw error;
+        return reply.code(error.statusCode).send({
+          error: { code: error.code, message: error.message },
+        });
+      }
+    });
+
+    app.post("/mobile/v1/credential-rotation-challenge", async (request, reply) => {
+      if (!this.options.admissionAuthority) {
+        return reply.code(503).send({
+          error: { code: "worker_admission_unavailable" },
+        });
+      }
+      const parsed = mobileCredentialRotationChallengeSchema.parse(request.body);
+      if (this.options.joinToken && parsed.joinToken !== this.options.joinToken) {
+        return reply.code(401).send({ error: { code: "invalid_join_token" } });
+      }
+      const { joinToken: _joinToken, ...rotation } = parsed;
+      if (rotation.identity.kind !== "browser") {
+        return reply.code(400).send({
+          error: { code: "browser_admission_identity_required" },
+        });
+      }
+      try {
+        return this.options.admissionAuthority.issueRotation(rotation);
+      } catch (error) {
+        if (!(error instanceof WorkerAdmissionError)) throw error;
+        return reply.code(error.statusCode).send({
+          error: { code: error.code, message: error.message },
+        });
+      }
+    });
+
+    app.post("/mobile/v1/credential-rotation", async (request, reply) => {
+      if (!this.options.admissionAuthority) {
+        return reply.code(503).send({
+          error: { code: "worker_admission_unavailable" },
+        });
+      }
+      const parsed = mobileCredentialRotationSchema.parse(request.body);
+      if (this.options.joinToken && parsed.joinToken !== this.options.joinToken) {
+        return reply.code(401).send({ error: { code: "invalid_join_token" } });
+      }
+      if (parsed.identity.kind !== "browser") {
+        return reply.code(400).send({
+          error: { code: "browser_admission_identity_required" },
+        });
+      }
+      try {
+        return this.options.admissionAuthority.verifyRotation({
+          identity: parsed.identity,
+          proof: parsed.proof,
+        });
       } catch (error) {
         if (!(error instanceof WorkerAdmissionError)) throw error;
         return reply.code(error.statusCode).send({

@@ -169,6 +169,41 @@ describe("public coordinator security boundaries", () => {
     expect(replay.json()).toMatchObject({
       error: { code: "worker_admission_challenge_unknown" },
     });
+
+    const credentialFingerprint = accepted.json<{
+      credentialFingerprint: string;
+    }>().credentialFingerprint;
+    const credentials = await runtime.app.inject({
+      method: "GET",
+      url: "/public/v1/worker-credentials",
+    });
+    expect(credentials.statusCode).toBe(200);
+    expect(credentials.json()).toMatchObject({
+      data: [expect.objectContaining({
+        identityKind: "device",
+        identityId: registration.identity.id,
+        fingerprint: credentialFingerprint,
+        status: "active",
+      })],
+    });
+    const revoked = await runtime.app.inject({
+      method: "POST",
+      url: `/public/v1/worker-credentials/device/${registration.identity.id}/revoke`,
+      payload: {
+        expectedFingerprint: credentialFingerprint,
+        reason: "security regression test",
+      },
+    });
+    expect(revoked.statusCode).toBe(200);
+    expect(revoked.json()).toMatchObject({
+      state: "revoked",
+      disconnected: 1,
+      credential: {
+        fingerprint: credentialFingerprint,
+        status: "revoked",
+        revocationReason: "security regression test",
+      },
+    });
   });
 
   it("rejects worker protocol downgrade or unsupported upgrade before enrollment", async () => {

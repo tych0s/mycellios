@@ -33,6 +33,9 @@ import {
   WORKER_PROTOCOL_MAX,
   WORKER_PROTOCOL_MIN,
   workerAdmissionChallengeRequestSchema,
+  workerAdmissionIdentitySchema,
+  workerCredentialRotationChallengeRequestSchema,
+  workerCredentialRotationProofSchema,
 } from "../contracts/worker-admission.js";
 import {
   type NativeBuildIdentity,
@@ -112,6 +115,7 @@ import {
 import {
   WorkerAdmissionAuthority,
   WorkerAdmissionError,
+  admissionCredentialSummary,
   selectWorkerProtocolVersion,
 } from "./worker-admission.js";
 
@@ -1818,6 +1822,33 @@ export async function createCoordinator(
     }
   });
 
+  app.post("/internal/v1/workers/credential-rotation-challenge", async (request, reply) => {
+    const rotation = workerCredentialRotationChallengeRequestSchema.parse(request.body);
+    try {
+      return workerAdmission.issueRotation(rotation);
+    } catch (error) {
+      if (!(error instanceof WorkerAdmissionError)) throw error;
+      return reply.code(error.statusCode).send({
+        error: { code: error.code, message: error.message },
+      });
+    }
+  });
+
+  app.post("/internal/v1/workers/credential-rotation", async (request, reply) => {
+    const rotation = z.object({
+      identity: workerAdmissionIdentitySchema,
+      proof: workerCredentialRotationProofSchema,
+    }).strict().parse(request.body);
+    try {
+      return workerAdmission.verifyRotation(rotation);
+    } catch (error) {
+      if (!(error instanceof WorkerAdmissionError)) throw error;
+      return reply.code(error.statusCode).send({
+        error: { code: error.code, message: error.message },
+      });
+    }
+  });
+
   app.post("/internal/v1/workers/register", async (request, reply) => {
     const registration = workerRegistrationSchema.parse(request.body);
     if (
@@ -1931,6 +1962,85 @@ export async function createCoordinator(
       })),
     ],
   }));
+
+  app.get("/public/v1/worker-credentials", async (request, reply) => {
+    if (!(await authorizeAdministrativeMutation(request, reply))) return;
+    return {
+      data: database.listWorkerAdmissionCredentials().map((credential) => ({
+        ...admissionCredentialSummary(credential),
+        createdAt: new Date(credential.createdAt).toISOString(),
+        updatedAt: new Date(credential.updatedAt).toISOString(),
+        lastSeenAt: new Date(credential.lastSeenAt).toISOString(),
+        revokedAt: credential.revokedAt === null
+          ? null
+          : new Date(credential.revokedAt).toISOString(),
+        revocationReason: credential.revocationReason,
+      })),
+    };
+  });
+
+  app.post(
+    "/public/v1/worker-credentials/:identityKind/:identityId/revoke",
+    async (request, reply) => {
+      if (!(await authorizeAdministrativeMutation(request, reply))) return;
+      const params = z.object({
+        identityKind: z.enum(["device", "cell", "browser"]),
+        identityId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/),
+      }).strict().parse(request.params);
+      const body = z.object({
+        expectedFingerprint: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+        reason: z.string().trim().min(3).max(300),
+      }).strict().parse(request.body);
+      const result = database.revokeWorkerAdmissionCredential({
+        ...params,
+        ...body,
+      });
+      if (result.state === "not_found") {
+        return reply.code(404).send({
+          error: { code: "worker_credential_unknown" },
+        });
+      }
+      if (result.state === "fingerprint_mismatch") {
+        return reply.code(409).send({
+          error: {
+            code: "worker_credential_changed",
+            message: "The worker credential changed before revocation was applied.",
+          },
+        });
+      }
+      if (!result.credential) throw new Error("worker_revocation_credential_missing");
+      const revokedCredential = result.credential;
+      let disconnected = 0;
+      if (params.identityKind === "browser") {
+        for (const worker of mobileHub.listWorkers()) {
+          if (worker.clientId === params.identityId && mobileHub.removeWorker(worker.id)) {
+            disconnected += 1;
+          }
+        }
+      } else {
+        for (const worker of store.listWorkers()) {
+          if (
+            worker.identityKind === params.identityKind
+            && worker.identityId === params.identityId
+            && hub.removeWorker(worker.id)
+          ) {
+            disconnected += 1;
+          }
+        }
+      }
+      return {
+        state: result.state,
+        disconnected,
+        credential: {
+          ...admissionCredentialSummary(revokedCredential),
+          revokedAt: revokedCredential.revokedAt === null
+            ? null
+            : new Date(revokedCredential.revokedAt).toISOString(),
+          revocationReason: revokedCredential.revocationReason,
+        },
+      };
+    },
+  );
 
   app.get("/v1/models", async () => {
     const models = scheduler.listAvailableModels({ connectedWorkerIds: hub.connectedWorkerIds() });

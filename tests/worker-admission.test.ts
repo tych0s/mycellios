@@ -163,6 +163,69 @@ describe("signed worker admission", () => {
     });
   });
 
+  it("rotates a credential only when both the current and replacement keys sign", () => {
+    const authority = createAuthority();
+    const current = workerAdmissionSigner(generateWorkerAdmissionCredential());
+    const next = workerAdmissionSigner(generateWorkerAdmissionCredential());
+    const enrolled = admit(authority, current, "desktop-rotate");
+    const identity = { kind: "device" as const, id: "desktop-rotate" };
+    const challenge = authority.issueRotation({
+      identity,
+      currentPublicKey: current.publicKey,
+      nextPublicKey: next.publicKey,
+      protocol: { min: 1, max: 1 },
+    });
+
+    const rotated = authority.verifyRotation({
+      identity,
+      proof: {
+        challengeId: challenge.challengeId,
+        currentSignature: current.sign(challenge.signingPayload),
+        nextSignature: next.sign(challenge.signingPayload),
+      },
+    });
+
+    expect(rotated.previousFingerprint).toBe(enrolled.credentialFingerprint);
+    expect(rotated.credentialFingerprint).not.toBe(enrolled.credentialFingerprint);
+    expect(admit(authority, next, "desktop-rotate").enrollment).toBe("accepted");
+    expect(() => admit(authority, current, "desktop-rotate")).toThrowError(
+      expect.objectContaining({ code: "worker_identity_key_mismatch" }),
+    );
+  });
+
+  it("revokes a credential idempotently and blocks later admission or rotation", () => {
+    const authority = createAuthority();
+    const current = workerAdmissionSigner(generateWorkerAdmissionCredential());
+    const enrolled = admit(authority, current, "desktop-revoked");
+    const database = databases.at(-1)!;
+    const first = database.revokeWorkerAdmissionCredential({
+      identityKind: "device",
+      identityId: "desktop-revoked",
+      expectedFingerprint: enrolled.credentialFingerprint,
+      reason: "device reported stolen",
+    });
+    const second = database.revokeWorkerAdmissionCredential({
+      identityKind: "device",
+      identityId: "desktop-revoked",
+      expectedFingerprint: enrolled.credentialFingerprint,
+      reason: "device reported stolen",
+    });
+
+    expect(first.state).toBe("revoked");
+    expect(second.state).toBe("already_revoked");
+    expect(() => admit(authority, current, "desktop-revoked")).toThrowError(
+      expect.objectContaining({ code: "worker_credential_revoked" }),
+    );
+    expect(() => authority.issueRotation({
+      identity: { kind: "device", id: "desktop-revoked" },
+      currentPublicKey: current.publicKey,
+      nextPublicKey: workerAdmissionSigner(generateWorkerAdmissionCredential()).publicKey,
+      protocol: { min: 1, max: 1 },
+    })).toThrowError(
+      expect.objectContaining({ code: "worker_credential_revoked" }),
+    );
+  });
+
   it("rejects protocol ranges that do not overlap the coordinator", () => {
     const authority = createAuthority();
     const signer = workerAdmissionSigner(generateWorkerAdmissionCredential());
