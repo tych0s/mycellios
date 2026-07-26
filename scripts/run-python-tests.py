@@ -58,7 +58,39 @@ PYTHON_DIR = REPO / "python"
 # La lección, que es la misma que la de los seis P2 del PR #19: un resultado
 # atribuido a la causa equivocada. Primero al código, luego a la plataforma, y
 # era el entorno. **Antes de declarar un fallo "conocido", fijar el entorno.**
-KNOWN_FAILURES_BY_PLATFORM: dict[str, dict[str, str]] = {}
+#
+# ⚠️ LAS DOS ENTRADAS DE LINUX SON DEUDA REAL, Y LAS DESTAPÓ ESTE MISMO GUION.
+# Con la regla vieja —eximir por prefijo de clase— llevaban al menos dos corridas
+# de CI fallando y saliendo como «intermitentes que han fallado esta vez, no
+# rompen la construcción». Se comprobó en el log de la corrida VERDE `f4e5bce`:
+# fallaban exactamente estas dos. No las causó fijar las dependencias; estaban
+# tapadas. Es el punto ciego que motivó el arreglo, encontrado por el arreglo.
+KNOWN_FAILURES_BY_PLATFORM: dict[str, dict[str, str]] = {
+    "linux": {
+        "test_cell_stage.TensorParallelCellStageTests"
+        ".test_local_cell_fork_has_exact_bytes_independent_kv_and_reference_promotion":
+            "Tolerancia numérica: la salida de la célula tensor-parallel contra "
+            "la referencia de un solo proceso falla 1 de 16 elementos, con "
+            "4,196e-05 absoluto frente a 1e-05 permitido (relativo 1,777e-05). "
+            "PASA en Windows con el MISMO torch sellado (2.13.0+cpu), así que "
+            "apunta a orden de acumulación distinto por despachar a un BLAS "
+            "distinto — float32 no es asociativo y la célula reduce sumas "
+            "parciales en otro orden que la referencia. "
+            "PARA QUITARLA: comprobar primero que célula y referencia hacen las "
+            "MISMAS operaciones. Si lo hacen, la tolerancia de 1e-5 es "
+            "demasiado justa para recomposición tensor-parallel en float32 y "
+            "hay que justificar una nueva. NO ensanchar la tolerancia antes de "
+            "esa comprobación: taparía un fallo de orden real igual de bien.",
+        "test_external_cell.ExternalTensorParallelCellTests"
+        ".test_external_rank_cli_and_anchor_rank_zero_execute_one_logical_stage":
+            "El mismo patrón y probablemente la misma causa: "
+            "`torch.allclose(actual_prompt, expected_prompt, rtol=1e-5, "
+            "atol=1e-5)` en `test_external_cell.py:246`, célula tensor-parallel "
+            "contra referencia de un proceso. También pasa en Windows. "
+            "PARA QUITARLA: la misma comprobación que la anterior; si comparten "
+            "causa, se van las dos juntas.",
+    },
+}
 
 KNOWN_FAILURES = KNOWN_FAILURES_BY_PLATFORM.get(sys.platform, {})
 
