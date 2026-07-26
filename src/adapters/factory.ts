@@ -1,31 +1,24 @@
 import type { WorkerConfig } from "../contracts/schemas.js";
 import type { InferenceAdapter } from "./base.js";
+import { MycelliosNativeControlAdapter } from "./mycellios-native-control.js";
+import { MycelliosPipelineAdapter } from "./mycellios-pipeline.js";
 import { MockAdapter } from "./mock.js";
-import { local model runtimeAdapter } from "./local-model-runtime.js";
-import { OpenAICompatibleAdapter } from "./openai-compatible.js";
 
 export function createAdapter(config: WorkerConfig): InferenceAdapter {
   switch (config.adapter.kind) {
-    case "mock":
-      return new MockAdapter(config.adapter);
-    case "local-model-runtime":
-      return new local model runtimeAdapter(config.adapter);
-    case "externalggufruntime":
-      return new OpenAICompatibleAdapter({ ...config.adapter, kind: "externalggufruntime" });
-    case "openai-compatible": {
-      const apiKey = config.adapter.apiKeyEnv
-        ? process.env[config.adapter.apiKeyEnv]
-        : undefined;
-      if (config.adapter.apiKeyEnv && !apiKey) {
-        throw new Error(
-          `Missing API key environment variable: ${config.adapter.apiKeyEnv}`,
-        );
-      }
-      return new OpenAICompatibleAdapter({
-        ...config.adapter,
-        kind: "openai-compatible",
-        ...(apiKey ? { apiKey } : {}),
+    case "mycellios-native":
+      return new MycelliosNativeControlAdapter();
+    case "mycellios-pipeline":
+      return new MycelliosPipelineAdapter({
+        baseUrl: config.adapter.baseUrl,
+        model: config.adapter.model,
+        modelDigest: config.deployment.modelDigest!,
+        activationId: config.deployment.activationId!,
       });
-    }
+    case "mock":
+      if (process.env.NODE_ENV === "production") {
+        throw new Error("mock_adapter_is_not_available_in_production");
+      }
+      return new MockAdapter(config.adapter);
   }
 }

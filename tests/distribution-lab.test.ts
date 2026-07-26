@@ -197,6 +197,7 @@ describe("distribution optimization laboratory", () => {
 
   it("shows why per-layer tensor collectives are a poor WAN baseline", () => {
     const base = fixedDistributionScenarios()[0]!;
+    const measuredAt = Date.now();
     const scenario = {
       ...base,
       topology: {
@@ -206,6 +207,14 @@ describe("distribution optimization laboratory", () => {
           oneWayLatencyMs: 12,
           jitterP95Ms: 4,
           bandwidthMbps: 150,
+          availability: 0.999,
+          evidence: {
+            source: "runtime-probe" as const,
+            measuredAt,
+            validUntil: measuredAt + 60_000,
+            successfulSamples: 8,
+            failedSamples: 0,
+          },
         })),
       },
     };
@@ -225,7 +234,10 @@ describe("distribution optimization laboratory", () => {
     const contiguous = comparison.find(
       (entry) => entry.architecture === "contiguous-pipeline",
     )!;
-    expect(ring.feasible).toBe(true);
+    expect(ring.feasible).toBe(false);
+    expect(ring.reason).toBe(
+      "tp_cell_one_way_latency_above_viability_ceiling",
+    );
     expect(ring.tpotMs).toBeGreaterThan(contiguous.tpotMs * 2);
     expect(ring.networkBytesPerOutputToken).toBeGreaterThan(
       contiguous.networkBytesPerOutputToken,

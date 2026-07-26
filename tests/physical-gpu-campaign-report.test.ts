@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { importPhysicalCampaign } from "../src/benchlab/physical-import.js";
+import type { RunIdentity } from "../src/benchlab/history.js";
 import {
   OUTPUT_TOKEN_HASH_SCHEME,
   PHYSICAL_GPU_CAMPAIGN_SCHEMA,
@@ -201,6 +203,44 @@ describe("physical GPU campaign report adapter", () => {
       "physical_gpu_campaign_report_host_agent_binding_mismatch",
     );
   });
+
+  it("imports benchmark evidence only from the sealed passing gate", () => {
+    const report = buildPhysicalGpuCampaignGateReport(fixture());
+    const identity: RunIdentity = {
+      runId: "physical-import-test",
+      version: "0.2.38",
+      label: "physical import",
+      gitCommit: null,
+      gitBranch: null,
+      gitDirty: null,
+      build: {
+        release: "0.2.38",
+        releaseSource: "override",
+        revision: null,
+        revisionSource: "unknown",
+        sourceId: null,
+        sourceIdSource: "unknown",
+        participantSourceIds: [],
+      },
+    };
+    const run = importPhysicalCampaign(identity, report);
+    expect(run.suite).toBe("physical-import");
+    expect(run.trigger).toBe("physical-import");
+    expect(run.measurements[0]).toMatchObject({
+      evidence: "physical",
+      inventory: { connectedDevices: 2, selectedDevices: 2 },
+      metrics: { exactnessRate: 1, requestSuccessRate: 1 },
+    });
+    expect(run.build.participantSourceIds).toEqual([
+      `sha256:${"1".repeat(64)}`,
+    ]);
+
+    const forged = structuredClone(report);
+    forged.samples[1]!.responseMs += 1;
+    expect(() => importPhysicalCampaign(identity, forged)).toThrow(
+      "physical_gpu_gate_seal_mismatch",
+    );
+  });
 });
 
 function fixture(
@@ -322,9 +362,14 @@ function campaignObservation(
       expectedAgentId: `agent-${nodeId}`,
       expectedNodeId: nodeId,
       health: {
-        schema: "gdlp-launch-agent-health/2" as const,
+        schema: "gdlp-launch-agent-health/3" as const,
         agentId: `agent-${nodeId}`,
         nodeId,
+        buildIdentity: {
+          schema: "mycellios-native-build-provenance/1" as const,
+          version: "0.2.38",
+          sourceId: `sha256:${"1".repeat(64)}` as const,
+        },
         activeProcesses: 0,
         retainedTombstones: 0,
       },
@@ -551,7 +596,7 @@ function launchDescription(
     model: modelProfile(),
     modelRevision: `sha256:${"d".repeat(64)}`,
     tokenizerId: "campaign-report-tokenizer",
-    topology: { nodes, links: completeLinks(nodes) },
+    topology: { nodes, links: measuredCollectiveLinks(nodes) },
     workload: {
       promptTokens: 12,
       outputTokens: 16,
@@ -706,18 +751,26 @@ function cellNode(id: string, host: string, port: number): RuntimeNodeProfile {
   };
 }
 
-function completeLinks(nodes: RuntimeNodeProfile[]) {
+function measuredCollectiveLinks(nodes: RuntimeNodeProfile[]) {
+  const measuredAt = Date.now();
   return nodes.flatMap((from) =>
     nodes
       .filter((to) => to.id !== from.id)
       .map((to) => ({
         from: from.id,
         to: to.id,
-        oneWayLatencyMs: 0.6,
+        oneWayLatencyMs: 0.2,
         jitterP95Ms: 0.1,
         bandwidthMbps: 1_000,
         lossRate: 0,
         availability: 0.999,
+        evidence: {
+          source: "runtime-probe" as const,
+          measuredAt,
+          validUntil: measuredAt + 60_000,
+          successfulSamples: 8,
+          failedSamples: 0,
+        },
       })),
   );
 }

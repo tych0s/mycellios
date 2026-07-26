@@ -77,18 +77,26 @@ import type {
   RequestedModelCapacity,
   SystemLogEntry,
   SystemLogSnapshot,
+  WorkerCredentialSummary,
 } from "../../src/desktop/contracts";
 import { consumeChatCompletionStreamWithRecovery } from "../../src/desktop/chat-stream";
-import type { ChatMessage } from "../../src/contracts/types";
+import type { ChatMessage, NetworkExecutionTrace } from "../../src/contracts/types";
+import type { NativeBuildIdentity } from "../../src/contracts/build-identity";
 import type { BenchmarkMeasurement, BenchmarkRun } from "../../src/benchlab/types";
 import { Contribute } from "./Contribute";
 import { SupportAssistant } from "./SupportAssistant";
 import brandIcon from "./assets/mycellios-app-icon-v2.png";
 import {
-  benchmarkRunHasModel,
   benchmarkRunSnapshot,
+  benchmarkFilterValues,
+  benchmarkComparisonNarrative,
+  benchmarkTrendRuns,
   compareBenchmarkRuns,
   defaultBenchmarkBaseline,
+  EMPTY_BENCHMARK_FILTERS,
+  filterBenchmarkRuns,
+  measurementBackends,
+  type BenchmarkFilters,
   type BenchmarkRunComparison,
   type BenchmarkRunSnapshot,
 } from "./benchmark-comparison";
@@ -166,7 +174,9 @@ interface PublicWorker {
   executionNodeId?: string;
   computeMode?: DesktopSettings["computeMode"];
   agentVersion?: string;
+  buildIdentity?: NativeBuildIdentity;
   acceleration?: DashboardSnapshot["workers"][number]["acceleration"];
+  isolation?: DashboardSnapshot["workers"][number]["isolation"];
   mobile?: {
     platform: string;
     backend: "webgpu" | "cpu";
@@ -192,6 +202,7 @@ interface PublicJob {
 interface PublicSnapshot {
   capturedAt: string;
   version: string;
+  buildIdentity: NativeBuildIdentity | null;
   summary: {
     registered: number;
     connected: number;
@@ -235,6 +246,7 @@ interface NetworkTelemetryHistory {
 const EMPTY: PublicSnapshot = {
   capturedAt: new Date(0).toISOString(),
   version: "—",
+  buildIdentity: null,
   summary: { registered: 0, connected: 0, online: 0, mobile: 0, offeredVramMb: 0, completedJobs: 0 },
   workers: [],
   models: [],
@@ -429,7 +441,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
    * alternativa y también como refuerzo cuando hay sesión, que es el mismo
    * orden que usa `requestModel`.
    */
-  function mutationHeaders(): Record<string, string> {
+  function administrativeRequestHeaders(): Record<string, string> {
     const token = modelAdminToken.trim();
     if (authSession) {
       return {
@@ -448,12 +460,11 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     }
     const response = await fetch(`/public/v1/workers/${encodeURIComponent(workerId)}`, {
       method: "DELETE",
-      headers: mutationHeaders(),
+      headers: administrativeRequestHeaders(),
     });
     if (!response.ok) {
-      throw new Error(response.status === 401
-        ? "Inicia sesión o introduce el token de administrador para expulsar nodos."
-        : `HTTP ${response.status}`);
+      const body = await response.json().catch(() => null) as { error?: { message?: string } } | null;
+      throw new Error(body?.error?.message ?? `HTTP ${response.status}`);
     }
     await refresh();
   }
@@ -466,12 +477,64 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     }
     const response = await fetch("/public/v1/workers/clear-offline", {
       method: "POST",
-      headers: mutationHeaders(),
+      headers: administrativeRequestHeaders(),
     });
     if (!response.ok) {
-      throw new Error(response.status === 401
-        ? "Inicia sesión o introduce el token de administrador para limpiar nodos."
-        : `HTTP ${response.status}`);
+      const body = await response.json().catch(() => null) as { error?: { message?: string } } | null;
+      throw new Error(body?.error?.message ?? `HTTP ${response.status}`);
+    }
+    await refresh();
+  }
+
+  async function listWorkerCredentials(): Promise<WorkerCredentialSummary[]> {
+    if (desktopBridge) {
+      return desktopBridge.listWorkerCredentials(modelAdminToken.trim() || undefined);
+    }
+    const response = await fetch("/public/v1/worker-credentials", {
+      cache: "no-store",
+      headers: administrativeRequestHeaders(),
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => null) as {
+        error?: { message?: string };
+      } | null;
+      throw new Error(body?.error?.message ?? `HTTP ${response.status}`);
+    }
+    const body = await response.json() as { data: WorkerCredentialSummary[] };
+    return body.data;
+  }
+
+  async function revokeWorkerCredential(
+    credential: Pick<WorkerCredentialSummary, "identityKind" | "identityId" | "fingerprint">,
+    reason: string,
+  ): Promise<void> {
+    if (desktopBridge) {
+      await desktopBridge.revokeWorkerCredential(
+        credential,
+        reason,
+        modelAdminToken.trim() || undefined,
+      );
+    } else {
+      const response = await fetch(
+        `/public/v1/worker-credentials/${encodeURIComponent(credential.identityKind)}/${encodeURIComponent(credential.identityId)}/revoke`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            ...administrativeRequestHeaders(),
+          },
+          body: JSON.stringify({
+            expectedFingerprint: credential.fingerprint,
+            reason,
+          }),
+        },
+      );
+      if (!response.ok) {
+        const body = await response.json().catch(() => null) as {
+          error?: { message?: string };
+        } | null;
+        throw new Error(body?.error?.message ?? `HTTP ${response.status}`);
+      }
     }
     await refresh();
   }
@@ -668,6 +731,8 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
               <button type="button" aria-label="Increase interface size" disabled={contentScale >= 1.3} onClick={() => changeContentScale(0.1)}><Plus size={14} /></button>
             </div>
             {desktopSnapshot?.update.state === "ready" && <button className="panel-update-ready" onClick={() => void desktopBridge?.installUpdate()} title="Restart and install update"><Download size={15} /></button>}
+            {desktopSnapshot && <span title={buildIdentityTitle(desktopSnapshot.buildIdentity)}>App {shortBuildIdentity(desktopSnapshot.buildIdentity)}</span>}
+            <span title={buildIdentityTitle(snapshot.buildIdentity)}>API {shortBuildIdentity(snapshot.buildIdentity)}</span>
             {!desktop && authConfig.enabled && (
               networkIdentity
                 ? <button className="panel-account-button signed-in" onClick={() => setAuthOpen(true)} title={networkIdentity.email ?? "Mycellios account"}><UserRound size={16} /><span>{networkIdentity.role ?? "member"}</span></button>
@@ -693,7 +758,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
               <>
               {view === "overview" && <Overview snapshot={snapshot} onNavigate={navigate} publicLink={publicLink} external={desktop} apiBaseUrl={apiBaseUrl} joinUrl={desktop ? publicLink("/join") : `${window.location.origin}/join`} localAcceleration={desktopSnapshot?.acceleration} localContributionState={desktopSnapshot?.contribution.state} localComputeMode={desktopSnapshot?.settings.computeMode} developerMode={panelMode === "developer"} />}
               {view === "history" && <NetworkHistory endpoint={desktop ? `${publicOrigin}/public/v1/history` : "/public/v1/history"} />}
-              {view === "nodes" && <Nodes snapshot={snapshot} onRemove={removeWorker} onClearOffline={clearOfflineWorkers} />}
+              {view === "nodes" && <Nodes snapshot={snapshot} onRemove={removeWorker} onClearOffline={clearOfflineWorkers} onListCredentials={listWorkerCredentials} onRevokeCredential={revokeWorkerCredential} />}
               {view === "models" && <Models snapshot={snapshot} onSearch={searchHubModels} onRequest={requestModel} onRemove={removeRequestedModel} adminToken={modelAdminToken} requiresAdminToken={requiresModelAdminToken} secureTokenStorage={desktop} />}
               {view === "jobs" && <Jobs snapshot={snapshot} />}
               {view === "tests" && <Tests bridge={desktopBridge} />}
@@ -1520,7 +1585,7 @@ function HistorySummaryCard({
 }
 
 function NetworkHistoryTable({ samples }: { samples: NetworkTelemetrySample[] }) {
-  const visible = samples.slice(-24).toReversed();
+  const visible = samples.slice(-24).reverse();
   return <article className="network-history-table-card">
     <header><div><span>MUESTRAS EXACTAS</span><h2>Últimas lecturas guardadas</h2></div><small>Se muestran las 24 más recientes</small></header>
     <div className="network-history-table-scroll">
@@ -2282,9 +2347,27 @@ export function MeshNodePopover({ worker, position, sharePercent, onClose }: {
   </aside>;
 }
 
-function Nodes({ snapshot, onRemove, onClearOffline }: { snapshot: PublicSnapshot; onRemove: (workerId: string) => Promise<void>; onClearOffline: () => Promise<void> }) {
+function Nodes({
+  snapshot,
+  onRemove,
+  onClearOffline,
+  onListCredentials,
+  onRevokeCredential,
+}: {
+  snapshot: PublicSnapshot;
+  onRemove: (workerId: string) => Promise<void>;
+  onClearOffline: () => Promise<void>;
+  onListCredentials: () => Promise<WorkerCredentialSummary[]>;
+  onRevokeCredential: (
+    credential: Pick<WorkerCredentialSummary, "identityKind" | "identityId" | "fingerprint">,
+    reason: string,
+  ) => Promise<void>;
+}) {
   const [busy, setBusy] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [selectedWorkerId, setSelectedWorkerId] = useState("");
+  const [credentials, setCredentials] = useState<WorkerCredentialSummary[] | null>(null);
+  const [credentialError, setCredentialError] = useState<string | null>(null);
   const connectedWorkers = snapshot.workers.filter((worker) => worker.connected);
   const activeWorkers = snapshot.workers.filter((worker) => worker.connected && worker.status === "online");
   const physicalWorkers = snapshot.workers.filter((worker) => worker.kind !== "cell");
@@ -2307,16 +2390,53 @@ function Nodes({ snapshot, onRemove, onClearOffline }: { snapshot: PublicSnapsho
   const selectedWorker = snapshot.workers.find((worker) => worker.id === selectedWorkerId) ?? activeWorkers[0] ?? snapshot.workers[0] ?? null;
   async function remove(workerId: string) {
     setBusy(workerId);
+    setActionError(null);
     try {
       await onRemove(workerId);
+    } catch (error) {
+      setActionError(friendlyModelMutationError(error));
     } finally {
       setBusy(null);
     }
   }
   async function clearOffline() {
     setBusy("offline");
+    setActionError(null);
     try {
       await onClearOffline();
+    } catch (error) {
+      setActionError(friendlyModelMutationError(error));
+    } finally {
+      setBusy(null);
+    }
+  }
+  async function loadCredentials() {
+    setBusy("credentials");
+    setCredentialError(null);
+    try {
+      setCredentials(await onListCredentials());
+    } catch (error) {
+      setCredentialError(friendlyModelMutationError(error));
+    } finally {
+      setBusy(null);
+    }
+  }
+  async function revokeCredential(credential: WorkerCredentialSummary) {
+    if (
+      !window.confirm(
+        `Revocar el acceso de ${credential.identityId}? El dispositivo se desconectará y no podrá volver a entrar con esta clave.`,
+      )
+    ) return;
+    setBusy(`credential:${credential.fingerprint}`);
+    setCredentialError(null);
+    try {
+      await onRevokeCredential(
+        credential,
+        "Revocada manualmente desde el panel de red",
+      );
+      setCredentials(await onListCredentials());
+    } catch (error) {
+      setCredentialError(friendlyModelMutationError(error));
     } finally {
       setBusy(null);
     }
@@ -2324,6 +2444,7 @@ function Nodes({ snapshot, onRemove, onClearOffline }: { snapshot: PublicSnapsho
   return (
     <section className="nodes-page">
       <PageTitle eyebrow="RED DISTRIBUIDA" title="Red de nodos" copy="Dispositivos físicos, navegadores activos y celdas de cómputo conectadas a mycellios." actions={<button disabled={busy !== null} onClick={() => void clearOffline()}><Trash2 size={15} /> Limpiar inactivos</button>} />
+      {actionError && <div className="inline-error" role="alert"><CircleAlert size={17} />{actionError}</div>}
 
       <div className="node-overview-grid">
         <NodeOverviewStat icon={Server} label="Dispositivos activos" value={`${activePhysicalWorkers.length} / ${physicalWorkers.length}`} detail={`${connectedPhysicalWorkers.length} conectados ahora · ${cellWorkers.length} celdas`} progress={physicalWorkers.length > 0 ? activePhysicalWorkers.length / physicalWorkers.length : 0} tone="green" />
@@ -2364,6 +2485,71 @@ function Nodes({ snapshot, onRemove, onClearOffline }: { snapshot: PublicSnapsho
           {snapshot.workers.length === 0 && <div className="node-topology-empty"><Server /><strong>Aún no hay nodos</strong><span>Conecta una máquina para verla aparecer en la red.</span></div>}
         </div>
         {selectedWorker && <NodeTopologyInspector worker={selectedWorker} snapshot={snapshot} />}
+      </section>
+
+      <section className="device-trust-card">
+        <header>
+          <div>
+            <span>CONFIANZA DE DISPOSITIVOS</span>
+            <h2>Identidades firmadas</h2>
+            <p>Inventario administrativo de claves enroladas. Revocar corta la sesión activa y bloquea nuevos registros.</p>
+          </div>
+          <button
+            type="button"
+            disabled={busy !== null}
+            onClick={() => void loadCredentials()}
+          >
+            {busy === "credentials" ? <LoaderCircle className="spin" /> : <ShieldCheck />}
+            {credentials === null ? "Cargar identidades" : "Actualizar"}
+          </button>
+        </header>
+        {credentialError && <div className="inline-error" role="alert"><CircleAlert size={17} />{credentialError}</div>}
+        {credentials !== null && credentials.length === 0 && (
+          <div className="device-trust-empty">
+            <ShieldCheck />
+            <strong>Aún no hay credenciales enroladas</strong>
+            <span>Los dispositivos aparecerán aquí después de completar su primer reto firmado.</span>
+          </div>
+        )}
+        {credentials !== null && credentials.length > 0 && (
+          <div className="device-trust-list">
+            {credentials.map((credential) => (
+              <article key={`${credential.identityKind}:${credential.identityId}`}>
+                <div className="device-trust-identity">
+                  <div><LockKeyhole /></div>
+                  <span>
+                    <small>{credentialKindLabel(credential.identityKind)}</small>
+                    <strong>{credential.identityId}</strong>
+                    <em title={credential.fingerprint}>{shortFingerprint(credential.fingerprint)}</em>
+                  </span>
+                </div>
+                <div className="device-trust-meta">
+                  <span><small>Protocolo</small><strong>v{credential.protocolVersion}</strong></span>
+                  <span><small>Última prueba</small><strong>{relativeTimeEs(credential.lastSeenAt)}</strong></span>
+                  <span><small>Estado</small><strong className={credential.status}>{credential.status === "active" ? "Activa" : "Revocada"}</strong></span>
+                </div>
+                <div className="device-trust-action">
+                  {credential.status === "active" ? (
+                    <button
+                      type="button"
+                      disabled={busy !== null}
+                      onClick={() => void revokeCredential(credential)}
+                    >
+                      {busy === `credential:${credential.fingerprint}`
+                        ? <LoaderCircle className="spin" />
+                        : <CircleAlert />}
+                      Revocar acceso
+                    </button>
+                  ) : (
+                    <span title={credential.revocationReason ?? undefined}>
+                      {credential.revokedAt ? `Revocada ${relativeTimeEs(credential.revokedAt)}` : "Revocada"}
+                    </span>
+                  )}
+                </div>
+              </article>
+            ))}
+          </div>
+        )}
       </section>
 
       <NodeInventorySection eyebrow="DISPOSITIVOS INSTALADOS" title="Equipos físicos" workers={installedWorkers} snapshot={snapshot} busy={busy} onRemove={remove} />
@@ -2433,6 +2619,7 @@ function NodeTopologyInspector({ worker, snapshot }: { worker: PublicWorker; sna
       <Metric label="Última señal" value={relativeTimeEs(worker.lastSeenAt)} />
       <Metric label="Fiabilidad" value={`${Math.round(Math.max(0, Math.min(1, worker.reliability)) * 100)}%`} />
       <Metric label="Versión" value={worker.agentVersion ? `v${worker.agentVersion}` : "Legacy"} />
+      <Metric label="Build declarado" value={shortBuildIdentity(worker.buildIdentity)} />
       <Metric label={worker.kind === "cell" ? "Capacidad agregada" : "VRAM física"} value={physicalVram > 0 ? formatMemory(physicalVram) : "Sin datos"} />
       <Metric label="Memoria ofrecida" value={formatMemory(worker.offeredVramMb)} />
       <Metric label="Memoria libre" value={formatMemory(free)} />
@@ -2447,7 +2634,42 @@ function NodeTopologyInspector({ worker, snapshot }: { worker: PublicWorker; sna
       <Metric label="Completadas" value={String(worker.jobsCompleted)} />
     </div>
     {worker.acceleration && <RemoteAccelerationDiagnostics diagnostics={worker.acceleration} />}
+    {worker.isolation && <ExecutorIsolationDiagnostics isolation={worker.isolation} />}
   </div>;
+}
+
+function ExecutorIsolationDiagnostics({
+  isolation,
+}: {
+  isolation: NonNullable<PublicWorker["isolation"]>;
+}) {
+  const jobObject = isolation.killOnClose === "windows-job-object";
+  return <details className="executor-isolation-diagnostics">
+    <summary>
+      <span><ShieldCheck />Aislamiento del ejecutor</span>
+      <strong>{jobObject ? "PARCIAL · JOB OBJECT" : "PARCIAL · POLÍTICA SELLADA"}</strong>
+      <ChevronDown />
+    </summary>
+    <div className="executor-isolation-body">
+      <p className="executor-isolation-summary">
+        <ShieldCheck />
+        <span><strong>Controles activos y verificables.</strong> El proceso recibe un entorno filtrado, un directorio temporal privado y un watchdog que detiene la ruta si supera sus límites.{jobObject ? " Windows además lo incorpora suspendido a un Job Object antes de ejecutarlo y cierra todo el árbol si muere la aplicación." : ""}</span>
+      </p>
+      <div className="executor-isolation-grid">
+        <Metric label="Entorno" value="Variables filtradas" />
+        <Metric label="Temporal privado" value={`Máx. ${formatMemory(isolation.maxWorkspaceBytes / (1024 * 1024))}`} />
+        <Metric label="Archivos temporales" value={`Máx. ${isolation.maxWorkspaceEntries.toLocaleString("es-ES")}`} />
+        <Metric label="Vigilancia" value={`Cada ${isolation.workspaceCheckIntervalMs} ms`} />
+        <Metric label="Árbol de procesos" value={jobObject ? "Job Object de Windows" : "Cierre best effort"} />
+        <Metric label="Al cerrar" value={jobObject ? "Terminación garantizada" : "Sin garantía del SO"} />
+        <Metric label="Política" value={isolation.launchPolicySchema.replace("gdlp-executor-isolation/", "v")} />
+      </div>
+      <div className="executor-isolation-pending">
+        <CircleAlert />
+        <span><strong>Aislamiento fuerte aún pendiente.</strong> Este nodo todavía no anuncia sandbox del sistema operativo ni cuotas duras de CPU/RAM/GPU{jobObject ? "." : " ni garantía kill-on-close."}</span>
+      </div>
+    </div>
+  </details>;
 }
 
 function RemoteAccelerationDiagnostics({
@@ -2699,6 +2921,7 @@ function RequestedModelCard({ model, onRemove }: { model: RequestedModelCapacity
   return <article className={`model-request-card ${model.status}`}>
     <div className="model-request-head"><div className="model-request-icon"><Boxes /></div><div><span>{model.source}</span><h2>{model.id}</h2><small>{model.adapterId ?? "Checking architecture"}</small></div><ModelStatus status={model.status} /></div>
     <p className="model-request-message">{model.message}</p>
+    {model.activationIncident && <ActivationIncidentPanel incident={model.activationIncident} />}
     {(model.status === "activating" || model.status === "failed" || (model.activationProgress?.length ?? 0) > 0) && <ActivationProgressLog model={model} />}
     <div className="model-capacity-bar"><i style={{ width: `${progress}%` }} /></div>
     <div className="model-capacity-grid">
@@ -2722,6 +2945,38 @@ function ModelStatus({ status }: { status: RequestedModelCapacity["status"] }) {
     failed: "Needs attention",
   };
   return <b className={`model-request-status ${status}`}>{status === "profiling" || status === "activating" ? <LoaderCircle className="spin" /> : status === "active" || status === "ready" ? <CheckCircle2 /> : <CircleAlert />}{labels[status]}</b>;
+}
+
+function ActivationIncidentPanel({
+  incident,
+}: {
+  incident: NonNullable<RequestedModelCapacity["activationIncident"]>;
+}) {
+  const repairLabels: Record<typeof incident.repairState, string> = {
+    scheduled: "Automatic retry scheduled",
+    retrying: "Automatic recovery running",
+    exhausted: "Safe retry limit reached",
+    manual_required: "Verified change required",
+  };
+  const automatic = incident.repairState === "scheduled"
+    || incident.repairState === "retrying";
+  return <aside className={`activation-incident ${incident.repairState}`}>
+    <header>
+      <span>{automatic ? <RefreshCw className="spin-slow" /> : <ShieldCheck />}</span>
+      <div><small>{automatic ? "AUTONOMOUS RECOVERY" : "FAIL-CLOSED DIAGNOSIS"}</small><strong>{incident.title}</strong></div>
+      <b>{repairLabels[incident.repairState]}</b>
+    </header>
+    <p>{incident.summary}</p>
+    <div className="activation-incident-grid">
+      <span><small>Scope</small><strong>{incident.scope}</strong></span>
+      <span><small>Equipment</small><strong>{incident.nodeId ? shortId(incident.nodeId) : "Not isolated"}</strong></span>
+      <span><small>Stage</small><strong>{incident.stageId ? shortId(incident.stageId) : "—"}</strong></span>
+      <span><small>Attempt</small><strong>{incident.attempt > 0 ? `${incident.attempt} / ${incident.maximumAttempts}` : "Not retrying"}</strong></span>
+    </div>
+    <div className="activation-incident-remedy"><Zap /><span><small>SAFE REMEDY</small><strong>{incident.remedy}</strong></span></div>
+    <ol>{incident.steps.map((step, index) => <li key={step}><b>{String(index + 1).padStart(2, "0")}</b>{step}</li>)}</ol>
+    {incident.nextRetryAt && <footer><Timer />Next bounded attempt: {new Date(incident.nextRetryAt).toLocaleString()}</footer>}
+  </aside>;
 }
 
 function Jobs({ snapshot }: { snapshot: PublicSnapshot }) {
@@ -2924,6 +3179,7 @@ function Tests({ bridge }: { bridge: DesktopBridge | undefined }) {
   const [runs, setRuns] = useState<BenchmarkRun[]>([]);
   const [selectedRunId, setSelectedRunId] = useState("");
   const [comparisonRunId, setComparisonRunId] = useState("");
+  const [filters, setFilters] = useState<BenchmarkFilters>(EMPTY_BENCHMARK_FILTERS);
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -2968,18 +3224,34 @@ function Tests({ bridge }: { bridge: DesktopBridge | undefined }) {
     setComparisonRunId("");
   }
 
-  const selected = runs.find((run) => run.runId === selectedRunId) ?? runs[0] ?? null;
+  function updateFilter<Key extends keyof BenchmarkFilters>(
+    key: Key,
+    value: BenchmarkFilters[Key],
+  ) {
+    const nextFilters = { ...filters, [key]: value };
+    const nextRuns = filterBenchmarkRuns(runs, nextFilters);
+    setFilters(nextFilters);
+    setSelectedRunId((current) =>
+      nextRuns.some((run) => run.runId === current) ? current : nextRuns[0]?.runId ?? ""
+    );
+    setComparisonRunId("");
+  }
+
+  const filterValues = benchmarkFilterValues(runs);
+  const filteredRuns = filterBenchmarkRuns(runs, filters);
+  const selected = filteredRuns.find((run) => run.runId === selectedRunId)
+    ?? filteredRuns[0]
+    ?? null;
   const selectedSnapshot = benchmarkRunSnapshot(selected);
-  const selectedModelKey = selectedSnapshot?.modelKey ?? "";
-  const trendRuns = selectedModelKey
-    ? runs.filter((run) => benchmarkRunHasModel(run, selectedModelKey)
-      && benchmarkRunSnapshot(run)?.measurement.evidence === selectedSnapshot?.measurement.evidence)
-    : runs;
+  const trendRuns = benchmarkTrendRuns(selected, filteredRuns);
   const comparableMeasurements = trendRuns
     .flatMap((run) => run.measurements)
-    .filter((measurement) => !selectedSnapshot || measurement.evidence === selectedSnapshot.measurement.evidence);
+    .filter((measurement) =>
+      !selectedSnapshot
+      || measurement.scenarioFingerprint === selectedSnapshot.scenarioFingerprint
+    );
   const bestThroughput = comparableMeasurements.reduce<number | null>((best, item) => {
-    const value = item.metrics.tokensPerSecond;
+    const value = item.metrics.tokensPerSecondP50 ?? item.metrics.tokensPerSecond;
     return value === null ? best : best === null ? value : Math.max(best, value);
   }, null);
   const selectedMeasurement = selectedSnapshot?.measurement ?? null;
@@ -2989,15 +3261,16 @@ function Tests({ bridge }: { bridge: DesktopBridge | undefined }) {
     ?? nullableBenchmarkSum(selectedInventory?.profiles
       .filter((profile) => profile.kind === "gpu")
       .map((profile) => profile.offeredMemoryGb ?? profile.memoryGb) ?? []);
-  const selectedPower = selectedInventory?.observedPowerWatts
+  const selectedPower = selectedMeasurement?.metrics.powerWattsP50
+    ?? selectedInventory?.observedPowerWatts
     ?? nullableBenchmarkSum(selectedInventory?.profiles.map((profile) => profile.observedPowerWatts) ?? []);
   const selectedPowerLimit = selectedInventory?.powerLimitWatts
     ?? nullableBenchmarkSum(selectedInventory?.profiles.map((profile) => profile.powerLimitWatts) ?? []);
-  const automaticBaseline = defaultBenchmarkBaseline(selected, runs);
-  const comparisonRun = runs.find((run) => run.runId === comparisonRunId && run.runId !== selected?.runId)
+  const automaticBaseline = defaultBenchmarkBaseline(selected, filteredRuns);
+  const comparisonRun = filteredRuns.find((run) => run.runId === comparisonRunId && run.runId !== selected?.runId)
     ?? automaticBaseline;
   const comparison = compareBenchmarkRuns(selected, comparisonRun);
-  const runOptions = runs.map((run) => {
+  const runOptions = filteredRuns.map((run) => {
     const snapshot = benchmarkRunSnapshot(run);
     return {
       value: run.runId,
@@ -3006,32 +3279,48 @@ function Tests({ bridge }: { bridge: DesktopBridge | undefined }) {
   });
   const comparisonOptions = [
     { value: "", label: "Sin referencia comparable" },
-    ...runs.filter((run) => run.runId !== selected?.runId).map((run) => {
+    ...filteredRuns.filter((run) => run.runId !== selected?.runId).map((run) => {
       const snapshot = benchmarkRunSnapshot(run);
+      const comparable = snapshot?.scenarioFingerprint === selectedSnapshot?.scenarioFingerprint
+        && snapshot?.scenarioComparable === true;
       return {
         value: run.runId,
-        label: `${snapshot?.measurement.model.label ?? "modelo"} · ${snapshot?.nodes ?? 0} nodos · v${run.version} · ${formatBenchmarkDate(run.finishedAt)}`,
+        label: `${comparable ? "Comparable" : "Configuración distinta"} · ${snapshot?.measurement.model.label ?? "modelo"} · ${snapshot ? snapshot.nodes : "Sin lectura"} nodos · v${run.version}`,
       };
     }),
   ];
 
   return <section className="tests-page">
-    <PageTitle eyebrow="PRUEBAS REALES AUTOMÁTICAS" title="Rendimiento por versión" copy="Cada arranque de un modelo ejecuta una prueba corta sobre la ruta real y guarda el hardware y las métricas para compararlas." actions={<button disabled={running} onClick={() => void runNow()}>{running ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}{running ? "Midiendo…" : "Repetir prueba ahora"}</button>} />
-    <div className="benchmark-auto-notice"><Activity size={17} /><span><strong>Automático al arrancar</strong>Al detectar un modelo activo se miden 3 respuestas reales. Si no hay modelo o nodos, no se inventa ningún resultado.</span></div>
+    <PageTitle eyebrow="PRUEBAS REALES AUTOMÁTICAS" title="¿Mycellios mejora de verdad?" copy="Compara velocidad, latencia y eficiencia sin mezclar modelos, capacidad, rutas o hardware diferentes." actions={<button disabled={running} onClick={() => void runNow()}>{running ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}{running ? "Midiendo…" : "Repetir prueba ahora"}</button>} />
+    <div className="benchmark-auto-notice"><Activity size={19} /><span><strong>Medición automática con evidencia real</strong>El banco calienta el modelo, repite peticiones y guarda su variación. Una lectura ausente aparece como “Sin lectura”; nunca se estima para rellenar la pantalla.</span></div>
     {error && <div className="benchmark-error"><CircleAlert size={17} /><span><strong>No se pudo ejecutar la prueba</strong>{error}</span></div>}
     <div className="panel-stat-grid benchmark-stats">
-      <Stat icon={Activity} label="Pruebas guardadas" value={String(runs.length)} detail="Solo ejecuciones reales" />
-      <Stat icon={Boxes} label="Modelo seleccionado" value={selectedMeasurement?.model.label ?? "—"} detail={selected ? `v${selected.version} · ${formatBenchmarkDate(selected.finishedAt)}` : "Sin mediciones"} />
-      <Stat icon={Server} label="Nodos del modelo" value={selectedNodes > 0 ? String(selectedNodes) : "—"} detail={selectedInventory ? `${selectedInventory.connectedDevices}/${selectedInventory.totalDevices} nodos conectados` : "Sin inventario"} />
-      <Stat icon={Gauge} label="Mejor velocidad del modelo" value={formatBenchmark(bestThroughput, " tok/s")} detail={selectedMeasurement ? `${selectedMeasurement.model.label} · misma evidencia` : "Medida con inferencia real"} tone="purple" />
+      <Stat icon={Activity} label="Pruebas visibles" value={String(filteredRuns.length)} detail={`${runs.length} guardadas en total`} />
+      <Stat icon={Boxes} label="Modelo seleccionado" value={selectedMeasurement?.model.label ?? "Sin lectura"} detail={selected ? `v${selected.version} · ${formatBenchmarkDate(selected.finishedAt)}` : "Sin mediciones"} />
+      <Stat icon={Server} label="Nodos usados" value={selectedInventory ? String(selectedNodes) : "Sin lectura"} detail={selectedInventory ? `${selectedInventory.connectedDevices}/${selectedInventory.totalDevices} conectados` : "Sin inventario"} />
+      <Stat icon={Gauge} label="Mejor P50 comparable" value={formatBenchmark(bestThroughput, " tok/s")} detail={selectedMeasurement ? `${trendRuns.length} prueba${trendRuns.length === 1 ? "" : "s"} con el mismo fingerprint` : "Sin escenario seleccionado"} tone="purple" />
     </div>
     {selectedMeasurement && <div className="benchmark-capacity-strip">
       <BenchmarkMetric icon={MemoryStick} label="Memoria ofrecida" value={formatBenchmark(selectedOfferedGb, " GB")} detail={formatBenchmark(selectedInventory?.physicalMemoryGb ?? null, " GB físicos")} />
-      <BenchmarkMetric icon={Zap} label="Potencia observada" value={selectedPower === null ? "Sin lectura" : formatPower(selectedPower)} detail={selectedPower === null ? selectedPowerLimit === null ? "El controlador no reportó vatios" : `Límite ofrecido ${formatPower(selectedPowerLimit)}` : selectedPowerLimit === null ? "Heartbeat físico de los nodos" : `Límite ofrecido ${formatPower(selectedPowerLimit)}`} />
-      <BenchmarkMetric icon={Gauge} label="Velocidad" value={formatBenchmark(selectedMeasurement.metrics.tokensPerSecond, " tok/s")} detail={`P95 ${formatBenchmark(selectedMeasurement.metrics.tokensPerSecondP95, " tok/s")}`} />
+      <BenchmarkMetric icon={Zap} label="Potencia P50" value={selectedPower === null ? "Sin lectura" : formatPower(selectedPower)} detail={`P95 ${formatPowerReading(selectedMeasurement.metrics.powerWattsP95 ?? null)} · pico ${formatPowerReading(selectedMeasurement.metrics.powerWattsPeak ?? null)}`} />
+      <BenchmarkMetric icon={Gauge} label="Velocidad P50" value={formatBenchmark(selectedMeasurement.metrics.tokensPerSecondP50 ?? selectedMeasurement.metrics.tokensPerSecond, " tok/s")} detail={`P5 ${formatBenchmark(selectedMeasurement.metrics.tokensPerSecondP5 ?? null, " tok/s")} · P95 ${formatBenchmark(selectedMeasurement.metrics.tokensPerSecondP95, " tok/s")}`} />
       <BenchmarkMetric icon={Timer} label="Primer token P95" value={formatBenchmark(selectedMeasurement.metrics.ttftMsP95, " ms")} detail={`P50 ${formatBenchmark(selectedMeasurement.metrics.ttftMsP50, " ms")}`} />
+      <BenchmarkMetric icon={ShieldCheck} label="Confianza estadística" value={benchmarkStabilityLabel(selectedMeasurement)} detail={`CV ${formatBenchmark(selectedMeasurement.metrics.coefficientOfVariationPct ?? null, "%")} · ±${formatBenchmark(selectedMeasurement.metrics.confidenceHalfWidthPct ?? null, "%")}`} />
+      <BenchmarkMetric icon={Activity} label="Energía medida" value={formatBenchmark(selectedMeasurement.metrics.energyWh ?? null, " Wh")} detail={`Cobertura ${formatBenchmark(selectedMeasurement.metrics.energyCoveragePct ?? null, "%")}`} />
     </div>}
     {loading && runs.length === 0 ? <div className="benchmark-loading"><LoaderCircle className="spin" /><span>Cargando el historial real…</span></div> : runs.length === 0 ? <Empty icon={Gauge} title="Todavía no hay pruebas reales" copy="Arranca un modelo. La primera medición se guardará automáticamente cuando tenga una ruta física disponible." /> : <>
+      <BenchmarkFiltersPanel
+        filters={filters}
+        values={filterValues}
+        visibleCount={filteredRuns.length}
+        onChange={updateFilter}
+        onClear={() => {
+          setFilters(EMPTY_BENCHMARK_FILTERS);
+          setSelectedRunId(runs[0]?.runId ?? "");
+          setComparisonRunId("");
+        }}
+      />
+      {filteredRuns.length === 0 ? <Empty icon={Search} title="No hay pruebas con esos filtros" copy="Cambia uno de los filtros para volver a ver el historial real guardado." /> : <>
       <div className="benchmark-toolbar">
         <div className="benchmark-toolbar-selects">
           <label>RESULTADO ACTUAL<AppSelect ariaLabel="Resultado actual" value={selected?.runId ?? ""} onChange={selectRun} options={runOptions} /></label>
@@ -3041,14 +3330,44 @@ function Tests({ bridge }: { bridge: DesktopBridge | undefined }) {
       </div>
       <BenchmarkComparisonPanel comparison={comparison} />
       <div className="benchmark-chart-grid">
-        <BenchmarkTrend runs={trendRuns} metric="tokensPerSecond" label="Velocidad por versión" unit="tok/s" tone="blue" />
+        <BenchmarkTrend runs={trendRuns} metric="tokensPerSecond" label="Velocidad P50 e intervalo P5–P95" unit="tok/s" tone="blue" />
         <BenchmarkTrend runs={trendRuns} metric="ttftMsP95" label="Primer token P95" unit="ms" tone="purple" />
         <BenchmarkTrend runs={trendRuns} metric="nodes" label="Nodos usados" unit=" nodos" tone="green" />
         <BenchmarkTrend runs={trendRuns} metric="tokensPerSecondPerNode" label="Eficiencia por nodo" unit=" tok/s/nodo" tone="orange" />
       </div>
-      <BenchmarkHistory runs={runs} selectedRunId={selected?.runId ?? ""} onSelect={selectRun} />
+      <BenchmarkHistory runs={filteredRuns} selectedRunId={selected?.runId ?? ""} onSelect={selectRun} />
       {selected && <BenchmarkRunDetails run={selected} />}
+      </>}
     </>}
+  </section>;
+}
+
+function BenchmarkFiltersPanel({
+  filters,
+  values,
+  visibleCount,
+  onChange,
+  onClear,
+}: {
+  filters: BenchmarkFilters;
+  values: ReturnType<typeof benchmarkFilterValues>;
+  visibleCount: number;
+  onChange: (key: keyof BenchmarkFilters, value: string) => void;
+  onClear: () => void;
+}) {
+  const activeFilters = Object.values(filters).filter(Boolean).length;
+  return <section className="benchmark-filters" aria-label="Filtros del banco de pruebas">
+    <div className="benchmark-filters-heading">
+      <div><SlidersHorizontal size={19} /><span><strong>Filtrar pruebas</strong><small>{visibleCount} resultado{visibleCount === 1 ? "" : "s"} visible{visibleCount === 1 ? "" : "s"}</small></span></div>
+      <button type="button" className="benchmark-clear-filters" disabled={activeFilters === 0} onClick={onClear}>Limpiar filtros{activeFilters > 0 ? ` (${activeFilters})` : ""}</button>
+    </div>
+    <div className="benchmark-filter-grid">
+      <label>MODELO<AppSelect ariaLabel="Filtrar por modelo" value={filters.model} onChange={(value) => onChange("model", value)} options={[{ value: "", label: "Todos los modelos" }, ...values.models]} /></label>
+      <label>VERSIÓN<AppSelect ariaLabel="Filtrar por versión" value={filters.version} onChange={(value) => onChange("version", value)} options={[{ value: "", label: "Todas las versiones" }, ...values.versions.map((version) => ({ value: version, label: `v${version}` }))]} /></label>
+      <label>ESTADO<AppSelect ariaLabel="Filtrar por estado" value={filters.status} onChange={(value) => onChange("status", value)} options={[{ value: "", label: "Todos los estados" }, ...values.statuses.map((status) => ({ value: status, label: benchmarkStatusLabel(status) }))]} /></label>
+      <label>BACKEND<AppSelect ariaLabel="Filtrar por backend" value={filters.backend} onChange={(value) => onChange("backend", value)} options={[{ value: "", label: "Todos los backends" }, ...values.backends.map((backend) => ({ value: backend, label: backend === "__without_reading__" ? "Sin lectura" : backend.toUpperCase() }))]} /></label>
+      <label>EVIDENCIA<AppSelect ariaLabel="Filtrar por evidencia" value={filters.evidence} onChange={(value) => onChange("evidence", value)} options={[{ value: "", label: "Toda la evidencia" }, ...values.evidence.map((evidence) => ({ value: evidence, label: evidence === "physical" ? "Física real" : "Loopback local" }))]} /></label>
+    </div>
   </section>;
 }
 
@@ -3060,21 +3379,45 @@ function BenchmarkTrend({ runs, metric, label, unit, tone }: { runs: BenchmarkRu
     const snapshot = benchmarkRunSnapshot(run);
     if (!snapshot) return null;
     const value = benchmarkSnapshotMetric(snapshot, metric);
-    return value === null ? null : { run, snapshot, value };
+    if (value === null) return null;
+    const low = metric === "tokensPerSecond" ? snapshot.tokensPerSecondP5 : null;
+    const high = metric === "tokensPerSecond" ? snapshot.tokensPerSecondP95 : null;
+    return { run, snapshot, value, low, high };
   }).filter((point): point is NonNullable<typeof point> => point !== null);
-  const values = points.map((point) => point.value);
+  const values = points.flatMap((point) => [
+    point.value,
+    point.low ?? point.value,
+    point.high ?? point.value,
+  ]);
   const width = 720; const height = 240; const left = 52; const right = 30; const top = 28; const bottom = 50;
   const ceiling = Math.max(...values, 1);
   const x = (index: number) => points.length === 1 ? (left + width - right) / 2 : left + (index / Math.max(points.length - 1, 1)) * (width - left - right);
   const y = (value: number) => top + (1 - value / ceiling) * (height - top - bottom);
   return <article className="benchmark-chart">
-    <div><span>EVOLUCIÓN REAL · {points[0]?.snapshot.measurement.model.label ?? "SIN DATOS"}</span><h2>{label}</h2></div>
+    <div><span>MISMO FINGERPRINT · {points[0]?.snapshot.measurement.model.label ?? "SIN DATOS"}</span><h2>{label}</h2></div>
     <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${label}. ${points.length} pruebas reales.`}>
       <line className="benchmark-axis" x1={left} y1={height - bottom} x2={width - right} y2={height - bottom} />
       {[0, 0.5, 1].map((ratio) => <g key={ratio}><line className="benchmark-grid-line" x1={left} y1={top + ratio * (height - top - bottom)} x2={width - right} y2={top + ratio * (height - top - bottom)} /><text x={left - 8} y={top + ratio * (height - top - bottom) + 4} textAnchor="end">{formatBenchmark(ceiling * (1 - ratio), "")}</text></g>)}
+      {metric === "tokensPerSecond" && points.length > 1 && points.every((point) => point.low !== null && point.high !== null) && <polygon
+        className="benchmark-confidence-band"
+        points={[
+          ...points.map((point, index) => `${x(index)},${y(point.high ?? point.value)}`),
+          ...[...points].reverse().map((point, reverseIndex) => `${x(points.length - 1 - reverseIndex)},${y(point.low ?? point.value)}`),
+        ].join(" ")}
+      />}
       <g className={`benchmark-series tone-${tone}`}>
         {points.length > 1 && <polyline points={points.map((point, index) => `${x(index)},${y(point.value)}`).join(" ")} />}
-        {points.map((point, index) => <circle key={point.run.runId} cx={x(index)} cy={y(point.value)} r="5"><title>{`v${point.run.version} · ${formatBenchmarkDate(point.run.finishedAt)}: ${formatBenchmark(point.value, ` ${unit}`)}`}</title></circle>)}
+        {metric === "tokensPerSecond" && points.map((point, index) =>
+          point.low === null || point.high === null ? null : <line
+            className="benchmark-range"
+            key={`range-${point.run.runId}`}
+            x1={x(index)}
+            x2={x(index)}
+            y1={y(point.low)}
+            y2={y(point.high)}
+          />
+        )}
+        {points.map((point, index) => <circle key={point.run.runId} cx={x(index)} cy={y(point.value)} r="5"><title>{`v${point.run.version} · ${formatBenchmarkDate(point.run.finishedAt)}: ${formatBenchmark(point.value, ` ${unit}`)}${point.low === null || point.high === null ? " · intervalo Sin lectura" : ` · P5 ${formatBenchmark(point.low, ` ${unit}`)} · P95 ${formatBenchmark(point.high, ` ${unit}`)}`}`}</title></circle>)}
       </g>
       {points.map((point, index) => {
         const labelEvery = Math.max(1, Math.ceil(points.length / 6));
@@ -3085,19 +3428,19 @@ function BenchmarkTrend({ runs, metric, label, unit, tone }: { runs: BenchmarkRu
         </text>;
       })}
     </svg>
-    <div className="benchmark-chart-summary"><span>{points.length} mediciones</span><strong>{formatBenchmark(points.at(-1)?.value ?? null, ` ${unit}`)}</strong></div>
+    <div className="benchmark-chart-summary"><span>{points.length} mediciones estrictamente comparables{metric === "tokensPerSecond" ? " · banda P5–P95" : ""}</span><strong>{formatBenchmark(points.at(-1)?.value ?? null, ` ${unit}`)}</strong></div>
   </article>;
 }
 
 function BenchmarkComparisonPanel({ comparison }: { comparison: BenchmarkRunComparison }) {
-  const copy = benchmarkComparisonCopy(comparison);
-  return <article className={`benchmark-comparison ${comparison.mode}`}>
+  const copy = benchmarkComparisonNarrative(comparison);
+  return <article className={`benchmark-comparison ${comparison.mode} ${comparison.verdict}`}>
     <div className="benchmark-comparison-heading">
       <div><span>{copy.eyebrow}</span><h2>{copy.title}</h2><p>{copy.description}</p></div>
       {comparison.current && comparison.baseline && <div className="benchmark-comparison-versions">
-        <span><small>REFERENCIA</small><strong>v{comparison.baseline.run.version}</strong><em>{formatBenchmarkDate(comparison.baseline.run.finishedAt)}</em></span>
+        <span><small>REFERENCIA</small><strong>v{comparison.baseline.run.version}</strong><em>rev {benchmarkBuildRevision(comparison.baseline.run)}</em></span>
         <ArrowRight size={17} />
-        <span><small>ACTUAL</small><strong>v{comparison.current.run.version}</strong><em>{formatBenchmarkDate(comparison.current.run.finishedAt)}</em></span>
+        <span><small>ACTUAL</small><strong>v{comparison.current.run.version}</strong><em>rev {benchmarkBuildRevision(comparison.current.run)}</em></span>
       </div>}
     </div>
     <div className="benchmark-comparison-grid">
@@ -3105,7 +3448,10 @@ function BenchmarkComparisonPanel({ comparison }: { comparison: BenchmarkRunComp
         label="Velocidad"
         baseline={formatBenchmark(comparison.baseline?.tokensPerSecond ?? null, " tok/s")}
         current={formatBenchmark(comparison.current?.tokensPerSecond ?? null, " tok/s")}
+        baselineDetail={formatBenchmarkRange(comparison.baseline)}
+        currentDetail={formatBenchmarkRange(comparison.current)}
         delta={comparison.speedChangePct}
+        claim={comparison.verdict === "faster-code-signal" || comparison.verdict === "slower-code-signal"}
       />
       <BenchmarkComparisonMetric
         label="Primer token P95"
@@ -3115,8 +3461,8 @@ function BenchmarkComparisonPanel({ comparison }: { comparison: BenchmarkRunComp
       />
       <BenchmarkComparisonMetric
         label="Nodos usados"
-        baseline={comparison.baseline ? String(comparison.baseline.nodes) : "—"}
-        current={comparison.current ? String(comparison.current.nodes) : "—"}
+        baseline={comparison.baseline ? String(comparison.baseline.nodes) : "Sin lectura"}
+        current={comparison.current ? String(comparison.current.nodes) : "Sin lectura"}
         rawDelta={formatSignedBenchmark(comparison.nodesDelta, "")}
         neutral
       />
@@ -3142,19 +3488,30 @@ function BenchmarkComparisonPanel({ comparison }: { comparison: BenchmarkRunComp
   </article>;
 }
 
-function BenchmarkComparisonMetric({ label, baseline, current, delta = null, rawDelta, neutral = false }: {
+function BenchmarkComparisonMetric({ label, baseline, current, baselineDetail, currentDetail, delta = null, rawDelta, neutral = false, claim = false }: {
   label: string;
   baseline: string;
   current: string;
+  baselineDetail?: string;
+  currentDetail?: string;
   delta?: number | null;
   rawDelta?: string;
   neutral?: boolean;
+  claim?: boolean;
 }) {
-  const tone = neutral ? "neutral" : delta === null ? "unavailable" : delta >= 0 ? "positive" : "negative";
-  const deltaLabel = rawDelta ?? (delta === null ? "Sin comparación" : delta >= 0 ? `+${delta.toFixed(1)}% mejor` : `${delta.toFixed(1)}% peor`);
+  const tone = delta === null && rawDelta === undefined
+    ? "unavailable"
+    : neutral || !claim
+      ? "neutral"
+      : (delta ?? 0) >= 0 ? "positive" : "negative";
+  const deltaLabel = rawDelta ?? (delta === null
+    ? "Sin comparación"
+    : claim
+      ? delta >= 0 ? `+${delta.toFixed(1)}% mejor` : `${delta.toFixed(1)}% peor`
+      : `${delta > 0 ? "+" : ""}${delta.toFixed(1)}% observado`);
   return <div className="benchmark-comparison-metric">
     <small>{label}</small>
-    <div><span><em>Antes</em><strong>{baseline}</strong></span><ArrowRight size={14} /><span><em>Ahora</em><strong>{current}</strong></span></div>
+    <div><span><em>Antes</em><strong>{baseline}</strong>{baselineDetail && <small>{baselineDetail}</small>}</span><ArrowRight size={14} /><span><em>Ahora</em><strong>{current}</strong>{currentDetail && <small>{currentDetail}</small>}</span></div>
     <b className={tone}>{deltaLabel}</b>
   </div>;
 }
@@ -3163,17 +3520,17 @@ function BenchmarkHistory({ runs, selectedRunId, onSelect }: { runs: BenchmarkRu
   return <article className="benchmark-history">
     <div className="card-heading"><div><span>HISTORIAL DE EVOLUCIÓN</span><h2>Todas las pruebas reales</h2></div><small>Selecciona una fila para analizarla</small></div>
     <div className="benchmark-history-table">
-      <div className="benchmark-history-head"><span>Versión</span><span>Modelo</span><span>Nodos</span><span>VRAM ofrecida</span><span>Velocidad</span><span>Primer token</span><span>Estado</span></div>
+      <div className="benchmark-history-head"><span>Versión / build</span><span>Modelo / evidencia</span><span>Nodos / topología</span><span>Capacidad</span><span>Velocidad P50</span><span>Confianza</span><span>Estado</span></div>
       {runs.map((run) => {
         const snapshot = benchmarkRunSnapshot(run);
         if (!snapshot) return null;
         return <button className={`benchmark-history-row ${run.runId === selectedRunId ? "selected" : ""}`} aria-pressed={run.runId === selectedRunId} key={run.runId} onClick={() => onSelect(run.runId)}>
-          <span><strong>v{run.version}</strong><small>{formatBenchmarkDate(run.finishedAt)}</small></span>
-          <span><strong>{snapshot.measurement.model.label}</strong><small>{snapshot.measurement.evidence === "physical" ? "Física" : "Loopback"} · {run.trigger === "automatic-model-start" ? "Auto" : "Manual"}</small></span>
-          <span><strong>{snapshot.nodes}</strong><small>{snapshot.measurement.inventory.connectedDevices} conectados</small></span>
-          <span><strong>{formatBenchmark(snapshot.offeredMemoryGb, " GB")}</strong><small>capacidad aportada</small></span>
-          <span><strong>{formatBenchmark(snapshot.tokensPerSecond, " tok/s")}</strong><small>{formatBenchmark(snapshot.tokensPerSecondPerNode, " por nodo")}</small></span>
-          <span><strong>{formatBenchmark(snapshot.ttftMsP95, " ms")}</strong><small>P95</small></span>
+          <span><strong>v{run.version}</strong><small>rev {benchmarkBuildRevision(run)} · src {shortSourceId(run.build.sourceId)} · {formatBenchmarkDate(run.finishedAt)}</small></span>
+          <span><strong>{snapshot.measurement.model.label}</strong><small>{snapshot.measurement.evidence === "physical" ? "Física real" : "Loopback"} · {formatBenchmarkBackend(snapshot.measurement)}</small></span>
+          <span><strong>{snapshot.nodes}</strong><small>{formatTopologyDigest(snapshot.measurement.topology.digest)}</small></span>
+          <span><strong>{formatBenchmark(snapshot.offeredMemoryGb, " GB")}</strong><small>{formatBenchmark(snapshot.measurement.inventory.physicalMemoryGb ?? null, " GB físicos")}</small></span>
+          <span><strong>{formatBenchmark(snapshot.tokensPerSecondP50, " tok/s")}</strong><small>{formatBenchmarkRange(snapshot)}</small></span>
+          <span><strong>{benchmarkStabilityLabel(snapshot.measurement)}</strong><small>CV {formatBenchmark(snapshot.coefficientOfVariationPct, "%")} · TTFT {formatBenchmark(snapshot.ttftMsP95, " ms")}</small></span>
           <span><b className={run.status}><i />{benchmarkStatusLabel(run.status)}</b><ChevronRight size={15} /></span>
         </button>;
       })}
@@ -3183,14 +3540,14 @@ function BenchmarkHistory({ runs, selectedRunId, onSelect }: { runs: BenchmarkRu
 
 function BenchmarkRunDetails({ run }: { run: BenchmarkRun }) {
   return <div className="benchmark-results">
-    <div className="card-heading"><div><span>RESULTADO SELECCIONADO</span><h2>{run.triggerModelId ?? run.label}</h2></div><small>v{run.version} · {run.gitCommit ? run.gitCommit.slice(0, 8) : "sin commit"}{run.gitDirty ? " · código con cambios" : ""}</small></div>
+    <div className="card-heading"><div><span>RESULTADO SELECCIONADO</span><h2>{run.triggerModelId ?? run.label}</h2></div><small>v{run.version} · revisión {benchmarkBuildRevision(run)} · fuente local {shortSourceId(run.build.sourceId)} · fuentes declaradas por nodos {run.build.participantSourceIds.map(shortSourceId).join(", ") || "sin declarar"} · {benchmarkDirtyLabel(run.gitDirty)}</small></div>
     <div className="benchmark-result-list">
-      {run.measurements.map((measurement) => <BenchmarkResultCard measurement={measurement} key={measurement.id} />)}
+      {run.measurements.map((measurement) => <BenchmarkResultCard measurement={measurement} run={run} key={measurement.id} />)}
     </div>
   </div>;
 }
 
-function BenchmarkResultCard({ measurement }: { measurement: BenchmarkMeasurement }) {
+function BenchmarkResultCard({ measurement, run }: { measurement: BenchmarkMeasurement; run: BenchmarkRun }) {
   const delta = measurement.comparison.tokensPerSecondPct;
   const physicalMemory = measurement.inventory.physicalMemoryGb
     ?? nullableBenchmarkSum(measurement.inventory.profiles
@@ -3200,37 +3557,107 @@ function BenchmarkResultCard({ measurement }: { measurement: BenchmarkMeasuremen
     ?? nullableBenchmarkSum(measurement.inventory.profiles
       .filter((profile) => profile.kind === "gpu")
       .map((profile) => profile.offeredMemoryGb ?? profile.memoryGb));
-  const power = measurement.inventory.observedPowerWatts
+  const power = measurement.metrics.powerWattsP50
+    ?? measurement.inventory.observedPowerWatts
     ?? nullableBenchmarkSum(measurement.inventory.profiles.map((profile) => profile.observedPowerWatts));
   const powerLimit = measurement.inventory.powerLimitWatts
     ?? nullableBenchmarkSum(measurement.inventory.profiles.map((profile) => profile.powerLimitWatts));
+  const temperaturePeak = measurement.metrics.temperatureCPeak
+    ?? nullableBenchmarkMax(measurement.inventory.profiles.map((profile) => profile.temperatureC));
   return <article className="benchmark-result-card">
     <div className="benchmark-result-heading">
-      <div><span className="benchmark-result-icon"><Gauge size={18} /></span><span><small>{measurement.evidence === "physical" ? "EVIDENCIA FÍSICA REAL" : "RUNTIME LOCAL REAL"}</small><strong>{measurement.model.label}</strong><em>{measurement.model.precision} · rev {measurement.model.revision?.slice(0, 12) ?? "sin revisión"}</em></span></div>
+      <div><span className="benchmark-result-icon"><Gauge size={18} /></span><span><small>{measurement.evidence === "physical" ? "EVIDENCIA FÍSICA REAL" : "RUNTIME LOCAL REAL"}</small><strong>{measurement.model.label}</strong><em>{measurement.model.precision} · modelo rev {measurement.model.revision?.slice(0, 12) ?? "Sin lectura"} · build rev {benchmarkBuildRevision(run)}</em></span></div>
       <b className={measurement.status}><i />{benchmarkStatusLabel(measurement.status)}</b>
     </div>
     <div className="benchmark-result-metrics">
       <BenchmarkValue label="Nodos usados" value={String(measurement.inventory.selectedDevices)} detail={`${measurement.inventory.connectedDevices}/${measurement.inventory.totalDevices} conectados`} />
       <BenchmarkValue label="VRAM ofrecida" value={formatBenchmark(offeredMemory, " GB")} detail={formatBenchmark(physicalMemory, " GB físicos")} />
-      <BenchmarkValue label="Potencia real" value={power === null ? "Sin lectura" : formatPower(power)} detail={powerLimit === null ? power === null ? "No estimada" : "Último heartbeat" : `Límite ${formatPower(powerLimit)}`} />
-      <BenchmarkValue label="Tokens / segundo" value={formatBenchmark(measurement.metrics.tokensPerSecond, " tok/s")} detail={`P95 ${formatBenchmark(measurement.metrics.tokensPerSecondP95, " tok/s")}`} accent />
+      <BenchmarkValue label="Potencia P50" value={formatPowerReading(power)} detail={`P95 ${formatPowerReading(measurement.metrics.powerWattsP95 ?? null)} · pico ${formatPowerReading(measurement.metrics.powerWattsPeak ?? null)}${powerLimit === null ? "" : ` · límite ${formatPower(powerLimit)}`}`} />
+      <BenchmarkValue label="Tokens / segundo P50" value={formatBenchmark(measurement.metrics.tokensPerSecondP50 ?? measurement.metrics.tokensPerSecond, " tok/s")} detail={`P5 ${formatBenchmark(measurement.metrics.tokensPerSecondP5 ?? null, " tok/s")} · P95 ${formatBenchmark(measurement.metrics.tokensPerSecondP95, " tok/s")}`} accent />
       <BenchmarkValue label="Primer token" value={formatBenchmark(measurement.metrics.ttftMsP95, " ms")} detail={`P50 ${formatBenchmark(measurement.metrics.ttftMsP50, " ms")}`} />
-      <BenchmarkValue label="Cambio guardado" value={delta === null ? "Primera base" : `${delta >= 0 ? "+" : ""}${delta.toFixed(2)}%`} detail={measurement.comparison.baselineRunId ? "Base automática del banco" : "Sin ejecución comparable"} tone={delta !== null && delta < 0 ? "negative" : "positive"} />
+      <BenchmarkValue label="Estabilidad" value={benchmarkStabilityLabel(measurement)} detail={`CV ${formatBenchmark(measurement.metrics.coefficientOfVariationPct ?? null, "%")} · IC ±${formatBenchmark(measurement.metrics.confidenceHalfWidthPct ?? null, "%")}`} tone={measurement.workload.statisticallyStable === false ? "negative" : measurement.workload.statisticallyStable === true ? "positive" : ""} />
+      <BenchmarkValue label="Energía" value={formatBenchmark(measurement.metrics.energyWh ?? null, " Wh")} detail={`Cobertura ${formatBenchmark(measurement.metrics.energyCoveragePct ?? null, "%")} · ${formatBenchmark(measurement.metrics.energyWhPerToken, " Wh/token")}`} />
+      <BenchmarkValue label="Temperatura pico" value={formatBenchmark(temperaturePeak, " °C")} detail={`Memoria usada pico ${formatBenchmark(measurement.metrics.usedMemoryGbPeak ?? null, " GB")}`} />
+      <BenchmarkValue label="Cambio guardado" value={delta === null ? "Sin comparación" : `${delta >= 0 ? "+" : ""}${delta.toFixed(2)}%`} detail={measurement.comparison.baselineRunId ? "Sólo válido con fingerprint idéntico" : "Sin ejecución comparable"} tone={delta === null ? "" : delta < 0 ? "negative" : "positive"} />
     </div>
     <div className="benchmark-node-list">
-      {measurement.inventory.profiles.map((profile) => <span key={profile.nodeId ?? profile.label}><Server size={14} /><strong>{profile.label}</strong><small>{profile.backend ?? profile.kind} · {formatBenchmark(profile.offeredMemoryGb ?? profile.memoryGb, " GB")}{profile.utilizationPct === null || profile.utilizationPct === undefined ? "" : ` · ${profile.utilizationPct.toFixed(0)}% GPU`}</small></span>)}
+      {measurement.inventory.profiles.map((profile) => <span key={profile.nodeId ?? profile.label}><Server size={16} /><strong>{profile.label}</strong><small>{profile.backend ?? "Sin lectura"} · {formatBenchmark(profile.offeredMemoryGb ?? profile.memoryGb, " GB")} · GPU {formatBenchmark(profile.utilizationPct ?? null, "%")} · {formatPowerReading(profile.observedPowerWatts ?? null)} · {formatBenchmark(profile.temperatureC ?? null, " °C")}</small></span>)}
     </div>
+    <div className="benchmark-topology-summary">
+      <div><Network size={18} /><span><small>TOPOLOGÍA OBSERVADA</small><strong>{measurement.topology.stageCount === null ? "Sin lectura" : `${measurement.topology.stageCount} etapas`} · {formatTopologyDigest(measurement.topology.digest)}</strong></span></div>
+      <dl>
+        <div><dt>Nodos de la ruta</dt><dd>{measurement.topology.nodeIds.length > 0 ? measurement.topology.nodeIds.map(shortId).join(" → ") : "Sin lectura"}</dd></div>
+        <div><dt>Límites de capas</dt><dd>{measurement.topology.boundaries.length > 0 ? measurement.topology.boundaries.join(" · ") : "Sin lectura"}</dd></div>
+        <div><dt>Clases de ruta</dt><dd>{measurement.topology.routeClasses.length > 0 ? measurement.topology.routeClasses.join(" · ") : "Sin lectura"}</dd></div>
+      </dl>
+    </div>
+    <BenchmarkNetworkTrace traces={measurement.networkTraces ?? []} />
     <details className="benchmark-technical-details">
       <summary>Ver todas las métricas de esta prueba</summary>
       <div>
-        <BenchmarkValue label="Peticiones" value={`${measurement.workload.successfulRequests ?? "—"} / ${measurement.workload.requests ?? "—"}`} detail={`${measurement.workload.outputTokens} tokens generados`} />
+        <BenchmarkValue label="Peticiones válidas" value={`${formatCountReading(measurement.workload.successfulRequests)} / ${formatCountReading(measurement.workload.requests)}`} detail={`Éxito ${formatRate(measurement.metrics.requestSuccessRate ?? null)}`} />
+        <BenchmarkValue label="Calentamiento" value={formatCountReading(measurement.workload.warmupRequests)} detail={`${formatCountReading(measurement.workload.recoveredFailures)} fallos recuperados`} />
+        <BenchmarkValue label="Tokens observados" value={formatCountReading(measurement.workload.observedOutputTokens)} detail={`${measurement.workload.outputTokens} solicitados por petición`} />
         <BenchmarkValue label="Duración total" value={formatBenchmark(measurement.workload.durationMs ?? null, " ms")} detail={`Latencia P95 ${formatBenchmark(measurement.metrics.latencyMsP95 ?? null, " ms")}`} />
         <BenchmarkValue label="Tiempo por token" value={formatBenchmark(measurement.metrics.tpotMsP95, " ms")} detail={`P50 ${formatBenchmark(measurement.metrics.tpotMsP50, " ms")}`} />
         <BenchmarkValue label="Velocidad agregada" value={formatBenchmark(measurement.metrics.aggregateTokensPerSecond, " tok/s")} detail={(measurement.workload.routeClasses ?? []).join(", ") || "Sin ruta completada"} />
+        <BenchmarkValue label="Exactitud" value={formatRate(measurement.metrics.exactnessRate ?? null)} detail={`Consistencia ${formatRate(measurement.metrics.deterministicConsistencyRate ?? null)}`} />
+        <BenchmarkValue label="Especulación aceptada" value={formatRate(measurement.metrics.speculativeAcceptanceRate ?? null)} detail={`Aceptación heredada ${formatRate(measurement.metrics.acceptanceRate)}`} />
+        <BenchmarkValue label="Uso GPU P50" value={formatBenchmark(measurement.metrics.utilizationPctP50 ?? null, "%")} detail={`P95 ${formatBenchmark(measurement.metrics.utilizationPctP95 ?? null, "%")}`} />
+        <BenchmarkValue label="Fin de campaña" value={benchmarkCampaignStopLabel(measurement.workload.campaignStopReason)} detail={measurement.scenarioFingerprint ? measurement.scenarioFingerprint.slice(0, 19) : "Sin lectura"} />
       </div>
       <ul>{measurement.notes.map((note) => <li key={note}>{note}</li>)}</ul>
     </details>
   </article>;
+}
+
+function BenchmarkNetworkTrace({ traces }: { traces: NetworkExecutionTrace[] }) {
+  const trace = traces.at(-1) ?? null;
+  if (!trace) {
+    return <div className="benchmark-network-trace empty">
+      <div><Wifi size={18} /><span><small>TRAZA DE RED POR PETICIÓN</small><strong>Sin lectura</strong></span></div>
+      <p>Esta ejecución no entregó evidencia física de etapas, transporte, RTT ni bytes.</p>
+    </div>;
+  }
+  return <div className="benchmark-network-trace">
+    <div className="benchmark-network-trace-heading">
+      <div><Wifi size={18} /><span><small>ÚLTIMA TRAZA DE RED · {traces.length} GUARDADAS</small><strong>{trace.stages.length} etapas observadas · {trace.physicalBoundaryCount === null ? "fronteras sin lectura" : `${trace.physicalBoundaryCount} fronteras físicas`}</strong></span></div>
+      <em>{trace.durationMs} ms · intento {trace.attempt}</em>
+    </div>
+    <div className="benchmark-trace-stages">
+      {trace.stages.length > 0
+        ? trace.stages.map((stage, index) => <span key={`${stage.routeStageIndex}-${stage.stageIndex}-${index}`}>
+            <b>{stage.stageIndex + 1}</b>
+            <strong>{stage.nodeId ? shortId(stage.nodeId) : "Nodo sin lectura"}</strong>
+            <small>{stage.layerStart === null || stage.layerEnd === null ? "Capas sin lectura" : `capas ${stage.layerStart}–${stage.layerEnd}`} · {stage.backend} · {stage.precision}</small>
+            <em>{stage.workerId ? `worker ${shortId(stage.workerId)}` : "worker sin lectura"} · despliegue {shortId(stage.deploymentId)} · tiempo sin lectura</em>
+          </span>)
+        : <p>Las etapas físicas no fueron observadas por este runtime.</p>}
+    </div>
+    <div className="benchmark-trace-boundaries">
+      {trace.boundaries.length > 0
+        ? trace.boundaries.map((boundary) => <span key={boundary.boundaryIndex}>
+            <strong>{networkTransportLabel(boundary.transport)}</strong>
+            <small>{boundary.sourceNodeId ? shortId(boundary.sourceNodeId) : "Sin lectura"} → {boundary.destinationNodeId ? shortId(boundary.destinationNodeId) : "Sin lectura"}</small>
+            <em>RTT {formatBenchmark(boundary.connectRttMs, " ms")} · bytes observados ida {formatTraceBytes(boundary.bytesSourceToDestination)} · vuelta {formatTraceBytes(boundary.bytesDestinationToSource)} · ventana {formatBenchmark(boundary.observedOverlapMs, " ms")}</em>
+          </span>)
+        : <p>Sin fronteras de transporte entre etapas.</p>}
+    </div>
+  </div>;
+}
+
+function networkTransportLabel(mode: NetworkExecutionTrace["boundaries"][number]["transport"]): string {
+  if (mode === "direct") return "Directo";
+  if (mode === "relay") return "Relay";
+  if (mode === "local") return "Local";
+  return "Sin lectura";
+}
+
+function formatTraceBytes(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return "Sin lectura";
+  if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(2)} MB`;
+  if (value >= 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${value} B`;
 }
 
 function BenchmarkMetric({ icon: Icon, label, value, detail }: { icon: typeof Gauge; label: string; value: string; detail: string }) {
@@ -3289,8 +3716,7 @@ function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthent
   apiAccount: ApiAccount | null;
 }) {
   const options = useMemo(() => snapshot.models.map((item) => inferenceModelOption(snapshot, item)), [snapshot]);
-  const realModels = options.filter((item) => !item.connectivityOnly);
-  const connectivityModel = options.find((item) => item.connectivityOnly) ?? null;
+  const realModels = options.filter((item) => !item.legacyExternalRuntime);
   const [model, setModel] = useState("");
   const [prompt, setPrompt] = useState("");
   const [attachments, setAttachments] = useState<InferenceAttachment[]>([]);
@@ -3300,7 +3726,6 @@ function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthent
   const [sessionId, setSessionId] = useState(() => newInferenceSessionId());
   const [error, setError] = useState<string | null>(null);
   const [pendingTurn, setPendingTurn] = useState<InferencePendingTurn | null>(null);
-  const [diagnostic, setDiagnostic] = useState<"idle" | "running" | "ok" | "failed">("idle");
   const outputRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const modelAvailable = realModels.length > 0;
@@ -3400,17 +3825,6 @@ function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthent
     }
   }
 
-  async function checkConnection() {
-    if (!connectivityModel || diagnostic === "running") return;
-    setDiagnostic("running");
-    try {
-      await onSend(connectivityModel.id, [{ role: "user", content: "ping" }], newInferenceSessionId());
-      setDiagnostic("ok");
-    } catch {
-      setDiagnostic("failed");
-    }
-  }
-
   function resetConversation(nextModel?: string) {
     if (nextModel !== undefined) setModel(nextModel);
     setTurns([]);
@@ -3429,8 +3843,7 @@ function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthent
       <div className="inference-unavailable-icon"><MessageSquareText /></div>
       <div className="inference-unavailable-copy"><span>NO HAY MODELOS DE IA DISPONIBLES</span><h2>Ahora mismo no se puede hacer una inferencia real</h2><p>La red no tiene ningún runtime de IA real conectado. Un PC puede aparecer como nodo disponible sin inventar un modelo ni respuestas.</p>
         {snapshot.requestedModels[0] && <div className="inference-request-state"><LoaderCircle className={snapshot.requestedModels[0].status === "active" ? "" : "spin"} /><span><strong>{snapshot.requestedModels[0].id}</strong>{snapshot.requestedModels[0].message}</span></div>}
-        <div className="inference-unavailable-actions">{developerMode && <button className="primary-button" onClick={() => onNavigate("models")}><Boxes size={16} />Ver y activar modelos</button>}{connectivityModel && <button className="secondary-button" disabled={diagnostic === "running"} onClick={() => void checkConnection()}>{diagnostic === "running" ? <LoaderCircle className="spin" size={16} /> : diagnostic === "ok" ? <CheckCircle2 size={16} /> : <Wifi size={16} />}{diagnostic === "idle" ? "Comprobar conexión" : diagnostic === "running" ? "Comprobando…" : diagnostic === "ok" ? "Conexión correcta" : "Reintentar conexión"}</button>}</div>
-        {diagnostic === "failed" && <div className="inference-diagnostic-error"><CircleAlert size={15} />El coordinador no ha completado la prueba de conexión.</div>}
+        <div className="inference-unavailable-actions"><button className="primary-button" onClick={() => onNavigate("models")}><Boxes size={16} />Ver y activar modelos</button></div>
       </div>
     </div>}
     {modelAvailable && !accountAuthenticated && <div className="inference-unavailable account-required">
@@ -3453,7 +3866,7 @@ function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthent
       </div>
       <div className="inference-output" aria-live="polite" ref={outputRef}>
         {turns.length === 0 && !pendingTurn && !error && (inferenceAvailable
-          ? <div className="inference-welcome"><Sparkles /><h2>Escribe una pregunta</h2><p>La respuesta vendrá del modelo seleccionado, no del adaptador de conectividad.</p><div className="inference-suggestions">{["Resume cómo funciona esta red", "Explica una idea en tres frases", "Responde con una prueba corta"].map((suggestion) => <button key={suggestion} onClick={() => setPrompt(suggestion)}>{suggestion}</button>)}</div></div>
+          ? <div className="inference-welcome"><Sparkles /><h2>Escribe una pregunta</h2><p>La respuesta vendrá exclusivamente del despliegue nativo seleccionado de Mycellios.</p><div className="inference-suggestions">{["Resume cómo funciona esta red", "Explica una idea en tres frases", "Responde con una prueba corta"].map((suggestion) => <button key={suggestion} onClick={() => setPrompt(suggestion)}>{suggestion}</button>)}</div></div>
           : <div className="inference-welcome inference-welcome-locked"><LockKeyhole /><h2>{modelAvailable ? "El chat está esperando tu cuenta" : "El chat está esperando un modelo"}</h2><p>{modelAvailable ? "Inicia sesión para activar el envío con tu saldo de tokens." : "Podrás escribir y enviar mensajes en cuanto la red confirme una conexión de inferencia real."}</p></div>)}
         {turns.map((turn) => <InferenceCompletedTurn turn={turn} key={turn.id} />)}
         {pendingTurn && <InferenceStreamingTurn turn={pendingTurn} />}
@@ -3700,9 +4113,14 @@ function ActivationProgressLog({ model }: { model: RequestedModelCapacity }) {
       }];
   const events = useMemo(() => orderActivationProgressEvents(rawEvents), [rawEvents]);
   const listRef = useRef<HTMLOListElement>(null);
-  const actionableIndex = events.findLastIndex(
-    (event) => event.state === "running" || event.state === "failed",
-  );
+  let actionableIndex = -1;
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event?.state === "running" || event?.state === "failed") {
+      actionableIndex = index;
+      break;
+    }
+  }
   const currentIndex = actionableIndex >= 0 ? actionableIndex : Math.max(0, events.length - 1);
   const current = events[currentIndex] ?? events.at(-1)!;
   const nodeCount = new Set(events.flatMap((event) => event.nodeId ? [event.nodeId] : [])).size;
@@ -3963,10 +4381,20 @@ function DesktopSettingsView({ snapshot, bridge, onSnapshot, developerMode }: { 
   return <section className="content-page settings-page">
     <PageTitle eyebrow={developerMode ? "DEVELOPER PREFERENCES" : "DESKTOP PREFERENCES"} title="Settings" copy={developerMode ? "Coordinator, runtime, contribution, background behavior and updates for this computer." : "The everyday application and update preferences for this computer."} />
     {error && <div className="inline-error"><CircleAlert size={17} />{error}</div>}
-    {developerMode && <div className="settings-section"><div><Globe2 size={20} /><div><h3>Coordinator</h3><p>Use the public network or host an isolated local coordinator.</p></div></div><div className="settings-fields"><label>Mode<AppSelect ariaLabel="Coordinator mode" value={draft.coordinatorMode} onChange={(value) => updateCoordinatorMode(value as DesktopSettings["coordinatorMode"])} options={[{ value: "remote", label: "Public mycellios network" }, { value: "local", label: "Local network on this machine" }]} /></label>{draft.coordinatorMode === "remote" && <label>Coordinator URL<input value={draft.remoteCoordinatorUrl} onChange={(event) => update("remoteCoordinatorUrl", event.target.value)} /></label>}<label>Region<input value={draft.region} onChange={(event) => update("region", event.target.value)} placeholder="auto" /></label></div></div>}
-    {developerMode && <div className="settings-section"><div><Gauge size={20} /><div><h3>Contribution runtime</h3><p>Register real hardware only, or expose a model through a verified local runtime.</p></div></div><div className="settings-fields"><label>Compute mode<AppSelect ariaLabel="Compute mode" value={draft.computeMode} onChange={(value) => update("computeMode", value as DesktopSettings["computeMode"])} options={[{ value: "automatic", label: "Automatic · GPU preferred" }, { value: "gpu-only", label: "GPU only · never CPU" }, { value: "cpu-only", label: "CPU only · GPU disabled" }]} /></label><label>Runtime<AppSelect ariaLabel="Contribution runtime" value={draft.adapterMode} onChange={(value) => update("adapterMode", value as DesktopSettings["adapterMode"])} options={[{ value: "connectivity-test", label: "Hardware only (no model)" }, { value: "local-model-runtime", label: "Local local model runtime" }]} /></label><label>Offered memory (GB)<input type="number" min="1" step="1" value={draft.offeredVramMb / 1_024} onChange={(event) => update("offeredVramMb", Math.round(Number(event.target.value) * 1_024))} /></label>{draft.adapterMode === "local-model-runtime" && <><label>local model runtime model<input value={draft.modelName} onChange={(event) => update("modelName", event.target.value)} /></label><label>local model runtime URL<input value={draft.adapterBaseUrl} onChange={(event) => update("adapterBaseUrl", event.target.value)} /></label><label>Pinned digest<input value={draft.modelDigest} onChange={(event) => update("modelDigest", event.target.value)} placeholder="sha256:…" /></label></>}</div></div>}
+    <div className="settings-section"><div><Globe2 size={20} /><div><h3>Coordinator</h3><p>Use the public network or host an isolated local coordinator.</p></div></div><div className="settings-fields"><label>Mode<AppSelect ariaLabel="Coordinator mode" value={draft.coordinatorMode} onChange={(value) => updateCoordinatorMode(value as DesktopSettings["coordinatorMode"])} options={[{ value: "remote", label: "Public mycellios network" }, { value: "local", label: "Local network on this machine" }]} /></label>{draft.coordinatorMode === "remote" && <label>Coordinator URL<input value={draft.remoteCoordinatorUrl} onChange={(event) => update("remoteCoordinatorUrl", event.target.value)} /></label>}<label>Region<input value={draft.region} onChange={(event) => update("region", event.target.value)} placeholder="auto" /></label></div></div>
+    <div className="settings-section">
+      <div><Gauge size={20} /><div><h3>Contribution</h3><p>This computer always uses the built-in Mycellios runtime. Models appear only after a verified native deployment starts.</p></div></div>
+      <div className="settings-fields">
+        <label>Compute mode<AppSelect ariaLabel="Compute mode" value={draft.computeMode} onChange={(value) => update("computeMode", value as DesktopSettings["computeMode"])} options={[{ value: "automatic", label: "Automatic · GPU preferred" }, { value: "gpu-only", label: "GPU only · never CPU" }, { value: "cpu-only", label: "CPU only · GPU disabled" }]} /></label>
+        <label>Offered memory (GB)<input type="number" min="1" step="1" value={draft.offeredVramMb / 1_024} onChange={(event) => update("offeredVramMb", Math.round(Number(event.target.value) * 1_024))} /></label>
+        <div className="settings-native-runtime" role="status" aria-label="Contribution runtime">
+          <ShieldCheck size={17} />
+          <span><small>RUNTIME</small><strong>Mycellios native</strong><em>No external model service</em></span>
+        </div>
+      </div>
+    </div>
     <div className="settings-section compact-settings"><div><SlidersHorizontal size={20} /><div><h3>Application</h3><p>Startup and background contribution.</p></div></div><div className="toggle-list"><Toggle label="Start with the system" checked={draft.launchAtLogin} onChange={(value) => update("launchAtLogin", value)} /><Toggle label="Keep running in the tray" checked={draft.closeToTray} onChange={(value) => update("closeToTray", value)} /><Toggle label="Contribute resources" checked={draft.contributionEnabled} onChange={(value) => update("contributionEnabled", value)} /></div></div>
-    <div className="settings-section"><div><Download size={20} /><div><h3>Automatic updates</h3><p>Desktop releases download in the background and install automatically as soon as active inference is idle.</p></div></div><div className="update-settings"><div><span className={`update-state ${snapshot.update.state}`}>{updateStateLabel(snapshot.update.state)}</span><strong>Version {snapshot.appVersion}</strong><p>{snapshot.update.message}</p></div><div className="update-actions"><button className="secondary-button" disabled={checkingUpdate || snapshot.update.state === "checking" || snapshot.update.state === "downloading"} onClick={() => void checkUpdate()}><RefreshCw className={checkingUpdate ? "spin" : ""} size={15} />Check now</button>{snapshot.update.state === "ready" && <button className="primary-button" onClick={() => void bridge.installUpdate()}><Download size={15} />Restart now</button>}</div></div></div>
+    <div className="settings-section"><div><Download size={20} /><div><h3>Automatic updates</h3><p>Desktop releases download in the background and install automatically as soon as active inference is idle.</p></div></div><div className="update-settings"><div><span className={`update-state ${snapshot.update.state}`}>{updateStateLabel(snapshot.update.state)}</span><strong>Version {snapshot.appVersion}</strong><p>{snapshot.update.message}</p><p title={buildIdentityTitle(snapshot.buildIdentity)}>Exact build: {shortBuildIdentity(snapshot.buildIdentity)}</p></div><div className="update-actions"><button className="secondary-button" disabled={checkingUpdate || snapshot.update.state === "checking" || snapshot.update.state === "downloading"} onClick={() => void checkUpdate()}><RefreshCw className={checkingUpdate ? "spin" : ""} size={15} />Check now</button>{snapshot.update.state === "ready" && <button className="primary-button" onClick={() => void bridge.installUpdate()}><Download size={15} />Restart now</button>}</div></div></div>
     <div className="settings-footer"><button className="primary-button" disabled={saving} onClick={() => void save()}>{saving ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}Save and reconnect</button></div>
   </section>;
 }
@@ -3988,6 +4416,7 @@ function desktopToPublicSnapshot(snapshot: DashboardSnapshot): PublicSnapshot {
   return {
     capturedAt: snapshot.capturedAt,
     version: snapshot.health?.version ?? "—",
+    buildIdentity: snapshot.health?.buildIdentity ?? null,
     summary: {
       registered: snapshot.health?.workers.registered ?? snapshot.workers.length,
       connected: snapshot.health?.workers.connected ?? snapshot.workers.filter((worker) => worker.connected).length,
@@ -4170,6 +4599,17 @@ function formatCompactTokens(value: number): string {
 }
 function formatPower(watts: number): string { return watts >= 1_000 ? `${(watts / 1_000).toFixed(1)} kW` : `${Math.round(watts)} W`; }
 function shortId(value: string) { return value.length <= 10 ? value : `${value.slice(0, 6)}…${value.slice(-4)}`; }
+function shortFingerprint(value: string) {
+  const digest = value.replace(/^sha256:/, "");
+  return digest.length <= 20 ? digest : `${digest.slice(0, 10)}…${digest.slice(-8)}`;
+}
+function credentialKindLabel(kind: WorkerCredentialSummary["identityKind"]) {
+  return kind === "browser"
+    ? "NAVEGADOR PWA"
+    : kind === "cell"
+      ? "CELDA DISTRIBUIDA"
+      : "DISPOSITIVO INSTALADO";
+}
 function formatMemory(value: number) { return value >= 1_024 ? `${(value / 1_024).toFixed(value >= 10_240 ? 0 : 1)} GB` : `${Math.round(value)} MB`; }
 function shouldShowAccelerationBanner(acceleration: AcceleratorProgressSnapshot): boolean {
   return acceleration.state !== "idle"
@@ -4531,20 +4971,42 @@ function inferenceModelOption(snapshot: PublicSnapshot, model: PublicSnapshot["m
   const deployments = snapshot.workers.flatMap((worker) => worker.deployments).filter((deployment) => deployment.model === model.id);
   const peers = snapshot.workers.filter((worker) => worker.connected && worker.deployments.some((deployment) => deployment.model === model.id));
   const adapters = deployments.map((deployment) => deployment.adapter).filter((adapter): adapter is NonNullable<PublicDeployment["adapter"]> => adapter !== undefined);
-  const connectivityOnly = model.id === "mycellios-connectivity-check" || (adapters.length > 0 && adapters.every((adapter) => adapter === "mock"));
+  const legacyExternalRuntime = adapters.some(
+    (adapter) => adapter !== "mycellios-pipeline",
+  );
   const freeSlots = deployments.reduce((total, deployment) => total + deployment.freeSlots, 0);
   const routeLabel = model.pipelines > 0
     ? `${model.pipelines} pipeline${model.pipelines === 1 ? "" : "s"}`
     : `${model.replicas} réplica${model.replicas === 1 ? "" : "s"}`;
   return {
     ...model,
-    connectivityOnly,
+    legacyExternalRuntime,
     freeSlots,
     routeLabel,
     nodeCount: peers.length,
     peerMemoryMb: peers.reduce((total, worker) => total + worker.offeredVramMb, 0),
     execution: summarizeDeploymentExecution(deployments),
   };
+}
+
+function shortBuildIdentity(
+  identity: NativeBuildIdentity | null | undefined,
+): string {
+  return shortSourceId(identity?.sourceId);
+}
+
+function shortSourceId(sourceId: string | null | undefined): string {
+  return sourceId
+    ? sourceId.slice("sha256:".length, "sha256:".length + 12)
+    : "sin declarar";
+}
+
+function buildIdentityTitle(
+  identity: NativeBuildIdentity | null | undefined,
+): string {
+  return identity
+    ? `Fuente exacta ${identity.sourceId} · versión ${identity.version}`
+    : "Este runtime no ha publicado una identidad de fuente sellada.";
 }
 
 function formatDuration(milliseconds: number): string {
@@ -4635,50 +5097,83 @@ function benchmarkSnapshotMetric(snapshot: BenchmarkRunSnapshot, metric: Benchma
   return snapshot.tokensPerSecondPerNode;
 }
 
-function benchmarkComparisonCopy(comparison: BenchmarkRunComparison): { eyebrow: string; title: string; description: string } {
-  if (comparison.mode === "same-scenario") {
-    return {
-      eyebrow: "COMPARACIÓN LIMPIA",
-      title: "Mismo modelo, hardware y carga",
-      description: "La configuración es equivalente y permite vigilar rendimiento. Repetir varias veces ayuda a separar una mejora real de la variación normal.",
-    };
-  }
-  if (comparison.mode === "capacity-change") {
-    return {
-      eyebrow: "CAMBIO DE CAPACIDAD",
-      title: "Ha cambiado el hardware o la carga",
-      description: "La velocidad total permite estudiar el escalado. Mira también tok/s por nodo y por GB: no se atribuye al código como mejora limpia.",
-    };
-  }
-  if (comparison.mode === "different-evidence") {
-    return {
-      eyebrow: "EVIDENCIA DISTINTA",
-      title: "Físico y loopback no se mezclan",
-      description: "Se muestran los valores reales de cada ejecución, pero no se calcula una mejora entre entornos diferentes.",
-    };
-  }
-  if (comparison.mode === "different-model") {
-    return {
-      eyebrow: "MODELOS DISTINTOS",
-      title: "Esta selección no es comparable",
-      description: "Selecciona una referencia del mismo modelo para medir evolución de velocidad y eficiencia.",
-    };
-  }
-  return {
-    eyebrow: "SIN REFERENCIA",
-    title: "Hace falta una segunda ejecución",
-    description: "Cuando haya otra prueba real podrás comparar versiones, nodos, VRAM, latencia y eficiencia.",
-  };
-}
-
 function formatSignedBenchmark(value: number | null, suffix: string): string {
   if (value === null || !Number.isFinite(value)) return "Sin comparación";
   return `${value > 0 ? "+" : ""}${value.toLocaleString("es-ES", { maximumFractionDigits: 2 })}${suffix}`;
 }
 
 function formatBenchmark(value: number | null, suffix: string): string {
-  if (value === null || !Number.isFinite(value)) return "—";
+  if (value === null || !Number.isFinite(value)) return "Sin lectura";
   return `${value.toLocaleString("en-US", { maximumFractionDigits: 2 })}${suffix}`;
+}
+
+function formatBenchmarkRange(snapshot: BenchmarkRunSnapshot | null | undefined): string {
+  if (!snapshot || snapshot.tokensPerSecondP5 === null || snapshot.tokensPerSecondP95 === null) {
+    return "P5–P95 Sin lectura";
+  }
+  return `P5 ${formatBenchmark(snapshot.tokensPerSecondP5, " tok/s")} · P95 ${formatBenchmark(snapshot.tokensPerSecondP95, " tok/s")}`;
+}
+
+function formatPowerReading(value: number | null): string {
+  return value === null || !Number.isFinite(value) ? "Sin lectura" : formatPower(value);
+}
+
+function benchmarkStabilityLabel(measurement: BenchmarkMeasurement): string {
+  if (measurement.workload.statisticallyStable === true) return "Estable";
+  if (measurement.workload.statisticallyStable === false) return "Inconclusa";
+  return "Sin lectura";
+}
+
+function benchmarkBuildRevision(run: BenchmarkRun): string {
+  const revision = run.build.revision ?? run.gitCommit;
+  return revision?.trim() ? revision.trim().slice(0, 12) : "Sin lectura";
+}
+
+function benchmarkDirtyLabel(dirty: boolean | null): string {
+  if (dirty === true) return "código con cambios locales";
+  if (dirty === false) return "build limpio";
+  return "limpieza del build Sin lectura";
+}
+
+function formatTopologyDigest(digest: string | null): string {
+  if (!digest?.trim()) return "topología Sin lectura";
+  const normalizedDigest = digest.trim().replace(/^sha256:/i, "");
+  return `topología ${normalizedDigest.slice(0, 12)}`;
+}
+
+function formatBenchmarkBackend(measurement: BenchmarkMeasurement): string {
+  const backends = measurementBackends(measurement);
+  return backends[0] === "__without_reading__"
+    ? "Backend Sin lectura"
+    : backends.map((backend) => backend.toUpperCase()).join(" + ");
+}
+
+function nullableBenchmarkMax(values: Array<number | null | undefined>): number | null {
+  const present = values.filter((value): value is number =>
+    value !== null && value !== undefined && Number.isFinite(value)
+  );
+  return present.length > 0 ? Math.max(...present) : null;
+}
+
+function formatCountReading(value: number | null | undefined): string {
+  return value === null || value === undefined || !Number.isFinite(value)
+    ? "Sin lectura"
+    : Math.round(value).toLocaleString("es-ES");
+}
+
+function formatRate(value: number | null): string {
+  return value === null || !Number.isFinite(value)
+    ? "Sin lectura"
+    : `${(value * 100).toLocaleString("es-ES", { maximumFractionDigits: 2 })}%`;
+}
+
+function benchmarkCampaignStopLabel(
+  reason: BenchmarkMeasurement["workload"]["campaignStopReason"],
+): string {
+  if (reason === "confidence_reached") return "Confianza alcanzada";
+  if (reason === "maximum_samples") return "Máximo de muestras";
+  if (reason === "insufficient_samples") return "Muestras insuficientes";
+  return "Sin lectura";
 }
 
 function nullableBenchmarkSum(values: Array<number | null | undefined>): number | null {
@@ -4697,9 +5192,10 @@ function formatBenchmarkChartTime(value: string): string {
 }
 
 function benchmarkStatusLabel(status: BenchmarkRun["status"]): string {
-  if (status === "baseline") return "Baseline";
-  if (status === "passed") return "Mejora / estable";
+  if (status === "baseline") return "Referencia";
+  if (status === "passed") return "Válida";
   if (status === "regression") return "Regresión";
+  if (status === "inconclusive") return "Inconcluso";
   return "Fallido";
 }
 

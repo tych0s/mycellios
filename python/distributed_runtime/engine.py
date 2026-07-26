@@ -18,6 +18,7 @@ import torch
 from transformers import AutoConfig
 
 from .device import normalize_torch_device_request
+from .dense_tiering import DenseTieringConfig
 from .macro_wave import KVVersion, MacroWaveState
 from .macro_wave_adapter import (
     MacroWaveProposal,
@@ -34,6 +35,12 @@ from .model import (
     ragged_grouping_enabled,
     resolve_model_snapshot,
 )
+from .native_gguf import NativeGgufStagePackage, verify_native_gguf_stage
+from .native_gguf_runtime import (
+    NativeGgufRuntimeConfig,
+    build_native_gguf_stage_runner,
+)
+from .paged_stage import HFPagedStageRunner, HFPagedStageRuntimeConfig
 from .protocol import (
     HEADER_BYTES,
     FrameType,
@@ -95,6 +102,8 @@ TokenCallback = Callable[[int, int, int, float], None]
 
 MAX_PREFILL_INFLIGHT_CHUNKS = 64
 MAX_PREFILL_INFLIGHT_BYTES = 1 << 30
+MAX_SPECULATIVE_INFLIGHT_WAVES = 16
+MAX_SPECULATIVE_INFLIGHT_BYTES = 1 << 30
 SCHEDULER_SHUTDOWN_GRACE_SECONDS = 2.0
 CHILD_SHUTDOWN_GRACE_SECONDS = 5.0
 IO_THREAD_SHUTDOWN_GRACE_SECONDS = 2.0
@@ -123,6 +132,14 @@ def _prefill_inflight_chunk_limit(config: Any) -> int:
 
 def _prefill_inflight_byte_limit(config: Any) -> int:
     return int(getattr(config, "prefill_inflight_bytes", 0))
+
+
+def _speculative_inflight_wave_limit(config: Any) -> int:
+    return int(getattr(config, "speculative_inflight_waves", 1))
+
+
+def _speculative_inflight_byte_limit(config: Any) -> int:
+    return int(getattr(config, "speculative_inflight_bytes", 0))
 
 
 def _hadamard_quantization_block_count(hidden_size: int) -> int:
@@ -203,6 +220,7 @@ class PipelineEngineConfig:
     codec: TensorCodec = TensorCodec.FP16
     threads_per_stage: int = 1
     device: str = "auto"
+    dense_tiering: DenseTieringConfig = DenseTieringConfig()
     startup_timeout_seconds: float = 180.0
     socket_timeout_seconds: float = 180.0
     one_way_delay_ms: float = 0.0
@@ -215,6 +233,7 @@ class PipelineEngineConfig:
     return_port: int = 0
     revision: str | None = None
     artifact_identity: str | None = None
+    stage_package_identity: str | None = None
     canonical_model_source: str | None = None
     canonical_model_revision: str | None = None
     pipeline_snapshot_identity: int | None = None
@@ -222,6 +241,13 @@ class PipelineEngineConfig:
     # the root slot may be configured here; each child process receives its own
     # independently sealed host-local binding from stage_cli.
     ram_backed_moe_stages: tuple[RamBackedMoeRuntimeConfig | None, ...] | None = None
+    # Native bounded paged KV/COW settings for root + every local child. In
+    # remote mode only the root slot belongs here; child bindings are sealed by
+    # stage_cli on their own hosts.
+    paged_kv_stages: tuple[HFPagedStageRuntimeConfig | None, ...] | None = None
+    # Authenticated native Mycellios GGUF packages for root + every local
+    # child. Remote child bindings are supplied independently to stage_cli.
+    native_gguf_stages: tuple[NativeGgufRuntimeConfig | None, ...] | None = None
     # Ordered executor ids for root + every child stage. Remote recovery must
     # receive this sealed route contract from its launcher because the root
     # process cannot infer a remote cell/GGUF/quantized backend from boundaries.
@@ -251,6 +277,12 @@ class PipelineEngineConfig:
     # Zero is exact autoregressive decode. Positive values enable exact target
     # verification with an adaptive n-gram draft source by default.
     speculative_max_draft_tokens: int = 0
+    # Exact linear VERIFY may keep several ordered waves in flight on a single
+    # active sequence. One wave preserves the historical stop-and-wait path.
+    # The byte ceiling is a conservative per-request reservation made before
+    # root KV is advanced; zero disables only that secondary ceiling.
+    speculative_inflight_waves: int = 1
+    speculative_inflight_bytes: int = 0
     speculation_minimum_speedup: float = 1.05
     speculation_probe: bool = True
     # Return frames from one downstream physical batch arrive individually.
@@ -274,6 +306,8 @@ class PipelineEngineConfig:
 
     def __post_init__(self) -> None:
         normalize_torch_device_request(self.device)
+        if not isinstance(self.dense_tiering, DenseTieringConfig):
+            raise TypeError("dense_tiering must be DenseTieringConfig")
         if not self.model_name.strip():
             raise ValueError("model_name cannot be empty")
         for name, value in (
@@ -342,6 +376,127 @@ class PipelineEngineConfig:
                         "RAM-backed MoE identity cannot be combined with standard "
                         "model identity fields"
                     )
+        stage_count = len(self.boundaries) - 1
+        if self.paged_kv_stages is not None:
+            if len(self.paged_kv_stages) != stage_count:
+                raise ValueError("paged_kv_stages must contain one entry per stage")
+            configured_paged = tuple(
+                entry for entry in self.paged_kv_stages if entry is not None
+            )
+            if any(
+                not isinstance(entry, HFPagedStageRuntimeConfig)
+                for entry in configured_paged
+            ):
+                raise TypeError(
+                    "paged_kv_stages entries must be HFPagedStageRuntimeConfig"
+                )
+            ram_stages = self.ram_backed_moe_stages or (None,) * stage_count
+            if any(
+                paged is not None and ram is not None
+                for paged, ram in zip(self.paged_kv_stages, ram_stages)
+            ):
+                raise ValueError(
+                    "paged KV and RAM-backed MoE bindings are mutually exclusive"
+                )
+            if not self.spawn_local_stages and any(
+                entry is not None for entry in self.paged_kv_stages[1:]
+            ):
+                raise ValueError(
+                    "remote child paged KV bindings belong to stage_cli"
+                )
+            if (
+                configured_paged
+                and normalize_torch_device_request(self.device) != "auto"
+            ):
+                raise ValueError(
+                    "device applies only to dense Torch stages; paged KV has a "
+                    "sealed per-stage device"
+                )
+        if self.native_gguf_stages is not None:
+            if len(self.native_gguf_stages) != stage_count:
+                raise ValueError(
+                    "native_gguf_stages must contain one entry per stage"
+                )
+            configured_native = tuple(
+                entry for entry in self.native_gguf_stages if entry is not None
+            )
+            if configured_native and self.native_gguf_stages[0] is None:
+                raise ValueError(
+                    "native GGUF execution requires a root-stage binding"
+                )
+            if any(
+                not isinstance(entry, NativeGgufRuntimeConfig)
+                for entry in configured_native
+            ):
+                raise TypeError(
+                    "native_gguf_stages entries must be NativeGgufRuntimeConfig"
+                )
+            if self.spawn_local_stages and configured_native and (
+                len(configured_native) != stage_count
+            ):
+                raise ValueError(
+                    "local native GGUF execution requires a binding for every stage"
+                )
+            if not self.spawn_local_stages and any(
+                entry is not None for entry in self.native_gguf_stages[1:]
+            ):
+                raise ValueError(
+                    "remote child native GGUF bindings belong to stage_cli"
+                )
+            ram_stages = self.ram_backed_moe_stages or (None,) * stage_count
+            paged_stages = self.paged_kv_stages or (None,) * stage_count
+            if any(
+                native is not None and (ram is not None or paged is not None)
+                for native, ram, paged in zip(
+                    self.native_gguf_stages,
+                    ram_stages,
+                    paged_stages,
+                    strict=True,
+                )
+            ):
+                raise ValueError(
+                    "native GGUF, paged KV and RAM-backed MoE bindings are "
+                    "mutually exclusive"
+                )
+            verified_native = tuple(
+                verify_native_gguf_stage(
+                    entry.package,
+                    expected_package_id=entry.package_id,
+                    expected_layer_start=self.boundaries[index],
+                    expected_layer_end=self.boundaries[index + 1],
+                    expected_total_layers=self.boundaries[-1],
+                )
+                for index, entry in enumerate(self.native_gguf_stages)
+                if entry is not None
+            )
+            if len({package.artifact_identity for package in verified_native}) > 1:
+                raise ValueError(
+                    "native GGUF stages must bind one common model identity"
+                )
+            if verified_native:
+                root_package = verified_native[0]
+                for name, supplied, sealed in (
+                    ("artifact_identity", self.artifact_identity, root_package.artifact_identity),
+                    (
+                        "canonical_model_source",
+                        self.canonical_model_source,
+                        root_package.model_source,
+                    ),
+                    (
+                        "canonical_model_revision",
+                        self.canonical_model_revision,
+                        root_package.model_revision,
+                    ),
+                    (
+                        "stage_package_identity",
+                        self.stage_package_identity,
+                        root_package.package_identity,
+                    ),
+                ):
+                    if supplied is not None and supplied != sealed:
+                        raise ValueError(
+                            f"{name} differs from the authenticated native GGUF package"
+                        )
         if self.stage_executor_ids is not None:
             if len(self.stage_executor_ids) != len(self.boundaries) - 1:
                 raise ValueError("stage_executor_ids must contain one id per stage")
@@ -419,6 +574,26 @@ class PipelineEngineConfig:
                 "speculative branch count, tokens and KV bytes must all be zero "
                 "or all be positive"
             )
+        for entry in self.paged_kv_stages or ():
+            if entry is None:
+                continue
+            required_request_slots = (
+                self.max_active_sequences + self.max_speculative_branches
+            )
+            if entry.max_active_requests < required_request_slots:
+                raise ValueError(
+                    "paged max_active_requests cannot hold all active sequences "
+                    "and sealed speculative branches"
+                )
+            if (
+                self.max_speculative_branch_tokens > 0
+                and entry.max_sequence_tokens
+                < self.max_speculative_branch_tokens
+            ):
+                raise ValueError(
+                    "paged max_sequence_tokens is smaller than the sealed "
+                    "speculative branch token ceiling"
+                )
         if (self.sealed_wave_tokens is None) != (
             self.max_prefill_chunk_tokens is None
         ):
@@ -432,6 +607,54 @@ class PipelineEngineConfig:
         ):
             raise ValueError(
                 f"speculative_max_draft_tokens must be between 0 and {MAX_DRAFT_TOKENS}"
+            )
+        if (
+            not isinstance(self.speculative_inflight_waves, int)
+            or isinstance(self.speculative_inflight_waves, bool)
+            or not 1
+            <= self.speculative_inflight_waves
+            <= MAX_SPECULATIVE_INFLIGHT_WAVES
+        ):
+            raise ValueError(
+                "speculative_inflight_waves must be between 1 and "
+                f"{MAX_SPECULATIVE_INFLIGHT_WAVES}"
+            )
+        if (
+            not isinstance(self.speculative_inflight_bytes, int)
+            or isinstance(self.speculative_inflight_bytes, bool)
+            or not 0
+            <= self.speculative_inflight_bytes
+            <= MAX_SPECULATIVE_INFLIGHT_BYTES
+        ):
+            raise ValueError(
+                "speculative_inflight_bytes must be zero or between 1 and "
+                f"{MAX_SPECULATIVE_INFLIGHT_BYTES}"
+            )
+        speculative_conveyor_enabled = (
+            self.speculative_inflight_waves > 1
+            or self.speculative_inflight_bytes > 0
+        )
+        if speculative_conveyor_enabled and (
+            self.speculative_inflight_waves <= 1
+            or self.speculative_inflight_bytes <= 0
+        ):
+            raise ValueError(
+                "speculative conveyor requires more than one in-flight wave "
+                "and a positive byte ceiling"
+            )
+        if speculative_conveyor_enabled and self.speculative_max_draft_tokens == 0:
+            raise ValueError(
+                "speculative_inflight_waves greater than one require "
+                "speculative_max_draft_tokens > 0"
+            )
+        if speculative_conveyor_enabled and self.max_active_sequences != 1:
+            raise ValueError(
+                "speculative conveyor currently requires max_active_sequences=1"
+            )
+        if speculative_conveyor_enabled and any(speculative_tree_limits_enabled):
+            raise ValueError(
+                "the linear VERIFY conveyor cannot be combined with physical "
+                "speculative-tree limits"
             )
         if self.sealed_wave_tokens is not None:
             if (
@@ -625,6 +848,8 @@ class PipelineRecoveryIdentity:
     sealed_wave_tokens: int
     max_prefill_chunk_tokens: int
     speculative_max_draft_tokens: int
+    speculative_inflight_waves: int
+    speculative_inflight_bytes: int
     speculation_minimum_speedup: float
     speculation_probe: bool
 
@@ -682,10 +907,19 @@ class _InflightWave:
     sent_at: float
     outbound_bytes: int
     reserved_bytes: int
+    verify_proposal: MacroWaveProposal | None = None
+    verify_base_tokens: int = 0
+    verify_seed_tokens: int = 0
+    verify_input_tokens: tuple[int, ...] = ()
+    verify_generation: int = 0
 
     @property
     def is_prefill(self) -> bool:
         return self.prefill_end is not None
+
+    @property
+    def is_verify(self) -> bool:
+        return self.frame_type == FrameType.VERIFY
 
 
 @dataclass
@@ -710,10 +944,19 @@ class _GenerationJob:
     prefill_inflight_bytes: int = 0
     prefill_reserved_bytes: int = 0
     inflight_waves: deque[_InflightWave] = field(default_factory=deque)
+    # Timeout eligibility belongs to the FIFO head, not to dispatch time of
+    # every queued credit. ``sent_at`` remains immutable for transport metrics.
+    inflight_head_started_at: float = 0.0
     wave_started_at: float = 0.0
     last_outbound_bytes: int = 0
     verify_proposal: MacroWaveProposal | None = None
     verify_base_tokens: int = 0
+    verify_generation: int = 0
+    verify_bridge_targets: dict[int, int] = field(default_factory=dict)
+    verify_inflight_bytes: int = 0
+    verify_reserved_bytes: int = 0
+    verify_collapse_pending: bool = False
+    verify_deferred_finish_reason: str | None = None
     speculation_profile: str = "load-1"
     # Retained session this job checked out at admission (None for fresh wires).
     session: "_RetainedSession | None" = None
@@ -728,6 +971,17 @@ class _GenerationJob:
     physical_tree_parent_closed: bool = False
     physical_tree_pending_result: GenerationOutput | None = None
     physical_tree_pending_exception: BaseException | None = None
+    # A physical tree is measured as one complete route operation, including
+    # its capacity quote, FORKs, VERIFY payloads and ordered cleanup. These
+    # fields are populated only after the conservative controller selects a
+    # measured candidate or an explicitly enabled warm-up probe.
+    tree_proposed_tokens: int = 0
+    tree_is_probe: bool = False
+    tree_outbound_bytes: int = 0
+    tree_inbound_bytes: int = 0
+    # Earliest instant this request could start preparing its next decode
+    # continuation. It includes batch-window and sibling-drafter queueing.
+    next_decode_ready_at: float = 0.0
 
     def __post_init__(self) -> None:
         if self.next_step is None:
@@ -764,6 +1018,13 @@ class _PreparedRootWave:
     step: int
     prefill_end: int | None = None
     reserved_bytes: int = 0
+    draft_latency_seconds: float = 0.0
+    measurement_started_at: float | None = None
+    verify_proposal: MacroWaveProposal | None = None
+    verify_base_tokens: int = 0
+    verify_seed_tokens: int = 0
+    verify_input_tokens: tuple[int, ...] = ()
+    verify_generation: int = 0
 
 
 @dataclass(frozen=True)
@@ -823,6 +1084,13 @@ class DistributedPipelineEngine:
         tree_draft_provider: NgramTreeDraftProvider | TreeDraftProvider | None = None,
     ) -> None:
         self.config = config
+        # One sender owns the root-to-stage TCP stream for its entire
+        # lifecycle. Reusing it across startup probes, data and shutdown keeps
+        # every frame in one FIFO when link emulation is enabled.
+        self._link_emulator = LinkEmulator(
+            config.one_way_delay_ms,
+            config.bandwidth_mbps,
+        )
         self._state_lock = threading.Lock()
         self._closed = False
         self._close_error: PipelineShutdownError | None = None
@@ -885,6 +1153,32 @@ class DistributedPipelineEngine:
         self._speculation_probe_waves = 0
         self._speculation_decision_reasons: dict[str, int] = {}
         self._speculation_selected_sizes: dict[int, int] = {}
+        self._speculative_current_waves = 0
+        self._speculative_current_bytes = 0
+        self._speculative_current_reserved_bytes = 0
+        self._speculative_high_water_waves = 0
+        self._speculative_high_water_bytes = 0
+        self._speculative_high_water_reserved_bytes = 0
+        self._speculative_max_request_waves = 0
+        self._speculative_max_request_bytes = 0
+        self._speculative_max_request_reserved_bytes = 0
+        self._speculative_dispatched_waves = 0
+        self._speculative_completed_waves = 0
+        self._speculative_committed_waves = 0
+        self._speculative_condemned_waves = 0
+        self._speculative_drained_waves = 0
+        self._speculative_rejection_collapses = 0
+        self._speculative_rejected_tokens = 0
+        self._speculative_condemned_tokens = 0
+        self._speculative_discarded_tokens = 0
+        self._speculative_rejected_wave_bytes = 0
+        self._speculative_tombstone_bytes = 0
+        self._speculative_discarded_bytes = 0
+        self._tree_gate_enabled_decisions = 0
+        self._tree_gate_disabled_decisions = 0
+        self._tree_gate_probe_waves = 0
+        self._tree_gate_measured_waves = 0
+        self._tree_gate_decision_reasons: dict[str, int] = {}
         # Session retention state. The map is owned by the scheduler thread;
         # insertion order doubles as the LRU order because every retention
         # refresh re-inserts the entry. The integer counters are read without a
@@ -927,8 +1221,18 @@ class DistributedPipelineEngine:
         self._route_probe_count = 0
         self.stage_metrics: list[dict[str, Any]] = []
         if config.speculative_max_draft_tokens > 0:
-            self.draft_provider: DraftProvider | None = draft_provider or NgramDraftProvider(
-                max_draft_tokens=config.speculative_max_draft_tokens
+            if tree_draft_provider is not None and draft_provider is not None:
+                raise ValueError(
+                    "draft-tree uses its own measured provider and cannot mix "
+                    "linear draft observations"
+                )
+            self.draft_provider: DraftProvider | None = (
+                None
+                if tree_draft_provider is not None
+                else draft_provider
+                or NgramDraftProvider(
+                    max_draft_tokens=config.speculative_max_draft_tokens
+                )
             )
             self.speculation_controller: AdaptiveSpeculationController | None = (
                 speculation_controller
@@ -970,13 +1274,49 @@ class DistributedPipelineEngine:
                 raise ValueError(
                     "tree_draft_provider requires speculative_max_draft_tokens > 0"
                 )
+            if (
+                int(tree_draft_provider.max_draft_tokens)
+                != config.speculative_max_draft_tokens
+            ):
+                raise ValueError(
+                    "tree_draft_provider max_draft_tokens must match the sealed limit"
+                )
+            if (
+                int(tree_draft_provider.max_branches)
+                != config.max_speculative_branches
+            ):
+                raise ValueError(
+                    "tree_draft_provider max_branches must match the sealed limit"
+                )
         self.tree_draft_provider: TreeDraftProvider | None = tree_draft_provider
 
         ram_stage_configs = config.ram_backed_moe_stages or tuple(
             None for _ in range(len(config.boundaries) - 1)
         )
+        native_stage_configs = config.native_gguf_stages or tuple(
+            None for _ in range(len(config.boundaries) - 1)
+        )
         root_ram_config = ram_stage_configs[0]
-        if root_ram_config is not None:
+        root_native_config = native_stage_configs[0]
+        root_native_package: NativeGgufStagePackage | None = None
+        if root_native_config is not None:
+            root_native_package = verify_native_gguf_stage(
+                root_native_config.package,
+                expected_package_id=root_native_config.package_id,
+                expected_layer_start=config.boundaries[0],
+                expected_layer_end=config.boundaries[1],
+                expected_total_layers=config.boundaries[-1],
+            )
+            # Tokenizer coordinates remain independent of the weight package.
+            # AutoTokenizer may resolve only tokenizer assets later; config and
+            # every executable weight come from this authenticated package.
+            self.model_snapshot = config.model_name
+            model_config = AutoConfig.from_pretrained(
+                root_native_package.root,
+                local_files_only=True,
+                trust_remote_code=False,
+            )
+        elif root_ram_config is not None:
             snapshot_path = validate_ram_backed_moe_binding(
                 root_ram_config,
                 model_name=config.model_name,
@@ -996,12 +1336,44 @@ class DistributedPipelineEngine:
             )
         self.total_layers = int(model_config.num_hidden_layers)
         self.hidden_size = int(model_config.hidden_size)
+        if _speculative_inflight_wave_limit(config) > 1:
+            minimum_verify_reservation = _prefill_frame_byte_reservation(
+                TensorCodec(config.codec),
+                config.speculative_max_draft_tokens + 1,
+                self.hidden_size,
+            )
+            if (
+                _speculative_inflight_byte_limit(config)
+                < minimum_verify_reservation
+            ):
+                raise ValueError(
+                    "speculative_inflight_bytes cannot reserve the largest "
+                    "sealed VERIFY frame: "
+                    f"{config.speculative_inflight_bytes} < "
+                    f"{minimum_verify_reservation}"
+                )
         if config.boundaries[-1] != self.total_layers:
             raise ValueError(
                 f"boundaries end at {config.boundaries[-1]}, model has {self.total_layers} layers"
             )
         self.maximum_context = int(getattr(model_config, "max_position_embeddings", 0) or 0)
-        if root_ram_config is not None:
+        for paged in config.paged_kv_stages or ():
+            if (
+                paged is not None
+                and self.maximum_context > 0
+                and paged.max_sequence_tokens > self.maximum_context
+            ):
+                raise ValueError(
+                    "paged max_sequence_tokens exceeds the model context limit"
+                )
+        if root_native_package is not None:
+            self.model_artifact = model_artifact_reference(
+                str(root_native_package.root),
+                artifact_identity=root_native_package.artifact_identity,
+                canonical_source=root_native_package.model_source,
+                canonical_revision=root_native_package.model_revision,
+            )
+        elif root_ram_config is not None:
             self.model_artifact = model_artifact_reference(
                 self.model_snapshot,
                 artifact_identity=root_ram_config.artifact_identity,
@@ -1124,7 +1496,7 @@ class DistributedPipelineEngine:
             )
         stage_executor_ids = self._recovery_stage_executor_ids()
         return PipelineRecoveryIdentity(
-            schema_version=4,
+            schema_version=5,
             artifact_identity=self.model_artifact.identity,
             canonical_model_source=self.model_artifact.canonical_source,
             canonical_model_revision=self.model_artifact.canonical_revision,
@@ -1146,6 +1518,8 @@ class DistributedPipelineEngine:
             sealed_wave_tokens=self.config.sealed_wave_token_limit,
             max_prefill_chunk_tokens=self.config.prefill_token_limit or 0,
             speculative_max_draft_tokens=self.config.speculative_max_draft_tokens,
+            speculative_inflight_waves=self.config.speculative_inflight_waves,
+            speculative_inflight_bytes=self.config.speculative_inflight_bytes,
             speculation_minimum_speedup=self.config.speculation_minimum_speedup,
             speculation_probe=self.config.speculation_probe,
         )
@@ -1213,12 +1587,16 @@ class DistributedPipelineEngine:
         controller = self.speculation_controller
         route_rtt_ms, route_probe_count = self._route_probe_snapshot()
         tree_stats = self._physical_tree_stats()
+        provider = self._linear_draft_provider_stats()
         if controller is None:
             return {
                 "configured": False,
                 "enabled": False,
+                "emitted_tokens": 0,
+                "observed_emitted_tokens_per_verification": None,
                 "route_rtt_ms": route_rtt_ms,
                 "route_probe_count": route_probe_count,
+                "provider": provider,
                 "physical_tree": tree_stats,
             }
         with self._speculation_lock:
@@ -1236,8 +1614,14 @@ class DistributedPipelineEngine:
             )
             proposed_tokens = sum(value.proposed_tokens for value in observations)
             accepted_tokens = sum(value.accepted_tokens for value in observations)
+            emitted_tokens = sum(value.emitted_tokens for value in observations)
             acceptance_rate = (
                 accepted_tokens / proposed_tokens if proposed_tokens else None
+            )
+            observed_emitted_per_verification = (
+                emitted_tokens / verification_observations
+                if verification_observations
+                else None
             )
             return {
                 # Keep enabled as a compatibility alias for older health clients;
@@ -1256,9 +1640,17 @@ class DistributedPipelineEngine:
                 "verification_observations": verification_observations,
                 "proposed_tokens": proposed_tokens,
                 "accepted_tokens": accepted_tokens,
+                "emitted_tokens": emitted_tokens,
                 "acceptance_rate": acceptance_rate,
+                # Intrinsic accepted+1 telemetry for valid controller VERIFY
+                # observations. This is not route-level conveyor g for W>1,
+                # where overlapping waves can duplicate the bridge token.
+                "observed_emitted_tokens_per_verification": _finite_or_none(
+                    observed_emitted_per_verification
+                ),
                 "route_rtt_ms": route_rtt_ms,
                 "route_probe_count": route_probe_count,
+                "provider": provider,
                 "physical_tree": tree_stats,
                 "verification_bytes": sum(
                     value.verification_bytes for value in observations
@@ -1268,15 +1660,38 @@ class DistributedPipelineEngine:
                         "rtt_ewma_ms": _finite_or_none(current.rtt_ewma_ms),
                         "classic_observations": current.stats().classic_observations,
                         "verification_observations": current.stats().verification_observations,
+                        "emitted_tokens": current.stats().emitted_tokens,
+                        "observed_emitted_tokens_per_verification": _finite_or_none(
+                            current.stats().observed_emitted_tokens_per_verification
+                        ),
                         "candidates": [
                             {
                                 "size": estimate.candidate_size,
                                 "ready": estimate.ready,
                                 "observations": estimate.observations,
                                 "acceptance_rate": estimate.acceptance_rate,
+                                "observed_emitted_tokens_per_verification": (
+                                    _finite_or_none(
+                                        estimate.observed_emitted_tokens_per_verification
+                                    )
+                                ),
+                                "observed_emitted_tokens_per_verification_lower_bound": (
+                                    _finite_or_none(
+                                        estimate.observed_emitted_tokens_per_verification_lower_bound
+                                    )
+                                ),
+                                "observed_emitted_tokens_per_verification_upper_bound": (
+                                    _finite_or_none(
+                                        estimate.observed_emitted_tokens_per_verification_upper_bound
+                                    )
+                                ),
                                 "predicted_speedup": _finite_or_none(
                                     estimate.predicted_speedup
                                 ),
+                                "predicted_speedup_lower_bound": _finite_or_none(
+                                    estimate.predicted_speedup_lower_bound
+                                ),
+                                "confidence_level": estimate.confidence_level,
                                 "predicted_latency_speedup": _finite_or_none(
                                     estimate.predicted_latency_speedup
                                 ),
@@ -1291,8 +1706,32 @@ class DistributedPipelineEngine:
                 },
             }
 
+    def _linear_draft_provider_stats(self) -> dict[str, Any] | None:
+        provider = getattr(self, "draft_provider", None)
+        if provider is None:
+            return None
+        snapshot = getattr(provider, "execution_snapshot", None)
+        if callable(snapshot):
+            value = snapshot()
+            if not isinstance(value, dict):
+                raise TypeError("draft provider execution snapshot must be an object")
+            return copy.deepcopy(value)
+        return {
+            "strategy": getattr(provider, "strategy", None),
+            "maxDraftTokens": int(getattr(provider, "max_draft_tokens", 0)),
+            "deferredUntilSelected": bool(
+                getattr(provider, "defer_until_selected", False)
+            ),
+        }
+
     def _physical_tree_stats(self) -> dict[str, Any]:
         provider = getattr(self, "tree_draft_provider", None)
+        controller = getattr(self, "speculation_controller", None)
+        confidence_level = (
+            float(controller.config.confidence_level)
+            if controller is not None
+            else None
+        )
         return {
             "configured": provider is not None,
             "strategy": getattr(provider, "strategy", None),
@@ -1318,6 +1757,25 @@ class DistributedPipelineEngine:
                 getattr(self, "_physical_tree_live_children", ())
             ),
             "virtual_routes": len(getattr(self, "_leaf_routes", {})),
+            "statistical_gate": {
+                "policy": "speedup-lower-confidence-bound",
+                "confidence_level": confidence_level,
+                "enabled_decisions": int(
+                    getattr(self, "_tree_gate_enabled_decisions", 0)
+                ),
+                "disabled_decisions": int(
+                    getattr(self, "_tree_gate_disabled_decisions", 0)
+                ),
+                "probe_waves": int(
+                    getattr(self, "_tree_gate_probe_waves", 0)
+                ),
+                "measured_waves": int(
+                    getattr(self, "_tree_gate_measured_waves", 0)
+                ),
+                "decision_reasons": dict(
+                    getattr(self, "_tree_gate_decision_reasons", {})
+                ),
+            },
             "capacity_quote": {
                 "pending": getattr(self, "_pending_tree_reservation", None)
                 is not None,
@@ -1413,6 +1871,83 @@ class DistributedPipelineEngine:
             ),
             "acknowledged_chunks": int(
                 getattr(self, "_prefill_acknowledged_chunks", 0)
+            ),
+        }
+
+    @property
+    def speculative_window_stats(self) -> dict[str, int | bool]:
+        configured_waves = _speculative_inflight_wave_limit(self.config)
+        configured_bytes = _speculative_inflight_byte_limit(self.config)
+        return {
+            "configured": configured_waves > 1,
+            "configured_waves_per_request": configured_waves,
+            "configured_bytes_per_request": configured_bytes,
+            "global_wave_ceiling": configured_waves
+            * int(self.config.max_active_sequences),
+            "global_byte_ceiling": configured_bytes
+            * int(self.config.max_active_sequences),
+            "current_waves": int(
+                getattr(self, "_speculative_current_waves", 0)
+            ),
+            "current_bytes": int(
+                getattr(self, "_speculative_current_bytes", 0)
+            ),
+            "current_reserved_bytes": int(
+                getattr(self, "_speculative_current_reserved_bytes", 0)
+            ),
+            "high_water_waves": int(
+                getattr(self, "_speculative_high_water_waves", 0)
+            ),
+            "high_water_bytes": int(
+                getattr(self, "_speculative_high_water_bytes", 0)
+            ),
+            "high_water_reserved_bytes": int(
+                getattr(self, "_speculative_high_water_reserved_bytes", 0)
+            ),
+            "max_request_waves": int(
+                getattr(self, "_speculative_max_request_waves", 0)
+            ),
+            "max_request_bytes": int(
+                getattr(self, "_speculative_max_request_bytes", 0)
+            ),
+            "max_request_reserved_bytes": int(
+                getattr(self, "_speculative_max_request_reserved_bytes", 0)
+            ),
+            "dispatched_waves": int(
+                getattr(self, "_speculative_dispatched_waves", 0)
+            ),
+            "completed_waves": int(
+                getattr(self, "_speculative_completed_waves", 0)
+            ),
+            "committed_waves": int(
+                getattr(self, "_speculative_committed_waves", 0)
+            ),
+            "condemned_waves": int(
+                getattr(self, "_speculative_condemned_waves", 0)
+            ),
+            "drained_waves": int(
+                getattr(self, "_speculative_drained_waves", 0)
+            ),
+            "rejection_collapses": int(
+                getattr(self, "_speculative_rejection_collapses", 0)
+            ),
+            "rejected_proposed_tokens": int(
+                getattr(self, "_speculative_rejected_tokens", 0)
+            ),
+            "condemned_proposed_tokens": int(
+                getattr(self, "_speculative_condemned_tokens", 0)
+            ),
+            "discarded_proposed_tokens": int(
+                getattr(self, "_speculative_discarded_tokens", 0)
+            ),
+            "rejected_wave_bytes": int(
+                getattr(self, "_speculative_rejected_wave_bytes", 0)
+            ),
+            "tombstone_bytes": int(
+                getattr(self, "_speculative_tombstone_bytes", 0)
+            ),
+            "discarded_bytes": int(
+                getattr(self, "_speculative_discarded_bytes", 0)
             ),
         }
 
@@ -1540,6 +2075,19 @@ class DistributedPipelineEngine:
                 cleanup_errors.append(
                     f"SHUTDOWN send failed: {type(error).__name__}: {error}"
                 )
+
+        if not scheduler_alive:
+            emulator = getattr(self, "_link_emulator", None)
+            if emulator is not None:
+                try:
+                    emulator.close(
+                        timeout_seconds=self.config.socket_timeout_seconds,
+                    )
+                except BaseException as error:
+                    cleanup_errors.append(
+                        "emulated-link drain failed: "
+                        f"{type(error).__name__}: {error}"
+                    )
 
         protocol_shutdown_ready = (
             not downstream_was_present or self._shutdown_sent
@@ -1717,6 +2265,12 @@ class DistributedPipelineEngine:
         ram_stage_configs = config.ram_backed_moe_stages or tuple(
             None for _ in range(self.stages)
         )
+        paged_stage_configs = config.paged_kv_stages or tuple(
+            None for _ in range(self.stages)
+        )
+        native_stage_configs = config.native_gguf_stages or tuple(
+            None for _ in range(self.stages)
+        )
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind((config.return_bind_host, config.return_port))
@@ -1738,15 +2292,36 @@ class DistributedPipelineEngine:
                 stage_index = child_index + 1
                 has_next = stage_index + 1 < self.stages
                 ram_stage_config = ram_stage_configs[stage_index]
+                paged_stage_config = paged_stage_configs[stage_index]
+                native_stage_config = native_stage_configs[stage_index]
+                native_package = (
+                    None
+                    if native_stage_config is None
+                    else verify_native_gguf_stage(
+                        native_stage_config.package,
+                        expected_package_id=native_stage_config.package_id,
+                        expected_layer_start=boundaries[stage_index],
+                        expected_layer_end=boundaries[stage_index + 1],
+                        expected_total_layers=self.total_layers,
+                    )
+                )
                 stage_artifact_identity = (
                     ram_stage_config.artifact_identity
                     if ram_stage_config is not None
-                    else self.model_artifact.identity
+                    else (
+                        native_package.artifact_identity
+                        if native_package is not None
+                        else self.model_artifact.identity
+                    )
                 )
                 stage_canonical_source = (
                     f"content-addressed://{stage_artifact_identity}"
                     if ram_stage_config is not None
-                    else self.model_artifact.canonical_source
+                    else (
+                        native_package.model_source
+                        if native_package is not None
+                        else self.model_artifact.canonical_source
+                    )
                 )
                 child_configs.append(
                     StageProcessConfig(
@@ -1761,7 +2336,16 @@ class DistributedPipelineEngine:
                             canonical_model_revision=(
                                 None
                                 if ram_stage_config is not None
-                                else self.model_artifact.canonical_revision
+                                else (
+                                    native_package.model_revision
+                                    if native_package is not None
+                                    else self.model_artifact.canonical_revision
+                                )
+                            ),
+                            stage_package_identity=(
+                                native_package.package_identity
+                                if native_package is not None
+                                else None
                             ),
                         ),
                         pipeline_id=self.pipeline_id,
@@ -1776,6 +2360,7 @@ class DistributedPipelineEngine:
                         one_way_delay_ms=config.one_way_delay_ms,
                         bandwidth_mbps=config.bandwidth_mbps,
                         device=config.device,
+                        dense_tiering=config.dense_tiering,
                         connect_timeout_seconds=config.startup_timeout_seconds,
                         sealed_wave_tokens=config.sealed_wave_tokens,
                         max_prefill_chunk_tokens=config.max_prefill_chunk_tokens,
@@ -1785,6 +2370,8 @@ class DistributedPipelineEngine:
                         ),
                         max_speculative_kv_bytes=config.max_speculative_kv_bytes,
                         ram_backed_moe=ram_stage_config,
+                        paged_kv=paged_stage_config,
+                        native_gguf=native_stage_config,
                     )
                 )
             for child_config in reversed(child_configs):
@@ -1801,6 +2388,19 @@ class DistributedPipelineEngine:
         if first_stage_port is None:
             raise RuntimeError("first stage port was not resolved")
         root_ram_config = ram_stage_configs[0]
+        root_paged_config = paged_stage_configs[0]
+        root_native_config = native_stage_configs[0]
+        root_native_package = (
+            None
+            if root_native_config is None
+            else verify_native_gguf_stage(
+                root_native_config.package,
+                expected_package_id=root_native_config.package_id,
+                expected_layer_start=boundaries[0],
+                expected_layer_end=boundaries[1],
+                expected_total_layers=self.total_layers,
+            )
+        )
         root_spec = StageModelSpec(
             self.model_snapshot,
             0,
@@ -1810,16 +2410,36 @@ class DistributedPipelineEngine:
             artifact_identity=self.model_artifact.identity,
             canonical_model_source=self.model_artifact.canonical_source,
             canonical_model_revision=self.model_artifact.canonical_revision,
+            stage_package_identity=(
+                root_native_package.package_identity
+                if root_native_package is not None
+                else config.stage_package_identity
+            ),
         )
-        self._runner = (
-            StageRunner(root_spec, device=config.device)
-            if root_ram_config is None
-            else build_ram_backed_moe_stage_runner(
+        if root_native_config is not None:
+            self._runner = build_native_gguf_stage_runner(
+                root_spec,
+                root_native_config,
+                device=config.device,
+                dense_tiering=config.dense_tiering,
+            )
+        elif root_ram_config is not None:
+            self._runner = build_ram_backed_moe_stage_runner(
                 root_spec,
                 root_ram_config,
                 pipeline_snapshot_identity=self.pipeline_id,
             )
-        )
+        elif root_paged_config is not None:
+            self._runner = HFPagedStageRunner.from_runtime_config(
+                root_spec,
+                root_paged_config,
+            )
+        else:
+            self._runner = StageRunner(
+                root_spec,
+                device=config.device,
+                dense_tiering=config.dense_tiering,
+            )
         if self._runner.hidden_size != self.hidden_size:
             raise RuntimeError("root stage hidden size differs from the model configuration")
         validate_speculative_runner(config, self._runner)
@@ -1869,10 +2489,7 @@ class DistributedPipelineEngine:
                     FrameType.PING,
                     self.pipeline_id,
                     step=0,
-                    emulator=LinkEmulator(
-                        config.one_way_delay_ms,
-                        config.bandwidth_mbps,
-                    ),
+                    emulator=self._link_emulator,
                 )
                 readable, _, _ = select.select(
                     (return_socket, downstream),
@@ -1934,10 +2551,7 @@ class DistributedPipelineEngine:
     def _scheduler_loop(self) -> None:
         runner = self._require_runner()
         downstream = self._require_socket(self._downstream, "downstream")
-        emulator = LinkEmulator(
-            self.config.one_way_delay_ms,
-            self.config.bandwidth_mbps,
-        )
+        emulator = getattr(self, "_link_emulator", None)
         active: dict[int, _GenerationJob] = {}
         decode_since_admission = 0
         fatal: BaseException | None = None
@@ -1996,6 +2610,13 @@ class DistributedPipelineEngine:
                     # cancellation and newly admissible work win over a long
                     # prompt before its entire window is filled.
                     if self._dispatch_prefill_credit_round(
+                        active,
+                        runner,
+                        downstream,
+                        emulator,
+                    ):
+                        continue
+                    if self._dispatch_speculative_credit_round(
                         active,
                         runner,
                         downstream,
@@ -2074,6 +2695,14 @@ class DistributedPipelineEngine:
                     self._shutdown_sent = True
                 except BaseException:
                     pass
+            if emulator is not None:
+                try:
+                    emulator.close(
+                        timeout_seconds=self.config.socket_timeout_seconds,
+                    )
+                except BaseException as error:
+                    if fatal is None:
+                        self._set_fatal(error)
 
     def _next_submission(self, timeout: float) -> list[_GenerationJob] | None:
         if self._deferred_batches:
@@ -2221,6 +2850,7 @@ class DistributedPipelineEngine:
         session.last_used = time.monotonic()
         job.session = session
         job.prefill_offset = reuse
+        job.prefill_acked_offset = reuse
         job.kv_valid = reuse
         job.reused_tokens = reuse
         self._session_reuse_hits += 1
@@ -2544,6 +3174,56 @@ class DistributedPipelineEngine:
         self._dispatch_root_waves(prepared, runner, downstream, emulator)
         return len(prepared)
 
+    def _dispatch_speculative_credit_round(
+        self,
+        active: dict[int, _GenerationJob],
+        runner: StageRunner,
+        downstream: socket.socket,
+        emulator: LinkEmulator,
+    ) -> int:
+        """Give one B=1 request at most one additional ordered VERIFY credit."""
+
+        if (
+            _speculative_inflight_wave_limit(self.config) <= 1
+            or len(active) != 1
+            or getattr(self, "tree_draft_provider", None) is not None
+            or getattr(self, "_pending_tree_reservation", None) is not None
+        ):
+            return 0
+        job = next(iter(active.values()))
+        if job.cancel_requested.is_set() or job.verify_collapse_pending:
+            return 0
+        current = tuple(
+            flight
+            for flight in job.inflight_waves
+            if flight.is_verify
+            and flight.verify_generation == job.verify_generation
+        )
+        if (
+            not current
+            or len(current) != len(job.inflight_waves)
+            or len(current) >= _speculative_inflight_wave_limit(self.config)
+        ):
+            return 0
+        wave = self._prepare_speculative_continuation_wave(
+            job,
+            runner,
+            active_sequences=1,
+        )
+        if wave is None:
+            return 0
+        byte_limit = _speculative_inflight_byte_limit(self.config)
+        if (
+            byte_limit > 0
+            and job.verify_reserved_bytes + wave.reserved_bytes > byte_limit
+        ):
+            proposal = wave.verify_proposal
+            if proposal is not None and proposal.tree.state is MacroWaveState.OPEN:
+                proposal.tree.rollback()
+            return 0
+        self._dispatch_root_waves([wave], runner, downstream, emulator)
+        return 1
+
     def _consume_inflight_return(
         self,
         job: _GenerationJob,
@@ -2577,9 +3257,37 @@ class DistributedPipelineEngine:
         job.step = (
             job.inflight_waves[0].step if job.inflight_waves else next_step
         )
+        if flight.is_verify and flight.verify_proposal is not None:
+            current_waves = int(getattr(self, "_speculative_current_waves", 0))
+            current_bytes = int(getattr(self, "_speculative_current_bytes", 0))
+            current_reserved = int(
+                getattr(self, "_speculative_current_reserved_bytes", 0)
+            )
+            if (
+                job.verify_inflight_bytes < flight.outbound_bytes
+                or job.verify_reserved_bytes < flight.reserved_bytes
+                or current_waves < 1
+                or current_bytes < flight.outbound_bytes
+                or current_reserved < flight.reserved_bytes
+            ):
+                raise RuntimeError("VERIFY in-flight telemetry underflow")
+            job.verify_inflight_bytes -= flight.outbound_bytes
+            job.verify_reserved_bytes -= flight.reserved_bytes
+            self._speculative_current_waves = current_waves - 1
+            self._speculative_current_bytes = current_bytes - flight.outbound_bytes
+            self._speculative_current_reserved_bytes = (
+                current_reserved - flight.reserved_bytes
+            )
+            self._speculative_completed_waves = int(
+                getattr(self, "_speculative_completed_waves", 0)
+            ) + 1
         if flight.is_prefill:
             if flight.prefill_end is None or flight.prefill_end <= job.prefill_acked_offset:
                 raise RuntimeError("prefill completion offsets are not strictly increasing")
+            # A prefix is reusable only after every remote stage has
+            # acknowledged it. Root execution at dispatch is not durable
+            # evidence for a route that may fail while the chunk is in flight.
+            job.kv_valid += flight.prefill_end - job.prefill_acked_offset
             job.prefill_acked_offset = flight.prefill_end
             current_chunks = int(getattr(self, "_prefill_current_chunks", 0))
             current_bytes = int(getattr(self, "_prefill_current_bytes", 0))
@@ -2608,7 +3316,99 @@ class DistributedPipelineEngine:
                 self._prefill_acknowledged_chunks = int(
                     getattr(self, "_prefill_acknowledged_chunks", 0)
                 ) + 1
+        job.inflight_head_started_at = (
+            time.monotonic() if job.inflight_waves else 0.0
+        )
         return flight
+
+    @staticmethod
+    def _rollback_verify_flight(
+        job: _GenerationJob,
+        flight: _InflightWave,
+    ) -> None:
+        proposal = flight.verify_proposal or job.verify_proposal
+        if proposal is not None and proposal.tree.state is MacroWaveState.OPEN:
+            proposal.tree.rollback()
+        if job.verify_proposal is proposal:
+            job.verify_proposal = None
+            job.verify_base_tokens = 0
+
+    @staticmethod
+    def _sync_legacy_verify_head(job: _GenerationJob) -> None:
+        for flight in job.inflight_waves:
+            if (
+                flight.is_verify
+                and flight.verify_generation == job.verify_generation
+                and flight.verify_proposal is not None
+            ):
+                job.verify_proposal = flight.verify_proposal
+                job.verify_base_tokens = flight.verify_base_tokens
+                return
+        job.verify_proposal = None
+        job.verify_base_tokens = 0
+
+    def _condemn_verify_descendants(
+        self,
+        job: _GenerationJob,
+        *,
+        rejection: bool,
+    ) -> int:
+        condemned = tuple(
+            flight
+            for flight in job.inflight_waves
+            if flight.is_verify
+            and flight.verify_generation == job.verify_generation
+        )
+        for flight in condemned:
+            proposal = flight.verify_proposal
+            if proposal is not None and proposal.tree.state is MacroWaveState.OPEN:
+                proposal.tree.rollback()
+        job.verify_generation += 1
+        job.verify_bridge_targets.clear()
+        job.verify_collapse_pending = bool(condemned)
+        job.verify_proposal = None
+        job.verify_base_tokens = 0
+        if condemned:
+            condemned_tokens = sum(
+                len(flight.verify_proposal.linear_tokens)
+                for flight in condemned
+                if flight.verify_proposal is not None
+            )
+            self._speculative_condemned_waves = int(
+                getattr(self, "_speculative_condemned_waves", 0)
+            ) + len(condemned)
+            self._speculative_condemned_tokens = int(
+                getattr(self, "_speculative_condemned_tokens", 0)
+            ) + condemned_tokens
+            self._speculative_discarded_tokens = int(
+                getattr(self, "_speculative_discarded_tokens", 0)
+            ) + condemned_tokens
+        if rejection:
+            self._speculative_rejection_collapses = int(
+                getattr(self, "_speculative_rejection_collapses", 0)
+            ) + 1
+        return len(condemned)
+
+    def _resume_after_verify_drain(
+        self,
+        job: _GenerationJob,
+        active: dict[int, _GenerationJob],
+        runner: StageRunner,
+        downstream: socket.socket,
+    ) -> _PreparedRootWave | _PreparedPhysicalTreeWave | None:
+        if job.inflight_waves:
+            return None
+        job.verify_collapse_pending = False
+        reason = job.verify_deferred_finish_reason
+        job.verify_deferred_finish_reason = None
+        if reason is not None:
+            self._finish_turn(job, active, runner, downstream, reason)
+            return None
+        return self._prepare_decode_wave(
+            job,
+            runner,
+            active_sequences=len(active),
+        )
 
     def _handle_return_value(
         self,
@@ -2667,7 +3467,11 @@ class DistributedPipelineEngine:
         if job is None:
             raise RuntimeError(f"token for unknown request {frame.request_id}")
         flight = self._consume_inflight_return(job, frame)
+        if frame.frame_type in (FrameType.TOKEN, FrameType.VERIFY_RESULT):
+            job.next_decode_ready_at = arrived
         if job.cancel_requested.is_set():
+            if flight.is_verify:
+                self._rollback_verify_flight(job, flight)
             if not job.cancel_sent:
                 send_frame(downstream, FrameType.CANCEL, frame.request_id)
                 job.cancel_sent = True
@@ -2683,6 +3487,31 @@ class DistributedPipelineEngine:
                 )
             return None
 
+        if flight.is_verify:
+            if flight.verify_generation > job.verify_generation:
+                raise RuntimeError("VERIFY return belongs to a future generation")
+            if flight.verify_generation < job.verify_generation:
+                self._rollback_verify_flight(job, flight)
+                self._speculative_drained_waves = int(
+                    getattr(self, "_speculative_drained_waves", 0)
+                ) + 1
+                tombstone_bytes = (
+                    flight.outbound_bytes + HEADER_BYTES + len(frame.payload)
+                )
+                self._speculative_tombstone_bytes = int(
+                    getattr(self, "_speculative_tombstone_bytes", 0)
+                ) + tombstone_bytes
+                self._speculative_discarded_bytes = int(
+                    getattr(self, "_speculative_discarded_bytes", 0)
+                ) + tombstone_bytes
+                self._sync_legacy_verify_head(job)
+                return self._resume_after_verify_drain(
+                    job,
+                    active,
+                    runner,
+                    downstream,
+                )
+
         if frame.frame_type == FrameType.PREFILL_ACK:
             if (
                 flight.prefill_end is None
@@ -2694,12 +3523,33 @@ class DistributedPipelineEngine:
             return None
 
         if frame.frame_type == FrameType.VERIFY_RESULT:
-            proposal = job.verify_proposal
+            proposal = flight.verify_proposal or job.verify_proposal
             if proposal is None:
                 raise RuntimeError(
                     f"request {frame.request_id} returned verification without a draft"
                 )
-            targets = decode_verify_result(frame)
+            raw_targets = decode_verify_result(frame)
+            legacy_flight = flight.verify_proposal is None
+            verify_seed_tokens = (
+                1 if legacy_flight else flight.verify_seed_tokens
+            )
+            verify_base_tokens = (
+                job.verify_base_tokens
+                if legacy_flight
+                else flight.verify_base_tokens
+            )
+            if verify_seed_tokens == 0:
+                bridge = job.verify_bridge_targets.pop(flight.step, None)
+                if bridge is None:
+                    raise RuntimeError(
+                        f"request {frame.request_id} VERIFY step {flight.step} "
+                        "returned before its predecessor bridge was committed"
+                    )
+                targets = (bridge, *raw_targets)
+            elif verify_seed_tokens == 1:
+                targets = raw_targets
+            else:
+                raise RuntimeError("VERIFY seed count must be zero or one")
             resolution = resolve_linear_macro_wave(proposal, targets)
             if self.speculation_controller is None:
                 raise RuntimeError("verification returned while speculation is disabled")
@@ -2716,29 +3566,87 @@ class DistributedPipelineEngine:
                         flight.outbound_bytes + HEADER_BYTES + len(frame.payload)
                     ),
                 )
-            verify_base_tokens = job.verify_base_tokens
-            job.verify_proposal = None
-            job.verify_base_tokens = 0
+            if resolution.truncate_required:
+                rejected_tokens = (
+                    len(proposal.linear_tokens) - resolution.truncate_draft_to
+                )
+                if rejected_tokens < 1:
+                    raise RuntimeError(
+                        "rejected VERIFY resolution has no rejected draft tokens"
+                    )
+                # A compressed activation frame has no exact per-token byte
+                # partition. Attribute its complete transport once to the wave
+                # that rejected, and keep descendant tombstones in a separate
+                # counter. The two sets of flights are disjoint.
+                rejected_wave_bytes = (
+                    flight.outbound_bytes + HEADER_BYTES + len(frame.payload)
+                )
+                self._speculative_rejected_tokens = int(
+                    getattr(self, "_speculative_rejected_tokens", 0)
+                ) + rejected_tokens
+                self._speculative_discarded_tokens = int(
+                    getattr(self, "_speculative_discarded_tokens", 0)
+                ) + rejected_tokens
+                self._speculative_rejected_wave_bytes = int(
+                    getattr(self, "_speculative_rejected_wave_bytes", 0)
+                ) + rejected_wave_bytes
+                self._speculative_discarded_bytes = int(
+                    getattr(self, "_speculative_discarded_bytes", 0)
+                ) + rejected_wave_bytes
+            successor = (
+                job.inflight_waves[0]
+                if job.inflight_waves
+                and job.inflight_waves[0].is_verify
+                and job.inflight_waves[0].verify_generation
+                == job.verify_generation
+                else None
+            )
+            if job.inflight_waves and successor is None:
+                raise RuntimeError("VERIFY conveyor mixed incompatible in-flight work")
+            self._sync_legacy_verify_head(job)
+            # A full predecessor with a successor publishes only its accepted
+            # drafts. Its bonus is the exact target bridge that validates the
+            # successor's first provisional token; publishing it here as well
+            # would duplicate that token when the successor resolves.
+            emitted_tokens = (
+                resolution.commit_tokens
+                if not resolution.truncate_required and successor is not None
+                else resolution.emitted_tokens
+            )
             appended_before = len(job.token_ids)
             reason = self._append_verified_tokens(
                 job,
-                resolution.emitted_tokens,
+                emitted_tokens,
                 arrived,
             )
             appended = len(job.token_ids) - appended_before
-            # Draft positions in the KV are valid only up to the accepted
-            # prefix AND only as far as tokens were actually emitted.
-            # truncate_draft_to is the committed draft count by construction.
-            job.kv_valid += min(resolution.truncate_draft_to, appended)
-            if reason is not None:
-                self._finish_turn(job, active, runner, downstream, reason)
+            accepted_emitted = min(resolution.truncate_draft_to, appended)
+            # Only the first wave carries the already-visible pending seed.
+            # Continuations consist entirely of provisional draft positions.
+            job.kv_valid += verify_seed_tokens + accepted_emitted
+            self._speculative_committed_waves = int(
+                getattr(self, "_speculative_committed_waves", 0)
+            ) + 1
+
+            if (
+                not resolution.truncate_required
+                and successor is not None
+                and reason is None
+            ):
+                bonus = resolution.bonus_token
+                if bonus is None:
+                    raise RuntimeError("fully accepted VERIFY wave lost its bonus")
+                job.verify_bridge_targets[successor.step] = bonus
                 return None
 
-            if resolution.truncate_required:
+            needs_truncate = successor is not None or (
+                resolution.truncate_required and reason is None
+            )
+            if needs_truncate:
                 keep_tokens = (
                     verify_base_tokens
-                    + 1
-                    + resolution.truncate_draft_to
+                    + verify_seed_tokens
+                    + accepted_emitted
                 )
                 runner.truncate(frame.request_id, keep_tokens)
                 send_frame(
@@ -2747,6 +3655,23 @@ class DistributedPipelineEngine:
                     frame.request_id,
                     token_count=keep_tokens,
                 )
+                self._condemn_verify_descendants(
+                    job,
+                    rejection=resolution.truncate_required,
+                )
+                if reason is not None:
+                    job.verify_deferred_finish_reason = reason
+                if job.inflight_waves:
+                    return None
+                return self._resume_after_verify_drain(
+                    job,
+                    active,
+                    runner,
+                    downstream,
+                )
+            if reason is not None:
+                self._finish_turn(job, active, runner, downstream, reason)
+                return None
             return self._prepare_decode_wave(
                 job,
                 runner,
@@ -2757,6 +3682,10 @@ class DistributedPipelineEngine:
             raise RuntimeError(
                 f"request {frame.request_id} returned TOKEN for a verification wave"
             )
+        # The returned TOKEN proves that the prior emitted input token has been
+        # committed into every stage KV. This newly returned token itself is
+        # still outside KV until a later wave succeeds.
+        job.kv_valid += 1
         prior_output_tokens = len(job.token_ids)
         token = decode_token(frame)
         job.token_ids.append(token)
@@ -2849,6 +3778,7 @@ class DistributedPipelineEngine:
         self._physical_tree_quote_rtt_seconds = float(
             getattr(self, "_physical_tree_quote_rtt_seconds", 0.0)
         ) + max(0.0, arrived - pending.sent_at)
+        job.tree_inbound_bytes += HEADER_BYTES + len(frame.payload)
         if job.cancel_requested.is_set():
             self._cancel_pending_tree_reservation(
                 job,
@@ -2900,7 +3830,7 @@ class DistributedPipelineEngine:
                 getattr(self, "_physical_tree_quote_protocol_failures", 0)
             ) + 1
             raise RuntimeError("root tree capacity changed before remote COMMIT")
-        send_frame(
+        job.tree_outbound_bytes += send_frame(
             downstream,
             FrameType.TREE_RESERVATION_COMMIT,
             parent_request_id,
@@ -2960,6 +3890,7 @@ class DistributedPipelineEngine:
             ) + 1
             raise
 
+        prepared.job.tree_inbound_bytes += HEADER_BYTES + len(frame.payload)
         pending.committed = True
         self._physical_tree_quote_ready = int(
             getattr(self, "_physical_tree_quote_ready", 0)
@@ -2983,6 +3914,7 @@ class DistributedPipelineEngine:
             raise RuntimeError(
                 f"virtual leaf {frame.request_id} lost parent {parent_request_id}"
             )
+        job.tree_inbound_bytes += HEADER_BYTES + len(frame.payload)
         targets = decode_verify_result(frame)
         outcome = self._physical_tree.accept_verify_result(
             frame.request_id,
@@ -3056,8 +3988,11 @@ class DistributedPipelineEngine:
 
         job.step = outcome.next_step
         job.next_step = outcome.next_step
+        tree_base_kv_tokens = self._physical_tree.wave(
+            parent_request_id
+        ).base_kv_tokens
         expected_parent_tokens = (
-            self._physical_tree.wave(parent_request_id).base_kv_tokens
+            tree_base_kv_tokens
             + 1
             + outcome.resolution.accepted_draft_tokens
         )
@@ -3094,13 +4029,38 @@ class DistributedPipelineEngine:
             return None
 
         # Publishing happens strictly after every physical mutation above.
+        appended_before = len(job.token_ids)
         reason = self._append_verified_tokens(
             job,
             outcome.resolution.emitted_tokens,
             arrived,
         )
+        appended = len(job.token_ids) - appended_before
+        exact_committed_drafts = min(
+            outcome.resolution.accepted_draft_tokens,
+            appended,
+        )
+        job.kv_valid = max(
+            job.kv_valid,
+            tree_base_kv_tokens + 1 + exact_committed_drafts,
+        )
+        # Conservatively reserve the final emitted position for the target
+        # continuation. If EOS stopped inside an accepted draft prefix this
+        # under-counts the gain instead of claiming unserved speculative work.
+        measured_accepted = min(
+            outcome.resolution.accepted_draft_tokens,
+            max(0, appended - 1),
+        )
         if reason is not None:
-            send_frame(downstream, FrameType.END, parent_request_id)
+            job.tree_outbound_bytes += send_frame(
+                downstream,
+                FrameType.END,
+                parent_request_id,
+            )
+            self._record_tree_measurement(
+                job,
+                accepted_tokens=measured_accepted,
+            )
             active.pop(parent_request_id)
             self._retire_job(
                 job,
@@ -3108,6 +4068,10 @@ class DistributedPipelineEngine:
                 result=self._generation_output(job, reason),
             )
             return None
+        self._record_tree_measurement(
+            job,
+            accepted_tokens=measured_accepted,
+        )
         return self._prepare_decode_wave(
             job,
             runner,
@@ -3121,12 +4085,13 @@ class DistributedPipelineEngine:
         runner: StageRunnerContract,
         downstream: socket.socket,
     ) -> CancelCommand | None:
+        parent_job = self._callback_routes.get(parent_request_id)
         if isinstance(command, EndCommand):
             if command.request_id not in self._physical_tree_live_children:
                 raise RuntimeError("physical tree END targets a non-live leaf")
             runner.end(command.request_id)
             self._physical_tree_live_children.remove(command.request_id)
-            send_frame(downstream, FrameType.END, command.request_id)
+            sent_bytes = send_frame(downstream, FrameType.END, command.request_id)
         elif isinstance(command, PromoteCommand):
             if command.parent_request_id != parent_request_id:
                 raise RuntimeError("physical tree PROMOTE targets another parent")
@@ -3137,7 +4102,7 @@ class DistributedPipelineEngine:
                 raise TypeError("root runner lost its exact PROMOTE capability")
             promote_request(command.parent_request_id, command.child_request_id)
             self._physical_tree_live_children.remove(command.child_request_id)
-            send_frame(
+            sent_bytes = send_frame(
                 downstream,
                 FrameType.PROMOTE,
                 command.parent_request_id,
@@ -3147,7 +4112,7 @@ class DistributedPipelineEngine:
             if command.request_id != parent_request_id:
                 raise RuntimeError("physical tree TRUNCATE targets another parent")
             runner.truncate(command.request_id, command.keep_tokens)
-            send_frame(
+            sent_bytes = send_frame(
                 downstream,
                 FrameType.TRUNCATE,
                 command.request_id,
@@ -3155,6 +4120,8 @@ class DistributedPipelineEngine:
             )
         else:
             raise TypeError("unknown physical tree cleanup command")
+        if parent_job is not None:
+            parent_job.tree_outbound_bytes += sent_bytes
         deferred = self._physical_tree.confirm_cleanup_command(
             parent_request_id,
             command,
@@ -3271,6 +4238,11 @@ class DistributedPipelineEngine:
         coordinator = getattr(self, "_physical_tree", None)
         if (
             tree_provider is not None
+            and getattr(self, "speculation_controller", None) is not None
+        ):
+            job.speculation_profile = _speculation_load_profile(active_sequences)
+        if (
+            tree_provider is not None
             and remaining > 1
             and (
                 getattr(self, "_pending_tree_reservation", None) is not None
@@ -3324,27 +4296,200 @@ class DistributedPipelineEngine:
                     max_branches=available_branches,
                 )
                 if proposal is not None:
-                    if self._physical_tree_preflight(
-                        job,
-                        proposal,
-                        runner,
-                        base_kv_tokens=base_kv_tokens,
-                    ):
-                        return _PreparedPhysicalTreeWave(
-                            job=job,
-                            proposal=proposal,
+                    controller = getattr(self, "speculation_controller", None)
+                    decision = None
+                    is_probe = False
+                    if controller is not None:
+                        profile = _speculation_load_profile(active_sequences)
+                        job.speculation_profile = profile
+                        with self._speculation_lock:
+                            controller = self._speculation_controller_for_profile_locked(
+                                profile
+                            )
+                            decision = controller.decide(
+                                history_tokens=len(history),
+                                available_draft_tokens=proposal.max_depth,
+                            )
+                            selected_depth = (
+                                decision.candidate_size if decision.enabled else 0
+                            )
+                            if selected_depth == 0 and self.config.speculation_probe:
+                                selected_depth = controller.next_probe_size(
+                                    history_tokens=len(history),
+                                    available_draft_tokens=proposal.max_depth,
+                                ) or 0
+                                is_probe = selected_depth > 0
+
+                        if selected_depth == 0:
+                            self._record_tree_gate_selection(
+                                enabled=False,
+                                is_probe=False,
+                                selected_depth=0,
+                                reason=decision.reason,
+                            )
+                            if proposal.tree.state is MacroWaveState.OPEN:
+                                proposal.tree.rollback()
+                            proposal = None
+                        elif proposal.max_depth != selected_depth:
+                            if proposal.tree.state is MacroWaveState.OPEN:
+                                proposal.tree.rollback()
+                            proposal = prepare_tree_macro_wave(
+                                tree_provider,
+                                history,
+                                request_id=job.wire_id,
+                                ordinal=job.step,
+                                parent_kv_version=KVVersion(base_kv_tokens),
+                                max_tokens=selected_depth,
+                                max_branches=available_branches,
+                            )
+                            if (
+                                proposal is None
+                                or proposal.max_depth != selected_depth
+                            ):
+                                self._record_tree_gate_selection(
+                                    enabled=False,
+                                    is_probe=False,
+                                    selected_depth=0,
+                                    reason="tree_candidate_unavailable",
+                                )
+                                if (
+                                    proposal is not None
+                                    and proposal.tree.state is MacroWaveState.OPEN
+                                ):
+                                    proposal.tree.rollback()
+                                proposal = None
+                    if proposal is not None:
+                        if self._physical_tree_preflight(
+                            job,
+                            proposal,
+                            runner,
                             base_kv_tokens=base_kv_tokens,
-                            pending_token=job.token_ids[-1],
-                            step=job.next_step if job.next_step is not None else job.step,
-                            active_sequences=active_sequences,
-                        )
-                    if proposal.tree.state is MacroWaveState.OPEN:
+                        ):
+                            if controller is not None:
+                                assert decision is not None
+                                self._record_tree_gate_selection(
+                                    enabled=decision.enabled,
+                                    is_probe=is_probe,
+                                    selected_depth=proposal.max_depth,
+                                    reason=decision.reason,
+                                )
+                            job.tree_proposed_tokens = proposal.max_depth
+                            job.tree_is_probe = (
+                                is_probe if controller is not None else False
+                            )
+                            job.tree_outbound_bytes = 0
+                            job.tree_inbound_bytes = 0
+                            return _PreparedPhysicalTreeWave(
+                                job=job,
+                                proposal=proposal,
+                                base_kv_tokens=base_kv_tokens,
+                                pending_token=job.token_ids[-1],
+                                step=(
+                                    job.next_step
+                                    if job.next_step is not None
+                                    else job.step
+                                ),
+                                active_sequences=active_sequences,
+                            )
+                        if controller is not None:
+                            self._record_tree_gate_selection(
+                                enabled=False,
+                                is_probe=False,
+                                selected_depth=0,
+                                reason="tree_capacity_unavailable",
+                            )
+                    if (
+                        proposal is not None
+                        and proposal.tree.state is MacroWaveState.OPEN
+                    ):
                         proposal.tree.rollback()
         return self._prepare_linear_or_classic_decode_wave(
             job,
             runner,
             active_sequences=active_sequences,
         )
+
+    def _record_tree_gate_selection(
+        self,
+        *,
+        enabled: bool,
+        is_probe: bool,
+        selected_depth: int,
+        reason: str,
+    ) -> None:
+        """Expose measured/probe decisions without calling a probe a speedup."""
+
+        rendered_reason = (
+            f"probe:{reason}" if is_probe else reason
+        )
+        reasons = getattr(self, "_tree_gate_decision_reasons", {})
+        reasons[rendered_reason] = int(reasons.get(rendered_reason, 0)) + 1
+        self._tree_gate_decision_reasons = reasons
+        if enabled:
+            self._tree_gate_enabled_decisions = int(
+                getattr(self, "_tree_gate_enabled_decisions", 0)
+            ) + 1
+            self._speculation_enabled_decisions = int(
+                getattr(self, "_speculation_enabled_decisions", 0)
+            ) + 1
+        else:
+            self._tree_gate_disabled_decisions = int(
+                getattr(self, "_tree_gate_disabled_decisions", 0)
+            ) + 1
+            self._speculation_disabled_decisions = int(
+                getattr(self, "_speculation_disabled_decisions", 0)
+            ) + 1
+        if is_probe:
+            self._tree_gate_probe_waves = int(
+                getattr(self, "_tree_gate_probe_waves", 0)
+            ) + 1
+            self._speculation_probe_waves = int(
+                getattr(self, "_speculation_probe_waves", 0)
+            ) + 1
+        decision_reasons = getattr(self, "_speculation_decision_reasons", {})
+        decision_reasons[rendered_reason] = (
+            int(decision_reasons.get(rendered_reason, 0)) + 1
+        )
+        self._speculation_decision_reasons = decision_reasons
+        if selected_depth > 0:
+            sizes = getattr(self, "_speculation_selected_sizes", {})
+            sizes[selected_depth] = int(sizes.get(selected_depth, 0)) + 1
+            self._speculation_selected_sizes = sizes
+
+    def _record_tree_measurement(
+        self,
+        job: _GenerationJob,
+        *,
+        accepted_tokens: int,
+    ) -> None:
+        """Feed one complete physical tree wave into its conservative gate."""
+
+        proposed = int(job.tree_proposed_tokens)
+        controller = getattr(self, "speculation_controller", None)
+        if proposed > 0 and controller is not None:
+            with self._speculation_lock:
+                profiled = self._speculation_controller_for_profile_locked(
+                    job.speculation_profile
+                )
+                profiled.record_verification(
+                    proposed_tokens=proposed,
+                    accepted_tokens=max(0, min(int(accepted_tokens), proposed)),
+                    latency_seconds=max(
+                        1e-9,
+                        time.perf_counter() - job.wave_started_at,
+                    ),
+                    transferred_bytes=(
+                        int(job.tree_outbound_bytes)
+                        + int(job.tree_inbound_bytes)
+                    ),
+                )
+            self._tree_gate_measured_waves = int(
+                getattr(self, "_tree_gate_measured_waves", 0)
+            ) + 1
+        job.tree_proposed_tokens = 0
+        job.tree_is_probe = False
+        job.tree_outbound_bytes = 0
+        job.tree_inbound_bytes = 0
 
     def _prepare_linear_or_classic_decode_wave(
         self,
@@ -3362,6 +4507,12 @@ class DistributedPipelineEngine:
         controller = self.speculation_controller
         proposal: MacroWaveProposal | None = None
         verify_base_tokens = 0
+        draft_latency_seconds = 0.0
+        measurement_started_at = (
+            job.next_decode_ready_at
+            if job.next_decode_ready_at > 0
+            else time.perf_counter()
+        )
         if provider is not None and controller is not None and remaining > 1:
             prompt_history = [
                 int(token)
@@ -3403,6 +4554,7 @@ class DistributedPipelineEngine:
                         self._speculation_selected_sizes.get(selected, 0) + 1
                     )
                 proposal = preparation.proposal
+                draft_latency_seconds = preparation.draft_latency_seconds
 
         job.verify_proposal = proposal
         if proposal is not None:
@@ -3419,6 +4571,25 @@ class DistributedPipelineEngine:
                 "prepared decode wave exceeds sealed_wave_tokens: "
                 f"{len(input_tokens)} > {sealed_wave_token_limit}"
             )
+        reserved_bytes = (
+            _prefill_frame_byte_reservation(
+                TensorCodec(self.config.codec),
+                len(input_tokens),
+                self.hidden_size,
+            )
+            if proposal is not None
+            else 0
+        )
+        byte_limit = _speculative_inflight_byte_limit(self.config)
+        if byte_limit > 0 and reserved_bytes > byte_limit:
+            if proposal is not None and proposal.tree.state is MacroWaveState.OPEN:
+                proposal.tree.rollback()
+            job.verify_proposal = None
+            job.verify_base_tokens = 0
+            raise RuntimeError(
+                f"request {job.wire_id} VERIFY wave reserves {reserved_bytes} bytes, "
+                f"exceeding speculative_inflight_bytes={byte_limit}"
+            )
         next_ids = torch.tensor([input_tokens], dtype=torch.long)
         next_step = job.next_step
         if next_step is None:
@@ -3430,6 +4601,14 @@ class DistributedPipelineEngine:
             input_ids=next_ids,
             frame_type=frame_type,
             step=next_step,
+            reserved_bytes=reserved_bytes,
+            draft_latency_seconds=draft_latency_seconds,
+            measurement_started_at=measurement_started_at,
+            verify_proposal=proposal,
+            verify_base_tokens=verify_base_tokens if proposal is not None else 0,
+            verify_seed_tokens=1 if proposal is not None else 0,
+            verify_input_tokens=tuple(input_tokens) if proposal is not None else (),
+            verify_generation=job.verify_generation,
         )
 
     def _prepare_classic_decode_wave(self, job: _GenerationJob) -> _PreparedRootWave:
@@ -3449,6 +4628,141 @@ class DistributedPipelineEngine:
             input_ids=torch.tensor([[job.token_ids[-1]]], dtype=torch.long),
             frame_type=FrameType.ACTIVATION,
             step=next_step,
+        )
+
+    def _prepare_speculative_continuation_wave(
+        self,
+        job: _GenerationJob,
+        runner: StageRunner,
+        *,
+        active_sequences: int,
+    ) -> _PreparedRootWave | None:
+        """Prepare one successor whose first draft is validated by a bridge.
+
+        The first VERIFY includes the exact pending seed. Every successor sends
+        only new provisional tokens: repeating a seed would duplicate it in KV.
+        Its missing first target is the previous wave's bonus, consumed later
+        as an explicit FIFO bridge in the return handler.
+        """
+
+        if (
+            job.wire_id is None
+            or not job.token_ids
+            or job.verify_collapse_pending
+            or self.draft_provider is None
+            or self.speculation_controller is None
+        ):
+            return None
+        current = tuple(
+            flight
+            for flight in job.inflight_waves
+            if flight.is_verify
+            and flight.verify_generation == job.verify_generation
+        )
+        if not current or len(current) != len(job.inflight_waves):
+            return None
+
+        prompt_history = tuple(
+            int(token) for token in job.request.input_ids.reshape(-1).tolist()
+        )
+        provisional = [*prompt_history, *job.token_ids]
+        pending_candidates = 0
+        for flight in current:
+            proposal = flight.verify_proposal
+            if proposal is None or not flight.verify_input_tokens:
+                raise RuntimeError("VERIFY conveyor flight lost its immutable proposal")
+            provisional.extend(
+                flight.verify_input_tokens[flight.verify_seed_tokens :]
+            )
+            pending_candidates += len(proposal.linear_tokens)
+
+        remaining_candidates = (
+            job.request.max_new_tokens
+            - len(job.token_ids)
+            - 1
+            - pending_candidates
+        )
+        if remaining_candidates < 1:
+            return None
+        verify_base_tokens = runner.sequence_length(job.wire_id)
+        if verify_base_tokens != len(provisional):
+            raise RuntimeError(
+                "VERIFY conveyor provisional history does not match root KV: "
+                f"{len(provisional)} != {verify_base_tokens}"
+            )
+        context_room = self.maximum_context - verify_base_tokens
+        maximum = min(
+            remaining_candidates,
+            context_room,
+            self.config.speculative_max_draft_tokens,
+            _sealed_wave_token_limit(self.config),
+        )
+        if maximum < 1:
+            return None
+
+        profile = _speculation_load_profile(active_sequences)
+        job.speculation_profile = profile
+        measurement_started_at = time.perf_counter()
+        with self._speculation_lock:
+            controller = self._speculation_controller_for_profile_locked(profile)
+            preparation = prepare_linear_macro_wave(
+                self.draft_provider,
+                controller,
+                provisional,
+                request_id=job.wire_id,
+                ordinal=(job.next_step if job.next_step is not None else job.step),
+                parent_kv_version=KVVersion(verify_base_tokens),
+                max_tokens=maximum,
+                allow_probe=self.config.speculation_probe,
+            )
+            decision = preparation.decision
+            reason = f"conveyor:{decision.reason}"
+            self._speculation_decision_reasons[reason] = (
+                self._speculation_decision_reasons.get(reason, 0) + 1
+            )
+            if decision.enabled:
+                self._speculation_enabled_decisions += 1
+            else:
+                self._speculation_disabled_decisions += 1
+            selected = len(preparation.selected_draft_tokens)
+            if preparation.is_probe:
+                self._speculation_probe_waves += 1
+            if selected > 0:
+                self._speculation_selected_sizes[selected] = (
+                    self._speculation_selected_sizes.get(selected, 0) + 1
+                )
+        proposal = preparation.proposal
+        if proposal is None:
+            return None
+        input_tokens = proposal.linear_tokens
+        reserved_bytes = _prefill_frame_byte_reservation(
+            TensorCodec(self.config.codec),
+            len(input_tokens),
+            self.hidden_size,
+        )
+        byte_limit = _speculative_inflight_byte_limit(self.config)
+        if byte_limit > 0 and reserved_bytes > byte_limit:
+            if proposal.tree.state is MacroWaveState.OPEN:
+                proposal.tree.rollback()
+            return None
+        next_step = job.next_step
+        if next_step is None:
+            if proposal.tree.state is MacroWaveState.OPEN:
+                proposal.tree.rollback()
+            raise RuntimeError("VERIFY conveyor lost its next outbound step")
+        return _PreparedRootWave(
+            job=job,
+            input_ids=torch.tensor([input_tokens], dtype=torch.long),
+            frame_type=FrameType.VERIFY,
+            step=next_step,
+            reserved_bytes=reserved_bytes,
+            draft_latency_seconds=preparation.draft_latency_seconds,
+            measurement_started_at=measurement_started_at,
+            verify_proposal=proposal,
+            verify_base_tokens=verify_base_tokens,
+            verify_seed_tokens=0,
+            verify_input_tokens=input_tokens,
+            verify_generation=job.verify_generation,
         )
 
     def _speculation_controller_for_profile_locked(
@@ -3656,6 +4970,18 @@ class DistributedPipelineEngine:
             job.verify_proposal = None
             job.verify_base_tokens = 0
         self._discard_inflight_waves(job)
+        release_draft = getattr(
+            getattr(self, "draft_provider", None),
+            "release_request",
+            None,
+        )
+        if callable(release_draft) and job.wire_id is not None:
+            try:
+                release_draft(job.wire_id)
+            except Exception:
+                # Draft acceleration is optional. Cleanup cannot replace an
+                # otherwise exact generation result with a pipeline failure.
+                pass
         if began and job.wire_id is not None:
             if not retained:
                 # A retained wire keeps its root KV; the session machinery owns
@@ -3738,9 +5064,45 @@ class DistributedPipelineEngine:
             self._prefill_current_chunks = current_chunks - len(prefill)
             self._prefill_current_bytes = current_bytes - released_bytes
             self._prefill_current_reserved_bytes = current_reserved - released_reserved
+        verifies = tuple(
+            wave
+            for wave in job.inflight_waves
+            if wave.is_verify and wave.verify_proposal is not None
+        )
+        if verifies:
+            released_bytes = sum(wave.outbound_bytes for wave in verifies)
+            released_reserved = sum(wave.reserved_bytes for wave in verifies)
+            current_waves = int(getattr(self, "_speculative_current_waves", 0))
+            current_bytes = int(getattr(self, "_speculative_current_bytes", 0))
+            current_reserved = int(
+                getattr(self, "_speculative_current_reserved_bytes", 0)
+            )
+            if (
+                job.verify_inflight_bytes < released_bytes
+                or job.verify_reserved_bytes < released_reserved
+                or current_waves < len(verifies)
+                or current_bytes < released_bytes
+                or current_reserved < released_reserved
+            ):
+                raise RuntimeError("VERIFY retirement telemetry underflow")
+            self._speculative_current_waves = current_waves - len(verifies)
+            self._speculative_current_bytes = current_bytes - released_bytes
+            self._speculative_current_reserved_bytes = (
+                current_reserved - released_reserved
+            )
+            for flight in verifies:
+                proposal = flight.verify_proposal
+                if proposal is not None and proposal.tree.state is MacroWaveState.OPEN:
+                    proposal.tree.rollback()
         job.inflight_waves.clear()
         job.prefill_inflight_bytes = 0
         job.prefill_reserved_bytes = 0
+        job.verify_inflight_bytes = 0
+        job.verify_reserved_bytes = 0
+        job.verify_bridge_targets.clear()
+        job.verify_collapse_pending = False
+        job.verify_deferred_finish_reason = None
+        job.inflight_head_started_at = 0.0
 
     def _check_pipeline_timeouts(self, active: dict[int, _GenerationJob]) -> None:
         pending_quote = getattr(self, "_pending_tree_reservation", None)
@@ -3859,7 +5221,12 @@ class DistributedPipelineEngine:
             job.request.client_id
             for job in active.values()
             if job.inflight_waves
-            and now - job.inflight_waves[0].sent_at
+            and now
+            - (
+                job.inflight_head_started_at
+                if job.inflight_head_started_at > 0
+                else job.inflight_waves[0].sent_at
+            )
             > self.config.socket_timeout_seconds
         ]
         if expired:
@@ -4155,15 +5522,109 @@ class DistributedPipelineEngine:
             step=wave.step,
             frame_type=wave.frame_type,
             prefill_end=wave.prefill_end,
-            started_at=started_at,
+            started_at=(
+                wave.measurement_started_at
+                if wave.measurement_started_at is not None
+                else max(0.0, started_at - wave.draft_latency_seconds)
+            ),
             sent_at=sent_at,
             outbound_bytes=outbound_bytes,
-            reserved_bytes=wave.reserved_bytes,
+            reserved_bytes=(
+                wave.reserved_bytes
+                or (
+                    _prefill_frame_byte_reservation(
+                        TensorCodec(self.config.codec),
+                        int(wave.input_ids.shape[1]),
+                        self.hidden_size,
+                    )
+                    if (
+                        wave.frame_type == FrameType.VERIFY
+                        and (wave.verify_proposal or job.verify_proposal) is not None
+                        and hasattr(self, "config")
+                        and hasattr(self, "hidden_size")
+                    )
+                    else 0
+                )
+            ),
+            verify_proposal=(
+                wave.verify_proposal
+                or (job.verify_proposal if wave.frame_type == FrameType.VERIFY else None)
+            ),
+            verify_base_tokens=(
+                wave.verify_base_tokens
+                or (
+                    job.verify_base_tokens
+                    if wave.frame_type == FrameType.VERIFY
+                    else 0
+                )
+            ),
+            verify_seed_tokens=wave.verify_seed_tokens,
+            verify_input_tokens=(
+                wave.verify_input_tokens
+                or (
+                    tuple(int(token) for token in wave.input_ids.reshape(-1).tolist())
+                    if wave.frame_type == FrameType.VERIFY
+                    else ()
+                )
+            ),
+            verify_generation=wave.verify_generation,
         )
+        was_empty = not job.inflight_waves
         job.inflight_waves.append(flight)
+        if was_empty:
+            job.inflight_head_started_at = sent_at
         job.next_step = wave.step + 1
         job.last_sent_at = sent_at
         job.last_outbound_bytes = outbound_bytes
+        if flight.is_verify and flight.verify_proposal is not None:
+            job.verify_inflight_bytes += outbound_bytes
+            job.verify_reserved_bytes += flight.reserved_bytes
+            self._speculative_current_waves = int(
+                getattr(self, "_speculative_current_waves", 0)
+            ) + 1
+            self._speculative_current_bytes = int(
+                getattr(self, "_speculative_current_bytes", 0)
+            ) + outbound_bytes
+            self._speculative_current_reserved_bytes = int(
+                getattr(self, "_speculative_current_reserved_bytes", 0)
+            ) + flight.reserved_bytes
+            self._speculative_high_water_waves = max(
+                int(getattr(self, "_speculative_high_water_waves", 0)),
+                self._speculative_current_waves,
+            )
+            self._speculative_high_water_bytes = max(
+                int(getattr(self, "_speculative_high_water_bytes", 0)),
+                self._speculative_current_bytes,
+            )
+            self._speculative_high_water_reserved_bytes = max(
+                int(getattr(self, "_speculative_high_water_reserved_bytes", 0)),
+                self._speculative_current_reserved_bytes,
+            )
+            request_waves = sum(
+                1 for current in job.inflight_waves if current.is_verify
+            )
+            self._speculative_max_request_waves = max(
+                int(getattr(self, "_speculative_max_request_waves", 0)),
+                request_waves,
+            )
+            self._speculative_max_request_bytes = max(
+                int(getattr(self, "_speculative_max_request_bytes", 0)),
+                job.verify_inflight_bytes,
+            )
+            self._speculative_max_request_reserved_bytes = max(
+                int(
+                    getattr(
+                        self,
+                        "_speculative_max_request_reserved_bytes",
+                        0,
+                    )
+                ),
+                job.verify_reserved_bytes,
+            )
+            self._speculative_dispatched_waves = int(
+                getattr(self, "_speculative_dispatched_waves", 0)
+            ) + 1
+            return
         if not flight.is_prefill:
             return
         if flight.prefill_end is None or flight.prefill_end <= job.prefill_offset:
@@ -4268,6 +5729,7 @@ class DistributedPipelineEngine:
         path_lengths = tuple(len(path) for path in ordered_paths)
         nonce = self._next_tree_quote_nonce()
         sent_at = time.perf_counter()
+        job.wave_started_at = sent_at
         pending = _PendingTreeReservation(
             prepared=prepared,
             nonce=nonce,
@@ -4281,7 +5743,7 @@ class DistributedPipelineEngine:
         self._physical_tree_quote_requests = int(
             getattr(self, "_physical_tree_quote_requests", 0)
         ) + 1
-        send_frame(
+        job.tree_outbound_bytes += send_frame(
             downstream,
             FrameType.TREE_PREPARE,
             parent_request_id,
@@ -4468,7 +5930,7 @@ class DistributedPipelineEngine:
                     self._physical_tree_live_children.remove(command.child_request_id)
                     runner.end(command.child_request_id)
                     raise RuntimeError("root FORK physical accounting report mismatch")
-            send_frame(
+            job.tree_outbound_bytes += send_frame(
                 downstream,
                 FrameType.FORK,
                 command.child_request_id,
@@ -4489,7 +5951,6 @@ class DistributedPipelineEngine:
             if command is None:
                 break
             verify_commands.append(command)
-        job.wave_started_at = time.perf_counter()
         self._dispatch_physical_tree_verifies(
             verify_commands,
             runner,
@@ -4509,6 +5970,12 @@ class DistributedPipelineEngine:
 
         if not commands:
             raise RuntimeError("physical tree has no VERIFY commands")
+        parent_request_id = self._leaf_routes.get(commands[0].request_id)
+        if parent_request_id is None:
+            raise RuntimeError("physical tree VERIFY lost its parent route")
+        parent_job = self._callback_routes.get(parent_request_id)
+        if parent_job is None:
+            raise RuntimeError("physical tree VERIFY lost its parent job")
         self._root_ready_items += len(commands)
         manifest = getattr(runner, "executor_manifest", None)
         features = tuple(getattr(manifest, "features", ()))
@@ -4628,7 +6095,7 @@ class DistributedPipelineEngine:
                         raise RuntimeError(
                             "root physical tree output has an incompatible shape"
                         )
-                    self._send_activation(
+                    parent_job.tree_outbound_bytes += self._send_activation(
                         downstream,
                         emulator,
                         command.request_id,
@@ -4650,9 +6117,6 @@ class DistributedPipelineEngine:
 
         if last_verify_sent_at is None:
             raise RuntimeError("physical tree sent no VERIFY frame")
-        parent_request_id = self._leaf_routes.get(commands[0].request_id)
-        if parent_request_id is None:
-            raise RuntimeError("physical tree VERIFY lost its parent route")
         # FORK cloning and root compute have their own fatal execution path;
         # they must not consume a leaf's return budget. Protocol v4 exposes one
         # wave deadline, so arm it after the last VERIFY is physically written.
@@ -4901,6 +6365,30 @@ class DistributedPipelineEngine:
                     next_step = wave.job.next_step
                     if next_step is None or wave.step != next_step:
                         raise RuntimeError("prepared root wave has a stale outbound step")
+                    if wave.frame_type == FrameType.VERIFY:
+                        proposal = wave.verify_proposal or wave.job.verify_proposal
+                        if proposal is None:
+                            raise RuntimeError(
+                                "prepared VERIFY wave has no immutable proposal"
+                            )
+                        reservation = wave.reserved_bytes or (
+                            _prefill_frame_byte_reservation(
+                                TensorCodec(self.config.codec),
+                                int(wave.input_ids.shape[1]),
+                                self.hidden_size,
+                            )
+                        )
+                        byte_limit = _speculative_inflight_byte_limit(self.config)
+                        if (
+                            byte_limit > 0
+                            and wave.job.verify_reserved_bytes + reservation
+                            > byte_limit
+                        ):
+                            raise RuntimeError(
+                                f"request {wave.job.wire_id} VERIFY credit would "
+                                "exceed speculative_inflight_bytes before root "
+                                "KV mutation"
+                            )
                 if len(chunk) > 1:
                     if not callable(batch_forward):
                         raise TypeError("root batch key exists without forward_ids_batch")
@@ -4934,14 +6422,6 @@ class DistributedPipelineEngine:
                     if not isinstance(hidden, torch.Tensor):
                         raise TypeError("root stage output must be a tensor")
                     job = wave.job
-                    if wave.prefill_end is not None:
-                        # Prompt tokens are the served sequence by definition.
-                        job.kv_valid += wave.prefill_end - job.prefill_offset
-                    else:
-                        # A decode wave re-forwards the last emitted token, which
-                        # always matches the served sequence; any draft position
-                        # after it becomes valid only once verification accepts it.
-                        job.kv_valid += 1
                     outbound_bytes = self._send_activation(
                         downstream,
                         emulator,

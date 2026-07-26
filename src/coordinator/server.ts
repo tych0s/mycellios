@@ -2,13 +2,26 @@ import websocket from "@fastify/websocket";
 import staticFiles from "@fastify/static";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { createHash, timingSafeEqual } from "node:crypto";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { resolve } from "node:path";
+import {
+  createReadStream,
+  existsSync,
+  lstatSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+} from "node:fs";
+import { dirname, resolve, sep } from "node:path";
 import { z, ZodError } from "zod";
+import {
+  StableBenchmarkActivationTracker,
+  type BenchmarkActivation,
+} from "../benchlab/activation-tracker.js";
 import { loadBenchmarkRuns } from "../benchlab/history.js";
 import {
+  buildCoordinatorBenchmarkTelemetrySnapshot,
   buildCoordinatorBenchmarkInventory,
-  detectNewActiveModels,
+  coordinatorBenchmarkActivations,
+  coordinatorBenchmarkModelIdentity,
   runAndPersistCoordinatorSuite,
   type CoordinatorBenchmarkModel,
 } from "../benchlab/coordinator-suite.js";
@@ -16,8 +29,27 @@ import {
   chatCompletionRequestSchema,
   workerRegistrationSchema,
 } from "../contracts/schemas.js";
+import {
+  WORKER_PROTOCOL_MAX,
+  WORKER_PROTOCOL_MIN,
+  workerAdmissionChallengeRequestSchema,
+  workerAdmissionIdentitySchema,
+  workerCredentialRotationChallengeRequestSchema,
+  workerCredentialRotationProofSchema,
+} from "../contracts/worker-admission.js";
+import {
+  type NativeBuildIdentity,
+} from "../contracts/build-identity.js";
 import type { ChatCompletionRequest } from "../contracts/types.js";
-import type { CoordinatorConfig } from "../core/config.js";
+import {
+  assertCoordinatorNetworkSecurity,
+  type CoordinatorConfig,
+} from "../core/config.js";
+import {
+  readNativeRuntimeBuildMetadata,
+  type NativeRuntimeBuildMetadata,
+} from "../core/native-build-identity.js";
+import { workerRegistrationDigest } from "../core/worker-admission-digest.js";
 import { Scheduler } from "../scheduler/scheduler.js";
 import { MeshDatabase } from "../storage/database.js";
 import {
@@ -35,7 +67,10 @@ import {
 } from "../support/assistant.js";
 import { MeshService, MeshServiceError, type JobStreamEvent } from "./mesh-service.js";
 import { MobileComputeHub, type MobileWorkerSnapshot } from "./mobile-compute-hub.js";
-import { verifyGitHubReleaseUploadToken } from "./github-oidc.js";
+import {
+  verifyGitHubReleaseUploadToken,
+  type GitHubReleaseClaims,
+} from "./github-oidc.js";
 import type { ModelActivationManager } from "./model-activation-manager.js";
 import {
   inspectHubModelCapacity,
@@ -45,8 +80,11 @@ import {
   type ModelActivationProgressEvent,
 } from "./model-catalog.js";
 import {
+  MAX_RELEASE_CHUNK_SIZE_BYTES,
+  NativeReleaseTransactionStore,
   parseReleaseChunkMetadata,
-  storeReleaseChunk,
+  parseReleaseTransactionIdentity,
+  validateReleaseAssetName,
   type ReleaseAssetChannel,
 } from "./release-upload.js";
 import { WorkerHub } from "./worker-hub.js";
@@ -59,6 +97,16 @@ import {
   registerContentHubRoutes,
 } from "./content-hub.js";
 import { SupabaseAuthService } from "./supabase-auth.js";
+import {
+  DeploymentControlPlane,
+  type DeploymentOperation,
+} from "./deployment-control-plane.js";
+import { stripWorkerDeclaredEvidence } from "./evidence-authority.js";
+import {
+  activationFailureIsTransient,
+  classifyActivationIncident,
+  type ActivationIncident,
+} from "./activation-incident.js";
 import type { AuthenticatedNetworkUser } from "./supabase-auth.js";
 import {
   API_KEY_PREFIX,
@@ -69,20 +117,15 @@ import {
   apiUsageJson,
   type ApiKeyPrincipal,
 } from "./api-access.js";
+import {
+  WorkerAdmissionAuthority,
+  WorkerAdmissionError,
+  admissionCredentialSummary,
+  selectWorkerProtocolVersion,
+} from "./worker-admission.js";
 
 export function automaticActivationFailureIsTransient(message: string): boolean {
-  const normalized = message.toLowerCase();
-  if (normalized.startsWith("automatic_activation_retries_exhausted:")) return false;
-  return [
-    "distributed_worker_disconnected:",
-    "distributed_worker_not_connected:",
-    "managed_launch_agent_is_unavailable:",
-    "worker_tunnel_prepare_timeout",
-    "gpu_only_runtime_not_ready",
-    "gpu_model_stage_unavailable_after_retries:",
-    "launch_readiness_timeout:",
-    "coordinator_worker_registration_timeout",
-  ].some((marker) => normalized.includes(marker));
+  return activationFailureIsTransient(message);
 }
 
 export const DEFAULT_AUTOMATIC_ACTIVATION_RETRY_DELAYS_MS = [
@@ -138,12 +181,14 @@ export interface CoordinatorRuntime {
   service: MeshService;
   apiAccess: ApiAccessManager;
   persistence: SupabasePersistence | null;
+  deploymentController: DeploymentControlPlane;
   close(): Promise<void>;
 }
 
 export interface CoordinatorActivationContext {
   store: MeshStore;
   hub: WorkerHub;
+  deploymentController: DeploymentControlPlane;
 }
 
 export async function createCoordinator(
@@ -152,12 +197,33 @@ export async function createCoordinator(
     logger?: boolean;
     activationManager?: ModelActivationManager;
     activationManagerFactory?: (context: CoordinatorActivationContext) => ModelActivationManager;
-    releaseTokenVerifier?: (token: string) => Promise<unknown>;
+    releaseTokenVerifier?: (token: string) => Promise<GitHubReleaseClaims>;
     mobileDisconnectedRetentionMs?: number;
     automaticActivationRetryDelaysMs?: readonly number[];
+    buildIdentity?: NativeBuildIdentity | null;
+    runtimeMetadata?: NativeRuntimeBuildMetadata;
+    benchmarkStorageRoot?: string;
+    releaseTransactionRoot?: string;
+    releaseChunkBodyLimitBytes?: number;
     supabaseAuthService?: SupabaseAuthService;
   } = {},
 ): Promise<CoordinatorRuntime> {
+  assertCoordinatorNetworkSecurity(config);
+  const runtimeMetadata = options.runtimeMetadata
+    ?? readNativeRuntimeBuildMetadata(resolve(import.meta.dirname, "../.."));
+  const coordinatorBuildIdentity = options.buildIdentity === undefined
+    ? runtimeMetadata.buildIdentity
+    : options.buildIdentity;
+  if (
+    coordinatorBuildIdentity
+    && coordinatorBuildIdentity.version !== runtimeMetadata.version
+  ) {
+    throw new Error(
+      `coordinator_build_version_mismatch:${coordinatorBuildIdentity.version}:${runtimeMetadata.version}`,
+    );
+  }
+  const runtimeVersion = runtimeMetadata.version;
+  const runtimeRevision = runtimeMetadata.revision;
   const app = Fastify({ logger: options.logger ?? false, bodyLimit: 2 * 1024 * 1024 });
   const apiAccessEnabled = config.apiAccessEnabled ?? false;
   app.addHook("onRequest", async (request, reply) => {
@@ -225,7 +291,7 @@ export async function createCoordinator(
   const supabaseAuth = options.supabaseAuthService ?? (config.supabaseUrl && config.supabaseServiceRoleKey
     ? new SupabaseAuthService(config.supabaseUrl, config.supabaseServiceRoleKey)
     : null);
-  const authorizeModelMutation = async (
+  const authorizeAdministrativeMutation = async (
     request: FastifyRequest,
     reply: FastifyReply,
   ): Promise<boolean> => {
@@ -248,7 +314,7 @@ export async function createCoordinator(
           void reply.code(403).send({
             error: {
               code: "insufficient_network_role",
-              message: "Your Mycellios account does not have permission to change shared models.",
+              message: "Your Mycellios account does not have permission to administer the shared network.",
             },
           });
           return false;
@@ -264,7 +330,7 @@ export async function createCoordinator(
       void reply.code(503).send({
         error: {
           code: "model_administration_not_configured",
-          message: "Remote model administration requires Supabase Auth or MYCELLIOS_MODEL_ADMIN_TOKEN.",
+          message: "Remote network administration requires Supabase Auth or MYCELLIOS_MODEL_ADMIN_TOKEN.",
         },
       });
       return false;
@@ -283,6 +349,7 @@ export async function createCoordinator(
     (_request, body, done) => done(null, body),
   );
   const database = new MeshDatabase(config.databasePath);
+  const workerAdmission = new WorkerAdmissionAuthority(database);
   const apiAccess = new ApiAccessManager(database, {
     starterTokens: config.apiStarterTokens ?? 25_000,
     requestsPerMinute: config.apiRequestsPerMinute ?? 30,
@@ -375,9 +442,13 @@ export async function createCoordinator(
       })
     : null;
   await persistence?.initialize();
-  const scheduler = new Scheduler(store);
+  const deploymentController = new DeploymentControlPlane(store);
+  deploymentController.initialize();
   await app.register(websocket, { options: { maxPayload: 10 * 1024 * 1024 } });
-  const mobileAssetsPath = resolveMobileAssetsPath(config.mobileAssetsPath);
+  const mobileAssetsPath = resolveMobileAssetsPath(
+    config.mobileAssetsPath,
+    runtimeMetadata.root,
+  );
   if (mobileAssetsPath) {
     await app.register(staticFiles, {
       root: mobileAssetsPath,
@@ -389,40 +460,92 @@ export async function createCoordinator(
     });
     app.get("/mobile", async (_request, reply) => reply.redirect("/mobile/"));
   }
-  const desktopUpdatesPath = resolveDesktopUpdatesPath(config.desktopUpdatesPath);
+  const desktopUpdatesPath = resolveDesktopUpdatesPath(
+    config.desktopUpdatesPath,
+    runtimeMetadata.root,
+  );
   const releaseDownloadsPath = resolveReleaseDownloadsPath(
     config.releaseDownloadsPath,
     config.landingAssetsPath,
+    runtimeMetadata.root,
   );
-  const publicAssetVersion = readPackageVersion();
-  if (desktopUpdatesPath) {
-    await app.register(staticFiles, {
-      root: desktopUpdatesPath,
-      prefix: "/updates/win32/x64/",
-      decorateReply: false,
-      cacheControl: false,
-      setHeaders: setPublicAssetCacheHeaders,
-    });
-    app.get("/downloads/windows", async (_request, reply) => {
-      reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
-      return reply.redirect(`/updates/win32/x64/mycellios-setup.exe?v=${publicAssetVersion}`);
-    });
-  }
-  if (releaseDownloadsPath) {
-    await app.register(staticFiles, {
-      root: releaseDownloadsPath,
-      prefix: "/downloads/",
-      decorateReply: false,
-      cacheControl: false,
-      setHeaders: setPublicAssetCacheHeaders,
-    });
-  }
+  const publicAssetVersion = runtimeVersion;
+  const uploadUpdatesRoot = releaseAssetRoot(
+    "updates",
+    config.desktopUpdatesPath,
+    config.releaseDownloadsPath,
+    config.landingAssetsPath,
+    runtimeMetadata.root,
+  );
+  const uploadDownloadsRoot = releaseAssetRoot(
+    "downloads",
+    config.desktopUpdatesPath,
+    config.releaseDownloadsPath,
+    config.landingAssetsPath,
+    runtimeMetadata.root,
+  );
+  const releaseTransactions = coordinatorBuildIdentity && runtimeRevision
+    ? new NativeReleaseTransactionStore({
+      storageRoot: options.releaseTransactionRoot
+        ?? releaseTransactionStorageRoot(
+          uploadUpdatesRoot,
+          uploadDownloadsRoot,
+          runtimeMetadata.root,
+        ),
+      legacyUpdatesRoot: desktopUpdatesPath,
+      legacyDownloadsRoot: releaseDownloadsPath,
+      sourceId: coordinatorBuildIdentity.sourceId,
+      revision: runtimeRevision,
+      version: runtimeVersion,
+    })
+    : null;
+  await releaseTransactions?.initialize();
+  app.get("/updates/win32/x64/:fileName", async (request, reply) => {
+    const { fileName } = z.object({
+      fileName: z.string().min(1).max(160),
+    }).parse(request.params);
+    return serveReleaseAsset(
+      request,
+      reply,
+      await releasePublicAssetPath(
+        releaseTransactions,
+        "updates",
+        fileName,
+        desktopUpdatesPath,
+      ),
+    );
+  });
+  app.get("/downloads/:fileName", async (request, reply) => {
+    const { fileName } = z.object({
+      fileName: z.string().min(1).max(160),
+    }).parse(request.params);
+    return serveReleaseAsset(
+      request,
+      reply,
+      await releasePublicAssetPath(
+        releaseTransactions,
+        "downloads",
+        fileName,
+        releaseDownloadsPath,
+      ),
+    );
+  });
+  app.get("/downloads/windows", async (_request, reply) => {
+    reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
+    return reply.redirect(`/updates/win32/x64/mycellios-setup.exe?v=${publicAssetVersion}`);
+  });
   const hub = new WorkerHub(store);
   hub.attach(app);
+  const scheduler = new Scheduler(store, {
+    runtimeLinkObservations: () => hub.runtimeLinkObservations(),
+    strictRuntimeLinks: true,
+  });
   const mobileHub = new MobileComputeHub({
     joinToken: config.mobileJoinToken,
     expertArtifactsPath: config.mobileExpertArtifactsPath,
     disconnectedRetentionMs: options.mobileDisconnectedRetentionMs,
+    admissionAuthority: workerAdmission,
+    isTrustedLocalRequest,
     ...(persistence
       ? { onArtifactStored: (artifact: Parameters<SupabasePersistence["registerArtifactBackup"]>[0]) =>
           persistence.registerArtifactBackup(artifact) }
@@ -434,30 +557,48 @@ export async function createCoordinator(
   }
   const service = new MeshService(store, scheduler, hub, config.requestTimeoutMs);
   const supportAssistantRateLimits = new Map<string, SupportAssistantRateState>();
+  const publicCatalogRateLimits = new Map<string, PublicCatalogRateState>();
   let activeSupportAssistantRequests = 0;
-  const activationManager = options.activationManager ?? options.activationManagerFactory?.({ store, hub });
+  let activePublicCatalogRequests = 0;
+  const activationManager = options.activationManager ?? options.activationManagerFactory?.({
+    store,
+    hub,
+    deploymentController,
+  });
   await activationManager?.initialize();
-  const benchmarkWorkspace = process.cwd();
-  const benchmarkStorageRoot = process.env.MYCELLIOS_BENCHMARK_ROOT?.trim();
-  const benchmarkHistoryDirectory = benchmarkStorageRoot
-    ? resolve(benchmarkStorageRoot, "history")
-    : undefined;
+  const benchmarkWorkspace = runtimeMetadata.root;
+  const benchmarkStorageRoot =
+    options.benchmarkStorageRoot?.trim()
+    || process.env.MYCELLIOS_BENCHMARK_ROOT?.trim()
+    || resolve(runtimeMetadata.root, "benchmarks");
+  const benchmarkHistoryDirectory = resolve(benchmarkStorageRoot, "history");
   for (const run of loadBenchmarkRuns(benchmarkWorkspace, benchmarkHistoryDirectory)) {
     store.queueBenchmarkRun(run);
   }
   void persistence?.flush();
   type PersistedBenchmark = Awaited<ReturnType<typeof runAndPersistCoordinatorSuite>>;
+  interface QueuedAutomaticBenchmark {
+    model: CoordinatorBenchmarkModel;
+    activation: BenchmarkActivation;
+  }
   let benchmarkRunInFlight: Promise<PersistedBenchmark> | null = null;
-  const automaticBenchmarkQueue: CoordinatorBenchmarkModel[] = [];
-  const queuedAutomaticBenchmarkModels = new Set<string>();
-  const observedActiveBenchmarkModels = new Set<string>();
+  const automaticBenchmarkQueue: QueuedAutomaticBenchmark[] = [];
+  const queuedAutomaticBenchmarkActivations = new Set<string>();
+  const benchmarkActivationTracker = new StableBenchmarkActivationTracker(3, 12_000);
+  const automaticBenchmarkRetryAttempts = new Map<string, number>();
+  const automaticBenchmarkRetryTimers = new Set<NodeJS.Timeout>();
   const benchmarkTargetForModel = (modelId: string): CoordinatorBenchmarkModel => {
     const requested = store.getRequestedModel(modelId);
-    return {
-      id: modelId,
-      source: requested?.source ?? modelId,
-      revision: requested?.revision ?? null,
-    };
+    const connectedWorkerIds = hub.connectedWorkerIds();
+    return coordinatorBenchmarkModelIdentity(
+      {
+        id: modelId,
+        source: requested?.source ?? modelId,
+        revision: requested?.revision ?? null,
+      },
+      store.listWorkers(),
+      connectedWorkerIds,
+    );
   };
   const benchmarkableActiveModelIds = (): string[] => {
     const connectedWorkerIds = hub.connectedWorkerIds();
@@ -465,7 +606,7 @@ export async function createCoordinator(
       store.listWorkers()
         .filter((worker) => connectedWorkerIds.has(worker.id))
         .flatMap((worker) => worker.capabilities.deployments)
-        .filter((deployment) => deployment.adapter !== "mock")
+        .filter((deployment) => deployment.adapter === "mycellios-pipeline")
         .map((deployment) => deployment.model),
     );
     return scheduler
@@ -473,10 +614,20 @@ export async function createCoordinator(
       .map((model) => model.id)
       .filter((modelId) => realDeploymentModels.has(modelId));
   };
+  const currentBenchmarkActivations = (): BenchmarkActivation[] =>
+    coordinatorBenchmarkActivations(
+      new Set(benchmarkableActiveModelIds()),
+      store.listWorkers(),
+      hub.connectedWorkerIds(),
+      coordinatorBuildIdentity,
+    );
   const startCoordinatorBenchmark = (
     model: CoordinatorBenchmarkModel,
     trigger: "automatic-model-start" | "manual",
-    metadata: { label?: string; version?: string } = {},
+    metadata: {
+      label?: string;
+      activation?: BenchmarkActivation;
+    } = {},
   ): Promise<PersistedBenchmark> => runAndPersistCoordinatorSuite({
     cwd: benchmarkWorkspace,
     ...(benchmarkHistoryDirectory ? { historyDirectory: benchmarkHistoryDirectory } : {}),
@@ -488,10 +639,43 @@ export async function createCoordinator(
       hub.connectedWorkerIds(),
       routedWorkerIds,
     ),
+    telemetrySnapshot: () => buildCoordinatorBenchmarkTelemetrySnapshot(
+      store.listWorkers(),
+      hub.connectedWorkerIds(),
+    ),
     resolveWorkerId: (jobId) => store.getJob(jobId)?.workerId ?? null,
     ...(config.networkToken ? { networkToken: config.networkToken } : {}),
+    buildIdentity: coordinatorBuildIdentity,
     ...(metadata.label ? { label: metadata.label } : {}),
-    ...(metadata.version ? { version: metadata.version } : {}),
+    version: runtimeVersion,
+    ...(metadata.activation ? { activation: metadata.activation } : {}),
+    ...(metadata.activation
+      ? {
+          validateActivation: (
+            activation: BenchmarkActivation,
+            routedWorkerIds: ReadonlySet<string>,
+          ) => {
+            const current = currentBenchmarkActivations().find(
+              (candidate) => candidate.activationId === activation.activationId,
+            );
+            if (!current) {
+              throw new Error(
+                `benchmark_activation_drifted:${activation.activationId}`,
+              );
+            }
+            const currentParticipantIds = new Set(
+              current.participants.map((participant) => participant.workerId),
+            );
+            for (const workerId of routedWorkerIds) {
+              if (!currentParticipantIds.has(workerId)) {
+                throw new Error(
+                  `benchmark_routed_worker_drifted:${workerId}:${activation.activationId}`,
+                );
+              }
+            }
+          },
+        }
+      : {}),
     trigger,
   }).then((result) => {
     store.queueBenchmarkRun(result.run);
@@ -500,34 +684,75 @@ export async function createCoordinator(
   });
   const drainAutomaticBenchmarkQueue = (): void => {
     if (benchmarkRunInFlight) return;
-    const model = automaticBenchmarkQueue.shift();
-    if (!model) return;
-    benchmarkRunInFlight = startCoordinatorBenchmark(model, "automatic-model-start");
+    const queued = automaticBenchmarkQueue.shift();
+    if (!queued) return;
+    const { model, activation } = queued;
+    benchmarkRunInFlight = startCoordinatorBenchmark(
+      model,
+      "automatic-model-start",
+      { activation },
+    );
     void benchmarkRunInFlight
       .then(({ run }) => {
         app.log.info(
           { modelId: model.id, benchmarkRunId: run.runId, status: run.status },
           "automatic model-start benchmark saved",
         );
+        if (run.status === "failed") {
+          scheduleAutomaticBenchmarkRetry(queued);
+        } else {
+          automaticBenchmarkRetryAttempts.delete(activation.activationId);
+        }
       })
       .catch((error: unknown) => {
         app.log.error(
           { modelId: model.id, error: error instanceof Error ? error.message : String(error) },
           "automatic model-start benchmark could not be saved",
         );
+        scheduleAutomaticBenchmarkRetry(queued);
       })
       .finally(() => {
-        queuedAutomaticBenchmarkModels.delete(model.id);
+        queuedAutomaticBenchmarkActivations.delete(activation.activationId);
         benchmarkRunInFlight = null;
         drainAutomaticBenchmarkQueue();
       });
   };
-  const queueAutomaticBenchmark = (modelId: string): void => {
-    if (queuedAutomaticBenchmarkModels.has(modelId)) return;
-    queuedAutomaticBenchmarkModels.add(modelId);
-    automaticBenchmarkQueue.push(benchmarkTargetForModel(modelId));
+  const queueAutomaticBenchmark = (activation: BenchmarkActivation): void => {
+    if (queuedAutomaticBenchmarkActivations.has(activation.activationId)) return;
+    const model = benchmarkTargetForModel(activation.modelId);
+    if (model.digest !== activation.modelDigest) {
+      app.log.warn(
+        {
+          modelId: activation.modelId,
+          activationId: activation.activationId,
+          observedDigest: model.digest,
+          activationDigest: activation.modelDigest,
+        },
+        "automatic benchmark skipped because model identity changed before queueing",
+      );
+      return;
+    }
+    queuedAutomaticBenchmarkActivations.add(activation.activationId);
+    automaticBenchmarkQueue.push({ model, activation });
     drainAutomaticBenchmarkQueue();
   };
+  function scheduleAutomaticBenchmarkRetry(queued: QueuedAutomaticBenchmark): void {
+    const attempts = automaticBenchmarkRetryAttempts.get(
+      queued.activation.activationId,
+    ) ?? 0;
+    if (attempts >= 2) return;
+    automaticBenchmarkRetryAttempts.set(queued.activation.activationId, attempts + 1);
+    const delayMs = attempts === 0 ? 30_000 : 120_000;
+    const timer = setTimeout(() => {
+      automaticBenchmarkRetryTimers.delete(timer);
+      const current = currentBenchmarkActivations().find(
+        (activation) => activation.activationId === queued.activation.activationId,
+      );
+      if (current) queueAutomaticBenchmark(current);
+    }, delayMs);
+    timer.unref();
+    automaticBenchmarkRetryTimers.add(timer);
+  }
   const automaticRepairState = new Map<string, { attempts: number; nextAttemptAt: number }>();
   const automaticRepairInFlight = new Set<string>();
   const inferenceRouteFailures = new Map<string, { count: number; lastAt: number }>();
@@ -535,7 +760,20 @@ export async function createCoordinator(
     options.automaticActivationRetryDelaysMs
     ?? DEFAULT_AUTOMATIC_ACTIVATION_RETRY_DELAYS_MS
   ).map((delay) => Math.max(0, Math.round(delay)));
-  const automaticActivationRetryState = new Map<string, AutomaticActivationRetryState>();
+  const automaticActivationRetryState = new Map<string, AutomaticActivationRetryState>(
+    deploymentController.listStates()
+      .filter((state) => state.nextRetryAt !== null && state.lastError !== null)
+      .map((state) => [
+        state.modelId,
+        {
+          retryCount: Math.max(0, state.retryCount - 1),
+          nextAttemptAt: state.nextRetryAt!,
+          lastError: state.lastError!,
+          updatedAt: state.updatedAt,
+          launching: false,
+        },
+      ]),
+  );
   const automaticActivationRetryProgressForModel = (
     modelId: string,
   ): readonly ModelActivationProgressEvent[] => {
@@ -583,15 +821,43 @@ export async function createCoordinator(
       ? `A node disconnected during startup. Automatic retry ${retryNumber} of ${automaticActivationRetryDelaysMs.length} starts in ${secondsRemaining}s.`
       : `Automatic retry ${retryNumber} of ${automaticActivationRetryDelaysMs.length} is ready and waiting for healthy capacity and a free activation slot.`;
   };
+  const activationIncidentForModel = (
+    modelId: string,
+  ): ActivationIncident | null => {
+    const retry = automaticActivationRetryState.get(modelId);
+    const stored = store.getRequestedModel(modelId);
+    const message = retry?.lastError ?? stored?.activationError;
+    if (!message) return null;
+    return classifyActivationIncident({
+      message,
+      ...(retry
+        ? {
+            retryCount: retry.retryCount,
+            retryLaunching: retry.launching,
+          }
+        : {}),
+      nextRetryAt: retry?.nextAttemptAt ?? null,
+      maximumAttempts: automaticActivationRetryDelaysMs.length,
+    });
+  };
   const handleRequestedModelActivationFailure = (
     modelId: string,
     error: unknown,
+    operation: DeploymentOperation | null = deploymentController.activeOperationForModel(modelId),
   ): void => {
     if (!store.getRequestedModel(modelId)) return;
     const message = error instanceof Error ? error.message : String(error);
     if (!automaticActivationFailureIsTransient(message)) {
       automaticActivationRetryState.delete(modelId);
       store.setRequestedModelActivationError(modelId, message);
+      if (operation) {
+        deploymentController.failOperation(
+          operation.id,
+          "activation_failed",
+          message,
+          { retryAt: null },
+        );
+      }
       return;
     }
     const previous = automaticActivationRetryState.get(modelId);
@@ -606,30 +872,60 @@ export async function createCoordinator(
     );
     if (!nextRetry) {
       automaticActivationRetryState.delete(modelId);
-      store.setRequestedModelActivationError(
-        modelId,
-        `automatic_activation_retries_exhausted:${retriesStarted}:${message}`,
-      );
+      const exhausted = `automatic_activation_retries_exhausted:${retriesStarted}:${message}`;
+      store.setRequestedModelActivationError(modelId, exhausted);
+      if (operation) {
+        deploymentController.failOperation(
+          operation.id,
+          "activation_retries_exhausted",
+          exhausted,
+          { retryAt: null },
+        );
+      }
       return;
     }
     automaticActivationRetryState.set(modelId, nextRetry);
     store.setRequestedModelActivation(modelId, false);
+    if (operation) {
+      deploymentController.failOperation(
+        operation.id,
+        "transient_activation_failure",
+        message,
+        { retryAt: nextRetry.nextAttemptAt },
+      );
+    }
   };
   const launchRequestedModel = (model: StoredRequestedModel): boolean => {
     if (!activationManager || activationManager.isManaging(model.id) || activationManager.isBusy()) {
       return false;
     }
+    deploymentController.ensureModel(model);
+    deploymentController.setDesiredState(
+      model.id,
+      model.autoActivate ? "active" : "inactive",
+    );
+    const state = deploymentController.getState(model.id);
+    const operation = deploymentController.claimOperation(
+      model.id,
+      state?.observedState === "active" || state?.observedState === "degraded"
+        ? "repair"
+        : "activate",
+      { leaseMs: 90_000 },
+    );
+    if (!operation) return false;
     try {
       void activationManager.activate(model)
         .then(() => {
-          automaticActivationRetryState.delete(model.id);
+          if (deploymentController.getState(model.id)?.observedState === "active") {
+            automaticActivationRetryState.delete(model.id);
+          }
         })
         .catch((error: unknown) => {
-          handleRequestedModelActivationFailure(model.id, error);
+          handleRequestedModelActivationFailure(model.id, error, operation);
         });
       return true;
     } catch (error) {
-      handleRequestedModelActivationFailure(model.id, error);
+      handleRequestedModelActivationFailure(model.id, error, operation);
       return true;
     }
   };
@@ -666,6 +962,8 @@ export async function createCoordinator(
       // health check and real inference canary before publishing it again.
       const stopped = await activationManager.deactivate(model.id);
       if (!stopped) return;
+      deploymentController.releaseRoutesForModel(model.id);
+      deploymentController.adoptObservedState(model.id, "degraded");
       const latest = store.getRequestedModel(model.id);
       if (!latest?.autoActivate) return;
       store.setRequestedModelActivation(model.id, true);
@@ -689,6 +987,8 @@ export async function createCoordinator(
       app.log.warn({ modelId, reason }, "rebuilding an unresponsive distributed model route");
       const stopped = await activationManager.deactivate(modelId);
       if (!stopped) return;
+      deploymentController.releaseRoutesForModel(modelId);
+      deploymentController.adoptObservedState(modelId, "degraded");
       const latest = store.getRequestedModel(modelId);
       if (!latest?.autoActivate) return;
       store.setRequestedModelActivation(modelId, true);
@@ -718,6 +1018,7 @@ export async function createCoordinator(
   const reconcileRequestedModels = () => {
     const workers = store.listWorkers();
     const connectedWorkerIds = hub.connectedWorkerIds();
+    const now = Date.now();
     const activeModelIds = new Set(
       scheduler
         .listAvailableModels({ connectedWorkerIds })
@@ -727,11 +1028,27 @@ export async function createCoordinator(
     const benchmarkableModelIds = new Set(
       [...activeModelIds].filter((modelId) => benchmarkableRoutes.has(modelId)),
     );
-    for (const modelId of detectNewActiveModels(benchmarkableModelIds, observedActiveBenchmarkModels)) {
-      queueAutomaticBenchmark(modelId);
+    const activations = coordinatorBenchmarkActivations(
+      benchmarkableModelIds,
+      workers,
+      connectedWorkerIds,
+    );
+    for (const activation of benchmarkActivationTracker.observe(activations, now)) {
+      queueAutomaticBenchmark(activation);
     }
     let requests = store.listRequestedModels();
-    const now = Date.now();
+    for (const request of requests) {
+      deploymentController.ensureModel(request, now);
+      deploymentController.setDesiredState(
+        request.id,
+        request.autoActivate ? "active" : "inactive",
+        now,
+      );
+      const operation = deploymentController.activeOperationForModel(request.id);
+      if (operation && activationManager?.isManaging(request.id)) {
+        deploymentController.renewOperation(operation.id, 90_000, now);
+      }
+    }
     for (const request of requests) {
       if (
         request.autoActivate
@@ -765,12 +1082,30 @@ export async function createCoordinator(
             activationStatusMessageForModel,
           }
         : {}),
+      activationIncidentForModel,
       activationAvailable: activationManager !== undefined,
     });
     for (const view of views) {
       const stored = requests.find((request) => request.id === view.id)!;
       if (view.status === "active") {
         automaticActivationRetryState.delete(view.id);
+        const operation = deploymentController.activeOperationForModel(view.id);
+        if (operation) {
+          deploymentController.completeOperation(
+            operation.id,
+            "active",
+            { publication: "scheduler-observed-active" },
+            now,
+          );
+        } else {
+          deploymentController.adoptObservedState(view.id, "active", now);
+        }
+        deploymentController.renewCommittedRoutesForModel(view.id, 90_000, now);
+      } else if (
+        view.status === "waiting_capacity"
+        && !deploymentController.activeOperationForModel(view.id)
+      ) {
+        deploymentController.markWaitingCapacity(view.id, view.message, now);
       }
       if (shouldQueueAutomaticActivation(view)) {
         const retry = automaticActivationRetryState.get(view.id);
@@ -864,7 +1199,8 @@ export async function createCoordinator(
     const snapshot = publicSnapshot(store, scheduler, hub, mobileHub, activationManager, {
       activationProgressForModel,
       activationStatusMessageForModel,
-    });
+      activationIncidentForModel,
+    }, runtimeVersion, coordinatorBuildIdentity);
     const capturedAt = Math.floor(now / NETWORK_TELEMETRY_INTERVAL_MS)
       * NETWORK_TELEMETRY_INTERVAL_MS;
     store.recordNetworkTelemetrySample(networkTelemetrySample(snapshot, capturedAt));
@@ -885,8 +1221,9 @@ export async function createCoordinator(
     const mobileWorkers = mobileHub.listWorkers();
     return {
       status: "ok",
-      version: readPackageVersion(),
-      revision: readBuildRevision(),
+      version: runtimeVersion,
+      revision: runtimeRevision,
+      buildIdentity: coordinatorBuildIdentity,
       workers: {
         registered: workers.length + mobileWorkers.length,
         connected: hub.connectedWorkerIds().size + mobileHub.connectedCount(),
@@ -1051,7 +1388,8 @@ export async function createCoordinator(
     return publicSnapshot(store, scheduler, hub, mobileHub, activationManager, {
       activationProgressForModel,
       activationStatusMessageForModel,
-    });
+      activationIncidentForModel,
+    }, runtimeVersion, coordinatorBuildIdentity);
   });
 
   const availableSupportAssistantModels = (): string[] =>
@@ -1078,7 +1416,7 @@ export async function createCoordinator(
   app.get("/public/v1/assistant/config", async () => publicSupportAssistantConfig());
 
   app.get("/public/v1/admin/assistant", async (request, reply) => {
-    if (!await authorizeModelMutation(request, reply)) return;
+    if (!await authorizeAdministrativeMutation(request, reply)) return;
     return {
       settings: store.getSupportAssistantSettings(),
       runtime: publicSupportAssistantConfig(),
@@ -1086,7 +1424,7 @@ export async function createCoordinator(
   });
 
   app.put("/public/v1/admin/assistant", async (request, reply) => {
-    if (!await authorizeModelMutation(request, reply)) return;
+    if (!await authorizeAdministrativeMutation(request, reply)) return;
     const body = supportAssistantSettingsUpdateSchema.parse(request.body);
     const availableModels = availableSupportAssistantModels();
     if (body.modelId && !availableModels.includes(body.modelId)) {
@@ -1153,7 +1491,8 @@ export async function createCoordinator(
       const snapshot = publicSnapshot(store, scheduler, hub, mobileHub, activationManager, {
         activationProgressForModel,
         activationStatusMessageForModel,
-      });
+        activationIncidentForModel,
+      }, runtimeVersion, coordinatorBuildIdentity);
       const parsed: ChatCompletionRequest = {
         model: selectedModel,
         messages: buildSupportAssistantMessages(
@@ -1229,7 +1568,7 @@ export async function createCoordinator(
           if (event.type === "token") streamedText += event.token.text;
           if (event.type === "completed") streamedResult = event;
           if (event.type === "failed") streamedFailure = event;
-          writeOpenAiEvent(reply.raw, event, parsed.model, handle.jobId);
+          writeMycelliosEvent(reply.raw, event, parsed.model, handle.jobId);
         }
       } finally {
         clearInterval(heartbeatTimer);
@@ -1265,6 +1604,27 @@ export async function createCoordinator(
 
   app.get("/public/v1/huggingface-models", async (request, reply) => {
     const { q, cursor, sort, limit } = huggingFaceModelSearchSchema.parse(request.query);
+    if (activePublicCatalogRequests >= 8) {
+      return reply.code(429).send({
+        error: {
+          code: "catalog_capacity_limited",
+          message: "The public model catalog is busy. Try again shortly.",
+        },
+      });
+    }
+    const releaseRateLimit = claimPublicCatalogRequest(
+      publicCatalogRateLimits,
+      publicCatalogRateKey(request),
+    );
+    if (!releaseRateLimit) {
+      return reply.code(429).send({
+        error: {
+          code: "catalog_rate_limited",
+          message: "Too many model catalog requests. Try again shortly.",
+        },
+      });
+    }
+    activePublicCatalogRequests += 1;
     try {
       return await searchHubModelCatalog(q, fetch, { ...(cursor ? { cursor } : {}), sort, limit });
     } catch (error) {
@@ -1274,11 +1634,14 @@ export async function createCoordinator(
           message: error instanceof Error ? error.message : String(error),
         },
       });
+    } finally {
+      activePublicCatalogRequests = Math.max(0, activePublicCatalogRequests - 1);
+      releaseRateLimit();
     }
   });
 
   app.post("/public/v1/requested-models", async (request, reply) => {
-    if (!await authorizeModelMutation(request, reply)) return;
+    if (!await authorizeAdministrativeMutation(request, reply)) return;
     const body = requestedModelCreateSchema.parse(request.body);
     automaticActivationRetryState.delete(body.id);
     const stored = store.upsertRequestedModel({
@@ -1289,6 +1652,11 @@ export async function createCoordinator(
       minimumNodes: body.minimumNodes,
       autoActivate: body.autoActivate,
     });
+    deploymentController.ensureModel(stored);
+    deploymentController.setDesiredState(
+      stored.id,
+      stored.autoActivate ? "active" : "inactive",
+    );
     try {
       const profile = await inspectHubModelCapacity({
         source: stored.source,
@@ -1308,23 +1676,40 @@ export async function createCoordinator(
     const snapshot = publicSnapshot(store, scheduler, hub, mobileHub, activationManager, {
       activationProgressForModel,
       activationStatusMessageForModel,
-    });
+      activationIncidentForModel,
+    }, runtimeVersion, coordinatorBuildIdentity);
     return reply.code(201).send({
       model: snapshot.requestedModels.find((model) => model.id === stored.id),
     });
   });
 
   app.delete("/public/v1/requested-models/:modelId", async (request, reply) => {
-    if (!await authorizeModelMutation(request, reply)) return;
+    if (!await authorizeAdministrativeMutation(request, reply)) return;
     const { modelId } = requestedModelParamsSchema.parse(request.params);
-    await activationManager?.deactivate(modelId);
-    if (!store.removeRequestedModel(modelId)) {
+    if (!store.getRequestedModel(modelId)) {
       return reply.code(404).send({ error: { code: "requested_model_not_found" } });
     }
+    deploymentController.setDesiredState(modelId, "inactive");
+    const deactivation = deploymentController.claimOperation(modelId, "deactivate", {
+      leaseMs: 60_000,
+    });
+    await activationManager?.deactivate(modelId);
+    deploymentController.releaseRoutesForModel(modelId);
+    if (deactivation) deploymentController.completeOperation(deactivation.id, "inactive");
+    store.removeRequestedModel(modelId);
     automaticActivationRetryState.delete(modelId);
     automaticRepairState.delete(modelId);
     automaticRepairInFlight.delete(modelId);
     return { removed: true, modelId };
+  });
+
+  app.get("/public/v1/requested-models/:modelId/timeline", async (request, reply) => {
+    const { modelId } = requestedModelParamsSchema.parse(request.params);
+    const timeline = deploymentController.timeline(modelId);
+    if (!timeline) {
+      return reply.code(404).send({ error: { code: "requested_model_not_found" } });
+    }
+    return { data: timeline };
   });
 
   app.get("/internal/v1/model-activation-requests", async () => {
@@ -1407,6 +1792,15 @@ export async function createCoordinator(
       });
     }
     const body = benchmarkRunRequestSchema.parse(request.body ?? {});
+    if (body.version !== undefined && body.version !== runtimeVersion) {
+      return reply.code(409).send({
+        error: {
+          code: "benchmark_version_mismatch",
+          message:
+            `La versión solicitada ${body.version} no coincide con el runtime real ${runtimeVersion}.`,
+        },
+      });
+    }
     const activeModelIds = benchmarkableActiveModelIds();
     const modelId = body.model ?? activeModelIds[0];
     if (!modelId || !activeModelIds.includes(modelId)) {
@@ -1419,12 +1813,24 @@ export async function createCoordinator(
         },
       });
     }
+    const activation = currentBenchmarkActivations().find(
+      (candidate) => candidate.modelId === modelId,
+    );
+    if (!activation) {
+      return reply.code(409).send({
+        error: {
+          code: "benchmark_activation_unsealed",
+          message:
+            "El modelo está activo, pero su cohorte de build declarada no coincide de forma estable con el coordinador.",
+        },
+      });
+    }
     benchmarkRunInFlight = startCoordinatorBenchmark(
       benchmarkTargetForModel(modelId),
       "manual",
       {
         ...(body.label ? { label: body.label } : {}),
-        ...(body.version ? { version: body.version } : {}),
+        activation,
       },
     );
     try {
@@ -1446,7 +1852,7 @@ export async function createCoordinator(
   app.delete("/public/v1/workers/:workerId", async (request, reply) => {
     // Evicting a worker takes capacity out of the shared network, so it needs
     // the same authorization as any other mutation of shared state.
-    if (!await authorizeModelMutation(request, reply)) return;
+    if (!await authorizeAdministrativeMutation(request, reply)) return;
     const { workerId } = workerIdParamsSchema.parse(request.params);
     const removed = hub.removeWorker(workerId) || mobileHub.removeWorker(workerId);
     if (!removed) return reply.code(404).send({ error: { code: "worker_not_found" } });
@@ -1454,14 +1860,133 @@ export async function createCoordinator(
   });
 
   app.post("/public/v1/workers/clear-offline", async (request, reply) => {
-    if (!await authorizeModelMutation(request, reply)) return;
-    return { removed: store.deregisterOfflineWorkers() + mobileHub.removeOfflineWorkers() };
+    if (!await authorizeAdministrativeMutation(request, reply)) return;
+    return {
+      removed: store.deregisterOfflineWorkers() + mobileHub.removeOfflineWorkers(),
+    };
+  });
+
+  app.post("/internal/v1/workers/admission-challenge", async (request, reply) => {
+    const challenge = workerAdmissionChallengeRequestSchema.parse(request.body);
+    try {
+      return workerAdmission.issue(challenge);
+    } catch (error) {
+      if (!(error instanceof WorkerAdmissionError)) throw error;
+      return reply.code(error.statusCode).send({
+        error: { code: error.code, message: error.message },
+      });
+    }
+  });
+
+  app.post("/internal/v1/workers/credential-rotation-challenge", async (request, reply) => {
+    const rotation = workerCredentialRotationChallengeRequestSchema.parse(request.body);
+    try {
+      return workerAdmission.issueRotation(rotation);
+    } catch (error) {
+      if (!(error instanceof WorkerAdmissionError)) throw error;
+      return reply.code(error.statusCode).send({
+        error: { code: error.code, message: error.message },
+      });
+    }
+  });
+
+  app.post("/internal/v1/workers/credential-rotation", async (request, reply) => {
+    const rotation = z.object({
+      identity: workerAdmissionIdentitySchema,
+      proof: workerCredentialRotationProofSchema,
+    }).strict().parse(request.body);
+    try {
+      return workerAdmission.verifyRotation(rotation);
+    } catch (error) {
+      if (!(error instanceof WorkerAdmissionError)) throw error;
+      return reply.code(error.statusCode).send({
+        error: { code: error.code, message: error.message },
+      });
+    }
   });
 
   app.post("/internal/v1/workers/register", async (request, reply) => {
     const registration = workerRegistrationSchema.parse(request.body);
-    const worker = store.registerWorker(registration);
-    return reply.code(201).send({ workerId: worker.id, protocolVersion: 1 });
+    if (
+      !config.allowDevelopmentAdapters
+      && registration.capabilities.deployments.some(
+        (deployment) => deployment.adapter === "mock",
+      )
+    ) {
+      return reply.code(400).send({
+        error: {
+          code: "development_adapter_not_allowed",
+          message: "Production coordinators accept native Mycellios deployments only.",
+        },
+      });
+    }
+    const protocol = registration.protocol ?? {
+      min: WORKER_PROTOCOL_MIN,
+      max: WORKER_PROTOCOL_MAX,
+    };
+    let admission:
+      | {
+        protocolVersion: number;
+        credentialFingerprint?: string;
+        enrollment: "enrolled" | "accepted" | "local-legacy";
+      };
+    if (registration.admission) {
+      if (!registration.identity) {
+        return reply.code(400).send({
+          error: {
+            code: "worker_admission_identity_required",
+            message: "Signed worker admission requires a stable device identity.",
+          },
+        });
+      }
+      let verified;
+      try {
+        verified = workerAdmission.verify({
+          identity: registration.identity,
+          registrationDigest: workerRegistrationDigest({
+            identity: registration.identity,
+            capabilities: registration.capabilities,
+            protocol,
+          }),
+          proof: registration.admission,
+        });
+      } catch (error) {
+        if (!(error instanceof WorkerAdmissionError)) throw error;
+        return reply.code(error.statusCode).send({
+          error: { code: error.code, message: error.message },
+        });
+      }
+      admission = {
+        protocolVersion: verified.protocolVersion,
+        credentialFingerprint: verified.credentialFingerprint,
+        enrollment: verified.enrollment,
+      };
+    } else {
+      if (!isTrustedLocalRequest(request)) {
+        return reply.code(401).send({
+          error: {
+            code: "worker_admission_required",
+            message: "Remote workers must prove a stable signed device identity.",
+          },
+        });
+      }
+      admission = {
+        protocolVersion: selectWorkerProtocolVersion(protocol),
+        enrollment: "local-legacy",
+      };
+    }
+    const worker = store.registerWorker({
+      ...(registration.identity ? { identity: registration.identity } : {}),
+      capabilities: stripWorkerDeclaredEvidence(registration.capabilities),
+    });
+    return reply.code(201).send({
+      workerId: worker.id,
+      protocolVersion: admission.protocolVersion,
+      ...(admission.credentialFingerprint
+        ? { credentialFingerprint: admission.credentialFingerprint }
+        : {}),
+      enrollment: admission.enrollment,
+    });
   });
 
   app.get("/internal/v1/workers", async () => ({
@@ -1472,6 +1997,7 @@ export async function createCoordinator(
       connected: hub.isConnected(worker.id),
       region: worker.capabilities.region,
       agentVersion: worker.capabilities.agentVersion,
+      buildIdentity: worker.capabilities.buildIdentity,
       offeredVramMb: worker.capabilities.gpus.reduce(
         (sum, gpu) => sum + gpu.offeredVramMb,
         0,
@@ -1481,7 +2007,7 @@ export async function createCoordinator(
       executionNodeId: worker.capabilities.distributedExecutor?.nodeId,
       computeMode: worker.capabilities.distributedExecutor?.computeMode,
       acceleration: worker.capabilities.distributedExecutor?.acceleration,
-      llmfit: worker.capabilities.llmfit,
+      isolation: worker.capabilities.distributedExecutor?.isolation,
       reliability: worker.reliability,
       jobsCompleted: worker.jobsCompleted,
       lastSeenAt: new Date(worker.lastSeenAt).toISOString(),
@@ -1494,6 +2020,85 @@ export async function createCoordinator(
     ],
   }));
 
+  app.get("/public/v1/worker-credentials", async (request, reply) => {
+    if (!(await authorizeAdministrativeMutation(request, reply))) return;
+    return {
+      data: database.listWorkerAdmissionCredentials().map((credential) => ({
+        ...admissionCredentialSummary(credential),
+        createdAt: new Date(credential.createdAt).toISOString(),
+        updatedAt: new Date(credential.updatedAt).toISOString(),
+        lastSeenAt: new Date(credential.lastSeenAt).toISOString(),
+        revokedAt: credential.revokedAt === null
+          ? null
+          : new Date(credential.revokedAt).toISOString(),
+        revocationReason: credential.revocationReason,
+      })),
+    };
+  });
+
+  app.post(
+    "/public/v1/worker-credentials/:identityKind/:identityId/revoke",
+    async (request, reply) => {
+      if (!(await authorizeAdministrativeMutation(request, reply))) return;
+      const params = z.object({
+        identityKind: z.enum(["device", "cell", "browser"]),
+        identityId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/),
+      }).strict().parse(request.params);
+      const body = z.object({
+        expectedFingerprint: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+        reason: z.string().trim().min(3).max(300),
+      }).strict().parse(request.body);
+      const result = database.revokeWorkerAdmissionCredential({
+        ...params,
+        ...body,
+      });
+      if (result.state === "not_found") {
+        return reply.code(404).send({
+          error: { code: "worker_credential_unknown" },
+        });
+      }
+      if (result.state === "fingerprint_mismatch") {
+        return reply.code(409).send({
+          error: {
+            code: "worker_credential_changed",
+            message: "The worker credential changed before revocation was applied.",
+          },
+        });
+      }
+      if (!result.credential) throw new Error("worker_revocation_credential_missing");
+      const revokedCredential = result.credential;
+      let disconnected = 0;
+      if (params.identityKind === "browser") {
+        for (const worker of mobileHub.listWorkers()) {
+          if (worker.clientId === params.identityId && mobileHub.removeWorker(worker.id)) {
+            disconnected += 1;
+          }
+        }
+      } else {
+        for (const worker of store.listWorkers()) {
+          if (
+            worker.identityKind === params.identityKind
+            && worker.identityId === params.identityId
+            && hub.removeWorker(worker.id)
+          ) {
+            disconnected += 1;
+          }
+        }
+      }
+      return {
+        state: result.state,
+        disconnected,
+        credential: {
+          ...admissionCredentialSummary(revokedCredential),
+          revokedAt: revokedCredential.revokedAt === null
+            ? null
+            : new Date(revokedCredential.revokedAt).toISOString(),
+          revocationReason: revokedCredential.revocationReason,
+        },
+      };
+    },
+  );
+
   app.get("/v1/models", async () => {
     const models = scheduler.listAvailableModels({ connectedWorkerIds: hub.connectedWorkerIds() });
     return {
@@ -1505,20 +2110,6 @@ export async function createCoordinator(
         owned_by: "mycellios",
         x_replicas: model.replicas,
         x_pipelines: model.pipelines,
-        ...(model.llmfit
-          ? {
-              x_llmfit: {
-                advised_replicas: model.llmfit.advisedReplicas,
-                best_fit: model.llmfit.bestFit,
-                quantizations: model.llmfit.quantizations,
-                max_estimated_tokens_per_second:
-                  model.llmfit.maxEstimatedTokensPerSecond,
-                max_measured_tokens_per_second:
-                  model.llmfit.maxMeasuredTokensPerSecond,
-                min_memory_required_mb: model.llmfit.minMemoryRequiredMb,
-              },
-            }
-          : {}),
       })),
     };
   });
@@ -1606,7 +2197,7 @@ export async function createCoordinator(
           if (event.type === "token") streamedText += event.token.text;
           if (event.type === "completed") streamedResult = event;
           if (event.type === "failed") streamedFailure = event;
-          writeOpenAiEvent(reply.raw, event, parsed.model, handle.jobId);
+          writeMycelliosEvent(reply.raw, event, parsed.model, handle.jobId);
         }
       } catch (error) {
         streamError = error;
@@ -1645,7 +2236,10 @@ export async function createCoordinator(
               failure_message: streamedFailure?.message
                 ?? (streamError instanceof Error ? streamError.message : String(streamError)),
             }
-          : { finish_reason: streamedResult?.result.finishReason ?? null },
+          : {
+              finish_reason: streamedResult?.result.finishReason ?? null,
+              execution_trace: streamedResult?.result.networkTrace ?? null,
+            },
       });
       void persistence?.flush();
       if (streamError && !reply.raw.destroyed && !reply.raw.writableEnded) {
@@ -1711,6 +2305,7 @@ export async function createCoordinator(
         affinity_hit: affinityHit,
         ttft_ms: result.result.metrics.ttftMs,
         reused_kv_tokens: result.result.metrics.reusedKvTokens ?? 0,
+        execution_trace: result.result.networkTrace ?? null,
       },
     });
     void persistence?.flush();
@@ -1738,6 +2333,7 @@ export async function createCoordinator(
         reused_kv_tokens: result.result.metrics.reusedKvTokens ?? 0,
         ttft_ms: result.result.metrics.ttftMs,
         active_ms: result.result.metrics.activeMs,
+        execution_trace: result.result.networkTrace ?? null,
       },
     };
   });
@@ -1808,18 +2404,65 @@ export async function createCoordinator(
     return reply.code(202).send({ id: jobId, status: "cancelled" });
   });
 
-  const landingAssetsPath = resolveLandingAssetsPath(config.landingAssetsPath);
+  const landingAssetsPath = resolveLandingAssetsPath(
+    config.landingAssetsPath,
+    runtimeMetadata.root,
+  );
   const releaseTokenVerifier = options.releaseTokenVerifier ?? verifyGitHubReleaseUploadToken;
-  app.put("/internal/v1/releases/:channel/:fileName", async (request, reply) => {
+  const releaseChunkBodyLimitBytes = options.releaseChunkBodyLimitBytes
+    ?? MAX_RELEASE_CHUNK_SIZE_BYTES;
+  if (
+    !Number.isSafeInteger(releaseChunkBodyLimitBytes)
+    || releaseChunkBodyLimitBytes < 1
+    || releaseChunkBodyLimitBytes > MAX_RELEASE_CHUNK_SIZE_BYTES
+  ) {
+    throw new Error("release_chunk_body_limit_invalid");
+  }
+  const authorizeReleaseMutation = async (
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ): Promise<GitHubReleaseClaims | null> => {
     const authorization = parseBearerToken(request.headers.authorization);
     if (!authorization) {
-      return reply.code(401).send({ error: { code: "release_upload_token_missing" } });
+      void reply.code(401).send({ error: { code: "release_upload_token_missing" } });
+      return null;
     }
+    let claims: GitHubReleaseClaims;
     try {
-      await releaseTokenVerifier(authorization);
+      claims = await releaseTokenVerifier(authorization);
     } catch {
-      return reply.code(401).send({ error: { code: "release_upload_token_invalid" } });
+      void reply.code(401).send({ error: { code: "release_upload_token_invalid" } });
+      return null;
     }
+    if (runtimeRevision === null) {
+      void reply.code(503).send({
+        error: { code: "release_upload_runtime_revision_unavailable" },
+      });
+      return null;
+    }
+    if (!coordinatorBuildIdentity || !releaseTransactions) {
+      void reply.code(503).send({
+        error: { code: "release_upload_runtime_source_unavailable" },
+      });
+      return null;
+    }
+    if (claims.sha !== runtimeRevision) {
+      void reply.code(409).send({
+        error: { code: "release_upload_revision_mismatch" },
+      });
+      return null;
+    }
+    return claims;
+  };
+  app.addHook("onRequest", async (request, reply) => {
+    const path = request.url.split("?", 1)[0] ?? request.url;
+    if (!path.startsWith("/internal/v1/releases/")) return;
+    if (!await authorizeReleaseMutation(request, reply)) return reply;
+  });
+  app.put(
+    "/internal/v1/releases/:channel/:fileName",
+    { bodyLimit: releaseChunkBodyLimitBytes },
+    async (request, reply) => {
     const params = z.object({
       channel: z.enum(["updates", "downloads"]),
       fileName: z.string().min(1).max(160),
@@ -1828,14 +2471,8 @@ export async function createCoordinator(
       return reply.code(400).send({ error: { code: "release_chunk_body_invalid" } });
     }
     try {
-      const root = releaseAssetRoot(
-        params.channel,
-        config.desktopUpdatesPath,
-        config.releaseDownloadsPath,
-        config.landingAssetsPath,
-      );
-      const result = await storeReleaseChunk({
-        root,
+      const result = await releaseTransactions!.storeChunk({
+        identity: parseReleaseTransactionIdentity(request.headers),
         channel: params.channel as ReleaseAssetChannel,
         fileName: params.fileName,
         metadata: parseReleaseChunkMetadata(request.headers),
@@ -1850,25 +2487,89 @@ export async function createCoordinator(
         },
       });
     }
+    },
+  );
+  app.post(
+    "/internal/v1/releases/transactions/:transactionId/commit",
+    { bodyLimit: 64 * 1024 },
+    async (request, reply) => {
+      const { transactionId } = z.object({
+        transactionId: z.string().min(16).max(128),
+      }).parse(request.params);
+      const bodyIdentity = z.object({
+        transactionId: z.string(),
+      }).passthrough().parse(request.body);
+      if (bodyIdentity.transactionId !== transactionId) {
+        return reply.code(400).send({
+          error: { code: "release_transaction_path_mismatch" },
+        });
+      }
+      try {
+        return reply.code(201).send(
+          await releaseTransactions!.commit(request.body),
+        );
+      } catch (error) {
+        return reply.code(409).send({
+          error: {
+            code: "release_commit_rejected",
+            message: error instanceof Error ? error.message : "release_commit_rejected",
+          },
+        });
+      }
+    },
+  );
+  app.post(
+    "/internal/v1/releases/transactions/:transactionId/rollback",
+    async (request, reply) => {
+      const { transactionId } = z.object({
+        transactionId: z.string().min(16).max(128),
+      }).parse(request.params);
+      try {
+        return reply.send(await releaseTransactions!.rollback(transactionId));
+      } catch (error) {
+        return reply.code(409).send({
+          error: {
+            code: "release_rollback_rejected",
+            message: error instanceof Error ? error.message : "release_rollback_rejected",
+          },
+        });
+      }
+    },
+  );
+  app.post(
+    "/internal/v1/releases/transactions/:transactionId/abort",
+    async (request, reply) => {
+      const { transactionId } = z.object({
+        transactionId: z.string().min(16).max(128),
+      }).parse(request.params);
+      try {
+        return reply.send(await releaseTransactions!.abort(transactionId));
+      } catch (error) {
+        return reply.code(409).send({
+          error: {
+            code: "release_abort_rejected",
+            message: error instanceof Error ? error.message : "release_abort_rejected",
+          },
+        });
+      }
+    },
+  );
+  app.get("/downloads/macos-arm64", async (_request, reply) => {
+    reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
+    return reply.redirect(`/downloads/mycellios-macos-arm64.dmg?v=${publicAssetVersion}`);
   });
-  if (releaseDownloadsPath) {
-    app.get("/downloads/macos-arm64", async (_request, reply) => {
-      reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
-      return reply.redirect(`/downloads/mycellios-macos-arm64.dmg?v=${publicAssetVersion}`);
-    });
-    app.get("/downloads/macos-x64", async (_request, reply) => {
-      reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
-      return reply.redirect(`/downloads/mycellios-macos-x64.dmg?v=${publicAssetVersion}`);
-    });
-    app.get("/downloads/linux-deb", async (_request, reply) => {
-      reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
-      return reply.redirect(`/downloads/mycellios-linux-x64.deb?v=${publicAssetVersion}`);
-    });
-    app.get("/downloads/linux-rpm", async (_request, reply) => {
-      reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
-      return reply.redirect(`/downloads/mycellios-linux-x64.rpm?v=${publicAssetVersion}`);
-    });
-  }
+  app.get("/downloads/macos-x64", async (_request, reply) => {
+    reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
+    return reply.redirect(`/downloads/mycellios-macos-x64.dmg?v=${publicAssetVersion}`);
+  });
+  app.get("/downloads/linux-deb", async (_request, reply) => {
+    reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
+    return reply.redirect(`/downloads/mycellios-linux-x64.deb?v=${publicAssetVersion}`);
+  });
+  app.get("/downloads/linux-rpm", async (_request, reply) => {
+    reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
+    return reply.redirect(`/downloads/mycellios-linux-x64.rpm?v=${publicAssetVersion}`);
+  });
   const contentHubClient = config.contentHubApiUrl
     ? new ContentHubClient({ baseUrl: config.contentHubApiUrl })
     : null;
@@ -1919,6 +2620,11 @@ export async function createCoordinator(
         error: { code: error.code, message: error.message },
       });
     }
+    if (error instanceof WorkerAdmissionError) {
+      return reply.code(error.statusCode).send({
+        error: { code: error.code, message: error.message },
+      });
+    }
     app.log.error(error);
     return reply.code(500).send({
       error: { code: "internal_error", message: "The coordinator could not process the request" },
@@ -1935,9 +2641,12 @@ export async function createCoordinator(
     service,
     apiAccess,
     persistence,
+    deploymentController,
     async close() {
       clearInterval(staleTimer);
       clearInterval(networkTelemetryTimer);
+      for (const timer of automaticBenchmarkRetryTimers) clearTimeout(timer);
+      automaticBenchmarkRetryTimers.clear();
       hub.close();
       mobileHub.close();
       await activationManager?.close();
@@ -2038,8 +2747,11 @@ export function isTrustedLocalRequest(request: FastifyRequest): boolean {
   return !PROXY_FORWARD_HEADERS.some((header) => request.headers[header] !== undefined);
 }
 
-function resolveMobileAssetsPath(configured: string | undefined): string | null {
-  const candidates = [configured, resolve(process.cwd(), "mobile-dist")].filter(
+function resolveMobileAssetsPath(
+  configured: string | undefined,
+  runtimeRoot: string,
+): string | null {
+  const candidates = [configured, resolve(runtimeRoot, "mobile-dist")].filter(
     (candidate): candidate is string => Boolean(candidate),
   );
   return candidates.find((candidate) => existsSync(resolve(candidate, "index.html"))) ?? null;
@@ -2074,8 +2786,11 @@ function setPublicAssetCacheHeaders(
   reply.header("Cache-Control", "public, max-age=3600");
 }
 
-function resolveDesktopUpdatesPath(configured: string | undefined): string | null {
-  const candidates = [configured, resolve(process.cwd(), "updates", "win32", "x64")].filter(
+function resolveDesktopUpdatesPath(
+  configured: string | undefined,
+  runtimeRoot: string,
+): string | null {
+  const candidates = [configured, resolve(runtimeRoot, "updates", "win32", "x64")].filter(
     (candidate): candidate is string => Boolean(candidate),
   );
   return candidates.find((candidate) => existsSync(resolve(candidate, "RELEASES"))) ?? null;
@@ -2086,62 +2801,165 @@ function releaseAssetRoot(
   configuredUpdates: string | undefined,
   configuredDownloads: string | undefined,
   configuredLanding: string | undefined,
+  runtimeRoot: string,
 ): string {
   if (channel === "updates") {
-    return resolve(configuredUpdates ?? resolve(process.cwd(), "updates", "win32", "x64"));
+    return resolve(configuredUpdates ?? resolve(runtimeRoot, "updates", "win32", "x64"));
   }
   if (configuredDownloads) return resolve(configuredDownloads);
   return resolve(
-    configuredLanding ?? resolve(process.cwd(), "landing-dist"),
+    configuredLanding ?? resolve(runtimeRoot, "landing-dist"),
     "downloads",
   );
+}
+
+function releaseTransactionStorageRoot(
+  updatesRoot: string,
+  downloadsRoot: string,
+  runtimeRoot: string,
+): string {
+  let common = dirname(resolve(updatesRoot));
+  const downloadsParent = dirname(resolve(downloadsRoot));
+  while (
+    downloadsParent !== common
+    && !downloadsParent.startsWith(`${common}${sep}`)
+  ) {
+    const parent = dirname(common);
+    if (parent === common) {
+      return resolve(runtimeRoot, "release-transactions");
+    }
+    common = parent;
+  }
+  if (dirname(common) === common) {
+    return resolve(runtimeRoot, "release-transactions");
+  }
+  return resolve(common, "release-transactions");
+}
+
+async function releasePublicAssetPath(
+  transactions: NativeReleaseTransactionStore | null,
+  channel: ReleaseAssetChannel,
+  fileName: string,
+  legacyRoot: string | null,
+): Promise<string | null> {
+  if (transactions) return transactions.publicAssetPath(channel, fileName);
+  try {
+    validateReleaseAssetName(channel, fileName);
+  } catch {
+    return null;
+  }
+  return legacyRoot ? resolve(legacyRoot, fileName) : null;
+}
+
+function serveReleaseAsset(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  filePath: string | null,
+): FastifyReply {
+  if (!filePath || !existsSync(filePath)) return reply.code(404).send();
+  const details = lstatSync(filePath);
+  if (!details.isFile() || details.isSymbolicLink()) {
+    return reply.code(404).send();
+  }
+  setPublicAssetCacheHeaders(reply, filePath);
+  const entityTag = `"${createHash("sha256")
+    .update(`${filePath}\n${details.size}\n${details.mtimeMs}`)
+    .digest("base64url")}"`;
+  const lastModified = details.mtime.toUTCString();
+  reply.header("Accept-Ranges", "bytes");
+  reply.header("ETag", entityTag);
+  reply.header("Last-Modified", lastModified);
+  if (filePath.endsWith(".json")) reply.type("application/json; charset=utf-8");
+  else if (filePath.endsWith(".dmg")) reply.type("application/x-apple-diskimage");
+  else if (filePath.endsWith(".deb")) reply.type("application/vnd.debian.binary-package");
+  else if (filePath.endsWith(".rpm")) reply.type("application/x-rpm");
+  else reply.type("application/octet-stream");
+
+  const rangeHeader = request.headers.range;
+  const ifRangeHeader = request.headers["if-range"];
+  if (
+    typeof rangeHeader === "string"
+    && (
+      typeof ifRangeHeader !== "string"
+      || ifRangeMatches(ifRangeHeader, entityTag, details.mtimeMs)
+    )
+  ) {
+    const range = parseSingleByteRange(rangeHeader, details.size);
+    if (!range) {
+      reply.header("Content-Range", `bytes */${details.size}`);
+      reply.header("Content-Length", 0);
+      return reply.code(416).send();
+    }
+    reply.header("Content-Range", `bytes ${range.start}-${range.end}/${details.size}`);
+    reply.header("Content-Length", range.end - range.start + 1);
+    reply.code(206);
+    return reply.send(createReadStream(filePath, range));
+  }
+
+  reply.header("Content-Length", details.size);
+  return reply.send(createReadStream(filePath));
+}
+
+export function parseSingleByteRange(
+  value: string,
+  size: number,
+): { start: number; end: number } | null {
+  if (!Number.isSafeInteger(size) || size < 1) return null;
+  const match = /^bytes=(\d*)-(\d*)$/i.exec(value.trim());
+  if (!match || (!match[1] && !match[2])) return null;
+  if (!match[1]) {
+    const suffixLength = Number(match[2]);
+    if (!Number.isSafeInteger(suffixLength) || suffixLength < 1) return null;
+    return {
+      start: Math.max(0, size - suffixLength),
+      end: size - 1,
+    };
+  }
+  const start = Number(match[1]);
+  if (!Number.isSafeInteger(start) || start < 0 || start >= size) return null;
+  const requestedEnd = match[2] ? Number(match[2]) : size - 1;
+  if (
+    !Number.isSafeInteger(requestedEnd)
+    || requestedEnd < start
+  ) return null;
+  return {
+    start,
+    end: Math.min(requestedEnd, size - 1),
+  };
+}
+
+function ifRangeMatches(
+  value: string,
+  entityTag: string,
+  modifiedAtMs: number,
+): boolean {
+  const candidate = value.trim();
+  if (candidate.startsWith("\"") || candidate.startsWith("W/")) {
+    return candidate === entityTag;
+  }
+  const timestamp = Date.parse(candidate);
+  return Number.isFinite(timestamp)
+    && Math.floor(modifiedAtMs / 1_000) * 1_000 <= timestamp;
 }
 
 function resolveReleaseDownloadsPath(
   configuredDownloads: string | undefined,
   configuredLanding: string | undefined,
+  runtimeRoot: string,
 ): string | null {
   const candidates = [
     configuredDownloads,
     configuredLanding ? resolve(configuredLanding, "downloads") : undefined,
-    resolve(process.cwd(), "landing-dist", "downloads"),
+    resolve(runtimeRoot, "landing-dist", "downloads"),
   ].filter((candidate): candidate is string => Boolean(candidate));
   return candidates.find((candidate) => existsSync(candidate)) ?? null;
 }
 
-function readPackageVersion(): string {
-  const environmentVersion = process.env.npm_package_version?.trim();
-  if (environmentVersion && /^\d+\.\d+\.\d+$/.test(environmentVersion)) {
-    return environmentVersion;
-  }
-  try {
-    const metadata = JSON.parse(
-      readFileSync(resolve(process.cwd(), "package.json"), "utf8"),
-    ) as { version?: unknown };
-    if (typeof metadata.version === "string" && /^\d+\.\d+\.\d+$/.test(metadata.version)) {
-      return metadata.version;
-    }
-  } catch {
-    // Packaged clients do not need public download redirects.
-  }
-  return "0";
-}
-
-function readBuildRevision(): string | null {
-  const environmentRevision = process.env.MYCELLIOS_REVISION?.trim();
-  if (environmentRevision && /^[0-9a-f]{7,40}$/i.test(environmentRevision)) {
-    return environmentRevision.toLowerCase();
-  }
-  try {
-    const revision = readFileSync(resolve(process.cwd(), "REVISION"), "utf8").trim();
-    return /^[0-9a-f]{7,40}$/i.test(revision) ? revision.toLowerCase() : null;
-  } catch {
-    return null;
-  }
-}
-
-function resolveLandingAssetsPath(configured: string | undefined): string | null {
-  const candidates = [configured, resolve(process.cwd(), "landing-dist")].filter(
+function resolveLandingAssetsPath(
+  configured: string | undefined,
+  runtimeRoot: string,
+): string | null {
+  const candidates = [configured, resolve(runtimeRoot, "landing-dist")].filter(
     (candidate): candidate is string => Boolean(candidate),
   );
   return candidates.find((candidate) => existsSync(resolve(candidate, "index.html"))) ?? null;
@@ -2155,6 +2973,7 @@ function dashboardWorkers(store: MeshStore, hub: WorkerHub, mobileHub: MobileCom
       connected: hub.isConnected(worker.id),
       region: worker.capabilities.region,
       agentVersion: worker.capabilities.agentVersion,
+      buildIdentity: worker.capabilities.buildIdentity,
       offeredVramMb: worker.capabilities.gpus.reduce(
         (sum, gpu) => sum + gpu.offeredVramMb,
         0,
@@ -2164,6 +2983,7 @@ function dashboardWorkers(store: MeshStore, hub: WorkerHub, mobileHub: MobileCom
       executionNodeId: worker.capabilities.distributedExecutor?.nodeId,
       computeMode: worker.capabilities.distributedExecutor?.computeMode,
       acceleration: worker.capabilities.distributedExecutor?.acceleration,
+      isolation: worker.capabilities.distributedExecutor?.isolation,
       reliability: worker.reliability,
       jobsCompleted: worker.jobsCompleted,
       lastSeenAt: new Date(worker.lastSeenAt).toISOString(),
@@ -2195,11 +3015,14 @@ function publicSnapshot(
   scheduler: Scheduler,
   hub: WorkerHub,
   mobileHub: MobileComputeHub,
-  activationManager?: ModelActivationManager,
-  activationPresentation?: {
+  activationManager: ModelActivationManager | undefined,
+  activationPresentation: {
     activationProgressForModel(modelId: string): readonly ModelActivationProgressEvent[];
     activationStatusMessageForModel(modelId: string): string | null;
-  },
+    activationIncidentForModel(modelId: string): ActivationIncident | null;
+  } | undefined,
+  version: string,
+  buildIdentity: NativeBuildIdentity | null = null,
 ) {
   const workers = dashboardWorkers(store, hub, mobileHub);
   const models = scheduler.listAvailableModels({ connectedWorkerIds: hub.connectedWorkerIds() });
@@ -2215,6 +3038,7 @@ function publicSnapshot(
       ? {
           activationProgressForModel: activationPresentation.activationProgressForModel,
           activationStatusMessageForModel: activationPresentation.activationStatusMessageForModel,
+          activationIncidentForModel: activationPresentation.activationIncidentForModel,
         }
       : activationManager?.activationProgressForModel
         ? { activationProgressForModel: (modelId: string) => activationManager.activationProgressForModel!(modelId) }
@@ -2234,7 +3058,8 @@ function publicSnapshot(
   }));
   return {
     capturedAt: new Date().toISOString(),
-    version: readPackageVersion(),
+    version,
+    buildIdentity,
     summary: {
       registered: workers.length,
       connected: workers.filter((worker) => worker.connected).length,
@@ -2298,6 +3123,7 @@ function mobileDashboardWorker(worker: MobileWorkerSnapshot) {
     status: worker.status,
     connected: worker.connected,
     region: worker.region,
+    buildIdentity: worker.buildIdentity,
     offeredVramMb: 0,
     reliability:
       worker.completedTasks + worker.failedTasks === 0
@@ -2365,12 +3191,8 @@ interface SupportAssistantRateState {
 
 function supportAssistantRateKey(request: FastifyRequest, sessionId: string): string {
   const userAgent = request.headers["user-agent"] ?? "unknown";
-  const forwardedFor = request.headers["x-forwarded-for"];
-  const address = typeof forwardedFor === "string"
-    ? forwardedFor.split(",", 1)[0]?.trim() || request.ip
-    : request.ip;
   return createHash("sha256")
-    .update(`${address}\n${userAgent}\n${sessionId}`)
+    .update(`${request.ip}\n${userAgent}\n${sessionId}`)
     .digest("hex")
     .slice(0, 24);
 }
@@ -2407,6 +3229,49 @@ function claimSupportAssistantRequest(
   };
 }
 
+interface PublicCatalogRateState {
+  windowStartedAt: number;
+  requests: number;
+  active: number;
+}
+
+function publicCatalogRateKey(request: FastifyRequest): string {
+  const userAgent = request.headers["user-agent"] ?? "unknown";
+  return createHash("sha256")
+    .update(`${request.ip}\n${userAgent}\nmodel-catalog`)
+    .digest("hex")
+    .slice(0, 24);
+}
+
+function claimPublicCatalogRequest(
+  states: Map<string, PublicCatalogRateState>,
+  key: string,
+  now = Date.now(),
+): (() => void) | null {
+  const windowMs = 10 * 60_000;
+  const previous = states.get(key);
+  const state = !previous || now - previous.windowStartedAt >= windowMs
+    ? { windowStartedAt: now, requests: 0, active: 0 }
+    : previous;
+  if (state.requests >= 120 || state.active >= 2) return null;
+  state.requests += 1;
+  state.active += 1;
+  states.set(key, state);
+  if (states.size > 2_000) {
+    for (const [candidateKey, candidate] of states) {
+      if (now - candidate.windowStartedAt >= windowMs && candidate.active === 0) {
+        states.delete(candidateKey);
+      }
+    }
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    state.active = Math.max(0, state.active - 1);
+  };
+}
+
 const jobIdParamsSchema = z.object({ jobId: z.string().min(1).max(128) }).strict();
 const workerIdParamsSchema = z.object({ workerId: z.string().min(1).max(256) }).strict();
 const requestedModelParamsSchema = z.object({
@@ -2424,7 +3289,7 @@ function constantTimeEqual(received: string, expected: string): boolean {
   return left.length === right.length && timingSafeEqual(left, right);
 }
 
-function writeOpenAiEvent(
+function writeMycelliosEvent(
   stream: NodeJS.WritableStream,
   event: JobStreamEvent,
   model: string,
@@ -2490,6 +3355,7 @@ function writeOpenAiEvent(
           ttft_ms: event.result.metrics.ttftMs,
           active_ms: event.result.metrics.activeMs,
           reused_kv_tokens: event.result.metrics.reusedKvTokens ?? 0,
+          execution_trace: event.result.networkTrace ?? null,
         },
       })}\n\n`,
     );

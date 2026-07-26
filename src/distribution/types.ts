@@ -130,6 +130,18 @@ export interface DirectedLinkProfile {
   lossRate: number;
   /** Probability that the peer-to-peer link itself is reachable for a route. */
   availability?: number;
+  /**
+   * Fresh physical probe evidence for this exact directed path. Analytical or
+   * region-default links deliberately omit it and can never admit a
+   * tensor-parallel collective.
+   */
+  evidence?: {
+    source: "runtime-probe";
+    measuredAt: number;
+    validUntil: number;
+    successfulSamples: number;
+    failedSamples: number;
+  };
 }
 
 export interface DistributionTopology {

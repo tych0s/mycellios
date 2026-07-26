@@ -22,7 +22,9 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
+import math
 from numbers import Integral
+from time import perf_counter
 
 from .macro_wave import (
     BranchIdentity,
@@ -186,8 +188,16 @@ class MacroWavePreparation:
     selected_draft_tokens: tuple[int, ...]
     proposal: MacroWaveProposal | None
     is_probe: bool = False
+    draft_latency_seconds: float = 0.0
 
     def __post_init__(self) -> None:
+        if (
+            not isinstance(self.draft_latency_seconds, (int, float))
+            or isinstance(self.draft_latency_seconds, bool)
+            or not math.isfinite(float(self.draft_latency_seconds))
+            or float(self.draft_latency_seconds) < 0
+        ):
+            raise ValueError("draft_latency_seconds must be finite and non-negative")
         if (self.proposal is None) != (not self.selected_draft_tokens):
             raise ValueError("proposal presence must match selected_draft_tokens")
         if self.proposal is not None:
@@ -370,27 +380,62 @@ def prepare_linear_macro_wave(
     else:
         limit = None
 
-    available = _tokens(
-        provider.draft(history, max_tokens=limit),
-        "provider draft",
-    )
+    draft_started = perf_counter()
+    deferred = bool(getattr(provider, "defer_until_selected", False))
+    if deferred:
+        assumed_available = min(
+            int(provider.max_draft_tokens),
+            int(provider.max_draft_tokens) if limit is None else limit,
+        )
+        decision = controller.decide(
+            history_tokens=len(history),
+            available_draft_tokens=assumed_available,
+        )
+        selected_size = decision.candidate_size if decision.enabled else 0
+        is_probe = False
+        if selected_size == 0 and allow_probe:
+            selected_size = controller.next_probe_size(
+                history_tokens=len(history),
+                available_draft_tokens=assumed_available,
+            ) or 0
+            is_probe = selected_size > 0
+        available = (
+            _tokens(
+                _draft_tokens_for_request(
+                    provider,
+                    request_id,
+                    history,
+                    selected_size,
+                ),
+                "provider draft",
+            )
+            if selected_size > 0
+            else ()
+        )
+        selected_size = min(selected_size, len(available))
+    else:
+        available = _tokens(
+            _draft_tokens_for_request(provider, request_id, history, limit),
+            "provider draft",
+        )
+        decision = controller.decide(
+            history_tokens=len(history),
+            available_draft_tokens=len(available),
+        )
+        selected_size = decision.candidate_size if decision.enabled else 0
+        is_probe = False
+        if selected_size == 0 and allow_probe:
+            selected_size = controller.next_probe_size(
+                history_tokens=len(history),
+                available_draft_tokens=len(available),
+            ) or 0
+            is_probe = selected_size > 0
+    draft_latency_seconds = perf_counter() - draft_started
+
     if limit is not None and len(available) > limit:
         raise ValueError("provider returned more tokens than max_tokens")
     if len(available) > int(provider.max_draft_tokens):
         raise ValueError("provider returned more tokens than max_draft_tokens")
-
-    decision = controller.decide(
-        history_tokens=len(history),
-        available_draft_tokens=len(available),
-    )
-    selected_size = decision.candidate_size if decision.enabled else 0
-    is_probe = False
-    if selected_size == 0 and allow_probe:
-        selected_size = controller.next_probe_size(
-            history_tokens=len(history),
-            available_draft_tokens=len(available),
-        ) or 0
-        is_probe = selected_size > 0
     if selected_size > len(available):
         raise ValueError("controller selected more draft tokens than are available")
 
@@ -411,7 +456,20 @@ def prepare_linear_macro_wave(
         selected_draft_tokens=selected,
         proposal=proposal,
         is_probe=is_probe,
+        draft_latency_seconds=draft_latency_seconds,
     )
+
+
+def _draft_tokens_for_request(
+    provider: DraftProvider,
+    request_id: str | int,
+    history: tuple[int, ...],
+    max_tokens: int | None,
+) -> Sequence[int]:
+    draft_for_request = getattr(provider, "draft_for_request", None)
+    if callable(draft_for_request):
+        return draft_for_request(request_id, history, max_tokens=max_tokens)
+    return provider.draft(history, max_tokens=max_tokens)
 
 
 def resolve_macro_wave(

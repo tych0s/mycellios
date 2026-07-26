@@ -68,21 +68,23 @@ class ExecutorCompatibilityRegistryTests(unittest.TestCase):
 
     def test_evidence_gate_does_not_promote_loopback_to_real_gpu_proof(self) -> None:
         key = _key(_manifest(0, 8))
-        registry = ExecutorCompatibilityRegistry(
-            (
-                build_executor_certification(
-                    key,
-                    evidence_level="loopback-physical",
-                    parity="exact-greedy",
-                    test_id="loopback-only",
-                ),
-            )
-        )
-
-        self.assertIsNotNone(registry.resolve(key, minimum_evidence="unit"))
-        self.assertIsNone(registry.resolve(key, minimum_evidence="hardware-physical"))
-        with self.assertRaises(CompatibilityNotCertifiedError):
-            registry.require(key, minimum_evidence="hardware-physical")
+        for evidence_level in ("contract", "unit", "loopback-physical"):
+            with self.subTest(evidence_level=evidence_level):
+                registry = ExecutorCompatibilityRegistry(
+                    (
+                        build_executor_certification(
+                            key,
+                            evidence_level=evidence_level,
+                            parity="exact-greedy",
+                            test_id=f"{evidence_level}-only",
+                        ),
+                    )
+                )
+                self.assertIsNone(
+                    registry.resolve(key, minimum_evidence="hardware-physical")
+                )
+                with self.assertRaises(CompatibilityNotCertifiedError):
+                    registry.require(key, minimum_evidence="hardware-physical")
 
     def test_key_builder_rejects_capabilities_not_advertised_by_executor(self) -> None:
         manifest = _manifest(0, 8)

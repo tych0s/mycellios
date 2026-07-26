@@ -178,6 +178,14 @@ describe("gdlp-physical-two-host-gpu-gate/1", () => {
       },
     ],
     [
+      "different declared native build",
+      "single_build_cohort" as const,
+      (evidence: PhysicalTwoHostGpuGateEvidenceV1) => {
+        evidence.hosts[1]!.buildIdentity.sourceId =
+          `sha256:${"8".repeat(64)}`;
+      },
+    ],
+    [
       "duplicate GPU",
       "two_distinct_gpus" as const,
       (evidence: PhysicalTwoHostGpuGateEvidenceV1) => {
@@ -277,6 +285,11 @@ function passingEvidence(mode: "gpu" | "cpu" = "gpu"): PhysicalTwoHostGpuGateEvi
       agentId: "agent-a",
       agentEndpoint: "http://10.20.0.11:9750",
       rankNodeId: rankZeroNode,
+      buildIdentity: {
+        schema: "mycellios-native-build-provenance/1" as const,
+        version: "0.2.19",
+        sourceId: `sha256:${"9".repeat(64)}` as const,
+      },
       gpu: {
         deviceFingerprintSha256: `sha256:${"a".repeat(64)}`,
         device: rankZeroDevice,
@@ -295,6 +308,11 @@ function passingEvidence(mode: "gpu" | "cpu" = "gpu"): PhysicalTwoHostGpuGateEvi
       agentId: "agent-b",
       agentEndpoint: "http://10.20.0.12:9750",
       rankNodeId: rankOneNode,
+      buildIdentity: {
+        schema: "mycellios-native-build-provenance/1" as const,
+        version: "0.2.19",
+        sourceId: `sha256:${"9".repeat(64)}` as const,
+      },
       gpu: {
         deviceFingerprintSha256: `sha256:${"b".repeat(64)}`,
         device: rankOneDevice,
@@ -426,7 +444,7 @@ function launchDescription(mode: "gpu" | "cpu"): PythonPipelineLaunchDescription
     model,
     modelRevision: `sha256:${"d".repeat(64)}`,
     tokenizerId: "physical-gate-tokenizer",
-    topology: { nodes, links: completeLinks(nodes) },
+    topology: { nodes, links: measuredCollectiveLinks(nodes) },
     workload: {
       promptTokens: 12,
       outputTokens: 16,
@@ -581,18 +599,26 @@ function cellNode(
   };
 }
 
-function completeLinks(nodes: RuntimeNodeProfile[]) {
+function measuredCollectiveLinks(nodes: RuntimeNodeProfile[]) {
+  const measuredAt = Date.now();
   return nodes.flatMap((from) =>
     nodes
       .filter((to) => to.id !== from.id)
       .map((to) => ({
         from: from.id,
         to: to.id,
-        oneWayLatencyMs: 0.6,
+        oneWayLatencyMs: 0.2,
         jitterP95Ms: 0.1,
         bandwidthMbps: 1_000,
         lossRate: 0,
         availability: 0.999,
+        evidence: {
+          source: "runtime-probe" as const,
+          measuredAt,
+          validUntil: measuredAt + 60_000,
+          successfulSamples: 8,
+          failedSamples: 0,
+        },
       })),
   );
 }

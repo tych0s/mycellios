@@ -778,6 +778,90 @@ export class MeshStore {
         this.queueActivationEvent(row.id);
         queued += 1;
       }
+      const deploymentStates = this.database.raw.prepare(
+        "SELECT * FROM deployment_states",
+      ).all() as unknown as Array<{
+        model_id: string;
+        desired_state: string;
+        observed_state: string;
+        generation: number;
+        observed_generation: number;
+        retry_count: number;
+        next_retry_at: number | null;
+        last_error: string | null;
+        active_operation_id: string | null;
+        controller_owner: string | null;
+        controller_lease_until: number | null;
+        created_at: number;
+        updated_at: number;
+      }>;
+      for (const row of deploymentStates) {
+        this.database.enqueueRemoteChange("deployment_states", row.model_id, "upsert", row);
+        queued += 1;
+      }
+      const deploymentOperations = this.database.raw.prepare(
+        "SELECT * FROM deployment_operations",
+      ).all() as unknown as Array<{
+        id: string;
+        model_id: string;
+        generation: number;
+        kind: string;
+        status: string;
+        attempt: number;
+        idempotency_key: string;
+        error_code: string | null;
+        error_message: string | null;
+        metadata_json: string;
+        started_at: number;
+        updated_at: number;
+        finished_at: number | null;
+      }>;
+      for (const row of deploymentOperations) {
+        const { metadata_json: metadataJson, ...operation } = row;
+        this.database.enqueueRemoteChange("deployment_operations", row.id, "upsert", {
+          ...operation,
+          metadata: JSON.parse(metadataJson) as unknown,
+        });
+        queued += 1;
+      }
+      const routeReservations = this.database.raw.prepare(
+        "SELECT * FROM route_reservations",
+      ).all() as unknown as Array<{
+        id: string;
+        model_id: string;
+        operation_id: string;
+        generation: number;
+        status: string;
+        route_digest: string;
+        stages_json: string;
+        canary_json: string | null;
+        expires_at: number;
+        committed_at: number | null;
+        released_at: number | null;
+        error: string | null;
+        created_at: number;
+        updated_at: number;
+      }>;
+      for (const row of routeReservations) {
+        const {
+          stages_json: stagesJson,
+          canary_json: canaryJson,
+          ...reservation
+        } = row;
+        this.database.enqueueRemoteChange("route_reservations", row.id, "upsert", {
+          ...reservation,
+          stages: JSON.parse(stagesJson) as unknown,
+          canary: canaryJson ? JSON.parse(canaryJson) as unknown : null,
+        });
+        queued += 1;
+      }
+      const deploymentStageLeases = this.database.raw.prepare(
+        "SELECT * FROM deployment_stage_leases",
+      ).all() as unknown as Array<Record<string, unknown> & { id: string }>;
+      for (const row of deploymentStageLeases) {
+        this.database.enqueueRemoteChange("deployment_stage_leases", row.id, "upsert", row);
+        queued += 1;
+      }
       return queued;
     });
   }

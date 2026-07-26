@@ -111,9 +111,9 @@ class StageExecutorManifest:
     """Language-neutral contract for one executable contiguous model stage.
 
     This document deliberately describes semantics, not Python objects or GPU
-    pointers.  A future external GGUF runtime, MLX, ONNX Runtime or mobile process can
-    implement the same operations and tensor layout without importing this
-    module.  The executor id seals every compatibility-relevant field.
+    pointers. Future Mycellios executors can implement the same operations and
+    tensor layout without importing this module. The executor id seals every
+    compatibility-relevant field.
     """
 
     executor_id: str

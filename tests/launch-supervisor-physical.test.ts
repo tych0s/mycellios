@@ -109,6 +109,7 @@ describe("physical GDLP/2 launch supervisor", () => {
       const localAgent = new LocalProcessAgent({
         id: "physical-local-agent",
         cwd: workspace,
+        allowedExecutables: [description.configuration.pythonExecutable],
         env: {
           PYTHONPATH: resolve(workspace, "python"),
           HF_HOME: resolve(workspace, "runtime", "hf-cache"),

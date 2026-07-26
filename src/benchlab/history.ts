@@ -1,14 +1,31 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
 import { join, resolve } from "node:path";
+import {
+  benchmarkScenarioCanBeCompared,
+  benchmarkScenarioFingerprint,
+  sealBenchmarkScenario,
+} from "./scenario.js";
 import {
   BENCHMARK_RUN_SCHEMA,
   DEFAULT_BENCHMARK_THRESHOLDS,
+  LEGACY_BENCHMARK_RUN_SCHEMA,
+  PREVIOUS_BENCHMARK_RUN_SCHEMA,
   type BenchmarkMeasurement,
   type BenchmarkRun,
   type BenchmarkThresholds,
 } from "./types.js";
+import { parseNetworkExecutionTrace } from "../telemetry/network-execution-trace.js";
+import { NATIVE_BUILD_PROVENANCE_FILE } from "../contracts/build-identity.js";
+import { readNativeBuildIdentity } from "../core/native-build-identity.js";
 
 export const DEFAULT_HISTORY_DIRECTORY = join("benchmarks", "history");
 
@@ -18,24 +35,45 @@ export interface RunIdentity {
   label: string;
   gitCommit: string | null;
   gitBranch: string | null;
-  gitDirty: boolean;
+  gitDirty: boolean | null;
+  build: BenchmarkRun["build"];
 }
 
-export function createRunIdentity(cwd: string, versionOverride?: string, label?: string): RunIdentity {
-  const packageDocument = JSON.parse(readFileSync(join(cwd, "package.json"), "utf8")) as {
-    version?: unknown;
-  };
-  const version = versionOverride?.trim() || String(packageDocument.version ?? "0.0.0-dev");
-  const gitCommit = git(cwd, ["rev-parse", "HEAD"]);
-  const shortCommit = gitCommit?.slice(0, 8) ?? "uncommitted";
+export function createRunIdentity(
+  cwd: string,
+  versionOverride?: string,
+  label?: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): RunIdentity {
+  const release = resolveRelease(cwd, versionOverride, environment);
+  const revision = resolveRevision(cwd, environment);
+  const sourceIdentity = resolveSourceIdentity(cwd, release.value);
+  const gitBranchResult = git(cwd, ["branch", "--show-current"]);
+  const gitStatusResult = git(cwd, ["status", "--porcelain"]);
+  const gitBranch = firstText(
+    environment.MYCELLIOS_BRANCH,
+    environment.GITHUB_REF_NAME,
+    gitBranchResult.ok ? gitBranchResult.output : null,
+  );
+  const gitDirty = gitStatusResult.ok ? gitStatusResult.output.length > 0 : null;
+  const shortCommit = revision.value?.slice(0, 8) ?? "revision-unknown";
   const timestamp = new Date().toISOString().replaceAll(":", "-").replace(".", "-");
   return {
     runId: `${timestamp}-${shortCommit}-${randomUUID().slice(0, 8)}`,
-    version,
-    label: label?.trim() || `v${version} · ${shortCommit}`,
-    gitCommit,
-    gitBranch: git(cwd, ["branch", "--show-current"]),
-    gitDirty: (git(cwd, ["status", "--porcelain"]) ?? "").length > 0,
+    version: release.value,
+    label: label?.trim() || `v${release.value} · ${shortCommit}`,
+    gitCommit: revision.value,
+    gitBranch,
+    gitDirty,
+    build: {
+      release: release.value,
+      releaseSource: release.source,
+      revision: revision.value,
+      revisionSource: revision.source,
+      sourceId: sourceIdentity.value,
+      sourceIdSource: sourceIdentity.source,
+      participantSourceIds: [],
+    },
   };
 }
 
@@ -53,8 +91,7 @@ export function loadBenchmarkRuns(
   return files
     .map((file) => {
       try {
-        const run = JSON.parse(readFileSync(join(absolute, file), "utf8")) as unknown;
-        return isBenchmarkRun(run) ? run : null;
+        return parseBenchmarkRun(JSON.parse(readFileSync(join(absolute, file), "utf8")) as unknown);
       } catch {
         return null;
       }
@@ -68,7 +105,7 @@ export function saveBenchmarkRun(
   run: BenchmarkRun,
   directory = DEFAULT_HISTORY_DIRECTORY,
 ): string {
-  if (!isBenchmarkRun(run)) throw new Error("The benchmark run is not valid.");
+  if (!isCurrentBenchmarkRun(run)) throw new Error("The benchmark run is not valid.");
   const absolute = resolve(cwd, directory);
   mkdirSync(absolute, { recursive: true });
   const destination = join(absolute, `${safeFilePart(run.runId)}.json`);
@@ -90,6 +127,8 @@ export function compareRunWithHistory(
     ? "failed"
     : measurements.some((measurement) => measurement.status === "regression")
       ? "regression"
+      : measurements.some((measurement) => measurement.status === "inconclusive")
+        ? "inconclusive"
       : measurements.every((measurement) => measurement.status === "baseline")
         ? "baseline"
         : "passed";
@@ -102,13 +141,29 @@ function compareMeasurement(
   history: BenchmarkRun[],
   thresholds: BenchmarkThresholds,
 ): BenchmarkMeasurement {
-  if (measurement.status === "failed") return measurement;
+  if (measurement.status === "failed" || measurement.status === "inconclusive") {
+    return measurement;
+  }
+  if (!benchmarkScenarioCanBeCompared(measurement)) {
+    return {
+      ...measurement,
+      status: "baseline",
+      comparison: {
+        baselineRunId: null,
+        tokensPerSecondPct: null,
+        ttftP95Pct: null,
+        acceptancePoints: null,
+        reasons: ["El digest del modelo no está disponible; comparación bloqueada."],
+      },
+    };
+  }
   const baseline = history
     .filter((run) => run.finishedAt < currentRun.finishedAt)
     .flatMap((run) => run.measurements.map((candidate) => ({ run, candidate })))
     .filter(
       ({ candidate }) =>
-        candidate.id === measurement.id && candidate.evidence === measurement.evidence,
+        benchmarkScenarioCanBeCompared(candidate)
+        && candidate.scenarioFingerprint === measurement.scenarioFingerprint,
     )
     .at(-1);
   if (!baseline) return { ...measurement, status: "baseline" };
@@ -158,17 +213,22 @@ function pointsChange(current: number | null, previous: number | null): number |
   return round((current - previous) * 100, 2);
 }
 
-function git(cwd: string, args: string[]): string | null {
+interface CommandResult {
+  ok: boolean;
+  output: string;
+}
+
+function git(cwd: string, args: string[]): CommandResult {
   try {
-    const value = execFileSync("git", args, {
+    const output = execFileSync("git", args, {
       cwd,
       encoding: "utf8",
       windowsHide: true,
       stdio: ["ignore", "pipe", "ignore"],
     }).trim();
-    return value || null;
+    return { ok: true, output };
   } catch {
-    return null;
+    return { ok: false, output: "" };
   }
 }
 
@@ -181,7 +241,23 @@ function round(value: number, decimals: number): number {
   return Math.round(value * factor) / factor;
 }
 
-function isBenchmarkRun(value: unknown): value is BenchmarkRun {
+export function parseBenchmarkRun(value: unknown): BenchmarkRun | null {
+  if (isCurrentBenchmarkRun(value)) return value;
+  if (!isRecord(value)) return null;
+  try {
+    if (value.schema === PREVIOUS_BENCHMARK_RUN_SCHEMA) {
+      return migratePreviousBenchmarkRun(value);
+    }
+    if (value.schema === LEGACY_BENCHMARK_RUN_SCHEMA) {
+      return migrateLegacyBenchmarkRun(value);
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function isCurrentBenchmarkRun(value: unknown): value is BenchmarkRun {
   if (!value || typeof value !== "object") return false;
   const record = value as Record<string, unknown>;
   return (
@@ -189,6 +265,300 @@ function isBenchmarkRun(value: unknown): value is BenchmarkRun {
     typeof record.runId === "string" &&
     typeof record.version === "string" &&
     typeof record.finishedAt === "string" &&
-    Array.isArray(record.measurements)
+    isRecord(record.build) &&
+    record.build.release === record.version &&
+    record.build.revision === record.gitCommit &&
+    isStrongSourceIdOrNull(record.build.sourceId) &&
+    (
+      (
+        record.build.sourceId === null
+        && record.build.sourceIdSource === "unknown"
+      )
+      || (
+        record.build.sourceId !== null
+        && (
+          record.build.sourceIdSource === "provenance-file"
+          || record.build.sourceIdSource === "runtime-local"
+        )
+      )
+    ) &&
+    (
+      record.build.releaseSource === "override"
+      || record.build.releaseSource === "environment"
+      || record.build.releaseSource === "package"
+      || record.build.releaseSource === "unknown"
+    ) &&
+    (
+      record.build.revisionSource === "environment"
+      || record.build.revisionSource === "revision-file"
+      || record.build.revisionSource === "git"
+      || record.build.revisionSource === "unknown"
+    ) &&
+    Array.isArray(record.build.participantSourceIds) &&
+    record.build.participantSourceIds.every(isStrongSourceId) &&
+    JSON.stringify(record.build.participantSourceIds)
+      === JSON.stringify([...new Set(record.build.participantSourceIds)].sort()) &&
+    (record.gitDirty === null || typeof record.gitDirty === "boolean") &&
+    Array.isArray(record.measurements) &&
+    record.measurements.every(isCurrentBenchmarkMeasurement)
   );
+}
+
+function isCurrentBenchmarkMeasurement(value: unknown): value is BenchmarkMeasurement {
+  if (
+    !isRecord(value)
+    || typeof value.scenarioFingerprint !== "string"
+    || !isRecord(value.model)
+    || (value.model.digest !== null && typeof value.model.digest !== "string")
+    || !isRecord(value.inventory)
+    || !Array.isArray(value.inventory.profiles)
+    || !isRecord(value.topology)
+    || !isRecord(value.workload)
+  ) return false;
+  if (
+    value.networkTraces !== undefined
+    && (
+      !Array.isArray(value.networkTraces)
+      || value.networkTraces.some((trace) => parseNetworkExecutionTrace(trace) === null)
+    )
+  ) return false;
+  try {
+    return benchmarkScenarioFingerprint(
+      value as unknown as BenchmarkMeasurement,
+    ) === value.scenarioFingerprint;
+  } catch {
+    return false;
+  }
+}
+
+function migrateLegacyBenchmarkRun(record: Record<string, unknown>): BenchmarkRun {
+  if (
+    typeof record.runId !== "string"
+    || typeof record.version !== "string"
+    || typeof record.label !== "string"
+    || typeof record.startedAt !== "string"
+    || typeof record.finishedAt !== "string"
+    || !Array.isArray(record.measurements)
+  ) {
+    throw new Error("legacy_benchmark_run_invalid");
+  }
+  const revision = nullableText(record.gitCommit);
+  const gitBranch = nullableText(record.gitBranch);
+  const legacyDirty = typeof record.gitDirty === "boolean" ? record.gitDirty : null;
+  const gitDirty = revision === null && gitBranch === null ? null : legacyDirty;
+  const measurements = record.measurements.map((value) => migrateLegacyMeasurement(value));
+  return {
+    ...(record as unknown as Omit<BenchmarkRun, "schema" | "gitDirty" | "build" | "measurements">),
+    schema: BENCHMARK_RUN_SCHEMA,
+    gitDirty,
+    build: {
+      release: record.version,
+      releaseSource: "package",
+      revision,
+      revisionSource: revision ? "git" : "unknown",
+      sourceId: null,
+      sourceIdSource: "unknown",
+      participantSourceIds: [],
+    },
+    measurements,
+  };
+}
+
+function migratePreviousBenchmarkRun(
+  record: Record<string, unknown>,
+): BenchmarkRun {
+  if (
+    typeof record.runId !== "string"
+    || typeof record.version !== "string"
+    || typeof record.label !== "string"
+    || typeof record.startedAt !== "string"
+    || typeof record.finishedAt !== "string"
+    || !isRecord(record.build)
+    || record.build.release !== record.version
+    || record.build.revision !== nullableText(record.gitCommit)
+    || !isReleaseSource(record.build.releaseSource)
+    || !isRevisionSource(record.build.revisionSource)
+    || !Array.isArray(record.measurements)
+    || !record.measurements.every(isCurrentBenchmarkMeasurement)
+  ) {
+    throw new Error("previous_benchmark_run_invalid");
+  }
+  const migrated = {
+    ...(record as unknown as Omit<BenchmarkRun, "schema" | "build">),
+    schema: BENCHMARK_RUN_SCHEMA,
+    build: {
+      ...(record.build as unknown as Omit<
+        BenchmarkRun["build"],
+        "sourceId" | "sourceIdSource" | "participantSourceIds"
+      >),
+      sourceId: null,
+      sourceIdSource: "unknown",
+      participantSourceIds: [],
+    },
+  } satisfies BenchmarkRun;
+  if (!isCurrentBenchmarkRun(migrated)) {
+    throw new Error("previous_benchmark_run_invalid");
+  }
+  return migrated;
+}
+
+function migrateLegacyMeasurement(value: unknown): BenchmarkMeasurement {
+  if (
+    !isRecord(value)
+    || !isRecord(value.model)
+    || !isRecord(value.inventory)
+    || !Array.isArray(value.inventory.profiles)
+    || !isRecord(value.workload)
+  ) {
+    throw new Error("legacy_benchmark_measurement_invalid");
+  }
+  const nodeIds = value.inventory.profiles.flatMap((profile) =>
+    isRecord(profile) && typeof profile.nodeId === "string" ? [profile.nodeId] : []
+  );
+  const routeClasses = Array.isArray(value.workload.routeClasses)
+    ? value.workload.routeClasses.filter((item): item is string => typeof item === "string")
+    : [];
+  return sealBenchmarkScenario({
+    ...(value as unknown as Omit<BenchmarkMeasurement, "scenarioFingerprint" | "model" | "topology">),
+    model: {
+      ...(value.model as unknown as Omit<BenchmarkMeasurement["model"], "digest">),
+      digest: null,
+    },
+    topology: {
+      digest: null,
+      stageCount: nodeIds.length > 0 ? nodeIds.length : null,
+      boundaries: [],
+      nodeIds,
+      routeClasses,
+    },
+  });
+}
+
+function resolveRelease(
+  cwd: string,
+  override: string | undefined,
+  environment: NodeJS.ProcessEnv,
+): { value: string; source: BenchmarkRun["build"]["releaseSource"] } {
+  const explicit = override?.trim();
+  if (explicit) return { value: explicit, source: "override" };
+  const configured = firstText(
+    environment.MYCELLIOS_RELEASE,
+    environment.MYCELLIOS_VERSION,
+    environment.npm_package_version,
+  );
+  if (configured) return { value: configured, source: "environment" };
+  try {
+    const packageDocument = JSON.parse(readFileSync(join(cwd, "package.json"), "utf8")) as {
+      version?: unknown;
+    };
+    if (typeof packageDocument.version === "string" && packageDocument.version.trim()) {
+      return { value: packageDocument.version.trim(), source: "package" };
+    }
+  } catch {
+    // A standalone artifact may not include package.json.
+  }
+  return { value: "0.0.0-unknown", source: "unknown" };
+}
+
+function resolveRevision(
+  cwd: string,
+  environment: NodeJS.ProcessEnv,
+): { value: string | null; source: BenchmarkRun["build"]["revisionSource"] } {
+  const configured = firstRevision(
+    environment.MYCELLIOS_REVISION,
+    environment.REVISION,
+    environment.GITHUB_SHA,
+    environment.SOURCE_VERSION,
+    environment.RENDER_GIT_COMMIT,
+    environment.COMMIT_SHA,
+  );
+  if (configured) return { value: configured, source: "environment" };
+  const revisionPath = join(cwd, "REVISION");
+  if (existsSync(revisionPath)) {
+    const revision = normalizedRevision(readFileSync(revisionPath, "utf8"));
+    if (!revision || !/^[0-9a-f]{40}$/.test(revision)) {
+      throw new Error("The benchmark runtime REVISION is not an exact Git identity.");
+    }
+    return { value: revision, source: "revision-file" };
+  }
+  const gitRevision = git(cwd, ["rev-parse", "HEAD"]);
+  const revision = gitRevision.ok ? normalizedRevision(gitRevision.output) : null;
+  return revision
+    ? { value: revision, source: "git" }
+    : { value: null, source: "unknown" };
+}
+
+function resolveSourceIdentity(
+  cwd: string,
+  expectedVersion: string,
+): {
+  value: `sha256:${string}` | null;
+  source: BenchmarkRun["build"]["sourceIdSource"];
+} {
+  const provenancePath = join(cwd, NATIVE_BUILD_PROVENANCE_FILE);
+  if (!existsSync(provenancePath)) {
+    return { value: null, source: "unknown" };
+  }
+  const identity = readNativeBuildIdentity(provenancePath, expectedVersion);
+  return {
+    value: identity.sourceId,
+    source: "provenance-file",
+  };
+}
+
+function firstRevision(...values: Array<string | undefined>): string | null {
+  for (const value of values) {
+    const revision = normalizedRevision(value);
+    if (revision) return revision;
+  }
+  return null;
+}
+
+function normalizedRevision(value: string | undefined): string | null {
+  const normalized = value?.trim().toLowerCase();
+  return normalized && /^[0-9a-f]{7,64}$/.test(normalized) ? normalized : null;
+}
+
+function firstText(...values: Array<string | null | undefined>): string | null {
+  for (const value of values) {
+    const normalized = value?.trim();
+    if (normalized) return normalized;
+  }
+  return null;
+}
+
+function isReleaseSource(
+  value: unknown,
+): value is BenchmarkRun["build"]["releaseSource"] {
+  return value === "override"
+    || value === "environment"
+    || value === "package"
+    || value === "unknown";
+}
+
+function isRevisionSource(
+  value: unknown,
+): value is BenchmarkRun["build"]["revisionSource"] {
+  return value === "environment"
+    || value === "revision-file"
+    || value === "git"
+    || value === "unknown";
+}
+
+function nullableText(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isStrongSourceId(value: unknown): value is `sha256:${string}` {
+  return typeof value === "string" && /^sha256:[0-9a-f]{64}$/.test(value);
+}
+
+function isStrongSourceIdOrNull(
+  value: unknown,
+): value is `sha256:${string}` | null {
+  return value === null || isStrongSourceId(value);
 }

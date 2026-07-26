@@ -8,7 +8,13 @@ import { FusesPlugin } from "@electron-forge/plugin-fuses";
 import { VitePlugin } from "@electron-forge/plugin-vite";
 import { FuseV1Options, FuseVersion } from "@electron/fuses";
 import { existsSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
+import { resolve } from "node:path";
+import {
+  NATIVE_BUILD_PROVENANCE_FILE,
+  buildNativeSourceProvenance,
+} from "./scripts/native-build-provenance.mjs";
 
 const windowsSign = process.env.WINDOWS_CERTIFICATE_FILE
   ? {
@@ -21,6 +27,7 @@ const windowsSign = process.env.WINDOWS_CERTIFICATE_FILE
   : undefined;
 
 const portableRuntimeArchive = "build/distribution-runtime.tar.gz";
+const windowsJobBrokerDirectory = "build/windows-job-broker";
 
 function commandLineOption(name: string): string | undefined {
   const equalsPrefix = `--${name}=`;
@@ -83,6 +90,16 @@ function portableRuntimeMatchesTarget(): boolean {
 const includePortableRuntime = portableRuntimeMatchesTarget();
 
 const config: ForgeConfig = {
+  hooks: {
+    packageAfterCopy: async (_forgeConfig, buildPath) => {
+      const provenance = buildNativeSourceProvenance(import.meta.dirname);
+      await writeFile(
+        resolve(buildPath, NATIVE_BUILD_PROVENANCE_FILE),
+        `${JSON.stringify(provenance, null, 2)}\n`,
+        "utf8",
+      );
+    },
+  },
   packagerConfig: {
     asar: true,
     executableName: "mycellios",
@@ -105,7 +122,12 @@ const config: ForgeConfig = {
       "build/icons",
       "mobile-dist",
       "landing-dist",
-      "python",
+      "build/python",
+      ...(targetPlatform === "win32"
+        && targetArch === "x64"
+        && existsSync(windowsJobBrokerDirectory)
+        ? [windowsJobBrokerDirectory]
+        : []),
       ...(includePortableRuntime
         ? [portableRuntimeArchive]
         : []),

@@ -1,8 +1,9 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  launchAgentRuntimeEnvironment,
   loadAllowedPythonLaunchDescription,
   parseLaunchAgentDaemonArguments,
   readLaunchAgentDaemonAuthToken,
@@ -122,6 +123,14 @@ describe("launch-agent daemon CLI security configuration", () => {
         "inline-is-forbidden",
       ]),
     ).toThrow("launch_agent_daemon_argument_is_invalid:--allow-launch-json");
+  });
+
+  it("seals Python imports to the native runtime source tree", () => {
+    const runtimeRoot = join("sealed", "mycellios-runtime");
+
+    expect(launchAgentRuntimeEnvironment(runtimeRoot)).toEqual({
+      PYTHONPATH: resolve(runtimeRoot, "python"),
+    });
   });
 
   it("loads and closed-validates one gdlp-python-launch/2 allowlist file", async () => {

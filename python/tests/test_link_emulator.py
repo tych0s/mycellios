@@ -1,249 +1,357 @@
-"""El emulador de enlace debe modelar la propagación como PROPAGACIÓN.
+from __future__ import annotations
 
-Bug histórico (bug 1 del §7 de `docs/01_TRASPASO_PARA_CONTINUAR.md`, vivo desde
-que existe el emulador): `wait_before_send` hacía `time.sleep` en el hilo emisor,
-así que el retardo de ida se cobraba en SERIE. Con W ventanas en vuelo el
-emulador cobraba W×retardo donde la red cobra retardo UNA vez, de modo que
-cualquier medida de la cinta especulativa daba un falso negativo garantizado:
-parecía que solapar no servía aunque la implementación fuese perfecta.
-
-Estas pruebas fijan las dos propiedades que lo distinguen:
-  - PARIDAD a W=1: un único frame sigue tardando lo mismo que antes.
-  - SOLAPE a W>1: N frames NO cuestan N×retardo.
-Y la propiedad que no se puede perder por el camino: el ORDEN de los bytes.
-"""
 import socket
-import struct
 import threading
-import time
 import unittest
 
 from distributed_runtime.protocol import (
+    HEADER,
+    HEADER_BYTES,
     FrameType,
     LinkEmulator,
+    LinkEmulatorError,
     close_emulated_link,
     recv_frame,
     send_frame,
 )
 
-DELAY_MS = 60.0
-DELAY_S = DELAY_MS / 1000.0
-# El reloj de Windows y el planificador del SO meten ruido; los umbrales dejan
-# margen de sobra para que la prueba distinga MECANISMOS, no milisegundos.
-TOLERANCE_S = 0.35
+
+class _ManualClock:
+    def __init__(self, initial: float = 0.0) -> None:
+        self._value = initial
+        self._reads = 0
+        self._condition = threading.Condition()
+
+    def __call__(self) -> float:
+        with self._condition:
+            self._reads += 1
+            self._condition.notify_all()
+            return self._value
+
+    @property
+    def value(self) -> float:
+        with self._condition:
+            return self._value
+
+    @property
+    def reads(self) -> int:
+        with self._condition:
+            return self._reads
+
+    def advance(self, seconds: float) -> None:
+        with self._condition:
+            self._value += seconds
+            self._condition.notify_all()
+
+    def wait_for_read_after(self, previous: int, timeout: float = 1.0) -> None:
+        with self._condition:
+            if not self._condition.wait_for(
+                lambda: self._reads > previous,
+                timeout=timeout,
+            ):
+                raise AssertionError("emulated-link worker did not read the clock")
 
 
-class _Link:
-    """Par de sockets conectados por loopback, con lector en segundo plano."""
+class _RecordingSocket:
+    def __init__(self, clock: _ManualClock, *, fail: bool = False) -> None:
+        self.clock = clock
+        self.fail = fail
+        self.chunks: list[bytes] = []
+        self.send_times: list[float] = []
+        self.send_threads: list[str] = []
+        self.shutdown_calls = 0
+        self._condition = threading.Condition()
 
-    def __init__(self):
-        listener = socket.socket()
-        listener.bind(("127.0.0.1", 0))
-        listener.listen(1)
-        self.client = socket.create_connection(listener.getsockname())
-        self.server, _ = listener.accept()
-        listener.close()
-        self.received = []
-        self._reader = None
+    def sendall(self, data: bytes | bytearray | memoryview) -> None:
+        with self._condition:
+            self.send_times.append(self.clock.value)
+            self.send_threads.append(threading.current_thread().name)
+            if self.fail:
+                self._condition.notify_all()
+                raise OSError("recording socket exploded")
+            self.chunks.append(bytes(data))
+            self._condition.notify_all()
 
-    def read_frames(self, count):
-        """Lee `count` frames en un hilo y anota CUÁNDO llegó cada uno."""
-        started = time.monotonic()
+    def shutdown(self, _: int) -> None:
+        with self._condition:
+            self.shutdown_calls += 1
+            self._condition.notify_all()
 
-        def _run():
-            for _ in range(count):
-                frame = recv_frame(self.server)
-                self.received.append((time.monotonic() - started, frame))
-
-        self._reader = threading.Thread(target=_run, daemon=True)
-        self._reader.start()
-        return self._reader
-
-    def close(self):
-        close_emulated_link(self.client)
-        for sock in (self.client, self.server):
-            try:
-                sock.close()
-            except OSError:
-                pass
-
-
-def _send(link, emulator, step, payload=b""):
-    # ERROR es el único tipo con payload libre y `step` libre, así que sirve de
-    # portador neutro para medir el transporte sin pelearse con el validador.
-    return send_frame(
-        link.client,
-        FrameType.ERROR,
-        request_id=1,
-        step=step,
-        payload=payload,
-        emulator=emulator,
-    )
+    def wait_for_calls(self, count: int, timeout: float = 1.0) -> None:
+        with self._condition:
+            if not self._condition.wait_for(
+                lambda: len(self.send_times) >= count,
+                timeout=timeout,
+            ):
+                raise AssertionError(
+                    f"expected {count} socket writes, got {len(self.send_times)}"
+                )
 
 
-class PropagationIsNotSerialTests(unittest.TestCase):
-    def setUp(self):
-        self.link = _Link()
-        self.addCleanup(self.link.close)
+def _advance_and_wake(
+    clock: _ManualClock,
+    emulator: LinkEmulator,
+    seconds: float,
+) -> None:
+    previous_reads = clock.reads
+    clock.advance(seconds)
+    emulator.notify_clock_advanced()
+    clock.wait_for_read_after(previous_reads)
 
-    def test_one_frame_still_takes_one_delay(self):
-        """PARIDAD a W=1: el arreglo no debe abaratar el caso de un solo frame."""
-        emulator = LinkEmulator(one_way_delay_ms=DELAY_MS)
-        reader = self.link.read_frames(1)
-        _send(self.link, emulator, step=0)
-        reader.join(timeout=10)
-        self.assertEqual(len(self.link.received), 1)
-        arrival, _ = self.link.received[0]
-        self.assertGreaterEqual(
-            arrival, DELAY_S * 0.5,
-            "el frame llegó demasiado pronto: la propagación no se está aplicando",
+
+class LinkEmulatorTests(unittest.TestCase):
+    def test_disabled_emulator_and_none_keep_inline_send_path(self) -> None:
+        clock = _ManualClock()
+        direct = _RecordingSocket(clock)
+        inactive = LinkEmulator(clock=clock)
+        expected_thread = threading.current_thread().name
+
+        send_frame(direct, FrameType.BEGIN, 1)
+        send_frame(direct, FrameType.END, 1, emulator=inactive)
+
+        self.assertEqual(len(direct.chunks), 2)
+        self.assertEqual(direct.send_threads, [expected_thread, expected_thread])
+        self.assertEqual(inactive.pending_frames, 0)
+        inactive.close()
+
+    def test_one_frame_matches_propagation_plus_serialization_model(self) -> None:
+        clock = _ManualClock(initial=100.0)
+        # A 32-byte frame takes exactly 250 ms at this bandwidth.
+        bandwidth_mbps = (HEADER_BYTES * 8) / (0.25 * 1_000_000)
+        emulator = LinkEmulator(
+            one_way_delay_ms=500,
+            bandwidth_mbps=bandwidth_mbps,
+            clock=clock,
         )
-        self.assertLess(arrival, DELAY_S + TOLERANCE_S)
+        recorded = _RecordingSocket(clock)
 
-    def test_the_sender_is_not_blocked_by_propagation(self):
-        """El emisor debe volver enseguida: la red no le hace esperar a que llegue."""
-        emulator = LinkEmulator(one_way_delay_ms=DELAY_MS)
-        reader = self.link.read_frames(4)
-        started = time.monotonic()
-        for step in range(4):
-            _send(self.link, emulator, step=step)
-        elapsed_sending = time.monotonic() - started
-        # Con el bug, enviar 4 frames costaba 4×60 = 240 ms de reloj DEL EMISOR.
-        self.assertLess(
-            elapsed_sending, DELAY_S * 2,
-            f"enviar 4 frames bloqueó al emisor {elapsed_sending * 1000:.0f} ms: "
-            "la propagación se sigue cobrando en serie",
+        send_frame(recorded, FrameType.BEGIN, 7, emulator=emulator)
+        _advance_and_wake(clock, emulator, 0.749)
+        self.assertEqual(recorded.send_times, [])
+        _advance_and_wake(clock, emulator, 0.001)
+        recorded.wait_for_calls(1)
+        emulator.flush(timeout_seconds=1)
+
+        self.assertEqual(recorded.send_times, [100.75])
+        self.assertAlmostEqual(
+            emulator.single_frame_delay_seconds(HEADER_BYTES),
+            0.75,
         )
-        reader.join(timeout=10)
-        self.assertEqual(len(self.link.received), 4)
+        emulator.close(timeout_seconds=1)
 
-    def test_frames_in_flight_overlap_instead_of_queueing(self):
-        """SOLAPE: N frames en vuelo no cuestan N retardos."""
-        emulator = LinkEmulator(one_way_delay_ms=DELAY_MS)
-        windows = 4
-        reader = self.link.read_frames(windows)
-        for step in range(windows):
-            _send(self.link, emulator, step=step)
-        reader.join(timeout=15)
-        self.assertEqual(len(self.link.received), windows)
-        last_arrival, _ = self.link.received[-1]
-        serial_cost = DELAY_S * windows
-        self.assertLess(
-            last_arrival, serial_cost * 0.6,
-            f"el último de {windows} frames llegó a {last_arrival * 1000:.0f} ms; "
-            f"en serie serían {serial_cost * 1000:.0f} ms — no hay solape",
+    def test_two_frames_overlap_propagation_and_preserve_fifo_order(self) -> None:
+        clock = _ManualClock()
+        emulator = LinkEmulator(one_way_delay_ms=1_000, clock=clock)
+        recorded = _RecordingSocket(clock)
+
+        send_frame(recorded, FrameType.BEGIN, 11, emulator=emulator)
+        send_frame(recorded, FrameType.BEGIN, 22, emulator=emulator)
+        _advance_and_wake(clock, emulator, 1.0)
+        recorded.wait_for_calls(2)
+        emulator.flush(timeout_seconds=1)
+
+        request_ids = [HEADER.unpack(chunk)[4] for chunk in recorded.chunks]
+        self.assertEqual(request_ids, [11, 22])
+        self.assertEqual(recorded.send_times, [1.0, 1.0])
+        self.assertTrue(
+            all(
+                name.startswith("mycellios-link-sender-")
+                for name in recorded.send_threads
+            )
+        )
+        emulator.close(timeout_seconds=1)
+
+    def test_control_frame_without_explicit_emulator_cannot_overtake_data(self) -> None:
+        clock = _ManualClock()
+        emulator = LinkEmulator(one_way_delay_ms=1_000, clock=clock)
+        recorded = _RecordingSocket(clock)
+
+        send_frame(
+            recorded,
+            FrameType.ACTIVATION,
+            31,
+            payload=b"\0\0\0\0",
+            token_count=1,
+            hidden_size=1,
+            emulator=emulator,
+        )
+        # Real engine/stage call sites historically omitted the emulator for
+        # lifecycle frames. Once the stream is owned this frame must enter the
+        # same FIFO instead of calling sendall inline.
+        send_frame(recorded, FrameType.END, 31)
+        self.assertEqual(recorded.send_times, [])
+
+        _advance_and_wake(clock, emulator, 1.0)
+        recorded.wait_for_calls(2)
+        emulator.close(timeout_seconds=1)
+        self.assertEqual(
+            [
+                HEADER.unpack(chunk)[2]
+                for chunk in recorded.chunks
+                if len(chunk) == HEADER_BYTES
+            ],
+            [FrameType.ACTIVATION, FrameType.END],
         )
 
-    def test_delivery_order_matches_send_order(self):
-        """Un hilo de entrega por enlace: reordenar partiría el stream."""
-        emulator = LinkEmulator(one_way_delay_ms=5.0)
-        count = 25
-        reader = self.link.read_frames(count)
-        for step in range(count):
-            _send(self.link, emulator, step=step)
-        reader.join(timeout=15)
-        self.assertEqual(len(self.link.received), count)
-        self.assertEqual([frame.step for _, frame in self.link.received], list(range(count)))
+        # Successful close releases stream ownership; a later unrelated
+        # non-emulated lifecycle write returns to the exact inline path.
+        send_frame(recorded, FrameType.SHUTDOWN, 0)
+        self.assertEqual(recorded.send_threads[-1], threading.current_thread().name)
 
-    def test_payloads_survive_the_delayed_path_intact(self):
-        emulator = LinkEmulator(one_way_delay_ms=5.0)
-        payloads = [struct.pack(">I", n) * (n + 1) for n in range(8)]
-        reader = self.link.read_frames(len(payloads))
-        for step, payload in enumerate(payloads):
-            _send(self.link, emulator, step=step, payload=payload)
-        reader.join(timeout=15)
-        self.assertEqual([frame.payload for _, frame in self.link.received], payloads)
-
-    def test_a_socket_with_an_emulated_link_keeps_using_it(self):
-        """Mezclar `sendall` directo con el hilo de entrega intercalaría bytes."""
-        emulator = LinkEmulator(one_way_delay_ms=5.0)
-        reader = self.link.read_frames(3)
-        _send(self.link, emulator, step=0)
-        _send(self.link, None, step=1)                    # sin emulador
-        _send(self.link, LinkEmulator(), step=2)          # emulador sin retardo
-        reader.join(timeout=15)
-        self.assertEqual([frame.step for _, frame in self.link.received], [0, 1, 2])
-
-
-class TerminalFrameIsDrainedTests(unittest.TestCase):
-    """Quien manda SHUTDOWN cierra el socket justo después.
-
-    Como una vez que el socket tiene enlace emulado TODO envío se encola —incluido
-    el SHUTDOWN, que va sin emulador—, cerrar sin drenar lo perdería en silencio y
-    el par se quedaría esperando un cierre que nunca llega.
-    """
-
-    def setUp(self):
-        self.link = _Link()
-        self.addCleanup(self.link.close)
-
-    def test_shutdown_reaches_the_peer_even_if_the_socket_closes_right_after(self):
-        emulator = LinkEmulator(one_way_delay_ms=DELAY_MS)
-        reader = self.link.read_frames(3)
-        _send(self.link, emulator, step=0)
-        _send(self.link, emulator, step=1)
-        send_frame(self.link.client, FrameType.SHUTDOWN, request_id=0, emulator=None)
-        # Cerrar inmediatamente: es lo que hace el llamante real.
-        self.link.client.close()
-        reader.join(timeout=10)
-        kinds = [frame.frame_type for _, frame in self.link.received]
-        self.assertEqual(len(self.link.received), 3, f"se perdió algún frame: {kinds}")
-        self.assertEqual(kinds[-1], FrameType.SHUTDOWN)
-
-    def test_a_non_terminal_frame_does_not_drain(self):
-        # Drenar en END o ERROR serializaría el enlace justo en el caso que el
-        # emulador existe para medir. Sólo SHUTDOWN cierra la conexión.
-        emulator = LinkEmulator(one_way_delay_ms=DELAY_MS)
-        reader = self.link.read_frames(4)
-        started = time.monotonic()
-        for step in range(4):
-            _send(self.link, emulator, step=step)   # ERROR, no terminal
-        elapsed = time.monotonic() - started
-        self.assertLess(
-            elapsed, DELAY_S * 2,
-            f"enviar 4 frames no terminales bloqueó {elapsed * 1000:.0f} ms: "
-            "se están drenando y eso destruye el solape",
+    def test_rejected_first_frame_does_not_poison_socket_ownership(self) -> None:
+        clock = _ManualClock()
+        emulator = LinkEmulator(
+            one_way_delay_ms=1_000,
+            max_queued_bytes=HEADER_BYTES,
+            clock=clock,
         )
-        reader.join(timeout=10)
+        recorded = _RecordingSocket(clock)
 
+        with self.assertRaisesRegex(ValueError, "queue byte capacity"):
+            send_frame(
+                recorded,
+                FrameType.ACTIVATION,
+                31,
+                payload=b"\0\0\0\0",
+                token_count=1,
+                hidden_size=1,
+                emulator=emulator,
+            )
 
-class WithoutEmulationNothingChangesTests(unittest.TestCase):
-    """El camino de producción (sin retardo configurado) queda intacto."""
+        send_frame(recorded, FrameType.BEGIN, 32)
+        self.assertEqual(recorded.send_threads, [threading.current_thread().name])
+        self.assertEqual(HEADER.unpack(recorded.chunks[0])[2], FrameType.BEGIN)
+        emulator.close()
 
-    def setUp(self):
-        self.link = _Link()
-        self.addCleanup(self.link.close)
+    def test_bandwidth_serialization_remains_ordered_while_delay_overlaps(self) -> None:
+        clock = _ManualClock()
+        # One second of serialization for each payload-free frame.
+        bandwidth_mbps = (HEADER_BYTES * 8) / 1_000_000
+        emulator = LinkEmulator(
+            one_way_delay_ms=2_000,
+            bandwidth_mbps=bandwidth_mbps,
+            clock=clock,
+        )
+        recorded = _RecordingSocket(clock)
 
-    def test_no_emulator_sends_synchronously(self):
-        reader = self.link.read_frames(1)
-        _send(self.link, None, step=0, payload=b"hola")
-        reader.join(timeout=5)
-        self.assertEqual(len(self.link.received), 1)
-        arrival, frame = self.link.received[0]
-        self.assertLess(arrival, 0.25)
-        self.assertEqual(frame.payload, b"hola")
+        send_frame(recorded, FrameType.BEGIN, 1, emulator=emulator)
+        send_frame(recorded, FrameType.BEGIN, 2, emulator=emulator)
+        _advance_and_wake(clock, emulator, 3.0)
+        recorded.wait_for_calls(1)
+        self.assertEqual(recorded.send_times, [3.0])
+        _advance_and_wake(clock, emulator, 1.0)
+        recorded.wait_for_calls(2)
+        emulator.flush(timeout_seconds=1)
 
-    def test_a_zero_delay_emulator_does_not_spawn_a_delivery_thread(self):
-        before = threading.active_count()
-        reader = self.link.read_frames(1)
-        _send(self.link, LinkEmulator(), step=0)
-        reader.join(timeout=5)
-        # +1 por el hilo lector de la propia prueba; el emulador no debe añadir otro.
-        self.assertLessEqual(threading.active_count(), before + 1)
+        self.assertEqual(recorded.send_times, [3.0, 4.0])
+        self.assertEqual(
+            [HEADER.unpack(chunk)[4] for chunk in recorded.chunks],
+            [1, 2],
+        )
+        emulator.close(timeout_seconds=1)
 
+    def test_real_socket_round_trip_is_byte_exact_after_async_drain(self) -> None:
+        clock = _ManualClock()
+        emulator = LinkEmulator(one_way_delay_ms=1_000, clock=clock)
+        sender, receiver = socket.socketpair()
+        try:
+            send_frame(sender, FrameType.BEGIN, 91, emulator=emulator)
+            send_frame(
+                sender,
+                FrameType.ERROR,
+                91,
+                payload=b"byte-exact",
+                emulator=emulator,
+            )
+            _advance_and_wake(clock, emulator, 1.0)
+            emulator.flush(timeout_seconds=1)
 
-class CostModelTests(unittest.TestCase):
-    def test_serialization_and_propagation_are_reported_separately(self):
-        emulator = LinkEmulator(one_way_delay_ms=100.0, bandwidth_mbps=8.0)
+            begin = recv_frame(receiver)
+            error = recv_frame(receiver)
+            self.assertEqual(
+                (begin.frame_type, begin.request_id), (FrameType.BEGIN, 91)
+            )
+            self.assertEqual(
+                (error.frame_type, error.request_id), (FrameType.ERROR, 91)
+            )
+            self.assertEqual(error.payload, b"byte-exact")
+            emulator.close(timeout_seconds=1)
+        finally:
+            sender.close()
+            receiver.close()
+
+    def test_queue_is_bounded_and_close_rejects_future_frames(self) -> None:
+        clock = _ManualClock()
+        emulator = LinkEmulator(
+            one_way_delay_ms=1_000,
+            max_queued_frames=1,
+            enqueue_timeout_seconds=0,
+            clock=clock,
+        )
+        recorded = _RecordingSocket(clock)
+
+        send_frame(recorded, FrameType.BEGIN, 1, emulator=emulator)
+        with self.assertRaisesRegex(LinkEmulatorError, "bounded"):
+            send_frame(recorded, FrameType.BEGIN, 2, emulator=emulator)
+        self.assertEqual(emulator.pending_frames, 1)
+
+        _advance_and_wake(clock, emulator, 1.0)
+        recorded.wait_for_calls(1)
+        emulator.close(timeout_seconds=1)
+        with self.assertRaisesRegex(LinkEmulatorError, "closed"):
+            send_frame(recorded, FrameType.BEGIN, 3, emulator=emulator)
+        self.assertIsNone(emulator._worker)
+
+    def test_background_socket_error_is_propagated_and_wakes_flush(self) -> None:
+        clock = _ManualClock()
+        emulator = LinkEmulator(one_way_delay_ms=1_000, clock=clock)
+        failing = _RecordingSocket(clock, fail=True)
+
+        send_frame(failing, FrameType.BEGIN, 1, emulator=emulator)
+        _advance_and_wake(clock, emulator, 1.0)
+        failing.wait_for_calls(1)
+        with self.assertRaisesRegex(LinkEmulatorError, "sender failed") as raised:
+            emulator.flush(timeout_seconds=1)
+        self.assertIsInstance(raised.exception.__cause__, OSError)
+        self.assertEqual(failing.shutdown_calls, 1)
+
+        # The asynchronous failure is sticky and is surfaced on every later send.
+        with self.assertRaisesRegex(LinkEmulatorError, "sender failed"):
+            send_frame(failing, FrameType.BEGIN, 2, emulator=emulator)
+
+    def test_cost_model_reports_propagation_and_serialization_separately(self) -> None:
+        emulator = LinkEmulator(one_way_delay_ms=100, bandwidth_mbps=8)
+
         self.assertAlmostEqual(emulator.propagation_seconds, 0.1)
-        # 1 MB a 8 Mbps = 1 s.
         self.assertAlmostEqual(emulator.serialization_seconds(1_000_000), 1.0)
+        self.assertAlmostEqual(
+            emulator.single_frame_delay_seconds(1_000_000),
+            1.1,
+        )
+        emulator.close()
 
-    def test_bandwidth_is_optional(self):
-        self.assertEqual(LinkEmulator(one_way_delay_ms=10.0).serialization_seconds(10_000), 0.0)
+    def test_cost_model_clamps_negative_delay_and_allows_no_bandwidth(self) -> None:
+        emulator = LinkEmulator(one_way_delay_ms=-5)
 
-    def test_negative_delay_is_clamped(self):
-        self.assertEqual(LinkEmulator(one_way_delay_ms=-5.0).propagation_seconds, 0.0)
+        self.assertEqual(emulator.propagation_seconds, 0.0)
+        self.assertEqual(emulator.serialization_seconds(10_000), 0.0)
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            emulator.serialization_seconds(-1)
+        emulator.close()
+
+    def test_close_emulated_link_compatibility_helper_is_idempotent(self) -> None:
+        clock = _ManualClock()
+        emulator = LinkEmulator(one_way_delay_ms=1_000, clock=clock)
+        recorded = _RecordingSocket(clock)
+
+        send_frame(recorded, FrameType.BEGIN, 1, emulator=emulator)
+        _advance_and_wake(clock, emulator, 1.0)
+        recorded.wait_for_calls(1)
+        close_emulated_link(recorded, timeout=1)
+        close_emulated_link(recorded, timeout=1)
+
+        send_frame(recorded, FrameType.BEGIN, 2)
+        self.assertEqual(recorded.send_threads[-1], threading.current_thread().name)
 
 
 if __name__ == "__main__":

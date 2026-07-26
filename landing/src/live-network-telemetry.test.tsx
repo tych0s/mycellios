@@ -7,6 +7,7 @@ describe("LiveNetworkTelemetry", () => {
     const snapshot = {
       capturedAt: new Date().toISOString(),
       version: "0.73.1",
+      buildIdentity: null,
       summary: { registered: 2, connected: 1, online: 1, mobile: 0, offeredVramMb: 196_608, completedJobs: 1 },
       workers: [{
         id: "online-peer",

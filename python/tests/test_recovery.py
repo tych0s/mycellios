@@ -17,21 +17,76 @@ from distributed_runtime.engine import (
 from distributed_runtime.protocol import TensorCodec
 from distributed_runtime.recovery import (
     PipelineRecoveryError,
+    RecoveryCompatibilityError,
     RecoveringPipelineEngine,
+    RemoteRecoveryStandbyEngineFactory,
+    RemoteRecoveryStandbyRoute,
+    recovery_identity_sha256,
+    visible_prefix_checkpoint_sha256,
 )
 
 
 class RecoveringPipelineEngineTests(unittest.TestCase):
-    def test_physical_tree_limits_are_part_of_recovery_identity_v4(self) -> None:
+    def test_remote_standby_contract_round_trips_and_is_content_sealed(self) -> None:
+        route = RemoteRecoveryStandbyRoute(
+            route_id="standby-eu-1",
+            first_stage_host="10.0.0.8",
+            first_stage_port=20_001,
+            stage_executor_ids=("1" * 32, "2" * 32),
+        )
+        parsed = RemoteRecoveryStandbyRoute.parse_json(
+            __import__("json").dumps(route.to_document())
+        )
+        self.assertEqual(parsed, route)
+        self.assertRegex(route.contract_sha256, r"^sha256:[0-9a-f]{64}$")
+        self.assertNotEqual(
+            route.contract_sha256,
+            RemoteRecoveryStandbyRoute(
+                route_id=route.route_id,
+                first_stage_host=route.first_stage_host,
+                first_stage_port=20_002,
+                stage_executor_ids=route.stage_executor_ids,
+            ).contract_sha256,
+        )
+        self.assertRegex(
+            recovery_identity_sha256(_identity()),
+            r"^sha256:[0-9a-f]{64}$",
+        )
+
+    def test_visible_prefix_checkpoint_is_token_exact_and_not_a_kv_claim(self) -> None:
+        prompt = torch.tensor([[1, 2]])
+        checkpoint = visible_prefix_checkpoint_sha256(prompt, (10, 11))
+        self.assertRegex(checkpoint, r"^sha256:[0-9a-f]{64}$")
+        self.assertNotEqual(
+            checkpoint,
+            visible_prefix_checkpoint_sha256(prompt, (10, 12)),
+        )
+        self.assertNotEqual(
+            checkpoint,
+            visible_prefix_checkpoint_sha256(torch.tensor([[1, 3]]), (10, 11)),
+        )
+
+    def test_speculative_execution_limits_are_part_of_recovery_identity_v5(self) -> None:
         disabled = _identity()
-        enabled = replace(
+        tree_enabled = replace(
             disabled,
             max_speculative_branches=2,
             max_speculative_branch_tokens=128,
             max_speculative_kv_bytes=4096,
         )
-        self.assertEqual(disabled.schema_version, 4)
-        self.assertNotEqual(disabled, enabled)
+        conveyor_enabled = replace(
+            disabled,
+            speculative_max_draft_tokens=2,
+            speculative_inflight_waves=3,
+            speculative_inflight_bytes=4096,
+        )
+        self.assertEqual(disabled.schema_version, 5)
+        self.assertNotEqual(disabled, tree_enabled)
+        self.assertNotEqual(disabled, conveyor_enabled)
+        self.assertNotEqual(
+            recovery_identity_sha256(disabled),
+            recovery_identity_sha256(conveyor_enabled),
+        )
 
     def test_executor_contract_requires_one_sealed_id_per_stage(self) -> None:
         common = {"model_name": "fixture", "boundaries": (0, 2, 4)}
@@ -84,6 +139,129 @@ class RecoveringPipelineEngineTests(unittest.TestCase):
         self.assertEqual(stats["route_recovery_successes"], 1)
         self.assertEqual(stats["recovered_requests"], 1)
         self.assertEqual(stats["replayed_output_tokens"], 2)
+        self.assertEqual(stats["duplicate_tokens_suppressed"], 2)
+        self.assertEqual(stats["visible_prefix_checkpoints"], 1)
+        self.assertEqual(stats["checkpoint_kind"], "visible-token-prefix-not-kv")
+        self.assertRegex(
+            stats["last_visible_prefix_sha256"],
+            r"^sha256:[0-9a-f]{64}$",
+        )
+
+    def test_prevalidated_remote_standby_is_promoted_before_primary_recreation(self) -> None:
+        identity = _identity()
+        expected = {17: (70, 71, 72)}
+        prompt_lengths = {17: 1}
+        first = _ScriptedEngine(
+            identity,
+            expected,
+            prompt_lengths,
+            emit_before_failure=1,
+        )
+        standby = _ScriptedEngine(identity, expected, prompt_lengths)
+        standby.config.spawn_local_stages = False
+        standby.config.stage_executor_ids = identity.stage_executor_ids
+        standby_factory_calls = 0
+
+        def build_standby() -> _ScriptedEngine:
+            nonlocal standby_factory_calls
+            standby_factory_calls += 1
+            return standby
+
+        route = RemoteRecoveryStandbyRoute(
+            route_id="standby-loopback",
+            first_stage_host="127.0.0.1",
+            first_stage_port=31_001,
+            stage_executor_ids=identity.stage_executor_ids,
+        )
+        engine = RecoveringPipelineEngine(
+            lambda: _ScriptedEngine(identity, expected, prompt_lengths),
+            initial_engine=first,
+            max_retries=1,
+            standby_factories=(
+                RemoteRecoveryStandbyEngineFactory(route, build_standby),
+            ),
+        )
+        observed: list[int] = []
+        try:
+            output = engine.generate(
+                [GenerationInput(17, torch.tensor([[4]]), 3)],
+                lambda _client, token, _step, _arrived: observed.append(token),
+            )[0]
+            stats = engine.recovery_stats
+        finally:
+            engine.close()
+
+        self.assertEqual(output.token_ids, expected[17])
+        self.assertEqual(observed, list(expected[17]))
+        self.assertEqual(standby_factory_calls, 1)
+        self.assertEqual(stats["active_route_id"], "standby-loopback")
+        self.assertEqual(stats["last_promoted_route_id"], "standby-loopback")
+        self.assertEqual(stats["standby_prevalidations"], 1)
+        self.assertEqual(stats["route_promotions"], 1)
+        self.assertEqual(stats["standby_routes"][0]["promotions"], 1)
+        self.assertTrue(stats["standby_routes"][0]["statically_prevalidated"])
+
+    def test_dirty_shutdown_of_failed_route_is_evidence_not_a_promotion_blocker(
+        self,
+    ) -> None:
+        identity = _identity()
+        expected = {18: (80, 81)}
+        first = _DirtyCloseEngine(
+            identity,
+            expected,
+            {18: 1},
+            emit_before_failure=1,
+        )
+        engine = RecoveringPipelineEngine(
+            lambda: _ScriptedEngine(identity, expected, {18: 1}),
+            initial_engine=first,
+            max_retries=1,
+        )
+        try:
+            output = engine.generate(
+                [GenerationInput(18, torch.tensor([[4]]), 2)]
+            )[0]
+            stats = engine.recovery_stats
+        finally:
+            engine.close()
+
+        self.assertEqual(output.token_ids, expected[18])
+        self.assertEqual(stats["route_recovery_successes"], 1)
+        self.assertEqual(stats["failed_route_close_errors"], 1)
+        self.assertIn(
+            "synthetic dirty route shutdown",
+            stats["last_failed_route_close_error"],
+        )
+
+    def test_incompatible_remote_standby_is_rejected_before_factory_execution(self) -> None:
+        identity = _identity()
+        first = _ScriptedEngine(identity, {1: (2,)}, {1: 1})
+        calls = 0
+
+        def forbidden_factory() -> _ScriptedEngine:
+            nonlocal calls
+            calls += 1
+            return _ScriptedEngine(identity, {1: (2,)}, {1: 1})
+
+        route = RemoteRecoveryStandbyRoute(
+            route_id="wrong-executor",
+            first_stage_host="127.0.0.1",
+            first_stage_port=31_002,
+            stage_executor_ids=("1" * 32, "9" * 32),
+        )
+        with self.assertRaisesRegex(
+            RecoveryCompatibilityError,
+            "does not match the active recovery identity",
+        ):
+            RecoveringPipelineEngine(
+                lambda: first,
+                initial_engine=first,
+                standby_factories=(
+                    RemoteRecoveryStandbyEngineFactory(route, forbidden_factory),
+                ),
+            )
+        self.assertEqual(calls, 0)
+        self.assertTrue(first.closed)
 
     def test_one_failed_batch_recovers_multiple_requests_together(self) -> None:
         identity = _identity()
@@ -433,12 +611,18 @@ class _BlockingEngine(_ScriptedEngine):
             future.cancel()
 
 
+class _DirtyCloseEngine(_ScriptedEngine):
+    def close(self) -> None:
+        self.closed = True
+        raise RuntimeError("synthetic dirty route shutdown")
+
+
 def _identity(
     *, artifact_identity: str = "sha256:same",
     stage_executor_ids: tuple[str, ...] = ("1" * 32, "2" * 32),
 ) -> PipelineRecoveryIdentity:
     return PipelineRecoveryIdentity(
-        schema_version=4,
+        schema_version=5,
         artifact_identity=artifact_identity,
         canonical_model_source="hf://fixture/model",
         canonical_model_revision="a" * 40,
@@ -460,6 +644,8 @@ def _identity(
         sealed_wave_tokens=1,
         max_prefill_chunk_tokens=0,
         speculative_max_draft_tokens=0,
+        speculative_inflight_waves=1,
+        speculative_inflight_bytes=0,
         speculation_minimum_speedup=1.05,
         speculation_probe=True,
     )

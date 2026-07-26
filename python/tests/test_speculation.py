@@ -8,6 +8,7 @@ from distributed_runtime.speculation import (
     MAX_TREE_DRAFT_BRANCHES,
     AdaptiveSpeculationConfig,
     AdaptiveSpeculationController,
+    CandidateEstimate,
     DraftProvider,
     NgramDraftProvider,
     NgramTreeDraftProvider,
@@ -197,6 +198,35 @@ class NgramTreeDraftProviderTests(unittest.TestCase):
 
 
 class AdaptiveSpeculationControllerTests(unittest.TestCase):
+    def test_candidate_estimate_preserves_the_legacy_positional_constructor(
+        self,
+    ) -> None:
+        estimate = CandidateEstimate(
+            2,
+            0,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0.95,
+            False,
+        )
+
+        self.assertEqual(estimate.candidate_size, 2)
+        self.assertIsNone(estimate.observed_emitted_tokens_per_verification)
+        self.assertIsNone(
+            estimate.observed_emitted_tokens_per_verification_lower_bound
+        )
+        self.assertIsNone(
+            estimate.observed_emitted_tokens_per_verification_upper_bound
+        )
+
     @staticmethod
     def _controller(
         *,
@@ -282,6 +312,11 @@ class AdaptiveSpeculationControllerTests(unittest.TestCase):
             {"seconds_per_byte": math.inf},
             {"minimum_speedup": 0.99},
             {"minimum_speedup": math.nan},
+            {"confidence_level": 0.5},
+            {"confidence_level": 1.0},
+            {"confidence_level": math.nan},
+            {"speedup_hysteresis": -0.01},
+            {"minimum_speedup": 1.1, "speedup_hysteresis": 1.1},
         )
         for kwargs in invalid_kwargs:
             with self.subTest(kwargs=kwargs):
@@ -342,6 +377,99 @@ class AdaptiveSpeculationControllerTests(unittest.TestCase):
         self.assertAlmostEqual(decision.predicted_speedup or 0, 3.0)
         self.assertAlmostEqual(decision.expected_emitted_tokens or 0, 3.0)
         self.assertAlmostEqual(decision.predicted_latency_speedup or 0, 3.0)
+        self.assertAlmostEqual(
+            decision.predicted_speedup_lower_bound or 0,
+            3.0,
+        )
+
+    def test_noisy_point_estimate_cannot_enable_without_a_speedup_lower_bound(
+        self,
+    ) -> None:
+        controller = AdaptiveSpeculationController(
+            AdaptiveSpeculationConfig(
+                max_draft_tokens=2,
+                candidate_sizes=(2,),
+                min_token_history=1,
+                min_classic_observations=4,
+                min_verify_observations=4,
+                minimum_speedup=1.05,
+                confidence_level=0.95,
+            )
+        )
+        for _ in range(4):
+            controller.record_classic(
+                latency_seconds=1.0,
+                transferred_bytes=0,
+            )
+        for latency in (0.1, 0.1, 5.0, 0.1):
+            controller.record_verification(
+                proposed_tokens=2,
+                accepted_tokens=2,
+                latency_seconds=latency,
+                transferred_bytes=0,
+            )
+
+        estimate = controller.candidate_estimate(2)
+        self.assertGreater(estimate.predicted_speedup or 0, 2.0)
+        self.assertLess(estimate.predicted_speedup_lower_bound or math.inf, 1.05)
+        decision = controller.decide(
+            history_tokens=20,
+            available_draft_tokens=2,
+        )
+        self.assertFalse(decision.enabled)
+        self.assertEqual(decision.reason, "not_beneficial")
+
+    def test_enabled_strategy_uses_a_lower_exit_threshold_to_avoid_flapping(
+        self,
+    ) -> None:
+        controller = AdaptiveSpeculationController(
+            AdaptiveSpeculationConfig(
+                max_draft_tokens=2,
+                candidate_sizes=(2,),
+                min_token_history=1,
+                min_classic_observations=2,
+                min_verify_observations=2,
+                minimum_speedup=1.2,
+                speedup_hysteresis=0.1,
+            )
+        )
+        for _ in range(40):
+            controller.record_classic(
+                latency_seconds=1.0,
+                transferred_bytes=0,
+            )
+        for _ in range(20):
+            controller.record_verification(
+                proposed_tokens=2,
+                accepted_tokens=2,
+                latency_seconds=2.4,
+                transferred_bytes=0,
+            )
+        entered = controller.decide(
+            history_tokens=20,
+            available_draft_tokens=2,
+        )
+        self.assertTrue(entered.enabled)
+        self.assertGreater(
+            entered.predicted_speedup_lower_bound or 0,
+            1.2,
+        )
+
+        for _ in range(20):
+            controller.record_verification(
+                proposed_tokens=2,
+                accepted_tokens=2,
+                latency_seconds=2.6,
+                transferred_bytes=0,
+            )
+        held = controller.decide(
+            history_tokens=20,
+            available_draft_tokens=2,
+        )
+        self.assertTrue(held.enabled)
+        self.assertEqual(held.reason, "hysteresis_hold")
+        self.assertLess(held.predicted_speedup_lower_bound or math.inf, 1.2)
+        self.assertGreater(held.predicted_speedup_lower_bound or 0, 1.1)
 
     def test_available_draft_count_filters_larger_candidates(self) -> None:
         controller = self._controller(candidates=(2, 4))
@@ -423,6 +551,10 @@ class AdaptiveSpeculationControllerTests(unittest.TestCase):
         self.assertEqual(stats.verification_latency_seconds, 4.0)
         self.assertEqual(stats.verification_bytes, 400)
         self.assertAlmostEqual(stats.acceptance_rate or 0, 2 / 3)
+        self.assertAlmostEqual(
+            stats.observed_emitted_tokens_per_verification or 0,
+            3.0,
+        )
 
         estimate = controller.candidate_estimate(4)
         self.assertTrue(estimate.ready)
@@ -430,8 +562,72 @@ class AdaptiveSpeculationControllerTests(unittest.TestCase):
         self.assertEqual(estimate.proposed_tokens, 8)
         self.assertEqual(estimate.accepted_tokens, 6)
         self.assertAlmostEqual(estimate.acceptance_rate or 0, 0.75)
+        self.assertAlmostEqual(
+            estimate.observed_emitted_tokens_per_verification or 0,
+            4.0,
+        )
+        self.assertAlmostEqual(
+            estimate.observed_emitted_tokens_per_verification_lower_bound or 0,
+            4.0,
+        )
+        self.assertAlmostEqual(
+            estimate.observed_emitted_tokens_per_verification_upper_bound or 0,
+            4.0,
+        )
         self.assertAlmostEqual(estimate.mean_verification_latency_seconds or 0, 1.25)
         self.assertAlmostEqual(estimate.mean_verification_bytes or 0, 120.0)
+
+    def test_observed_emitted_bounds_fail_closed_until_two_verifications(
+        self,
+    ) -> None:
+        controller = self._controller(candidates=(2,))
+        empty = controller.candidate_estimate(2)
+        self.assertIsNone(empty.observed_emitted_tokens_per_verification)
+        self.assertIsNone(
+            empty.observed_emitted_tokens_per_verification_lower_bound
+        )
+        self.assertIsNone(
+            empty.observed_emitted_tokens_per_verification_upper_bound
+        )
+        self.assertIsNone(
+            controller.stats().observed_emitted_tokens_per_verification
+        )
+
+        controller.record_verification(
+            proposed_tokens=2,
+            accepted_tokens=1,
+            latency_seconds=1.0,
+            transferred_bytes=10,
+        )
+        one = controller.candidate_estimate(2)
+        self.assertEqual(one.observed_emitted_tokens_per_verification, 2.0)
+        self.assertIsNone(
+            one.observed_emitted_tokens_per_verification_lower_bound
+        )
+        self.assertIsNone(
+            one.observed_emitted_tokens_per_verification_upper_bound
+        )
+
+        for accepted in (0, 2, 1):
+            controller.record_verification(
+                proposed_tokens=2,
+                accepted_tokens=accepted,
+                latency_seconds=1.0,
+                transferred_bytes=10,
+            )
+        observed = controller.candidate_estimate(2)
+        mean = observed.observed_emitted_tokens_per_verification
+        lower = observed.observed_emitted_tokens_per_verification_lower_bound
+        upper = observed.observed_emitted_tokens_per_verification_upper_bound
+        self.assertIsNotNone(mean)
+        self.assertIsNotNone(lower)
+        self.assertIsNotNone(upper)
+        assert mean is not None and lower is not None and upper is not None
+        self.assertTrue(all(math.isfinite(value) for value in (mean, lower, upper)))
+        self.assertLessEqual(1.0, lower)
+        self.assertLessEqual(lower, mean)
+        self.assertLessEqual(mean, upper)
+        self.assertLessEqual(upper, 3.0)
 
     def test_reset_discards_all_observations(self) -> None:
         controller = self._controller(candidates=(2,))

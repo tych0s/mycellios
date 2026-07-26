@@ -6,7 +6,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -25,6 +25,12 @@ import {
   verifyPortableRuntimeInstallation,
   type RuntimeCommandRunner,
 } from "../src/desktop/accelerator-runtime.js";
+import {
+  ARTIFACT_SWARM_SCHEMA,
+  ArtifactSwarmRegistry,
+  artifactChunkId,
+  signArtifactSwarmManifest,
+} from "../src/model-fabric/artifact-swarm.js";
 
 const temporaryDirectories: string[] = [];
 const artifactRestorers: Array<() => void> = [];
@@ -309,7 +315,7 @@ describe("desktop accelerator runtime", () => {
       .rejects.toThrow("Python provenance does not match win32/x64");
   });
 
-  it("rejects a stale v3 base runtime with different dependency versions", async () => {
+  it("rejects a stale v4 base runtime with different dependency versions", async () => {
     const root = temporaryRoot();
     const base = createBaseRuntime(root);
     const manifestPath = join(base, "runtime-manifest.json");
@@ -321,6 +327,20 @@ describe("desktop accelerator runtime", () => {
 
     await expect(readPortableRuntimeManifest(base, { platform: "win32", arch: "x64" }))
       .rejects.toThrow("package versions do not match win32/x64");
+  });
+
+  it("rejects a portable runtime whose sealed wheel-lock hash drifted", async () => {
+    const root = temporaryRoot();
+    const base = createBaseRuntime(root);
+    const manifestPath = join(base, "runtime-manifest.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+      wheelLock: { sha256: string };
+    };
+    manifest.wheelLock.sha256 = "0".repeat(64);
+    writeFileSync(manifestPath, JSON.stringify(manifest), "utf8");
+
+    await expect(readPortableRuntimeManifest(base, { platform: "win32", arch: "x64" }))
+      .rejects.toThrow("wheel lock does not match win32/x64");
   });
 
   it("executes the portable Python before accepting an extracted runtime", async () => {
@@ -605,6 +625,94 @@ describe("desktop accelerator runtime", () => {
     expect(existsSync(abandonedShortStaging)).toBe(false);
   });
 
+  it("uses the native verified swarm in the real accelerator provisioner before HTTPS origin", async () => {
+    const root = temporaryRoot();
+    const base = createBaseRuntime(root);
+    const userData = join(root, "user-data");
+    const artifactBytes = Buffer.from("verified-test-cuda-wheel");
+    const artifact = replaceCudaArtifact(artifactBytes);
+    const registry = new ArtifactSwarmRegistry();
+    const keys = generateKeyPairSync("ed25519");
+    const packageId = createHash("sha256").update("accelerator-package").digest("hex");
+    const manifestBytes = Buffer.from("accelerator-package-manifest");
+    const manifestDigest = createHash("sha256").update(manifestBytes).digest("hex");
+    const signed = registry.publish(signArtifactSwarmManifest({
+      schema: ARTIFACT_SWARM_SCHEMA,
+      modelIdentity: `sha256:${createHash("sha256").update("accelerator-runtime").digest("hex")}`,
+      sourceRevision: "mycellios-desktop-native",
+      tensorAbi: "mycellios-accelerator-artifact/1",
+      packages: [{
+        packageId,
+        layerStart: 0,
+        layerEnd: 1,
+        manifest: {
+          sha256: manifestDigest,
+          sizeBytes: manifestBytes.length,
+          chunks: [{
+            index: 0,
+            offset: 0,
+            sizeBytes: manifestBytes.length,
+            sha256: manifestDigest,
+          }],
+        },
+        blobs: [{
+          sha256: artifact.sha256,
+          sizeBytes: artifact.sizeBytes,
+          chunks: [{
+            index: 0,
+            offset: 0,
+            sizeBytes: artifact.sizeBytes,
+            sha256: artifact.sha256,
+          }],
+        }],
+      }],
+    }, keys.privateKey, keys.publicKey));
+    const artifactChunk = artifactChunkId(artifact.sha256, 0);
+    registry.announcePeer({
+      peerId: "desktop-peer",
+      chunkIds: [artifactChunk],
+      expiresAt: Date.now() + 60_000,
+      rttMs: 1,
+      goodputMbps: 1_000,
+      activeTransfers: 0,
+      reliability: 1,
+    });
+    const peerClient = {
+      fetchChunk: vi.fn(async () => ({
+        body: (async function* () {
+          yield artifactBytes;
+        })(),
+        contentLength: artifactBytes.length,
+      })),
+    };
+    const fetchMock = vi.fn(async () => {
+      throw new Error("origin_must_not_be_used");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const runner: RuntimeCommandRunner = vi.fn(async (_executable, args) => {
+      if (args[0] === "-c") return cudaProbeResult();
+      return { code: 0, stdout: "", stderr: "" };
+    });
+
+    const result = await prepareAcceleratorRuntime({
+      baseRuntimeRoot: base,
+      userDataPath: userData,
+      hardware: cudaHardware(),
+      allowProvisioning: true,
+      commandRunner: runner,
+      artifactSwarm: {
+        registry,
+        manifestId: signed.manifestId,
+        requesterPeerId: "desktop-requester",
+        peerClient,
+      },
+    });
+
+    expect(result.status).toBe("gpu-ready");
+    expect(peerClient.fetchChunk).toHaveBeenCalledOnce();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("uses a compact persistent Windows CUDA path without moving the package cache", () => {
     const root = temporaryRoot();
     const userData = join(root, "user-data");
@@ -884,6 +992,7 @@ function createBaseRuntime(root: string): string {
     pythonAbi: "cp312",
     executable: "python.exe",
     pythonArtifact: portablePythonArtifact("win32/x64"),
+    wheelLock: portableWheelLock("win32/x64"),
     torchVersion: "2.13.0+cpu",
     transformersVersion: "5.14.1",
     accelerateVersion: "1.14.0",
@@ -892,6 +1001,7 @@ function createBaseRuntime(root: string): string {
     sentencepieceVersion: "0.2.2",
     numpyVersion: "1.26.4",
     backend: "cpu",
+    bundledAccelerators: [],
   }), "utf8");
   return base;
 }
@@ -909,7 +1019,8 @@ function createMpsBaseRuntime(root: string): string {
     pythonAbi: "cp312",
     executable: "bin/python3",
     pythonArtifact: portablePythonArtifact("darwin/arm64"),
-    torchVersion: "2.13.0",
+    wheelLock: portableWheelLock("darwin/arm64"),
+    torchVersion: "2.11.0",
     transformersVersion: "5.14.1",
     accelerateVersion: "1.14.0",
     safetensorsVersion: "0.8.0",
@@ -917,6 +1028,7 @@ function createMpsBaseRuntime(root: string): string {
     sentencepieceVersion: "0.2.2",
     numpyVersion: "1.26.4",
     backend: "cpu",
+    bundledAccelerators: ["mps"],
   }), "utf8");
   return base;
 }
@@ -934,6 +1046,7 @@ function createMacIntelBaseRuntime(root: string): string {
     pythonAbi: "cp312",
     executable: "bin/python3",
     pythonArtifact: portablePythonArtifact("darwin/x64"),
+    wheelLock: portableWheelLock("darwin/x64"),
     torchVersion: "2.2.2",
     transformersVersion: "4.57.3",
     accelerateVersion: "1.14.0",
@@ -942,6 +1055,7 @@ function createMacIntelBaseRuntime(root: string): string {
     sentencepieceVersion: "0.2.2",
     numpyVersion: "1.26.4",
     backend: "cpu",
+    bundledAccelerators: [],
   }), "utf8");
   return base;
 }
@@ -973,6 +1087,25 @@ function portablePythonArtifact(platform: "win32/x64" | "darwin/arm64" | "darwin
     url: `https://github.com/astral-sh/python-build-standalone/releases/download/20260510/${metadata.filename}`,
     size: metadata.size,
     sha256: metadata.sha256,
+  };
+}
+
+function portableWheelLock(platform: "win32/x64" | "darwin/arm64" | "darwin/x64") {
+  if (platform === "win32/x64") {
+    return {
+      path: "scripts/wheel-locks/win32-x64-cp312.txt",
+      sha256: "2a5de3d3f2e3ba4ebac91e1efe068159e81263d3ccd6a3d93333078e753c6c65",
+    };
+  }
+  if (platform === "darwin/arm64") {
+    return {
+      path: "scripts/wheel-locks/darwin-arm64-cp312.txt",
+      sha256: "75c84302540edc1b7f6c1620c3474b7ccbf431dd6df881717f74ebf419c56348",
+    };
+  }
+  return {
+    path: "scripts/wheel-locks/darwin-x64-cp312.txt",
+    sha256: "808a7fd6894862abf2ed704eef036bf0b6290c6cce4f618682e831d67bf2b5eb",
   };
 }
 
@@ -1030,7 +1163,7 @@ function mpsProbeResult() {
       backend: "mps",
       device: "mps",
       device_name: "Apple M4 Pro",
-      torch_version: "2.13.0",
+      torch_version: "2.11.0",
       python_version: "3.12.13",
       cuda_version: null,
       hip_version: null,

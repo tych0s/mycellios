@@ -21,12 +21,14 @@ import {
   normalizeCopiedInternalAbsoluteSymlinks,
   samePath,
 } from "./portable-runtime-filesystem.mjs";
+import { readPortableRuntimeWheelLock } from "./portable-runtime-wheel-lock.mjs";
 
 const workspace = resolve(import.meta.dirname, "..");
 const spec = portableRuntimeSpec(process.platform, process.arch);
 const standalone = resolve(workspace, "runtime", "distribution-venv");
 const output = resolve(workspace, "build", "distribution-runtime");
 const archive = resolve(workspace, "build", "distribution-runtime.tar.gz");
+const packagedPythonSource = resolve(workspace, "build", "python");
 const resolvedBuild = resolve(workspace, "build");
 
 if (!spec.supported) {
@@ -35,6 +37,7 @@ if (!spec.supported) {
   process.stdout.write(`${spec.reason}\n`);
   process.exit(0);
 }
+const wheelLock = readPortableRuntimeWheelLock(workspace, spec);
 if (dirname(standalone) !== resolve(workspace, "runtime")) {
   throw new Error("Standalone Python escaped the managed runtime directory.");
 }
@@ -85,6 +88,10 @@ const manifest = {
   pythonAbi: runtime.pythonAbi,
   executable: spec.pythonExecutable,
   pythonArtifact: { ...spec.pythonArtifact },
+  wheelLock: {
+    path: wheelLock.path,
+    sha256: wheelLock.sha256,
+  },
   torchVersion: runtime.torchVersion,
   transformersVersion: runtime.transformersVersion,
   accelerateVersion: runtime.accelerateVersion,
@@ -116,13 +123,14 @@ const verified = spawnSync(process.execPath, [
   `--archive=${archive}`,
   `--platform=${spec.platform}`,
   `--arch=${spec.arch}`,
+  `--python-source=${packagedPythonSource}`,
 ], { stdio: "inherit", shell: false, windowsHide: true });
 if (verified.error) throw verified.error;
 if (verified.status !== 0) {
   throw new Error("The relocated portable runtime archive did not pass verification.");
 }
 process.stdout.write(
-  `Portable distribution runtime v3 ready: Python ${manifest.pythonVersion}, ${manifest.torchVersion} ` +
+  `Portable distribution runtime v4 ready: Python ${manifest.pythonVersion}, ${manifest.torchVersion} ` +
   `(${manifest.platform}/${manifest.arch}${manifest.bundledAccelerators.length ? `, ${manifest.bundledAccelerators.join(",")}` : ""})\n`,
 );
 

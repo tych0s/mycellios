@@ -15,6 +15,9 @@ import {
   type LaunchProcessHandle,
 } from "./launch-supervisor.js";
 import {
+  MYCELLIOS_CELL_MEMBER_MODULE,
+  MYCELLIOS_SERVER_MODULE,
+  MYCELLIOS_STAGE_MODULE,
   validatePythonLaunchDescription,
   type PythonLaunchProcess,
   type PythonPipelineLaunchDescription,
@@ -26,11 +29,16 @@ import {
   type PhysicalProbeCollector,
   type PhysicalProbeV1,
 } from "./physical-probe.js";
+import {
+  nativeBuildIdentitySchema,
+  type NativeBuildIdentity,
+} from "../contracts/build-identity.js";
+import { validateExecutorIsolationPolicy } from "./process-environment.js";
 
 const START_SCHEMA = "gdlp-launch-agent-start/1";
 const STOP_SCHEMA = "gdlp-launch-agent-stop/1";
 const SNAPSHOT_SCHEMA = "gdlp-launch-agent-process/1";
-const HEALTH_SCHEMA = "gdlp-launch-agent-health/2";
+const HEALTH_SCHEMA = "gdlp-launch-agent-health/3";
 const ERROR_SCHEMA = "gdlp-launch-agent-error/1";
 
 type RpcProcessState = "starting" | "ready" | "exited";
@@ -50,6 +58,7 @@ export interface LaunchAgentRpcHealth {
   schema: typeof HEALTH_SCHEMA;
   agentId: string;
   nodeId: string | null;
+  buildIdentity: NativeBuildIdentity | null;
   /** Processes that are still starting or running. */
   activeProcesses: number;
   /** Completed idempotency records retained to prevent duplicate launches. */
@@ -502,6 +511,8 @@ class HttpLaunchProcessHandle implements LaunchProcessHandle {
 export interface LaunchAgentRpcServerOptions {
   agent: LaunchAgent;
   nodeId?: string;
+  /** Exact sealed runtime source. Null keeps the daemon usable but unverified. */
+  buildIdentity?: NativeBuildIdentity | null;
   /** Optional bearer credential required on every HTTP route. */
   authToken?: string;
   /**
@@ -549,6 +560,7 @@ interface ServerEntry {
 export class LaunchAgentRpcServer {
   private readonly agent: LaunchAgent;
   private readonly nodeId: string | undefined;
+  private readonly buildIdentity: NativeBuildIdentity | null;
   private readonly authTokenDigest: Buffer | undefined;
   private readonly allowedStartFingerprints: ReadonlyMap<string, string> | undefined;
   private readonly physicalProbe: PhysicalProbeCollector | undefined;
@@ -568,6 +580,9 @@ export class LaunchAgentRpcServer {
     this.agent = options.agent;
     if (options.nodeId !== undefined) assertIdentifier(options.nodeId, "nodeId");
     this.nodeId = options.nodeId;
+    this.buildIdentity = options.buildIdentity === undefined
+      ? null
+      : nativeBuildIdentitySchema.parse(options.buildIdentity);
     const authToken = normalizeOptionalAuthToken(options.authToken);
     this.authTokenDigest =
       authToken === undefined ? undefined : launchAgentAuthTokenDigest(authToken);
@@ -717,6 +732,7 @@ export class LaunchAgentRpcServer {
           schema: HEALTH_SCHEMA,
           agentId: this.agent.id,
           nodeId: this.nodeId ?? null,
+          buildIdentity: this.buildIdentity,
           activeProcesses,
           retainedTombstones: this.entries.size - activeProcesses,
         });
@@ -1047,6 +1063,7 @@ function validatePythonLaunchProcess(value: unknown, nodeId: string): asserts va
   if (!(["cell-member", "remote-stage", "root-engine"] as unknown[]).includes(value.kind)) {
     throw new Error("python_launch_process_kind_is_invalid");
   }
+  const processKind = value.kind as PythonLaunchProcess["kind"];
   const common = [
     "kind",
     "launchIndex",
@@ -1065,6 +1082,7 @@ function validatePythonLaunchProcess(value: unknown, nodeId: string): asserts va
     "anchor",
     "members",
     "macroWave",
+    "isolation",
     "command",
   ];
   const variant =
@@ -1082,8 +1100,9 @@ function validatePythonLaunchProcess(value: unknown, nodeId: string): asserts va
           "startupTimeoutSeconds",
         ]
       : value.kind === "remote-stage"
-        ? ["downstream", "returnEndpoint", "cell", "native_stage"]
+        ? ["downstream", "returnEndpoint", "cell", "nativeGguf"]
         : [
+            "nativeGguf",
             "boundaries",
             "firstRemoteStage",
             "apiEndpoint",
@@ -1093,6 +1112,7 @@ function validatePythonLaunchProcess(value: unknown, nodeId: string): asserts va
             "decode",
           ];
   assertExactKeys(value, [...common, ...variant], [], "python_launch_process");
+  validateExecutorIsolationPolicy(value.isolation);
   for (const name of ["launchIndex", "stageIndex", "layerStart", "layerEnd", "totalLayers"] as const) {
     assertInteger(value[name], 0, Number.MAX_SAFE_INTEGER, `python_launch_${name}`);
   }
@@ -1122,7 +1142,7 @@ function validatePythonLaunchProcess(value: unknown, nodeId: string): asserts va
   }
   validateMembers(value.members);
   validateMacroWaveStage(value.macroWave);
-  validateCommand(value.command);
+  validateCommand(value.command, processKind);
   if (value.kind === "root-engine") validateRootEngineCommand(value.command);
   if (value.kind === "remote-stage") {
     validateSpeculativeTreeCommand(value.command, "remote_stage");
@@ -1165,83 +1185,138 @@ function validateRemoteStage(value: Record<string, unknown>): void {
   if (value.downstream !== null) validateDownstream(value.downstream, "downstream");
   validateEndpoint(value.returnEndpoint, "returnEndpoint");
   if (value.cell !== null) validateCell(value.cell);
-  if (value.native_stage !== null) validateNativeStageStage(value.native_stage, value);
+  if (value.nativeGguf !== null) validateNativeGgufStage(value.nativeGguf, value);
 }
 
-function validateNativeStageStage(
+function validateNativeGgufStage(
   value: unknown,
   launch: Record<string, unknown>,
 ): void {
-  assertRecord(value, "native_stage");
+  assertRecord(value, "nativeGguf");
   assertExactKeys(
     value,
     [
       "packagePath",
       "packageId",
-      "manifestSha256",
+      "modelIdentity",
       "modelSource",
       "modelRevision",
-      "modelIdentity",
       "layerStart",
       "layerEnd",
       "totalLayers",
-      "daemonExecutable",
-      "pipelineId",
-      "contextTokens",
-      "gpuLayers",
-      "computeApi",
-      "startupTimeoutSeconds",
-      "callTimeoutSeconds",
-      "closeTimeoutSeconds",
     ],
     [],
-    "native_stage",
+    "nativeGguf",
   );
-  assertPath(value.packagePath, "native_stage.packagePath");
-  assertSha256(value.packageId, "native_stage.packageId");
-  assertSha256(value.manifestSha256, "native_stage.manifestSha256");
-  assertPath(value.modelSource, "native_stage.modelSource");
-  if (value.modelRevision !== null) {
-    assertPath(value.modelRevision, "native_stage.modelRevision", 1_024);
-  }
+  assertPath(value.packagePath, "nativeGguf.packagePath");
+  assertSha256(value.packageId, "nativeGguf.packageId");
   if (
     typeof value.modelIdentity !== "string" ||
     !/^sha256:[0-9a-f]{64}$/.test(value.modelIdentity)
   ) {
-    throw new Error("native_stage.modelIdentity_is_invalid");
+    throw new Error("nativeGguf.modelIdentity_is_invalid");
   }
-  assertInteger(value.layerStart, 0, Number.MAX_SAFE_INTEGER, "native_stage.layerStart");
-  assertInteger(value.layerEnd, 1, Number.MAX_SAFE_INTEGER, "native_stage.layerEnd");
-  assertInteger(value.totalLayers, 1, Number.MAX_SAFE_INTEGER, "native_stage.totalLayers");
+  assertPath(value.modelSource, "nativeGguf.modelSource");
+  if (value.modelRevision !== null) {
+    assertPath(value.modelRevision, "nativeGguf.modelRevision", 1_024);
+  }
+  assertInteger(value.layerStart, 0, Number.MAX_SAFE_INTEGER, "nativeGguf.layerStart");
+  assertInteger(value.layerEnd, 1, Number.MAX_SAFE_INTEGER, "nativeGguf.layerEnd");
+  assertInteger(value.totalLayers, 1, Number.MAX_SAFE_INTEGER, "nativeGguf.totalLayers");
   if (
     value.layerStart !== launch.layerStart ||
     value.layerEnd !== launch.layerEnd ||
     value.totalLayers !== launch.totalLayers
   ) {
-    throw new Error("native_stage_layer_range_does_not_match_launch");
+    throw new Error("native_gguf_layer_range_does_not_match_launch");
   }
-  if (launch.stageIndex === 0) throw new Error("native_stage_stage_cannot_be_root");
-  if (launch.cell !== null) throw new Error("native_stage_stage_cannot_use_cell_execution");
+  if (
+    launch.macroWave !== null ||
+    (launch.kind === "remote-stage" && launch.cell !== null)
+  ) {
+    throw new Error("native_gguf_stage_has_conflicting_execution");
+  }
   if (!Array.isArray(launch.members) || launch.members.length !== 1) {
-    throw new Error("native_stage_stage_requires_single_member");
+    throw new Error("native_gguf_stage_requires_single_member");
   }
-  assertPath(value.daemonExecutable, "native_stage.daemonExecutable");
-  assertUint64String(value.pipelineId, "native_stage.pipelineId");
-  assertInteger(value.contextTokens, 1, 2_147_483_647, "native_stage.contextTokens");
-  assertInteger(value.gpuLayers, 0, 1_000_000, "native_stage.gpuLayers");
-  if (!(value.computeApi === "cpu" || value.computeApi === "cuda" || value.computeApi === "rocm" || value.computeApi === "metal" || value.computeApi === "vulkan")) {
-    throw new Error("native_stage.computeApi_is_invalid");
+  validateNativeGgufCommand(launch.command, value);
+}
+
+function validateNativeGgufCommand(
+  value: unknown,
+  binding: Record<string, unknown>,
+): void {
+  assertRecord(value, "native_gguf_command");
+  if (!Array.isArray(value.args)) {
+    throw new Error("native_gguf_command_args_are_invalid");
   }
-  if ((value.computeApi === "cpu") !== (value.gpuLayers === 0)) {
-    throw new Error("native_stage_compute_api_gpu_layers_mismatch");
+  assertExactCommandStringFlag(
+    value.args,
+    "--native-gguf-package",
+    binding.packagePath,
+    "native_gguf_package",
+  );
+  assertExactCommandStringFlag(
+    value.args,
+    "--native-gguf-package-id",
+    binding.packageId,
+    "native_gguf_package_id",
+  );
+  assertExactCommandStringFlag(
+    value.args,
+    "--stage-package-identity",
+    `sha256:${String(binding.packageId)}`,
+    "native_gguf_stage_package_identity",
+  );
+  assertExactCommandStringFlag(
+    value.args,
+    "--model-artifact-identity",
+    binding.modelIdentity,
+    "native_gguf_model_identity",
+  );
+  assertExactCommandStringFlag(
+    value.args,
+    "--model-canonical-source",
+    binding.modelSource,
+    "native_gguf_model_source",
+  );
+  const revisionPositions = value.args.flatMap(
+    (argument, index) => argument === "--model-canonical-revision" ? [index] : [],
+  );
+  if (binding.modelRevision === null) {
+    if (revisionPositions.length !== 0) {
+      throw new Error("native_gguf_model_revision_flag_is_invalid");
+    }
+  } else if (
+    revisionPositions.length !== 1 ||
+    value.args[revisionPositions[0]! + 1] !== binding.modelRevision
+  ) {
+    throw new Error("native_gguf_model_revision_flag_is_invalid");
   }
-  assertPositiveFinite(value.startupTimeoutSeconds, "native_stage.startupTimeoutSeconds");
-  assertPositiveFinite(value.callTimeoutSeconds, "native_stage.callTimeoutSeconds");
-  assertPositiveFinite(value.closeTimeoutSeconds, "native_stage.closeTimeoutSeconds");
+  const pipelinePositions = value.args.flatMap(
+    (argument, index) => argument === "--pipeline-snapshot-identity" ? [index] : [],
+  );
+  if (pipelinePositions.length !== 1) {
+    throw new Error("native_gguf_pipeline_identity_flag_is_invalid");
+  }
+  assertUint64String(
+    value.args[pipelinePositions[0]! + 1],
+    "native_gguf_pipeline_identity",
+  );
+  for (const incompatible of [
+    "--native_stage-package",
+    "--ram-moe-artifact-schema",
+    "--cell-fixture",
+  ]) {
+    if (value.args.includes(incompatible)) {
+      throw new Error("native_gguf_command_backend_is_not_exclusive");
+    }
+  }
 }
 
 function validateRootEngine(value: Record<string, unknown>): void {
   if (value.stageIndex !== 0) throw new Error("root_engine_stage_index_is_invalid");
+  if (value.nativeGguf !== null) validateNativeGgufStage(value.nativeGguf, value);
   assertIntegerArray(value.boundaries, "boundaries", 2);
   validateDownstream(value.firstRemoteStage, "firstRemoteStage");
   validateEndpoint(value.apiEndpoint, "apiEndpoint");
@@ -1273,14 +1348,63 @@ function macroWavePlanExecutionIdentity(value: unknown): string {
   });
 }
 
-function validateCommand(value: unknown): void {
+function validateCommand(
+  value: unknown,
+  kind: PythonLaunchProcess["kind"],
+): void {
   assertRecord(value, "command");
   assertExactKeys(value, ["executable", "args"], [], "command");
   assertPath(value.executable, "command.executable");
-  if (!Array.isArray(value.args) || value.args.length > 2_048) {
+  const executableLeaf = value.executable
+    .replaceAll("\\", "/")
+    .split("/")
+    .at(-1)!
+    .toLowerCase();
+  if (!/^python(?:3(?:\.\d+)?)?(?:\.exe)?$/.test(executableLeaf)) {
+    throw new Error("command_executable_must_be_python");
+  }
+  if (
+    !Array.isArray(value.args) ||
+    value.args.length < 3 ||
+    value.args.length > 2_048
+  ) {
     throw new Error("command_args_are_invalid");
   }
-  for (const argument of value.args) assertArgument(argument);
+  const expectedModule =
+    kind === "cell-member"
+      ? MYCELLIOS_CELL_MEMBER_MODULE
+      : kind === "remote-stage"
+        ? MYCELLIOS_STAGE_MODULE
+        : MYCELLIOS_SERVER_MODULE;
+  if (
+    value.args[0] !== "-u" ||
+    value.args[1] !== "-m" ||
+    value.args[2] !== expectedModule
+  ) {
+    throw new Error(`command_entrypoint_must_be_mycellios_native:${kind}`);
+  }
+  for (const argument of value.args) {
+    assertArgument(argument);
+    const lowered = argument.toLowerCase();
+    for (const [prefix, backend] of [
+      ["--native_stage", "native_stage"],
+      ["--external-gguf-runtime", "external GGUF runtime"],
+      ["--local-model-runtime", "local-model-runtime"],
+      ["--model-serving-runtime", "model-serving-runtime"],
+    ] as const) {
+      if (lowered.startsWith(prefix)) {
+        throw new Error(`external_backend_command_is_not_allowed:${backend}`);
+      }
+    }
+    for (const [moduleName, backend] of [
+      ["distributed_runtime.native_stage", "native_stage"],
+      ["distributed_runtime.external_gguf_runtime", "external GGUF runtime"],
+    ] as const) {
+      if (lowered === moduleName || lowered.startsWith(`${moduleName}_`)) {
+        throw new Error(`external_backend_command_is_not_allowed:${backend}`);
+      }
+    }
+  }
 }
 
 function validateRootEngineCommand(value: unknown): void {
@@ -1300,10 +1424,70 @@ function validateRootEngineCommand(value: unknown): void {
     1024 * 1024 * 1024,
     "root_engine_prefill_inflight_bytes",
   );
-  validateSpeculativeTreeCommand(value, "root_engine");
+  const physicalSpeculativeTreeEnabled = validateSpeculativeTreeCommand(
+    value,
+    "root_engine",
+  );
+  const speculativeInflightWaves = assertOptionalCommandIntegerFlag(
+    value.args,
+    "--speculative-inflight-waves",
+    1,
+    16,
+    "root_engine_speculative_inflight_waves",
+  );
+  const speculativeInflightBytes = assertOptionalCommandIntegerFlag(
+    value.args,
+    "--speculative-inflight-bytes",
+    0,
+    1024 * 1024 * 1024,
+    "root_engine_speculative_inflight_bytes",
+  );
+  if (
+    (speculativeInflightWaves === undefined)
+    !== (speculativeInflightBytes === undefined)
+  ) {
+    throw new Error("root_engine_speculative_conveyor_flags_are_incomplete");
+  }
+  if (
+    speculativeInflightWaves !== undefined
+    && speculativeInflightBytes !== undefined
+  ) {
+    if (speculativeInflightWaves <= 1 || speculativeInflightBytes <= 0) {
+      throw new Error(
+        "root_engine_speculative_conveyor_limits_must_be_disabled_or_complete",
+      );
+    }
+    const speculation = assertCommandStringFlag(
+      value.args,
+      "--speculation",
+      "root_engine_speculation",
+    );
+    if (speculation !== "ngram" && speculation !== "draft-model") {
+      throw new Error(
+        "root_engine_speculative_conveyor_requires_linear_speculation",
+      );
+    }
+    if (physicalSpeculativeTreeEnabled) {
+      throw new Error(
+        "root_engine_speculative_conveyor_cannot_use_physical_tree_limits",
+      );
+    }
+    const maxActiveSequences = assertCommandIntegerFlag(
+      value.args,
+      "--max-active-sequences",
+      1,
+      1_000_000,
+      "root_engine_max_active_sequences",
+    );
+    if (maxActiveSequences !== 1) {
+      throw new Error(
+        "root_engine_speculative_conveyor_requires_single_active_sequence",
+      );
+    }
+  }
 }
 
-function validateSpeculativeTreeCommand(value: unknown, prefix: string): void {
+function validateSpeculativeTreeCommand(value: unknown, prefix: string): boolean {
   assertRecord(value, `${prefix}_command`);
   if (!Array.isArray(value.args)) throw new Error(`${prefix}_command_args_are_invalid`);
   const branches = assertCommandIntegerFlag(
@@ -1331,6 +1515,7 @@ function validateSpeculativeTreeCommand(value: unknown, prefix: string): void {
   if (enabled.some(Boolean) && !enabled.every(Boolean)) {
     throw new Error(`${prefix}_speculative_tree_limits_are_incomplete`);
   }
+  return enabled.every(Boolean);
 }
 
 function assertCommandIntegerFlag(
@@ -1349,6 +1534,55 @@ function assertCommandIntegerFlag(
   const parsed = Number(raw);
   assertInteger(parsed, minimum, maximum, name);
   return parsed;
+}
+
+function assertOptionalCommandIntegerFlag(
+  args: unknown[],
+  flag: string,
+  minimum: number,
+  maximum: number,
+  name: string,
+): number | undefined {
+  const positions = args.flatMap((argument, index) => argument === flag ? [index] : []);
+  if (positions.length === 0) return undefined;
+  if (positions.length !== 1) throw new Error(`${name}_flag_is_invalid`);
+  const raw = args[positions[0]! + 1];
+  if (typeof raw !== "string" || !/^(?:0|[1-9][0-9]*)$/.test(raw)) {
+    throw new Error(`${name}_is_invalid`);
+  }
+  const parsed = Number(raw);
+  assertInteger(parsed, minimum, maximum, name);
+  return parsed;
+}
+
+function assertCommandStringFlag(
+  args: unknown[],
+  flag: string,
+  name: string,
+): string {
+  const positions = args.flatMap((argument, index) => argument === flag ? [index] : []);
+  if (positions.length !== 1) throw new Error(`${name}_flag_is_invalid`);
+  const raw = args[positions[0]! + 1];
+  if (typeof raw !== "string" || raw.length < 1 || raw.length > 256) {
+    throw new Error(`${name}_is_invalid`);
+  }
+  return raw;
+}
+
+function assertExactCommandStringFlag(
+  args: unknown[],
+  flag: string,
+  expected: unknown,
+  name: string,
+): void {
+  const positions = args.flatMap((argument, index) => argument === flag ? [index] : []);
+  if (
+    positions.length !== 1 ||
+    typeof expected !== "string" ||
+    args[positions[0]! + 1] !== expected
+  ) {
+    throw new Error(`${name}_flag_is_invalid`);
+  }
 }
 
 function validateAnchor(value: unknown, name: string): void {
@@ -1939,7 +2173,13 @@ function validateSpeculation(value: unknown): void {
     assertExactKeys(
       strategy,
       ["id", "kind", "maxDraftTokens", "minAcceptanceRate", "maxWasteRatio", "priority"],
-      ["artifactId"],
+      [
+        "artifactId",
+        "maxBranches",
+        "maxBranchTokens",
+        "maxKvBytes",
+        "maxWaveTokens",
+      ],
       "speculation.strategy",
     );
     assertIdentifier(strategy.id, "speculation.strategy.id");
@@ -1949,6 +2189,40 @@ function validateSpeculation(value: unknown): void {
     assertFiniteRange(strategy.maxWasteRatio, 0, 1, "speculation.strategy.maxWasteRatio");
     assertInteger(strategy.priority, 0, 1_000_000, "speculation.strategy.priority");
     if (strategy.artifactId !== undefined) assertIdentifier(strategy.artifactId, "speculation.strategy.artifactId");
+    for (const [name, maximum] of [
+      ["maxBranches", 64],
+      ["maxBranchTokens", 1_048_576],
+      ["maxKvBytes", 2 ** 40],
+      ["maxWaveTokens", 17],
+    ] as const) {
+      if (strategy[name] !== undefined) {
+        assertInteger(
+          strategy[name],
+          1,
+          maximum,
+          `speculation.strategy.${name}`,
+        );
+      }
+    }
+    const treeLimits = [
+      strategy.maxBranches,
+      strategy.maxBranchTokens,
+      strategy.maxKvBytes,
+      strategy.maxWaveTokens,
+    ];
+    if (strategy.kind === "draft-tree") {
+      if (treeLimits.some((limit) => limit === undefined)) {
+        throw new Error("speculation_strategy_tree_limits_are_missing");
+      }
+      if (
+        Number(strategy.maxWaveTokens) !==
+        Number(strategy.maxDraftTokens) + 1
+      ) {
+        throw new Error("speculation_strategy_tree_wave_is_invalid");
+      }
+    } else if (treeLimits.some((limit) => limit !== undefined)) {
+      throw new Error("speculation_strategy_tree_limits_are_unexpected");
+    }
   }
 }
 
@@ -1987,7 +2261,7 @@ function validateHealth(value: unknown): LaunchAgentRpcHealth {
   assertRecord(value, "launch_agent_rpc_health");
   assertExactKeys(
     value,
-    ["schema", "agentId", "nodeId", "activeProcesses", "retainedTombstones"],
+    ["schema", "agentId", "nodeId", "buildIdentity", "activeProcesses", "retainedTombstones"],
     [],
     "launch_agent_rpc_health",
   );
@@ -1998,6 +2272,9 @@ function validateHealth(value: unknown): LaunchAgentRpcHealth {
   if (value.nodeId !== null) {
     assertIdentifier(value.nodeId, "launch_agent_rpc_health_node_id");
   }
+  const buildIdentity = value.buildIdentity === null
+    ? null
+    : nativeBuildIdentitySchema.parse(value.buildIdentity);
   if (
     !Number.isSafeInteger(value.activeProcesses) ||
     (value.activeProcesses as number) < 0
@@ -2010,7 +2287,14 @@ function validateHealth(value: unknown): LaunchAgentRpcHealth {
   ) {
     throw new Error("launch_agent_rpc_health_tombstone_count_is_invalid");
   }
-  return value as unknown as LaunchAgentRpcHealth;
+  return {
+    schema: HEALTH_SCHEMA,
+    agentId: value.agentId as string,
+    nodeId: value.nodeId as string | null,
+    buildIdentity,
+    activeProcesses: value.activeProcesses as number,
+    retainedTombstones: value.retainedTombstones as number,
+  };
 }
 
 function validateOutput(value: unknown, maxBytes: number): LaunchCapturedOutput {

@@ -1,9 +1,12 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { z } from "zod";
+import type { NativeBuildIdentity } from "../contracts/build-identity.js";
 import { workerConfigSchema, type WorkerConfig } from "../contracts/schemas.js";
+import { readNativeRuntimeBuildMetadata } from "../core/native-build-identity.js";
 import { WorkerAgent } from "../worker/agent.js";
 import { evaluateDistributionPlan, stageMemoryBytes } from "./cost-model.js";
 import { HttpLaunchAgent } from "./launch-agent-rpc.js";
@@ -89,6 +92,20 @@ const linkSchema = z
     bandwidthMbps: z.number().positive().finite(),
     lossRate: z.number().min(0).max(0.9).default(0),
     availability: z.number().positive().max(1).default(0.999),
+    evidence: z
+      .object({
+        source: z.literal("runtime-probe"),
+        measuredAt: z.number().int().positive(),
+        validUntil: z.number().int().positive(),
+        successfulSamples: z.number().int().nonnegative(),
+        failedSamples: z.number().int().nonnegative(),
+      })
+      .strict()
+      .refine((value) => value.validUntil > value.measuredAt, {
+        message: "link evidence must expire after it was measured",
+        path: ["validUntil"],
+      })
+      .optional(),
   })
   .strict();
 
@@ -265,10 +282,19 @@ export interface AutoDistributionRunOptions {
     launch: PythonPipelineLaunchDescription,
   ) => LaunchAgent | undefined;
   onProgress?: (event: AutoDistributionProgressEvent) => void;
+  /**
+   * Atomic publication hook. It runs after health and real inference canary
+   * succeed, but before the model is announced as active.
+   */
+  onActivated?: (result: AutoDistributionRunResult) => void | Promise<void>;
+  /** Exact native release cohort announced by the generated cell worker. */
+  workerBuildIdentity?: NativeBuildIdentity;
+  /** Runtime version paired with workerBuildIdentity. */
+  workerAgentVersion?: string;
 }
 
 export interface AutoDistributionProgressEvent {
-  phase: "preparing_nodes" | "launching_stages" | "stage_loading" | "stage_ready" | "stages_ready" | "checking_health" | "running_canary" | "publishing_model" | "active" | "failed";
+  phase: "preparing_nodes" | "preparing_artifact" | "artifact_ready" | "launching_stages" | "stage_loading" | "stage_ready" | "stages_ready" | "checking_health" | "running_canary" | "publishing_model" | "active" | "failed";
   message: string;
   nodeId?: string;
   processId?: string;
@@ -383,6 +409,23 @@ export async function runAutoDistribution(
   options: AutoDistributionRunOptions = {},
 ): Promise<AutoDistributionRunResult> {
   const config = parseAutoDistributionConfig(configValue);
+  const runtimeMetadata = existsSync(resolve(cwd, "package.json"))
+    ? readNativeRuntimeBuildMetadata(cwd)
+    : null;
+  const workerBuildIdentity =
+    options.workerBuildIdentity ?? runtimeMetadata?.buildIdentity ?? undefined;
+  const workerAgentVersion =
+    options.workerAgentVersion
+    ?? workerBuildIdentity?.version
+    ?? runtimeMetadata?.version;
+  if (
+    workerBuildIdentity
+    && workerAgentVersion !== workerBuildIdentity.version
+  ) {
+    throw new Error(
+      `cell_build_version_mismatch:${workerBuildIdentity.version}:${workerAgentVersion ?? "missing"}`,
+    );
+  }
   options.onProgress?.({
     phase: "preparing_nodes",
     message: `Preparing ${config.nodes.length} network nodes.`,
@@ -392,6 +435,30 @@ export async function runAutoDistribution(
     )),
   });
   const agents = await createLaunchAgents(config, cwd, environment, compilation.launch, options);
+  const preparationUnsubscribers = [...new Set(agents.values())].flatMap((agent) => {
+    if (!agent.subscribeRuntimePreparation) return [];
+    return [agent.subscribeRuntimePreparation((event) => {
+      const nodeId = compilation.launch.launchOrder.find(
+        (process) => process.stageIndex === event.stageIndex,
+      )?.anchor.memberId;
+      const layers = `${event.layerStart}–${Math.max(event.layerStart, event.layerEnd - 1)}`;
+      options.onProgress?.({
+        phase: event.state === "preparing" ? "preparing_artifact" : "artifact_ready",
+        message: event.state === "preparing"
+          ? `Preparing verified layers ${layers}${nodeId ? ` on ${nodeId}` : ""}.`
+          : `Verified layers ${layers}${nodeId ? ` are cached on ${nodeId}` : " are cached"}.`,
+        ...(nodeId ? { nodeId } : {}),
+        details: [
+          `Stage: ${event.stageIndex + 1}`,
+          `Layers: ${layers}`,
+          ...(event.weightsSizeBytes !== undefined
+            ? [`Verified package: ${(event.weightsSizeBytes / (1024 * 1024)).toFixed(1)} MiB`]
+            : []),
+          ...(event.packageId ? [`Package: sha256:${event.packageId}`] : []),
+        ],
+      });
+    })];
+  });
   const supervisor = new PythonLaunchSupervisor(compilation.launch, {
     resolveAgent: (nodeId) => agents.get(nodeId),
     readinessTimeoutMs: config.runtime.readinessTimeoutMs,
@@ -469,12 +536,14 @@ export async function runAutoDistribution(
         config,
         compilation,
         apiBaseUrl,
-        canary.metrics,
+        health.pipeline_snapshot_identity as string,
         collectExecutionTelemetry(compilation, runningSnapshot),
       );
       const token = optionalSecret(environment, config.coordinator.networkTokenEnv);
       worker = new WorkerAgent(workerConfig, {
         coordinatorUrl: config.coordinator.url,
+        ...(workerAgentVersion ? { agentVersion: workerAgentVersion } : {}),
+        ...(workerBuildIdentity ? { buildIdentity: workerBuildIdentity } : {}),
         ...(token ? { networkToken: token } : {}),
         identity: {
           kind: "cell",
@@ -491,6 +560,7 @@ export async function runAutoDistribution(
       canaryMetrics: canary.metrics,
       workerId: worker?.workerId ?? null,
     };
+    await options.onActivated?.(result);
     await writeRuntimeStatus(config, result, cwd, "running");
     options.onProgress?.({
       phase: "active",
@@ -504,6 +574,7 @@ export async function runAutoDistribution(
     await writeRuntimeFailure(config, error, failureSnapshot, cwd).catch(() => undefined);
     throw error;
   } finally {
+    for (const unsubscribe of preparationUnsubscribers) unsubscribe();
     unsubscribeTelemetry();
     if (worker) await worker.stop().catch(() => undefined);
     await supervisor.stop("auto_distribute_shutdown").catch(() => undefined);
@@ -662,7 +733,11 @@ function runtimeTopology(config: AutoDistributionConfig): RuntimeTopology {
       if (from.id === to.id) continue;
       const override = overrides.get(`${from.id}\0${to.id}`);
       if (override) {
-        links.push({ ...override });
+        const { evidence, ...link } = override;
+        links.push({
+          ...link,
+          ...(evidence ? { evidence: { ...evidence } } : {}),
+        });
       } else {
         // Arista sin medir. Antes se rellenaba con `sameRegion ? 1 : 35`, que
         // premiaba justo al enlace del que no sabemos nada: un nodo sin sonda
@@ -883,6 +958,7 @@ async function createLaunchAgents(
   const local = new LocalProcessAgent({
     id: "auto-distribute-local",
     cwd,
+    allowedExecutables: [launch.configuration.pythonExecutable],
     env: {
       PYTHONPATH: absoluteFrom(cwd, config.runtime.pythonPath),
       HF_HOME: absoluteFrom(cwd, config.runtime.hfHome),
@@ -931,6 +1007,9 @@ async function verifyRootHealth(
     value.status !== "ready" ||
     value.model !== config.model.publicName ||
     value.artifact_identity !== compilation.profile.source.artifactIdentity ||
+    typeof value.pipeline_snapshot_identity !== "string" ||
+    !value.pipeline_snapshot_identity.trim() ||
+    value.pipeline_snapshot_identity.length > 256 ||
     value.stages !== compilation.boundaries.length - 1 ||
     JSON.stringify(value.boundaries) !== JSON.stringify(compilation.boundaries)
   ) {
@@ -940,6 +1019,37 @@ async function verifyRootHealth(
 }
 
 async function runCanary(
+  apiBaseUrl: string,
+  config: AutoDistributionConfig,
+): Promise<{
+  text: string;
+  metrics: AutoDistributionCanaryMetrics;
+  evidenceSamples: Array<{
+    sampleId: string;
+    outputTokens: number;
+    activeMs: number;
+    ttftMs: number;
+    completed: true;
+  }>;
+}> {
+  await runCanarySample(apiBaseUrl, config);
+  const measured = [];
+  for (let index = 0; index < 3; index += 1) {
+    measured.push(await runCanarySample(apiBaseUrl, config));
+  }
+  return {
+    ...measured[0]!,
+    evidenceSamples: measured.map(({ metrics }, index) => ({
+      sampleId: `activation-canary-${index + 1}`,
+      outputTokens: metrics.completionTokens,
+      activeMs: Math.max(1, Math.round(metrics.pipelineMs)),
+      ttftMs: Math.max(0, Math.round(metrics.ttftMs)),
+      completed: true,
+    })),
+  };
+}
+
+async function runCanarySample(
   apiBaseUrl: string,
   config: AutoDistributionConfig,
 ): Promise<{ text: string; metrics: AutoDistributionCanaryMetrics }> {
@@ -997,11 +1107,11 @@ async function runCanary(
   };
 }
 
-function buildCellWorkerConfig(
+export function buildCellWorkerConfig(
   config: AutoDistributionConfig,
   compilation: AutoDistributionCompilation,
   apiBaseUrl: string,
-  canary: AutoDistributionCanaryMetrics,
+  activationId: string,
   execution?: NonNullable<ModelDeployment["execution"]>,
 ): WorkerConfig {
   const stages = compilation.manifest.plans.decode.stages;
@@ -1019,19 +1129,15 @@ function buildCellWorkerConfig(
       pauseWhenForeground: false,
     },
     adapter: {
-      kind: "openai-compatible",
+      kind: "mycellios-pipeline",
       model: config.model.publicName,
       baseUrl: apiBaseUrl,
-      apiPathPrefix: "v1",
-      requestTemperature: 0,
-      allowedHosts: [],
     },
     deployment: {
       modelDigest: compilation.profile.source.artifactIdentity,
+      activationId,
       peakVramMb: peakMiB,
       contextLimit: config.workload.contextTokens,
-      tokensPerSecond: Math.max(0.001, canary.measuredTokensPerSecond),
-      ttftMs: canary.ttftMs,
       internalPipeline: {
         stageCount: stages.length,
         boundaries: [...compilation.boundaries],

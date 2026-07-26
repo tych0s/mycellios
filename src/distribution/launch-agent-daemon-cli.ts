@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
-import { delimiter, resolve } from "node:path";
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readNativeRuntimeBuildMetadata } from "../core/native-build-identity.js";
 import { LocalProcessAgent } from "./launch-supervisor.js";
 import { LaunchAgentRpcServer } from "./launch-agent-rpc.js";
 import { PythonPhysicalProbe } from "./physical-probe.js";
@@ -31,6 +32,13 @@ async function main(): Promise<void> {
     options.authTokenEnv,
     process.env,
   );
+  const runtimeMetadata = readNativeRuntimeBuildMetadata(
+    resolve(import.meta.dirname, "../.."),
+  );
+  const buildIdentity = runtimeMetadata.buildIdentity;
+  const runtimeEnvironment = launchAgentRuntimeEnvironment(
+    runtimeMetadata.root,
+  );
   const allowedLaunch =
     options.allowLaunchFile === undefined
       ? undefined
@@ -39,24 +47,25 @@ async function main(): Promise<void> {
     pythonExecutable: options.physicalProbePython,
     ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
     env: {
-      PYTHONPATH: [
-        resolve(options.cwd ?? process.cwd(), "python"),
-        process.env.PYTHONPATH,
-      ]
-        .filter((value): value is string => value !== undefined && value.length > 0)
-        .join(delimiter),
+      ...runtimeEnvironment,
     },
     timeoutMs: options.physicalProbeTimeoutMs,
   });
   const local = new LocalProcessAgent({
     id: `local-process:${options.nodeId}`,
     ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+    env: runtimeEnvironment,
+    allowedExecutables: [
+      allowedLaunch?.configuration.pythonExecutable ??
+        options.physicalProbePython,
+    ],
     maxOutputBytesPerStream: options.maxOutputBytes,
     stopGraceMs: options.stopGraceMs,
   });
   const daemon = new LaunchAgentRpcServer({
     agent: local,
     nodeId: options.nodeId,
+    buildIdentity,
     ...(authToken === undefined ? {} : { authToken }),
     ...(allowedLaunch === undefined
       ? {}
@@ -75,6 +84,7 @@ async function main(): Promise<void> {
       event: "ready",
       nodeId: options.nodeId,
       agentId: local.id,
+      buildIdentity,
       host: address.host,
       port: address.port,
       url: address.url,
@@ -200,6 +210,14 @@ export function parseLaunchAgentDaemonArguments(
       1,
       1_000_000,
     ),
+  };
+}
+
+export function launchAgentRuntimeEnvironment(
+  runtimeRoot: string,
+): NodeJS.ProcessEnv {
+  return {
+    PYTHONPATH: resolve(runtimeRoot, "python"),
   };
 }
 

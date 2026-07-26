@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { buildIsolatedProcessEnvironment } from "./process-environment.js";
 
 export const PHYSICAL_PROBE_SCHEMA = "gdlp-physical-probe/1" as const;
 export const PHYSICAL_PROBE_REQUEST_SCHEMA =
@@ -99,9 +100,9 @@ export class PythonPhysicalProbe implements PhysicalProbeCollector {
           maxBuffer: this.maxOutputBytes,
           encoding: "utf8",
           ...(this.cwd === undefined ? {} : { cwd: this.cwd }),
-          ...(this.env === undefined
-            ? {}
-            : { env: { ...process.env, ...this.env } }),
+          env: buildIsolatedProcessEnvironment(
+            this.env === undefined ? {} : { overrides: this.env },
+          ),
           ...(signal === undefined ? {} : { signal }),
         },
         (error, stdout, stderr) => {

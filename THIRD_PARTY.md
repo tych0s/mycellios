@@ -1,42 +1,70 @@
-# External integrations and licences
+# Third-party libraries and research provenance
 
-This repository contains a proper implementation of the control planee. It has not been copied or incorporated source code of the projects studied.
+Mycellios is the product runtime. Projects studied during its design are not
+selectable engines, sidecars or services in a Mycellios release. Their source
+code and binaries are not incorporated into the production artifacts.
 
-The mycellios kernel license is pending decision by the owner before publishing it. Until a `LICENSE` file exists, an open source license should not be assumed.
+The repository can retain clearly isolated research notes or gated experiments.
+Those files are source-only: the desktop and coordinator releases are assembled
+from a closed allowlist, carry SHA-256 manifests and reject research or
+simulation modules during verification.
 
-| Proyecto | Licencia observada |Integration policy|
+The Mycellios kernel licence is pending a decision by the owner. Until a
+`LICENSE` file exists, no open-source licence should be assumed for Mycellios
+code.
+
+## Libraries used by the native runtime
+
+These are implementation libraries, not alternative inference services.
+Versions and distribution artefacts are pinned by the portable-runtime policy
+and must be re-verified when that policy changes.
+
+| Library or platform | Observed licence | Product role |
 |---|---|---|
-| distributed runtime | GPL-3.0 |Only external process/bridge or clean-room inspiration|
-| AI Horde | AGPL-3.0 |External API or reimplemented concepts; not selling|
-| [external runtime A](https://github.com/external runtime A/external-runtime-a) | Apache-2.0 |Sidecar experimental fixed by release/committee; private cell as a single deployment using OpenAI-compatible API|
-| peer runtime | MIT | Sidecar Python opcional |
-| BloomBee | Apache-2.0 |Sidecar Python with fixed environment and commit|
-| parallel runtime | Apache-2.0 | Celda independiente mediante API OpenAI-compatible |
-| PRIMA.cpp |MIT in the observed repository| Binario/proceso LAN aislado |
-| external runtime B | Apache-2.0 | Celda independiente mediante API |
-| external GGUF runtime | MIT |Runtime stock GGUF and cell RPC LAN; local build observed `b10068`/`571d0d540`. The base of the partial NativeStage backend is fixed separately in `c46583b86bed573c4ff30685dae59874f124e664`|
-| Hugging Face Transformers | Apache-2.0 |Python unit fixed in `5.14.1`; own selective loader and native TP/EP as cell executor|
-| Hugging Face Accelerate | Apache-2.0 |Python unit set to `1.14.0`, required by native TP/EP load; does not replace PyTorch|
-| [llmfit](https://github.com/AlexsJones/llmfit) | MIT |Optional binary invoked without shell for hardware profile and recommendation; does not incorporate its code nor decides the layered GDLP distribution|
-| Distributed Llama | MIT |LAN laboratory as an isolated process|
-| Helix | Apache-2.0 |Planning ideas are used; Gurobi and his runtime are not included|
-| DeServe |No license declared in the observed repository|Only ideas described in paper; do not copy code|
-| [NNTrainer](https://github.com/nntrainer/nntrainer) | Apache-2.0 |Possible future sidecar for limited devices; not integrated or sold within the repository|
-| [KVzip](https://github.com/snu-mllab/KVzip) | MIT |Future compression experiment of KV cache; no built-in code|
-| [LMCache](https://github.com/LMCache/LMCache) | Apache-2.0 |Future experiment for trusted cells and compatible runtimes; do not use as a WAN cache among strangers|
-| [FlowSpec](https://github.com/Leosang-lx/FlowSpec) |No license declared in the observed repository|Paper only and planning concepts; do not copy or redistribute code|
-| [MDI-LLM](https://github.com/davmacario/MDI-LLM) | MIT |Research reference for recurring pipelines; not integrated|
-| [NativeStage](https://github.com/fthrvi/native_stage) | MIT |Partial Backend Integrated flame by isolated process; source fixed in `0c16119713396ec6052400f3eb049c5e7a66cd94`, verified patches and sealed sub-GGGUF packages|
-| LunarG Vulkan SDK |Licences by component|Local toolchain `1.4.350.0` used to compile the Vulkan gate; it is not edited or redistributed within the repository|
-| w64devkit |Licences by component|Local portable toolchain `2.6.0` used for Windows builds; no version or redistribution within the repository|
-| [Speculative Pipeline Decoding](https://github.com/yuyijiong/speculative_pipeline_decoding) |No license declared in the observed repository|Paper only, external evaluation and concepts; do not copy or redistribute code|
-| [Multi-Block Diffusion](https://github.com/SJTU-DENG-Lab/mbd-lms) | MIT |Future and isolated WAN-native line; not integrated into autoregressive runtime|
-|SpecPipe, Jupiter and Halo|No official localized linked repository|Only paper ideas and results; there is no code to incorporate into this project|
+| PyTorch | BSD-3-Clause | Tensor execution and native CPU/CUDA/ROCm/MPS backends |
+| Hugging Face Transformers | Apache-2.0 | Model definitions and tokenizer/configuration support used by Mycellios loaders |
+| Hugging Face Accelerate | Apache-2.0 | Device-aware loading support; it does not replace the Mycellios scheduler |
+| safetensors | Apache-2.0 | Verified tensor-file loading |
+| NumPy | BSD-3-Clause | Numeric and tensor metadata utilities |
+| aiohttp | Apache-2.0 | Native Python runtime transport |
+| SentencePiece | Apache-2.0 | Tokenizer support for compatible model artefacts |
+| CUDA, ROCm, Metal/MPS and Vulkan components | Licence varies by component | Hardware APIs/toolchains selected by the native Mycellios runtime |
 
-This table is an engineering guide, not legal advice. Licenses and commits must be re-verified before distributing an image that includes any external engine.
+## Research references not shipped as product engines
 
-## Security rule
+The following projects informed experiments, comparisons or clean-room design
+work. A reference here does not mean that Mycellios imports, launches, embeds or
+connects to that project in production.
 
-The local inference endpoints are linked to loopback. The domestic agent opens the connection to the coordinator. The RPC ports of external GGUF runtime, PRIMA.cpp or Distributed Call, nor the HTTP or external runtime A management ports, should not be published in WAN. A private external runtime A cell controls the admission, but does not constitute confidential execution or host attestation.
+| Project | Observed licence | Provenance status |
+|---|---|---|
+| distributed runtime | GPL-3.0 | Research reference only; no product code incorporated |
+| AI Horde | AGPL-3.0 | Architectural comparison only |
+| external runtime A | Apache-2.0 | Historical experiment; not shipped or selectable |
+| peer runtime | MIT | Research reference only |
+| BloomBee | Apache-2.0 | Research reference only |
+| parallel runtime | Apache-2.0 | Research reference only |
+| PRIMA.cpp | MIT in the observed repository | Research reference only |
+| external runtime B | Apache-2.0 | Research reference only |
+| external GGUF runtime | MIT | Historical GGUF/RPC comparison; not a Mycellios product runtime |
+| llmfit | MIT | Historical hardware-profiling comparison; not invoked by the product |
+| Distributed Llama | MIT | LAN research reference only |
+| Helix | Apache-2.0 | Planning reference; its optimiser/runtime is not included |
+| DeServe | No licence declared in the observed repository | Paper/reference only; no code copied |
+| NNTrainer | Apache-2.0 | Future research reference only |
+| KVzip | MIT | KV-cache research reference only |
+| LMCache | Apache-2.0 | Cache research reference only |
+| FlowSpec | No licence declared in the observed repository | Paper/reference only; no code copied |
+| MDI-LLM | MIT | Pipeline research reference only |
+| NativeStage | MIT | Historical partial-GGUF experiment; not shipped or selectable |
+| Speculative Pipeline Decoding | No licence declared in the observed repository | Paper/reference only; no code copied |
+| Multi-Block Diffusion | MIT | Future research reference only |
+| SpecPipe, Jupiter and Halo | No canonical repository recorded | Paper/reference comparison only |
 
-Critical reference: [advisory of external GGUF runtime RPC](https://github.com/ggml-org/external GGUF runtime/security/advisories/GHSA-j8rj-fmpv-wcxw).
+Build toolchains such as the LunarG Vulkan SDK and w64devkit may be used on a
+developer or CI machine. Using a compiler/toolchain does not make it a packaged
+Mycellios inference engine.
+
+This document is an engineering provenance record, not legal advice. Licences
+and redistribution terms must be reviewed again before publishing any artefact
+whose dependency set changes.

@@ -55,28 +55,54 @@ class _FixedTreeDraftProvider:
         return self.paths
 
 
+@dataclass
+class _DeferredDraftProvider:
+    tokens: tuple[int, ...]
+    max_draft_tokens: int = 8
+    strategy: str = "deferred-test"
+    defer_until_selected: bool = True
+    calls: int = 0
+    last_max_tokens: int | None = None
+
+    def draft(
+        self,
+        token_history: object,
+        max_tokens: int | None = None,
+    ) -> tuple[int, ...]:
+        del token_history
+        self.calls += 1
+        self.last_max_tokens = max_tokens
+        limit = self.max_draft_tokens if max_tokens is None else max_tokens
+        return self.tokens[:limit]
+
+
 def _controller(*, verification_ready: bool) -> AdaptiveSpeculationController:
     controller = AdaptiveSpeculationController(
         AdaptiveSpeculationConfig(
             max_draft_tokens=4,
             candidate_sizes=(2,),
             min_token_history=0,
-            min_classic_observations=1,
-            min_verify_observations=1,
+            min_classic_observations=2,
+            min_verify_observations=2,
             minimum_speedup=1.0,
         )
     )
-    controller.record_classic(
-        latency_seconds=1.0,
-        transferred_bytes=100,
-    )
-    if verification_ready:
-        controller.record_verification(
-            proposed_tokens=2,
-            accepted_tokens=2,
-            latency_seconds=0.1,
+    # A conservative confidence bound is undefined from one observation.
+    # Seed two repeatable measurements so this helper represents a genuinely
+    # activation-ready controller rather than relying on a point estimate.
+    for _ in range(2):
+        controller.record_classic(
+            latency_seconds=1.0,
             transferred_bytes=100,
         )
+    if verification_ready:
+        for _ in range(2):
+            controller.record_verification(
+                proposed_tokens=2,
+                accepted_tokens=2,
+                latency_seconds=0.1,
+                transferred_bytes=100,
+            )
     return controller
 
 
@@ -210,6 +236,44 @@ class LinearMacroWaveAdapterTests(unittest.TestCase):
         self.assertTrue(probe.enabled)
         self.assertTrue(probe.is_probe)
         self.assertEqual(probe.selected_draft_tokens, (10, 11))
+
+    def test_deferred_model_runs_only_for_an_enabled_decision_or_probe(self) -> None:
+        provider = _DeferredDraftProvider((10, 11, 12, 13))
+        disabled = prepare_linear_macro_wave(
+            provider,
+            _controller(verification_ready=False),
+            (1, 2, 3),
+            request_id="deferred-disabled",
+            ordinal=0,
+        )
+        self.assertFalse(disabled.enabled)
+        self.assertEqual(provider.calls, 0)
+
+        probe = prepare_linear_macro_wave(
+            provider,
+            _controller(verification_ready=False),
+            (1, 2, 3),
+            request_id="deferred-probe",
+            ordinal=0,
+            allow_probe=True,
+        )
+        self.assertTrue(probe.is_probe)
+        self.assertEqual(probe.selected_draft_tokens, (10, 11))
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(provider.last_max_tokens, 2)
+        self.assertGreaterEqual(probe.draft_latency_seconds, 0.0)
+
+        enabled = prepare_linear_macro_wave(
+            provider,
+            _controller(verification_ready=True),
+            (1, 2, 3),
+            request_id="deferred-enabled",
+            ordinal=0,
+        )
+        self.assertTrue(enabled.decision.enabled)
+        self.assertEqual(enabled.selected_draft_tokens, (10, 11))
+        self.assertEqual(provider.calls, 2)
+        self.assertEqual(provider.last_max_tokens, 2)
 
     def test_linear_result_records_through_unchanged_controller_api(self) -> None:
         controller = AdaptiveSpeculationController(

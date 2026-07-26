@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import gc
+import json
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -33,9 +34,13 @@ from distributed_runtime.compatibility import (
 from distributed_runtime.stage_cli import build_config as build_stage_config
 from distributed_runtime.stage_cli import parse_args as parse_stage_args
 from distributed_runtime.model_adapters import (
+    ADAPTER_REGISTRY_ID,
+    ADAPTER_REGISTRY_SCHEMA,
     UnsupportedSelectiveStageArchitectureError,
     adapter_registry_document,
+    canonical_adapter_registry_bytes,
     resolve_selective_stage_adapter,
+    validate_adapter_registry_document,
 )
 
 
@@ -108,7 +113,9 @@ class SelectiveStageAdapterRegistryTests(unittest.TestCase):
 
     def test_registry_document_exposes_semantics_not_wildcards(self) -> None:
         document = adapter_registry_document()
-        self.assertEqual(document["schema"], "gdlp-transformers-stage-adapters/1")
+        self.assertEqual(document["schema"], ADAPTER_REGISTRY_SCHEMA)
+        self.assertEqual(document["registryId"], ADAPTER_REGISTRY_ID)
+        self.assertEqual(document["evidenceScope"], "software-contract-only")
         self.assertEqual(
             [entry["modelType"] for entry in document["adapters"]],
             ["llama", "qwen3", "qwen3_moe", "glm4_moe"],
@@ -116,6 +123,29 @@ class SelectiveStageAdapterRegistryTests(unittest.TestCase):
         qwen = document["adapters"][1]
         self.assertIn("self_attn.q_norm", qwen["requiredLayerModules"])
         self.assertEqual(qwen["attentionScope"], "full-only")
+        self.assertRegex(qwen["adapterContractId"], r"^sha256:[0-9a-f]{64}$")
+
+    def test_packaged_registry_is_identity_sealed_and_matches_implementation(self) -> None:
+        packaged = json.loads(canonical_adapter_registry_bytes())
+        self.assertEqual(
+            validate_adapter_registry_document(
+                packaged,
+                expected_registry_id=ADAPTER_REGISTRY_ID,
+            ),
+            ADAPTER_REGISTRY_ID,
+        )
+        packaged["adapters"][0]["architectures"] = ["PretendLlamaForCausalLM"]
+        with self.assertRaisesRegex(ValueError, "identity"):
+            validate_adapter_registry_document(
+                packaged,
+                expected_registry_id=ADAPTER_REGISTRY_ID,
+            )
+        unknown_implementation = json.loads(canonical_adapter_registry_bytes())
+        unknown_implementation["adapters"][0]["implementationContract"] = (
+            "mycellios-selective-pretend/1"
+        )
+        with self.assertRaisesRegex(ValueError, "exact Mycellios implementation"):
+            validate_adapter_registry_document(unknown_implementation)
 
     def test_tiny_qwen3_moe_checkpoint_is_exact_across_two_pipeline_ranges(self) -> None:
         torch.manual_seed(107)

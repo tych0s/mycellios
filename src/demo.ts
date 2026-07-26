@@ -8,6 +8,7 @@ const runtime = await createCoordinator(
     port: 0,
     databasePath: ":memory:",
     requestTimeoutMs: 30_000,
+    allowDevelopmentAdapters: true,
   },
   { logger: false },
 );
@@ -28,6 +29,7 @@ try {
     },
     adapter: {
       kind: "mock",
+      developmentOnly: true,
       model: "distributed-small",
       tokensPerSecond: 200,
       ttftMs: 10,

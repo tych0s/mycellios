@@ -153,13 +153,19 @@ class ModelContractTests(unittest.TestCase):
                 {key: value for key, value in checkpoint.items() if not key.endswith("omitted")},
                 root / "model.safetensors",
             )
-            _load_stage_parameters_from_safetensors(model, spec)
+            evidence = _load_stage_parameters_from_safetensors(model, spec)
             self.assertTrue(
                 torch.equal(model.model.layers[0].weight, torch.full((2, 2), 7.0))
             )
             self.assertTrue(
                 torch.equal(model.model.layers[0].scale, torch.tensor([3.0, 4.0]))
             )
+            self.assertEqual(evidence["format"], "safetensors")
+            self.assertEqual(evidence["artifactBytesMaterialized"], 24)
+            self.assertEqual(evidence["tensorReadOperations"], 2)
+            self.assertGreaterEqual(evidence["materializeAndCopyNanoseconds"], 0)
+            self.assertIsNone(evidence["physicalDiskBytes"])
+            self.assertIsNone(evidence["osPageCacheHits"])
 
     def test_zero_token_reference_does_not_load_a_model(self) -> None:
         ids = torch.tensor([[1]], dtype=torch.long)

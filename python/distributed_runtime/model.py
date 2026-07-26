@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import time
 from typing import Any, Mapping, Protocol
 
 from huggingface_hub import snapshot_download
@@ -18,6 +19,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, Dynami
 from transformers.cache_utils import DynamicLayer
 
 from .decode_attention import apply_to as apply_grouped_prefix_attention
+from .dense_tiering import DenseTieringConfig, configure_dense_tiering
 from .device import TorchExecutionDevice, resolve_torch_execution_device
 from .kv_arena import (
     ArenaCache,
@@ -117,6 +119,10 @@ class StageModelSpec:
     # the two can be compared in one interleaved A/B campaign.
     kv_cache: str = "arena"
     decode_attention: str = "grouped-prefix"
+    # Identity of one exact local range package. This is intentionally distinct
+    # from ``artifact_identity``, which names the complete source model and must
+    # remain identical across every executor in a pipeline.
+    stage_package_identity: str | None = None
 
     def __post_init__(self) -> None:
         if not self.model_name.strip():
@@ -145,6 +151,7 @@ class StageModelSpec:
             ("artifact_identity", self.artifact_identity),
             ("canonical_model_source", self.canonical_model_source),
             ("canonical_model_revision", self.canonical_model_revision),
+            ("stage_package_identity", self.stage_package_identity),
         ):
             if value is not None and not value.strip():
                 raise ValueError(f"{name} cannot be blank")
@@ -218,7 +225,13 @@ class StageRunnerContract(Protocol):
 class StageRunner:
     MAX_PHYSICAL_BATCH_SIZE = MAX_PHYSICAL_STAGE_BATCH_SIZE
 
-    def __init__(self, spec: StageModelSpec, *, device: str = "auto") -> None:
+    def __init__(
+        self,
+        spec: StageModelSpec,
+        *,
+        device: str = "auto",
+        dense_tiering: DenseTieringConfig | None = None,
+    ) -> None:
         torch.set_num_threads(spec.threads)
         execution_device = resolve_torch_execution_device(device)
         compute_dtype = (
@@ -226,7 +239,12 @@ class StageRunner:
         )
         if spec.quantize == "dynamic-int8" and execution_device.accelerated:
             raise ValueError("dynamic-int8 stage quantization is CPU-only")
-        model = _load_selective_stage_model(spec)
+        tiering_config = dense_tiering or DenseTieringConfig()
+        model = _load_selective_stage_model(
+            spec,
+            resident_dtype=compute_dtype,
+            host_ram_budget_bytes=tiering_config.host_ram_budget_bytes,
+        )
         self._initialize_from_loaded_model(
             spec,
             model,
@@ -235,6 +253,7 @@ class StageRunner:
             execution_device=execution_device,
             compute_dtype=compute_dtype,
             move_model=True,
+            dense_tiering=tiering_config,
         )
 
     def _initialize_from_loaded_model(
@@ -247,6 +266,7 @@ class StageRunner:
         execution_device: TorchExecutionDevice,
         compute_dtype: torch.dtype,
         move_model: bool,
+        dense_tiering: DenseTieringConfig | None = None,
         semantic_features: tuple[str, ...] | None = None,
     ) -> None:
         """Adopt one already-loaded, adapter-certified local model.
@@ -277,8 +297,20 @@ class StageRunner:
         # cache lookup and sequence-length accounting dense and O(number of local layers).
         for local_index, layer in enumerate(selected):
             layer.self_attn.layer_idx = local_index
+        self.dense_tiering = None
         if move_model:
-            model.to(device=execution_device.device, dtype=compute_dtype)
+            self.dense_tiering = configure_dense_tiering(
+                model,
+                execution_device=execution_device,
+                compute_dtype=compute_dtype,
+                config=dense_tiering or DenseTieringConfig(),
+                storage_evidence=getattr(
+                    model,
+                    "_mycellios_dense_storage_evidence",
+                    {},
+                ),
+                permit_bounded_tiering=spec.compile_mode is None,
+            )
         self.base = model.model
         self.head = model.lm_head if spec.last else None
         self.execution_device = execution_device
@@ -353,6 +385,39 @@ class StageRunner:
                 "rollback",
                 "exact-request-fork-safe-copy",
                 "selective-load",
+                *(
+                    ("measured-dense-memory-budget",)
+                    if self.dense_tiering is not None
+                    else ()
+                ),
+                *(
+                    (
+                        "bounded-dense-layer-residency",
+                        "immutable-host-weight-source",
+                        "synchronous-next-layer-admission",
+                    )
+                    if (
+                        self.dense_tiering is not None
+                        and self.dense_tiering.mode == "bounded-layer-cache"
+                        and (dense_tiering or DenseTieringConfig()).admit_next_layer
+                    )
+                    else (
+                        ("bounded-dense-layer-residency", "immutable-host-weight-source")
+                        if (
+                            self.dense_tiering is not None
+                            and self.dense_tiering.mode == "bounded-layer-cache"
+                        )
+                        else ()
+                    )
+                ),
+                *(
+                    ("full-dense-stage-residency",)
+                    if (
+                        self.dense_tiering is not None
+                        and self.dense_tiering.mode == "full-resident"
+                    )
+                    else ()
+                ),
                 *(adapter.semantic_features if semantic_features is None else semantic_features),
                 *(
                     ("physical-tensor-batching",)
@@ -392,10 +457,13 @@ class StageRunner:
     def execution_snapshot(self) -> dict[str, Any]:
         """Return effective backend and current allocator evidence."""
 
-        return self.execution_device.snapshot(
+        snapshot = self.execution_device.snapshot(
             weight_bytes=self.parameter_bytes,
             precision=str(self.compute_dtype).removeprefix("torch."),
         )
+        if self.dense_tiering is not None:
+            snapshot["denseTiering"] = self.dense_tiering.snapshot()
+        return snapshot
 
     def begin(self, request_id: int) -> None:
         if request_id in self.active_requests:
@@ -420,6 +488,8 @@ class StageRunner:
         self.caches.clear()
         self.tokens_seen.clear()
         self.active_requests.clear()
+        if self.dense_tiering is not None:
+            self.dense_tiering.close()
 
     def truncate(self, request_id: int, token_count: int) -> None:
         """Crop this stage's local KV cache to an accepted speculative prefix."""
@@ -1659,7 +1729,12 @@ def _hub_snapshot_repository(snapshot: Path) -> str | None:
     return "/".join(coordinates)
 
 
-def _load_selective_stage_model(spec: StageModelSpec):
+def _load_selective_stage_model(
+    spec: StageModelSpec,
+    *,
+    resident_dtype: torch.dtype = torch.float32,
+    host_ram_budget_bytes: int = 0,
+):
     """Instantiate only this stage and stream only its tensors from safetensors.
 
     The previous prototype loaded the entire checkpoint in every process and
@@ -1676,6 +1751,57 @@ def _load_selective_stage_model(spec: StageModelSpec):
         layer_end=spec.layer_end,
         total_layers=spec.total_layers,
     )
+    # A native Mycellios stage package is authenticated before Transformers is
+    # allowed to construct or copy a single resident parameter. Arbitrary local
+    # Hugging Face checkpoints remain supported for development, while the
+    # presence of our manifest makes verification mandatory and fail-closed.
+    from .stage_artifact import (
+        STAGE_ARTIFACT_MANIFEST,
+        STAGE_ARTIFACT_WEIGHTS,
+        verify_stage_artifact,
+    )
+
+    artifact_root = Path(snapshot_name)
+    has_stage_package = any(
+        (artifact_root / name).exists()
+        for name in (STAGE_ARTIFACT_MANIFEST, STAGE_ARTIFACT_WEIGHTS)
+    )
+    verified_stage_artifact = None
+    if has_stage_package:
+        expected_package_id = None
+        if (
+            spec.stage_package_identity is not None
+            and spec.stage_package_identity.startswith("sha256:")
+            and len(spec.stage_package_identity) == 71
+        ):
+            expected_package_id = spec.stage_package_identity.removeprefix("sha256:")
+        if expected_package_id is None:
+            raise ValueError(
+                "authenticated stage packages require stage_package_identity"
+            )
+        verified_stage_artifact = verify_stage_artifact(
+            snapshot_name,
+            expected_layer_start=spec.layer_start,
+            expected_layer_end=spec.layer_end,
+            expected_total_layers=spec.total_layers,
+            expected_package_id=expected_package_id,
+        )
+    elif spec.stage_package_identity is not None:
+        raise ValueError(
+            "stage_package_identity requires an authenticated stage package"
+        )
+    if verified_stage_artifact is not None and host_ram_budget_bytes > 0:
+        required = _stage_artifact_resident_bytes(
+            verified_stage_artifact.manifest.to_document(),
+            resident_dtype,
+        )
+        if required > host_ram_budget_bytes:
+            from .dense_tiering import DenseTieringError
+
+            raise DenseTieringError(
+                "dense_tiering_authenticated_stage_exceeds_host_ram_budget:"
+                f"required={required}:budget={host_ram_budget_bytes}"
+            )
     resolved_spec = replace(spec, model_name=snapshot_name, revision=None)
     config = AutoConfig.from_pretrained(snapshot_name)
     adapter = resolve_selective_stage_adapter(config)
@@ -1695,7 +1821,10 @@ def _load_selective_stage_model(spec: StageModelSpec):
     if not spec.first and not spec.last:
         local_config.vocab_size = 1
         local_config.pad_token_id = 0
-    model = AutoModelForCausalLM.from_config(local_config, dtype=torch.float32)
+    model = AutoModelForCausalLM.from_config(
+        local_config,
+        dtype=resident_dtype,
+    )
     adapter.inspect_constructed_model(model, local_layers=local_layers)
     if not spec.last:
         model.model.norm = nn.Identity()
@@ -1711,7 +1840,13 @@ def _load_selective_stage_model(spec: StageModelSpec):
         # Preserve the original semantic config for any forward code that reads it.
         model.config.vocab_size = original_vocab_size
         model.config.pad_token_id = original_pad_token_id
-    _load_stage_parameters_from_safetensors(model, resolved_spec, adapter=adapter)
+    model._mycellios_dense_storage_evidence = (
+        _load_stage_parameters_from_safetensors(
+            model,
+            resolved_spec,
+            adapter=adapter,
+        )
+    )
     model.model.config.num_hidden_layers = local_layers
     model.config.num_hidden_layers = local_layers
     model._gdlp_selective_stage_adapter = adapter
@@ -1727,6 +1862,57 @@ def _slice_layer_specific_config(config: Any, spec: StageModelSpec) -> None:
             setattr(config, name, value[spec.layer_start : spec.layer_end])
 
 
+def _stage_artifact_resident_bytes(
+    document: Mapping[str, Any],
+    resident_dtype: torch.dtype,
+) -> int:
+    """Exact target bytes from an already-authenticated stage manifest."""
+
+    tensors = document.get("tensors")
+    if not isinstance(tensors, list) or not tensors:
+        raise ValueError("authenticated stage manifest has no tensor inventory")
+    target_float_bytes = torch.empty((), dtype=resident_dtype).element_size()
+    floating = {
+        "F8_E4M3",
+        "F8_E5M2",
+        "F8_E8M0",
+        "F16",
+        "BF16",
+        "F32",
+        "F64",
+    }
+    total = 0
+    for item in tensors:
+        if not isinstance(item, Mapping):
+            raise ValueError("authenticated stage tensor inventory is invalid")
+        shape = item.get("shape")
+        dtype = item.get("dtype")
+        source_bytes = item.get("sizeBytes")
+        if (
+            not isinstance(shape, list)
+            or not shape
+            or any(
+                not isinstance(dimension, int)
+                or isinstance(dimension, bool)
+                or dimension < 1
+                for dimension in shape
+            )
+            or not isinstance(dtype, str)
+            or not isinstance(source_bytes, int)
+            or isinstance(source_bytes, bool)
+            or source_bytes < 1
+        ):
+            raise ValueError("authenticated stage tensor inventory is invalid")
+        if dtype not in floating:
+            total += source_bytes
+            continue
+        elements = 1
+        for dimension in shape:
+            elements *= dimension
+        total += elements * target_float_bytes
+    return total
+
+
 def _load_stage_parameters_from_safetensors(
     model: Any,
     spec: StageModelSpec,
@@ -1734,7 +1920,7 @@ def _load_stage_parameters_from_safetensors(
     adapter: SelectiveStageAdapter | None = None,
     preloaded_checkpoint_tensors: Mapping[str, torch.Tensor] | None = None,
     ignored_checkpoint_names: set[str] | frozenset[str] = frozenset(),
-) -> None:
+) -> dict[str, Any]:
     """Load every required local tensor, with explicit RAM-MoE exceptions.
 
     ``preloaded_checkpoint_tensors`` is used by the direct MoE loader for the
@@ -1840,10 +2026,14 @@ def _load_stage_parameters_from_safetensors(
             (local_name, target, checkpoint_name)
         )
 
+    storage_bytes = 0
+    storage_operations = 0
+    storage_to_ram_nanoseconds = 0
     with torch.no_grad():
         for file_path, file_targets in by_file.items():
             with safe_open(file_path, framework="pt", device="cpu") as tensors:
                 for local_name, target, checkpoint_name in file_targets:
+                    started = time.perf_counter_ns()
                     value = tensors.get_tensor(checkpoint_name)
                     if tuple(value.shape) != tuple(target.shape):
                         raise ValueError(
@@ -1854,7 +2044,24 @@ def _load_stage_parameters_from_safetensors(
                     # destination. An explicit value.to(...) would allocate another
                     # full-size tensor, which is especially damaging for vocab matrices.
                     target.copy_(value)
+                    storage_to_ram_nanoseconds += max(
+                        0, time.perf_counter_ns() - started
+                    )
+                    storage_bytes += value.numel() * value.element_size()
+                    storage_operations += 1
                     del value
+    return {
+        "schema": "mycellios-storage-to-ram/1",
+        "format": "safetensors",
+        # Exact tensor payload requested from the authenticated artifact. The
+        # OS may satisfy mmap pages from its page cache, so this is deliberately
+        # not labelled physical disk traffic.
+        "artifactBytesMaterialized": storage_bytes,
+        "tensorReadOperations": storage_operations,
+        "materializeAndCopyNanoseconds": storage_to_ram_nanoseconds,
+        "physicalDiskBytes": None,
+        "osPageCacheHits": None,
+    }
 
 
 def _checkpoint_root(spec: StageModelSpec) -> Path:

@@ -8,6 +8,11 @@ import {
   type CoordinatorRuntime,
 } from "../src/coordinator/server.js";
 import type { StoredRequestedModel } from "../src/storage/store.js";
+import {
+  MODEL_ADAPTER_EVIDENCE_SCOPE,
+  MODEL_ADAPTER_REGISTRY_ID,
+  resolveModelAdapterContract,
+} from "../src/contracts/model-adapter-registry.js";
 import { addWorker } from "./helpers.js";
 
 describe("requested model API activation flow", () => {
@@ -65,6 +70,22 @@ describe("requested model API activation flow", () => {
     const stored = runtime.store.getRequestedModel("qwen-ui")!;
     expect(stored.activationRequestedAt).not.toBeNull();
     expect(stored.activationError).toBeNull();
+    const timeline = await runtime.app.inject({
+      method: "GET",
+      url: "/public/v1/requested-models/qwen-ui/timeline",
+    });
+    expect(timeline.statusCode).toBe(200);
+    expect(timeline.json().data.state).toMatchObject({
+      modelId: "qwen-ui",
+      desiredState: "active",
+      observedState: "preparing",
+      generation: 1,
+    });
+    expect(timeline.json().data.operations).toHaveLength(1);
+    expect(timeline.json().data.operations[0]).toMatchObject({
+      kind: "activate",
+      status: "running",
+    });
   });
 
   it("returns an actionable authorization error for protected model changes", async () => {
@@ -121,6 +142,9 @@ describe("requested model API activation flow", () => {
       schema: "mycellios-hub-model-capacity/1",
       compatible: true,
       adapterId: "transformers-qwen3-v1",
+      ...qwenAdapterIdentity(),
+      modelType: "qwen3",
+      architecture: "Qwen3ForCausalLM",
       requiredVramMiB: 2_200,
       minimumStageVramMiB: 512,
       minimumNodes: 2,
@@ -144,6 +168,17 @@ describe("requested model API activation flow", () => {
     );
     expect(model.status).toBe("activating");
     expect(model.message).toContain("Automatic retry 1 of 1");
+    expect(model.activationIncident).toMatchObject({
+      schema: "mycellios-activation-incident/1",
+      code: "launch_agent_unavailable",
+      scope: "node",
+      repairState: "retrying",
+      automatic: true,
+      automaticAction: "reconnect_node",
+      attempt: 1,
+      maximumAttempts: 1,
+      nodeId: "desktop-a",
+    });
     expect(model.activationProgress).toEqual(expect.arrayContaining([
       expect.objectContaining({ phase: "retrying", state: "running" }),
     ]));
@@ -180,6 +215,9 @@ describe("requested model API activation flow", () => {
       schema: "mycellios-hub-model-capacity/1",
       compatible: true,
       adapterId: "transformers-qwen3-v1",
+      ...qwenAdapterIdentity(),
+      modelType: "qwen3",
+      architecture: "Qwen3ForCausalLM",
       requiredVramMiB: 2_200,
       minimumStageVramMiB: 512,
       minimumNodes: 2,
@@ -200,6 +238,12 @@ describe("requested model API activation flow", () => {
       (entry: { id: string }) => entry.id === "retry-live",
     );
     expect(model.status).toBe("activating");
+    expect(model.activationIncident).toMatchObject({
+      code: "launch_agent_unavailable",
+      repairState: "retrying",
+      automatic: true,
+      nodeId: "desktop-a",
+    });
     expect(model.activationProgress).toEqual(expect.arrayContaining([
       expect.objectContaining({ phase: "retrying", state: "running" }),
     ]));
@@ -382,9 +426,26 @@ function requestedModel(runtime: CoordinatorRuntime, id: string): StoredRequeste
     schema: "mycellios-hub-model-capacity/1",
     compatible: true,
     adapterId: "transformers-qwen3-v1",
+    ...qwenAdapterIdentity(),
+    modelType: "qwen3",
+    architecture: "Qwen3ForCausalLM",
     requiredVramMiB: 2_200,
     minimumStageVramMiB: 512,
     minimumNodes: 2,
   }, null);
   return runtime.store.getRequestedModel(id)!;
+}
+
+function qwenAdapterIdentity(): {
+  adapterContractId: string;
+  adapterRegistryId: string;
+  adapterEvidenceScope: "software-contract-only";
+} {
+  const adapter = resolveModelAdapterContract("qwen3", "Qwen3ForCausalLM");
+  if (!adapter) throw new Error("qwen3 adapter registry fixture is missing");
+  return {
+    adapterContractId: adapter.adapterContractId,
+    adapterRegistryId: MODEL_ADAPTER_REGISTRY_ID,
+    adapterEvidenceScope: MODEL_ADAPTER_EVIDENCE_SCOPE,
+  };
 }

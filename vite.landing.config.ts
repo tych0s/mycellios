@@ -3,10 +3,12 @@ import { resolve } from "node:path";
 import { defineConfig } from "vite";
 
 const LOCAL_UI_PORT = 4_174;
+const apiTarget = process.env.MYCELLIOS_UI_API_TARGET?.trim()
+  || "https://www.mycellios.com";
 const productionProxy = () => ({
-  target: "https://www.mycellios.com",
+  target: apiTarget,
   changeOrigin: true,
-  secure: true,
+  secure: apiTarget.startsWith("https://"),
 });
 
 export default defineConfig({

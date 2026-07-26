@@ -17,10 +17,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $workspacePath = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
-$venvPython = Join-Path $workspacePath "runtime\distribution-venv\Scripts\python.exe"
-if (-not (Test-Path -LiteralPath $venvPython)) {
-    throw "Distribution runtime is missing. Run scripts\setup-distribution-runtime.ps1 first."
-}
+$venvPython = & (Join-Path $PSScriptRoot "resolve-distribution-python.ps1") -WorkspacePath $workspacePath
 $cachePath = Join-Path $workspacePath "runtime\hf-cache"
 New-Item -ItemType Directory -Force -Path $cachePath | Out-Null
 $env:HF_HOME = $cachePath

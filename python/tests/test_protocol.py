@@ -1373,10 +1373,25 @@ class PersistentStageDataPlaneTests(unittest.TestCase):
                 flags=int(TensorCodec.FP32),
                 payload=encode_tensor(verify_hidden, TensorCodec.FP32),
             )
+            verify_hidden_2 = torch.arange(8, dtype=torch.float32).reshape(1, 2, 4)
+            send_frame(
+                upstream,
+                FrameType.VERIFY,
+                request_id,
+                step=2,
+                token_count=2,
+                hidden_size=4,
+                flags=int(TensorCodec.FP32),
+                payload=encode_tensor(verify_hidden_2, TensorCodec.FP32),
+            )
             verify_frame = recv_frame(direct_return)
             self.assertEqual(verify_frame.frame_type, FrameType.VERIFY_RESULT)
             self.assertEqual(verify_frame.step, 1)
             self.assertEqual(decode_verify_result(verify_frame), (42, 42, 42))
+            verify_frame_2 = recv_frame(direct_return)
+            self.assertEqual(verify_frame_2.frame_type, FrameType.VERIFY_RESULT)
+            self.assertEqual(verify_frame_2.step, 2)
+            self.assertEqual(decode_verify_result(verify_frame_2), (42, 42))
 
             send_frame(
                 upstream,
@@ -1389,7 +1404,7 @@ class PersistentStageDataPlaneTests(unittest.TestCase):
                 upstream,
                 FrameType.ACTIVATION,
                 request_id,
-                step=2,
+                step=3,
                 token_count=1,
                 hidden_size=4,
                 flags=int(TensorCodec.FP32),
@@ -1397,15 +1412,15 @@ class PersistentStageDataPlaneTests(unittest.TestCase):
             )
             token_frame = recv_frame(direct_return)
             self.assertEqual(token_frame.request_id, request_id)
-            self.assertEqual(token_frame.step, 2)
+            self.assertEqual(token_frame.step, 3)
             self.assertEqual(decode_token(token_frame), 42)
 
             send_frame(upstream, FrameType.END, request_id)
             result = metrics.get(timeout=2)
             self.assertEqual(result["request_id"], request_id)
-            self.assertEqual(result["frames"], 3)
-            self.assertEqual(result["tokens"], 6)
-            self.assertEqual(result["bytes_out"], HEADER_BYTES * 3 + 16)
+            self.assertEqual(result["frames"], 4)
+            self.assertEqual(result["tokens"], 8)
+            self.assertEqual(result["bytes_out"], HEADER_BYTES * 4 + 24)
             self.assertEqual(result["loader"], "fake-selective")
             self.assertEqual(result["parameter_bytes"], 16)
             self.assertEqual(
@@ -1414,9 +1429,9 @@ class PersistentStageDataPlaneTests(unittest.TestCase):
                     {
                         "rank": rank,
                         "device": "cpu",
-                        "forwardCalls": 3,
-                        "collectiveCalls": 15,
-                        "tokensProcessed": 6,
+                        "forwardCalls": 4,
+                        "collectiveCalls": 20,
+                        "tokensProcessed": 8,
                         "memory": {
                             "allocatedBytes": 0,
                             "reservedBytes": 0,

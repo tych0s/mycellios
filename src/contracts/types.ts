@@ -1,5 +1,15 @@
+import type {
+  CoordinatorRuntimePerformanceEvidence,
+} from "../performance/runtime-profile.js";
+import type { DeploymentCanaryEvidence } from "./deployment-canary.js";
+import type { NativeBuildIdentity } from "./build-identity.js";
+
 export type WorkloadClass = "interactive" | "batch" | "benchmark";
-export type AdapterKind = "mock" | "local-model-runtime" | "externalggufruntime" | "openai-compatible";
+export type AdapterKind =
+  | "mycellios-native"
+  | "mycellios-pipeline"
+  | "mock";
+export type DeploymentAdapterKind = Exclude<AdapterKind, "mycellios-native">;
 export type ExecutionMode = "replica" | "pipeline";
 export type ExecutionDeviceType = "cpu" | "gpu" | "mixed";
 export type ExecutionBackend =
@@ -13,6 +23,21 @@ export type ExecutionBackend =
   | "webgpu";
 export type WorkerStatus = "online" | "suspect" | "offline" | "draining";
 export type WorkerIdentityKind = "device" | "cell";
+
+export interface WorkerExecutorIsolationCapability {
+  schema: "mycellios-executor-isolation-capability/1";
+  launchPolicySchema: "gdlp-executor-isolation/4";
+  environment: "filtered";
+  workspace: "private-temp-watchdog";
+  processTree: "best-effort" | "windows-job-object";
+  resourceLimits: "workspace-watchdog-only";
+  osSandbox: "not-enforced";
+  hardResourceQuotas: "not-enforced";
+  killOnClose: "not-enforced" | "windows-job-object";
+  maxWorkspaceBytes: number;
+  maxWorkspaceEntries: number;
+  workspaceCheckIntervalMs: number;
+}
 export type ComputeMode = "automatic" | "gpu-only" | "cpu-only";
 export type JobStatus =
   | "queued"
@@ -34,6 +59,9 @@ export interface HubCatalogModel {
   modelType: string | null;
   architecture: string | null;
   adapterId: string | null;
+  adapterContractId: string | null;
+  adapterRegistryId: string;
+  adapterEvidenceScope: "software-contract-only";
   compatible: boolean;
   gated: boolean;
   compatibilityReason: string | null;
@@ -80,8 +108,10 @@ export interface ModelDeployment {
   deploymentId: string;
   model: string;
   modelDigest: string;
+  /** Exact native pipeline snapshot verified independently through /health. */
+  activationId?: string | undefined;
   mode: ExecutionMode;
-  adapter: AdapterKind;
+  adapter: DeploymentAdapterKind;
   peakVramMb: number;
   contextLimit: number;
   maxConcurrency: number;
@@ -93,7 +123,17 @@ export interface ModelDeployment {
    */
   throughputSource?: "measured" | "estimated" | "configured" | "default" | undefined;
   ttftMs: number;
-  dataLocality: "local" | "external";
+  /**
+   * Native pipeline deployments remain invisible to scheduling until the
+   * coordinator has completed a live activation challenge.
+   */
+  verificationState?: "pending" | "verified" | undefined;
+  /**
+   * Content-addressed physical canary bound to the exact model artifact and
+   * active native pipeline from which measured throughput was derived.
+   */
+  canaryEvidence?: DeploymentCanaryEvidence | undefined;
+  dataLocality: "local";
   stage?: {
     index: number;
     total: number;
@@ -152,45 +192,6 @@ export interface WorkerLimits {
   pauseWhenForeground: boolean;
 }
 
-export interface LlmfitGpuAdvisory {
-  name: string;
-  backend: string;
-  vramMb: number;
-  unifiedMemory: boolean;
-}
-
-export interface LlmfitModelAdvisory {
-  deploymentId?: string | undefined;
-  requestedModel: string;
-  resolvedModel: string;
-  fitLevel: string;
-  runMode: string;
-  runtime?: string | undefined;
-  bestQuant?: string | undefined;
-  estimatedTokensPerSecond?: number | undefined;
-  measuredTokensPerSecond?: number | undefined;
-  memoryRequiredMb?: number | undefined;
-  usableContext?: number | undefined;
-}
-
-/**
- * Node-local advice from llmfit. This is intentionally separate from the
- * canonical deployment and pipeline profiles: whole-model fit does not prove
- * that a node is suitable (or unsuitable) for an individual GDLP stage.
- */
-export interface LlmfitAdvisory {
-  source: "llmfit";
-  scope: "host";
-  backend: string;
-  cpuName: string;
-  cpuCores: number;
-  totalRamMb: number;
-  availableRamMb: number;
-  gpuCount: number;
-  gpus: LlmfitGpuAdvisory[];
-  model?: LlmfitModelAdvisory | undefined;
-}
-
 export type WorkerAcceleratorDiagnosticState =
   | "idle"
   | "preparing"
@@ -246,6 +247,8 @@ export interface WorkerAcceleratorDiagnostics {
 export interface WorkerCapabilities {
   region: string;
   agentVersion: string;
+  /** Exact sealed source identity. Missing only on legacy or development nodes. */
+  buildIdentity?: NativeBuildIdentity | undefined;
   gpus: GpuCapability[];
   limits: WorkerLimits;
   deployments: ModelDeployment[];
@@ -254,10 +257,14 @@ export interface WorkerCapabilities {
     uplinkMbps: number;
     downlinkMbps: number;
   };
-  llmfit?: LlmfitAdvisory | undefined;
   /** A node-local shard executor controlled through the existing worker tunnel. */
   distributedExecutor?: {
     protocol: "gdlp-worker-tunnel/1" | "gdlp-worker-tunnel/2";
+    /**
+     * Optional, negotiated recovery extension for the authenticated relay.
+     * Legacy v2 workers omit it and remain fail-closed on any disconnect.
+     */
+    streamRecovery?: "offset-ack-v1" | undefined;
     nodeId: string;
     stageHost: string;
     stagePort: number;
@@ -268,6 +275,24 @@ export interface WorkerCapabilities {
     cpuEligible?: boolean | undefined;
     /** Sanitized self-repair state; absent on legacy and non-desktop workers. */
     acceleration?: WorkerAcceleratorDiagnostics | undefined;
+    /** Coordinator-observed physical calibration consumed by placement. */
+    performanceEvidence?: CoordinatorRuntimePerformanceEvidence | undefined;
+    /** Honest host-side process isolation controls; absent on legacy workers. */
+    isolation?: WorkerExecutorIsolationCapability | undefined;
+    /**
+     * Native peer listener candidates. These are reachability hints only:
+     * every session still requires a coordinator-issued, one-time grant.
+     */
+    directTransport?: {
+      protocol: "mycellios-direct/1";
+      candidates: Array<{
+        host: string;
+        port: number;
+        scope: "lan" | "configured" | "public-mapped";
+      }>;
+      maxSessions: number;
+      maxSessionBytes: number;
+    } | undefined;
   } | undefined;
 }
 
@@ -277,6 +302,23 @@ export interface WorkerRegistration {
     id: string;
   } | undefined;
   capabilities: WorkerCapabilities;
+  protocol?: {
+    min: number;
+    max: number;
+  } | undefined;
+  admission?: {
+    challengeId: string;
+    publicKey: {
+      algorithm: "ed25519" | "ecdsa-p256-sha256";
+      spki: string;
+    };
+    protocol: {
+      min: number;
+      max: number;
+    };
+    registrationDigest: string;
+    signature: string;
+  } | undefined;
 }
 
 export interface WorkerHeartbeat {
@@ -301,6 +343,77 @@ export interface CompletionMetrics {
   /** Exact prompt KV positions reused by the selected runtime, when reported. */
   reusedKvTokens?: number | undefined;
   energyWh?: number | undefined;
+}
+
+export type NetworkTransportMode = "direct" | "relay" | "local" | "unobserved";
+
+/**
+ * Coordinator-built evidence for one physical stage that actually backed the
+ * selected deployment. Null timing fields mean that the runtime did not expose
+ * a per-stage clock; they must never be inferred from whole-request latency.
+ */
+export interface NetworkExecutionTraceStage {
+  routeStageIndex: number;
+  stageIndex: number;
+  nodeId: string | null;
+  workerId: string | null;
+  deploymentId: string;
+  deploymentOwnerWorkerId: string;
+  modelDigest: string;
+  layerStart: number | null;
+  layerEnd: number | null;
+  deviceType: Exclude<ExecutionDeviceType, "mixed">;
+  backend: ExecutionBackend;
+  precision: string;
+  deviceName: string;
+  startedAt: number | null;
+  endedAt: number | null;
+  durationMs: number | null;
+}
+
+/**
+ * Effective transport observed on a directed physical boundary during a job.
+ * Byte counts are null when another overlapping job could have used the same
+ * persistent stream, because aggregate stream counters are not per-request.
+ */
+export interface NetworkExecutionBoundaryTrace {
+  boundaryIndex: number;
+  fromStageIndex: number;
+  toStageIndex: number;
+  sourceNodeId: string | null;
+  destinationNodeId: string | null;
+  physicalBoundary: boolean | null;
+  transport: NetworkTransportMode;
+  streamId: string | null;
+  bytesSourceToDestination: number | null;
+  bytesDestinationToSource: number | null;
+  countersExclusive: boolean | null;
+  connectRttMs: number | null;
+  streamCreatedAt: number | null;
+  streamConnectedAt: number | null;
+  streamEndedAt: number | null;
+  observedOverlapMs: number | null;
+}
+
+export interface NetworkExecutionTrace {
+  schema: "mycellios-network-execution-trace/1";
+  jobId: string;
+  attempt: number;
+  observedFrom: number;
+  observedUntil: number;
+  durationMs: number;
+  routeClass: ExecutionMode;
+  affinityHit: boolean;
+  selectedRoute: Array<{
+    routeStageIndex: number;
+    workerId: string;
+    deploymentId: string;
+    modelDigest: string;
+    stageIndex: number;
+  }>;
+  stages: NetworkExecutionTraceStage[];
+  physicalBoundaryCount: number | null;
+  boundaries: NetworkExecutionBoundaryTrace[];
 }
 
 export interface WorkerEnvelope<T = unknown> {
@@ -357,4 +470,6 @@ export interface CompletionResult {
   text: string;
   finishReason: "stop" | "length" | "cancelled" | "error";
   metrics: CompletionMetrics;
+  /** Added by the coordinator after validating worker completion evidence. */
+  networkTrace?: NetworkExecutionTrace | undefined;
 }

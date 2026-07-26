@@ -116,7 +116,7 @@ export function buildSupportAssistantMessages(
     "- The network may use replicas or distributed stages; never claim a model is distributed unless the supplied live state proves it.",
     "- The desktop application can offer a chosen amount of memory and can use Automatic, GPU-only, or CPU-only compute mode.",
     "- Browser contribution uses WebGPU when the browser, operating system, and driver expose a compatible adapter.",
-    "- mycellios does not require local model runtime from every user; managed distributed runtimes and browser workers are separate execution paths.",
+    "- Desktop inference runs through the installed Mycellios runtime; external model-serving daemons are not product execution paths.",
     "- The Tests area contains measured benchmark history. Do not turn configured or estimated throughput into a measurement.",
     "",
     "Live network state for this answer:",

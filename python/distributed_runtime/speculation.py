@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 import math
 from numbers import Integral
+from statistics import NormalDist
 from typing import Protocol, runtime_checkable
 
 
@@ -324,6 +325,12 @@ class AdaptiveSpeculationConfig:
     min_verify_observations: int = 3
     seconds_per_byte: float = 0.0
     minimum_speedup: float = 1.0
+    # A strategy is enabled only when this one-sided confidence bound clears
+    # minimum_speedup. Point estimates remain telemetry, never authority.
+    confidence_level: float = 0.95
+    # Once enabled, a small lower exit threshold prevents noisy measurements
+    # from toggling the route on every decode wave.
+    speedup_hysteresis: float = 0.02
     # Opt-in delay-adaptive depth cap (UCB-SpecStop, arXiv 2606.20591): the
     # optimal draft depth is a monotone threshold in communication delay and
     # grows only logarithmically with it.  Defaults keep behaviour unchanged.
@@ -374,6 +381,18 @@ class AdaptiveSpeculationConfig:
             raise ValueError("minimum_speedup must be >= 1")
         object.__setattr__(self, "seconds_per_byte", byte_cost)
         object.__setattr__(self, "minimum_speedup", threshold)
+        confidence = _validate_measurement(
+            "confidence_level", self.confidence_level, allow_zero=False
+        )
+        if not 0.5 < confidence < 1.0:
+            raise ValueError("confidence_level must be between 0.5 and 1")
+        hysteresis = _validate_measurement(
+            "speedup_hysteresis", self.speedup_hysteresis, allow_zero=True
+        )
+        if hysteresis >= threshold:
+            raise ValueError("speedup_hysteresis must be smaller than minimum_speedup")
+        object.__setattr__(self, "confidence_level", confidence)
+        object.__setattr__(self, "speedup_hysteresis", hysteresis)
 
         if not isinstance(self.delay_adaptive, bool):
             raise ValueError("delay_adaptive must be a bool")
@@ -408,9 +427,30 @@ class SpeculationStats:
             return None
         return self.accepted_tokens / self.proposed_tokens
 
+    @property
+    def observed_emitted_tokens_per_verification(self) -> float | None:
+        """Mean ``accepted + 1`` for valid VERIFY observations.
+
+        This is intrinsic controller telemetry.  It is a useful W=1 estimator,
+        but it is not route-level conveyor ``g`` for W>1 because overlapping
+        waves can count the same bridge token more than once.
+        """
+
+        if self.verification_observations == 0:
+            return None
+        value = self.emitted_tokens / self.verification_observations
+        return value if math.isfinite(value) else None
+
 
 @dataclass(frozen=True)
 class CandidateEstimate:
+    """Observed and predicted statistics for one fixed VERIFY candidate size.
+
+    ``observed_emitted_tokens_per_verification`` and its confidence bounds use
+    only valid controller VERIFY observations.  They must not be interpreted
+    as route-level useful tokens per traversal for a W>1 conveyor.
+    """
+
     candidate_size: int
     observations: int
     proposed_tokens: int
@@ -422,7 +462,14 @@ class CandidateEstimate:
     predicted_latency_speedup: float | None
     predicted_byte_efficiency: float | None
     predicted_speedup: float | None
+    predicted_speedup_lower_bound: float | None
+    confidence_level: float
     ready: bool
+    # Appended with defaults to preserve the public positional constructor used
+    # before route-quality telemetry existed.
+    observed_emitted_tokens_per_verification: float | None = None
+    observed_emitted_tokens_per_verification_lower_bound: float | None = None
+    observed_emitted_tokens_per_verification_upper_bound: float | None = None
 
 
 @dataclass(frozen=True)
@@ -430,6 +477,7 @@ class SpeculationDecision:
     enabled: bool
     candidate_size: int
     predicted_speedup: float | None
+    predicted_speedup_lower_bound: float | None
     predicted_latency_speedup: float | None
     predicted_byte_efficiency: float | None
     expected_emitted_tokens: float | None
@@ -448,6 +496,8 @@ class _ClassicMeasurements:
     generated_tokens: int = 0
     latency_seconds: float = 0.0
     transferred_bytes: int = 0
+    cost_per_token_sum: float = 0.0
+    cost_per_token_square_sum: float = 0.0
 
 
 @dataclass
@@ -458,6 +508,10 @@ class _VerificationMeasurements:
     emitted_tokens: int = 0
     latency_seconds: float = 0.0
     transferred_bytes: int = 0
+    emitted_per_wave_sum: float = 0.0
+    emitted_per_wave_square_sum: float = 0.0
+    cost_per_wave_sum: float = 0.0
+    cost_per_wave_square_sum: float = 0.0
 
 
 class AdaptiveSpeculationController:
@@ -474,11 +528,13 @@ class AdaptiveSpeculationController:
         self._classic = _ClassicMeasurements()
         self._verification: dict[int, _VerificationMeasurements] = {}
         self._rtt_ewma_ms: float | None = None
+        self._enabled_candidate_size: int | None = None
 
     def reset(self) -> None:
         self._classic = _ClassicMeasurements()
         self._verification.clear()
         self._rtt_ewma_ms = None
+        self._enabled_candidate_size = None
 
     def record_rtt(self, rtt_ms: float) -> None:
         rtt = _validate_measurement("rtt_ms", rtt_ms, allow_zero=True)
@@ -531,6 +587,11 @@ class AdaptiveSpeculationController:
         self._classic.generated_tokens += tokens
         self._classic.latency_seconds += latency
         self._classic.transferred_bytes += byte_count
+        observed_cost = (
+            latency + float(self.config.seconds_per_byte) * byte_count
+        ) / tokens
+        self._classic.cost_per_token_sum += observed_cost
+        self._classic.cost_per_token_square_sum += observed_cost * observed_cost
 
     def record_verification(
         self,
@@ -562,6 +623,12 @@ class AdaptiveSpeculationController:
         measurements.emitted_tokens += accepted + 1
         measurements.latency_seconds += latency
         measurements.transferred_bytes += byte_count
+        emitted = float(accepted + 1)
+        observed_cost = latency + float(self.config.seconds_per_byte) * byte_count
+        measurements.emitted_per_wave_sum += emitted
+        measurements.emitted_per_wave_square_sum += emitted * emitted
+        measurements.cost_per_wave_sum += observed_cost
+        measurements.cost_per_wave_square_sum += observed_cost * observed_cost
 
     def stats(self) -> SpeculationStats:
         verification = tuple(self._verification.values())
@@ -599,9 +666,41 @@ class AdaptiveSpeculationController:
             expected_emitted = 1.0 + candidate * acceptance_rate
 
         if measurements.observations == 0:
+            observed_emitted_per_verification = None
+            observed_emitted_lower_bound = None
+            observed_emitted_upper_bound = None
             mean_verify_latency = None
             mean_verify_bytes = None
         else:
+            observed_emitted_per_verification = (
+                measurements.emitted_tokens / measurements.observations
+            )
+            if not math.isfinite(observed_emitted_per_verification):
+                observed_emitted_per_verification = None
+            observed_emitted_lower_bound = _one_sided_mean_bound(
+                total=measurements.emitted_per_wave_sum,
+                square_total=measurements.emitted_per_wave_square_sum,
+                count=measurements.observations,
+                confidence_level=float(self.config.confidence_level),
+                upper=False,
+            )
+            observed_emitted_upper_bound = _one_sided_mean_bound(
+                total=measurements.emitted_per_wave_sum,
+                square_total=measurements.emitted_per_wave_square_sum,
+                count=measurements.observations,
+                confidence_level=float(self.config.confidence_level),
+                upper=True,
+            )
+            if observed_emitted_lower_bound is not None:
+                observed_emitted_lower_bound = max(
+                    1.0,
+                    min(float(candidate + 1), observed_emitted_lower_bound),
+                )
+            if observed_emitted_upper_bound is not None:
+                observed_emitted_upper_bound = max(
+                    1.0,
+                    min(float(candidate + 1), observed_emitted_upper_bound),
+                )
             mean_verify_latency = (
                 measurements.latency_seconds / measurements.observations
             )
@@ -612,6 +711,7 @@ class AdaptiveSpeculationController:
         predicted_latency_speedup: float | None = None
         predicted_byte_efficiency: float | None = None
         predicted_speedup: float | None = None
+        predicted_speedup_lower_bound: float | None = None
         if ready and expected_emitted is not None:
             classic_latency_per_token = (
                 self._classic.latency_seconds / self._classic.generated_tokens
@@ -641,6 +741,38 @@ class AdaptiveSpeculationController:
             predicted_speedup = (
                 classic_cost_per_token * expected_emitted / verification_cost
             )
+            classic_cost_lower = _one_sided_mean_bound(
+                total=self._classic.cost_per_token_sum,
+                square_total=self._classic.cost_per_token_square_sum,
+                count=self._classic.observations,
+                confidence_level=float(self.config.confidence_level),
+                upper=False,
+            )
+            emitted_lower = _one_sided_mean_bound(
+                total=measurements.emitted_per_wave_sum,
+                square_total=measurements.emitted_per_wave_square_sum,
+                count=measurements.observations,
+                confidence_level=float(self.config.confidence_level),
+                upper=False,
+            )
+            verification_cost_upper = _one_sided_mean_bound(
+                total=measurements.cost_per_wave_sum,
+                square_total=measurements.cost_per_wave_square_sum,
+                count=measurements.observations,
+                confidence_level=float(self.config.confidence_level),
+                upper=True,
+            )
+            if (
+                classic_cost_lower is not None
+                and emitted_lower is not None
+                and verification_cost_upper is not None
+                and verification_cost_upper > 0
+            ):
+                predicted_speedup_lower_bound = (
+                    classic_cost_lower
+                    * emitted_lower
+                    / verification_cost_upper
+                )
 
         return CandidateEstimate(
             candidate_size=candidate,
@@ -649,11 +781,22 @@ class AdaptiveSpeculationController:
             accepted_tokens=measurements.accepted_tokens,
             acceptance_rate=acceptance_rate,
             expected_emitted_tokens=expected_emitted,
+            observed_emitted_tokens_per_verification=(
+                observed_emitted_per_verification
+            ),
+            observed_emitted_tokens_per_verification_lower_bound=(
+                observed_emitted_lower_bound
+            ),
+            observed_emitted_tokens_per_verification_upper_bound=(
+                observed_emitted_upper_bound
+            ),
             mean_verification_latency_seconds=mean_verify_latency,
             mean_verification_bytes=mean_verify_bytes,
             predicted_latency_speedup=predicted_latency_speedup,
             predicted_byte_efficiency=predicted_byte_efficiency,
             predicted_speedup=predicted_speedup,
+            predicted_speedup_lower_bound=predicted_speedup_lower_bound,
+            confidence_level=float(self.config.confidence_level),
             ready=ready,
         )
 
@@ -713,25 +856,42 @@ class AdaptiveSpeculationController:
         if not eligible:
             return self._disabled("verification_warmup")
 
-        # Prefer measured speedup, resolving exact ties toward the smaller and
-        # therefore lower-risk verification wave.
+        # Prefer the conservative bound, resolving exact ties toward the
+        # smaller and therefore lower-risk verification wave. A noisy point
+        # estimate is never sufficient to switch speculation on.
         best = max(
             eligible,
             key=lambda estimate: (
-                float(estimate.predicted_speedup),
+                float(estimate.predicted_speedup_lower_bound or 0.0),
                 -estimate.candidate_size,
             ),
         )
         assert best.predicted_speedup is not None
-        enabled = best.predicted_speedup > float(self.config.minimum_speedup)
+        lower_bound = best.predicted_speedup_lower_bound
+        was_enabled = self._enabled_candidate_size == best.candidate_size
+        threshold = float(self.config.minimum_speedup)
+        if was_enabled:
+            threshold = max(
+                0.0,
+                threshold - float(self.config.speedup_hysteresis),
+            )
+        enabled = lower_bound is not None and lower_bound > threshold
+        self._enabled_candidate_size = best.candidate_size if enabled else None
         return SpeculationDecision(
             enabled=enabled,
             candidate_size=best.candidate_size if enabled else 0,
             predicted_speedup=best.predicted_speedup,
+            predicted_speedup_lower_bound=lower_bound,
             predicted_latency_speedup=best.predicted_latency_speedup,
             predicted_byte_efficiency=best.predicted_byte_efficiency,
             expected_emitted_tokens=best.expected_emitted_tokens,
-            reason="beneficial" if enabled else "not_beneficial",
+            reason=(
+                "hysteresis_hold"
+                if enabled and was_enabled and lower_bound <= float(self.config.minimum_speedup)
+                else "beneficial"
+                if enabled
+                else "not_beneficial"
+            ),
         )
 
     def _capped_available(self, available: int) -> int:
@@ -756,11 +916,33 @@ class AdaptiveSpeculationController:
             enabled=False,
             candidate_size=0,
             predicted_speedup=None,
+            predicted_speedup_lower_bound=None,
             predicted_latency_speedup=None,
             predicted_byte_efficiency=None,
             expected_emitted_tokens=None,
             reason=reason,
         )
+
+
+def _one_sided_mean_bound(
+    *,
+    total: float,
+    square_total: float,
+    count: int,
+    confidence_level: float,
+    upper: bool,
+) -> float | None:
+    """Normal one-sided mean bound with sample variance and fail-closed n<2."""
+
+    if count < 2:
+        return None
+    mean = total / count
+    variance_numerator = max(0.0, square_total - total * total / count)
+    sample_variance = variance_numerator / (count - 1)
+    standard_error = math.sqrt(sample_variance / count)
+    z_score = NormalDist().inv_cdf(confidence_level)
+    margin = z_score * standard_error
+    return max(0.0, mean + margin if upper else mean - margin)
 
 
 __all__ = [

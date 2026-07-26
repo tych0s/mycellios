@@ -16,12 +16,18 @@ import {
   Tray,
 } from "electron";
 import started from "electron-squirrel-startup";
+import {
+  NATIVE_BUILD_PROVENANCE_FILE,
+  type NativeBuildIdentity,
+} from "../contracts/build-identity.js";
 import { workerConfigSchema, type WorkerConfig } from "../contracts/schemas.js";
 import type { CoordinatorRuntime } from "../coordinator/server.js";
 import { createCoordinator } from "../coordinator/server.js";
 import { DynamicModelActivationManager } from "../coordinator/model-activation-manager.js";
-import { estimateLinkLatencyMs } from "../coordinator/connected-executor-activation.js";
+import { buildConnectedExecutorActivationSnapshot } from "../coordinator/connected-executor-activation.js";
 import { parseAutoDistributionConfig } from "../distribution/auto-distribute.js";
+import { executorIsolationCapabilityFromPolicy } from "../distribution/process-environment.js";
+import { probeWindowsJobBroker } from "../distribution/windows-job-broker.js";
 import {
   LocalProcessAgent,
   type LaunchAgent,
@@ -34,6 +40,12 @@ import { WorkerTunnelLaunchAgent } from "../distribution/worker-tunnel-launch-ag
 import type { StoredWorker } from "../storage/store.js";
 import type { WorkerHub } from "../coordinator/worker-hub.js";
 import { WorkerAgent, validateCoordinatorUrl } from "../worker/agent.js";
+import {
+  generateWorkerAdmissionCredential,
+  parseWorkerAdmissionCredential,
+  workerAdmissionSigner,
+} from "../worker/admission-credential.js";
+import { prepareNodeStageArtifacts } from "../worker/stage-artifact-preparer.js";
 import {
   probeHardware,
   type HardwareProbe,
@@ -55,6 +67,8 @@ import type {
   SupportAssistantPublicConfig,
   SystemLogEntry,
   SystemLogSnapshot,
+  WorkerCredentialRevocationResponse,
+  WorkerCredentialSummary,
 } from "./contracts.js";
 import type {
   HubCatalogPage,
@@ -75,7 +89,7 @@ import {
   readVerifiedAccelerationUsage,
 } from "./acceleration-evidence.js";
 import { consumeChatCompletionStreamWithRecovery } from "./chat-stream.js";
-import { desktopExecutorPolicy, normalizeComputeMode } from "./compute-mode.js";
+import { desktopExecutorPolicy } from "./compute-mode.js";
 import {
   selectDesktopHardwareGpu,
   selectWorkerCapacityHardware,
@@ -98,39 +112,24 @@ import {
   summarizeAutomaticUpdateError,
 } from "./update-recovery.js";
 import { SingleFlight } from "./single-flight.js";
+import { readNativeBuildIdentity } from "../core/native-build-identity.js";
+import { probeRuntimePerformanceProfile } from "../performance/runtime-profile-probe.js";
+import {
+  DEFAULT_DESKTOP_SETTINGS as DEFAULT_SETTINGS,
+  PUBLIC_COORDINATOR_URL,
+  desktopSettingsRequireMigration,
+  sanitizeDesktopSettings,
+} from "./settings.js";
 
 if (started) app.quit();
 
 app.setName("mycellios");
 if (process.platform === "win32") app.setAppUserModelId("app.mycellios.desktop.v2");
 
-const PUBLIC_COORDINATOR_URL = "https://www.mycellios.com";
 const LOCAL_DASHBOARD_COORDINATOR_URL = "http://127.0.0.1:4180";
 const LOCAL_DASHBOARD_COORDINATOR_PORT = 4_180;
 
-const DEFAULT_SETTINGS: DesktopSettings = {
-  coordinatorMode: "remote",
-  remoteCoordinatorUrl: PUBLIC_COORDINATOR_URL,
-  remoteCoordinatorToken: "",
-  contributionEnabled: false,
-  computeMode: "automatic",
-  launchAtLogin: false,
-  closeToTray: true,
-  onboardingComplete: false,
-  region: "auto",
-  offeredVramMb: 4_096,
-  adapterMode: "connectivity-test",
-  modelName: "mycellios-connectivity-check",
-  adapterBaseUrl: "http://127.0.0.1:11434",
-  modelDigest: "",
-};
-
 const UPDATE_FEED_URL = "https://www.mycellios.com/updates/win32/x64/";
-const LEGACY_PUBLIC_COORDINATOR_URLS = new Set([
-  "https://www.mycellios.com",
-  "https://mycellios.com",
-  "https://network.mycellios.app",
-]);
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
@@ -159,6 +158,8 @@ let settings: DesktopSettings = DEFAULT_SETTINGS;
 let modelAdminToken = "";
 let isQuitting = false;
 let runtimeError: string | null = null;
+let nativeBuildIdentity: NativeBuildIdentity | null = null;
+let nativeBuildIdentityError: string | null = null;
 let accelerationStatus: DashboardSnapshot["acceleration"] = createInitialAccelerationStatus();
 let updateCheckTimer: NodeJS.Timeout | null = null;
 let updateRetryTimer: NodeJS.Timeout | null = null;
@@ -197,6 +198,43 @@ function modelAdminTokenPath(): string {
 
 function desktopLogPath(): string {
   return join(app.getPath("userData"), "mycellios.log");
+}
+
+function workerAdmissionCredentialPath(): string {
+  return join(app.getPath("userData"), "worker-admission-credential.enc");
+}
+
+function loadOrCreateDesktopAdmissionSigner() {
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error(
+      "Secure operating-system storage is unavailable. This device cannot join a remote network safely.",
+    );
+  }
+  const path = workerAdmissionCredentialPath();
+  if (existsSync(path)) {
+    try {
+      const decoded = safeStorage.decryptString(readFileSync(path));
+      return workerAdmissionSigner(
+        parseWorkerAdmissionCredential(JSON.parse(decoded) as unknown),
+      );
+    } catch (error) {
+      writeDesktopLog("worker-admission-credential-load-failed", {
+        error: errorText(error),
+      });
+      throw new Error(
+        "The protected device identity could not be read. Rotate or recover this device from network settings.",
+      );
+    }
+  }
+  const credential = generateWorkerAdmissionCredential();
+  const temporary = `${path}.tmp`;
+  writeFileSync(
+    temporary,
+    safeStorage.encryptString(JSON.stringify(credential)),
+    { flag: "wx" },
+  );
+  renameSync(temporary, path);
+  return workerAdmissionSigner(credential);
 }
 
 function loadModelAdminToken(): string {
@@ -561,13 +599,9 @@ async function installDownloadedUpdate(force: boolean, reason: string): Promise<
 
 function loadSettings(): DesktopSettings {
   try {
-    const stored = JSON.parse(readFileSync(settingsPath(), "utf8")) as Partial<DesktopSettings>;
-    const storedCoordinatorUrl = stored.remoteCoordinatorUrl?.trim().replace(/\/+$/, "");
-    const migrated = storedCoordinatorUrl && LEGACY_PUBLIC_COORDINATOR_URLS.has(storedCoordinatorUrl)
-      ? { ...stored, remoteCoordinatorUrl: DEFAULT_SETTINGS.remoteCoordinatorUrl }
-      : stored;
-    const loaded = sanitizeSettings({ ...DEFAULT_SETTINGS, ...migrated });
-    if (migrated !== stored) {
+    const stored: unknown = JSON.parse(readFileSync(settingsPath(), "utf8"));
+    const loaded = sanitizeDesktopSettings(stored);
+    if (desktopSettingsRequireMigration(stored, loaded)) {
       writeFileSync(settingsPath(), `${JSON.stringify(loaded, null, 2)}\n`, "utf8");
     }
     return loaded;
@@ -576,36 +610,8 @@ function loadSettings(): DesktopSettings {
   }
 }
 
-function sanitizeSettings(input: DesktopSettings): DesktopSettings {
-  const offeredVramMb = Number.isFinite(input.offeredVramMb)
-    ? Math.max(512, Math.min(262_144, Math.round(input.offeredVramMb)))
-    : DEFAULT_SETTINGS.offeredVramMb;
-  const remoteCoordinatorUrl = input.remoteCoordinatorUrl.trim();
-  const remoteCoordinatorToken = input.remoteCoordinatorToken.trim();
-  if (input.coordinatorMode === "remote") validateCoordinatorUrl(remoteCoordinatorUrl);
-  if (input.adapterMode === "local-model-runtime" && !input.modelDigest.trim()) {
-    throw new Error("local model runtime requires a pinned model digest before contributing resources.");
-  }
-  return {
-    coordinatorMode: input.coordinatorMode === "remote" ? "remote" : "local",
-    remoteCoordinatorUrl,
-    remoteCoordinatorToken,
-    contributionEnabled: Boolean(input.contributionEnabled),
-    computeMode: normalizeComputeMode(input.computeMode),
-    launchAtLogin: Boolean(input.launchAtLogin),
-    closeToTray: Boolean(input.closeToTray),
-    onboardingComplete: Boolean(input.onboardingComplete),
-    region: input.region.trim() || "auto",
-    offeredVramMb,
-    adapterMode: input.adapterMode === "local-model-runtime" ? "local-model-runtime" : "connectivity-test",
-    modelName: input.modelName.trim() || DEFAULT_SETTINGS.modelName,
-    adapterBaseUrl: input.adapterBaseUrl.trim() || DEFAULT_SETTINGS.adapterBaseUrl,
-    modelDigest: input.modelDigest.trim(),
-  };
-}
-
 function persistSettings(next: DesktopSettings): void {
-  settings = sanitizeSettings(next);
+  settings = sanitizeDesktopSettings(next);
   writeFileSync(settingsPath(), `${JSON.stringify(settings, null, 2)}\n`, "utf8");
   configureLaunchAtLogin(settings.launchAtLogin);
 }
@@ -676,10 +682,52 @@ async function startCoordinatorIfNeeded(): Promise<void> {
     },
     {
       logger: false,
-      activationManagerFactory: ({ store, hub }) => new DynamicModelActivationManager({
+      buildIdentity: nativeBuildIdentity,
+      runtimeMetadata: {
+        root: app.getAppPath(),
+        version: app.getVersion(),
+        revision: null,
+        buildIdentity: nativeBuildIdentity,
+      },
+      benchmarkStorageRoot: join(app.getPath("userData"), "benchmarks"),
+      activationManagerFactory: ({ store, hub, deploymentController }) => new DynamicModelActivationManager({
         cwd: app.getAppPath(),
-        snapshot: () => buildDesktopActivationSnapshot(store.listWorkers(), hub.connectedWorkerIds()),
+        workerAgentVersion: app.getVersion(),
+        ...(nativeBuildIdentity ? { workerBuildIdentity: nativeBuildIdentity } : {}),
+        snapshot: () => buildConnectedExecutorActivationSnapshot(
+          desktopActivationBaseConfig(),
+          store.listWorkers(),
+          hub.connectedWorkerIds(),
+          hub.runtimeLinkObservations(),
+        ),
         resolveManagedAgent: (nodeId, launch) => resolveDesktopTunnelAgent(store.listWorkers(), hub, nodeId, launch),
+        loadProgress: (modelId) => store.listActivationEvents(modelId),
+        onProgress: (modelId, event) => {
+          store.appendActivationEvent(modelId, event);
+          if (event.phase === "running_canary") {
+            const operation = deploymentController.activeOperationForModel(modelId);
+            if (operation) deploymentController.markCanary(operation.id);
+          }
+        },
+        onPlanPrepared: (modelId, stages) => {
+          const operation = deploymentController.activeOperationForModel(modelId);
+          if (!operation) throw new Error(`deployment_operation_missing:${modelId}`);
+          return deploymentController.prepareRoute(operation.id, stages).id;
+        },
+        onActivated: (modelId, reservationId, result) => {
+          const canary = {
+            passed: true,
+            text: result.canaryText,
+            ...result.canaryMetrics,
+            workerId: result.workerId,
+          };
+          if (reservationId) {
+            deploymentController.commitRoute(reservationId, canary);
+            return;
+          }
+          const operation = deploymentController.activeOperationForModel(modelId);
+          if (operation) deploymentController.completeOperation(operation.id, "active", { canary });
+        },
       }),
     },
   );
@@ -738,20 +786,6 @@ async function buildWorkerConfig(
       gpu: primary?.model,
     });
   }
-  const adapter =
-    settings.adapterMode === "local-model-runtime"
-      ? {
-          kind: "local-model-runtime" as const,
-          model: settings.modelName,
-          baseUrl: settings.adapterBaseUrl,
-        }
-      : {
-          kind: "mock" as const,
-          model: "mycellios-connectivity-check",
-          tokensPerSecond: 20,
-          ttftMs: 150,
-          failureRate: 0,
-        };
   return workerConfigSchema.parse({
     region: settings.region,
     capacityScope: "host",
@@ -761,12 +795,13 @@ async function buildWorkerConfig(
       maxTemperatureC: 80,
       pauseWhenForeground: false,
     },
-    adapter,
+    adapter: {
+      kind: "mycellios-native",
+      model: "mycellios-native-control",
+    },
     deployment: {
-      ...(settings.adapterMode === "local-model-runtime" ? { modelDigest: settings.modelDigest } : {}),
       contextLimit: 8_192,
     },
-    llmfit: { enabled: false },
   });
 }
 
@@ -777,6 +812,11 @@ async function startWorkerIfEnabled(): Promise<void> {
 
 async function initializeWorker(): Promise<void> {
   if (!settings.contributionEnabled || worker || isQuitting) return;
+  if (app.isPackaged && !nativeBuildIdentity) {
+    throw new Error(
+      `native_build_identity_unverified:${nativeBuildIdentityError ?? "missing_provenance"}`,
+    );
+  }
   writeDesktopLog("worker-start-requested", { coordinatorUrl, contributionEnabled: settings.contributionEnabled });
   try {
     distributedExecutor ??= await createDesktopDistributedExecutor();
@@ -813,13 +853,17 @@ async function initializeWorker(): Promise<void> {
   const nextWorker = new WorkerAgent(config, {
     coordinatorUrl,
     agentVersion: app.getVersion(),
+    ...(nativeBuildIdentity ? { buildIdentity: nativeBuildIdentity } : {}),
     ...(settings.coordinatorMode === "remote" && settings.remoteCoordinatorToken
       ? { networkToken: settings.remoteCoordinatorToken }
       : {}),
+    ...(settings.coordinatorMode === "remote"
+      ? { admissionSigner: loadOrCreateDesktopAdmissionSigner() }
+      : {}),
     reconnect: true,
-    // The legacy connectivity option now means hardware-only standby. It
-    // registers this physical PC but never advertises a fake model.
-    advertiseDeployment: settings.adapterMode !== "connectivity-test",
+    // This worker contributes hardware and the authenticated distributed
+    // executor. Models are advertised only by verified native deployments.
+    advertiseDeployment: false,
     ...(preferredHardwareGpu
       ? { preferredHardwareGpu: { id: preferredHardwareGpu.id, vendor: preferredHardwareGpu.vendor, model: preferredHardwareGpu.model } }
       : {}),
@@ -829,6 +873,7 @@ async function initializeWorker(): Promise<void> {
       ...currentDesktopExecutorPolicy(),
       acceleration: currentAccelerationDiagnostics(),
     },
+    runtimePerformanceProfileProbe: measureDesktopRuntimePerformanceProfile,
     logger: {
       info: (message) => {
         console.info(`[agent] ${message}`);
@@ -856,6 +901,41 @@ async function initializeWorker(): Promise<void> {
     runtimeError = errorText(error);
     writeDesktopLog("worker-start-failed", { error: runtimeError });
     if (worker === nextWorker) worker = null;
+  });
+}
+
+async function measureDesktopRuntimePerformanceProfile() {
+  const runtimeRoot = acceleratorRuntimeRoot;
+  if (!runtimeRoot) throw new Error("distribution_runtime_is_not_ready");
+  const runtime = settings.computeMode === "cpu-only"
+    ? await prepareDesktopCpuRuntime(runtimeRoot)
+    : await selectImmediateRuntime(
+        () => resolvedAcceleratorRuntime,
+        () => prepareDesktopCpuRuntime(runtimeRoot),
+      );
+  if (settings.computeMode === "gpu-only" && runtime.deviceType !== "gpu") {
+    return null;
+  }
+  const pythonPath = resourcePath("python");
+  const hfHome = join(app.getPath("userData"), "model-shards");
+  mkdirSync(hfHome, { recursive: true });
+  return probeRuntimePerformanceProfile({
+    pythonExecutable: runtime.pythonExecutable,
+    pythonPath: [...runtime.pythonPathAdditions, pythonPath],
+    pathAdditions: [
+      ...runtime.pathAdditions,
+      dirname(runtime.pythonExecutable),
+    ],
+    backend: runtime.effectiveBackend,
+    device: runtime.launchDevice,
+    precision: runtime.precision,
+    ...(runtime.deviceType === "gpu"
+      ? { expectedDeviceName: runtime.deviceName }
+      : {}),
+    cwd: app.isPackaged ? dirname(app.getAppPath()) : app.getAppPath(),
+    env: {
+      HF_HOME: hfHome,
+    },
   });
 }
 
@@ -959,6 +1039,7 @@ async function readSnapshot(): Promise<DashboardSnapshot> {
     capturedAt: new Date().toISOString(),
     coordinatorUrl,
     appVersion: app.getVersion(),
+    buildIdentity: nativeBuildIdentity,
     platform: process.platform,
     connectionError,
     runtimeError,
@@ -1165,13 +1246,52 @@ function registerIpc(): void {
     ) => supportAssistantAdminRequest("PUT", adminToken, assistantSettings),
   );
   ipcMain.handle("workers:remove", async (_event, workerId: string) => {
-    await fetchJson(`public/v1/workers/${encodeURIComponent(workerId)}`, { method: "DELETE" });
+    await fetchJson(`public/v1/workers/${encodeURIComponent(workerId)}`, {
+      method: "DELETE",
+      ...(modelAdminToken ? { headers: { authorization: `Bearer ${modelAdminToken}` } } : {}),
+    });
     return readSnapshot();
   });
   ipcMain.handle("workers:clear-offline", async () => {
-    await fetchJson("public/v1/workers/clear-offline", { method: "POST" });
+    await fetchJson("public/v1/workers/clear-offline", {
+      method: "POST",
+      ...(modelAdminToken ? { headers: { authorization: `Bearer ${modelAdminToken}` } } : {}),
+    });
     return readSnapshot();
   });
+  ipcMain.handle("workers:credentials:list", async (_event, adminToken?: string) => {
+    const token = adminToken?.trim() || modelAdminToken;
+    const response = await fetchJson<{ data: WorkerCredentialSummary[] }>(
+      "public/v1/worker-credentials",
+      token ? { headers: { authorization: `Bearer ${token}` } } : undefined,
+    );
+    return response.data;
+  });
+  ipcMain.handle(
+    "workers:credentials:revoke",
+    async (
+      _event,
+      credential: Pick<WorkerCredentialSummary, "identityKind" | "identityId" | "fingerprint">,
+      reason: string,
+      adminToken?: string,
+    ) => {
+      const token = adminToken?.trim() || modelAdminToken;
+      return fetchJson<WorkerCredentialRevocationResponse>(
+        `public/v1/worker-credentials/${encodeURIComponent(credential.identityKind)}/${encodeURIComponent(credential.identityId)}/revoke`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            ...(token ? { authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify({
+            expectedFingerprint: credential.fingerprint,
+            reason,
+          }),
+        },
+      );
+    },
+  );
   ipcMain.handle("models:search-hub", async (_event, input: HubCatalogSearchInput) => {
     const parameters = new URLSearchParams({
       q: input.query,
@@ -1513,7 +1633,12 @@ async function createDesktopDistributedExecutor() {
     throw new Error("The packaged shard runtime is missing. Reinstall mycellios to contribute this device.");
   }
   const nodeId = persistentDistributedNodeId();
-  const launchAgent = new DesktopAcceleratedLaunchAgent(runtimeRoot, nodeId);
+  const windowsJobBroker = await desktopWindowsJobBrokerExecutable();
+  const launchAgent = new DesktopAcceleratedLaunchAgent(
+    runtimeRoot,
+    nodeId,
+    windowsJobBroker,
+  );
   // The small certified CPU runtime ships with the app and becomes available
   // before registration. GPU provisioning always happens beside it in an
   // isolated app-data directory, so a multi-gigabyte download never blocks
@@ -1522,12 +1647,42 @@ async function createDesktopDistributedExecutor() {
   return {
     nodeId,
     // This is a globally unique logical route name, never a reachable LAN IP.
-    // Protocol v2 rewrites every runtime connection onto the coordinator relay.
+    // Protocol v2 rewrites every runtime connection onto an authenticated
+    // tunnel. The worker additionally advertises verified LAN candidates for
+    // the native encrypted data plane; if the listener or candidate probe
+    // fails, the coordinator keeps using the resumable relay.
     stageHost: `${nodeId}.relay`,
     stagePort: 9_850,
     pythonExecutable,
     launchAgent,
+    isolation: executorIsolationCapabilityFromPolicy(
+      undefined,
+      windowsJobBroker === undefined
+        ? "portable-best-effort"
+        : "windows-job-object",
+    ),
+    directTransport: {
+      enabled: true,
+      listenHost: "0.0.0.0",
+      listenPort: 0,
+      publicPortMapping: true,
+    },
   };
+}
+
+async function desktopWindowsJobBrokerExecutable(): Promise<string | undefined> {
+  if (process.platform !== "win32" || process.arch !== "x64") return undefined;
+  const executable = app.isPackaged
+    ? resourcePath("windows-job-broker", "mycellios-job-broker.exe")
+    : resourcePath("build", "windows-job-broker", "mycellios-job-broker.exe");
+  if (!existsSync(executable)) {
+    if (app.isPackaged) {
+      throw new Error("The packaged Windows Job Object broker is missing. Reinstall mycellios.");
+    }
+    return undefined;
+  }
+  await probeWindowsJobBroker(executable);
+  return executable;
 }
 
 class DesktopAcceleratedLaunchAgent implements LaunchAgent {
@@ -1536,8 +1691,49 @@ class DesktopAcceleratedLaunchAgent implements LaunchAgent {
   constructor(
     private readonly baseRuntimeRoot: string,
     private readonly nodeId: string,
+    private readonly windowsJobBrokerExecutable: string | undefined,
   ) {
     this.id = `desktop-shard-executor:${nodeId}`;
+  }
+
+  async prepareRuntime(
+    description: PythonPipelineLaunchDescription,
+    nodeId: string,
+    onProgress?: (
+      event: import("../distribution/launch-supervisor.js").RuntimePreparationProgressEvent,
+    ) => void,
+  ) {
+    if (nodeId !== this.nodeId) throw new Error("desktop_stage_artifact_node_mismatch");
+    const runtime = await prepareDesktopCpuRuntime(this.baseRuntimeRoot);
+    const pythonPath = resourcePath("python");
+    const hfHome = join(app.getPath("userData"), "model-shards");
+    mkdirSync(hfHome, { recursive: true });
+    return await prepareNodeStageArtifacts(description, {
+      nodeId,
+      pythonExecutable: runtime.pythonExecutable,
+      cacheDirectory: hfHome,
+      cwd: app.isPackaged ? dirname(app.getAppPath()) : app.getAppPath(),
+      environment: {
+        PYTHONPATH: [...runtime.pythonPathAdditions, pythonPath].join(delimiter),
+        HF_HOME: hfHome,
+        TOKENIZERS_PARALLELISM: "false",
+        PATH: [...runtime.pathAdditions, dirname(runtime.pythonExecutable), process.env.PATH]
+          .filter(Boolean)
+          .join(delimiter),
+      },
+      onProgress: (event) => {
+        onProgress?.(event);
+        const layerLabel = `${event.layerStart}–${Math.max(event.layerStart, event.layerEnd - 1)}`;
+        accelerationStatus = appendAccelerationLog(accelerationStatus, {
+          at: new Date().toISOString(),
+          level: "info",
+          message: event.state === "preparing"
+            ? `Preparing verified model layers ${layerLabel} for this device.`
+            : `Verified model layers ${layerLabel} are ready in the local content cache.`,
+        });
+        scheduleAccelerationDiagnosticsPublish();
+      },
+    });
   }
 
   async start(
@@ -1622,6 +1818,13 @@ class DesktopAcceleratedLaunchAgent implements LaunchAgent {
     const executor = new LocalProcessAgent({
       id: this.id,
       cwd: app.isPackaged ? dirname(app.getAppPath()) : app.getAppPath(),
+      allowedExecutables: [runtime.pythonExecutable],
+      ...(this.windowsJobBrokerExecutable === undefined
+        ? {}
+        : {
+            windowsJobBrokerExecutable:
+              this.windowsJobBrokerExecutable,
+          }),
       env: {
         PYTHONPATH: [...runtime.pythonPathAdditions, pythonPath].join(delimiter),
         HF_HOME: hfHome,
@@ -1985,7 +2188,7 @@ function applyDesktopAcceleratorProgress(event: AcceleratorProgressEvent): void 
 }
 
 function distributionPythonExecutable(root = app.isPackaged
-  ? join(app.getPath("userData"), "distribution-runtime-v3")
+  ? join(app.getPath("userData"), "distribution-runtime-v4")
   : join(app.getAppPath(), "runtime", "distribution-venv")): string {
   if (process.platform === "win32") {
     const portable = join(root, "python.exe");
@@ -2007,8 +2210,8 @@ function ensureDistributionRuntime(): Promise<string> {
 async function ensureDistributionRuntimeOnce(): Promise<string> {
   if (!app.isPackaged) return join(app.getAppPath(), "runtime", "distribution-venv");
   const userData = app.getPath("userData");
-  const root = join(userData, "distribution-runtime-v3");
-  const staging = join(userData, "distribution-runtime-v3.staging");
+  const root = join(userData, "distribution-runtime-v4");
+  const staging = join(userData, "distribution-runtime-v4.staging");
   if (dirname(root) !== userData || dirname(staging) !== userData) {
     throw new Error("The shard runtime escaped its managed application directory.");
   }
@@ -2021,7 +2224,7 @@ async function ensureDistributionRuntimeOnce(): Promise<string> {
       rmSync(staging, { recursive: true, force: true });
       return root;
     } catch (error) {
-      writeDesktopLog("distribution-runtime-v3-invalid", { error: errorText(error) });
+      writeDesktopLog("distribution-runtime-v4-invalid", { error: errorText(error) });
       rmSync(root, { recursive: true, force: true });
     }
   }
@@ -2069,58 +2272,47 @@ function persistentDistributedNodeId(): string {
   return nodeId;
 }
 
-function buildDesktopActivationSnapshot(
-  workers: readonly StoredWorker[],
-  connectedWorkerIds: ReadonlySet<string>,
-): import("../coordinator/model-activation-manager.js").DynamicActivationSnapshot {
-  const executors = workers
-    .filter((worker) => connectedWorkerIds.has(worker.id) && worker.capabilities.distributedExecutor)
-    .map((worker) => ({ worker, executor: worker.capabilities.distributedExecutor! }))
-    .filter(({ executor }) => executor.protocol === "gdlp-worker-tunnel/2")
-    .filter((entry, index, all) => all.findIndex((candidate) => candidate.executor.nodeId === entry.executor.nodeId) === index);
-  const capacityNodes = executors.map(({ worker, executor }) => ({
-    id: executor.nodeId,
-    availableVramMiB: worker.capabilities.gpus.reduce((sum, gpu) => sum + gpu.freeOfferedVramMb, 0),
-  }));
-  if (executors.length < 2) return { capacityNodes, config: null };
-  const nodes = executors.map(({ worker, executor }) => {
-    const memoryMiB = worker.capabilities.gpus.reduce((sum, gpu) => sum + gpu.offeredVramMb, 0);
-    const measuredPower = worker.capabilities.gpus.reduce((sum, gpu) => sum + (gpu.powerW ?? 0), 0);
-    return {
-      id: executor.nodeId,
-      region: worker.capabilities.region,
-      endpoint: { host: executor.stageHost, port: executor.stagePort },
-      memoryMiB,
-      reserveMiB: Math.min(256, Math.max(0, memoryMiB - 1)),
-      decodeScale: 1,
-      prefillScale: 1,
-      codecScale: 1,
-      powerWatts: measuredPower > 0 ? measuredPower : 1,
-      availability: Math.max(0.01, Math.min(1, worker.reliability)),
-      agent: { kind: "managed" as const },
-    };
-  });
-  const links = executors.flatMap((from) => executors
-    .filter((to) => to.executor.nodeId !== from.executor.nodeId)
-    .map((to) => ({
-      from: from.executor.nodeId,
-      to: to.executor.nodeId,
-      oneWayLatencyMs: estimateLinkLatencyMs(
-        from.worker.capabilities.network.coordinatorRttMs,
-        to.worker.capabilities.network.coordinatorRttMs,
-      ),
-      jitterP95Ms: 0,
-      bandwidthMbps: Math.max(1, Math.min(from.worker.capabilities.network.uplinkMbps, to.worker.capabilities.network.downlinkMbps)),
-      lossRate: 0,
-      availability: Math.max(0.01, Math.min(from.worker.reliability, to.worker.reliability)),
-    })));
-  const rootHost = nodes[0]!.endpoint.host;
-  const config = parseAutoDistributionConfig({
+function desktopActivationBaseConfig() {
+  return parseAutoDistributionConfig({
     schema: "gdlp-auto-distribute/1",
     model: { source: "HuggingFaceTB/SmolLM2-135M-Instruct", revision: null, publicName: "pending-model" },
-    nodes,
-    links,
-    distribution: { minimumStages: 2, maximumStages: Math.min(8, nodes.length), allowLossyActivation: false },
+    nodes: [
+      {
+        id: "dynamic-slot-a",
+        region: settings.region,
+        endpoint: { host: "127.0.0.1", port: 9_850 },
+        memoryMiB: 512,
+        reserveMiB: 0,
+        agent: { kind: "managed" },
+      },
+      {
+        id: "dynamic-slot-b",
+        region: settings.region,
+        endpoint: { host: "127.0.0.1", port: 9_851 },
+        memoryMiB: 512,
+        reserveMiB: 0,
+        agent: { kind: "managed" },
+      },
+    ],
+    links: [
+      {
+        from: "dynamic-slot-a",
+        to: "dynamic-slot-b",
+        oneWayLatencyMs: 1,
+        jitterP95Ms: 0,
+        bandwidthMbps: 1,
+        lossRate: 0,
+      },
+      {
+        from: "dynamic-slot-b",
+        to: "dynamic-slot-a",
+        oneWayLatencyMs: 1,
+        jitterP95Ms: 0,
+        bandwidthMbps: 1,
+        lossRate: 0,
+      },
+    ],
+    distribution: { minimumStages: 2, maximumStages: 8, allowLossyActivation: false },
     workload: { promptTokens: 128, outputTokens: 128, contextTokens: 4_096, concurrentSequences: 1, minRouteAvailability: 0.9, batchWindowMs: 2, p95: true },
     runtime: {
       pythonExecutable: distributionPythonExecutable(),
@@ -2128,8 +2320,8 @@ function buildDesktopActivationSnapshot(
       pythonPath: resourcePath("python"),
       hfHome: join(app.getPath("userData"), "coordinator-model-cache"),
       apiEndpoint: { host: "0.0.0.0", port: 9_860 },
-      apiAdvertiseHost: rootHost,
-      returnEndpoint: { host: rootHost, port: 9_861 },
+      apiAdvertiseHost: "127.0.0.1",
+      returnEndpoint: { host: "127.0.0.1", port: 9_861 },
       returnBindHost: "0.0.0.0",
       threadsPerStage: 1,
       connectTimeoutSeconds: 300,
@@ -2141,7 +2333,6 @@ function buildDesktopActivationSnapshot(
     canary: { prompt: "Reply with only OK. /no_think", maxTokens: 16, timeoutMs: 300_000 },
     coordinator: { url: LOCAL_DASHBOARD_COORDINATOR_URL, region: settings.region, maxConcurrency: 1 },
   });
-  return { capacityNodes, config };
 }
 
 function resolveDesktopTunnelAgent(
@@ -2169,6 +2360,23 @@ else {
 }
 
 app.whenReady().then(async () => {
+  if (app.isPackaged) {
+    try {
+      nativeBuildIdentity = readNativeBuildIdentity(
+        join(app.getAppPath(), NATIVE_BUILD_PROVENANCE_FILE),
+        app.getVersion(),
+      );
+      writeDesktopLog("native-build-identity-verified", {
+        sourceId: nativeBuildIdentity.sourceId,
+        version: nativeBuildIdentity.version,
+      });
+    } catch (error) {
+      nativeBuildIdentityError = errorText(error);
+      writeDesktopLog("native-build-identity-rejected", {
+        error: nativeBuildIdentityError,
+      });
+    }
+  }
   settings = loadSettings();
   modelAdminToken = loadModelAdminToken();
   registerIpc();

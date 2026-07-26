@@ -5,6 +5,7 @@ from concurrent.futures import Future
 import json
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from aiohttp.test_utils import TestClient, TestServer
 import torch
@@ -18,7 +19,7 @@ from distributed_runtime.engine import (
 from distributed_runtime.protocol import TensorCodec
 from distributed_runtime.server import (
     ContinuousMicroBatcher,
-    DistributedOpenAIServer,
+    DistributedMycelliosServer,
     IncrementalTokenDecoder,
     OUTPUT_TOKEN_HASH_SCHEME,
     PendingGeneration,
@@ -26,14 +27,301 @@ from distributed_runtime.server import (
     chunk_payload,
     output_token_ids_sha256,
     parse_args as parse_server_args,
+    parse_remote_recovery_standby_routes,
+    tree_draft_provider_from_args,
 )
 
 
 class EngineConfigurationTests(unittest.TestCase):
+    def test_server_cli_rejects_known_external_backends(self) -> None:
+        for argument, backend in (
+            ("--native_stage-package", "native_stage"),
+            ("--external-gguf-runtime-server", "external GGUF runtime"),
+            ("--local-model-runtime-url", "local-model-runtime"),
+            ("--model-serving-runtime-endpoint", "model-serving-runtime"),
+        ):
+            with self.subTest(argument=argument):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    f"mycellios_native_runtime_forbids_external_backend:{backend}",
+                ):
+                    parse_server_args([argument, "research-only"])
+
+    def test_remote_recovery_cli_accepts_only_complete_unique_standby_contracts(
+        self,
+    ) -> None:
+        executor_ids = ["1" * 32, "2" * 32]
+        document = {
+            "schema": "gdlp-recovery-standby-route/1",
+            "routeId": "standby-one",
+            "firstStage": {"host": "10.0.0.8", "port": 20_001},
+            "stageExecutorIds": executor_ids,
+        }
+        raw = json.dumps(document, separators=(",", ":"), sort_keys=True)
+        args = parse_server_args(
+            [
+                "--first-stage-host",
+                "10.0.0.7",
+                "--first-stage-port",
+                "20000",
+                "--return-port",
+                "20002",
+                "--recovery-max-retries",
+                "2",
+                "--stage-executor-id",
+                executor_ids[0],
+                "--stage-executor-id",
+                executor_ids[1],
+                "--recovery-standby-route",
+                raw,
+            ]
+        )
+        routes = parse_remote_recovery_standby_routes(
+            args.recovery_standby_route
+        )
+        self.assertEqual(len(routes), 1)
+        self.assertEqual(routes[0].route_id, "standby-one")
+        self.assertEqual(routes[0].stage_executor_ids, tuple(executor_ids))
+
+        with self.assertRaisesRegex(ValueError, "routeId values must be unique"):
+            parse_remote_recovery_standby_routes([raw, raw])
+
+        same_endpoint = {
+            **document,
+            "routeId": "standby-two",
+        }
+        with self.assertRaisesRegex(
+            ValueError,
+            "first-stage endpoints must be unique",
+        ):
+            parse_remote_recovery_standby_routes(
+                [raw, json.dumps(same_endpoint)]
+            )
+
+    def test_remote_recovery_cli_rejects_unknown_fields_and_weak_ids(self) -> None:
+        base = {
+            "schema": "gdlp-recovery-standby-route/1",
+            "routeId": "standby-one",
+            "firstStage": {"host": "127.0.0.1", "port": 20_001},
+            "stageExecutorIds": ["1" * 32, "2" * 32],
+        }
+        with self.assertRaisesRegex(ValueError, "unknown or missing fields"):
+            parse_remote_recovery_standby_routes(
+                [json.dumps({**base, "ignored": True})]
+            )
+        with self.assertRaisesRegex(ValueError, "32 lowercase hex"):
+            parse_remote_recovery_standby_routes(
+                [json.dumps({**base, "stageExecutorIds": ["weak"]})]
+            )
+
+    def test_remote_recovery_fails_before_model_loading_without_independent_contract(
+        self,
+    ) -> None:
+        primary_ids = ["1" * 32, "2" * 32]
+        base_arguments = [
+            "--first-stage-host",
+            "127.0.0.1",
+            "--first-stage-port",
+            "20001",
+            "--return-port",
+            "20002",
+            "--recovery-max-retries",
+            "1",
+            "--stage-executor-id",
+            primary_ids[0],
+            "--stage-executor-id",
+            primary_ids[1],
+        ]
+        mismatched = {
+            "schema": "gdlp-recovery-standby-route/1",
+            "routeId": "mismatched",
+            "firstStage": {"host": "127.0.0.1", "port": 20_003},
+            "stageExecutorIds": [primary_ids[0], "9" * 32],
+        }
+        with self.assertRaisesRegex(
+            ValueError,
+            "does not match the configured active route",
+        ):
+            build_server(
+                parse_server_args(
+                    [
+                        *base_arguments,
+                        "--recovery-standby-route",
+                        json.dumps(mismatched),
+                    ]
+                )
+            )
+
+        reused = {
+            **mismatched,
+            "routeId": "reused",
+            "firstStage": {"host": "127.0.0.1", "port": 20_001},
+            "stageExecutorIds": primary_ids,
+        }
+        with self.assertRaisesRegex(ValueError, "reuses the primary endpoint"):
+            build_server(
+                parse_server_args(
+                    [
+                        *base_arguments,
+                        "--recovery-standby-route",
+                        json.dumps(reused),
+                    ]
+                )
+            )
+
     def test_server_rejects_partial_wave_limits_before_model_loading(self) -> None:
         args = parse_server_args(["--sealed-wave-tokens", "1"])
         with self.assertRaisesRegex(ValueError, "must be supplied together"):
             build_server(args)
+
+    def test_paged_slots_are_derived_or_rejected_before_model_loading(self) -> None:
+        automatic = parse_server_args(["--paged-kv"])
+        with patch(
+            "distributed_runtime.server.resolve_model_snapshot",
+            side_effect=RuntimeError("model resolution reached"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "model resolution reached"):
+                build_server(automatic)
+        self.assertEqual(automatic.paged_max_active_requests, 36)
+
+        explicit_shortfall = parse_server_args(
+            [
+                "--paged-kv",
+                "--paged-max-active-requests",
+                "35",
+            ]
+        )
+        with patch("distributed_runtime.server.resolve_model_snapshot") as resolve:
+            with self.assertRaisesRegex(
+                ValueError,
+                "active sequences, sealed speculative branches and retained sessions",
+            ):
+                build_server(explicit_shortfall)
+        resolve.assert_not_called()
+
+    def test_native_draft_tree_cli_preserves_every_sealed_limit(self) -> None:
+        args = parse_server_args(
+            [
+                "--speculation",
+                "draft-tree",
+                "--speculative-max-draft-tokens",
+                "4",
+                "--max-speculative-branches",
+                "6",
+                "--max-speculative-branch-tokens",
+                "32768",
+                "--max-speculative-kv-bytes",
+                str(384 * 1024 * 1024),
+                "--sealed-wave-tokens",
+                "5",
+            ]
+        )
+        provider = tree_draft_provider_from_args(args)
+        self.assertIsNotNone(provider)
+        assert provider is not None
+        self.assertEqual(provider.strategy, "ngram-tree")
+        self.assertEqual(provider.max_draft_tokens, 4)
+        self.assertEqual(provider.max_branches, 6)
+        self.assertIsNone(
+            tree_draft_provider_from_args(parse_server_args(["--speculation", "ngram"]))
+        )
+
+    def test_native_draft_tree_cli_fails_closed_before_model_loading(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires sealed positive"):
+            build_server(
+                parse_server_args(
+                    [
+                        "--speculation",
+                        "draft-tree",
+                        "--sealed-wave-tokens",
+                        "5",
+                        "--max-prefill-chunk-tokens",
+                        "32",
+                    ]
+                )
+            )
+        complete_limits = [
+            "--speculation",
+            "draft-tree",
+            "--speculative-max-draft-tokens",
+            "4",
+            "--max-speculative-branches",
+            "4",
+            "--max-speculative-branch-tokens",
+            "8192",
+            "--max-speculative-kv-bytes",
+            str(64 * 1024 * 1024),
+        ]
+        with self.assertRaisesRegex(ValueError, "explicit sealed-wave-tokens"):
+            build_server(parse_server_args(complete_limits))
+        with self.assertRaisesRegex(ValueError, "must equal draft depth plus one"):
+            build_server(
+                parse_server_args(
+                    [
+                        *complete_limits,
+                        "--sealed-wave-tokens",
+                        "6",
+                        "--max-prefill-chunk-tokens",
+                        "32",
+                    ]
+                )
+            )
+
+    def test_native_draft_model_wave_limit_fails_before_model_loading(self) -> None:
+        common = [
+            "--speculation",
+            "draft-model",
+            "--speculative-max-draft-tokens",
+            "4",
+            "--draft-model-source",
+            "local-draft",
+            "--draft-model-artifact-identity",
+            f"sha256:{'a' * 64}",
+            "--draft-model-parameter-bytes",
+            "16",
+            "--draft-model-memory-reservation-bytes",
+            str(64 * 1024 * 1024),
+        ]
+        with patch("distributed_runtime.server.resolve_model_snapshot") as resolve:
+            with self.assertRaisesRegex(ValueError, "explicit sealed-wave-tokens"):
+                build_server(parse_server_args(common))
+        resolve.assert_not_called()
+
+        with patch("distributed_runtime.server.resolve_model_snapshot") as resolve:
+            with self.assertRaisesRegex(
+                ValueError,
+                "cannot be smaller than the VERIFY input",
+            ):
+                build_server(
+                    parse_server_args(
+                        [
+                            *common,
+                            "--sealed-wave-tokens",
+                            "1",
+                            "--max-prefill-chunk-tokens",
+                            "32",
+                        ]
+                    )
+                )
+        resolve.assert_not_called()
+
+        with patch("distributed_runtime.server.resolve_model_snapshot") as resolve:
+            with self.assertRaisesRegex(
+                ValueError,
+                "must equal draft depth plus one",
+            ):
+                build_server(
+                    parse_server_args(
+                        [
+                            *common,
+                            "--sealed-wave-tokens",
+                            "6",
+                            "--max-prefill-chunk-tokens",
+                            "32",
+                        ]
+                    )
+                )
+        resolve.assert_not_called()
 
     def test_server_rejects_invalid_prefill_pipeline_credits_before_model_loading(self) -> None:
         for arguments, message in (
@@ -49,6 +337,79 @@ class EngineConfigurationTests(unittest.TestCase):
                 args = parse_server_args(arguments)
                 with self.assertRaisesRegex(ValueError, message):
                     build_server(args)
+
+    def test_speculative_conveyor_cli_is_bounded_and_opt_in(self) -> None:
+        defaults = parse_server_args([])
+        self.assertEqual(defaults.speculative_inflight_waves, 1)
+        self.assertEqual(defaults.speculative_inflight_bytes, 0)
+
+        invalid_cases = (
+            (["--speculative-inflight-waves", "0"], "between 1 and 16"),
+            (["--speculative-inflight-waves", "17"], "between 1 and 16"),
+            (["--speculative-inflight-bytes", "-1"], "between 0 and 1 GiB"),
+            (
+                [
+                    "--speculative-inflight-bytes",
+                    str(1024 * 1024 * 1024 + 1),
+                ],
+                "between 0 and 1 GiB",
+            ),
+            (
+                ["--speculative-inflight-waves", "2"],
+                "more than one in-flight wave and a positive byte ceiling",
+            ),
+            (
+                ["--speculative-inflight-bytes", "4096"],
+                "more than one in-flight wave and a positive byte ceiling",
+            ),
+            (
+                [
+                    "--speculative-inflight-waves",
+                    "2",
+                    "--speculative-inflight-bytes",
+                    "4096",
+                ],
+                "requires linear ngram or draft-model speculation",
+            ),
+            (
+                [
+                    "--speculation",
+                    "ngram",
+                    "--speculative-inflight-waves",
+                    "2",
+                    "--speculative-inflight-bytes",
+                    "4096",
+                ],
+                "requires max-active-sequences=1",
+            ),
+        )
+        for arguments, message in invalid_cases:
+            with self.subTest(arguments=arguments):
+                with patch("distributed_runtime.server.resolve_model_snapshot") as resolve:
+                    with self.assertRaisesRegex(ValueError, message):
+                        build_server(parse_server_args(arguments))
+                resolve.assert_not_called()
+
+        valid = parse_server_args(
+            [
+                "--max-batch-size",
+                "1",
+                "--max-active-sequences",
+                "1",
+                "--speculation",
+                "ngram",
+                "--speculative-inflight-waves",
+                "3",
+                "--speculative-inflight-bytes",
+                str(64 * 1024 * 1024),
+            ]
+        )
+        with patch(
+            "distributed_runtime.server.resolve_model_snapshot",
+            side_effect=RuntimeError("model resolution reached"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "model resolution reached"):
+                build_server(valid)
 
     def test_server_rejects_partial_or_unbounded_tree_limits_before_model_loading(self) -> None:
         for arguments, message in (
@@ -176,7 +537,7 @@ class HealthStatusCodeTests(unittest.IsolatedAsyncioTestCase):
     """
 
     async def _health(self, engine):
-        server = DistributedOpenAIServer(
+        server = DistributedMycelliosServer(
             engine,
             _HttpTokenizer(),
             public_model_name="distributed-test",
@@ -218,7 +579,7 @@ class HealthStatusCodeTests(unittest.IsolatedAsyncioTestCase):
 class HttpInferenceEvidenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_real_http_health_non_stream_and_sse_expose_sealed_evidence(self) -> None:
         engine = _HttpEngine()
-        server = DistributedOpenAIServer(
+        server = DistributedMycelliosServer(
             engine,
             _HttpTokenizer(),
             public_model_name="distributed-test",
@@ -254,6 +615,12 @@ class HttpInferenceEvidenceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(health["max_speculative_branches"], 0)
             self.assertEqual(health["max_speculative_branch_tokens"], 0)
             self.assertEqual(health["max_speculative_kv_bytes"], 0)
+            self.assertEqual(health["speculative_inflight_waves"], 3)
+            self.assertEqual(health["speculative_inflight_bytes"], 8192)
+            self.assertEqual(
+                health["speculative_window"]["high_water_waves"],
+                2,
+            )
             self.assertEqual(health["prefill_window"]["high_water_chunks"], 2)
 
             non_stream_response = await client.post(
@@ -283,7 +650,7 @@ class HttpInferenceEvidenceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_real_http_mismatch_fails_closed_for_non_stream_and_sse(self) -> None:
         engine = _HttpEngine(emitted_token_ids=(10,), output_token_ids=(10, 11))
-        server = DistributedOpenAIServer(
+        server = DistributedMycelliosServer(
             engine,
             _HttpTokenizer(),
             public_model_name="distributed-test",
@@ -385,7 +752,7 @@ class ContinuousMicroBatcherTests(unittest.IsolatedAsyncioTestCase):
 
 class RequestValidationTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.server = DistributedOpenAIServer(
+        self.server = DistributedMycelliosServer(
             _PrepareEngine(),
             _TemplateTokenizer(),
             public_model_name="distributed-small",
@@ -510,6 +877,8 @@ class _HttpEngine:
             max_speculative_branches=0,
             max_speculative_branch_tokens=0,
             max_speculative_kv_bytes=0,
+            speculative_inflight_waves=3,
+            speculative_inflight_bytes=8192,
             sealed_wave_token_limit=4,
             prefill_token_limit=64,
         )
@@ -520,6 +889,12 @@ class _HttpEngine:
         )
         self.pipeline_id = self.PIPELINE_ID
         self.speculation_stats = {"configured": False}
+        self.speculative_window_stats = {
+            "configured": True,
+            "configured_waves_per_request": 3,
+            "configured_bytes_per_request": 8192,
+            "high_water_waves": 2,
+        }
         self.prefill_window_stats = {
             "configured_chunks": 3,
             "configured_bytes": 4096,
