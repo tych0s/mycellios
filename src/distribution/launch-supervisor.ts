@@ -6,6 +6,7 @@ import {
   type PythonLaunchProcess,
   type PythonPipelineLaunchDescription,
 } from "./python-launcher.js";
+import { buildIsolatedProcessEnvironment } from "./process-environment.js";
 
 export type LaunchSupervisorState =
   | "idle"
@@ -551,7 +552,9 @@ export class LocalProcessAgent implements LaunchAgent {
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"] as ["ignore", "pipe", "pipe"],
       ...(this.cwd ? { cwd: this.cwd } : {}),
-      ...(this.env ? { env: { ...process.env, ...this.env } } : {}),
+      env: buildIsolatedProcessEnvironment(
+        this.env === undefined ? {} : { overrides: this.env },
+      ),
     };
     const child = spawn(command.executable, command.args, spawnOptions);
     const handle = new LocalProcessHandle(

@@ -423,6 +423,49 @@ describe("Python launch supervisor", () => {
     await handle.exited;
   });
 
+  it("does not leak an ungranted parent secret into the executor", async () => {
+    const inheritedSecretName = "MYCELLIOS_TEST_PARENT_SECRET_DO_NOT_INHERIT";
+    const previous = process.env[inheritedSecretName];
+    process.env[inheritedSecretName] = "parent-secret";
+    try {
+      const marker = "ISOLATED_ENVIRONMENT_RESULT";
+      const local = new LocalProcessAgent({
+        id: "isolated-environment-local",
+        allowedExecutables: [process.execPath],
+        env: {
+          MYCELLIOS_TEST_EXPLICIT_VALUE: "explicit-value",
+        },
+        readyWhen: ({ recentStdout }) => recentStdout.includes(marker),
+      });
+      const request = {
+        launchId: "isolated-environment-launch",
+        pipelineId: "isolated-environment-pipeline",
+        nodeId: "local-node",
+        process: {
+          processId: "isolated-environment-process",
+          kind: "root-engine",
+          command: {
+            executable: process.execPath,
+            args: [
+              "-e",
+              `process.stdout.write("${marker}:" + JSON.stringify({ inherited: process.env.${inheritedSecretName} ?? null, explicit: process.env.MYCELLIOS_TEST_EXPLICIT_VALUE ?? null }) + "\\n");`,
+            ],
+          },
+        },
+      } as unknown as LaunchAgentStartRequest;
+
+      const handle = await local.start(request, new AbortController().signal);
+      await handle.ready;
+      await handle.exited;
+      expect(handle.output?.().stdout).toContain(
+        `${marker}:{"inherited":null,"explicit":"explicit-value"}`,
+      );
+    } finally {
+      if (previous === undefined) delete process.env[inheritedSecretName];
+      else process.env[inheritedSecretName] = previous;
+    }
+  });
+
   it("stops from idle idempotently without resolving any agent", async () => {
     const description = fixtureDescription();
     const setup = harness(description);

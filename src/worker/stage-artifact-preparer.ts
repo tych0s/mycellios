@@ -11,6 +11,7 @@ import {
   type PythonLaunchProcess,
   type PythonPipelineLaunchDescription,
 } from "../distribution/python-launcher.js";
+import { buildIsolatedProcessEnvironment } from "../distribution/process-environment.js";
 
 const SHA256 = /^[0-9a-f]{64}$/;
 const SHA256_IDENTITY = /^sha256:[0-9a-f]{64}$/;
@@ -611,7 +612,11 @@ async function runCompiler(
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
       ...(options.cwd ? { cwd: options.cwd } : {}),
-      env: { ...process.env, ...options.environment },
+      env: buildIsolatedProcessEnvironment({
+        ...(options.environment === undefined
+          ? {}
+          : { overrides: options.environment }),
+      }),
     });
     let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0);
     let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
