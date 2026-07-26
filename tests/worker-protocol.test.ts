@@ -184,6 +184,54 @@ describe("worker protocol schemas", () => {
       computeMode: "automatic",
       cpuEligible: false,
     });
+    const isolatedHeartbeat = workerHeartbeatEnvelopeSchema.parse({
+      ...heartbeat,
+      payload: {
+        ...heartbeat.payload,
+        capabilities: {
+          ...heartbeat.payload.capabilities,
+          distributedExecutor: {
+            ...heartbeat.payload.capabilities.distributedExecutor,
+            isolation: {
+              schema: "mycellios-executor-isolation-capability/1",
+              launchPolicySchema: "gdlp-executor-isolation/4",
+              environment: "filtered",
+              workspace: "private-temp-watchdog",
+              processTree: "best-effort",
+              resourceLimits: "workspace-watchdog-only",
+              osSandbox: "not-enforced",
+              hardResourceQuotas: "not-enforced",
+              killOnClose: "not-enforced",
+              maxWorkspaceBytes: 512 * 1024 * 1024,
+              maxWorkspaceEntries: 10_000,
+              workspaceCheckIntervalMs: 1_000,
+            },
+          },
+        },
+      },
+    });
+    expect(isolatedHeartbeat.payload.capabilities.distributedExecutor?.isolation).toMatchObject({
+      launchPolicySchema: "gdlp-executor-isolation/4",
+      workspace: "private-temp-watchdog",
+      osSandbox: "not-enforced",
+      hardResourceQuotas: "not-enforced",
+    });
+    expect(workerHeartbeatEnvelopeSchema.safeParse({
+      ...isolatedHeartbeat,
+      payload: {
+        ...isolatedHeartbeat.payload,
+        capabilities: {
+          ...isolatedHeartbeat.payload.capabilities,
+          distributedExecutor: {
+            ...isolatedHeartbeat.payload.capabilities.distributedExecutor,
+            isolation: {
+              ...isolatedHeartbeat.payload.capabilities.distributedExecutor?.isolation,
+              osSandbox: "enforced",
+            },
+          },
+        },
+      },
+    }).success).toBe(false);
     const physicalProfile = sealRuntimePerformanceProfile({
       measuredAt: new Date().toISOString(),
       backend: "cuda",

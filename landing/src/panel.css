@@ -1734,6 +1734,13 @@
   background: rgba(11, 21, 44, 0.94);
 }
 
+.public-panel .node-topology-inspector > .remote-accelerator-diagnostics,
+.public-panel .node-topology-inspector > .executor-isolation-diagnostics {
+  width: 100%;
+  grid-column: 1 / -1;
+  margin-top: 0;
+}
+
 .public-panel .device-trust-card {
   margin-top: 18px;
   overflow: hidden;
@@ -2762,9 +2769,51 @@
 .public-panel .remote-accelerator-body li.error span { color: #ff91a5; }
 .public-panel .remote-accelerator-body li.success span { color: #78e5be; }
 
+.public-panel .executor-isolation-diagnostics {
+  margin-top: 10px;
+  overflow: hidden;
+  border: 1px solid rgba(99, 230, 176, 0.18);
+  border-radius: 11px;
+  background: linear-gradient(115deg, rgba(22, 65, 66, 0.24), rgba(5, 14, 34, 0.64) 42%);
+}
+
+.public-panel .executor-isolation-diagnostics summary {
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px;
+  cursor: pointer;
+  list-style: none;
+  color: var(--text-tertiary);
+  font-size: 9px;
+}
+
+.public-panel .executor-isolation-diagnostics summary::-webkit-details-marker { display: none; }
+.public-panel .executor-isolation-diagnostics summary > span { display: flex; align-items: center; gap: 7px; text-transform: uppercase; letter-spacing: 0.08em; }
+.public-panel .executor-isolation-diagnostics summary > span svg { width: 13px; color: var(--success); }
+.public-panel .executor-isolation-diagnostics summary > strong { margin-left: auto; color: #78e5be; font-size: 8px; font-weight: 650; letter-spacing: 0.06em; }
+.public-panel .executor-isolation-diagnostics summary > svg { width: 13px; transition: transform 160ms ease; }
+.public-panel .executor-isolation-diagnostics[open] summary > svg { transform: rotate(180deg); }
+.public-panel .executor-isolation-body { display: grid; gap: 10px; padding: 12px; border-top: 1px solid rgba(255, 255, 255, 0.05); }
+.public-panel .executor-isolation-summary,
+.public-panel .executor-isolation-pending { margin: 0; display: flex; align-items: flex-start; gap: 8px; color: #b7c6e8; font-size: 9px; line-height: 1.5; }
+.public-panel .executor-isolation-summary > svg,
+.public-panel .executor-isolation-pending > svg { width: 14px; flex: 0 0 auto; margin-top: 1px; }
+.public-panel .executor-isolation-summary > svg { color: var(--success); }
+.public-panel .executor-isolation-pending { padding: 9px 10px; border: 1px solid rgba(246, 184, 95, 0.16); border-radius: 9px; background: rgba(97, 66, 24, 0.11); }
+.public-panel .executor-isolation-pending > svg { color: var(--warning); }
+.public-panel .executor-isolation-summary strong,
+.public-panel .executor-isolation-pending strong { color: var(--text-secondary); font-weight: 620; }
+.public-panel .executor-isolation-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; overflow: hidden; border: 1px solid var(--border-subtle); border-radius: 9px; background: var(--border-subtle); }
+.public-panel .executor-isolation-grid > div { min-width: 0; display: grid; gap: 3px; padding: 9px; background: rgba(7, 19, 43, 0.94); }
+.public-panel .executor-isolation-grid span { color: var(--text-disabled); font-size: 8px; text-transform: uppercase; letter-spacing: 0.08em; }
+.public-panel .executor-isolation-grid strong { overflow: hidden; color: var(--text-secondary); font-size: 9px; font-weight: 560; text-overflow: ellipsis; white-space: nowrap; }
+
 @media (max-width: 720px) {
   .public-panel .remote-accelerator-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .public-panel .remote-accelerator-body li { grid-template-columns: 58px minmax(0, 1fr); }
+  .public-panel .executor-isolation-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 .public-panel .execution-stage-list { display: grid; gap: 7px; margin-top: 10px; }
@@ -7568,6 +7617,44 @@
 .public-panel.theme-light .topology-node:hover,
 .public-panel.theme-light .topology-node.selected { background: #edf3fd; }
 .public-panel.theme-light .topology-node > div > i { border-color: #fff; }
+.public-panel.theme-light .executor-isolation-diagnostics {
+  border-color: #bcded3;
+  background: linear-gradient(120deg, #f2fbf8, #fff 46%);
+}
+.public-panel.theme-light .executor-isolation-diagnostics summary {
+  color: #58716b;
+}
+.public-panel.theme-light .executor-isolation-diagnostics summary > strong {
+  color: #24795e;
+}
+.public-panel.theme-light .executor-isolation-body {
+  border-top-color: #dfece8;
+}
+.public-panel.theme-light .executor-isolation-summary,
+.public-panel.theme-light .executor-isolation-pending {
+  color: #526177;
+}
+.public-panel.theme-light .executor-isolation-summary strong,
+.public-panel.theme-light .executor-isolation-pending strong {
+  color: #233149;
+}
+.public-panel.theme-light .executor-isolation-grid {
+  border-color: #d8e1ed;
+  background: #d8e1ed;
+}
+.public-panel.theme-light .executor-isolation-grid > div {
+  background: #fff;
+}
+.public-panel.theme-light .executor-isolation-grid span {
+  color: #718098;
+}
+.public-panel.theme-light .executor-isolation-grid strong {
+  color: #27364d;
+}
+.public-panel.theme-light .executor-isolation-pending {
+  border-color: #ecd7af;
+  background: #fff9ef;
+}
 
 @media (max-width: 920px) {
   .public-panel .device-trust-list article {

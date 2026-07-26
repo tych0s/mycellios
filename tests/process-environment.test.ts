@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildIsolatedProcessEnvironment,
+  executorIsolationCapabilityFromPolicy,
   ISOLATED_PROCESS_INHERITED_ENVIRONMENT_KEYS,
   normalizeExecutorIsolationPolicy,
   validateExecutorIsolationPolicy,
@@ -108,5 +109,30 @@ describe("isolated process environment", () => {
     expect(() => validateExecutorIsolationPolicy(policy)).toThrow(
       "executor_isolation_environment_allowlist_mismatch",
     );
+  });
+
+  it("advertises the active controls without claiming an OS sandbox or hard quotas", () => {
+    const capability = executorIsolationCapabilityFromPolicy(
+      normalizeExecutorIsolationPolicy({
+        maxWorkspaceBytes: 256 * 1024 * 1024,
+        maxWorkspaceEntries: 2_500,
+        workspaceCheckIntervalMs: 750,
+      }),
+    );
+
+    expect(capability).toEqual({
+      schema: "mycellios-executor-isolation-capability/1",
+      launchPolicySchema: "gdlp-executor-isolation/4",
+      environment: "filtered",
+      workspace: "private-temp-watchdog",
+      processTree: "best-effort",
+      resourceLimits: "workspace-watchdog-only",
+      osSandbox: "not-enforced",
+      hardResourceQuotas: "not-enforced",
+      killOnClose: "not-enforced",
+      maxWorkspaceBytes: 256 * 1024 * 1024,
+      maxWorkspaceEntries: 2_500,
+      workspaceCheckIntervalMs: 750,
+    });
   });
 });

@@ -1,3 +1,5 @@
+import type { WorkerExecutorIsolationCapability } from "../contracts/types.js";
+
 /**
  * Environment keys that an isolated Mycellios child may inherit from its
  * controller without an explicit per-launch grant.
@@ -206,6 +208,26 @@ export function validateExecutorIsolationPolicy(
   normalizeExecutorIsolationPolicy(
     value as unknown as ExecutorIsolationPolicyV4,
   );
+}
+
+export function executorIsolationCapabilityFromPolicy(
+  policyValue: ExecutorIsolationPolicyV4 = normalizeExecutorIsolationPolicy(),
+): WorkerExecutorIsolationCapability {
+  validateExecutorIsolationPolicy(policyValue);
+  return {
+    schema: "mycellios-executor-isolation-capability/1",
+    launchPolicySchema: policyValue.schema,
+    environment: "filtered",
+    workspace: "private-temp-watchdog",
+    processTree: "best-effort",
+    resourceLimits: "workspace-watchdog-only",
+    osSandbox: "not-enforced",
+    hardResourceQuotas: "not-enforced",
+    killOnClose: "not-enforced",
+    maxWorkspaceBytes: policyValue.maxWorkspaceBytes,
+    maxWorkspaceEntries: policyValue.maxWorkspaceEntries,
+    workspaceCheckIntervalMs: policyValue.workspaceCheckIntervalMs,
+  };
 }
 
 function assertExactPolicyKeys(value: Record<string, unknown>): void {

@@ -161,6 +161,7 @@ interface PublicWorker {
   agentVersion?: string;
   buildIdentity?: NativeBuildIdentity;
   acceleration?: DashboardSnapshot["workers"][number]["acceleration"];
+  isolation?: DashboardSnapshot["workers"][number]["isolation"];
   mobile?: {
     platform: string;
     backend: "webgpu" | "cpu";
@@ -1447,7 +1448,40 @@ function NodeTopologyInspector({ worker, snapshot }: { worker: PublicWorker; sna
       <Metric label="Completadas" value={String(worker.jobsCompleted)} />
     </div>
     {worker.acceleration && <RemoteAccelerationDiagnostics diagnostics={worker.acceleration} />}
+    {worker.isolation && <ExecutorIsolationDiagnostics isolation={worker.isolation} />}
   </div>;
+}
+
+function ExecutorIsolationDiagnostics({
+  isolation,
+}: {
+  isolation: NonNullable<PublicWorker["isolation"]>;
+}) {
+  return <details className="executor-isolation-diagnostics">
+    <summary>
+      <span><ShieldCheck />Aislamiento del ejecutor</span>
+      <strong>PARCIAL · POLÍTICA SELLADA</strong>
+      <ChevronDown />
+    </summary>
+    <div className="executor-isolation-body">
+      <p className="executor-isolation-summary">
+        <ShieldCheck />
+        <span><strong>Controles activos y verificables.</strong> El proceso recibe un entorno filtrado, un directorio temporal privado y un watchdog que detiene la ruta si supera sus límites.</span>
+      </p>
+      <div className="executor-isolation-grid">
+        <Metric label="Entorno" value="Variables filtradas" />
+        <Metric label="Temporal privado" value={`Máx. ${formatMemory(isolation.maxWorkspaceBytes / (1024 * 1024))}`} />
+        <Metric label="Archivos temporales" value={`Máx. ${isolation.maxWorkspaceEntries.toLocaleString("es-ES")}`} />
+        <Metric label="Vigilancia" value={`Cada ${isolation.workspaceCheckIntervalMs} ms`} />
+        <Metric label="Árbol de procesos" value="Cierre best effort" />
+        <Metric label="Política" value={isolation.launchPolicySchema.replace("gdlp-executor-isolation/", "v")} />
+      </div>
+      <div className="executor-isolation-pending">
+        <CircleAlert />
+        <span><strong>Aislamiento fuerte aún pendiente.</strong> Este nodo todavía no anuncia sandbox del sistema operativo, cuotas duras de CPU/RAM/GPU ni garantía kill-on-close.</span>
+      </div>
+    </div>
+  </details>;
 }
 
 function RemoteAccelerationDiagnostics({

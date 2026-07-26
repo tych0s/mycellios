@@ -11,6 +11,7 @@ import type {
   WorkerCapabilities,
   WorkerAcceleratorDiagnostics,
   WorkerEnvelope,
+  WorkerExecutorIsolationCapability,
   WorkerHeartbeat,
 } from "../contracts/types.js";
 import type { AdapterChunk, InferenceAdapter } from "../adapters/base.js";
@@ -114,6 +115,7 @@ export interface WorkerAgentOptions {
     computeMode?: ComputeMode;
     cpuEligible?: boolean;
     acceleration?: WorkerAcceleratorDiagnostics;
+    isolation?: WorkerExecutorIsolationCapability;
     /** Native peer transport. Enabled by default; options can pin listener/candidates. */
     directTransport?: RuntimeDirectTransportOptions;
   };
@@ -784,6 +786,9 @@ export class WorkerAgent {
               cpuEligible: this.options.distributedExecutor.cpuEligible === true,
               ...(this.options.distributedExecutor.acceleration
                 ? { acceleration: structuredClone(this.options.distributedExecutor.acceleration) }
+                : {}),
+              ...(this.options.distributedExecutor.isolation
+                ? { isolation: structuredClone(this.options.distributedExecutor.isolation) }
                 : {}),
               ...(this.directTransportAdvertisement
                 ? { directTransport: structuredClone(this.directTransportAdvertisement) }

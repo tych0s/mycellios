@@ -26,6 +26,7 @@ import { createCoordinator } from "../coordinator/server.js";
 import { DynamicModelActivationManager } from "../coordinator/model-activation-manager.js";
 import { buildConnectedExecutorActivationSnapshot } from "../coordinator/connected-executor-activation.js";
 import { parseAutoDistributionConfig } from "../distribution/auto-distribute.js";
+import { executorIsolationCapabilityFromPolicy } from "../distribution/process-environment.js";
 import {
   LocalProcessAgent,
   type LaunchAgent,
@@ -1507,12 +1508,13 @@ async function createDesktopDistributedExecutor() {
     stagePort: 9_850,
     pythonExecutable,
     launchAgent,
-      directTransport: {
-        enabled: true,
-        listenHost: "0.0.0.0",
-        listenPort: 0,
-        publicPortMapping: true,
-      },
+    isolation: executorIsolationCapabilityFromPolicy(),
+    directTransport: {
+      enabled: true,
+      listenHost: "0.0.0.0",
+      listenPort: 0,
+      publicPortMapping: true,
+    },
   };
 }
 

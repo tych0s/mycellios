@@ -370,6 +370,45 @@ describe("public coordinator security boundaries", () => {
     expect(authorized.json()).toMatchObject({ removed: true });
   });
 
+  it("publishes the executor isolation truth for the node inspector", async () => {
+    const runtime = await coordinator();
+    const payload = validWorkerRegistration();
+    payload.capabilities.distributedExecutor = {
+      protocol: "gdlp-worker-tunnel/2",
+      nodeId: "public-worker-node",
+      stageHost: "public-worker-node.relay",
+      stagePort: 9_850,
+      runtime: "python-safetensors",
+      isolation: {
+        schema: "mycellios-executor-isolation-capability/1",
+        launchPolicySchema: "gdlp-executor-isolation/4",
+        environment: "filtered",
+        workspace: "private-temp-watchdog",
+        processTree: "best-effort",
+        resourceLimits: "workspace-watchdog-only",
+        osSandbox: "not-enforced",
+        hardResourceQuotas: "not-enforced",
+        killOnClose: "not-enforced",
+        maxWorkspaceBytes: 512 * 1024 * 1024,
+        maxWorkspaceEntries: 10_000,
+        workspaceCheckIntervalMs: 1_000,
+      },
+    };
+
+    const registration = await runtime.app.inject({
+      method: "POST",
+      url: "/internal/v1/workers/register",
+      payload,
+    });
+    expect(registration.statusCode).toBe(201);
+
+    const snapshot = await runtime.app.inject({ method: "GET", url: "/public/v1/snapshot" });
+    expect(snapshot.statusCode).toBe(200);
+    expect(snapshot.json().workers[0].isolation).toEqual(
+      payload.capabilities.distributedExecutor.isolation,
+    );
+  });
+
   it("does not treat a proxied request as local just because the socket is loopback", async () => {
     // Regression: Fastify runs without `trustProxy`, so a reverse proxy
     // terminating on 127.0.0.1 makes every remote request look like loopback.

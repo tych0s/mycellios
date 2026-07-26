@@ -23,6 +23,21 @@ export type ExecutionBackend =
   | "webgpu";
 export type WorkerStatus = "online" | "suspect" | "offline" | "draining";
 export type WorkerIdentityKind = "device" | "cell";
+
+export interface WorkerExecutorIsolationCapability {
+  schema: "mycellios-executor-isolation-capability/1";
+  launchPolicySchema: "gdlp-executor-isolation/4";
+  environment: "filtered";
+  workspace: "private-temp-watchdog";
+  processTree: "best-effort";
+  resourceLimits: "workspace-watchdog-only";
+  osSandbox: "not-enforced";
+  hardResourceQuotas: "not-enforced";
+  killOnClose: "not-enforced";
+  maxWorkspaceBytes: number;
+  maxWorkspaceEntries: number;
+  workspaceCheckIntervalMs: number;
+}
 export type ComputeMode = "automatic" | "gpu-only" | "cpu-only";
 export type JobStatus =
   | "queued"
@@ -262,6 +277,8 @@ export interface WorkerCapabilities {
     acceleration?: WorkerAcceleratorDiagnostics | undefined;
     /** Coordinator-observed physical calibration consumed by placement. */
     performanceEvidence?: CoordinatorRuntimePerformanceEvidence | undefined;
+    /** Honest host-side process isolation controls; absent on legacy workers. */
+    isolation?: WorkerExecutorIsolationCapability | undefined;
     /**
      * Native peer listener candidates. These are reachability hints only:
      * every session still requires a coordinator-issued, one-time grant.

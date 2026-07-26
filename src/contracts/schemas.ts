@@ -341,6 +341,23 @@ export const workerCapabilitiesSchema = z.object({
        * challenge on the current authenticated worker session.
        */
       performanceEvidence: coordinatorRuntimePerformanceEvidenceSchema.optional(),
+      isolation: z
+        .object({
+          schema: z.literal("mycellios-executor-isolation-capability/1"),
+          launchPolicySchema: z.literal("gdlp-executor-isolation/4"),
+          environment: z.literal("filtered"),
+          workspace: z.literal("private-temp-watchdog"),
+          processTree: z.literal("best-effort"),
+          resourceLimits: z.literal("workspace-watchdog-only"),
+          osSandbox: z.literal("not-enforced"),
+          hardResourceQuotas: z.literal("not-enforced"),
+          killOnClose: z.literal("not-enforced"),
+          maxWorkspaceBytes: z.number().int().min(64 * 1024).max(64 * 1024 * 1024 * 1024),
+          maxWorkspaceEntries: z.number().int().min(16).max(1_000_000),
+          workspaceCheckIntervalMs: z.number().int().min(25).max(60_000),
+        })
+        .strict()
+        .optional(),
       directTransport: z
         .object({
           protocol: z.literal("mycellios-direct/1"),

@@ -7,6 +7,7 @@ import type {
   HubCatalogSearchInput,
   HubCatalogSort,
   WorkerAcceleratorDiagnostics,
+  WorkerExecutorIsolationCapability,
 } from "../contracts/types.js";
 import type { NativeBuildIdentity } from "../contracts/build-identity.js";
 import type { ActivationIncident } from "../coordinator/activation-incident.js";
@@ -91,6 +92,7 @@ export interface DashboardWorker {
   agentVersion?: string;
   buildIdentity?: NativeBuildIdentity;
   acceleration?: WorkerAcceleratorDiagnostics;
+  isolation?: WorkerExecutorIsolationCapability;
   mobile?: {
     platform: string;
     backend: "webgpu" | "cpu";
