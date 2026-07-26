@@ -10,6 +10,10 @@ import {
   buildIsolatedProcessEnvironment,
   validateExecutorIsolationPolicy,
 } from "./process-environment.js";
+import {
+  createExecutorWorkspace,
+  type ExecutorWorkspaceLease,
+} from "./executor-workspace.js";
 
 export type LaunchSupervisorState =
   | "idle"
@@ -494,6 +498,8 @@ export interface LocalProcessAgentOptions {
    * construction site pins the prepared Mycellios Python interpreter.
    */
   allowedExecutables: readonly string[];
+  /** Parent directory for per-process private temporary workspaces. */
+  workspaceRoot?: string;
   maxOutputBytesPerStream?: number;
   stopGraceMs?: number;
   readyWhen?: (observation: LocalProcessReadinessObservation) => boolean;
@@ -507,6 +513,7 @@ export class LocalProcessAgent implements LaunchAgent {
   readonly id: string;
   private readonly cwd: string | undefined;
   private readonly env: NodeJS.ProcessEnv | undefined;
+  private readonly workspaceRoot: string | undefined;
   private readonly allowedExecutables: ReadonlySet<string>;
   private readonly maxOutputBytes: number;
   private readonly stopGraceMs: number;
@@ -516,6 +523,7 @@ export class LocalProcessAgent implements LaunchAgent {
     this.id = options.id ?? "local-process";
     this.cwd = options.cwd;
     this.env = options.env;
+    this.workspaceRoot = options.workspaceRoot;
     this.allowedExecutables = new Set(
       options.allowedExecutables.map((value) =>
         localExecutableIdentity(value),
@@ -559,29 +567,101 @@ export class LocalProcessAgent implements LaunchAgent {
     ) {
       throw new Error("local_process_executable_is_not_authorized");
     }
+    const workspace = createExecutorWorkspace({
+      launchId: request.launchId,
+      processId: request.process.processId,
+      ...(this.workspaceRoot === undefined
+        ? {}
+        : { root: this.workspaceRoot }),
+    });
     const spawnOptions = {
       shell: false,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"] as ["ignore", "pipe", "pipe"],
       ...(this.cwd ? { cwd: this.cwd } : {}),
       env: buildIsolatedProcessEnvironment(
-        this.env === undefined ? {} : { overrides: this.env },
+        {
+          overrides: {
+            ...this.env,
+            TMPDIR: workspace.path,
+            TEMP: workspace.path,
+            TMP: workspace.path,
+            MYCELLIOS_EXECUTOR_WORKSPACE: workspace.path,
+          },
+        },
       ),
     };
-    const child = spawn(command.executable, command.args, spawnOptions);
-    const handle = new LocalProcessHandle(
-      child,
-      request.process,
-      request.process.isolation.maxOutputBytesPerStream,
-      request.process.isolation.stopGraceMs,
-      this.readyWhen,
-    );
+    let localHandle: LocalProcessHandle;
+    try {
+      const child = spawn(command.executable, command.args, spawnOptions);
+      localHandle = new LocalProcessHandle(
+        child,
+        request.process,
+        request.process.isolation.maxOutputBytesPerStream,
+        request.process.isolation.stopGraceMs,
+        this.readyWhen,
+      );
+    } catch (error) {
+      workspace.cleanup();
+      throw error;
+    }
+    const handle = new WorkspaceBoundProcessHandle(localHandle, workspace);
     const abort = () => {
       void handle.stop("launch_aborted");
     };
     signal.addEventListener("abort", abort, { once: true });
     void handle.exited.finally(() => signal.removeEventListener("abort", abort));
     return handle;
+  }
+}
+
+class WorkspaceBoundProcessHandle implements LaunchProcessHandle {
+  readonly ready: Promise<void>;
+  readonly exited: Promise<LaunchProcessExit>;
+
+  constructor(
+    private readonly inner: LocalProcessHandle,
+    workspace: ExecutorWorkspaceLease,
+  ) {
+    this.ready = inner.ready;
+    this.exited = inner.exited.then(
+      (exit) => cleanupWorkspace(workspace, exit),
+      (error) => {
+        try {
+          workspace.cleanup();
+        } catch (cleanupError) {
+          throw new AggregateError(
+            [error, cleanupError],
+            "executor_workspace_cleanup_failed",
+          );
+        }
+        throw error;
+      },
+    );
+  }
+
+  async stop(reason: string): Promise<void> {
+    await this.inner.stop(reason);
+    await this.exited.then(() => undefined);
+  }
+
+  output(): LaunchCapturedOutput {
+    return this.inner.output();
+  }
+}
+
+function cleanupWorkspace(
+  workspace: ExecutorWorkspaceLease,
+  exit: LaunchProcessExit,
+): LaunchProcessExit {
+  try {
+    workspace.cleanup();
+    return exit;
+  } catch (error) {
+    return {
+      ...exit,
+      error: `executor_workspace_cleanup_failed:${normalizeError(error).message}`,
+    };
   }
 }
 

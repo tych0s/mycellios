@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { existsSync } from "node:fs";
 import {
   LaunchCancelledError,
   LaunchProcessExitedError,
@@ -479,8 +480,8 @@ describe("Python launch supervisor", () => {
           command: {
             executable: process.execPath,
             args: [
-              "-e",
-              `process.stdout.write("${marker}:" + JSON.stringify({ inherited: process.env.${inheritedSecretName} ?? null, explicit: process.env.MYCELLIOS_TEST_EXPLICIT_VALUE ?? null }) + "\\n");`,
+            "-e",
+              `process.stdout.write("${marker}:" + JSON.stringify({ inherited: process.env.${inheritedSecretName} ?? null, explicit: process.env.MYCELLIOS_TEST_EXPLICIT_VALUE ?? null, workspace: process.env.MYCELLIOS_EXECUTOR_WORKSPACE ?? null, tempMatches: process.env.TMP === process.env.MYCELLIOS_EXECUTOR_WORKSPACE && process.env.TEMP === process.env.MYCELLIOS_EXECUTOR_WORKSPACE && process.env.TMPDIR === process.env.MYCELLIOS_EXECUTOR_WORKSPACE }) + "\\n");`,
             ],
           },
         },
@@ -489,9 +490,21 @@ describe("Python launch supervisor", () => {
       const handle = await local.start(request, new AbortController().signal);
       await handle.ready;
       await handle.exited;
-      expect(handle.output?.().stdout).toContain(
-        `${marker}:{"inherited":null,"explicit":"explicit-value"}`,
-      );
+      const output = handle.output?.().stdout ?? "";
+      const encoded = output.split(`${marker}:`)[1]?.trim();
+      const observed = JSON.parse(encoded ?? "{}") as {
+        inherited: string | null;
+        explicit: string | null;
+        workspace: string | null;
+        tempMatches: boolean;
+      };
+      expect(observed).toMatchObject({
+        inherited: null,
+        explicit: "explicit-value",
+        tempMatches: true,
+      });
+      expect(observed.workspace).toBeTruthy();
+      expect(existsSync(observed.workspace!)).toBe(false);
     } finally {
       if (previous === undefined) delete process.env[inheritedSecretName];
       else process.env[inheritedSecretName] = previous;
