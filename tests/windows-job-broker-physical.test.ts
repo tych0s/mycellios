@@ -149,6 +149,69 @@ physical("Windows Job Object broker physical containment", () => {
     survivorPids.delete(pids.target);
     survivorPids.delete(pids.descendant);
   });
+
+  it("kills the job when its trusted parent exits", async () => {
+    const workspace = temporaryWorkspace();
+    const pidPath = join(workspace, "parent-exit-pids.json");
+    const descendantScript = "setInterval(() => undefined, 1000);";
+    const targetScript = [
+      "const {spawn}=require('node:child_process');",
+      "const {writeFileSync}=require('node:fs');",
+      `const descendant=spawn(process.execPath,['-e',${JSON.stringify(descendantScript)}],`,
+      "{detached:true,stdio:'ignore',windowsHide:true});",
+      "writeFileSync(process.argv[1],JSON.stringify({target:process.pid,descendant:descendant.pid}));",
+      "setInterval(() => undefined, 1000);",
+    ].join("");
+    const wrapperScript = [
+      "const {existsSync,writeFileSync}=require('node:fs');",
+      "const {join}=require('node:path');",
+      "const {spawn}=require('node:child_process');",
+      "const [broker,workspace,pidPath,targetScript]=process.argv.slice(1);",
+      "const requestPath=join(workspace,'windows-job-broker-request.json');",
+      "writeFileSync(requestPath,JSON.stringify({",
+      "schema:'mycellios-windows-job-broker/1',",
+      "executable:process.execPath,args:['-e',targetScript,pidPath],",
+      "cwd:process.cwd(),parentPid:process.pid}));",
+      "spawn(broker,[requestPath],{stdio:'ignore',windowsHide:true});",
+      "const deadline=Date.now()+5000;",
+      "const timer=setInterval(()=>{",
+      "if(existsSync(pidPath)){clearInterval(timer);process.exit(0);}",
+      "if(Date.now()>deadline){clearInterval(timer);process.exit(92);}",
+      "},10);",
+    ].join("");
+    const wrapper = spawn(
+      process.execPath,
+      [
+        "-e",
+        wrapperScript,
+        brokerExecutable,
+        workspace,
+        pidPath,
+        targetScript,
+      ],
+      {
+        cwd: resolve("."),
+        shell: false,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    await expect(childExit(wrapper)).resolves.toEqual({
+      code: 0,
+      signal: null,
+    });
+    const pids = await waitForPids(pidPath);
+    survivorPids.add(pids.target);
+    survivorPids.add(pids.descendant);
+    await waitFor(() =>
+      !processIsAlive(pids.target) && !processIsAlive(pids.descendant),
+    );
+
+    expect(processIsAlive(pids.target)).toBe(false);
+    expect(processIsAlive(pids.descendant)).toBe(false);
+    survivorPids.delete(pids.target);
+    survivorPids.delete(pids.descendant);
+  });
 });
 
 function temporaryWorkspace(): string {
