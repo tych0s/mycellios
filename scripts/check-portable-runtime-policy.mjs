@@ -18,7 +18,7 @@ const expected = [
   ["win32", "x64", true, "2.13.0+cpu", [], "cpython-3.12.13+20260510-x86_64-pc-windows-msvc-install_only_stripped.tar.gz", 21_921_642, "24168aff2e7d93784c6a436124c4ebb79b076a4e289bde4902c08333507b71d0", "scripts/wheel-locks/win32-x64-cp312.txt", "2a5de3d3f2e3ba4ebac91e1efe068159e81263d3ccd6a3d93333078e753c6c65"],
   ["linux", "x64", true, "2.13.0+cpu", [], "cpython-3.12.13+20260510-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz", 34_075_380, "d480f5d5878910ecbae212bf23bd7c25d7b209eb8cf5e98823c977384d272e88", "scripts/wheel-locks/linux-x64-cp312.txt", "090355535c96e7202ae761a18dadc5d66c9e98493a148eba16ae3c3e7c95c59d"],
   ["darwin", "arm64", true, "2.11.0", ["mps"], "cpython-3.12.13+20260510-aarch64-apple-darwin-install_only_stripped.tar.gz", 24_942_229, "55bc1a5edbc8ac4da0081f4f5731ed2d1ed10c57cb37a820b2a0dbc7cad742e9", "scripts/wheel-locks/darwin-arm64-cp312.txt", "75c84302540edc1b7f6c1620c3474b7ccbf431dd6df881717f74ebf419c56348"],
-  ["darwin", "x64", true, "2.2.2", [], "cpython-3.12.13+20260510-x86_64-apple-darwin-install_only_stripped.tar.gz", 24_639_521, "6bab7fa97d4f2ddba86da0e05acff66c53b5edaca1df8edcf00ddca785a9c59b", "scripts/wheel-locks/darwin-x64-cp312.txt", "891ccb84593d7e20296da529a72fb73775f9bc22bcf49de69b326c6d9ecabc46"],
+  ["darwin", "x64", false, undefined, undefined, undefined, undefined, undefined, undefined, undefined],
   ["linux", "arm64", false, undefined, undefined, undefined, undefined, undefined, undefined, undefined],
 ];
 
@@ -113,4 +113,4 @@ if (requirements.size !== Object.keys(DISTRIBUTION_PACKAGE_VERSIONS).length) {
   throw new Error("The distribution requirements and portable-runtime policy have drifted.");
 }
 
-process.stdout.write("Portable runtime policy verified for Windows x64, Linux x64, macOS arm64, and macOS Intel x64.\n");
+process.stdout.write("Portable runtime policy verified for Windows x64, Linux x64, and macOS arm64.\n");

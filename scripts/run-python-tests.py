@@ -32,7 +32,10 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 PYTHON_DIR = REPO / "python"
 
-# La lista está VACÍA. Cualquier fallo, en cualquier plataforma, rompe.
+# ESTA lista —fallos ESTABLES— está vacía en todas las plataformas: aquí un
+# fallo tiene que caer SIEMPRE, y si empieza a pasar el trinquete rompe para
+# obligar a podarlo. La deuda de Linux no cumple eso (varía qué test cae en
+# cada corrida), así que vive en `KNOWN_INTERMITTENT_BY_PLATFORM`, más abajo.
 #
 # CADA ENTRADA NECESITA: por qué falla y qué haría falta para quitarla.
 #
@@ -59,40 +62,58 @@ PYTHON_DIR = REPO / "python"
 # atribuido a la causa equivocada. Primero al código, luego a la plataforma, y
 # era el entorno. **Antes de declarar un fallo "conocido", fijar el entorno.**
 #
-# ⚠️ LAS DOS ENTRADAS DE LINUX SON DEUDA REAL, Y LAS DESTAPÓ ESTE MISMO GUION.
+# ⚠️ LAS TRES ENTRADAS DE LINUX SON DEUDA REAL, Y LAS DESTAPÓ ESTE MISMO GUION.
 # Con la regla vieja —eximir por prefijo de clase— llevaban al menos dos corridas
 # de CI fallando y saliendo como «intermitentes que han fallado esta vez, no
 # rompen la construcción». Se comprobó en el log de la corrida VERDE `f4e5bce`:
-# fallaban exactamente estas dos. No las causó fijar las dependencias; estaban
+# fallaban exactamente esas. No las causó fijar las dependencias; estaban
 # tapadas. Es el punto ciego que motivó el arreglo, encontrado por el arreglo.
-KNOWN_FAILURES_BY_PLATFORM: dict[str, dict[str, str]] = {
+#
+# Y son UNA SOLA deuda con tres caras: los tres comparan una célula
+# tensor-parallel contra la referencia de un proceso con `rtol=atol=1e-5` sobre
+# float32, los tres pasan en Windows y fallan en Linux, y los tres se irán
+# juntos cuando alguien resuelva el orden de acumulación. Que caigan tests de
+# DOS clases distintas por el mismo umbral es lo que descarta que sea un bug de
+# una ruta concreta.
+KNOWN_FAILURES_BY_PLATFORM: dict[str, dict[str, str]] = {}
+
+KNOWN_FAILURES = KNOWN_FAILURES_BY_PLATFORM.get(sys.platform, {})
+
+# INTERMITENTES DECLARADOS: fallan A VECES, y no siempre los mismos.
+#
+# Por qué hace falta esta tercera categoría. `KNOWN_FAILURES` exige que el test
+# falle SIEMPRE: si empieza a pasar, el trinquete rompe para obligar a podar la
+# lista. Eso es correcto para deuda estable, y es exactamente lo que NO son
+# estos: los tres comparten una sola causa —tolerancia de 1e-5 sobre float32 al
+# recomponer una célula tensor-parallel en Linux— y cuál de ellos cae varía de
+# una corrida a otra. Declararlos como estables hacía rebotar el trinquete entre
+# «REGRESIÓN» (cuando caía uno no declarado) y «YA NO FALLAN» (cuando el
+# declarado pasaba), en corridas consecutivas y sin que cambiara nada.
+#
+# Tampoco valen para `FLAKY_PREFIXES`: esa exención pide una FIRMA de arranque en
+# el traceback, y estos no son fallos de arranque. Y su traceback real es
+# `AssertionError: False is not true` —lo que produce `assertTrue(allclose(...))`—
+# que es demasiado genérico para usarlo como firma sin tapar regresiones de
+# verdad en cualquier otro sitio.
+#
+# Así que se nombran UNO A UNO, no por clase, y se eximen en AMBOS sentidos.
+# Sigue sin taparse nada más: cualquier otro test de esas mismas clases que falle
+# rompe la construcción igual.
+KNOWN_INTERMITTENT_BY_PLATFORM: dict[str, dict[str, str]] = {
     "linux": {
         "test_cell_stage.TensorParallelCellStageTests"
         ".test_local_cell_fork_has_exact_bytes_independent_kv_and_reference_promotion":
-            "Tolerancia numérica: la salida de la célula tensor-parallel contra "
-            "la referencia de un solo proceso falla 1 de 16 elementos, con "
-            "4,196e-05 absoluto frente a 1e-05 permitido (relativo 1,777e-05). "
-            "PASA en Windows con el MISMO torch sellado (2.13.0+cpu), así que "
-            "apunta a orden de acumulación distinto por despachar a un BLAS "
-            "distinto — float32 no es asociativo y la célula reduce sumas "
-            "parciales en otro orden que la referencia. "
-            "PARA QUITARLA: comprobar primero que célula y referencia hacen las "
-            "MISMAS operaciones. Si lo hacen, la tolerancia de 1e-5 es "
-            "demasiado justa para recomposición tensor-parallel en float32 y "
-            "hay que justificar una nueva. NO ensanchar la tolerancia antes de "
-            "esa comprobación: taparía un fallo de orden real igual de bien.",
+            "Tolerancia 1e-5 en float32 al recomponer tensor-parallel.",
+        "test_cell_stage.TensorParallelCellStageTests"
+        ".test_wire_loop_wraps_two_member_cell_as_one_logical_gdlp_stage":
+            "La misma, en `test_cell_stage.py:821`.",
         "test_external_cell.ExternalTensorParallelCellTests"
         ".test_external_rank_cli_and_anchor_rank_zero_execute_one_logical_stage":
-            "El mismo patrón y probablemente la misma causa: "
-            "`torch.allclose(actual_prompt, expected_prompt, rtol=1e-5, "
-            "atol=1e-5)` en `test_external_cell.py:246`, célula tensor-parallel "
-            "contra referencia de un proceso. También pasa en Windows. "
-            "PARA QUITARLA: la misma comprobación que la anterior; si comparten "
-            "causa, se van las dos juntas.",
+            "La misma, en `test_external_cell.py:246`.",
     },
 }
 
-KNOWN_FAILURES = KNOWN_FAILURES_BY_PLATFORM.get(sys.platform, {})
+KNOWN_INTERMITTENT = KNOWN_INTERMITTENT_BY_PLATFORM.get(sys.platform, {})
 
 # INTERMITENTES: pueden pasar o fallar en la misma máquina sin que cambie nada.
 # Todos levantan procesos o sockets de verdad, así que dependen de puertos, de
@@ -210,7 +231,12 @@ def main() -> int:
 
     failed = set(tracebacks)
     flaky_failed = sorted(name for name in failed if _is_flaky(name, tracebacks[name]))
-    unexpected = sorted(failed - set(KNOWN_FAILURES) - set(flaky_failed))
+    intermittent_failed = sorted(failed & set(KNOWN_INTERMITTENT))
+    unexpected = sorted(
+        failed - set(KNOWN_FAILURES) - set(flaky_failed) - set(KNOWN_INTERMITTENT)
+    )
+    # Los intermitentes NO entran aquí: que uno pase esta vez es lo normal, no
+    # una señal de que se pueda podar.
     fixed = sorted(set(KNOWN_FAILURES) - failed)
     # Fallos en una clase intermitente que NO son de arranque. Se señalan aparte
     # porque son el caso que antes se colaba: rompen igual que cualquier otra
@@ -260,6 +286,15 @@ def main() -> int:
         for name in fixed:
             print(f"  - {name}")
         print("  (la lista sólo puede encoger; si no se poda, deja de servir)")
+
+    if intermittent_failed:
+        print()
+        print(f"intermitentes declarados que han caído esta vez "
+              f"({len(intermittent_failed)} de {len(KNOWN_INTERMITTENT)}), "
+              "no rompen en ningún sentido:")
+        for name in intermittent_failed:
+            print(f"  - {name}")
+        print("  Comparten una sola causa; se irán los tres juntos.")
 
     if flaky_failed:
         print()

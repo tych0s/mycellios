@@ -15,7 +15,7 @@ afterEach(() => {
 });
 
 describe("public release transaction CLI", () => {
-  it("hashes the one exact nine-asset release set in canonical order", async () => {
+  it("hashes the one exact eight-asset release set in canonical order", async () => {
     const root = fixture();
     writeChecksums(root);
     const outputPath = join(root, "manifest.json");
@@ -29,13 +29,14 @@ describe("public release transaction CLI", () => {
       version: "0.2.19",
     });
 
-    expect(manifest.assets).toHaveLength(9);
+    // Ocho, no nueve: macOS Intel se retiro el 26-07-2026 y su DMG ya no
+    // forma parte del conjunto publicado.
+    expect(manifest.assets).toHaveLength(8);
     expect(manifest.assets.map(({ channel, fileName }) => `${channel}/${fileName}`))
       .toEqual([
         "downloads/mycellios-linux-x64.deb",
         "downloads/mycellios-linux-x64.rpm",
         "downloads/mycellios-macos-arm64.dmg",
-        "downloads/mycellios-macos-x64.dmg",
         "downloads/mycellios-windows-x64.exe",
         "updates/RELEASES",
         "updates/latest.json",
@@ -89,7 +90,6 @@ function fixture(): string {
     "mycellios-setup.exe",
     "mycellios-windows-x64.exe",
     "mycellios-macos-arm64.dmg",
-    "mycellios-macos-x64.dmg",
     "mycellios-linux-x64.deb",
     "mycellios-linux-x64.rpm",
   ];
@@ -103,7 +103,6 @@ function writeChecksums(root: string): void {
     "mycellios-linux-x64.deb",
     "mycellios-linux-x64.rpm",
     "mycellios-macos-arm64.dmg",
-    "mycellios-macos-x64.dmg",
     "mycellios-setup.exe",
     "mycellios-windows-x64.exe",
   ];

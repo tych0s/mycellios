@@ -1047,7 +1047,6 @@ function releaseFixture(
     ["downloads/mycellios-linux-x64.deb", Buffer.from("sealed Debian installer")],
     ["downloads/mycellios-linux-x64.rpm", Buffer.from("sealed RPM installer")],
     ["downloads/mycellios-macos-arm64.dmg", Buffer.from("sealed arm64 DMG")],
-    ["downloads/mycellios-macos-x64.dmg", Buffer.from("sealed x64 DMG")],
     ["downloads/mycellios-windows-x64.exe", windows],
     [
       "updates/RELEASES",

@@ -320,18 +320,12 @@ const CERTIFIED_PORTABLE_PYTHON = {
     size: 24_942_229,
     sha256: "55bc1a5edbc8ac4da0081f4f5731ed2d1ed10c57cb37a820b2a0dbc7cad742e9",
   },
-  "darwin/x64": {
-    filename: "cpython-3.12.13+20260510-x86_64-apple-darwin-install_only_stripped.tar.gz",
-    size: 24_639_521,
-    sha256: "6bab7fa97d4f2ddba86da0e05acff66c53b5edaca1df8edcf00ddca785a9c59b",
-  },
 } as const;
 
 const CERTIFIED_PORTABLE_RUNTIME = {
   "win32/x64": { executable: "python.exe", torchVersion: "2.13.0+cpu", transformersVersion: "5.14.1", bundledAccelerators: [] },
   "linux/x64": { executable: "bin/python3", torchVersion: "2.13.0+cpu", transformersVersion: "5.14.1", bundledAccelerators: [] },
   "darwin/arm64": { executable: "bin/python3", torchVersion: "2.11.0", transformersVersion: "5.14.1", bundledAccelerators: ["mps"] },
-  "darwin/x64": { executable: "bin/python3", torchVersion: "2.2.2", transformersVersion: "4.57.3", bundledAccelerators: [] },
 } as const;
 
 const CERTIFIED_PORTABLE_WHEEL_LOCKS = {
@@ -346,10 +340,6 @@ const CERTIFIED_PORTABLE_WHEEL_LOCKS = {
   "darwin/arm64": {
     path: "scripts/wheel-locks/darwin-arm64-cp312.txt",
     sha256: "75c84302540edc1b7f6c1620c3474b7ccbf431dd6df881717f74ebf419c56348",
-  },
-  "darwin/x64": {
-    path: "scripts/wheel-locks/darwin-x64-cp312.txt",
-    sha256: "891ccb84593d7e20296da529a72fb73775f9bc22bcf49de69b326c6d9ecabc46",
   },
 } as const;
 

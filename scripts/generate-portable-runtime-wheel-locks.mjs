@@ -19,11 +19,6 @@ const targets = [
     arch: "arm64",
     report: "build/mycellios-darwin-arm64-lock-report.json",
   },
-  {
-    platform: "darwin",
-    arch: "x64",
-    report: "build/mycellios-darwin-x64-lock-report.json",
-  },
 ];
 
 mkdirSync(outputDirectory, { recursive: true });
