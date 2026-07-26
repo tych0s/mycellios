@@ -1,9 +1,17 @@
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  buildCoordinatorBenchmarkTelemetrySnapshot,
   buildCoordinatorBenchmarkInventory,
+  coordinatorBenchmarkActivations,
+  coordinatorBenchmarkModelIdentity,
   detectNewActiveModels,
+  runAndPersistCoordinatorSuite,
   runCoordinatorModelSuite,
 } from "../src/benchlab/coordinator-suite.js";
+import { workerCapabilitiesSchema } from "../src/contracts/schemas.js";
 import type { RunIdentity } from "../src/benchlab/history.js";
 import type { StoredWorker } from "../src/storage/store.js";
 
@@ -14,6 +22,15 @@ const IDENTITY: RunIdentity = {
   gitCommit: "0123456789abcdef",
   gitBranch: "main",
   gitDirty: false,
+  build: {
+    release: "0.2.19",
+    releaseSource: "override",
+    revision: "0123456789abcdef",
+    revisionSource: "git",
+    sourceId: null,
+    sourceIdSource: "unknown",
+    participantSourceIds: [],
+  },
 };
 
 describe("automatic coordinator benchmark", () => {
@@ -23,6 +40,104 @@ describe("automatic coordinator benchmark", () => {
     expect(detectNewActiveModels(new Set(["qwen"]), observed)).toEqual([]);
     expect(detectNewActiveModels(new Set(), observed)).toEqual([]);
     expect(detectNewActiveModels(new Set(["qwen"]), observed)).toEqual(["qwen"]);
+  });
+
+  it("propagates one real deployment digest and fails closed on conflicts", () => {
+    const workers = distributedWorkers();
+    const connected = new Set(workers.map((worker) => worker.id));
+    const identity = coordinatorBenchmarkModelIdentity(
+      { id: "qwen3-0.6b", source: "Qwen/Qwen3-0.6B", revision: "rev-1" },
+      workers,
+      connected,
+    );
+    expect(identity.digest).toBe("sha256:model");
+
+    const conflicting = structuredClone(workers);
+    conflicting[1]!.capabilities.deployments = [{
+      ...conflicting[0]!.capabilities.deployments[0]!,
+      deploymentId: "qwen-conflict",
+      modelDigest: "sha256:other",
+    }];
+    expect(coordinatorBenchmarkModelIdentity(
+      { id: "qwen3-0.6b", source: "Qwen/Qwen3-0.6B", revision: "rev-1" },
+      conflicting,
+      connected,
+    ).digest).toBeNull();
+  });
+
+  it("seals a concrete activation from deployment generation and stage ranges", () => {
+    const workers = distributedWorkers();
+    const connected = new Set(workers.map((worker) => worker.id));
+    const [activation] = coordinatorBenchmarkActivations(
+      new Set(["qwen3-0.6b"]),
+      workers,
+      connected,
+    );
+    if (!activation) throw new Error("expected benchmark activation");
+    expect(activation).toMatchObject({
+      modelId: "qwen3-0.6b",
+      modelDigest: "sha256:model",
+      participants: [{
+        workerId: "worker-a",
+        deploymentId: "qwen-pipeline",
+        nodeIds: ["node-a", "node-b"],
+      }],
+    });
+    expect(activation?.activationId).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(activation?.topologyDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
+
+    const replacement = structuredClone(workers);
+    replacement[0]!.capabilities.deployments[0]!.deploymentId = "qwen-pipeline-2";
+    expect(coordinatorBenchmarkActivations(
+      new Set(["qwen3-0.6b"]),
+      replacement,
+      connected,
+    )[0]?.activationId).not.toBe(activation?.activationId);
+
+    const mismatchedBuild = structuredClone(workers);
+    mismatchedBuild[0]!.capabilities.buildIdentity!.version = "0.2.20";
+    expect(
+      workerCapabilitiesSchema.safeParse(
+        mismatchedBuild[0]!.capabilities,
+      ).success,
+    ).toBe(false);
+    expect(coordinatorBenchmarkActivations(
+      new Set(["qwen3-0.6b"]),
+      mismatchedBuild,
+      connected,
+    )).toEqual([]);
+
+    const unverifiedBuild = structuredClone(workers);
+    delete unverifiedBuild[0]!.capabilities.buildIdentity;
+    expect(coordinatorBenchmarkActivations(
+      new Set(["qwen3-0.6b"]),
+      unverifiedBuild,
+      connected,
+    )).toEqual([]);
+  });
+
+  it("samples live power and free memory without using configured limits", () => {
+    const workers = distributedWorkers();
+    const snapshot = buildCoordinatorBenchmarkTelemetrySnapshot(
+      workers,
+      new Set(workers.map((worker) => worker.id)),
+      10_000,
+    );
+    expect(snapshot.atMs).toBe(10_000);
+    expect(snapshot.nodes).toEqual([
+      expect.objectContaining({
+        nodeId: "node-a",
+        powerWatts: 70,
+        offeredMemoryGb: 4,
+        freeOfferedMemoryGb: 4,
+      }),
+      expect.objectContaining({
+        nodeId: "node-b",
+        powerWatts: 80,
+        offeredMemoryGb: 6,
+        freeOfferedMemoryGb: 6,
+      }),
+    ]);
   });
 
   it("records real coordinator inference with routed nodes, VRAM, power and latency", async () => {
@@ -39,13 +154,19 @@ describe("automatic coordinator benchmark", () => {
         reused_kv_tokens: 0,
         ttft_ms: 420,
         active_ms: 6_000,
+        execution_trace: benchmarkTrace("job-real"),
       },
     }), { status: 200, headers: { "content-type": "application/json" } });
 
     const run = await runCoordinatorModelSuite(IDENTITY, {
       cwd: ".",
       coordinatorUrl: "http://127.0.0.1:4180",
-      model: { id: "qwen3-0.6b", source: "Qwen/Qwen3-0.6B", revision: "rev-1" },
+      model: {
+        id: "qwen3-0.6b",
+        source: "Qwen/Qwen3-0.6B",
+        revision: "rev-1",
+        digest: "sha256:rev-1",
+      },
       inventory: (routed) =>
         buildCoordinatorBenchmarkInventory("qwen3-0.6b", workers, connected, routed),
       resolveWorkerId: () => "worker-a",
@@ -67,14 +188,116 @@ describe("automatic coordinator benchmark", () => {
     expect(measurement.metrics.ttftMsP95).toBe(420);
     expect(measurement.workload.successfulRequests).toBe(3);
     expect(measurement.workload.routeClasses).toEqual(["pipeline"]);
+    expect(measurement.model.digest).toBe("sha256:rev-1");
+    expect(measurement.scenarioFingerprint).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(measurement.networkTraces).toHaveLength(3);
+    expect(measurement.networkTraces?.[0]).toMatchObject({
+      jobId: "job-real",
+      stages: [
+        { nodeId: "node-a", layerStart: 0, layerEnd: 14 },
+        { nodeId: "node-b", layerStart: 14, layerEnd: 28 },
+      ],
+      boundaries: [{
+        transport: "relay",
+        bytesSourceToDestination: 8_192,
+        bytesDestinationToSource: 512,
+      }],
+    });
+    expect(measurement.topology.digest).toMatch(/^sha256:[0-9a-f]{64}$/);
     expect(measurement.notes.join(" ")).toContain("no hay datos simulados");
+  });
+
+  it("binds an automatic run to coordinator and participant source identities", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "mycellios-coordinator-build-"));
+    writeFileSync(
+      join(cwd, "package.json"),
+      JSON.stringify({ version: "0.2.19" }),
+      "utf8",
+    );
+    const workers = distributedWorkers();
+    const connected = new Set(workers.map((worker) => worker.id));
+    const [activation] = coordinatorBenchmarkActivations(
+      new Set(["qwen3-0.6b"]),
+      workers,
+      connected,
+    );
+    if (!activation) throw new Error("expected build-bound benchmark activation");
+    const result = await runAndPersistCoordinatorSuite({
+      cwd,
+      coordinatorUrl: "http://127.0.0.1:4180",
+      buildIdentity: {
+        schema: "mycellios-native-build-provenance/1",
+        version: "0.2.19",
+        sourceId: `sha256:${"c".repeat(64)}`,
+      },
+      model: {
+        id: "qwen3-0.6b",
+        source: "Qwen/Qwen3-0.6B",
+        revision: "rev-1",
+        digest: "sha256:rev-1",
+      },
+      inventory: () => buildCoordinatorBenchmarkInventory(
+        "qwen3-0.6b",
+        workers,
+        connected,
+        new Set(["worker-a"]),
+      ),
+      fetchImpl: async () => new Response(JSON.stringify({
+        id: "job-build",
+        model: "qwen3-0.6b",
+        choices: [{ message: { content: "ok" } }],
+        usage: { prompt_tokens: 2, completion_tokens: 4, total_tokens: 6 },
+        x_network: {
+          route_class: "pipeline",
+          affinity_hit: false,
+          reused_kv_tokens: 0,
+          ttft_ms: 10,
+          active_ms: 100,
+          execution_trace: benchmarkTrace("job-build"),
+        },
+      }), { status: 200, headers: { "content-type": "application/json" } }),
+      activation,
+      samples: 1,
+      warmupSamples: 0,
+      outputTokens: 4,
+    });
+
+    expect(result.run.build).toMatchObject({
+      sourceId: `sha256:${"c".repeat(64)}`,
+      sourceIdSource: "runtime-local",
+      participantSourceIds: [`sha256:${"1".repeat(64)}`],
+    });
+    await expect(
+      runAndPersistCoordinatorSuite({
+        cwd,
+        coordinatorUrl: "http://127.0.0.1:4180",
+        version: "0.2.20",
+        buildIdentity: {
+          schema: "mycellios-native-build-provenance/1",
+          version: "0.2.19",
+          sourceId: `sha256:${"c".repeat(64)}`,
+        },
+        model: {
+          id: "qwen3-0.6b",
+          source: "Qwen/Qwen3-0.6B",
+          revision: "rev-1",
+          digest: "sha256:rev-1",
+        },
+        inventory: () => ({
+          totalDevices: 0,
+          connectedDevices: 0,
+          selectedDevices: 0,
+          profiles: [],
+        }),
+      }),
+    ).rejects.toThrow("benchmark_build_version_mismatch");
   });
 
   it("keeps a failed real test without manufacturing performance numbers", async () => {
     const run = await runCoordinatorModelSuite(IDENTITY, {
       cwd: ".",
       coordinatorUrl: "http://127.0.0.1:4180",
-      model: { id: "missing", source: "missing", revision: null },
+      model: { id: "missing", source: "missing", revision: null, digest: null },
       inventory: () => ({
         totalDevices: 0,
         connectedDevices: 0,
@@ -85,6 +308,8 @@ describe("automatic coordinator benchmark", () => {
         error: { message: "No model route is active" },
       }), { status: 503 }),
       samples: 2,
+      warmupSamples: 0,
+      retryDelayMs: 0,
     });
 
     const measurement = run.measurements[0]!;
@@ -93,6 +318,7 @@ describe("automatic coordinator benchmark", () => {
     expect(measurement.metrics.ttftMsP95).toBeNull();
     expect(measurement.workload.successfulRequests).toBe(0);
     expect(measurement.notes.join(" ")).toContain("No model route is active");
+    expect(measurement.comparison.baselineRunId).toBeNull();
   });
 });
 
@@ -101,6 +327,83 @@ function distributedWorkers(): StoredWorker[] {
     worker("worker-a", "node-a", "NVIDIA RTX A", 4_096, 6_144, 70, true),
     worker("worker-b", "node-b", "AMD Radeon B", 6_144, 6_144, 80, false),
   ];
+}
+
+function benchmarkTrace(jobId: string) {
+  return {
+    schema: "mycellios-network-execution-trace/1",
+    jobId,
+    attempt: 1,
+    observedFrom: 1_000,
+    observedUntil: 7_000,
+    durationMs: 6_000,
+    routeClass: "replica",
+    affinityHit: false,
+    selectedRoute: [{
+      routeStageIndex: 0,
+      workerId: "worker-a",
+      deploymentId: "qwen-pipeline",
+      modelDigest: "sha256:model",
+      stageIndex: 0,
+    }],
+    stages: [
+      {
+        routeStageIndex: 0,
+        stageIndex: 0,
+        nodeId: "node-a",
+        workerId: "worker-a",
+        deploymentId: "qwen-pipeline",
+        deploymentOwnerWorkerId: "worker-a",
+        modelDigest: "sha256:model",
+        layerStart: 0,
+        layerEnd: 14,
+        deviceType: "gpu",
+        backend: "cuda",
+        precision: "bf16",
+        deviceName: "NVIDIA RTX A",
+        startedAt: null,
+        endedAt: null,
+        durationMs: null,
+      },
+      {
+        routeStageIndex: 0,
+        stageIndex: 1,
+        nodeId: "node-b",
+        workerId: "worker-b",
+        deploymentId: "qwen-pipeline",
+        deploymentOwnerWorkerId: "worker-a",
+        modelDigest: "sha256:model",
+        layerStart: 14,
+        layerEnd: 28,
+        deviceType: "gpu",
+        backend: "rocm",
+        precision: "bf16",
+        deviceName: "AMD Radeon B",
+        startedAt: null,
+        endedAt: null,
+        durationMs: null,
+      },
+    ],
+    physicalBoundaryCount: 1,
+    boundaries: [{
+      boundaryIndex: 0,
+      fromStageIndex: 0,
+      toStageIndex: 1,
+      sourceNodeId: "node-a",
+      destinationNodeId: "node-b",
+      physicalBoundary: true,
+      transport: "relay",
+      streamId: "stream-ab",
+      bytesSourceToDestination: 8_192,
+      bytesDestinationToSource: 512,
+      countersExclusive: true,
+      connectRttMs: 14,
+      streamCreatedAt: 900,
+      streamConnectedAt: 950,
+      streamEndedAt: null,
+      observedOverlapMs: 6_000,
+    }],
+  };
 }
 
 function worker(
@@ -123,6 +426,11 @@ function worker(
     capabilities: {
       region: "local",
       agentVersion: "0.2.19",
+      buildIdentity: {
+        schema: "mycellios-native-build-provenance/1",
+        version: "0.2.19",
+        sourceId: `sha256:${"1".repeat(64)}`,
+      },
       gpus: [{
         id: `${id}-gpu`,
         vendor: gpuModel.startsWith("NVIDIA") ? "nvidia" : "amd",
@@ -144,7 +452,7 @@ function worker(
         model: "qwen3-0.6b",
         modelDigest: "sha256:model",
         mode: "replica",
-        adapter: "local-model-runtime",
+        adapter: "mycellios-pipeline",
         peakVramMb: 8_192,
         contextLimit: 4_096,
         maxConcurrency: 1,

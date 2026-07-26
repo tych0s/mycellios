@@ -9,6 +9,7 @@ import {
   MacroWaveRamVramPlanner,
   type MacroWavePlannerOptions,
 } from "./macro-wave.js";
+import { tensorParallelCellGateReason } from "./parallelism.js";
 import type {
   ActivationCodecId,
   ComputeNodeProfile,
@@ -34,7 +35,7 @@ export type RuntimePlanTransport =
   | "persistent-tcp-macro-wave-v1";
 export const MAX_WAN_VIRTUAL_STAGES = 8;
 
-/** Backend metadata is intentionally open-ended so new runtimes do not require a protocol bump. */
+/** Mycellios executor metadata remains extensible without changing the wire protocol. */
 export interface RuntimeBackendProfile {
   engine: string;
   version?: string;
@@ -43,9 +44,9 @@ export interface RuntimeBackendProfile {
 }
 
 /**
- * Capability names are negotiated strings, not a closed enum.  That lets a
- * external GGUF runtime CUDA worker, an MLX worker and a future accelerator coexist while
- * retaining a small, portable manifest.
+ * Capability names are negotiated strings, not a closed enum. That lets
+ * Mycellios executors for different accelerators coexist while retaining a
+ * small, portable manifest.
  */
 export interface RuntimeMemberCapabilities {
   deviceKinds: string[];
@@ -250,10 +251,23 @@ export interface RuntimeSpeculationStrategy {
   id: string;
   kind: RuntimeSpeculationKind;
   maxDraftTokens: number;
+  /**
+   * Exact physical-tree limits. They are forbidden for every other strategy
+   * kind and required together for `draft-tree`, so an executor never invents
+   * capacity that the planner did not seal.
+   */
+  maxBranches?: number;
+  maxBranchTokens?: number;
+  maxKvBytes?: number;
+  maxWaveTokens?: number;
   minAcceptanceRate: number;
   maxWasteRatio: number;
   priority: number;
   artifactId?: string;
+  /** Exact loaded parameter bytes for an artifact-backed local drafter. */
+  parameterBytes?: number;
+  /** Capacity reserved before loading the optional local drafter. */
+  memoryReservationBytes?: number;
 }
 
 export interface RuntimeSpeculationPolicy {
@@ -673,6 +687,53 @@ export function materializeRuntimeTensorParallelCell(
           : []),
       ]),
     ];
+  }
+  sealRuntimePipelineIdentities(manifest);
+  validateRuntimePipelineManifest(manifest);
+  return manifest;
+}
+
+/**
+ * Certify every materialized TP cell against fresh physical link probes.
+ *
+ * Materialization deliberately marks collective cost as unprofiled. The only
+ * route from that state to a launchable manifest is this fail-closed gate:
+ * every ordered member pair must exist in one locality domain and carry fresh,
+ * sufficiently sampled runtime-probe evidence within the TP latency ceiling.
+ */
+export function certifyRuntimeTensorParallelCollectives(
+  manifestValue: RuntimePipelineManifestV2,
+  topology: RuntimeTopology,
+  now = Date.now(),
+): RuntimePipelineManifestV2 {
+  validateRuntimePipelineManifest(manifestValue);
+  const manifest = structuredClone(manifestValue);
+  let cells = 0;
+  for (const plan of [manifest.plans.prefill, manifest.plans.decode]) {
+    for (const stage of plan.stages) {
+      if (stage.execution?.mode !== "tensor-parallel-cell") continue;
+      cells += 1;
+      const memberNodeIds = stage.execution.rankMemberIds;
+      const gateReason = tensorParallelCellGateReason(
+        memberNodeIds,
+        topology,
+        now,
+      );
+      if (gateReason !== null) {
+        throw new Error(
+          `runtime_tensor_parallel_collective_profile_rejected:${gateReason}`,
+        );
+      }
+      applyTensorParallelEvidence(
+        plan.predicted,
+        memberNodeIds,
+        topology,
+        now,
+      );
+    }
+  }
+  if (cells === 0) {
+    throw new Error("runtime_tensor_parallel_collective_cell_is_missing");
   }
   sealRuntimePipelineIdentities(manifest);
   validateRuntimePipelineManifest(manifest);
@@ -1130,6 +1191,15 @@ function materializePlannedTensorParallelCells(
       members,
       execution: structuredClone(cell.execution),
     });
+    for (const plan of [manifest.plans.prefill, manifest.plans.decode]) {
+      applyTensorParallelEvidence(
+        plan.predicted,
+        cell.memberNodeIds,
+        request.topology,
+      );
+    }
+    sealRuntimePipelineIdentities(manifest);
+    validateRuntimePipelineManifest(manifest);
   }
   return manifest;
 }
@@ -1241,6 +1311,45 @@ function materializePlannedTensorParallelCellForPhase(
         : []),
     ]),
   ];
+  applyTensorParallelEvidence(
+    plan.predicted,
+    cell.memberNodeIds,
+    request.topology,
+  );
+}
+
+function applyTensorParallelEvidence(
+  predicted: DistributionMetrics,
+  memberNodeIds: string[],
+  topology: RuntimeTopology,
+  now = Date.now(),
+): void {
+  const gateReason = tensorParallelCellGateReason(memberNodeIds, topology, now);
+  if (gateReason !== null) {
+    predicted.calibrationRequired = true;
+    predicted.calibrationReasons = [
+      ...new Set([
+        ...(predicted.calibrationReasons ?? []),
+        gateReason,
+      ]),
+    ];
+    return;
+  }
+  const remainingCalibrationReasons = (
+    predicted.calibrationReasons ?? []
+  ).filter(
+    (reason) =>
+      reason !== "tensor_parallel_collective_cost_unprofiled" &&
+      reason !== "external_cell_internal_links_unprofiled" &&
+      !reason.startsWith("tp_cell_") &&
+      reason !== "collective_link_missing",
+  );
+  predicted.calibrationRequired = remainingCalibrationReasons.length > 0;
+  if (remainingCalibrationReasons.length === 0) {
+    delete predicted.calibrationReasons;
+  } else {
+    predicted.calibrationReasons = remainingCalibrationReasons;
+  }
 }
 
 function plannedRankMemoryBytes(
@@ -1515,6 +1624,18 @@ function runtimeSpeculationIdentity(policy: RuntimeSpeculationPolicy): object {
       id: strategy.id,
       kind: strategy.kind,
       maxDraftTokens: strategy.maxDraftTokens,
+      ...(strategy.maxBranches !== undefined
+        ? { maxBranches: strategy.maxBranches }
+        : {}),
+      ...(strategy.maxBranchTokens !== undefined
+        ? { maxBranchTokens: strategy.maxBranchTokens }
+        : {}),
+      ...(strategy.maxKvBytes !== undefined
+        ? { maxKvBytes: strategy.maxKvBytes }
+        : {}),
+      ...(strategy.maxWaveTokens !== undefined
+        ? { maxWaveTokens: strategy.maxWaveTokens }
+        : {}),
       minAcceptanceRate: strategy.minAcceptanceRate,
       maxWasteRatio: strategy.maxWasteRatio,
       priority: strategy.priority,
@@ -2812,11 +2933,82 @@ function validateSpeculationPolicy(value: unknown): void {
       strategy.priority,
       "runtime_speculation_priority_is_invalid",
     );
+    const artifactBacked =
+      strategy.kind === "draft-model"
+      || strategy.kind === "mtp"
+      || strategy.kind === "intermediate-head";
+    if (artifactBacked && strategy.artifactId === undefined) {
+      throw new Error("runtime_speculation_artifact_is_missing");
+    }
     if (strategy.artifactId !== undefined) {
-      asNonEmptyString(strategy.artifactId, "runtime_speculation_artifact_is_invalid");
+      validateSha256Identity(
+        strategy.artifactId,
+        "runtime_speculation_artifact_is_invalid",
+      );
+    }
+    const draftMemory = [
+      strategy.parameterBytes,
+      strategy.memoryReservationBytes,
+    ];
+    if (strategy.kind === "draft-model") {
+      if (draftMemory.some((value) => value === undefined)) {
+        throw new Error("runtime_draft_model_memory_contract_is_missing");
+      }
+      assertPositiveInteger(
+        strategy.parameterBytes,
+        "runtime_draft_model_parameter_bytes_are_invalid",
+      );
+      assertPositiveInteger(
+        strategy.memoryReservationBytes,
+        "runtime_draft_model_memory_reservation_is_invalid",
+      );
+      if (
+        (strategy.memoryReservationBytes as number)
+        < (strategy.parameterBytes as number)
+      ) {
+        throw new Error("runtime_draft_model_memory_reservation_is_too_small");
+      }
+    } else if (draftMemory.some((value) => value !== undefined)) {
+      throw new Error("runtime_draft_model_memory_requires_draft_model_strategy");
     }
     if (strategy.kind === "autoregressive" && strategy.maxDraftTokens !== 1) {
       throw new Error("runtime_autoregressive_draft_length_must_be_one");
+    }
+    const treeLimits = [
+      strategy.maxBranches,
+      strategy.maxBranchTokens,
+      strategy.maxKvBytes,
+      strategy.maxWaveTokens,
+    ];
+    if (strategy.kind === "draft-tree") {
+      if (treeLimits.some((limit) => limit === undefined)) {
+        throw new Error("runtime_draft_tree_limits_are_missing");
+      }
+      assertBoundedPositiveInteger(
+        strategy.maxBranches,
+        64,
+        "runtime_draft_tree_branches_are_invalid",
+      );
+      assertBoundedPositiveInteger(
+        strategy.maxBranchTokens,
+        1_048_576,
+        "runtime_draft_tree_branch_tokens_are_invalid",
+      );
+      assertBoundedPositiveInteger(
+        strategy.maxKvBytes,
+        2 ** 40,
+        "runtime_draft_tree_kv_bytes_are_invalid",
+      );
+      assertBoundedPositiveInteger(
+        strategy.maxWaveTokens,
+        17,
+        "runtime_draft_tree_wave_tokens_are_invalid",
+      );
+      if ((strategy.maxWaveTokens as number) !== strategy.maxDraftTokens + 1) {
+        throw new Error("runtime_draft_tree_wave_does_not_match_draft_depth");
+      }
+    } else if (treeLimits.some((limit) => limit !== undefined)) {
+      throw new Error("runtime_tree_limits_require_draft_tree_strategy");
     }
   }
   const defaultId = asNonEmptyString(
@@ -2886,6 +3078,12 @@ function validateMacroWaveSpeculationBinding(
       throw new Error("runtime_macro_wave_autoregressive_contract_mismatch");
     }
     return;
+  }
+  if (
+    selected.kind === "draft-tree" &&
+    selected.maxWaveTokens !== waveTokens
+  ) {
+    throw new Error("runtime_draft_tree_wave_contract_mismatch");
   }
 
   for (const strategy of speculation.strategies) {
@@ -3086,6 +3284,21 @@ function validatePlanRequest(request: RuntimePlanRequest): void {
     if (link.availability !== undefined) {
       assertProbability(link.availability, "runtime_link_availability_is_invalid");
     }
+    if (link.evidence !== undefined) {
+      if (
+        link.evidence.source !== "runtime-probe"
+        || !Number.isInteger(link.evidence.measuredAt)
+        || link.evidence.measuredAt <= 0
+        || !Number.isInteger(link.evidence.validUntil)
+        || link.evidence.validUntil <= link.evidence.measuredAt
+        || !Number.isInteger(link.evidence.successfulSamples)
+        || link.evidence.successfulSamples < 0
+        || !Number.isInteger(link.evidence.failedSamples)
+        || link.evidence.failedSamples < 0
+      ) {
+        throw new Error("runtime_link_evidence_is_invalid");
+      }
+    }
   }
   for (const [name, value] of [
     ["prompt_tokens", request.workload.promptTokens],
@@ -3139,6 +3352,15 @@ function validateSafeHost(value: unknown, error: string): asserts value is strin
 
 function validateSha256(value: unknown, error: string): asserts value is string {
   if (typeof value !== "string" || !/^[0-9a-f]{64}$/i.test(value)) {
+    throw new Error(error);
+  }
+}
+
+function validateSha256Identity(
+  value: unknown,
+  error: string,
+): asserts value is string {
+  if (typeof value !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value)) {
     throw new Error(error);
   }
 }
@@ -3197,6 +3419,20 @@ function assertPositiveFinite(value: unknown, error: string): asserts value is n
 
 function assertPositiveInteger(value: unknown, error: string): asserts value is number {
   if (!Number.isSafeInteger(value) || (value as number) < 1) throw new Error(error);
+}
+
+function assertBoundedPositiveInteger(
+  value: unknown,
+  maximum: number,
+  error: string,
+): asserts value is number {
+  if (
+    !Number.isSafeInteger(value) ||
+    (value as number) < 1 ||
+    (value as number) > maximum
+  ) {
+    throw new Error(error);
+  }
 }
 
 function assertNonNegativeInteger(value: unknown, error: string): asserts value is number {

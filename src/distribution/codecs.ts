@@ -4,8 +4,11 @@ export const ACTIVATION_CODECS: Readonly<Record<ActivationCodecId, ActivationCod
   fp16: {
     id: "fp16",
     bytesPerElement: 2,
-    encodeGbps: Number.POSITIVE_INFINITY,
-    decodeGbps: Number.POSITIVE_INFINITY,
+    // A 1 GB/s normalization anchor, not an asserted hardware speed. The
+    // node's sealed physical codec scale converts this into its measured GDLP
+    // FP16 encode/decode throughput. Optimized routes never use the default.
+    encodeGbps: 1,
+    decodeGbps: 1,
     fixedEncodeMs: 0,
     fixedDecodeMs: 0,
     estimatedQualityLoss: 0,

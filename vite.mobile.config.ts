@@ -1,9 +1,22 @@
 import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import react from "@vitejs/plugin-react";
 import { defineConfig, type Plugin } from "vite";
+import { buildNativeSourceProvenance } from "./scripts/native-build-provenance.mjs";
+
+const workspaceRoot = import.meta.dirname;
+const mobileRoot = resolve(workspaceRoot, "src/mobile");
+const mobileBuildProvenance = buildNativeSourceProvenance(workspaceRoot);
+const mobileBuildIdentity = {
+  schema: mobileBuildProvenance.schema,
+  version: mobileBuildProvenance.version,
+  sourceId: mobileBuildProvenance.sourceId,
+};
 
 function mobileAssets(): Plugin {
-  const packageVersion = JSON.parse(readFileSync("package.json", "utf8")) as { version: string };
+  const packageVersion = JSON.parse(
+    readFileSync(resolve(workspaceRoot, "package.json"), "utf8"),
+  ) as { version: string };
   return {
     name: "mycellios-mobile-assets",
     generateBundle() {
@@ -37,24 +50,30 @@ function mobileAssets(): Plugin {
       this.emitFile({
         type: "asset",
         fileName: "mycellios-app-icon-v2.png",
-        source: readFileSync("build/icons/app-icon-v2.png"),
+        source: readFileSync(resolve(workspaceRoot, "build/icons/app-icon-v2.png")),
       });
       this.emitFile({
         type: "asset",
         fileName: "sw.js",
-        source: readFileSync("src/mobile/sw.js", "utf8").replace("__MYCELLIOS_VERSION__", packageVersion.version),
+        source: readFileSync(resolve(mobileRoot, "sw.js"), "utf8").replace(
+          "__MYCELLIOS_VERSION__",
+          packageVersion.version,
+        ),
       });
     },
   };
 }
 
 export default defineConfig({
-  root: "src/mobile",
+  root: mobileRoot,
   base: "./",
   publicDir: false,
+  define: {
+    __MYCELLIOS_BUILD_IDENTITY__: JSON.stringify(mobileBuildIdentity),
+  },
   plugins: [react(), mobileAssets()],
   build: {
-    outDir: "../../mobile-dist",
+    outDir: resolve(workspaceRoot, "mobile-dist"),
     emptyOutDir: true,
     sourcemap: true,
     target: "es2022",

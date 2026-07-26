@@ -3,9 +3,18 @@ import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
 const GITHUB_ACTIONS_ISSUER = "https://token.actions.githubusercontent.com";
 const RELEASE_UPLOAD_AUDIENCE = "mycellios-release-upload";
 const RELEASE_REPOSITORY = "tych0s/mycellios";
-const RELEASE_WORKFLOWS = [
-  `${RELEASE_REPOSITORY}/.github/workflows/desktop-build.yml@`,
-  `${RELEASE_REPOSITORY}/.github/workflows/publish-existing-release.yml@`,
+const RELEASE_REF = "refs/heads/main";
+const RELEASE_WORKFLOW_POLICIES = [
+  {
+    workflowRef:
+      `${RELEASE_REPOSITORY}/.github/workflows/desktop-build.yml@${RELEASE_REF}`,
+    eventName: "push",
+  },
+  {
+    workflowRef:
+      `${RELEASE_REPOSITORY}/.github/workflows/publish-existing-release.yml@${RELEASE_REF}`,
+    eventName: "workflow_dispatch",
+  },
 ] as const;
 const githubActionsKeys = createRemoteJWKSet(
   new URL(`${GITHUB_ACTIONS_ISSUER}/.well-known/jwks`),
@@ -16,6 +25,7 @@ export interface GitHubReleaseClaims {
   ref: string;
   sha: string;
   workflowRef: string;
+  eventName: "push" | "workflow_dispatch";
   environment: "production";
 }
 
@@ -41,19 +51,25 @@ export function validateGitHubReleaseClaims(payload: JWTPayload): GitHubReleaseC
   const environment = stringClaim(payload, "environment");
 
   if (repository !== RELEASE_REPOSITORY) throw new Error("release_repository_not_allowed");
-  if (eventName !== "push" && eventName !== "workflow_dispatch") {
-    throw new Error("release_event_not_allowed");
-  }
-  if (ref !== "refs/heads/main" && !/^refs\/tags\/v\d+\.\d+\.\d+$/.test(ref)) {
-    throw new Error("release_ref_not_allowed");
-  }
-  if (!RELEASE_WORKFLOWS.some((workflow) => workflowRef.startsWith(workflow))) {
+  if (ref !== RELEASE_REF) throw new Error("release_ref_not_allowed");
+  const workflowPolicy = RELEASE_WORKFLOW_POLICIES.find(
+    (candidate) => candidate.workflowRef === workflowRef,
+  );
+  if (!workflowPolicy) {
     throw new Error("release_workflow_not_allowed");
   }
+  if (eventName !== workflowPolicy.eventName) throw new Error("release_event_not_allowed");
   if (environment !== "production") throw new Error("release_environment_not_allowed");
   if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error("release_sha_invalid");
 
-  return { repository, ref, sha, workflowRef, environment };
+  return {
+    repository,
+    ref,
+    sha,
+    workflowRef,
+    eventName: workflowPolicy.eventName,
+    environment,
+  };
 }
 
 function stringClaim(payload: JWTPayload, name: string): string {

@@ -7,6 +7,7 @@ import type {
   LaunchCapturedOutput,
   LaunchProcessExit,
   LaunchProcessHandle,
+  RuntimePreparationProgressEvent,
 } from "./launch-supervisor.js";
 import type { PythonPipelineLaunchDescription } from "./python-launcher.js";
 
@@ -28,6 +29,9 @@ export class WorkerTunnelLaunchAgent implements LaunchAgent {
   private readonly pending = new Map<string, PendingStart>();
   private readonly preparations = new Map<string, Deferred<void>>();
   private prepared = false;
+  private readonly preparationListeners = new Set<
+    (event: RuntimePreparationProgressEvent) => void
+  >();
   private readonly runtimeProxies = new Set<RuntimeProxyHandle>();
   private readonly onEnvelope = (envelope: WorkerEnvelope) => this.handleEnvelope(envelope);
   private readonly onDisconnect = (workerId: string) => {
@@ -48,7 +52,7 @@ export class WorkerTunnelLaunchAgent implements LaunchAgent {
     private readonly workerId: string,
     private readonly nodeId: string,
     private readonly description: PythonPipelineLaunchDescription,
-    private readonly timeoutMs = 30_000,
+    private readonly timeoutMs = 3_600_000,
   ) {
     this.id = `worker-tunnel:${workerId}`;
     hub.on("envelope", this.onEnvelope);
@@ -101,6 +105,13 @@ export class WorkerTunnelLaunchAgent implements LaunchAgent {
     };
   }
 
+  subscribeRuntimePreparation(
+    listener: (event: RuntimePreparationProgressEvent) => void,
+  ): () => void {
+    this.preparationListeners.add(listener);
+    return () => this.preparationListeners.delete(listener);
+  }
+
   async close(): Promise<void> {
     this.hub.off("envelope", this.onEnvelope);
     this.hub.off("disconnect", this.onDisconnect);
@@ -111,6 +122,7 @@ export class WorkerTunnelLaunchAgent implements LaunchAgent {
       start.exited.reject(error);
     }
     this.preparations.clear();
+    this.preparationListeners.clear();
     this.pending.clear();
     this.prepared = false;
     const proxies = [...this.runtimeProxies];
@@ -168,6 +180,29 @@ export class WorkerTunnelLaunchAgent implements LaunchAgent {
     const requestId = typeof payload?.requestId === "string" ? payload.requestId : null;
     if (!requestId) return;
     if (!payload) return;
+    if (envelope.type === "runtime.prepare.progress") {
+      const event = {
+        stageIndex: payload.stageIndex,
+        layerStart: payload.layerStart,
+        layerEnd: payload.layerEnd,
+        state: payload.state,
+        ...(typeof payload.packageId === "string" ? { packageId: payload.packageId } : {}),
+        ...(typeof payload.weightsSizeBytes === "number"
+          ? { weightsSizeBytes: payload.weightsSizeBytes }
+          : {}),
+      };
+      if (
+        typeof event.stageIndex === "number"
+        && typeof event.layerStart === "number"
+        && typeof event.layerEnd === "number"
+        && (event.state === "preparing" || event.state === "ready")
+      ) {
+        for (const listener of this.preparationListeners) listener(
+          event as RuntimePreparationProgressEvent,
+        );
+      }
+      return;
+    }
     if (envelope.type === "runtime.prepared") {
       const preparation = this.preparations.get(requestId);
       if (!preparation) return;

@@ -11,7 +11,10 @@ import {
   DynamicModelActivationManager,
 } from "./model-activation-manager.js";
 import { createCoordinator } from "./server.js";
+import { readNativeRuntimeBuildMetadata } from "../core/native-build-identity.js";
 
+const runtimeRoot = resolve(import.meta.dirname, "../..");
+const runtimeMetadata = readNativeRuntimeBuildMetadata(runtimeRoot);
 const config = loadCoordinatorConfig();
 const activationConfigPath = process.env.MYCELLIOS_AUTO_DISTRIBUTE_CONFIG?.trim();
 const dynamicWorkerActivation = process.env.MYCELLIOS_DYNAMIC_WORKER_ACTIVATION?.trim() === "1";
@@ -22,18 +25,29 @@ const baseActivationConfig = absoluteActivationConfigPath
   ? parseAutoDistributionConfig(JSON.parse(await readFile(absoluteActivationConfigPath, "utf8")) as unknown)
   : undefined;
 const activationManager = baseActivationConfig && !dynamicWorkerActivation
-  ? new AutomaticModelActivationManager(baseActivationConfig)
+  ? new AutomaticModelActivationManager(
+      baseActivationConfig,
+      runtimeRoot,
+      process.env,
+    )
   : undefined;
 const runtime = await createCoordinator(config, {
   logger: true,
+  runtimeMetadata,
   ...(activationManager ? { activationManager } : {}),
   ...(baseActivationConfig && dynamicWorkerActivation
     ? {
-        activationManagerFactory: ({ store, hub }) => new DynamicModelActivationManager({
+        activationManagerFactory: ({ store, hub, deploymentController }) => new DynamicModelActivationManager({
+          cwd: runtimeRoot,
+          workerAgentVersion: runtimeMetadata.version,
+          ...(runtimeMetadata.buildIdentity
+            ? { workerBuildIdentity: runtimeMetadata.buildIdentity }
+            : {}),
           snapshot: () => buildConnectedExecutorActivationSnapshot(
             baseActivationConfig,
             store.listWorkers(),
             hub.connectedWorkerIds(),
+            hub.runtimeLinkObservations(),
           ),
           resolveManagedAgent: (nodeId, launch) => resolveConnectedExecutorAgent(
             store.listWorkers(),
@@ -43,7 +57,32 @@ const runtime = await createCoordinator(config, {
             launch,
           ),
           loadProgress: (modelId) => store.listActivationEvents(modelId),
-          onProgress: (modelId, event) => store.appendActivationEvent(modelId, event),
+          onProgress: (modelId, event) => {
+            store.appendActivationEvent(modelId, event);
+            if (event.phase === "running_canary") {
+              const operation = deploymentController.activeOperationForModel(modelId);
+              if (operation) deploymentController.markCanary(operation.id);
+            }
+          },
+          onPlanPrepared: (modelId, stages) => {
+            const operation = deploymentController.activeOperationForModel(modelId);
+            if (!operation) throw new Error(`deployment_operation_missing:${modelId}`);
+            return deploymentController.prepareRoute(operation.id, stages).id;
+          },
+          onActivated: (modelId, reservationId, result) => {
+            const canary = {
+              passed: true,
+              text: result.canaryText,
+              ...result.canaryMetrics,
+              workerId: result.workerId,
+            };
+            if (reservationId) {
+              deploymentController.commitRoute(reservationId, canary);
+              return;
+            }
+            const operation = deploymentController.activeOperationForModel(modelId);
+            if (operation) deploymentController.completeOperation(operation.id, "active", { canary });
+          },
         }),
       }
     : {}),

@@ -1,5 +1,6 @@
 {
   "region": "es-mad",
+  "capacityScope": "host",
   "offeredVramMb": 4096,
   "limits": {
     "maxConcurrency": 1,
@@ -8,17 +9,10 @@
     "pauseWhenForeground": true
   },
   "adapter": {
-    "kind": "mock",
-    "model": "distributed-small",
-    "tokensPerSecond": 20,
-    "ttftMs": 150,
-    "failureRate": 0
+    "kind": "mycellios-native",
+    "model": "mycellios-native-control"
   },
   "deployment": {
-    "modelDigest": "sha256:mock-distributed-small-v1",
-    "peakVramMb": 3000,
-    "contextLimit": 8192,
-    "tokensPerSecond": 20,
-    "ttftMs": 150
+    "contextLimit": 8192
   }
 }

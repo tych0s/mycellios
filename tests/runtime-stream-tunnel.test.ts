@@ -30,7 +30,20 @@ describe("RuntimeStreamTunnel", () => {
       const target = sender === "root-node" ? right : left;
       const value = payload as Record<string, unknown>;
       const message = type === "runtime.stream.open"
-        ? { type, payload: { streamId: value.streamId, targetPort: value.targetPort } }
+        ? {
+            type,
+            payload: {
+              streamId: value.streamId,
+              targetPort: value.targetPort,
+              ...(typeof value.generation === "number"
+                && typeof value.recoveryToken === "string"
+                ? {
+                    generation: value.generation,
+                    recoveryToken: value.recoveryToken,
+                  }
+                : {}),
+            },
+          }
         : { type, payload };
       queueMicrotask(() => void target.handle(message as RuntimeStreamServerMessage));
     };
@@ -56,7 +69,9 @@ describe("RuntimeStreamTunnel", () => {
 
   it("rejects coordinator stream requests for ports outside the prepared runtime", async () => {
     const sent: Array<{ type: string; payload: unknown }> = [];
-    const tunnel = new RuntimeStreamTunnel("root-node", (type, payload) => sent.push({ type, payload }));
+    const tunnel = new RuntimeStreamTunnel("root-node", (type, payload) => {
+      sent.push({ type, payload });
+    });
     cleanup.push(() => tunnel.close());
     await tunnel.prepare(launchDescription(19_850));
     await tunnel.handle({
@@ -67,6 +82,113 @@ describe("RuntimeStreamTunnel", () => {
       type: "runtime.stream.error",
       payload: { streamId: "unauthorized", message: "runtime_stream_target_is_not_authorized:22" },
     });
+  });
+
+  it("fails closed before its replay buffer can exceed the configured memory ceiling", async () => {
+    const sent: Array<{ type: string; payload: Record<string, unknown> }> = [];
+    const tunnel = new RuntimeStreamTunnel(
+      "root-node",
+      (type, payload) => {
+        sent.push({ type, payload: payload as Record<string, unknown> });
+        return true;
+      },
+      { maxReplayBytes: 96 * 1024 },
+    );
+    cleanup.push(() => tunnel.close());
+    const description = launchDescription(19_850);
+    await tunnel.prepare(description);
+    const root = description.launchOrder.find((process) => process.kind === "root-engine")!;
+    const rewritten = tunnel.rewriteProcess(root);
+    const socket = connect({
+      host: "127.0.0.1",
+      port: Number(flag(rewritten.command.args, "--first-stage-port")),
+    });
+    socket.on("error", () => undefined);
+    cleanup.push(() => closeSocket(socket));
+    await onceConnected(socket);
+    await waitUntil(() => sent.some((message) => message.type === "runtime.stream.open"));
+    const opened = sent.find((message) => message.type === "runtime.stream.open")!;
+    await tunnel.handle({
+      type: "runtime.stream.opened",
+      payload: {
+        streamId: opened.payload.streamId as string,
+        generation: opened.payload.generation as number,
+        recoveryToken: opened.payload.recoveryToken as string,
+      },
+    });
+
+    // Two 48 KiB chunks fill the exact ceiling. The third byte range must
+    // terminate the stream; it can never become an untracked in-memory tail.
+    socket.write(Buffer.alloc(96 * 1024 + 1, 7));
+    await waitUntil(() => sent.some((message) =>
+      message.type === "runtime.stream.error"
+      && message.payload.message === "runtime_stream_replay_buffer_exceeded"
+    ));
+    expect(tunnel.recoverySnapshot()).toEqual([]);
+  });
+
+  it("acknowledges a duplicate idempotently and rejects a forward offset gap", async () => {
+    const received: Buffer[] = [];
+    const target = createServer((socket) => {
+      socket.on("data", (data) => received.push(Buffer.from(data)));
+    });
+    await listen(target);
+    cleanup.push(() => closeServer(target));
+    const targetPort = (target.address() as AddressInfo).port;
+    const sent: Array<{ type: string; payload: Record<string, unknown> }> = [];
+    const tunnel = new RuntimeStreamTunnel("stage-node", (type, payload) => {
+      sent.push({ type, payload: payload as Record<string, unknown> });
+      return true;
+    });
+    cleanup.push(() => tunnel.close());
+    await tunnel.prepare(launchDescription(targetPort));
+    const recoveryToken = "recovery_token_0123456789";
+    await tunnel.handle({
+      type: "runtime.stream.open",
+      payload: {
+        streamId: "recoverable-incoming",
+        targetPort,
+        generation: 0,
+        recoveryToken,
+      },
+    });
+    const data = Buffer.from("one").toString("base64");
+    const chunk: RuntimeStreamServerMessage = {
+      type: "runtime.stream.data",
+      payload: {
+        streamId: "recoverable-incoming",
+        generation: 0,
+        recoveryToken,
+        sequence: 0,
+        offset: 0,
+        data,
+      },
+    };
+    await tunnel.handle(chunk);
+    await waitUntil(() => Buffer.concat(received).toString("utf8") === "one");
+    await tunnel.handle(chunk);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(Buffer.concat(received).toString("utf8")).toBe("one");
+    expect(sent.filter((message) =>
+      message.type === "runtime.stream.ack"
+      && message.payload.acknowledgedOffset === 3
+    )).toHaveLength(2);
+
+    await tunnel.handle({
+      type: "runtime.stream.data",
+      payload: {
+        ...chunk.payload,
+        sequence: 1,
+        offset: 7,
+      },
+    });
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: "runtime.stream.error",
+      payload: expect.objectContaining({
+        message: "runtime_stream_offset_mismatch:3:7",
+      }),
+    }));
+    expect(tunnel.recoverySnapshot()).toEqual([]);
   });
 });
 
@@ -158,4 +280,12 @@ function readOnce(socket: Socket): Promise<Buffer> {
     socket.once("data", resolve);
     socket.once("error", reject);
   });
+}
+
+async function waitUntil(check: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!check()) {
+    if (Date.now() >= deadline) throw new Error("condition_not_met");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }

@@ -142,7 +142,12 @@ class CompatibilityNotCertifiedError(ValueError):
 
 
 class ExecutorCompatibilityRegistry:
-    """Fail-closed registry keyed by the complete physical execution tuple."""
+    """Fail-closed registry keyed by the complete physical execution tuple.
+
+    Adapter-registry membership is only a software contract. Evidence levels
+    are accepted exactly as recorded here: contract, unit and loopback results
+    can never satisfy a ``hardware-physical`` requirement.
+    """
 
     def __init__(self, certifications: Iterable[ExecutorCertification] = ()) -> None:
         self._by_key: dict[ExecutorCompatibilityKey, list[ExecutorCertification]] = {}

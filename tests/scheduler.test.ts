@@ -73,59 +73,6 @@ describe("multi-objective scheduler", () => {
     expect(route?.affinityHit).toBe(true);
   });
 
-  it("uses llmfit whole-model fit as a soft replica ranking signal", () => {
-    const marginal = addWorker(store, {
-      id: "marginal",
-      tokensPerSecond: 20,
-      llmfit: { fitLevel: "Marginal", bestQuant: "Q4_K_M" },
-    });
-    const perfect = addWorker(store, {
-      id: "perfect",
-      tokensPerSecond: 20,
-      llmfit: { fitLevel: "Perfect", bestQuant: "Q8_0" },
-    });
-    const route = scheduler.selectRoute(request, "llmfit-ranking", {
-      connectedWorkerIds: new Set([marginal.id, perfect.id]),
-    });
-    expect(route?.stages[0]?.workerId).toBe(perfect.id);
-    expect(route!.score).toBeLessThan(
-      scheduler.scoreWorker(marginal, marginal.capabilities.deployments[0]!, request),
-    );
-  });
-
-  it("summarizes linked llmfit advice in the application model catalog", () => {
-    const measured = addWorker(store, {
-      id: "measured",
-      llmfit: {
-        fitLevel: "Good",
-        bestQuant: "Q5_K_M",
-        estimatedTokensPerSecond: 30,
-        measuredTokensPerSecond: 24,
-        memoryRequiredMb: 5_900,
-      },
-    });
-    const perfect = addWorker(store, {
-      id: "catalog-perfect",
-      llmfit: {
-        fitLevel: "Perfect",
-        bestQuant: "Q8_0",
-        estimatedTokensPerSecond: 40,
-        memoryRequiredMb: 7_000,
-      },
-    });
-    const models = scheduler.listAvailableModels({
-      connectedWorkerIds: new Set([measured.id, perfect.id]),
-    });
-    expect(models[0]?.llmfit).toEqual({
-      advisedReplicas: 2,
-      bestFit: "Perfect",
-      quantizations: ["Q5_K_M", "Q8_0"],
-      maxEstimatedTokensPerSecond: 40,
-      maxMeasuredTokensPerSecond: 24,
-      minMemoryRequiredMb: 5_900,
-    });
-  });
-
   it("reports a distributed cell as a pipeline instead of a whole-model replica", () => {
     const cell = addWorker(store, {
       id: "distributed-cell",
@@ -234,7 +181,6 @@ describe("multi-objective scheduler", () => {
         mode: "pipeline",
         offeredVramMb: 12_288,
         peakVramMb: 7_000,
-        ...(index === 0 ? { llmfit: { fitLevel: "Too Tight" } } : {}),
         stage: { index, total: 3, layerStart: index * 10, layerEnd: index * 10 + 9 },
       }),
     );
@@ -246,6 +192,101 @@ describe("multi-objective scheduler", () => {
     expect(route?.routeClass).toBe("pipeline");
     expect(route?.stages).toHaveLength(3);
     expect(new Set(route?.stages.map((stage) => stage.workerId)).size).toBe(3);
+  });
+
+  it("fails closed for a physical pipeline until every forward and return link is measured", () => {
+    const observations = [
+      measuredLink("node-0", "node-1", 14, 800),
+      measuredLink("node-1", "node-2", 18, 700),
+    ];
+    scheduler = new Scheduler(store, {
+      runtimeLinkObservations: () => observations,
+      strictRuntimeLinks: true,
+    });
+    const workers = [0, 1, 2].map((index) =>
+      addWorker(store, {
+        id: `measured-stage-${index}`,
+        model: "measured-model",
+        mode: "pipeline",
+        stage: { index, total: 3, layerStart: index * 10, layerEnd: index * 10 + 10 },
+        distributedExecutor: {
+          protocol: "gdlp-worker-tunnel/2",
+          nodeId: `node-${index}`,
+          stageHost: `node-${index}.relay`,
+          stagePort: 43_100 + index,
+          runtime: "python-safetensors",
+          computeMode: "gpu-only",
+          cpuEligible: false,
+        },
+      }),
+    );
+    const routeInput = { ...request, model: "measured-model" };
+    const options = {
+      connectedWorkerIds: new Set(workers.map((worker) => worker.id)),
+      allowPipeline: true,
+    };
+
+    expect(scheduler.selectRoute(routeInput, "missing-return", options)).toBeNull();
+    observations.push(measuredLink("node-2", "node-0", 16, 750));
+    expect(scheduler.selectRoute(routeInput, "complete-cycle", options)?.stages).toHaveLength(3);
+  });
+
+  it("routes interactive and batch traffic with different latency objectives", () => {
+    const lowTtft = addWorker(store, {
+      id: "low-ttft",
+      ttftMs: 100,
+      tokensPerSecond: 10,
+    });
+    const highThroughput = addWorker(store, {
+      id: "high-throughput",
+      ttftMs: 5_000,
+      tokensPerSecond: 100,
+    });
+    const connectedWorkerIds = new Set([lowTtft.id, highThroughput.id]);
+
+    expect(scheduler.selectRoute(
+      { ...request, workload_class: "interactive" },
+      "interactive-objective",
+      { connectedWorkerIds },
+    )?.stages[0]?.workerId).toBe(lowTtft.id);
+    expect(scheduler.selectRoute(
+      { ...request, workload_class: "batch" },
+      "throughput-objective",
+      { connectedWorkerIds },
+    )?.stages[0]?.workerId).toBe(highThroughput.id);
+  });
+
+  it("drops KV affinity when its route is saturated and a free route exists", () => {
+    const pinned = addWorker(store, {
+      id: "affinity-saturated",
+      maxConcurrency: 4,
+      tokensPerSecond: 50,
+    });
+    const available = addWorker(store, {
+      id: "affinity-free",
+      maxConcurrency: 4,
+      tokensPerSecond: 20,
+    });
+    const pinnedRoute = scheduler.selectRoute(request, "saturation-session", {
+      connectedWorkerIds: new Set([pinned.id]),
+    })!;
+    store.saveSession("saturation-session", request.model, pinnedRoute);
+    for (let index = 0; index < 3; index += 1) {
+      const job = store.createJob({
+        id: `saturated-${index}`,
+        sessionId: `saturated-session-${index}`,
+        model: request.model,
+        workloadClass: "interactive",
+        deadlineAt: Date.now() + 60_000,
+      });
+      store.setJobRoute(job.id, pinnedRoute, `lease-${index}`);
+    }
+
+    const selected = scheduler.selectRoute(request, "saturation-session", {
+      connectedWorkerIds: new Set([pinned.id, available.id]),
+    });
+    expect(selected?.stages[0]?.workerId).toBe(available.id);
+    expect(selected?.affinityHit).toBe(false);
   });
 
   it("does not select stale or disconnected workers", () => {
@@ -268,3 +309,22 @@ describe("multi-objective scheduler", () => {
     expect(route).toBeNull();
   });
 });
+
+function measuredLink(
+  fromNodeId: string,
+  toNodeId: string,
+  rttP95Ms: number,
+  goodputMbpsP50: number,
+) {
+  return {
+    fromNodeId,
+    toNodeId,
+    measuredAt: Date.now(),
+    rttP50Ms: rttP95Ms * 0.75,
+    rttP95Ms,
+    goodputMbpsP50,
+    successfulSamples: 7,
+    failedSamples: 0,
+    availability: 1,
+  };
+}

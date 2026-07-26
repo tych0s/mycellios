@@ -9,12 +9,14 @@ import type {
   RequestModelInput,
   SupportAssistantAdminSettings,
   SupportAssistantChatRequest,
+  WorkerCredentialSummary,
 } from "./contracts.js";
 
 let chatStreamSequence = 0;
 
 const bridge: DesktopBridge = Object.freeze({
   getSnapshot: () => ipcRenderer.invoke("dashboard:read"),
+  getSystemLogs: () => ipcRenderer.invoke("logs:read"),
   saveSettings: (settings: DesktopSettings) => ipcRenderer.invoke("settings:save", settings),
   setContribution: (enabled: boolean) => ipcRenderer.invoke("contribution:set", enabled),
   sendChat: (request: ChatRequest) => ipcRenderer.invoke("chat:send", request),
@@ -53,6 +55,13 @@ const bridge: DesktopBridge = Object.freeze({
   ) => ipcRenderer.invoke("assistant:admin:save", assistantSettings, adminToken),
   removeWorker: (workerId: string) => ipcRenderer.invoke("workers:remove", workerId),
   clearOfflineWorkers: () => ipcRenderer.invoke("workers:clear-offline"),
+  listWorkerCredentials: (adminToken?: string) =>
+    ipcRenderer.invoke("workers:credentials:list", adminToken),
+  revokeWorkerCredential: (
+    credential: Pick<WorkerCredentialSummary, "identityKind" | "identityId" | "fingerprint">,
+    reason: string,
+    adminToken?: string,
+  ) => ipcRenderer.invoke("workers:credentials:revoke", credential, reason, adminToken),
   searchHubModels: (input: HubCatalogSearchInput) => ipcRenderer.invoke("models:search-hub", input),
   requestModel: (input: RequestModelInput, adminToken?: string) => ipcRenderer.invoke("models:request", input, adminToken),
   removeRequestedModel: (modelId: string, adminToken?: string) => ipcRenderer.invoke("models:remove-request", modelId, adminToken),

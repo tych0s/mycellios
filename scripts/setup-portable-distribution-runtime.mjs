@@ -30,6 +30,11 @@ import {
   assertNoEscapingSymlinks,
   normalizeCopiedInternalAbsoluteSymlinks,
 } from "./portable-runtime-filesystem.mjs";
+import {
+  portableRuntimeOfflineRequirements,
+  readPortableRuntimeWheelLock,
+  verifyPortableRuntimeWheelhouse,
+} from "./portable-runtime-wheel-lock.mjs";
 
 const workspace = resolve(import.meta.dirname, "..");
 const runtimeDirectory = resolve(workspace, "runtime");
@@ -52,6 +57,8 @@ if (!spec.supported) {
   process.exit(0);
 }
 
+const wheelLock = readPortableRuntimeWheelLock(workspace, spec);
+const wheelLockPath = resolve(workspace, ...wheelLock.path.split("/"));
 const suppliedArchive = readArgument("python-archive");
 const verifyArtifactOnly = process.argv.includes("--verify-python-artifact-only");
 const temporary = mkdtempSync(join(tmpdir(), "mycellios-python-standalone-"));
@@ -74,13 +81,27 @@ try {
     );
     process.exitCode = 0;
   } else {
+    const wheelhouse = join(temporary, "wheelhouse");
+    const offlineRequirements = join(temporary, "offline-requirements.txt");
+    await downloadWheelClosure(
+      extractedPython,
+      wheelLockPath,
+      wheelhouse,
+      wheelLock,
+    );
+    writeFileSync(
+      offlineRequirements,
+      portableRuntimeOfflineRequirements(wheelLock),
+      "utf8",
+    );
+
     mkdirSync(runtimeDirectory, { recursive: true });
     rmSync(standalone, { recursive: true, force: true });
     moveDirectory(extracted, standalone);
     writeProvenance(standalone, spec);
 
     const standalonePython = join(standalone, ...spec.pythonExecutable.split("/"));
-    installPackages(standalonePython);
+    installPackages(standalonePython, wheelhouse, offlineRequirements);
     const verification = verifyInstalledRuntime(standalonePython);
     process.stdout.write(
       `Platform runtime ready: Python ${verification.pythonVersion}, ${verification.torchVersion} ` +
@@ -201,32 +222,54 @@ function writeProvenance(root, runtimeSpec) {
   );
 }
 
-function installPackages(python) {
+async function downloadWheelClosure(python, lockPath, wheelhouse, lock) {
+  mkdirSync(wheelhouse, { recursive: true });
+  const pipEnvironment = sealedPipEnvironment();
+  run(python, [
+    "-m", "pip", "download",
+    "--isolated",
+    "--disable-pip-version-check",
+    "--no-input",
+    "--no-index",
+    "--only-binary=:all:",
+    "--no-deps",
+    "--require-hashes",
+    "--dest", wheelhouse,
+    "--requirement", lockPath,
+  ], pipEnvironment);
+  await verifyPortableRuntimeWheelhouse(wheelhouse, lock);
+}
+
+function installPackages(python, wheelhouse, offlineRequirements) {
+  const pipEnvironment = sealedPipEnvironment();
+  run(python, [
+    "-m", "pip", "install",
+    "--isolated",
+    "--disable-pip-version-check",
+    "--no-input",
+    "--no-index",
+    "--only-binary=:all:",
+    "--no-deps",
+    "--require-hashes",
+    "--find-links", wheelhouse,
+    "--requirement", offlineRequirements,
+  ], pipEnvironment);
+  run(python, [
+    "-m", "pip", "check",
+    "--isolated",
+    "--disable-pip-version-check",
+  ], pipEnvironment);
+}
+
+function sealedPipEnvironment() {
   const pipEnvironment = {
     ...process.env,
     PIP_DISABLE_PIP_VERSION_CHECK: "1",
     PIP_NO_INPUT: "1",
+    PIP_NO_INDEX: "1",
     PYTHONNOUSERSITE: "1",
   };
-  run(python, [
-    "-m", "pip", "install",
-    "--isolated",
-    "--disable-pip-version-check",
-    "--no-input",
-    "--only-binary=:all:",
-    "--index-url", spec.torchIndex,
-    spec.torchRequirement,
-  ], pipEnvironment);
-  run(python, [
-    "-m", "pip", "install",
-    "--isolated",
-    "--disable-pip-version-check",
-    "--no-input",
-    "--only-binary=:all:",
-    "--index-url", "https://pypi.org/simple",
-    ...Object.entries(spec.packageVersions).map(([name, version]) => `${name}==${version}`),
-  ], pipEnvironment);
-  run(python, ["-m", "pip", "check"], pipEnvironment);
+  return pipEnvironment;
 }
 
 function verifyInstalledRuntime(python) {

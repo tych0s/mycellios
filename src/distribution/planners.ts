@@ -6,6 +6,7 @@ import {
   stageMemoryBytes,
 } from "./cost-model.js";
 import { activationCodec } from "./codecs.js";
+import { UNMEASURED_RTT_MS } from "../core/rtt.js";
 import type {
   ActivationCodecId,
   ComputeNodeProfile,
@@ -279,6 +280,84 @@ const DEFAULT_FLEET_OPTIONS: FleetPlannerOptions = {
  * most promising latency cells. The actual route is still optimized by the
  * same exact cost model as TopologyBeamPlanner.
  */
+/**
+ * Drop nodes whose network position is catastrophically worse than the fleet's.
+ *
+ * Measured on the real fleet (Exp15, `docs/benchmarks/gpu_cloud-exp15-mapa-latencia-2026-07-25/`):
+ * the best node sat at 54 ms and the worst at 437 ms, and a single far node is
+ * enough to drag a four-hop chain from ~3.1 tok/s down to ~0.55. Since the cost
+ * model sums latency along the route, one outlier taxes every token that crosses
+ * it — so the cheapest possible win is simply not routing through it.
+ *
+ * The rule is relative, not absolute: a threshold in milliseconds would be wrong
+ * for a LAN cell and wrong again for an intercontinental swarm. A node is evicted
+ * when its median link is `multiple` times worse than the fleet median.
+ *
+ * Two guards, both learned from peer runtime doing this in production:
+ *  - Never evict below `minimumNodes`. A planner with nothing left to place is
+ *    worse than a slow route.
+ *  - If the rule wants to drop (nearly) everyone, the outlier is the measurement,
+ *    not the fleet. peer runtime words it as "if I banned them all, the problem is me".
+ */
+export function evictFarNodes(
+  topology: DistributionTopology,
+  options: { multiple?: number; minimumNodes?: number } = {},
+): { topology: DistributionTopology; evicted: string[] } {
+  const multiple = options.multiple ?? 3;
+  const minimumNodes = options.minimumNodes ?? 2;
+  if (topology.nodes.length <= minimumNodes) return { topology, evicted: [] };
+
+  const latencies = new Map<string, number[]>();
+  for (const link of topology.links) {
+    if (!Number.isFinite(link.oneWayLatencyMs) || link.oneWayLatencyMs <= 0) continue;
+    for (const id of [link.from, link.to]) {
+      const bucket = latencies.get(id);
+      if (bucket) bucket.push(link.oneWayLatencyMs);
+      else latencies.set(id, [link.oneWayLatencyMs]);
+    }
+  }
+  const nodeMedians = new Map<string, number>();
+  for (const [id, samples] of latencies) nodeMedians.set(id, median(samples));
+  // Nodes without a single measured link are NOT evicted: unmeasured is not the
+  // same as slow, and punishing it would make the fleet shrink as instrumentation
+  // lags behind. They are simply invisible to this rule.
+  if (nodeMedians.size < 3) return { topology, evicted: [] };
+
+  const fleetMedian = median([...nodeMedians.values()]);
+  if (fleetMedian <= 0) return { topology, evicted: [] };
+  const ceiling = fleetMedian * multiple;
+
+  const candidates = [...nodeMedians.entries()]
+    .filter(([, value]) => value > ceiling)
+    .sort((left, right) => right[1] - left[1])
+    .map(([id]) => id);
+  if (candidates.length === 0) return { topology, evicted: [] };
+  if (topology.nodes.length - candidates.length < minimumNodes) {
+    // "Si los baneé a todos, el problema soy yo."
+    return { topology, evicted: [] };
+  }
+
+  const evicted = new Set(candidates);
+  return {
+    topology: {
+      nodes: topology.nodes.filter((node) => !evicted.has(node.id)),
+      links: topology.links.filter(
+        (link) => !evicted.has(link.from) && !evicted.has(link.to),
+      ),
+    },
+    evicted: candidates,
+  };
+}
+
+function median(values: number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((left, right) => left - right);
+  const middle = sorted.length >> 1;
+  return sorted.length % 2 === 1
+    ? sorted[middle]!
+    : (sorted[middle - 1]! + sorted[middle]!) / 2;
+}
+
 export class FleetTopologyPlanner implements DistributionPlanner {
   readonly id = "fleet-topology";
 
@@ -288,6 +367,32 @@ export class FleetTopologyPlanner implements DistributionPlanner {
   ) {}
 
   plan(
+    model: DistributedModelProfile,
+    fullTopology: DistributionTopology,
+    workload: DistributionWorkload,
+  ): DistributionPlan | null {
+    // Antes de gastar la búsqueda combinatoria, quitar de en medio los nodos
+    // cuya posición de red arruina cualquier ruta que los cruce.
+    const { topology, evicted } = evictFarNodes(fullTopology);
+    const pruned = this.planWithin(model, topology, workload);
+    if (pruned) return pruned;
+
+    // La poda es una heurística de LATENCIA, no una comprobación de viabilidad.
+    // `evictFarNodes` sólo se compromete a conservar dos nodos: no mira las
+    // capas del modelo, ni la memoria por nodo, ni el agregado de la flota. En
+    // una flota de más de 64 nodos —el único caso que llega hasta aquí— puede
+    // dejar un subconjunto donde el modelo ya no cabe, y entonces devolver
+    // `null` sería declarar imposible un plan que sí existe: la flota entera
+    // tenía sitio, y lo que lo quitó fue un descarte de valores atípicos.
+    //
+    // Reintentar con la topología completa cuesta una segunda búsqueda sólo en
+    // el camino donde la primera ya fracasó, así que el caso normal no paga
+    // nada. Preferir un plan lento a ningún plan.
+    if (evicted.length === 0) return null;
+    return this.planWithin(model, fullTopology, workload);
+  }
+
+  private planWithin(
     model: DistributedModelProfile,
     topology: DistributionTopology,
     workload: DistributionWorkload,
@@ -793,6 +898,11 @@ function optimisticRemainingCompute(
 
 function nodeLatencyScore(node: ComputeNodeProfile, topology: DistributionTopology): number {
   const outgoing = topology.links.filter((link) => link.from === node.id);
+  // Un nodo sin aristas salientes ya costaba el centinela. Lo que faltaba es
+  // que una arista concreta sin medir cueste lo mismo: antes, un nodo con una
+  // sola arista medida y nueve desconocidas promediaba barato y entraba en el
+  // plan. `oneWayLatencyMs` ya llega con el centinela desde `auto-distribute`,
+  // así que aquí basta con no diluirlo — el promedio lo hace por sí solo.
   const meanLink =
     outgoing.length > 0
       ? outgoing.reduce(
@@ -800,7 +910,7 @@ function nodeLatencyScore(node: ComputeNodeProfile, topology: DistributionTopolo
             total + link.oneWayLatencyMs + link.jitterP95Ms + 10 / link.bandwidthMbps,
           0,
         ) / outgoing.length
-      : 10_000;
+      : UNMEASURED_RTT_MS;
   return node.decodeScale + node.prefillScale * 0.25 + meanLink * 0.08;
 }
 

@@ -1,5 +1,9 @@
 import { canonicalEvidenceJson, sha256CanonicalEvidence } from "../core/json.js";
 import {
+  nativeBuildIdentitySchema,
+  type NativeBuildIdentity,
+} from "../contracts/build-identity.js";
+import {
   OUTPUT_TOKEN_HASH_SCHEME,
   PHYSICAL_GPU_CAMPAIGN_SCHEMA,
   type PhysicalGpuCampaignCanaryObservation,
@@ -72,7 +76,11 @@ export function buildPhysicalGpuCampaignGateReport(
 ): PhysicalTwoHostGpuGateReportV1 {
   canonicalEvidenceJson(inputValue);
   const input = validateInput(inputValue);
-  validateCampaignConsistency(input.campaign, input.launch, input.hosts);
+  const buildIdentity = validateCampaignConsistency(
+    input.campaign,
+    input.launch,
+    input.hosts,
+  );
   if (input.samplesTruncated) {
     throw new Error("physical_gpu_campaign_report_samples_are_truncated");
   }
@@ -111,7 +119,7 @@ export function buildPhysicalGpuCampaignGateReport(
     throw new Error("physical_gpu_campaign_report_reference_measurement_is_too_short");
   }
 
-  const hosts = input.hosts.map(mapHost);
+  const hosts = input.hosts.map((host) => mapHost(host, buildIdentity));
   const started = input.campaign.lifecycle.supervisorStarted!;
   const stopped = input.campaign.lifecycle.supervisorStopped!;
   const health = input.campaign.apiHealth!;
@@ -377,7 +385,7 @@ function validateCampaignConsistency(
   campaignValue: unknown,
   launch: PythonPipelineLaunchDescription,
   hosts: PhysicalGpuCampaignReportHostBinding[],
-): asserts campaignValue is PhysicalGpuCampaignObservation {
+): NativeBuildIdentity {
   const campaign = record(campaignValue, "physical_gpu_campaign_report_campaign");
   if (campaign.schema !== PHYSICAL_GPU_CAMPAIGN_SCHEMA) {
     throw new Error("physical_gpu_campaign_report_campaign_schema_is_invalid");
@@ -435,7 +443,12 @@ function validateCampaignConsistency(
   if (started.processes.length !== stopped.processes.length) {
     throw new Error("physical_gpu_campaign_report_supervisor_process_count_changed");
   }
-  validateAgentCleanup(lifecycle.agentHealthBefore, lifecycle.agentHealthAfter, launch, hosts);
+  const buildIdentity = validateAgentCleanup(
+    lifecycle.agentHealthBefore,
+    lifecycle.agentHealthAfter,
+    launch,
+    hosts,
+  );
 
   const health = record(campaign.apiHealth, "physical_gpu_campaign_report_api_health");
   if (
@@ -472,6 +485,7 @@ function validateCampaignConsistency(
       throw new Error("physical_gpu_campaign_report_campaign_has_failed_canaries");
     }
   }
+  return buildIdentity;
 }
 
 function validateReferenceCanary(
@@ -552,7 +566,10 @@ function mapSample(
   };
 }
 
-function mapHost(binding: PhysicalGpuCampaignReportHostBinding) {
+function mapHost(
+  binding: PhysicalGpuCampaignReportHostBinding,
+  buildIdentity: NativeBuildIdentity,
+) {
   const device = selectedDevice(binding);
   return {
     hostId: binding.hostId,
@@ -560,6 +577,7 @@ function mapHost(binding: PhysicalGpuCampaignReportHostBinding) {
     agentId: binding.agentId,
     agentEndpoint: binding.agentEndpoint,
     rankNodeId: binding.rankNodeId,
+    buildIdentity,
     gpu: {
       deviceFingerprintSha256: device.fingerprintSha256,
       device: binding.device,
@@ -613,11 +631,12 @@ function validateAgentCleanup(
   afterValue: unknown,
   launch: PythonPipelineLaunchDescription,
   hosts: PhysicalGpuCampaignReportHostBinding[],
-): void {
+): NativeBuildIdentity {
   if (!Array.isArray(beforeValue) || !Array.isArray(afterValue)) {
     throw new Error("physical_gpu_campaign_report_agent_health_is_invalid");
   }
   const expectedNodes = new Set(launch.launchOrder.map((process) => process.anchor.memberId));
+  const observedBuildIdentities = new Map<string, NativeBuildIdentity>();
   for (const observations of [beforeValue, afterValue]) {
     if (observations.length !== expectedNodes.size) {
       throw new Error("physical_gpu_campaign_report_agent_health_count_mismatch");
@@ -628,15 +647,19 @@ function validateAgentCleanup(
       const health = record(observation.health, "physical_gpu_campaign_report_agent_health_value");
       exactKeys(
         health,
-        ["schema", "agentId", "nodeId", "activeProcesses", "retainedTombstones"],
+        ["schema", "agentId", "nodeId", "buildIdentity", "activeProcesses", "retainedTombstones"],
         "physical_gpu_campaign_report_agent_health_value",
+      );
+      const buildIdentity = nativeBuildIdentitySchema.safeParse(
+        health.buildIdentity,
       );
       if (
         observation.passed !== true ||
         observation.error !== null ||
         typeof observation.expectedNodeId !== "string" ||
         typeof observation.expectedAgentId !== "string" ||
-        health.schema !== "gdlp-launch-agent-health/2" ||
+        health.schema !== "gdlp-launch-agent-health/3" ||
+        !buildIdentity.success ||
         health.agentId !== observation.expectedAgentId ||
         health.nodeId !== observation.expectedNodeId ||
         health.activeProcesses !== 0 ||
@@ -646,11 +669,18 @@ function validateAgentCleanup(
       ) {
         throw new Error("physical_gpu_campaign_report_agent_health_mismatch");
       }
+      const identityKey = canonicalEvidenceJson(buildIdentity.data);
+      observedBuildIdentities.set(identityKey, buildIdentity.data);
       observedNodes.add(observation.expectedNodeId);
     }
     if (observedNodes.size !== expectedNodes.size) {
       throw new Error("physical_gpu_campaign_report_agent_health_nodes_are_not_unique");
     }
+  }
+  if (observedBuildIdentities.size !== 1) {
+    throw new Error(
+      "physical_gpu_campaign_report_agent_build_cohort_mismatch",
+    );
   }
   for (const host of hosts) {
     const matching = afterValue.filter(
@@ -663,6 +693,7 @@ function validateAgentCleanup(
       throw new Error("physical_gpu_campaign_report_host_agent_binding_mismatch");
     }
   }
+  return structuredClone([...observedBuildIdentities.values()][0]!);
 }
 
 function record(value: unknown, name: string): Record<string, any> {

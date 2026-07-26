@@ -14,6 +14,8 @@ import {
   assertNoEscapingSymlinks,
   samePath,
 } from "./portable-runtime-filesystem.mjs";
+import { runInstalledStageCanary } from "./installed-stage-canary.mjs";
+import { readPortableRuntimeWheelLock } from "./portable-runtime-wheel-lock.mjs";
 
 const platform = readArgument("platform") ?? process.platform;
 const arch = readArgument("arch") ?? process.arch;
@@ -21,7 +23,11 @@ const spec = portableRuntimeSpec(platform, arch);
 if (!spec.supported) throw new Error(spec.reason);
 
 const workspace = resolve(import.meta.dirname, "..");
+const wheelLock = readPortableRuntimeWheelLock(workspace, spec);
 const archive = resolve(readArgument("archive") ?? join(workspace, "build", "distribution-runtime.tar.gz"));
+const pythonSource = resolve(
+  readArgument("python-source") ?? join(workspace, "build", "python"),
+);
 if (!existsSync(archive)) throw new Error(`Portable runtime archive is missing: ${archive}.`);
 
 const entries = tar(["-tzf", archive])
@@ -50,6 +56,9 @@ if (
   manifest.pythonAbi !== "cp312" ||
   manifest.executable !== spec.pythonExecutable ||
   !matchesPinnedPythonArtifact(manifest.pythonArtifact, spec.pythonArtifact) ||
+  manifest.wheelLock?.path !== wheelLock.path ||
+  manifest.wheelLock?.sha256 !== wheelLock.sha256 ||
+  Object.keys(manifest.wheelLock ?? {}).sort().join(",") !== "path,sha256" ||
   manifest.torchVersion !== spec.torchVersion ||
   manifest.transformersVersion !== spec.packageVersions.transformers ||
   manifest.accelerateVersion !== spec.packageVersions.accelerate ||
@@ -87,7 +96,7 @@ try {
   if (!matchesPinnedPythonArtifact(extractedProvenance.artifact, spec.pythonArtifact)) {
     throw new Error("Relocated Python provenance drifted after extraction.");
   }
-  const probe = spawnSync(python, ["-c", [
+  const probe = spawnSync(python, ["-I", "-c", [
     "import accelerate,aiohttp,json,numpy,platform,safetensors,sentencepiece,struct,sys,torch,transformers",
     "mps=getattr(getattr(torch,'backends',None),'mps',None)",
     "print(json.dumps({'pythonVersion':'.'.join(map(str,sys.version_info[:3])),'machine':platform.machine(),'bits':struct.calcsize('P')*8,'prefix':sys.prefix,'basePrefix':sys.base_prefix,'torchVersion':torch.__version__,'cudaVersion':torch.version.cuda,'hipVersion':getattr(torch.version,'hip',None),'cudaAvailable':bool(torch.cuda.is_available()),'mpsBuilt':bool(mps and mps.is_built()),'packages':{'numpy':numpy.__version__,'aiohttp':aiohttp.__version__,'accelerate':accelerate.__version__,'transformers':transformers.__version__,'safetensors':safetensors.__version__,'sentencepiece':sentencepiece.__version__}},sort_keys=True))",
@@ -124,6 +133,17 @@ try {
       throw new Error(`Relocated runtime has ${name} ${runtime.packages?.[name] ?? "missing"}; expected ${version}.`);
     }
   }
+  const canary = runInstalledStageCanary({
+    pythonExecutable: python,
+    pythonSourceRoot: pythonSource,
+    expectedPythonPrefix: temporary,
+    expectedTorchVersion: spec.torchVersion,
+    expectedTransformersVersion: spec.packageVersions.transformers,
+  });
+  process.stdout.write(
+    `Installed stage canary verified: ${canary.engine}/${canary.adapter}, ` +
+      `${canary.kvBytes} KV bytes, batch ${canary.batchSize}.\n`,
+  );
 } finally {
   rmSync(temporary, { recursive: true, force: true });
 }

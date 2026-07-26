@@ -213,6 +213,22 @@ describe("MacroWave runtime contract integration", () => {
         .map((stage) => stage.macroWave)
         .concat(manifest.plans.decode.stages[0]!.macroWave),
     );
+    for (const process of launch.launchOrder) {
+      const contract = process.macroWave!;
+      expect(argumentValue(
+        process.command.args,
+        "--dense-host-ram-budget-bytes",
+      )).toBe(String(contract.budgets.hostRamBytes));
+      expect(argumentValue(
+        process.command.args,
+        "--dense-vram-budget-bytes",
+      )).toBe(String(contract.budgets.vramBytes));
+      expect(argumentValue(
+        process.command.args,
+        "--dense-activation-reserve-bytes",
+      )).toBe(String(contract.requirements.activationBufferBytes));
+      expect(process.command.args).toContain("--dense-require-full-residency");
+    }
   });
 
   it("seals budgets and compiles certified RAM-backed stages", () => {
@@ -446,3 +462,8 @@ describe("MacroWave runtime contract integration", () => {
     }
   });
 });
+
+function argumentValue(args: string[], name: string): string | undefined {
+  const index = args.indexOf(name);
+  return index < 0 ? undefined : args[index + 1];
+}

@@ -1,6 +1,5 @@
 import type {
   ChatCompletionRequest,
-  LlmfitModelAdvisory,
   ModelDeployment,
   RouteStage,
   ScheduledRoute,
@@ -9,6 +8,8 @@ import type {
 import { estimateInputTokens } from "../core/request.js";
 import { safeVramBudget } from "../core/tiers.js";
 import type { MeshStore, StoredWorker } from "../storage/store.js";
+import type { RuntimeLinkObservation } from "../coordinator/runtime-link-observations.js";
+import { deploymentMetricsFromCanaryEvidence } from "../contracts/deployment-canary.js";
 
 export interface SchedulerOptions {
   connectedWorkerIds?: ReadonlySet<string>;
@@ -21,30 +22,33 @@ export interface RoutePlanOptions extends SchedulerOptions {
   maxStandbyRoutes?: number;
 }
 
+export interface SchedulerEvidenceOptions {
+  /**
+   * Current observations for the exact worker-to-worker data path. Production
+   * enables strict mode so coordinator RTT and advertised uplink never stand
+   * in for a link that has not actually carried a probe.
+   */
+  runtimeLinkObservations?: (() => readonly RuntimeLinkObservation[]) | undefined;
+  strictRuntimeLinks?: boolean | undefined;
+}
+
 interface Candidate {
   worker: StoredWorker;
   deployment: ModelDeployment;
   score: number;
 }
 
-export interface ModelLlmfitSummary {
-  advisedReplicas: number;
-  bestFit: string;
-  quantizations: string[];
-  maxEstimatedTokensPerSecond?: number | undefined;
-  maxMeasuredTokensPerSecond?: number | undefined;
-  minMemoryRequiredMb?: number | undefined;
-}
-
 export interface AvailableModel {
   id: string;
   replicas: number;
   pipelines: number;
-  llmfit?: ModelLlmfitSummary | undefined;
 }
 
 export class Scheduler {
-  constructor(private readonly store: MeshStore) {}
+  constructor(
+    private readonly store: MeshStore,
+    private readonly evidence: SchedulerEvidenceOptions = {},
+  ) {}
 
   selectRoute(
     request: ChatCompletionRequest,
@@ -58,7 +62,11 @@ export class Scheduler {
       .filter((worker) => !options.excludeWorkerIds?.has(worker.id));
 
     const affinity = this.store.getSessionRoute(sessionId, request.model);
-    if (affinity && this.routeStillValid(affinity, request, workers)) {
+    if (
+      affinity
+      && this.routeStillValid(affinity, request, workers)
+      && !this.routeIsSaturated(affinity, workers)
+    ) {
       return { ...affinity, affinityHit: true };
     }
 
@@ -124,24 +132,20 @@ export class Scheduler {
       .filter((worker) => !options.connectedWorkerIds || options.connectedWorkerIds.has(worker.id));
     const models = new Map<
       string,
-      { replicas: number; internalPipelines: number; stages: Set<string>; llmfit: LlmfitModelAdvisory[] }
+      { replicas: number; internalPipelines: number; stages: Set<string> }
     >();
     for (const worker of workers) {
       for (const deployment of worker.capabilities.deployments) {
+        if (!this.deploymentEvidenceIsEligible(worker, deployment, now)) continue;
         if (!this.internalPipelineDependenciesConnected(deployment, workers)) continue;
         const entry = models.get(deployment.model) ?? {
           replicas: 0,
           internalPipelines: 0,
           stages: new Set<string>(),
-          llmfit: [],
         };
         if (deployment.mode === "replica") {
           if (deployment.internalPipeline) entry.internalPipelines += 1;
           else entry.replicas += 1;
-          const advisory = worker.capabilities.llmfit?.model;
-          if (advisory?.deploymentId === deployment.deploymentId) {
-            entry.llmfit.push(advisory);
-          }
         }
         if (deployment.mode === "pipeline" && deployment.stage) {
           entry.stages.add(`${deployment.model}:${deployment.stage.total}:${deployment.stage.index}`);
@@ -149,15 +153,11 @@ export class Scheduler {
         models.set(deployment.model, entry);
       }
     }
-    return [...models.entries()].map(([id, value]) => {
-      const llmfit = summarizeLlmfit(value.llmfit);
-      return {
-        id,
-        replicas: value.replicas,
-        pipelines: value.internalPipelines + this.countCompletePipelines(value.stages),
-        ...(llmfit ? { llmfit } : {}),
-      };
-    });
+    return [...models.entries()].map(([id, value]) => ({
+      id,
+      replicas: value.replicas,
+      pipelines: value.internalPipelines + this.countCompletePipelines(value.stages),
+    }));
   }
 
   scoreWorker(
@@ -175,19 +175,34 @@ export class Scheduler {
     const estimatedMs = deployment.ttftMs + generationMs;
     const deadline = request.deadline_ms ?? 120_000;
     const slaRisk = Math.min(1, estimatedMs / deadline);
-    const serviceTime = Math.min(1, estimatedMs / 120_000);
+    const workloadClass = request.workload_class ?? "interactive";
+    const interactive = workloadClass === "interactive";
+    const firstTokenRisk = Math.min(1, deployment.ttftMs / Math.max(250, deadline * 0.2));
+    const throughputServiceTime = Math.min(1, generationMs / 120_000);
+    const interactiveServiceTime = Math.min(1, estimatedMs / 120_000);
     const failure = 1 - Math.max(0, Math.min(1, worker.reliability));
     const rtt = Math.min(1, worker.capabilities.network.coordinatorRttMs / 250);
     const regionPenalty =
       request.preferred_region && request.preferred_region !== worker.capabilities.region ? 0.35 : 0;
-    const llmfitPenalty = this.llmfitReplicaPenalty(worker, deployment);
+    if (interactive) {
+      return (
+        0.3 * slaRisk
+        + 0.24 * firstTokenRisk
+        + 0.14 * interactiveServiceTime
+        + 0.18 * queueRatio
+        + 0.08 * failure
+        + 0.06 * Math.min(1, rtt + regionPenalty)
+      );
+    }
+    // Batch and benchmark traffic optimize the sustained bottleneck. TTFT is
+    // deliberately almost absent so a high-throughput route can differ from
+    // the interactive route for the same model and prompt.
     return (
-      0.4 * slaRisk +
-      0.25 * serviceTime +
-      0.15 * queueRatio +
-      0.1 * failure +
-      0.1 * Math.min(1, rtt + regionPenalty) +
-      llmfitPenalty
+      0.14 * slaRisk
+      + 0.46 * throughputServiceTime
+      + 0.26 * queueRatio
+      + 0.08 * failure
+      + 0.06 * Math.min(1, rtt + regionPenalty)
     );
   }
 
@@ -236,6 +251,7 @@ export class Scheduler {
             if (request.workload_class === "interactive" && !sameRegion) continue;
             const previous = path.stages.at(-1)!;
             const linkPenalty = this.linkPenalty(previous.worker, candidate.worker);
+            if (!Number.isFinite(linkPenalty)) continue;
             next.push({
               stages: [...path.stages, candidate],
               cost: path.cost + candidate.score + linkPenalty,
@@ -249,12 +265,17 @@ export class Scheduler {
 
       const path = paths.sort((left, right) => left.cost - right.cost)[0];
       if (!path || path.stages.length !== total) continue;
+      const returnPenalty = this.linkPenalty(
+        path.stages.at(-1)!.worker,
+        path.stages[0]!.worker,
+      );
+      if (!Number.isFinite(returnPenalty)) continue;
       const route: ScheduledRoute = {
         routeClass: "pipeline",
         model: request.model,
         region: path.region,
         stages: path.stages.map((candidate, index) => this.toRouteStage(candidate, index)),
-        score: path.cost,
+        score: path.cost + returnPenalty,
         affinityHit: false,
       };
       if (!best || route.score < best.score) best = route;
@@ -287,6 +308,7 @@ export class Scheduler {
     request: ChatCompletionRequest,
   ): boolean {
     if (worker.status !== "online" || deployment.freeSlots < 1) return false;
+    if (!this.deploymentEvidenceIsEligible(worker, deployment)) return false;
     if (estimateInputTokens(request) + (request.max_tokens ?? 256) > deployment.contextLimit) {
       return false;
     }
@@ -375,31 +397,36 @@ export class Scheduler {
     };
   }
 
-  private llmfitReplicaPenalty(
-    worker: StoredWorker,
-    deployment: ModelDeployment,
-  ): number {
-    if (deployment.mode !== "replica") return 0;
-    const advisory = worker.capabilities.llmfit?.model;
-    if (!advisory || advisory.deploymentId !== deployment.deploymentId) return 0;
-    switch (normalizedFit(advisory.fitLevel)) {
-      case "perfect":
-        return 0;
-      case "good":
-        return 0.01;
-      case "marginal":
-        return 0.06;
-      case "tootight":
-        // A live deployment remains eligible: llmfit evaluates whole-model
-        // fit and may not understand backend offload. This is only a ranking
-        // signal, never a hard rejection.
-        return 0.15;
-      default:
-        return 0;
-    }
-  }
-
   private linkPenalty(left: StoredWorker, right: StoredWorker): number {
+    const observations = this.evidence.runtimeLinkObservations?.();
+    if (observations) {
+      const leftNodeId = left.capabilities.distributedExecutor?.nodeId;
+      const rightNodeId = right.capabilities.distributedExecutor?.nodeId;
+      if (leftNodeId && rightNodeId) {
+        const observation = observations.find(
+          (candidate) =>
+            candidate.fromNodeId === leftNodeId
+            && candidate.toNodeId === rightNodeId,
+        );
+        if (
+          observation
+          && observation.successfulSamples > 0
+          && observation.availability > 0
+        ) {
+          const latencyPenalty = Math.min(1, observation.rttP95Ms / 500);
+          const bandwidthPenalty = Math.min(1, 20 / observation.goodputMbpsP50);
+          const availabilityPenalty = 1 - Math.min(1, observation.availability);
+          return (
+            0.55 * latencyPenalty
+            + 0.25 * bandwidthPenalty
+            + 0.2 * availabilityPenalty
+          );
+        }
+      }
+      if (this.evidence.strictRuntimeLinks) return Number.POSITIVE_INFINITY;
+    } else if (this.evidence.strictRuntimeLinks) {
+      return Number.POSITIVE_INFINITY;
+    }
     const regionPenalty =
       left.capabilities.region === right.capabilities.region ? 0.01 : 0.5;
     const weakestUplink = Math.min(
@@ -414,6 +441,57 @@ export class Scheduler {
         500,
     );
     return regionPenalty + 0.15 * bandwidthPenalty + 0.1 * rttPenalty;
+  }
+
+  private deploymentEvidenceIsEligible(
+    worker: StoredWorker,
+    deployment: ModelDeployment,
+    now = Date.now(),
+  ): boolean {
+    if (deployment.adapter !== "mycellios-pipeline") return true;
+    if (
+      deployment.verificationState !== "verified"
+      || deployment.throughputSource !== "measured"
+      || !deployment.activationId
+      || !deployment.canaryEvidence
+    ) {
+      return false;
+    }
+    try {
+      const metrics = deploymentMetricsFromCanaryEvidence(
+        deployment.canaryEvidence,
+        {
+          model: deployment.model,
+          modelDigest: deployment.modelDigest,
+          activationId: deployment.activationId,
+          workerId: worker.id,
+          now,
+        },
+      );
+      return metrics.tokensPerSecond === deployment.tokensPerSecond
+        && metrics.ttftMs === deployment.ttftMs;
+    } catch {
+      return false;
+    }
+  }
+
+  private routeIsSaturated(
+    route: ScheduledRoute,
+    workers: readonly StoredWorker[],
+  ): boolean {
+    const workerById = new Map(workers.map((worker) => [worker.id, worker]));
+    return route.stages.some((stage) => {
+      const worker = workerById.get(stage.workerId);
+      const deployment = worker?.capabilities.deployments.find(
+        (candidate) => candidate.deploymentId === stage.deploymentId,
+      );
+      if (!worker || !deployment) return true;
+      const capacity = Math.max(
+        1,
+        Math.min(worker.capabilities.limits.maxConcurrency, deployment.maxConcurrency),
+      );
+      return this.store.countActiveJobs(worker.id) / capacity >= 0.75;
+    });
   }
 
   private countCompletePipelines(stages: Set<string>): number {
@@ -433,52 +511,4 @@ export class Scheduler {
       return indexes.size === total;
     }).length;
   }
-}
-
-function summarizeLlmfit(advisories: LlmfitModelAdvisory[]): ModelLlmfitSummary | null {
-  if (advisories.length === 0) return null;
-  const fitOrder = new Map([
-    ["perfect", 0],
-    ["good", 1],
-    ["marginal", 2],
-    ["tootight", 3],
-  ]);
-  const best = advisories
-    .slice()
-    .sort(
-      (left, right) =>
-        (fitOrder.get(normalizedFit(left.fitLevel)) ?? 99) -
-        (fitOrder.get(normalizedFit(right.fitLevel)) ?? 99),
-    )[0]!;
-  const estimated = advisories
-    .map((advisory) => advisory.estimatedTokensPerSecond)
-    .filter((value): value is number => value !== undefined);
-  const measured = advisories
-    .map((advisory) => advisory.measuredTokensPerSecond)
-    .filter((value): value is number => value !== undefined);
-  const memory = advisories
-    .map((advisory) => advisory.memoryRequiredMb)
-    .filter((value): value is number => value !== undefined);
-  return {
-    advisedReplicas: advisories.length,
-    bestFit: best.fitLevel,
-    quantizations: [
-      ...new Set(
-        advisories
-          .map((advisory) => advisory.bestQuant)
-          .filter((value): value is string => value !== undefined),
-      ),
-    ].sort(),
-    ...(estimated.length > 0
-      ? { maxEstimatedTokensPerSecond: Math.max(...estimated) }
-      : {}),
-    ...(measured.length > 0
-      ? { maxMeasuredTokensPerSecond: Math.max(...measured) }
-      : {}),
-    ...(memory.length > 0 ? { minMemoryRequiredMb: Math.min(...memory) } : {}),
-  };
-}
-
-function normalizedFit(value: string): string {
-  return value.toLowerCase().replace(/[\s_-]+/g, "");
 }

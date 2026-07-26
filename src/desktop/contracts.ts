@@ -1,5 +1,4 @@
 export type CoordinatorMode = "local" | "remote";
-export type AdapterMode = "connectivity-test" | "local-model-runtime";
 import type {
   ChatMessage,
   ComputeMode,
@@ -8,7 +7,10 @@ import type {
   HubCatalogSearchInput,
   HubCatalogSort,
   WorkerAcceleratorDiagnostics,
+  WorkerExecutorIsolationCapability,
 } from "../contracts/types.js";
+import type { NativeBuildIdentity } from "../contracts/build-identity.js";
+import type { ActivationIncident } from "../coordinator/activation-incident.js";
 export type { ComputeMode } from "../contracts/types.js";
 export type { HubCatalogModel, HubCatalogPage, HubCatalogSearchInput, HubCatalogSort } from "../contracts/types.js";
 
@@ -23,10 +25,6 @@ export interface DesktopSettings {
   onboardingComplete: boolean;
   region: string;
   offeredVramMb: number;
-  adapterMode: AdapterMode;
-  modelName: string;
-  adapterBaseUrl: string;
-  modelDigest: string;
 }
 
 export interface DashboardGpu {
@@ -92,7 +90,9 @@ export interface DashboardWorker {
   executionNodeId?: string;
   computeMode?: ComputeMode;
   agentVersion?: string;
+  buildIdentity?: NativeBuildIdentity;
   acceleration?: WorkerAcceleratorDiagnostics;
+  isolation?: WorkerExecutorIsolationCapability;
   mobile?: {
     platform: string;
     backend: "webgpu" | "cpu";
@@ -135,6 +135,7 @@ export interface RequestedModelCapacity {
   weightBytes: number | null;
   contextTokens: number;
   message: string;
+  activationIncident: ActivationIncident | null;
   activationProgress: Array<{
     phase: string;
     message: string;
@@ -287,12 +288,14 @@ export interface DashboardSnapshot {
   capturedAt: string;
   coordinatorUrl: string;
   appVersion: string;
+  buildIdentity: NativeBuildIdentity | null;
   platform: string;
   connectionError: string | null;
   runtimeError: string | null;
   health: {
     status: string;
     version: string;
+    buildIdentity: NativeBuildIdentity | null;
     workers: { registered: number; connected: number; online: number };
   } | null;
   workers: DashboardWorker[];
@@ -385,6 +388,25 @@ export interface SupportAssistantAdminResponse {
   runtime: SupportAssistantPublicConfig;
 }
 
+export interface WorkerCredentialSummary {
+  identityKind: "device" | "cell" | "browser";
+  identityId: string;
+  fingerprint: string;
+  status: "active" | "revoked";
+  protocolVersion: number;
+  createdAt: string;
+  updatedAt: string;
+  lastSeenAt: string;
+  revokedAt: string | null;
+  revocationReason: string | null;
+}
+
+export interface WorkerCredentialRevocationResponse {
+  state: "revoked" | "already_revoked";
+  disconnected: number;
+  credential: WorkerCredentialSummary;
+}
+
 export interface SupportAssistantChatRequest {
   sessionId: string;
   messages: Array<{ role: "user" | "assistant"; content: string }>;
@@ -392,8 +414,28 @@ export interface SupportAssistantChatRequest {
   platform?: string;
 }
 
+export type SystemLogLevel = "info" | "warning" | "error";
+
+export interface SystemLogEntry {
+  id: string;
+  at: string;
+  level: SystemLogLevel;
+  source: "desktop" | "coordinator" | "worker" | "runtime" | "renderer" | "network";
+  event: string;
+  message: string;
+  details?: string;
+}
+
+export interface SystemLogSnapshot {
+  capturedAt: string;
+  entries: SystemLogEntry[];
+  truncated: boolean;
+  source: "desktop-file" | "network-snapshot";
+}
+
 export interface DesktopBridge {
   getSnapshot(): Promise<DashboardSnapshot>;
+  getSystemLogs(): Promise<SystemLogSnapshot>;
   saveSettings(settings: DesktopSettings): Promise<DashboardSnapshot>;
   setContribution(enabled: boolean): Promise<DashboardSnapshot>;
   sendChat(request: ChatRequest): Promise<ChatResponse>;
@@ -410,6 +452,12 @@ export interface DesktopBridge {
   ): Promise<SupportAssistantAdminResponse>;
   removeWorker(workerId: string): Promise<DashboardSnapshot>;
   clearOfflineWorkers(): Promise<DashboardSnapshot>;
+  listWorkerCredentials(adminToken?: string): Promise<WorkerCredentialSummary[]>;
+  revokeWorkerCredential(
+    credential: Pick<WorkerCredentialSummary, "identityKind" | "identityId" | "fingerprint">,
+    reason: string,
+    adminToken?: string,
+  ): Promise<WorkerCredentialRevocationResponse>;
   searchHubModels(input: HubCatalogSearchInput): Promise<HubCatalogPage>;
   requestModel(input: RequestModelInput, adminToken?: string): Promise<DashboardSnapshot>;
   removeRequestedModel(modelId: string, adminToken?: string): Promise<DashboardSnapshot>;

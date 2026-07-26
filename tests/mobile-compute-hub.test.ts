@@ -7,6 +7,10 @@ import WebSocket from "ws";
 import { afterEach, describe, expect, it } from "vitest";
 import type { CoordinatorRuntime } from "../src/coordinator/server.js";
 import { createCoordinator } from "../src/coordinator/server.js";
+import {
+  generateWorkerAdmissionCredential,
+  workerAdmissionSigner,
+} from "../src/worker/admission-credential.js";
 
 const runtimes: CoordinatorRuntime[] = [];
 const artifactDirectories: string[] = [];
@@ -326,6 +330,26 @@ describe("mobile compute hub", () => {
       { logger: false },
     );
     runtimes.push(runtime);
+    const signer = workerAdmissionSigner(generateWorkerAdmissionCredential());
+    const challengePayload = {
+      identity: { kind: "browser", id: "mobile-client-test" },
+      publicKey: signer.publicKey,
+      protocol: { min: 1, max: 1 },
+      registrationDigest: `sha256:${"a".repeat(64)}`,
+    };
+    const rejectedChallenge = await runtime.app.inject({
+      method: "POST",
+      url: "/mobile/v1/admission-challenge",
+      payload: challengePayload,
+    });
+    expect(rejectedChallenge.statusCode).toBe(401);
+    const acceptedChallenge = await runtime.app.inject({
+      method: "POST",
+      url: "/mobile/v1/admission-challenge",
+      payload: { ...challengePayload, joinToken: "invite-test" },
+    });
+    expect(acceptedChallenge.statusCode).toBe(200);
+
     const rejected = await runtime.app.inject({
       method: "POST",
       url: "/mobile/v1/register",

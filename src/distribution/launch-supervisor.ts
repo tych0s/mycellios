@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessByStdio } from "node:child_process";
+import { resolve } from "node:path";
 import type { Readable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import {
@@ -6,6 +7,23 @@ import {
   type PythonLaunchProcess,
   type PythonPipelineLaunchDescription,
 } from "./python-launcher.js";
+import {
+  buildIsolatedProcessEnvironment,
+  validateExecutorIsolationPolicy,
+  type ExecutorIsolationPolicyV4,
+} from "./process-environment.js";
+import {
+  createExecutorWorkspace,
+  type ExecutorWorkspaceLease,
+} from "./executor-workspace.js";
+import {
+  processTreeSpawnOptions,
+  terminateProcessTree,
+} from "./process-tree.js";
+import {
+  normalizeWindowsJobBrokerExecutable,
+  writeWindowsJobBrokerRequest,
+} from "./windows-job-broker.js";
 
 export type LaunchSupervisorState =
   | "idle"
@@ -50,9 +68,31 @@ export interface LaunchAgentStartRequest {
   process: PythonLaunchProcess;
 }
 
+export interface RuntimePreparationProgressEvent {
+  stageIndex: number;
+  layerStart: number;
+  layerEnd: number;
+  state: "preparing" | "ready";
+  packageId?: string;
+  weightsSizeBytes?: number;
+}
+
 /** Implement this interface with an RPC client to launch on a remote node. */
 export interface LaunchAgent {
   readonly id: string;
+  /**
+   * Optional worker-local model preparation. The returned processes may only
+   * replace host-local command arguments; the coordinator description remains
+   * the authorization contract sent with runtime.start.
+   */
+  prepareRuntime?(
+    description: PythonPipelineLaunchDescription,
+    nodeId: string,
+    onProgress?: (event: RuntimePreparationProgressEvent) => void,
+  ): Promise<readonly PythonLaunchProcess[]>;
+  subscribeRuntimePreparation?(
+    listener: (event: RuntimePreparationProgressEvent) => void,
+  ): () => void;
   start(request: LaunchAgentStartRequest, signal: AbortSignal): Promise<LaunchProcessHandle>;
   /** Optional coordinator-side loopback proxy for runtimes behind NAT. */
   createRuntimeProxy?(targetPort: number): Promise<{
@@ -462,6 +502,21 @@ export interface LocalProcessAgentOptions {
   id?: string;
   cwd?: string;
   env?: NodeJS.ProcessEnv;
+  /**
+   * Exact executable identities accepted by this product-facing agent.
+   * Tests of the generic process harness may omit it; every production
+   * construction site pins the prepared Mycellios Python interpreter.
+   */
+  allowedExecutables: readonly string[];
+  /** Parent directory for per-process private temporary workspaces. */
+  workspaceRoot?: string;
+  /** Hard ceiling for any sealed workspace watchdog allowance. */
+  maxWorkspaceBytes?: number;
+  /**
+   * Native Windows broker that assigns the target to a kill-on-close Job
+   * Object before resuming it. Omit on hosts without that packaged guarantee.
+   */
+  windowsJobBrokerExecutable?: string;
   maxOutputBytesPerStream?: number;
   stopGraceMs?: number;
   readyWhen?: (observation: LocalProcessReadinessObservation) => boolean;
@@ -475,14 +530,45 @@ export class LocalProcessAgent implements LaunchAgent {
   readonly id: string;
   private readonly cwd: string | undefined;
   private readonly env: NodeJS.ProcessEnv | undefined;
+  private readonly workspaceRoot: string | undefined;
+  private readonly maxWorkspaceBytes: number;
+  private readonly windowsJobBrokerExecutable: string | undefined;
+  private readonly allowedExecutables: ReadonlySet<string>;
   private readonly maxOutputBytes: number;
   private readonly stopGraceMs: number;
   private readonly readyWhen: (observation: LocalProcessReadinessObservation) => boolean;
 
-  constructor(options: LocalProcessAgentOptions = {}) {
+  constructor(options: LocalProcessAgentOptions) {
     this.id = options.id ?? "local-process";
     this.cwd = options.cwd;
     this.env = options.env;
+    this.workspaceRoot = options.workspaceRoot;
+    this.windowsJobBrokerExecutable =
+      options.windowsJobBrokerExecutable === undefined
+        ? undefined
+        : normalizeWindowsJobBrokerExecutable(
+            options.windowsJobBrokerExecutable,
+          );
+    if (
+      this.windowsJobBrokerExecutable !== undefined
+      && process.platform !== "win32"
+    ) {
+      throw new Error("windows_job_broker_is_only_supported_on_windows");
+    }
+    this.maxWorkspaceBytes = boundedInteger(
+      options.maxWorkspaceBytes ?? 4 * 1024 * 1024 * 1024,
+      64 * 1024,
+      64 * 1024 * 1024 * 1024,
+      "local_process_workspace_limit_is_invalid",
+    );
+    this.allowedExecutables = new Set(
+      options.allowedExecutables.map((value) =>
+        localExecutableIdentity(value),
+      ),
+    );
+    if (this.allowedExecutables.size === 0) {
+      throw new Error("local_process_allowed_executables_are_empty");
+    }
     this.maxOutputBytes = boundedInteger(
       options.maxOutputBytesPerStream ?? 64 * 1024,
       1_024,
@@ -503,21 +589,81 @@ export class LocalProcessAgent implements LaunchAgent {
     signal: AbortSignal,
   ): Promise<LaunchProcessHandle> {
     if (signal.aborted) throw cancellationFromSignal(signal);
+    validateExecutorIsolationPolicy(request.process.isolation);
+    if (
+      request.process.isolation.maxOutputBytesPerStream > this.maxOutputBytes
+    ) {
+      throw new Error("local_process_output_limit_exceeds_agent_ceiling");
+    }
+    if (request.process.isolation.stopGraceMs > this.stopGraceMs) {
+      throw new Error("local_process_stop_grace_exceeds_agent_ceiling");
+    }
+    if (
+      request.process.isolation.maxWorkspaceBytes > this.maxWorkspaceBytes
+    ) {
+      throw new Error("local_process_workspace_limit_exceeds_agent_ceiling");
+    }
     const command = request.process.command;
+    if (
+      !this.allowedExecutables.has(localExecutableIdentity(command.executable))
+    ) {
+      throw new Error("local_process_executable_is_not_authorized");
+    }
+    const workspace = createExecutorWorkspace({
+      launchId: request.launchId,
+      processId: request.process.processId,
+      ...(this.workspaceRoot === undefined
+        ? {}
+        : { root: this.workspaceRoot }),
+    });
     const spawnOptions = {
       shell: false,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"] as ["ignore", "pipe", "pipe"],
+      ...processTreeSpawnOptions(),
       ...(this.cwd ? { cwd: this.cwd } : {}),
-      ...(this.env ? { env: { ...process.env, ...this.env } } : {}),
+      env: buildIsolatedProcessEnvironment(
+        {
+          overrides: {
+            ...this.env,
+            TMPDIR: workspace.path,
+            TEMP: workspace.path,
+            TMP: workspace.path,
+            MYCELLIOS_EXECUTOR_WORKSPACE: workspace.path,
+          },
+        },
+      ),
     };
-    const child = spawn(command.executable, command.args, spawnOptions);
-    const handle = new LocalProcessHandle(
-      child,
-      request.process,
-      this.maxOutputBytes,
-      this.stopGraceMs,
-      this.readyWhen,
+    let localHandle: LocalProcessHandle;
+    try {
+      const brokerRequest =
+        this.windowsJobBrokerExecutable === undefined
+          ? undefined
+          : writeWindowsJobBrokerRequest(
+              workspace.path,
+              command,
+              resolveLocalWorkingDirectory(this.cwd),
+            );
+      const child = spawn(
+        this.windowsJobBrokerExecutable ?? command.executable,
+        brokerRequest === undefined ? command.args : [brokerRequest],
+        spawnOptions,
+      );
+      localHandle = new LocalProcessHandle(
+        child,
+        request.process,
+        request.process.isolation.maxOutputBytesPerStream,
+        request.process.isolation.stopGraceMs,
+        this.readyWhen,
+      );
+    } catch (error) {
+      workspace.cleanup();
+      throw error;
+    }
+    const handle = new WorkspaceBoundProcessHandle(
+      localHandle,
+      workspace,
+      request.process.isolation,
     );
     const abort = () => {
       void handle.stop("launch_aborted");
@@ -525,6 +671,88 @@ export class LocalProcessAgent implements LaunchAgent {
     signal.addEventListener("abort", abort, { once: true });
     void handle.exited.finally(() => signal.removeEventListener("abort", abort));
     return handle;
+  }
+}
+
+class WorkspaceBoundProcessHandle implements LaunchProcessHandle {
+  readonly ready: Promise<void>;
+  readonly exited: Promise<LaunchProcessExit>;
+  private readonly watchdog: NodeJS.Timeout;
+  private violation: string | null = null;
+
+  constructor(
+    private readonly inner: LocalProcessHandle,
+    workspace: ExecutorWorkspaceLease,
+    policy: ExecutorIsolationPolicyV4,
+  ) {
+    this.ready = inner.ready;
+    this.watchdog = setInterval(() => {
+      if (this.violation !== null) return;
+      try {
+        const usage = workspace.measure(policy.maxWorkspaceEntries);
+        if (usage.entryLimitExceeded) {
+          this.violation =
+            `executor_workspace_entry_limit_exceeded:${usage.entries}:${policy.maxWorkspaceEntries}`;
+        } else if (usage.bytes > policy.maxWorkspaceBytes) {
+          this.violation =
+            `executor_workspace_byte_limit_exceeded:${usage.bytes}:${policy.maxWorkspaceBytes}`;
+        }
+      } catch (error) {
+        this.violation =
+          `executor_workspace_measurement_failed:${normalizeError(error).message}`;
+      }
+      if (this.violation !== null) {
+        void this.inner.stop(this.violation).catch(() => undefined);
+      }
+    }, policy.workspaceCheckIntervalMs);
+    this.watchdog.unref?.();
+    this.exited = inner.exited.then(
+      (exit) => {
+        clearInterval(this.watchdog);
+        return cleanupWorkspace(
+          workspace,
+          this.violation === null
+            ? exit
+            : { ...exit, error: this.violation },
+        );
+      },
+      (error) => {
+        clearInterval(this.watchdog);
+        try {
+          workspace.cleanup();
+        } catch (cleanupError) {
+          throw new AggregateError(
+            [error, cleanupError],
+            "executor_workspace_cleanup_failed",
+          );
+        }
+        throw error;
+      },
+    );
+  }
+
+  async stop(reason: string): Promise<void> {
+    await this.inner.stop(reason);
+    await this.exited.then(() => undefined);
+  }
+
+  output(): LaunchCapturedOutput {
+    return this.inner.output();
+  }
+}
+
+function cleanupWorkspace(
+  workspace: ExecutorWorkspaceLease,
+  exit: LaunchProcessExit,
+): LaunchProcessExit {
+  try {
+    workspace.cleanup();
+    return exit;
+  } catch (error) {
+    return {
+      ...exit,
+      error: `executor_workspace_cleanup_failed:${normalizeError(error).message}`,
+    };
   }
 }
 
@@ -587,9 +815,11 @@ class LocalProcessHandle implements LaunchProcessHandle {
 
   private async stopInternal(): Promise<void> {
     if (this.didExit) return;
-    this.child.kill("SIGTERM");
+    await terminateProcessTree(this.child, false, this.stopGraceMs);
     if (await settlesWithin(this.exited, this.stopGraceMs)) return;
-    if (!this.didExit) this.child.kill("SIGKILL");
+    if (!this.didExit) {
+      await terminateProcessTree(this.child, true, this.stopGraceMs);
+    }
     if (!(await settlesWithin(this.exited, this.stopGraceMs))) {
       throw new Error(`local_process_did_not_exit:${this.process.processId}`);
     }
@@ -767,6 +997,23 @@ function renderExit(exit: LaunchProcessExit): string {
 
 function normalizeError(value: unknown): Error {
   return value instanceof Error ? value : new Error(String(value));
+}
+
+function localExecutableIdentity(value: string): string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value !== value.trim() ||
+    /[\0\r\n]/.test(value)
+  ) {
+    throw new Error("local_process_executable_identity_is_invalid");
+  }
+  const normalized = value.replaceAll("\\", "/");
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function resolveLocalWorkingDirectory(value: string | undefined): string {
+  return value === undefined ? process.cwd() : resolve(value);
 }
 
 function boundedInteger(value: unknown, min: number, max: number, error: string): number {

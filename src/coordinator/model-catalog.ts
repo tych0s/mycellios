@@ -1,5 +1,11 @@
 import type { StoredRequestedModel, StoredWorker } from "../storage/store.js";
 import type { HubCatalogModel, HubCatalogPage, HubCatalogSearchInput } from "../contracts/types.js";
+import {
+  MODEL_ADAPTER_EVIDENCE_SCOPE,
+  MODEL_ADAPTER_REGISTRY_ID,
+  resolveModelAdapterContract,
+} from "../contracts/model-adapter-registry.js";
+import type { ActivationIncident } from "./activation-incident.js";
 
 const MIB = 1024 * 1024;
 const MAX_SAFETENSORS_HEADER_BYTES = 64 * MIB;
@@ -50,18 +56,18 @@ export async function searchHubModelCatalog(
     const architecture = Array.isArray(config.architectures) && typeof config.architectures[0] === "string"
       ? config.architectures[0]
       : null;
-    const adapterId = certifiedAdapter(modelType, architecture);
+    const adapter = resolveModelAdapterContract(modelType, architecture);
     const gated = entry.gated !== false && entry.gated !== undefined && entry.gated !== null;
     const tags = Array.isArray(entry.tags) ? entry.tags.filter((tag): tag is string => typeof tag === "string") : [];
     const hasSafetensors = tags.includes("safetensors");
     const parameterCount = hubSafetensorsParameterCount(entry.safetensors);
-    const compatible = adapterId !== null && !gated && hasSafetensors;
+    const compatible = adapter !== null && !gated && hasSafetensors;
     const compatibilityReason = gated
       ? "Access approval is required on Hugging Face."
       : !hasSafetensors
         ? "No public Safetensors checkpoint was advertised."
-        : adapterId === null
-          ? "This architecture does not have a certified mycellios adapter yet."
+        : adapter === null
+          ? "This architecture does not have a registered native Mycellios adapter yet."
           : null;
     return [{
       id: entry.id,
@@ -72,7 +78,10 @@ export async function searchHubModelCatalog(
       pipelineTag: typeof entry.pipeline_tag === "string" ? entry.pipeline_tag : null,
       modelType,
       architecture,
-      adapterId,
+      adapterId: adapter?.id ?? null,
+      adapterContractId: adapter?.adapterContractId ?? null,
+      adapterRegistryId: MODEL_ADAPTER_REGISTRY_ID,
+      adapterEvidenceScope: MODEL_ADAPTER_EVIDENCE_SCOPE,
       compatible,
       gated,
       compatibilityReason,
@@ -129,6 +138,9 @@ export type RequestedModelStatus =
 export interface HubModelCapacityProfile {
   schema: "mycellios-hub-model-capacity/1";
   adapterId: string | null;
+  adapterContractId: string | null;
+  adapterRegistryId: string;
+  adapterEvidenceScope: typeof MODEL_ADAPTER_EVIDENCE_SCOPE;
   compatible: boolean;
   incompatibilityReason: string | null;
   architecture: string | null;
@@ -161,6 +173,7 @@ export interface RequestedModelCapacityView {
   weightBytes: number | null;
   contextTokens: number;
   message: string;
+  activationIncident: ActivationIncident | null;
   activationProgress: readonly ModelActivationProgressEvent[];
   activationRequestedAt: string | null;
   createdAt: string;
@@ -200,7 +213,7 @@ export async function inspectHubModelCapacity(
   const architecture = Array.isArray(config.architectures) && typeof config.architectures[0] === "string"
     ? config.architectures[0]
     : null;
-  const adapterId = certifiedAdapter(modelType, architecture);
+  const adapter = resolveModelAdapterContract(modelType, architecture);
   const totalLayers = positiveConfigInteger(config, "num_hidden_layers", "n_layer", "num_layers");
   const hiddenSize = positiveConfigInteger(config, "hidden_size", "n_embd", "d_model");
   const attentionHeads = positiveConfigInteger(config, "num_attention_heads", "n_head");
@@ -217,10 +230,13 @@ export async function inspectHubModelCapacity(
   );
   return {
     schema: "mycellios-hub-model-capacity/1",
-    adapterId,
-    compatible: adapterId !== null,
-    incompatibilityReason: adapterId === null
-      ? `No certified adapter for model_type=${modelType ?? "unknown"}, architecture=${architecture ?? "unknown"}`
+    adapterId: adapter?.id ?? null,
+    adapterContractId: adapter?.adapterContractId ?? null,
+    adapterRegistryId: MODEL_ADAPTER_REGISTRY_ID,
+    adapterEvidenceScope: MODEL_ADAPTER_EVIDENCE_SCOPE,
+    compatible: adapter !== null,
+    incompatibilityReason: adapter === null
+      ? `No native adapter in registry ${MODEL_ADAPTER_REGISTRY_ID} for model_type=${modelType ?? "unknown"}, architecture=${architecture ?? "unknown"}`
       : null,
     architecture,
     modelType,
@@ -244,6 +260,7 @@ export function requestedModelCapacityViews(input: {
   executionNodesForModel?: (modelId: string) => readonly ModelExecutionCapacityNode[];
   activationProgressForModel?: (modelId: string) => readonly ModelActivationProgressEvent[];
   activationStatusMessageForModel?: (modelId: string) => string | null;
+  activationIncidentForModel?: (modelId: string) => ActivationIncident | null;
   activationAvailable?: boolean;
 }): RequestedModelCapacityView[] {
   const workerCapacity = input.workers
@@ -291,7 +308,7 @@ export function requestedModelCapacityViews(input: {
       message = "Reading model metadata and calculating capacity.";
     } else if (!profile.compatible) {
       status = "incompatible";
-      message = profile.incompatibilityReason ?? "This architecture is not certified.";
+      message = profile.incompatibilityReason ?? "This architecture has no registered native adapter.";
     } else if ((missingVramMiB ?? 0) > 0 || missingNodes > 0) {
       status = "waiting_capacity";
       message = capacityMessage(missingVramMiB ?? 0, missingNodes);
@@ -322,6 +339,7 @@ export function requestedModelCapacityViews(input: {
       weightBytes: profile?.weightBytes ?? null,
       contextTokens: request.contextTokens,
       message,
+      activationIncident: input.activationIncidentForModel?.(request.id) ?? null,
       activationProgress: input.activationProgressForModel?.(request.id) ?? [],
       activationRequestedAt: request.activationRequestedAt === null
         ? null
@@ -334,16 +352,6 @@ export function requestedModelCapacityViews(input: {
 
 export function shouldQueueAutomaticActivation(view: RequestedModelCapacityView): boolean {
   return view.status === "activating" && view.autoActivate && view.activationRequestedAt === null;
-}
-
-function certifiedAdapter(modelType: string | null, architecture: string | null): string | null {
-  const key = `${modelType ?? ""}\0${architecture ?? ""}`;
-  return new Map([
-    ["llama\0LlamaForCausalLM", "transformers-llama-v1"],
-    ["qwen3\0Qwen3ForCausalLM", "transformers-qwen3-v1"],
-    ["qwen3_moe\0Qwen3MoeForCausalLM", "transformers-qwen3-moe-v1"],
-    ["glm4_moe\0Glm4MoeForCausalLM", "transformers-glm4-moe-v1"],
-  ]).get(key) ?? null;
 }
 
 async function hubSafetensorsWeightBytes(base: string, fetcher: typeof fetch): Promise<number> {
@@ -442,6 +450,28 @@ function nonNegativeNumber(value: unknown): number {
 
 function parseProfile(value: Record<string, unknown> | null): HubModelCapacityProfile | null {
   if (!value || value.schema !== "mycellios-hub-model-capacity/1") return null;
+  if (value.adapterRegistryId !== MODEL_ADAPTER_REGISTRY_ID) return null;
+  if (value.adapterEvidenceScope !== MODEL_ADAPTER_EVIDENCE_SCOPE) return null;
+  const adapter = resolveModelAdapterContract(
+    typeof value.modelType === "string" ? value.modelType : null,
+    typeof value.architecture === "string" ? value.architecture : null,
+  );
+  if (
+    value.compatible === true
+    && (
+      adapter === null
+      || value.adapterId !== adapter.id
+      || value.adapterContractId !== adapter.adapterContractId
+    )
+  ) {
+    return null;
+  }
+  if (
+    value.compatible === false
+    && (value.adapterId !== null || value.adapterContractId !== null)
+  ) {
+    return null;
+  }
   return value as unknown as HubModelCapacityProfile;
 }
 

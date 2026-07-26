@@ -4,6 +4,10 @@ import {
   sha256CanonicalEvidence,
 } from "../core/json.js";
 import {
+  nativeBuildIdentitySchema,
+  type NativeBuildIdentity,
+} from "../contracts/build-identity.js";
+import {
   validatePythonLaunchDescription,
   type PythonPipelineLaunchDescription,
   type PythonRemoteStageLaunch,
@@ -71,6 +75,8 @@ export interface PhysicalGateHostEvidenceV1 {
   agentId: string;
   agentEndpoint: string;
   rankNodeId: string;
+  /** Self-reported native release cohort, sealed into the gate report. */
+  buildIdentity: NativeBuildIdentity;
   gpu: PhysicalGateGpuEvidenceV1;
 }
 
@@ -158,6 +164,7 @@ export interface PhysicalGateMetricSummaryV1 {
 export type PhysicalGateCheckId =
   | "physical_measurement"
   | "sealed_launch"
+  | "single_build_cohort"
   | "two_distinct_hosts"
   | "two_distinct_gpus"
   | "non_loopback_route"
@@ -358,6 +365,13 @@ function deriveGate(
     !body.provenance.loopback &&
     !body.provenance.emulated;
   const sealedLaunch = body.launch.canonicalSha256 === launchHash;
+  const singleBuildCohort =
+    hosts.length === 2
+    && uniqueCount(
+      hosts.map((host) =>
+        `${host.buildIdentity.schema}\0${host.buildIdentity.version}\0${host.buildIdentity.sourceId}`
+      ),
+    ) === 1;
   const twoDistinctHosts =
     hosts.length === 2 &&
     uniqueCount(hostIds) === 2 &&
@@ -446,6 +460,11 @@ function deriveGate(
   const checks: PhysicalGateCheckV1[] = [
     result("physical_measurement", physicalMeasurement, "requires_real_non_emulated_measurement"),
     result("sealed_launch", sealedLaunch, "launch_description_hash_mismatch"),
+    result(
+      "single_build_cohort",
+      singleBuildCohort,
+      "launch_agents_do_not_declare_one_native_build_cohort",
+    ),
     result("two_distinct_hosts", twoDistinctHosts, "requires_two_distinct_host_identities"),
     result("two_distinct_gpus", twoDistinctGpus, "requires_two_distinct_physical_gpus"),
     result("non_loopback_route", nonLoopbackRoute, "route_contains_local_or_unspecified_host"),
@@ -715,7 +734,15 @@ function assertHost(value: unknown): void {
   const host = record(value, "physical_gpu_gate_host");
   exactKeys(
     host,
-    ["hostId", "hostFingerprintSha256", "agentId", "agentEndpoint", "rankNodeId", "gpu"],
+    [
+      "hostId",
+      "hostFingerprintSha256",
+      "agentId",
+      "agentEndpoint",
+      "rankNodeId",
+      "buildIdentity",
+      "gpu",
+    ],
     "physical_gpu_gate_host",
   );
   text(host.hostId, "physical_gpu_gate_host_id");
@@ -723,6 +750,9 @@ function assertHost(value: unknown): void {
   text(host.agentId, "physical_gpu_gate_agent_id");
   httpEndpoint(host.agentEndpoint, "physical_gpu_gate_agent_endpoint");
   text(host.rankNodeId, "physical_gpu_gate_rank_node_id");
+  if (!nativeBuildIdentitySchema.safeParse(host.buildIdentity).success) {
+    throw new Error("physical_gpu_gate_host_build_identity_is_invalid");
+  }
   assertGpu(host.gpu);
 }
 
@@ -945,6 +975,7 @@ function assertGate(value: unknown): void {
       [
         "physical_measurement",
         "sealed_launch",
+        "single_build_cohort",
         "two_distinct_hosts",
         "two_distinct_gpus",
         "non_loopback_route",

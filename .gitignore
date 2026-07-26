@@ -3,6 +3,14 @@ dist/
 out/
 build/distribution-runtime/
 build/distribution-runtime.tar.gz
+build/python/
+build/coordinator-release/
+build/mycellios-coordinator-output-receipt.json
+build/mycellios-*-lock-report.json
+build/validation-logs/
+build/windows-job-broker/
+native-helpers/**/bin/
+native-helpers/**/obj/
 .vite/
 landing-dist/
 mobile-dist/

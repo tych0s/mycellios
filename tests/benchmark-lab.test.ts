@@ -1,14 +1,15 @@
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { buildNativeSourceProvenance } from "../scripts/native-build-provenance.mjs";
 import {
   compareRunWithHistory,
+  createRunIdentity,
   loadBenchmarkRuns,
   saveBenchmarkRun,
   type RunIdentity,
 } from "../src/benchlab/history.js";
-import { importPhysicalCampaign } from "../src/benchlab/physical-import.js";
 import {
   buildRealBenchmarkRun,
   type ApiBenchmarkDocument,
@@ -21,6 +22,15 @@ const IDENTITY: RunIdentity = {
   gitCommit: "0123456789abcdef",
   gitBranch: "test",
   gitDirty: false,
+  build: {
+    release: "1.0.0",
+    releaseSource: "override",
+    revision: "0123456789abcdef",
+    revisionSource: "git",
+    sourceId: null,
+    sourceIdSource: "unknown",
+    participantSourceIds: [],
+  },
 };
 
 describe("benchmark lab", () => {
@@ -55,70 +65,179 @@ describe("benchmark lab", () => {
   it("persists and reloads versioned history", () => {
     const cwd = mkdtempSync(join(tmpdir(), "mycellios-benchlab-"));
     const run = realRun(IDENTITY);
+    run.measurements[0]!.networkTraces = [singleStageTrace()];
     const path = saveBenchmarkRun(cwd, run);
-    expect(JSON.parse(readFileSync(path, "utf8")).schema).toBe("mycellios-benchmark-run/1");
-    expect(loadBenchmarkRuns(cwd)).toHaveLength(1);
+    expect(JSON.parse(readFileSync(path, "utf8")).schema).toBe("mycellios-benchmark-run/3");
+    const loaded = loadBenchmarkRuns(cwd);
+    expect(loaded).toHaveLength(1);
+    expect(loaded[0]?.measurements[0]?.networkTraces?.[0]).toMatchObject({
+      jobId: "job-persisted-trace",
+      stages: [{ nodeId: "node-local", backend: "cuda" }],
+    });
   });
 
-  it("imports real campaign metrics without relabelling them as simulated", () => {
-    const observation = {
-      schema: "gdlp-physical-gpu-campaign-cli-observation/1",
-      capturedAt: "2026-07-21T08:00:00.000Z",
-      passed: true,
-      launchId: "launch-1",
-      pipelineId: "pipeline-1",
-      probes: [
-        {
-          probe: {
-            devices: [
-              { name: "NVIDIA test GPU", totalMemoryBytes: 4 * 1024 ** 3 },
-            ],
-          },
-        },
-      ],
-      campaign: {
-        passed: true,
-        apiHealth: {
-          model: "physical-model",
-          canonicalModelRevision: "revision-1",
-          codec: "fp16",
-          stages: 2,
-        },
-        samples: [
-          {
-            phase: "measure",
-            concurrency: 1,
-            passed: true,
-            promptTokens: 32,
-            completionTokens: 16,
-          },
-        ],
-        summary: {
-          byConcurrency: [
-            { concurrency: 1, aggregateOutputTokensPerSecondIncludingTtft: 12.5 },
-          ],
-          serverTtftMs: { p50: 120, p95: 180 },
-          serverTpotMs: { p50: 70, p95: 85 },
-        },
-      },
-    };
-    const config = {
-      schema: "gdlp-physical-gpu-campaign-config/1",
-      networkScope: "lan",
-      hosts: [{}, {}],
-    };
-    const run = importPhysicalCampaign(IDENTITY, observation, config);
-    expect(run.suite).toBe("physical-import");
-    expect(run.measurements[0]!.evidence).toBe("physical");
-    expect(run.measurements[0]!.inventory.profiles[0]!.label).toBe("NVIDIA test GPU");
-    expect(run.measurements[0]!.metrics.tokensPerSecond).toBe(12.5);
+  it("uses deployment release and revision without a .git directory", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "mycellios-release-"));
+    writeFileSync(join(cwd, "package.json"), JSON.stringify({ version: "0.2.19" }));
+    writeFileSync(join(cwd, "REVISION"), `${"a".repeat(40)}\n`);
+
+    const fromFile = createRunIdentity(cwd, undefined, undefined, {});
+    expect(fromFile.version).toBe("0.2.19");
+    expect(fromFile.gitCommit).toBe("a".repeat(40));
+    expect(fromFile.gitDirty).toBeNull();
+    expect(fromFile.build).toEqual({
+      release: "0.2.19",
+      releaseSource: "package",
+      revision: "a".repeat(40),
+      revisionSource: "revision-file",
+      sourceId: null,
+      sourceIdSource: "unknown",
+      participantSourceIds: [],
+    });
+
+    const fromEnvironment = createRunIdentity(cwd, undefined, undefined, {
+      MYCELLIOS_RELEASE: "0.3.0",
+      MYCELLIOS_REVISION: "b".repeat(40),
+    });
+    expect(fromEnvironment.version).toBe("0.3.0");
+    expect(fromEnvironment.gitCommit).toBe("b".repeat(40));
+    expect(fromEnvironment.build.releaseSource).toBe("environment");
+    expect(fromEnvironment.build.revisionSource).toBe("environment");
   });
+
+  it("fails closed when sealed benchmark identity is relabelled or malformed", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "mycellios-sealed-benchmark-"));
+    const provenance = buildNativeSourceProvenance(process.cwd());
+    writeFileSync(
+      join(cwd, "package.json"),
+      JSON.stringify({ version: provenance.version }),
+    );
+    writeFileSync(
+      join(cwd, "mycellios-native-build-provenance.json"),
+      JSON.stringify(provenance),
+    );
+    writeFileSync(join(cwd, "REVISION"), `${"a".repeat(40)}\n`);
+
+    expect(() =>
+      createRunIdentity(cwd, `${provenance.version}-relabeled`, undefined, {}),
+    ).toThrow("does not match runtime");
+
+    writeFileSync(join(cwd, "REVISION"), "short\n");
+    expect(() =>
+      createRunIdentity(cwd, provenance.version, undefined, {}),
+    ).toThrow("REVISION is not an exact Git identity");
+  });
+
+  it("migrates schema v1 explicitly and blocks comparisons without a model digest", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "mycellios-benchlab-v1-"));
+    const current = realRun(IDENTITY);
+    const legacy = structuredClone(current) as unknown as Record<string, unknown>;
+    legacy.schema = "mycellios-benchmark-run/1";
+    legacy.gitCommit = null;
+    legacy.gitBranch = null;
+    legacy.gitDirty = false;
+    delete legacy.build;
+    for (const measurement of legacy.measurements as Array<Record<string, unknown>>) {
+      delete measurement.scenarioFingerprint;
+      delete measurement.topology;
+      delete (measurement.model as Record<string, unknown>).digest;
+    }
+    writeFileSync(join(cwd, "legacy.json"), JSON.stringify(legacy));
+
+    const [migrated] = loadBenchmarkRuns(cwd, ".");
+    expect(migrated?.schema).toBe("mycellios-benchmark-run/3");
+    expect(migrated?.gitDirty).toBeNull();
+    expect(migrated?.measurements[0]?.model.digest).toBeNull();
+    expect(migrated?.measurements[0]?.scenarioFingerprint).toMatch(/^sha256:[0-9a-f]{64}$/);
+
+    const compared = compareRunWithHistory(current, [migrated!]);
+    expect(compared.measurements[0]?.comparison.baselineRunId).toBeNull();
+  });
+
+  it("migrates schema v2 without inventing source provenance", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "mycellios-benchlab-v2-"));
+    const previous = structuredClone(realRun(IDENTITY)) as unknown as Record<string, unknown>;
+    previous.schema = "mycellios-benchmark-run/2";
+    const build = previous.build as Record<string, unknown>;
+    delete build.sourceId;
+    delete build.sourceIdSource;
+    delete build.participantSourceIds;
+    writeFileSync(join(cwd, "previous.json"), JSON.stringify(previous));
+
+    const [migrated] = loadBenchmarkRuns(cwd, ".");
+    expect(migrated?.schema).toBe("mycellios-benchmark-run/3");
+    expect(migrated?.build).toMatchObject({
+      sourceId: null,
+      sourceIdSource: "unknown",
+      participantSourceIds: [],
+    });
+  });
+
+  it("rejects contradictory build provenance in current and previous history", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "mycellios-benchlab-invalid-build-"));
+    const current = realRun(IDENTITY);
+    current.build.sourceId = null;
+    current.build.sourceIdSource = "runtime-local";
+    writeFileSync(join(cwd, "invalid-v3.json"), JSON.stringify(current));
+    expect(loadBenchmarkRuns(cwd, ".")).toEqual([]);
+
+    const previous = structuredClone(realRun(IDENTITY)) as unknown as Record<string, unknown>;
+    previous.schema = "mycellios-benchmark-run/2";
+    const previousBuild = previous.build as Record<string, unknown>;
+    previousBuild.release = "9.9.9";
+    delete previousBuild.sourceId;
+    delete previousBuild.sourceIdSource;
+    delete previousBuild.participantSourceIds;
+    writeFileSync(join(cwd, "invalid-v2.json"), JSON.stringify(previous));
+    expect(loadBenchmarkRuns(cwd, ".")).toEqual([]);
+  });
+
 });
+
+function singleStageTrace() {
+  return {
+    schema: "mycellios-network-execution-trace/1" as const,
+    jobId: "job-persisted-trace",
+    attempt: 1,
+    observedFrom: 1_000,
+    observedUntil: 2_000,
+    durationMs: 1_000,
+    routeClass: "replica" as const,
+    affinityHit: false,
+    selectedRoute: [{
+      routeStageIndex: 0,
+      workerId: "worker-local",
+      deploymentId: "deployment-local",
+      modelDigest: "sha256:model",
+      stageIndex: 0,
+    }],
+    stages: [{
+      routeStageIndex: 0,
+      stageIndex: 0,
+      nodeId: "node-local",
+      workerId: "worker-local",
+      deploymentId: "deployment-local",
+      deploymentOwnerWorkerId: "worker-local",
+      modelDigest: "sha256:model",
+      layerStart: 0,
+      layerEnd: 28,
+      deviceType: "gpu" as const,
+      backend: "cuda" as const,
+      precision: "bf16",
+      deviceName: "GPU local",
+      startedAt: null,
+      endedAt: null,
+      durationMs: null,
+    }],
+    physicalBoundaryCount: 0,
+    boundaries: [],
+  };
+}
 
 function realRun(identity: RunIdentity) {
   const benchmark: ApiBenchmarkDocument = {
     schema_version: 2,
-    kind: "openai_api_continuous_scheduler",
+    kind: "mycellios_api_continuous_scheduler",
     configuration: {
       base_url: "http://127.0.0.1:8082",
       model: "qwen-real",

@@ -17,6 +17,7 @@ from typing import Any, Iterable
 import torch
 from transformers import AutoConfig
 
+from .device import resolve_torch_execution_device
 from .model import (
     StageModelSpec,
     StageRunner,
@@ -492,6 +493,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     runner: StageRunner | None = None
     stage_metrics: list[dict[str, Any]] = []
     shutdown_sent = False
+    emulator: LinkEmulator | None = None
     all_batches: list[dict[str, Any]] = []
     all_requests: list[dict[str, Any]] = []
     fatal_errors: list[dict[str, Any]] = []
@@ -596,7 +598,10 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         return_socket, _ = return_listener.accept()
         configure_socket(return_socket)
         return_socket.settimeout(args.socket_timeout_seconds)
-        emulator = LinkEmulator(delay_for_link(args.one_way_delay_ms, 0), args.bandwidth_mbps)
+        emulator = LinkEmulator(
+            delay_for_link(args.one_way_delay_ms, 0),
+            args.bandwidth_mbps,
+        )
 
         total_batches = args.warmups + args.iterations
         for batch_offset in range(total_batches):
@@ -626,6 +631,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
         send_frame(downstream, FrameType.SHUTDOWN, 0)
         shutdown_sent = True
+        emulator.close(timeout_seconds=args.socket_timeout_seconds)
         for process in processes:
             process.join(timeout=args.socket_timeout_seconds)
         stage_metrics.extend(drain_metrics(metrics_queue))
@@ -643,6 +649,11 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         if downstream is not None and not shutdown_sent:
             try:
                 send_frame(downstream, FrameType.SHUTDOWN, 0)
+            except BaseException:
+                pass
+        if emulator is not None:
+            try:
+                emulator.close(timeout_seconds=args.socket_timeout_seconds)
             except BaseException:
                 pass
         for sock in (return_socket, downstream, return_listener):
@@ -687,6 +698,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         2 + max(0, args.stages - 2)
     )
     total_network_bytes = counted_network_bytes + uncounted_control_bytes
+    execution_device = resolve_torch_execution_device("auto")
     result = {
         "schema_version": 1,
         "success": exact_count == len(measured_requests),
@@ -725,6 +737,18 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "torch": torch.__version__,
             "platform": platform.platform(),
             "logical_cpus": os.cpu_count(),
+            # El dispositivo que las etapas resuelven DE VERDAD, no una etiqueta.
+            # Las etapas corren con `device="auto"` (el valor por defecto de
+            # StageProcessConfig) y son procesos locales de esta misma máquina,
+            # así que resolver "auto" aquí da la misma respuesta que allí.
+            #
+            # Sin esto, quien analiza el informe tiene que deducir el hardware
+            # del nombre del fichero, y ahí es donde se cuela un resultado de CPU
+            # archivado como si fuera de GPU.
+            "device": str(execution_device.device),
+            "device_kind": execution_device.kind,
+            "device_name": execution_device.name,
+            "accelerated": execution_device.accelerated,
         },
         "reference": {
             "tokens": expected_tokens,

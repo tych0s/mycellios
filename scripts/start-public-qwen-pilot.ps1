@@ -7,16 +7,13 @@ $ErrorActionPreference = 'Stop'
 $workspace = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $runtimeDirectory = Join-Path $workspace 'runtime\public-qwen-pilot'
 $statePath = Join-Path $runtimeDirectory 'state.json'
-$python = Join-Path $workspace 'runtime\distribution-venv\Scripts\python.exe'
+$python = & (Join-Path $PSScriptRoot 'resolve-distribution-python.ps1') -WorkspacePath $workspace
 $node = (Get-Command node.exe -ErrorAction Stop).Source
 $workerConfig = Join-Path $workspace 'config\worker.public-qwen-pilot.json'
 $revision = 'c1899de289a04d12100db370d81485cdf75e47ca'
 $model = 'Qwen/Qwen3-0.6B'
 $publicModel = 'qwen3-0.6b-gdlp2-pilot'
 
-if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
-    throw 'Distribution runtime is missing. Run npm run setup:distribution-runtime first.'
-}
 if (Test-Path -LiteralPath $statePath) {
     $existing = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
     $live = @($existing.serverPid, $existing.workerPid) | Where-Object {

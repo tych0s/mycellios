@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
 import {
   LaunchCancelledError,
   LaunchProcessExitedError,
@@ -25,6 +27,7 @@ import type {
   DistributionPlan,
   DistributionWorkload,
 } from "../src/distribution/types.js";
+import { normalizeExecutorIsolationPolicy } from "../src/distribution/process-environment.js";
 
 const MIB = 1024 * 1024;
 
@@ -356,16 +359,114 @@ describe("Python launch supervisor", () => {
   it("allows constructing the local opt-in agent without starting a process", () => {
     const local = new LocalProcessAgent({
       id: "explicit-local",
+      allowedExecutables: [process.execPath],
       maxOutputBytesPerStream: 2_048,
       stopGraceMs: 10,
     });
     expect(local.id).toBe("explicit-local");
   });
 
+  it("routes an authorized Windows target through the packaged Job Object broker", async () => {
+    const broker = resolve(
+      "build",
+      "windows-job-broker",
+      "mycellios-job-broker.exe",
+    );
+    if (process.platform !== "win32" || !existsSync(broker)) return;
+    const description = fixtureDescription();
+    const launchProcess = structuredClone(
+      description.launchOrder.find((candidate) => candidate.kind === "remote-stage")!,
+    );
+    launchProcess.command = {
+      executable: process.execPath,
+      args: [
+        "-e",
+        "console.error('stage_ready');setInterval(() => undefined, 1000);",
+      ],
+    };
+    launchProcess.isolation = normalizeExecutorIsolationPolicy({
+      stopGraceMs: 1_000,
+    });
+    const local = new LocalProcessAgent({
+      id: "windows-job-local",
+      cwd: resolve("."),
+      allowedExecutables: [process.execPath],
+      windowsJobBrokerExecutable: broker,
+      stopGraceMs: 1_000,
+    });
+
+    const handle = await local.start(
+      {
+        launchId: description.launchId,
+        pipelineId: description.pipelineId,
+        nodeId: launchProcess.anchor.memberId,
+        process: launchProcess,
+      },
+      new AbortController().signal,
+    );
+    await handle.ready;
+    expect(handle.output?.().stderr).toContain("stage_ready");
+    await handle.stop("test_complete");
+    await expect(handle.exited).resolves.toMatchObject({
+      code: expect.anything(),
+    });
+  });
+
+  it("rejects a sealed process policy above the local agent ceilings", async () => {
+    const description = fixtureDescription();
+    const process = structuredClone(description.launchOrder[0]!);
+    process.isolation = normalizeExecutorIsolationPolicy({
+      maxOutputBytesPerStream: 128 * 1024,
+    });
+    const local = new LocalProcessAgent({
+      id: "bounded-local",
+      allowedExecutables: [process.command.executable],
+      maxOutputBytesPerStream: 64 * 1024,
+    });
+
+    await expect(
+      local.start(
+        {
+          launchId: description.launchId,
+          pipelineId: description.pipelineId,
+          nodeId: process.anchor.memberId,
+          process,
+        },
+        new AbortController().signal,
+      ),
+    ).rejects.toThrow("local_process_output_limit_exceeds_agent_ceiling");
+  });
+
+  it("pins the exact prepared interpreter before spawning a local process", async () => {
+    const local = new LocalProcessAgent({
+      id: "pinned-local",
+      allowedExecutables: [process.execPath],
+    });
+    const request = {
+      launchId: "pinned-launch",
+      pipelineId: "pinned-pipeline",
+      nodeId: "local-node",
+      process: {
+        processId: "pinned-process",
+        kind: "root-engine",
+        isolation: normalizeExecutorIsolationPolicy(),
+        command: {
+          executable: `${process.execPath}.untrusted`,
+          args: ["-e", "process.exit(0)"],
+        },
+      },
+    } as unknown as LaunchAgentStartRequest;
+
+    await expect(
+      local.start(request, new AbortController().signal),
+    ).rejects.toThrow("local_process_executable_is_not_authorized");
+  });
+
   it("retains a final readiness marker when bounded process output is truncated", async () => {
     const marker = "FINAL_EXECUTION_MARKER";
     const local = new LocalProcessAgent({
       id: "tail-capture-local",
+      allowedExecutables: [process.execPath],
       maxOutputBytesPerStream: 1_024,
       stopGraceMs: 1_000,
       readyWhen: ({ recentStdout }) => recentStdout.includes(marker),
@@ -377,6 +478,10 @@ describe("Python launch supervisor", () => {
       process: {
         processId: "tail-capture-process",
         kind: "root-engine",
+        isolation: normalizeExecutorIsolationPolicy({
+          maxOutputBytesPerStream: 1_024,
+          stopGraceMs: 1_000,
+        }),
         command: {
           executable: process.execPath,
           args: [
@@ -397,6 +502,149 @@ describe("Python launch supervisor", () => {
     await handle.exited;
   });
 
+  it("terminates the ordinary descendant process tree", async () => {
+    const marker = "PROCESS_TREE_READY";
+    const local = new LocalProcessAgent({
+      id: "process-tree-local",
+      allowedExecutables: [process.execPath],
+      stopGraceMs: 2_000,
+      readyWhen: ({ recentStdout }) => recentStdout.includes(marker),
+    });
+    const request = {
+      launchId: "process-tree-launch",
+      pipelineId: "process-tree-pipeline",
+      nodeId: "local-node",
+      process: {
+        processId: "process-tree-root",
+        kind: "root-engine",
+        isolation: normalizeExecutorIsolationPolicy({
+          stopGraceMs: 1_000,
+        }),
+        command: {
+          executable: process.execPath,
+          args: [
+            "-e",
+            `const { spawn } = require("node:child_process"); const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" }); process.stdout.write("${marker}:" + JSON.stringify({ root: process.pid, descendant: descendant.pid }) + "\\n"); setInterval(() => {}, 1000);`,
+          ],
+        },
+      },
+    } as unknown as LaunchAgentStartRequest;
+
+    const handle = await local.start(request, new AbortController().signal);
+    await handle.ready;
+    const output = handle.output?.().stdout ?? "";
+    const encoded = output.split(`${marker}:`)[1]?.trim();
+    const pids = JSON.parse(encoded ?? "{}") as {
+      root: number;
+      descendant: number;
+    };
+    expect(isProcessAlive(pids.root)).toBe(true);
+    expect(isProcessAlive(pids.descendant)).toBe(true);
+
+    await handle.stop("tree_test_complete");
+    await handle.exited;
+    expect(await processBecomesDead(pids.root, 3_000)).toBe(true);
+    expect(await processBecomesDead(pids.descendant, 3_000)).toBe(true);
+  }, 15_000);
+
+  it("terminates a process that exceeds its sealed private workspace quota", async () => {
+    const marker = "WORKSPACE_QUOTA_READY";
+    const local = new LocalProcessAgent({
+      id: "workspace-quota-local",
+      allowedExecutables: [process.execPath],
+      stopGraceMs: 2_000,
+      readyWhen: ({ recentStdout }) => recentStdout.includes(marker),
+    });
+    const request = {
+      launchId: "workspace-quota-launch",
+      pipelineId: "workspace-quota-pipeline",
+      nodeId: "local-node",
+      process: {
+        processId: "workspace-quota-process",
+        kind: "root-engine",
+        isolation: normalizeExecutorIsolationPolicy({
+          stopGraceMs: 1_000,
+          maxWorkspaceBytes: 64 * 1024,
+          maxWorkspaceEntries: 32,
+          workspaceCheckIntervalMs: 25,
+        }),
+        command: {
+          executable: process.execPath,
+          args: [
+            "-e",
+            `const { writeFileSync } = require("node:fs"); const { join } = require("node:path"); const workspace = process.env.MYCELLIOS_EXECUTOR_WORKSPACE; process.stdout.write("${marker}:" + workspace + "\\n"); setTimeout(() => writeFileSync(join(workspace, "quota.bin"), Buffer.alloc(128 * 1024)), 10); setInterval(() => {}, 1000);`,
+          ],
+        },
+      },
+    } as unknown as LaunchAgentStartRequest;
+
+    const handle = await local.start(request, new AbortController().signal);
+    await handle.ready;
+    const workspace = (handle.output?.().stdout ?? "")
+      .split(`${marker}:`)[1]
+      ?.trim();
+    expect(workspace).toBeTruthy();
+    const exit = await handle.exited;
+    expect(exit.error).toContain("executor_workspace_byte_limit_exceeded");
+    expect(existsSync(workspace!)).toBe(false);
+  }, 15_000);
+
+  it("does not leak an ungranted parent secret into the executor", async () => {
+    const inheritedSecretName = "MYCELLIOS_TEST_PARENT_SECRET_DO_NOT_INHERIT";
+    const previous = process.env[inheritedSecretName];
+    process.env[inheritedSecretName] = "parent-secret";
+    try {
+      const marker = "ISOLATED_ENVIRONMENT_RESULT";
+      const local = new LocalProcessAgent({
+        id: "isolated-environment-local",
+        allowedExecutables: [process.execPath],
+        env: {
+          MYCELLIOS_TEST_EXPLICIT_VALUE: "explicit-value",
+        },
+        readyWhen: ({ recentStdout }) => recentStdout.includes(marker),
+      });
+      const request = {
+        launchId: "isolated-environment-launch",
+        pipelineId: "isolated-environment-pipeline",
+        nodeId: "local-node",
+        process: {
+          processId: "isolated-environment-process",
+          kind: "root-engine",
+          isolation: normalizeExecutorIsolationPolicy(),
+          command: {
+            executable: process.execPath,
+            args: [
+            "-e",
+              `process.stdout.write("${marker}:" + JSON.stringify({ inherited: process.env.${inheritedSecretName} ?? null, explicit: process.env.MYCELLIOS_TEST_EXPLICIT_VALUE ?? null, workspace: process.env.MYCELLIOS_EXECUTOR_WORKSPACE ?? null, tempMatches: process.env.TMP === process.env.MYCELLIOS_EXECUTOR_WORKSPACE && process.env.TEMP === process.env.MYCELLIOS_EXECUTOR_WORKSPACE && process.env.TMPDIR === process.env.MYCELLIOS_EXECUTOR_WORKSPACE }) + "\\n");`,
+            ],
+          },
+        },
+      } as unknown as LaunchAgentStartRequest;
+
+      const handle = await local.start(request, new AbortController().signal);
+      await handle.ready;
+      await handle.exited;
+      const output = handle.output?.().stdout ?? "";
+      const encoded = output.split(`${marker}:`)[1]?.trim();
+      const observed = JSON.parse(encoded ?? "{}") as {
+        inherited: string | null;
+        explicit: string | null;
+        workspace: string | null;
+        tempMatches: boolean;
+      };
+      expect(observed).toMatchObject({
+        inherited: null,
+        explicit: "explicit-value",
+        tempMatches: true,
+      });
+      expect(observed.workspace).toBeTruthy();
+      expect(existsSync(observed.workspace!)).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env[inheritedSecretName];
+      else process.env[inheritedSecretName] = previous;
+    }
+  });
+
   it("stops from idle idempotently without resolving any agent", async () => {
     const description = fixtureDescription();
     const setup = harness(description);
@@ -407,6 +655,28 @@ describe("Python launch supervisor", () => {
     expect(setup.trace.stops).toEqual([]);
   });
 });
+
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid < 1) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function processBecomesDead(
+  pid: number,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(pid)) return true;
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  }
+  return !isProcessAlive(pid);
+}
 
 function deferred<T>(): {
   promise: Promise<T>;

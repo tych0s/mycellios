@@ -197,6 +197,33 @@ function cellAwareRequest(
   return current;
 }
 
+function attachMeasuredTensorParallelLinks(request: RuntimePlanRequest): void {
+  const cell =
+    request.tensorParallelCells?.[0] ??
+    request.phaseTensorParallelCells?.prefill?.[0] ??
+    request.phaseTensorParallelCells?.decode?.[0];
+  if (!cell) throw new Error("test TP cell is missing");
+  const members = new Set(cell.memberNodeIds);
+  const now = Date.now();
+  for (const link of request.topology.links) {
+    if (
+      link.from !== link.to &&
+      members.has(link.from) &&
+      members.has(link.to)
+    ) {
+      link.oneWayLatencyMs = 0.05;
+      link.availability = 0.999;
+      link.evidence = {
+        source: "runtime-probe",
+        measuredAt: now - 1_000,
+        validUntil: now + 60_000,
+        successfulSamples: 8,
+        failedSamples: 0,
+      };
+    }
+  }
+}
+
 function singleNodePlan(nodeId: string, overrides: Partial<DistributionPlan> = {}): DistributionPlan {
   return {
     algorithm: "test-manual",
@@ -295,6 +322,7 @@ describe("GDLP/2 runtime manifest", () => {
       prefill: [prefillCell],
       decode: [decodeCell],
     };
+    attachMeasuredTensorParallelLinks(request);
 
     const first = buildRuntimePipelineManifest(request);
     const second = buildRuntimePipelineManifest(structuredClone(request));
@@ -349,6 +377,7 @@ describe("GDLP/2 runtime manifest", () => {
       prefill: structuredClone(sharedCells),
       decode: structuredClone(sharedCells),
     };
+    attachMeasuredTensorParallelLinks(shared);
     const compatible = buildRuntimePipelineManifest(shared);
     expect(compatible.kvTransition.mode).toBe("in-place");
     expect(compatible.plans.prefill.stages[1]!.stageId).toBe(
@@ -396,6 +425,19 @@ describe("GDLP/2 runtime manifest", () => {
       );
     }
     expect(() => validateRuntimePipelineManifest(first)).not.toThrow();
+  });
+
+  it("omits empty calibration reasons after measured TP evidence clears the gate", () => {
+    const request = cellAwareRequest({ withCell: true });
+    attachMeasuredTensorParallelLinks(request);
+
+    const manifest = buildRuntimePipelineManifest(request);
+
+    for (const phase of [manifest.plans.prefill, manifest.plans.decode]) {
+      expect(phase.predicted.calibrationRequired).toBe(false);
+      expect(phase.predicted).not.toHaveProperty("calibrationReasons");
+    }
+    expect(() => validateRuntimePipelineManifest(manifest)).not.toThrow();
   });
 
   it("validates NCCL devices, normalized dtypes and seals the GPU contract", () => {
@@ -793,7 +835,7 @@ describe("GDLP/2 runtime manifest", () => {
           minAcceptanceRate: 0.65,
           maxWasteRatio: 0.25,
           priority: 20,
-          artifactId: "sha256:stage-head-r1",
+          artifactId: `sha256:${"a".repeat(64)}`,
         },
         {
           id: "autoregressive",
@@ -811,6 +853,22 @@ describe("GDLP/2 runtime manifest", () => {
 
     expect(manifest.plans.decode.speculation).toEqual(speculation);
     expect(() => validateRuntimePipelineManifest(manifest)).not.toThrow();
+
+    const missingArtifact = structuredClone(speculation);
+    delete missingArtifact.strategies[1]!.artifactId;
+    const missingRequest = runtimeRequest(1);
+    missingRequest.speculation = missingArtifact;
+    expect(() => buildRuntimePipelineManifest(missingRequest)).toThrow(
+      "runtime_speculation_artifact_is_missing",
+    );
+
+    const weakArtifact = structuredClone(speculation);
+    weakArtifact.strategies[1]!.artifactId = "stage-head-r1";
+    const weakRequest = runtimeRequest(1);
+    weakRequest.speculation = weakArtifact;
+    expect(() => buildRuntimePipelineManifest(weakRequest)).toThrow(
+      "runtime_speculation_artifact_is_invalid",
+    );
   });
 
   it("rejects unknown speculation references and non-autoregressive fallback", () => {

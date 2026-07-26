@@ -13,7 +13,7 @@ describe("automatic GPU repair", () => {
       model: "model",
       modelDigest: "sha256:test",
       mode: "replica",
-      adapter: "openai-compatible",
+      adapter: "mycellios-pipeline",
       peakVramMb: 512,
       contextLimit: 4_096,
       maxConcurrency: 1,

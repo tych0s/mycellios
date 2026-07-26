@@ -1,9 +1,12 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { z } from "zod";
+import type { NativeBuildIdentity } from "../contracts/build-identity.js";
 import { workerConfigSchema, type WorkerConfig } from "../contracts/schemas.js";
+import { readNativeRuntimeBuildMetadata } from "../core/native-build-identity.js";
 import { WorkerAgent } from "../worker/agent.js";
 import { evaluateDistributionPlan, stageMemoryBytes } from "./cost-model.js";
 import { HttpLaunchAgent } from "./launch-agent-rpc.js";
@@ -32,6 +35,7 @@ import type {
   DistributionWorkload,
   StagePlacement,
 } from "./types.js";
+import { UNMEASURED_RTT_MS } from "../core/rtt.js";
 
 export const AUTO_DISTRIBUTE_SCHEMA = "gdlp-auto-distribute/1";
 export const MODEL_PROFILE_SCHEMA = "gdlp-model-profile/1";
@@ -88,6 +92,20 @@ const linkSchema = z
     bandwidthMbps: z.number().positive().finite(),
     lossRate: z.number().min(0).max(0.9).default(0),
     availability: z.number().positive().max(1).default(0.999),
+    evidence: z
+      .object({
+        source: z.literal("runtime-probe"),
+        measuredAt: z.number().int().positive(),
+        validUntil: z.number().int().positive(),
+        successfulSamples: z.number().int().nonnegative(),
+        failedSamples: z.number().int().nonnegative(),
+      })
+      .strict()
+      .refine((value) => value.validUntil > value.measuredAt, {
+        message: "link evidence must expire after it was measured",
+        path: ["validUntil"],
+      })
+      .optional(),
   })
   .strict();
 
@@ -264,10 +282,19 @@ export interface AutoDistributionRunOptions {
     launch: PythonPipelineLaunchDescription,
   ) => LaunchAgent | undefined;
   onProgress?: (event: AutoDistributionProgressEvent) => void;
+  /**
+   * Atomic publication hook. It runs after health and real inference canary
+   * succeed, but before the model is announced as active.
+   */
+  onActivated?: (result: AutoDistributionRunResult) => void | Promise<void>;
+  /** Exact native release cohort announced by the generated cell worker. */
+  workerBuildIdentity?: NativeBuildIdentity;
+  /** Runtime version paired with workerBuildIdentity. */
+  workerAgentVersion?: string;
 }
 
 export interface AutoDistributionProgressEvent {
-  phase: "preparing_nodes" | "launching_stages" | "stage_loading" | "stage_ready" | "stages_ready" | "checking_health" | "running_canary" | "publishing_model" | "active" | "failed";
+  phase: "preparing_nodes" | "preparing_artifact" | "artifact_ready" | "launching_stages" | "stage_loading" | "stage_ready" | "stages_ready" | "checking_health" | "running_canary" | "publishing_model" | "active" | "failed";
   message: string;
   nodeId?: string;
   processId?: string;
@@ -382,6 +409,23 @@ export async function runAutoDistribution(
   options: AutoDistributionRunOptions = {},
 ): Promise<AutoDistributionRunResult> {
   const config = parseAutoDistributionConfig(configValue);
+  const runtimeMetadata = existsSync(resolve(cwd, "package.json"))
+    ? readNativeRuntimeBuildMetadata(cwd)
+    : null;
+  const workerBuildIdentity =
+    options.workerBuildIdentity ?? runtimeMetadata?.buildIdentity ?? undefined;
+  const workerAgentVersion =
+    options.workerAgentVersion
+    ?? workerBuildIdentity?.version
+    ?? runtimeMetadata?.version;
+  if (
+    workerBuildIdentity
+    && workerAgentVersion !== workerBuildIdentity.version
+  ) {
+    throw new Error(
+      `cell_build_version_mismatch:${workerBuildIdentity.version}:${workerAgentVersion ?? "missing"}`,
+    );
+  }
   options.onProgress?.({
     phase: "preparing_nodes",
     message: `Preparing ${config.nodes.length} network nodes.`,
@@ -391,6 +435,30 @@ export async function runAutoDistribution(
     )),
   });
   const agents = await createLaunchAgents(config, cwd, environment, compilation.launch, options);
+  const preparationUnsubscribers = [...new Set(agents.values())].flatMap((agent) => {
+    if (!agent.subscribeRuntimePreparation) return [];
+    return [agent.subscribeRuntimePreparation((event) => {
+      const nodeId = compilation.launch.launchOrder.find(
+        (process) => process.stageIndex === event.stageIndex,
+      )?.anchor.memberId;
+      const layers = `${event.layerStart}–${Math.max(event.layerStart, event.layerEnd - 1)}`;
+      options.onProgress?.({
+        phase: event.state === "preparing" ? "preparing_artifact" : "artifact_ready",
+        message: event.state === "preparing"
+          ? `Preparing verified layers ${layers}${nodeId ? ` on ${nodeId}` : ""}.`
+          : `Verified layers ${layers}${nodeId ? ` are cached on ${nodeId}` : " are cached"}.`,
+        ...(nodeId ? { nodeId } : {}),
+        details: [
+          `Stage: ${event.stageIndex + 1}`,
+          `Layers: ${layers}`,
+          ...(event.weightsSizeBytes !== undefined
+            ? [`Verified package: ${(event.weightsSizeBytes / (1024 * 1024)).toFixed(1)} MiB`]
+            : []),
+          ...(event.packageId ? [`Package: sha256:${event.packageId}`] : []),
+        ],
+      });
+    })];
+  });
   const supervisor = new PythonLaunchSupervisor(compilation.launch, {
     resolveAgent: (nodeId) => agents.get(nodeId),
     readinessTimeoutMs: config.runtime.readinessTimeoutMs,
@@ -468,12 +536,14 @@ export async function runAutoDistribution(
         config,
         compilation,
         apiBaseUrl,
-        canary.metrics,
+        health.pipeline_snapshot_identity as string,
         collectExecutionTelemetry(compilation, runningSnapshot),
       );
       const token = optionalSecret(environment, config.coordinator.networkTokenEnv);
       worker = new WorkerAgent(workerConfig, {
         coordinatorUrl: config.coordinator.url,
+        ...(workerAgentVersion ? { agentVersion: workerAgentVersion } : {}),
+        ...(workerBuildIdentity ? { buildIdentity: workerBuildIdentity } : {}),
         ...(token ? { networkToken: token } : {}),
         identity: {
           kind: "cell",
@@ -490,6 +560,7 @@ export async function runAutoDistribution(
       canaryMetrics: canary.metrics,
       workerId: worker?.workerId ?? null,
     };
+    await options.onActivated?.(result);
     await writeRuntimeStatus(config, result, cwd, "running");
     options.onProgress?.({
       phase: "active",
@@ -503,6 +574,7 @@ export async function runAutoDistribution(
     await writeRuntimeFailure(config, error, failureSnapshot, cwd).catch(() => undefined);
     throw error;
   } finally {
+    for (const unsubscribe of preparationUnsubscribers) unsubscribe();
     unsubscribeTelemetry();
     if (worker) await worker.stop().catch(() => undefined);
     await supervisor.stop("auto_distribute_shutdown").catch(() => undefined);
@@ -661,13 +733,22 @@ function runtimeTopology(config: AutoDistributionConfig): RuntimeTopology {
       if (from.id === to.id) continue;
       const override = overrides.get(`${from.id}\0${to.id}`);
       if (override) {
-        links.push({ ...override });
+        const { evidence, ...link } = override;
+        links.push({
+          ...link,
+          ...(evidence ? { evidence: { ...evidence } } : {}),
+        });
       } else {
+        // Arista sin medir. Antes se rellenaba con `sameRegion ? 1 : 35`, que
+        // premiaba justo al enlace del que no sabemos nada: un nodo sin sonda
+        // entraba en el plan por delante de uno medido a 40 ms. La etiqueta de
+        // región tampoco autoriza el optimismo — dos nodos etiquetados `us`
+        // midieron 65 y 132 ms en Exp15. Sin muestra, se cobra el centinela.
         const sameRegion = from.region === to.region;
         links.push({
           from: from.id,
           to: to.id,
-          oneWayLatencyMs: sameRegion ? 1 : 35,
+          oneWayLatencyMs: UNMEASURED_RTT_MS,
           jitterP95Ms: sameRegion ? 0.25 : 5,
           bandwidthMbps: sameRegion ? 1_000 : 100,
           lossRate: 0,
@@ -697,6 +778,13 @@ function exactStagePlan(request: RuntimePlanRequest, count: number): Distributio
     .map((node) => node.id);
   const orders = uniqueOrders([
     [...preferred, ...remaining].slice(0, count),
+    // Orden por LATENCIA de la cadena. Sin este candidato, los otros cuatro
+    // órdenes se derivan solo de `decodeScale` y `memoryBytes`, de modo que con
+    // nodos de cómputo parecido todos degeneran en orden de declaración y un
+    // nodo cercano no llega a enumerarse nunca. `evaluateDistributionPlan` sí
+    // puntúa `tpotMs`, pero no puede rescatar una opción que nadie propuso: la
+    // enumeración es la que decide, no la puntuación.
+    latencyGreedyOrder(request, preferred[0], count),
     request.topology.nodes.map((node) => node.id).slice(0, count),
     request.topology.nodes
       .slice()
@@ -732,6 +820,56 @@ function exactStagePlan(request: RuntimePlanRequest, count: number): Distributio
   }
   if (!best) throw new Error(`no_feasible_automatic_${count}_stage_pipeline`);
   return best.plan;
+}
+
+/**
+ * Encadena los nodos por vecino más cercano según el RTT medido de la arista.
+ *
+ * Una tubería de etapas paga cada frontera en serie, así que el orden importa
+ * tanto como el conjunto: los mismos tres nodos en distinto orden dan TPOT muy
+ * distintos. Esto es un heurístico de vecino más cercano, no un óptimo — el
+ * óptimo es un camino hamiltoniano mínimo y no compensa resolverlo aquí, porque
+ * el candidato solo tiene que ser lo bastante bueno para que
+ * `evaluateDistributionPlan` lo puntúe frente a los órdenes por cómputo.
+ *
+ * Arranca en el nodo raíz preferido, porque la etapa 0 es la que habla con la
+ * API y moverla tiene otros costes que este heurístico no ve.
+ */
+function latencyGreedyOrder(
+  request: RuntimePlanRequest,
+  root: string | undefined,
+  count: number,
+): string[] {
+  const ids = request.topology.nodes.map((node) => node.id);
+  if (ids.length === 0) return [];
+  const cost = new Map<string, number>();
+  for (const link of request.topology.links) {
+    cost.set(`${link.from} ${link.to}`, link.oneWayLatencyMs);
+  }
+  const linkMs = (from: string, to: string): number =>
+    // Una arista no declarada se cobra como no medida, igual que en
+    // `runtimeTopology`. No declarar un enlace no puede salir barato.
+    cost.get(`${from} ${to}`) ?? UNMEASURED_RTT_MS;
+
+  const start = root && ids.includes(root) ? root : ids[0]!;
+  const ordered = [start];
+  const pending = new Set(ids.filter((id) => id !== start));
+  while (pending.size > 0 && ordered.length < count) {
+    const tail = ordered.at(-1)!;
+    let best: string | null = null;
+    let bestMs = Number.POSITIVE_INFINITY;
+    for (const candidate of pending) {
+      const ms = linkMs(tail, candidate);
+      if (ms < bestMs) {
+        bestMs = ms;
+        best = candidate;
+      }
+    }
+    if (best === null) break;
+    ordered.push(best);
+    pending.delete(best);
+  }
+  return ordered.slice(0, count);
 }
 
 function planningNodes(topology: RuntimeTopology): ComputeNodeProfile[] {
@@ -820,6 +958,7 @@ async function createLaunchAgents(
   const local = new LocalProcessAgent({
     id: "auto-distribute-local",
     cwd,
+    allowedExecutables: [launch.configuration.pythonExecutable],
     env: {
       PYTHONPATH: absoluteFrom(cwd, config.runtime.pythonPath),
       HF_HOME: absoluteFrom(cwd, config.runtime.hfHome),
@@ -868,6 +1007,9 @@ async function verifyRootHealth(
     value.status !== "ready" ||
     value.model !== config.model.publicName ||
     value.artifact_identity !== compilation.profile.source.artifactIdentity ||
+    typeof value.pipeline_snapshot_identity !== "string" ||
+    !value.pipeline_snapshot_identity.trim() ||
+    value.pipeline_snapshot_identity.length > 256 ||
     value.stages !== compilation.boundaries.length - 1 ||
     JSON.stringify(value.boundaries) !== JSON.stringify(compilation.boundaries)
   ) {
@@ -877,6 +1019,37 @@ async function verifyRootHealth(
 }
 
 async function runCanary(
+  apiBaseUrl: string,
+  config: AutoDistributionConfig,
+): Promise<{
+  text: string;
+  metrics: AutoDistributionCanaryMetrics;
+  evidenceSamples: Array<{
+    sampleId: string;
+    outputTokens: number;
+    activeMs: number;
+    ttftMs: number;
+    completed: true;
+  }>;
+}> {
+  await runCanarySample(apiBaseUrl, config);
+  const measured = [];
+  for (let index = 0; index < 3; index += 1) {
+    measured.push(await runCanarySample(apiBaseUrl, config));
+  }
+  return {
+    ...measured[0]!,
+    evidenceSamples: measured.map(({ metrics }, index) => ({
+      sampleId: `activation-canary-${index + 1}`,
+      outputTokens: metrics.completionTokens,
+      activeMs: Math.max(1, Math.round(metrics.pipelineMs)),
+      ttftMs: Math.max(0, Math.round(metrics.ttftMs)),
+      completed: true,
+    })),
+  };
+}
+
+async function runCanarySample(
   apiBaseUrl: string,
   config: AutoDistributionConfig,
 ): Promise<{ text: string; metrics: AutoDistributionCanaryMetrics }> {
@@ -934,11 +1107,11 @@ async function runCanary(
   };
 }
 
-function buildCellWorkerConfig(
+export function buildCellWorkerConfig(
   config: AutoDistributionConfig,
   compilation: AutoDistributionCompilation,
   apiBaseUrl: string,
-  canary: AutoDistributionCanaryMetrics,
+  activationId: string,
   execution?: NonNullable<ModelDeployment["execution"]>,
 ): WorkerConfig {
   const stages = compilation.manifest.plans.decode.stages;
@@ -956,19 +1129,15 @@ function buildCellWorkerConfig(
       pauseWhenForeground: false,
     },
     adapter: {
-      kind: "openai-compatible",
+      kind: "mycellios-pipeline",
       model: config.model.publicName,
       baseUrl: apiBaseUrl,
-      apiPathPrefix: "v1",
-      requestTemperature: 0,
-      allowedHosts: [],
     },
     deployment: {
       modelDigest: compilation.profile.source.artifactIdentity,
+      activationId,
       peakVramMb: peakMiB,
       contextLimit: config.workload.contextTokens,
-      tokensPerSecond: Math.max(0.001, canary.measuredTokensPerSecond),
-      ttftMs: canary.ttftMs,
       internalPipeline: {
         stageCount: stages.length,
         boundaries: [...compilation.boundaries],

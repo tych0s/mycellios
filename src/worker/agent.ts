@@ -11,6 +11,7 @@ import type {
   WorkerCapabilities,
   WorkerAcceleratorDiagnostics,
   WorkerEnvelope,
+  WorkerExecutorIsolationCapability,
   WorkerHeartbeat,
 } from "../contracts/types.js";
 import type { AdapterChunk, InferenceAdapter } from "../adapters/base.js";
@@ -25,7 +26,6 @@ import {
   type HardwareProbe,
   type VerifiedGpuRuntimeEvidence,
 } from "./hardware.js";
-import { llmfitHardwareFallback, probeLlmfit } from "./llmfit.js";
 import {
   LaunchProcessExitedError,
   type LaunchAgent,
@@ -36,21 +36,51 @@ import {
   validatePythonLaunchDescription,
   type PythonPipelineLaunchDescription,
 } from "../distribution/python-launcher.js";
+import { validateExecutorIsolationPolicy } from "../distribution/process-environment.js";
 import { MAX_RUNTIME_STREAM_CHUNK_BYTES } from "../contracts/worker-protocol.js";
 import {
   RuntimeStreamTunnel,
   type RuntimeStreamServerMessage,
+  type RuntimeStreamTransportSnapshot,
 } from "./runtime-stream-tunnel.js";
+import type {
+  DirectTransportAdvertisement,
+  RuntimeDirectTransportOptions,
+} from "./runtime-direct-transport.js";
+import {
+  runtimePerformanceProfileSchema,
+  type RuntimePerformanceProfile,
+} from "../performance/runtime-profile.js";
+import {
+  evidenceChallengeSchema,
+  type DeploymentCanaryChallenge,
+  type EvidenceChallenge,
+  type RuntimePerformanceChallenge,
+} from "../contracts/evidence-challenge.js";
+import {
+  WORKER_PROTOCOL_MAX,
+  WORKER_PROTOCOL_MIN,
+  workerAdmissionChallengeResponseSchema,
+} from "../contracts/worker-admission.js";
+import { workerRegistrationDigest } from "../core/worker-admission-digest.js";
+import type { WorkerAdmissionSigner } from "./admission-credential.js";
 
 export interface WorkerAgentOptions {
   coordinatorUrl: string;
   networkToken?: string;
   heartbeatIntervalMs?: number;
+  /** How often to probe the coordinator RTT with a WebSocket ping. */
+  rttProbeIntervalMs?: number;
   reconnect?: boolean;
   identity?: {
     kind: "device" | "cell";
     id: string;
   };
+  /**
+   * Stable device proof used by remote coordinators. The private key never
+   * leaves the worker; only one-time challenge signatures are transmitted.
+   */
+  admissionSigner?: WorkerAdmissionSigner | undefined;
   /** Register the physical node without claiming that a model runtime exists. */
   advertiseDeployment?: boolean;
   /** Deterministic hardware source for embedded agents and tests. */
@@ -74,6 +104,8 @@ export interface WorkerAgentOptions {
   verifiedGpuRuntime?: VerifiedGpuRuntimeEvidence | undefined;
   /** Desktop application version reported to the coordinator. */
   agentVersion?: string | undefined;
+  /** Exact sealed source identity reported to the coordinator. */
+  buildIdentity?: import("../contracts/build-identity.js").NativeBuildIdentity | undefined;
   distributedExecutor?: {
     nodeId: string;
     stageHost: string;
@@ -83,7 +115,13 @@ export interface WorkerAgentOptions {
     computeMode?: ComputeMode;
     cpuEligible?: boolean;
     acceleration?: WorkerAcceleratorDiagnostics;
+    isolation?: WorkerExecutorIsolationCapability;
+    /** Native peer transport. Enabled by default; options can pin listener/candidates. */
+    directTransport?: RuntimeDirectTransportOptions;
   };
+  /** Runs the packaged, physical runtime calibration for this exact node. */
+  runtimePerformanceProfileProbe?: (challenge: RuntimePerformanceChallenge) =>
+    Promise<RuntimePerformanceProfile | null | undefined>;
   logger?: Pick<Console, "info" | "warn" | "error">;
 }
 
@@ -93,6 +131,14 @@ const MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
 const RECENT_JOB_LIMIT = 2_048;
 const MAX_WEBSOCKET_BUFFERED_BYTES = 8 * 1024 * 1024;
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+/** Tags our own RTT probes so unsolicited pongs cannot corrupt the estimate. */
+const RTT_PROBE_PAYLOAD = Buffer.from("gdlp-rtt");
+/**
+ * peer runtime uses 0.2 for the same job (`overhead_delay` / EMA over peer pings) and
+ * it is a reasonable default: fast enough to follow a route change, slow enough
+ * that one scheduling hiccup does not move placement.
+ */
+const RTT_EMA_ALPHA = 0.2;
 
 const envelopeFields = {
   v: z.literal(1),
@@ -106,6 +152,27 @@ const runtimeStreamDataSchema = z.string()
     (value) => Buffer.from(value, "base64").byteLength <= MAX_RUNTIME_STREAM_CHUNK_BYTES,
     `Runtime stream chunks cannot exceed ${MAX_RUNTIME_STREAM_CHUNK_BYTES} bytes`,
   );
+const runtimeStreamIdSchema = z.string().min(1).max(256);
+const runtimeStreamRecoveryTokenSchema = z.string()
+  .min(16)
+  .max(128)
+  .regex(/^[A-Za-z0-9_-]+$/);
+const runtimeStreamGenerationSchema = z.number().int().nonnegative().max(1_000_000);
+const runtimeStreamOffsetSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+const directGrantSchema = z.object({
+  protocol: z.literal("mycellios-direct/1"),
+  connectionId: runtimeStreamIdSchema,
+  sourceNodeId: runtimeStreamIdSchema,
+  destinationNodeId: runtimeStreamIdSchema,
+  targetPort: z.number().int().min(1).max(65_535),
+  expiresAt: z.number().int().positive(),
+  secret: z.string().length(43).regex(/^[A-Za-z0-9_-]+$/),
+}).strict();
+const directCandidateSchema = z.object({
+  host: z.string().min(1).max(253),
+  port: z.number().int().min(1).max(65_535),
+  scope: z.enum(["lan", "configured", "public-mapped"]),
+}).strict();
 
 const serverMessageSchema = z.discriminatedUnion("type", [
   z
@@ -115,6 +182,11 @@ const serverMessageSchema = z.discriminatedUnion("type", [
       payload: z.object({ workerId: z.string().min(1).max(256) }).strict(),
     })
     .strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("evidence.challenge"),
+    payload: evidenceChallengeSchema,
+  }).strict(),
   z
     .object({
       ...envelopeFields,
@@ -155,36 +227,169 @@ const serverMessageSchema = z.discriminatedUnion("type", [
   z.object({
     ...envelopeFields,
     type: z.literal("runtime.stream.open"),
+    payload: z.union([
+      z.object({
+        streamId: runtimeStreamIdSchema,
+        targetPort: z.number().int().min(1).max(65_535),
+      }).strict(),
+      z.object({
+        streamId: runtimeStreamIdSchema,
+        targetPort: z.number().int().min(1).max(65_535),
+        generation: runtimeStreamGenerationSchema,
+        recoveryToken: runtimeStreamRecoveryTokenSchema,
+      }).strict(),
+    ]),
+  }).strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.direct.offer"),
     payload: z.object({
-      streamId: z.string().min(1).max(256),
-      targetPort: z.number().int().min(1).max(65_535),
+      streamId: runtimeStreamIdSchema,
+      grant: directGrantSchema,
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.direct.connect"),
+    payload: z.object({
+      streamId: runtimeStreamIdSchema,
+      destinationNodeId: runtimeStreamIdSchema,
+      grant: directGrantSchema,
+      candidates: z.array(directCandidateSchema).min(1).max(8),
+      timeoutMs: z.number().int().min(250).max(15_000),
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.direct.commit"),
+    payload: z.object({
+      streamId: runtimeStreamIdSchema,
+      connectionId: runtimeStreamIdSchema,
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.direct.cancel"),
+    payload: z.object({
+      streamId: runtimeStreamIdSchema,
+      connectionId: runtimeStreamIdSchema,
     }).strict(),
   }).strict(),
   z.object({
     ...envelopeFields,
     type: z.literal("runtime.stream.opened"),
-    payload: z.object({ streamId: z.string().min(1).max(256) }).strict(),
+    payload: z.union([
+      z.object({ streamId: runtimeStreamIdSchema }).strict(),
+      z.object({
+        streamId: runtimeStreamIdSchema,
+        generation: runtimeStreamGenerationSchema,
+        recoveryToken: runtimeStreamRecoveryTokenSchema,
+      }).strict(),
+    ]),
   }).strict(),
   z.object({
     ...envelopeFields,
     type: z.literal("runtime.stream.data"),
+    payload: z.union([
+      z.object({
+        streamId: runtimeStreamIdSchema,
+        sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+        data: runtimeStreamDataSchema,
+      }).strict(),
+      z.object({
+        streamId: runtimeStreamIdSchema,
+        sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+        generation: runtimeStreamGenerationSchema,
+        recoveryToken: runtimeStreamRecoveryTokenSchema,
+        offset: runtimeStreamOffsetSchema,
+        data: runtimeStreamDataSchema,
+      }).strict(),
+    ]),
+  }).strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.stream.ack"),
     payload: z.object({
-      streamId: z.string().min(1).max(256),
-      sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-      data: runtimeStreamDataSchema,
+      streamId: runtimeStreamIdSchema,
+      generation: runtimeStreamGenerationSchema,
+      recoveryToken: runtimeStreamRecoveryTokenSchema,
+      acknowledgedOffset: runtimeStreamOffsetSchema,
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.stream.suspend"),
+    payload: z.object({
+      streamId: runtimeStreamIdSchema,
+      generation: runtimeStreamGenerationSchema,
+      recoveryToken: runtimeStreamRecoveryTokenSchema,
+      deadlineAt: z.number().int().positive(),
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.stream.resumed"),
+    payload: z.object({
+      streamId: runtimeStreamIdSchema,
+      previousGeneration: runtimeStreamGenerationSchema,
+      generation: runtimeStreamGenerationSchema,
+      recoveryToken: runtimeStreamRecoveryTokenSchema,
+      sendFromOffset: runtimeStreamOffsetSchema,
     }).strict(),
   }).strict(),
   z.object({
     ...envelopeFields,
     type: z.literal("runtime.stream.end"),
-    payload: z.object({ streamId: z.string().min(1).max(256) }).strict(),
+    payload: z.union([
+      z.object({ streamId: runtimeStreamIdSchema }).strict(),
+      z.object({
+        streamId: runtimeStreamIdSchema,
+        generation: runtimeStreamGenerationSchema,
+        recoveryToken: runtimeStreamRecoveryTokenSchema,
+        finalOffset: runtimeStreamOffsetSchema,
+      }).strict(),
+    ]),
   }).strict(),
   z.object({
     ...envelopeFields,
     type: z.literal("runtime.stream.error"),
+    payload: z.union([
+      z.object({
+        streamId: runtimeStreamIdSchema,
+        message: z.string().min(1).max(1_024),
+      }).strict(),
+      z.object({
+        streamId: runtimeStreamIdSchema,
+        generation: runtimeStreamGenerationSchema,
+        recoveryToken: runtimeStreamRecoveryTokenSchema,
+        message: z.string().min(1).max(1_024),
+      }).strict(),
+    ]),
+  }).strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.link.probe.start"),
     payload: z.object({
-      streamId: z.string().min(1).max(256),
-      message: z.string().min(1).max(1_024),
+      probeId: z.string().min(1).max(256),
+      destinationNodeId: z.string().min(1).max(256),
+      timeoutMs: z.number().int().min(100).max(60_000),
+      payloadBytes: z.number().int().min(1).max(16 * 1024),
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.link.probe.ping"),
+    payload: z.object({
+      probeId: z.string().min(1).max(256),
+      data: runtimeStreamDataSchema,
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...envelopeFields,
+    type: z.literal("runtime.link.probe.pong"),
+    payload: z.object({
+      probeId: z.string().min(1).max(256),
+      data: runtimeStreamDataSchema,
     }).strict(),
   }).strict(),
 ]);
@@ -193,10 +398,22 @@ const registrationResponseSchema = z
   .object({
     workerId: z.string().min(1).max(256),
     protocolVersion: z.literal(1),
+    credentialFingerprint: z.string().regex(/^sha256:[a-f0-9]{64}$/).optional(),
+    enrollment: z.enum(["enrolled", "accepted", "local-legacy"]).optional(),
   })
   .strict();
 
 type ValidatedServerMessage = z.infer<typeof serverMessageSchema>;
+
+interface PendingRuntimeLinkProbe {
+  destinationNodeId: string;
+  payloadBytes: number;
+  startedAt: bigint;
+  timeout: NodeJS.Timeout;
+}
+
+const MAX_PENDING_RUNTIME_LINK_PROBES = 64;
+const RUNTIME_RECONNECT_GRACE_MS = 45_000;
 
 export class WorkerAgent {
   private readonly adapter: InferenceAdapter;
@@ -204,32 +421,57 @@ export class WorkerAgent {
   private registeredWorkerId: string | undefined;
   private capabilities: WorkerCapabilities | null = null;
   private socket: WebSocket | null = null;
+  private rttProbeTimer: NodeJS.Timeout | null = null;
+  private pendingRttProbe: bigint | null = null;
+  private lastRttSampleMs: number | null = null;
   private stopped = false;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private readonly activeJobs = new Map<string, AbortController>();
   private readonly recentJobs = new Map<string, number>();
   private readonly authorizedRuntimeProcesses = new Map<string, string>();
+  private readonly preparedRuntimeProcesses = new Map<string, import("../distribution/python-launcher.js").PythonLaunchProcess>();
   private readonly runtimeProcesses = new Map<string, LaunchProcessHandle>();
+  private readonly runtimeLinkProbes = new Map<string, PendingRuntimeLinkProbe>();
+  private readonly activeEvidenceChallenges = new Set<string>();
   private readonly runtimeTunnel: RuntimeStreamTunnel | null;
+  private directTransportAdvertisement: DirectTransportAdvertisement | null = null;
   private readonly logger: Pick<Console, "info" | "warn" | "error">;
   private runtimeCapacityGeneration = 0;
+  private runtimeDisconnectTimer: NodeJS.Timeout | null = null;
 
   constructor(
     private readonly config: WorkerConfig,
     private readonly options: WorkerAgentOptions,
   ) {
     this.coordinatorBaseUrl = validateCoordinatorUrl(options.coordinatorUrl);
+    if (
+      config.adapter.kind === "mycellios-native"
+      && options.advertiseDeployment !== false
+    ) {
+      throw new Error(
+        "mycellios_native_control_must_not_advertise_an_inference_deployment",
+      );
+    }
     this.adapter = createAdapter(config);
     this.logger = options.logger ?? console;
     this.runtimeTunnel = options.distributedExecutor
       ? new RuntimeStreamTunnel(
           options.distributedExecutor.nodeId,
           (type, payload) => this.sendMessage(type, payload),
+          {
+            ...(options.distributedExecutor.directTransport
+              ? { directTransport: options.distributedExecutor.directTransport }
+              : {}),
+            onDirectTransportAdvertisementChanged: (advertisement) => {
+              this.applyDirectTransportAdvertisement(advertisement);
+            },
+          },
         )
       : null;
   }
 
   async start(): Promise<void> {
+    this.directTransportAdvertisement = await this.runtimeTunnel?.startDirectTransport() ?? null;
     this.capabilities = await this.buildCapabilities();
     await this.register();
     let delayMs = 500;
@@ -249,8 +491,11 @@ export class WorkerAgent {
   async stop(): Promise<void> {
     this.stopped = true;
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    this.clearRuntimeDisconnectTimer();
+    this.clearRuntimeLinkProbes();
     await this.abortActiveJobs("Worker shutting down");
     await this.resetDistributedRuntime("worker_shutting_down");
+    await this.runtimeTunnel?.close();
     await this.sendGoodbye("user_requested");
     await this.closeSocket();
   }
@@ -301,6 +546,13 @@ export class WorkerAgent {
     const defaultPeakVramMb = Math.max(512, Math.floor(safeVramBudget(offeredVramMb) * 0.9));
     const publicPrimary = publicHardwareGpu(primary);
 
+    const existingExecutor = this.capabilities.distributedExecutor;
+    const executorWithoutEvidence = existingExecutor
+      ? (() => {
+          const { performanceEvidence: _previousEvidence, ...rest } = existingExecutor;
+          return rest;
+        })()
+      : undefined;
     this.capabilities = {
       ...this.capabilities,
       gpus: [{
@@ -312,10 +564,10 @@ export class WorkerAgent {
         ...deployment,
         peakVramMb: this.config.deployment.peakVramMb ?? defaultPeakVramMb,
       })),
-      ...(this.capabilities.distributedExecutor
+      ...(executorWithoutEvidence
         ? {
             distributedExecutor: {
-              ...this.capabilities.distributedExecutor,
+              ...executorWithoutEvidence,
               computeMode: this.options.distributedExecutor?.computeMode ?? "automatic",
               cpuEligible: this.options.distributedExecutor?.cpuEligible === true,
               ...(this.options.distributedExecutor?.acceleration
@@ -348,6 +600,27 @@ export class WorkerAgent {
 
   get activeJobCount(): number {
     return this.activeJobs.size;
+  }
+
+  private applyDirectTransportAdvertisement(
+    advertisement: DirectTransportAdvertisement,
+  ): void {
+    this.directTransportAdvertisement = structuredClone(advertisement);
+    const executor = this.capabilities?.distributedExecutor;
+    if (!this.capabilities || !executor) return;
+    this.capabilities = {
+      ...this.capabilities,
+      distributedExecutor: {
+        ...executor,
+        directTransport: structuredClone(advertisement),
+      },
+    };
+    // Heartbeats carry the full capability document, so the coordinator drops
+    // an expired public candidate on the next normal heartbeat.
+  }
+
+  runtimeTransportSnapshot(): RuntimeStreamTransportSnapshot[] {
+    return this.runtimeTunnel?.transportSnapshot() ?? [];
   }
 
   private async sendGoodbye(reason: "user_requested" | "shutdown"): Promise<void> {
@@ -394,10 +667,9 @@ export class WorkerAgent {
   }
 
   private async buildCapabilities(): Promise<WorkerCapabilities> {
-    const [hardware, adapter, llmfit] = await Promise.all([
+    const [hardware, adapter] = await Promise.all([
       this.options.hardwareProbe?.() ?? probeHardware(),
       this.adapter.probe(),
-      this.inspectWithLlmfit(),
     ]);
     const selectedHardwareGpu = selectHardwareGpu(hardware.gpus, this.options.preferredHardwareGpu)
       ?? hardware.gpus[0];
@@ -407,48 +679,50 @@ export class WorkerAgent {
         selectedHardwareGpu,
         this.options.verifiedGpuRuntime,
       );
-    const primary =
-      detectedPrimary.vendor === "unknown" && detectedPrimary.physicalVramMb === 0 && llmfit
-        ? (llmfitHardwareFallback(llmfit) ?? detectedPrimary)
-        : detectedPrimary;
+    const primary = detectedPrimary;
     const primaryCapacityMb = primary.physicalVramMb + (primary.sharedMemoryMb ?? 0);
     const offeredVramMb = this.config.capacityScope === "cell"
       ? this.config.offeredVramMb
       : Math.min(this.config.offeredVramMb, Math.max(512, primaryCapacityMb));
     const safeBudget = safeVramBudget(offeredVramMb);
     const model = this.config.adapter.model;
-    const deploymentId = `dep-${sha256Text(`${model}:${adapter.kind}`).slice(-12)}`;
-    if (llmfit?.model) llmfit.model.deploymentId = deploymentId;
-    const llmfitTokensPerSecond = this.config.llmfit.applyPerformanceEstimate
-      ? (llmfit?.model?.measuredTokensPerSecond ??
-        llmfit?.model?.estimatedTokensPerSecond)
-      : undefined;
+    // A restarted native pipeline is a new deployment even when it serves the
+    // same public model name. Binding the identifier to the artifact and
+    // independently probed pipeline snapshot prevents stale scheduler state
+    // from being reused across activations.
+    const deploymentId = `dep-${sha256Text([
+      model,
+      adapter.kind,
+      this.config.deployment.modelDigest ?? "",
+      this.config.deployment.activationId ?? "",
+    ].join(":")).slice(-12)}`;
     const throughputSource =
-      this.config.deployment.tokensPerSecond !== undefined
+      this.config.adapter.kind === "mycellios-pipeline"
+        ? "default"
+        : this.config.deployment.tokensPerSecond !== undefined
         ? "configured"
-        : this.config.llmfit.applyPerformanceEstimate && llmfit?.model?.measuredTokensPerSecond !== undefined
-          ? "measured"
-          : this.config.llmfit.applyPerformanceEstimate && llmfit?.model?.estimatedTokensPerSecond !== undefined
-            ? "estimated"
-            : this.config.adapter.kind === "mock"
-              ? "configured"
-              : "default";
+        : this.config.adapter.kind === "mock"
+          ? "configured"
+          : "default";
     const defaultTokensPerSecond =
       this.config.adapter.kind === "mock"
         ? this.config.adapter.tokensPerSecond
-        : (llmfitTokensPerSecond ?? 5);
+        : 5;
     const defaultTtft = this.config.adapter.kind === "mock" ? this.config.adapter.ttftMs : 2_000;
     const publicPrimary = publicHardwareGpu(primary);
     return {
       region: this.config.region,
       agentVersion: this.options.agentVersion?.trim() || "0.1.0",
+      ...(this.options.buildIdentity
+        ? { buildIdentity: this.options.buildIdentity }
+        : {}),
       gpus: [
         {
           ...(this.config.capacityScope === "cell"
             ? {
                 id: "cell-aggregate",
-                vendor: "sidecar-cell",
-                model: `Aggregate capacity exposed by ${this.config.adapter.model}`,
+                vendor: "mycellios",
+                model: `Native pipeline capacity for ${this.config.adapter.model}`,
                 // Zero means no claim about a single physical GPU. The quota
                 // below represents the independently measured whole cell.
                 physicalVramMb: 0,
@@ -466,18 +740,27 @@ export class WorkerAgent {
           model,
           modelDigest:
             this.config.deployment.modelDigest ?? sha256Text(`${adapter.kind}:${model}`),
+          ...(this.config.deployment.activationId
+            ? { activationId: this.config.deployment.activationId }
+            : {}),
           mode: "replica",
-          adapter: adapter.kind,
+          adapter: deploymentAdapterKind(adapter.kind),
           peakVramMb:
             this.config.deployment.peakVramMb ?? Math.max(512, Math.floor(safeBudget * 0.9)),
           contextLimit: this.config.deployment.contextLimit,
           maxConcurrency: this.config.limits.maxConcurrency,
           freeSlots: this.config.limits.maxConcurrency,
-          tokensPerSecond:
-            this.config.deployment.tokensPerSecond ?? defaultTokensPerSecond,
+          tokensPerSecond: this.config.adapter.kind === "mycellios-pipeline"
+            ? 1
+            : this.config.deployment.tokensPerSecond ?? defaultTokensPerSecond,
           throughputSource,
-          ttftMs: this.config.deployment.ttftMs ?? defaultTtft,
-          dataLocality: adapterDataLocality(this.config),
+          ttftMs: this.config.adapter.kind === "mycellios-pipeline"
+            ? 60_000
+            : this.config.deployment.ttftMs ?? defaultTtft,
+          ...(this.config.adapter.kind === "mycellios-pipeline"
+            ? { verificationState: "pending" as const }
+            : {}),
+          dataLocality: "local",
           ...(this.config.deployment.internalPipeline
             ? { internalPipeline: structuredClone(this.config.deployment.internalPipeline) }
             : {}),
@@ -490,11 +773,11 @@ export class WorkerAgent {
         uplinkMbps: 100,
         downlinkMbps: 100,
       },
-      ...(llmfit ? { llmfit } : {}),
       ...(this.options.distributedExecutor
         ? {
             distributedExecutor: {
               protocol: "gdlp-worker-tunnel/2" as const,
+              streamRecovery: "offset-ack-v1" as const,
               nodeId: this.options.distributedExecutor.nodeId,
               stageHost: this.options.distributedExecutor.stageHost,
               stagePort: this.options.distributedExecutor.stagePort,
@@ -504,55 +787,125 @@ export class WorkerAgent {
               ...(this.options.distributedExecutor.acceleration
                 ? { acceleration: structuredClone(this.options.distributedExecutor.acceleration) }
                 : {}),
+              ...(this.options.distributedExecutor.isolation
+                ? { isolation: structuredClone(this.options.distributedExecutor.isolation) }
+                : {}),
+              ...(this.directTransportAdvertisement
+                ? { directTransport: structuredClone(this.directTransportAdvertisement) }
+                : {}),
             },
           }
         : {}),
     };
   }
 
-  private async inspectWithLlmfit(): Promise<WorkerCapabilities["llmfit"] | null> {
-    if (!this.config.llmfit.enabled) return null;
-    if (this.config.capacityScope === "cell") {
-      this.logger.warn(
-        "llmfit reports the gateway host only; it will not replace aggregate cell capacity",
-      );
-    }
+  private async measureRuntimePerformanceProfile(
+    challenge: RuntimePerformanceChallenge,
+  ): Promise<RuntimePerformanceProfile | undefined> {
+    const probe = this.options.runtimePerformanceProfileProbe;
+    if (!this.options.distributedExecutor || !probe) return undefined;
     try {
-      const result = await probeLlmfit({
-        executable: this.config.llmfit.executable,
-        arguments: this.config.llmfit.arguments,
-        timeoutMs: this.config.llmfit.timeoutMs,
-        model: this.config.llmfit.model ?? this.config.adapter.model,
-        maxContext: this.config.deployment.contextLimit,
-      });
-      for (const warning of result.warnings) this.logger.warn(warning);
-      const model = result.advisory.model;
-      if (model) {
-        const basis = model.measuredTokensPerSecond ? "measured" : "estimated";
-        const tps = model.measuredTokensPerSecond ?? model.estimatedTokensPerSecond;
-        this.logger.info(
-          `llmfit matched ${model.resolvedModel}: ${model.fitLevel}, ${model.bestQuant ?? "quant unknown"}${tps ? `, ${tps} tok/s ${basis}` : ""}`,
-        );
+      const measured = await probe(challenge);
+      if (!measured) return undefined;
+      const profile = runtimePerformanceProfileSchema.parse(measured);
+      const expectedBackend = this.options.verifiedGpuRuntime?.backend ?? "cpu";
+      const expectedPrecision = expectedBackend === "cpu" ? "float32" : "float16";
+      if (profile.backend !== expectedBackend) {
+        throw new Error("runtime_performance_profile_backend_does_not_match_capacity");
       }
-      return result.advisory;
+      if (profile.precision !== expectedPrecision) {
+        throw new Error("runtime_performance_profile_precision_does_not_match_capacity");
+      }
+      if (
+        this.options.verifiedGpuRuntime
+        && normalizeDeviceName(profile.deviceName)
+          !== normalizeDeviceName(this.options.verifiedGpuRuntime.deviceName)
+      ) {
+        throw new Error("runtime_performance_profile_device_does_not_match_capacity");
+      }
+      return profile;
     } catch (error) {
-      const message = `llmfit inspection failed: ${errorText(error)}`;
-      if (this.config.llmfit.required) throw new Error(message, { cause: error });
-      this.logger.warn(`${message}; continuing with the native worker probe`);
-      return null;
+      this.logger.warn(
+        `Native runtime performance calibration unavailable: ${errorText(error)}`,
+      );
+      return undefined;
     }
   }
 
   private async register(): Promise<void> {
     const identity = this.options.identity ?? this.defaultIdentity();
+    if (!this.capabilities) throw new Error("Worker capabilities are not initialized");
+    const protocol = { min: WORKER_PROTOCOL_MIN, max: WORKER_PROTOCOL_MAX };
+    const registration = {
+      ...(identity ? { identity } : {}),
+      capabilities: this.capabilities,
+      protocol,
+    };
+    let admission:
+      | {
+        challengeId: string;
+        publicKey: WorkerAdmissionSigner["publicKey"];
+        protocol: typeof protocol;
+        registrationDigest: string;
+        signature: string;
+      }
+      | undefined;
+    if (this.options.admissionSigner) {
+      if (!identity) {
+        throw new Error("A stable worker identity is required for signed admission");
+      }
+      const registrationDigest = workerRegistrationDigest({
+        identity,
+        capabilities: this.capabilities,
+        protocol,
+      });
+      const challengeResponse = await fetch(
+        coordinatorHttpUrl(
+          this.coordinatorBaseUrl,
+          "internal/v1/workers/admission-challenge",
+        ),
+        {
+          method: "POST",
+          headers: this.requestHeaders({ "content-type": "application/json" }),
+          body: JSON.stringify({
+            identity,
+            publicKey: this.options.admissionSigner.publicKey,
+            protocol,
+            registrationDigest,
+          }),
+          signal: AbortSignal.timeout(10_000),
+          redirect: "manual",
+        },
+      );
+      if (!challengeResponse.ok) {
+        throw new Error(
+          `Worker admission challenge failed with HTTP ${challengeResponse.status}`,
+        );
+      }
+      const challengeText = await readResponseTextLimited(challengeResponse, 16 * 1024);
+      let challengeJson: unknown;
+      try {
+        challengeJson = JSON.parse(challengeText) as unknown;
+      } catch {
+        throw new Error("Worker admission challenge returned invalid JSON");
+      }
+      const challenge = workerAdmissionChallengeResponseSchema.parse(challengeJson);
+      admission = {
+        challengeId: challenge.challengeId,
+        publicKey: this.options.admissionSigner.publicKey,
+        protocol,
+        registrationDigest,
+        signature: this.options.admissionSigner.sign(challenge.signingPayload),
+      };
+    }
     const response = await fetch(
       coordinatorHttpUrl(this.coordinatorBaseUrl, "internal/v1/workers/register"),
       {
         method: "POST",
         headers: this.requestHeaders({ "content-type": "application/json" }),
         body: JSON.stringify({
-          ...(identity ? { identity } : {}),
-          capabilities: this.capabilities,
+          ...registration,
+          ...(admission ? { admission } : {}),
         }),
         signal: AbortSignal.timeout(10_000),
         redirect: "manual",
@@ -604,6 +957,10 @@ export class WorkerAgent {
       socket.on("open", () => {
         opened = true;
         this.sendMessage("worker.hello", {});
+        this.startRttProbe(socket);
+      });
+      socket.on("pong", (payload: Buffer) => {
+        this.recordRttSample(payload);
       });
       socket.on("message", (raw) => {
         let decoded: unknown;
@@ -627,14 +984,90 @@ export class WorkerAgent {
       socket.on("close", () => {
         if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
         this.heartbeatTimer = null;
+        this.stopRttProbe();
         this.socket = null;
+        this.clearRuntimeLinkProbes();
+        this.runtimeTunnel?.transportDisconnected();
         void this.abortActiveJobs("Coordinator disconnected");
-        void this.resetDistributedRuntime("coordinator_disconnected").finally(() => {
-          if (opened) resolve();
-          else reject(new Error("Coordinator connection closed before it became ready"));
-        });
+        if (
+          opened
+          && !this.stopped
+          && this.options.reconnect !== false
+          && this.runtimeTunnel
+        ) {
+          this.scheduleRuntimeDisconnectReset();
+          resolve();
+        } else {
+          void this.resetDistributedRuntime("coordinator_disconnected").finally(() => {
+            if (opened) resolve();
+            else reject(new Error("Coordinator connection closed before it became ready"));
+          });
+        }
       });
     });
+  }
+
+  /**
+   * Measure the real round-trip time to the coordinator.
+   *
+   * Until now `coordinatorRttMs` was hardcoded to 0 and nothing ever wrote it,
+   * so every consumer scored placement on a constant: the scheduler's latency
+   * term (`scheduler.ts`) was always 0, and the desktop planner concluded that
+   * every worker-to-worker link cost 0.1 ms. Measured reality on the fleet is
+   * 54-437 ms per hop, and picking the right node is worth ~1.8x — a decision
+   * the planner could not make because it never saw the number.
+   *
+   * WebSocket ping/pong is the honest probe: it rides the same connection as
+   * the data, needs nothing from the coordinator, and cannot be confused with
+   * application queueing. Samples are smoothed with an EMA so one scheduling
+   * hiccup does not move placement.
+   */
+  private startRttProbe(socket: WebSocket): void {
+    this.stopRttProbe();
+    const probe = (): void => {
+      if (socket.readyState !== WebSocket.OPEN) return;
+      // An outstanding probe means the previous pong never came back. Leaving
+      // the old timestamp in place would turn a lost pong into an absurd RTT.
+      this.pendingRttProbe = process.hrtime.bigint();
+      try {
+        socket.ping(RTT_PROBE_PAYLOAD);
+      } catch {
+        this.pendingRttProbe = null;
+      }
+    };
+    probe();
+    this.rttProbeTimer = setInterval(probe, this.options.rttProbeIntervalMs ?? 15_000);
+    this.rttProbeTimer.unref?.();
+  }
+
+  private stopRttProbe(): void {
+    if (this.rttProbeTimer) clearInterval(this.rttProbeTimer);
+    this.rttProbeTimer = null;
+    this.pendingRttProbe = null;
+  }
+
+  private recordRttSample(payload: Buffer): void {
+    const sentAt = this.pendingRttProbe;
+    // Only answer our own probes: `ws` also emits `pong` for unsolicited frames
+    // and for the library's own keepalive, which would corrupt the estimate.
+    if (sentAt === null || !payload.equals(RTT_PROBE_PAYLOAD)) return;
+    this.pendingRttProbe = null;
+    const sampleMs = Number(process.hrtime.bigint() - sentAt) / 1_000_000;
+    if (!Number.isFinite(sampleMs) || sampleMs < 0) return;
+    const previous = this.capabilities?.network.coordinatorRttMs;
+    const smoothed = previous === undefined || previous <= 0
+      ? sampleMs
+      : previous * (1 - RTT_EMA_ALPHA) + sampleMs * RTT_EMA_ALPHA;
+    // Report the rounded value: sub-microsecond precision is noise, and the
+    // wire schema only promises a non-negative number.
+    const rounded = Math.round(smoothed * 100) / 100;
+    if (this.capabilities) this.capabilities.network.coordinatorRttMs = rounded;
+    this.lastRttSampleMs = sampleMs;
+  }
+
+  /** Última muestra cruda de RTT, sin suavizar. Diagnóstico y pruebas. */
+  get measuredRttMs(): number | null {
+    return this.lastRttSampleMs;
   }
 
   private requestHeaders(initial: Record<string, string> = {}): Record<string, string> {
@@ -651,7 +1084,9 @@ export class WorkerAgent {
         }
         this.logger.info(`Worker ${this.registeredWorkerId ?? "unknown"} connected`);
         if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+        this.clearRuntimeDisconnectTimer();
         await this.sendHeartbeat();
+        this.runtimeTunnel?.transportConnected();
         this.heartbeatTimer = setInterval(
           () => void this.sendHeartbeat(),
           this.options.heartbeatIntervalMs ?? 5_000,
@@ -669,6 +1104,9 @@ export class WorkerAgent {
         await this.adapter.cancel(jobId);
         break;
       }
+      case "evidence.challenge":
+        void this.handleEvidenceChallenge(message.payload);
+        break;
       case "runtime.prepare":
         await this.prepareDistributedRuntime(message.payload.requestId, message.payload.description);
         break;
@@ -681,10 +1119,239 @@ export class WorkerAgent {
       case "runtime.stream.open":
       case "runtime.stream.opened":
       case "runtime.stream.data":
+      case "runtime.stream.ack":
+      case "runtime.stream.suspend":
+      case "runtime.stream.resumed":
       case "runtime.stream.end":
       case "runtime.stream.error":
+      case "runtime.direct.offer":
+      case "runtime.direct.connect":
+      case "runtime.direct.commit":
+      case "runtime.direct.cancel":
         await this.runtimeTunnel?.handle(message as RuntimeStreamServerMessage);
         break;
+      case "runtime.link.probe.start":
+        this.startRuntimeLinkProbe(
+          message.payload.probeId,
+          message.payload.destinationNodeId,
+          message.payload.timeoutMs,
+          message.payload.payloadBytes,
+        );
+        break;
+      case "runtime.link.probe.ping":
+        this.sendMessage("runtime.link.probe.pong", {
+          probeId: message.payload.probeId,
+          data: message.payload.data,
+        });
+        break;
+      case "runtime.link.probe.pong":
+        this.completeRuntimeLinkProbe(message.payload.probeId, message.payload.data);
+        break;
+    }
+  }
+
+  private startRuntimeLinkProbe(
+    probeId: string,
+    destinationNodeId: string,
+    timeoutMs: number,
+    payloadBytes: number,
+  ): void {
+    if (this.runtimeLinkProbes.has(probeId)) return;
+    if (this.runtimeLinkProbes.size >= MAX_PENDING_RUNTIME_LINK_PROBES) {
+      this.sendMessage("runtime.link.probe.result", {
+        probeId,
+        destinationNodeId,
+        rttMs: null,
+        goodputMbps: null,
+      });
+      return;
+    }
+    const timeout = setTimeout(() => {
+      const pending = this.runtimeLinkProbes.get(probeId);
+      if (!pending || !this.runtimeLinkProbes.delete(probeId)) return;
+      this.sendMessage("runtime.link.probe.result", {
+        probeId,
+        destinationNodeId: pending.destinationNodeId,
+        rttMs: null,
+        goodputMbps: null,
+      });
+    }, timeoutMs);
+    timeout.unref();
+    this.runtimeLinkProbes.set(probeId, {
+      destinationNodeId,
+      payloadBytes,
+      startedAt: process.hrtime.bigint(),
+      timeout,
+    });
+    const fill = probeId.charCodeAt(probeId.length - 1) || 1;
+    const data = Buffer.alloc(payloadBytes, fill).toString("base64");
+    this.sendMessage("runtime.link.probe.ping", { probeId, destinationNodeId, data });
+  }
+
+  private completeRuntimeLinkProbe(probeId: string, data: string): void {
+    const pending = this.runtimeLinkProbes.get(probeId);
+    if (!pending || !this.runtimeLinkProbes.delete(probeId)) return;
+    clearTimeout(pending.timeout);
+    const receivedBytes = Buffer.from(data, "base64").byteLength;
+    if (receivedBytes !== pending.payloadBytes) {
+      this.sendMessage("runtime.link.probe.result", {
+        probeId,
+        destinationNodeId: pending.destinationNodeId,
+        rttMs: null,
+        goodputMbps: null,
+      });
+      return;
+    }
+    const elapsedNs = process.hrtime.bigint() - pending.startedAt;
+    const rttMs = Number(elapsedNs) / 1_000_000;
+    const goodputMbps = (2 * pending.payloadBytes * 8) / (rttMs * 1_000);
+    this.sendMessage("runtime.link.probe.result", {
+      probeId,
+      destinationNodeId: pending.destinationNodeId,
+      rttMs: Math.min(60_000, Math.max(Number.EPSILON, rttMs)),
+      goodputMbps: Math.min(10_000_000, Math.max(Number.EPSILON, goodputMbps)),
+    });
+  }
+
+  private clearRuntimeLinkProbes(): void {
+    for (const probe of this.runtimeLinkProbes.values()) clearTimeout(probe.timeout);
+    this.runtimeLinkProbes.clear();
+  }
+
+  private async handleEvidenceChallenge(challenge: EvidenceChallenge): Promise<void> {
+    if (
+      challenge.workerId !== this.registeredWorkerId
+      || Date.now() > Date.parse(challenge.expiresAt)
+      || this.activeEvidenceChallenges.has(challenge.challengeId)
+    ) {
+      return;
+    }
+    this.activeEvidenceChallenges.add(challenge.challengeId);
+    try {
+      if (challenge.kind === "deployment-canary") {
+        await this.runDeploymentCanaryChallenge(challenge);
+      } else {
+        const profile = await this.measureRuntimePerformanceProfile(challenge);
+        if (!profile) throw new Error("runtime_performance_probe_unavailable");
+        this.sendMessage("evidence.runtime.complete", {
+          challengeId: challenge.challengeId,
+          nonce: challenge.nonce,
+          sessionId: challenge.sessionId,
+          profile,
+        });
+      }
+    } catch (error) {
+      this.sendMessage("evidence.challenge.failed", {
+        challengeId: challenge.challengeId,
+        nonce: challenge.nonce,
+        sessionId: challenge.sessionId,
+        reason: errorText(error).slice(0, 512),
+      });
+    } finally {
+      this.activeEvidenceChallenges.delete(challenge.challengeId);
+    }
+  }
+
+  private async runDeploymentCanaryChallenge(
+    challenge: DeploymentCanaryChallenge,
+  ): Promise<void> {
+    const deployment = this.capabilities?.deployments.find(
+      (candidate) =>
+        candidate.deploymentId === challenge.deploymentId
+        && candidate.model === challenge.model
+        && candidate.modelDigest === challenge.modelDigest
+        && candidate.activationId === challenge.activationId,
+    );
+    if (!deployment || this.config.adapter.kind !== "mycellios-pipeline") {
+      throw new Error("deployment_canary_target_is_not_local");
+    }
+    const deadlineAt = Date.parse(challenge.expiresAt);
+    const runSample = async (sampleIndex: number, publish: boolean): Promise<void> => {
+      const remainingMs = deadlineAt - Date.now();
+      if (remainingMs <= 0) throw new Error("evidence_challenge_expired");
+      const controller = new AbortController();
+      const timeout = setTimeout(
+        () => controller.abort(new Error("evidence_challenge_expired")),
+        remainingMs,
+      );
+      let output = "";
+      let backendMetrics: AdapterChunk["metrics"] | undefined;
+      let nextObservedIndex = 0;
+      try {
+        if (publish) {
+          this.sendMessage("evidence.canary.started", {
+            challengeId: challenge.challengeId,
+            nonce: challenge.nonce,
+            sessionId: challenge.sessionId,
+            sampleIndex,
+          });
+        }
+        for await (const chunk of this.adapter.generate({
+          jobId: `evidence-${challenge.challengeId}-${publish ? sampleIndex : `warmup-${sampleIndex}`}`,
+          request: {
+            model: challenge.model,
+            messages: [{ role: "user", content: challenge.prompt }],
+            max_tokens: challenge.maxOutputTokens,
+            temperature: 0,
+            top_p: 1,
+            seed: 20_260_725,
+            workload_class: "benchmark",
+            // Warmups and measured samples must never share a KV/session key:
+            // reuse would make sample 0 look faster than a cold independent
+            // request and would corrupt the coordinator-observed comparison.
+            session_id:
+              `evidence-${challenge.challengeId}-${publish ? "sample" : "warmup"}-${sampleIndex}`,
+            deadline_ms: Math.max(1_000, remainingMs),
+          },
+        }, controller.signal)) {
+          if (chunk.metrics) backendMetrics = { ...backendMetrics, ...chunk.metrics };
+          if (!chunk.text) continue;
+          const chunkBytes = Buffer.byteLength(chunk.text, "utf8");
+          if (
+            chunkBytes > MAX_OUTPUT_CHUNK_BYTES
+            || Buffer.byteLength(output, "utf8") + chunkBytes > MAX_OUTPUT_BYTES
+          ) {
+            throw new Error("deployment_canary_output_limit_exceeded");
+          }
+          output += chunk.text;
+          if (publish) {
+            this.sendMessage("evidence.canary.token", {
+              challengeId: challenge.challengeId,
+              nonce: challenge.nonce,
+              sessionId: challenge.sessionId,
+              sampleIndex,
+              index: nextObservedIndex++,
+              text: chunk.text,
+            });
+          }
+        }
+        if (!output) throw new Error("deployment_canary_returned_empty_output");
+        if (publish) {
+          const outputTokens = Math.max(
+            1,
+            Math.min(
+              challenge.maxOutputTokens,
+              Math.round(backendMetrics?.outputTokens ?? Math.ceil(output.length / 4)),
+            ),
+          );
+          this.sendMessage("evidence.canary.complete", {
+            challengeId: challenge.challengeId,
+            nonce: challenge.nonce,
+            sessionId: challenge.sessionId,
+            sampleIndex,
+            outputTokens,
+            finishReason: outputTokens >= challenge.maxOutputTokens ? "length" : "stop",
+          });
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+    };
+    for (let index = 0; index < challenge.warmupSamples; index += 1) {
+      await runSample(index, false);
+    }
+    for (let index = 0; index < challenge.samples; index += 1) {
+      await runSample(index, true);
     }
   }
 
@@ -696,10 +1363,29 @@ export class WorkerAgent {
       const description = input as PythonPipelineLaunchDescription;
       const local = description.launchOrder.filter((process) => process.anchor.memberId === executor.nodeId);
       if (local.length === 0) throw new Error("distributed_plan_has_no_process_for_this_node");
+      const prepared = executor.launchAgent.prepareRuntime
+        ? await executor.launchAgent.prepareRuntime(
+            description,
+            executor.nodeId,
+            (event) => this.sendMessage("runtime.prepare.progress", {
+              requestId,
+              ...event,
+            }),
+          )
+        : local;
+      const preparedById = new Map(prepared.map((process) => [process.processId, process]));
+      if (
+        preparedById.size !== local.length
+        || local.some((process) => !preparedById.has(process.processId))
+      ) {
+        throw new Error("distributed_runtime_preparation_did_not_cover_local_plan");
+      }
       await this.runtimeTunnel?.prepare(description);
       this.authorizedRuntimeProcesses.clear();
+      this.preparedRuntimeProcesses.clear();
       for (const process of local) {
         this.authorizedRuntimeProcesses.set(process.processId, JSON.stringify(process));
+        this.preparedRuntimeProcesses.set(process.processId, preparedById.get(process.processId)!);
       }
       this.sendMessage("runtime.prepared", { requestId, ok: true });
     } catch (error) {
@@ -716,9 +1402,11 @@ export class WorkerAgent {
       if (this.authorizedRuntimeProcesses.get(input.process.processId) !== JSON.stringify(input.process)) {
         throw new Error("distributed_launch_process_was_not_prepared");
       }
+      const preparedProcess = this.preparedRuntimeProcesses.get(input.process.processId);
+      if (!preparedProcess) throw new Error("distributed_launch_artifact_was_not_prepared");
       if (this.runtimeProcesses.has(requestId)) throw new Error("distributed_launch_request_is_duplicate");
       const controller = new AbortController();
-      const tunneledProcess = this.runtimeTunnel?.rewriteProcess(input.process) ?? input.process;
+      const tunneledProcess = this.runtimeTunnel?.rewriteProcess(preparedProcess) ?? preparedProcess;
       const localRequest: LaunchAgentStartRequest = executor.pythonExecutable
         ? {
             ...input,
@@ -763,11 +1451,30 @@ export class WorkerAgent {
   }
 
   private async resetDistributedRuntime(reason: string): Promise<void> {
+    this.clearRuntimeDisconnectTimer();
     const handles = [...this.runtimeProcesses.values()];
     this.runtimeProcesses.clear();
     this.authorizedRuntimeProcesses.clear();
+    this.preparedRuntimeProcesses.clear();
     await Promise.all(handles.map((handle) => handle.stop(reason).catch(() => undefined)));
-    await this.runtimeTunnel?.close();
+    await this.runtimeTunnel?.reset();
+  }
+
+  private scheduleRuntimeDisconnectReset(): void {
+    this.clearRuntimeDisconnectTimer();
+    const timer = setTimeout(() => {
+      if (this.runtimeDisconnectTimer !== timer) return;
+      this.runtimeDisconnectTimer = null;
+      void this.resetDistributedRuntime("coordinator_reconnect_timeout");
+    }, RUNTIME_RECONNECT_GRACE_MS);
+    timer.unref();
+    this.runtimeDisconnectTimer = timer;
+  }
+
+  private clearRuntimeDisconnectTimer(): void {
+    if (!this.runtimeDisconnectTimer) return;
+    clearTimeout(this.runtimeDisconnectTimer);
+    this.runtimeDisconnectTimer = null;
   }
 
   private sendRuntimeExit(
@@ -888,7 +1595,14 @@ export class WorkerAgent {
       const measuredTokensPerSecond = metrics.outputTokens > 0
         ? metrics.outputTokens / (metrics.activeMs / 1_000)
         : 0;
-      if (this.capabilities && measuredTokensPerSecond > 0) {
+      // A normal request is useful operational telemetry, but it is not the
+      // sealed multi-sample activation canary. Keep production pipeline
+      // scheduling metrics immutable until a new bound canary is published.
+      if (
+        this.config.adapter.kind !== "mycellios-pipeline"
+        && this.capabilities
+        && measuredTokensPerSecond > 0
+      ) {
         this.capabilities = {
           ...this.capabilities,
           deployments: this.capabilities.deployments.map((deployment) =>
@@ -1023,11 +1737,13 @@ export class WorkerAgent {
     };
   }
 
-  private sendMessage(type: string, payload: unknown): void {
-    if (!this.registeredWorkerId || !this.socket || this.socket.readyState !== WebSocket.OPEN) return;
+  private sendMessage(type: string, payload: unknown): boolean {
+    if (!this.registeredWorkerId || !this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      return false;
+    }
     if (this.socket.bufferedAmount > MAX_WEBSOCKET_BUFFERED_BYTES) {
       this.socket.close(4429, "runtime stream backpressure exceeded");
-      return;
+      return false;
     }
     const envelope: WorkerEnvelope = {
       v: 1,
@@ -1036,6 +1752,7 @@ export class WorkerAgent {
       payload,
     };
     this.socket.send(JSON.stringify(envelope));
+    return true;
   }
 }
 
@@ -1124,6 +1841,19 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function normalizeDeviceName(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function deploymentAdapterKind(
+  adapter: InferenceAdapter["kind"],
+): "mycellios-pipeline" | "mock" {
+  if (adapter === "mycellios-native") {
+    throw new Error("mycellios_native_control_cannot_be_a_model_deployment");
+  }
+  return adapter;
+}
+
 function isLaunchAgentStartRequest(value: unknown): value is LaunchAgentStartRequest {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const request = value as Record<string, unknown>;
@@ -1137,14 +1867,19 @@ function isLaunchAgentStartRequest(value: unknown): value is LaunchAgentStartReq
   ) return false;
   const process = request.process as Record<string, unknown>;
   const anchor = process.anchor;
-  return typeof process.processId === "string" && !!anchor && typeof anchor === "object" &&
-    !Array.isArray(anchor) && (anchor as Record<string, unknown>).memberId === request.nodeId;
-}
-
-function adapterDataLocality(config: WorkerConfig): "local" | "external" {
-  if (config.adapter.kind !== "openai-compatible") return "local";
-  const hostname = new URL(config.adapter.baseUrl).hostname.toLowerCase();
-  return new Set(["localhost", "127.0.0.1", "::1", "[::1]"]).has(hostname)
-    ? "local"
-    : "external";
+  if (
+    typeof process.processId !== "string"
+    || !anchor
+    || typeof anchor !== "object"
+    || Array.isArray(anchor)
+    || (anchor as Record<string, unknown>).memberId !== request.nodeId
+  ) {
+    return false;
+  }
+  try {
+    validateExecutorIsolationPolicy(process.isolation);
+    return true;
+  } catch {
+    return false;
+  }
 }

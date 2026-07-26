@@ -241,6 +241,7 @@ describe("physical external TP-cell launch supervisor", () => {
         const localAgent = new LocalProcessAgent({
           id: "physical-external-cell-local-agent",
           cwd: workspace,
+          allowedExecutables: [description.configuration.pythonExecutable],
           env: childEnvironment,
           maxOutputBytesPerStream: 512 * 1024,
           stopGraceMs: 20_000,

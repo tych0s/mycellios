@@ -6,12 +6,27 @@ from pathlib import Path
 import sys
 from typing import Any
 
-from .model import StageModelSpec, model_artifact_reference, resolve_model_snapshot
+from .dense_tiering import (
+    add_dense_tiering_arguments,
+    dense_tiering_config_from_args,
+)
+from .model import (
+    StageModelSpec,
+    model_artifact_reference,
+    resolve_model_metadata_snapshot,
+)
+from .native_gguf import verify_native_gguf_stage
+from .native_gguf_runtime import (
+    add_native_gguf_arguments,
+    native_gguf_runtime_from_args,
+)
+from .paged_stage import add_paged_kv_arguments, paged_kv_config_from_args
 from .protocol import TensorCodec
 from .ram_backed_moe_runtime import (
     add_ram_backed_moe_arguments,
     ram_backed_moe_config_from_args,
 )
+from .runtime_policy import reject_external_backend_arguments
 from .stage import StageProcessConfig, run_stage_process
 
 
@@ -52,16 +67,21 @@ def _uint64_argument(value: str) -> int:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    reject_external_backend_arguments(arguments)
     parser = argparse.ArgumentParser(
         description="Run one persistent remote layer stage for a GDLP pipeline."
     )
     parser.add_argument("--model", required=True)
     parser.add_argument("--revision")
     parser.add_argument("--model-artifact-identity")
+    parser.add_argument("--stage-package-identity")
     parser.add_argument("--model-canonical-source")
     parser.add_argument("--model-canonical-revision")
     parser.add_argument("--pipeline-snapshot-identity", type=_uint64_argument)
     add_ram_backed_moe_arguments(parser)
+    add_paged_kv_arguments(parser)
+    add_native_gguf_arguments(parser)
     parser.add_argument("--layer-start", type=int, required=True)
     parser.add_argument("--layer-end", type=int, required=True)
     parser.add_argument("--total-layers", type=int, required=True)
@@ -74,6 +94,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "An explicit accelerator request fails if it is unavailable."
         ),
     )
+    add_dense_tiering_arguments(parser)
     parser.add_argument("--listen-host", default="0.0.0.0")
     parser.add_argument("--listen-port", type=int, required=True)
     parser.add_argument("--next-host")
@@ -152,23 +173,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0,
         help="Sealed total live speculative KV bytes, checked before allocation.",
     )
-    parser.add_argument("--native_stage-package")
-    parser.add_argument("--native_stage-package-id")
-    parser.add_argument("--native_stage-manifest-sha256")
-    parser.add_argument("--native_stage-daemon-bin")
-    parser.add_argument("--native_stage-pipeline-id", type=_uint64_argument)
-    parser.add_argument("--native_stage-context-tokens", type=int)
-    parser.add_argument("--native_stage-gpu-layers", type=int, default=0)
-    parser.add_argument(
-        "--native_stage-compute-api",
-        choices=("cpu", "cuda", "rocm", "metal", "vulkan"),
-        default="cpu",
-    )
-    parser.add_argument("--native_stage-startup-timeout-seconds", type=float, default=120.0)
-    parser.add_argument("--native_stage-call-timeout-seconds", type=float, default=120.0)
-    parser.add_argument("--native_stage-close-timeout-seconds", type=float, default=5.0)
     parser.add_argument("--metrics-jsonl", type=Path)
-    return parser.parse_args(argv)
+    return parser.parse_args(arguments)
 
 
 def build_config(args: argparse.Namespace) -> StageProcessConfig:
@@ -179,6 +185,9 @@ def build_config(args: argparse.Namespace) -> StageProcessConfig:
             "sealed-wave-tokens and max-prefill-chunk-tokens must be supplied together"
         )
     ram_backed_moe = ram_backed_moe_config_from_args(args)
+    paged_kv = paged_kv_config_from_args(args)
+    native_gguf = native_gguf_runtime_from_args(args)
+    dense_tiering = dense_tiering_config_from_args(args)
     downstream_values = (args.next_host, args.next_port, args.next_layer_end)
     if any(value is not None for value in downstream_values) and not all(
         value is not None for value in downstream_values
@@ -198,26 +207,67 @@ def build_config(args: argparse.Namespace) -> StageProcessConfig:
         "int8-grouped-deflate": TensorCodec.INT8_GROUPED_DEFLATE,
         "int8-hadamard-deflate": TensorCodec.INT8_HADAMARD_DEFLATE,
     }[args.codec]
-    native_stage_required = (
-        args.native_stage_daemon_bin,
-        args.native_stage_pipeline_id,
-        args.native_stage_context_tokens,
-    )
-    if ram_backed_moe is not None:
-        if args.native_stage_package is not None or any(
+    if native_gguf is not None:
+        if (
+            ram_backed_moe is not None
+            or paged_kv is not None
+            or args.cell_fixture is not None
+        ):
+            raise ValueError(
+                "native GGUF cannot be combined with another model, package or "
+                "tensor-parallel backend"
+            )
+        package = verify_native_gguf_stage(
+            native_gguf.package,
+            expected_package_id=native_gguf.package_id,
+            expected_layer_start=args.layer_start,
+            expected_layer_end=args.layer_end,
+            expected_total_layers=args.total_layers,
+        )
+        supplied_coordinates = (
+            ("model-artifact-identity", args.model_artifact_identity, package.artifact_identity),
+            ("stage-package-identity", args.stage_package_identity, package.package_identity),
+            ("model-canonical-source", args.model_canonical_source, package.model_source),
+            (
+                "model-canonical-revision",
+                args.model_canonical_revision,
+                package.model_revision,
+            ),
+            ("revision", args.revision, package.model_revision),
+        )
+        for name, supplied, sealed in supplied_coordinates:
+            if supplied is not None and supplied != sealed:
+                raise ValueError(
+                    f"{name} differs from the authenticated native GGUF package"
+                )
+        snapshot = "sealed-native-gguf"
+        pipeline_id = (
+            args.pipeline_snapshot_identity
+            if args.pipeline_snapshot_identity is not None
+            else int(package.artifact_identity.removeprefix("sha256:")[:16], 16)
+        )
+        spec = StageModelSpec(
+            snapshot,
+            args.layer_start,
+            args.layer_end,
+            args.total_layers,
+            args.threads,
+            artifact_identity=package.artifact_identity,
+            canonical_model_source=package.model_source,
+            canonical_model_revision=package.model_revision,
+            stage_package_identity=package.package_identity,
+        )
+    elif ram_backed_moe is not None:
+        if paged_kv is not None or any(
             value is not None
             for value in (
-                args.native_stage_daemon_bin,
-                args.native_stage_pipeline_id,
-                args.native_stage_context_tokens,
-                args.native_stage_package_id,
-                args.native_stage_manifest_sha256,
                 args.cell_fixture,
                 args.cell_world_size,
+                args.stage_package_identity,
             )
         ):
             raise ValueError(
-                "RAM-backed MoE, NativeStage and tensor-parallel cell backends "
+                "paged KV, RAM-backed MoE and tensor-parallel cell backends "
                 "are mutually exclusive"
             )
         snapshot = str(Path(args.model).expanduser().resolve())
@@ -233,49 +283,25 @@ def build_config(args: argparse.Namespace) -> StageProcessConfig:
                 f"content-addressed://{ram_backed_moe.artifact_identity}"
             ),
         )
-    elif args.native_stage_package is not None:
-        if any(value is None for value in native_stage_required):
-            raise ValueError(
-                "NativeStage package requires daemon-bin, pipeline-id and context-tokens"
-            )
-        if args.layer_start == 0:
-            raise ValueError(
-                "NativeStage child-stage adapter cannot execute layer_start=0"
-            )
-        if any(
-            value is not None
-            for value in (
-                args.model_artifact_identity,
-                args.model_canonical_source,
-                args.model_canonical_revision,
-                args.pipeline_snapshot_identity,
-            )
-        ):
-            raise ValueError(
-                "standard model identity flags cannot be combined with NativeStage"
-            )
-        snapshot = args.model
-        revision = args.revision
-        pipeline_id = args.native_stage_pipeline_id
-        spec = StageModelSpec(
-            snapshot,
-            args.layer_start,
-            args.layer_end,
-            args.total_layers,
-            args.threads,
-            revision,
-        )
     else:
-        optional_native_stage = (
-            *native_stage_required,
-            args.native_stage_package_id,
-            args.native_stage_manifest_sha256,
-        )
-        if any(value is not None for value in optional_native_stage):
-            raise ValueError("NativeStage flags require --native_stage-package")
-        snapshot = resolve_model_snapshot(args.model, args.revision)
+        # Sólo METADATOS aquí (kilobytes), no el checkpoint entero.
+        #
+        # Antes esto llamaba a `resolve_model_snapshot`, que baja TODOS los
+        # pesos. El efecto no era sólo el tráfico: al pasarle a `StageModelSpec`
+        # un directorio ya descargado, el cargador selectivo hacía cortocircuito
+        # (`resolve_stage_model_snapshot` devuelve tal cual cualquier ruta local)
+        # y la descarga por capas —que está escrita y probada— no llegaba a
+        # ejecutarse nunca. Por eso cada nodo se traía el modelo completo y
+        # "un modelo mayor que cualquier host" no se sostenía.
+        #
+        # La identidad no sufre: para un snapshot del Hub se deriva del commit
+        # de la ruta de caché, no de los bytes (`_model_snapshot_digest`), así
+        # que un proceso con sólo metadatos declara EXACTAMENTE la misma
+        # identidad que uno con todo el modelo — que es justo lo que permite a
+        # las etapas acordar sin que ninguna guarde el checkpoint entero.
+        metadata_snapshot = resolve_model_metadata_snapshot(args.model, args.revision)
         artifact = model_artifact_reference(
-            snapshot,
+            metadata_snapshot,
             artifact_identity=args.model_artifact_identity,
             canonical_source=args.model_canonical_source,
             canonical_revision=args.model_canonical_revision,
@@ -286,14 +312,25 @@ def build_config(args: argparse.Namespace) -> StageProcessConfig:
             else artifact.snapshot_identity
         )
         spec = StageModelSpec(
-            snapshot,
+            # El NOMBRE del repositorio, no una ruta ya resuelta: el cargador
+            # selectivo necesita poder pedir sólo los shards de esta etapa.
+            args.model,
             args.layer_start,
             args.layer_end,
             args.total_layers,
             args.threads,
+            revision=args.revision,
             artifact_identity=artifact.identity,
             canonical_model_source=artifact.canonical_source,
             canonical_model_revision=artifact.canonical_revision,
+            stage_package_identity=args.stage_package_identity,
+        )
+    if paged_kv is not None and any(
+        value is not None for value in (args.cell_fixture, args.cell_world_size)
+    ):
+        raise ValueError(
+            "paged KV, RAM-backed MoE and tensor-parallel cell backends "
+            "are mutually exclusive"
         )
     return StageProcessConfig(
         spec=spec,
@@ -309,6 +346,7 @@ def build_config(args: argparse.Namespace) -> StageProcessConfig:
         one_way_delay_ms=args.one_way_delay_ms,
         bandwidth_mbps=args.bandwidth_mbps,
         device=args.device,
+        dense_tiering=dense_tiering,
         connect_timeout_seconds=args.connect_timeout_seconds,
         sealed_wave_tokens=args.sealed_wave_tokens,
         max_prefill_chunk_tokens=args.max_prefill_chunk_tokens,
@@ -332,20 +370,8 @@ def build_config(args: argparse.Namespace) -> StageProcessConfig:
         max_speculative_branch_tokens=args.max_speculative_branch_tokens,
         max_speculative_kv_bytes=args.max_speculative_kv_bytes,
         ram_backed_moe=ram_backed_moe,
-        native_stage_package=args.native_stage_package,
-        native_stage_package_id=args.native_stage_package_id,
-        native_stage_manifest_sha256=args.native_stage_manifest_sha256,
-        native_stage_daemon_command=(
-            ()
-            if args.native_stage_daemon_bin is None
-            else (args.native_stage_daemon_bin,)
-        ),
-        native_stage_context_tokens=args.native_stage_context_tokens,
-        native_stage_gpu_layers=args.native_stage_gpu_layers,
-        native_stage_compute_api=args.native_stage_compute_api,
-        native_stage_startup_timeout_seconds=args.native_stage_startup_timeout_seconds,
-        native_stage_call_timeout_seconds=args.native_stage_call_timeout_seconds,
-        native_stage_close_timeout_seconds=args.native_stage_close_timeout_seconds,
+        paged_kv=paged_kv,
+        native_gguf=native_gguf,
     )
 
 
@@ -363,6 +389,14 @@ def main(argv: list[str] | None = None) -> int:
                 "return": [config.return_host, config.return_port],
                 "codec": config.codec.name.lower(),
                 "requested_device": config.device,
+                "pagedKv": (
+                    None
+                    if config.paged_kv is None
+                    else {
+                        **config.paged_kv.to_document(),
+                        "configurationId": config.paged_kv.configuration_id,
+                    }
+                ),
                 "cell": (
                     None
                     if config.cell_fixture is None
@@ -384,18 +418,14 @@ def main(argv: list[str] | None = None) -> int:
                         ],
                     }
                 ),
-                "native_stage": (
+                "nativeGguf": (
                     None
-                    if config.native_stage_package is None
+                    if config.native_gguf is None
                     else {
-                        "package": config.native_stage_package,
-                        "package_id": config.native_stage_package_id,
-                        "manifest_sha256": config.native_stage_manifest_sha256,
-                        "daemon": list(config.native_stage_daemon_command),
-                        "context_tokens": config.native_stage_context_tokens,
-                        "gpu_layers": config.native_stage_gpu_layers,
-                        "compute_api": config.native_stage_compute_api,
-                        "max_active_requests": 1,
+                        "package_id": config.native_gguf.package_id,
+                        "model_identity": config.spec.artifact_identity,
+                        "stage_identity": config.spec.stage_package_identity,
+                        "external_runtime_required": False,
                     }
                 ),
             },

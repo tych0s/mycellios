@@ -1,0 +1,23 @@
+{
+  "region": "dev-local",
+  "offeredVramMb": 4096,
+  "limits": {
+    "maxConcurrency": 1,
+    "pauseWhenForeground": false
+  },
+  "adapter": {
+    "kind": "mock",
+    "developmentOnly": true,
+    "model": "mock-dev-only",
+    "tokensPerSecond": 20,
+    "ttftMs": 150,
+    "failureRate": 0
+  },
+  "deployment": {
+    "modelDigest": "sha256:mock-dev-only",
+    "peakVramMb": 3000,
+    "contextLimit": 8192,
+    "tokensPerSecond": 20,
+    "ttftMs": 150
+  }
+}

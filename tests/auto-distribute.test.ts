@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   AUTO_DISTRIBUTE_SCHEMA,
+  buildCellWorkerConfig,
   compileAutoDistribution,
   parseAutoDistributionConfig,
   type AutoDistributionConfig,
@@ -54,6 +55,30 @@ describe("automatic compatible-model distribution", () => {
     value.distribution.minimumStages = 3;
 
     expect(() => parseAutoDistributionConfig(value)).toThrow();
+  });
+
+  it("leaves performance pending for a coordinator-issued live challenge", () => {
+    const input = configFixture();
+    input.coordinator = {
+      url: "http://127.0.0.1:8080",
+      region: "test-lan",
+      maxConcurrency: 1,
+    };
+    const config = parseAutoDistributionConfig(input);
+    const compilation = compileAutoDistribution(config, profileFixture());
+    const worker = buildCellWorkerConfig(
+      config,
+      compilation,
+      "http://127.0.0.1:8088",
+      "pipeline-activation-123",
+    );
+
+    expect(worker.deployment.tokensPerSecond).toBeUndefined();
+    expect(worker.deployment.ttftMs).toBeUndefined();
+    expect(worker.deployment).toMatchObject({
+      activationId: "pipeline-activation-123",
+    });
+    expect("canaryEvidence" in worker.deployment).toBe(false);
   });
 });
 

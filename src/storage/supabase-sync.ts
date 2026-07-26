@@ -1,5 +1,6 @@
 import type { MeshStore } from "./store.js";
 import type { BenchmarkRun } from "../benchlab/types.js";
+import { parseBenchmarkRun } from "../benchlab/history.js";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 
@@ -13,6 +14,10 @@ const TABLE_PRIMARY_KEYS = Object.freeze({
   inference_conversations: "id",
   inference_messages: "id",
   activation_events: "id",
+  deployment_states: "model_id",
+  deployment_operations: "id",
+  route_reservations: "id",
+  deployment_stage_leases: "id",
 } as const);
 
 type SyncedTable = keyof typeof TABLE_PRIMARY_KEYS;
@@ -132,13 +137,8 @@ export class SupabasePersistence {
   async readBenchmarkRuns(): Promise<BenchmarkRun[]> {
     const rows = await this.readTable("benchmark_runs");
     return rows
-      .map((row) => row.document)
-      .filter((document): document is BenchmarkRun =>
-        isRecord(document)
-        && document.schema === "mycellios-benchmark-run/1"
-        && typeof document.runId === "string"
-        && typeof document.finishedAt === "string"
-        && Array.isArray(document.measurements))
+      .map((row) => parseBenchmarkRun(row.document))
+      .filter((document): document is BenchmarkRun => document !== null)
       .sort((left, right) => left.finishedAt.localeCompare(right.finishedAt));
   }
 
@@ -159,6 +159,10 @@ export class SupabasePersistence {
       inferenceConversations,
       inferenceMessages,
       activationEvents,
+      deploymentStates,
+      deploymentOperations,
+      routeReservations,
+      deploymentStageLeases,
     ] = await Promise.all([
       this.readTable("workers"),
       this.readTable("requested_models"),
@@ -168,6 +172,10 @@ export class SupabasePersistence {
       this.readTable("inference_conversations"),
       this.readTable("inference_messages"),
       this.readTable("activation_events"),
+      this.readTable("deployment_states"),
+      this.readTable("deployment_operations"),
+      this.readTable("route_reservations"),
+      this.readTable("deployment_stage_leases"),
     ]);
     this.store.database.transaction(() => {
       for (const row of workers) this.restoreWorker(row);
@@ -178,6 +186,10 @@ export class SupabasePersistence {
       for (const row of inferenceConversations) this.restoreInferenceConversation(row);
       for (const row of inferenceMessages) this.restoreInferenceMessage(row);
       for (const row of activationEvents) this.restoreActivationEvent(row);
+      for (const row of deploymentOperations) this.restoreDeploymentOperation(row);
+      for (const row of routeReservations) this.restoreRouteReservation(row);
+      for (const row of deploymentStageLeases) this.restoreDeploymentStageLease(row);
+      for (const row of deploymentStates) this.restoreDeploymentState(row);
     });
   }
 
@@ -526,6 +538,160 @@ export class SupabasePersistence {
       nullableString(row.device),
       row.details == null ? null : JSON.stringify(row.details),
       numberValue(row.occurred_at, Date.now()),
+    );
+  }
+
+  private restoreDeploymentState(row: Record<string, unknown>): void {
+    if (typeof row.model_id !== "string" || typeof row.updated_at !== "number") return;
+    const existing = this.store.database.raw.prepare(
+      "SELECT updated_at FROM deployment_states WHERE model_id = ?",
+    ).get(row.model_id) as { updated_at: number } | undefined;
+    if (existing && Number(existing.updated_at) >= row.updated_at) return;
+    this.store.database.raw.prepare(
+      `INSERT INTO deployment_states(
+         model_id, desired_state, observed_state, generation, observed_generation,
+         retry_count, next_retry_at, last_error, active_operation_id,
+         controller_owner, controller_lease_until, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(model_id) DO UPDATE SET
+         desired_state=excluded.desired_state,
+         observed_state=excluded.observed_state,
+         generation=excluded.generation,
+         observed_generation=excluded.observed_generation,
+         retry_count=excluded.retry_count,
+         next_retry_at=excluded.next_retry_at,
+         last_error=excluded.last_error,
+         active_operation_id=excluded.active_operation_id,
+         controller_owner=excluded.controller_owner,
+         controller_lease_until=excluded.controller_lease_until,
+         updated_at=excluded.updated_at`,
+    ).run(
+      row.model_id,
+      stringValue(row.desired_state, "inactive"),
+      stringValue(row.observed_state, "inactive"),
+      numberValue(row.generation, 1),
+      numberValue(row.observed_generation, 0),
+      numberValue(row.retry_count, 0),
+      nullableNumber(row.next_retry_at),
+      nullableString(row.last_error),
+      nullableString(row.active_operation_id),
+      nullableString(row.controller_owner),
+      nullableNumber(row.controller_lease_until),
+      numberValue(row.created_at, row.updated_at),
+      row.updated_at,
+    );
+  }
+
+  private restoreDeploymentOperation(row: Record<string, unknown>): void {
+    if (
+      typeof row.id !== "string"
+      || typeof row.model_id !== "string"
+      || typeof row.updated_at !== "number"
+    ) return;
+    const existing = this.store.database.raw.prepare(
+      "SELECT updated_at FROM deployment_operations WHERE id = ?",
+    ).get(row.id) as { updated_at: number } | undefined;
+    if (existing && Number(existing.updated_at) >= row.updated_at) return;
+    this.store.database.raw.prepare(
+      `INSERT INTO deployment_operations(
+         id, model_id, generation, kind, status, attempt, idempotency_key,
+         error_code, error_message, metadata_json, started_at, updated_at, finished_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         generation=excluded.generation, kind=excluded.kind, status=excluded.status,
+         attempt=excluded.attempt, idempotency_key=excluded.idempotency_key,
+         error_code=excluded.error_code, error_message=excluded.error_message,
+         metadata_json=excluded.metadata_json, updated_at=excluded.updated_at,
+         finished_at=excluded.finished_at`,
+    ).run(
+      row.id,
+      row.model_id,
+      numberValue(row.generation, 1),
+      stringValue(row.kind, "activate"),
+      stringValue(row.status, "interrupted"),
+      numberValue(row.attempt, 1),
+      stringValue(row.idempotency_key, row.id),
+      nullableString(row.error_code),
+      nullableString(row.error_message),
+      JSON.stringify(row.metadata ?? {}),
+      numberValue(row.started_at, row.updated_at),
+      row.updated_at,
+      nullableNumber(row.finished_at),
+    );
+  }
+
+  private restoreRouteReservation(row: Record<string, unknown>): void {
+    if (
+      typeof row.id !== "string"
+      || typeof row.model_id !== "string"
+      || typeof row.operation_id !== "string"
+      || typeof row.updated_at !== "number"
+    ) return;
+    const existing = this.store.database.raw.prepare(
+      "SELECT updated_at FROM route_reservations WHERE id = ?",
+    ).get(row.id) as { updated_at: number } | undefined;
+    if (existing && Number(existing.updated_at) >= row.updated_at) return;
+    this.store.database.raw.prepare(
+      `INSERT INTO route_reservations(
+         id, model_id, operation_id, generation, status, route_digest,
+         stages_json, canary_json, expires_at, committed_at, released_at,
+         error, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         status=excluded.status, route_digest=excluded.route_digest,
+         stages_json=excluded.stages_json, canary_json=excluded.canary_json,
+         expires_at=excluded.expires_at, committed_at=excluded.committed_at,
+         released_at=excluded.released_at, error=excluded.error,
+         updated_at=excluded.updated_at`,
+    ).run(
+      row.id,
+      row.model_id,
+      row.operation_id,
+      numberValue(row.generation, 1),
+      stringValue(row.status, "expired"),
+      stringValue(row.route_digest, row.id),
+      JSON.stringify(row.stages ?? []),
+      row.canary == null ? null : JSON.stringify(row.canary),
+      numberValue(row.expires_at, 0),
+      nullableNumber(row.committed_at),
+      nullableNumber(row.released_at),
+      nullableString(row.error),
+      numberValue(row.created_at, row.updated_at),
+      row.updated_at,
+    );
+  }
+
+  private restoreDeploymentStageLease(row: Record<string, unknown>): void {
+    if (
+      typeof row.id !== "string"
+      || typeof row.reservation_id !== "string"
+      || typeof row.model_id !== "string"
+      || typeof row.node_id !== "string"
+      || typeof row.updated_at !== "number"
+    ) return;
+    const existing = this.store.database.raw.prepare(
+      "SELECT updated_at FROM deployment_stage_leases WHERE id = ?",
+    ).get(row.id) as { updated_at: number } | undefined;
+    if (existing && Number(existing.updated_at) >= row.updated_at) return;
+    this.store.database.raw.prepare(
+      `INSERT INTO deployment_stage_leases(
+         id, reservation_id, model_id, node_id, stage_index, memory_mib,
+         status, expires_at, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         status=excluded.status, expires_at=excluded.expires_at,
+         memory_mib=excluded.memory_mib, updated_at=excluded.updated_at`,
+    ).run(
+      row.id,
+      row.reservation_id,
+      row.model_id,
+      row.node_id,
+      numberValue(row.stage_index, 0),
+      numberValue(row.memory_mib, 0),
+      stringValue(row.status, "expired"),
+      numberValue(row.expires_at, 0),
+      numberValue(row.created_at, row.updated_at),
+      row.updated_at,
     );
   }
 }

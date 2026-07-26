@@ -6,12 +6,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $workspacePath = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
-$defaultPython = Join-Path $workspacePath "runtime\distribution-venv\Scripts\python.exe"
 if ([string]::IsNullOrWhiteSpace($PythonExe)) {
-    if (-not (Test-Path -LiteralPath $defaultPython -PathType Leaf)) {
-        throw "Distribution runtime is missing. Run scripts\setup-distribution-runtime.ps1 or pass -PythonExe."
-    }
-    $selectedPython = $defaultPython
+    $selectedPython = & (Join-Path $PSScriptRoot "resolve-distribution-python.ps1") -WorkspacePath $workspacePath
 } elseif (Test-Path -LiteralPath $PythonExe -PathType Leaf) {
     $selectedPython = [System.IO.Path]::GetFullPath($PythonExe)
 } else {

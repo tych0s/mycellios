@@ -1,9 +1,26 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyRequest } from "fastify";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type WebSocket from "ws";
 import { z } from "zod";
+import { nativeBuildIdentitySchema, type NativeBuildIdentity } from "../contracts/build-identity.js";
+import {
+  WORKER_PROTOCOL_MAX,
+  WORKER_PROTOCOL_MIN,
+  workerAdmissionChallengeRequestSchema,
+  workerAdmissionIdentitySchema,
+  workerAdmissionProofSchema,
+  workerProtocolRangeSchema,
+  workerCredentialRotationChallengeRequestSchema,
+  workerCredentialRotationProofSchema,
+} from "../contracts/worker-admission.js";
+import { sha256CanonicalEvidence } from "../core/json.js";
+import {
+  WorkerAdmissionAuthority,
+  WorkerAdmissionError,
+  selectWorkerProtocolVersion,
+} from "./worker-admission.js";
 
 const LEVELS = ["low", "balanced", "maximum"] as const;
 const BACKENDS = ["webgpu", "cpu"] as const;
@@ -42,6 +59,7 @@ export const mobileRegistrationSchema = z
     name: z.string().min(1).max(80),
     region: z.string().min(1).max(80).default("auto"),
     platform: z.string().min(1).max(120),
+    buildIdentity: nativeBuildIdentitySchema.optional(),
     backend: z.enum(BACKENDS),
     performanceLevel: z.enum(LEVELS),
     joinToken: z.string().max(512).optional(),
@@ -62,8 +80,25 @@ export const mobileRegistrationSchema = z
         matrixSize: z.number().int().min(8).max(2_048),
       })
       .strict(),
+    protocol: workerProtocolRangeSchema.optional(),
+    admission: workerAdmissionProofSchema.optional(),
   })
   .strict();
+
+const mobileAdmissionChallengeSchema = workerAdmissionChallengeRequestSchema.extend({
+  joinToken: z.string().max(512).optional(),
+}).strict();
+
+const mobileCredentialRotationChallengeSchema =
+  workerCredentialRotationChallengeRequestSchema.extend({
+    joinToken: z.string().max(512).optional(),
+  }).strict();
+
+const mobileCredentialRotationSchema = z.object({
+  identity: workerAdmissionIdentitySchema,
+  proof: workerCredentialRotationProofSchema,
+  joinToken: z.string().max(512).optional(),
+}).strict();
 
 const connectionQuerySchema = z
   .object({
@@ -178,6 +213,7 @@ export interface MobileWorkerSnapshot {
   name: string;
   region: string;
   platform: string;
+  buildIdentity?: NativeBuildIdentity;
   backend: MobileBackend;
   performanceLevel: PerformanceLevel;
   connected: boolean;
@@ -237,6 +273,8 @@ export interface MobileComputeHubOptions {
   taskTimeoutMs?: number | undefined;
   expertArtifactsPath?: string | undefined;
   disconnectedRetentionMs?: number | undefined;
+  admissionAuthority?: WorkerAdmissionAuthority | undefined;
+  isTrustedLocalRequest?(request: FastifyRequest): boolean;
   onArtifactStored?(artifact: {
     id: string;
     localPath: string;
@@ -289,16 +327,150 @@ export class MobileComputeHub {
   }
 
   attach(app: FastifyInstance): void {
+    app.post("/mobile/v1/admission-challenge", async (request, reply) => {
+      if (!this.options.admissionAuthority) {
+        return reply.code(503).send({
+          error: { code: "worker_admission_unavailable" },
+        });
+      }
+      const parsed = mobileAdmissionChallengeSchema.parse(request.body);
+      if (this.options.joinToken && parsed.joinToken !== this.options.joinToken) {
+        return reply.code(401).send({ error: { code: "invalid_join_token" } });
+      }
+      const { joinToken: _joinToken, ...challenge } = parsed;
+      if (challenge.identity.kind !== "browser") {
+        return reply.code(400).send({
+          error: { code: "browser_admission_identity_required" },
+        });
+      }
+      try {
+        return this.options.admissionAuthority.issue(challenge);
+      } catch (error) {
+        if (!(error instanceof WorkerAdmissionError)) throw error;
+        return reply.code(error.statusCode).send({
+          error: { code: error.code, message: error.message },
+        });
+      }
+    });
+
+    app.post("/mobile/v1/credential-rotation-challenge", async (request, reply) => {
+      if (!this.options.admissionAuthority) {
+        return reply.code(503).send({
+          error: { code: "worker_admission_unavailable" },
+        });
+      }
+      const parsed = mobileCredentialRotationChallengeSchema.parse(request.body);
+      if (this.options.joinToken && parsed.joinToken !== this.options.joinToken) {
+        return reply.code(401).send({ error: { code: "invalid_join_token" } });
+      }
+      const { joinToken: _joinToken, ...rotation } = parsed;
+      if (rotation.identity.kind !== "browser") {
+        return reply.code(400).send({
+          error: { code: "browser_admission_identity_required" },
+        });
+      }
+      try {
+        return this.options.admissionAuthority.issueRotation(rotation);
+      } catch (error) {
+        if (!(error instanceof WorkerAdmissionError)) throw error;
+        return reply.code(error.statusCode).send({
+          error: { code: error.code, message: error.message },
+        });
+      }
+    });
+
+    app.post("/mobile/v1/credential-rotation", async (request, reply) => {
+      if (!this.options.admissionAuthority) {
+        return reply.code(503).send({
+          error: { code: "worker_admission_unavailable" },
+        });
+      }
+      const parsed = mobileCredentialRotationSchema.parse(request.body);
+      if (this.options.joinToken && parsed.joinToken !== this.options.joinToken) {
+        return reply.code(401).send({ error: { code: "invalid_join_token" } });
+      }
+      if (parsed.identity.kind !== "browser") {
+        return reply.code(400).send({
+          error: { code: "browser_admission_identity_required" },
+        });
+      }
+      try {
+        return this.options.admissionAuthority.verifyRotation({
+          identity: parsed.identity,
+          proof: parsed.proof,
+        });
+      } catch (error) {
+        if (!(error instanceof WorkerAdmissionError)) throw error;
+        return reply.code(error.statusCode).send({
+          error: { code: error.code, message: error.message },
+        });
+      }
+    });
+
     app.post("/mobile/v1/register", async (request, reply) => {
       const registration = mobileRegistrationSchema.parse(request.body);
       if (this.options.joinToken && registration.joinToken !== this.options.joinToken) {
         return reply.code(401).send({ error: { code: "invalid_join_token" } });
       }
+      const protocol = registration.protocol ?? {
+        min: WORKER_PROTOCOL_MIN,
+        max: WORKER_PROTOCOL_MAX,
+      };
+      let admission:
+        | {
+          protocolVersion: number;
+          credentialFingerprint?: string;
+          enrollment: "enrolled" | "accepted" | "local-legacy";
+        };
+      if (registration.admission && this.options.admissionAuthority) {
+        const { admission: _proof, ...unsignedRegistration } = registration;
+        try {
+          const verified = this.options.admissionAuthority.verify({
+            identity: { kind: "browser", id: registration.clientId },
+            registrationDigest: sha256CanonicalEvidence({
+              schema: "mycellios-mobile-registration/1",
+              identity: { kind: "browser", id: registration.clientId },
+              registration: { ...unsignedRegistration, protocol },
+            }),
+            proof: registration.admission,
+          });
+          admission = {
+            protocolVersion: verified.protocolVersion,
+            credentialFingerprint: verified.credentialFingerprint,
+            enrollment: verified.enrollment,
+          };
+        } catch (error) {
+          if (!(error instanceof WorkerAdmissionError)) throw error;
+          return reply.code(error.statusCode).send({
+            error: { code: error.code, message: error.message },
+          });
+        }
+      } else {
+        if (
+          this.options.admissionAuthority
+          && !this.options.isTrustedLocalRequest?.(request)
+        ) {
+          return reply.code(401).send({
+            error: {
+              code: "worker_admission_required",
+              message: "Remote browser workers must prove a stable signed identity.",
+            },
+          });
+        }
+        admission = {
+          protocolVersion: selectWorkerProtocolVersion(protocol),
+          enrollment: "local-legacy",
+        };
+      }
       const worker = this.register(registration);
       return reply.code(201).send({
         workerId: worker.id,
         token: worker.token,
-        protocolVersion: 1,
+        protocolVersion: admission.protocolVersion,
+        ...(admission.credentialFingerprint
+          ? { credentialFingerprint: admission.credentialFingerprint }
+          : {}),
+        enrollment: admission.enrollment,
         websocketPath: "/mobile/v1/connect",
       });
     });
@@ -485,6 +657,9 @@ export class MobileComputeHub {
         name: worker.registration.name,
         region: worker.registration.region,
         platform: worker.registration.platform,
+        ...(worker.registration.buildIdentity
+          ? { buildIdentity: worker.registration.buildIdentity }
+          : {}),
         backend: worker.registration.backend,
         performanceLevel: worker.registration.performanceLevel,
         connected: worker.connected,

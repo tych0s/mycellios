@@ -6,9 +6,27 @@ import {
   shouldQueueAutomaticActivation,
   type HubModelCapacityProfile,
 } from "../src/coordinator/model-catalog.js";
+import {
+  MODEL_ADAPTER_EVIDENCE_SCOPE,
+  MODEL_ADAPTER_REGISTRY_ID,
+  modelAdapterRegistry,
+  resolveModelAdapterContract,
+} from "../src/contracts/model-adapter-registry.js";
 import type { StoredRequestedModel, StoredWorker } from "../src/storage/store.js";
 
 describe("requested model capacity catalog", () => {
+  it("uses the one identity-sealed software registry without claiming physical evidence", () => {
+    const registry = modelAdapterRegistry();
+    expect(registry.registryId).toBe(MODEL_ADAPTER_REGISTRY_ID);
+    expect(registry.evidenceScope).toBe("software-contract-only");
+    expect(registry.adapters).toHaveLength(4);
+    expect(resolveModelAdapterContract("qwen3", "Qwen3ForCausalLM")).toMatchObject({
+      id: "transformers-qwen3-v1",
+      adapterContractId: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+    });
+    expect(resolveModelAdapterContract("mistral", "MistralForCausalLM")).toBeNull();
+  });
+
   it("searches and paginates the public Hub catalog without hiding unsupported models", async () => {
     const results = await searchHubModelCatalog("qwen", async (input) => {
       const url = new URL(String(input));
@@ -51,7 +69,8 @@ describe("requested model capacity catalog", () => {
     expect(results.data[1]?.parameterCount).toBe(751_632_384);
     expect(results.data[1]?.estimatedMemoryMiB).toBeGreaterThan(1_500);
     expect(results.data[0]?.compatible).toBe(false);
-    expect(results.data[0]?.compatibilityReason).toContain("certified");
+    expect(results.data[0]?.compatibilityReason).toContain("registered native");
+    expect(results.data[1]?.adapterRegistryId).toBe(MODEL_ADAPTER_REGISTRY_ID);
   });
 
   it("profiles a compatible Hub checkpoint from metadata without downloading weights", async () => {
@@ -85,6 +104,8 @@ describe("requested model capacity catalog", () => {
     );
 
     expect(profile.adapterId).toBe("transformers-qwen3-v1");
+    expect(profile.adapterRegistryId).toBe(MODEL_ADAPTER_REGISTRY_ID);
+    expect(profile.adapterContractId).toMatch(/^sha256:[0-9a-f]{64}$/);
     expect(profile.compatible).toBe(true);
     expect(profile.weightBytes).toBe(1_200_000_000);
     expect(profile.requiredVramMiB).toBeGreaterThan(1_200_000_000 / 1024 / 1024);
@@ -160,12 +181,33 @@ describe("requested model capacity catalog", () => {
     })[0]!;
     expect(active.status).toBe("active");
   });
+
+  it("fails closed instead of activating a profile from another adapter registry", () => {
+    const staleProfile = {
+      ...profileFixture(2_000, 500),
+      adapterRegistryId: `sha256:${"0".repeat(64)}`,
+    };
+    const view = requestedModelCapacityViews({
+      requests: [requestedModel(staleProfile)],
+      workers: [worker("a", 4_096, 0), worker("b", 4_096, 0)],
+      connectedWorkerIds: new Set(["a", "b"]),
+      activeModelIds: new Set(),
+    })[0]!;
+
+    expect(view.status).toBe("profiling");
+    expect(view.compatible).toBeNull();
+    expect(shouldQueueAutomaticActivation(view)).toBe(false);
+  });
 });
 
 function profileFixture(requiredVramMiB: number, minimumStageVramMiB: number): HubModelCapacityProfile {
+  const adapter = resolveModelAdapterContract("qwen3", "Qwen3ForCausalLM")!;
   return {
     schema: "mycellios-hub-model-capacity/1",
-    adapterId: "transformers-qwen3-v1",
+    adapterId: adapter.id,
+    adapterContractId: adapter.adapterContractId,
+    adapterRegistryId: MODEL_ADAPTER_REGISTRY_ID,
+    adapterEvidenceScope: MODEL_ADAPTER_EVIDENCE_SCOPE,
     compatible: true,
     incompatibilityReason: null,
     architecture: "Qwen3ForCausalLM",
