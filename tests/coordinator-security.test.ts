@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createCoordinator, type CoordinatorRuntime } from "../src/coordinator/server.js";
+import { SupabaseAuthService } from "../src/coordinator/supabase-auth.js";
 
 const runtimes: CoordinatorRuntime[] = [];
 
@@ -196,6 +197,86 @@ describe("public coordinator security boundaries", () => {
     expect(fetchMock).toHaveBeenCalledTimes(120);
   });
 
+  it("refuses anonymous worker eviction from the public network", async () => {
+    // Regression: `DELETE /public/v1/workers/:id` and `clear-offline` carried no
+    // guard at all, and the network-token hook only covers `/internal/v1/` and
+    // `/v1/`. Anyone who loaded the public panel could empty the whole network.
+    const runtime = await coordinator(undefined, undefined, "admin-secret");
+    const registration = await runtime.app.inject({
+      method: "POST",
+      url: "/internal/v1/workers/register",
+      payload: validWorkerRegistration(),
+    });
+    expect(registration.statusCode).toBe(201);
+    const workerId = registration.json().workerId;
+
+    const anonymousDelete = await runtime.app.inject({
+      method: "DELETE",
+      url: `/public/v1/workers/${workerId}`,
+    });
+    expect(anonymousDelete.statusCode).toBe(401);
+
+    const anonymousClear = await runtime.app.inject({
+      method: "POST",
+      url: "/public/v1/workers/clear-offline",
+    });
+    expect(anonymousClear.statusCode).toBe(401);
+
+    // The worker must still be there: a rejected request may not have side effects.
+    const snapshot = await runtime.app.inject({ method: "GET", url: "/public/v1/snapshot" });
+    expect(snapshot.json().workers).toHaveLength(1);
+
+    const authorized = await runtime.app.inject({
+      method: "DELETE",
+      url: `/public/v1/workers/${workerId}`,
+      headers: { authorization: "Bearer admin-secret" },
+    });
+    expect(authorized.statusCode).toBe(200);
+    expect(authorized.json()).toMatchObject({ removed: true });
+  });
+
+  it("does not treat a proxied request as local just because the socket is loopback", async () => {
+    // Regression: Fastify runs without `trustProxy`, so a reverse proxy
+    // terminating on 127.0.0.1 makes every remote request look like loopback.
+    // The `!expected && isLoopbackAddress(request.ip)` shortcut therefore handed
+    // model administration to the whole internet.
+    const runtime = await coordinator();
+
+    const direct = await runtime.app.inject({
+      method: "POST",
+      url: "/public/v1/requested-models",
+      payload: { source: "acme/model", contextTokens: 4_096 },
+    });
+    expect(direct.statusCode).not.toBe(503);
+
+    for (const header of ["x-forwarded-for", "x-real-ip", "forwarded", "x-forwarded-host"]) {
+      const proxied = await runtime.app.inject({
+        method: "POST",
+        url: "/public/v1/requested-models",
+        headers: { [header]: "203.0.113.9" },
+        payload: { source: "acme/model", contextTokens: 4_096 },
+      });
+      expect(proxied.statusCode, `header ${header} must not grant local trust`).toBe(503);
+      expect(proxied.json()).toMatchObject({
+        error: { code: "model_administration_not_configured" },
+      });
+    }
+  });
+
+  it("keeps host-only benchmark routes closed behind a reverse proxy", async () => {
+    const runtime = await coordinator();
+    const local = await runtime.app.inject({ method: "GET", url: "/local/v1/benchmarks" });
+    expect(local.statusCode).toBe(200);
+
+    const proxied = await runtime.app.inject({
+      method: "GET",
+      url: "/local/v1/benchmarks",
+      headers: { "x-forwarded-for": "203.0.113.9" },
+    });
+    expect(proxied.statusCode).toBe(403);
+    expect(proxied.json()).toMatchObject({ error: { code: "local_access_required" } });
+  });
+
   it("sends anti-iframe headers independently of the reverse proxy", async () => {
     const runtime = await coordinator();
     const response = await runtime.app.inject({ method: "GET", url: "/health" });
@@ -265,6 +346,86 @@ describe("public coordinator security boundaries", () => {
     expect(response.json()).toMatchObject({
       error: { code: "development_adapter_not_allowed" },
     });
+  });
+
+  it("protects the public API with account sessions or revocable API keys and supports CORS", async () => {
+    const auth = new SupabaseAuthService(
+      "https://accounts.example.test",
+      "service-role",
+      (async (input) => {
+        const url = String(input);
+        if (url.includes("/auth/v1/user")) {
+          return Response.json({
+            id: "73b6d6c3-ec87-4f67-b98e-9ffca4fb5576",
+            email: "user@example.test",
+          });
+        }
+        if (url.includes("/rest/v1/network_members")) {
+          return Response.json([{ role: "viewer" }]);
+        }
+        return new Response(null, { status: 404 });
+      }) as typeof fetch,
+    );
+    const runtime = await createCoordinator({
+      host: "127.0.0.1",
+      port: 0,
+      databasePath: ":memory:",
+      requestTimeoutMs: 1_000,
+      apiAccessEnabled: true,
+      apiStarterTokens: 100,
+    }, { logger: false, supabaseAuthService: auth });
+    runtimes.push(runtime);
+
+    const preflight = await runtime.app.inject({
+      method: "OPTIONS",
+      url: "/v1/chat/completions",
+    });
+    expect(preflight.statusCode).toBe(204);
+    expect(preflight.headers["access-control-allow-origin"]).toBe("*");
+
+    const anonymous = await runtime.app.inject({ method: "GET", url: "/v1/models" });
+    expect(anonymous.statusCode).toBe(401);
+    expect(anonymous.json()).toMatchObject({ error: { code: "authentication_required" } });
+
+    const account = await runtime.app.inject({
+      method: "GET",
+      url: "/v1/account",
+      headers: { authorization: "Bearer account-session" },
+    });
+    expect(account.statusCode).toBe(200);
+    expect(account.json()).toMatchObject({ token_balance: 100 });
+
+    const created = await runtime.app.inject({
+      method: "POST",
+      url: "/v1/api-keys",
+      headers: { authorization: "Bearer account-session" },
+      payload: { name: "Test client" },
+    });
+    expect(created.statusCode).toBe(201);
+    const key = created.json() as { id: string; secret: string };
+    expect(key.secret).toMatch(/^myc_live_/);
+
+    const models = await runtime.app.inject({
+      method: "GET",
+      url: "/v1/models",
+      headers: { authorization: `Bearer ${key.secret}` },
+    });
+    expect(models.statusCode).toBe(200);
+    expect(models.json()).toEqual({ object: "list", data: [] });
+
+    const revoked = await runtime.app.inject({
+      method: "DELETE",
+      url: `/v1/api-keys/${key.id}`,
+      headers: { authorization: "Bearer account-session" },
+    });
+    expect(revoked.statusCode).toBe(204);
+    const rejected = await runtime.app.inject({
+      method: "GET",
+      url: "/v1/models",
+      headers: { authorization: `Bearer ${key.secret}` },
+    });
+    expect(rejected.statusCode).toBe(401);
+    expect(rejected.json()).toMatchObject({ error: { code: "invalid_api_key" } });
   });
 
   it("exposes bounded desktop repair diagnostics without requiring machine access", async () => {

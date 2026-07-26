@@ -10,7 +10,11 @@ from .dense_tiering import (
     add_dense_tiering_arguments,
     dense_tiering_config_from_args,
 )
-from .model import StageModelSpec, model_artifact_reference, resolve_model_snapshot
+from .model import (
+    StageModelSpec,
+    model_artifact_reference,
+    resolve_model_metadata_snapshot,
+)
 from .native_gguf import verify_native_gguf_stage
 from .native_gguf_runtime import (
     add_native_gguf_arguments,
@@ -280,9 +284,24 @@ def build_config(args: argparse.Namespace) -> StageProcessConfig:
             ),
         )
     else:
-        snapshot = resolve_model_snapshot(args.model, args.revision)
+        # Sólo METADATOS aquí (kilobytes), no el checkpoint entero.
+        #
+        # Antes esto llamaba a `resolve_model_snapshot`, que baja TODOS los
+        # pesos. El efecto no era sólo el tráfico: al pasarle a `StageModelSpec`
+        # un directorio ya descargado, el cargador selectivo hacía cortocircuito
+        # (`resolve_stage_model_snapshot` devuelve tal cual cualquier ruta local)
+        # y la descarga por capas —que está escrita y probada— no llegaba a
+        # ejecutarse nunca. Por eso cada nodo se traía el modelo completo y
+        # "un modelo mayor que cualquier host" no se sostenía.
+        #
+        # La identidad no sufre: para un snapshot del Hub se deriva del commit
+        # de la ruta de caché, no de los bytes (`_model_snapshot_digest`), así
+        # que un proceso con sólo metadatos declara EXACTAMENTE la misma
+        # identidad que uno con todo el modelo — que es justo lo que permite a
+        # las etapas acordar sin que ninguna guarde el checkpoint entero.
+        metadata_snapshot = resolve_model_metadata_snapshot(args.model, args.revision)
         artifact = model_artifact_reference(
-            snapshot,
+            metadata_snapshot,
             artifact_identity=args.model_artifact_identity,
             canonical_source=args.model_canonical_source,
             canonical_revision=args.model_canonical_revision,
@@ -293,11 +312,14 @@ def build_config(args: argparse.Namespace) -> StageProcessConfig:
             else artifact.snapshot_identity
         )
         spec = StageModelSpec(
-            snapshot,
+            # El NOMBRE del repositorio, no una ruta ya resuelta: el cargador
+            # selectivo necesita poder pedir sólo los shards de esta etapa.
+            args.model,
             args.layer_start,
             args.layer_end,
             args.total_layers,
             args.threads,
+            revision=args.revision,
             artifact_identity=artifact.identity,
             canonical_model_source=artifact.canonical_source,
             canonical_model_revision=artifact.canonical_revision,

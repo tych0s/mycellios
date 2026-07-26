@@ -118,7 +118,7 @@ describe("coordinator crash recovery", () => {
     const reopened = new MeshDatabase(path);
     expect(
       (reopened.raw.prepare("SELECT version FROM schema_meta").get() as { version: number })
-      .version,
+        .version,
     ).toBe(13);
     reopened.close();
   });

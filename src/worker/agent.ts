@@ -60,6 +60,8 @@ export interface WorkerAgentOptions {
   coordinatorUrl: string;
   networkToken?: string;
   heartbeatIntervalMs?: number;
+  /** How often to probe the coordinator RTT with a WebSocket ping. */
+  rttProbeIntervalMs?: number;
   reconnect?: boolean;
   identity?: {
     kind: "device" | "cell";
@@ -114,6 +116,14 @@ const MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
 const RECENT_JOB_LIMIT = 2_048;
 const MAX_WEBSOCKET_BUFFERED_BYTES = 8 * 1024 * 1024;
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+/** Tags our own RTT probes so unsolicited pongs cannot corrupt the estimate. */
+const RTT_PROBE_PAYLOAD = Buffer.from("gdlp-rtt");
+/**
+ * peer runtime uses 0.2 for the same job (`overhead_delay` / EMA over peer pings) and
+ * it is a reasonable default: fast enough to follow a route change, slow enough
+ * that one scheduling hiccup does not move placement.
+ */
+const RTT_EMA_ALPHA = 0.2;
 
 const envelopeFields = {
   v: z.literal(1),
@@ -394,6 +404,9 @@ export class WorkerAgent {
   private registeredWorkerId: string | undefined;
   private capabilities: WorkerCapabilities | null = null;
   private socket: WebSocket | null = null;
+  private rttProbeTimer: NodeJS.Timeout | null = null;
+  private pendingRttProbe: bigint | null = null;
+  private lastRttSampleMs: number | null = null;
   private stopped = false;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private readonly activeJobs = new Map<string, AbortController>();
@@ -860,6 +873,10 @@ export class WorkerAgent {
       socket.on("open", () => {
         opened = true;
         this.sendMessage("worker.hello", {});
+        this.startRttProbe(socket);
+      });
+      socket.on("pong", (payload: Buffer) => {
+        this.recordRttSample(payload);
       });
       socket.on("message", (raw) => {
         let decoded: unknown;
@@ -883,6 +900,7 @@ export class WorkerAgent {
       socket.on("close", () => {
         if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
         this.heartbeatTimer = null;
+        this.stopRttProbe();
         this.socket = null;
         this.clearRuntimeLinkProbes();
         this.runtimeTunnel?.transportDisconnected();
@@ -903,6 +921,69 @@ export class WorkerAgent {
         }
       });
     });
+  }
+
+  /**
+   * Measure the real round-trip time to the coordinator.
+   *
+   * Until now `coordinatorRttMs` was hardcoded to 0 and nothing ever wrote it,
+   * so every consumer scored placement on a constant: the scheduler's latency
+   * term (`scheduler.ts`) was always 0, and the desktop planner concluded that
+   * every worker-to-worker link cost 0.1 ms. Measured reality on the fleet is
+   * 54-437 ms per hop, and picking the right node is worth ~1.8x — a decision
+   * the planner could not make because it never saw the number.
+   *
+   * WebSocket ping/pong is the honest probe: it rides the same connection as
+   * the data, needs nothing from the coordinator, and cannot be confused with
+   * application queueing. Samples are smoothed with an EMA so one scheduling
+   * hiccup does not move placement.
+   */
+  private startRttProbe(socket: WebSocket): void {
+    this.stopRttProbe();
+    const probe = (): void => {
+      if (socket.readyState !== WebSocket.OPEN) return;
+      // An outstanding probe means the previous pong never came back. Leaving
+      // the old timestamp in place would turn a lost pong into an absurd RTT.
+      this.pendingRttProbe = process.hrtime.bigint();
+      try {
+        socket.ping(RTT_PROBE_PAYLOAD);
+      } catch {
+        this.pendingRttProbe = null;
+      }
+    };
+    probe();
+    this.rttProbeTimer = setInterval(probe, this.options.rttProbeIntervalMs ?? 15_000);
+    this.rttProbeTimer.unref?.();
+  }
+
+  private stopRttProbe(): void {
+    if (this.rttProbeTimer) clearInterval(this.rttProbeTimer);
+    this.rttProbeTimer = null;
+    this.pendingRttProbe = null;
+  }
+
+  private recordRttSample(payload: Buffer): void {
+    const sentAt = this.pendingRttProbe;
+    // Only answer our own probes: `ws` also emits `pong` for unsolicited frames
+    // and for the library's own keepalive, which would corrupt the estimate.
+    if (sentAt === null || !payload.equals(RTT_PROBE_PAYLOAD)) return;
+    this.pendingRttProbe = null;
+    const sampleMs = Number(process.hrtime.bigint() - sentAt) / 1_000_000;
+    if (!Number.isFinite(sampleMs) || sampleMs < 0) return;
+    const previous = this.capabilities?.network.coordinatorRttMs;
+    const smoothed = previous === undefined || previous <= 0
+      ? sampleMs
+      : previous * (1 - RTT_EMA_ALPHA) + sampleMs * RTT_EMA_ALPHA;
+    // Report the rounded value: sub-microsecond precision is noise, and the
+    // wire schema only promises a non-negative number.
+    const rounded = Math.round(smoothed * 100) / 100;
+    if (this.capabilities) this.capabilities.network.coordinatorRttMs = rounded;
+    this.lastRttSampleMs = sampleMs;
+  }
+
+  /** Última muestra cruda de RTT, sin suavizar. Diagnóstico y pruebas. */
+  get measuredRttMs(): number | null {
+    return this.lastRttSampleMs;
   }
 
   private requestHeaders(initial: Record<string, string> = {}): Record<string, string> {

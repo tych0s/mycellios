@@ -10,6 +10,7 @@ from distributed_runtime.protocol import (
     FrameType,
     LinkEmulator,
     LinkEmulatorError,
+    close_emulated_link,
     recv_frame,
     send_frame,
 )
@@ -317,6 +318,40 @@ class LinkEmulatorTests(unittest.TestCase):
         # The asynchronous failure is sticky and is surfaced on every later send.
         with self.assertRaisesRegex(LinkEmulatorError, "sender failed"):
             send_frame(failing, FrameType.BEGIN, 2, emulator=emulator)
+
+    def test_cost_model_reports_propagation_and_serialization_separately(self) -> None:
+        emulator = LinkEmulator(one_way_delay_ms=100, bandwidth_mbps=8)
+
+        self.assertAlmostEqual(emulator.propagation_seconds, 0.1)
+        self.assertAlmostEqual(emulator.serialization_seconds(1_000_000), 1.0)
+        self.assertAlmostEqual(
+            emulator.single_frame_delay_seconds(1_000_000),
+            1.1,
+        )
+        emulator.close()
+
+    def test_cost_model_clamps_negative_delay_and_allows_no_bandwidth(self) -> None:
+        emulator = LinkEmulator(one_way_delay_ms=-5)
+
+        self.assertEqual(emulator.propagation_seconds, 0.0)
+        self.assertEqual(emulator.serialization_seconds(10_000), 0.0)
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            emulator.serialization_seconds(-1)
+        emulator.close()
+
+    def test_close_emulated_link_compatibility_helper_is_idempotent(self) -> None:
+        clock = _ManualClock()
+        emulator = LinkEmulator(one_way_delay_ms=1_000, clock=clock)
+        recorded = _RecordingSocket(clock)
+
+        send_frame(recorded, FrameType.BEGIN, 1, emulator=emulator)
+        _advance_and_wake(clock, emulator, 1.0)
+        recorded.wait_for_calls(1)
+        close_emulated_link(recorded, timeout=1)
+        close_emulated_link(recorded, timeout=1)
+
+        send_frame(recorded, FrameType.BEGIN, 2)
+        self.assertEqual(recorded.send_threads[-1], threading.current_thread().name)
 
 
 if __name__ == "__main__":

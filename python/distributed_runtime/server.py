@@ -34,6 +34,7 @@ from .engine import (
     GenerationInput,
     GenerationOutput,
     PipelineEngineConfig,
+    QueueFullError,
     balanced_boundaries,
     parse_boundaries,
 )
@@ -375,11 +376,14 @@ class DistributedMycelliosServer:
             "recovery_stats",
             {"configured": False, "state": "disabled"},
         )
-        status = (
-            "recovering"
-            if recovery.get("state") == "recovering"
-            else ("ready" if healthy else "degraded")
-        )
+        recovering = recovery.get("state") == "recovering"
+        status = "recovering" if recovering else ("ready" if healthy else "degraded")
+        # `degraded` significa que el motor tiene un error fatal y NO va a servir
+        # ni una petición más. Devolver 200 con esa palabra dentro convierte una
+        # caída en un outage silencioso: todo supervisor, balanceador y sonda
+        # mira el código, no el cuerpo. Y en el despliegue real (GpuCloud) la
+        # recuperación automática está prohibida, así que nadie se entera nunca.
+        # `recovering` sí es 200: el motor está trabajando en volver.
         return web.json_response(
             {
                 "status": status,
@@ -439,7 +443,8 @@ class DistributedMycelliosServer:
                     "dispatches": len(self.batcher.inflight),
                 },
                 "uptime_seconds": max(0.0, time.time() - self.started_at),
-            }
+            },
+            status=200 if (healthy or recovering) else 503,
         )
 
     async def models(self, _: web.Request) -> web.Response:
@@ -468,6 +473,16 @@ class DistributedMycelliosServer:
             return error_response(str(error), "invalid_request", 400)
         try:
             await self.batcher.submit(pending)
+        except QueueFullError as error:
+            # Backpressure, not failure. A 503 tells a client (and any load
+            # balancer in front) that this node is broken and should be taken
+            # out; a 429 with Retry-After tells it to slow down and come back,
+            # which is what a saturated but healthy pipeline actually wants.
+            # Measured under overload with a flat queue, every admitted request
+            # timed out and goodput fell to ZERO
+            # (docs/benchmarks/gpu_cloud-exp10-salida-larga-2026-07-24): refusing
+            # work we cannot serve is what keeps the served work served.
+            return overloaded_response(error)
         except RuntimeError as error:
             return error_response(str(error), "service_unavailable", 503)
         if stream:
@@ -820,6 +835,28 @@ def error_response(message: str, kind: str, status: int) -> web.Response:
         {"error": {"message": message, "type": kind}},
         status=status,
     )
+
+
+# A refused request costs the client one round trip; retrying into a queue that
+# is still full costs everyone. One second is long enough for a decode slot to
+# free at fleet speeds and short enough that a caller does not give up.
+OVERLOAD_RETRY_AFTER_SECONDS = 1
+
+
+def overloaded_response(error: QueueFullError) -> web.Response:
+    response = web.json_response(
+        {
+            "error": {
+                "message": str(error),
+                "type": "overloaded",
+                "pending": error.pending,
+                "capacity": error.capacity,
+            }
+        },
+        status=429,
+    )
+    response.headers["Retry-After"] = str(OVERLOAD_RETRY_AFTER_SECONDS)
+    return response
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

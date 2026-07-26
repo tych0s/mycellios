@@ -318,6 +318,57 @@ export class MeshDatabase {
         updated_at INTEGER NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS api_accounts (
+        user_id TEXT PRIMARY KEY,
+        token_balance INTEGER NOT NULL DEFAULT 0 CHECK(token_balance >= 0),
+        usd_micros INTEGER NOT NULL DEFAULT 0 CHECK(usd_micros >= 0),
+        lifetime_input_tokens INTEGER NOT NULL DEFAULT 0,
+        lifetime_output_tokens INTEGER NOT NULL DEFAULT 0,
+        request_count INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS api_keys (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES api_accounts(user_id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        prefix TEXT NOT NULL UNIQUE,
+        secret_hash TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        last_used_at INTEGER,
+        revoked_at INTEGER
+      );
+
+      CREATE INDEX IF NOT EXISTS api_keys_user_created
+      ON api_keys(user_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS api_usage (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES api_accounts(user_id) ON DELETE CASCADE,
+        api_key_id TEXT REFERENCES api_keys(id) ON DELETE SET NULL,
+        job_id TEXT,
+        session_id TEXT,
+        model TEXT NOT NULL,
+        reserved_tokens INTEGER NOT NULL,
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL CHECK(status IN ('pending', 'completed', 'failed')),
+        error_code TEXT,
+        created_at INTEGER NOT NULL,
+        completed_at INTEGER
+      );
+
+      CREATE INDEX IF NOT EXISTS api_usage_user_created
+      ON api_usage(user_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS api_usage_user_status
+      ON api_usage(user_id, status);
+
+      CREATE UNIQUE INDEX IF NOT EXISTS api_usage_job
+      ON api_usage(job_id)
+      WHERE job_id IS NOT NULL;
+
     `);
     if (currentVersion >= 2 && currentVersion < 3) {
       const columns = this.raw.prepare("PRAGMA table_info(workers)").all() as Array<{

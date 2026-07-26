@@ -184,6 +184,25 @@ def _prefill_frame_byte_reservation(
     return HEADER_BYTES + payload_bytes
 
 
+class QueueFullError(RuntimeError):
+    """Backpressure: the request was refused because the backlog is full.
+
+    Distinct from every other `RuntimeError` the engine can raise, because the
+    two mean opposite things to a caller. A full queue is "I am healthy but
+    saturated, retry shortly"; anything else is "I am broken". Both used to
+    surface as one flat HTTP 503 `service_unavailable`, so a client could not
+    back off correctly and a genuine internal failure was indistinguishable
+    from load.
+
+    Subclasses `RuntimeError` on purpose: existing handlers keep working.
+    """
+
+    def __init__(self, message: str, *, pending: int, capacity: int) -> None:
+        super().__init__(message)
+        self.pending = pending
+        self.capacity = capacity
+
+
 @dataclass(frozen=True)
 class PipelineEngineConfig:
     model_name: str
@@ -1741,7 +1760,11 @@ class DistributedPipelineEngine:
             if duplicate_active:
                 raise ValueError(f"client_id already active: {duplicate_active[0]}")
             if len(self._jobs_by_client) + len(jobs) > self.config.max_pending_requests:
-                raise RuntimeError("pipeline request queue is full")
+                raise QueueFullError(
+                    "pipeline request queue is full",
+                    pending=len(self._jobs_by_client),
+                    capacity=self.config.max_pending_requests,
+                )
             for job in jobs:
                 self._jobs_by_client[job.request.client_id] = job
         self._submission_queue.put(jobs)

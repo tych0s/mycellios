@@ -9,6 +9,7 @@ import {
   ChevronRight,
   CircleAlert,
   CirclePower,
+  Coins,
   Cpu,
   Download,
   ExternalLink,
@@ -19,6 +20,7 @@ import {
   Laptop,
   LayoutDashboard,
   LoaderCircle,
+  LockKeyhole,
   LogOut,
   Maximize2,
   MemoryStick,
@@ -38,6 +40,7 @@ import {
   SlidersHorizontal,
   Sparkles,
   Smartphone,
+  SunMoon,
   Timer,
   Trash2,
   UserRound,
@@ -98,6 +101,8 @@ import {
   type NetworkIdentity,
   type PublicAuthConfig,
 } from "./auth";
+import { ApiAccessPanel } from "./ApiAccessPanel";
+import { loadApiAccount, type ApiAccount } from "./api-access";
 import "./panel.css";
 
 const PUBLIC_COORDINATOR_URL = "https://www.mycellios.com";
@@ -259,7 +264,13 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   const [authConfig, setAuthConfig] = useState<PublicAuthConfig>({ enabled: false });
   const [authSession, setAuthSession] = useState<AuthSession | null>(null);
   const [networkIdentity, setNetworkIdentity] = useState<NetworkIdentity | null>(null);
+  const [apiAccount, setApiAccount] = useState<ApiAccount | null>(null);
   const [authOpen, setAuthOpen] = useState(false);
+  const [theme, setTheme] = useState<"dark" | "light">(() => {
+    const saved = window.localStorage.getItem("mycellios.theme");
+    if (saved === "light" || saved === "dark") return saved;
+    return window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark";
+  });
   const canManageModels = networkIdentity?.role === "owner"
     || networkIdentity?.role === "admin"
     || networkIdentity?.role === "operator";
@@ -307,11 +318,17 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
       setAuthSession(session);
       try {
         const identity = await loadNetworkIdentity(session.accessToken);
-        if (!cancelled) setNetworkIdentity(identity);
+        if (!cancelled) {
+          setNetworkIdentity(identity);
+          if (config.apiAccessEnabled) {
+            setApiAccount(await loadApiAccount(session.accessToken).catch(() => null));
+          }
+        }
       } catch {
         if (!cancelled) {
           setAuthSession(null);
           setNetworkIdentity(null);
+          setApiAccount(null);
         }
       }
     });
@@ -322,6 +339,14 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     setContentScale((current) => {
       const next = Math.min(1.3, Math.max(0.9, Math.round((current + delta) * 10) / 10));
       window.localStorage.setItem("mycellios.content-scale", String(next));
+      return next;
+    });
+  }
+
+  function toggleTheme() {
+    setTheme((current) => {
+      const next = current === "dark" ? "light" : "dark";
+      window.localStorage.setItem("mycellios.theme", next);
       return next;
     });
   }
@@ -458,10 +483,17 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   async function sendPrompt(model: string, messages: ChatMessage[], sessionId: string, onUpdate?: (update: ChatStreamUpdate) => void): Promise<ChatResponse> {
     if (desktopBridge?.streamChat) return desktopBridge.streamChat({ model, messages, sessionId }, onUpdate ?? (() => undefined));
     if (desktopBridge) return desktopBridge.sendChat({ model, messages, sessionId });
-    return consumeChatCompletionStreamWithRecovery(
+    if (authConfig.apiAccessEnabled && !authSession) {
+      throw new Error("Inicia sesión para usar el saldo de inferencia de tu cuenta.");
+    }
+    const result = await consumeChatCompletionStreamWithRecovery(
       (_attempt, signal) => fetch("/v1/chat/completions", {
         method: "POST",
-        headers: { accept: "text/event-stream", "content-type": "application/json" },
+        headers: {
+          accept: "text/event-stream",
+          "content-type": "application/json",
+          ...(authSession ? { authorization: `Bearer ${authSession.accessToken}` } : {}),
+        },
         body: JSON.stringify({ model, messages, session_id: sessionId, stream: true, max_tokens: 128, temperature: 0, top_p: 1 }),
         signal,
       }),
@@ -469,24 +501,35 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
       onUpdate ?? (() => undefined),
       { sessionId },
     );
+    if (authSession && authConfig.apiAccessEnabled) {
+      setApiAccount(await loadApiAccount(authSession.accessToken).catch(() => apiAccount));
+    }
+    return result;
   }
 
   const publicOrigin = desktopSnapshot?.coordinatorUrl
     ? desktopSnapshot.coordinatorUrl.replace(/\/$/, "")
     : PUBLIC_COORDINATOR_URL;
   const publicLink = (path: string) => desktop ? `${publicOrigin}${path}` : path;
+  const configuredApiBase = authConfig.publicApiBaseUrl ?? "/v1";
+  const apiBaseUrl = desktop
+    ? `${publicOrigin}/v1`
+    : configuredApiBase.startsWith("http")
+      ? configuredApiBase
+      : `${window.location.origin}${configuredApiBase.startsWith("/") ? "" : "/"}${configuredApiBase}`;
   const externalProps = desktop ? { target: "_blank", rel: "noreferrer" } as const : {};
 
   async function disconnectAccount() {
     if (authSession) await signOut(authConfig, authSession);
     setAuthSession(null);
     setNetworkIdentity(null);
+    setApiAccount(null);
   }
 
   return (
     <div className="public-panel-viewport">
       <div
-        className={`public-panel ${desktop ? `desktop-panel platform-${desktopSnapshot?.platform ?? "loading"}` : ""}`}
+        className={`public-panel theme-${theme} ${desktop ? `desktop-panel platform-${desktopSnapshot?.platform ?? "loading"}` : ""}`}
         style={{
           width: `${100 / contentScale}%`,
           height: `${100 / contentScale}vh`,
@@ -518,6 +561,10 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
             <small>{error ? "Coordinator unavailable" : "All systems operational"}</small>
           </div>
         </div>
+        <div className="panel-sidebar-version" aria-label="Versiones">
+          {desktopSnapshot && <span><small>APP</small><strong>v{desktopSnapshot.appVersion}</strong></span>}
+          <span><small>API</small><strong>{snapshot.version}</strong></span>
+        </div>
       </aside>
       {menuOpen && <button className="panel-menu-backdrop" aria-label="Close navigation overlay" onClick={() => setMenuOpen(false)} />}
 
@@ -531,6 +578,11 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
           ><Menu /></button>
           <div className="panel-topbar-status"><span className={`panel-live-dot ${error ? "degraded" : ""}`} /><div><strong>{error ? "Network degraded" : "Network healthy"}</strong><small>{snapshot.capturedAt === EMPTY.capturedAt ? "Waiting for snapshot" : `Updated ${relativeTime(snapshot.capturedAt)}`}</small></div></div>
           <div className="panel-top-actions">
+            <div className="panel-balance-group" aria-label="Saldos de la cuenta">
+              <span className="panel-balance-badge money" aria-label={`Saldo: ${apiAccount?.usd_balance ?? "0.00"} dólares`} title="Saldo monetario disponible">${apiAccount?.usd_balance ?? "0.00"}</span>
+              <span className="panel-balance-badge tokens" aria-label={`Tokens: ${apiAccount?.token_balance ?? 0}`} title="Tokens de inferencia disponibles"><Coins size={14} />{formatCompactTokens(apiAccount?.token_balance ?? 0)} TOK</span>
+            </div>
+            <button className="panel-theme-indicator" type="button" onClick={toggleTheme} aria-label={`Cambiar a modo ${theme === "dark" ? "claro" : "oscuro"}`} title={`Cambiar a modo ${theme === "dark" ? "claro" : "oscuro"}`}><SunMoon size={16} /></button>
             {localProductionProxy && <span className="panel-environment-badge"><Globe2 size={13} /> Production via local</span>}
             <div className="panel-zoom-controls" role="group" aria-label="Interface zoom">
               <button type="button" aria-label="Reduce interface size" disabled={contentScale <= 0.9} onClick={() => changeContentScale(-0.1)}><Minus size={14} /></button>
@@ -538,9 +590,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
               <button type="button" aria-label="Increase interface size" disabled={contentScale >= 1.3} onClick={() => changeContentScale(0.1)}><Plus size={14} /></button>
             </div>
             {desktopSnapshot?.update.state === "ready" && <button className="panel-update-ready" onClick={() => void desktopBridge?.installUpdate()} title="Restart and install update"><Download size={15} /></button>}
-            {desktopSnapshot && <span>v{desktopSnapshot.appVersion}</span>}
             {desktopSnapshot && <span title={buildIdentityTitle(desktopSnapshot.buildIdentity)}>App {shortBuildIdentity(desktopSnapshot.buildIdentity)}</span>}
-            <span>API {snapshot.version}</span>
             <span title={buildIdentityTitle(snapshot.buildIdentity)}>API {shortBuildIdentity(snapshot.buildIdentity)}</span>
             {!desktop && authConfig.enabled && (
               networkIdentity
@@ -563,7 +613,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
               {view === "models" && <Models snapshot={snapshot} onSearch={searchHubModels} onRequest={requestModel} onRemove={removeRequestedModel} adminToken={modelAdminToken} requiresAdminToken={requiresModelAdminToken} secureTokenStorage={desktop} />}
               {view === "jobs" && <Jobs snapshot={snapshot} />}
               {view === "tests" && <Tests bridge={desktopBridge} />}
-              {view === "inference" && <Inference snapshot={snapshot} onSend={sendPrompt} onNavigate={navigate} />}
+              {view === "inference" && <Inference snapshot={snapshot} onSend={sendPrompt} onNavigate={navigate} accountAuthenticated={desktop || !authConfig.apiAccessEnabled || authSession !== null} onSignIn={() => setAuthOpen(true)} apiAccessEnabled={authConfig.apiAccessEnabled ?? false} apiBaseUrl={apiBaseUrl} accessToken={authSession?.accessToken ?? null} apiAccount={apiAccount} />}
               {view === "contribute" && <Contribute />}
               {view === "join" && <JoinNetwork publicLink={publicLink} external={desktop} />}
               {view === "downloads" && <Downloads publicLink={publicLink} external={desktop} />}
@@ -593,6 +643,9 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
         onAuthenticated={(session, identity) => {
           setAuthSession(session);
           setNetworkIdentity(identity);
+          if (authConfig.apiAccessEnabled) {
+            void loadApiAccount(session.accessToken).then(setApiAccount);
+          }
           setAuthOpen(false);
         }}
         onSignOut={() => void disconnectAccount().finally(() => setAuthOpen(false))}
@@ -2048,10 +2101,16 @@ interface InferencePendingTurn extends ChatStreamUpdate {
   prompt: string;
 }
 
-function Inference({ snapshot, onSend, onNavigate }: {
+function Inference({ snapshot, onSend, onNavigate, accountAuthenticated, onSignIn, apiAccessEnabled, apiBaseUrl, accessToken, apiAccount }: {
   snapshot: PublicSnapshot;
   onSend: (model: string, messages: ChatMessage[], sessionId: string, onUpdate?: (update: ChatStreamUpdate) => void) => Promise<ChatResponse>;
   onNavigate: (view: PanelView) => void;
+  accountAuthenticated: boolean;
+  onSignIn: () => void;
+  apiAccessEnabled: boolean;
+  apiBaseUrl: string;
+  accessToken: string | null;
+  apiAccount: ApiAccount | null;
 }) {
   const options = useMemo(() => snapshot.models.map((item) => inferenceModelOption(snapshot, item)), [snapshot]);
   const realModels = options.filter((item) => !item.legacyExternalRuntime);
@@ -2062,6 +2121,8 @@ function Inference({ snapshot, onSend, onNavigate }: {
   const [error, setError] = useState<string | null>(null);
   const [pendingTurn, setPendingTurn] = useState<InferencePendingTurn | null>(null);
   const outputRef = useRef<HTMLDivElement>(null);
+  const modelAvailable = realModels.length > 0;
+  const inferenceAvailable = modelAvailable && accountAuthenticated;
   const selectedModel = realModels.some((item) => item.id === model) ? model : realModels[0]?.id ?? "";
   const selectedOption = realModels.find((item) => item.id === selectedModel) ?? null;
 
@@ -2132,28 +2193,38 @@ function Inference({ snapshot, onSend, onNavigate }: {
 
   return <section className="inference-page">
     <PageTitle eyebrow="INFERENCIA REAL" title="Probar un modelo" copy="Habla con un modelo conectado y comprueba la ruta, la latencia y los tokens de cada respuesta." />
-    {realModels.length === 0 ? <div className="inference-unavailable">
+    <ApiAccessPanel enabled={apiAccessEnabled} apiBaseUrl={apiBaseUrl} accessToken={accessToken} account={apiAccount} availableModels={realModels.length} onSignIn={onSignIn} />
+    {!modelAvailable && <div className="inference-unavailable">
       <div className="inference-unavailable-icon"><MessageSquareText /></div>
       <div className="inference-unavailable-copy"><span>NO HAY MODELOS DE IA DISPONIBLES</span><h2>Ahora mismo no se puede hacer una inferencia real</h2><p>La red no tiene ningún runtime de IA real conectado. Un PC puede aparecer como nodo disponible sin inventar un modelo ni respuestas.</p>
         {snapshot.requestedModels[0] && <div className="inference-request-state"><LoaderCircle className={snapshot.requestedModels[0].status === "active" ? "" : "spin"} /><span><strong>{snapshot.requestedModels[0].id}</strong>{snapshot.requestedModels[0].message}</span></div>}
         <div className="inference-unavailable-actions"><button className="primary-button" onClick={() => onNavigate("models")}><Boxes size={16} />Ver y activar modelos</button></div>
       </div>
-    </div> : <div className="inference-console">
+    </div>}
+    {modelAvailable && !accountAuthenticated && <div className="inference-unavailable account-required">
+      <div className="inference-unavailable-icon"><LockKeyhole /></div>
+      <div className="inference-unavailable-copy"><span>CUENTA NECESARIA</span><h2>El modelo está conectado; inicia sesión para usarlo</h2><p>El envío utiliza el saldo y los límites de tu cuenta. El chat permanece visible para que puedas ver cómo funcionará.</p><div className="inference-unavailable-actions"><button className="primary-button" onClick={onSignIn}><UserRound size={16} />Iniciar sesión</button></div></div>
+    </div>}
+    <div className={`inference-console${inferenceAvailable ? "" : " is-unavailable"}`} aria-disabled={!inferenceAvailable}>
       <div className="inference-toolbar">
-        <label><span>MODELO REAL</span><AppSelect ariaLabel="Modelo real" value={selectedModel} onChange={(nextModel) => resetConversation(nextModel)} options={realModels.map((item) => ({ value: item.id, label: item.id }))} /></label>
-        <div className="inference-model-summary"><ExecutionBadge execution={selectedOption?.execution ?? unknownExecutionSummary()} workers={snapshot.workers} large /><span className="inference-live"><i />DISPONIBLE</span><span>{selectedOption?.routeLabel}</span><span>{selectedOption?.freeSlots ?? 0} hueco{selectedOption?.freeSlots === 1 ? "" : "s"} libre{selectedOption?.freeSlots === 1 ? "" : "s"}</span></div>
+        <label><span>MODELO REAL</span><AppSelect ariaLabel="Modelo real" value={selectedModel} onChange={(nextModel) => resetConversation(nextModel)} options={realModels.map((item) => ({ value: item.id, label: item.id }))} placeholder="Esperando un modelo conectado…" /></label>
+        {inferenceAvailable
+          ? <div className="inference-model-summary"><ExecutionBadge execution={selectedOption?.execution ?? unknownExecutionSummary()} workers={snapshot.workers} large /><span className="inference-live"><i />DISPONIBLE</span><span>{selectedOption?.routeLabel}</span><span>{selectedOption?.freeSlots ?? 0} hueco{selectedOption?.freeSlots === 1 ? "" : "s"} libre{selectedOption?.freeSlots === 1 ? "" : "s"}</span></div>
+          : <div className="inference-model-summary inference-offline"><LockKeyhole size={14} /><span>{modelAvailable ? "INICIA SESIÓN" : "SIN CONEXIÓN REAL"}</span></div>}
       </div>
       <div className="inference-output" aria-live="polite" ref={outputRef}>
-        {turns.length === 0 && !pendingTurn && !error && <div className="inference-welcome"><Sparkles /><h2>Escribe una pregunta</h2><p>La respuesta vendrá exclusivamente de un despliegue nativo de Mycellios.</p><div className="inference-suggestions">{["Resume cómo funciona esta red", "Explica una idea en tres frases", "Responde con una prueba corta"].map((suggestion) => <button key={suggestion} onClick={() => setPrompt(suggestion)}>{suggestion}</button>)}</div></div>}
+        {turns.length === 0 && !pendingTurn && !error && (inferenceAvailable
+          ? <div className="inference-welcome"><Sparkles /><h2>Escribe una pregunta</h2><p>La respuesta vendrá exclusivamente del despliegue nativo seleccionado de Mycellios.</p><div className="inference-suggestions">{["Resume cómo funciona esta red", "Explica una idea en tres frases", "Responde con una prueba corta"].map((suggestion) => <button key={suggestion} onClick={() => setPrompt(suggestion)}>{suggestion}</button>)}</div></div>
+          : <div className="inference-welcome inference-welcome-locked"><LockKeyhole /><h2>{modelAvailable ? "El chat está esperando tu cuenta" : "El chat está esperando un modelo"}</h2><p>{modelAvailable ? "Inicia sesión para activar el envío con tu saldo de tokens." : "Podrás escribir y enviar mensajes en cuanto la red confirme una conexión de inferencia real."}</p></div>)}
         {turns.map((turn) => <InferenceCompletedTurn turn={turn} key={turn.id} />)}
         {pendingTurn && <InferenceStreamingTurn turn={pendingTurn} />}
         {error && <div className="inference-error"><CircleAlert /><div><strong>No se pudo completar la inferencia</strong><span>{friendlyInferenceError(error)}</span></div></div>}
       </div>
       <div className="inference-input">
-        <textarea aria-label="Mensaje" value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder={`Escribe a ${selectedModel}…`} />
-        <div className="inference-input-foot"><span><kbd>Enter</kbd> enviar · <kbd>Shift</kbd> + <kbd>Enter</kbd> nueva línea</span><div>{turns.length > 0 && <button className="inference-clear" onClick={() => resetConversation()}><Trash2 size={14} />Nueva conversación</button>}<button className="inference-send" disabled={!prompt.trim() || pendingTurn !== null} onClick={() => void send()}>{pendingTurn ? <LoaderCircle className="spin" /> : <Send />}<span>Enviar</span></button></div></div>
+        <textarea aria-label="Mensaje" value={prompt} disabled={!inferenceAvailable || pendingTurn !== null} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder={inferenceAvailable ? `Escribe a ${selectedModel}…` : modelAvailable ? "Inicia sesión para empezar a escribir…" : "Conecta un modelo real para empezar a escribir…"} />
+        <div className="inference-input-foot"><span>{inferenceAvailable ? <><kbd>Enter</kbd> enviar · <kbd>Shift</kbd> + <kbd>Enter</kbd> nueva línea</> : <><LockKeyhole size={12} />{modelAvailable ? "El envío se activará al iniciar sesión" : "El envío se activará cuando haya una conexión real"}</>}</span><div>{turns.length > 0 && <button className="inference-clear" onClick={() => resetConversation()}><Trash2 size={14} />Nueva conversación</button>}<button className="inference-send" disabled={!inferenceAvailable || !prompt.trim() || pendingTurn !== null} onClick={() => void send()}>{pendingTurn ? <LoaderCircle className="spin" /> : <Send />}<span>Enviar</span></button></div></div>
       </div>
-    </div>}
+    </div>
   </section>;
 }
 
@@ -2634,7 +2705,7 @@ interface AppSelectOption {
   label: string;
 }
 
-function AppSelect({ ariaLabel, value, options, onChange }: { ariaLabel: string; value: string; options: AppSelectOption[]; onChange: (value: string) => void }) {
+function AppSelect({ ariaLabel, value, options, onChange, placeholder = "Selecciona una opción" }: { ariaLabel: string; value: string; options: AppSelectOption[]; onChange: (value: string) => void; placeholder?: string }) {
   const [open, setOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const selectedIndex = Math.max(0, options.findIndex((option) => option.value === value));
@@ -2663,7 +2734,7 @@ function AppSelect({ ariaLabel, value, options, onChange }: { ariaLabel: string;
         if (event.key === "ArrowUp") { event.preventDefault(); setOpen(true); moveSelection(-1); }
       }}
     >
-      <span>{selected?.label ?? "Selecciona una opción"}</span><ChevronDown size={16} />
+      <span>{selected?.label ?? placeholder}</span><ChevronDown size={16} />
     </button>
     {open && <div className="app-select-menu" role="listbox" aria-label={ariaLabel}>
       {options.map((option) => <button
@@ -2774,6 +2845,11 @@ function topologyPosition(index: number, total: number): { x: number; y: number 
   return { x: 50 + Math.cos(angle) * (inner ? 28 : 43), y: 52 + Math.sin(angle) * (inner ? 25 : 38) };
 }
 function formatCompactNumber(value: number): string { return new Intl.NumberFormat("es-ES", { maximumFractionDigits: value < 10 ? 1 : 0 }).format(value); }
+function formatCompactTokens(value: number): string {
+  if (value >= 1_000_000) return `${new Intl.NumberFormat("es-ES", { maximumFractionDigits: 1 }).format(value / 1_000_000)}M`;
+  if (value >= 1_000) return `${new Intl.NumberFormat("es-ES", { maximumFractionDigits: 1 }).format(value / 1_000)}K`;
+  return new Intl.NumberFormat("es-ES").format(value);
+}
 function formatPower(watts: number): string { return watts >= 1_000 ? `${(watts / 1_000).toFixed(1)} kW` : `${Math.round(watts)} W`; }
 function shortId(value: string) { return value.length <= 10 ? value : `${value.slice(0, 6)}…${value.slice(-4)}`; }
 function formatMemory(value: number) { return value >= 1_024 ? `${(value / 1_024).toFixed(value >= 10_240 ? 0 : 1)} GB` : `${Math.round(value)} MB`; }

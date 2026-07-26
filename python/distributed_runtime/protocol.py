@@ -274,13 +274,35 @@ class LinkEmulator:
             inflight = self._inflight.wire_bytes if self._inflight else 0
             return self._queued_bytes + inflight
 
-    def single_frame_delay_seconds(self, wire_bytes: int) -> float:
+    @property
+    def propagation_seconds(self) -> float:
+        """Return the parallel propagation component of the link model."""
+
+        return self.one_way_delay_ms / 1_000
+
+    def serialization_seconds(self, wire_bytes: int) -> float:
+        """Return the serial wire-time component for one complete frame."""
+
         if wire_bytes < 0:
             raise ValueError("wire_bytes must be non-negative")
-        serialization = 0.0
-        if self.bandwidth_mbps > 0:
-            serialization = (wire_bytes * 8) / (self.bandwidth_mbps * 1_000_000)
-        return self.one_way_delay_ms / 1_000 + serialization
+        if self.bandwidth_mbps <= 0:
+            return 0.0
+        return (wire_bytes * 8) / (self.bandwidth_mbps * 1_000_000)
+
+    def single_frame_delay_seconds(self, wire_bytes: int) -> float:
+        return self.propagation_seconds + self.serialization_seconds(wire_bytes)
+
+    def wait_before_send(self, wire_bytes: int) -> None:
+        """Reproduce the retired serial-delay model for historical benchmarks.
+
+        Production sends must use :func:`send_frame`, which queues propagation
+        asynchronously. This compatibility shim exists only so the versioned
+        benchmark can compare the former behaviour against the corrected one.
+        """
+
+        delay = self.single_frame_delay_seconds(wire_bytes)
+        if delay > 0:
+            time.sleep(delay)
 
     def send(
         self,
@@ -573,6 +595,16 @@ def _release_link_emulator_socket(
     with _LINK_EMULATOR_OWNERS_LOCK:
         if _LINK_EMULATOR_OWNERS.get(sock) is emulator:
             del _LINK_EMULATOR_OWNERS[sock]
+
+
+def close_emulated_link(sock: object, timeout: float = 5.0) -> None:
+    """Drain and release the emulator that owns ``sock``, if any."""
+
+    if timeout < 0:
+        raise ValueError("timeout must be non-negative")
+    owner = _owned_link_emulator(sock)
+    if owner is not None:
+        owner.close(timeout_seconds=timeout)
 
 
 def configure_socket(sock: socket.socket) -> None:
