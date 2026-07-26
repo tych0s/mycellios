@@ -8,6 +8,7 @@ from distributed_runtime.speculation import (
     MAX_TREE_DRAFT_BRANCHES,
     AdaptiveSpeculationConfig,
     AdaptiveSpeculationController,
+    CandidateEstimate,
     DraftProvider,
     NgramDraftProvider,
     NgramTreeDraftProvider,
@@ -197,6 +198,35 @@ class NgramTreeDraftProviderTests(unittest.TestCase):
 
 
 class AdaptiveSpeculationControllerTests(unittest.TestCase):
+    def test_candidate_estimate_preserves_the_legacy_positional_constructor(
+        self,
+    ) -> None:
+        estimate = CandidateEstimate(
+            2,
+            0,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0.95,
+            False,
+        )
+
+        self.assertEqual(estimate.candidate_size, 2)
+        self.assertIsNone(estimate.observed_emitted_tokens_per_verification)
+        self.assertIsNone(
+            estimate.observed_emitted_tokens_per_verification_lower_bound
+        )
+        self.assertIsNone(
+            estimate.observed_emitted_tokens_per_verification_upper_bound
+        )
+
     @staticmethod
     def _controller(
         *,
@@ -521,6 +551,10 @@ class AdaptiveSpeculationControllerTests(unittest.TestCase):
         self.assertEqual(stats.verification_latency_seconds, 4.0)
         self.assertEqual(stats.verification_bytes, 400)
         self.assertAlmostEqual(stats.acceptance_rate or 0, 2 / 3)
+        self.assertAlmostEqual(
+            stats.observed_emitted_tokens_per_verification or 0,
+            3.0,
+        )
 
         estimate = controller.candidate_estimate(4)
         self.assertTrue(estimate.ready)
@@ -528,8 +562,72 @@ class AdaptiveSpeculationControllerTests(unittest.TestCase):
         self.assertEqual(estimate.proposed_tokens, 8)
         self.assertEqual(estimate.accepted_tokens, 6)
         self.assertAlmostEqual(estimate.acceptance_rate or 0, 0.75)
+        self.assertAlmostEqual(
+            estimate.observed_emitted_tokens_per_verification or 0,
+            4.0,
+        )
+        self.assertAlmostEqual(
+            estimate.observed_emitted_tokens_per_verification_lower_bound or 0,
+            4.0,
+        )
+        self.assertAlmostEqual(
+            estimate.observed_emitted_tokens_per_verification_upper_bound or 0,
+            4.0,
+        )
         self.assertAlmostEqual(estimate.mean_verification_latency_seconds or 0, 1.25)
         self.assertAlmostEqual(estimate.mean_verification_bytes or 0, 120.0)
+
+    def test_observed_emitted_bounds_fail_closed_until_two_verifications(
+        self,
+    ) -> None:
+        controller = self._controller(candidates=(2,))
+        empty = controller.candidate_estimate(2)
+        self.assertIsNone(empty.observed_emitted_tokens_per_verification)
+        self.assertIsNone(
+            empty.observed_emitted_tokens_per_verification_lower_bound
+        )
+        self.assertIsNone(
+            empty.observed_emitted_tokens_per_verification_upper_bound
+        )
+        self.assertIsNone(
+            controller.stats().observed_emitted_tokens_per_verification
+        )
+
+        controller.record_verification(
+            proposed_tokens=2,
+            accepted_tokens=1,
+            latency_seconds=1.0,
+            transferred_bytes=10,
+        )
+        one = controller.candidate_estimate(2)
+        self.assertEqual(one.observed_emitted_tokens_per_verification, 2.0)
+        self.assertIsNone(
+            one.observed_emitted_tokens_per_verification_lower_bound
+        )
+        self.assertIsNone(
+            one.observed_emitted_tokens_per_verification_upper_bound
+        )
+
+        for accepted in (0, 2, 1):
+            controller.record_verification(
+                proposed_tokens=2,
+                accepted_tokens=accepted,
+                latency_seconds=1.0,
+                transferred_bytes=10,
+            )
+        observed = controller.candidate_estimate(2)
+        mean = observed.observed_emitted_tokens_per_verification
+        lower = observed.observed_emitted_tokens_per_verification_lower_bound
+        upper = observed.observed_emitted_tokens_per_verification_upper_bound
+        self.assertIsNotNone(mean)
+        self.assertIsNotNone(lower)
+        self.assertIsNotNone(upper)
+        assert mean is not None and lower is not None and upper is not None
+        self.assertTrue(all(math.isfinite(value) for value in (mean, lower, upper)))
+        self.assertLessEqual(1.0, lower)
+        self.assertLessEqual(lower, mean)
+        self.assertLessEqual(mean, upper)
+        self.assertLessEqual(upper, 3.0)
 
     def test_reset_discards_all_observations(self) -> None:
         controller = self._controller(candidates=(2,))

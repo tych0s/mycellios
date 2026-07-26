@@ -1592,6 +1592,8 @@ class DistributedPipelineEngine:
             return {
                 "configured": False,
                 "enabled": False,
+                "emitted_tokens": 0,
+                "observed_emitted_tokens_per_verification": None,
                 "route_rtt_ms": route_rtt_ms,
                 "route_probe_count": route_probe_count,
                 "provider": provider,
@@ -1612,8 +1614,14 @@ class DistributedPipelineEngine:
             )
             proposed_tokens = sum(value.proposed_tokens for value in observations)
             accepted_tokens = sum(value.accepted_tokens for value in observations)
+            emitted_tokens = sum(value.emitted_tokens for value in observations)
             acceptance_rate = (
                 accepted_tokens / proposed_tokens if proposed_tokens else None
+            )
+            observed_emitted_per_verification = (
+                emitted_tokens / verification_observations
+                if verification_observations
+                else None
             )
             return {
                 # Keep enabled as a compatibility alias for older health clients;
@@ -1632,7 +1640,14 @@ class DistributedPipelineEngine:
                 "verification_observations": verification_observations,
                 "proposed_tokens": proposed_tokens,
                 "accepted_tokens": accepted_tokens,
+                "emitted_tokens": emitted_tokens,
                 "acceptance_rate": acceptance_rate,
+                # Intrinsic accepted+1 telemetry for valid controller VERIFY
+                # observations. This is not route-level conveyor g for W>1,
+                # where overlapping waves can duplicate the bridge token.
+                "observed_emitted_tokens_per_verification": _finite_or_none(
+                    observed_emitted_per_verification
+                ),
                 "route_rtt_ms": route_rtt_ms,
                 "route_probe_count": route_probe_count,
                 "provider": provider,
@@ -1645,12 +1660,31 @@ class DistributedPipelineEngine:
                         "rtt_ewma_ms": _finite_or_none(current.rtt_ewma_ms),
                         "classic_observations": current.stats().classic_observations,
                         "verification_observations": current.stats().verification_observations,
+                        "emitted_tokens": current.stats().emitted_tokens,
+                        "observed_emitted_tokens_per_verification": _finite_or_none(
+                            current.stats().observed_emitted_tokens_per_verification
+                        ),
                         "candidates": [
                             {
                                 "size": estimate.candidate_size,
                                 "ready": estimate.ready,
                                 "observations": estimate.observations,
                                 "acceptance_rate": estimate.acceptance_rate,
+                                "observed_emitted_tokens_per_verification": (
+                                    _finite_or_none(
+                                        estimate.observed_emitted_tokens_per_verification
+                                    )
+                                ),
+                                "observed_emitted_tokens_per_verification_lower_bound": (
+                                    _finite_or_none(
+                                        estimate.observed_emitted_tokens_per_verification_lower_bound
+                                    )
+                                ),
+                                "observed_emitted_tokens_per_verification_upper_bound": (
+                                    _finite_or_none(
+                                        estimate.observed_emitted_tokens_per_verification_upper_bound
+                                    )
+                                ),
                                 "predicted_speedup": _finite_or_none(
                                     estimate.predicted_speedup
                                 ),

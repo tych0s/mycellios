@@ -427,9 +427,30 @@ class SpeculationStats:
             return None
         return self.accepted_tokens / self.proposed_tokens
 
+    @property
+    def observed_emitted_tokens_per_verification(self) -> float | None:
+        """Mean ``accepted + 1`` for valid VERIFY observations.
+
+        This is intrinsic controller telemetry.  It is a useful W=1 estimator,
+        but it is not route-level conveyor ``g`` for W>1 because overlapping
+        waves can count the same bridge token more than once.
+        """
+
+        if self.verification_observations == 0:
+            return None
+        value = self.emitted_tokens / self.verification_observations
+        return value if math.isfinite(value) else None
+
 
 @dataclass(frozen=True)
 class CandidateEstimate:
+    """Observed and predicted statistics for one fixed VERIFY candidate size.
+
+    ``observed_emitted_tokens_per_verification`` and its confidence bounds use
+    only valid controller VERIFY observations.  They must not be interpreted
+    as route-level useful tokens per traversal for a W>1 conveyor.
+    """
+
     candidate_size: int
     observations: int
     proposed_tokens: int
@@ -444,6 +465,11 @@ class CandidateEstimate:
     predicted_speedup_lower_bound: float | None
     confidence_level: float
     ready: bool
+    # Appended with defaults to preserve the public positional constructor used
+    # before route-quality telemetry existed.
+    observed_emitted_tokens_per_verification: float | None = None
+    observed_emitted_tokens_per_verification_lower_bound: float | None = None
+    observed_emitted_tokens_per_verification_upper_bound: float | None = None
 
 
 @dataclass(frozen=True)
@@ -640,9 +666,41 @@ class AdaptiveSpeculationController:
             expected_emitted = 1.0 + candidate * acceptance_rate
 
         if measurements.observations == 0:
+            observed_emitted_per_verification = None
+            observed_emitted_lower_bound = None
+            observed_emitted_upper_bound = None
             mean_verify_latency = None
             mean_verify_bytes = None
         else:
+            observed_emitted_per_verification = (
+                measurements.emitted_tokens / measurements.observations
+            )
+            if not math.isfinite(observed_emitted_per_verification):
+                observed_emitted_per_verification = None
+            observed_emitted_lower_bound = _one_sided_mean_bound(
+                total=measurements.emitted_per_wave_sum,
+                square_total=measurements.emitted_per_wave_square_sum,
+                count=measurements.observations,
+                confidence_level=float(self.config.confidence_level),
+                upper=False,
+            )
+            observed_emitted_upper_bound = _one_sided_mean_bound(
+                total=measurements.emitted_per_wave_sum,
+                square_total=measurements.emitted_per_wave_square_sum,
+                count=measurements.observations,
+                confidence_level=float(self.config.confidence_level),
+                upper=True,
+            )
+            if observed_emitted_lower_bound is not None:
+                observed_emitted_lower_bound = max(
+                    1.0,
+                    min(float(candidate + 1), observed_emitted_lower_bound),
+                )
+            if observed_emitted_upper_bound is not None:
+                observed_emitted_upper_bound = max(
+                    1.0,
+                    min(float(candidate + 1), observed_emitted_upper_bound),
+                )
             mean_verify_latency = (
                 measurements.latency_seconds / measurements.observations
             )
@@ -723,6 +781,15 @@ class AdaptiveSpeculationController:
             accepted_tokens=measurements.accepted_tokens,
             acceptance_rate=acceptance_rate,
             expected_emitted_tokens=expected_emitted,
+            observed_emitted_tokens_per_verification=(
+                observed_emitted_per_verification
+            ),
+            observed_emitted_tokens_per_verification_lower_bound=(
+                observed_emitted_lower_bound
+            ),
+            observed_emitted_tokens_per_verification_upper_bound=(
+                observed_emitted_upper_bound
+            ),
             mean_verification_latency_seconds=mean_verify_latency,
             mean_verification_bytes=mean_verify_bytes,
             predicted_latency_speedup=predicted_latency_speedup,

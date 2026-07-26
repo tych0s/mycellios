@@ -284,6 +284,25 @@ class EngineUnitTests(unittest.TestCase):
         candidate = engine.speculation_stats["profiles"]["load-1"]["candidates"][0]
         self.assertIsNone(candidate["predicted_speedup"])
         self.assertIsNone(candidate["predicted_speedup_lower_bound"])
+        self.assertEqual(engine.speculation_stats["emitted_tokens"], 0)
+        self.assertIsNone(
+            engine.speculation_stats[
+                "observed_emitted_tokens_per_verification"
+            ]
+        )
+        self.assertIsNone(
+            candidate["observed_emitted_tokens_per_verification"]
+        )
+        self.assertIsNone(
+            candidate[
+                "observed_emitted_tokens_per_verification_lower_bound"
+            ]
+        )
+        self.assertIsNone(
+            candidate[
+                "observed_emitted_tokens_per_verification_upper_bound"
+            ]
+        )
 
     def test_physical_tree_probe_is_labelled_and_never_claims_speedup(self) -> None:
         engine = _root_batch_test_engine(
@@ -433,8 +452,36 @@ class EngineUnitTests(unittest.TestCase):
         engine._speculation_selected_sizes = {2: 1}
         engine.tree_draft_provider = None
 
-        candidate = engine.speculation_stats["profiles"]["load-1"]["candidates"][0]
+        health = engine.speculation_stats
+        profile = health["profiles"]["load-1"]
+        candidate = profile["candidates"][0]
         self.assertEqual(candidate["confidence_level"], 0.95)
+        self.assertEqual(health["emitted_tokens"], 6)
+        self.assertEqual(
+            health["observed_emitted_tokens_per_verification"],
+            3.0,
+        )
+        self.assertEqual(profile["emitted_tokens"], 6)
+        self.assertEqual(
+            profile["observed_emitted_tokens_per_verification"],
+            3.0,
+        )
+        self.assertEqual(
+            candidate["observed_emitted_tokens_per_verification"],
+            3.0,
+        )
+        self.assertEqual(
+            candidate[
+                "observed_emitted_tokens_per_verification_lower_bound"
+            ],
+            3.0,
+        )
+        self.assertEqual(
+            candidate[
+                "observed_emitted_tokens_per_verification_upper_bound"
+            ],
+            3.0,
+        )
         self.assertIsNotNone(candidate["predicted_speedup"])
         self.assertIsNotNone(candidate["predicted_speedup_lower_bound"])
         self.assertLessEqual(
