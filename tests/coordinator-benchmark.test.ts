@@ -1,6 +1,7 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   buildCoordinatorBenchmarkTelemetrySnapshot,
@@ -15,15 +16,27 @@ import { workerCapabilitiesSchema } from "../src/contracts/schemas.js";
 import type { RunIdentity } from "../src/benchlab/history.js";
 import type { StoredWorker } from "../src/storage/store.js";
 
+// La version SE LEE, no se escribe a mano. `runAndPersistCoordinatorSuite`
+// compara la de este fixture contra la que deriva de `package.json` y aborta con
+// `benchmark_build_version_mismatch` si difieren, asi que un numero fijo aqui
+// convierte cada subida de version en un test roto — y eso ya paso al subir de
+// 0.2.19 a 0.2.52 para desatascar la publicacion.
+const PACKAGE_VERSION: string = JSON.parse(
+  readFileSync(
+    resolve(fileURLToPath(new URL(".", import.meta.url)), "..", "package.json"),
+    "utf8",
+  ),
+).version;
+
 const IDENTITY: RunIdentity = {
   runId: "auto-run-1",
-  version: "0.2.19",
-  label: "v0.2.19",
+  version: PACKAGE_VERSION,
+  label: `v${PACKAGE_VERSION}`,
   gitCommit: "0123456789abcdef",
   gitBranch: "main",
   gitDirty: false,
   build: {
-    release: "0.2.19",
+    release: PACKAGE_VERSION,
     releaseSource: "override",
     revision: "0123456789abcdef",
     revisionSource: "git",
@@ -227,7 +240,12 @@ describe("automatic coordinator benchmark", () => {
       coordinatorUrl: "http://127.0.0.1:4180",
       buildIdentity: {
         schema: "mycellios-native-build-provenance/1",
-        version: "0.2.19",
+        // Esta llamada NO pasa `version`, asi que `createRunIdentity` la deriva
+        // del `package.json` del repositorio. Para que la comprobacion de
+        // procedencia case, la del build tiene que ser la misma — leida, no
+        // escrita a mano. Con un numero fijo aqui, cada subida de version
+        // rompia este test.
+        version: PACKAGE_VERSION,
         sourceId: `sha256:${"c".repeat(64)}`,
       },
       model: {
