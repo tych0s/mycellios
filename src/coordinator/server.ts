@@ -515,6 +515,7 @@ export async function createCoordinator(
       ),
     );
   });
+  app.get("/downloads/", async (_request, reply) => reply.redirect("/downloads"));
   app.get("/downloads/:fileName", async (request, reply) => {
     const { fileName } = z.object({
       fileName: z.string().min(1).max(160),

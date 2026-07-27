@@ -156,6 +156,20 @@ describe("inference-only coordinator and worker", () => {
       ).status,
     ).toBe(200);
   });
+
+  it("serves the downloads page with a trailing slash", async () => {
+    const { runtime, address, agent, run } = await startNetwork();
+    cleanup.push(async () => {
+      await agent.stop();
+      await run;
+      await runtime.close();
+    });
+
+    const response = await fetch(new URL("downloads/", `${address}/`));
+    expect(response.status).toBe(200);
+    expect(response.url).toBe(`${address}/downloads`);
+    expect(await response.text()).toContain("mycellios test network");
+  });
 });
 
 async function startNetwork(options: { networkToken?: string } = {}): Promise<{
