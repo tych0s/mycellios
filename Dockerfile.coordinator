@@ -3,6 +3,7 @@
 FROM python:3.12-slim-bookworm AS python-runtime
 
 FROM node:24-bookworm-slim AS build
+ARG DEPLOY_REVISION
 COPY --from=python-runtime /usr/local /opt/python
 ENV PATH="/opt/python/bin:${PATH}" \
     LD_LIBRARY_PATH="/opt/python/lib"
@@ -11,7 +12,9 @@ COPY package.json package-lock.json ./
 RUN --mount=type=cache,id=mycellios-npm-build,target=/root/.npm,sharing=locked \
     npm ci --no-audit --no-fund
 COPY . .
-RUN npm run build
+RUN node scripts/prepare-coordinator-runtime-identity.mjs \
+      --revision="${DEPLOY_REVISION}" \
+    && npm run build
 
 FROM node:24-bookworm-slim AS runtime
 COPY --from=python-runtime /usr/local /opt/python
@@ -29,6 +32,9 @@ COPY --from=build /app/landing-dist ./landing-dist
 COPY --from=build /app/mobile-dist ./mobile-dist
 COPY --from=build /app/build/mycellios-coordinator-output-receipt.json \
     ./build/mycellios-coordinator-output-receipt.json
+COPY --from=build /app/REVISION ./REVISION
+COPY --from=build /app/mycellios-native-build-provenance.json \
+    ./mycellios-native-build-provenance.json
 COPY python ./python
 COPY config ./config
 
