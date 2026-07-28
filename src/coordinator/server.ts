@@ -123,6 +123,11 @@ import {
   admissionCredentialSummary,
   selectWorkerProtocolVersion,
 } from "./worker-admission.js";
+import {
+  WORKER_SESSION_TOKEN_PREFIX,
+  issueWorkerSessionToken,
+  verifyWorkerSessionToken,
+} from "./worker-session-token.js";
 
 export function automaticActivationFailureIsTransient(message: string): boolean {
   return activationFailureIsTransient(message);
@@ -138,6 +143,14 @@ export const DEFAULT_AUTOMATIC_ACTIVATION_RETRY_DELAYS_MS = [
 
 export const NETWORK_TELEMETRY_INTERVAL_MS = 10 * 60_000;
 export const NETWORK_TELEMETRY_RETENTION_DAYS = 90;
+
+const SIGNED_WORKER_ADMISSION_PATHS = new Set([
+  "/internal/v1/workers/admission-challenge",
+  "/internal/v1/workers/credential-rotation-challenge",
+  "/internal/v1/workers/credential-rotation",
+  "/internal/v1/workers/register",
+]);
+const WORKER_CONNECT_PATH = "/internal/v1/workers/connect";
 
 const networkHistoryRanges = {
   "24h": 24,
@@ -278,11 +291,22 @@ export async function createCoordinator(
       ) return;
       if (path.startsWith("/internal/v1/releases/")) return;
       if (path === "/v1/auth/me") return;
+      const received = parseBearerToken(request.headers.authorization);
+      // Remote public workers prove possession of a stable device key on these
+      // routes. Registration returns a narrowly scoped session token for the
+      // worker WebSocket; the global network secret never leaves the server.
+      if (SIGNED_WORKER_ADMISSION_PATHS.has(path)) {
+        if (!received || constantTimeEqual(received, expectedToken)) return;
+        return reply.code(401).send({ error: { code: "invalid_network_token" } });
+      }
       // Mobile expert administration has its own stronger control-plane
       // credential above. Requiring both secrets in one Authorization header
       // would make the route impossible to use when the tokens differ.
       if (path.startsWith("/internal/v1/mobile/experts/")) return;
-      const received = parseBearerToken(request.headers.authorization);
+      if (
+        path === WORKER_CONNECT_PATH
+        && received?.startsWith(`${WORKER_SESSION_TOKEN_PREFIX}.`)
+      ) return;
       if (!received || !constantTimeEqual(received, expectedToken)) {
         return reply.code(401).send({ error: { code: "invalid_network_token" } });
       }
@@ -350,6 +374,30 @@ export async function createCoordinator(
   );
   const database = new MeshDatabase(config.databasePath);
   const workerAdmission = new WorkerAdmissionAuthority(database);
+  const workerSessionPrincipals = new WeakMap<FastifyRequest, string>();
+  if (config.networkToken) {
+    app.addHook("onRequest", async (request, reply) => {
+      const path = request.url.split("?", 1)[0] ?? request.url;
+      if (path !== WORKER_CONNECT_PATH) return;
+      const token = parseBearerToken(request.headers.authorization);
+      if (token && constantTimeEqual(token, config.networkToken!)) return;
+      const claims = token ? verifyWorkerSessionToken(config.networkToken!, token) : null;
+      const credential = claims
+        ? database.getWorkerAdmissionCredential(claims.identityKind, claims.identityId)
+        : null;
+      if (
+        !claims
+        || !credential
+        || credential.status !== "active"
+        || credential.fingerprint !== claims.credentialFingerprint
+      ) {
+        return reply.code(401).send({
+          error: { code: "invalid_worker_session_token" },
+        });
+      }
+      workerSessionPrincipals.set(request, claims.workerId);
+    });
+  }
   const apiAccess = new ApiAccessManager(database, {
     starterTokens: config.apiStarterTokens ?? 25_000,
     requestsPerMinute: config.apiRequestsPerMinute ?? 30,
@@ -536,7 +584,9 @@ export async function createCoordinator(
     return reply.redirect(`/updates/win32/x64/mycellios-setup.exe?v=${publicAssetVersion}`);
   });
   const hub = new WorkerHub(store);
-  hub.attach(app);
+  hub.attach(app, {
+    authorizedWorkerId: (request) => workerSessionPrincipals.get(request) ?? null,
+  });
   const scheduler = new Scheduler(store, {
     runtimeLinkObservations: () => hub.runtimeLinkObservations(),
     strictRuntimeLinks: true,
@@ -1980,12 +2030,23 @@ export async function createCoordinator(
       ...(registration.identity ? { identity: registration.identity } : {}),
       capabilities: stripWorkerDeclaredEvidence(registration.capabilities),
     });
+    const workerSessionToken = config.networkToken
+      && registration.identity
+      && admission.credentialFingerprint
+      ? issueWorkerSessionToken(config.networkToken, {
+          workerId: worker.id,
+          identityKind: registration.identity.kind,
+          identityId: registration.identity.id,
+          credentialFingerprint: admission.credentialFingerprint,
+        })
+      : undefined;
     return reply.code(201).send({
       workerId: worker.id,
       protocolVersion: admission.protocolVersion,
       ...(admission.credentialFingerprint
         ? { credentialFingerprint: admission.credentialFingerprint }
         : {}),
+      ...(workerSessionToken ? { workerSessionToken } : {}),
       enrollment: admission.enrollment,
     });
   });

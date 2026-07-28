@@ -69,6 +69,12 @@ button { font: inherit; }
 .nav-blog-link:hover { transform: translateY(-2px); border-color: rgba(131,181,255,.42); background: rgba(35,45,84,.9); }
 .nav-cta { min-height: 42px; display: inline-flex; align-items: center; gap: 9px; padding: 0 16px; border: 1px solid rgba(121,166,255,.22); border-radius: 12px; color: #fff; background: #3f7cff; box-shadow: 0 10px 24px rgba(32,73,164,.18), inset 0 1px rgba(255,255,255,.12); font-size: 12px; font-weight: 700; transition: transform .2s, background .2s, box-shadow .2s; }
 .nav-cta:hover { transform: translateY(-2px); background: #4a84ff; box-shadow: 0 14px 30px rgba(32,73,164,.24); }
+.nav-socials { display: flex; align-items: center; gap: 3px; margin-left: 10px; padding-left: 10px; border-left: 1px solid rgba(225,231,255,.11); }
+.nav-socials a { position: relative; width: 36px; height: 36px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 10px; color: #8f9bb8; transition: color .2s, transform .2s, border-color .2s, background .2s, box-shadow .2s; }
+.nav-socials a::before { content: ""; position: absolute; inset: 7px; border-radius: 50%; background: rgba(92,150,255,.18); filter: blur(9px); opacity: 0; transform: scale(.6); transition: opacity .2s, transform .2s; }
+.nav-socials a:hover { color: #fff; border-color: rgba(131,181,255,.24); background: rgba(35,45,84,.72); box-shadow: 0 8px 22px rgba(4,9,28,.2); transform: translateY(-2px); }
+.nav-socials a:hover::before { opacity: 1; transform: scale(1); }
+.nav-socials svg { position: relative; z-index: 1; width: 17px; height: 17px; }
 
 /* Hero */
 .hero { position: relative; min-height: 880px; overflow: hidden; background: #10162d; }
@@ -1173,8 +1179,13 @@ button { font: inherit; }
   .nav { height: 70px; }
   .brand { font-size: 18px; }
   .brand img { width: 27px; height: 27px; }
+  .nav-docs-link { display: none; }
   .nav-blog-link { width: 40px; min-height: 40px; justify-content: center; padding: 0; font-size: 0; }
   .nav-cta { width: 40px; min-height: 40px; padding: 0; justify-content: center; font-size: 0; }
+  .nav-actions { gap: 6px; }
+  .nav-socials { gap: 1px; margin-left: 5px; padding-left: 5px; }
+  .nav-socials a { width: 32px; height: 32px; border-radius: 9px; }
+  .nav-socials svg { width: 15px; height: 15px; }
   .hero, .hero-inner { min-height: 880px; }
   .hero-inner { align-items: flex-start; padding-top: 120px; padding-bottom: 286px; }
   .hero-copy { width: 100%; max-width: none; }

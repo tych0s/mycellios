@@ -401,6 +401,7 @@ const registrationResponseSchema = z
     workerId: z.string().min(1).max(256),
     protocolVersion: z.literal(1),
     credentialFingerprint: z.string().regex(/^sha256:[a-f0-9]{64}$/).optional(),
+    workerSessionToken: z.string().min(1).max(4_096).optional(),
     enrollment: z.enum(["enrolled", "accepted", "local-legacy"]).optional(),
   })
   .strict();
@@ -421,6 +422,7 @@ export class WorkerAgent {
   private readonly adapter: InferenceAdapter;
   private readonly coordinatorBaseUrl: URL;
   private registeredWorkerId: string | undefined;
+  private workerSessionToken: string | undefined;
   private capabilities: WorkerCapabilities | null = null;
   private socket: WebSocket | null = null;
   private rttProbeTimer: NodeJS.Timeout | null = null;
@@ -928,6 +930,7 @@ export class WorkerAgent {
     }
     const body = registrationResponseSchema.parse(decoded);
     this.registeredWorkerId = body.workerId;
+    this.workerSessionToken = body.workerSessionToken;
   }
 
   private defaultIdentity(): WorkerAgentOptions["identity"] {
@@ -954,8 +957,8 @@ export class WorkerAgent {
       let opened = false;
       const socket = new WebSocket(url, {
         maxPayload: MAX_SERVER_MESSAGE_BYTES,
-        ...(this.options.networkToken
-          ? { headers: { authorization: `Bearer ${this.options.networkToken}` } }
+        ...(this.options.networkToken || this.workerSessionToken
+          ? { headers: { authorization: `Bearer ${this.options.networkToken ?? this.workerSessionToken}` } }
           : {}),
       });
       this.socket = socket;
