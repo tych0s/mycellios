@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { randomBytes, randomUUID } from "node:crypto";
 import { createServer, type AddressInfo, type Server, type Socket } from "node:net";
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyRequest } from "fastify";
 import type WebSocket from "ws";
 import type { ServerEnvelope, WorkerEnvelope } from "../contracts/types.js";
 import {
@@ -55,6 +55,7 @@ interface HubEvents {
 interface ConnectionState {
   socket: WebSocket;
   workerId: string | null;
+  authorizedWorkerId?: string | null;
   ready: boolean;
   helloTimer: NodeJS.Timeout;
   pending: boolean;
@@ -196,9 +197,14 @@ export class WorkerHub extends EventEmitter<HubEvents> {
     super();
   }
 
-  attach(app: FastifyInstance): void {
+  attach(
+    app: FastifyInstance,
+    options: {
+      authorizedWorkerId?: (request: FastifyRequest) => string | null;
+    } = {},
+  ): void {
     this.logger = app.log;
-    app.get("/internal/v1/workers/connect", { websocket: true }, (socket) => {
+    app.get("/internal/v1/workers/connect", { websocket: true }, (socket, request) => {
       if (this.pendingConnections >= 256) {
         socket.close(4429, "too many pending connections");
         return;
@@ -206,6 +212,7 @@ export class WorkerHub extends EventEmitter<HubEvents> {
       const state: ConnectionState = {
         socket,
         workerId: null,
+        authorizedWorkerId: options.authorizedWorkerId?.(request) ?? null,
         ready: false,
         helloTimer: setTimeout(() => socket.close(4408, "worker hello timeout"), 5_000),
         pending: true,
@@ -467,7 +474,14 @@ export class WorkerHub extends EventEmitter<HubEvents> {
       }
 
       if (!state.workerId) {
-        if (envelope.type !== "worker.hello" || !this.store.getWorker(envelope.workerId)) {
+        if (
+          envelope.type !== "worker.hello"
+          || !this.store.getWorker(envelope.workerId)
+          || (
+            typeof state.authorizedWorkerId === "string"
+            && state.authorizedWorkerId !== envelope.workerId
+          )
+        ) {
           this.closeInvalid(state, "invalid worker hello", 4404);
           return;
         }

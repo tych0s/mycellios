@@ -130,6 +130,7 @@ const LOCAL_DASHBOARD_COORDINATOR_URL = "http://127.0.0.1:4180";
 const LOCAL_DASHBOARD_COORDINATOR_PORT = 4_180;
 
 const UPDATE_FEED_URL = "https://www.mycellios.com/updates/win32/x64/";
+const WORKER_START_RETRY_DELAYS_MS = [2_000, 5_000, 15_000, 30_000, 60_000] as const;
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
@@ -137,6 +138,8 @@ let coordinator: CoordinatorRuntime | null = null;
 let coordinatorUrl = "";
 let worker: WorkerAgent | null = null;
 const workerStartFlight = new SingleFlight();
+let workerStartRetryTimer: NodeJS.Timeout | null = null;
+let workerStartRetryAttempt = 0;
 let distributedExecutor: Awaited<ReturnType<typeof createDesktopDistributedExecutor>> | null = null;
 let distributionRuntimePromise: Promise<string> | null = null;
 let cpuRuntimePromise: Promise<AcceleratorRuntimeResult> | null = null;
@@ -810,6 +813,38 @@ async function startWorkerIfEnabled(): Promise<void> {
   await workerStartFlight.run(initializeWorker);
 }
 
+function clearWorkerStartRetryTimer(resetAttempt = true): void {
+  if (workerStartRetryTimer) clearTimeout(workerStartRetryTimer);
+  workerStartRetryTimer = null;
+  if (resetAttempt) workerStartRetryAttempt = 0;
+}
+
+function scheduleWorkerStartRetry(): void {
+  if (
+    workerStartRetryTimer
+    || worker
+    || !settings.contributionEnabled
+    || isQuitting
+  ) return;
+  const delayMs = WORKER_START_RETRY_DELAYS_MS[
+    Math.min(workerStartRetryAttempt, WORKER_START_RETRY_DELAYS_MS.length - 1)
+  ]!;
+  workerStartRetryAttempt += 1;
+  writeDesktopLog("worker-start-retry-scheduled", {
+    attempt: workerStartRetryAttempt,
+    delayMs,
+  });
+  workerStartRetryTimer = setTimeout(() => {
+    workerStartRetryTimer = null;
+    void startWorkerIfEnabled().catch((error: unknown) => {
+      runtimeError = errorText(error);
+      writeDesktopLog("worker-start-retry-failed", { error: runtimeError });
+      scheduleWorkerStartRetry();
+    });
+  }, delayMs);
+  workerStartRetryTimer.unref();
+}
+
 async function initializeWorker(): Promise<void> {
   if (!settings.contributionEnabled || worker || isQuitting) return;
   if (app.isPackaged && !nativeBuildIdentity) {
@@ -878,6 +913,10 @@ async function initializeWorker(): Promise<void> {
       info: (message) => {
         console.info(`[agent] ${message}`);
         writeDesktopLog("worker-info", { message });
+        if (/^Worker .+ connected$/.test(message)) {
+          runtimeError = null;
+          clearWorkerStartRetryTimer();
+        }
       },
       warn: (message) => {
         console.warn(`[agent] ${message}`);
@@ -901,6 +940,7 @@ async function initializeWorker(): Promise<void> {
     runtimeError = errorText(error);
     writeDesktopLog("worker-start-failed", { error: runtimeError });
     if (worker === nextWorker) worker = null;
+    scheduleWorkerStartRetry();
   });
 }
 
@@ -940,6 +980,7 @@ async function measureDesktopRuntimePerformanceProfile() {
 }
 
 async function stopWorker(): Promise<void> {
+  clearWorkerStartRetryTimer();
   await workerStartFlight.wait().catch(() => undefined);
   const activeWorker = worker;
   worker = null;
@@ -1212,6 +1253,7 @@ function registerIpc(): void {
     persistSettings({ ...settings, contributionEnabled: Boolean(enabled) });
     if (enabled) await startWorkerIfEnabled();
     else {
+      clearWorkerStartRetryTimer();
       clearAcceleratorRetryTimer();
       if (worker) {
         const active = worker;

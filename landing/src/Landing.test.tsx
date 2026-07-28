@@ -13,6 +13,15 @@ describe("Landing navigation", () => {
     expect(html).toContain('<a href="/blog">Blog</a>');
   });
 
+  it("exposes GitHub, X, and Telegram as accessible social links", () => {
+    const html = renderToStaticMarkup(<Landing />);
+
+    expect(html).toContain('aria-label="Mycellios social links"');
+    expect(html).toContain('href="https://github.com/tych0s/mycellios" target="_blank"');
+    expect(html).toContain('href="https://x.com/mycellios" target="_blank"');
+    expect(html).toContain('href="https://t.me/mycellios" target="_blank"');
+  });
+
   it("places the short visual explanation before the first idea section", () => {
     const html = renderToStaticMarkup(<Landing />);
     const explainer = html.indexOf('id="explainer"');

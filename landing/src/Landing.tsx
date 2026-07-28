@@ -33,6 +33,9 @@ import { MyceliumHero } from "./MyceliumHero";
 
 const EMAIL = "hello@mycellios.com";
 const RELEASES_URL = "https://github.com/tych0s/mycellios";
+const GITHUB_URL = "https://github.com/tych0s/mycellios";
+const X_URL = "https://x.com/mycellios";
+const TELEGRAM_URL = "https://t.me/mycellios";
 const ExplainerVideo = lazy(() => import("./ExplainerVideo"));
 
 const downloads = {
@@ -208,6 +211,30 @@ const links = [[0, 1], [0, 2], [0, 8], [1, 2], [1, 3], [2, 4], [2, 6], [3, 4], [
 
 function Brand({ compact = false, homeLabel }: { compact?: boolean; homeLabel: string }) {
   return <a className={`brand ${compact ? "brand-compact" : ""}`} href="#top" aria-label={homeLabel}><img src={brandIcon} alt="" /><span>mycellios</span></a>;
+}
+
+function GitHubIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path fill="currentColor" d="M12 .7A11.3 11.3 0 0 0 8.43 22.72c.57.1.77-.25.77-.55v-2.16c-3.15.68-3.81-1.34-3.81-1.34-.52-1.31-1.26-1.66-1.26-1.66-1.03-.7.08-.69.08-.69 1.14.08 1.74 1.17 1.74 1.17 1.01 1.74 2.66 1.24 3.3.95.1-.74.4-1.24.72-1.52-2.51-.29-5.15-1.26-5.15-5.59 0-1.24.44-2.24 1.17-3.03-.12-.29-.51-1.44.11-2.99 0 0 .95-.31 3.11 1.16a10.72 10.72 0 0 1 5.66 0c2.16-1.47 3.11-1.16 3.11-1.16.62 1.55.23 2.7.11 2.99.73.79 1.17 1.79 1.17 3.03 0 4.34-2.64 5.29-5.16 5.57.41.35.77 1.04.77 2.1v3.18c0 .3.2.66.78.55A11.3 11.3 0 0 0 12 .7Z" />
+    </svg>
+  );
+}
+
+function XIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path fill="currentColor" d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231 5.451-6.231Zm-1.161 17.52h1.833L7.084 4.126H5.117L17.083 19.77Z" />
+    </svg>
+  );
+}
+
+function TelegramIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path fill="currentColor" d="M23.91 3.79 20.3 20.84c-.27 1.2-.98 1.49-1.98.93l-5.5-4.05-2.65 2.55c-.29.29-.54.54-1.11.54l.4-5.61L19.67 5.97c.44-.4-.1-.62-.69-.22L6.36 13.7.93 12c-1.18-.37-1.2-1.18.25-1.75L22.4 2.07c.98-.36 1.84.24 1.51 1.72Z" />
+    </svg>
+  );
 }
 
 function LivingBackdrop() {
@@ -631,7 +658,27 @@ function Landing() {
   return (
     <div className="site" id="top" ref={page} onPointerMove={trackPointer}>
       <div className="scroll-progress" aria-hidden="true" /><LivingBackdrop /><div className="ambient-pointer" />
-      <header className="nav-shell"><nav className="nav container" aria-label={t.nav.aria}><Brand homeLabel={t.home} /><div className="nav-links"><a href="/network">Live network</a><a href="/mobile/">Contribute</a><a href="#architecture">{t.nav.architecture}</a><a href="#roadmap">Roadmap</a></div><div className="nav-actions"><a className="nav-blog-link" href="/docs/">Docs</a><a className="nav-blog-link" href="/blog" aria-label="Read the Mycellios blog"><BookOpen size={15} />Blog</a><a className="nav-cta" href="/join">Join now <Zap size={15} /></a></div></nav></header>
+      <header className="nav-shell">
+        <nav className="nav container" aria-label={t.nav.aria}>
+          <Brand homeLabel={t.home} />
+          <div className="nav-links">
+            <a href="/network">Live network</a>
+            <a href="/mobile/">Contribute</a>
+            <a href="#architecture">{t.nav.architecture}</a>
+            <a href="#roadmap">Roadmap</a>
+          </div>
+          <div className="nav-actions">
+            <a className="nav-blog-link nav-docs-link" href="/docs/">Docs</a>
+            <a className="nav-blog-link" href="/blog" aria-label="Read the Mycellios blog"><BookOpen size={15} />Blog</a>
+            <a className="nav-cta" href="/join">Join now <Zap size={15} /></a>
+          </div>
+          <div className="nav-socials" aria-label="Mycellios social links">
+            <a href={GITHUB_URL} target="_blank" rel="noreferrer" aria-label="Mycellios on GitHub" title="GitHub"><GitHubIcon /></a>
+            <a href={X_URL} target="_blank" rel="noreferrer" aria-label="Mycellios on X" title="X"><XIcon /></a>
+            <a href={TELEGRAM_URL} target="_blank" rel="noreferrer" aria-label="Mycellios community on Telegram" title="Telegram"><TelegramIcon /></a>
+          </div>
+        </nav>
+      </header>
 
       <main>
         <section className="hero">

@@ -288,6 +288,20 @@ function initialView(desktop: boolean, mobileEntry: boolean): PanelView {
   return "overview";
 }
 
+export type PanelIssue = {
+  source: "coordinator" | "runtime";
+  message: string;
+};
+
+export function panelIssueForErrors(
+  connectionError: string | null,
+  runtimeError: string | null,
+): PanelIssue | null {
+  if (connectionError) return { source: "coordinator", message: connectionError };
+  if (runtimeError) return { source: "runtime", message: runtimeError };
+  return null;
+}
+
 function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   const desktop = desktopBridge !== undefined;
   const localBrowser = !desktop && ["localhost", "127.0.0.1", "::1", "[::1]"].includes(window.location.hostname);
@@ -311,7 +325,9 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   const [snapshot, setSnapshot] = useState<PublicSnapshot>(EMPTY);
   const [desktopSnapshot, setDesktopSnapshot] = useState<DashboardSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [issue, setIssue] = useState<PanelIssue | null>(null);
+  const coordinatorError = issue?.source === "coordinator" ? issue.message : null;
+  const error = issue?.message ?? null;
   const [menuOpen, setMenuOpen] = useState(false);
   const [contentScale, setContentScale] = useState(() => {
     const saved = Number(window.localStorage.getItem("mycellios.content-scale"));
@@ -339,7 +355,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   const applyDesktopSnapshot = useCallback((next: DashboardSnapshot) => {
     setDesktopSnapshot(next);
     setSnapshot(desktopToPublicSnapshot(next));
-    setError(next.connectionError ?? next.runtimeError);
+    setIssue(panelIssueForErrors(next.connectionError, next.runtimeError));
   }, []);
 
   const refresh = useCallback(async () => {
@@ -352,9 +368,12 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
       const response = await fetch("/public/v1/snapshot", { cache: "no-store" });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       setSnapshot(await response.json() as PublicSnapshot);
-      setError(null);
+      setIssue(null);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
+      setIssue({
+        source: "coordinator",
+        message: caught instanceof Error ? caught.message : String(caught),
+      });
     } finally {
       setLoading(false);
     }
@@ -694,12 +713,12 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
           <a href={publicLink("/mobile/")} {...externalProps}><Smartphone size={17} /><span>Mobile app</span><ExternalLink size={13} /></a>
           <a href={publicLink("/")} {...externalProps}><House size={17} /><span>Landing</span><ExternalLink size={13} /></a>
         </div>
-        <div className={`panel-sidebar-status ${error ? "degraded" : "healthy"}`}>
+        <div className={`panel-sidebar-status ${coordinatorError ? "degraded" : "healthy"}`}>
           <i />
           <div>
             <span>Network Status</span>
-            <strong>{error ? "Degraded" : "Healthy"}</strong>
-            <small>{error ? "Coordinator unavailable" : "All systems operational"}</small>
+            <strong>{coordinatorError ? "Degraded" : "Healthy"}</strong>
+            <small>{coordinatorError ? "Coordinator unavailable" : "Coordinator operational"}</small>
           </div>
         </div>
         <div className="panel-sidebar-version" aria-label="Versiones">
@@ -717,7 +736,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
             aria-expanded={menuOpen}
             onClick={() => setMenuOpen((current) => !current)}
           ><Menu /></button>
-          <div className="panel-topbar-status"><span className={`panel-live-dot ${error ? "degraded" : ""}`} /><div><strong>{error ? "Network degraded" : "Network healthy"}</strong><small>{snapshot.capturedAt === EMPTY.capturedAt ? "Waiting for snapshot" : `Updated ${relativeTime(snapshot.capturedAt)}`}</small></div></div>
+          <div className="panel-topbar-status"><span className={`panel-live-dot ${coordinatorError ? "degraded" : ""}`} /><div><strong>{coordinatorError ? "Network degraded" : "Network healthy"}</strong><small>{snapshot.capturedAt === EMPTY.capturedAt ? "Waiting for snapshot" : `Updated ${relativeTime(snapshot.capturedAt)}`}</small></div></div>
           <div className="panel-top-actions">
             <div className="panel-balance-group" aria-label="Saldos de la cuenta">
               <span className="panel-balance-badge money" aria-label={`Saldo: ${apiAccount?.usd_balance ?? "0.00"} dólares`} title="Saldo monetario disponible">${apiAccount?.usd_balance ?? "0.00"}</span>
@@ -751,7 +770,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
           </div>
         </header>
 
-        {error && <div className="panel-error" title={error}><CircleAlert size={17} /> Coordinator unavailable. Retrying automatically.</div>}
+        {issue && <div className="panel-error" title={issue.message}><CircleAlert size={17} /> {issue.source === "coordinator" ? "Coordinator unavailable." : "This node could not join the network."} Retrying automatically.</div>}
         <main className="panel-content">
           <div className="panel-content-scale">
             {loading && snapshot.capturedAt === EMPTY.capturedAt ? <PanelLoading /> : (
@@ -762,7 +781,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
               {view === "models" && <Models snapshot={snapshot} onSearch={searchHubModels} onRequest={requestModel} onRemove={removeRequestedModel} adminToken={modelAdminToken} requiresAdminToken={requiresModelAdminToken} secureTokenStorage={desktop} />}
               {view === "jobs" && <Jobs snapshot={snapshot} />}
               {view === "tests" && <Tests bridge={desktopBridge} />}
-              {view === "logs" && <SystemLogs snapshot={snapshot} bridge={desktopBridge} connectionError={error} />}
+              {view === "logs" && <SystemLogs snapshot={snapshot} bridge={desktopBridge} connectionError={coordinatorError} />}
               {view === "inference" && <Inference snapshot={snapshot} onSend={sendPrompt} onNavigate={navigate} developerMode={panelMode === "developer"} accountAuthenticated={desktop || !authConfig.apiAccessEnabled || authSession !== null} onSignIn={() => setAuthOpen(true)} apiAccessEnabled={authConfig.apiAccessEnabled ?? false} apiBaseUrl={apiBaseUrl} accessToken={authSession?.accessToken ?? null} apiAccount={apiAccount} />}
               {view === "contribute" && <Contribute />}
               {view === "join" && <JoinNetwork publicLink={publicLink} external={desktop} />}
