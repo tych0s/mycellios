@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1.7
+
+FROM python:3.12-slim-bookworm AS python-runtime
+
+FROM node:24-bookworm-slim AS build
+COPY --from=python-runtime /usr/local /opt/python
+ENV PATH="/opt/python/bin:${PATH}" \
+    LD_LIBRARY_PATH="/opt/python/lib"
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,id=mycellios-npm-build,target=/root/.npm,sharing=locked \
+    npm ci --no-audit --no-fund
+COPY . .
+RUN npm run build
+
+FROM node:24-bookworm-slim AS runtime
+COPY --from=python-runtime /usr/local /opt/python
+ENV NODE_ENV=production \
+    PATH="/opt/python/bin:${PATH}" \
+    LD_LIBRARY_PATH="/opt/python/lib" \
+    PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,id=mycellios-npm-runtime,target=/root/.npm,sharing=locked \
+    npm ci --omit=dev --no-audit --no-fund \
+    && npm cache clean --force
+COPY --from=build /app/dist ./dist
+COPY --from=build /app/landing-dist ./landing-dist
+COPY --from=build /app/mobile-dist ./mobile-dist
+COPY --from=build /app/build/mycellios-coordinator-output-receipt.json \
+    ./build/mycellios-coordinator-output-receipt.json
+COPY python ./python
+COPY config ./config
+
+EXPOSE 4174
+CMD ["npm", "run", "start:coordinator"]
