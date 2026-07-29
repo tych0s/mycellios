@@ -269,6 +269,12 @@ export const workerCapabilitiesSchema = z.object({
   region: z.string().min(1),
   agentVersion: z.string().min(1),
   buildIdentity: nativeBuildIdentitySchema.optional(),
+  administration: z
+    .object({
+      contributionControl: z.literal("mycellios-contribution-control/1"),
+    })
+    .strict()
+    .optional(),
   gpus: z.array(gpuSchema).min(1),
   limits: z.object({
     maxConcurrency: z.number().int().positive(),

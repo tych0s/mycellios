@@ -35,6 +35,7 @@ import {
   Minus,
   Network,
   Paperclip,
+  Pause,
   Play,
   Plus,
   Radio,
@@ -69,6 +70,8 @@ import type {
   DesktopBridge,
   DesktopSettings,
   DesktopUpdateStatus,
+  FleetContributionCommandResponse,
+  FleetContributionStatus,
   HubCatalogModel,
   HubCatalogPage,
   HubCatalogSearchInput,
@@ -329,6 +332,8 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   const coordinatorError = issue?.source === "coordinator" ? issue.message : null;
   const error = issue?.message ?? null;
   const [menuOpen, setMenuOpen] = useState(false);
+  const menuButtonRef = useRef<HTMLButtonElement>(null);
+  const sidebarCloseButtonRef = useRef<HTMLButtonElement>(null);
   const [contentScale, setContentScale] = useState(() => {
     const saved = Number(window.localStorage.getItem("mycellios.content-scale"));
     return Number.isFinite(saved) && saved >= 0.9 && saved <= 1.3 ? saved : 1;
@@ -384,6 +389,28 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     const timer = window.setInterval(() => void refresh(), 2_000);
     return () => window.clearInterval(timer);
   }, [refresh]);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+
+    const focusFrame = window.requestAnimationFrame(() => sidebarCloseButtonRef.current?.focus());
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setMenuOpen(false);
+      menuButtonRef.current?.focus();
+    };
+    const closeBeyondCompactLayout = () => {
+      if (!window.matchMedia("(max-width: 1440px)").matches) setMenuOpen(false);
+    };
+
+    window.addEventListener("keydown", closeOnEscape);
+    window.addEventListener("resize", closeBeyondCompactLayout);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      window.removeEventListener("keydown", closeOnEscape);
+      window.removeEventListener("resize", closeBeyondCompactLayout);
+    };
+  }, [menuOpen]);
 
   useEffect(() => {
     if (desktop) return;
@@ -446,6 +473,11 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
       window.history.replaceState({}, "", `${path}${query}`);
       applySeoMetadata(path);
     }
+  }
+
+  function closeNavigation() {
+    setMenuOpen(false);
+    window.requestAnimationFrame(() => menuButtonRef.current?.focus());
   }
 
   /**
@@ -687,8 +719,8 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
           transformOrigin: "top left",
         } as CSSProperties}
       >
-      <aside className={menuOpen ? "panel-sidebar open" : "panel-sidebar"}>
-        <button className="panel-sidebar-close" aria-label="Close navigation" onClick={() => setMenuOpen(false)}><X size={18} /></button>
+      <aside id="panel-navigation" className={menuOpen ? "panel-sidebar open" : "panel-sidebar"} aria-label="Primary navigation">
+        <button ref={sidebarCloseButtonRef} className="panel-sidebar-close" aria-label="Close navigation" onClick={closeNavigation}><X size={18} /></button>
         <a className="panel-brand" href={publicLink("/")} {...externalProps}><img src={brandIcon} alt="" /><div><strong>mycellios</strong><span>network control</span></div></a>
         <nav>
           <span className="panel-nav-label">{panelMode === "developer" ? "DEVELOPER TOOLS" : "MYCELLIOS"}</span>
@@ -726,13 +758,15 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
           <span><small>API</small><strong>{snapshot.version}</strong></span>
         </div>
       </aside>
-      {menuOpen && <button className="panel-menu-backdrop" aria-label="Close navigation overlay" onClick={() => setMenuOpen(false)} />}
+      {menuOpen && <button className="panel-menu-backdrop" aria-label="Close navigation overlay" onClick={closeNavigation} />}
 
       <div className="panel-main">
         <header className="panel-topbar">
           <button
+            ref={menuButtonRef}
             className="panel-menu-button"
-            aria-label="Open menu"
+            aria-label={menuOpen ? "Close navigation" : "Show navigation labels"}
+            aria-controls="panel-navigation"
             aria-expanded={menuOpen}
             onClick={() => setMenuOpen((current) => !current)}
           ><Menu /></button>
@@ -1062,6 +1096,11 @@ function AssistantAdmin({
   const [draftToken, setDraftToken] = useState(adminToken);
   const [settings, setSettings] = useState<AssistantAdminSettings | null>(null);
   const [runtime, setRuntime] = useState<AssistantAdminRuntime | null>(null);
+  const [fleet, setFleet] = useState<FleetContributionStatus | null>(null);
+  const [fleetAction, setFleetAction] = useState<"activate" | "pause" | null>(null);
+  const [fleetConfirmation, setFleetConfirmation] = useState<"activate" | "pause" | null>(null);
+  const [fleetResult, setFleetResult] = useState<FleetContributionCommandResponse | null>(null);
+  const [fleetError, setFleetError] = useState<string | null>(null);
   const [suggestionsText, setSuggestionsText] = useState("");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -1085,14 +1124,30 @@ function AssistantAdmin({
     setSuggestionsText(response.settings.suggestions.join("\n"));
   }
 
+  async function requestFleetStatus(token = draftToken): Promise<FleetContributionStatus> {
+    if (desktopBridge) {
+      return desktopBridge.getFleetContributionAdmin(token.trim() || undefined);
+    }
+    return fetch(`${apiOrigin}/public/v1/admin/fleet-contribution`, {
+      cache: "no-store",
+      headers: authorizationHeaders(token),
+    }).then(async (response) => {
+      if (!response.ok) {
+        const body = await response.json().catch(() => null) as { error?: { message?: string } } | null;
+        throw new Error(body?.error?.message ?? `HTTP ${response.status}`);
+      }
+      return response.json() as Promise<FleetContributionStatus>;
+    });
+  }
+
   async function load(token = draftToken) {
     setLoading(true);
     setError(null);
     setSaved(false);
     try {
-      const result = desktopBridge
-        ? await desktopBridge.getSupportAssistantAdmin(token.trim() || undefined)
-        : await fetch(`${apiOrigin}/public/v1/admin/assistant`, {
+      const assistantRequest = desktopBridge
+        ? desktopBridge.getSupportAssistantAdmin(token.trim() || undefined)
+        : fetch(`${apiOrigin}/public/v1/admin/assistant`, {
             cache: "no-store",
             headers: authorizationHeaders(token),
           }).then(async (response) => {
@@ -1102,11 +1157,18 @@ function AssistantAdmin({
             }
             return response.json() as Promise<AssistantAdminResponse>;
           });
-      applyResponse(result);
+      const [assistantResult, fleetStatus] = await Promise.all([
+        assistantRequest,
+        requestFleetStatus(token),
+      ]);
+      applyResponse(assistantResult);
+      setFleet(fleetStatus);
+      setFleetError(null);
       if (token.trim()) onAdminTokenChange(token.trim());
     } catch (caught) {
       setSettings(null);
       setRuntime(null);
+      setFleet(null);
       setError(errorText(caught));
     } finally {
       setLoading(false);
@@ -1116,6 +1178,14 @@ function AssistantAdmin({
   useEffect(() => {
     void load(adminToken);
   }, [apiOrigin, authSession?.accessToken, desktopBridge]);
+
+  useEffect(() => {
+    if (!settings) return;
+    const interval = window.setInterval(() => {
+      void requestFleetStatus().then(setFleet).catch(() => undefined);
+    }, 5_000);
+    return () => window.clearInterval(interval);
+  }, [settings, apiOrigin, authSession?.accessToken, desktopBridge, draftToken]);
 
   function update<K extends keyof AssistantAdminSettings>(key: K, value: AssistantAdminSettings[K]) {
     setSettings((current) => current ? { ...current, [key]: value } : current);
@@ -1170,6 +1240,42 @@ function AssistantAdmin({
     }
   }
 
+  async function setFleetContribution(enabled: boolean) {
+    const action = enabled ? "activate" : "pause";
+    setFleetAction(action);
+    setFleetError(null);
+    setFleetResult(null);
+    try {
+      const result = desktopBridge
+        ? await desktopBridge.setFleetContributionAdmin(
+            enabled,
+            draftToken.trim() || undefined,
+          )
+        : await fetch(`${apiOrigin}/public/v1/admin/fleet-contribution`, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              ...authorizationHeaders(),
+            },
+            body: JSON.stringify({ enabled }),
+          }).then(async (response) => {
+            if (!response.ok) {
+              const body = await response.json().catch(() => null) as { error?: { message?: string } } | null;
+              throw new Error(body?.error?.message ?? `HTTP ${response.status}`);
+            }
+            return response.json() as Promise<FleetContributionCommandResponse>;
+          });
+      setFleet(result.status);
+      setFleetResult(result);
+      setFleetConfirmation(null);
+      if (draftToken.trim()) onAdminTokenChange(draftToken.trim());
+    } catch (caught) {
+      setFleetError(errorText(caught));
+    } finally {
+      setFleetAction(null);
+    }
+  }
+
   const modelOptions = [
     { value: "", label: "Automatic · first available network model" },
     ...(runtime?.availableModels ?? []).map((model) => ({ value: model, label: model })),
@@ -1177,20 +1283,24 @@ function AssistantAdmin({
   if (settings?.modelId && !modelOptions.some((option) => option.value === settings.modelId)) {
     modelOptions.push({ value: settings.modelId, label: `${settings.modelId} · currently offline` });
   }
+  const confirmedFleetResults = fleetResult?.results.filter(
+    (result) => result.state === "applied" || result.state === "unchanged",
+  ).length ?? 0;
+  const failedFleetResults = (fleetResult?.results.length ?? 0) - confirmedFleetResults;
 
   return (
     <section className="assistant-admin-page">
       <PageTitle
         eyebrow="NETWORK ADMINISTRATION"
-        title="Support assistant"
-        copy="Control the help agent shown across mycellios. Its answers always run on a real model connected to this network."
-        actions={<span className="assistant-network-only"><ShieldCheck size={15} /> Network models only</span>}
+        title="Network administration"
+        copy="Control connected desktop contributors and the support assistant from one protected workspace."
+        actions={<span className="assistant-network-only"><ShieldCheck size={15} /> Owner controls</span>}
       />
 
       <article className="assistant-admin-auth">
         <div className="assistant-admin-auth-copy">
           <ShieldCheck size={21} />
-          <span><strong>Administrator authorization</strong><small>{authSession ? "Your signed-in network role is used first. A token can also be supplied if needed." : "Enter the network administrator token to read or change private assistant instructions."}</small></span>
+          <span><strong>Administrator authorization</strong><small>{authSession ? "Your signed-in network role is used first. A token can also be supplied if needed." : "Enter the network administrator token to read or change private network controls."}</small></span>
         </div>
         <div className="assistant-admin-auth-control">
           <input
@@ -1212,8 +1322,90 @@ function AssistantAdmin({
 
       {loading && !settings ? (
         <div className="assistant-admin-loading"><LoaderCircle className="spin" /><strong>Loading private assistant configuration…</strong></div>
-      ) : settings && runtime ? (
-        <form className="assistant-admin-form" onSubmit={(event) => void save(event)}>
+      ) : settings && runtime && fleet ? (
+        <div className="assistant-admin-content">
+          <article className="fleet-control-card" aria-live="polite">
+            <div className="fleet-control-heading">
+              <div className="assistant-admin-section-icon"><Server size={21} /></div>
+              <div>
+                <span>DESKTOP CONTRIBUTION</span>
+                <strong>Control every reachable node</strong>
+                <small>Only computers with Mycellios open and the compatible control channel can acknowledge these commands.</small>
+              </div>
+              <button
+                type="button"
+                className="fleet-refresh"
+                disabled={fleetAction !== null}
+                onClick={() => void requestFleetStatus().then(setFleet).catch((caught) => setFleetError(errorText(caught)))}
+                aria-label="Refresh contribution status"
+              >
+                <RefreshCw size={16} />
+              </button>
+            </div>
+
+            <div className="fleet-control-summary">
+              <div><span>CONTRIBUTING</span><strong className="fleet-positive">{fleet.summary.contributing}</strong><small>Available to the scheduler</small></div>
+              <div><span>PAUSED</span><strong>{fleet.summary.paused}</strong><small>Connected, accepting no work</small></div>
+              <div><span>CONTROL READY</span><strong>{fleet.summary.controlReady}</strong><small>Can receive this command now</small></div>
+              <div><span>OUT OF REACH</span><strong>{fleet.summary.offline + fleet.summary.unsupported}</strong><small>Offline or requires an update</small></div>
+            </div>
+
+            <div className="fleet-control-actions">
+              <div>
+                <strong>{fleet.summary.connected} of {fleet.summary.desktopNodes} desktop nodes connected</strong>
+                <small>This controls Mycellios contribution, not the computer's physical power.</small>
+              </div>
+              <button
+                type="button"
+                className="fleet-action fleet-action-pause"
+                disabled={fleetAction !== null || fleet.summary.controlReady === 0}
+                onClick={() => setFleetConfirmation("pause")}
+              >
+                <Pause size={17} />Pause all
+              </button>
+              <button
+                type="button"
+                className="fleet-action fleet-action-activate"
+                disabled={fleetAction !== null || fleet.summary.controlReady === 0}
+                onClick={() => setFleetConfirmation("activate")}
+              >
+                <CirclePower size={17} />Activate all
+              </button>
+            </div>
+
+            {fleetConfirmation && (
+              <div className="fleet-confirmation" role="alert">
+                <CircleAlert size={19} />
+                <div>
+                  <strong>{fleetConfirmation === "activate" ? "Activate" : "Pause"} {fleet.summary.controlReady} reachable nodes?</strong>
+                  <small>{fleetConfirmation === "activate" ? "They will begin accepting compatible network work." : "Active work may be interrupted and no new work will be accepted."}</small>
+                </div>
+                <button type="button" className="secondary" onClick={() => setFleetConfirmation(null)}>Cancel</button>
+                <button
+                  type="button"
+                  className={fleetConfirmation === "activate" ? "confirm-activate" : "confirm-pause"}
+                  disabled={fleetAction !== null}
+                  onClick={() => void setFleetContribution(fleetConfirmation === "activate")}
+                >
+                  {fleetAction ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}
+                  Confirm
+                </button>
+              </div>
+            )}
+
+            {fleetError && <div className="fleet-control-message error"><CircleAlert size={16} />{fleetError}</div>}
+            {fleetResult && (
+              <div className={`fleet-control-message ${failedFleetResults > 0 ? "warning" : "success"}`}>
+                {failedFleetResults > 0 ? <CircleAlert size={16} /> : <CheckCircle2 size={16} />}
+                <span>
+                  <strong>{confirmedFleetResults} of {fleetResult.results.length} nodes confirmed the command.</strong>
+                  <small>{failedFleetResults > 0 ? `${failedFleetResults} did not acknowledge it; their state was not assumed.` : "Every targeted node reported its resulting state."}</small>
+                </span>
+              </div>
+            )}
+          </article>
+
+          <form className="assistant-admin-form" onSubmit={(event) => void save(event)}>
           <div className="assistant-admin-status-grid">
             <article>
               <span>PUBLIC STATUS</span>
@@ -1292,7 +1484,8 @@ function AssistantAdmin({
               {saving ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}{saving ? "Saving…" : "Save assistant"}
             </button>
           </div>
-        </form>
+          </form>
+        </div>
       ) : (
         <article className="assistant-admin-locked">
           <ShieldCheck size={26} />

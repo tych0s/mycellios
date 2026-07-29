@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-const SCHEMA_VERSION = 14;
+const SCHEMA_VERSION = 15;
 
 export interface PersistenceOutboxRow {
   id: number;
@@ -417,6 +417,28 @@ export class MeshDatabase {
 
       CREATE INDEX IF NOT EXISTS network_telemetry_history_captured
       ON network_telemetry_history(captured_at DESC);
+
+      CREATE TABLE IF NOT EXISTS diagnostic_events (
+        id TEXT PRIMARY KEY,
+        source_id TEXT NOT NULL,
+        app_version TEXT NOT NULL,
+        platform TEXT NOT NULL,
+        arch TEXT NOT NULL,
+        level TEXT NOT NULL CHECK(level IN ('info', 'warning', 'error')),
+        source TEXT NOT NULL,
+        event TEXT NOT NULL,
+        message TEXT NOT NULL,
+        details TEXT,
+        occurred_at INTEGER NOT NULL,
+        received_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS diagnostic_events_occurred
+      ON diagnostic_events(occurred_at DESC);
+
+      CREATE INDEX IF NOT EXISTS diagnostic_events_source_occurred
+      ON diagnostic_events(source_id, occurred_at DESC);
+
       CREATE TABLE IF NOT EXISTS worker_admission_credentials (
         identity_kind TEXT NOT NULL CHECK(identity_kind IN ('device', 'cell', 'browser')),
         identity_id TEXT NOT NULL,

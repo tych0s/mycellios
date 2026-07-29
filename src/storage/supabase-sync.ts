@@ -14,6 +14,7 @@ const TABLE_PRIMARY_KEYS = Object.freeze({
   inference_conversations: "id",
   inference_messages: "id",
   activation_events: "id",
+  diagnostic_events: "id",
   deployment_states: "model_id",
   deployment_operations: "id",
   route_reservations: "id",
@@ -159,6 +160,7 @@ export class SupabasePersistence {
       inferenceConversations,
       inferenceMessages,
       activationEvents,
+      diagnosticEvents,
       deploymentStates,
       deploymentOperations,
       routeReservations,
@@ -172,6 +174,7 @@ export class SupabasePersistence {
       this.readTable("inference_conversations"),
       this.readTable("inference_messages"),
       this.readTable("activation_events"),
+      this.readTable("diagnostic_events"),
       this.readTable("deployment_states"),
       this.readTable("deployment_operations"),
       this.readTable("route_reservations"),
@@ -186,6 +189,7 @@ export class SupabasePersistence {
       for (const row of inferenceConversations) this.restoreInferenceConversation(row);
       for (const row of inferenceMessages) this.restoreInferenceMessage(row);
       for (const row of activationEvents) this.restoreActivationEvent(row);
+      for (const row of diagnosticEvents) this.restoreDiagnosticEvent(row);
       for (const row of deploymentOperations) this.restoreDeploymentOperation(row);
       for (const row of routeReservations) this.restoreRouteReservation(row);
       for (const row of deploymentStageLeases) this.restoreDeploymentStageLease(row);
@@ -538,6 +542,39 @@ export class SupabasePersistence {
       nullableString(row.device),
       row.details == null ? null : JSON.stringify(row.details),
       numberValue(row.occurred_at, Date.now()),
+    );
+  }
+
+  private restoreDiagnosticEvent(row: Record<string, unknown>): void {
+    if (
+      typeof row.id !== "string"
+      || typeof row.source_id !== "string"
+      || typeof row.app_version !== "string"
+      || typeof row.platform !== "string"
+      || typeof row.arch !== "string"
+      || typeof row.level !== "string"
+      || typeof row.source !== "string"
+      || typeof row.event !== "string"
+      || typeof row.message !== "string"
+    ) return;
+    this.store.database.raw.prepare(
+      `INSERT OR IGNORE INTO diagnostic_events(
+         id, source_id, app_version, platform, arch, level, source, event,
+         message, details, occurred_at, received_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      row.id,
+      row.source_id,
+      row.app_version,
+      row.platform,
+      row.arch,
+      row.level,
+      row.source,
+      row.event,
+      row.message,
+      nullableString(row.details),
+      numberValue(row.occurred_at, Date.now()),
+      numberValue(row.received_at, Date.now()),
     );
   }
 

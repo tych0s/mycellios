@@ -107,6 +107,15 @@ export interface WorkerAgentOptions {
   agentVersion?: string | undefined;
   /** Exact sealed source identity reported to the coordinator. */
   buildIdentity?: import("../contracts/build-identity.js").NativeBuildIdentity | undefined;
+  /**
+   * Keeps the authenticated control channel alive while compute contribution
+   * is paused. Omit this for workers that cannot persist administrator
+   * commands.
+   */
+  contributionControl?: {
+    initialEnabled: boolean;
+    onRemoteChange?: (enabled: boolean) => Promise<void> | void;
+  };
   distributedExecutor?: {
     nodeId: string;
     stageHost: string;
@@ -182,6 +191,19 @@ const serverMessageSchema = z.discriminatedUnion("type", [
       ...envelopeFields,
       type: z.literal("server.ready"),
       payload: z.object({ workerId: z.string().min(1).max(256) }).strict(),
+    })
+    .strict(),
+  z
+    .object({
+      ...envelopeFields,
+      type: z.literal("contribution.set"),
+      payload: z
+        .object({
+          commandId: z.string().min(1).max(256),
+          enabled: z.boolean(),
+          issuedAt: z.number().int().positive(),
+        })
+        .strict(),
     })
     .strict(),
   z.object({
@@ -442,6 +464,7 @@ export class WorkerAgent {
   private readonly logger: Pick<Console, "info" | "warn" | "error">;
   private runtimeCapacityGeneration = 0;
   private runtimeDisconnectTimer: NodeJS.Timeout | null = null;
+  private contributionEnabled: boolean;
 
   constructor(
     private readonly config: WorkerConfig,
@@ -458,6 +481,7 @@ export class WorkerAgent {
     }
     this.adapter = createAdapter(config);
     this.logger = options.logger ?? console;
+    this.contributionEnabled = options.contributionControl?.initialEnabled ?? true;
     this.runtimeTunnel = options.distributedExecutor
       ? new RuntimeStreamTunnel(
           options.distributedExecutor.nodeId,
@@ -477,6 +501,7 @@ export class WorkerAgent {
   async start(): Promise<void> {
     this.directTransportAdvertisement = await this.runtimeTunnel?.startDirectTransport() ?? null;
     this.capabilities = await this.buildCapabilities();
+    this.updateFreeSlots();
     await this.register();
     let delayMs = 500;
     do {
@@ -506,6 +531,25 @@ export class WorkerAgent {
 
   get workerId(): string | undefined {
     return this.registeredWorkerId;
+  }
+
+  get isContributionEnabled(): boolean {
+    return this.contributionEnabled;
+  }
+
+  async setContributionEnabled(enabled: boolean): Promise<boolean> {
+    const changed = this.contributionEnabled !== enabled;
+    this.contributionEnabled = enabled;
+    this.updateFreeSlots();
+    await this.sendHeartbeat();
+    if (!enabled && changed) {
+      void this.abortActiveJobs("Contribution paused by administrator")
+        .then(() => this.resetDistributedRuntime("contribution_paused"))
+        .catch((error) => {
+          this.logger.warn(`Paused contribution cleanup failed: ${errorText(error)}`);
+        });
+    }
+    return changed;
   }
 
   /**
@@ -719,6 +763,13 @@ export class WorkerAgent {
       agentVersion: this.options.agentVersion?.trim() || "0.1.0",
       ...(this.options.buildIdentity
         ? { buildIdentity: this.options.buildIdentity }
+        : {}),
+      ...(this.options.contributionControl
+        ? {
+            administration: {
+              contributionControl: "mycellios-contribution-control/1" as const,
+            },
+          }
         : {}),
       gpus: [
         {
@@ -1101,6 +1152,38 @@ export class WorkerAgent {
         );
         break;
       }
+      case "contribution.set": {
+        const { commandId, enabled } = message.payload;
+        if (!this.options.contributionControl) {
+          this.sendMessage("contribution.ack", {
+            commandId,
+            enabled,
+            changed: false,
+            applied: false,
+            error: "contribution_control_not_supported",
+          });
+          break;
+        }
+        try {
+          await this.options.contributionControl.onRemoteChange?.(enabled);
+          const changed = await this.setContributionEnabled(enabled);
+          this.sendMessage("contribution.ack", {
+            commandId,
+            enabled,
+            changed,
+            applied: true,
+          });
+        } catch (error) {
+          this.sendMessage("contribution.ack", {
+            commandId,
+            enabled,
+            changed: false,
+            applied: false,
+            error: errorText(error),
+          });
+        }
+        break;
+      }
       case "lease.offer":
         // Zod has already validated and normalized every field. The cast only
         // bridges its optional-property representation under exactOptionalPropertyTypes.
@@ -1116,9 +1199,30 @@ export class WorkerAgent {
         void this.handleEvidenceChallenge(message.payload);
         break;
       case "runtime.prepare":
+        if (!this.contributionEnabled) {
+          this.sendMessage("runtime.prepared", {
+            requestId: message.payload.requestId,
+            ok: false,
+            error: "contribution_paused",
+          });
+          break;
+        }
         await this.prepareDistributedRuntime(message.payload.requestId, message.payload.description);
         break;
       case "runtime.start":
+        if (!this.contributionEnabled) {
+          this.sendMessage("runtime.exited", {
+            requestId: message.payload.requestId,
+            exit: { code: null, signal: null, error: "contribution_paused" },
+            output: {
+              stdout: "",
+              stderr: "",
+              stdoutTruncated: false,
+              stderrTruncated: false,
+            },
+          });
+          break;
+        }
         await this.startDistributedRuntime(message.payload.requestId, message.payload.request);
         break;
       case "runtime.stop":
@@ -1497,6 +1601,14 @@ export class WorkerAgent {
   }
 
   private async execute(payload: JobPayload): Promise<void> {
+    if (!this.contributionEnabled) {
+      this.sendMessage("lease.reject", {
+        jobId: payload.jobId,
+        leaseId: payload.leaseId,
+        reason: "contribution_paused",
+      });
+      return;
+    }
     const deploymentMatches = this.capabilities?.deployments.some(
       (deployment) =>
         deployment.model === payload.request.model &&
@@ -1711,8 +1823,8 @@ export class WorkerAgent {
       };
     }
     const heartbeat: WorkerHeartbeat = {
-      draining: false,
-      pausedReason: null,
+      draining: !this.contributionEnabled,
+      pausedReason: this.contributionEnabled ? null : "Contribution paused",
       activeLeases: [...this.activeJobs.keys()],
       gpus: this.capabilities.gpus.map((gpu) => ({
         id: gpu.id,
@@ -1730,12 +1842,21 @@ export class WorkerAgent {
         uplinkMbps: this.capabilities.network.uplinkMbps,
       },
     };
-    this.sendMessage("worker.heartbeat", { heartbeat, capabilities: this.capabilities, metrics });
+    this.sendMessage("worker.heartbeat", {
+      heartbeat,
+      capabilities: this.capabilities,
+      metrics: {
+        ...metrics,
+        ready: this.contributionEnabled && metrics.ready,
+      },
+    });
   }
 
   private updateFreeSlots(): void {
     if (!this.capabilities) return;
-    const freeSlots = Math.max(0, this.config.limits.maxConcurrency - this.activeJobs.size);
+    const freeSlots = this.contributionEnabled
+      ? Math.max(0, this.config.limits.maxConcurrency - this.activeJobs.size)
+      : 0;
     this.capabilities = {
       ...this.capabilities,
       deployments: this.capabilities.deployments.map((deployment) => ({
