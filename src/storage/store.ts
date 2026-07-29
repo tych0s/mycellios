@@ -6,6 +6,7 @@ import type {
   WorkerRegistration,
   WorkerStatus,
 } from "../contracts/types.js";
+import type { RemoteDiagnosticEvent } from "../contracts/remote-diagnostics.js";
 import type { BenchmarkRun } from "../benchlab/types.js";
 import { newId } from "../core/ids.js";
 import {
@@ -128,6 +129,17 @@ export interface StoredNetworkTelemetrySample {
   inflightJobs: number;
   runningJobs: number;
   completedJobs: number;
+}
+
+export interface StoredDiagnosticEvent extends RemoteDiagnosticEvent {
+  receivedAt: string;
+}
+
+export interface DiagnosticEventQuery {
+  limit?: number;
+  level?: RemoteDiagnosticEvent["level"];
+  sourceId?: string;
+  since?: string;
 }
 
 interface RequestedModelRow {
@@ -778,6 +790,13 @@ export class MeshStore {
         this.queueActivationEvent(row.id);
         queued += 1;
       }
+      const diagnosticEvents = this.database.raw.prepare(
+        "SELECT id FROM diagnostic_events",
+      ).all() as unknown as Array<{ id: string }>;
+      for (const row of diagnosticEvents) {
+        this.queueDiagnosticEvent(row.id);
+        queued += 1;
+      }
       const deploymentStates = this.database.raw.prepare(
         "SELECT * FROM deployment_states",
       ).all() as unknown as Array<{
@@ -1068,6 +1087,100 @@ export class MeshStore {
     }));
   }
 
+  appendDiagnosticEvents(
+    events: readonly RemoteDiagnosticEvent[],
+  ): { accepted: number; duplicates: number } {
+    return this.database.transaction(() => {
+      const insert = this.database.raw.prepare(
+        `INSERT OR IGNORE INTO diagnostic_events(
+           id, source_id, app_version, platform, arch, level, source, event,
+           message, details, occurred_at, received_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      const receivedAt = Date.now();
+      let accepted = 0;
+      for (const event of events) {
+        const occurredAt = Date.parse(event.occurredAt);
+        const safeOccurredAt = Number.isFinite(occurredAt)
+          ? Math.min(occurredAt, receivedAt + 5 * 60_000)
+          : receivedAt;
+        const result = insert.run(
+          event.id,
+          event.sourceId,
+          event.appVersion,
+          event.platform,
+          event.arch,
+          event.level,
+          event.source,
+          event.event,
+          event.message,
+          event.details ?? null,
+          safeOccurredAt,
+          receivedAt,
+        );
+        if (Number(result.changes) === 0) continue;
+        accepted += 1;
+        this.queueDiagnosticEvent(event.id);
+      }
+      this.pruneDiagnosticEvents(receivedAt);
+      return { accepted, duplicates: events.length - accepted };
+    });
+  }
+
+  listDiagnosticEvents(query: DiagnosticEventQuery = {}): StoredDiagnosticEvent[] {
+    const where: string[] = [];
+    const parameters: Array<string | number> = [];
+    if (query.level) {
+      where.push("level = ?");
+      parameters.push(query.level);
+    }
+    if (query.sourceId) {
+      where.push("source_id = ?");
+      parameters.push(query.sourceId);
+    }
+    if (query.since) {
+      const since = Date.parse(query.since);
+      if (Number.isFinite(since)) {
+        where.push("occurred_at >= ?");
+        parameters.push(since);
+      }
+    }
+    const limit = Math.max(1, Math.min(500, Math.trunc(query.limit ?? 100)));
+    const rows = this.database.raw.prepare(
+      `SELECT * FROM diagnostic_events
+       ${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
+       ORDER BY occurred_at DESC, id DESC
+       LIMIT ?`,
+    ).all(...parameters, limit) as unknown as Array<{
+      id: string;
+      source_id: string;
+      app_version: string;
+      platform: string;
+      arch: string;
+      level: RemoteDiagnosticEvent["level"];
+      source: RemoteDiagnosticEvent["source"];
+      event: string;
+      message: string;
+      details: string | null;
+      occurred_at: number;
+      received_at: number;
+    }>;
+    return rows.map((row) => ({
+      id: row.id,
+      sourceId: row.source_id,
+      appVersion: row.app_version,
+      platform: row.platform,
+      arch: row.arch,
+      level: row.level,
+      source: row.source,
+      event: row.event,
+      message: row.message,
+      ...(row.details ? { details: row.details } : {}),
+      occurredAt: new Date(Number(row.occurred_at)).toISOString(),
+      receivedAt: new Date(Number(row.received_at)).toISOString(),
+    }));
+  }
+
   recordNetworkTelemetrySample(sample: StoredNetworkTelemetrySample): void {
     this.database.raw.prepare(
       `INSERT INTO network_telemetry_history(
@@ -1308,6 +1421,47 @@ export class MeshStore {
       details: row.details_json ? JSON.parse(row.details_json) as unknown : null,
       occurred_at: Number(row.occurred_at),
     });
+  }
+
+  private queueDiagnosticEvent(eventId: string): void {
+    const row = this.database.raw.prepare(
+      "SELECT * FROM diagnostic_events WHERE id = ?",
+    ).get(eventId) as {
+      id: string;
+      source_id: string;
+      app_version: string;
+      platform: string;
+      arch: string;
+      level: string;
+      source: string;
+      event: string;
+      message: string;
+      details: string | null;
+      occurred_at: number;
+      received_at: number;
+    } | undefined;
+    if (!row) return;
+    this.database.enqueueRemoteChange("diagnostic_events", eventId, "upsert", row);
+  }
+
+  private pruneDiagnosticEvents(now: number): void {
+    const cutoff = now - 30 * 24 * 60 * 60 * 1_000;
+    const expired = this.database.raw.prepare(
+      "SELECT id FROM diagnostic_events WHERE occurred_at < ?",
+    ).all(cutoff) as unknown as Array<{ id: string }>;
+    const overflow = this.database.raw.prepare(
+      `SELECT id FROM diagnostic_events
+       ORDER BY occurred_at DESC, id DESC
+       LIMIT -1 OFFSET 10000`,
+    ).all() as unknown as Array<{ id: string }>;
+    const ids = new Set([...expired, ...overflow].map((row) => row.id));
+    const remove = this.database.raw.prepare(
+      "DELETE FROM diagnostic_events WHERE id = ?",
+    );
+    for (const id of ids) {
+      remove.run(id);
+      this.database.enqueueRemoteChange("diagnostic_events", id, "delete", null);
+    }
   }
 
   private mapWorker(row: WorkerRow): StoredWorker {

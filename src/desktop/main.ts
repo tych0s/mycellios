@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
-import { cpus, release } from "node:os";
+import { arch, cpus, release } from "node:os";
 import { spawn } from "node:child_process";
 import type { AddressInfo } from "node:net";
 import {
@@ -116,6 +116,7 @@ import {
   summarizeAutomaticUpdateError,
 } from "./update-recovery.js";
 import { SingleFlight } from "./single-flight.js";
+import { RemoteDiagnosticsUploader } from "./remote-diagnostics.js";
 import { readNativeBuildIdentity } from "../core/native-build-identity.js";
 import { probeRuntimePerformanceProfile } from "../performance/runtime-profile-probe.js";
 import {
@@ -171,6 +172,7 @@ let updateRetryAttempt = 0;
 let updateCheckInFlight = false;
 let automaticUpdateInstallTimer: NodeJS.Timeout | null = null;
 let automaticUpdateInstallInFlight = false;
+let remoteDiagnosticsUploader: RemoteDiagnosticsUploader | null = null;
 let updateStatus: DesktopUpdateStatus = {
   state: app.isPackaged ? "idle" : "development",
   currentVersion: app.getVersion(),
@@ -202,6 +204,25 @@ function modelAdminTokenPath(): string {
 
 function desktopLogPath(): string {
   return join(app.getPath("userData"), "mycellios.log");
+}
+
+function diagnosticSourceId(): string {
+  const path = join(app.getPath("userData"), "diagnostic-source-id.txt");
+  try {
+    const existing = readFileSync(path, "utf8").trim();
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(existing)) {
+      return existing;
+    }
+  } catch {
+    // First launch creates a pseudonymous diagnostics identity below.
+  }
+  const sourceId = randomUUID();
+  try {
+    writeFileSync(path, `${sourceId}\n`, { encoding: "utf8", mode: 0o600 });
+  } catch {
+    // A read-only profile must not prevent the desktop runtime from starting.
+  }
+  return sourceId;
 }
 
 function workerAdmissionCredentialPath(): string {
@@ -271,10 +292,22 @@ function writeDesktopLog(event: string, details: unknown): void {
       `${new Date().toISOString()} ${event} ${JSON.stringify(details)}\n`,
       "utf8",
     );
+    remoteDiagnosticsUploader?.notify();
   } catch {
     // Diagnostics must never prevent the app from starting.
   }
 }
+
+process.on("uncaughtExceptionMonitor", (error, origin) => {
+  writeDesktopLog("desktop-uncaught-exception", {
+    error: errorText(error),
+    origin,
+  });
+});
+
+app.on("child-process-gone", (_event, details) => {
+  writeDesktopLog("desktop-child-process-gone", details);
+});
 
 const DESKTOP_LOG_TAIL_BYTES = 512 * 1_024;
 const DESKTOP_LOG_ENTRY_LIMIT = 400;
@@ -982,6 +1015,9 @@ async function stopWorker(): Promise<void> {
 
 async function stopRuntime(): Promise<void> {
   clearAcceleratorRetryTimer();
+  const diagnostics = remoteDiagnosticsUploader;
+  remoteDiagnosticsUploader = null;
+  await diagnostics?.stop();
   await stopWorker();
   const activeCoordinator = coordinator;
   coordinator = null;
@@ -993,6 +1029,23 @@ async function restartRuntime(): Promise<void> {
   runtimeError = null;
   await stopRuntime();
   await startCoordinatorIfNeeded();
+  if (
+    settings.coordinatorMode === "remote"
+    && settings.remoteCoordinatorToken
+  ) {
+    remoteDiagnosticsUploader = new RemoteDiagnosticsUploader({
+      coordinatorUrl,
+      networkToken: settings.remoteCoordinatorToken,
+      metadata: {
+        sourceId: diagnosticSourceId(),
+        appVersion: app.getVersion(),
+        platform: process.platform,
+        arch: arch(),
+      },
+      readLogs: readSystemLogs,
+    });
+    remoteDiagnosticsUploader.start();
+  }
   await startWorkerConnection();
 }
 

@@ -30,6 +30,12 @@ import {
   workerRegistrationSchema,
 } from "../contracts/schemas.js";
 import {
+  redactDiagnosticDetails,
+  redactDiagnosticText,
+  remoteDiagnosticBatchSchema,
+  remoteDiagnosticQuerySchema,
+} from "../contracts/remote-diagnostics.js";
+import {
   WORKER_PROTOCOL_MAX,
   WORKER_PROTOCOL_MIN,
   workerAdmissionChallengeRequestSchema,
@@ -296,6 +302,8 @@ export async function createCoordinator(
   const authorizeAdministrativeMutation = async (
     request: FastifyRequest,
     reply: FastifyReply,
+    allowedRoles: readonly NonNullable<AuthenticatedNetworkUser["role"]>[] =
+      ["owner", "admin", "operator"],
   ): Promise<boolean> => {
     const expected = config.modelAdminToken;
     if (!expected && isTrustedLocalRequest(request)) return true;
@@ -311,7 +319,7 @@ export async function createCoordinator(
     if (bearer && supabaseAuth) {
       try {
         const user = await supabaseAuth.authenticate(bearer);
-        if (user && user.role && ["owner", "admin", "operator"].includes(user.role)) return true;
+        if (user?.role && allowedRoles.includes(user.role)) return true;
         if (user) {
           void reply.code(403).send({
             error: {
@@ -1401,6 +1409,54 @@ export async function createCoordinator(
       activationStatusMessageForModel,
       activationIncidentForModel,
     }, runtimeVersion, coordinatorBuildIdentity);
+  });
+
+  app.post("/internal/v1/diagnostics", async (request, reply) => {
+    const parsed = remoteDiagnosticBatchSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: {
+          code: "invalid_request",
+          message: "Request validation failed",
+          details: parsed.error.issues,
+        },
+      });
+    }
+    const body = parsed.data;
+    const events = body.events.map((event) => ({
+      ...event,
+      message: redactDiagnosticText(event.message),
+      ...(event.details
+        ? { details: redactDiagnosticDetails(event.details) }
+        : {}),
+    }));
+    const result = store.appendDiagnosticEvents(events);
+    void persistence?.flush();
+    return reply.code(result.accepted > 0 ? 201 : 200).send(result);
+  });
+
+  app.get("/public/v1/admin/diagnostics", async (request, reply) => {
+    if (!await authorizeAdministrativeMutation(request, reply, ["owner", "admin"])) return;
+    const parsed = remoteDiagnosticQuerySchema.safeParse(request.query);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: {
+          code: "invalid_request",
+          message: "Request validation failed",
+          details: parsed.error.issues,
+        },
+      });
+    }
+    const query = parsed.data;
+    return {
+      capturedAt: new Date().toISOString(),
+      events: store.listDiagnosticEvents({
+        limit: query.limit,
+        ...(query.level ? { level: query.level } : {}),
+        ...(query.sourceId ? { sourceId: query.sourceId } : {}),
+        ...(query.since ? { since: query.since } : {}),
+      }),
+    };
   });
 
   const availableSupportAssistantModels = (): string[] =>
