@@ -36,6 +36,9 @@ interface ProviderRuntime {
   adapter: FederatedProviderAdapter;
   models: Map<string, FederatedModel>;
   nodes: FederatedNode[];
+  activeOperations: number;
+  closeAfterDrain: boolean;
+  drainTask: Promise<void> | null;
   consecutivePretokenFailures: number;
   circuitOpenCount: number;
   retryAt: number | null;
@@ -91,6 +94,9 @@ export class FederationManager {
         adapter,
         models: new Map(),
         nodes: [],
+        activeOperations: 0,
+        closeAfterDrain: false,
+        drainTask: null,
         consecutivePretokenFailures: 0,
         circuitOpenCount: 0,
         retryAt: null,
@@ -162,12 +168,14 @@ export class FederationManager {
     const runtime = this.runtimes.get(id);
     if (runtime && !updated.enabled) {
       runtime.state = "draining";
+      runtime.closeAfterDrain = true;
       // Existing streams retain their selected route. New route selection sees
       // the persisted desired state immediately, so draining never swaps a
       // response after its first token.
-      runtime.state = "disabled";
+      this.closeRuntimeWhenDrained(id, runtime);
     } else if (runtime && updated.enabled) {
-      this.trackBackground(this.discover(id));
+      runtime.closeAfterDrain = false;
+      if (!runtime.drainTask) this.trackBackground(this.discover(id));
     }
     return updated;
   }
@@ -219,6 +227,7 @@ export class FederationManager {
       return this.networkView(id);
     }
     runtime.state = "discovering";
+    runtime.activeOperations += 1;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(new Error("discovery_timeout")), 15_000);
     try {
@@ -254,15 +263,19 @@ export class FederationManager {
         lastVerifiedAt: latestVerifiedAt(runtime, node.models),
         ...(node.capacity ? { capacity: node.capacity } : {}),
       }));
-      runtime.state = this.verifiedModels(runtime).length > 0 ? "ready" : "degraded";
+      runtime.state = runtime.closeAfterDrain
+        ? "draining"
+        : this.verifiedModels(runtime).length > 0 ? "ready" : "degraded";
       runtime.lastError = this.verifiedModels(runtime).length > 0
         ? null
         : "Discovered capacity has not completed a real generation in the last 30 minutes";
     } catch (error) {
-      runtime.state = "error";
+      runtime.state = runtime.closeAfterDrain ? "draining" : "error";
       runtime.lastError = errorMessage(error);
     } finally {
       clearTimeout(timer);
+      runtime.activeOperations = Math.max(0, runtime.activeOperations - 1);
+      this.closeRuntimeWhenDrained(id, runtime);
     }
     return this.networkView(id);
   }
@@ -270,7 +283,12 @@ export class FederationManager {
   async probe(id: FederatedNetworkId, requestedModel?: string): Promise<FederatedNetwork> {
     await this.discover(id);
     const runtime = this.runtimes.get(id);
-    if (!runtime || runtime.state === "blocked" || runtime.state === "disabled") {
+    if (
+      !runtime
+      || runtime.state === "blocked"
+      || runtime.state === "disabled"
+      || runtime.state === "draining"
+    ) {
       return this.networkView(id);
     }
     const model = requestedModel
@@ -294,6 +312,7 @@ export class FederationManager {
     };
     const startedAt = this.now();
     let firstTokenAt: number | null = null;
+    runtime.activeOperations += 1;
     try {
       for await (const event of runtime.adapter.infer({
         requestId: newId("canary"),
@@ -312,7 +331,7 @@ export class FederationManager {
           });
           runtime.lastCanaryAt = verifiedAt;
           runtime.ttftMs = firstTokenAt === null ? verifiedAt - startedAt : firstTokenAt - startedAt;
-          runtime.state = "ready";
+          runtime.state = runtime.closeAfterDrain ? "draining" : "ready";
           runtime.lastError = null;
           runtime.consecutivePretokenFailures = 0;
           runtime.retryAt = null;
@@ -325,10 +344,12 @@ export class FederationManager {
       }
       throw new Error("canary_missing_completion");
     } catch (error) {
-      this.recordPretokenFailure(runtime, error);
+      if (!runtime.closeAfterDrain) this.recordPretokenFailure(runtime, error);
       return this.networkView(id);
     } finally {
       clearTimeout(timer);
+      runtime.activeOperations = Math.max(0, runtime.activeOperations - 1);
+      this.closeRuntimeWhenDrained(id, runtime);
     }
   }
 
@@ -485,6 +506,10 @@ export class FederationManager {
     let fallbackReason: string | null = null;
     for (const [index, candidate] of candidates.entries()) {
       const { runtime, model } = candidate;
+      if (runtime.closeAfterDrain) {
+        fallbackReason = "network_disabled";
+        continue;
+      }
       const attemptId = newId("froute");
       const reservationId = newId("spend");
       const attemptStartedAt = this.now();
@@ -535,6 +560,7 @@ export class FederationManager {
       queue.push({ type: "accepted", jobId, sessionId, route });
       this.store.setJobStatus(jobId, "running");
       let firstTokenAt: number | null = null;
+      runtime.activeOperations += 1;
       try {
         for await (const event of runtime.adapter.infer({
           requestId: jobId,
@@ -576,7 +602,7 @@ export class FederationManager {
               node.models.includes(model.canonicalId)
                 ? { ...node, routable: true, lastVerifiedAt: completedAt }
                 : node);
-            runtime.state = "ready";
+            runtime.state = runtime.closeAfterDrain ? "draining" : "ready";
             runtime.lastError = null;
             runtime.consecutivePretokenFailures = 0;
             runtime.retryAt = null;
@@ -642,6 +668,9 @@ export class FederationManager {
         this.recordPretokenFailure(runtime, error);
         fallbackReason = safeFailureCode(message);
         if (controller.signal.aborted) break;
+      } finally {
+        runtime.activeOperations = Math.max(0, runtime.activeOperations - 1);
+        this.closeRuntimeWhenDrained(runtime.adapter.id, runtime);
       }
     }
     queue.push({
@@ -788,6 +817,32 @@ export class FederationManager {
 
   private rentalConfigured(_id: FederatedNetworkId): boolean {
     return this.rentalProviderConfigured[_id] ?? false;
+  }
+
+  private closeRuntimeWhenDrained(
+    id: FederatedNetworkId,
+    runtime: ProviderRuntime,
+  ): void {
+    if (
+      !runtime.closeAfterDrain
+      || runtime.activeOperations > 0
+      || runtime.drainTask
+    ) return;
+    const task = Promise.resolve()
+      .then(() => runtime.adapter.close?.())
+      .catch((error) => {
+        runtime.lastError = errorMessage(error);
+      })
+      .finally(() => {
+        runtime.drainTask = null;
+        if (runtime.closeAfterDrain) {
+          runtime.state = "disabled";
+        } else if (!this.closed) {
+          this.trackBackground(this.discover(id));
+        }
+      });
+    runtime.drainTask = task;
+    this.trackBackground(task);
   }
 
   private trackBackground(task: Promise<unknown>): void {

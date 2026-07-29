@@ -9,6 +9,7 @@ import type {
 } from "../contracts/federation.js";
 import type { ChatCompletionRequest } from "../contracts/types.js";
 import type { FederationRuntimeConfig } from "../core/config.js";
+import { spawn, type ChildProcess } from "node:child_process";
 
 interface OpenAiProviderOptions {
   id: FederatedNetworkId;
@@ -25,7 +26,11 @@ export function createFederatedProviderAdapters(
   config: FederationRuntimeConfig,
 ): FederatedProviderAdapter[] {
   return [
-    new ExternalRuntimeAAdapter(config.external-runtime-aInferenceUrl, config.external-runtime-aManagementUrl),
+    new ExternalRuntimeAAdapter(
+      config.external-runtime-aInferenceUrl,
+      config.external-runtime-aManagementUrl,
+      config.external-runtime-aExecutable,
+    ),
     new AiHordeAdapter(config.aiHordeBaseUrl, config.aiHordeApiKey),
     new OpenAiFederatedAdapter({
       id: "peer-runtime",
@@ -220,15 +225,20 @@ class ExternalRuntimeAAdapter implements FederatedProviderAdapter {
   readonly class = "community" as const;
   readonly configured = true;
 
+  private child: ChildProcess | null = null;
+  private starting: Promise<void> | null = null;
+
   constructor(
     private readonly inferenceUrl: string,
     private readonly managementUrl: string,
+    private readonly executable: string | undefined,
   ) {}
 
   async discover(signal: AbortSignal): Promise<{
     models: FederatedProviderModel[];
     nodes: FederatedProviderNode[];
   }> {
+    await this.ensureClient(signal);
     const [modelsResponse, statusResponse] = await Promise.all([
       fetch(`${this.inferenceUrl}/v1/models`, { signal }),
       fetch(`${this.managementUrl}/api/status`, { signal }),
@@ -276,6 +286,56 @@ class ExternalRuntimeAAdapter implements FederatedProviderAdapter {
 
   estimateMaximumCostUsd(): number {
     return 0;
+  }
+
+  async close(): Promise<void> {
+    const child = this.child;
+    this.child = null;
+    this.starting = null;
+    if (!child || child.exitCode !== null) return;
+    child.kill("SIGTERM");
+    await Promise.race([
+      new Promise<void>((resolveExit) => child.once("exit", () => resolveExit())),
+      new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 5_000)),
+    ]);
+    if (child.exitCode === null) child.kill("SIGKILL");
+  }
+
+  private ensureClient(signal: AbortSignal): Promise<void> {
+    if (!this.executable || this.child?.exitCode === null) return Promise.resolve();
+    if (this.starting) return this.starting;
+    this.starting = new Promise<void>((resolveStart, rejectStart) => {
+      const child = spawn(this.executable!, ["client", "--auto"], {
+        shell: false,
+        windowsHide: true,
+        stdio: "ignore",
+        env: minimalSidecarEnvironment(process.env),
+      });
+      this.child = child;
+      const onAbort = () => {
+        child.kill("SIGTERM");
+        rejectStart(signal.reason ?? new Error("external-runtime-a_start_aborted"));
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      child.once("error", (error) => {
+        signal.removeEventListener("abort", onAbort);
+        this.child = null;
+        rejectStart(new Error(`external-runtime-a_client_start_failed:${error.message}`));
+      });
+      // Successful spawn is enough here. The bounded discovery requests below
+      // are the readiness check and will keep advertised capacity unroutable
+      // until both APIs and a real generation succeed.
+      child.once("spawn", () => {
+        signal.removeEventListener("abort", onAbort);
+        resolveStart();
+      });
+      child.once("exit", () => {
+        if (this.child === child) this.child = null;
+      });
+    }).finally(() => {
+      this.starting = null;
+    });
+    return this.starting;
   }
 }
 
@@ -510,4 +570,28 @@ function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void
       reject(signal.reason ?? new Error("aborted"));
     }, { once: true });
   });
+}
+
+function minimalSidecarEnvironment(
+  environment: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+  const allowed = [
+    "PATH",
+    "Path",
+    "PATHEXT",
+    "SYSTEMROOT",
+    "SystemRoot",
+    "WINDIR",
+    "HOME",
+    "USERPROFILE",
+    "TMP",
+    "TEMP",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+  ] as const;
+  return Object.fromEntries(
+    allowed.flatMap((key) => environment[key] === undefined
+      ? []
+      : [[key, environment[key]]]),
+  );
 }

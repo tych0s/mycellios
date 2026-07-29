@@ -85,6 +85,40 @@ describe("FederationManager", () => {
     expect(network.retryAt).not.toBeNull();
   });
 
+  it("drains an active request before closing a disabled network", async () => {
+    const adapter = new FakeCommunityAdapter();
+    const { manager } = createManager(adapter);
+    await manager.probe("external-runtime-a");
+
+    let releaseInference!: () => void;
+    let markStarted!: () => void;
+    const held = new Promise<void>((resolve) => {
+      releaseInference = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    adapter.waitBeforeToken = held;
+    adapter.onInferenceStarted = markStarted;
+
+    const handle = manager.submit(chatRequest("test/model"));
+    const collected = collectEvents(handle.events);
+    await started;
+    manager.updateNetwork("external-runtime-a", { enabled: false });
+
+    expect(adapter.closeCalls).toBe(0);
+    expect(manager.networks().find((network) => network.id === "external-runtime-a")?.actualState)
+      .toBe("draining");
+
+    releaseInference();
+    expect((await collected).at(-1)?.type).toBe("completed");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(adapter.closeCalls).toBe(1);
+    expect(manager.networks().find((network) => network.id === "external-runtime-a")?.actualState)
+      .toBe("disabled");
+  });
+
   it("reserves provider spend atomically and hard-blocks the limit", () => {
     const database = new MeshDatabase(":memory:");
     const store = new MeshStore(database);
@@ -119,6 +153,9 @@ class FakeCommunityAdapter implements FederatedProviderAdapter {
   readonly rawNodeId = "upstream-secret-node-123";
   failInference = false;
   lastRequest: ChatCompletionRequest | null = null;
+  waitBeforeToken: Promise<void> | null = null;
+  onInferenceStarted: (() => void) | null = null;
+  closeCalls = 0;
 
   async discover() {
     return {
@@ -139,6 +176,8 @@ class FakeCommunityAdapter implements FederatedProviderAdapter {
   async *infer(input: FederatedInferenceInput): AsyncIterable<FederatedInferenceEvent> {
     this.lastRequest = input.request;
     if (this.failInference) throw new Error("fake_pretoken_failure");
+    this.onInferenceStarted?.();
+    if (this.waitBeforeToken) await this.waitBeforeToken;
     yield { type: "token", text: "OK", index: 0, at: Date.now() };
     yield {
       type: "completed",
@@ -151,6 +190,10 @@ class FakeCommunityAdapter implements FederatedProviderAdapter {
 
   estimateMaximumCostUsd() {
     return 0;
+  }
+
+  async close() {
+    this.closeCalls += 1;
   }
 }
 
@@ -169,4 +212,12 @@ function chatRequest(model: string): ChatCompletionRequest {
     stream: true,
     max_tokens: 32,
   };
+}
+
+async function collectEvents(
+  events: AsyncIterable<{ type: string }>,
+): Promise<Array<{ type: string }>> {
+  const collected = [];
+  for await (const event of events) collected.push(event);
+  return collected;
 }
