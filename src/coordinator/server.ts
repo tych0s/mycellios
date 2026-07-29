@@ -37,6 +37,7 @@ import {
   workerCredentialRotationChallengeRequestSchema,
   workerCredentialRotationProofSchema,
 } from "../contracts/worker-admission.js";
+import { contributionAckEnvelopeSchema } from "../contracts/worker-protocol.js";
 import {
   type NativeBuildIdentity,
 } from "../contracts/build-identity.js";
@@ -123,6 +124,7 @@ import {
   admissionCredentialSummary,
   selectWorkerProtocolVersion,
 } from "./worker-admission.js";
+import { FleetContributionController } from "./fleet-contribution-control.js";
 
 export function automaticActivationFailureIsTransient(message: string): boolean {
   return activationFailureIsTransient(message);
@@ -536,6 +538,7 @@ export async function createCoordinator(
     return reply.redirect(`/updates/win32/x64/mycellios-setup.exe?v=${publicAssetVersion}`);
   });
   const hub = new WorkerHub(store);
+  const fleetContribution = new FleetContributionController(store, hub);
   hub.attach(app);
   const scheduler = new Scheduler(store, {
     runtimeLinkObservations: () => hub.runtimeLinkObservations(),
@@ -1157,6 +1160,13 @@ export async function createCoordinator(
     }
   };
   hub.on("envelope", (envelope) => {
+    if (envelope.type === "contribution.ack") {
+      const acknowledgement = contributionAckEnvelopeSchema.parse(envelope);
+      fleetContribution.acknowledge(
+        acknowledgement.workerId,
+        acknowledgement.payload,
+      );
+    }
     if (envelope.type === "worker.heartbeat") queueMicrotask(reconcileRequestedModels);
   });
   hub.on("disconnect", (workerId) => {
@@ -1415,6 +1425,17 @@ export async function createCoordinator(
   };
 
   app.get("/public/v1/assistant/config", async () => publicSupportAssistantConfig());
+
+  app.get("/public/v1/admin/fleet-contribution", async (request, reply) => {
+    if (!await authorizeAdministrativeMutation(request, reply)) return;
+    return fleetContribution.status();
+  });
+
+  app.post("/public/v1/admin/fleet-contribution", async (request, reply) => {
+    if (!await authorizeAdministrativeMutation(request, reply)) return;
+    const body = z.object({ enabled: z.boolean() }).strict().parse(request.body);
+    return fleetContribution.setAll(body.enabled);
+  });
 
   app.get("/public/v1/admin/assistant", async (request, reply) => {
     if (!await authorizeAdministrativeMutation(request, reply)) return;
@@ -2645,6 +2666,7 @@ export async function createCoordinator(
       clearInterval(networkTelemetryTimer);
       for (const timer of automaticBenchmarkRetryTimers) clearTimeout(timer);
       automaticBenchmarkRetryTimers.clear();
+      fleetContribution.close();
       hub.close();
       mobileHub.close();
       await activationManager?.close();

@@ -262,6 +262,10 @@ export interface WorkerCapabilities {
   agentVersion: string;
   /** Exact sealed source identity. Missing only on legacy or development nodes. */
   buildIdentity?: NativeBuildIdentity | undefined;
+  /** Explicit opt-in to administrator commands supported by this worker. */
+  administration?: {
+    contributionControl: "mycellios-contribution-control/1";
+  } | undefined;
   gpus: GpuCapability[];
   limits: WorkerLimits;
   deployments: ModelDeployment[];

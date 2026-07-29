@@ -20,6 +20,10 @@ import {
   NATIVE_BUILD_PROVENANCE_FILE,
   type NativeBuildIdentity,
 } from "../contracts/build-identity.js";
+import type {
+  FleetContributionCommandResponse,
+  FleetContributionStatus,
+} from "../contracts/fleet-contribution.js";
 import { workerConfigSchema, type WorkerConfig } from "../contracts/schemas.js";
 import type { CoordinatorRuntime } from "../coordinator/server.js";
 import { createCoordinator } from "../coordinator/server.js";
@@ -805,13 +809,33 @@ async function buildWorkerConfig(
   });
 }
 
-async function startWorkerIfEnabled(): Promise<void> {
-  if (!settings.contributionEnabled || worker) return;
+async function startWorkerConnection(): Promise<void> {
+  if (worker) return;
   await workerStartFlight.run(initializeWorker);
 }
 
+function persistContributionPreference(
+  enabled: boolean,
+  source: "local" | "remote",
+): void {
+  persistSettings({ ...settings, contributionEnabled: enabled });
+  if (enabled && settings.computeMode !== "cpu-only" && acceleratorRuntimeRoot) {
+    startDesktopAcceleratorPreparation(acceleratorRuntimeRoot);
+  } else if (!enabled) {
+    clearAcceleratorRetryTimer();
+  }
+  writeDesktopLog(`contribution-${source}-change`, { enabled });
+  createTray();
+}
+
+async function setDesktopContribution(enabled: boolean): Promise<void> {
+  persistContributionPreference(enabled, "local");
+  await startWorkerConnection();
+  await worker?.setContributionEnabled(enabled);
+}
+
 async function initializeWorker(): Promise<void> {
-  if (!settings.contributionEnabled || worker || isQuitting) return;
+  if (worker || isQuitting) return;
   if (app.isPackaged && !nativeBuildIdentity) {
     throw new Error(
       `native_build_identity_unverified:${nativeBuildIdentityError ?? "missing_provenance"}`,
@@ -825,7 +849,11 @@ async function initializeWorker(): Promise<void> {
       stageHost: distributedExecutor.stageHost,
       stagePort: distributedExecutor.stagePort,
     });
-    if (settings.computeMode !== "cpu-only" && acceleratorRuntimeRoot) {
+    if (
+      settings.contributionEnabled
+      && settings.computeMode !== "cpu-only"
+      && acceleratorRuntimeRoot
+    ) {
       startDesktopAcceleratorPreparation(acceleratorRuntimeRoot);
     }
   } catch (error) {
@@ -861,6 +889,12 @@ async function initializeWorker(): Promise<void> {
       ? { admissionSigner: loadOrCreateDesktopAdmissionSigner() }
       : {}),
     reconnect: true,
+    contributionControl: {
+      initialEnabled: settings.contributionEnabled,
+      onRemoteChange: (enabled) => {
+        persistContributionPreference(enabled, "remote");
+      },
+    },
     // This worker contributes hardware and the authenticated distributed
     // executor. Models are advertised only by verified native deployments.
     advertiseDeployment: false,
@@ -959,7 +993,7 @@ async function restartRuntime(): Promise<void> {
   runtimeError = null;
   await stopRuntime();
   await startCoordinatorIfNeeded();
-  await startWorkerIfEnabled();
+  await startWorkerConnection();
 }
 
 function getHardware(): Promise<HardwareProbe> {
@@ -1191,6 +1225,28 @@ async function supportAssistantAdminRequest(
   return response;
 }
 
+async function fleetContributionAdminRequest(
+  method: "GET" | "POST",
+  providedAdminToken: string | undefined,
+  enabled?: boolean,
+): Promise<FleetContributionStatus | FleetContributionCommandResponse> {
+  const providedToken = providedAdminToken?.trim() ?? "";
+  const token = providedToken || modelAdminToken;
+  const response = await fetchJson<FleetContributionStatus | FleetContributionCommandResponse>(
+    "public/v1/admin/fleet-contribution",
+    {
+      method,
+      headers: {
+        ...(enabled === undefined ? {} : { "content-type": "application/json" }),
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+      },
+      ...(enabled === undefined ? {} : { body: JSON.stringify({ enabled }) }),
+    },
+  );
+  if (providedToken && providedToken !== modelAdminToken) persistModelAdminToken(providedToken);
+  return response;
+}
+
 function normalizeDesktopChatMessages(messages: ChatRequest["messages"]): ChatRequest["messages"] {
   const normalized = messages.map((message) => ({ ...message }));
   const last = normalized.at(-1);
@@ -1209,16 +1265,7 @@ function registerIpc(): void {
     return readSnapshot();
   });
   ipcMain.handle("contribution:set", async (_event, enabled: boolean) => {
-    persistSettings({ ...settings, contributionEnabled: Boolean(enabled) });
-    if (enabled) await startWorkerIfEnabled();
-    else {
-      clearAcceleratorRetryTimer();
-      if (worker) {
-        const active = worker;
-        worker = null;
-        await active.stop();
-      }
-    }
+    await setDesktopContribution(Boolean(enabled));
     return readSnapshot();
   });
   ipcMain.handle("chat:send", (_event, request: ChatRequest) => sendChat(request));
@@ -1244,6 +1291,20 @@ function registerIpc(): void {
       assistantSettings: Omit<SupportAssistantAdminSettings, "updatedAt">,
       adminToken?: string,
     ) => supportAssistantAdminRequest("PUT", adminToken, assistantSettings),
+  );
+  ipcMain.handle(
+    "fleet-contribution:admin:read",
+    (_event, adminToken?: string) =>
+      fleetContributionAdminRequest("GET", adminToken) as Promise<FleetContributionStatus>,
+  );
+  ipcMain.handle(
+    "fleet-contribution:admin:set",
+    (_event, enabled: boolean, adminToken?: string) =>
+      fleetContributionAdminRequest(
+        "POST",
+        adminToken,
+        Boolean(enabled),
+      ) as Promise<FleetContributionCommandResponse>,
   );
   ipcMain.handle("workers:remove", async (_event, workerId: string) => {
     await fetchJson(`public/v1/workers/${encodeURIComponent(workerId)}`, {
@@ -1456,9 +1517,7 @@ function createTrayUnsafe(): void {
         label: settings.contributionEnabled ? "Pause contribution" : "Enable contribution",
         click: () => {
           void (async () => {
-            persistSettings({ ...settings, contributionEnabled: !settings.contributionEnabled });
-            await restartRuntime();
-            createTray();
+            await setDesktopContribution(!settings.contributionEnabled);
           })();
         },
       },

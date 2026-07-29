@@ -53,6 +53,10 @@ const bridge: DesktopBridge = Object.freeze({
     assistantSettings: Omit<SupportAssistantAdminSettings, "updatedAt">,
     adminToken?: string,
   ) => ipcRenderer.invoke("assistant:admin:save", assistantSettings, adminToken),
+  getFleetContributionAdmin: (adminToken?: string) =>
+    ipcRenderer.invoke("fleet-contribution:admin:read", adminToken),
+  setFleetContributionAdmin: (enabled: boolean, adminToken?: string) =>
+    ipcRenderer.invoke("fleet-contribution:admin:set", enabled, adminToken),
   removeWorker: (workerId: string) => ipcRenderer.invoke("workers:remove", workerId),
   clearOfflineWorkers: () => ipcRenderer.invoke("workers:clear-offline"),
   listWorkerCredentials: (adminToken?: string) =>
