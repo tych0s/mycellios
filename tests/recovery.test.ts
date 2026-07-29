@@ -74,7 +74,7 @@ describe("coordinator crash recovery", () => {
     const row = migrated.raw
       .prepare("SELECT id, deregistered FROM workers WHERE id = 'wrk-existing'")
       .get() as { id: string; deregistered: number };
-    expect(version.version).toBe(15);
+    expect(version.version).toBe(16);
     expect(row).toEqual({ id: "wrk-existing", deregistered: 1 });
     migrated.close();
   });
@@ -111,7 +111,7 @@ describe("coordinator crash recovery", () => {
     const row = migrated.raw
       .prepare("SELECT id, deregistered FROM workers WHERE id = 'wrk-partially-migrated'")
       .get() as { id: string; deregistered: number };
-    expect(version.version).toBe(15);
+    expect(version.version).toBe(16);
     expect(row).toEqual({ id: "wrk-partially-migrated", deregistered: 1 });
     migrated.close();
 
@@ -119,7 +119,7 @@ describe("coordinator crash recovery", () => {
     expect(
       (reopened.raw.prepare("SELECT version FROM schema_meta").get() as { version: number })
         .version,
-    ).toBe(15);
+    ).toBe(16);
     reopened.close();
   });
 
@@ -155,7 +155,7 @@ describe("coordinator crash recovery", () => {
     expect(columns.some((column) => column.name === "activation_error")).toBe(true);
     expect(
       (migrated.raw.prepare("SELECT version FROM schema_meta").get() as { version: number }).version,
-    ).toBe(15);
+    ).toBe(16);
     migrated.close();
   });
 
