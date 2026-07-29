@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  contributionAckEnvelopeSchema,
   parseWorkerEnvelope,
   taskCompleteEnvelopeSchema,
   taskTokenEnvelopeSchema,
@@ -81,6 +82,25 @@ describe("worker protocol schemas", () => {
     expect(workerGoodbyeEnvelopeSchema.safeParse({
       ...goodbye,
       payload: { reason: "network_error" },
+    }).success).toBe(false);
+  });
+
+  it("accepts a contribution acknowledgement bound to one command", () => {
+    const acknowledgement = {
+      ...baseEnvelope,
+      type: "contribution.ack" as const,
+      payload: {
+        commandId: "command-1",
+        enabled: false,
+        changed: true,
+        applied: true,
+      },
+    };
+    expect(contributionAckEnvelopeSchema.safeParse(acknowledgement).success).toBe(true);
+    expect(parseWorkerEnvelope(acknowledgement)?.type).toBe("contribution.ack");
+    expect(contributionAckEnvelopeSchema.safeParse({
+      ...acknowledgement,
+      payload: { ...acknowledgement.payload, commandId: "" },
     }).success).toBe(false);
   });
 

@@ -11,8 +11,16 @@ import type {
 } from "../contracts/types.js";
 import type { NativeBuildIdentity } from "../contracts/build-identity.js";
 import type { ActivationIncident } from "../coordinator/activation-incident.js";
+import type {
+  FleetContributionCommandResponse,
+  FleetContributionStatus,
+} from "../contracts/fleet-contribution.js";
 export type { ComputeMode } from "../contracts/types.js";
 export type { HubCatalogModel, HubCatalogPage, HubCatalogSearchInput, HubCatalogSort } from "../contracts/types.js";
+export type {
+  FleetContributionCommandResponse,
+  FleetContributionStatus,
+} from "../contracts/fleet-contribution.js";
 
 export interface DesktopSettings {
   coordinatorMode: CoordinatorMode;
@@ -450,6 +458,11 @@ export interface DesktopBridge {
     settings: Omit<SupportAssistantAdminSettings, "updatedAt">,
     adminToken?: string,
   ): Promise<SupportAssistantAdminResponse>;
+  getFleetContributionAdmin(adminToken?: string): Promise<FleetContributionStatus>;
+  setFleetContributionAdmin(
+    enabled: boolean,
+    adminToken?: string,
+  ): Promise<FleetContributionCommandResponse>;
   removeWorker(workerId: string): Promise<DashboardSnapshot>;
   clearOfflineWorkers(): Promise<DashboardSnapshot>;
   listWorkerCredentials(adminToken?: string): Promise<WorkerCredentialSummary[]>;
