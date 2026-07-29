@@ -5,6 +5,28 @@ import {
 } from "../src/coordinator/activation-incident.js";
 
 describe("activation incident classification", () => {
+  it("retries while two connected desktops finish executor verification", () => {
+    const incident = classifyActivationIncident({
+      message: "distributed_activation_requires_two_connected_shard_executors",
+      retryCount: 0,
+      nextRetryAt: Date.UTC(2026, 6, 29, 15, 0, 5),
+      maximumAttempts: 5,
+    });
+
+    expect(incident).toMatchObject({
+      code: "executor_pool_not_ready",
+      scope: "network",
+      repairState: "scheduled",
+      automaticAction: "rebuild_route",
+      retryable: true,
+      automatic: true,
+      attempt: 1,
+    });
+    expect(activationFailureIsTransient(
+      "distributed_activation_requires_two_connected_shard_executors",
+    )).toBe(true);
+  });
+
   it("publishes a bounded autonomous node-recovery plan", () => {
     const incident = classifyActivationIncident({
       message: "distributed_worker_disconnected:wrk-68_320a",

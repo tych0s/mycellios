@@ -71,6 +71,9 @@ describe("connected executor activation", () => {
     );
     expect(snapshot.capacityNodes).toEqual([{ id: "node-a", availableVramMiB: 3_500 }]);
     expect(snapshot.config).toBeNull();
+    expect(snapshot.readinessDetails).toEqual([
+      "node-a: runtime performance verified.",
+    ]);
   });
 
   it("waits for verified GPU capacity instead of distributing a permanent CPU fallback", () => {
@@ -136,6 +139,10 @@ describe("connected executor activation", () => {
     );
     expect(withoutEvidence.capacityNodes).toHaveLength(2);
     expect(withoutEvidence.config).toBeNull();
+    expect(withoutEvidence.readinessDetails).toEqual([
+      "node-a: runtime verified; waiting for a reciprocal network link measurement.",
+      "node-b: runtime verified; waiting for a reciprocal network link measurement.",
+    ]);
 
     const oneDirection = buildConnectedExecutorActivationSnapshot(
       baseConfig(),
@@ -192,6 +199,10 @@ describe("connected executor activation", () => {
     );
     expect(missing.capacityNodes).toHaveLength(2);
     expect(missing.config).toBeNull();
+    expect(missing.readinessDetails).toEqual([
+      "node-a: runtime performance verified.",
+      "node-b: connected; waiting for a verified runtime performance profile.",
+    ]);
 
     second.capabilities.distributedExecutor!.performanceEvidence =
       performanceEvidence(

@@ -104,7 +104,20 @@ export function buildConnectedExecutorActivationSnapshot(
     const performance = eligiblePlannerPerformance(entry);
     return performance ? [{ ...entry, performance }] : [];
   });
-  if (profiledExecutors.length < 2) return { capacityNodes, config: null };
+  const profiledNodeIds = new Set(
+    profiledExecutors.map(({ executor }) => executor.nodeId),
+  );
+  if (profiledExecutors.length < 2) {
+    return {
+      capacityNodes,
+      config: null,
+      readinessDetails: executors.map(({ executor }) =>
+        profiledNodeIds.has(executor.nodeId)
+          ? `${executor.nodeId}: runtime performance verified.`
+          : `${executor.nodeId}: connected; waiting for a verified runtime performance profile.`
+      ),
+    };
+  }
 
   // El SEGUNDO cero del planificador. `coordinatorRttMs` ya se mide, pero
   // `decodeScale` seguía fijado a 1 aquí, así que `ProportionalComputePlanner`
@@ -186,7 +199,17 @@ export function buildConnectedExecutorActivationSnapshot(
       : []
   )));
   const routableNodes = nodes.filter((node) => reciprocalNodeIds.has(node.id));
-  if (routableNodes.length < 2) return { capacityNodes, config: null };
+  if (routableNodes.length < 2) {
+    return {
+      capacityNodes,
+      config: null,
+      readinessDetails: executors.map(({ executor }) =>
+        reciprocalNodeIds.has(executor.nodeId)
+          ? `${executor.nodeId}: runtime and reciprocal network link verified.`
+          : `${executor.nodeId}: runtime verified; waiting for a reciprocal network link measurement.`
+      ),
+    };
+  }
   const links = measuredLinks.filter(
     (link) => reciprocalNodeIds.has(link.from) && reciprocalNodeIds.has(link.to),
   );

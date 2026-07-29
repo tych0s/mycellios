@@ -2,6 +2,7 @@ export const ACTIVATION_INCIDENT_SCHEMA =
   "mycellios-activation-incident/1" as const;
 
 export type ActivationIncidentCode =
+  | "executor_pool_not_ready"
   | "node_disconnected"
   | "launch_agent_unavailable"
   | "network_prepare_timeout"
@@ -145,6 +146,22 @@ export function activationFailureIsTransient(message: string): boolean {
 
 function incidentDefinition(message: string): IncidentDefinition {
   const normalized = message.toLowerCase();
+  if (normalized.includes("distributed_activation_requires_two_connected_shard_executors")) {
+    return {
+      code: "executor_pool_not_ready",
+      scope: "network",
+      title: "The verified executor topology is not ready",
+      summary: "Connected capacity is visible, but fewer than two executors have completed the runtime and reciprocal-link evidence required to launch a distributed route.",
+      remedy: "Mycellios keeps the model unpublished while the connected desktops finish verification, then rebuilds the route automatically.",
+      steps: Object.freeze([
+        "Keep both contributing desktop clients online.",
+        "Wait for their runtime performance and reciprocal link probes to complete.",
+        ...ROUTE_REBUILD_STEPS,
+      ]),
+      automaticAction: "rebuild_route",
+      intrinsicallyRetryable: true,
+    };
+  }
   if (
     normalized.includes("distributed_worker_disconnected:")
     || normalized.includes("distributed_worker_not_connected:")

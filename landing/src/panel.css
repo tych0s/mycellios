@@ -7172,7 +7172,9 @@
   color: var(--text-tertiary);
   font-family: "SFMono-Regular", Consolas, monospace;
   font-size: 9px;
-  white-space: nowrap;
+  line-height: 1.45;
+  text-align: right;
+  white-space: pre-line;
 }
 
 .public-panel .model-activation-details {
