@@ -872,7 +872,7 @@ function scheduleWorkerStartRetry(): void {
   });
   workerStartRetryTimer = setTimeout(() => {
     workerStartRetryTimer = null;
-    void startWorkerIfEnabled().catch((error: unknown) => {
+    void startWorkerConnection().catch((error: unknown) => {
       runtimeError = errorText(error);
       writeDesktopLog("worker-start-retry-failed", { error: runtimeError });
       scheduleWorkerStartRetry();
