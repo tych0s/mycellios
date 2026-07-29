@@ -830,6 +830,13 @@ export async function createCoordinator(
   ): readonly ModelActivationProgressEvent[] => {
     const retry = automaticActivationRetryState.get(modelId);
     if (!retry) return [];
+    const incident = classifyActivationIncident({
+      message: retry.lastError,
+      retryCount: retry.retryCount,
+      retryLaunching: retry.launching,
+      nextRetryAt: retry.nextAttemptAt,
+      maximumAttempts: automaticActivationRetryDelaysMs.length,
+    });
     const retryNumber = retry.launching ? retry.retryCount : retry.retryCount + 1;
     const secondsRemaining = Math.max(0, Math.ceil((retry.nextAttemptAt - Date.now()) / 1_000));
     const waitMessage = secondsRemaining > 0
@@ -839,7 +846,7 @@ export async function createCoordinator(
       phase: retry.launching ? "retrying" : "retry_wait",
       message: retry.launching
         ? `Automatic retry ${retryNumber} of ${automaticActivationRetryDelaysMs.length} is starting.`
-        : `A node became unavailable during startup. ${waitMessage}`,
+        : `${incident.title}. ${waitMessage}`,
       at: new Date(retry.updatedAt).toISOString(),
       state: "running",
       details: [retry.lastError],
@@ -863,13 +870,20 @@ export async function createCoordinator(
   const activationStatusMessageForModel = (modelId: string): string | null => {
     const retry = automaticActivationRetryState.get(modelId);
     if (!retry) return null;
+    const incident = classifyActivationIncident({
+      message: retry.lastError,
+      retryCount: retry.retryCount,
+      retryLaunching: retry.launching,
+      nextRetryAt: retry.nextAttemptAt,
+      maximumAttempts: automaticActivationRetryDelaysMs.length,
+    });
     const retryNumber = retry.launching ? retry.retryCount : retry.retryCount + 1;
     if (retry.launching) {
       return `Automatic retry ${retryNumber} of ${automaticActivationRetryDelaysMs.length} is starting.`;
     }
     const secondsRemaining = Math.max(0, Math.ceil((retry.nextAttemptAt - Date.now()) / 1_000));
     return secondsRemaining > 0
-      ? `A node disconnected during startup. Automatic retry ${retryNumber} of ${automaticActivationRetryDelaysMs.length} starts in ${secondsRemaining}s.`
+      ? `${incident.title}. Automatic retry ${retryNumber} of ${automaticActivationRetryDelaysMs.length} starts in ${secondsRemaining}s.`
       : `Automatic retry ${retryNumber} of ${automaticActivationRetryDelaysMs.length} is ready and waiting for healthy capacity and a free activation slot.`;
   };
   const activationIncidentForModel = (
@@ -1140,6 +1154,7 @@ export async function createCoordinator(
       const stored = requests.find((request) => request.id === view.id)!;
       if (view.status === "active") {
         automaticActivationRetryState.delete(view.id);
+        if (stored.activationError) store.clearRequestedModelActivationError(view.id);
         const operation = deploymentController.activeOperationForModel(view.id);
         if (operation) {
           deploymentController.completeOperation(

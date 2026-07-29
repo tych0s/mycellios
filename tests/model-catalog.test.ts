@@ -174,12 +174,36 @@ describe("requested model capacity catalog", () => {
     expect(shouldQueueAutomaticActivation(oneRealExecutor)).toBe(false);
 
     const active = requestedModelCapacityViews({
-      requests: [{ ...request, activationRequestedAt: Date.now() }],
+      requests: [{
+        ...request,
+        activationRequestedAt: Date.now(),
+        activationError: "an older activation failed",
+      }],
       workers: [worker("a", 4_096, 0), worker("b", 4_096, 0)],
       connectedWorkerIds: new Set(["a", "b"]),
       activeModelIds: new Set([request.id]),
+      activationIncidentForModel: () => ({
+        schema: "mycellios-activation-incident/1",
+        code: "unknown",
+        scope: "model",
+        title: "Stale failure",
+        summary: "Stale failure",
+        remedy: "Stale failure",
+        steps: [],
+        retryable: false,
+        automatic: false,
+        repairState: "manual_required",
+        automaticAction: "none",
+        attempt: 0,
+        maximumAttempts: 5,
+        nextRetryAt: null,
+        nodeId: null,
+        stageId: null,
+        processExitCode: null,
+      }),
     })[0]!;
     expect(active.status).toBe("active");
+    expect(active.activationIncident).toBeNull();
   });
 
   it("fails closed instead of activating a profile from another adapter registry", () => {

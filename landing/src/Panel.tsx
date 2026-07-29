@@ -4119,28 +4119,9 @@ function AcceleratorCompactBanner({ acceleration, contributionState, computeMode
 }
 
 function ActivationProgressLog({ model }: { model: RequestedModelCapacity }) {
-  const rawEvents: RequestedModelCapacity["activationProgress"] = (model.activationProgress?.length ?? 0) > 0
-    ? model.activationProgress
-    : [{
-        phase: "queued",
-        message: model.status === "failed"
-          ? friendlyActivationFailure(model.message)
-          : "Waiting for the coordinator to begin activation.",
-        at: model.activationRequestedAt ?? model.updatedAt,
-        state: model.status === "failed" ? "failed" as const : "running" as const,
-        ...(model.status === "failed" ? { details: fallbackActivationDetails(model.message) } : {}),
-      }];
-  const events = useMemo(() => orderActivationProgressEvents(rawEvents), [rawEvents]);
+  const events = useMemo(() => activationProgressEventsForModel(model), [model]);
   const listRef = useRef<HTMLOListElement>(null);
-  let actionableIndex = -1;
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
-    if (event?.state === "running" || event?.state === "failed") {
-      actionableIndex = index;
-      break;
-    }
-  }
-  const currentIndex = actionableIndex >= 0 ? actionableIndex : Math.max(0, events.length - 1);
+  const currentIndex = Math.max(0, events.length - 1);
   const current = events[currentIndex] ?? events.at(-1)!;
   const nodeCount = new Set(events.flatMap((event) => event.nodeId ? [event.nodeId] : [])).size;
   const stageCount = activationStageCount(events);
@@ -4196,6 +4177,55 @@ export function orderActivationProgressEvents<T extends { at: string }>(events: 
     .map(({ event }) => event);
 }
 
+type ActivationProgressEvent = RequestedModelCapacity["activationProgress"][number];
+
+export function normalizeActivationProgressEvents(
+  events: readonly ActivationProgressEvent[],
+): ActivationProgressEvent[] {
+  const ordered = orderActivationProgressEvents(events);
+  const lastIndex = ordered.length - 1;
+  return ordered.map((event, index) =>
+    index < lastIndex && event.state === "running"
+      ? { ...event, state: "completed" }
+      : event
+  );
+}
+
+export function activationProgressEventsForModel(
+  model: Pick<
+    RequestedModelCapacity,
+    "activationProgress" | "activationRequestedAt" | "message" | "status" | "updatedAt"
+  >,
+): ActivationProgressEvent[] {
+  const ordered = normalizeActivationProgressEvents(model.activationProgress ?? []);
+  const latest = ordered.at(-1);
+  const fallbackAt = model.activationRequestedAt ?? model.updatedAt;
+  const failureAt = latest && Date.parse(fallbackAt) < Date.parse(latest.at)
+    ? latest.at
+    : fallbackAt;
+
+  if (model.status === "failed" && latest?.state !== "failed") {
+    return normalizeActivationProgressEvents([
+      ...ordered,
+      {
+        phase: "failed",
+        message: friendlyActivationFailure(model.message),
+        at: failureAt,
+        state: "failed",
+        details: fallbackActivationDetails(model.message),
+      },
+    ]);
+  }
+
+  if (ordered.length > 0) return ordered;
+  return [{
+    phase: "queued",
+    message: "Waiting for the coordinator to begin activation.",
+    at: fallbackAt,
+    state: "running",
+  }];
+}
+
 function activationStageCount(events: RequestedModelCapacity["activationProgress"]): number {
   let count = 0;
   for (const event of events) {
@@ -4216,11 +4246,19 @@ function activationDetailIsReadable(detail: string): boolean {
   return detail.length <= 180
     && !detail.includes("launch_process_exited:")
     && !detail.includes("managed_launch_agent_")
+    && !detail.includes("distributed_activation_")
     && !detail.includes("distributed_worker_disconnected:");
 }
 
 function friendlyActivationFailure(message: string): string {
-  if (message.includes("automatic_activation_retries_exhausted:")) {
+  const exhausted = /automatic_activation_retries_exhausted:(\d+):/i.exec(message);
+  if (exhausted && message.includes("distributed_activation_requires_two_connected_shard_executors")) {
+    return `Automatic activation paused after ${exhausted[1]} attempts because the two-PC execution route was still not verified. Keep both PCs online, then run activation again.`;
+  }
+  if (message.includes("distributed_activation_requires_two_connected_shard_executors")) {
+    return "Two verified shard executors are not ready yet. The model remains unpublished while Mycellios rebuilds the route.";
+  }
+  if (exhausted) {
     return "Automatic activation stopped after repeated temporary node disconnections. The model was not published.";
   }
   if (message.includes("3221225477")) {
@@ -4230,8 +4268,20 @@ function friendlyActivationFailure(message: string): string {
 }
 
 function fallbackActivationDetails(message: string): string[] {
-  const details: string[] = [];
   const exhaustedRetries = /automatic_activation_retries_exhausted:(\d+):/i.exec(message)?.[1];
+  if (message.includes("distributed_activation_requires_two_connected_shard_executors")) {
+    return exhaustedRetries
+      ? [
+          `Automatic retries attempted: ${exhaustedRetries}`,
+          "Connected capacity is visible, but fewer than two nodes completed the required runtime and reciprocal-link evidence.",
+          "Keep both PCs online, then run activation again.",
+        ]
+      : [
+          "Connected capacity is visible, but fewer than two nodes have completed the required runtime and reciprocal-link evidence.",
+          "Mycellios will retry after the verified executor topology changes.",
+        ];
+  }
+  const details: string[] = [];
   const stage = /(?:stage-|process=)([a-z0-9-]+)/i.exec(message)?.[1];
   const code = /code=(\d+)/i.exec(message)?.[1];
   if (exhaustedRetries) details.push(`Automatic retries attempted: ${exhaustedRetries}`);
@@ -4263,9 +4313,20 @@ function activationPhaseLabel(phase: string): string {
   } as Record<string, string>)[phase] ?? phase.replaceAll("_", " ");
 }
 
-function formatActivationTime(value: string): string {
+export function formatActivationTime(value: string): string {
   const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? "—" : date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  if (Number.isNaN(date.getTime())) return "—";
+  const day = date.toLocaleDateString([], {
+    month: "short",
+    day: "numeric",
+    ...(date.getFullYear() === new Date().getFullYear() ? {} : { year: "numeric" }),
+  });
+  const time = date.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+  return `${day}\n${time}`;
 }
 
 function newInferenceSessionId(): string {
