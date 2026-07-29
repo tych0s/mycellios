@@ -10519,58 +10519,98 @@
   }
 }
 
+@media (max-width: 1440px) {
+  .public-panel .panel-sidebar.open .panel-sidebar-close {
+    position: absolute;
+    top: 20px;
+    right: 16px;
+    width: 36px;
+    height: 36px;
+    display: grid;
+    place-items: center;
+    z-index: 2;
+    border: 1px solid var(--border-subtle);
+    border-radius: 11px;
+    color: var(--text-secondary);
+    background: rgba(255, 255, 255, 0.035);
+    cursor: pointer;
+  }
+
+  .public-panel .panel-sidebar.open .panel-sidebar-close:hover {
+    color: var(--text-primary);
+    border-color: var(--border-strong);
+    background: rgba(63, 124, 255, 0.1);
+  }
+
+  .public-panel .panel-menu-backdrop {
+    position: fixed;
+    inset: 0;
+    display: block;
+    z-index: 35;
+    border: 0;
+    background: rgba(1, 7, 18, 0.58);
+    backdrop-filter: blur(3px);
+    cursor: default;
+    animation: panel-menu-backdrop-enter 180ms ease-out;
+  }
+
+  .public-panel .panel-menu-button {
+    display: grid;
+  }
+}
+
 @media (max-width: 1440px) and (min-width: 921px) {
   .public-panel {
     grid-template-columns: 88px minmax(0, 1fr);
   }
 
-  .public-panel .panel-sidebar {
+  .public-panel .panel-sidebar:not(.open) {
     padding-inline: 12px;
   }
 
-  .public-panel .panel-brand {
+  .public-panel .panel-sidebar:not(.open) .panel-brand {
     justify-content: center;
     padding-inline: 0;
   }
 
-  .public-panel .panel-brand div,
-  .public-panel .panel-nav-label,
-  .public-panel .panel-sidebar nav button span,
-  .public-panel .panel-sidebar nav button b,
-  .public-panel .panel-sidebar-links,
-  .public-panel .panel-sidebar-status div {
+  .public-panel .panel-sidebar:not(.open) .panel-brand div,
+  .public-panel .panel-sidebar:not(.open) .panel-nav-label,
+  .public-panel .panel-sidebar:not(.open) nav button span,
+  .public-panel .panel-sidebar:not(.open) nav button b,
+  .public-panel .panel-sidebar:not(.open) .panel-sidebar-links,
+  .public-panel .panel-sidebar:not(.open) .panel-sidebar-status div {
     display: none;
   }
 
-  .public-panel .panel-sidebar nav button {
+  .public-panel .panel-sidebar:not(.open) nav button {
     justify-content: center;
     padding: 0;
   }
 
-  .public-panel .panel-mode-toggle {
+  .public-panel .panel-sidebar:not(.open) .panel-mode-toggle {
     min-height: 52px;
     grid-template-columns: 1fr;
     justify-items: center;
     padding: 0;
   }
 
-  .public-panel .panel-mode-toggle > span,
-  .public-panel .panel-mode-toggle > i {
+  .public-panel .panel-sidebar:not(.open) .panel-mode-toggle > span,
+  .public-panel .panel-sidebar:not(.open) .panel-mode-toggle > i {
     display: none;
   }
 
-  .public-panel .panel-sidebar-status {
+  .public-panel .panel-sidebar:not(.open) .panel-sidebar-status {
     display: grid;
     place-items: center;
     grid-template-columns: 1fr;
     padding: 15px 0;
   }
 
-  .public-panel .panel-sidebar-status > i {
+  .public-panel .panel-sidebar:not(.open) .panel-sidebar-status > i {
     margin: 0;
   }
 
-  .public-panel .panel-sidebar-version {
+  .public-panel .panel-sidebar:not(.open) .panel-sidebar-version {
     display: grid;
     justify-content: center;
     gap: 6px;
@@ -10578,16 +10618,26 @@
     text-align: center;
   }
 
-  .public-panel .panel-sidebar-version > span {
+  .public-panel .panel-sidebar:not(.open) .panel-sidebar-version > span {
     gap: 1px;
   }
 
-  .public-panel .panel-sidebar-version small {
+  .public-panel .panel-sidebar:not(.open) .panel-sidebar-version small {
     font-size: 7px;
   }
 
-  .public-panel .panel-sidebar-version strong {
+  .public-panel .panel-sidebar:not(.open) .panel-sidebar-version strong {
     font-size: 8px;
+  }
+
+  .public-panel .panel-sidebar.open {
+    position: fixed;
+    inset: 0 auto 0 0;
+    width: 288px;
+    padding: 28px 20px 20px;
+    overflow-y: auto;
+    box-shadow: 28px 0 80px rgba(0, 5, 18, 0.58);
+    animation: panel-compact-sidebar-enter 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
   }
 
   .public-panel .panel-stat-grid {
@@ -10621,6 +10671,22 @@
   }
 }
 
+@keyframes panel-compact-sidebar-enter {
+  from {
+    opacity: 0.72;
+    transform: translateX(-14px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes panel-menu-backdrop-enter {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
 @media (max-width: 920px) {
   .public-panel {
     grid-template-columns: minmax(0, 1fr);
@@ -10641,43 +10707,6 @@
 
   .public-panel .panel-sidebar.open {
     transform: translateX(0);
-  }
-
-  .public-panel .panel-sidebar-close {
-    position: absolute;
-    top: 20px;
-    right: 16px;
-    width: 36px;
-    height: 36px;
-    display: grid;
-    place-items: center;
-    z-index: 2;
-    border: 1px solid var(--border-subtle);
-    border-radius: 11px;
-    color: var(--text-secondary);
-    background: rgba(255, 255, 255, 0.035);
-    cursor: pointer;
-  }
-
-  .public-panel .panel-sidebar-close:hover {
-    color: var(--text-primary);
-    border-color: var(--border-strong);
-    background: rgba(63, 124, 255, 0.1);
-  }
-
-  .public-panel .panel-menu-backdrop {
-    position: fixed;
-    inset: 0;
-    display: block;
-    z-index: 35;
-    border: 0;
-    background: rgba(1, 7, 18, 0.58);
-    backdrop-filter: blur(3px);
-    cursor: default;
-  }
-
-  .public-panel .panel-menu-button {
-    display: grid;
   }
 
   .public-panel .panel-topbar {

@@ -329,6 +329,8 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   const coordinatorError = issue?.source === "coordinator" ? issue.message : null;
   const error = issue?.message ?? null;
   const [menuOpen, setMenuOpen] = useState(false);
+  const menuButtonRef = useRef<HTMLButtonElement>(null);
+  const sidebarCloseButtonRef = useRef<HTMLButtonElement>(null);
   const [contentScale, setContentScale] = useState(() => {
     const saved = Number(window.localStorage.getItem("mycellios.content-scale"));
     return Number.isFinite(saved) && saved >= 0.9 && saved <= 1.3 ? saved : 1;
@@ -384,6 +386,28 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     const timer = window.setInterval(() => void refresh(), 2_000);
     return () => window.clearInterval(timer);
   }, [refresh]);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+
+    const focusFrame = window.requestAnimationFrame(() => sidebarCloseButtonRef.current?.focus());
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setMenuOpen(false);
+      menuButtonRef.current?.focus();
+    };
+    const closeBeyondCompactLayout = () => {
+      if (!window.matchMedia("(max-width: 1440px)").matches) setMenuOpen(false);
+    };
+
+    window.addEventListener("keydown", closeOnEscape);
+    window.addEventListener("resize", closeBeyondCompactLayout);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      window.removeEventListener("keydown", closeOnEscape);
+      window.removeEventListener("resize", closeBeyondCompactLayout);
+    };
+  }, [menuOpen]);
 
   useEffect(() => {
     if (desktop) return;
@@ -446,6 +470,11 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
       window.history.replaceState({}, "", `${path}${query}`);
       applySeoMetadata(path);
     }
+  }
+
+  function closeNavigation() {
+    setMenuOpen(false);
+    window.requestAnimationFrame(() => menuButtonRef.current?.focus());
   }
 
   /**
@@ -687,8 +716,8 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
           transformOrigin: "top left",
         } as CSSProperties}
       >
-      <aside className={menuOpen ? "panel-sidebar open" : "panel-sidebar"}>
-        <button className="panel-sidebar-close" aria-label="Close navigation" onClick={() => setMenuOpen(false)}><X size={18} /></button>
+      <aside id="panel-navigation" className={menuOpen ? "panel-sidebar open" : "panel-sidebar"} aria-label="Primary navigation">
+        <button ref={sidebarCloseButtonRef} className="panel-sidebar-close" aria-label="Close navigation" onClick={closeNavigation}><X size={18} /></button>
         <a className="panel-brand" href={publicLink("/")} {...externalProps}><img src={brandIcon} alt="" /><div><strong>mycellios</strong><span>network control</span></div></a>
         <nav>
           <span className="panel-nav-label">{panelMode === "developer" ? "DEVELOPER TOOLS" : "MYCELLIOS"}</span>
@@ -726,13 +755,15 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
           <span><small>API</small><strong>{snapshot.version}</strong></span>
         </div>
       </aside>
-      {menuOpen && <button className="panel-menu-backdrop" aria-label="Close navigation overlay" onClick={() => setMenuOpen(false)} />}
+      {menuOpen && <button className="panel-menu-backdrop" aria-label="Close navigation overlay" onClick={closeNavigation} />}
 
       <div className="panel-main">
         <header className="panel-topbar">
           <button
+            ref={menuButtonRef}
             className="panel-menu-button"
-            aria-label="Open menu"
+            aria-label={menuOpen ? "Close navigation" : "Show navigation labels"}
+            aria-controls="panel-navigation"
             aria-expanded={menuOpen}
             onClick={() => setMenuOpen((current) => !current)}
           ><Menu /></button>
