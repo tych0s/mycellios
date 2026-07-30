@@ -39,6 +39,7 @@ export function configureCoordinatorModelProfileRuntime(
           paths.join(localRuntimeRoot, "Scripts", "python.exe"),
         ]
       : [
+          "/usr/local/bin/python",
           "/opt/python/bin/python",
           paths.join(localRuntimeRoot, "bin", "python"),
           paths.join(localRuntimeRoot, "bin", "python3"),
