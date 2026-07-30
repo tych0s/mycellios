@@ -40,7 +40,11 @@ from .engine import (
     balanced_boundaries,
     parse_boundaries,
 )
-from .model import load_tokenizer, resolve_model_snapshot
+from .model import (
+    load_tokenizer,
+    resolve_model_metadata_snapshot,
+    resolve_model_snapshot,
+)
 from .native_gguf import verify_native_gguf_stage
 from .native_gguf_runtime import (
     add_native_gguf_arguments,
@@ -74,6 +78,38 @@ DEFAULT_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
 PENDING_PER_ACTIVE_SLOT = 4
 OUTPUT_TOKEN_HASH_SCHEME = "gdlp-output-token-ids-v1"
 OUTPUT_TOKEN_DIGEST_DOMAIN = OUTPUT_TOKEN_HASH_SCHEME.encode("ascii") + b"\0"
+
+
+def resolve_execution_tokenizer_snapshot(
+    execution_snapshot: str,
+    stage_package_identity: str | None,
+) -> str:
+    """Resolve tokenizer metadata outside a range-local stage package.
+
+    A sealed SafeTensors stage contains only config, its assigned weights and
+    the adapter registry.  The root process still needs the model tokenizer,
+    so its authenticated package manifest supplies the immutable Hub
+    coordinates used to resolve the small metadata snapshot.
+    """
+
+    if stage_package_identity is None:
+        return execution_snapshot
+    if (
+        not stage_package_identity.startswith("sha256:")
+        or len(stage_package_identity) != 71
+    ):
+        raise ValueError("stage package identity is not a SHA-256 identity")
+    from .stage_artifact import verify_stage_artifact
+
+    verified = verify_stage_artifact(
+        execution_snapshot,
+        expected_package_id=stage_package_identity.removeprefix("sha256:"),
+    )
+    model = verified.manifest.to_document()["model"]
+    return resolve_model_metadata_snapshot(
+        str(model["source"]),
+        None if model["revision"] is None else str(model["revision"]),
+    )
 
 
 def tree_draft_provider_from_args(
@@ -1426,6 +1462,7 @@ def build_server(args: argparse.Namespace) -> DistributedMycelliosServer:
             local_files_only=True,
             trust_remote_code=False,
         )
+        tokenizer_snapshot = snapshot
     elif ram_backed_moe is not None:
         snapshot = str(Path(args.model).expanduser().resolve())
         model_config = AutoConfig.from_pretrained(
@@ -1433,16 +1470,21 @@ def build_server(args: argparse.Namespace) -> DistributedMycelliosServer:
             local_files_only=True,
             trust_remote_code=False,
         )
+        tokenizer_snapshot = snapshot
     else:
         snapshot = resolve_model_snapshot(args.model, args.revision)
         model_config = AutoConfig.from_pretrained(snapshot)
+        tokenizer_snapshot = resolve_execution_tokenizer_snapshot(
+            snapshot,
+            args.stage_package_identity,
+        )
     total_layers = int(model_config.num_hidden_layers)
     boundaries = (
         parse_boundaries(args.boundaries, total_layers)
         if args.boundaries
         else balanced_boundaries(total_layers, args.stages)
     )
-    tokenizer = load_tokenizer(snapshot)
+    tokenizer = load_tokenizer(tokenizer_snapshot)
     if native_package is not None:
         verify_native_gguf_stage(
             native_package.root,
