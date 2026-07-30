@@ -103,7 +103,12 @@ interface RuntimeStreamSession {
   transportMode: "negotiating" | "direct" | "relay";
   direct: {
     grant: DirectSessionGrant;
-    state: "offered" | "ready" | "established" | "committed";
+    state:
+      | "offered"
+      | "ready"
+      | "established"
+      | "destination-committing"
+      | "committed";
     timeout: NodeJS.Timeout;
     connectRttMs: number | null;
   } | null;
@@ -1245,7 +1250,9 @@ export class WorkerHub extends EventEmitter<HubEvents> {
       const targetPort = payload.targetPort as number;
       const directSupported =
         sourceExecutor?.directTransport?.protocol === "mycellios-direct/1"
+        && sourceExecutor.directTransport.commitAck === "destination-v1"
         && destinationExecutor?.directTransport?.protocol === "mycellios-direct/1"
+        && destinationExecutor.directTransport.commitAck === "destination-v1"
         && destinationExecutor.directTransport.candidates.length > 0;
       const session: RuntimeStreamSession = {
         streamId,
@@ -1485,20 +1492,39 @@ export class WorkerHub extends EventEmitter<HubEvents> {
       direct.state = "established";
       direct.connectRttMs = payload.connectRttMs;
       clearTimeout(direct.timeout);
-      // Commit the destination first. The source remains paused until both
-      // authenticated peers have received coordinator authority.
-      const destinationCommitted = this.send(
+      // WebSocket delivery across two peers is not ordered. Release only the
+      // destination now and wait for its explicit acknowledgement before the
+      // source can emit the first application byte.
+      const destinationCommitSent = this.send(
         session.destinationWorkerId,
         "runtime.direct.commit",
         { streamId, connectionId },
       );
-      const sourceCommitted = destinationCommitted && session.sourceWorkerId
+      if (!destinationCommitSent) {
+        this.terminateRuntimeStream(session, "direct_commit_delivery_failed");
+        return;
+      }
+      direct.state = "destination-committing";
+      direct.timeout = setTimeout(() => {
+        this.terminateRuntimeStream(session, "direct_destination_commit_ack_timeout");
+      }, DIRECT_NEGOTIATION_TIMEOUT_MS);
+      direct.timeout.unref();
+      return;
+    }
+
+    if (envelope.type === "runtime.direct.committed") {
+      if (!fromDestination || direct.state !== "destination-committing") {
+        this.terminateRuntimeStream(session, "direct_commit_ack_identity_is_invalid");
+        return;
+      }
+      clearTimeout(direct.timeout);
+      const sourceCommitted = session.sourceWorkerId
         ? this.send(session.sourceWorkerId, "runtime.direct.commit", {
             streamId,
             connectionId,
           })
         : false;
-      if (!destinationCommitted || !sourceCommitted) {
+      if (!sourceCommitted) {
         this.terminateRuntimeStream(session, "direct_commit_delivery_failed");
         return;
       }

@@ -438,6 +438,14 @@ export const runtimeDirectEstablishedEnvelopeSchema = envelopeSchema(
   }).strict(),
 );
 
+export const runtimeDirectCommittedEnvelopeSchema = envelopeSchema(
+  "runtime.direct.committed",
+  z.object({
+    streamId: runtimeStreamIdSchema,
+    connectionId: runtimeStreamIdSchema,
+  }).strict(),
+);
+
 export const runtimeDirectClosedEnvelopeSchema = envelopeSchema(
   "runtime.direct.closed",
   z.object({
@@ -515,6 +523,7 @@ export const workerEnvelopeSchema = z.discriminatedUnion("type", [
   runtimeDirectReadyEnvelopeSchema,
   runtimeDirectFallbackEnvelopeSchema,
   runtimeDirectEstablishedEnvelopeSchema,
+  runtimeDirectCommittedEnvelopeSchema,
   runtimeDirectClosedEnvelopeSchema,
   runtimeDirectTelemetryEnvelopeSchema,
   runtimeLinkProbePingEnvelopeSchema,

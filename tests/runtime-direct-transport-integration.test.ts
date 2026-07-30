@@ -41,6 +41,27 @@ describe("coordinator-negotiated native direct runtime transport", () => {
     expect(fixture.sent.some((message) => message.type === "runtime.stream.data")).toBe(false);
   });
 
+  it("waits for the destination commit acknowledgement before releasing the source", async () => {
+    const fixture = await createFixture({ delayDestinationCommitMs: 40 });
+    const client = await fixture.openClient();
+    const response = readOnce(client);
+    client.write(Buffer.from("ordered-commit"));
+    expect((await response).toString()).toBe("ordered-commit");
+
+    const destinationCommit = fixture.sent.findIndex((message) =>
+      message.workerId === "worker-stage" && message.type === "runtime.direct.commit"
+    );
+    const destinationAcknowledgement = fixture.sent.findIndex((message) =>
+      message.workerId === "worker-stage" && message.type === "runtime.direct.committed"
+    );
+    const sourceCommit = fixture.sent.findIndex((message) =>
+      message.workerId === "worker-root" && message.type === "runtime.direct.commit"
+    );
+    expect(destinationCommit).toBeGreaterThanOrEqual(0);
+    expect(destinationAcknowledgement).toBeGreaterThan(destinationCommit);
+    expect(sourceCommit).toBeGreaterThan(destinationAcknowledgement);
+  });
+
   it("falls back to offset-ACK relay when every advertised candidate is unreachable", async () => {
     const fixture = await createFixture({ advertiseUnreachableCandidate: true });
     const client = await fixture.openClient();
@@ -53,6 +74,16 @@ describe("coordinator-negotiated native direct runtime transport", () => {
       )
     );
     expect(fixture.sent.some((message) => message.type === "runtime.direct.fallback")).toBe(true);
+    expect(fixture.sent.some((message) => message.type === "runtime.stream.data")).toBe(true);
+  });
+
+  it("keeps legacy direct peers on the race-free relay path", async () => {
+    const fixture = await createFixture({ legacyDestinationCommit: true });
+    const client = await fixture.openClient();
+    const response = readOnce(client);
+    client.write(Buffer.from("legacy-relay"));
+    expect((await response).toString()).toBe("legacy-relay");
+    expect(fixture.sent.some((message) => message.type === "runtime.direct.offer")).toBe(false);
     expect(fixture.sent.some((message) => message.type === "runtime.stream.data")).toBe(true);
   });
 
@@ -111,6 +142,8 @@ async function createFixture(
   options: {
     advertiseUnreachableCandidate?: boolean;
     prependUnreachableCandidate?: boolean;
+    delayDestinationCommitMs?: number;
+    legacyDestinationCommit?: boolean;
   } = {},
 ) {
   const echo = createServer((socket) => socket.pipe(socket));
@@ -184,7 +217,12 @@ async function createFixture(
     port: await unusedPort(),
     scope: "configured" as const,
   };
-  const advertisedRight = options.advertiseUnreachableCandidate
+  const advertisedRight = options.legacyDestinationCommit
+    ? (() => {
+        const { commitAck: _commitAck, ...legacy } = rightDirect;
+        return legacy as typeof rightDirect;
+      })()
+    : options.advertiseUnreachableCandidate
     ? { ...rightDirect, candidates: [deadCandidate] }
     : options.prependUnreachableCandidate
       ? { ...rightDirect, candidates: [deadCandidate, ...rightDirect.candidates] }
@@ -202,9 +240,18 @@ async function createFixture(
   vi.spyOn(hub, "send").mockImplementation((workerId, type, payload) => {
     sent.push({ workerId, type, payload: payload as Record<string, unknown> });
     const tunnel = workerId === "worker-root" ? left : right;
-    queueMicrotask(() => {
+    const deliver = () => {
       void tunnel.handle({ type, payload } as RuntimeStreamServerMessage);
-    });
+    };
+    if (
+      workerId === "worker-stage"
+      && type === "runtime.direct.commit"
+      && options.delayDestinationCommitMs
+    ) {
+      setTimeout(deliver, options.delayDestinationCommitMs);
+    } else {
+      queueMicrotask(deliver);
+    }
     return true;
   });
   const root = description.launchOrder.find((process) => process.kind === "root-engine")!;
