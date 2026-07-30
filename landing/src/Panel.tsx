@@ -85,13 +85,6 @@ import type {
 import { consumeChatCompletionStreamWithRecovery } from "../../src/desktop/chat-stream";
 import type { ChatMessage, NetworkExecutionTrace } from "../../src/contracts/types";
 import type { NativeBuildIdentity } from "../../src/contracts/build-identity";
-import type {
-  FederatedNetwork,
-  FederatedNode,
-  FederationSettings,
-  FederationSnapshot,
-  ManagedRental,
-} from "../../src/contracts/federation";
 import type { BenchmarkMeasurement, BenchmarkRun } from "../../src/benchlab/types";
 import { Contribute } from "./Contribute";
 import { SupportAssistant } from "./SupportAssistant";
@@ -134,7 +127,7 @@ const PUBLIC_COORDINATOR_URL = "https://www.mycellios.com";
 import "./panel-downloads.css";
 import "./panel-desktop.css";
 
-type PanelView = "overview" | "history" | "nodes" | "networks" | "models" | "jobs" | "tests" | "logs" | "inference" | "contribute" | "join" | "downloads" | "machine" | "settings" | "admin";
+type PanelView = "overview" | "history" | "nodes" | "models" | "jobs" | "tests" | "logs" | "inference" | "contribute" | "join" | "downloads" | "machine" | "settings" | "admin";
 type PanelMode = "simple" | "developer";
 
 interface PanelProps {
@@ -222,10 +215,7 @@ interface PublicSnapshot {
     completedJobs: number;
   };
   workers: PublicWorker[];
-  federation: FederationSnapshot;
-  federatedNetworks: FederatedNetwork[];
-  federatedNodes: FederatedNode[];
-  models: Array<{ id: string; replicas: number; pipelines: number; federatedRoutes?: number }>;
+  models: Array<{ id: string; replicas: number; pipelines: number }>;
   requestedModels: RequestedModelCapacity[];
   jobs: PublicJob[];
 }
@@ -262,18 +252,6 @@ const EMPTY: PublicSnapshot = {
   buildIdentity: null,
   summary: { registered: 0, connected: 0, online: 0, mobile: 0, offeredVramMb: 0, completedJobs: 0 },
   workers: [],
-  federation: {
-    enabled: false,
-    notice: "Community and external nodes may process inference content.",
-    readyNetworks: 0,
-    routableNodes: 0,
-    verifiedModels: 0,
-    spentTodayUsd: 0,
-    spentMonthUsd: 0,
-    externalRequestsAllowed: true,
-  },
-  federatedNetworks: [],
-  federatedNodes: [],
   models: [],
   requestedModels: [],
   jobs: [],
@@ -283,7 +261,6 @@ const sharedNavItems: Array<{ id: PanelView; label: string; icon: typeof Network
   { id: "overview", label: "Overview", icon: LayoutDashboard },
   { id: "history", label: "Histórico", icon: History },
   { id: "nodes", label: "Nodes", icon: Server },
-  { id: "networks", label: "Networks", icon: Globe2 },
   { id: "jobs", label: "Tasks", icon: Activity },
   { id: "tests", label: "Tests", icon: Gauge },
   { id: "logs", label: "Logs", icon: ScrollText },
@@ -295,7 +272,7 @@ const sharedNavItems: Array<{ id: PanelView; label: string; icon: typeof Network
 ];
 
 const simplePanelViews = new Set<PanelView>(["overview", "history", "inference", "contribute", "downloads", "machine", "settings"]);
-const developerPanelViews = new Set<PanelView>(["nodes", "networks", "jobs", "tests", "logs", "models"]);
+const developerPanelViews = new Set<PanelView>(["nodes", "jobs", "tests", "logs", "models"]);
 
 function initialPanelMode(): PanelMode {
   const requested = new URLSearchParams(window.location.search).get("view") as PanelView | null;
@@ -382,10 +359,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     : (!localBrowser || localProductionProxy) && !canManageModels;
   const applyDesktopSnapshot = useCallback((next: DashboardSnapshot) => {
     setDesktopSnapshot(next);
-    setSnapshot((current) => desktopToPublicSnapshot(
-      next,
-      next.settings.coordinatorMode === "remote" ? current : undefined,
-    ));
+    setSnapshot(desktopToPublicSnapshot(next));
     setIssue(panelIssueForErrors(next.connectionError, next.runtimeError));
   }, []);
 
@@ -394,12 +368,6 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
       if (desktopBridge) {
         const next = await desktopBridge.getSnapshot();
         applyDesktopSnapshot(next);
-        if (next.settings.coordinatorMode === "remote") {
-          const coordinatorOrigin = (next.coordinatorUrl || PUBLIC_COORDINATOR_URL).replace(/\/$/, "");
-          const response = await fetch(`${coordinatorOrigin}/public/v1/snapshot`, { cache: "no-store" });
-          if (!response.ok) throw new Error(`HTTP ${response.status}`);
-          setSnapshot(await response.json() as PublicSnapshot);
-        }
         return;
       }
       const response = await fetch("/public/v1/snapshot", { cache: "no-store" });
@@ -758,7 +726,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
           <span className="panel-nav-label">{panelMode === "developer" ? "DEVELOPER TOOLS" : "MYCELLIOS"}</span>
           {navItems.map(({ id, label, icon: Icon }) => (
             <button key={id} className={view === id ? "active" : ""} title={label} aria-label={label} onClick={() => navigate(id)}>
-              <Icon size={18} /><span>{label}</span>{id === "nodes" && <b>{snapshot.summary.connected + snapshot.federatedNodes.length}</b>}
+              <Icon size={18} /><span>{label}</span>{id === "nodes" && <b>{snapshot.summary.connected}</b>}
             </button>
           ))}
         </nav>
@@ -844,18 +812,6 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
               {view === "overview" && <Overview snapshot={snapshot} onNavigate={navigate} publicLink={publicLink} external={desktop} apiBaseUrl={apiBaseUrl} joinUrl={desktop ? publicLink("/join") : `${window.location.origin}/join`} localAcceleration={desktopSnapshot?.acceleration} localContributionState={desktopSnapshot?.contribution.state} localComputeMode={desktopSnapshot?.settings.computeMode} developerMode={panelMode === "developer"} />}
               {view === "history" && <NetworkHistory endpoint={desktop ? `${publicOrigin}/public/v1/history` : "/public/v1/history"} />}
               {view === "nodes" && <Nodes snapshot={snapshot} onRemove={removeWorker} onClearOffline={clearOfflineWorkers} onListCredentials={listWorkerCredentials} onRevokeCredential={revokeWorkerCredential} />}
-              {view === "networks" && <Networks
-                apiOrigin={desktop ? publicOrigin : ""}
-                adminToken={modelAdminToken}
-                authSession={authSession}
-                snapshot={snapshot}
-                onSnapshotRefresh={refresh}
-                onAdminTokenChange={(token) => {
-                  setModelAdminToken(token);
-                  if (token) window.sessionStorage.setItem("mycellios-model-admin-token", token);
-                  else window.sessionStorage.removeItem("mycellios-model-admin-token");
-                }}
-              />}
               {view === "models" && <Models snapshot={snapshot} onSearch={searchHubModels} onRequest={requestModel} onRemove={removeRequestedModel} adminToken={modelAdminToken} requiresAdminToken={requiresModelAdminToken} secureTokenStorage={desktop} />}
               {view === "jobs" && <Jobs snapshot={snapshot} />}
               {view === "tests" && <Tests bridge={desktopBridge} />}
@@ -2019,7 +1975,6 @@ function Overview({ snapshot, onNavigate, publicLink, external, apiBaseUrl, join
         </div>
       </aside>
       <LiveNetworkTelemetry snapshot={snapshot} />
-      {snapshot.federation.readyNetworks > 0 && <aside className="federated-capacity-note"><Globe2 /><span><strong>Federated capacity available</strong><small>{snapshot.federation.routableNodes} routable node{snapshot.federation.routableNodes === 1 ? "" : "s"} · {snapshot.federation.verifiedModels} model{snapshot.federation.verifiedModels === 1 ? "" : "s"} verified by real generation</small></span><em>Federated</em></aside>}
       {localAcceleration && shouldShowAccelerationBanner(localAcceleration) && <AcceleratorCompactBanner acceleration={localAcceleration} contributionState={localContributionState} computeMode={localComputeMode} onOpen={() => onNavigate("machine")} />}
       <DashboardConnect
         apiBaseUrl={apiBaseUrl}
@@ -2054,7 +2009,6 @@ function Overview({ snapshot, onNavigate, publicLink, external, apiBaseUrl, join
       <div className="overview-grid overview-grid-interactive">
         <InteractiveMesh
           workers={active}
-          federatedNodes={snapshot.federatedNodes}
           registeredWorkers={snapshot.summary.registered}
           sharedVramMb={activeOfferedVramMb}
           publicLink={publicLink}
@@ -2233,7 +2187,6 @@ interface NetworkCatalogEntry {
   state: "active" | "queued";
   replicas: number;
   pipelines: number;
-  federatedRoutes: number;
   request: RequestedModelCapacity | null;
 }
 
@@ -2250,7 +2203,6 @@ function NetworkModelCatalog({ snapshot, developerMode, onNavigate }: {
       state: "active" as const,
       replicas: model.replicas,
       pipelines: model.pipelines,
-      federatedRoutes: model.federatedRoutes ?? 0,
       request: snapshot.requestedModels.find((request) => request.id === model.id) ?? null,
     }));
     const activeIds = new Set(active.map((model) => model.id.toLowerCase()));
@@ -2261,7 +2213,6 @@ function NetworkModelCatalog({ snapshot, developerMode, onNavigate }: {
         state: "queued" as const,
         replicas: 0,
         pipelines: 0,
-        federatedRoutes: 0,
         request,
       }));
     return [...active, ...queued];
@@ -2289,9 +2240,9 @@ function NetworkModelCatalog({ snapshot, developerMode, onNavigate }: {
           <tbody>{entries.map((entry) => {
             const telemetry = networkModelTelemetry(snapshot, entry.id);
             return <tr key={entry.id} className={selectedModelId === entry.id ? "selected" : ""}>
-              <td><button type="button" className="network-model-name" onClick={() => setSelectedModelId(entry.id)}><i><Boxes /></i><span><strong>{entry.id}{entry.federatedRoutes > 0 && <em className="federated-model-badge">Federated</em>}</strong><small>{telemetry.federatedNodes.length > 0 ? `${networkModelRuntimeLabel(telemetry.deployments)} · federated` : networkModelRuntimeLabel(telemetry.deployments)}</small></span></button></td>
+              <td><button type="button" className="network-model-name" onClick={() => setSelectedModelId(entry.id)}><i><Boxes /></i><span><strong>{entry.id}</strong><small>{networkModelRuntimeLabel(telemetry.deployments)}</small></span></button></td>
               <td><span className={`network-model-state ${entry.state}`}>{entry.state === "active" ? "Active" : modelRequestStatusLabel(entry.request?.status)}</span></td>
-              <td><strong>{telemetry.peers.length + telemetry.federatedNodes.length} node{telemetry.peers.length + telemetry.federatedNodes.length === 1 ? "" : "s"}</strong><small>{entry.replicas} replicas · {entry.pipelines} pipelines · {entry.federatedRoutes} federated</small></td>
+              <td><strong>{telemetry.peers.length} node{telemetry.peers.length === 1 ? "" : "s"}</strong><small>{entry.replicas} replicas · {entry.pipelines} pipelines</small></td>
               <td>{telemetry.peerMemoryMb > 0 ? formatMemory(telemetry.peerMemoryMb) : "Not reported"}</td>
               <td>{telemetry.measuredThroughput > 0 ? `${formatCompactNumber(telemetry.measuredThroughput)} tok/s` : "Not measured"}</td>
               <td>{telemetry.processedTokens > 0 ? formatCompactTokens(telemetry.processedTokens) : "No activity"}</td>
@@ -2329,7 +2280,7 @@ function NetworkModelDrawer({ entry, snapshot, titleId, onClose }: {
       </header>
       <div className="model-detail-badges"><span className={entry.state}><i />{entry.state === "active" ? "Active now" : modelRequestStatusLabel(entry.request?.status)}</span><span className={`execution ${execution.deviceType}`}><Cpu />{executionShortLabel(execution)}</span></div>
       <section className="model-detail-metrics" aria-label="Model telemetry">
-        <ModelDetailMetric icon={Network} label="Availability" value={`${telemetry.peers.length + telemetry.federatedNodes.length} node${telemetry.peers.length + telemetry.federatedNodes.length === 1 ? "" : "s"}`} />
+        <ModelDetailMetric icon={Network} label="Availability" value={`${telemetry.peers.length} node${telemetry.peers.length === 1 ? "" : "s"}`} />
         <ModelDetailMetric icon={MemoryStick} label="Peer memory" value={telemetry.peerMemoryMb > 0 ? formatMemory(telemetry.peerMemoryMb) : "Not reported"} />
         <ModelDetailMetric icon={Coins} label="Processed tokens" value={telemetry.processedTokens > 0 ? formatCompactTokens(telemetry.processedTokens) : "No activity"} />
         <ModelDetailMetric icon={Gauge} label="Measured speed" value={telemetry.measuredThroughput > 0 ? `${formatCompactNumber(telemetry.measuredThroughput)} tok/s` : "Not measured"} />
@@ -2375,13 +2326,10 @@ function networkModelTelemetry(snapshot: PublicSnapshot, modelId: string) {
   });
   const deployments = peers.flatMap((peer) => peer.deployments);
   const jobs = snapshot.jobs.filter((job) => job.model.toLowerCase() === normalizedModelId);
-  const federatedNodes = snapshot.federatedNodes.filter((node) =>
-    node.routable && node.models.some((model) => model.toLowerCase() === normalizedModelId));
   return {
     peers,
     deployments,
     jobs,
-    federatedNodes,
     peerMemoryMb: peers.reduce((total, peer) => total + peer.worker.offeredVramMb, 0),
     measuredThroughput: deployments.filter(isMeasuredDeployment).reduce((total, deployment) => total + deployment.tokensPerSecond, 0),
     processedTokens: jobs.reduce((total, job) => total + job.inputTokens + job.outputTokens, 0),
@@ -2420,9 +2368,8 @@ const MESH_AMBIENT_SPORES = [
   { x: 94, y: 28 }, { x: 7, y: 77 },
 ] as const;
 
-function InteractiveMesh({ workers, federatedNodes, registeredWorkers, sharedVramMb, publicLink, external, developerMode, onNavigate }: {
+function InteractiveMesh({ workers, registeredWorkers, sharedVramMb, publicLink, external, developerMode, onNavigate }: {
   workers: PublicWorker[];
-  federatedNodes: FederatedNode[];
   registeredWorkers: number;
   sharedVramMb: number;
   publicLink: (path: string) => string;
@@ -2436,9 +2383,6 @@ function InteractiveMesh({ workers, federatedNodes, registeredWorkers, sharedVra
   const cardRef = useRef<HTMLElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const visibleWorkers = workers.slice(0, MESH_OVERVIEW_POSITIONS.length);
-  const visibleFederatedNodes = federatedNodes
-    .filter((node) => node.routable)
-    .slice(0, Math.max(0, MESH_OVERVIEW_POSITIONS.length - visibleWorkers.length));
   const selectedWorker = visibleWorkers.find((worker) => worker.id === selectedWorkerId) ?? null;
   const selectedWorkerIndex = selectedWorker ? visibleWorkers.findIndex((worker) => worker.id === selectedWorker.id) : -1;
   const selectedWorkerPosition = selectedWorkerIndex >= 0 ? MESH_OVERVIEW_POSITIONS[selectedWorkerIndex] ?? { x: 50, y: 50 } : null;
@@ -2446,17 +2390,10 @@ function InteractiveMesh({ workers, federatedNodes, registeredWorkers, sharedVra
   const selectedSharePercent = selectedWorker && visibleOfferedVramMb > 0 ? selectedWorker.offeredVramMb / visibleOfferedVramMb * 100 : 0;
   const links = visibleWorkers.map((worker, index) => {
     const target = MESH_OVERVIEW_POSITIONS[index] ?? { x: 50, y: 50 };
-    if (index < 2) return { nodeId: worker.id, target, source: { x: 50, y: 50 } };
+    if (index < 2) return { worker, target, source: { x: 50, y: 50 } };
     const parentIndex = Math.floor((index - 2) / 2);
-    return { nodeId: worker.id, target, source: MESH_OVERVIEW_POSITIONS[parentIndex] ?? { x: 50, y: 50 } };
-  }).concat(visibleFederatedNodes.map((node, federatedIndex) => {
-    const index = visibleWorkers.length + federatedIndex;
-    return {
-      nodeId: node.id,
-      target: MESH_OVERVIEW_POSITIONS[index] ?? { x: 50, y: 50 },
-      source: { x: 50, y: 50 },
-    };
-  }));
+    return { worker, target, source: MESH_OVERVIEW_POSITIONS[parentIndex] ?? { x: 50, y: 50 } };
+  });
 
   useEffect(() => {
     const updateFullscreen = () => setFullscreen(document.fullscreenElement === cardRef.current);
@@ -2526,9 +2463,9 @@ function InteractiveMesh({ workers, federatedNodes, registeredWorkers, sharedVra
                 <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
               </filter>
             </defs>
-            {links.map(({ nodeId, source, target }, index) => {
+            {links.map(({ worker, source, target }, index) => {
               const path = `M ${source.x} ${source.y} L ${target.x} ${target.y}`;
-              return <g key={nodeId} className={selectedWorkerId === nodeId ? "selected" : ""}>
+              return <g key={worker.id} className={selectedWorkerId === worker.id ? "selected" : ""}>
                 <path d={path} pathLength="1" />
                 <circle className="mesh-packet" r=".62" filter="url(#mesh-packet-glow)">
                   <animateMotion dur={`${3.6 + (index % 4) * 0.7}s`} begin={`${index * -0.73}s`} path={path} repeatCount="indefinite" />
@@ -2560,25 +2497,9 @@ function InteractiveMesh({ workers, federatedNodes, registeredWorkers, sharedVra
               </button>
             );
           })}
-          {visibleFederatedNodes.map((node, federatedIndex) => {
-            const index = visibleWorkers.length + federatedIndex;
-            const position = MESH_OVERVIEW_POSITIONS[index] ?? { x: 50, y: 50 };
-            return <button
-              className="mesh-node federated"
-              style={{ "--node-x": `${position.x}%`, "--node-y": `${position.y}%`, "--node-delay": `${index * -0.41}s` } as CSSProperties}
-              key={node.id}
-              onClick={() => developerMode && onNavigate("networks")}
-              aria-label={`${developerMode ? node.networkId : "Federated"} capacity, ${node.models.length} models`}
-              title={developerMode ? `${node.networkId} · ${node.scope} · ${node.models.join(", ")}` : "Federated capacity"}
-            >
-              <span><Globe2 /><i /></span>
-              <strong>{developerMode ? node.networkId : "Federated"}</strong>
-              <small>{node.scope} · {node.models.length} model{node.models.length === 1 ? "" : "s"}</small>
-            </button>;
-          })}
         </div>
         {visibleWorkers.length === 0 && <div className="network-empty interactive-empty"><Wifi size={28} /><strong>The mesh is ready for its first node</strong><span>Every connected device becomes part of the live topology.</span><a href={publicLink("/mobile/")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}>Connect this device <ArrowRight size={13} /></a></div>}
-        <div className="mesh-stage-legend"><b><i /> LIVE</b><span>{visibleWorkers.length + visibleFederatedNodes.length} nodes</span><span>{visibleFederatedNodes.length > 0 ? "Federated + native routes" : "Encrypted peer links"}</span></div>
+        <div className="mesh-stage-legend"><b><i /> LIVE</b><span>{visibleWorkers.length} nodes</span><span>Encrypted peer links</span></div>
         {selectedWorker && selectedWorkerPosition && <MeshNodePopover worker={selectedWorker} position={selectedWorkerPosition} sharePercent={selectedSharePercent} onClose={() => setSelectedWorkerId("")} />}
         {visibleWorkers.length > 0 && <div className="mesh-zoom-controls" aria-label="Network zoom controls">
           <button onClick={() => setZoom((value) => Math.min(1.35, value + 0.12))} disabled={zoom >= 1.35} aria-label="Zoom in"><Plus /></button>
@@ -2587,7 +2508,7 @@ function InteractiveMesh({ workers, federatedNodes, registeredWorkers, sharedVra
         </div>}
       </div>
       <div className="network-summary mesh-network-summary">
-        <div><span>Nodes online</span><strong>{workers.length + visibleFederatedNodes.length} / {registeredWorkers + federatedNodes.length}</strong></div>
+        <div><span>Nodes online</span><strong>{workers.length} / {registeredWorkers}</strong></div>
         <div><span>Active links</span><strong>{links.length}</strong></div>
         <div><span>Shared VRAM</span><strong>{formatMemory(sharedVramMb)}</strong></div>
       </div>
@@ -2657,7 +2578,6 @@ function Nodes({
   const [busy, setBusy] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [selectedWorkerId, setSelectedWorkerId] = useState("");
-  const [selectedFederatedNodeId, setSelectedFederatedNodeId] = useState("");
   const [credentials, setCredentials] = useState<WorkerCredentialSummary[] | null>(null);
   const [credentialError, setCredentialError] = useState<string | null>(null);
   const connectedWorkers = snapshot.workers.filter((worker) => worker.connected);
@@ -2679,16 +2599,7 @@ function Nodes({
   const measuredDeployments = activeDeployments.filter(isMeasuredDeployment);
   const measuredThroughput = measuredDeployments.reduce((total, deployment) => total + deployment.tokensPerSecond, 0);
   const sortedWorkers = [...snapshot.workers].sort((left, right) => nodeStateOrder(left) - nodeStateOrder(right));
-  const sortedFederatedNodes = [...snapshot.federatedNodes].sort((left, right) =>
-    Number(right.routable) - Number(left.routable)
-    || left.networkId.localeCompare(right.networkId)
-    || left.label.localeCompare(right.label));
-  const topologyNodeCount = sortedWorkers.length + sortedFederatedNodes.length;
-  const routableFederatedNodes = sortedFederatedNodes.filter((node) => node.routable);
-  const federatedNetworkCount = new Set(sortedFederatedNodes.map((node) => node.networkId)).size;
-  const selectedWorker = snapshot.workers.find((worker) => worker.id === selectedWorkerId)
-    ?? (selectedFederatedNodeId ? null : activeWorkers[0] ?? snapshot.workers[0] ?? null);
-  const selectedFederatedNode = sortedFederatedNodes.find((node) => node.id === selectedFederatedNodeId) ?? null;
+  const selectedWorker = snapshot.workers.find((worker) => worker.id === selectedWorkerId) ?? activeWorkers[0] ?? snapshot.workers[0] ?? null;
   async function remove(workerId: string) {
     setBusy(workerId);
     setActionError(null);
@@ -2744,12 +2655,11 @@ function Nodes({
   }
   return (
     <section className="nodes-page">
-      <PageTitle eyebrow="RED DISTRIBUIDA" title="Red de nodos" copy="Dispositivos nativos y capacidad federada disponible a través de mycellios." actions={<button disabled={busy !== null} onClick={() => void clearOffline()}><Trash2 size={15} /> Limpiar inactivos</button>} />
+      <PageTitle eyebrow="RED DISTRIBUIDA" title="Red de nodos" copy="Dispositivos físicos, navegadores activos y celdas de cómputo conectadas a mycellios." actions={<button disabled={busy !== null} onClick={() => void clearOffline()}><Trash2 size={15} /> Limpiar inactivos</button>} />
       {actionError && <div className="inline-error" role="alert"><CircleAlert size={17} />{actionError}</div>}
 
       <div className="node-overview-grid">
         <NodeOverviewStat icon={Server} label="Dispositivos activos" value={`${activePhysicalWorkers.length} / ${physicalWorkers.length}`} detail={`${connectedPhysicalWorkers.length} conectados ahora · ${cellWorkers.length} celdas`} progress={physicalWorkers.length > 0 ? activePhysicalWorkers.length / physicalWorkers.length : 0} tone="green" />
-        <NodeOverviewStat icon={Globe2} label="Capacidad federada" value={`${routableFederatedNodes.length} / ${sortedFederatedNodes.length}`} detail={`${federatedNetworkCount} red${federatedNetworkCount === 1 ? "" : "es"} exponiendo nodos`} progress={sortedFederatedNodes.length > 0 ? routableFederatedNodes.length / sortedFederatedNodes.length : 0} tone="purple" />
         <NodeOverviewStat icon={MemoryStick} label="Memoria ofrecida" value={formatMemory(activeOfferedVramMb)} detail={`${formatMemory(freeVramMb)} disponibles para modelos`} progress={activeOfferedVramMb > 0 ? freeVramMb / activeOfferedVramMb : 0} tone="blue" />
         <NodeOverviewStat icon={Gauge} label="Carga GPU media" value={averageUtilization === null ? "Sin datos" : `${averageUtilization.toFixed(0)}%`} detail={`${telemetryGpus.length} GPU${telemetryGpus.length === 1 ? "" : "s"} con telemetría`} progress={averageUtilization === null ? 0 : averageUtilization / 100} tone="purple" />
         <NodeOverviewStat icon={Zap} label="Capacidad de inferencia medida" value={measuredThroughput > 0 ? `${formatCompactNumber(measuredThroughput)} tok/s` : "Sin medir"} detail={measuredDeployments.length > 0 ? `${measuredDeployments.length} runtime${measuredDeployments.length === 1 ? "" : "s"} con inferencias completadas` : activeDeployments.length > 0 ? "Se medirá tras la primera inferencia real" : "Requiere un modelo activo"} tone="violet" />
@@ -2759,24 +2669,20 @@ function Nodes({
 
       <section className="node-topology-card">
         <header className="node-topology-head">
-          <div><span>TOPOLOGÍA EN VIVO</span><h2>Conexiones y rutas con el coordinador</h2><p>Las líneas nativas son sesiones; las federadas son capacidades expuestas por cada red.</p></div>
-          <div className="node-topology-legend"><span><i className="active" />Activo</span><span><i className="warning" />Atención</span><span><i className="offline" />Inactivo</span><span><i className="federated" />Federada</span></div>
+          <div><span>TOPOLOGÍA EN VIVO</span><h2>Conexiones con el coordinador</h2><p>Cada línea representa una sesión real con mycellios.</p></div>
+          <div className="node-topology-legend"><span><i className="active" />Activo</span><span><i className="warning" />Atención</span><span><i className="offline" />Inactivo</span></div>
         </header>
-        <div className={`node-topology-map${topologyNodeCount === 0 ? " empty" : ""}${sortedFederatedNodes.length > 20 ? " dense" : ""}`}>
+        <div className={`node-topology-map${snapshot.workers.length === 0 ? " empty" : ""}`}>
           <div className="node-topology-grid" />
           <svg className="node-topology-links" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
             {sortedWorkers.map((worker, index) => {
-              const position = topologyPosition(index, topologyNodeCount);
+              const position = topologyPosition(index, sortedWorkers.length);
               return <line key={worker.id} className={`${nodeVisualState(worker)}${selectedWorker?.id === worker.id ? " selected" : ""}`} x1="50" y1="52" x2={position.x} y2={position.y} vectorEffect="non-scaling-stroke" />;
             })}
-            {sortedFederatedNodes.map((node, index) => {
-              const position = topologyPosition(sortedWorkers.length + index, topologyNodeCount);
-              return <line key={node.id} className={`federated ${federatedNodeVisualState(node)}${selectedFederatedNode?.id === node.id ? " selected" : ""}`} x1="50" y1="52" x2={position.x} y2={position.y} vectorEffect="non-scaling-stroke" />;
-            })}
           </svg>
-          <div className="node-network-hub"><div><Network /></div><strong>mycellios</strong><span>{activeWorkers.length + routableFederatedNodes.length} utilizable{activeWorkers.length + routableFederatedNodes.length === 1 ? "" : "s"}</span><i /></div>
+          <div className="node-network-hub"><div><Network /></div><strong>mycellios</strong><span>{activeWorkers.length} activo{activeWorkers.length === 1 ? "" : "s"}</span><i /></div>
           {sortedWorkers.map((worker, index) => {
-            const position = topologyPosition(index, topologyNodeCount);
+            const position = topologyPosition(index, sortedWorkers.length);
             const label = workerLabel(worker);
             return <button
               type="button"
@@ -2785,33 +2691,12 @@ function Nodes({
               aria-pressed={selectedWorker?.id === worker.id}
               className={`topology-node ${nodeVisualState(worker)}${selectedWorker?.id === worker.id ? " selected" : ""}`}
               style={{ "--node-x": `${position.x}%`, "--node-y": `${position.y}%` } as CSSProperties}
-              onClick={() => {
-                setSelectedFederatedNodeId("");
-                setSelectedWorkerId(worker.id);
-              }}
+              onClick={() => setSelectedWorkerId(worker.id)}
             ><div><WorkerKindIcon worker={worker} /><i /></div><span><strong>{label}</strong><small>{worker.region} · {nodeStatusLabel(worker)}</small></span></button>;
           })}
-          {sortedFederatedNodes.map((node, index) => {
-            const position = topologyPosition(sortedWorkers.length + index, topologyNodeCount);
-            const selected = selectedFederatedNode?.id === node.id;
-            return <button
-              type="button"
-              key={node.id}
-              aria-label={`Ver nodo federado ${node.label}`}
-              aria-pressed={selected}
-              className={`topology-node topology-node-federated ${federatedNodeVisualState(node)}${selected ? " selected" : ""}`}
-              style={{ "--node-x": `${position.x}%`, "--node-y": `${position.y}%` } as CSSProperties}
-              title={`${node.networkId} · ${node.scope} · ${node.models.length} modelos`}
-              onClick={() => {
-                setSelectedWorkerId("");
-                setSelectedFederatedNodeId(node.id);
-              }}
-            ><div><Globe2 /><i /></div><span><strong>{node.label}</strong><small>{node.networkId} · {node.scope}</small></span></button>;
-          })}
-          {topologyNodeCount === 0 && <div className="node-topology-empty"><Server /><strong>Aún no hay nodos</strong><span>Conecta una máquina o activa una red federada.</span></div>}
+          {snapshot.workers.length === 0 && <div className="node-topology-empty"><Server /><strong>Aún no hay nodos</strong><span>Conecta una máquina para verla aparecer en la red.</span></div>}
         </div>
         {selectedWorker && <NodeTopologyInspector worker={selectedWorker} snapshot={snapshot} />}
-        {selectedFederatedNode && <FederatedNodeTopologyInspector node={selectedFederatedNode} />}
       </section>
 
       <section className="device-trust-card">
@@ -2882,7 +2767,7 @@ function Nodes({
       <NodeInventorySection eyebrow="DISPOSITIVOS INSTALADOS" title="Equipos físicos" workers={installedWorkers} snapshot={snapshot} busy={busy} onRemove={remove} />
       {browserWorkers.length > 0 && <NodeInventorySection eyebrow="CAPACIDAD TEMPORAL" title="Navegadores activos" workers={browserWorkers} snapshot={snapshot} busy={busy} onRemove={remove} />}
       {cellWorkers.length > 0 && <NodeInventorySection eyebrow="EJECUTORES DISTRIBUIDOS" title="Celdas de cómputo" workers={cellWorkers} snapshot={snapshot} busy={busy} onRemove={remove} />}
-      {snapshot.workers.length === 0 && snapshot.federatedNodes.length === 0 && <div className="node-card-grid"><div className="wide-empty"><Empty icon={Server} title="No hay nodos registrados" copy="Abre el worker móvil o instala mycellios para añadir la primera máquina." /><a href="/mobile/">Conectar un dispositivo <ArrowRight size={15} /></a></div></div>}
+      {snapshot.workers.length === 0 && <div className="node-card-grid"><div className="wide-empty"><Empty icon={Server} title="No hay nodos registrados" copy="Abre el worker móvil o instala mycellios para añadir la primera máquina." /><a href="/mobile/">Conectar un dispositivo <ArrowRight size={15} /></a></div></div>}
     </section>
   );
 }
@@ -2918,234 +2803,6 @@ function NodeInventorySection({ eyebrow, title, workers, snapshot, busy, onRemov
 
 function NodeOverviewStat({ icon: Icon, label, value, detail, progress, tone }: { icon: typeof Server; label: string; value: string; detail: string; progress?: number; tone: "green" | "blue" | "purple" | "violet" | "cyan" | "orange" }) {
   return <article className={`node-overview-stat ${tone}`}><div className="node-overview-icon"><Icon /></div><span>{label}</span><strong>{value}</strong><small>{detail}</small>{progress !== undefined && <div className="node-overview-progress"><i style={{ width: `${Math.max(0, Math.min(1, progress)) * 100}%` }} /></div>}</article>;
-}
-
-interface FederationAdminResponse {
-  settings: FederationSettings;
-  federation: FederationSnapshot;
-  networks: FederatedNetwork[];
-  nodes: FederatedNode[];
-  managedRentals: ManagedRental[];
-}
-
-function Networks({
-  apiOrigin,
-  adminToken,
-  authSession,
-  snapshot,
-  onSnapshotRefresh,
-  onAdminTokenChange,
-}: {
-  apiOrigin: string;
-  adminToken: string;
-  authSession: AuthSession | null;
-  snapshot: PublicSnapshot;
-  onSnapshotRefresh: () => Promise<void>;
-  onAdminTokenChange: (token: string) => void;
-}) {
-  const [state, setState] = useState<FederationAdminResponse | null>(null);
-  const [busy, setBusy] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  const authorizationHeaders = useCallback((): Record<string, string> => {
-    if (authSession) {
-      return {
-        authorization: `Bearer ${authSession.accessToken}`,
-        ...(adminToken.trim() ? { "x-mycellios-admin-token": adminToken.trim() } : {}),
-      };
-    }
-    return adminToken.trim() ? { authorization: `Bearer ${adminToken.trim()}` } : {};
-  }, [adminToken, authSession]);
-
-  const load = useCallback(async () => {
-    const response = await fetch(`${apiOrigin}/public/v1/admin/federation`, {
-      cache: "no-store",
-      headers: authorizationHeaders(),
-    });
-    if (!response.ok) throw new Error(await responseMessage(response));
-    setState(await response.json() as FederationAdminResponse);
-  }, [apiOrigin, authorizationHeaders]);
-
-  useEffect(() => {
-    let cancelled = false;
-    void load().catch((caught) => {
-      if (!cancelled) setError(errorText(caught));
-    });
-    return () => { cancelled = true; };
-  }, [load]);
-
-  async function mutate(path: string, method: "PUT" | "POST", body: unknown) {
-    const response = await fetch(`${apiOrigin}${path}`, {
-      method,
-      headers: {
-        "content-type": "application/json",
-        ...authorizationHeaders(),
-      },
-      body: JSON.stringify(body),
-    });
-    if (!response.ok) throw new Error(await responseMessage(response));
-    await Promise.all([load(), onSnapshotRefresh()]);
-  }
-
-  async function updateGlobal(patch: Record<string, unknown>) {
-    setBusy("settings");
-    setError(null);
-    try {
-      await mutate("/public/v1/admin/federation/settings", "PUT", patch);
-    } catch (caught) {
-      setError(errorText(caught));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function updateNetwork(network: FederatedNetwork, patch: Record<string, unknown>) {
-    setBusy(network.id);
-    setError(null);
-    try {
-      await mutate(
-        `/public/v1/admin/federation/networks/${encodeURIComponent(network.id)}`,
-        "PUT",
-        patch,
-      );
-    } catch (caught) {
-      setError(errorText(caught));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function probe(network: FederatedNetwork) {
-    setBusy(`probe:${network.id}`);
-    setError(null);
-    try {
-      await mutate(
-        `/public/v1/admin/federation/networks/${encodeURIComponent(network.id)}/probe`,
-        "POST",
-        {},
-      );
-    } catch (caught) {
-      setError(errorText(caught));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function emergencyStop() {
-    if (!window.confirm("This immediately cancels external routes and closes managed rentals. Continue?")) {
-      return;
-    }
-    setBusy("emergency");
-    setError(null);
-    try {
-      await mutate("/public/v1/admin/federation/emergency-stop", "POST", { confirm: true });
-    } catch (caught) {
-      setError(errorText(caught));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  const groups: Array<{
-    id: FederatedNetwork["class"];
-    title: string;
-    copy: string;
-  }> = [
-    { id: "community", title: "Community", copy: "Public distributed inference networks." },
-    { id: "token-api", title: "Token APIs", copy: "Distributed providers billed per request." },
-    { id: "rental", title: "Rental capacity", copy: "Managed GPUs that register as native Mycellios workers." },
-  ];
-  const networks = state?.networks ?? snapshot.federatedNetworks;
-  const settings = state?.settings;
-  return <section className="networks-page">
-    <PageTitle
-      eyebrow="FEDERATION CONTROL"
-      title="Networks"
-      copy="Discover, verify and route external capacity through one Mycellios API. Advertised models remain unroutable until a real generation succeeds."
-      actions={<button className="network-emergency-stop" disabled={busy !== null} onClick={() => void emergencyStop()}><CirclePower />Emergency stop</button>}
-    />
-    <div className="federation-disclosure"><ShieldCheck /><span><strong>External processing disclosure</strong><small>{state?.federation.notice ?? snapshot.federation.notice}</small></span></div>
-    {!authSession && <label className="model-admin-auth federation-admin-auth"><ShieldCheck /><span><strong>Network administrator authorization</strong><small>Kept only for this browser session and never sent to providers.</small></span><input type="password" autoComplete="off" spellCheck={false} value={adminToken} onChange={(event) => onAdminTokenChange(event.target.value)} placeholder="Administrator token" aria-label="Federation administrator token" /></label>}
-    {error && <div className="inline-error"><CircleAlert />{error}</div>}
-    {!state && !error && <div className="network-admin-loading"><LoaderCircle className="spin" />Loading federation control plane…</div>}
-    {settings && <section className="federation-settings-card">
-      <header><div><span>GLOBAL POLICY</span><h2>Budgets and autoscaling</h2></div><label className="federation-switch"><input type="checkbox" checked={settings.enabled} disabled={busy !== null} onChange={(event) => void updateGlobal({ enabled: event.target.checked })} /><i /><span>{settings.enabled ? "Enabled" : "Disabled"}</span></label></header>
-      <div className="federation-settings-grid">
-        <label>Daily budget (USD)<input type="number" min="0" step="0.01" defaultValue={settings.dailyBudgetUsd} disabled={busy !== null} onBlur={(event) => void updateGlobal({ dailyBudgetUsd: Number(event.target.value) })} /></label>
-        <label>Monthly budget (USD)<input type="number" min="0" step="0.01" defaultValue={settings.monthlyBudgetUsd} disabled={busy !== null} onBlur={(event) => void updateGlobal({ monthlyBudgetUsd: Number(event.target.value) })} /></label>
-        <label>Maximum rentals<input type="number" min="0" max="4" step="1" defaultValue={settings.maxRentals} disabled={busy !== null} onBlur={(event) => void updateGlobal({ maxRentals: Number(event.target.value) })} /></label>
-        <label className="federation-checkbox"><input type="checkbox" checked={settings.autoscalingEnabled} disabled={busy !== null || settings.dailyBudgetUsd <= 0 || settings.monthlyBudgetUsd <= 0} onChange={(event) => void updateGlobal({ autoscalingEnabled: event.target.checked })} /><span><strong>Automatic rental scaling</strong><small>Five-minute demand gate · one instance · ten-minute cooldown.</small></span></label>
-      </div>
-      <footer><span>Today: ${(state?.federation.spentTodayUsd ?? 0).toFixed(4)}</span><span>This month: ${(state?.federation.spentMonthUsd ?? 0).toFixed(4)}</span><span>{state?.managedRentals.filter((rental) => !["stopped", "failed"].includes(rental.state)).length ?? 0} managed rentals</span></footer>
-    </section>}
-    {groups.map((group) => <section className="federation-group" key={group.id}>
-      <div className="federation-group-title"><div><span>{group.id.toUpperCase()}</span><h2>{group.title}</h2><p>{group.copy}</p></div><strong>{networks.filter((network) => network.class === group.id && network.actualState === "ready").length} ready</strong></div>
-      <div className="federation-card-grid">
-        {networks.filter((network) => network.class === group.id).map((network) => {
-          const verified = network.models.filter((model) => !model.advertisedOnly);
-          const networkNodes = (state?.nodes ?? snapshot.federatedNodes).filter((node) => node.networkId === network.id);
-          const probing = busy === `probe:${network.id}`;
-          return <article className={`federation-card state-${network.actualState}`} key={network.id}>
-            <header><div className="federation-provider-icon"><Globe2 /></div><div><span>{network.class === "community" ? "COMMUNITY" : network.class === "token-api" ? "TOKEN API" : "MANAGED RENTAL"}</span><h3>{network.name}{network.experimental && <em>Experimental</em>}</h3></div><label className="federation-switch"><input type="checkbox" checked={network.desiredEnabled} disabled={busy !== null} onChange={(event) => void updateNetwork(network, { enabled: event.target.checked })} /><i /></label></header>
-            <div className="federation-state-row"><span className={`federation-state ${network.actualState}`}><i />{network.actualState}</span><small>{network.configured ? "Secret/config ready" : "Not configured"}</small></div>
-            <div className="federation-metrics">
-              <Metric label="Verified models" value={`${verified.length} / ${network.models.length}`} />
-              <Metric label="Exposed nodes" value={String(networkNodes.length)} />
-              <Metric label="TTFT" value={network.ttftMs === null ? "No canary" : `${network.ttftMs} ms`} />
-              <Metric label="Reliability" value={network.reliability > 0 ? `${Math.round(network.reliability * 100)}%` : "No traffic"} />
-              <Metric label="Spent today" value={`$${network.spentTodayUsd.toFixed(4)}`} />
-              <Metric label="Priority" value={String(network.priority)} />
-            </div>
-            {network.models.length > 0 && <div className="federation-model-list">{network.models.slice(0, 4).map((model) => <span className={model.advertisedOnly ? "advertised" : "verified"} key={model.externalId}><i />{model.canonicalId}</span>)}</div>}
-            {network.lastError && <p className="federation-error"><CircleAlert />{network.lastError}</p>}
-            <footer>
-              <label>Priority<input type="number" min="0" max="1000" defaultValue={network.priority} disabled={busy !== null} onBlur={(event) => void updateNetwork(network, { priority: Number(event.target.value) })} /></label>
-              {network.class !== "community" && <label>Daily limit<input type="number" min="0" step="0.01" defaultValue={network.dailyBudgetUsd} disabled={busy !== null} onBlur={(event) => void updateNetwork(network, { dailyBudgetUsd: Number(event.target.value) })} /></label>}
-              {network.class !== "community" && <label>Monthly limit<input type="number" min="0" step="0.01" defaultValue={network.monthlyBudgetUsd} disabled={busy !== null} onBlur={(event) => void updateNetwork(network, { monthlyBudgetUsd: Number(event.target.value) })} /></label>}
-              {network.class !== "rental" && <button disabled={busy !== null || !network.desiredEnabled} onClick={() => void probe(network)}>{probing ? <LoaderCircle className="spin" /> : <Activity />}{probing ? "Probing…" : "Discover + canary"}</button>}
-            </footer>
-            <small className="federation-last-canary">Last real canary: {network.lastCanaryAt === null ? "never" : relativeTime(new Date(network.lastCanaryAt).toISOString())}</small>
-          </article>;
-        })}
-      </div>
-    </section>)}
-  </section>;
-}
-
-async function responseMessage(response: Response): Promise<string> {
-  const body = await response.json().catch(() => null) as {
-    error?: { message?: string };
-  } | null;
-  return body?.error?.message ?? `HTTP ${response.status}`;
-}
-
-function FederatedNodeTopologyInspector({ node }: { node: FederatedNode }) {
-  const state = federatedNodeVisualState(node);
-  const gpu = node.capacity?.gpuModel ?? (
-    node.scope === "physical" ? "No informada" : "No expuesta por la red"
-  );
-  return <div className="node-topology-inspector federated-node-inspector">
-    <div className={`node-inspector-identity ${state}`}>
-      <div><Globe2 /></div>
-      <span>
-        <small>NODO FEDERADO</small>
-        <strong>{node.label}</strong>
-        <em>{node.networkId} · {node.scope} · {shortId(node.id)}</em>
-        <b>Federada</b>
-      </span>
-    </div>
-    <div className="node-inspector-metrics">
-      <Metric label="Estado" value={federatedNodeStatusLabel(node)} />
-      <Metric label="Proveedor" value={node.networkId} />
-      <Metric label="Alcance" value={node.scope} />
-      <Metric label="Modelos" value={String(node.models.length)} />
-      <Metric label="Fiabilidad" value={`${Math.round(Math.max(0, Math.min(1, node.reliability)) * 100)}%`} />
-      <Metric label="Último canario" value={node.lastVerifiedAt === null ? "Sin verificar" : relativeTime(new Date(node.lastVerifiedAt).toISOString())} />
-      <Metric label="Selección individual" value={node.individuallySelectable ? "Permitida" : "Gestionada por la red"} />
-      <Metric label="GPU expuesta" value={gpu} />
-      <Metric label="VRAM expuesta" value={node.capacity?.vramMb ? formatMemory(node.capacity.vramMb) : "No informada"} />
-    </div>
-  </div>;
 }
 
 function NodeTopologyInspector({ worker, snapshot }: { worker: PublicWorker; snapshot: PublicSnapshot }) {
@@ -3456,7 +3113,7 @@ function Models({ snapshot, onSearch, onRequest, onRemove, adminToken: initialAd
     <div className="panel-table model-active-table"><div className="panel-table-head"><span>Active model</span><span>Replicas</span><span>Pipelines</span><span>Effective device</span></div>
       {snapshot.models.map((model) => {
         const execution = modelExecutionSummary(snapshot, model.id);
-        return <div className="panel-table-row model-execution-row" key={model.id}><strong><Boxes size={17} />{model.id}{(model.federatedRoutes ?? 0) > 0 && <em className="federated-model-badge">Federated</em>}</strong><span>{model.replicas}</span><span>{model.pipelines}</span>{(model.federatedRoutes ?? 0) > 0 ? <span className="federated-table-route">{model.federatedRoutes} federated route{model.federatedRoutes === 1 ? "" : "s"}</span> : <ExecutionBadge execution={execution} workers={snapshot.workers} />}</div>;
+        return <div className="panel-table-row model-execution-row" key={model.id}><strong><Boxes size={17} />{model.id}</strong><span>{model.replicas}</span><span>{model.pipelines}</span><ExecutionBadge execution={execution} workers={snapshot.workers} /></div>;
       })}
       {snapshot.models.length === 0 && <Empty icon={Boxes} title="No active models" copy="Choose a model above. It will remain queued with an exact capacity shortfall until the network can run it." />}
     </div>
@@ -5028,10 +4685,7 @@ function DesktopOnboarding({ snapshot, bridge, onSnapshot }: { snapshot: Dashboa
   return <div className="modal-backdrop"><div className="onboarding-card"><div className="onboarding-brand"><img src={brandIcon} alt="" /><span>GET STARTED</span></div><h1>Connect this machine to mycellios</h1><p>The desktop agent and the web panel will show the same public network.</p><div className="mode-grid single-mode"><button className="selected"><Globe2 size={23} /><strong>Public mycellios network</strong><span>{PUBLIC_COORDINATOR_URL}</span><Check size={16} className="mode-check" /></button></div><label className="contribute-choice"><input type="checkbox" checked={contribute} onChange={(event) => setContribute(event.target.checked)} /><span><strong>Contribute this machine's resources</strong><small>Register real hardware only; models appear only when a verified runtime is active.</small></span></label>{error && <div className="inline-error"><CircleAlert size={17} />{error}</div>}<button className="primary-button onboarding-submit" disabled={saving} onClick={() => void complete()}>{saving ? <LoaderCircle className="spin" size={18} /> : <Sparkles size={18} />}Enter mycellios <ChevronRight size={18} /></button><div className="onboarding-security"><ShieldCheck size={15} />Connected through HTTPS/WSS to the public coordinator.</div></div></div>;
 }
 
-export function desktopToPublicSnapshot(
-  snapshot: DashboardSnapshot,
-  federationSource?: PublicSnapshot,
-): PublicSnapshot {
+function desktopToPublicSnapshot(snapshot: DashboardSnapshot): PublicSnapshot {
   return {
     capturedAt: snapshot.capturedAt,
     version: snapshot.health?.version ?? "—",
@@ -5045,9 +4699,6 @@ export function desktopToPublicSnapshot(
       completedJobs: snapshot.jobs.filter((job) => job.status === "completed").length,
     },
     workers: snapshot.workers,
-    federation: federationSource?.federation ?? EMPTY.federation,
-    federatedNetworks: federationSource?.federatedNetworks ?? [],
-    federatedNodes: federationSource?.federatedNodes ?? [],
     models: snapshot.models,
     requestedModels: snapshot.requestedModels,
     jobs: snapshot.jobs,
@@ -5200,18 +4851,6 @@ function nodeStatusLabel(worker: PublicWorker): string {
   if (worker.status === "draining") return "Finalizando";
   if (worker.connected) return "Conectado";
   return "Inactivo";
-}
-function federatedNodeVisualState(node: FederatedNode): "active" | "warning" | "offline" {
-  if (node.routable && node.status === "online") return "active";
-  if (node.status === "online" || node.status === "degraded") return "warning";
-  return "offline";
-}
-function federatedNodeStatusLabel(node: FederatedNode): string {
-  if (node.routable) return "Enrutable";
-  if (node.status === "online") return "Descubierto";
-  if (node.status === "degraded") return "Degradado";
-  if (node.status === "offline") return "Inactivo";
-  return "Estado desconocido";
 }
 function topologyPosition(index: number, total: number): { x: number; y: number } {
   if (total <= 1) return { x: 50, y: 17 };

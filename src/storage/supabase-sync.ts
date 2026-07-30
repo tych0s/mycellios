@@ -19,11 +19,6 @@ const TABLE_PRIMARY_KEYS = Object.freeze({
   deployment_operations: "id",
   route_reservations: "id",
   deployment_stage_leases: "id",
-  federation_settings: "id",
-  federated_network_settings: "id",
-  federated_route_attempts: "id",
-  provider_spend_reservations: "id",
-  managed_rentals: "id",
 } as const);
 
 type SyncedTable = keyof typeof TABLE_PRIMARY_KEYS;
@@ -170,11 +165,6 @@ export class SupabasePersistence {
       deploymentOperations,
       routeReservations,
       deploymentStageLeases,
-      federationSettings,
-      federatedNetworkSettings,
-      federatedRouteAttempts,
-      providerSpendReservations,
-      managedRentals,
     ] = await Promise.all([
       this.readTable("workers"),
       this.readTable("requested_models"),
@@ -189,11 +179,6 @@ export class SupabasePersistence {
       this.readTable("deployment_operations"),
       this.readTable("route_reservations"),
       this.readTable("deployment_stage_leases"),
-      this.readTable("federation_settings"),
-      this.readTable("federated_network_settings"),
-      this.readTable("federated_route_attempts"),
-      this.readTable("provider_spend_reservations"),
-      this.readTable("managed_rentals"),
     ]);
     this.store.database.transaction(() => {
       for (const row of workers) this.restoreWorker(row);
@@ -209,11 +194,6 @@ export class SupabasePersistence {
       for (const row of routeReservations) this.restoreRouteReservation(row);
       for (const row of deploymentStageLeases) this.restoreDeploymentStageLease(row);
       for (const row of deploymentStates) this.restoreDeploymentState(row);
-      for (const row of federationSettings) this.restoreFederationSettings(row);
-      for (const row of federatedNetworkSettings) this.restoreFederatedNetworkSettings(row);
-      for (const row of federatedRouteAttempts) this.restoreFederatedRouteAttempt(row);
-      for (const row of providerSpendReservations) this.restoreProviderSpendReservation(row);
-      for (const row of managedRentals) this.restoreManagedRental(row);
     });
   }
 
@@ -749,160 +729,6 @@ export class SupabasePersistence {
       numberValue(row.expires_at, 0),
       numberValue(row.created_at, row.updated_at),
       row.updated_at,
-    );
-  }
-
-  private restoreFederationSettings(row: Record<string, unknown>): void {
-    if (row.id !== "global" || typeof row.updated_at !== "number") return;
-    this.store.database.raw.prepare(
-      `INSERT INTO federation_settings(
-         id, enabled, daily_budget_usd, monthly_budget_usd,
-         autoscaling_enabled, max_rentals, updated_at
-       ) VALUES ('global', ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET
-         enabled=excluded.enabled, daily_budget_usd=excluded.daily_budget_usd,
-         monthly_budget_usd=excluded.monthly_budget_usd,
-         autoscaling_enabled=excluded.autoscaling_enabled,
-         max_rentals=excluded.max_rentals, updated_at=excluded.updated_at
-       WHERE excluded.updated_at > federation_settings.updated_at`,
-    ).run(
-      row.enabled === true ? 1 : 0,
-      numberValue(row.daily_budget_usd, 0),
-      numberValue(row.monthly_budget_usd, 0),
-      row.autoscaling_enabled === true ? 1 : 0,
-      numberValue(row.max_rentals, 4),
-      row.updated_at,
-    );
-  }
-
-  private restoreFederatedNetworkSettings(row: Record<string, unknown>): void {
-    if (typeof row.id !== "string" || typeof row.updated_at !== "number") return;
-    this.store.database.raw.prepare(
-      `INSERT INTO federated_network_settings(
-         id, enabled, priority, daily_budget_usd, monthly_budget_usd, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET
-         enabled=excluded.enabled, priority=excluded.priority,
-         daily_budget_usd=excluded.daily_budget_usd,
-         monthly_budget_usd=excluded.monthly_budget_usd,
-         updated_at=excluded.updated_at
-       WHERE excluded.updated_at > federated_network_settings.updated_at`,
-    ).run(
-      row.id,
-      row.enabled === true ? 1 : 0,
-      numberValue(row.priority, 100),
-      numberValue(row.daily_budget_usd, 0),
-      numberValue(row.monthly_budget_usd, 0),
-      row.updated_at,
-    );
-  }
-
-  private restoreFederatedRouteAttempt(row: Record<string, unknown>): void {
-    if (
-      typeof row.id !== "string"
-      || typeof row.request_id !== "string"
-      || typeof row.provider !== "string"
-      || typeof row.started_at !== "number"
-    ) return;
-    this.store.database.raw.prepare(
-      `INSERT INTO federated_route_attempts(
-         id, request_id, provider, canonical_model, external_model, route_kind,
-         started_at, first_token_at, completed_at, input_tokens, output_tokens,
-         reserved_cost_usd, actual_cost_usd, result, fallback_reason, failure_code
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET
-         first_token_at=excluded.first_token_at,
-         completed_at=excluded.completed_at,
-         input_tokens=excluded.input_tokens,
-         output_tokens=excluded.output_tokens,
-         actual_cost_usd=excluded.actual_cost_usd,
-         result=excluded.result,
-         fallback_reason=excluded.fallback_reason,
-         failure_code=excluded.failure_code`,
-    ).run(
-      row.id,
-      row.request_id,
-      row.provider,
-      stringValue(row.canonical_model, ""),
-      stringValue(row.external_model, ""),
-      stringValue(row.route_kind, "federated"),
-      row.started_at,
-      nullableNumber(row.first_token_at),
-      nullableNumber(row.completed_at),
-      numberValue(row.input_tokens, 0),
-      numberValue(row.output_tokens, 0),
-      numberValue(row.reserved_cost_usd, 0),
-      numberValue(row.actual_cost_usd, 0),
-      stringValue(row.result, "failed"),
-      nullableString(row.fallback_reason),
-      nullableString(row.failure_code),
-    );
-  }
-
-  private restoreProviderSpendReservation(row: Record<string, unknown>): void {
-    if (
-      typeof row.id !== "string"
-      || typeof row.provider !== "string"
-      || typeof row.request_id !== "string"
-      || typeof row.created_at !== "number"
-    ) return;
-    this.store.database.raw.prepare(
-      `INSERT INTO provider_spend_reservations(
-         id, provider, request_id, reserved_usd, actual_usd, status,
-         created_at, reconciled_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET
-         actual_usd=excluded.actual_usd, status=excluded.status,
-         reconciled_at=excluded.reconciled_at`,
-    ).run(
-      row.id,
-      row.provider,
-      row.request_id,
-      numberValue(row.reserved_usd, 0),
-      nullableNumber(row.actual_usd),
-      stringValue(row.status, "released"),
-      row.created_at,
-      nullableNumber(row.reconciled_at),
-    );
-  }
-
-  private restoreManagedRental(row: Record<string, unknown>): void {
-    if (
-      typeof row.id !== "string"
-      || typeof row.provider !== "string"
-      || typeof row.external_id !== "string"
-      || typeof row.updated_at !== "number"
-    ) return;
-    this.store.database.raw.prepare(
-      `INSERT INTO managed_rentals(
-         id, provider, external_id, state, image, hardware_json, worker_id,
-         credential_identity_id, reserved_cost_usd, labels_json, created_at,
-         updated_at, drain_started_at, stopped_at, last_error
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET
-         state=excluded.state, worker_id=excluded.worker_id,
-         credential_identity_id=excluded.credential_identity_id,
-         reserved_cost_usd=excluded.reserved_cost_usd,
-         updated_at=excluded.updated_at,
-         drain_started_at=excluded.drain_started_at,
-         stopped_at=excluded.stopped_at, last_error=excluded.last_error
-       WHERE excluded.updated_at > managed_rentals.updated_at`,
-    ).run(
-      row.id,
-      row.provider,
-      row.external_id,
-      stringValue(row.state, "failed"),
-      stringValue(row.image, ""),
-      JSON.stringify(row.hardware_json ?? {}),
-      nullableString(row.worker_id),
-      nullableString(row.credential_identity_id),
-      numberValue(row.reserved_cost_usd, 0),
-      JSON.stringify(row.labels_json ?? {}),
-      numberValue(row.created_at, row.updated_at),
-      row.updated_at,
-      nullableNumber(row.drain_started_at),
-      nullableNumber(row.stopped_at),
-      nullableString(row.last_error),
     );
   }
 }

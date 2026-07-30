@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-const SCHEMA_VERSION = 16;
+const SCHEMA_VERSION = 15;
 
 export interface PersistenceOutboxRow {
   id: number;
@@ -457,85 +457,6 @@ export class MeshDatabase {
 
       CREATE INDEX IF NOT EXISTS worker_admission_credentials_status
       ON worker_admission_credentials(status, last_seen_at);
-
-      CREATE TABLE IF NOT EXISTS federation_settings (
-        id TEXT PRIMARY KEY CHECK(id = 'global'),
-        enabled INTEGER NOT NULL DEFAULT 0,
-        daily_budget_usd REAL NOT NULL DEFAULT 0 CHECK(daily_budget_usd >= 0),
-        monthly_budget_usd REAL NOT NULL DEFAULT 0 CHECK(monthly_budget_usd >= 0),
-        autoscaling_enabled INTEGER NOT NULL DEFAULT 0,
-        max_rentals INTEGER NOT NULL DEFAULT 4 CHECK(max_rentals BETWEEN 0 AND 4),
-        updated_at INTEGER NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS federated_network_settings (
-        id TEXT PRIMARY KEY,
-        enabled INTEGER NOT NULL DEFAULT 0,
-        priority INTEGER NOT NULL DEFAULT 100 CHECK(priority BETWEEN 0 AND 1000),
-        daily_budget_usd REAL NOT NULL DEFAULT 0 CHECK(daily_budget_usd >= 0),
-        monthly_budget_usd REAL NOT NULL DEFAULT 0 CHECK(monthly_budget_usd >= 0),
-        updated_at INTEGER NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS federated_route_attempts (
-        id TEXT PRIMARY KEY,
-        request_id TEXT NOT NULL,
-        provider TEXT NOT NULL,
-        canonical_model TEXT NOT NULL,
-        external_model TEXT NOT NULL,
-        route_kind TEXT NOT NULL CHECK(route_kind IN ('native-replica', 'native-pipeline', 'federated')),
-        started_at INTEGER NOT NULL,
-        first_token_at INTEGER,
-        completed_at INTEGER,
-        input_tokens INTEGER NOT NULL DEFAULT 0,
-        output_tokens INTEGER NOT NULL DEFAULT 0,
-        reserved_cost_usd REAL NOT NULL DEFAULT 0,
-        actual_cost_usd REAL NOT NULL DEFAULT 0,
-        result TEXT NOT NULL CHECK(result IN ('running', 'completed', 'failed', 'cancelled')),
-        fallback_reason TEXT,
-        failure_code TEXT
-      );
-
-      CREATE INDEX IF NOT EXISTS federated_route_attempts_request
-      ON federated_route_attempts(request_id, started_at);
-
-      CREATE INDEX IF NOT EXISTS federated_route_attempts_provider_started
-      ON federated_route_attempts(provider, started_at DESC);
-
-      CREATE TABLE IF NOT EXISTS provider_spend_reservations (
-        id TEXT PRIMARY KEY,
-        provider TEXT NOT NULL,
-        request_id TEXT NOT NULL,
-        reserved_usd REAL NOT NULL CHECK(reserved_usd >= 0),
-        actual_usd REAL,
-        status TEXT NOT NULL CHECK(status IN ('reserved', 'reconciled', 'released')),
-        created_at INTEGER NOT NULL,
-        reconciled_at INTEGER
-      );
-
-      CREATE INDEX IF NOT EXISTS provider_spend_reservations_provider_created
-      ON provider_spend_reservations(provider, created_at);
-
-      CREATE TABLE IF NOT EXISTS managed_rentals (
-        id TEXT PRIMARY KEY,
-        provider TEXT NOT NULL CHECK(provider IN ('gpu_cloud', 'vast', 'clore')),
-        external_id TEXT NOT NULL,
-        state TEXT NOT NULL,
-        image TEXT NOT NULL,
-        hardware_json TEXT NOT NULL,
-        worker_id TEXT,
-        credential_identity_id TEXT,
-        reserved_cost_usd REAL NOT NULL DEFAULT 0,
-        labels_json TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL,
-        drain_started_at INTEGER,
-        stopped_at INTEGER,
-        last_error TEXT
-      );
-
-      CREATE INDEX IF NOT EXISTS managed_rentals_provider_state
-      ON managed_rentals(provider, state, updated_at);
 
     `);
     if (currentVersion >= 2 && currentVersion < 3) {

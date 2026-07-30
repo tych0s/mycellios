@@ -9,18 +9,6 @@ describe("LiveNetworkTelemetry", () => {
       version: "0.73.1",
       buildIdentity: null,
       summary: { registered: 2, connected: 1, online: 1, mobile: 0, offeredVramMb: 196_608, completedJobs: 1 },
-      federation: {
-        enabled: false,
-        notice: "Community and external nodes may process inference content.",
-        readyNetworks: 0,
-        routableNodes: 0,
-        verifiedModels: 0,
-        spentTodayUsd: 0,
-        spentMonthUsd: 0,
-        externalRequestsAllowed: true,
-      },
-      federatedNetworks: [],
-      federatedNodes: [],
       workers: [{
         id: "online-peer",
         kind: "desktop",
