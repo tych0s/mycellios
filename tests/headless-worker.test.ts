@@ -46,7 +46,7 @@ describe("headless GpuCloud worker", () => {
       GPU_CLOUD_MACHINE_ID: machineId,
       GPU_MESH_COORDINATOR: "https://www.mycellios.com",
     }, "/opt/mycellios")).toThrow(
-      "headless_worker_external_coordinator_requires_32_character_network_token",
+      "headless_worker_external_coordinator_requires_scoped_credential_or_32_character_network_token",
     );
 
     const environment = loadHeadlessWorkerEnvironment({
@@ -59,6 +59,15 @@ describe("headless GpuCloud worker", () => {
     expect(environment.provider).toBe("gpu_cloud");
     expect(environment.configPath).toBe(
       resolve("/opt/mycellios", "./config/worker.gpu_cloud.example.json"),
+    );
+    const scoped = loadHeadlessWorkerEnvironment({
+      GPU_CLOUD_MACHINE_ID: machineId,
+      GPU_MESH_COORDINATOR: "https://www.mycellios.com",
+      MYCELLIOS_WORKER_CREDENTIAL_PATH: "/var/lib/mycellios/worker-credential.json",
+    }, "/opt/mycellios");
+    expect(scoped.networkToken).toBeUndefined();
+    expect(scoped.workerCredentialPath).toBe(
+      resolve("/opt/mycellios", "/var/lib/mycellios/worker-credential.json"),
     );
   });
 

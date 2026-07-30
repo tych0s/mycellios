@@ -30,6 +30,13 @@ import {
   workerRegistrationSchema,
 } from "../contracts/schemas.js";
 import {
+  FEDERATED_NETWORK_IDS,
+  federatedNetworkUpdateSchema,
+  federationProbeSchema,
+  federationSettingsUpdateSchema,
+  type FederatedNetworkId,
+} from "../contracts/federation.js";
+import {
   redactDiagnosticDetails,
   redactDiagnosticText,
   remoteDiagnosticBatchSchema,
@@ -136,6 +143,13 @@ import {
   verifyWorkerSessionToken,
 } from "./worker-session-token.js";
 import { FleetContributionController } from "./fleet-contribution-control.js";
+import { createFederatedProviderAdapters } from "./federated-providers.js";
+import { FederationManager } from "./federation-manager.js";
+import { UnifiedInferenceRouter } from "./unified-inference-router.js";
+import {
+  createRentalProviderDrivers,
+  RentalCapacityManager,
+} from "./rental-capacity-manager.js";
 
 export function automaticActivationFailureIsTransient(message: string): boolean {
   return activationFailureIsTransient(message);
@@ -200,6 +214,9 @@ export interface CoordinatorRuntime {
   hub: WorkerHub;
   mobileHub: MobileComputeHub;
   service: MeshService;
+  inferenceRouter: UnifiedInferenceRouter;
+  federation: FederationManager;
+  rentals: RentalCapacityManager;
   apiAccess: ApiAccessManager;
   persistence: SupabasePersistence | null;
   deploymentController: DeploymentControlPlane;
@@ -256,12 +273,12 @@ export async function createCoordinator(
     reply.header("X-Content-Type-Options", "nosniff");
     reply.header("Referrer-Policy", "strict-origin-when-cross-origin");
     const path = request.url.split("?", 1)[0] ?? request.url;
-    if (path.startsWith("/v1/")) {
+    if (path.startsWith("/v1/") || path.startsWith("/public/v1/admin/")) {
       reply.header("Access-Control-Allow-Origin", "*");
-      reply.header("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
+      reply.header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
       reply.header(
         "Access-Control-Allow-Headers",
-        "Authorization,Content-Type,Idempotency-Key",
+        "Authorization,Content-Type,Idempotency-Key,X-Mycellios-Admin-Token",
       );
       reply.header(
         "Access-Control-Expose-Headers",
@@ -618,6 +635,32 @@ export async function createCoordinator(
     queueExistingMobileArtifacts(persistence, config.mobileExpertArtifactsPath);
   }
   const service = new MeshService(store, scheduler, hub, config.requestTimeoutMs);
+  const federationConfig = config.federation ?? {
+    enabled: false,
+    external-runtime-aInferenceUrl: "http://127.0.0.1:9337",
+    external-runtime-aManagementUrl: "http://127.0.0.1:3131",
+    aiHordeBaseUrl: "https://aihorde.net/api",
+    peer-runtimeBaseUrl: "http://127.0.0.1:8000/v1",
+    chutesBaseUrl: "https://llm.chutes.ai/v1",
+    akashMlBaseUrl: "https://chatapi.akash.network/api/v1",
+  };
+  const rentals = new RentalCapacityManager(
+    store,
+    hub,
+    createRentalProviderDrivers(federationConfig),
+    absoluteUrlOrigin(config.publicApiBaseUrl),
+    federationConfig.rentalWorkerImage,
+  );
+  const federation = new FederationManager(
+    store,
+    createFederatedProviderAdapters(federationConfig),
+    federationConfig.enabled,
+    {},
+    rentals.configuredProviders(),
+  );
+  const inferenceRouter = new UnifiedInferenceRouter(service, federation, store, rentals);
+  federation.start();
+  rentals.start();
   const supportAssistantRateLimits = new Map<string, SupportAssistantRateState>();
   const publicCatalogRateLimits = new Map<string, PublicCatalogRateState>();
   let activeSupportAssistantRequests = 0;
@@ -1284,7 +1327,7 @@ export async function createCoordinator(
       activationProgressForModel,
       activationStatusMessageForModel,
       activationIncidentForModel,
-    }, runtimeVersion, coordinatorBuildIdentity);
+    }, federation, runtimeVersion, coordinatorBuildIdentity);
     const capturedAt = Math.floor(now / NETWORK_TELEMETRY_INTERVAL_MS)
       * NETWORK_TELEMETRY_INTERVAL_MS;
     store.recordNetworkTelemetrySample(networkTelemetrySample(snapshot, capturedAt));
@@ -1473,7 +1516,7 @@ export async function createCoordinator(
       activationProgressForModel,
       activationStatusMessageForModel,
       activationIncidentForModel,
-    }, runtimeVersion, coordinatorBuildIdentity);
+    }, federation, runtimeVersion, coordinatorBuildIdentity);
   });
 
   app.post("/internal/v1/diagnostics", async (request, reply) => {
@@ -1558,6 +1601,74 @@ export async function createCoordinator(
     return fleetContribution.setAll(body.enabled);
   });
 
+  app.get("/public/v1/admin/federation", async (request, reply) => {
+    if (!await authorizeAdministrativeMutation(request, reply)) return;
+    return {
+      settings: federation.settings(),
+      federation: federation.snapshot(),
+      networks: federation.networks(),
+      nodes: federation.nodes(),
+      managedRentals: store.listManagedRentals(),
+    };
+  });
+
+  app.put("/public/v1/admin/federation/settings", async (request, reply) => {
+    if (!await authorizeAdministrativeMutation(request, reply)) return;
+    const patch = federationSettingsUpdateSchema.parse(request.body);
+    return {
+      settings: federation.updateSettings(patch),
+      federation: federation.snapshot(),
+    };
+  });
+
+  app.put("/public/v1/admin/federation/networks/:id", async (request, reply) => {
+    if (!await authorizeAdministrativeMutation(request, reply)) return;
+    const { id } = z.object({
+      id: z.enum(FEDERATED_NETWORK_IDS),
+    }).parse(request.params);
+    const patch = federatedNetworkUpdateSchema.parse(request.body);
+    return {
+      settings: federation.updateNetwork(id, patch),
+      network: federation.networks().find((network) => network.id === id),
+    };
+  });
+
+  app.post("/public/v1/admin/federation/networks/:id/probe", async (request, reply) => {
+    if (!await authorizeAdministrativeMutation(request, reply)) return;
+    const { id } = z.object({
+      id: z.enum(FEDERATED_NETWORK_IDS),
+    }).parse(request.params);
+    if (["gpu_cloud", "vast", "clore"].includes(id)) {
+      return reply.code(409).send({
+        error: {
+          code: "rental_probe_requires_managed_worker",
+          message: "Rental capacity is verified through its signed Mycellios worker canary.",
+        },
+      });
+    }
+    const body = federationProbeSchema.parse(request.body ?? {});
+    return { network: await federation.probe(id as FederatedNetworkId, body.model) };
+  });
+
+  app.post("/public/v1/admin/federation/emergency-stop", async (request, reply) => {
+    if (!await authorizeAdministrativeMutation(request, reply, ["owner", "admin"])) return;
+    const confirmation = z.object({ confirm: z.literal(true) }).strict().safeParse(request.body);
+    if (!confirmation.success) {
+      return reply.code(400).send({
+        error: {
+          code: "emergency_stop_confirmation_required",
+          message: "Set confirm=true to stop external routes and managed rentals.",
+        },
+      });
+    }
+    await Promise.all([federation.emergencyStop(), rentals.emergencyStop()]);
+    return {
+      stopped: true,
+      settings: federation.settings(),
+      networks: federation.networks(),
+    };
+  });
+
   app.get("/public/v1/admin/assistant", async (request, reply) => {
     if (!await authorizeAdministrativeMutation(request, reply)) return;
     return {
@@ -1635,7 +1746,7 @@ export async function createCoordinator(
         activationProgressForModel,
         activationStatusMessageForModel,
         activationIncidentForModel,
-      }, runtimeVersion, coordinatorBuildIdentity);
+      }, federation, runtimeVersion, coordinatorBuildIdentity);
       const parsed: ChatCompletionRequest = {
         model: selectedModel,
         messages: buildSupportAssistantMessages(
@@ -1820,7 +1931,7 @@ export async function createCoordinator(
       activationProgressForModel,
       activationStatusMessageForModel,
       activationIncidentForModel,
-    }, runtimeVersion, coordinatorBuildIdentity);
+    }, federation, runtimeVersion, coordinatorBuildIdentity);
     return reply.code(201).send({
       model: snapshot.requestedModels.find((model) => model.id === stored.id),
     });
@@ -2255,16 +2366,71 @@ export async function createCoordinator(
   );
 
   app.get("/v1/models", async () => {
-    const models = scheduler.listAvailableModels({ connectedWorkerIds: hub.connectedWorkerIds() });
+    const nativeModels = scheduler.listAvailableModels({
+      connectedWorkerIds: hub.connectedWorkerIds(),
+    });
+    const federatedModels = federation.verifiedModels();
+    const federatedRouteCounts = federation.verifiedModelRouteCounts();
+    const models = new Map<string, {
+      id: string;
+      replicas: number;
+      pipelines: number;
+      federatedRoutes: number;
+    }>();
+    for (const model of nativeModels) {
+      models.set(model.id, {
+        id: model.id,
+        replicas: model.replicas,
+        pipelines: model.pipelines,
+        federatedRoutes: 0,
+      });
+    }
+    for (const model of federatedModels) {
+      const current = models.get(model.canonicalId);
+      models.set(model.canonicalId, {
+        id: model.canonicalId,
+        replicas: current?.replicas ?? 0,
+        pipelines: current?.pipelines ?? 0,
+        federatedRoutes: federatedRouteCounts.get(model.canonicalId) ?? 1,
+      });
+    }
+    const aliasNativeRoutes = nativeModels.reduce(
+      (total, model) => total + model.replicas + model.pipelines,
+      0,
+    );
+    const aliasFederatedRoutes = [...federatedRouteCounts.values()].reduce(
+      (total, count) => total + count,
+      0,
+    );
+    const aliasRouteCount = aliasNativeRoutes + aliasFederatedRoutes;
+    if (aliasRouteCount > 0) {
+      for (const id of [
+        "mycellios-auto",
+        "mycellios-fast",
+        "mycellios-code",
+        "mycellios-quality",
+      ]) {
+        models.set(id, {
+          id,
+          replicas: aliasNativeRoutes,
+          pipelines: 0,
+          federatedRoutes: aliasFederatedRoutes,
+        });
+      }
+    }
     return {
       object: "list",
-      data: models.map((model) => ({
+      data: [...models.values()].map((model) => ({
         id: model.id,
         object: "model",
         created: 0,
         owned_by: "mycellios",
         x_replicas: model.replicas,
         x_pipelines: model.pipelines,
+        x_routes: model.replicas + model.pipelines + model.federatedRoutes,
+        x_capacity_class: model.federatedRoutes > 0 && model.replicas + model.pipelines > 0
+          ? "mixed"
+          : model.federatedRoutes > 0 ? "federated" : "native",
       })),
     };
   });
@@ -2275,7 +2441,7 @@ export async function createCoordinator(
       ? principalFor(request)
       : { kind: "system" };
     const idempotencyKey = parseIdempotencyKey(request.headers["idempotency-key"]);
-    const supersededJobId = service.cancelMatchingActiveSession(parsed, parsed.session_id);
+    const supersededJobId = inferenceRouter.cancelMatchingActiveSession(parsed, parsed.session_id);
     if (supersededJobId) {
       app.log.warn({
         supersededJobId,
@@ -2286,11 +2452,11 @@ export async function createCoordinator(
       // slot before the replacement lease is offered on the same socket.
       await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 1_000));
     }
-    if (parsed.stream && !service.hasCapacity(parsed, parsed.session_id)) {
+    if (parsed.stream && !inferenceRouter.hasCapacity(parsed, parsed.session_id)) {
       // A reconnect can race both route rebuilding and the automatic startup
       // benchmark. Keep the fetch pending while capacity returns instead of
       // making the installed desktop surface a transient 503.
-      await waitForChatCapacity(service, parsed, parsed.session_id, 45_000);
+      await waitForChatCapacity(inferenceRouter, parsed, parsed.session_id, 45_000);
     }
     const usage = principal.kind === "system"
       ? null
@@ -2305,9 +2471,9 @@ export async function createCoordinator(
       reply.header("x-ratelimit-reset", Math.ceil(usage.rateLimit.resetAt / 1_000));
       reply.header("x-token-balance", usage.remainingTokens);
     }
-    let handle: ReturnType<MeshService["submit"]>;
+    let handle: ReturnType<UnifiedInferenceRouter["submit"]>;
     try {
-      handle = service.submit(parsed, parsed.session_id, idempotencyKey);
+      handle = inferenceRouter.submit(parsed, parsed.session_id, idempotencyKey);
     } catch (error) {
       if (usage) apiAccess.failUsage(usage.id, "submission_failed");
       throw error;
@@ -2338,7 +2504,7 @@ export async function createCoordinator(
       let streamedFailure: Extract<JobStreamEvent, { type: "failed" }> | null = null;
       let streamError: unknown = null;
       reply.raw.once("close", () => {
-        if (!finished) service.cancel(handle.jobId);
+        if (!finished) inferenceRouter.cancel(handle.jobId);
       });
       const heartbeatTimer = setInterval(() => {
         if (!reply.raw.destroyed && !reply.raw.writableEnded) {
@@ -2553,7 +2719,7 @@ export async function createCoordinator(
     ) {
       return reply.code(404).send({ error: { code: "not_found_or_terminal" } });
     }
-    if (!service.cancel(jobId)) {
+    if (!inferenceRouter.cancel(jobId)) {
       return reply.code(404).send({ error: { code: "not_found_or_terminal" } });
     }
     return reply.code(202).send({ id: jobId, status: "cancelled" });
@@ -2790,6 +2956,9 @@ export async function createCoordinator(
     hub,
     mobileHub,
     service,
+    inferenceRouter,
+    federation,
+    rentals,
     apiAccess,
     persistence,
     deploymentController,
@@ -2801,6 +2970,8 @@ export async function createCoordinator(
       fleetContribution.close();
       hub.close();
       mobileHub.close();
+      rentals.close();
+      await federation.close();
       await activationManager?.close();
       await app.close();
       await persistence?.close();
@@ -3174,6 +3345,7 @@ function publicSnapshot(
     activationStatusMessageForModel(modelId: string): string | null;
     activationIncidentForModel(modelId: string): ActivationIncident | null;
   } | undefined,
+  federation: FederationManager,
   version: string,
   buildIdentity: NativeBuildIdentity | null = null,
 ) {
@@ -3209,6 +3381,25 @@ function publicSnapshot(
     createdAt: new Date(job.createdAt).toISOString(),
     updatedAt: new Date(job.updatedAt).toISOString(),
   }));
+  const federatedNetworks = federation.networks();
+  const federatedNodes = federation.nodes();
+  const federatedModels = federation.verifiedModels();
+  const federatedRouteCounts = federation.verifiedModelRouteCounts();
+  const publicModels = new Map(models.map((model) => [model.id, {
+    id: model.id,
+    replicas: model.replicas,
+    pipelines: model.pipelines,
+    federatedRoutes: 0,
+  }]));
+  for (const model of federatedModels) {
+    const current = publicModels.get(model.canonicalId);
+    publicModels.set(model.canonicalId, {
+      id: model.canonicalId,
+      replicas: current?.replicas ?? 0,
+      pipelines: current?.pipelines ?? 0,
+      federatedRoutes: federatedRouteCounts.get(model.canonicalId) ?? 1,
+    });
+  }
   return {
     capturedAt: new Date().toISOString(),
     version,
@@ -3222,11 +3413,10 @@ function publicSnapshot(
       completedJobs: jobs.filter((job) => job.status === "completed").length,
     },
     workers,
-    models: models.map((model) => ({
-      id: model.id,
-      replicas: model.replicas,
-      pipelines: model.pipelines,
-    })),
+    federation: federation.snapshot(),
+    federatedNetworks,
+    federatedNodes,
+    models: [...publicModels.values()],
     requestedModels,
     jobs,
   };
@@ -3312,7 +3502,7 @@ function mobileDashboardWorker(worker: MobileWorkerSnapshot) {
 }
 
 async function waitForChatCapacity(
-  service: MeshService,
+  service: Pick<MeshService, "hasCapacity"> | Pick<UnifiedInferenceRouter, "hasCapacity">,
   request: ChatCompletionRequest,
   sessionId: string | undefined,
   timeoutMs: number,
@@ -3334,6 +3524,16 @@ function parseIdempotencyKey(received: string | string[] | undefined): string | 
     );
   }
   return value;
+}
+
+function absoluteUrlOrigin(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" ? url.origin : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 interface SupportAssistantRateState {

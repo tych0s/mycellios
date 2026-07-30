@@ -8,6 +8,13 @@ import type {
 } from "../contracts/types.js";
 import type { RemoteDiagnosticEvent } from "../contracts/remote-diagnostics.js";
 import type { BenchmarkRun } from "../benchlab/types.js";
+import type {
+  FederatedNetworkId,
+  FederatedNetworkSettings,
+  FederatedRouteAttempt,
+  FederationSettings,
+  ManagedRental,
+} from "../contracts/federation.js";
 import { newId } from "../core/ids.js";
 import {
   ASSISTANT_SETTINGS_ID,
@@ -15,6 +22,11 @@ import {
   type SupportAssistantSettings,
 } from "../support/assistant.js";
 import { MeshDatabase } from "./database.js";
+
+function startOfUtcDay(timestamp: number): number {
+  const date = new Date(timestamp);
+  return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
+}
 
 export interface StoredWorker {
   id: string;
@@ -159,6 +171,381 @@ interface RequestedModelRow {
 
 export class MeshStore {
   constructor(readonly database: MeshDatabase) {}
+
+  getFederationSettings(defaultEnabled = false): FederationSettings {
+    const row = this.database.raw.prepare(
+      "SELECT * FROM federation_settings WHERE id = 'global'",
+    ).get() as {
+      enabled: number;
+      daily_budget_usd: number;
+      monthly_budget_usd: number;
+      autoscaling_enabled: number;
+      max_rentals: number;
+      updated_at: number;
+    } | undefined;
+    if (row) {
+      return {
+        enabled: Boolean(row.enabled),
+        dailyBudgetUsd: Number(row.daily_budget_usd),
+        monthlyBudgetUsd: Number(row.monthly_budget_usd),
+        autoscalingEnabled: Boolean(row.autoscaling_enabled),
+        maxRentals: Number(row.max_rentals),
+        updatedAt: Number(row.updated_at),
+      };
+    }
+    return this.saveFederationSettings({
+      enabled: defaultEnabled,
+      dailyBudgetUsd: 0,
+      monthlyBudgetUsd: 0,
+      autoscalingEnabled: false,
+      maxRentals: 4,
+    });
+  }
+
+  saveFederationSettings(
+    input: Omit<FederationSettings, "updatedAt">,
+  ): FederationSettings {
+    const updatedAt = Date.now();
+    this.database.raw.prepare(
+      `INSERT INTO federation_settings(
+         id, enabled, daily_budget_usd, monthly_budget_usd,
+         autoscaling_enabled, max_rentals, updated_at
+       ) VALUES ('global', ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         enabled = excluded.enabled,
+         daily_budget_usd = excluded.daily_budget_usd,
+         monthly_budget_usd = excluded.monthly_budget_usd,
+         autoscaling_enabled = excluded.autoscaling_enabled,
+         max_rentals = excluded.max_rentals,
+         updated_at = excluded.updated_at`,
+    ).run(
+      input.enabled ? 1 : 0,
+      input.dailyBudgetUsd,
+      input.monthlyBudgetUsd,
+      input.autoscalingEnabled ? 1 : 0,
+      input.maxRentals,
+      updatedAt,
+    );
+    this.queueFederationSettings();
+    return { ...input, updatedAt };
+  }
+
+  getFederatedNetworkSettings(
+    id: FederatedNetworkId,
+    defaults: Omit<FederatedNetworkSettings, "id" | "updatedAt">,
+  ): FederatedNetworkSettings {
+    const row = this.database.raw.prepare(
+      "SELECT * FROM federated_network_settings WHERE id = ?",
+    ).get(id) as {
+      enabled: number;
+      priority: number;
+      daily_budget_usd: number;
+      monthly_budget_usd: number;
+      updated_at: number;
+    } | undefined;
+    if (row) {
+      return {
+        id,
+        enabled: Boolean(row.enabled),
+        priority: Number(row.priority),
+        dailyBudgetUsd: Number(row.daily_budget_usd),
+        monthlyBudgetUsd: Number(row.monthly_budget_usd),
+        updatedAt: Number(row.updated_at),
+      };
+    }
+    return this.saveFederatedNetworkSettings({ id, ...defaults });
+  }
+
+  listFederatedNetworkSettings(): FederatedNetworkSettings[] {
+    const rows = this.database.raw.prepare(
+      "SELECT * FROM federated_network_settings ORDER BY priority, id",
+    ).all() as unknown as Array<{
+      id: FederatedNetworkId;
+      enabled: number;
+      priority: number;
+      daily_budget_usd: number;
+      monthly_budget_usd: number;
+      updated_at: number;
+    }>;
+    return rows.map((row) => ({
+      id: row.id,
+      enabled: Boolean(row.enabled),
+      priority: Number(row.priority),
+      dailyBudgetUsd: Number(row.daily_budget_usd),
+      monthlyBudgetUsd: Number(row.monthly_budget_usd),
+      updatedAt: Number(row.updated_at),
+    }));
+  }
+
+  saveFederatedNetworkSettings(
+    input: Omit<FederatedNetworkSettings, "updatedAt">,
+  ): FederatedNetworkSettings {
+    const updatedAt = Date.now();
+    this.database.raw.prepare(
+      `INSERT INTO federated_network_settings(
+         id, enabled, priority, daily_budget_usd, monthly_budget_usd, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         enabled = excluded.enabled,
+         priority = excluded.priority,
+         daily_budget_usd = excluded.daily_budget_usd,
+         monthly_budget_usd = excluded.monthly_budget_usd,
+         updated_at = excluded.updated_at`,
+    ).run(
+      input.id,
+      input.enabled ? 1 : 0,
+      input.priority,
+      input.dailyBudgetUsd,
+      input.monthlyBudgetUsd,
+      updatedAt,
+    );
+    this.queueFederatedNetworkSettings(input.id);
+    return { ...input, updatedAt };
+  }
+
+  reserveProviderSpend(input: {
+    id: string;
+    provider: FederatedNetworkId;
+    requestId: string;
+    maximumUsd: number;
+    dailyBudgetUsd: number;
+    monthlyBudgetUsd: number;
+    now?: number;
+  }): boolean {
+    if (input.maximumUsd <= 0) return true;
+    return this.database.transaction(() => {
+      const now = input.now ?? Date.now();
+      const dayStart = startOfUtcDay(now);
+      const monthStart = Date.UTC(
+        new Date(now).getUTCFullYear(),
+        new Date(now).getUTCMonth(),
+        1,
+      );
+      const sumSince = (since: number) => {
+        const row = this.database.raw.prepare(
+          `SELECT COALESCE(SUM(
+             CASE WHEN status = 'reserved' THEN reserved_usd
+                  WHEN status = 'reconciled' THEN COALESCE(actual_usd, reserved_usd)
+                  ELSE 0 END
+           ), 0) AS spent
+           FROM provider_spend_reservations
+           WHERE provider = ? AND created_at >= ?`,
+        ).get(input.provider, since) as { spent: number };
+        return Number(row.spent);
+      };
+      if (
+        input.dailyBudgetUsd <= 0
+        || input.monthlyBudgetUsd <= 0
+        || sumSince(dayStart) + input.maximumUsd > input.dailyBudgetUsd
+        || sumSince(monthStart) + input.maximumUsd > input.monthlyBudgetUsd
+      ) return false;
+      this.database.raw.prepare(
+        `INSERT INTO provider_spend_reservations(
+           id, provider, request_id, reserved_usd, status, created_at
+         ) VALUES (?, ?, ?, ?, 'reserved', ?)`,
+      ).run(input.id, input.provider, input.requestId, input.maximumUsd, now);
+      this.queueFederationTableRow("provider_spend_reservations", input.id);
+      return true;
+    });
+  }
+
+  reconcileProviderSpend(id: string, actualUsd: number): void {
+    this.database.raw.prepare(
+      `UPDATE provider_spend_reservations
+       SET actual_usd = ?, status = 'reconciled', reconciled_at = ?
+       WHERE id = ? AND status = 'reserved'`,
+    ).run(Math.max(0, actualUsd), Date.now(), id);
+    this.queueFederationTableRow("provider_spend_reservations", id);
+  }
+
+  releaseProviderSpend(id: string): void {
+    this.database.raw.prepare(
+      `UPDATE provider_spend_reservations
+       SET status = 'released', reconciled_at = ?
+       WHERE id = ? AND status = 'reserved'`,
+    ).run(Date.now(), id);
+    this.queueFederationTableRow("provider_spend_reservations", id);
+  }
+
+  providerReservedForRequest(requestId: string): number {
+    const row = this.database.raw.prepare(
+      `SELECT COALESCE(SUM(reserved_usd), 0) AS reserved
+       FROM provider_spend_reservations
+       WHERE request_id = ? AND status = 'reserved'`,
+    ).get(requestId) as { reserved: number };
+    return Number(row.reserved);
+  }
+
+  reconcileProviderSpendForRequest(requestId: string, actualUsd: number): void {
+    this.database.transaction(() => {
+      const rows = this.database.raw.prepare(
+        `SELECT id FROM provider_spend_reservations
+         WHERE request_id = ? AND status = 'reserved'
+         ORDER BY created_at, id`,
+      ).all(requestId) as unknown as Array<{ id: string }>;
+      rows.forEach((row, index) => {
+        this.reconcileProviderSpend(row.id, index === 0 ? Math.max(0, actualUsd) : 0);
+      });
+    });
+  }
+
+  providerSpend(provider: FederatedNetworkId, now = Date.now()): {
+    todayUsd: number;
+    monthUsd: number;
+  } {
+    const total = (since: number) => {
+      const row = this.database.raw.prepare(
+        `SELECT COALESCE(SUM(
+           CASE WHEN status = 'reserved' THEN reserved_usd
+                WHEN status = 'reconciled' THEN COALESCE(actual_usd, reserved_usd)
+                ELSE 0 END
+         ), 0) AS spent
+         FROM provider_spend_reservations
+         WHERE provider = ? AND created_at >= ?`,
+      ).get(provider, since) as { spent: number };
+      return Number(row.spent);
+    };
+    const date = new Date(now);
+    return {
+      todayUsd: total(startOfUtcDay(now)),
+      monthUsd: total(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1)),
+    };
+  }
+
+  createFederatedRouteAttempt(attempt: FederatedRouteAttempt): void {
+    this.database.raw.prepare(
+      `INSERT INTO federated_route_attempts(
+         id, request_id, provider, canonical_model, external_model, route_kind,
+         started_at, first_token_at, completed_at, input_tokens, output_tokens,
+         reserved_cost_usd, actual_cost_usd, result, fallback_reason, failure_code
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      attempt.id,
+      attempt.requestId,
+      attempt.provider,
+      attempt.canonicalModel,
+      attempt.externalModel,
+      attempt.routeKind,
+      attempt.startedAt,
+      attempt.firstTokenAt,
+      attempt.completedAt,
+      attempt.inputTokens,
+      attempt.outputTokens,
+      attempt.reservedCostUsd,
+      attempt.actualCostUsd,
+      attempt.result,
+      attempt.fallbackReason,
+      attempt.failureCode,
+    );
+    this.queueFederationTableRow("federated_route_attempts", attempt.id);
+  }
+
+  updateFederatedRouteAttempt(
+    id: string,
+    input: Partial<Pick<
+      FederatedRouteAttempt,
+      "firstTokenAt" | "completedAt" | "inputTokens" | "outputTokens"
+      | "actualCostUsd" | "result" | "fallbackReason" | "failureCode"
+    >>,
+  ): void {
+    const entries = Object.entries({
+      first_token_at: input.firstTokenAt,
+      completed_at: input.completedAt,
+      input_tokens: input.inputTokens,
+      output_tokens: input.outputTokens,
+      actual_cost_usd: input.actualCostUsd,
+      result: input.result,
+      fallback_reason: input.fallbackReason,
+      failure_code: input.failureCode,
+    }).filter((entry) => entry[1] !== undefined);
+    if (entries.length === 0) return;
+    this.database.raw.prepare(
+      `UPDATE federated_route_attempts
+       SET ${entries.map(([column]) => `${column} = ?`).join(", ")}
+       WHERE id = ?`,
+    ).run(...entries.map(([, value]) => value ?? null), id);
+    this.queueFederationTableRow("federated_route_attempts", id);
+  }
+
+  listManagedRentals(): ManagedRental[] {
+    const rows = this.database.raw.prepare(
+      "SELECT * FROM managed_rentals ORDER BY created_at DESC",
+    ).all() as unknown as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      id: String(row.id),
+      provider: row.provider as ManagedRental["provider"],
+      state: row.state as ManagedRental["state"],
+      image: String(row.image),
+      requestedHardware: JSON.parse(String(row.hardware_json)) as ManagedRental["requestedHardware"],
+      workerId: row.worker_id === null ? null : String(row.worker_id),
+      reservedCostUsd: Number(row.reserved_cost_usd),
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+      drainStartedAt: row.drain_started_at === null ? null : Number(row.drain_started_at),
+      stoppedAt: row.stopped_at === null ? null : Number(row.stopped_at),
+      lastError: row.last_error === null ? null : String(row.last_error),
+    }));
+  }
+
+  saveManagedRental(input: ManagedRental & {
+    externalId: string;
+    credentialIdentityId: string | null;
+    labels: Record<string, string>;
+  }): void {
+    this.database.raw.prepare(
+      `INSERT INTO managed_rentals(
+         id, provider, external_id, state, image, hardware_json, worker_id,
+         credential_identity_id, reserved_cost_usd, labels_json, created_at,
+         updated_at, drain_started_at, stopped_at, last_error
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         state = excluded.state,
+         worker_id = excluded.worker_id,
+         reserved_cost_usd = excluded.reserved_cost_usd,
+         updated_at = excluded.updated_at,
+         drain_started_at = excluded.drain_started_at,
+         stopped_at = excluded.stopped_at,
+         last_error = excluded.last_error`,
+    ).run(
+      input.id,
+      input.provider,
+      input.externalId,
+      input.state,
+      input.image,
+      JSON.stringify(input.requestedHardware),
+      input.workerId,
+      input.credentialIdentityId,
+      input.reservedCostUsd,
+      JSON.stringify(input.labels),
+      input.createdAt,
+      input.updatedAt,
+      input.drainStartedAt,
+      input.stoppedAt,
+      input.lastError,
+    );
+    this.queueFederationTableRow("managed_rentals", input.id);
+  }
+
+  getManagedRentalPrivate(id: string): (ManagedRental & {
+    externalId: string;
+    credentialIdentityId: string | null;
+    labels: Record<string, string>;
+  }) | null {
+    const row = this.database.raw.prepare(
+      "SELECT * FROM managed_rentals WHERE id = ?",
+    ).get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    const publicRental = this.listManagedRentals().find((rental) => rental.id === id);
+    if (!publicRental) return null;
+    return {
+      ...publicRental,
+      externalId: String(row.external_id),
+      credentialIdentityId: row.credential_identity_id === null
+        ? null
+        : String(row.credential_identity_id),
+      labels: JSON.parse(String(row.labels_json)) as Record<string, string>,
+    };
+  }
 
   getSupportAssistantSettings(): SupportAssistantSettings {
     const row = this.database.raw.prepare(
@@ -881,6 +1268,32 @@ export class MeshStore {
         this.database.enqueueRemoteChange("deployment_stage_leases", row.id, "upsert", row);
         queued += 1;
       }
+      if (this.database.raw.prepare(
+        "SELECT 1 FROM federation_settings WHERE id = 'global'",
+      ).get()) {
+        this.queueFederationSettings();
+        queued += 1;
+      }
+      const networkSettings = this.database.raw.prepare(
+        "SELECT id FROM federated_network_settings",
+      ).all() as unknown as Array<{ id: FederatedNetworkId }>;
+      for (const row of networkSettings) {
+        this.queueFederatedNetworkSettings(row.id);
+        queued += 1;
+      }
+      for (const table of [
+        "federated_route_attempts",
+        "provider_spend_reservations",
+        "managed_rentals",
+      ] as const) {
+        const rows = this.database.raw.prepare(
+          `SELECT id FROM ${table}`,
+        ).all() as unknown as Array<{ id: string }>;
+        for (const row of rows) {
+          this.queueFederationTableRow(table, row.id);
+          queued += 1;
+        }
+      }
       return queued;
     });
   }
@@ -1268,6 +1681,49 @@ export class MeshStore {
         "DELETE FROM network_telemetry_history WHERE captured_at < ?",
       ).run(before).changes,
     );
+  }
+
+  private queueFederationSettings(): void {
+    const row = this.database.raw.prepare(
+      "SELECT * FROM federation_settings WHERE id = 'global'",
+    ).get() as Record<string, unknown> | undefined;
+    if (!row) return;
+    this.database.enqueueRemoteChange("federation_settings", "global", "upsert", {
+      ...row,
+      enabled: Number(row.enabled) === 1,
+      autoscaling_enabled: Number(row.autoscaling_enabled) === 1,
+    });
+  }
+
+  private queueFederatedNetworkSettings(id: string): void {
+    const row = this.database.raw.prepare(
+      "SELECT * FROM federated_network_settings WHERE id = ?",
+    ).get(id) as Record<string, unknown> | undefined;
+    if (!row) return;
+    this.database.enqueueRemoteChange("federated_network_settings", id, "upsert", {
+      ...row,
+      enabled: Number(row.enabled) === 1,
+    });
+  }
+
+  private queueFederationTableRow(
+    table:
+      | "federated_route_attempts"
+      | "provider_spend_reservations"
+      | "managed_rentals",
+    id: string,
+  ): void {
+    const row = this.database.raw.prepare(
+      `SELECT * FROM ${table} WHERE id = ?`,
+    ).get(id) as Record<string, unknown> | undefined;
+    if (!row) return;
+    this.database.enqueueRemoteChange(table, id, "upsert", table === "managed_rentals"
+      ? {
+          ...row,
+          hardware_json: JSON.parse(String(row.hardware_json)),
+          labels_json: JSON.parse(String(row.labels_json)),
+        }
+      : row);
   }
 
   private queueWorker(workerId: string): void {
