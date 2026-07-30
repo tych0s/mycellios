@@ -117,6 +117,7 @@ import {
 } from "./update-recovery.js";
 import { SingleFlight } from "./single-flight.js";
 import { RemoteDiagnosticsUploader } from "./remote-diagnostics.js";
+import { stageStartupDiagnostic } from "./stage-startup-diagnostic.js";
 import { readNativeBuildIdentity } from "../core/native-build-identity.js";
 import { probeRuntimePerformanceProfile } from "../performance/runtime-profile-probe.js";
 import {
@@ -1919,6 +1920,7 @@ class DesktopAcceleratedLaunchAgent implements LaunchAgent {
   ): Promise<LaunchProcessHandle> {
     const maximumAttempts = 2;
     let lastError: unknown = new Error("gpu_model_stage_failed");
+    let lastDiagnostic: string | null = null;
     for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
       let handle: LaunchProcessHandle | null = null;
       try {
@@ -1928,6 +1930,7 @@ class DesktopAcceleratedLaunchAgent implements LaunchAgent {
         return handle;
       } catch (error) {
         lastError = error;
+        lastDiagnostic = stageStartupDiagnostic(handle) ?? lastDiagnostic;
         if (signal.aborted) {
           throw signal.reason instanceof Error ? signal.reason : new Error("distributed_launch_cancelled");
         }
@@ -1943,7 +1946,8 @@ class DesktopAcceleratedLaunchAgent implements LaunchAgent {
     }
 
     const reason = errorText(lastError);
-    invalidateGpuRuntimeAfterStageFailure(runtime, request.launchId, reason);
+    const failureReason = `${reason}${lastDiagnostic ? `:diagnostic=${lastDiagnostic}` : ""}`;
+    invalidateGpuRuntimeAfterStageFailure(runtime, request.launchId, failureReason);
     if (settings.computeMode === "automatic") {
       accelerationStatus = appendAccelerationLog(accelerationStatus, {
         at: new Date().toISOString(),
@@ -1955,7 +1959,9 @@ class DesktopAcceleratedLaunchAgent implements LaunchAgent {
       this.observeHandle(cpuHandle, request, cpuRuntime, false);
       return cpuHandle;
     }
-    throw new Error(`gpu_model_stage_unavailable_after_retries:${runtime.effectiveBackend}:${reason}`);
+    throw new Error(
+      `gpu_model_stage_unavailable_after_retries:${runtime.effectiveBackend}:${failureReason}`,
+    );
   }
 
   private async launchWithRuntime(
