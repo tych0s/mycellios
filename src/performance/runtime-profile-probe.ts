@@ -52,8 +52,13 @@ const MAXIMUM_OUTPUT_BYTES = 256 * 1024;
 export async function probeRuntimePerformanceProfile(
   options: ProbeRuntimePerformanceProfileOptions,
 ): Promise<RuntimePerformanceProfile> {
-  const warmupSamples = boundedInteger(options.warmupSamples ?? 2, 1, 1_000);
-  const samples = boundedInteger(options.samples ?? 9, 7, 10_000);
+  // Integrated GPUs share memory and the Windows scheduler with the desktop.
+  // A very short sample frequently produces a statistically valid profile
+  // that the planner must nevertheless reject as too noisy. Twenty-one
+  // samples keeps the physical calibration interactive while making the
+  // planner's 20% confidence gate reliable on those devices.
+  const warmupSamples = boundedInteger(options.warmupSamples ?? 3, 1, 1_000);
+  const samples = boundedInteger(options.samples ?? 21, 7, 10_000);
   const threads = boundedInteger(options.threads ?? 1, 1, 256);
   const timeoutMs = boundedInteger(options.timeoutMs ?? 180_000, 1_000, 3_600_000);
   const executable = options.pythonExecutable.trim();
@@ -125,12 +130,7 @@ export function parsePhysicalRuntimePerformanceProfile(
   if (Buffer.byteLength(serialized, "utf8") > MAXIMUM_OUTPUT_BYTES) {
     throw new Error("runtime_performance_probe_output_is_too_large");
   }
-  let decoded: unknown;
-  try {
-    decoded = JSON.parse(serialized.trim());
-  } catch {
-    throw new Error("runtime_performance_probe_output_is_not_json");
-  }
+  const decoded = parseRuntimeProfileOutput(serialized);
   const input = runtimePerformanceProfileInputSchema.parse(decoded);
   if (input.source !== "physical-microbenchmark") {
     throw new Error("runtime_performance_probe_source_is_not_physical");
@@ -152,6 +152,37 @@ export function parsePhysicalRuntimePerformanceProfile(
     throw new Error("runtime_performance_probe_device_does_not_match");
   }
   return sealRuntimePerformanceProfile(input);
+}
+
+/**
+ * Accelerator runtimes can emit native diagnostics before Python gets control
+ * of stdout. ROCm on Windows, for example, prints an `offload-arch` warning
+ * before the physical probe's JSON even though the benchmark succeeds.
+ *
+ * Prefer the whole stream so pretty-printed JSON remains valid. If native
+ * diagnostics precede it, accept only a complete JSON value on the final
+ * non-empty line. Output after the evidence remains a hard failure: otherwise
+ * a truncated or contaminated probe could look successful accidentally.
+ */
+function parseRuntimeProfileOutput(serialized: string): unknown {
+  const trimmed = serialized.trim();
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    const finalLine = trimmed
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .at(-1);
+    if (!finalLine) {
+      throw new Error("runtime_performance_probe_output_is_not_json");
+    }
+    try {
+      return JSON.parse(finalLine);
+    } catch {
+      throw new Error("runtime_performance_probe_output_is_not_json");
+    }
+  }
 }
 
 export const runRuntimeProfileCommand: RuntimeProfileCommandRunner = (

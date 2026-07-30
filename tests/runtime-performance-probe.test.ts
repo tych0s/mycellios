@@ -58,7 +58,7 @@ describe("physical runtime performance probe", () => {
       "--device",
       "cuda:0",
       "--samples",
-      "9",
+      "21",
     ]));
     expect(calls[0]?.pythonPath).toContain("mycellios");
   });
@@ -77,6 +77,28 @@ describe("physical runtime performance probe", () => {
       ...input(),
       invented: true,
     }), expected)).toThrow();
+  });
+
+  it("accepts native ROCm diagnostics before the final physical profile", () => {
+    const expected = { backend: "rocm" as const, precision: "float16" as const };
+    const profile = parsePhysicalRuntimePerformanceProfile([
+      "[WARNING] offload-arch failed with return code 1",
+      "[stderr]",
+      JSON.stringify({ ...input(), backend: "rocm" }),
+      "",
+    ].join("\r\n"), expected);
+
+    expect(profile.backend).toBe("rocm");
+    expect(profile.source).toBe("physical-microbenchmark");
+    expect(profile.profileId).toMatch(/^sha256:[0-9a-f]{64}$/);
+  });
+
+  it("rejects diagnostics appended after the physical profile", () => {
+    const expected = { backend: "rocm" as const, precision: "float16" as const };
+    expect(() => parsePhysicalRuntimePerformanceProfile([
+      JSON.stringify({ ...input(), backend: "rocm" }),
+      "[WARNING] trailing output",
+    ].join("\n"), expected)).toThrow("runtime_performance_probe_output_is_not_json");
   });
 
   it("publishes a physical profile only in response to a coordinator challenge", async () => {

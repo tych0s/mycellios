@@ -49,6 +49,7 @@ import type {
   RuntimeDirectTransportOptions,
 } from "./runtime-direct-transport.js";
 import {
+  plannerScalesFromProfile,
   runtimePerformanceProfileSchema,
   type RuntimePerformanceProfile,
 } from "../performance/runtime-profile.js";
@@ -881,6 +882,12 @@ export class WorkerAgent {
       ) {
         throw new Error("runtime_performance_profile_device_does_not_match_capacity");
       }
+      // Do not let the coordinator seal evidence that its planner must reject.
+      // A noisy physical result is retriable evidence, not usable capacity.
+      plannerScalesFromProfile(profile);
+      this.logger.info(
+        `Native runtime performance calibration verified for ${profile.deviceName} (${profile.backend}).`,
+      );
       return profile;
     } catch (error) {
       this.logger.warn(
