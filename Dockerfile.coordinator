@@ -11,7 +11,9 @@ RUN --mount=type=cache,id=mycellios-pip-coordinator,target=/root/.cache/pip,shar
       -r /tmp/linux-x64-cp312.txt \
     && python -c "import safetensors,torch,transformers; print(torch.__version__, transformers.__version__, safetensors.__version__)"
 
-FROM node:24-bookworm-slim AS build
+FROM node:24-bookworm-slim AS node-runtime
+
+FROM node-runtime AS build
 ARG DEPLOY_REVISION
 COPY --from=python-runtime /usr/local /opt/python
 ENV PATH="/opt/python/bin:${PATH}" \
@@ -25,12 +27,16 @@ RUN node scripts/prepare-coordinator-runtime-identity.mjs \
       --revision="${DEPLOY_REVISION}" \
     && npm run build
 
-FROM node:24-bookworm-slim AS runtime
-COPY --from=coordinator-python-runtime /usr/local /opt/python
+# Keep the Python image as the OS base so its dynamically linked standard
+# library extensions retain all Debian runtime dependencies (notably OpenSSL).
+# Node's /usr/local tree merges cleanly with the sealed Python installation.
+FROM coordinator-python-runtime AS runtime
+COPY --from=node-runtime /usr/local /usr/local
 ENV NODE_ENV=production \
-    PATH="/opt/python/bin:${PATH}" \
-    LD_LIBRARY_PATH="/opt/python/lib" \
     PYTHONUNBUFFERED=1
+RUN node --version \
+    && npm --version \
+    && python -c "import ssl,safetensors,torch,transformers; print(ssl.OPENSSL_VERSION, torch.__version__, transformers.__version__, safetensors.__version__)"
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN --mount=type=cache,id=mycellios-npm-runtime,target=/root/.npm,sharing=locked \

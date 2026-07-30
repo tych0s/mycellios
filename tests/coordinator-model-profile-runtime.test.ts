@@ -7,11 +7,11 @@ describe("coordinator model profile runtime", () => {
     const configured = configureCoordinatorModelProfileRuntime(baseConfig(), {
       runtimeRoot: "/app",
       platform: "linux",
-      exists: (path) => path === "/opt/python/bin/python",
+      exists: (path) => path === "/usr/local/bin/python",
       environment: {},
     });
 
-    expect(configured.runtime.pythonExecutable).toBe("/opt/python/bin/python");
+    expect(configured.runtime.pythonExecutable).toBe("/usr/local/bin/python");
     expect(configured.runtime.pythonPath).toBe("/app/python");
     expect(configured.runtime.hfHome).toBe("/var/lib/mycellios/hf-cache");
   });
