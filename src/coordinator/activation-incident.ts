@@ -160,10 +160,19 @@ export function activationFailureCanRetryAfterRuntimeChange(
   message: string,
   runtimeVersion: string,
 ): boolean {
+  return activationFailureMessageAfterRuntimeChange(message, runtimeVersion) !== null;
+}
+
+export function activationFailureMessageAfterRuntimeChange(
+  message: string,
+  runtimeVersion: string,
+): string | null {
   const exhausted = unwrapExhausted(message);
   return exhausted.attempts !== null
     && exhausted.runtimeVersion !== runtimeVersion
-    && incidentDefinition(exhausted.message).intrinsicallyRetryable;
+    && incidentDefinition(exhausted.message).intrinsicallyRetryable
+    ? exhausted.message
+    : null;
 }
 
 function incidentDefinition(message: string): IncidentDefinition {
