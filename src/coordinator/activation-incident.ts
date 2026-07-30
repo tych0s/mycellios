@@ -3,6 +3,7 @@ export const ACTIVATION_INCIDENT_SCHEMA =
 
 export type ActivationIncidentCode =
   | "executor_pool_not_ready"
+  | "route_evidence_not_ready"
   | "node_disconnected"
   | "launch_agent_unavailable"
   | "network_prepare_timeout"
@@ -177,6 +178,25 @@ export function activationFailureMessageAfterRuntimeChange(
 
 function incidentDefinition(message: string): IncidentDefinition {
   const normalized = message.toLowerCase();
+  if (
+    normalized.includes("route_availability_below_minimum")
+    || /^no_feasible_automatic_\d+_stage_pipeline$/i.test(message.trim())
+  ) {
+    return {
+      code: "route_evidence_not_ready",
+      scope: "network",
+      title: "The verified route is temporarily below its reliability threshold",
+      summary: "The nodes have enough memory, but their recent connection evidence is not yet reliable enough to publish a distributed route.",
+      remedy: "Mycellios keeps the model unpublished while fresh reciprocal probes replace the degraded samples, then replans automatically.",
+      steps: Object.freeze([
+        "Keep both contributing desktop clients online.",
+        "Collect fresh successful reciprocal-link probes.",
+        ...ROUTE_REBUILD_STEPS,
+      ]),
+      automaticAction: "rebuild_route",
+      intrinsicallyRetryable: true,
+    };
+  }
   if (normalized.includes("distributed_activation_requires_two_connected_shard_executors")) {
     return {
       code: "executor_pool_not_ready",

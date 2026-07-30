@@ -825,9 +825,14 @@ function exactStagePlan(request: RuntimePlanRequest, count: number): Distributio
       .slice(0, count),
   ]);
   let best: { plan: DistributionPlan; score: number } | null = null;
+  const costModelRejectionReasons = new Set<string>();
+  let placementRejected = false;
   for (const order of orders) {
     const stages = balancedExactPlacement(request, order);
-    if (!stages) continue;
+    if (!stages) {
+      placementRejected = true;
+      continue;
+    }
     const plan: DistributionPlan = {
       algorithm: "auto-balanced-exact-stages",
       codec: "fp16",
@@ -841,11 +846,18 @@ function exactStagePlan(request: RuntimePlanRequest, count: number): Distributio
       request.workload,
       plan,
     );
-    if (!metrics.feasible) continue;
+    if (!metrics.feasible) {
+      costModelRejectionReasons.add(metrics.infeasibleReason ?? "cost_model_rejected");
+      continue;
+    }
     const score = metrics.tpotMs + metrics.ttftMs * 0.05;
     if (!best || score < best.score) best = { plan, score };
   }
-  if (!best) throw new Error(`no_feasible_automatic_${count}_stage_pipeline`);
+  if (!best) {
+    const reason = [...costModelRejectionReasons].sort()[0]
+      ?? (placementRejected ? "no_balanced_exact_placement" : "unknown");
+    throw new Error(`no_feasible_automatic_${count}_stage_pipeline:${reason}`);
+  }
   return best.plan;
 }
 
