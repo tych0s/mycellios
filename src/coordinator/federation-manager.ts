@@ -175,7 +175,7 @@ export class FederationManager {
       this.closeRuntimeWhenDrained(id, runtime);
     } else if (runtime && updated.enabled) {
       runtime.closeAfterDrain = false;
-      if (!runtime.drainTask) this.trackBackground(this.discover(id));
+      if (!runtime.drainTask) this.trackBackground(this.probe(id));
     }
     return updated;
   }

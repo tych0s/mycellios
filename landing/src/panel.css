@@ -4549,6 +4549,10 @@
 .public-panel .topology-node.warning > div > i { background: var(--warning); box-shadow: 0 0 9px rgba(246, 184, 95, 0.38); }
 .public-panel .node-topology-legend i.offline,
 .public-panel .topology-node.offline > div > i { background: var(--text-disabled); }
+.public-panel .node-topology-legend i.federated {
+  background: #9d82ff;
+  box-shadow: 0 0 9px rgba(157, 130, 255, 0.48);
+}
 
 .public-panel .node-topology-map {
   position: relative;
@@ -4559,6 +4563,10 @@
     radial-gradient(circle at 50% 52%, rgba(63, 124, 255, 0.115), transparent 20%),
     radial-gradient(circle at 50% 52%, rgba(63, 124, 255, 0.035), transparent 48%),
     #111832;
+}
+
+.public-panel .node-topology-map.dense {
+  min-height: 720px;
 }
 
 .public-panel .node-topology-grid {
@@ -4593,6 +4601,12 @@
   animation: topology-flow 8s linear infinite;
 }
 
+.public-panel .node-topology-links line.federated {
+  stroke: rgba(157, 130, 255, 0.25);
+}
+.public-panel .node-topology-links line.federated.active {
+  stroke: rgba(157, 130, 255, 0.48);
+}
 .public-panel .node-topology-links line.warning { stroke: rgba(246, 184, 95, 0.34); }
 .public-panel .node-topology-links line.offline { stroke: rgba(110, 119, 145, 0.18); }
 .public-panel .node-topology-links line.selected { stroke-width: 2; filter: drop-shadow(0 0 3px rgba(99, 230, 176, 0.38)); }
@@ -4699,6 +4713,33 @@
 .public-panel .topology-node strong { overflow: hidden; font-size: 11px; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
 .public-panel .topology-node small { overflow: hidden; color: var(--text-tertiary); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 
+.public-panel .topology-node-federated {
+  width: 104px;
+  min-height: 48px;
+  gap: 6px;
+  padding: 6px 7px;
+  border-color: rgba(157, 130, 255, 0.2);
+  background: rgba(31, 27, 67, 0.94);
+}
+
+.public-panel .topology-node-federated > div {
+  width: 29px;
+  height: 29px;
+  border-color: rgba(157, 130, 255, 0.2);
+  color: #b9aaff;
+  background: rgba(157, 130, 255, 0.12);
+}
+
+.public-panel .topology-node-federated > div > svg { width: 14px; }
+.public-panel .topology-node-federated strong { font-size: 8px; }
+.public-panel .topology-node-federated small { font-size: 7px; }
+.public-panel .topology-node-federated:hover,
+.public-panel .topology-node-federated.selected {
+  border-color: rgba(157, 130, 255, 0.56);
+  background: rgba(43, 36, 90, 0.98);
+  box-shadow: 0 12px 28px rgba(2, 6, 20, 0.24), 0 0 0 3px rgba(157, 130, 255, 0.08);
+}
+
 .public-panel .node-topology-empty {
   position: absolute;
   left: 50%;
@@ -4750,6 +4791,19 @@
 .public-panel .node-inspector-identity small { color: var(--text-tertiary); font-size: 9px; letter-spacing: 0.1em; }
 .public-panel .node-inspector-identity strong { margin-top: 4px; overflow: hidden; color: var(--text-primary); font-size: 13px; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
 .public-panel .node-inspector-identity em { margin-top: 3px; overflow: hidden; color: var(--text-tertiary); font-size: 9px; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
+.public-panel .federated-node-inspector .node-inspector-identity b {
+  width: max-content;
+  margin-top: 7px;
+  padding: 3px 7px;
+  border: 1px solid rgba(157, 130, 255, 0.24);
+  border-radius: 999px;
+  color: #c6baff;
+  background: rgba(157, 130, 255, 0.1);
+  font-size: 8px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
 
 .public-panel .node-inspector-metrics {
   display: grid;

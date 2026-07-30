@@ -749,7 +749,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
           <span className="panel-nav-label">{panelMode === "developer" ? "DEVELOPER TOOLS" : "MYCELLIOS"}</span>
           {navItems.map(({ id, label, icon: Icon }) => (
             <button key={id} className={view === id ? "active" : ""} title={label} aria-label={label} onClick={() => navigate(id)}>
-              <Icon size={18} /><span>{label}</span>{id === "nodes" && <b>{snapshot.summary.connected}</b>}
+              <Icon size={18} /><span>{label}</span>{id === "nodes" && <b>{snapshot.summary.connected + snapshot.federatedNodes.length}</b>}
             </button>
           ))}
         </nav>
@@ -2648,6 +2648,7 @@ function Nodes({
   const [busy, setBusy] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [selectedWorkerId, setSelectedWorkerId] = useState("");
+  const [selectedFederatedNodeId, setSelectedFederatedNodeId] = useState("");
   const [credentials, setCredentials] = useState<WorkerCredentialSummary[] | null>(null);
   const [credentialError, setCredentialError] = useState<string | null>(null);
   const connectedWorkers = snapshot.workers.filter((worker) => worker.connected);
@@ -2669,7 +2670,16 @@ function Nodes({
   const measuredDeployments = activeDeployments.filter(isMeasuredDeployment);
   const measuredThroughput = measuredDeployments.reduce((total, deployment) => total + deployment.tokensPerSecond, 0);
   const sortedWorkers = [...snapshot.workers].sort((left, right) => nodeStateOrder(left) - nodeStateOrder(right));
-  const selectedWorker = snapshot.workers.find((worker) => worker.id === selectedWorkerId) ?? activeWorkers[0] ?? snapshot.workers[0] ?? null;
+  const sortedFederatedNodes = [...snapshot.federatedNodes].sort((left, right) =>
+    Number(right.routable) - Number(left.routable)
+    || left.networkId.localeCompare(right.networkId)
+    || left.label.localeCompare(right.label));
+  const topologyNodeCount = sortedWorkers.length + sortedFederatedNodes.length;
+  const routableFederatedNodes = sortedFederatedNodes.filter((node) => node.routable);
+  const federatedNetworkCount = new Set(sortedFederatedNodes.map((node) => node.networkId)).size;
+  const selectedWorker = snapshot.workers.find((worker) => worker.id === selectedWorkerId)
+    ?? (selectedFederatedNodeId ? null : activeWorkers[0] ?? snapshot.workers[0] ?? null);
+  const selectedFederatedNode = sortedFederatedNodes.find((node) => node.id === selectedFederatedNodeId) ?? null;
   async function remove(workerId: string) {
     setBusy(workerId);
     setActionError(null);
@@ -2725,11 +2735,12 @@ function Nodes({
   }
   return (
     <section className="nodes-page">
-      <PageTitle eyebrow="RED DISTRIBUIDA" title="Red de nodos" copy="Dispositivos físicos, navegadores activos y celdas de cómputo conectadas a mycellios." actions={<button disabled={busy !== null} onClick={() => void clearOffline()}><Trash2 size={15} /> Limpiar inactivos</button>} />
+      <PageTitle eyebrow="RED DISTRIBUIDA" title="Red de nodos" copy="Dispositivos nativos y capacidad federada disponible a través de mycellios." actions={<button disabled={busy !== null} onClick={() => void clearOffline()}><Trash2 size={15} /> Limpiar inactivos</button>} />
       {actionError && <div className="inline-error" role="alert"><CircleAlert size={17} />{actionError}</div>}
 
       <div className="node-overview-grid">
         <NodeOverviewStat icon={Server} label="Dispositivos activos" value={`${activePhysicalWorkers.length} / ${physicalWorkers.length}`} detail={`${connectedPhysicalWorkers.length} conectados ahora · ${cellWorkers.length} celdas`} progress={physicalWorkers.length > 0 ? activePhysicalWorkers.length / physicalWorkers.length : 0} tone="green" />
+        <NodeOverviewStat icon={Globe2} label="Capacidad federada" value={`${routableFederatedNodes.length} / ${sortedFederatedNodes.length}`} detail={`${federatedNetworkCount} red${federatedNetworkCount === 1 ? "" : "es"} exponiendo nodos`} progress={sortedFederatedNodes.length > 0 ? routableFederatedNodes.length / sortedFederatedNodes.length : 0} tone="purple" />
         <NodeOverviewStat icon={MemoryStick} label="Memoria ofrecida" value={formatMemory(activeOfferedVramMb)} detail={`${formatMemory(freeVramMb)} disponibles para modelos`} progress={activeOfferedVramMb > 0 ? freeVramMb / activeOfferedVramMb : 0} tone="blue" />
         <NodeOverviewStat icon={Gauge} label="Carga GPU media" value={averageUtilization === null ? "Sin datos" : `${averageUtilization.toFixed(0)}%`} detail={`${telemetryGpus.length} GPU${telemetryGpus.length === 1 ? "" : "s"} con telemetría`} progress={averageUtilization === null ? 0 : averageUtilization / 100} tone="purple" />
         <NodeOverviewStat icon={Zap} label="Capacidad de inferencia medida" value={measuredThroughput > 0 ? `${formatCompactNumber(measuredThroughput)} tok/s` : "Sin medir"} detail={measuredDeployments.length > 0 ? `${measuredDeployments.length} runtime${measuredDeployments.length === 1 ? "" : "s"} con inferencias completadas` : activeDeployments.length > 0 ? "Se medirá tras la primera inferencia real" : "Requiere un modelo activo"} tone="violet" />
@@ -2739,20 +2750,24 @@ function Nodes({
 
       <section className="node-topology-card">
         <header className="node-topology-head">
-          <div><span>TOPOLOGÍA EN VIVO</span><h2>Conexiones con el coordinador</h2><p>Cada línea representa una sesión real con mycellios.</p></div>
-          <div className="node-topology-legend"><span><i className="active" />Activo</span><span><i className="warning" />Atención</span><span><i className="offline" />Inactivo</span></div>
+          <div><span>TOPOLOGÍA EN VIVO</span><h2>Conexiones y rutas con el coordinador</h2><p>Las líneas nativas son sesiones; las federadas son capacidades expuestas por cada red.</p></div>
+          <div className="node-topology-legend"><span><i className="active" />Activo</span><span><i className="warning" />Atención</span><span><i className="offline" />Inactivo</span><span><i className="federated" />Federada</span></div>
         </header>
-        <div className={`node-topology-map${snapshot.workers.length === 0 ? " empty" : ""}`}>
+        <div className={`node-topology-map${topologyNodeCount === 0 ? " empty" : ""}${sortedFederatedNodes.length > 20 ? " dense" : ""}`}>
           <div className="node-topology-grid" />
           <svg className="node-topology-links" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
             {sortedWorkers.map((worker, index) => {
-              const position = topologyPosition(index, sortedWorkers.length);
+              const position = topologyPosition(index, topologyNodeCount);
               return <line key={worker.id} className={`${nodeVisualState(worker)}${selectedWorker?.id === worker.id ? " selected" : ""}`} x1="50" y1="52" x2={position.x} y2={position.y} vectorEffect="non-scaling-stroke" />;
             })}
+            {sortedFederatedNodes.map((node, index) => {
+              const position = topologyPosition(sortedWorkers.length + index, topologyNodeCount);
+              return <line key={node.id} className={`federated ${federatedNodeVisualState(node)}${selectedFederatedNode?.id === node.id ? " selected" : ""}`} x1="50" y1="52" x2={position.x} y2={position.y} vectorEffect="non-scaling-stroke" />;
+            })}
           </svg>
-          <div className="node-network-hub"><div><Network /></div><strong>mycellios</strong><span>{activeWorkers.length} activo{activeWorkers.length === 1 ? "" : "s"}</span><i /></div>
+          <div className="node-network-hub"><div><Network /></div><strong>mycellios</strong><span>{activeWorkers.length + routableFederatedNodes.length} utilizable{activeWorkers.length + routableFederatedNodes.length === 1 ? "" : "s"}</span><i /></div>
           {sortedWorkers.map((worker, index) => {
-            const position = topologyPosition(index, sortedWorkers.length);
+            const position = topologyPosition(index, topologyNodeCount);
             const label = workerLabel(worker);
             return <button
               type="button"
@@ -2761,12 +2776,33 @@ function Nodes({
               aria-pressed={selectedWorker?.id === worker.id}
               className={`topology-node ${nodeVisualState(worker)}${selectedWorker?.id === worker.id ? " selected" : ""}`}
               style={{ "--node-x": `${position.x}%`, "--node-y": `${position.y}%` } as CSSProperties}
-              onClick={() => setSelectedWorkerId(worker.id)}
+              onClick={() => {
+                setSelectedFederatedNodeId("");
+                setSelectedWorkerId(worker.id);
+              }}
             ><div><WorkerKindIcon worker={worker} /><i /></div><span><strong>{label}</strong><small>{worker.region} · {nodeStatusLabel(worker)}</small></span></button>;
           })}
-          {snapshot.workers.length === 0 && <div className="node-topology-empty"><Server /><strong>Aún no hay nodos</strong><span>Conecta una máquina para verla aparecer en la red.</span></div>}
+          {sortedFederatedNodes.map((node, index) => {
+            const position = topologyPosition(sortedWorkers.length + index, topologyNodeCount);
+            const selected = selectedFederatedNode?.id === node.id;
+            return <button
+              type="button"
+              key={node.id}
+              aria-label={`Ver nodo federado ${node.label}`}
+              aria-pressed={selected}
+              className={`topology-node topology-node-federated ${federatedNodeVisualState(node)}${selected ? " selected" : ""}`}
+              style={{ "--node-x": `${position.x}%`, "--node-y": `${position.y}%` } as CSSProperties}
+              title={`${node.networkId} · ${node.scope} · ${node.models.length} modelos`}
+              onClick={() => {
+                setSelectedWorkerId("");
+                setSelectedFederatedNodeId(node.id);
+              }}
+            ><div><Globe2 /><i /></div><span><strong>{node.label}</strong><small>{node.networkId} · {node.scope}</small></span></button>;
+          })}
+          {topologyNodeCount === 0 && <div className="node-topology-empty"><Server /><strong>Aún no hay nodos</strong><span>Conecta una máquina o activa una red federada.</span></div>}
         </div>
         {selectedWorker && <NodeTopologyInspector worker={selectedWorker} snapshot={snapshot} />}
+        {selectedFederatedNode && <FederatedNodeTopologyInspector node={selectedFederatedNode} />}
       </section>
 
       <section className="device-trust-card">
@@ -2837,7 +2873,7 @@ function Nodes({
       <NodeInventorySection eyebrow="DISPOSITIVOS INSTALADOS" title="Equipos físicos" workers={installedWorkers} snapshot={snapshot} busy={busy} onRemove={remove} />
       {browserWorkers.length > 0 && <NodeInventorySection eyebrow="CAPACIDAD TEMPORAL" title="Navegadores activos" workers={browserWorkers} snapshot={snapshot} busy={busy} onRemove={remove} />}
       {cellWorkers.length > 0 && <NodeInventorySection eyebrow="EJECUTORES DISTRIBUIDOS" title="Celdas de cómputo" workers={cellWorkers} snapshot={snapshot} busy={busy} onRemove={remove} />}
-      {snapshot.workers.length === 0 && <div className="node-card-grid"><div className="wide-empty"><Empty icon={Server} title="No hay nodos registrados" copy="Abre el worker móvil o instala mycellios para añadir la primera máquina." /><a href="/mobile/">Conectar un dispositivo <ArrowRight size={15} /></a></div></div>}
+      {snapshot.workers.length === 0 && snapshot.federatedNodes.length === 0 && <div className="node-card-grid"><div className="wide-empty"><Empty icon={Server} title="No hay nodos registrados" copy="Abre el worker móvil o instala mycellios para añadir la primera máquina." /><a href="/mobile/">Conectar un dispositivo <ArrowRight size={15} /></a></div></div>}
     </section>
   );
 }
@@ -3072,6 +3108,35 @@ async function responseMessage(response: Response): Promise<string> {
     error?: { message?: string };
   } | null;
   return body?.error?.message ?? `HTTP ${response.status}`;
+}
+
+function FederatedNodeTopologyInspector({ node }: { node: FederatedNode }) {
+  const state = federatedNodeVisualState(node);
+  const gpu = node.capacity?.gpuModel ?? (
+    node.scope === "physical" ? "No informada" : "No expuesta por la red"
+  );
+  return <div className="node-topology-inspector federated-node-inspector">
+    <div className={`node-inspector-identity ${state}`}>
+      <div><Globe2 /></div>
+      <span>
+        <small>NODO FEDERADO</small>
+        <strong>{node.label}</strong>
+        <em>{node.networkId} · {node.scope} · {shortId(node.id)}</em>
+        <b>Federada</b>
+      </span>
+    </div>
+    <div className="node-inspector-metrics">
+      <Metric label="Estado" value={federatedNodeStatusLabel(node)} />
+      <Metric label="Proveedor" value={node.networkId} />
+      <Metric label="Alcance" value={node.scope} />
+      <Metric label="Modelos" value={String(node.models.length)} />
+      <Metric label="Fiabilidad" value={`${Math.round(Math.max(0, Math.min(1, node.reliability)) * 100)}%`} />
+      <Metric label="Último canario" value={node.lastVerifiedAt === null ? "Sin verificar" : relativeTime(new Date(node.lastVerifiedAt).toISOString())} />
+      <Metric label="Selección individual" value={node.individuallySelectable ? "Permitida" : "Gestionada por la red"} />
+      <Metric label="GPU expuesta" value={gpu} />
+      <Metric label="VRAM expuesta" value={node.capacity?.vramMb ? formatMemory(node.capacity.vramMb) : "No informada"} />
+    </div>
+  </div>;
 }
 
 function NodeTopologyInspector({ worker, snapshot }: { worker: PublicWorker; snapshot: PublicSnapshot }) {
@@ -5123,6 +5188,18 @@ function nodeStatusLabel(worker: PublicWorker): string {
   if (worker.status === "draining") return "Finalizando";
   if (worker.connected) return "Conectado";
   return "Inactivo";
+}
+function federatedNodeVisualState(node: FederatedNode): "active" | "warning" | "offline" {
+  if (node.routable && node.status === "online") return "active";
+  if (node.status === "online" || node.status === "degraded") return "warning";
+  return "offline";
+}
+function federatedNodeStatusLabel(node: FederatedNode): string {
+  if (node.routable) return "Enrutable";
+  if (node.status === "online") return "Descubierto";
+  if (node.status === "degraded") return "Degradado";
+  if (node.status === "offline") return "Inactivo";
+  return "Estado desconocido";
 }
 function topologyPosition(index: number, total: number): { x: number; y: number } {
   if (total <= 1) return { x: 50, y: 17 };

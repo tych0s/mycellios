@@ -239,16 +239,28 @@ class ExternalRuntimeAAdapter implements FederatedProviderAdapter {
     nodes: FederatedProviderNode[];
   }> {
     await this.ensureClient(signal);
-    const [modelsResponse, statusResponse] = await Promise.all([
-      fetch(`${this.inferenceUrl}/v1/models`, { signal }),
-      fetch(`${this.managementUrl}/api/status`, { signal }),
+    const modelsRequest = this.executable
+      ? this.fetchModelsWhenReady(signal)
+      : fetch(`${this.inferenceUrl}/v1/models`, { signal });
+    const [modelsResponse, status] = await Promise.all([
+      modelsRequest,
+      fetch(`${this.managementUrl}/api/status`, { signal })
+        .then(async (response) =>
+          response.ok
+            ? await response.json() as Record<string, unknown>
+            : {})
+        .catch((error: unknown) => {
+          if (signal.aborted) throw error;
+          // Some external runtime A client builds expose the inference gateway without
+          // opening the optional management console. Models remain advertised
+          // only and still need a real generation before becoming routable.
+          return {};
+        }),
     ]);
     if (!modelsResponse.ok) throw await providerHttpError(this.id, modelsResponse);
-    if (!statusResponse.ok) throw await providerHttpError(this.id, statusResponse);
     const modelBody = await modelsResponse.json() as {
       data?: Array<{ id?: unknown }>;
     };
-    const status = await statusResponse.json() as Record<string, unknown>;
     const models = (modelBody.data ?? []).flatMap((entry) =>
       typeof entry.id === "string" && entry.id.trim()
         ? [{ canonicalId: entry.id, externalId: entry.id, displayName: entry.id }]
@@ -337,6 +349,22 @@ class ExternalRuntimeAAdapter implements FederatedProviderAdapter {
     });
     return this.starting;
   }
+
+  private async fetchModelsWhenReady(signal: AbortSignal): Promise<Response> {
+    let lastError: unknown = new Error("external-runtime-a_gateway_not_ready");
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      try {
+        const response = await fetch(`${this.inferenceUrl}/v1/models`, { signal });
+        if (response.ok || response.status < 500 && response.status !== 404) return response;
+        lastError = new Error(`external-runtime-a_gateway_http_${response.status}`);
+      } catch (error) {
+        if (signal.aborted) throw error;
+        lastError = error;
+      }
+      await abortableDelay(500, signal);
+    }
+    throw lastError;
+  }
 }
 
 class AiHordeAdapter implements FederatedProviderAdapter {
@@ -362,10 +390,17 @@ class AiHordeAdapter implements FederatedProviderAdapter {
     if (!workersResponse.ok) throw await providerHttpError(this.id, workersResponse);
     const rawModels = await modelsResponse.json() as Array<Record<string, unknown>>;
     const rawWorkers = await workersResponse.json() as Array<Record<string, unknown>>;
-    const models = rawModels.flatMap((entry) => {
-      const name = typeof entry.name === "string" ? entry.name : null;
-      return name ? [{ canonicalId: name, externalId: name, displayName: name }] : [];
-    });
+    const models = [...rawModels]
+      .sort((left, right) =>
+        (finiteNumber(left.eta) ?? Number.MAX_SAFE_INTEGER)
+          - (finiteNumber(right.eta) ?? Number.MAX_SAFE_INTEGER)
+        || (finiteNumber(left.queued) ?? Number.MAX_SAFE_INTEGER)
+          - (finiteNumber(right.queued) ?? Number.MAX_SAFE_INTEGER)
+        || (finiteNumber(right.count) ?? 0) - (finiteNumber(left.count) ?? 0))
+      .flatMap((entry) => {
+        const name = typeof entry.name === "string" ? entry.name : null;
+        return name ? [{ canonicalId: name, externalId: name, displayName: name }] : [];
+      });
     const nodes = rawWorkers.map((worker, index): FederatedProviderNode => ({
       externalId: String(worker.id ?? `worker-${index}`),
       label: `AI Horde worker ${index + 1}`,
