@@ -1955,7 +1955,6 @@ def _load_stage_parameters_from_safetensors(
         identity = id(target)
         if identity in seen_tensors:
             continue
-        seen_tensors.add(identity)
         assignments = (
             adapter.checkpoint_assignments(
                 local_name,
@@ -1967,6 +1966,7 @@ def _load_stage_parameters_from_safetensors(
             else None
         )
         if assignments is not None:
+            seen_tensors.add(identity)
             targets.extend(
                 (local_name, assignment.destination, assignment.checkpoint_name)
                 for assignment in assignments
@@ -1980,6 +1980,10 @@ def _load_stage_parameters_from_safetensors(
         )
         if checkpoint_name is None:
             continue
+        # A tied embedding/projection appears twice in state_dict. Do not claim
+        # its shared identity when the first alias is outside this stage;
+        # the later in-stage alias must still be allowed to consume it.
+        seen_tensors.add(identity)
         targets.append((local_name, target, checkpoint_name))
 
     loaded_checkpoint_names = {checkpoint_name for _, _, checkpoint_name in targets}
