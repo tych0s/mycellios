@@ -110,8 +110,10 @@ import {
 } from "./deployment-control-plane.js";
 import { stripWorkerDeclaredEvidence } from "./evidence-authority.js";
 import {
+  activationFailureCanRetryAfterRuntimeChange,
   activationFailureIsTransient,
   classifyActivationIncident,
+  formatExhaustedActivationFailure,
   type ActivationIncident,
 } from "./activation-incident.js";
 import type { AuthenticatedNetworkUser } from "./supabase-auth.js";
@@ -948,7 +950,11 @@ export async function createCoordinator(
     );
     if (!nextRetry) {
       automaticActivationRetryState.delete(modelId);
-      const exhausted = `automatic_activation_retries_exhausted:${retriesStarted}:${message}`;
+      const exhausted = formatExhaustedActivationFailure(
+        retriesStarted,
+        runtimeVersion,
+        message,
+      );
       store.setRequestedModelActivationError(modelId, exhausted);
       if (operation) {
         deploymentController.failOperation(
@@ -1129,7 +1135,13 @@ export async function createCoordinator(
       if (
         request.autoActivate
         && request.activationError
-        && automaticActivationFailureIsTransient(request.activationError)
+        && (
+          automaticActivationFailureIsTransient(request.activationError)
+          || activationFailureCanRetryAfterRuntimeChange(
+            request.activationError,
+            runtimeVersion,
+          )
+        )
       ) {
         if (!automaticActivationRetryState.has(request.id)) {
           const retry = nextAutomaticActivationRetry(

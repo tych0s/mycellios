@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  activationFailureCanRetryAfterRuntimeChange,
   activationFailureIsTransient,
   classifyActivationIncident,
+  formatExhaustedActivationFailure,
 } from "../src/coordinator/activation-incident.js";
 
 describe("activation incident classification", () => {
@@ -133,6 +135,40 @@ describe("activation incident classification", () => {
     });
     expect(activationFailureIsTransient(
       "automatic_activation_retries_exhausted:5:managed_launch_agent_is_unavailable:desktop-a",
+    )).toBe(false);
+  });
+
+  it("rearms an exhausted transient failure exactly once when the runtime changes", () => {
+    const failure = formatExhaustedActivationFailure(
+      5,
+      "0.2.63",
+      "managed_launch_agent_is_unavailable:desktop-a",
+    );
+
+    expect(failure).toBe(
+      "automatic_activation_retries_exhausted:5:runtime=0.2.63:managed_launch_agent_is_unavailable:desktop-a",
+    );
+    expect(activationFailureCanRetryAfterRuntimeChange(failure, "0.2.63")).toBe(false);
+    expect(activationFailureCanRetryAfterRuntimeChange(failure, "0.2.64")).toBe(true);
+    expect(classifyActivationIncident({
+      message: failure,
+      maximumAttempts: 5,
+    })).toMatchObject({
+      code: "launch_agent_unavailable",
+      repairState: "exhausted",
+      attempt: 5,
+      nodeId: "desktop-a",
+    });
+  });
+
+  it("allows one migration retry for a legacy exhausted transient failure", () => {
+    expect(activationFailureCanRetryAfterRuntimeChange(
+      "automatic_activation_retries_exhausted:5:distributed_worker_disconnected:wrk-a",
+      "0.2.64",
+    )).toBe(true);
+    expect(activationFailureCanRetryAfterRuntimeChange(
+      "automatic_activation_retries_exhausted:5:unsupported_model_architecture:qwen-next",
+      "0.2.64",
     )).toBe(false);
   });
 

@@ -373,6 +373,76 @@ describe("automatic activation recovery", () => {
       "automatic_activation_retries_exhausted:2:managed_launch_agent_is_unavailable:desktop-test",
     )).toBe(false);
   });
+
+  it("rearms a legacy exhausted activation after a coordinator runtime upgrade", async () => {
+    const manager = new FakeActivationManager();
+    const localRuntime = await createCoordinator({
+      host: "127.0.0.1",
+      port: 8_787,
+      databasePath: ":memory:",
+      requestTimeoutMs: 30_000,
+    }, {
+      activationManager: manager,
+      automaticActivationRetryDelaysMs: [0],
+      runtimeMetadata: {
+        root: process.cwd(),
+        version: "0.2.64",
+        revision: null,
+        buildIdentity: null,
+      },
+    });
+    try {
+      requestedModel(localRuntime, "runtime-upgrade");
+      localRuntime.store.setRequestedModelActivationError(
+        "runtime-upgrade",
+        "automatic_activation_retries_exhausted:5:managed_launch_agent_is_unavailable:desktop-a",
+      );
+
+      await localRuntime.app.inject({ method: "GET", url: "/public/v1/snapshot" });
+
+      expect(manager.activated.map((model) => model.id)).toEqual(["runtime-upgrade"]);
+      expect(localRuntime.store.getRequestedModel("runtime-upgrade")?.activationError).toBeNull();
+    } finally {
+      await localRuntime.close();
+    }
+  });
+
+  it("does not rearm an exhausted activation again on the same runtime", async () => {
+    const manager = new FakeActivationManager();
+    const localRuntime = await createCoordinator({
+      host: "127.0.0.1",
+      port: 8_787,
+      databasePath: ":memory:",
+      requestTimeoutMs: 30_000,
+    }, {
+      activationManager: manager,
+      automaticActivationRetryDelaysMs: [0],
+      runtimeMetadata: {
+        root: process.cwd(),
+        version: "0.2.64",
+        revision: null,
+        buildIdentity: null,
+      },
+    });
+    try {
+      requestedModel(localRuntime, "same-runtime");
+      const failure =
+        "automatic_activation_retries_exhausted:5:runtime=0.2.64:"
+        + "managed_launch_agent_is_unavailable:desktop-a";
+      localRuntime.store.setRequestedModelActivationError("same-runtime", failure);
+
+      const response = await localRuntime.app.inject({
+        method: "GET",
+        url: "/public/v1/snapshot",
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(manager.activated).toEqual([]);
+      expect(localRuntime.store.getRequestedModel("same-runtime")?.activationError).toBe(failure);
+    } finally {
+      await localRuntime.close();
+    }
+  });
 });
 
 class FakeActivationManager implements ModelActivationManager {

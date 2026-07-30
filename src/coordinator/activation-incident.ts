@@ -144,6 +144,28 @@ export function activationFailureIsTransient(message: string): boolean {
     && incidentDefinition(exhausted.message).intrinsicallyRetryable;
 }
 
+export function formatExhaustedActivationFailure(
+  attempts: number,
+  runtimeVersion: string,
+  message: string,
+): string {
+  const safeRuntimeVersion = runtimeVersion
+    .trim()
+    .replace(/[^0-9A-Za-z._+-]/g, "_")
+    .slice(0, 64) || "unknown";
+  return `automatic_activation_retries_exhausted:${boundedInteger(attempts, 0, 32)}:runtime=${safeRuntimeVersion}:${message}`;
+}
+
+export function activationFailureCanRetryAfterRuntimeChange(
+  message: string,
+  runtimeVersion: string,
+): boolean {
+  const exhausted = unwrapExhausted(message);
+  return exhausted.attempts !== null
+    && exhausted.runtimeVersion !== runtimeVersion
+    && incidentDefinition(exhausted.message).intrinsicallyRetryable;
+}
+
 function incidentDefinition(message: string): IncidentDefinition {
   const normalized = message.toLowerCase();
   if (normalized.includes("distributed_activation_requires_two_connected_shard_executors")) {
@@ -339,17 +361,19 @@ function incidentDefinition(message: string): IncidentDefinition {
 
 function unwrapExhausted(message: string): {
   attempts: number | null;
+  runtimeVersion: string | null;
   message: string;
 } {
-  const match = /^automatic_activation_retries_exhausted:(\d+):([\s\S]*)$/i.exec(
+  const match = /^automatic_activation_retries_exhausted:(\d+):(?:runtime=([^:\s]+):)?([\s\S]*)$/i.exec(
     message.trim(),
   );
   return match
     ? {
         attempts: boundedInteger(Number(match[1]), 0, 32),
-        message: match[2] ?? "",
+        runtimeVersion: match[2] ?? null,
+        message: match[3] ?? "",
       }
-    : { attempts: null, message };
+    : { attempts: null, runtimeVersion: null, message };
 }
 
 function extractNodeId(message: string): string | null {
