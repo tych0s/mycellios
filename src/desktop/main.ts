@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { delimiter, dirname, join } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { arch, cpus, release } from "node:os";
 import { spawn } from "node:child_process";
 import type { AddressInfo } from "node:net";
@@ -2339,9 +2339,16 @@ function applyDesktopAcceleratorProgress(event: AcceleratorProgressEvent): void 
   scheduleAccelerationDiagnosticsPublish(event.recordLog ? 500 : 10_000);
 }
 
+function developmentDistributionRuntimeRoot(): string {
+  const configured = process.env.MYCELLIOS_DESKTOP_RUNTIME_ROOT?.trim();
+  return configured
+    ? resolve(configured)
+    : join(app.getAppPath(), "runtime", "distribution-venv");
+}
+
 function distributionPythonExecutable(root = app.isPackaged
   ? join(app.getPath("userData"), "distribution-runtime-v4")
-  : join(app.getAppPath(), "runtime", "distribution-venv")): string {
+  : developmentDistributionRuntimeRoot()): string {
   if (process.platform === "win32") {
     const portable = join(root, "python.exe");
     return app.isPackaged || existsSync(portable) ? portable : join(root, "Scripts", "python.exe");
@@ -2360,7 +2367,7 @@ function ensureDistributionRuntime(): Promise<string> {
 }
 
 async function ensureDistributionRuntimeOnce(): Promise<string> {
-  if (!app.isPackaged) return join(app.getAppPath(), "runtime", "distribution-venv");
+  if (!app.isPackaged) return developmentDistributionRuntimeRoot();
   const userData = app.getPath("userData");
   const root = join(userData, "distribution-runtime-v4");
   const staging = join(userData, "distribution-runtime-v4.staging");

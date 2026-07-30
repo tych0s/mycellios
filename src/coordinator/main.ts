@@ -12,6 +12,7 @@ import {
 } from "./model-activation-manager.js";
 import { createCoordinator } from "./server.js";
 import { readNativeRuntimeBuildMetadata } from "../core/native-build-identity.js";
+import { configureCoordinatorModelProfileRuntime } from "./model-profile-runtime.js";
 
 const runtimeRoot = resolve(import.meta.dirname, "../..");
 const runtimeMetadata = readNativeRuntimeBuildMetadata(runtimeRoot);
@@ -21,8 +22,14 @@ const dynamicWorkerActivation = process.env.MYCELLIOS_DYNAMIC_WORKER_ACTIVATION?
 const absoluteActivationConfigPath = activationConfigPath
   ? isAbsolute(activationConfigPath) ? activationConfigPath : resolve(process.cwd(), activationConfigPath)
   : undefined;
-const baseActivationConfig = absoluteActivationConfigPath
+const storedActivationConfig = absoluteActivationConfigPath
   ? parseAutoDistributionConfig(JSON.parse(await readFile(absoluteActivationConfigPath, "utf8")) as unknown)
+  : undefined;
+const baseActivationConfig = storedActivationConfig
+  ? configureCoordinatorModelProfileRuntime(storedActivationConfig, {
+      runtimeRoot,
+      environment: process.env,
+    })
   : undefined;
 const activationManager = baseActivationConfig && !dynamicWorkerActivation
   ? new AutomaticModelActivationManager(
