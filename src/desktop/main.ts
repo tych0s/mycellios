@@ -114,6 +114,7 @@ import {
   automaticUpdateRetryDelayMs,
   canInstallAutomaticUpdate,
   summarizeAutomaticUpdateError,
+  trackActiveStage,
 } from "./update-recovery.js";
 import { SingleFlight } from "./single-flight.js";
 import { RemoteDiagnosticsUploader } from "./remote-diagnostics.js";
@@ -2012,7 +2013,9 @@ class DesktopAcceleratedLaunchAgent implements LaunchAgent {
         },
       },
     }, signal);
-    activeDistributedStages.add(handle);
+    trackActiveStage(activeDistributedStages, handle, () => {
+      if (updateStatus.state === "ready") scheduleAutomaticUpdateInstall();
+    });
     const deviceType = runtime.deviceType;
     const setupInProgress = deviceType === "cpu" && gpuPreparationIsContinuing(accelerationStatus);
     accelerationStatus = appendAccelerationLog(accelerationStatus, {
@@ -2053,8 +2056,6 @@ class DesktopAcceleratedLaunchAgent implements LaunchAgent {
       },
     );
     void handle.exited.then((exit) => {
-      activeDistributedStages.delete(handle);
-      if (updateStatus.state === "ready") scheduleAutomaticUpdateInstall();
       const unexpected = unexpectedRuntimeExit(exit);
       accelerationStatus = appendAccelerationLog(accelerationStatus, {
         at: new Date().toISOString(),
