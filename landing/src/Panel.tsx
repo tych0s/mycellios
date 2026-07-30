@@ -382,7 +382,10 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     : (!localBrowser || localProductionProxy) && !canManageModels;
   const applyDesktopSnapshot = useCallback((next: DashboardSnapshot) => {
     setDesktopSnapshot(next);
-    setSnapshot(desktopToPublicSnapshot(next));
+    setSnapshot((current) => desktopToPublicSnapshot(
+      next,
+      next.settings.coordinatorMode === "remote" ? current : undefined,
+    ));
     setIssue(panelIssueForErrors(next.connectionError, next.runtimeError));
   }, []);
 
@@ -391,6 +394,12 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
       if (desktopBridge) {
         const next = await desktopBridge.getSnapshot();
         applyDesktopSnapshot(next);
+        if (next.settings.coordinatorMode === "remote") {
+          const coordinatorOrigin = (next.coordinatorUrl || PUBLIC_COORDINATOR_URL).replace(/\/$/, "");
+          const response = await fetch(`${coordinatorOrigin}/public/v1/snapshot`, { cache: "no-store" });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          setSnapshot(await response.json() as PublicSnapshot);
+        }
         return;
       }
       const response = await fetch("/public/v1/snapshot", { cache: "no-store" });
@@ -5019,7 +5028,10 @@ function DesktopOnboarding({ snapshot, bridge, onSnapshot }: { snapshot: Dashboa
   return <div className="modal-backdrop"><div className="onboarding-card"><div className="onboarding-brand"><img src={brandIcon} alt="" /><span>GET STARTED</span></div><h1>Connect this machine to mycellios</h1><p>The desktop agent and the web panel will show the same public network.</p><div className="mode-grid single-mode"><button className="selected"><Globe2 size={23} /><strong>Public mycellios network</strong><span>{PUBLIC_COORDINATOR_URL}</span><Check size={16} className="mode-check" /></button></div><label className="contribute-choice"><input type="checkbox" checked={contribute} onChange={(event) => setContribute(event.target.checked)} /><span><strong>Contribute this machine's resources</strong><small>Register real hardware only; models appear only when a verified runtime is active.</small></span></label>{error && <div className="inline-error"><CircleAlert size={17} />{error}</div>}<button className="primary-button onboarding-submit" disabled={saving} onClick={() => void complete()}>{saving ? <LoaderCircle className="spin" size={18} /> : <Sparkles size={18} />}Enter mycellios <ChevronRight size={18} /></button><div className="onboarding-security"><ShieldCheck size={15} />Connected through HTTPS/WSS to the public coordinator.</div></div></div>;
 }
 
-function desktopToPublicSnapshot(snapshot: DashboardSnapshot): PublicSnapshot {
+export function desktopToPublicSnapshot(
+  snapshot: DashboardSnapshot,
+  federationSource?: PublicSnapshot,
+): PublicSnapshot {
   return {
     capturedAt: snapshot.capturedAt,
     version: snapshot.health?.version ?? "—",
@@ -5033,9 +5045,9 @@ function desktopToPublicSnapshot(snapshot: DashboardSnapshot): PublicSnapshot {
       completedJobs: snapshot.jobs.filter((job) => job.status === "completed").length,
     },
     workers: snapshot.workers,
-    federation: EMPTY.federation,
-    federatedNetworks: [],
-    federatedNodes: [],
+    federation: federationSource?.federation ?? EMPTY.federation,
+    federatedNetworks: federationSource?.federatedNetworks ?? [],
+    federatedNodes: federationSource?.federatedNodes ?? [],
     models: snapshot.models,
     requestedModels: snapshot.requestedModels,
     jobs: snapshot.jobs,
