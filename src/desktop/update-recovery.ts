@@ -16,6 +16,28 @@ export function canInstallAutomaticUpdate(state: AutomaticUpdateInstallState): b
     && state.activeStages === 0;
 }
 
+export interface TrackedStageHandle {
+  exited: Promise<unknown>;
+}
+
+/**
+ * Track a distributed stage from the instant it starts, rather than only after
+ * it becomes ready. Startup failures otherwise remain in the active set and
+ * can strand a downloaded repair forever.
+ */
+export function trackActiveStage<T extends TrackedStageHandle>(
+  activeStages: Set<T>,
+  handle: T,
+  onIdle: () => void,
+): void {
+  activeStages.add(handle);
+  const release = () => {
+    if (!activeStages.delete(handle) || activeStages.size !== 0) return;
+    onIdle();
+  };
+  void handle.exited.then(release, release);
+}
+
 export const AUTOMATIC_UPDATE_GRACE_MS = 60_000;
 export const AUTOMATIC_UPDATE_IDLE_RECHECK_MS = 30_000;
 // An unattended node must discover repairs promptly. The feed is a tiny local
