@@ -57,6 +57,39 @@ describe("automatic compatible-model distribution", () => {
     expect(() => parseAutoDistributionConfig(value)).toThrow();
   });
 
+  it("preserves the cost-model reason when recent route evidence is insufficient", () => {
+    const value = configFixture();
+    value.nodes[0]!.availability = 0.95;
+    value.nodes[1]!.availability = 0.95;
+    value.links = [
+      {
+        from: "node-a",
+        to: "node-b",
+        oneWayLatencyMs: 10,
+        jitterP95Ms: 1,
+        bandwidthMbps: 1_000,
+        lossRate: 0,
+        availability: 0.9,
+      },
+      {
+        from: "node-b",
+        to: "node-a",
+        oneWayLatencyMs: 10,
+        jitterP95Ms: 1,
+        bandwidthMbps: 1_000,
+        lossRate: 0,
+        availability: 0.9,
+      },
+    ];
+
+    expect(() => compileAutoDistribution(
+      parseAutoDistributionConfig(value),
+      profileFixture(),
+    )).toThrow(
+      "no_feasible_automatic_2_stage_pipeline:route_availability_below_minimum",
+    );
+  });
+
   it("leaves performance pending for a coordinator-issued live challenge", () => {
     const input = configFixture();
     input.coordinator = {
