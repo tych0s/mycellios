@@ -237,6 +237,35 @@ export class DeploymentControlPlane {
     });
   }
 
+  rearmAfterRuntimeChange(
+    modelId: string,
+    reason: string,
+    now = Date.now(),
+  ): DeploymentState {
+    return this.store.database.transaction(() => {
+      const model = this.store.getRequestedModel(modelId);
+      if (!model) throw new Error(`deployment_model_not_found:${modelId}`);
+      const state = this.ensureModel(model, now);
+      if (state.activeOperationId !== null) {
+        throw new Error(`deployment_operation_is_active:${modelId}`);
+      }
+      this.store.database.raw.prepare(
+        `UPDATE deployment_states
+         SET generation = generation + 1,
+             observed_state = 'failed',
+             retry_count = 0,
+             next_retry_at = NULL,
+             last_error = ?,
+             controller_owner = NULL,
+             controller_lease_until = NULL,
+             updated_at = ?
+         WHERE model_id = ? AND active_operation_id IS NULL`,
+      ).run(reason.slice(0, 2_000), now, modelId);
+      this.queueState(modelId);
+      return this.getState(modelId)!;
+    });
+  }
+
   getState(modelId: string): DeploymentState | null {
     const row = this.store.database.raw.prepare(
       "SELECT * FROM deployment_states WHERE model_id = ?",

@@ -110,8 +110,8 @@ import {
 } from "./deployment-control-plane.js";
 import { stripWorkerDeclaredEvidence } from "./evidence-authority.js";
 import {
-  activationFailureCanRetryAfterRuntimeChange,
   activationFailureIsTransient,
+  activationFailureMessageAfterRuntimeChange,
   classifyActivationIncident,
   formatExhaustedActivationFailure,
   type ActivationIncident,
@@ -1132,18 +1132,34 @@ export async function createCoordinator(
       }
     }
     for (const request of requests) {
+      const runtimeChangedFailure = request.activationError
+        ? activationFailureMessageAfterRuntimeChange(
+            request.activationError,
+            runtimeVersion,
+          )
+        : null;
       if (
         request.autoActivate
         && request.activationError
         && (
           automaticActivationFailureIsTransient(request.activationError)
-          || activationFailureCanRetryAfterRuntimeChange(
-            request.activationError,
-            runtimeVersion,
-          )
+          || runtimeChangedFailure !== null
         )
       ) {
-        if (!automaticActivationRetryState.has(request.id)) {
+        if (runtimeChangedFailure !== null) {
+          deploymentController.rearmAfterRuntimeChange(
+            request.id,
+            runtimeChangedFailure,
+            now,
+          );
+          const retry = nextAutomaticActivationRetry(
+            0,
+            runtimeChangedFailure,
+            now,
+            automaticActivationRetryDelaysMs,
+          );
+          if (retry) automaticActivationRetryState.set(request.id, retry);
+        } else if (!automaticActivationRetryState.has(request.id)) {
           const retry = nextAutomaticActivationRetry(
             0,
             request.activationError,
