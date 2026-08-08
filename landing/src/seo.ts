@@ -1,7 +1,8 @@
 /// <reference lib="dom" />
 
 const SITE_ORIGIN = "https://www.mycellios.com";
-const BRAND_IMAGE_URL = `${SITE_ORIGIN}/mycellios-app-icon-v2.png`;
+const BRAND_IMAGE_URL = `${SITE_ORIGIN}/assets/brand/og-image.png`;
+const BRAND_LOGO_URL = `${SITE_ORIGIN}/assets/brand/app-icon.png`;
 const ORGANIZATION_ID = `${SITE_ORIGIN}/#organization`;
 const WEBSITE_ID = `${SITE_ORIGIN}/#website`;
 const SOFTWARE_ID = `${SITE_ORIGIN}/#software`;
@@ -27,9 +28,10 @@ const organization = {
   "@id": ORGANIZATION_ID,
   name: "mycellios",
   url: `${SITE_ORIGIN}/`,
+  slogan: "Distributed intelligence, rooted in nature.",
   logo: {
     "@type": "ImageObject",
-    url: BRAND_IMAGE_URL,
+    url: BRAND_LOGO_URL,
   },
   email: "hello@mycellios.com",
 };
@@ -49,7 +51,7 @@ const softwareApplication = {
   applicationCategory: "DeveloperApplication",
   operatingSystem: "Windows 10/11, macOS, Ubuntu, Debian, Fedora, RHEL",
   description:
-    "A heterogeneous distributed AI runtime that coordinates multiple machines to run models beyond the memory of a single computer.",
+    "A distributed intelligence network that connects capacity across different machines to run AI models that cannot fit on a single device.",
   url: `${SITE_ORIGIN}/`,
   downloadUrl: `${SITE_ORIGIN}/downloads`,
   publisher: { "@id": ORGANIZATION_ID },
@@ -74,9 +76,9 @@ function webPage(name: string, description: string, path: string): JsonValue {
 
 export const SEO_PAGES = {
   "/": {
-    title: "mycellios — Distributed AI across many machines",
+    title: "mycellios — Intelligence grows through the network",
     description:
-      "mycellios coordinates heterogeneous computers to run AI models that do not fit on a single machine, with pooled memory and adaptive routes.",
+      "mycellios connects capacity across different machines to run AI models that cannot fit on a single device.",
     canonicalPath: "/",
     robots: "index, follow, max-image-preview:large",
     structuredData: {
@@ -214,8 +216,8 @@ export function applySeoMetadata(pathname = window.location.pathname): void {
   upsertMeta("property", "og:title", page.title);
   upsertMeta("property", "og:description", page.description);
   upsertMeta("property", "og:image", BRAND_IMAGE_URL);
-  upsertMeta("property", "og:image:alt", "mycellios distributed AI network");
-  upsertMeta("name", "twitter:card", "summary");
+  upsertMeta("property", "og:image:alt", "mycellios — distributed intelligence, rooted in nature");
+  upsertMeta("name", "twitter:card", "summary_large_image");
   upsertMeta("name", "twitter:title", page.title);
   upsertMeta("name", "twitter:description", page.description);
   upsertMeta("name", "twitter:image", BRAND_IMAGE_URL);

@@ -88,7 +88,7 @@ import type { NativeBuildIdentity } from "../../src/contracts/build-identity";
 import type { BenchmarkMeasurement, BenchmarkRun } from "../../src/benchlab/types";
 import { Contribute } from "./Contribute";
 import { SupportAssistant } from "./SupportAssistant";
-import brandIcon from "./assets/mycellios-app-icon-v2.png";
+const brandIcon = "/assets/logos/logo.png";
 import {
   benchmarkRunSnapshot,
   benchmarkFilterValues,

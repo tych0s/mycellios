@@ -67,4 +67,4 @@ It uses no animated raster, SVG turbulence, or perpetual background particles.
 The editorial images are combined with lightweight SVG and CSS overlays.
 
 Before publishing, confirm that `hello@mycellios.com` can receive email or update
-the `EMAIL` constant in `src/Landing.tsx` with the final address.
+the `EMAIL` constant in `src/rebrand/RebrandLanding.tsx` with the final address.

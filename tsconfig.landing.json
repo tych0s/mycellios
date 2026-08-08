@@ -12,6 +12,7 @@
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
     "jsx": "react-jsx",
+    "noEmit": true,
     "types": ["node", "vite/client", "@webgpu/types"]
   },
   "include": ["landing/**/*.ts", "landing/**/*.tsx", "vite.landing.config.ts"],

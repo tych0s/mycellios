@@ -1,31 +1,46 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { Landing } from "./Landing.js";
+import { RebrandLanding } from "./rebrand/RebrandLanding.js";
 
-describe("Landing navigation", () => {
-  it("keeps the blog visible in both the primary navigation and footer", () => {
-    const html = renderToStaticMarkup(<Landing />);
+describe("Merged landing (rebrand design + legacy content)", () => {
+  it("renders the hero with the status pill and public-testing footnote", () => {
+    const html = renderToStaticMarkup(<RebrandLanding />);
 
-    expect(html.match(/href="\/blog"/g)).toHaveLength(2);
-    expect(html).toContain(
-      'class="nav-blog-link" href="/blog" aria-label="Read the Mycellios blog"',
-    );
-    expect(html).toContain('<a href="/blog">Blog</a>');
+    expect(html).toContain("Intelligence");
+    expect(html.match(/<h1/g)).toHaveLength(1);
+    expect(html).toContain("Physical multi-node validation underway");
+    expect(html).toContain("No account or invitation required during public testing.");
+    expect(html).toContain('href="/join"');
+    expect(html).toContain('href="#how-it-works"');
   });
 
-  it("places the short visual explanation before the first idea section", () => {
-    const html = renderToStaticMarkup(<Landing />);
-    const explainer = html.indexOf('id="explainer"');
-    const idea = html.indexOf('id="vision"');
+  it("renders the explainer, evidence, and install sections without crashing", () => {
+    const html = renderToStaticMarkup(<RebrandLanding />);
 
-    expect(explainer).toBeGreaterThan(-1);
-    expect(idea).toBeGreaterThan(-1);
-    expect(explainer).toBeLessThan(idea);
-    expect(html).toContain("Several devices. One AI model.");
-    expect(html).toContain('href="#explainer"');
+    expect(html).toContain('id="explainer"');
+    expect(html).toContain("Several devices.");
+    expect(html).toContain('id="evidence"');
+    expect(html).toContain("We are building");
+    expect(html).toContain("Multi-node · GPU · LAN");
+    expect(html).toContain('id="install"');
+    expect(html).toContain("NETWORK READY");
   });
+
+  it("preserves the efficiency claims and honesty disclaimers", () => {
+    const html = renderToStaticMarkup(<RebrandLanding />);
+
+    expect(html).toContain('id="acceleration"');
+    expect(html).toContain("≈13,000×");
+    expect(html).toContain("$0.231 / task");
+    expect(html).toContain("87.5% ARC-AGI-1");
+    expect(html).toContain("DIRECTION · NOT A PERFORMANCE FORECAST");
+    expect(html).toContain('id="roadmap"');
+    expect(html).toContain("VISION · NOT LIVE YET");
+    expect(html).toContain("No active token · no financial promise");
+  });
+
   it("renders the network-only support assistant entry point", () => {
-    const html = renderToStaticMarkup(<Landing />);
+    const html = renderToStaticMarkup(<RebrandLanding />);
 
     expect(html).toContain('aria-label="Abrir asistente de mycellios"');
     expect(html).toContain("¿Necesitas ayuda?");
