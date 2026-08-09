@@ -22,6 +22,7 @@ export interface HeadlessWorkerEnvironment {
   configPath: string;
   coordinatorUrl: string;
   networkToken?: string;
+  workerCredentialPath?: string;
   nodeId: string;
   provider: "gpu_cloud" | "generic";
   providerMachineId: string;
@@ -65,14 +66,21 @@ export function loadHeadlessWorkerEnvironment(
     environment.MYCELLIOS_NETWORK_TOKEN_FILE,
     cwd,
   );
+  const workerCredentialPath = environment.MYCELLIOS_WORKER_CREDENTIAL_PATH?.trim();
   const loopback = LOOPBACK_HOSTS.has(coordinator.hostname);
   const insecureDevelopment =
     environment.MYCELLIOS_ALLOW_INSECURE_COORDINATOR === "true" && loopback;
   if (coordinator.protocol !== "https:" && !insecureDevelopment) {
     throw new Error("headless_worker_external_coordinator_requires_https");
   }
-  if (!loopback && (!networkToken || networkToken.length < 32)) {
-    throw new Error("headless_worker_external_coordinator_requires_32_character_network_token");
+  if (
+    !loopback
+    && (!networkToken || networkToken.length < 32)
+    && !workerCredentialPath
+  ) {
+    throw new Error(
+      "headless_worker_external_coordinator_requires_scoped_credential_or_32_character_network_token",
+    );
   }
 
   return {
@@ -83,6 +91,9 @@ export function loadHeadlessWorkerEnvironment(
     ),
     coordinatorUrl: coordinator.href.replace(/\/$/, ""),
     ...(networkToken ? { networkToken } : {}),
+    ...(workerCredentialPath
+      ? { workerCredentialPath: resolve(cwd, workerCredentialPath) }
+      : {}),
     nodeId,
     provider,
     providerMachineId,

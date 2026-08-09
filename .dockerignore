@@ -1,12 +1,10 @@
 .git
-.github
 .agent-state
 .claude
 .codex-runtime
 node_modules
 dist
 out
-build
 .vite
 landing-dist
 mobile-dist

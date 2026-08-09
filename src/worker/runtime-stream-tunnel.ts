@@ -402,10 +402,15 @@ export class RuntimeStreamTunnel {
         break;
       }
       case "runtime.direct.commit":
-        this.directTransport.commit(
+        if (this.directTransport.commit(
           message.payload.streamId,
           message.payload.connectionId,
-        );
+        ) === "destination") {
+          this.sendEnvelope("runtime.direct.committed", {
+            streamId: message.payload.streamId,
+            connectionId: message.payload.connectionId,
+          });
+        }
         break;
       case "runtime.direct.cancel":
         this.directTransport.cancel(

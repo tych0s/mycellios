@@ -11,6 +11,7 @@ import {
   runtimeLinkProbePongEnvelopeSchema,
   runtimeLinkProbeResultEnvelopeSchema,
   runtimeDirectClosedEnvelopeSchema,
+  runtimeDirectCommittedEnvelopeSchema,
   runtimeDirectEstablishedEnvelopeSchema,
   runtimeDirectFallbackEnvelopeSchema,
   runtimeDirectReadyEnvelopeSchema,
@@ -555,6 +556,11 @@ describe("worker protocol schemas", () => {
         connectionId: "stream-direct",
         connectRttMs: 2.4,
       },
+    }).success).toBe(true);
+    expect(runtimeDirectCommittedEnvelopeSchema.safeParse({
+      ...baseEnvelope,
+      type: "runtime.direct.committed",
+      payload: { streamId: "stream-direct", connectionId: "stream-direct" },
     }).success).toBe(true);
     expect(runtimeDirectFallbackEnvelopeSchema.safeParse({
       ...baseEnvelope,

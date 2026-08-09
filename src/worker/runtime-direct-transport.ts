@@ -35,6 +35,11 @@ export interface DirectTransportCandidate {
 
 export interface DirectTransportAdvertisement {
   protocol: typeof DIRECT_TRANSPORT_PROTOCOL;
+  /**
+   * The destination acknowledges its local commit before the coordinator
+   * releases the source socket. Absent on legacy workers, which must use relay.
+   */
+  commitAck: "destination-v1";
   candidates: DirectTransportCandidate[];
   maxSessions: number;
   maxSessionBytes: number;
@@ -236,6 +241,7 @@ export class RuntimeDirectTransport {
     this.server = server;
     this.advertisement = {
       protocol: DIRECT_TRANSPORT_PROTOCOL,
+      commitAck: "destination-v1",
       candidates,
       maxSessions: this.maxSessions,
       maxSessionBytes: this.maxSessionBytes,
@@ -374,14 +380,14 @@ export class RuntimeDirectTransport {
     this.rejectSource(input.streamId, input.grant.connectionId, lastError.message);
   }
 
-  commit(streamId: string, connectionId: string): boolean {
+  commit(streamId: string, connectionId: string): DirectRecord["role"] | false {
     const record = this.records.get(streamId);
     if (!record || record.grant.connectionId !== connectionId || record.committed) return false;
     record.committed = true;
     record.connectedAt = Date.now();
     record.socket.resume();
     if (record.role === "source") this.callbacks.onSourceCommitted(streamId);
-    return true;
+    return record.role;
   }
 
   writeSource(streamId: string, data: Buffer): boolean {

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { delimiter, dirname, join } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { arch, cpus, release } from "node:os";
 import { spawn } from "node:child_process";
 import type { AddressInfo } from "node:net";
@@ -114,9 +114,11 @@ import {
   automaticUpdateRetryDelayMs,
   canInstallAutomaticUpdate,
   summarizeAutomaticUpdateError,
+  trackActiveStage,
 } from "./update-recovery.js";
 import { SingleFlight } from "./single-flight.js";
 import { RemoteDiagnosticsUploader } from "./remote-diagnostics.js";
+import { stageStartupDiagnostic } from "./stage-startup-diagnostic.js";
 import { readNativeBuildIdentity } from "../core/native-build-identity.js";
 import { probeRuntimePerformanceProfile } from "../performance/runtime-profile-probe.js";
 import {
@@ -135,6 +137,7 @@ const LOCAL_DASHBOARD_COORDINATOR_URL = "http://127.0.0.1:4180";
 const LOCAL_DASHBOARD_COORDINATOR_PORT = 4_180;
 
 const UPDATE_FEED_URL = "https://www.mycellios.com/updates/win32/x64/";
+const WORKER_START_RETRY_DELAYS_MS = [2_000, 5_000, 15_000, 30_000, 60_000] as const;
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
@@ -142,6 +145,8 @@ let coordinator: CoordinatorRuntime | null = null;
 let coordinatorUrl = "";
 let worker: WorkerAgent | null = null;
 const workerStartFlight = new SingleFlight();
+let workerStartRetryTimer: NodeJS.Timeout | null = null;
+let workerStartRetryAttempt = 0;
 let distributedExecutor: Awaited<ReturnType<typeof createDesktopDistributedExecutor>> | null = null;
 let distributionRuntimePromise: Promise<string> | null = null;
 let cpuRuntimePromise: Promise<AcceleratorRuntimeResult> | null = null;
@@ -847,6 +852,37 @@ async function startWorkerConnection(): Promise<void> {
   await workerStartFlight.run(initializeWorker);
 }
 
+function clearWorkerStartRetryTimer(resetAttempt = true): void {
+  if (workerStartRetryTimer) clearTimeout(workerStartRetryTimer);
+  workerStartRetryTimer = null;
+  if (resetAttempt) workerStartRetryAttempt = 0;
+}
+
+function scheduleWorkerStartRetry(): void {
+  if (
+    workerStartRetryTimer
+    || worker
+    || isQuitting
+  ) return;
+  const delayMs = WORKER_START_RETRY_DELAYS_MS[
+    Math.min(workerStartRetryAttempt, WORKER_START_RETRY_DELAYS_MS.length - 1)
+  ]!;
+  workerStartRetryAttempt += 1;
+  writeDesktopLog("worker-start-retry-scheduled", {
+    attempt: workerStartRetryAttempt,
+    delayMs,
+  });
+  workerStartRetryTimer = setTimeout(() => {
+    workerStartRetryTimer = null;
+    void startWorkerConnection().catch((error: unknown) => {
+      runtimeError = errorText(error);
+      writeDesktopLog("worker-start-retry-failed", { error: runtimeError });
+      scheduleWorkerStartRetry();
+    });
+  }, delayMs);
+  workerStartRetryTimer.unref();
+}
+
 function persistContributionPreference(
   enabled: boolean,
   source: "local" | "remote",
@@ -945,6 +981,10 @@ async function initializeWorker(): Promise<void> {
       info: (message) => {
         console.info(`[agent] ${message}`);
         writeDesktopLog("worker-info", { message });
+        if (/^Worker .+ connected$/.test(message)) {
+          runtimeError = null;
+          clearWorkerStartRetryTimer();
+        }
       },
       warn: (message) => {
         console.warn(`[agent] ${message}`);
@@ -968,6 +1008,7 @@ async function initializeWorker(): Promise<void> {
     runtimeError = errorText(error);
     writeDesktopLog("worker-start-failed", { error: runtimeError });
     if (worker === nextWorker) worker = null;
+    scheduleWorkerStartRetry();
   });
 }
 
@@ -1007,6 +1048,7 @@ async function measureDesktopRuntimePerformanceProfile() {
 }
 
 async function stopWorker(): Promise<void> {
+  clearWorkerStartRetryTimer();
   await workerStartFlight.wait().catch(() => undefined);
   const activeWorker = worker;
   worker = null;
@@ -1879,6 +1921,7 @@ class DesktopAcceleratedLaunchAgent implements LaunchAgent {
   ): Promise<LaunchProcessHandle> {
     const maximumAttempts = 2;
     let lastError: unknown = new Error("gpu_model_stage_failed");
+    let lastDiagnostic: string | null = null;
     for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
       let handle: LaunchProcessHandle | null = null;
       try {
@@ -1888,6 +1931,7 @@ class DesktopAcceleratedLaunchAgent implements LaunchAgent {
         return handle;
       } catch (error) {
         lastError = error;
+        lastDiagnostic = stageStartupDiagnostic(handle) ?? lastDiagnostic;
         if (signal.aborted) {
           throw signal.reason instanceof Error ? signal.reason : new Error("distributed_launch_cancelled");
         }
@@ -1903,7 +1947,8 @@ class DesktopAcceleratedLaunchAgent implements LaunchAgent {
     }
 
     const reason = errorText(lastError);
-    invalidateGpuRuntimeAfterStageFailure(runtime, request.launchId, reason);
+    const failureReason = `${reason}${lastDiagnostic ? `:diagnostic=${lastDiagnostic}` : ""}`;
+    invalidateGpuRuntimeAfterStageFailure(runtime, request.launchId, failureReason);
     if (settings.computeMode === "automatic") {
       accelerationStatus = appendAccelerationLog(accelerationStatus, {
         at: new Date().toISOString(),
@@ -1915,7 +1960,9 @@ class DesktopAcceleratedLaunchAgent implements LaunchAgent {
       this.observeHandle(cpuHandle, request, cpuRuntime, false);
       return cpuHandle;
     }
-    throw new Error(`gpu_model_stage_unavailable_after_retries:${runtime.effectiveBackend}:${reason}`);
+    throw new Error(
+      `gpu_model_stage_unavailable_after_retries:${runtime.effectiveBackend}:${failureReason}`,
+    );
   }
 
   private async launchWithRuntime(
@@ -1966,7 +2013,9 @@ class DesktopAcceleratedLaunchAgent implements LaunchAgent {
         },
       },
     }, signal);
-    activeDistributedStages.add(handle);
+    trackActiveStage(activeDistributedStages, handle, () => {
+      if (updateStatus.state === "ready") scheduleAutomaticUpdateInstall();
+    });
     const deviceType = runtime.deviceType;
     const setupInProgress = deviceType === "cpu" && gpuPreparationIsContinuing(accelerationStatus);
     accelerationStatus = appendAccelerationLog(accelerationStatus, {
@@ -2007,8 +2056,6 @@ class DesktopAcceleratedLaunchAgent implements LaunchAgent {
       },
     );
     void handle.exited.then((exit) => {
-      activeDistributedStages.delete(handle);
-      if (updateStatus.state === "ready") scheduleAutomaticUpdateInstall();
       const unexpected = unexpectedRuntimeExit(exit);
       accelerationStatus = appendAccelerationLog(accelerationStatus, {
         at: new Date().toISOString(),
@@ -2299,9 +2346,16 @@ function applyDesktopAcceleratorProgress(event: AcceleratorProgressEvent): void 
   scheduleAccelerationDiagnosticsPublish(event.recordLog ? 500 : 10_000);
 }
 
+function developmentDistributionRuntimeRoot(): string {
+  const configured = process.env.MYCELLIOS_DESKTOP_RUNTIME_ROOT?.trim();
+  return configured
+    ? resolve(configured)
+    : join(app.getAppPath(), "runtime", "distribution-venv");
+}
+
 function distributionPythonExecutable(root = app.isPackaged
   ? join(app.getPath("userData"), "distribution-runtime-v4")
-  : join(app.getAppPath(), "runtime", "distribution-venv")): string {
+  : developmentDistributionRuntimeRoot()): string {
   if (process.platform === "win32") {
     const portable = join(root, "python.exe");
     return app.isPackaged || existsSync(portable) ? portable : join(root, "Scripts", "python.exe");
@@ -2320,7 +2374,7 @@ function ensureDistributionRuntime(): Promise<string> {
 }
 
 async function ensureDistributionRuntimeOnce(): Promise<string> {
-  if (!app.isPackaged) return join(app.getAppPath(), "runtime", "distribution-venv");
+  if (!app.isPackaged) return developmentDistributionRuntimeRoot();
   const userData = app.getPath("userData");
   const root = join(userData, "distribution-runtime-v4");
   const staging = join(userData, "distribution-runtime-v4.staging");

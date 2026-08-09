@@ -35,6 +35,7 @@ export interface ModelActivationManager {
 export interface DynamicActivationSnapshot {
   capacityNodes: readonly ModelExecutionCapacityNode[];
   config: AutoDistributionConfig | null;
+  readinessDetails?: readonly string[];
 }
 
 export interface DynamicActivationRouteStage {
@@ -252,8 +253,24 @@ export class DynamicModelActivationManager implements ModelActivationManager {
   activate(model: StoredRequestedModel): Promise<void> {
     if (this.isManaging(model.id)) return this.activePromise!;
     if (this.activePromise) return Promise.reject(new Error(`automatic_activation_busy:${this.activeModelId}`));
+    this.progress.set(model.id, []);
+    this.appendProgress(model.id, "queued", "Activation accepted by the coordinator.");
     const base = this.current.config;
-    if (!base) return Promise.reject(new Error("distributed_activation_requires_two_connected_shard_executors"));
+    if (!base) {
+      const error = new Error("distributed_activation_requires_two_connected_shard_executors");
+      this.appendProgress(
+        model.id,
+        "failed",
+        "The connected PCs have not finished preparing a verified two-node execution route.",
+        "failed",
+        {
+          details: this.current.readinessDetails ?? [
+            "Two connected shard executors must finish runtime and reciprocal-link verification.",
+          ],
+        },
+      );
+      return Promise.reject(error);
+    }
     let config = parseAutoDistributionConfig({
       ...structuredClone(base),
       model: { source: model.source, revision: model.revision, publicName: model.id },
@@ -266,8 +283,6 @@ export class DynamicModelActivationManager implements ModelActivationManager {
       artifactsDirectory: modelArtifactsDirectory(base, model.id),
     });
     const controller = new AbortController();
-    this.progress.set(model.id, []);
-    this.appendProgress(model.id, "queued", "Activation accepted by the coordinator.");
     this.activeModelId = model.id;
     this.activeAbort = controller;
     const cwd = this.options.cwd ?? process.cwd();

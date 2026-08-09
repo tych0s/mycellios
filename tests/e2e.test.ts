@@ -4,6 +4,10 @@ import { workerConfigSchema } from "../src/contracts/schemas.js";
 import type { CoordinatorRuntime } from "../src/coordinator/server.js";
 import { createCoordinator } from "../src/coordinator/server.js";
 import { WorkerAgent } from "../src/worker/agent.js";
+import {
+  generateWorkerAdmissionCredential,
+  workerAdmissionSigner,
+} from "../src/worker/admission-credential.js";
 
 describe("inference-only coordinator and worker", () => {
   const cleanup: Array<() => Promise<void> | void> = [];
@@ -153,7 +157,7 @@ describe("inference-only coordinator and worker", () => {
         await fetch(new URL("v1/models", `${address}/`), {
           headers: { authorization: `Bearer ${networkToken}` },
         })
-      ).status,
+    ).status,
     ).toBe(200);
   });
 
@@ -170,9 +174,27 @@ describe("inference-only coordinator and worker", () => {
     expect(response.url).toBe(`${address}/downloads`);
     expect(await response.text()).toContain("mycellios test network");
   });
+
+  it("connects a signed public worker without exposing the global network token", async () => {
+    const { runtime, agent, run } = await startNetwork({
+      networkToken: "server-only-network-token",
+      signedPublic: true,
+    });
+    cleanup.push(async () => {
+      await agent.stop();
+      await run;
+      await runtime.close();
+    });
+
+    expect(runtime.hub.connectedWorkerIds().size).toBe(1);
+    expect(runtime.database.listWorkerAdmissionCredentials()).toHaveLength(1);
+  });
 });
 
-async function startNetwork(options: { networkToken?: string } = {}): Promise<{
+async function startNetwork(options: {
+  networkToken?: string;
+  signedPublic?: boolean;
+} = {}): Promise<{
   runtime: CoordinatorRuntime;
   address: string;
   agent: WorkerAgent;
@@ -228,7 +250,15 @@ async function startNetwork(options: { networkToken?: string } = {}): Promise<{
         }],
       }),
       logger: { info() {}, warn() {}, error() {} },
-      ...(options.networkToken ? { networkToken: options.networkToken } : {}),
+      ...(options.networkToken && !options.signedPublic
+        ? { networkToken: options.networkToken }
+        : {}),
+      ...(options.signedPublic
+        ? {
+            identity: { kind: "device" as const, id: "signed-e2e-worker" },
+            admissionSigner: workerAdmissionSigner(generateWorkerAdmissionCredential()),
+          }
+        : {}),
     },
   );
   const run = agent.start();

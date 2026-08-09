@@ -111,7 +111,9 @@ import {
 import { stripWorkerDeclaredEvidence } from "./evidence-authority.js";
 import {
   activationFailureIsTransient,
+  activationFailureMessageAfterRuntimeChange,
   classifyActivationIncident,
+  formatExhaustedActivationFailure,
   type ActivationIncident,
 } from "./activation-incident.js";
 import type { AuthenticatedNetworkUser } from "./supabase-auth.js";
@@ -130,6 +132,11 @@ import {
   admissionCredentialSummary,
   selectWorkerProtocolVersion,
 } from "./worker-admission.js";
+import {
+  WORKER_SESSION_TOKEN_PREFIX,
+  issueWorkerSessionToken,
+  verifyWorkerSessionToken,
+} from "./worker-session-token.js";
 import { FleetContributionController } from "./fleet-contribution-control.js";
 
 export function automaticActivationFailureIsTransient(message: string): boolean {
@@ -146,6 +153,14 @@ export const DEFAULT_AUTOMATIC_ACTIVATION_RETRY_DELAYS_MS = [
 
 export const NETWORK_TELEMETRY_INTERVAL_MS = 10 * 60_000;
 export const NETWORK_TELEMETRY_RETENTION_DAYS = 90;
+
+const SIGNED_WORKER_ADMISSION_PATHS = new Set([
+  "/internal/v1/workers/admission-challenge",
+  "/internal/v1/workers/credential-rotation-challenge",
+  "/internal/v1/workers/credential-rotation",
+  "/internal/v1/workers/register",
+]);
+const WORKER_CONNECT_PATH = "/internal/v1/workers/connect";
 
 const networkHistoryRanges = {
   "24h": 24,
@@ -286,11 +301,22 @@ export async function createCoordinator(
       ) return;
       if (path.startsWith("/internal/v1/releases/")) return;
       if (path === "/v1/auth/me") return;
+      const received = parseBearerToken(request.headers.authorization);
+      // Remote public workers prove possession of a stable device key on these
+      // routes. Registration returns a narrowly scoped session token for the
+      // worker WebSocket; the global network secret never leaves the server.
+      if (SIGNED_WORKER_ADMISSION_PATHS.has(path)) {
+        if (!received || constantTimeEqual(received, expectedToken)) return;
+        return reply.code(401).send({ error: { code: "invalid_network_token" } });
+      }
       // Mobile expert administration has its own stronger control-plane
       // credential above. Requiring both secrets in one Authorization header
       // would make the route impossible to use when the tokens differ.
       if (path.startsWith("/internal/v1/mobile/experts/")) return;
-      const received = parseBearerToken(request.headers.authorization);
+      if (
+        path === WORKER_CONNECT_PATH
+        && received?.startsWith(`${WORKER_SESSION_TOKEN_PREFIX}.`)
+      ) return;
       if (!received || !constantTimeEqual(received, expectedToken)) {
         return reply.code(401).send({ error: { code: "invalid_network_token" } });
       }
@@ -360,6 +386,30 @@ export async function createCoordinator(
   );
   const database = new MeshDatabase(config.databasePath);
   const workerAdmission = new WorkerAdmissionAuthority(database);
+  const workerSessionPrincipals = new WeakMap<FastifyRequest, string>();
+  if (config.networkToken) {
+    app.addHook("onRequest", async (request, reply) => {
+      const path = request.url.split("?", 1)[0] ?? request.url;
+      if (path !== WORKER_CONNECT_PATH) return;
+      const token = parseBearerToken(request.headers.authorization);
+      if (token && constantTimeEqual(token, config.networkToken!)) return;
+      const claims = token ? verifyWorkerSessionToken(config.networkToken!, token) : null;
+      const credential = claims
+        ? database.getWorkerAdmissionCredential(claims.identityKind, claims.identityId)
+        : null;
+      if (
+        !claims
+        || !credential
+        || credential.status !== "active"
+        || credential.fingerprint !== claims.credentialFingerprint
+      ) {
+        return reply.code(401).send({
+          error: { code: "invalid_worker_session_token" },
+        });
+      }
+      workerSessionPrincipals.set(request, claims.workerId);
+    });
+  }
   const apiAccess = new ApiAccessManager(database, {
     starterTokens: config.apiStarterTokens ?? 25_000,
     requestsPerMinute: config.apiRequestsPerMinute ?? 30,
@@ -547,7 +597,9 @@ export async function createCoordinator(
   });
   const hub = new WorkerHub(store);
   const fleetContribution = new FleetContributionController(store, hub);
-  hub.attach(app);
+  hub.attach(app, {
+    authorizedWorkerId: (request) => workerSessionPrincipals.get(request) ?? null,
+  });
   const scheduler = new Scheduler(store, {
     runtimeLinkObservations: () => hub.runtimeLinkObservations(),
     strictRuntimeLinks: true,
@@ -791,6 +843,13 @@ export async function createCoordinator(
   ): readonly ModelActivationProgressEvent[] => {
     const retry = automaticActivationRetryState.get(modelId);
     if (!retry) return [];
+    const incident = classifyActivationIncident({
+      message: retry.lastError,
+      retryCount: retry.retryCount,
+      retryLaunching: retry.launching,
+      nextRetryAt: retry.nextAttemptAt,
+      maximumAttempts: automaticActivationRetryDelaysMs.length,
+    });
     const retryNumber = retry.launching ? retry.retryCount : retry.retryCount + 1;
     const secondsRemaining = Math.max(0, Math.ceil((retry.nextAttemptAt - Date.now()) / 1_000));
     const waitMessage = secondsRemaining > 0
@@ -800,7 +859,7 @@ export async function createCoordinator(
       phase: retry.launching ? "retrying" : "retry_wait",
       message: retry.launching
         ? `Automatic retry ${retryNumber} of ${automaticActivationRetryDelaysMs.length} is starting.`
-        : `A node became unavailable during startup. ${waitMessage}`,
+        : `${incident.title}. ${waitMessage}`,
       at: new Date(retry.updatedAt).toISOString(),
       state: "running",
       details: [retry.lastError],
@@ -824,13 +883,20 @@ export async function createCoordinator(
   const activationStatusMessageForModel = (modelId: string): string | null => {
     const retry = automaticActivationRetryState.get(modelId);
     if (!retry) return null;
+    const incident = classifyActivationIncident({
+      message: retry.lastError,
+      retryCount: retry.retryCount,
+      retryLaunching: retry.launching,
+      nextRetryAt: retry.nextAttemptAt,
+      maximumAttempts: automaticActivationRetryDelaysMs.length,
+    });
     const retryNumber = retry.launching ? retry.retryCount : retry.retryCount + 1;
     if (retry.launching) {
       return `Automatic retry ${retryNumber} of ${automaticActivationRetryDelaysMs.length} is starting.`;
     }
     const secondsRemaining = Math.max(0, Math.ceil((retry.nextAttemptAt - Date.now()) / 1_000));
     return secondsRemaining > 0
-      ? `A node disconnected during startup. Automatic retry ${retryNumber} of ${automaticActivationRetryDelaysMs.length} starts in ${secondsRemaining}s.`
+      ? `${incident.title}. Automatic retry ${retryNumber} of ${automaticActivationRetryDelaysMs.length} starts in ${secondsRemaining}s.`
       : `Automatic retry ${retryNumber} of ${automaticActivationRetryDelaysMs.length} is ready and waiting for healthy capacity and a free activation slot.`;
   };
   const activationIncidentForModel = (
@@ -884,7 +950,11 @@ export async function createCoordinator(
     );
     if (!nextRetry) {
       automaticActivationRetryState.delete(modelId);
-      const exhausted = `automatic_activation_retries_exhausted:${retriesStarted}:${message}`;
+      const exhausted = formatExhaustedActivationFailure(
+        retriesStarted,
+        runtimeVersion,
+        message,
+      );
       store.setRequestedModelActivationError(modelId, exhausted);
       if (operation) {
         deploymentController.failOperation(
@@ -1062,12 +1132,34 @@ export async function createCoordinator(
       }
     }
     for (const request of requests) {
+      const runtimeChangedFailure = request.activationError
+        ? activationFailureMessageAfterRuntimeChange(
+            request.activationError,
+            runtimeVersion,
+          )
+        : null;
       if (
         request.autoActivate
         && request.activationError
-        && automaticActivationFailureIsTransient(request.activationError)
+        && (
+          automaticActivationFailureIsTransient(request.activationError)
+          || runtimeChangedFailure !== null
+        )
       ) {
-        if (!automaticActivationRetryState.has(request.id)) {
+        if (runtimeChangedFailure !== null) {
+          deploymentController.rearmAfterRuntimeChange(
+            request.id,
+            runtimeChangedFailure,
+            now,
+          );
+          const retry = nextAutomaticActivationRetry(
+            0,
+            runtimeChangedFailure,
+            now,
+            automaticActivationRetryDelaysMs,
+          );
+          if (retry) automaticActivationRetryState.set(request.id, retry);
+        } else if (!automaticActivationRetryState.has(request.id)) {
           const retry = nextAutomaticActivationRetry(
             0,
             request.activationError,
@@ -1101,6 +1193,7 @@ export async function createCoordinator(
       const stored = requests.find((request) => request.id === view.id)!;
       if (view.status === "active") {
         automaticActivationRetryState.delete(view.id);
+        if (stored.activationError) store.clearRequestedModelActivationError(view.id);
         const operation = deploymentController.activeOperationForModel(view.id);
         if (operation) {
           deploymentController.completeOperation(
@@ -2057,12 +2150,23 @@ export async function createCoordinator(
       ...(registration.identity ? { identity: registration.identity } : {}),
       capabilities: stripWorkerDeclaredEvidence(registration.capabilities),
     });
+    const workerSessionToken = config.networkToken
+      && registration.identity
+      && admission.credentialFingerprint
+      ? issueWorkerSessionToken(config.networkToken, {
+          workerId: worker.id,
+          identityKind: registration.identity.kind,
+          identityId: registration.identity.id,
+          credentialFingerprint: admission.credentialFingerprint,
+        })
+      : undefined;
     return reply.code(201).send({
       workerId: worker.id,
       protocolVersion: admission.protocolVersion,
       ...(admission.credentialFingerprint
         ? { credentialFingerprint: admission.credentialFingerprint }
         : {}),
+      ...(workerSessionToken ? { workerSessionToken } : {}),
       enrollment: admission.enrollment,
     });
   });

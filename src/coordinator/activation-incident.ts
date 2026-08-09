@@ -2,6 +2,8 @@ export const ACTIVATION_INCIDENT_SCHEMA =
   "mycellios-activation-incident/1" as const;
 
 export type ActivationIncidentCode =
+  | "executor_pool_not_ready"
+  | "route_evidence_not_ready"
   | "node_disconnected"
   | "launch_agent_unavailable"
   | "network_prepare_timeout"
@@ -143,8 +145,74 @@ export function activationFailureIsTransient(message: string): boolean {
     && incidentDefinition(exhausted.message).intrinsicallyRetryable;
 }
 
+export function formatExhaustedActivationFailure(
+  attempts: number,
+  runtimeVersion: string,
+  message: string,
+): string {
+  const safeRuntimeVersion = runtimeVersion
+    .trim()
+    .replace(/[^0-9A-Za-z._+-]/g, "_")
+    .slice(0, 64) || "unknown";
+  return `automatic_activation_retries_exhausted:${boundedInteger(attempts, 0, 32)}:runtime=${safeRuntimeVersion}:${message}`;
+}
+
+export function activationFailureCanRetryAfterRuntimeChange(
+  message: string,
+  runtimeVersion: string,
+): boolean {
+  return activationFailureMessageAfterRuntimeChange(message, runtimeVersion) !== null;
+}
+
+export function activationFailureMessageAfterRuntimeChange(
+  message: string,
+  runtimeVersion: string,
+): string | null {
+  const exhausted = unwrapExhausted(message);
+  return exhausted.attempts !== null
+    && exhausted.runtimeVersion !== runtimeVersion
+    && incidentDefinition(exhausted.message).intrinsicallyRetryable
+    ? exhausted.message
+    : null;
+}
+
 function incidentDefinition(message: string): IncidentDefinition {
   const normalized = message.toLowerCase();
+  if (
+    normalized.includes("route_availability_below_minimum")
+    || /^no_feasible_automatic_\d+_stage_pipeline$/i.test(message.trim())
+  ) {
+    return {
+      code: "route_evidence_not_ready",
+      scope: "network",
+      title: "The verified route is temporarily below its reliability threshold",
+      summary: "The nodes have enough memory, but their recent connection evidence is not yet reliable enough to publish a distributed route.",
+      remedy: "Mycellios keeps the model unpublished while fresh reciprocal probes replace the degraded samples, then replans automatically.",
+      steps: Object.freeze([
+        "Keep both contributing desktop clients online.",
+        "Collect fresh successful reciprocal-link probes.",
+        ...ROUTE_REBUILD_STEPS,
+      ]),
+      automaticAction: "rebuild_route",
+      intrinsicallyRetryable: true,
+    };
+  }
+  if (normalized.includes("distributed_activation_requires_two_connected_shard_executors")) {
+    return {
+      code: "executor_pool_not_ready",
+      scope: "network",
+      title: "The verified executor topology is not ready",
+      summary: "Connected capacity is visible, but fewer than two executors have completed the runtime and reciprocal-link evidence required to launch a distributed route.",
+      remedy: "Mycellios keeps the model unpublished while the connected desktops finish verification, then rebuilds the route automatically.",
+      steps: Object.freeze([
+        "Keep both contributing desktop clients online.",
+        "Wait for their runtime performance and reciprocal link probes to complete.",
+        ...ROUTE_REBUILD_STEPS,
+      ]),
+      automaticAction: "rebuild_route",
+      intrinsicallyRetryable: true,
+    };
+  }
   if (
     normalized.includes("distributed_worker_disconnected:")
     || normalized.includes("distributed_worker_not_connected:")
@@ -322,17 +390,19 @@ function incidentDefinition(message: string): IncidentDefinition {
 
 function unwrapExhausted(message: string): {
   attempts: number | null;
+  runtimeVersion: string | null;
   message: string;
 } {
-  const match = /^automatic_activation_retries_exhausted:(\d+):([\s\S]*)$/i.exec(
+  const match = /^automatic_activation_retries_exhausted:(\d+):(?:runtime=([^:\s]+):)?([\s\S]*)$/i.exec(
     message.trim(),
   );
   return match
     ? {
         attempts: boundedInteger(Number(match[1]), 0, 32),
-        message: match[2] ?? "",
+        runtimeVersion: match[2] ?? null,
+        message: match[3] ?? "",
       }
-    : { attempts: null, message };
+    : { attempts: null, runtimeVersion: null, message };
 }
 
 function extractNodeId(message: string): string | null {

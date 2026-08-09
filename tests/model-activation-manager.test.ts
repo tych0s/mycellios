@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   AutomaticModelActivationManager,
+  DynamicModelActivationManager,
   type AutomaticModelRunner,
 } from "../src/coordinator/model-activation-manager.js";
 import { parseAutoDistributionConfig } from "../src/distribution/auto-distribute.js";
@@ -8,6 +9,52 @@ import type { AutoDistributionConfig } from "../src/distribution/auto-distribute
 import type { StoredRequestedModel } from "../src/storage/store.js";
 
 describe("automatic model activation manager", () => {
+  it("replaces stale progress when the verified executor topology is not ready", async () => {
+    const persisted = [{
+      phase: "active",
+      message: "A previous activation completed.",
+      at: "2026-07-24T08:18:45.682Z",
+      state: "completed" as const,
+    }];
+    const emitted: Array<{ phase: string; state: string; message: string }> = [];
+    const manager = new DynamicModelActivationManager({
+      snapshot: () => ({
+        capacityNodes: [
+          { id: "node-a", availableVramMiB: 4_096 },
+          { id: "node-b", availableVramMiB: 4_096 },
+        ],
+        config: null,
+        readinessDetails: [
+          "node-a: runtime performance verified.",
+          "node-b: connected; waiting for a verified runtime performance profile.",
+        ],
+      }),
+      resolveManagedAgent: () => undefined,
+      loadProgress: () => persisted,
+      onProgress: (_modelId, event) => emitted.push(event),
+    });
+    await manager.initialize();
+    expect(manager.activationProgressForModel("qwen-ui")).toEqual(persisted);
+
+    await expect(manager.activate(requestedModel())).rejects.toThrow(
+      "distributed_activation_requires_two_connected_shard_executors",
+    );
+
+    expect(manager.activationProgressForModel("qwen-ui")).toEqual([
+      expect.objectContaining({ phase: "queued", state: "completed" }),
+      expect.objectContaining({
+        phase: "failed",
+        state: "failed",
+        message: "The connected PCs have not finished preparing a verified two-node execution route.",
+        details: [
+          "node-a: runtime performance verified.",
+          "node-b: connected; waiting for a verified runtime performance profile.",
+        ],
+      }),
+    ]);
+    expect(emitted.map((event) => event.phase)).toEqual(["queued", "failed"]);
+  });
+
   it("reserves a healthy executor pool and translates an interface request into a launch", async () => {
     const launchedConfigs: AutoDistributionConfig[] = [];
     const runner: AutomaticModelRunner = async (config, signal) => {

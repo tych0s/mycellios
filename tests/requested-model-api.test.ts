@@ -373,6 +373,104 @@ describe("automatic activation recovery", () => {
       "automatic_activation_retries_exhausted:2:managed_launch_agent_is_unavailable:desktop-test",
     )).toBe(false);
   });
+
+  it("resets persisted deployment retries after a coordinator runtime upgrade", async () => {
+    const manager = new FakeActivationManager();
+    const localRuntime = await createCoordinator({
+      host: "127.0.0.1",
+      port: 8_787,
+      databasePath: ":memory:",
+      requestTimeoutMs: 30_000,
+    }, {
+      activationManager: manager,
+      automaticActivationRetryDelaysMs: [0],
+      runtimeMetadata: {
+        root: process.cwd(),
+        version: "0.2.65",
+        revision: null,
+        buildIdentity: null,
+      },
+    });
+    try {
+      requestedModel(localRuntime, "runtime-upgrade");
+      for (let attempt = 0; attempt < 7; attempt += 1) {
+        const operation = localRuntime.deploymentController.claimOperation(
+          "runtime-upgrade",
+          "activate",
+        );
+        expect(operation).not.toBeNull();
+        localRuntime.deploymentController.failOperation(
+          operation!.id,
+          "transient_activation_failure",
+          "distributed_activation_requires_two_connected_shard_executors",
+        );
+      }
+      expect(
+        localRuntime.deploymentController.getState("runtime-upgrade")?.retryCount,
+      ).toBe(7);
+      localRuntime.store.setRequestedModelActivationError(
+        "runtime-upgrade",
+        "automatic_activation_retries_exhausted:7:runtime=0.2.64:"
+          + "distributed_activation_requires_two_connected_shard_executors",
+      );
+
+      await localRuntime.app.inject({ method: "GET", url: "/public/v1/snapshot" });
+
+      expect(manager.activated.map((model) => model.id)).toEqual(["runtime-upgrade"]);
+      expect(localRuntime.store.getRequestedModel("runtime-upgrade")?.activationError).toBeNull();
+      expect(localRuntime.deploymentController.getState("runtime-upgrade")).toMatchObject({
+        generation: 2,
+        retryCount: 0,
+        lastError: "distributed_activation_requires_two_connected_shard_executors",
+      });
+      expect(
+        localRuntime.deploymentController.activeOperationForModel("runtime-upgrade"),
+      ).toMatchObject({
+        attempt: 1,
+        generation: 2,
+        status: "running",
+      });
+    } finally {
+      await localRuntime.close();
+    }
+  });
+
+  it("does not rearm an exhausted activation again on the same runtime", async () => {
+    const manager = new FakeActivationManager();
+    const localRuntime = await createCoordinator({
+      host: "127.0.0.1",
+      port: 8_787,
+      databasePath: ":memory:",
+      requestTimeoutMs: 30_000,
+    }, {
+      activationManager: manager,
+      automaticActivationRetryDelaysMs: [0],
+      runtimeMetadata: {
+        root: process.cwd(),
+        version: "0.2.65",
+        revision: null,
+        buildIdentity: null,
+      },
+    });
+    try {
+      requestedModel(localRuntime, "same-runtime");
+      const failure =
+        "automatic_activation_retries_exhausted:5:runtime=0.2.65:"
+        + "managed_launch_agent_is_unavailable:desktop-a";
+      localRuntime.store.setRequestedModelActivationError("same-runtime", failure);
+
+      const response = await localRuntime.app.inject({
+        method: "GET",
+        url: "/public/v1/snapshot",
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(manager.activated).toEqual([]);
+      expect(localRuntime.store.getRequestedModel("same-runtime")?.activationError).toBe(failure);
+    } finally {
+      await localRuntime.close();
+    }
+  });
 });
 
 class FakeActivationManager implements ModelActivationManager {

@@ -34,6 +34,48 @@ from distributed_runtime.stage_artifact import (
 
 
 class StageArtifactTests(unittest.TestCase):
+    def test_hugging_face_blob_links_stay_inside_the_repository_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "hub" / "models--Qwen--Qwen3-0.6B"
+            snapshot = repository / "snapshots" / ("a" * 40)
+            blob = repository / "blobs" / ("b" * 64)
+            snapshot.mkdir(parents=True)
+            blob.parent.mkdir(parents=True)
+            blob.write_bytes(b"sealed")
+            link = snapshot / "model.safetensors"
+            try:
+                link.symlink_to(blob)
+            except OSError as error:
+                self.skipTest(f"symbolic links are unavailable: {error}")
+
+            self.assertEqual(
+                stage_artifact._resolve_checkpoint_tensor_path(
+                    snapshot,
+                    "model.safetensors",
+                ),
+                blob.resolve(),
+            )
+
+    def test_local_checkpoint_link_cannot_escape_its_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = root / "checkpoint"
+            snapshot.mkdir()
+            outside = root / "outside.safetensors"
+            outside.write_bytes(b"not trusted")
+            link = snapshot / "model.safetensors"
+            try:
+                link.symlink_to(outside)
+            except OSError as error:
+                self.skipTest(f"symbolic links are unavailable: {error}")
+
+            with self.assertRaisesRegex(ValueError, "escapes the snapshot"):
+                stage_artifact._resolve_checkpoint_tensor_path(
+                    snapshot,
+                    "model.safetensors",
+                )
+
     def test_compiles_only_the_requested_indexed_layers_without_materializing_tensors(
         self,
     ) -> None:
@@ -178,6 +220,29 @@ class StageArtifactTests(unittest.TestCase):
             self.assertTrue(all("model.layers.1." in name for name in names))
             manifest = verify_stage_artifact(destination).manifest.to_document()
             self.assertEqual(manifest["model"]["architecture"], "Qwen3ForCausalLM")
+
+    def test_tied_final_stage_consumes_the_projection_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "qwen3-tied"
+            self._write_checkpoint(
+                checkpoint,
+                family="qwen3",
+                tie_word_embeddings=True,
+            )
+            destination = root / "stage"
+
+            compile_safetensors_stage_artifact(
+                str(checkpoint),
+                destination,
+                layer_start=1,
+                layer_end=3,
+            )
+
+            names = set(load_file(str(destination / STAGE_ARTIFACT_WEIGHTS)))
+            self.assertIn("model.embed_tokens.weight", names)
+            self.assertNotIn("lm_head.weight", names)
+            self.assertIn("model.norm.weight", names)
 
     def test_every_certified_moe_family_compiles_its_exact_global_range(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -469,6 +534,7 @@ class StageArtifactTests(unittest.TestCase):
         *,
         family: str,
         extra_tensor: str | None = None,
+        tie_word_embeddings: bool = False,
     ) -> dict[str, torch.Tensor]:
         root.mkdir(parents=True)
         if family == "llama":
@@ -480,7 +546,7 @@ class StageArtifactTests(unittest.TestCase):
                 num_attention_heads=4,
                 num_key_value_heads=2,
                 head_dim=2,
-                tie_word_embeddings=False,
+                tie_word_embeddings=tie_word_embeddings,
                 attention_bias=False,
                 mlp_bias=False,
             )
@@ -494,7 +560,7 @@ class StageArtifactTests(unittest.TestCase):
                 num_attention_heads=4,
                 num_key_value_heads=2,
                 head_dim=2,
-                tie_word_embeddings=False,
+                tie_word_embeddings=tie_word_embeddings,
             )
             config.architectures = ["Qwen3ForCausalLM"]
         elif family == "qwen3_moe":
@@ -510,7 +576,7 @@ class StageArtifactTests(unittest.TestCase):
                 num_experts=4,
                 num_experts_per_tok=2,
                 max_position_embeddings=64,
-                tie_word_embeddings=False,
+                tie_word_embeddings=tie_word_embeddings,
                 architectures=["Qwen3MoeForCausalLM"],
             )
         elif family == "glm4_moe":
@@ -528,7 +594,7 @@ class StageArtifactTests(unittest.TestCase):
                 n_shared_experts=1,
                 first_k_dense_replace=1,
                 max_position_embeddings=64,
-                tie_word_embeddings=False,
+                tie_word_embeddings=tie_word_embeddings,
                 architectures=["Glm4MoeForCausalLM"],
             )
         else:

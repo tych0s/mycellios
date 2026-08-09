@@ -28,11 +28,60 @@ from distributed_runtime.server import (
     output_token_ids_sha256,
     parse_args as parse_server_args,
     parse_remote_recovery_standby_routes,
+    resolve_execution_tokenizer_snapshot,
     tree_draft_provider_from_args,
 )
 
 
 class EngineConfigurationTests(unittest.TestCase):
+    def test_root_stage_resolves_tokenizer_from_authenticated_model_coordinates(
+        self,
+    ) -> None:
+        package_identity = f"sha256:{'a' * 64}"
+        manifest = SimpleNamespace(
+            to_document=lambda: {
+                "model": {
+                    "source": "HMellor/tiny-random-LlamaForCausalLM",
+                    "revision": "9408c553e5c189a7dcdc5a5dbd2feb476b061759",
+                }
+            }
+        )
+        verified = SimpleNamespace(manifest=manifest)
+        with (
+            patch(
+                "distributed_runtime.stage_artifact.verify_stage_artifact",
+                return_value=verified,
+            ) as verify,
+            patch(
+                "distributed_runtime.server.resolve_model_metadata_snapshot",
+                return_value="/cache/authenticated-tokenizer",
+            ) as resolve,
+        ):
+            tokenizer_snapshot = resolve_execution_tokenizer_snapshot(
+                "/cache/root-stage-package",
+                package_identity,
+            )
+
+        self.assertEqual(tokenizer_snapshot, "/cache/authenticated-tokenizer")
+        verify.assert_called_once_with(
+            "/cache/root-stage-package",
+            expected_package_id="a" * 64,
+        )
+        resolve.assert_called_once_with(
+            "HMellor/tiny-random-LlamaForCausalLM",
+            "9408c553e5c189a7dcdc5a5dbd2feb476b061759",
+        )
+
+    def test_unpacked_model_keeps_its_existing_tokenizer_snapshot(self) -> None:
+        with patch(
+            "distributed_runtime.server.resolve_model_metadata_snapshot",
+        ) as resolve:
+            self.assertEqual(
+                resolve_execution_tokenizer_snapshot("/cache/full-model", None),
+                "/cache/full-model",
+            )
+        resolve.assert_not_called()
+
     def test_server_cli_rejects_known_external_backends(self) -> None:
         for argument, backend in (
             ("--native_stage-package", "native_stage"),

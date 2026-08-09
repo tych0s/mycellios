@@ -339,7 +339,9 @@ export function requestedModelCapacityViews(input: {
       weightBytes: profile?.weightBytes ?? null,
       contextTokens: request.contextTokens,
       message,
-      activationIncident: input.activationIncidentForModel?.(request.id) ?? null,
+      activationIncident: active
+        ? null
+        : input.activationIncidentForModel?.(request.id) ?? null,
       activationProgress: input.activationProgressForModel?.(request.id) ?? [],
       activationRequestedAt: request.activationRequestedAt === null
         ? null

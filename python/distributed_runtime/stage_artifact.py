@@ -920,7 +920,6 @@ def _expected_stage_tensors(
         identity = id(target)
         if identity in seen_tensors:
             continue
-        seen_tensors.add(identity)
         assignments = adapter.checkpoint_assignments(
             local_name,
             target,
@@ -936,8 +935,10 @@ def _expected_stage_tensors(
             )
             if checkpoint_name is None:
                 continue
+            seen_tensors.add(identity)
             values = ((checkpoint_name, tuple(target.shape)),)
         else:
+            seen_tensors.add(identity)
             values = tuple(
                 (assignment.checkpoint_name, tuple(assignment.destination.shape))
                 for assignment in assignments
@@ -978,11 +979,7 @@ def _select_source_tensors(
         relative = key_map.get(item.name)
         if relative is None:
             raise KeyError(f"required stage tensor is absent: {item.name}")
-        source_path = (snapshot / relative).resolve()
-        try:
-            source_path.relative_to(snapshot)
-        except ValueError as error:
-            raise ValueError("checkpoint tensor path escapes the snapshot") from error
+        source_path = _resolve_checkpoint_tensor_path(snapshot, relative)
         by_name = layouts.get(relative)
         if by_name is None:
             by_name = _read_safetensors_layout(source_path)
@@ -1006,6 +1003,27 @@ def _select_source_tensors(
             )
         )
     return tuple(selected)
+
+
+def _resolve_checkpoint_tensor_path(snapshot: Path, relative: str) -> Path:
+    snapshot_root = snapshot.resolve(strict=True)
+    source_path = (snapshot_root / relative).resolve(strict=True)
+    if source_path.is_relative_to(snapshot_root):
+        return source_path
+
+    # Hugging Face snapshots deliberately symlink files to the immutable
+    # sibling blobs directory. Permit only a target inside the same
+    # models--owner--repo cache root; arbitrary local-checkpoint escapes stay
+    # fail-closed.
+    snapshots_root = snapshot_root.parent
+    repository_cache_root = snapshots_root.parent
+    if (
+        snapshots_root.name == "snapshots"
+        and repository_cache_root.name.startswith("models--")
+        and source_path.is_relative_to(repository_cache_root)
+    ):
+        return source_path
+    raise ValueError("checkpoint tensor path escapes the snapshot")
 
 
 def _read_safetensors_layout(path: Path) -> dict[str, _SafeTensorLayout]:

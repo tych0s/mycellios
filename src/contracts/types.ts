@@ -302,6 +302,8 @@ export interface WorkerCapabilities {
      */
     directTransport?: {
       protocol: "mycellios-direct/1";
+      /** Absent on legacy peers whose direct commit ordering is not race-free. */
+      commitAck?: "destination-v1" | undefined;
       candidates: Array<{
         host: string;
         port: number;

@@ -312,15 +312,42 @@ export async function profileCompatibleModel(
   cwd = process.cwd(),
   environment: NodeJS.ProcessEnv = process.env,
 ): Promise<CompiledModelProfile> {
-  const python = absoluteFrom(cwd, config.runtime.pythonExecutable);
-  const pythonPath = absoluteFrom(cwd, config.runtime.pythonPath);
-  const hfHome = absoluteFrom(cwd, config.runtime.hfHome);
-  const args = ["-m", "distributed_runtime.profile", config.model.source];
-  if (config.model.revision !== null) args.push("--revision", config.model.revision);
-  const stdout = await runCaptured(python, args, cwd, {
-    ...environment,
-    PYTHONPATH: pythonPath,
-    HF_HOME: hfHome,
+  return profileCompatibleModelWithRuntime({
+    source: config.model.source,
+    revision: config.model.revision,
+    pythonExecutable: absoluteFrom(cwd, config.runtime.pythonExecutable),
+    pythonPath: absoluteFrom(cwd, config.runtime.pythonPath),
+    hfHome: absoluteFrom(cwd, config.runtime.hfHome),
+    cwd,
+    environment,
+  });
+}
+
+export interface CompatibleModelProfileRuntime {
+  source: string;
+  revision: string | null;
+  pythonExecutable: string;
+  pythonPath: string;
+  hfHome: string;
+  cwd?: string;
+  environment?: NodeJS.ProcessEnv;
+}
+
+/**
+ * Profile a model with an explicitly selected, already-provisioned runtime.
+ * Local development and the coordinator container use the same path, so this
+ * gate can be exercised without packaging or publishing a desktop release.
+ */
+export async function profileCompatibleModelWithRuntime(
+  options: CompatibleModelProfileRuntime,
+): Promise<CompiledModelProfile> {
+  const cwd = options.cwd ?? process.cwd();
+  const args = ["-m", "distributed_runtime.profile", options.source];
+  if (options.revision !== null) args.push("--revision", options.revision);
+  const stdout = await runCaptured(options.pythonExecutable, args, cwd, {
+    ...(options.environment ?? process.env),
+    PYTHONPATH: options.pythonPath,
+    HF_HOME: options.hfHome,
     TOKENIZERS_PARALLELISM: "false",
   });
   return validateCompiledProfile(JSON.parse(stdout) as unknown);
@@ -798,9 +825,14 @@ function exactStagePlan(request: RuntimePlanRequest, count: number): Distributio
       .slice(0, count),
   ]);
   let best: { plan: DistributionPlan; score: number } | null = null;
+  const costModelRejectionReasons = new Set<string>();
+  let placementRejected = false;
   for (const order of orders) {
     const stages = balancedExactPlacement(request, order);
-    if (!stages) continue;
+    if (!stages) {
+      placementRejected = true;
+      continue;
+    }
     const plan: DistributionPlan = {
       algorithm: "auto-balanced-exact-stages",
       codec: "fp16",
@@ -814,11 +846,18 @@ function exactStagePlan(request: RuntimePlanRequest, count: number): Distributio
       request.workload,
       plan,
     );
-    if (!metrics.feasible) continue;
+    if (!metrics.feasible) {
+      costModelRejectionReasons.add(metrics.infeasibleReason ?? "cost_model_rejected");
+      continue;
+    }
     const score = metrics.tpotMs + metrics.ttftMs * 0.05;
     if (!best || score < best.score) best = { plan, score };
   }
-  if (!best) throw new Error(`no_feasible_automatic_${count}_stage_pipeline`);
+  if (!best) {
+    const reason = [...costModelRejectionReasons].sort()[0]
+      ?? (placementRejected ? "no_balanced_exact_placement" : "unknown");
+    throw new Error(`no_feasible_automatic_${count}_stage_pipeline:${reason}`);
+  }
   return best.plan;
 }
 

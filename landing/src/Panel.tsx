@@ -291,6 +291,20 @@ function initialView(desktop: boolean, mobileEntry: boolean): PanelView {
   return "overview";
 }
 
+export type PanelIssue = {
+  source: "coordinator" | "runtime";
+  message: string;
+};
+
+export function panelIssueForErrors(
+  connectionError: string | null,
+  runtimeError: string | null,
+): PanelIssue | null {
+  if (connectionError) return { source: "coordinator", message: connectionError };
+  if (runtimeError) return { source: "runtime", message: runtimeError };
+  return null;
+}
+
 function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   const desktop = desktopBridge !== undefined;
   const localBrowser = !desktop && ["localhost", "127.0.0.1", "::1", "[::1]"].includes(window.location.hostname);
@@ -314,7 +328,9 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   const [snapshot, setSnapshot] = useState<PublicSnapshot>(EMPTY);
   const [desktopSnapshot, setDesktopSnapshot] = useState<DashboardSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [issue, setIssue] = useState<PanelIssue | null>(null);
+  const coordinatorError = issue?.source === "coordinator" ? issue.message : null;
+  const error = issue?.message ?? null;
   const [menuOpen, setMenuOpen] = useState(false);
   const menuButtonRef = useRef<HTMLButtonElement>(null);
   const sidebarCloseButtonRef = useRef<HTMLButtonElement>(null);
@@ -344,7 +360,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   const applyDesktopSnapshot = useCallback((next: DashboardSnapshot) => {
     setDesktopSnapshot(next);
     setSnapshot(desktopToPublicSnapshot(next));
-    setError(next.connectionError ?? next.runtimeError);
+    setIssue(panelIssueForErrors(next.connectionError, next.runtimeError));
   }, []);
 
   const refresh = useCallback(async () => {
@@ -357,9 +373,12 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
       const response = await fetch("/public/v1/snapshot", { cache: "no-store" });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       setSnapshot(await response.json() as PublicSnapshot);
-      setError(null);
+      setIssue(null);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
+      setIssue({
+        source: "coordinator",
+        message: caught instanceof Error ? caught.message : String(caught),
+      });
     } finally {
       setLoading(false);
     }
@@ -726,12 +745,12 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
           <a href={publicLink("/mobile/")} {...externalProps}><Smartphone size={17} /><span>Mobile app</span><ExternalLink size={13} /></a>
           <a href={publicLink("/")} {...externalProps}><House size={17} /><span>Landing</span><ExternalLink size={13} /></a>
         </div>
-        <div className={`panel-sidebar-status ${error ? "degraded" : "healthy"}`}>
+        <div className={`panel-sidebar-status ${coordinatorError ? "degraded" : "healthy"}`}>
           <i />
           <div>
             <span>Network Status</span>
-            <strong>{error ? "Degraded" : "Healthy"}</strong>
-            <small>{error ? "Coordinator unavailable" : "All systems operational"}</small>
+            <strong>{coordinatorError ? "Degraded" : "Healthy"}</strong>
+            <small>{coordinatorError ? "Coordinator unavailable" : "Coordinator operational"}</small>
           </div>
         </div>
         <div className="panel-sidebar-version" aria-label="Versiones">
@@ -751,7 +770,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
             aria-expanded={menuOpen}
             onClick={() => setMenuOpen((current) => !current)}
           ><Menu /></button>
-          <div className="panel-topbar-status"><span className={`panel-live-dot ${error ? "degraded" : ""}`} /><div><strong>{error ? "Network degraded" : "Network healthy"}</strong><small>{snapshot.capturedAt === EMPTY.capturedAt ? "Waiting for snapshot" : `Updated ${relativeTime(snapshot.capturedAt)}`}</small></div></div>
+          <div className="panel-topbar-status"><span className={`panel-live-dot ${coordinatorError ? "degraded" : ""}`} /><div><strong>{coordinatorError ? "Network degraded" : "Network healthy"}</strong><small>{snapshot.capturedAt === EMPTY.capturedAt ? "Waiting for snapshot" : `Updated ${relativeTime(snapshot.capturedAt)}`}</small></div></div>
           <div className="panel-top-actions">
             <div className="panel-balance-group" aria-label="Saldos de la cuenta">
               <span className="panel-balance-badge money" aria-label={`Saldo: ${apiAccount?.usd_balance ?? "0.00"} dólares`} title="Saldo monetario disponible">${apiAccount?.usd_balance ?? "0.00"}</span>
@@ -785,7 +804,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
           </div>
         </header>
 
-        {error && <div className="panel-error" title={error}><CircleAlert size={17} /> Coordinator unavailable. Retrying automatically.</div>}
+        {issue && <div className="panel-error" title={issue.message}><CircleAlert size={17} /> {issue.source === "coordinator" ? "Coordinator unavailable." : "This node could not join the network."} Retrying automatically.</div>}
         <main className="panel-content">
           <div className="panel-content-scale">
             {loading && snapshot.capturedAt === EMPTY.capturedAt ? <PanelLoading /> : (
@@ -796,7 +815,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
               {view === "models" && <Models snapshot={snapshot} onSearch={searchHubModels} onRequest={requestModel} onRemove={removeRequestedModel} adminToken={modelAdminToken} requiresAdminToken={requiresModelAdminToken} secureTokenStorage={desktop} />}
               {view === "jobs" && <Jobs snapshot={snapshot} />}
               {view === "tests" && <Tests bridge={desktopBridge} />}
-              {view === "logs" && <SystemLogs snapshot={snapshot} bridge={desktopBridge} connectionError={error} />}
+              {view === "logs" && <SystemLogs snapshot={snapshot} bridge={desktopBridge} connectionError={coordinatorError} />}
               {view === "inference" && <Inference snapshot={snapshot} onSend={sendPrompt} onNavigate={navigate} developerMode={panelMode === "developer"} accountAuthenticated={desktop || !authConfig.apiAccessEnabled || authSession !== null} onSignIn={() => setAuthOpen(true)} apiAccessEnabled={authConfig.apiAccessEnabled ?? false} apiBaseUrl={apiBaseUrl} accessToken={authSession?.accessToken ?? null} apiAccount={apiAccount} />}
               {view === "contribute" && <Contribute />}
               {view === "join" && <JoinNetwork publicLink={publicLink} external={desktop} />}
@@ -4299,28 +4318,9 @@ function AcceleratorCompactBanner({ acceleration, contributionState, computeMode
 }
 
 function ActivationProgressLog({ model }: { model: RequestedModelCapacity }) {
-  const rawEvents: RequestedModelCapacity["activationProgress"] = (model.activationProgress?.length ?? 0) > 0
-    ? model.activationProgress
-    : [{
-        phase: "queued",
-        message: model.status === "failed"
-          ? friendlyActivationFailure(model.message)
-          : "Waiting for the coordinator to begin activation.",
-        at: model.activationRequestedAt ?? model.updatedAt,
-        state: model.status === "failed" ? "failed" as const : "running" as const,
-        ...(model.status === "failed" ? { details: fallbackActivationDetails(model.message) } : {}),
-      }];
-  const events = useMemo(() => orderActivationProgressEvents(rawEvents), [rawEvents]);
+  const events = useMemo(() => activationProgressEventsForModel(model), [model]);
   const listRef = useRef<HTMLOListElement>(null);
-  let actionableIndex = -1;
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
-    if (event?.state === "running" || event?.state === "failed") {
-      actionableIndex = index;
-      break;
-    }
-  }
-  const currentIndex = actionableIndex >= 0 ? actionableIndex : Math.max(0, events.length - 1);
+  const currentIndex = Math.max(0, events.length - 1);
   const current = events[currentIndex] ?? events.at(-1)!;
   const nodeCount = new Set(events.flatMap((event) => event.nodeId ? [event.nodeId] : [])).size;
   const stageCount = activationStageCount(events);
@@ -4376,6 +4376,55 @@ export function orderActivationProgressEvents<T extends { at: string }>(events: 
     .map(({ event }) => event);
 }
 
+type ActivationProgressEvent = RequestedModelCapacity["activationProgress"][number];
+
+export function normalizeActivationProgressEvents(
+  events: readonly ActivationProgressEvent[],
+): ActivationProgressEvent[] {
+  const ordered = orderActivationProgressEvents(events);
+  const lastIndex = ordered.length - 1;
+  return ordered.map((event, index) =>
+    index < lastIndex && event.state === "running"
+      ? { ...event, state: "completed" }
+      : event
+  );
+}
+
+export function activationProgressEventsForModel(
+  model: Pick<
+    RequestedModelCapacity,
+    "activationProgress" | "activationRequestedAt" | "message" | "status" | "updatedAt"
+  >,
+): ActivationProgressEvent[] {
+  const ordered = normalizeActivationProgressEvents(model.activationProgress ?? []);
+  const latest = ordered.at(-1);
+  const fallbackAt = model.activationRequestedAt ?? model.updatedAt;
+  const failureAt = latest && Date.parse(fallbackAt) < Date.parse(latest.at)
+    ? latest.at
+    : fallbackAt;
+
+  if (model.status === "failed" && latest?.state !== "failed") {
+    return normalizeActivationProgressEvents([
+      ...ordered,
+      {
+        phase: "failed",
+        message: friendlyActivationFailure(model.message),
+        at: failureAt,
+        state: "failed",
+        details: fallbackActivationDetails(model.message),
+      },
+    ]);
+  }
+
+  if (ordered.length > 0) return ordered;
+  return [{
+    phase: "queued",
+    message: "Waiting for the coordinator to begin activation.",
+    at: fallbackAt,
+    state: "running",
+  }];
+}
+
 function activationStageCount(events: RequestedModelCapacity["activationProgress"]): number {
   let count = 0;
   for (const event of events) {
@@ -4396,11 +4445,19 @@ function activationDetailIsReadable(detail: string): boolean {
   return detail.length <= 180
     && !detail.includes("launch_process_exited:")
     && !detail.includes("managed_launch_agent_")
+    && !detail.includes("distributed_activation_")
     && !detail.includes("distributed_worker_disconnected:");
 }
 
 function friendlyActivationFailure(message: string): string {
-  if (message.includes("automatic_activation_retries_exhausted:")) {
+  const exhausted = /automatic_activation_retries_exhausted:(\d+):/i.exec(message);
+  if (exhausted && message.includes("distributed_activation_requires_two_connected_shard_executors")) {
+    return `Automatic activation paused after ${exhausted[1]} attempts because the two-PC execution route was still not verified. Keep both PCs online, then run activation again.`;
+  }
+  if (message.includes("distributed_activation_requires_two_connected_shard_executors")) {
+    return "Two verified shard executors are not ready yet. The model remains unpublished while Mycellios rebuilds the route.";
+  }
+  if (exhausted) {
     return "Automatic activation stopped after repeated temporary node disconnections. The model was not published.";
   }
   if (message.includes("3221225477")) {
@@ -4410,8 +4467,20 @@ function friendlyActivationFailure(message: string): string {
 }
 
 function fallbackActivationDetails(message: string): string[] {
-  const details: string[] = [];
   const exhaustedRetries = /automatic_activation_retries_exhausted:(\d+):/i.exec(message)?.[1];
+  if (message.includes("distributed_activation_requires_two_connected_shard_executors")) {
+    return exhaustedRetries
+      ? [
+          `Automatic retries attempted: ${exhaustedRetries}`,
+          "Connected capacity is visible, but fewer than two nodes completed the required runtime and reciprocal-link evidence.",
+          "Keep both PCs online, then run activation again.",
+        ]
+      : [
+          "Connected capacity is visible, but fewer than two nodes have completed the required runtime and reciprocal-link evidence.",
+          "Mycellios will retry after the verified executor topology changes.",
+        ];
+  }
+  const details: string[] = [];
   const stage = /(?:stage-|process=)([a-z0-9-]+)/i.exec(message)?.[1];
   const code = /code=(\d+)/i.exec(message)?.[1];
   if (exhaustedRetries) details.push(`Automatic retries attempted: ${exhaustedRetries}`);
@@ -4443,9 +4512,20 @@ function activationPhaseLabel(phase: string): string {
   } as Record<string, string>)[phase] ?? phase.replaceAll("_", " ");
 }
 
-function formatActivationTime(value: string): string {
+export function formatActivationTime(value: string): string {
   const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? "—" : date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  if (Number.isNaN(date.getTime())) return "—";
+  const day = date.toLocaleDateString([], {
+    month: "short",
+    day: "numeric",
+    ...(date.getFullYear() === new Date().getFullYear() ? {} : { year: "numeric" }),
+  });
+  const time = date.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+  return `${day}\n${time}`;
 }
 
 function newInferenceSessionId(): string {

@@ -9,6 +9,8 @@ build/mycellios-coordinator-output-receipt.json
 build/mycellios-*-lock-report.json
 build/validation-logs/
 build/windows-job-broker/
+REVISION
+mycellios-native-build-provenance.json
 native-helpers/**/bin/
 native-helpers/**/obj/
 .vite/
@@ -41,6 +43,7 @@ __pycache__/
 
 # Estado local de Codex y artefactos de publicación generados
 .codex-runtime/
+.cache/
 updates/
 
 # Configuración específica de pilotos locales (las plantillas sí se versionan)

@@ -454,7 +454,6 @@ def _stream_native_gguf_parameters(
         identity = id(target)
         if identity in seen_tensors:
             continue
-        seen_tensors.add(identity)
         assignments = adapter.checkpoint_assignments(
             local_name,
             target,
@@ -462,6 +461,7 @@ def _stream_native_gguf_parameters(
             checkpoint_names=set(checkpoint_files),
         )
         if assignments is not None:
+            seen_tensors.add(identity)
             targets.extend(
                 (local_name, assignment.destination, assignment.checkpoint_name)
                 for assignment in assignments
@@ -474,6 +474,7 @@ def _stream_native_gguf_parameters(
             tied_embeddings=tied_embeddings,
         )
         if checkpoint_name is not None:
+            seen_tensors.add(identity)
             targets.append((local_name, target, checkpoint_name))
 
     loaded_checkpoint_names = {
