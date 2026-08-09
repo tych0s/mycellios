@@ -53,7 +53,7 @@ interface AssistantAction {
   execute: () => Promise<void> | void;
 }
 
-const DEFAULT_WELCOME = "Hola, soy el asistente de mycellios. Puedo ayudarte con la red, modelos, instalación, drivers y potencia del dispositivo.";
+const DEFAULT_WELCOME = "Hi, I’m the mycellios assistant. I can help with the network, models, installation, drivers, and device performance.";
 
 function assistantSessionId(): string {
   if (typeof window === "undefined") return "server-render";
@@ -142,7 +142,7 @@ export function SupportAssistant({
   const pendingAction = useMemo<AssistantAction | null>(() => {
     if (!latestIntent || !config) return null;
     const intent = normalizeIntent(latestIntent);
-    const requestsChange = /\b(cambia|cambiar|pon|poner|usa|usar|activa|activar|quiero|ajusta|ajustar|configura|configurar)\b/.test(intent);
+    const requestsChange = /\b(change|switch|set|use|enable|activate|want|adjust|configure|cambia|cambiar|pon|poner|usa|usar|activa|activar|quiero|ajusta|ajustar|configura|configurar)\b/.test(intent);
     const computeMode = intent.includes("cpu")
       ? "cpu-only"
       : /\b(gpu|maxima potencia|rendimiento maximo)\b/.test(intent)
@@ -153,25 +153,25 @@ export function SupportAssistant({
 
     if (requestsChange && computeMode && config.allowDeviceControl) {
       const modeLabel = computeMode === "gpu-only"
-        ? "Sólo GPU"
+        ? "GPU only"
         : computeMode === "cpu-only"
-          ? "Sólo CPU"
-          : "Automático";
+          ? "CPU only"
+          : "Automatic";
       if (deviceControl) {
         if (deviceControl.currentMode === computeMode) return null;
         return {
           key: `compute-${computeMode}`,
-          title: `Cambiar este equipo a ${modeLabel}`,
-          detail: "Esta acción sólo cambia el modo de cálculo local. No modifica otros nodos.",
-          label: `Confirmar ${modeLabel}`,
+          title: `Switch this device to ${modeLabel}`,
+          detail: "This action only changes the local compute mode. It does not affect other nodes.",
+          label: `Confirm ${modeLabel}`,
           execute: () => deviceControl.onChange(computeMode),
         };
       }
       return {
         key: `open-compute-${computeMode}`,
-        title: `Configurar ${modeLabel}`,
-        detail: "Abre los controles de este dispositivo para que confirmes el cambio allí.",
-        label: "Abrir este dispositivo",
+        title: `Configure ${modeLabel}`,
+        detail: "Open this device’s controls to confirm the change there.",
+        label: "Open this device",
         execute: () => navigate("machine"),
       };
     }
@@ -179,18 +179,18 @@ export function SupportAssistant({
     if (/\b(modelo|modelos)\b/.test(intent) && /\b(conecta|conectar|activa|activar|disponible|disponibles|cargar|carga)\b/.test(intent)) {
       return {
         key: "open-models",
-        title: "Abrir modelos de la red",
-        detail: "La activación compartida requiere autorización de administrador.",
-        label: "Ver modelos",
+        title: "Open network models",
+        detail: "Shared activation requires administrator authorization.",
+        label: "View models",
         execute: () => navigate("models"),
       };
     }
     if (/\b(contribuir|contribution|conectar este|anadir este|añadir este|aportar)\b/.test(intent)) {
       return {
         key: "open-contribute",
-        title: "Conectar este dispositivo",
-        detail: "Abre el control local para revisar qué recursos se ofrecerán antes de conectarlo.",
-        label: "Abrir contribución",
+        title: "Connect this device",
+        detail: "Open the local controls to review which resources will be offered before connecting.",
+        label: "Open contribution settings",
         execute: () => navigate(deviceControl ? "machine" : "contribute"),
       };
     }
@@ -293,21 +293,21 @@ export function SupportAssistant({
   return (
     <div className={`support-assistant support-assistant-${surface}`}>
       {open && (
-        <section className="support-assistant-window" role="dialog" aria-label="Asistente de mycellios">
+        <section className="support-assistant-window" role="dialog" aria-label="mycellios assistant">
           <header>
             <div className="support-assistant-avatar"><Bot size={20} /></div>
             <div>
-              <strong>Asistente mycellios</strong>
-              <span className={online ? "online" : "offline"}><i />{online ? "Modelo de la red conectado" : "Sin modelo de red"}</span>
+              <strong>mycellios assistant</strong>
+              <span className={online ? "online" : "offline"}><i />{online ? "Network model connected" : "No network model"}</span>
             </div>
-            <button type="button" title="Nueva conversación" aria-label="Nueva conversación" onClick={resetConversation}><RotateCcw size={16} /></button>
-            <button type="button" title="Cerrar" aria-label="Cerrar asistente" onClick={() => setOpen(false)}><X size={18} /></button>
+            <button type="button" title="New conversation" aria-label="New conversation" onClick={resetConversation}><RotateCcw size={16} /></button>
+            <button type="button" title="Close" aria-label="Close assistant" onClick={() => setOpen(false)}><X size={18} /></button>
           </header>
 
           <div className="support-assistant-trust">
             <ShieldCheck size={14} />
-            <span>IA de la red únicamente</span>
-            <b>{config?.selectedModel ?? "ningún modelo"}</b>
+            <span>Network AI only</span>
+            <b>{config?.selectedModel ?? "no model"}</b>
           </div>
 
           <div className="support-assistant-conversation" ref={conversationRef}>
@@ -319,7 +319,7 @@ export function SupportAssistant({
             {messages.map((message) => (
               <div className={`support-assistant-message ${message.role}`} key={message.id}>
                 {message.role === "assistant" && <div className="support-assistant-mini-avatar"><Sparkles size={14} /></div>}
-                <p>{message.content || (message.streaming ? "Conectando con el modelo de la red…" : "")}{message.streaming && message.content && <i className="support-assistant-caret" />}</p>
+                <p>{message.content || (message.streaming ? "Connecting to the network model…" : "")}{message.streaming && message.content && <i className="support-assistant-caret" />}</p>
               </div>
             ))}
 
@@ -343,18 +343,18 @@ export function SupportAssistant({
             )}
 
             {pendingAction && actionDone === pendingAction.key && (
-              <div className="support-assistant-success"><Check size={14} /> Acción aplicada en este dispositivo.</div>
+              <div className="support-assistant-success"><Check size={14} /> Action applied on this device.</div>
             )}
 
             {(error || configError) && (
-              <div className="support-assistant-error"><CircleAlert size={15} /><span>{error ?? "No se puede consultar el estado del asistente."}</span></div>
+              <div className="support-assistant-error"><CircleAlert size={15} /><span>{error ?? "The assistant status could not be retrieved."}</span></div>
             )}
 
             {config && !config.enabled && (
-              <div className="support-assistant-unavailable"><CircleAlert size={16} /><span><strong>Asistente desactivado</strong><small>El administrador de la red lo ha desactivado temporalmente.</small></span></div>
+              <div className="support-assistant-unavailable"><CircleAlert size={16} /><span><strong>Assistant disabled</strong><small>The network administrator has temporarily disabled it.</small></span></div>
             )}
             {config?.enabled && !config.available && (
-              <div className="support-assistant-unavailable"><Cpu size={16} /><span><strong>No hay un modelo real conectado</strong><small>El chat no usa una IA externa como sustituto. Volverá a estar disponible cuando la red anuncie un modelo.</small></span></div>
+              <div className="support-assistant-unavailable"><Cpu size={16} /><span><strong>No live model connected</strong><small>The chat does not substitute an external AI. It will become available when the network announces a model.</small></span></div>
             )}
           </div>
 
@@ -369,27 +369,27 @@ export function SupportAssistant({
                   void submitPrompt();
                 }
               }}
-              placeholder={online ? "Pregunta sobre mycellios, tu GPU o la red…" : "Esperando un modelo de la red…"}
+              placeholder={online ? "Ask about mycellios, your GPU, or the network…" : "Waiting for a network model…"}
               disabled={!online || busy}
-              aria-label="Mensaje para el asistente"
+              aria-label="Message for the assistant"
             />
-            <button type="submit" disabled={!online || busy || !draft.trim()} aria-label="Enviar mensaje">
+            <button type="submit" disabled={!online || busy || !draft.trim()} aria-label="Send message">
               {busy ? <LoaderCircle className="spin" size={18} /> : <Send size={18} />}
             </button>
           </form>
-          <footer>Las acciones que cambian el sistema siempre requieren confirmación.</footer>
+          <footer>Actions that change the system always require confirmation.</footer>
         </section>
       )}
 
       <button
         className={`support-assistant-launcher ${open ? "open" : ""}`}
         type="button"
-        aria-label={open ? "Cerrar asistente" : "Abrir asistente de mycellios"}
+        aria-label={open ? "Close assistant" : "Open mycellios assistant"}
         aria-expanded={open}
         onClick={() => setOpen((current) => !current)}
       >
         {open ? <X size={22} /> : <MessageCircle size={23} />}
-        {!open && <span><strong>¿Necesitas ayuda?</strong><small>{online ? "Pregunta a la red" : "Asistente sin conexión"}</small></span>}
+        {!open && <span><strong>Need help?</strong><small>{online ? "Ask the network" : "Assistant offline"}</small></span>}
         {!open && <i className={online ? "online" : ""} />}
       </button>
     </div>
