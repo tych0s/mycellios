@@ -8,7 +8,6 @@ import {
   ChevronDown,
   ChevronRight,
   CircleDot,
-  CirclePlay,
   Coins,
   Cpu,
   Download,
@@ -31,19 +30,47 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { lazy, Suspense, useEffect, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useRef, useState, type CSSProperties, type FormEvent } from "react";
 import efficiencyCurve from "../assets/efficiency-curve-ai.webp";
 import storyImage from "../assets/mycelium-story.webp";
 import { applySeoMetadata } from "../seo";
 import { SupportAssistant } from "../SupportAssistant";
-import heroImage from "./assets/mycellios-rebrand-hero.webp";
+import { HeroGlobe } from "./HeroGlobe";
 import liveImage from "./assets/mycellios-live-network.webp";
 import "./rebrand.css";
 
 const brandLogo = "/assets/logos/logo.png";
 const EMAIL = "hello@mycellios.com";
 const RELEASES_URL = "https://github.com/tych0s/mycellios";
-const ExplainerVideo = lazy(() => import("../ExplainerVideo"));
+const GITHUB_URL = "https://github.com/tych0s/mycellios";
+const X_URL = "https://x.com/mycellios";
+const TELEGRAM_URL = "https://t.me/mycellios";
+
+/* Lucide dropped its brand marks, so the three social glyphs are inline paths.
+   They are decorative: each link carries its own accessible name. */
+function GithubMark() {
+  return (
+    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false">
+      <path d="M12 .5C5.37.5 0 5.87 0 12.5c0 5.3 3.44 9.8 8.21 11.39.6.11.82-.26.82-.58 0-.29-.01-1.05-.02-2.06-3.34.73-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.09-.75.08-.73.08-.73 1.21.09 1.84 1.24 1.84 1.24 1.07 1.83 2.81 1.3 3.5.99.11-.78.42-1.31.76-1.61-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.12-.3-.54-1.52.12-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6.01 0c2.29-1.55 3.3-1.23 3.3-1.23.66 1.66.24 2.88.12 3.18.77.84 1.23 1.91 1.23 3.22 0 4.61-2.8 5.63-5.48 5.92.43.37.81 1.1.81 2.22 0 1.6-.01 2.89-.01 3.29 0 .32.22.7.83.58A12.01 12.01 0 0 0 24 12.5C24 5.87 18.63.5 12 .5Z" />
+    </svg>
+  );
+}
+
+function XMark() {
+  return (
+    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false">
+      <path d="M18.24 2.25h3.31l-7.23 8.26 8.5 11.24h-6.65l-5.22-6.82-5.96 6.82H1.68l7.73-8.84L1.25 2.25h6.82l4.71 6.23 5.46-6.23Zm-1.16 17.52h1.83L7.01 4.13H5.05l12.03 15.64Z" />
+    </svg>
+  );
+}
+
+function TelegramMark() {
+  return (
+    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false">
+      <path d="M21.94 3.4a1.2 1.2 0 0 0-1.24-.2L2.72 10.4c-.86.34-.83 1.57.05 1.86l4.4 1.47 1.7 5.24c.2.62 1 .8 1.45.33l2.47-2.56 4.5 3.3c.55.4 1.34.11 1.5-.56l3.36-14.6a1.2 1.2 0 0 0-.21-1.05ZM9.35 14.3l-.53 3.53-1.19-3.66 9.1-5.98-7.38 6.11Z" />
+    </svg>
+  );
+}
 
 const steps = [
   { id: "01", title: "Your device", copy: "Choose how much capacity to share. You stay in control." },
@@ -66,12 +93,6 @@ const hardwareProfiles = {
   "rtx-4090": { label: "Boletus worker", type: "High-performance GPU", models: "Large stages and accelerated routes", compute: "High contribution", capacity: "24 GB VRAM" },
   "multi": { label: "Distributed colony", type: "Farm or community", models: "Models split across multiple nodes", compute: "Coordinated contribution", capacity: "Combined capacity" },
 } as const;
-
-const heroSignals = [
-  { worker: "worker_04", status: "Compatible route found" },
-  { worker: "worker_12", status: "Stage assigned to cell" },
-  { worker: "worker_07", status: "Response gathered at origin" },
-] as const;
 
 const explainerSteps = [
   ["01", "Offer capacity", "Choose what each device can contribute."],
@@ -207,55 +228,56 @@ function NetworkThreads({ compact = false }: { compact?: boolean }) {
   );
 }
 
-function HeroNetwork() {
-  const nodes = [
-    [110, 258, "worker_01"], [238, 126, "worker_04"], [346, 372, "worker_07"],
-    [476, 206, "worker_12"], [592, 426, "worker_15"], [712, 132, "worker_18"],
-    [818, 316, "worker_21"], [690, 514, "worker_24"],
-  ] as const;
-  return (
-    <div className="rb-hero-network" aria-hidden="true">
-      <svg viewBox="0 0 900 620" role="presentation">
-        <ellipse className="rb-world-orbit orbit-one" cx="505" cy="314" rx="386" ry="238" />
-        <ellipse className="rb-world-orbit orbit-two" cx="505" cy="314" rx="280" ry="184" />
-        <g className="rb-world-lines">
-          <path d="M110 258C220 236 227 118 346 372S527 172 712 132 766 249 818 316" />
-          <path d="M238 126c42 72 92 173 238 80s132 37 216 220" />
-          <path d="M110 258c105 74 122 168 236 114s145-10 246 54 132 75 198 88" />
-          <path d="M346 372c95-32 144-20 246 54s148-22 226-110" />
-          <path d="M476 206c-8 88 31 152 116 220s122 40 98 88" />
-        </g>
-        <g className="rb-world-nodes">
-          {nodes.map(([cx, cy, label], index) => <g key={label} className={index === 3 ? "is-origin" : ""} style={{ "--i": index } as CSSProperties}><circle cx={cx} cy={cy} r={index === 3 ? 13 : 8} /><circle className="rb-node-ring" cx={cx} cy={cy} r={index === 3 ? 25 : 17} /><title>{label}</title></g>)}
-        </g>
-        <circle className="rb-world-pulse" cx="476" cy="206" r="5" />
-      </svg>
-      <span className="rb-network-label label-origin">origin · request</span>
-      <span className="rb-network-label label-north">north cell · ready</span>
-      <span className="rb-network-label label-south">south cell · response</span>
-      <div className="rb-network-readout"><i /> 08 workers connected <b>·</b> 03 routes active</div>
-    </div>
-  );
-}
-
 function ExplainerSection() {
   const section = useRef<HTMLElement>(null);
-  const [shouldLoad, setShouldLoad] = useState(false);
+  const [activeScene, setActiveScene] = useState(0);
+  const [isPaused, setIsPaused] = useState(false);
+  const [hasStarted, setHasStarted] = useState(false);
 
   useEffect(() => {
     const target = section.current;
     if (!target) return;
-    const observer = new IntersectionObserver(
-      ([entry]) => {
-        if (!entry?.isIntersecting) return;
-        setShouldLoad(true);
-        observer.disconnect();
-      },
-      { rootMargin: "420px 0px" },
-    );
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      setActiveScene(explainerSteps.length - 1);
+      setHasStarted(true);
+      return;
+    }
+    const observer = new IntersectionObserver(([entry]) => {
+      if (!entry?.isIntersecting) return;
+      setHasStarted(true);
+      observer.disconnect();
+    }, { threshold: 0.28 });
     observer.observe(target);
     return () => observer.disconnect();
   }, []);
+
+  useEffect(() => {
+    if (!hasStarted || isPaused || activeScene >= explainerSteps.length - 1) return;
+    const timer = window.setTimeout(() => setActiveScene((scene) => scene + 1), 4000);
+    return () => window.clearTimeout(timer);
+  }, [activeScene, hasStarted, isPaused]);
+
+  const stageLabels = ["Request enters", "Cell plans the route", "Workers receive stages", "One answer returns"];
+  const stageDetails = [
+    "Your app sends one familiar request to the local Mycellios endpoint.",
+    "The cell checks the model, then chooses useful memory and compute.",
+    "Only the selected machines appear; each receives a stage sized for its hardware.",
+    "Partial results travel back through the cell as one continuous answer.",
+  ];
+  const selectScene = (index: number) => {
+    setActiveScene(index);
+    setIsPaused(true);
+  };
+  const isComplete = activeScene === explainerSteps.length - 1;
+  const togglePlayback = () => {
+    if (isComplete) {
+      setActiveScene(0);
+      setIsPaused(false);
+      setHasStarted(true);
+      return;
+    }
+    setIsPaused((paused) => !paused);
+  };
 
   return (
     <section className="rb-explainer" id="explainer" ref={section} aria-labelledby="rb-explainer-title">
@@ -266,22 +288,63 @@ function ExplainerSection() {
           <p>Each computer contributes only the capacity you choose. mycellios connects that capacity, distributes the model, and returns one streamed answer.</p>
         </div>
 
-        <div className="rb-explainer-player rb-reveal">
-          {shouldLoad ? (
-            <Suspense fallback={<div className="rb-explainer-loading"><CirclePlay /><span>Preparing the explanation…</span></div>}>
-              <ExplainerVideo />
-            </Suspense>
-          ) : (
-            <div className="rb-explainer-loading"><CirclePlay /><span>Preparing the explanation…</span></div>
-          )}
+        <div className={`rb-system-demo scene-${activeScene}`} aria-live="polite">
+          <div className="rb-demo-grid" aria-hidden="true" />
+          <div className="rb-demo-explanation" key={activeScene}>
+            <span>STEP 0{activeScene + 1}</span>
+            <strong>{stageLabels[activeScene]}</strong>
+            <p>{stageDetails[activeScene]}</p>
+          </div>
+          <svg className="rb-demo-routes" viewBox="0 0 1000 520" preserveAspectRatio="none" aria-hidden="true">
+            <path className="route-in" d="M120 260 C260 260 290 260 410 260" />
+            <path className="route-a" d="M540 250 C650 110 720 100 855 105" />
+            <path className="route-b" d="M540 260 C675 260 720 260 875 260" />
+            <path className="route-c" d="M540 270 C650 410 720 420 855 415" />
+            <path className="route-out" d="M540 260 C690 260 720 260 940 260" />
+          </svg>
+
+          <button className="rb-demo-node rb-demo-request" type="button" onClick={() => selectScene(0)} aria-label="Show request stage">
+            <span><Sparkles /></span><small>YOUR APP</small><strong>“Explain this image”</strong><i>OpenAI-compatible request</i>
+          </button>
+
+          <button className="rb-demo-core" type="button" disabled={activeScene < 1} onClick={() => selectScene(1)} aria-label="Show coordination stage">
+            <span className="rb-core-rings"><i /><i /><i /></span><Network /><small>MYCELLIOS CELL</small><strong>{stageLabels[activeScene]}</strong><b>{isPaused ? "MANUAL" : "AUTO"}</b>
+          </button>
+
+          <div className="rb-demo-workers" aria-label="Available workers">
+            {[
+              { id: "worker_01", name: "RTX 4090", memory: "24 GB", Icon: Cpu },
+              { id: "worker_02", name: "Mac Studio", memory: "64 GB", Icon: MonitorDown },
+              { id: "worker_03", name: "Home PC", memory: "16 GB", Icon: MemoryStick },
+            ].map(({ id, name, memory, Icon }, index) => (
+              <button key={id} type="button" disabled={activeScene < 2} className={`rb-demo-worker worker-${index}`} onClick={() => selectScene(2)} aria-label={`Inspect ${name}`}>
+                <Icon /><span><small>{id}</small><strong>{name}</strong></span><b>{memory}</b><i>{activeScene >= 2 ? `stage 0${index + 1}` : "available"}</i>
+              </button>
+            ))}
+          </div>
+
+          <button className="rb-demo-response" type="button" disabled={activeScene < 3} onClick={() => selectScene(3)} aria-label="Show assembled response">
+            <Check /><span><small>ONE STREAM</small><strong>Answer assembled</strong></span><i>token by token</i>
+          </button>
+
+          <div className="rb-demo-status"><i /><span>{stageLabels[activeScene]}</span><b>0{activeScene + 1} / 04</b></div>
+          <button className="rb-demo-play" type="button" onClick={togglePlayback} aria-label={isComplete ? "Replay automatic demonstration" : isPaused ? "Resume automatic demonstration" : "Pause automatic demonstration"}>{isComplete || isPaused ? <Play /> : <Pause />}{isComplete ? "Replay story" : isPaused ? "Resume flow" : "Pause flow"}</button>
         </div>
 
-        <ol className="rb-explainer-steps rb-reveal">
-          {explainerSteps.map(([number, title, detail]) => (
+        <ol className="rb-explainer-steps rb-reveal" aria-label="Choose a stage in the system explanation">
+          {explainerSteps.map(([number, title, detail], index) => (
             <li key={number}>
-              <span>{number}</span>
-              <strong>{title}</strong>
-              <p>{detail}</p>
+              <button
+                type="button"
+                className={index === activeScene ? "is-active" : ""}
+                aria-pressed={index === activeScene}
+                onClick={() => selectScene(index)}
+              >
+                <span>{number}</span>
+                <strong>{title}</strong>
+                <p>{detail}</p>
+                <small>{index === activeScene ? "Playing this stage" : "Play this stage"}<ArrowRight /></small>
+              </button>
             </li>
           ))}
         </ol>
@@ -592,7 +655,7 @@ function RoadmapSection() {
 
 export function RebrandLanding() {
   const [mobileOpen, setMobileOpen] = useState(false);
-  const [heroSignal, setHeroSignal] = useState(0);
+  const [heroPrompt, setHeroPrompt] = useState("");
   const [flowStep, setFlowStep] = useState(0);
   const [metric, setMetric] = useState(0);
   const [activeWorker, setActiveWorker] = useState(1);
@@ -618,15 +681,6 @@ export function RebrandLanding() {
     );
     page.querySelectorAll(".rb-reveal").forEach((element) => observer.observe(element));
     return () => observer.disconnect();
-  }, []);
-
-  useEffect(() => {
-    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
-    const timer = window.setInterval(
-      () => setHeroSignal((current) => (current + 1) % heroSignals.length),
-      3800,
-    );
-    return () => window.clearInterval(timer);
   }, []);
 
   useEffect(() => {
@@ -667,7 +721,16 @@ export function RebrandLanding() {
   const currentStep = steps[flowStep] ?? steps[0]!;
   const currentWorker = workers[activeWorker] ?? workers[0]!;
   const currentMetric = liveMetrics[metric] ?? liveMetrics[0]!;
-  const currentHeroSignal = heroSignals[heroSignal] ?? heroSignals[0]!;
+
+  // The hero input is an entry point, not an inference client: the prompt is
+  // handed to the panel chat, which owns models, auth, and streaming.
+  const submitHeroPrompt = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const text = heroPrompt.trim();
+    if (!text) return;
+    window.sessionStorage.setItem("mycellios.hero-prompt", text);
+    window.location.assign("/network?view=inference");
+  };
 
   const scrollToFlowStep = (index: number) => {
     const section = flowRef.current;
@@ -686,33 +749,38 @@ export function RebrandLanding() {
         <div className="rb-header-inner rb-shell">
           <Brand />
           <nav aria-label="Main navigation">
-            <a href="#how-it-works">How it works</a><a href="#architecture">Architecture</a><a href="#evidence">Evidence</a><a href="#install">Install</a><a href="#roadmap">Roadmap</a>
+            <a href="#how-it-works">How it works</a><a href="#architecture">Architecture</a><a href="#evidence">Evidence</a><a href="#install">Install</a><a href="#roadmap">Roadmap</a><a href="/blog">Blog</a>
           </nav>
-          <a className="rb-pill rb-pill-dark rb-desktop-cta" href="#hardware">Find your worker <ArrowRight /></a>
+          <div className="rb-header-actions rb-desktop-cta">
+            <a className="rb-social" href={GITHUB_URL} target="_blank" rel="noreferrer" aria-label="mycellios on GitHub"><GithubMark /></a>
+            <a className="rb-social" href={X_URL} target="_blank" rel="noreferrer" aria-label="mycellios on X"><XMark /></a>
+            <a className="rb-social" href={TELEGRAM_URL} target="_blank" rel="noreferrer" aria-label="mycellios on Telegram"><TelegramMark /></a>
+            <a className="rb-pill rb-pill-ghost" href="/network">Login</a>
+          </div>
           <button className="rb-menu" type="button" aria-label={mobileOpen ? "Close menu" : "Open menu"} aria-expanded={mobileOpen} onClick={() => setMobileOpen(!mobileOpen)}>{mobileOpen ? <X /> : <Menu />}</button>
-          {mobileOpen && <div className="rb-mobile-nav"><a href="#how-it-works" onClick={() => setMobileOpen(false)}>How it works</a><a href="#live-network" onClick={() => setMobileOpen(false)}>Live network</a><a href="#architecture" onClick={() => setMobileOpen(false)}>Architecture</a><a href="#evidence" onClick={() => setMobileOpen(false)}>Evidence</a><a href="#install" onClick={() => setMobileOpen(false)}>Install</a><a href="#hardware" onClick={() => setMobileOpen(false)}>Find your worker</a></div>}
+          {mobileOpen && <div className="rb-mobile-nav"><a href="#how-it-works" onClick={() => setMobileOpen(false)}>How it works</a><a href="#live-network" onClick={() => setMobileOpen(false)}>Live network</a><a href="#architecture" onClick={() => setMobileOpen(false)}>Architecture</a><a href="#evidence" onClick={() => setMobileOpen(false)}>Evidence</a><a href="#install" onClick={() => setMobileOpen(false)}>Install</a><a href="/blog">Blog</a><a href="/network">Login</a><div className="rb-mobile-social"><a className="rb-social" href={GITHUB_URL} target="_blank" rel="noreferrer" aria-label="mycellios on GitHub"><GithubMark /></a><a className="rb-social" href={X_URL} target="_blank" rel="noreferrer" aria-label="mycellios on X"><XMark /></a><a className="rb-social" href={TELEGRAM_URL} target="_blank" rel="noreferrer" aria-label="mycellios on Telegram"><TelegramMark /></a></div></div>}
         </div>
       </header>
 
       <section className="rb-hero" aria-labelledby="rb-hero-title">
-        <img className="rb-hero-image" src={heroImage} alt="A mushroom colony connected by a mycelium network and warm nodes" fetchPriority="high" decoding="async" />
-        <HeroNetwork />
-        <NetworkThreads />
+        <HeroGlobe />
         <div className="rb-hero-inner rb-shell">
           <div className="rb-hero-copy">
-            <p className="rb-status-pill"><i /><strong>EARLY NETWORK</strong><b />Physical multi-node validation underway</p>
-            <p className="rb-kicker"><i /><span>Distributed AI · Rooted in nature</span></p>
-            <h1 id="rb-hero-title" aria-label="Intelligence grows through the network.">Intelligence<br />grows through the <em>network.</em></h1>
+            <h1 id="rb-hero-title" aria-label="Intelligence grows through the network.">Intelligence grows<br />through the <em>network.</em></h1>
             <p className="rb-lede">Mycellios connects capacity across different machines to run AI models that cannot fit on a single device.</p>
-            <div className="rb-actions"><a className="rb-pill rb-pill-dark" href="/join">Join the network <ArrowRight /></a><a className="rb-text-link" href="#how-it-works">See how it works <ArrowDown /></a></div>
-            <p className="rb-hero-footnote"><ShieldCheck /><span>No account or invitation required during public testing.</span></p>
+            <form className="rb-hero-prompt" onSubmit={submitHeroPrompt}>
+              <label className="rb-visually-hidden" htmlFor="rb-hero-prompt-input">Ask the network</label>
+              <input id="rb-hero-prompt-input" name="prompt" type="text" autoComplete="off" placeholder="Ask the impossible…" value={heroPrompt} onChange={(event) => setHeroPrompt(event.target.value)} />
+              <button type="submit" aria-label="Send this prompt to the network"><ArrowRight /></button>
+            </form>
           </div>
-          <figure className="rb-active-card" aria-label="Conceptual network status">
-            <span><i /> Concept sequence</span><div className="rb-active-card-content" key={currentHeroSignal.worker}><strong>{currentHeroSignal.worker}</strong><small>{currentHeroSignal.status}</small></div>
-            <div className="rb-mini-route"><b /><b /><b /><b /></div>
-          </figure>
-          <p className="rb-hero-note">Every mushroom is capacity. The mycelium decides how to connect it.</p>
         </div>
+        {/* The hero owns the whole viewport, so nothing below it peeks in to hint
+            there is more. This cue is that hint, and it jumps to the explainer. */}
+        <a className="rb-scroll-cue" href="#explainer" aria-label="Scroll to the next section">
+          <span>Scroll</span>
+          <ArrowDown />
+        </a>
       </section>
 
       <ExplainerSection />

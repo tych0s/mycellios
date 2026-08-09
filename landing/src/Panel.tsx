@@ -3911,7 +3911,13 @@ function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthent
   const options = useMemo(() => snapshot.models.map((item) => inferenceModelOption(snapshot, item)), [snapshot]);
   const realModels = options.filter((item) => !item.legacyExternalRuntime);
   const [model, setModel] = useState("");
-  const [prompt, setPrompt] = useState("");
+  // The landing hero hands off its prompt through sessionStorage so the visitor
+  // lands in the chat with what they already typed, instead of an empty box.
+  const [prompt, setPrompt] = useState(() => {
+    const handoff = window.sessionStorage.getItem("mycellios.hero-prompt");
+    if (handoff) window.sessionStorage.removeItem("mycellios.hero-prompt");
+    return handoff ?? "";
+  });
   const [attachments, setAttachments] = useState<InferenceAttachment[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [filesBusy, setFilesBusy] = useState(false);
