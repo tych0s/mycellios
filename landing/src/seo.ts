@@ -98,6 +98,18 @@ export const SEO_PAGES = {
       "/network",
     ),
   },
+  "/create": {
+    title: "Create images with mycellios",
+    description:
+      "Describe an image, choose a visual style and aspect ratio, and prepare an image generation request in the mycellios creative studio.",
+    canonicalPath: "/create",
+    robots: "index, follow, max-image-preview:large",
+    structuredData: webPage(
+      "Create images with mycellios",
+      "The mycellios creative studio for preparing image generation requests.",
+      "/create",
+    ),
+  },
   "/join": {
     title: "Join a distributed AI network | mycellios",
     description:
@@ -155,8 +167,8 @@ export const SEO_PAGES = {
 
 export type SeoPath = keyof typeof SEO_PAGES;
 
-export const INDEXABLE_SEO_PATHS = ["/", "/network", "/join", "/downloads", "/mobile/"] as const;
-export const LANDING_SEO_PATHS = ["/", "/network", "/join", "/downloads", "/admin"] as const;
+export const INDEXABLE_SEO_PATHS = ["/", "/network", "/create", "/join", "/downloads", "/mobile/"] as const;
+export const LANDING_SEO_PATHS = ["/", "/network", "/create", "/join", "/downloads", "/admin"] as const;
 
 export function canonicalUrl(page: SeoPage): string {
   return `${SITE_ORIGIN}${page.canonicalPath}`;

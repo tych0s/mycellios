@@ -14,6 +14,7 @@ const templatePath = join(outputRoot, "index.html");
 const routeOutputPaths: Record<(typeof LANDING_SEO_PATHS)[number], string> = {
   "/": "index.html",
   "/network": "network/index.html",
+  "/create": "create/index.html",
   "/join": "join/index.html",
   "/downloads": "downloads/index.html",
   "/admin": "admin/index.html",
