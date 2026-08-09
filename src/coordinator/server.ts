@@ -2770,6 +2770,7 @@ export async function createCoordinator(
     });
     const landingRouteDocuments = {
       "/network": "network/index.html",
+      "/create": "create/index.html",
       "/admin": "admin/index.html",
       "/join": "join/index.html",
       "/downloads": "downloads/index.html",
