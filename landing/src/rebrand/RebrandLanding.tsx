@@ -749,7 +749,7 @@ export function RebrandLanding() {
         <div className="rb-header-inner rb-shell">
           <Brand />
           <nav aria-label="Main navigation">
-            <a href="/network?view=inference">Chat</a><a href="#how-it-works">How it works</a><a href="#architecture">Architecture</a><a href="#evidence">Evidence</a><a href="#install">Install</a><a href="#roadmap">Roadmap</a><a href="/blog">Blog</a>
+            <a href="/network?view=inference">Chat</a><a href="/create">Create</a><a href="#how-it-works">How it works</a><a href="#architecture">Architecture</a><a href="#evidence">Evidence</a><a href="#install">Install</a><a href="#roadmap">Roadmap</a><a href="/blog">Blog</a>
           </nav>
           <div className="rb-header-actions rb-desktop-cta">
             <a className="rb-social" href={GITHUB_URL} target="_blank" rel="noreferrer" aria-label="mycellios on GitHub"><GithubMark /></a>
@@ -758,7 +758,7 @@ export function RebrandLanding() {
             <a className="rb-pill rb-pill-ghost" href="/network">Login</a>
           </div>
           <button className="rb-menu" type="button" aria-label={mobileOpen ? "Close menu" : "Open menu"} aria-expanded={mobileOpen} onClick={() => setMobileOpen(!mobileOpen)}>{mobileOpen ? <X /> : <Menu />}</button>
-          {mobileOpen && <div className="rb-mobile-nav"><a href="/network?view=inference">Chat</a><a href="#how-it-works" onClick={() => setMobileOpen(false)}>How it works</a><a href="#live-network" onClick={() => setMobileOpen(false)}>Live network</a><a href="#architecture" onClick={() => setMobileOpen(false)}>Architecture</a><a href="#evidence" onClick={() => setMobileOpen(false)}>Evidence</a><a href="#install" onClick={() => setMobileOpen(false)}>Install</a><a href="/blog">Blog</a><a href="/network">Login</a><div className="rb-mobile-social"><a className="rb-social" href={GITHUB_URL} target="_blank" rel="noreferrer" aria-label="mycellios on GitHub"><GithubMark /></a><a className="rb-social" href={X_URL} target="_blank" rel="noreferrer" aria-label="mycellios on X"><XMark /></a><a className="rb-social" href={TELEGRAM_URL} target="_blank" rel="noreferrer" aria-label="mycellios on Telegram"><TelegramMark /></a></div></div>}
+          {mobileOpen && <div className="rb-mobile-nav"><a href="/network?view=inference">Chat</a><a href="/create">Create</a><a href="#how-it-works" onClick={() => setMobileOpen(false)}>How it works</a><a href="#live-network" onClick={() => setMobileOpen(false)}>Live network</a><a href="#architecture" onClick={() => setMobileOpen(false)}>Architecture</a><a href="#evidence" onClick={() => setMobileOpen(false)}>Evidence</a><a href="#install" onClick={() => setMobileOpen(false)}>Install</a><a href="/blog">Blog</a><a href="/network">Login</a><div className="rb-mobile-social"><a className="rb-social" href={GITHUB_URL} target="_blank" rel="noreferrer" aria-label="mycellios on GitHub"><GithubMark /></a><a className="rb-social" href={X_URL} target="_blank" rel="noreferrer" aria-label="mycellios on X"><XMark /></a><a className="rb-social" href={TELEGRAM_URL} target="_blank" rel="noreferrer" aria-label="mycellios on Telegram"><TelegramMark /></a></div></div>}
         </div>
       </header>
 

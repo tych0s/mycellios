@@ -2,6 +2,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { Panel } from "./Panel";
 import { RebrandLanding } from "./rebrand/RebrandLanding";
+import { CreateStudio } from "./rebrand/CreateStudio";
 import { applySeoMetadata } from "./seo";
 
 const root = document.getElementById("root");
@@ -17,6 +18,6 @@ applySeoMetadata();
 
 createRoot(root).render(
   <StrictMode>
-    {panelRoutes.has(window.location.pathname) ? <Panel /> : <RebrandLanding />}
+    {window.location.pathname === "/create" ? <CreateStudio /> : panelRoutes.has(window.location.pathname) ? <Panel /> : <RebrandLanding />}
   </StrictMode>,
 );
