@@ -100,8 +100,8 @@ describe("Merged landing (rebrand design + legacy content)", () => {
   it("renders the network-only support assistant entry point", () => {
     const html = renderToStaticMarkup(<RebrandLanding />);
 
-    expect(html).toContain('aria-label="Abrir asistente de mycellios"');
-    expect(html).toContain("¿Necesitas ayuda?");
-    expect(html).toContain("Asistente sin conexión");
+    expect(html).toContain('aria-label="Open mycellios assistant"');
+    expect(html).toContain("Need help?");
+    expect(html).toContain("Assistant offline");
   });
 });
