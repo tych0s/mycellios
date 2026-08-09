@@ -15,6 +15,7 @@ native-helpers/**/bin/
 native-helpers/**/obj/
 .vite/
 docs-site/.docusaurus/
+docs-site/build/
 landing-dist/
 mobile-dist/
 coverage/

@@ -10,6 +10,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import type { CSSProperties, ReactNode } from "react";
+import { useState } from "react";
 import { Player } from "@remotion/player";
 import {
   AbsoluteFill,
@@ -20,7 +21,7 @@ import {
   useCurrentFrame,
   useVideoConfig,
 } from "remotion";
-import brandIcon from "./assets/mycellios-app-icon-v2.png";
+import brandMark from "./assets/mycellios-mark-ivory.png";
 
 const FPS = 30;
 const SCENE_FRAMES = 150;
@@ -28,15 +29,32 @@ const DURATION = SCENE_FRAMES * 4;
 const WIDTH = 1600;
 const HEIGHT = 900;
 
+/*
+ * mycelium brand tokens, hardcoded from `landing/src/brand-tokens.css`
+ * (Remotion renders cannot rely on CSS custom properties). This piece uses
+ * the dark variant of the system — `.mycelium-dark` — so the video sits
+ * seamlessly inside the forest `.rb-explainer-player` frame: forest base,
+ * ivory text, bronze accent, sage secondary.
+ */
 const colors = {
-  ink: "#f5f7ff",
-  muted: "#a9b6d2",
-  dim: "#6f7d9c",
-  line: "rgba(150, 181, 255, 0.2)",
-  blue: "#4f8dff",
-  cyan: "#67e8c4",
-  violet: "#9b8cff",
-  panel: "rgba(18, 29, 61, 0.88)",
+  paper: "#f8f5f0",
+  ivory: "#eee9e2",
+  ink: "#1e2a22",
+  forest: "#142019",
+  forestDeep: "#0e1712",
+  bronze: "#ad7a48",
+  bronzeLight: "#d9b98c",
+  sage: "#70806d",
+  sageLight: "#93a18e",
+  muted: "#b9c2b6",
+  line: "rgba(238, 233, 226, 0.16)",
+  panel: "rgba(238, 233, 226, 0.055)",
+};
+
+const fonts = {
+  display: '"Fraunces", Georgia, serif',
+  ui: 'Manrope, system-ui, -apple-system, "Segoe UI", sans-serif',
+  mono: '"IBM Plex Mono", ui-monospace, SFMono-Regular, monospace',
 };
 
 const clamp = {
@@ -57,16 +75,31 @@ function enter(frame: number, start: number, delay = 0): number {
   return spring({
     frame: Math.max(0, frame - start - delay),
     fps: FPS,
-    config: { damping: 18, stiffness: 105, mass: 0.85 },
+    config: { damping: 22, stiffness: 95, mass: 0.9 },
   });
 }
 
+/*
+ * Scenes crossfade (no hard cuts): each scene rises in with a spring and
+ * drifts gently upward as it hands over to the next one.
+ */
 function sceneTransform(frame: number, start: number): CSSProperties {
   const value = enter(frame, start);
+  const exit = interpolate(
+    frame,
+    [start + SCENE_FRAMES - 18, start + SCENE_FRAMES],
+    [0, 1],
+    clamp,
+  );
   return {
     opacity: sceneOpacity(frame, start),
-    transform: `translateY(${interpolate(value, [0, 1], [32, 0])}px)`,
+    transform: `translateY(${interpolate(value, [0, 1], [30, 0]) - exit * 16}px)`,
   };
+}
+
+/* Slow organic drift, scaled by `amount`, for background and idle motion. */
+function breathe(frame: number, phase = 0): number {
+  return Math.sin(frame / 72 + phase);
 }
 
 function Label({ children }: { children: ReactNode }) {
@@ -76,20 +109,20 @@ function Label({ children }: { children: ReactNode }) {
         display: "inline-flex",
         alignItems: "center",
         gap: 12,
-        color: colors.cyan,
-        fontSize: 19,
-        fontWeight: 750,
-        letterSpacing: "0.12em",
+        color: colors.bronzeLight,
+        fontFamily: fonts.mono,
+        fontSize: 17,
+        fontWeight: 500,
+        letterSpacing: "0.14em",
         textTransform: "uppercase",
       }}
     >
       <span
         style={{
-          width: 9,
-          height: 9,
+          width: 8,
+          height: 8,
           borderRadius: "50%",
-          background: colors.cyan,
-          boxShadow: `0 0 20px ${colors.cyan}`,
+          background: colors.bronze,
         }}
       />
       {children}
@@ -112,11 +145,12 @@ function SceneHeading({
       <h2
         style={{
           margin: "24px 0 16px",
-          color: colors.ink,
-          fontSize: 70,
-          fontWeight: 420,
-          lineHeight: 1.02,
-          letterSpacing: "-0.055em",
+          color: colors.ivory,
+          fontFamily: fonts.display,
+          fontSize: 68,
+          fontWeight: 400,
+          lineHeight: 1.04,
+          letterSpacing: "-0.045em",
         }}
       >
         {title}
@@ -126,8 +160,8 @@ function SceneHeading({
           maxWidth: 900,
           margin: "0 auto",
           color: colors.muted,
-          fontSize: 27,
-          lineHeight: 1.45,
+          fontSize: 26,
+          lineHeight: 1.5,
         }}
       >
         {copy}
@@ -162,7 +196,7 @@ function DeviceCard({
         border: `1px solid ${colors.line}`,
         borderRadius: 24,
         background: colors.panel,
-        boxShadow: "0 24px 70px rgba(2, 7, 25, 0.3)",
+        boxShadow: "0 24px 70px rgba(8, 14, 10, 0.45)",
         ...style,
       }}
     >
@@ -175,7 +209,7 @@ function DeviceCard({
           border: `1px solid ${accent}66`,
           borderRadius: 20,
           color: accent,
-          background: `${accent}16`,
+          background: `${accent}14`,
         }}
       >
         {icon}
@@ -184,9 +218,9 @@ function DeviceCard({
         <strong
           style={{
             display: "block",
-            color: colors.ink,
+            color: colors.ivory,
             fontSize: 24,
-            fontWeight: 720,
+            fontWeight: 600,
           }}
         >
           {title}
@@ -195,8 +229,8 @@ function DeviceCard({
           style={{
             display: "block",
             marginTop: 8,
-            color: colors.muted,
-            fontSize: 17,
+            color: colors.sageLight,
+            fontSize: 16,
           }}
         >
           {detail}
@@ -211,6 +245,7 @@ function HardwareScene({ frame }: { frame: number }) {
   const cardOne = enter(frame, start, 22);
   const cardTwo = enter(frame, start, 34);
   const cardThree = enter(frame, start, 46);
+  const cards = [cardOne, cardTwo, cardThree];
 
   return (
     <AbsoluteFill
@@ -227,36 +262,27 @@ function HardwareScene({ frame }: { frame: number }) {
         copy="Desktops, laptops and workstations spend much of the day underused."
       />
       <div style={{ display: "flex", gap: 30, marginTop: 58 }}>
-        <DeviceCard
-          icon={<Monitor size={36} />}
-          title="Desktop"
-          detail="Capacity available"
-          accent={colors.blue}
-          style={{
-            opacity: cardOne,
-            transform: `translateY(${interpolate(cardOne, [0, 1], [38, 0])}px)`,
-          }}
-        />
-        <DeviceCard
-          icon={<Laptop size={36} />}
-          title="Laptop"
-          detail="Capacity available"
-          accent={colors.cyan}
-          style={{
-            opacity: cardTwo,
-            transform: `translateY(${interpolate(cardTwo, [0, 1], [38, 0])}px)`,
-          }}
-        />
-        <DeviceCard
-          icon={<Server size={36} />}
-          title="Workstation"
-          detail="Capacity available"
-          accent={colors.violet}
-          style={{
-            opacity: cardThree,
-            transform: `translateY(${interpolate(cardThree, [0, 1], [38, 0])}px)`,
-          }}
-        />
+        {[
+          { icon: <Monitor size={36} />, title: "Desktop", accent: colors.bronzeLight },
+          { icon: <Laptop size={36} />, title: "Laptop", accent: colors.sageLight },
+          { icon: <Server size={36} />, title: "Workstation", accent: colors.bronze },
+        ].map((card, index) => {
+          const progress = cards[index] ?? 0;
+          const float = breathe(frame, index * 1.7) * 4 * progress;
+          return (
+            <DeviceCard
+              key={card.title}
+              icon={card.icon}
+              title={card.title}
+              detail="Capacity available"
+              accent={card.accent}
+              style={{
+                opacity: progress,
+                transform: `translateY(${interpolate(progress, [0, 1], [36, 0]) + float}px)`,
+              }}
+            />
+          );
+        })}
       </div>
     </AbsoluteFill>
   );
@@ -299,20 +325,20 @@ function NetworkLine({
         overflow: "visible",
         transformOrigin: "0 50%",
         transform: `rotate(${angle}rad) scaleX(${progress})`,
-        background: "linear-gradient(90deg, rgba(79,141,255,.62), rgba(103,232,196,.35))",
-        boxShadow: "0 0 18px rgba(79,141,255,.3)",
+        background: `linear-gradient(90deg, ${colors.bronze}b0, ${colors.sageLight}59)`,
+        boxShadow: `0 0 16px ${colors.bronze}40`,
       }}
     >
       <span
         style={{
           position: "absolute",
           left: `${packet * 100}%`,
-          top: -5,
-          width: 11,
-          height: 11,
+          top: -4,
+          width: 10,
+          height: 10,
           borderRadius: "50%",
-          background: colors.cyan,
-          boxShadow: `0 0 18px ${colors.cyan}`,
+          background: colors.bronzeLight,
+          boxShadow: `0 0 14px ${colors.bronzeLight}`,
         }}
       />
     </div>
@@ -324,9 +350,10 @@ function ConnectScene({ frame }: { frame: number }) {
   const localFrame = Math.max(0, frame - start);
   const lineProgress = interpolate(localFrame, [24, 72], [0, 1], {
     ...clamp,
-    easing: Easing.out(Easing.cubic),
+    easing: Easing.bezier(0.22, 1, 0.36, 1),
   });
   const hub = enter(frame, start, 12);
+  const hubPulse = 1 + breathe(localFrame, 0.6) * 0.015;
 
   return (
     <AbsoluteFill style={{ ...sceneTransform(frame, start) }}>
@@ -355,15 +382,27 @@ function ConnectScene({ frame }: { frame: number }) {
           height: 200,
           display: "grid",
           placeItems: "center",
-          border: `2px solid ${colors.blue}88`,
+          border: `1.5px solid ${colors.bronze}90`,
           borderRadius: "50%",
-          background: "radial-gradient(circle, rgba(52,94,190,.9), rgba(20,30,67,.96) 68%)",
-          boxShadow: "0 0 0 34px rgba(79,141,255,.07), 0 0 90px rgba(79,141,255,.28)",
+          background: `radial-gradient(circle, ${colors.bronze}33, ${colors.forestDeep} 70%)`,
+          boxShadow: `0 0 0 34px ${colors.bronze}12, 0 0 90px ${colors.bronze}38`,
           opacity: hub,
-          transform: `scale(${interpolate(hub, [0, 1], [0.65, 1])})`,
+          transform: `scale(${interpolate(hub, [0, 1], [0.65, 1]) * hubPulse})`,
         }}
       >
-        <Img src={brandIcon} style={{ width: 82, height: 82 }} />
+        <div
+          style={{
+            width: 108,
+            height: 108,
+            display: "grid",
+            placeItems: "center",
+            borderRadius: "50%",
+            background: colors.paper,
+            overflow: "hidden",
+          }}
+        >
+          <Img src={brandMark} style={{ width: 96, height: 96 }} />
+        </div>
       </div>
       {networkNodes.map((node, index) => {
         const nodeEnter = enter(frame, start, 28 + index * 8);
@@ -383,7 +422,7 @@ function ConnectScene({ frame }: { frame: number }) {
               padding: 16,
               border: `1px solid ${colors.line}`,
               borderRadius: 18,
-              color: colors.blue,
+              color: colors.bronzeLight,
               background: colors.panel,
               opacity: nodeEnter,
               transform: `scale(${interpolate(nodeEnter, [0, 1], [0.72, 1])})`,
@@ -391,8 +430,30 @@ function ConnectScene({ frame }: { frame: number }) {
           >
             {node.icon}
             <div>
-              <strong style={{ display: "block", color: colors.ink, fontSize: 16 }}>{node.label}</strong>
-              <span style={{ display: "block", marginTop: 5, color: colors.cyan, fontSize: 13 }}>CONNECTED</span>
+              <strong
+                style={{
+                  display: "block",
+                  color: colors.ivory,
+                  fontFamily: fonts.mono,
+                  fontSize: 14,
+                  fontWeight: 500,
+                  letterSpacing: "0.06em",
+                }}
+              >
+                {node.label}
+              </strong>
+              <span
+                style={{
+                  display: "block",
+                  marginTop: 5,
+                  color: colors.sageLight,
+                  fontFamily: fonts.mono,
+                  fontSize: 12,
+                  letterSpacing: "0.08em",
+                }}
+              >
+                CONNECTED
+              </span>
             </div>
           </div>
         );
@@ -421,9 +482,11 @@ function Shard({
         border: `1px solid ${color}88`,
         borderRadius: 18,
         color,
-        background: `${color}18`,
-        fontSize: 25,
-        fontWeight: 800,
+        background: `${color}16`,
+        fontFamily: fonts.mono,
+        fontSize: 21,
+        fontWeight: 500,
+        letterSpacing: "0.06em",
         opacity: progress,
         transform: `translateY(${interpolate(progress, [0, 1], [30, 0])}px)`,
       }}
@@ -472,34 +535,47 @@ function SplitScene({ frame }: { frame: number }) {
           }}
         >
           <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 22 }}>
-            <Boxes size={30} color={colors.blue} />
-            <strong style={{ color: colors.ink, fontSize: 23 }}>LARGE AI MODEL</strong>
+            <Boxes size={30} color={colors.bronzeLight} />
+            <strong
+              style={{
+                color: colors.ivory,
+                fontFamily: fonts.mono,
+                fontSize: 19,
+                fontWeight: 500,
+                letterSpacing: "0.08em",
+              }}
+            >
+              LARGE AI MODEL
+            </strong>
           </div>
           <div style={{ display: "flex", gap: 14 }}>
-            <Shard name="SHARD A" color={colors.blue} progress={first} />
-            <Shard name="SHARD B" color={colors.cyan} progress={second} />
-            <Shard name="SHARD C" color={colors.violet} progress={third} />
+            <Shard name="SHARD A" color={colors.bronzeLight} progress={first} />
+            <Shard name="SHARD B" color={colors.sageLight} progress={second} />
+            <Shard name="SHARD C" color={colors.bronze} progress={third} />
           </div>
         </div>
         <div style={{ position: "relative", height: 2, background: colors.line }}>
           <span
             style={{
               position: "absolute",
-              left: `${interpolate(frame, [start + 35, start + 95], [0, 100], clamp)}%`,
-              top: -6,
-              width: 13,
-              height: 13,
+              left: `${interpolate(frame, [start + 35, start + 95], [0, 100], {
+                ...clamp,
+                easing: Easing.bezier(0.22, 1, 0.36, 1),
+              })}%`,
+              top: -5,
+              width: 12,
+              height: 12,
               borderRadius: "50%",
-              background: colors.cyan,
-              boxShadow: `0 0 18px ${colors.cyan}`,
+              background: colors.bronzeLight,
+              boxShadow: `0 0 16px ${colors.bronzeLight}`,
             }}
           />
         </div>
         <div style={{ display: "grid", gap: 12 }}>
           {[
-            [colors.blue, "NODE A", "Stores shard A"],
-            [colors.cyan, "NODE B", "Stores shard B"],
-            [colors.violet, "NODE C", "Stores shard C"],
+            [colors.bronzeLight, "NODE A", "Stores shard A"],
+            [colors.sageLight, "NODE B", "Stores shard B"],
+            [colors.bronze, "NODE C", "Stores shard C"],
           ].map(([color, name, detail], index) => {
             const value = [first, second, third][index] ?? 0;
             return (
@@ -520,7 +596,18 @@ function SplitScene({ frame }: { frame: number }) {
               >
                 <Cpu size={31} color={color} />
                 <div>
-                  <strong style={{ display: "block", color: colors.ink, fontSize: 18 }}>{name}</strong>
+                  <strong
+                    style={{
+                      display: "block",
+                      color: colors.ivory,
+                      fontFamily: fonts.mono,
+                      fontSize: 16,
+                      fontWeight: 500,
+                      letterSpacing: "0.06em",
+                    }}
+                  >
+                    {name}
+                  </strong>
                   <span style={{ color: colors.muted, fontSize: 15 }}>{detail}</span>
                 </div>
               </div>
@@ -542,6 +629,7 @@ function AnswerScene({ frame }: { frame: number }) {
   const response = answer.slice(0, visibleCharacters);
   const promptEnter = enter(frame, start, 22);
   const answerEnter = enter(frame, start, 44);
+  const caretVisible = Math.floor(localFrame / 16) % 2 === 0;
 
   return (
     <AbsoluteFill
@@ -563,16 +651,30 @@ function AnswerScene({ frame }: { frame: number }) {
             justifySelf: "end",
             width: 720,
             padding: "22px 26px",
-            border: `1px solid ${colors.blue}77`,
+            border: `1px solid ${colors.bronze}70`,
             borderRadius: "24px 24px 5px 24px",
-            color: colors.ink,
-            background: "rgba(58, 102, 205, .28)",
+            color: colors.ivory,
+            background: `${colors.bronze}24`,
             opacity: promptEnter,
             transform: `translateX(${interpolate(promptEnter, [0, 1], [38, 0])}px)`,
           }}
         >
-          <span style={{ display: "block", marginBottom: 8, color: colors.blue, fontSize: 14, fontWeight: 800 }}>YOU</span>
-          <strong style={{ fontSize: 22, fontWeight: 600 }}>Explain the result in plain language.</strong>
+          <span
+            style={{
+              display: "block",
+              marginBottom: 8,
+              color: colors.bronzeLight,
+              fontFamily: fonts.mono,
+              fontSize: 13,
+              fontWeight: 500,
+              letterSpacing: "0.1em",
+            }}
+          >
+            YOU
+          </span>
+          <strong style={{ fontSize: 22, fontWeight: 600 }}>
+            Explain the result in plain language.
+          </strong>
         </div>
         <div
           style={{
@@ -595,20 +697,40 @@ function AnswerScene({ frame }: { frame: number }) {
               display: "grid",
               placeItems: "center",
               borderRadius: 17,
-              background: "rgba(79, 141, 255, .15)",
+              background: colors.paper,
+              overflow: "hidden",
             }}
           >
-            <Img src={brandIcon} style={{ width: 42, height: 42 }} />
+            <Img src={brandMark} style={{ width: 52, height: 52 }} />
           </div>
           <div>
-            <span style={{ display: "flex", alignItems: "center", gap: 9, color: colors.cyan, fontSize: 14, fontWeight: 800 }}>
+            <span
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 9,
+                color: colors.bronzeLight,
+                fontFamily: fonts.mono,
+                fontSize: 13,
+                fontWeight: 500,
+                letterSpacing: "0.1em",
+              }}
+            >
               <Sparkles size={16} />
               STREAMING
             </span>
-            <p style={{ minHeight: 60, margin: "12px 0 0", color: colors.ink, fontSize: 22, lineHeight: 1.48 }}>
+            <p
+              style={{
+                minHeight: 60,
+                margin: "12px 0 0",
+                color: colors.ivory,
+                fontSize: 22,
+                lineHeight: 1.48,
+              }}
+            >
               {response}
               {visibleCharacters < answer.length && (
-                <span style={{ color: colors.cyan }}>|</span>
+                <span style={{ color: colors.bronzeLight, opacity: caretVisible ? 1 : 0 }}>|</span>
               )}
             </p>
           </div>
@@ -627,19 +749,25 @@ function MycelliosExplainerComposition() {
     <AbsoluteFill
       style={{
         overflow: "hidden",
-        color: colors.ink,
-        background:
-          "radial-gradient(circle at 18% 15%, rgba(72, 129, 255, .17), transparent 30%), radial-gradient(circle at 82% 80%, rgba(113, 82, 255, .14), transparent 32%), #0b1228",
-        fontFamily: '"Manrope Variable", Manrope, "Segoe UI", sans-serif',
+        color: colors.ivory,
+        background: colors.forest,
+        fontFamily: fonts.ui,
       }}
     >
+      {/* Warm organic washes that drift slowly, like light through a canopy. */}
+      <div
+        style={{
+          position: "absolute",
+          inset: -80,
+          background: `radial-gradient(circle at ${18 + breathe(frame) * 2}% 15%, ${colors.bronze}2e, transparent 34%), radial-gradient(circle at ${82 + breathe(frame, 2.1) * 2}% 80%, ${colors.sage}33, transparent 36%), radial-gradient(circle at 50% 45%, ${colors.forestDeep}, transparent 75%)`,
+        }}
+      />
       <div
         style={{
           position: "absolute",
           inset: 0,
-          opacity: 0.18,
-          backgroundImage:
-            "linear-gradient(rgba(145, 178, 255, .16) 1px, transparent 1px), linear-gradient(90deg, rgba(145, 178, 255, .16) 1px, transparent 1px)",
+          opacity: 0.5,
+          backgroundImage: `linear-gradient(rgba(238, 233, 226, .045) 1px, transparent 1px), linear-gradient(90deg, rgba(238, 233, 226, .045) 1px, transparent 1px)`,
           backgroundSize: "70px 70px",
           maskImage: "radial-gradient(circle at center, black, transparent 78%)",
         }}
@@ -656,10 +784,39 @@ function MycelliosExplainerComposition() {
           gap: 14,
         }}
       >
-        <Img src={brandIcon} style={{ width: 44, height: 44 }} />
+        <div
+          style={{
+            width: 46,
+            height: 46,
+            display: "grid",
+            placeItems: "center",
+            borderRadius: 13,
+            background: colors.paper,
+            overflow: "hidden",
+          }}
+        >
+          <Img src={brandMark} style={{ width: 42, height: 42 }} />
+        </div>
         <div>
-          <strong style={{ display: "block", fontSize: 21 }}>mycellios</strong>
-          <span style={{ color: colors.dim, fontSize: 13, letterSpacing: "0.1em" }}>
+          <strong
+            style={{
+              display: "block",
+              fontFamily: fonts.display,
+              fontSize: 22,
+              fontWeight: 500,
+              letterSpacing: "-0.01em",
+            }}
+          >
+            mycellios
+          </strong>
+          <span
+            style={{
+              color: colors.sageLight,
+              fontFamily: fonts.mono,
+              fontSize: 12,
+              letterSpacing: "0.12em",
+            }}
+          >
             HOW IT WORKS
           </span>
         </div>
@@ -697,7 +854,7 @@ function MycelliosExplainerComposition() {
                   height: 3,
                   overflow: "hidden",
                   borderRadius: 999,
-                  background: "rgba(141, 170, 230, .14)",
+                  background: "rgba(238, 233, 226, .12)",
                 }}
               >
                 <span
@@ -706,7 +863,7 @@ function MycelliosExplainerComposition() {
                     width: `${index < activeScene ? 100 : index === activeScene ? sceneProgress : 0}%`,
                     height: "100%",
                     borderRadius: 999,
-                    background: index === activeScene ? colors.cyan : colors.blue,
+                    background: index === activeScene ? colors.bronzeLight : colors.sage,
                   }}
                 />
               </div>
@@ -714,10 +871,11 @@ function MycelliosExplainerComposition() {
                 style={{
                   display: "block",
                   marginTop: 8,
-                  color: index === activeScene ? colors.ink : colors.dim,
-                  fontSize: 12,
-                  fontWeight: 750,
-                  letterSpacing: "0.1em",
+                  color: index === activeScene ? colors.ivory : colors.sage,
+                  fontFamily: fonts.mono,
+                  fontSize: 11,
+                  fontWeight: 500,
+                  letterSpacing: "0.12em",
                 }}
               >
                 0{index + 1} · {label}
@@ -731,10 +889,12 @@ function MycelliosExplainerComposition() {
         style={{
           position: "absolute",
           right: 48,
-          top: 45,
-          color: colors.dim,
-          fontSize: 14,
+          top: 48,
+          color: colors.sage,
+          fontFamily: fonts.mono,
+          fontSize: 13,
           fontVariantNumeric: "tabular-nums",
+          letterSpacing: "0.08em",
         }}
       >
         {Math.min(20, Math.floor(frame / FPS) + 1)} / {Math.floor(durationInFrames / FPS)} SEC
@@ -744,6 +904,17 @@ function MycelliosExplainerComposition() {
 }
 
 export default function ExplainerVideo() {
+  /*
+   * Reduced-motion: the Player API has no built-in media-query handling, so
+   * autoplay is gated here. Users with reduced motion get a paused first
+   * frame and can still start playback manually via the controls.
+   */
+  const [allowAutoPlay] = useState(
+    () =>
+      typeof window === "undefined" ||
+      !window.matchMedia("(prefers-reduced-motion: reduce)").matches,
+  );
+
   return (
     <Player
       component={MycelliosExplainerComposition}
@@ -751,14 +922,14 @@ export default function ExplainerVideo() {
       compositionWidth={WIDTH}
       compositionHeight={HEIGHT}
       fps={FPS}
-      autoPlay
+      autoPlay={allowAutoPlay}
       loop
       controls
       acknowledgeRemotionLicense
       style={{
         width: "100%",
         aspectRatio: "16 / 9",
-        background: "#0b1228",
+        background: colors.forest,
       }}
     />
   );

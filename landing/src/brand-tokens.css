@@ -1,0 +1,40 @@
+/*
+ * mycellios brand tokens — single source of truth for the mycelium brand.
+ * The `--rb-*` custom properties were promoted here from `rebrand/rebrand.css`
+ * so the landing, the panel reskin, and other surfaces share one token layer.
+ * Keep the `--rb-` names stable to avoid churn in consumers.
+ */
+
+:root {
+  --rb-ink: #1e2a22;
+  --rb-forest: #142019;
+  --rb-sage: #70806d;
+  --rb-ivory: #eee9e2;
+  --rb-paper: #f8f5f0;
+  --rb-bronze: #ad7a48;
+  --rb-line: rgba(30, 42, 34, 0.16);
+  --rb-content: 1200px;
+  --rb-gutter: clamp(20px, 3.5vw, 48px);
+
+  --rb-font-display: "Fraunces", Georgia, serif;
+  --rb-font-ui: "Manrope", system-ui, -apple-system, sans-serif;
+  --rb-font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+/*
+ * Dark variant for ops surfaces (panel reskin, etc.): forest base background,
+ * ivory text, bronze accent. Apply the `.mycelium-dark` class to a scope root.
+ */
+.mycelium-dark {
+  color-scheme: dark;
+  --rb-ink: #eee9e2;
+  --rb-forest: #142019;
+  --rb-sage: #93a18e;
+  --rb-ivory: #eee9e2;
+  --rb-paper: #142019;
+  --rb-bronze: #ad7a48;
+  --rb-line: rgba(238, 233, 226, 0.16);
+
+  background: var(--rb-paper);
+  color: var(--rb-ink);
+}
