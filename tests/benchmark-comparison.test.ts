@@ -165,8 +165,8 @@ describe("benchmark comparison", () => {
     const comparison = compareBenchmarkRuns(current, baseline);
     expect(comparison.verdict).toBe("faster-code-signal");
     expect(benchmarkComparisonNarrative(comparison)).toMatchObject({
-      eyebrow: "SEÑAL DE MEJORA DEL CÓDIGO",
-      title: "Más rápido con la misma capacidad",
+      eyebrow: "CODE IMPROVEMENT SIGNAL",
+      title: "Faster with the same capacity",
     });
   });
 
@@ -197,7 +197,7 @@ describe("benchmark comparison", () => {
     const inconclusive = compareBenchmarkRuns(unstable, baseline);
     expect(inconclusive.verdict).toBe("insufficient-confidence");
     expect(benchmarkComparisonNarrative(inconclusive).title)
-      .toBe("Mismo escenario, faltan muestras estables");
+      .toBe("Same scenario, stable samples missing");
   });
 
   it("separates capacity scaling from a code improvement", () => {
