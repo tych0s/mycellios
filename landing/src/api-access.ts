@@ -14,6 +14,17 @@ export interface ApiAccount {
   updated_at: string;
 }
 
+export interface ApiUsage {
+  id: string;
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  status: "pending" | "completed" | "failed";
+  created_at: string;
+  completed_at: string | null;
+}
+
 export interface ApiKeySummary {
   id: string;
   name: string;
@@ -29,6 +40,11 @@ export interface CreatedApiKey extends ApiKeySummary {
 
 export async function loadApiAccount(accessToken: string): Promise<ApiAccount> {
   return apiRequest<ApiAccount>("/v1/account", accessToken);
+}
+
+export async function loadApiUsage(accessToken: string, limit = 50): Promise<ApiUsage[]> {
+  const response = await apiRequest<{ data: ApiUsage[] }>(`/v1/account/usage?limit=${limit}`, accessToken);
+  return response.data;
 }
 
 export async function loadApiKeys(accessToken: string): Promise<ApiKeySummary[]> {

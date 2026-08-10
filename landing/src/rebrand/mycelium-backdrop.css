@@ -1,0 +1,40 @@
+/* ── The mycelium backdrop ─────────────────────────────────────────────
+ *
+ * Fixed to the viewport rather than placed in the flow: the canvas stays put
+ * and the colony is drawn at a document-space offset, so a single element
+ * covers the whole span without being clipped by any section's background.
+ *
+ * The layering problem is the interesting one. Every band on this page paints
+ * its own opaque background, so a canvas *behind* the page would be painted
+ * over and never seen. Rather than make seven sections transparent — which
+ * would mean touching the background of every band on the page to add one
+ * decoration — the canvas is layered *over* them and composited with
+ * `multiply` at under 10% alpha.
+ *
+ * That inverts the problem into its own solution:
+ *  - over the ivory and paper bands, a near-black filament darkens the surface
+ *    a few percent and reads as tint in the stock, not as a line on top of it;
+ *  - over the dark hero and the forest install band, multiplying a dark ink
+ *    into an already-dark surface is a no-op, so the colony cannot smudge the
+ *    two sections it must stay out of, even before the span logic in the
+ *    component excludes them;
+ *  - over the body text, the same multiply against near-black type is
+ *    invisible, so nothing ever reduces reading contrast.
+ *
+ * z-index 0 keeps it below the header (30) and the assistant (40+), and
+ * `pointer-events: none` keeps it out of every gesture.
+ */
+
+.rb-myco {
+  position: fixed;
+  z-index: 0;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  mix-blend-mode: multiply;
+  /* The band has to end without a visible edge, so it dissolves at the top and
+     bottom of the viewport instead of being cut off by one. */
+  -webkit-mask-image: linear-gradient(180deg, transparent, #000 16%, #000 84%, transparent);
+  mask-image: linear-gradient(180deg, transparent, #000 16%, #000 84%, transparent);
+}

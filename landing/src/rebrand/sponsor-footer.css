@@ -1,0 +1,100 @@
+.rb-sponsors {
+  border-top: 1px solid var(--rb-line);
+  background: #e7e1d8;
+}
+
+.rb-sponsors-inner {
+  display: grid;
+  grid-template-columns: minmax(210px, .55fr) minmax(420px, 1.45fr);
+  gap: clamp(36px, 7vw, 110px);
+  align-items: end;
+  padding-block: 46px;
+}
+
+.rb-sponsors-heading span {
+  color: #765f49;
+  font: 600 10px "IBM Plex Mono", monospace;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+
+.rb-sponsors-heading p {
+  max-width: 350px;
+  margin: 12px 0 0;
+  color: #626a63;
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.rb-sponsor-cta {
+  min-height: 76px;
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) 20px;
+  gap: 15px;
+  align-items: center;
+  padding: 12px 18px 12px 12px;
+  border: 1px solid rgba(30, 42, 34, .17);
+  border-radius: 14px;
+  color: var(--rb-ink);
+  background: rgba(248, 245, 240, .58);
+  transition: transform .16s ease, border-color .16s ease, background .16s ease, box-shadow .16s ease;
+}
+
+.rb-sponsor-cta:hover,
+.rb-sponsor-cta:focus-visible {
+  transform: translateY(-2px);
+  border-color: rgba(173, 122, 72, .48);
+  background: rgba(248, 245, 240, .92);
+  box-shadow: 0 14px 30px rgba(30, 42, 34, .08);
+}
+
+.rb-sponsor-cta:focus-visible {
+  outline: 2px solid var(--rb-bronze);
+  outline-offset: 3px;
+}
+
+.rb-sponsor-mark {
+  position: relative;
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid rgba(30, 42, 34, .18);
+  border-radius: 10px;
+  background: #18251e;
+}
+
+.rb-sponsor-mark::before,
+.rb-sponsor-mark i {
+  content: "";
+  position: absolute;
+  width: 24px;
+  height: 24px;
+  border: 1px solid rgba(215, 178, 137, .58);
+  border-radius: 48% 52% 44% 56%;
+}
+
+.rb-sponsor-mark i:first-child { transform: rotate(35deg) scale(.72); }
+.rb-sponsor-mark i:nth-child(2) { transform: rotate(70deg) scale(.48); }
+.rb-sponsor-mark i:last-child { width: 4px; height: 4px; border: 0; border-radius: 50%; background: #dfb98c; }
+.rb-sponsor-cta > span:nth-child(2) { min-width: 0; display: grid; gap: 4px; }
+.rb-sponsor-cta strong { font: 500 16px "Fraunces", serif; }
+.rb-sponsor-cta small { overflow: hidden; color: #6f766f; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.rb-sponsor-cta > svg { width: 17px; height: 17px; color: var(--rb-bronze); transition: transform .16s ease; }
+.rb-sponsor-cta:hover > svg,
+.rb-sponsor-cta:focus-visible > svg { transform: translate(2px, -2px); }
+
+@media (max-width: 760px) {
+  .rb-sponsors-inner { grid-template-columns: 1fr; gap: 24px; padding-block: 38px; }
+  .rb-sponsor-cta { min-height: 72px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rb-sponsor-cta,
+  .rb-sponsor-cta > svg { transition-duration: .01ms; }
+  .rb-sponsor-cta:hover,
+  .rb-sponsor-cta:focus-visible,
+  .rb-sponsor-cta:hover > svg,
+  .rb-sponsor-cta:focus-visible > svg { transform: none; }
+}

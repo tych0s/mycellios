@@ -1,0 +1,214 @@
+/* ── The awkward questions ─────────────────────────────────────────────
+ *
+ * Not a stack of floating pills. The page already spends three sections on
+ * rounded cards (doors, rules, models), so another card grid here would read as
+ * a fourth list of features rather than as a conversation. Instead: a sticky
+ * heading on the left and one hairline-ruled column on the right, which is the
+ * shape of a page of questions and answers and of nothing else on this page.
+ *
+ * Ivory, between the paper of the evidence board above and the forest of the
+ * install below, so the band is legible as its own beat without inventing a
+ * fifth surface colour.
+ */
+
+.rb-quest {
+  padding-block: clamp(90px, 12vh, 140px);
+  background: var(--rb-ivory);
+  border-top: 1px solid var(--rb-line);
+}
+
+.rb-quest-inner {
+  display: grid;
+  grid-template-columns: .85fr 1.15fr;
+  gap: clamp(48px, 7vw, 100px);
+  align-items: start;
+}
+
+/* The heading holds while the answers move past it: a reader four questions
+   down never loses the thing being answered. */
+.rb-quest-head {
+  position: sticky;
+  top: 120px;
+}
+
+/* Size comes from `.rb-page h2`: this is a full section like the evidence board
+   above and the doors below, and a smaller headline here would read as a
+   subsection of the one before it. */
+.rb-quest-head h2 { margin-top: 16px; }
+
+.rb-quest-head > p:not(.rb-kicker) {
+  max-width: 370px;
+  margin: 24px 0 0;
+  color: #555d57;
+  font-size: 14px;
+  line-height: 1.75;
+}
+
+/* ── The column ──────────────────────────────────────────────────────── */
+/* Rules between the rows, not boxes around them. The first row keeps a rule on
+   top so the column reads as a set rather than as a heading plus a list. */
+.rb-quest-item {
+  border-bottom: 1px solid var(--rb-line);
+}
+
+.rb-quest-item:first-of-type {
+  border-top: 1px solid var(--rb-line);
+}
+
+.rb-quest-item summary {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) 22px;
+  gap: 14px;
+  align-items: baseline;
+  min-height: 44px;
+  padding: 26px 4px;
+  cursor: pointer;
+  list-style: none;
+  transition: color .18s ease;
+}
+
+/* Safari still paints the disclosure triangle without this. */
+.rb-quest-item summary::-webkit-details-marker { display: none; }
+.rb-quest-item summary::marker { content: ""; }
+
+.rb-quest-no {
+  color: #9c8a76;
+  font: 500 10px "IBM Plex Mono", monospace;
+  letter-spacing: .14em;
+  transition: color .18s ease;
+}
+
+.rb-quest-q {
+  font: 400 clamp(17px, 1.5vw, 21px)/1.4 "Fraunces", serif;
+  letter-spacing: -.01em;
+  transition: color .18s ease;
+}
+
+.rb-quest-item summary:hover .rb-quest-q,
+.rb-quest-item summary:focus-visible .rb-quest-q { color: var(--rb-bronze); }
+.rb-quest-item summary:hover .rb-quest-no { color: var(--rb-bronze); }
+.rb-quest-item[open] .rb-quest-no { color: var(--rb-bronze); }
+
+/* Focus belongs to the whole row, not to the 22px sign at its end. */
+.rb-quest-item summary:focus-visible {
+  outline: 2px solid var(--rb-bronze);
+  outline-offset: 6px;
+  border-radius: 4px;
+}
+
+/* ── The sign ────────────────────────────────────────────────────────── */
+/* Two bars: the upright one rotates flat, so the plus becomes a minus in a
+   single transform and the mark never redraws. */
+.rb-quest-sign {
+  position: relative;
+  align-self: center;
+  justify-self: end;
+  width: 15px;
+  height: 15px;
+}
+
+.rb-quest-sign b {
+  position: absolute;
+  inset: 50% 0 auto;
+  height: 1.5px;
+  background: var(--rb-ink);
+  border-radius: 2px;
+  transform: translateY(-50%);
+  transition: transform .32s cubic-bezier(.22, .8, .2, 1), background .18s ease;
+}
+
+.rb-quest-sign b:last-child { transform: translateY(-50%) rotate(90deg); }
+.rb-quest-item[open] .rb-quest-sign b:last-child { transform: translateY(-50%) rotate(0deg); }
+.rb-quest-item[open] .rb-quest-sign b,
+.rb-quest-item summary:hover .rb-quest-sign b { background: var(--rb-bronze); }
+
+/* ── The answer ──────────────────────────────────────────────────────── */
+/* The answer is inset to the question's own column and carries a bronze rule at
+   its left edge, so an open row is legible as an answer to the line above it
+   rather than as a new paragraph in the column. */
+.rb-quest-body {
+  padding: 0 30px 28px 56px;
+}
+
+.rb-quest-body p {
+  margin: 0;
+  padding-left: 18px;
+  border-left: 1px solid rgba(173, 122, 72, .5);
+  color: #555d57;
+  font-size: 14px;
+  line-height: 1.8;
+}
+
+/* Opening is a rendering change, so a transition would never start — but an
+   animation on a newly rendered element does. This is the baseline everywhere:
+   the answer arrives, it does not blink into place. */
+.rb-quest-item[open] .rb-quest-body {
+  animation: rbQuestIn .42s cubic-bezier(.22, .8, .2, 1);
+}
+
+@keyframes rbQuestIn {
+  from { opacity: 0; transform: translateY(-7px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* Where the browser can interpolate a details' own content box, the row also
+   grows into its height instead of jumping. Progressive: the animation above is
+   the floor, this is the ceiling. */
+@supports selector(details::details-content) {
+  .rb-quest-item {
+    interpolate-size: allow-keywords;
+  }
+
+  .rb-quest-item::details-content {
+    block-size: 0;
+    overflow: hidden;
+    transition: block-size .42s cubic-bezier(.22, .8, .2, 1), content-visibility .42s allow-discrete;
+  }
+
+  .rb-quest-item[open]::details-content { block-size: auto; }
+}
+
+.rb-quest-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 16px;
+  margin: 30px 0 0;
+  color: #6e766f;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.rb-quest-foot a {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 44px;
+  color: var(--rb-ink);
+  font-weight: 600;
+  border-bottom: 1px solid var(--rb-bronze);
+}
+
+.rb-quest-foot a svg { width: 13px; height: 13px; color: var(--rb-bronze); }
+
+@media (max-width: 1000px) {
+  .rb-quest-inner { grid-template-columns: 1fr; gap: 44px; }
+  /* Stuck to the top of a single column, the heading would sit over its own
+     answers. Below the breakpoint it simply scrolls away. */
+  .rb-quest-head { position: static; }
+}
+
+@media (max-width: 700px) {
+  .rb-quest { padding-block: 80px; }
+  .rb-quest-item summary { grid-template-columns: 30px minmax(0, 1fr) 18px; gap: 10px; padding: 22px 2px; }
+  .rb-quest-body { padding: 0 4px 24px 40px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rb-quest-item[open] .rb-quest-body { animation: none; }
+  .rb-quest-sign b { transition: none; }
+
+  @supports selector(details::details-content) {
+    .rb-quest-item::details-content { transition: none; }
+  }
+}

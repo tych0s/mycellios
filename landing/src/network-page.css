@@ -1,0 +1,364 @@
+@import "@fontsource-variable/manrope";
+
+/* The observatory is a full-bleed stage: a warm near-black field, white at
+   graded opacities, hairline rules, and a Newsreader display face over an Inter
+   body. Every figure on screen comes from /public/v1/snapshot. */
+
+.net {
+  --net-bg: #0c0a09;
+  --net-pop: #17140f;
+  --net-text: rgba(255, 255, 255, .92);
+  --net-dim: rgba(255, 255, 255, .58);
+  --net-faint: rgba(255, 255, 255, .38);
+  --net-line: rgba(255, 255, 255, .08);
+  --net-green: #22c55e;
+  --net-amber: #d0a878;
+  --net-ease: cubic-bezier(.2, 0, 0, 1);
+  --net-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --net-inset: 30px;
+
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  color: var(--net-text);
+  background: var(--net-bg);
+  font-family: "Manrope Variable", Manrope, system-ui, -apple-system, sans-serif;
+  font-size: 15px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.net *, .net *::before, .net *::after { box-sizing: border-box; }
+.net a { color: inherit; text-decoration: none; }
+.net button { font: inherit; }
+
+.net-visually-hidden {
+  position: absolute;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.net-stage { position: absolute; inset: 0; }
+
+.net-globe {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  cursor: grab;
+  touch-action: none;
+}
+.net-globe.dragging { cursor: grabbing; }
+
+/* Every overlay sits above the canvas but stays click-through except where it
+   has its own interactive affordance. */
+.net-hud { position: absolute; z-index: 2; }
+
+/* ---------- brand ---------- */
+
+.net-brand {
+  top: 24px;
+  left: var(--net-inset);
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.net-brand-name {
+  font-family: Newsreader, Georgia, "Times New Roman", serif;
+  font-size: 27px;
+  font-weight: 500;
+  letter-spacing: -.01em;
+  line-height: 1.15;
+  color: #fff;
+}
+.net-brand-sub { color: var(--net-dim); font-size: 15px; }
+
+/* ---------- legend ---------- */
+
+.net-legend {
+  top: 30px;
+  right: var(--net-inset);
+  display: flex;
+  align-items: center;
+  color: var(--net-dim);
+  font-size: 11px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+.net-legend span { display: inline-flex; align-items: center; }
+.net-legend i {
+  display: inline-block;
+  width: 8px; height: 8px;
+  margin: 0 6px 0 18px;
+  border-radius: 2px;
+}
+.net-legend span:first-child i { margin-left: 0; }
+
+/* ---------- stat rails ---------- */
+
+.net-stats {
+  top: 50%;
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+  transform: translateY(-50%);
+}
+.net-stats-left { left: 34px; text-align: left; }
+.net-stats-right { right: 34px; text-align: right; }
+/* The node panel occupies the right rail's column, so the rail steps aside
+   rather than bleeding numerals through the panel edge. */
+.net-stats-right.hidden { display: none; }
+
+.net-stats-left .net-stat { padding-left: 14px; border-left: 1px solid rgba(34, 197, 94, .5); }
+.net-stats-right .net-stat { padding-right: 14px; border-right: 1px solid rgba(34, 197, 94, .5); }
+
+.net-stat-value {
+  padding-bottom: 2px;
+  color: #fff;
+  font-family: Newsreader, Georgia, "Times New Roman", serif;
+  font-size: 42px;
+  font-weight: 500;
+  line-height: 1.15;
+  letter-spacing: -.01em;
+  font-variant-numeric: tabular-nums;
+}
+.net-stat-value small { color: var(--net-dim); font-size: 15px; }
+.net-stat-label {
+  margin-top: 7px;
+  color: var(--net-dim);
+  font-size: 11px;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+}
+
+/* ---------- joining ticker ---------- */
+
+.net-ticker { left: 34px; bottom: var(--net-inset); max-width: 340px; font-size: 13px; }
+.net-ticker-label {
+  margin-bottom: 8px;
+  color: var(--net-faint);
+  font-size: 10px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+.net-ticker-row {
+  padding: 3px 0;
+  overflow: hidden;
+  color: var(--net-dim);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: opacity .4s var(--net-ease);
+}
+.net-ticker-row b { color: #fff; font-weight: 500; }
+.net-ticker-row .mark { color: var(--net-green); margin-right: 4px; }
+.net-ticker-row .loc { color: rgba(255, 255, 255, .8); }
+.net-ticker-row.empty { color: var(--net-faint); }
+
+/* ---------- snapshot command ---------- */
+
+.net-cmd {
+  right: var(--net-inset);
+  bottom: 28px;
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  max-width: min(600px, 92vw);
+}
+.net-cmd code {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  align-items: center;
+  overflow-x: auto;
+  padding: 10px 13px;
+  border: 1px solid var(--net-line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, .045);
+  color: var(--net-text);
+  font-family: var(--net-mono);
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+.net-cmd button {
+  padding: 0 15px;
+  border: 1px solid var(--net-line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, .045);
+  color: var(--net-dim);
+  font-size: 11px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 150ms var(--net-ease), color 150ms var(--net-ease);
+}
+.net-cmd button:hover { background: rgba(255, 255, 255, .075); color: var(--net-text); }
+
+/* ---------- live status ---------- */
+
+.net-status {
+  left: 34px;
+  top: 76px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--net-faint);
+  font-size: 10px;
+}
+.net-status > span:first-child {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--net-dim);
+  letter-spacing: .1em;
+}
+.net-status i { width: 6px; height: 6px; border-radius: 50%; background: var(--net-green); }
+.net-status .degraded { color: var(--net-amber); }
+.net-status .degraded i { background: var(--net-amber); }
+.net-status a { color: var(--net-faint); text-decoration: underline; text-underline-offset: 3px; }
+.net-status a:hover { color: var(--net-text); }
+
+/* ---------- node panel ---------- */
+
+.net-panel {
+  top: 76px;
+  right: var(--net-inset);
+  width: 308px;
+  max-width: calc(100vw - 60px);
+  padding: 16px 18px 18px;
+  border: 1px solid var(--net-line);
+  border-radius: 16px;
+  background: var(--net-pop);
+  box-shadow: 0 10px 40px rgba(0, 0, 0, .5);
+}
+.net-panel-top { display: flex; align-items: baseline; gap: 8px; }
+.net-panel-city {
+  color: #fff;
+  font-family: Newsreader, Georgia, serif;
+  font-size: 22px;
+  font-weight: 500;
+}
+.net-panel-cc { color: var(--net-dim); font-size: 12px; }
+.net-panel-close {
+  width: 26px; height: 26px;
+  margin-left: auto;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--net-faint);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 150ms var(--net-ease), color 150ms var(--net-ease);
+}
+.net-panel-close:hover { background: rgba(255, 255, 255, .075); color: var(--net-text); }
+.net-panel-state {
+  margin-top: 10px;
+  font-size: 11px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.net-panel-state.serving { color: var(--net-green); }
+.net-panel-state.standby { color: rgba(255, 255, 255, .82); }
+.net-panel-state.joining { color: var(--net-dim); }
+.net-panel-id {
+  margin-top: 4px;
+  color: var(--net-faint);
+  font-family: var(--net-mono);
+  font-size: 10.5px;
+  word-break: break-all;
+}
+.net-panel-rows { margin-top: 16px; display: flex; flex-direction: column; gap: 9px; }
+.net-panel-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12.5px;
+}
+.net-panel-row .kk { color: var(--net-dim); letter-spacing: .02em; }
+.net-panel-row .vv { color: var(--net-text); text-align: right; }
+.net-panel-bar {
+  position: relative;
+  height: 6px;
+  margin-top: -2px;
+  overflow: hidden;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, .07);
+}
+.net-panel-bar .fill { position: absolute; top: 0; bottom: 0; left: 0; border-radius: 99px; background: var(--net-green); }
+.net-panel-note { margin: 12px 0 0; color: var(--net-faint); font-size: 10.5px; line-height: 1.5; }
+
+/* ---------- empty / error ---------- */
+
+.net-empty {
+  top: 50%; left: 50%;
+  z-index: 3;
+  display: grid;
+  justify-items: center;
+  gap: 7px;
+  width: 300px;
+  padding: 26px;
+  border: 1px solid var(--net-line);
+  border-radius: 16px;
+  background: var(--net-pop);
+  text-align: center;
+  transform: translate(-50%, -50%);
+}
+.net-empty strong { color: #fff; font-family: Newsreader, Georgia, serif; font-size: 21px; font-weight: 500; }
+.net-empty span { color: var(--net-dim); font-size: 12px; line-height: 1.5; }
+.net-empty a { margin-top: 6px; color: var(--net-green); font-size: 12px; }
+
+.net-error {
+  top: 24px; left: 50%;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border: 1px solid rgba(208, 168, 120, .3);
+  border-radius: 10px;
+  background: rgba(33, 24, 15, .95);
+  color: #d8b58c;
+  font-size: 11px;
+  transform: translateX(-50%);
+}
+.net-error button {
+  border: 0;
+  background: transparent;
+  color: #f0dcc4;
+  font-size: 11px;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+/* ---------- responsive ---------- */
+
+@media (max-width: 820px) {
+  .net { --net-inset: 20px; }
+  /* Two bottom-anchored columns, not two rows: the groups are absolutely
+     positioned, so a row that outgrows the viewport would paint over its twin
+     instead of pushing it away. Half the width each, stacked internally. */
+  .net-stats { top: auto; bottom: 92px; gap: 16px; transform: none; }
+  .net-stats-left { left: 20px; right: calc(50% + 8px); }
+  .net-stats-right { left: calc(50% + 8px); right: 20px; }
+  .net-stat-value { font-size: 26px; }
+  .net-stat-value small { font-size: 12px; }
+  .net-stat-label { margin-top: 4px; font-size: 9px; }
+  .net-ticker, .net-legend { display: none; }
+  .net-cmd { left: 20px; right: 20px; bottom: 20px; max-width: none; }
+  .net-panel { top: auto; bottom: 84px; left: 20px; right: 20px; width: auto; max-height: 64vh; overflow-y: auto; }
+  .net-status { top: 70px; left: 20px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .net *, .net *::before, .net *::after {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+  }
+}

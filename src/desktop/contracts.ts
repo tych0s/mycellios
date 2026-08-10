@@ -11,6 +11,7 @@ import type {
 } from "../contracts/types.js";
 import type { NativeBuildIdentity } from "../contracts/build-identity.js";
 import type { ActivationIncident } from "../coordinator/activation-incident.js";
+import type { ChatActivity } from "../contracts/chat-activity.js";
 import type {
   FleetContributionCommandResponse,
   FleetContributionStatus,
@@ -344,6 +345,7 @@ export interface ChatResponse {
   reusedKvTokens: number;
   ttftMs: number;
   activeMs: number;
+  activity?: ChatActivity;
 }
 
 export interface ChatStreamUpdate {

@@ -54,6 +54,7 @@ import {
   Timer,
   Trash2,
   UserRound,
+  WalletCards,
   Wifi,
   X,
   Zap,
@@ -110,6 +111,8 @@ import {
   loadNetworkIdentity,
   restoreAuthSession,
   signIn,
+  signInWithMetaMask,
+  signInWithX,
   signOut,
   signUp,
   type AuthSession,
@@ -119,7 +122,9 @@ import {
 import { ApiAccessPanel } from "./ApiAccessPanel";
 import {
   loadApiAccount,
+  loadApiUsage,
   type ApiAccount,
+  type ApiUsage,
 } from "./api-access";
 import "./panel.css";
 
@@ -753,6 +758,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
             <small>{coordinatorError ? "Coordinator unavailable" : "Coordinator operational"}</small>
           </div>
         </div>
+        {!desktop && <button className="panel-sidebar-account" onClick={() => setAuthOpen(true)}><UserRound /><span><strong>{networkIdentity ? `@${networkIdentity.email?.split("@")[0] ?? "mycellios"}` : "Mycellios account"}</strong><small>{networkIdentity ? `${formatCompactTokens(apiAccount?.token_balance ?? 0)} tokens · View usage` : "Sign in · View usage"}</small></span><ChevronRight /></button>}
         <div className="panel-sidebar-version" aria-label="Versiones">
           {desktopSnapshot && <span><small>APP</small><strong>v{desktopSnapshot.appVersion}</strong></span>}
           <span><small>API</small><strong>{snapshot.version}</strong></span>
@@ -843,6 +849,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
         config={authConfig}
         session={authSession}
         identity={networkIdentity}
+        account={apiAccount}
         onAuthenticated={(session, identity) => {
           setAuthSession(session);
           setNetworkIdentity(identity);
@@ -992,6 +999,7 @@ function AccountModal({
   config,
   session,
   identity,
+  account,
   onAuthenticated,
   onSignOut,
   onClose,
@@ -999,6 +1007,7 @@ function AccountModal({
   config: PublicAuthConfig;
   session: AuthSession | null;
   identity: NetworkIdentity | null;
+  account: ApiAccount | null;
   onAuthenticated: (session: AuthSession, identity: NetworkIdentity) => void;
   onSignOut: () => void;
   onClose: () => void;
@@ -1007,7 +1016,26 @@ function AccountModal({
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
+  const [providerBusy, setProviderBusy] = useState<"x" | "metamask" | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [accountTab, setAccountTab] = useState<"account" | "usage">("account");
+  const [usage, setUsage] = useState<ApiUsage[]>([]);
+  const [usageBusy, setUsageBusy] = useState(false);
+
+  useEffect(() => {
+    if (!session || accountTab !== "usage") return;
+    setUsageBusy(true);
+    void loadApiUsage(session.accessToken).then(setUsage).catch((caught) => setError(errorText(caught))).finally(() => setUsageBusy(false));
+  }, [accountTab, session]);
+
+  const usageByModel = useMemo(() => {
+    const totals = new Map<string, { requests: number; tokens: number }>();
+    for (const entry of usage) {
+      const current = totals.get(entry.model) ?? { requests: 0, tokens: 0 };
+      totals.set(entry.model, { requests: current.requests + 1, tokens: current.tokens + entry.total_tokens });
+    }
+    return [...totals.entries()].sort((left, right) => right[1].tokens - left[1].tokens);
+  }, [usage]);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -1026,18 +1054,52 @@ function AccountModal({
     }
   }
 
+  function continueWithX() {
+    setProviderBusy("x");
+    setError(null);
+    try {
+      signInWithX(config);
+    } catch (caught) {
+      setProviderBusy(null);
+      setError(errorText(caught));
+    }
+  }
+
+  async function continueWithMetaMask() {
+    setProviderBusy("metamask");
+    setError(null);
+    try {
+      const nextSession = await signInWithMetaMask(config);
+      const nextIdentity = await loadNetworkIdentity(nextSession.accessToken);
+      onAuthenticated(nextSession, nextIdentity);
+    } catch (caught) {
+      setError(errorText(caught));
+    } finally {
+      setProviderBusy(null);
+    }
+  }
+
   return <div className="modal-backdrop account-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) onClose(); }}>
     <section className="account-modal" role="dialog" aria-modal="true" aria-label="Mycellios account">
       <button className="account-modal-close" aria-label="Close" onClick={onClose}><X size={18} /></button>
       <div className="account-modal-brand"><img src={brandIcon} alt="" /><span>MYCELLIOS ID</span></div>
       {session && identity ? <>
-        <h2>Your network identity</h2>
-        <p>History and permissions now follow this account across devices.</p>
-        <div className="account-identity-card"><UserRound /><span><strong>{identity.email ?? session.user.email ?? identity.id}</strong><small>{identity.role ?? "member"} · public network</small></span></div>
-        <button className="account-signout" onClick={onSignOut}><LogOut size={16} />Sign out</button>
+        <div className="account-detail-tabs"><button className={accountTab === "account" ? "active" : ""} onClick={() => setAccountTab("account")}>Account</button><button className={accountTab === "usage" ? "active" : ""} onClick={() => setAccountTab("usage")}>Usage</button></div>
+        {accountTab === "account" ? <><h2>Your network identity</h2><p>History and permissions follow this account across devices.</p><div className="account-identity-card"><UserRound /><span><strong>{identity.email ?? session.user.email ?? identity.id}</strong><small>{identity.role ?? "member"} · public network</small></span></div><div className="account-facts"><span><small>MEMBER SINCE</small><strong>{account ? new Date(account.created_at).toLocaleDateString() : "—"}</strong></span><span><small>PROMPTS SENT</small><strong>{account?.request_count ?? 0}</strong></span><span><small>AVAILABLE</small><strong>{formatCompactTokens(account?.token_balance ?? 0)} tokens</strong></span></div><button className="account-signout" onClick={onSignOut}><LogOut size={16} />Sign out</button></> : <><h2>Usage</h2><p>Real requests and tokens across chat and the API.</p><div className="account-usage-summary"><span><small>REQUESTS</small><strong>{account?.request_count ?? 0}</strong></span><span><small>INPUT TOKENS</small><strong>{formatCompactTokens(account?.lifetime_input_tokens ?? 0)}</strong></span><span><small>OUTPUT TOKENS</small><strong>{formatCompactTokens(account?.lifetime_output_tokens ?? 0)}</strong></span></div><div className="account-usage-models"><span>BY MODEL</span>{usageBusy ? <div className="account-usage-empty"><LoaderCircle className="spin" />Loading usage…</div> : usageByModel.length === 0 ? <div className="account-usage-empty">No usage recorded yet.</div> : usageByModel.map(([model, total]) => <div key={model}><strong>{model}</strong><span>{total.requests} request{total.requests === 1 ? "" : "s"}</span><b>{formatCompactTokens(total.tokens)} tokens</b></div>)}</div></>}
       </> : <>
         <h2>{mode === "signin" ? "Welcome back" : "Create your account"}</h2>
         <p>Use one identity for network access, history and administration.</p>
+        <div className="account-provider-actions">
+          <button type="button" className="account-provider-x" disabled={providerBusy !== null || busy} onClick={continueWithX}>
+            {providerBusy === "x" ? <LoaderCircle className="spin" /> : <span aria-hidden="true">𝕏</span>}
+            Continue with X
+          </button>
+          <div className="account-provider-divider"><i />or<i /></div>
+          <button type="button" className="account-provider-wallet" disabled={providerBusy !== null || busy} onClick={() => void continueWithMetaMask()}>
+            {providerBusy === "metamask" ? <LoaderCircle className="spin" /> : <WalletCards />}
+            MetaMask
+          </button>
+        </div>
         <div className="account-mode-tabs"><button className={mode === "signin" ? "active" : ""} onClick={() => setMode("signin")}>Sign in</button><button className={mode === "signup" ? "active" : ""} onClick={() => setMode("signup")}>Create account</button></div>
         <form onSubmit={(event) => void submit(event)}>
           <label>Email<input type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} required /></label>
@@ -3944,12 +4006,20 @@ function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthent
   const [sessionId, setSessionId] = useState(() => newInferenceSessionId());
   const [error, setError] = useState<string | null>(null);
   const [pendingTurn, setPendingTurn] = useState<InferencePendingTurn | null>(null);
+  const [instructionsOpen, setInstructionsOpen] = useState(false);
+  const [instructions, setInstructions] = useState(() => window.localStorage.getItem("mycellios.chat.instructions") ?? "");
   const outputRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const modelAvailable = realModels.length > 0;
   const inferenceAvailable = modelAvailable && accountAuthenticated;
   const selectedModel = realModels.some((item) => item.id === model) ? model : realModels[0]?.id ?? "";
   const selectedOption = realModels.find((item) => item.id === selectedModel) ?? null;
+
+  function saveInstructions(next: string) {
+    setInstructions(next);
+    if (next.trim()) window.localStorage.setItem("mycellios.chat.instructions", next);
+    else window.localStorage.removeItem("mycellios.chat.instructions");
+  }
 
   useEffect(() => {
     if (!pendingTurn) return;
@@ -4023,6 +4093,7 @@ function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthent
     setError(null);
     try {
       const messages: ChatMessage[] = [
+        ...(instructions.trim() ? [{ role: "developer" as const, content: instructions.trim() }] : []),
         ...turns.flatMap((turn): ChatMessage[] => [
           { role: "user", content: turn.messageContent },
           { role: "assistant", content: turn.response.text },
@@ -4074,7 +4145,6 @@ function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthent
         <div className="inference-toolbar-controls">
           <span className="inference-toolbar-stat"><Network /><b>{selectedOption?.nodeCount ?? 0}</b> nodo{selectedOption?.nodeCount === 1 ? "" : "s"}</span>
           <span className="inference-toolbar-stat"><MemoryStick /><b>{selectedOption && selectedOption.peerMemoryMb > 0 ? formatMemory(selectedOption.peerMemoryMb) : "—"}</b> memoria</span>
-          <InferenceModelPicker options={realModels} value={model} onChange={(nextModel) => resetConversation(nextModel)} />
         </div>
       </div>
       <div className="inference-route-strip">
@@ -4098,7 +4168,14 @@ function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthent
           <button type="button" className="inference-attach" disabled={!inferenceAvailable || pendingTurn !== null || filesBusy || attachments.length >= MAX_INFERENCE_FILES} onClick={() => fileInputRef.current?.click()} aria-label="Adjuntar documentos" title="PDF, DOCX, texto, código, CSV o JSON">{filesBusy ? <LoaderCircle className="spin" /> : <Paperclip />}</button>
           <textarea aria-label="Mensaje" value={prompt} disabled={!inferenceAvailable || pendingTurn !== null} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder={inferenceAvailable ? `Escribe a ${model ? selectedModel : "la malla automática"}…` : modelAvailable ? "Inicia sesión para empezar a escribir…" : "Conecta un modelo real para empezar a escribir…"} />
         </div>
-        <div className="inference-input-foot"><span>{inferenceAvailable ? <><Paperclip size={12} />PDF, DOCX, texto y código · extracción local · <kbd>Enter</kbd> enviar</> : <><LockKeyhole size={12} />{modelAvailable ? "El envío se activará al iniciar sesión" : "El envío se activará cuando haya una conexión real"}</>}</span><div>{turns.length > 0 && <button className="inference-clear" onClick={() => resetConversation()}><Trash2 size={14} />Nueva conversación</button>}<button className="inference-send" disabled={!inferenceAvailable || (!prompt.trim() && attachments.length === 0) || pendingTurn !== null || filesBusy} onClick={() => void send()}>{pendingTurn ? <LoaderCircle className="spin" /> : <Send />}<span>Enviar</span></button></div></div>
+        <div className="inference-input-foot"><div className="inference-composer-tools">
+          <InferenceModelPicker options={realModels} value={model} onChange={(nextModel) => resetConversation(nextModel)} />
+          <div className={`inference-instructions${instructionsOpen ? " open" : ""}`}>
+            <button type="button" aria-label="Instrucciones de esta conversación" aria-expanded={instructionsOpen} onClick={() => setInstructionsOpen((current) => !current)}><SlidersHorizontal />{instructions.trim() && <i />}</button>
+            {instructionsOpen && <div className="inference-instructions-popover"><header><strong>Instrucciones para esta conversación</strong><span>Se enviarán antes de cada mensaje.</span></header><textarea value={instructions} onChange={(event) => saveInstructions(event.target.value)} placeholder="Por ejemplo: responde en español claro y avisa cuando no estés seguro." maxLength={2_000} /><div className="inference-instruction-presets">{["Respuestas directas", "Paso a paso", "Código primero", "Resumen breve"].map((preset) => <button type="button" key={preset} onClick={() => saveInstructions(instructions.trim() ? `${instructions.trim()}\n${preset}.` : `${preset}.`)}>{preset}</button>)}</div><footer><button type="button" onClick={() => saveInstructions("")}>Limpiar</button><button type="button" onClick={() => setInstructionsOpen(false)}>Listo</button></footer></div>}
+          </div>
+          <span>{inferenceAvailable ? <><Paperclip size={12} />Archivos · <kbd>Enter</kbd> enviar</> : <><LockKeyhole size={12} />{modelAvailable ? "Inicia sesión para enviar" : "Conecta un modelo real"}</>}</span>
+        </div><div>{turns.length > 0 && <button className="inference-clear" onClick={() => resetConversation()}><Trash2 size={14} />Nueva conversación</button>}<button className="inference-send" disabled={!inferenceAvailable || (!prompt.trim() && attachments.length === 0) || pendingTurn !== null || filesBusy} onClick={() => void send()}>{pendingTurn ? <LoaderCircle className="spin" /> : <Send />}<span>Enviar</span></button></div></div>
       </div>
     </div>
   </section>;
@@ -4123,8 +4200,26 @@ function InferenceCompletedTurn({ turn }: { turn: InferenceTurn }) {
   const content = splitThinkingContent(turn.response.text);
   return <div className="inference-turn">
     <InferenceUserMessage prompt={turn.prompt} attachments={turn.attachments} />
+    {turn.response.activity && <InferenceActivitySummary activity={turn.response.activity} />}
     <div className="inference-message"><img src={brandIcon} alt="" /><div><span>{turn.response.model}</span>{content.reasoning && <details className="inference-reasoning"><summary>Ver razonamiento del modelo</summary><p>{content.reasoning}</p></details>}<p>{content.answer}</p><div className="inference-response-metrics"><span><b>{formatDuration(turn.response.ttftMs)}</b>primer token</span><span><b>{formatDuration(turn.response.activeMs)}</b>tiempo total</span><span><b>{turn.response.outputTokens}</b>tokens salida</span><span><b>{formatResponseThroughput(turn.response)}</b>tokens/s</span><span><b>{turn.response.routeClass}</b>ruta</span>{turn.response.reusedKvTokens > 0 ? <span><b>{turn.response.reusedKvTokens}</b>tokens KV reutilizados</span> : turn.response.affinityHit ? <span><b>AFÍN</b>misma ruta</span> : null}</div></div></div>
   </div>;
+}
+
+function InferenceActivitySummary({ activity }: { activity: NonNullable<ChatResponse["activity"]> }) {
+  const status = activity.goal?.status ?? "in_progress";
+  const storageKey = `mycellios.remembered-activity.${activity.goal?.title ?? activity.model}`;
+  const [remembered, setRemembered] = useState(() => window.localStorage.getItem(storageKey) !== null);
+  function toggleRemembered() {
+    if (remembered) window.localStorage.removeItem(storageKey);
+    else window.localStorage.setItem(storageKey, JSON.stringify(activity));
+    setRemembered(!remembered);
+  }
+  return <aside className="inference-activity-summary">
+    <header><span><strong>Model {activity.model}</strong>{activity.effort && <><i />Effort {activity.effort}</>}</span>{activity.rememberable && <button type="button" aria-pressed={remembered} onClick={toggleRemembered}>{remembered ? <Check /> : <History />}{remembered ? "Remembered" : "Remember this"}</button>}</header>
+    {activity.goal && <section><span className={`inference-activity-status ${status}`}>{status.replaceAll("_", " ")}</span><h3>{activity.goal.title}</h3><small>{activity.goal.tokens !== null ? `${activity.goal.tokens.toLocaleString()} tokens` : ""}{activity.goal.tokens !== null && activity.goal.elapsedMs !== null ? " · " : ""}{activity.goal.elapsedMs !== null ? formatDuration(activity.goal.elapsedMs) : ""}</small></section>}
+    {activity.requestSummary && <section><span>Request summary</span><p>{activity.requestSummary}</p></section>}
+    {activity.decision && <section className="inference-activity-decision"><span>{activity.goal?.status === "needs_decision" ? "Needs decision" : "Outcome"}</span><h3>{activity.decision.headline}</h3>{activity.decision.pending.length > 0 && <ul>{activity.decision.pending.map((item) => <li key={item}>{item}</li>)}</ul>}{activity.decision.userAction && <p><strong>Your action:</strong> {activity.decision.userAction}</p>}</section>}
+  </aside>;
 }
 
 function InferenceUserMessage({ prompt, attachments }: { prompt: string; attachments: InferenceAttachmentSummary[] }) {
@@ -4616,6 +4711,7 @@ function AcceleratorProgressPanel({ acceleration, contributionState, computeMode
 }
 
 function DesktopSettingsView({ snapshot, bridge, onSnapshot, developerMode }: { snapshot: DashboardSnapshot; bridge: DesktopBridge; onSnapshot: (snapshot: DashboardSnapshot) => void; developerMode: boolean }) {
+  const [settingsTab, setSettingsTab] = useState<"general" | "node" | "updates" | "developer">("general");
   const [draft, setDraft] = useState(snapshot.settings);
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -4659,9 +4755,17 @@ function DesktopSettingsView({ snapshot, bridge, onSnapshot, developerMode }: { 
   }
   return <section className="content-page settings-page">
     <PageTitle eyebrow={developerMode ? "DEVELOPER PREFERENCES" : "DESKTOP PREFERENCES"} title="Settings" copy={developerMode ? "Coordinator, runtime, contribution, background behavior and updates for this computer." : "The everyday application and update preferences for this computer."} />
+    <div className={`settings-workspace show-${settingsTab}`}>
+      <nav className="settings-local-nav" aria-label="Settings sections">
+        <button className={settingsTab === "general" ? "active" : ""} onClick={() => setSettingsTab("general")}><UserRound />General</button>
+        <button className={settingsTab === "node" ? "active" : ""} onClick={() => setSettingsTab("node")}><Cpu />Node</button>
+        <button className={settingsTab === "updates" ? "active" : ""} onClick={() => setSettingsTab("updates")}><Download />Updates</button>
+        {developerMode && <button className={settingsTab === "developer" ? "active" : ""} onClick={() => setSettingsTab("developer")}><Code2 />Developer</button>}
+      </nav>
+      <div className="settings-local-content">
     {error && <div className="inline-error"><CircleAlert size={17} />{error}</div>}
-    <div className="settings-section"><div><Globe2 size={20} /><div><h3>Coordinator</h3><p>Use the public network or host an isolated local coordinator.</p></div></div><div className="settings-fields"><label>Mode<AppSelect ariaLabel="Coordinator mode" value={draft.coordinatorMode} onChange={(value) => updateCoordinatorMode(value as DesktopSettings["coordinatorMode"])} options={[{ value: "remote", label: "Public mycellios network" }, { value: "local", label: "Local network on this machine" }]} /></label>{draft.coordinatorMode === "remote" && <label>Coordinator URL<input value={draft.remoteCoordinatorUrl} onChange={(event) => update("remoteCoordinatorUrl", event.target.value)} /></label>}<label>Region<input value={draft.region} onChange={(event) => update("region", event.target.value)} placeholder="auto" /></label></div></div>
-    <div className="settings-section">
+    <div className="settings-section" data-settings-group="general"><div><Globe2 size={20} /><div><h3>Coordinator</h3><p>Use the public network or host an isolated local coordinator.</p></div></div><div className="settings-fields"><label>Mode<AppSelect ariaLabel="Coordinator mode" value={draft.coordinatorMode} onChange={(value) => updateCoordinatorMode(value as DesktopSettings["coordinatorMode"])} options={[{ value: "remote", label: "Public mycellios network" }, { value: "local", label: "Local network on this machine" }]} /></label>{draft.coordinatorMode === "remote" && <label>Coordinator URL<input value={draft.remoteCoordinatorUrl} onChange={(event) => update("remoteCoordinatorUrl", event.target.value)} /></label>}<label>Region<input value={draft.region} onChange={(event) => update("region", event.target.value)} placeholder="auto" /></label></div></div>
+    <div className="settings-section" data-settings-group="node">
       <div><Gauge size={20} /><div><h3>Contribution</h3><p>This computer always uses the built-in Mycellios runtime. Models appear only after a verified native deployment starts.</p></div></div>
       <div className="settings-fields">
         <label>Compute mode<AppSelect ariaLabel="Compute mode" value={draft.computeMode} onChange={(value) => update("computeMode", value as DesktopSettings["computeMode"])} options={[{ value: "automatic", label: "Automatic · GPU preferred" }, { value: "gpu-only", label: "GPU only · never CPU" }, { value: "cpu-only", label: "CPU only · GPU disabled" }]} /></label>
@@ -4672,9 +4776,11 @@ function DesktopSettingsView({ snapshot, bridge, onSnapshot, developerMode }: { 
         </div>
       </div>
     </div>
-    <div className="settings-section compact-settings"><div><SlidersHorizontal size={20} /><div><h3>Application</h3><p>Startup and background contribution.</p></div></div><div className="toggle-list"><Toggle label="Start with the system" checked={draft.launchAtLogin} onChange={(value) => update("launchAtLogin", value)} /><Toggle label="Keep running in the tray" checked={draft.closeToTray} onChange={(value) => update("closeToTray", value)} /><Toggle label="Contribute resources" checked={draft.contributionEnabled} onChange={(value) => update("contributionEnabled", value)} /></div></div>
-    <div className="settings-section"><div><Download size={20} /><div><h3>Automatic updates</h3><p>Desktop releases download in the background and install automatically as soon as active inference is idle.</p></div></div><div className="update-settings"><div><span className={`update-state ${snapshot.update.state}`}>{updateStateLabel(snapshot.update.state)}</span><strong>Version {snapshot.appVersion}</strong><p>{snapshot.update.message}</p><p title={buildIdentityTitle(snapshot.buildIdentity)}>Exact build: {shortBuildIdentity(snapshot.buildIdentity)}</p></div><div className="update-actions"><button className="secondary-button" disabled={checkingUpdate || snapshot.update.state === "checking" || snapshot.update.state === "downloading"} onClick={() => void checkUpdate()}><RefreshCw className={checkingUpdate ? "spin" : ""} size={15} />Check now</button>{snapshot.update.state === "ready" && <button className="primary-button" onClick={() => void bridge.installUpdate()}><Download size={15} />Restart now</button>}</div></div></div>
+    <div className="settings-section compact-settings" data-settings-group="general"><div><SlidersHorizontal size={20} /><div><h3>Application</h3><p>Startup and background contribution.</p></div></div><div className="toggle-list"><Toggle label="Start with the system" checked={draft.launchAtLogin} onChange={(value) => update("launchAtLogin", value)} /><Toggle label="Keep running in the tray" checked={draft.closeToTray} onChange={(value) => update("closeToTray", value)} /><Toggle label="Contribute resources" checked={draft.contributionEnabled} onChange={(value) => update("contributionEnabled", value)} /></div></div>
+    <div className="settings-section" data-settings-group="updates"><div><Download size={20} /><div><h3>Automatic updates</h3><p>Desktop releases download in the background and install automatically as soon as active inference is idle.</p></div></div><div className="update-settings"><div><span className={`update-state ${snapshot.update.state}`}>{updateStateLabel(snapshot.update.state)}</span><strong>Version {snapshot.appVersion}</strong><p>{snapshot.update.message}</p><p title={buildIdentityTitle(snapshot.buildIdentity)}>Exact build: {shortBuildIdentity(snapshot.buildIdentity)}</p></div><div className="update-actions"><button className="secondary-button" disabled={checkingUpdate || snapshot.update.state === "checking" || snapshot.update.state === "downloading"} onClick={() => void checkUpdate()}><RefreshCw className={checkingUpdate ? "spin" : ""} size={15} />Check now</button>{snapshot.update.state === "ready" && <button className="primary-button" onClick={() => void bridge.installUpdate()}><Download size={15} />Restart now</button>}</div></div></div>
     <div className="settings-footer"><button className="primary-button" disabled={saving} onClick={() => void save()}>{saving ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}Save and reconnect</button></div>
+      </div>
+    </div>
   </section>;
 }
 

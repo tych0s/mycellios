@@ -1,5 +1,6 @@
 import { ChevronDown, Image as ImageIcon, Menu, X } from "lucide-react";
 import { useState, type FormEvent } from "react";
+import { SporeMenu, SporeMobileLinks } from "./SporeMenu";
 import "./create-studio.css";
 
 const styles = ["None", "Photo", "Cinematic", "Anime", "Digital Art", "3D"] as const;
@@ -14,7 +15,7 @@ export function CreateStudio() {
 
   function submit(event: FormEvent) {
     event.preventDefault();
-    window.location.assign("/network");
+    window.location.assign("/network?view=overview");
   }
 
   return (
@@ -22,11 +23,11 @@ export function CreateStudio() {
       <header className="create-header">
         <a className="create-brand" href="/" aria-label="Mycellios home"><img src="/assets/logos/logo.png" alt="" />mycellios</a>
         <nav aria-label="Main navigation">
-          <a href="/network?view=inference">Chat</a><a className="active" href="/create" aria-current="page">Create</a><a href="/#how-it-works">How it works</a><a href="/#architecture">Architecture</a><a href="/#evidence">Evidence</a><a href="/blog">Blog</a>
+          <a href="/network?view=inference">Chat</a><a className="active" href="/create" aria-current="page">Create</a><a href="/earn">Earn</a><SporeMenu /><a href="/#how-it-works">Network</a><a href="/blog">Blog</a>
         </nav>
-        <a className="create-login" href="/network">Login</a>
+        <a className="create-login" href="/network?view=overview">Login</a>
         <button className="create-menu-button" type="button" aria-label={menuOpen ? "Close menu" : "Open menu"} aria-expanded={menuOpen} onClick={() => setMenuOpen((open) => !open)}>{menuOpen ? <X /> : <Menu />}</button>
-        {menuOpen && <div className="create-mobile-nav"><a href="/network?view=inference">Chat</a><a className="active" href="/create">Create</a><a href="/#how-it-works">How it works</a><a href="/#architecture">Architecture</a><a href="/#evidence">Evidence</a><a href="/blog">Blog</a><a href="/network">Login</a></div>}
+        {menuOpen && <div className="create-mobile-nav"><a href="/network?view=inference">Chat</a><a className="active" href="/create">Create</a><a href="/earn">Earn</a><SporeMobileLinks /><a href="/#how-it-works">Network</a><a href="/blog">Blog</a><a href="/network?view=overview">Login</a></div>}
       </header>
 
       <section className="create-canvas" aria-live="polite">

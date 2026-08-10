@@ -43,6 +43,8 @@ export function storedAuthSession(): AuthSession | null {
 }
 
 export async function restoreAuthSession(config: PublicAuthConfig): Promise<AuthSession | null> {
+  const redirected = await consumeOAuthRedirect(config);
+  if (redirected) return redirected;
   const current = storedAuthSession();
   if (!current || !config.enabled || !config.url || !config.anonKey) return null;
   if (current.expiresAt > Date.now() + 60_000) return current;
@@ -72,6 +74,48 @@ export function signUp(
   return authRequest(config, "/auth/v1/signup", { email, password });
 }
 
+export function signInWithX(config: PublicAuthConfig): void {
+  assertAuthConfig(config);
+  const authorizeUrl = new URL("/auth/v1/authorize", config.url);
+  authorizeUrl.searchParams.set("provider", "x");
+  authorizeUrl.searchParams.set("redirect_to", `${window.location.origin}${window.location.pathname}${window.location.search}`);
+  window.location.assign(authorizeUrl);
+}
+
+export async function signInWithMetaMask(config: PublicAuthConfig): Promise<AuthSession> {
+  assertAuthConfig(config);
+  const ethereum = (window as Window & {
+    ethereum?: { request: (request: { method: string; params?: unknown[] }) => Promise<unknown> };
+  }).ethereum;
+  if (!ethereum) throw new Error("MetaMask is not installed in this browser.");
+
+  const accounts = await ethereum.request({ method: "eth_requestAccounts" });
+  const address = Array.isArray(accounts) && typeof accounts[0] === "string" ? accounts[0] : null;
+  if (!address) throw new Error("MetaMask did not provide an Ethereum account.");
+  const rawChainId = await ethereum.request({ method: "eth_chainId" });
+  const chainId = typeof rawChainId === "string" ? Number.parseInt(rawChainId, 16) : Number.NaN;
+  if (!Number.isSafeInteger(chainId)) throw new Error("MetaMask returned an invalid chain ID.");
+
+  const uri = `${window.location.origin}${window.location.pathname}`;
+  const nonce = [...crypto.getRandomValues(new Uint8Array(8))]
+    .map((value) => value.toString(16).padStart(2, "0"))
+    .join("");
+  const message = `${window.location.host} wants you to sign in with your Ethereum account:\n${address}\n\nSign in to Mycellios.\n\nURI: ${uri}\nVersion: 1\nChain ID: ${chainId}\nNonce: ${nonce}\nIssued At: ${new Date().toISOString()}`;
+  const encodedMessage = `0x${[...new TextEncoder().encode(message)]
+    .map((value) => value.toString(16).padStart(2, "0"))
+    .join("")}`;
+  const signature = await ethereum.request({
+    method: "personal_sign",
+    params: [encodedMessage, address],
+  });
+  if (typeof signature !== "string") throw new Error("MetaMask did not return a valid signature.");
+  return authRequest(config, "/auth/v1/token?grant_type=web3", {
+    chain: "ethereum",
+    message,
+    signature,
+  });
+}
+
 export async function loadNetworkIdentity(accessToken: string): Promise<NetworkIdentity> {
   const response = await fetch("/v1/auth/me", {
     cache: "no-store",
@@ -98,14 +142,43 @@ function clearAuthSession(): void {
   window.localStorage.removeItem(SESSION_KEY);
 }
 
+function assertAuthConfig(config: PublicAuthConfig): asserts config is PublicAuthConfig & { url: string; anonKey: string } {
+  if (!config.enabled || !config.url || !config.anonKey) {
+    throw new Error("Mycellios accounts are not available yet.");
+  }
+}
+
+async function consumeOAuthRedirect(config: PublicAuthConfig): Promise<AuthSession | null> {
+  if (!window.location.hash.includes("access_token=") && !window.location.hash.includes("error=")) return null;
+  const params = new URLSearchParams(window.location.hash.slice(1));
+  const oauthError = params.get("error_description") ?? params.get("error");
+  window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+  if (oauthError) throw new Error(oauthError);
+  assertAuthConfig(config);
+  const accessToken = params.get("access_token");
+  const refreshToken = params.get("refresh_token");
+  if (!accessToken || !refreshToken) throw new Error("X did not return a valid Mycellios session.");
+  const response = await fetch(new URL("/auth/v1/user", config.url), {
+    headers: { apikey: config.anonKey, authorization: `Bearer ${accessToken}` },
+  });
+  const user = await response.json().catch(() => null) as { id?: unknown; email?: unknown } | null;
+  if (!response.ok || typeof user?.id !== "string") throw new Error("X returned an invalid Mycellios identity.");
+  const session: AuthSession = {
+    accessToken,
+    refreshToken,
+    expiresAt: Date.now() + Number(params.get("expires_in") ?? 3600) * 1_000,
+    user: { id: user.id, email: typeof user.email === "string" ? user.email : null },
+  };
+  window.localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+  return session;
+}
+
 async function authRequest(
   config: PublicAuthConfig,
   path: string,
   body: Record<string, string>,
 ): Promise<AuthSession> {
-  if (!config.enabled || !config.url || !config.anonKey) {
-    throw new Error("Mycellios accounts are not available yet.");
-  }
+  assertAuthConfig(config);
   const response = await fetch(new URL(path, config.url), {
     method: "POST",
     headers: { apikey: config.anonKey, "content-type": "application/json" },

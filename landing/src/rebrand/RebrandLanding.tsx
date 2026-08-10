@@ -3,41 +3,52 @@ import {
   ArrowDownRight,
   ArrowRight,
   ArrowUpRight,
-  Boxes,
   Check,
-  ChevronDown,
-  ChevronRight,
   CircleDot,
   Coins,
   Cpu,
   Download,
-  Gauge,
   GitBranch,
   HardDriveDownload,
-  Layers3,
-  MemoryStick,
   Menu,
-  MonitorDown,
-  Network,
-  Pause,
-  Play,
-  Radio,
   Route,
   ShieldCheck,
   Sparkles,
   Users,
-  Workflow,
   X,
   Zap,
 } from "lucide-react";
-import { useEffect, useRef, useState, type CSSProperties, type FormEvent } from "react";
-import efficiencyCurve from "../assets/efficiency-curve-ai.webp";
-import storyImage from "../assets/mycelium-story.webp";
+import { useEffect, useRef, useState, type CSSProperties, type FormEvent, type PointerEvent } from "react";
 import { applySeoMetadata } from "../seo";
 import { SupportAssistant } from "../SupportAssistant";
 import { HeroGlobe } from "./HeroGlobe";
-import liveImage from "./assets/mycellios-live-network.webp";
+import { MyceliumBackdrop } from "./MyceliumBackdrop";
+import { LocalStrip } from "./LocalStrip";
+import { ModelsSection } from "./ModelsSection";
+import { PaymentsSection } from "./PaymentsSection";
+import { QuestionsSection } from "./QuestionsSection";
+import { ScrollStory } from "./ScrollStory";
+import { SponsorFooter } from "./SponsorFooter";
+import { SporeMenu, SporeMobileLinks } from "./SporeMenu";
+import { useCountUp, useInView, useRevealOnScroll } from "./use-motion";
 import "./rebrand.css";
+
+/*
+ * The landing is a scroll pitch, not a product manual.
+ *
+ * After the hero it runs a fixed order of sections, each answering exactly one
+ * question a first-time visitor or an investor asks: how does it work, who pays
+ * whom, which models can I run, do I have to join anything, where do I fit, is
+ * any of this actually built, what about the parts I am sceptical of, how do I
+ * start, and who is behind it. Detail that belongs to the docs, the panel or
+ * the blog is linked, not restated — the earlier fourteen-section version made
+ * the reader work for a story that fits in this.
+ *
+ * Every visual here is generated in the browser (SVG, canvas, CSS) and driven
+ * by the reader's own scroll. There are no still renders standing in for the
+ * system: a diagram that moves when you move explains a distributed runtime
+ * better than a photograph of mycelium ever did.
+ */
 
 const brandLogo = "/assets/logos/logo.png";
 const EMAIL = "hello@mycellios.com";
@@ -72,68 +83,42 @@ function TelegramMark() {
   );
 }
 
-const steps = [
-  { id: "01", title: "Your device", copy: "Choose how much capacity to share. You stay in control." },
-  { id: "02", title: "A worker sprouts", copy: "mycellios detects the hardware and turns it into usable capacity." },
-  { id: "03", title: "It reaches the network", copy: "The node finds a compatible cell by memory, latency, and availability." },
-  { id: "04", title: "It runs one part", copy: "Each worker receives only the model stage it can process." },
-  { id: "05", title: "One answer returns", copy: "The network gathers the result and returns it as a single stream." },
-] as const;
-
-const workers = [
-  { species: "Small", name: "Home computer", hardware: "8–16 GB · CPU / iGPU", model: "Compact models", load: "Light", group: "single" },
-  { species: "Robust", name: "Dedicated GPU", hardware: "12–24 GB VRAM", model: "Accelerated stages", load: "Medium", group: "strong" },
-  { species: "Colony", name: "Farm or community", hardware: "Multiple machines", model: "Distributed models", load: "Coordinated", group: "cluster" },
-  { species: "Dormant", name: "Offline node", hardware: "Reserved capacity", model: "Receives no tasks", load: "Paused", group: "dormant" },
-] as const;
-
-const hardwareProfiles = {
-  "integrated": { label: "Mycelium worker", type: "Home computer", models: "Compact models and support tasks", compute: "Light contribution", capacity: "System memory" },
-  "rtx-3060": { label: "Chanterelle worker", type: "Dedicated GPU", models: "Quantized stages up to 12 GB", compute: "Medium contribution", capacity: "12 GB VRAM" },
-  "rtx-4090": { label: "Boletus worker", type: "High-performance GPU", models: "Large stages and accelerated routes", compute: "High contribution", capacity: "24 GB VRAM" },
-  "multi": { label: "Distributed colony", type: "Farm or community", models: "Models split across multiple nodes", compute: "Coordinated contribution", capacity: "Combined capacity" },
-} as const;
-
-const explainerSteps = [
-  ["01", "Offer capacity", "Choose what each device can contribute."],
-  ["02", "Connect nodes", "Useful machines form one coordinated network."],
-  ["03", "Split the model", "Every node holds only its assigned part."],
-  ["04", "Stream the answer", "One request returns one continuous response."],
-] as const;
-
-const accelerationPhases = [
-  { step: "NOW · 01", title: "Fit the model", copy: "Pool heterogeneous memory so models can run beyond the limit of any single machine.", signal: "MEMORY" },
-  { step: "NEXT · 02", title: "Shorten the route", copy: "Keep experts resident and move each request through fewer, faster network boundaries.", signal: "LOCALITY" },
-  { step: "SCALE · 03", title: "Multiply the paths", copy: "Coordinate parallel cells so added capacity can become useful throughput instead of added latency.", signal: "TOKENS / S" },
-] as const;
-
-const pipelineStages = [
-  { number: "01", name: "Analyze", detail: "memory · topology" },
-  { number: "02", name: "Partition", detail: "layers · experts" },
-  { number: "03", name: "Assign", detail: "the best machine" },
-  { number: "04", name: "Coordinate", detail: "one route" },
-] as const;
-
-const pipelineNodes = ["GPU · 12 GB", "GPU · 4 GB", "CPU · 64 GB", "GPU · 8 GB", "STANDBY"] as const;
-
-const architecturePrinciples = [
-  { title1: "One model,", title2: "many memories", copy: "Each node stores and processes only one part. The complete model emerges from collaboration.", label: "PARTITIONING" },
-  { title1: "Cells first,", title2: "then the network", copy: "Nearby machines form fast cells. The WAN connects a few virtual stages, not hundreds of hops.", label: "HIERARCHICAL MESH" },
-  { title1: "The route changes.", title2: "The work continues.", copy: "The scheduler measures capacity, connectivity, and availability to prepare alternatives as the network changes.", label: "ADAPTIVE ROUTING" },
+const doors = [
+  {
+    label: "Developers",
+    title: "One API. Served by a network.",
+    copy: "An OpenAI-compatible endpoint that runs on pooled machines instead of a data center.",
+    action: { href: "/network?view=inference", text: "Try it live" },
+    icon: Sparkles,
+  },
+  {
+    label: "GPU owners",
+    title: "Idle hardware. Useful work.",
+    copy: "Contribute what you choose, pause whenever you want, and only accepted work counts.",
+    action: { href: "/earn", text: "Start contributing" },
+    icon: Cpu,
+  },
+  {
+    label: "Open-model community",
+    title: "Open models need open infrastructure.",
+    copy: "The runtime, the scheduler and the evidence behind every claim are public.",
+    action: { href: GITHUB_URL, text: "Read the source", external: true },
+    icon: Users,
+  },
 ] as const;
 
 const evidenceRows = [
-  ["Partitioned-model runtime", "Real pipeline and compatible API", "READY"],
-  ["Heterogeneous scheduler", "Memory, topology, and availability", "READY"],
-  ["Stage recovery", "Alternate route and greedy continuation", "LAB"],
-  ["Model larger than every node", "Test across 2–4 physical machines", "TESTING"],
+  { title: "Partitioned-model runtime", detail: "Real pipeline, compatible API", status: "READY", done: true },
+  { title: "Heterogeneous scheduler", detail: "Memory, topology, availability", status: "READY", done: true },
+  { title: "Stage recovery", detail: "Alternate route, greedy continuation", status: "LAB", done: true },
+  { title: "Model larger than every node", detail: "2–4 physical machines", status: "TESTING", done: false },
 ] as const;
 
 const downloads = {
-  windows: { label: "Windows", detail: "Windows 10/11 · x64", filename: "mycellios-windows-x64.exe" },
-  "mac-arm64": { label: "macOS", detail: "Apple Silicon", filename: "mycellios-macos-arm64.dmg" },
-  "linux-deb": { label: "Linux", detail: "Ubuntu / Debian · x64", filename: "mycellios-linux-x64.deb" },
-  "linux-rpm": { label: "Linux", detail: "Fedora / RHEL · x64", filename: "mycellios-linux-x64.rpm" },
+  windows: { label: "Windows", detail: "Windows 10/11 · x64" },
+  "mac-arm64": { label: "macOS", detail: "Apple Silicon" },
+  "linux-deb": { label: "Linux", detail: "Ubuntu / Debian · x64" },
+  "linux-rpm": { label: "Linux", detail: "Fedora / RHEL · x64" },
 } as const;
 
 type DownloadKey = keyof typeof downloads;
@@ -146,508 +131,84 @@ function downloadUrl(key: DownloadKey): string {
   throw new Error(`Unsupported download target: ${String(key)}`);
 }
 
-const installSteps = [
-  { label: "Install", detail: "Desktop agent added", status: "DONE" },
-  { label: "Detect", detail: "CPU · RAM · GPU mapped", status: "DONE" },
-  { label: "Choose", detail: "Join or create a network", status: "READY" },
-] as const;
-
-const futureCards = {
-  improvement: {
-    index: "01",
-    label: "AUTONOMOUS IMPROVEMENT",
-    metric: "0.1",
-    unit: "%",
-    metricDetail: "OF VERIFIED USEFUL COMPUTE",
-    title: "The network improves the network.",
-    copy: "Reserve a strictly bounded share of useful compute for infrastructure R&D: regression and failure tests, new scheduling algorithms, and candidate routes or topologies evaluated in isolation.",
-    steps: ["Test failures and regressions", "Trial algorithms and routes", "Promote only verified gains"],
-    footer: "Bounded budget · auditable history · controlled rollout",
-  },
-  token: {
-    index: "02",
-    label: "VERIFIABLE INCENTIVES",
-    metric: "TOKEN",
-    metricDetail: "FOR ACCEPTED NETWORK WORK",
-    title: "Useful compute becomes verifiable value.",
-    copy: "Build a crypto token around work the network actually accepts — not advertised capacity or passive connection — with quality, reliability and fraud resistance built in.",
-    steps: ["Internal credits first", "Public testnet without monetary value", "Audited launch after legal review"],
-    footer: "No active token · no financial promise",
-  },
-  router: {
-    index: "03",
-    label: "INTELLIGENT MODEL ROUTING",
-    metric: "ONE API",
-    metricDetail: "EVERY MODEL · BEST AVAILABLE PATH",
-    title: "One request. The right intelligence.",
-    copy: "A unified AI router inspired by the model gateways behind products such as OpenRouter and Cursor. It will evaluate the task, quality, cost, latency, privacy and live network capacity before selecting the best model and execution path.",
-    steps: ["Unify Mycellios, local and external models", "Choose by quality, price, speed and privacy", "Fail over without changing the application"],
-    footer: "Provider-neutral · policy-controlled · every routing decision observable",
-    input: "UNIFIED REQUEST",
-    engine: "ROUTING ENGINE",
-    policies: ["QUALITY", "COST", "LATENCY", "PRIVACY"],
-    destinations: ["MYCELLIOS", "LOCAL GPU", "OPEN MODELS", "CLOUD APIs"],
-  },
-} as const;
-
-const participateCards = [
-  {
-    label: "FOR CONTRIBUTORS",
-    title: "Turn idle capacity into useful capacity.",
-    copy: "Connect a PC, workstation, or server. Decide how much you contribute and pause whenever you want.",
-    bullets: ["Different hardware, one network", "Voluntary contribution", "Verifiable work"],
-  },
-  {
-    label: "FOR TEAMS AND ORGANIZATIONS",
-    title: "Run open models on infrastructure you control.",
-    copy: "Create private networks for labs, companies, and communities with distributed hardware.",
-    bullets: ["Larger models through pooled memory", "A familiar API for your applications", "Topology adapted to your network"],
-  },
-] as const;
-
-type HardwareKey = keyof typeof hardwareProfiles;
-
 function Brand() {
   return <a className="rb-brand" href="#rb-top" aria-label="mycellios, home"><img src={brandLogo} alt="" /><span>mycellios</span></a>;
 }
 
-function NetworkThreads({ compact = false }: { compact?: boolean }) {
-  return (
-    <svg className={`rb-threads ${compact ? "is-compact" : ""}`} viewBox="0 0 900 520" aria-hidden="true">
-      <g className="rb-thread-lines">
-        <path d="M40 350C150 295 190 390 285 310S450 210 535 275s148 42 318-90" />
-        <path d="M80 170c100 5 116 102 211 94s137-98 226-52 145 123 305 75" />
-        <path d="M120 450c42-112 129-106 196-57s109-8 137-94 110-131 195-84 92 121 173 154" />
-        <path d="M172 91c40 82 96 114 164 82s120-11 169 62 99 91 178 41 104-43 161-19" />
-      </g>
-      {["80,170", "172,91", "285,310", "336,173", "453,299", "517,212", "535,275", "648,215", "683,276", "821,369", "853,185"].map((point, index) => {
-        const [cx, cy] = point.split(",");
-        return <circle key={point} cx={cx} cy={cy} r={index % 3 === 0 ? 7 : 4} style={{ "--i": index } as CSSProperties} />;
-      })}
-    </svg>
-  );
+/*
+ * Pointer-tracked highlight for the card grids.
+ *
+ * The position is written straight to the element as two custom properties and
+ * the light itself is a CSS radial gradient, so the card follows the cursor
+ * without a single React re-render. Nothing depends on this: with no pointer
+ * (touch, keyboard) the properties keep their fallbacks and the card is simply
+ * a card.
+ */
+function trackGlow(event: PointerEvent<HTMLElement>): void {
+  const box = event.currentTarget.getBoundingClientRect();
+  event.currentTarget.style.setProperty("--mx", `${((event.clientX - box.left) / box.width) * 100}%`);
+  event.currentTarget.style.setProperty("--my", `${((event.clientY - box.top) / box.height) * 100}%`);
 }
 
-function ExplainerSection() {
-  const section = useRef<HTMLElement>(null);
-  const [activeScene, setActiveScene] = useState(0);
-  const [isPaused, setIsPaused] = useState(false);
-  const [hasStarted, setHasStarted] = useState(false);
-
-  useEffect(() => {
-    const target = section.current;
-    if (!target) return;
-    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-      setActiveScene(explainerSteps.length - 1);
-      setHasStarted(true);
-      return;
-    }
-    const observer = new IntersectionObserver(([entry]) => {
-      if (!entry?.isIntersecting) return;
-      setHasStarted(true);
-      observer.disconnect();
-    }, { threshold: 0.28 });
-    observer.observe(target);
-    return () => observer.disconnect();
-  }, []);
-
-  useEffect(() => {
-    if (!hasStarted || isPaused || activeScene >= explainerSteps.length - 1) return;
-    const timer = window.setTimeout(() => setActiveScene((scene) => scene + 1), 4000);
-    return () => window.clearTimeout(timer);
-  }, [activeScene, hasStarted, isPaused]);
-
-  const stageLabels = ["Request enters", "Cell plans the route", "Workers receive stages", "One answer returns"];
-  const stageDetails = [
-    "Your app sends one familiar request to the local Mycellios endpoint.",
-    "The cell checks the model, then chooses useful memory and compute.",
-    "Only the selected machines appear; each receives a stage sized for its hardware.",
-    "Partial results travel back through the cell as one continuous answer.",
-  ];
-  const selectScene = (index: number) => {
-    setActiveScene(index);
-    setIsPaused(true);
-  };
-  const isComplete = activeScene === explainerSteps.length - 1;
-  const togglePlayback = () => {
-    if (isComplete) {
-      setActiveScene(0);
-      setIsPaused(false);
-      setHasStarted(true);
-      return;
-    }
-    setIsPaused((paused) => !paused);
-  };
-
-  return (
-    <section className="rb-explainer" id="explainer" ref={section} aria-labelledby="rb-explainer-title">
-      <div className="rb-shell">
-        <div className="rb-explainer-heading rb-reveal">
-          <p className="rb-kicker"><i /><span>00 / Start here — mycellios in 20 seconds</span></p>
-          <h2 id="rb-explainer-title">Several devices.<br /><em>One AI model.</em></h2>
-          <p>Each computer contributes only the capacity you choose. mycellios connects that capacity, distributes the model, and returns one streamed answer.</p>
-        </div>
-
-        <div className={`rb-system-demo scene-${activeScene}`} aria-live="polite">
-          <div className="rb-demo-grid" aria-hidden="true" />
-          <div className="rb-demo-explanation" key={activeScene}>
-            <span>STEP 0{activeScene + 1}</span>
-            <strong>{stageLabels[activeScene]}</strong>
-            <p>{stageDetails[activeScene]}</p>
-          </div>
-          <svg className="rb-demo-routes" viewBox="0 0 1000 520" preserveAspectRatio="none" aria-hidden="true">
-            <path className="route-in" d="M120 260 C260 260 290 260 410 260" />
-            <path className="route-a" d="M540 250 C650 110 720 100 855 105" />
-            <path className="route-b" d="M540 260 C675 260 720 260 875 260" />
-            <path className="route-c" d="M540 270 C650 410 720 420 855 415" />
-            <path className="route-out" d="M540 260 C690 260 720 260 940 260" />
-          </svg>
-
-          <button className="rb-demo-node rb-demo-request" type="button" onClick={() => selectScene(0)} aria-label="Show request stage">
-            <span><Sparkles /></span><small>YOUR APP</small><strong>“Explain this image”</strong><i>OpenAI-compatible request</i>
-          </button>
-
-          <button className="rb-demo-core" type="button" disabled={activeScene < 1} onClick={() => selectScene(1)} aria-label="Show coordination stage">
-            <span className="rb-core-rings"><i /><i /><i /></span><Network /><small>MYCELLIOS CELL</small><strong>{stageLabels[activeScene]}</strong><b>{isPaused ? "MANUAL" : "AUTO"}</b>
-          </button>
-
-          <div className="rb-demo-workers" aria-label="Available workers">
-            {[
-              { id: "worker_01", name: "RTX 4090", memory: "24 GB", Icon: Cpu },
-              { id: "worker_02", name: "Mac Studio", memory: "64 GB", Icon: MonitorDown },
-              { id: "worker_03", name: "Home PC", memory: "16 GB", Icon: MemoryStick },
-            ].map(({ id, name, memory, Icon }, index) => (
-              <button key={id} type="button" disabled={activeScene < 2} className={`rb-demo-worker worker-${index}`} onClick={() => selectScene(2)} aria-label={`Inspect ${name}`}>
-                <Icon /><span><small>{id}</small><strong>{name}</strong></span><b>{memory}</b><i>{activeScene >= 2 ? `stage 0${index + 1}` : "available"}</i>
-              </button>
-            ))}
-          </div>
-
-          <button className="rb-demo-response" type="button" disabled={activeScene < 3} onClick={() => selectScene(3)} aria-label="Show assembled response">
-            <Check /><span><small>ONE STREAM</small><strong>Answer assembled</strong></span><i>token by token</i>
-          </button>
-
-          <div className="rb-demo-status"><i /><span>{stageLabels[activeScene]}</span><b>0{activeScene + 1} / 04</b></div>
-          <button className="rb-demo-play" type="button" onClick={togglePlayback} aria-label={isComplete ? "Replay automatic demonstration" : isPaused ? "Resume automatic demonstration" : "Pause automatic demonstration"}>{isComplete || isPaused ? <Play /> : <Pause />}{isComplete ? "Replay story" : isPaused ? "Resume flow" : "Pause flow"}</button>
-        </div>
-
-        <ol className="rb-explainer-steps rb-reveal" aria-label="Choose a stage in the system explanation">
-          {explainerSteps.map(([number, title, detail], index) => (
-            <li key={number}>
-              <button
-                type="button"
-                className={index === activeScene ? "is-active" : ""}
-                aria-pressed={index === activeScene}
-                onClick={() => selectScene(index)}
-              >
-                <span>{number}</span>
-                <strong>{title}</strong>
-                <p>{detail}</p>
-                <small>{index === activeScene ? "Playing this stage" : "Play this stage"}<ArrowRight /></small>
-              </button>
-            </li>
-          ))}
-        </ol>
-        <p className="rb-explainer-note rb-reveal">Conceptual flow · Real capacity and speed are measured in Network and Tests.</p>
-      </div>
-    </section>
-  );
-}
-
-function AccelerationSection() {
-  return (
-    <section className="rb-accel" id="acceleration" aria-labelledby="rb-accel-title">
-      <div className="rb-shell">
-        <div className="rb-section-title rb-reveal">
-          <p className="rb-kicker">02 — The compounding curve</p>
-          <h2 id="rb-accel-title">Intelligence gets cheaper.<br /><em>Distribution makes it go further.</em></h2>
-          <p>Model efficiency is already moving at extraordinary speed. mycellios is being built to compound that progress: pooling memory first, shortening routes next, and increasing effective tokens per second as the network matures.</p>
-        </div>
-
-        <article className="rb-curve rb-reveal" aria-label="Observed benchmark shift on ARC-AGI-1 between December 2024 and December 2025">
-          <img src={efficiencyCurve} alt="An abstract luminous mycelium network accelerating into a dense flow of information" loading="lazy" decoding="async" />
-          <div className="rb-curve-veil" />
-          <div className="rb-curve-topline"><span>Observed benchmark shift</span><span>ARC-AGI-1 · 12 MONTHS</span></div>
-          <span className="rb-curve-axis">CAPABILITY PER DOLLAR</span>
-          <svg className="rb-curve-plot" viewBox="0 0 1000 470" preserveAspectRatio="none" aria-hidden="true">
-            <defs>
-              <linearGradient id="rbEfficiencyLine" x1="0" x2="1"><stop offset="0" stopColor="#70806d" /><stop offset=".55" stopColor="#ad7a48" /><stop offset="1" stopColor="#e4b06e" /></linearGradient>
-              <filter id="rbCurveGlow" x="-30%" y="-50%" width="160%" height="200%"><feGaussianBlur stdDeviation="7" result="blur" /><feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge></filter>
-            </defs>
-            <g className="rb-curve-grid">
-              {[90, 180, 270, 360].map((y) => <line key={`h-${y}`} x1="80" y1={y} x2="930" y2={y} />)}
-              {[160, 350, 540, 730, 920].map((x) => <line key={`v-${x}`} x1={x} y1="55" x2={x} y2="405" />)}
-            </g>
-            <path className="rb-curve-shadow" d="M150 365 C330 360 475 315 590 240 S750 115 845 82" />
-            <path className="rb-curve-line" d="M150 365 C330 360 475 315 590 240 S750 115 845 82" />
-            <g className="rb-curve-point point-start"><circle cx="150" cy="365" r="20" /><circle cx="150" cy="365" r="5" /></g>
-            <g className="rb-curve-point point-end" filter="url(#rbCurveGlow)"><circle cx="845" cy="82" r="24" /><circle cx="845" cy="82" r="6" /></g>
-          </svg>
-          <div className="rb-benchmark rb-benchmark-from"><span>DEC 2024</span><strong>o3-preview · high compute</strong><b>&gt;$3,000 / task</b><small>87.5% ARC-AGI-1</small></div>
-          <div className="rb-benchmark rb-benchmark-to"><span>DEC 2025</span><strong>Gemini 3 Flash · high</strong><b>$0.231 / task</b><small>84.7% ARC-AGI-1</small></div>
-          <div className="rb-curve-multiplier"><strong>≈13,000×</strong><span>lower cost per task</span><ArrowUpRight /></div>
-        </article>
-
-        <div className="rb-curve-evidence rb-reveal">
-          <p>The same benchmark family, but different systems and evaluation configurations. This is a directional efficiency signal—not an apples-to-apples price comparison.</p>
-          <div>
-            <a href="https://arcprize.org/blog/oai-o3-pub-breakthrough" target="_blank" rel="noreferrer">o3 analysis <ArrowUpRight /></a>
-            <a href="https://arcprize.org/leaderboard?hl=en-US" target="_blank" rel="noreferrer">Inspect the ARC Prize data <ArrowUpRight /></a>
-          </div>
-        </div>
-
-        <div className="rb-accel-roadmap-head rb-reveal">
-          <div><span>The mycellios development curve</span><h3>Fit. Route. Multiply.</h3></div>
-          <p>Every layer removes a different bottleneck. The target is a compounding throughput curve, not a single benchmark trick.</p>
-          <small>DIRECTION · NOT A PERFORMANCE FORECAST</small>
-        </div>
-        <div className="rb-accel-roadmap">
-          {accelerationPhases.map((phase, index) => (
-            <article className="rb-accel-phase rb-reveal" key={phase.step}>
-              <div className="rb-phase-line"><i /><span>{phase.step}</span><b>0{index + 1}</b></div>
-              <h4>{phase.title}</h4><p>{phase.copy}</p><strong>{phase.signal}</strong>
-              {index < accelerationPhases.length - 1 && <ArrowRight className="rb-phase-arrow" />}
-            </article>
-          ))}
-        </div>
-        <div className="rb-curve-equation rb-reveal"><i /><span>MODEL EFFICIENCY × NETWORK EFFICIENCY = COMPOUND SYSTEM SPEED</span><i /></div>
-      </div>
-    </section>
-  );
-}
-
-function ArchitectureSection() {
-  return (
-    <section className="rb-arch rb-shell" id="architecture" aria-labelledby="rb-arch-title">
-      <div className="rb-section-title rb-reveal">
-        <p className="rb-kicker">04 — Adaptive architecture</p>
-        <h2 id="rb-arch-title">We do not connect more machines.<br /><em>We build the right route.</em></h2>
-        <p>Adding a slow node can make the entire system worse. GDLP/2 analyzes each model, groups nearby resources, and selects only the machines that add value to that run.</p>
-      </div>
-
-      <div className="rb-pipeline rb-reveal">
-        <div className="rb-pipeline-topline"><span>GDLP / 2</span><span>ROUTE COMPILER</span><span className="rb-pipeline-live"><i />LIVE</span></div>
-        <div className="rb-pipeline-model">
-          <div className="rb-model-cube"><Boxes /><span>70B</span></div>
-          <div><small>TARGET MODEL</small><strong>Too large<br />for a single node</strong></div>
-          <ArrowDownRight />
-        </div>
-        <div className="rb-pipeline-flow">
-          {pipelineStages.map((stage, index) => (
-            <div className="rb-pipeline-stage" key={stage.number}>
-              <span>{stage.number}</span>
-              <div><strong>{stage.name}</strong><small>{stage.detail}</small></div>
-              {index < pipelineStages.length - 1 && <ChevronRight className="rb-pipeline-arrow" />}
-            </div>
-          ))}
-        </div>
-        <div className="rb-pipeline-nodes">
-          {pipelineNodes.map((node, index) => (
-            <div key={node} className={index === 4 ? "standby" : ""}>
-              <i /><span>{node}</span>
-              <small>{index === 4 ? "reserve" : `shard ${String.fromCharCode(65 + index)}`}</small>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      <div className="rb-arch-principles">
-        {architecturePrinciples.map((principle, index) => {
-          const Icon = [Layers3, Network, Workflow][index] ?? Network;
-          return (
-            <article className="rb-arch-card rb-reveal" key={principle.label}>
-              <div className="rb-arch-card-top"><Icon /><span>0{index + 1}</span></div>
-              <h3>{principle.title1}<br />{principle.title2}</h3>
-              <p>{principle.copy}</p>
-              <span className="rb-arch-label">{principle.label} <ArrowUpRight /></span>
-            </article>
-          );
-        })}
-      </div>
-    </section>
-  );
-}
-
-function EvidenceSection() {
-  return (
-    <section className="rb-evidence" id="evidence" aria-labelledby="rb-evidence-title">
-      <div className="rb-evidence-inner rb-shell">
-        <div className="rb-evidence-copy rb-reveal">
-          <p className="rb-kicker"><i /><span>07 — Evidence before promises</span></p>
-          <h2 id="rb-evidence-title">We are building<br /><em>in public.</em></h2>
-          <p>We do not call a simulation a global network. Every important claim passes a reproducible test before it becomes a product promise.</p>
-          <div className="rb-evidence-legend"><span><i className="done" />Implemented</span><span><i className="next" />Next physical milestone</span></div>
-        </div>
-        <div className="rb-board rb-reveal" aria-label="Build status board, dated 20 July 2026">
-          <div className="rb-board-head"><span>BUILD STATUS</span><span>20 · 07 · 2026</span></div>
-          {evidenceRows.map((row, index) => (
-            <div className={`rb-board-row ${index === 3 ? "active" : ""}`} key={row[0]}>
-              <i className={index === 3 ? "next" : "done"}>{index === 3 ? <CircleDot /> : <Check />}</i>
-              <div><strong>{row[0]}</strong><small>{row[1]}</small></div>
-              <span>{row[2]}</span>
-            </div>
-          ))}
-          <div className="rb-board-footer"><span>NEXT GATE</span><strong>Multi-node · GPU · LAN</strong><Gauge /></div>
-        </div>
-      </div>
-    </section>
-  );
-}
-
-function InstallSection() {
+/* Downloads. The visitor's platform is detected so the primary action is a
+   single button; every other build stays one click away rather than on screen. */
+function GetStartedSection() {
   const [recommended, setRecommended] = useState<DownloadKey>("windows");
   const [macVisitor, setMacVisitor] = useState(false);
 
   useEffect(() => {
     const agent = navigator.userAgent.toLowerCase();
-    const isAppleMobile =
-      /iphone|ipad|ipod/.test(agent) ||
-      (agent.includes("mac") && navigator.maxTouchPoints > 1);
+    const isAppleMobile = /iphone|ipad|ipod/.test(agent) || (agent.includes("mac") && navigator.maxTouchPoints > 1);
     if (agent.includes("mac") && !isAppleMobile) {
       setMacVisitor(true);
       setRecommended("mac-arm64");
-    }
-    else if (agent.includes("linux")) setRecommended("linux-deb");
+    } else if (agent.includes("linux")) setRecommended("linux-deb");
     else setRecommended("windows");
   }, []);
 
   const selected = downloads[recommended];
 
   return (
-    <section className="rb-install" id="install" aria-labelledby="rb-install-title">
-      <div className="rb-install-layout rb-shell">
-        <div className="rb-install-copy rb-reveal">
-          <p className="rb-kicker rb-kicker-light"><i /><span>09 — From download to network</span></p>
-          <h2 id="rb-install-title">One click.<br /><em>Your machine joins the organism.</em></h2>
-          <p>Install the desktop app, choose how you want to participate, and mycellios detects your hardware automatically. No terminal, Docker, or manual configuration required.</p>
-          <div className="rb-install-detected"><span><MonitorDown />Recommended for this device</span><strong>{selected.label} · {selected.detail}</strong></div>
-          <a className="rb-install-primary" href={downloadUrl(recommended)}>
-            <span className="rb-install-icon"><Download /></span>
+    <section className="rb-get" id="install" aria-labelledby="rb-get-title">
+      <div className="rb-shell rb-get-inner">
+        <div className="rb-get-copy rb-reveal">
+          <p className="rb-kicker rb-kicker-light"><i /><span>Join</span></p>
+          <h2 id="rb-get-title">One install.<br /><em>Your machine joins the network.</em></h2>
+          <p>Hardware is detected automatically. No terminal, no Docker, no configuration.</p>
+          <a className="rb-get-primary" href={downloadUrl(recommended)}>
+            <span className="rb-get-icon"><Download /></span>
             <span><small>Download for</small><strong>{selected.label}</strong></span>
             <ArrowDownRight />
           </a>
-          <div className="rb-install-meta"><ShieldCheck /><span>Early access · automatic hardware detection</span></div>
+          <p className="rb-get-meta"><ShieldCheck />You choose what to share · pause at any time</p>
         </div>
 
-        <div className="rb-console rb-reveal" aria-label="First run console preview">
-          <div className="rb-console-top"><div><i /><i /><i /></div><span>MYCELLIOS · FIRST RUN</span><b>01:18</b></div>
-          <div className="rb-console-body">
-            <div className="rb-console-orb"><span /><Radio /><i /></div>
-            <div className="rb-console-ready"><span><i />NETWORK READY</span><strong>this machine</strong><small>NODE · 7FA3_C2E1</small></div>
-            <div className="rb-console-steps">
-              {installSteps.map((step, index) => (
-                <div key={step.label} style={{ "--install-delay": `${index * .45}s` } as CSSProperties}>
-                  <span>0{index + 1}</span><i><Check /></i>
-                  <p><strong>{step.label}</strong><small>{step.detail}</small></p>
-                  <b>{step.status}</b>
-                </div>
-              ))}
-            </div>
-            <div className="rb-console-promise"><ShieldCheck />YOU DECIDE WHAT TO SHARE · PAUSE AT ANY TIME</div>
-          </div>
-        </div>
-      </div>
-
-      <div className="rb-shelf rb-shell rb-reveal">
-        <div className="rb-shelf-head"><span>Other downloads</span><a href={RELEASES_URL} target="_blank" rel="noreferrer">Release notes and checksums <ArrowUpRight /></a></div>
-        <div className="rb-shelf-options">
-          {(Object.keys(downloads) as DownloadKey[]).map((key) => {
-            const option = downloads[key];
-            return (
-              <a className={key === recommended ? "recommended" : ""} href={downloadUrl(key)} key={key}>
+        <div className="rb-get-side rb-reveal">
+          <div className="rb-get-shelf">
+            {(Object.keys(downloads) as DownloadKey[]).map((key, index) => (
+              <a className={key === recommended ? "recommended" : ""} href={downloadUrl(key)} key={key} style={{ "--i": index } as CSSProperties}>
                 <HardDriveDownload />
-                <span><strong>{option.label}</strong><small>{option.detail}</small></span>
-                {key === recommended ? <b>RECOMMENDED</b> : <ArrowDownRight />}
+                <span><strong>{downloads[key].label}</strong><small>{downloads[key].detail}</small></span>
+                {key === recommended ? <b>PICKED</b> : <ArrowDownRight />}
               </a>
-            );
-          })}
-        </div>
-        {macVisitor && (
-          <aside className="rb-mac-guide" aria-labelledby="rb-mac-test-title">
-            <div className="rb-mac-guide-head">
-              <span><ShieldCheck />MACOS TEST BUILD</span>
-              <div>
-                <h3 id="rb-mac-test-title">Try mycellios without an Apple developer licence</h3>
-                <p>The app is ad-hoc signed and package-attested. macOS still asks you to approve this test build once.</p>
-              </div>
-              <div className="rb-mac-guide-download">
-                <a href={downloadUrl("mac-arm64")}><Cpu /><span><strong>Apple Silicon</strong><small>M1 · M2 · M3 · M4</small></span><Download /></a>
-              </div>
-            </div>
-            <ol>
-              <li><b>01</b><span><strong>Install</strong><small>Open the DMG and drag mycellios to Applications.</small></span></li>
-              <li><b>02</b><span><strong>Try to open it once</strong><small>macOS shows a security warning. Close that message.</small></span></li>
-              <li><b>03</b><span><strong>Open Privacy &amp; Security</strong><small>Go to System Settings → Privacy &amp; Security.</small></span></li>
-              <li><b>04</b><span><strong>Choose Open Anyway</strong><small>Confirm once, then open mycellios normally.</small></span></li>
-            </ol>
-            <footer><Check />No Terminal commands required <i /> Manual downloads remain required for test builds</footer>
-          </aside>
-        )}
-        <p className="rb-install-safety"><ShieldCheck />Every installer is built and package-verified in GitHub Actions. Code signing is being rolled out; early builds may still trigger an operating-system publisher warning.</p>
-      </div>
-    </section>
-  );
-}
-
-function RoadmapSection() {
-  const { improvement, token, router } = futureCards;
-  return (
-    <section className="rb-roadmap" id="roadmap" aria-labelledby="rb-roadmap-title">
-      <div className="rb-shell">
-        <div className="rb-roadmap-heading rb-reveal">
-          <div>
-            <p className="rb-kicker">10 — The next layer</p>
-            <h2 id="rb-roadmap-title">A network that<br /><em>improves itself.</em></h2>
+            ))}
           </div>
-          <div className="rb-roadmap-intro">
-            <span className="rb-roadmap-status"><CircleDot />VISION · NOT LIVE YET</span>
-            <p>Three long-term systems designed to make mycellios more capable every day, route every request intelligently, and return value to the machines that make that progress possible.</p>
-          </div>
+          {macVisitor && (
+            <details className="rb-mac-note">
+              <summary>Opening the macOS test build</summary>
+              <ol>
+                <li>Open the DMG and drag mycellios to Applications.</li>
+                <li>Open it once — macOS shows a warning. Close it.</li>
+                <li>System Settings → Privacy &amp; Security → <strong>Open Anyway</strong>.</li>
+              </ol>
+            </details>
+          )}
+          <p className="rb-get-safety">
+            Installers are built and package-verified in GitHub Actions. Code signing is rolling out; early
+            builds may still trigger a publisher warning.
+            <a href={RELEASES_URL} target="_blank" rel="noreferrer">Release notes <ArrowUpRight /></a>
+          </p>
         </div>
-
-        <div className="rb-roadmap-stage">
-          <article className="rb-future-card rb-reveal">
-            <header><span>{improvement.index} / {improvement.label}</span><Sparkles /></header>
-            <div className="rb-future-metric"><strong>{improvement.metric}</strong><span><b>{improvement.unit}</b><small>{improvement.metricDetail}</small></span></div>
-            <h3>{improvement.title}</h3>
-            <p>{improvement.copy}</p>
-            <ol>{improvement.steps.map((step, index) => <li key={step}><b>0{index + 1}</b><span>{step}</span></li>)}</ol>
-            <footer><ShieldCheck /><span>{improvement.footer}</span></footer>
-          </article>
-
-          <div className="rb-roadmap-bridge" aria-hidden="true"><i /><span><Zap /></span><b>PROVEN WORK → MEASURABLE VALUE</b></div>
-
-          <article className="rb-future-card rb-reveal">
-            <header><span>{token.index} / {token.label}</span><Coins /></header>
-            <div className="rb-future-metric word"><strong>{token.metric}</strong><span><small>{token.metricDetail}</small></span></div>
-            <h3>{token.title}</h3>
-            <p>{token.copy}</p>
-            <ol>{token.steps.map((step, index) => <li key={step}><b>0{index + 1}</b><span>{step}</span></li>)}</ol>
-            <footer><ShieldCheck /><span>{token.footer}</span></footer>
-          </article>
-        </div>
-
-        <article className="rb-router rb-reveal">
-          <header><span>{router.index} / {router.label}</span><Route /></header>
-          <div className="rb-router-content">
-            <div className="rb-router-copy">
-              <div className="rb-future-metric word"><strong>{router.metric}</strong><span><small>{router.metricDetail}</small></span></div>
-              <h3>{router.title}</h3>
-              <p>{router.copy}</p>
-            </div>
-            <div className="rb-router-visual" aria-label="A unified request routed to the best available AI model">
-              <div className="rb-router-input"><Radio /><span>{router.input}</span></div>
-              <i className="rb-router-line incoming" />
-              <div className="rb-router-engine"><Route /><strong>{router.engine}</strong><span>{router.policies.map((policy) => <b key={policy}>{policy}</b>)}</span></div>
-              <i className="rb-router-line outgoing" />
-              <div className="rb-router-destinations">{router.destinations.map((destination, index) => <span key={destination} style={{ "--route-delay": `${index * .7}s` } as CSSProperties}><i />{destination}</span>)}</div>
-            </div>
-          </div>
-          <ol>{router.steps.map((step, index) => <li key={step}><b>0{index + 1}</b><span>{step}</span></li>)}</ol>
-          <footer><ShieldCheck /><span>{router.footer}</span></footer>
-        </article>
-
-        <div className="rb-roadmap-principle rb-reveal"><ShieldCheck /><span>Direction, not a promise. Each stage must prove security, usefulness and measurable results before it can reach the public network.</span></div>
       </div>
     </section>
   );
@@ -656,52 +217,13 @@ function RoadmapSection() {
 export function RebrandLanding() {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [heroPrompt, setHeroPrompt] = useState("");
-  const [flowStep, setFlowStep] = useState(0);
-  const [metric, setMetric] = useState(0);
-  const [activeWorker, setActiveWorker] = useState(1);
-  const [hardware, setHardware] = useState<HardwareKey>("rtx-3060");
-  const [paused, setPaused] = useState(false);
-  const flowRef = useRef<HTMLElement>(null);
   const pageRef = useRef<HTMLElement>(null);
 
   useEffect(() => {
     applySeoMetadata("/");
   }, []);
 
-  useEffect(() => {
-    const page = pageRef.current;
-    if (!page) return;
-    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-      page.querySelectorAll(".rb-reveal").forEach((element) => element.classList.add("is-visible"));
-      return;
-    }
-    const observer = new IntersectionObserver(
-      (entries) => entries.forEach((entry) => entry.isIntersecting && entry.target.classList.add("is-visible")),
-      { threshold: 0.12 },
-    );
-    page.querySelectorAll(".rb-reveal").forEach((element) => observer.observe(element));
-    return () => observer.disconnect();
-  }, []);
-
-  useEffect(() => {
-    const onScroll = () => {
-      const section = flowRef.current;
-      if (!section) return;
-      const rect = section.getBoundingClientRect();
-      const distance = Math.max(1, section.offsetHeight - window.innerHeight);
-      const progress = Math.min(0.999, Math.max(0, -rect.top / distance));
-      setFlowStep(Math.min(4, Math.floor(progress * 5)));
-    };
-    onScroll();
-    window.addEventListener("scroll", onScroll, { passive: true });
-    return () => window.removeEventListener("scroll", onScroll);
-  }, []);
-
-  useEffect(() => {
-    if (paused) return;
-    const timer = window.setInterval(() => setMetric((current) => (current + 1) % 3), 3200);
-    return () => window.clearInterval(timer);
-  }, [paused]);
+  useRevealOnScroll(pageRef);
 
   useEffect(() => {
     if (!mobileOpen) return;
@@ -711,16 +233,6 @@ export function RebrandLanding() {
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [mobileOpen]);
-
-  const liveMetrics = [
-    { value: "5", label: "stages in a distributed run" },
-    { value: "1", label: "answer gathered for the user" },
-    { value: "0", label: "unmeasured performance claims" },
-  ];
-  const profile = hardwareProfiles[hardware];
-  const currentStep = steps[flowStep] ?? steps[0]!;
-  const currentWorker = workers[activeWorker] ?? workers[0]!;
-  const currentMetric = liveMetrics[metric] ?? liveMetrics[0]!;
 
   // The hero input is an entry point, not an inference client: the prompt is
   // handed to the panel chat, which owns models, auth, and streaming.
@@ -732,33 +244,28 @@ export function RebrandLanding() {
     window.location.assign("/network?view=inference");
   };
 
-  const scrollToFlowStep = (index: number) => {
-    const section = flowRef.current;
-    if (!section) return;
-    const distance = Math.max(0, section.offsetHeight - window.innerHeight);
-    const stepProgress = (index + 0.5) / steps.length;
-    window.scrollTo({
-      top: section.offsetTop + distance * stepProgress,
-      behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
-    });
-  };
-
   return (
     <main className="rb-page" id="rb-top" ref={pageRef}>
+      {/* The brand is a fungal network, so the page grows one while you read:
+          a colony that branches from the story down to the download ask. It is
+          scrubbed by the scroll, never autoplayed, and kept under 10% ink so it
+          is felt rather than looked at. */}
+      <MyceliumBackdrop />
+
       <header className="rb-header">
         <div className="rb-header-inner rb-shell">
           <Brand />
           <nav aria-label="Main navigation">
-            <a href="/network?view=inference">Chat</a><a href="/create">Create</a><a href="#how-it-works">How it works</a><a href="#architecture">Architecture</a><a href="#evidence">Evidence</a><a href="#install">Install</a><a href="#roadmap">Roadmap</a><a href="/blog">Blog</a>
+            <a href="/network?view=inference">Chat</a><a href="/create">Create</a><a href="/earn">Earn</a><SporeMenu /><a href="/network">Network</a><a href="/blog">Blog</a>
           </nav>
           <div className="rb-header-actions rb-desktop-cta">
             <a className="rb-social" href={GITHUB_URL} target="_blank" rel="noreferrer" aria-label="mycellios on GitHub"><GithubMark /></a>
             <a className="rb-social" href={X_URL} target="_blank" rel="noreferrer" aria-label="mycellios on X"><XMark /></a>
             <a className="rb-social" href={TELEGRAM_URL} target="_blank" rel="noreferrer" aria-label="mycellios on Telegram"><TelegramMark /></a>
-            <a className="rb-pill rb-pill-ghost" href="/network">Login</a>
+            <a className="rb-pill rb-pill-ghost" href="/network?view=overview">Login</a>
           </div>
           <button className="rb-menu" type="button" aria-label={mobileOpen ? "Close menu" : "Open menu"} aria-expanded={mobileOpen} onClick={() => setMobileOpen(!mobileOpen)}>{mobileOpen ? <X /> : <Menu />}</button>
-          {mobileOpen && <div className="rb-mobile-nav"><a href="/network?view=inference">Chat</a><a href="/create">Create</a><a href="#how-it-works" onClick={() => setMobileOpen(false)}>How it works</a><a href="#live-network" onClick={() => setMobileOpen(false)}>Live network</a><a href="#architecture" onClick={() => setMobileOpen(false)}>Architecture</a><a href="#evidence" onClick={() => setMobileOpen(false)}>Evidence</a><a href="#install" onClick={() => setMobileOpen(false)}>Install</a><a href="/blog">Blog</a><a href="/network">Login</a><div className="rb-mobile-social"><a className="rb-social" href={GITHUB_URL} target="_blank" rel="noreferrer" aria-label="mycellios on GitHub"><GithubMark /></a><a className="rb-social" href={X_URL} target="_blank" rel="noreferrer" aria-label="mycellios on X"><XMark /></a><a className="rb-social" href={TELEGRAM_URL} target="_blank" rel="noreferrer" aria-label="mycellios on Telegram"><TelegramMark /></a></div></div>}
+          {mobileOpen && <div className="rb-mobile-nav"><a href="/network?view=inference">Chat</a><a href="/create">Create</a><a href="/earn">Earn</a><SporeMobileLinks /><a href="/network" onClick={() => setMobileOpen(false)}>Network</a><a href="/blog">Blog</a><a href="/network?view=overview">Login</a><div className="rb-mobile-social"><a className="rb-social" href={GITHUB_URL} target="_blank" rel="noreferrer" aria-label="mycellios on GitHub"><GithubMark /></a><a className="rb-social" href={X_URL} target="_blank" rel="noreferrer" aria-label="mycellios on X"><XMark /></a><a className="rb-social" href={TELEGRAM_URL} target="_blank" rel="noreferrer" aria-label="mycellios on Telegram"><TelegramMark /></a></div></div>}
         </div>
       </header>
 
@@ -766,8 +273,15 @@ export function RebrandLanding() {
         <HeroGlobe />
         <div className="rb-hero-inner rb-shell">
           <div className="rb-hero-copy">
-            <h1 id="rb-hero-title" aria-label="Intelligence grows through the network.">Intelligence grows<br />through the <em>network.</em></h1>
-            <p className="rb-lede">Mycellios connects capacity across different machines to run AI models that cannot fit on a single device.</p>
+            {/* "Intelligence grows through the network" was true but told a
+                stranger nothing: it named neither the product nor the problem.
+                This says AI, states the exact thing no competitor can do, and
+                keeps "outgrows" so the growth metaphor the whole brand rests on
+                survives the rewrite. The lede resolves it in one line. */}
+            <h1 id="rb-hero-title" aria-label="AI that outgrows your machine.">AI that outgrows<br />your <em>machine.</em></h1>
+            {/* Kept under the lede's 470px measure so it sets as one line: the
+                longer version broke with "anyway." orphaned on its own. */}
+            <p className="rb-lede">Mycellios splits the model across many machines.</p>
             <form className="rb-hero-prompt" onSubmit={submitHeroPrompt}>
               <label className="rb-visually-hidden" htmlFor="rb-hero-prompt-input">Ask the network</label>
               <input id="rb-hero-prompt-input" name="prompt" type="text" autoComplete="off" placeholder="Ask the impossible…" value={heroPrompt} onChange={(event) => setHeroPrompt(event.target.value)} />
@@ -776,148 +290,101 @@ export function RebrandLanding() {
           </div>
         </div>
         {/* The hero owns the whole viewport, so nothing below it peeks in to hint
-            there is more. This cue is that hint, and it jumps to the explainer. */}
-        <a className="rb-scroll-cue" href="#explainer" aria-label="Scroll to the next section">
+            there is more. This cue is that hint, and it jumps to the story. */}
+        <a className="rb-scroll-cue" href="#how-it-works" aria-label="Scroll to the next section">
           <span>Scroll</span>
           <ArrowDown />
         </a>
       </section>
 
-      <ExplainerSection />
+      <ScrollStory />
 
-      <section className="rb-manifesto rb-shell" aria-label="Manifesto">
-        <p className="rb-manifesto-side rb-reveal">An organism,<br />not a data center.</p>
-        <div className="rb-manifesto-main rb-reveal">
-          <p className="rb-kicker"><i /><span>The capacity exists. It is fragmented.</span></p>
-          <h2>The most powerful AI lives behind walls of silicon. <em>We are building another door.</em></h2>
-          <p className="rb-manifesto-copy">Millions of PCs, workstations, and small servers spend much of the day underused. Alone, they are not enough. Coordinated, they can become a new class of infrastructure.</p>
-          <figure className="rb-manifesto-visual">
-            <img src={storyImage} alt="Fine mycelium threads connecting colonies beneath a forest floor" loading="lazy" decoding="async" />
-            <figcaption>Independent organisms · one living network</figcaption>
-          </figure>
-          <a className="rb-text-link" href="#architecture">Discover GDLP/2 <ArrowUpRight /></a>
-        </div>
-      </section>
+      <PaymentsSection />
 
-      <section className="rb-flow" id="how-it-works" ref={flowRef}>
-        <div className="rb-flow-sticky rb-shell">
-          <div className="rb-flow-heading"><p className="rb-kicker">01 — How it works</p><h2>One task.<br />Many organisms.</h2><p>Scroll to follow a request as it moves through the network.</p></div>
-          <div className={`rb-flow-scene step-${flowStep}`}>
-            <div className="rb-device"><span /><span /><span /><b>Your request</b></div>
-            <div className="rb-sprout"><i /><b /></div>
-            <svg className="rb-flow-roots" viewBox="0 0 720 260" aria-hidden="true"><path d="M74 120c75 0 91 44 154 44s77-81 144-81 104 104 176 104 73-63 126-63" /><path d="M226 164c-23 38-47 52-85 64m88-64c35 22 59 46 73 80m69-161c-26 46-23 88 8 126m-8-126c37 34 66 39 104 22m73 82c-2 31 16 48 55 60" /></svg>
-            <div className="rb-worker-node node-a"><i /><span>worker_01</span></div><div className="rb-worker-node node-b"><i /><span>worker_02</span></div><div className="rb-worker-node node-c"><i /><span>worker_03</span></div>
-            <div className="rb-result"><Check /><span>Answer</span></div>
-            <div className="rb-flow-pulse" />
+      <ModelsSection />
+
+      {/* Half a section, on purpose: "you do not have to join anything" is one
+          line of reassurance between the catalogue and the three doors, and a
+          full chapter would give it more weight than it needs. */}
+      <LocalStrip />
+
+      <section className="rb-doors" id="doors" aria-labelledby="rb-doors-title">
+        <div className="rb-shell">
+          <div className="rb-doors-head rb-reveal">
+            <p className="rb-kicker"><i /><span>Where you fit</span></p>
+            <h2 id="rb-doors-title">Three doors.<br /><em>One network.</em></h2>
           </div>
-          <div className="rb-flow-copy">
-            <div className="rb-flow-copy-content" key={currentStep.id}><span>{currentStep.id} / 05</span><h3>{currentStep.title}</h3><p>{currentStep.copy}</p></div>
-            <div className="rb-progress">{steps.map((step, index) => <button type="button" key={step.id} className={index <= flowStep ? "is-active" : ""} onClick={() => scrollToFlowStep(index)} aria-label={`Go to step ${step.id}: ${step.title}`} />)}</div>
+          <div className="rb-doors-grid">
+            {doors.map((door, index) => {
+              const Icon = door.icon;
+              const external = "external" in door.action && door.action.external;
+              return (
+                <article className="rb-door rb-glow rb-reveal" key={door.label} style={{ "--i": index } as CSSProperties} onPointerMove={trackGlow}>
+                  <div className="rb-door-top"><Icon /><span>{door.label}</span></div>
+                  <h3>{door.title}</h3>
+                  <p>{door.copy}</p>
+                  <a href={door.action.href} {...(external ? { target: "_blank", rel: "noreferrer" } : {})}>
+                    {door.action.text} <ArrowUpRight />
+                  </a>
+                </article>
+              );
+            })}
           </div>
-          <ol className="rb-flow-fallback">{steps.map((step) => <li key={step.id}><span>{step.id}</span><div><h3>{step.title}</h3><p>{step.copy}</p></div></li>)}</ol>
         </div>
       </section>
 
-      <AccelerationSection />
-
-      <section className="rb-live" id="live-network">
-        <img src={liveImage} alt="Living mycelium carrying warm signals between small mushroom colonies" loading="lazy" decoding="async" />
-        <div className="rb-live-shade" />
-        <div className="rb-live-inner rb-shell">
-          <div className="rb-live-head"><p className="rb-kicker rb-kicker-light"><i /> 03 — Live network</p><h2>Activity emerges.<br />The network responds.</h2><p className="rb-live-copy">Connections light up only when a task finds a useful route.</p><p className="rb-live-disclaimer">Narrative visualization · not production telemetry</p></div>
-          <div className="rb-live-map"><NetworkThreads compact /><span className="rb-map-label label-eu">Madrid · new worker</span><span className="rb-map-label label-us">Virginia · stage complete</span><span className="rb-map-label label-sa">São Paulo · route available</span></div>
-          <aside className="rb-live-feed"><div className="rb-feed-head"><span>Concept sequence</span><i>sample</i></div><ul><li><b /><span>New worker connected<small>Madrid · RTX 3060</small></span><time>now</time></li><li><b /><span>Model stage executed<small>Route 08 · northern cell</small></span><time>4 s</time></li><li><b /><span>Response gathered<small>Stream returned to origin</small></span><time>11 s</time></li></ul></aside>
-          <div className="rb-live-metric" aria-label="Rotating conceptual summary"><div className="rb-metric-value" key={metric} aria-live="polite" aria-atomic="true"><span>{currentMetric.value}</span><p>{currentMetric.label}</p></div><button type="button" onClick={() => setPaused(!paused)} aria-label={paused ? "Resume summary" : "Pause summary"}>{paused ? <Play /> : <Pause />}</button></div>
-        </div>
-      </section>
-
-      <ArchitectureSection />
-
-      <section className="rb-workers rb-shell" id="workers">
-        <div className="rb-section-title"><p className="rb-kicker">05 — Workers</p><h2>One species for<br />every kind of capacity.</h2><p>Mushrooms are the network's living language: they signal power, grouping, and availability.</p></div>
-        <div className="rb-worker-tabs" role="tablist" aria-label="Worker types">{workers.map((worker, index) => <button key={worker.species} id={`worker-tab-${index}`} type="button" role="tab" aria-selected={activeWorker === index} aria-controls="worker-panel" className={activeWorker === index ? "is-active" : ""} onClick={() => setActiveWorker(index)} onFocus={() => setActiveWorker(index)} onMouseEnter={() => setActiveWorker(index)}><span>{String(index + 1).padStart(2, "0")}</span>{worker.species}</button>)}</div>
-        <div className="rb-worker-stage" id="worker-panel" role="tabpanel" aria-labelledby={`worker-tab-${activeWorker}`}>
-          <div key={`mushroom-${currentWorker.species}`} className={`rb-mushroom-family ${currentWorker.group}`} aria-hidden="true"><div className="cap cap-one" /><div className="stem stem-one" /><div className="cap cap-two" /><div className="stem stem-two" /><div className="cap cap-three" /><div className="stem stem-three" /><div className="family-roots" /></div>
-          <article key={currentWorker.species}><p>{currentWorker.species}</p><h3>{currentWorker.name}</h3><dl><div><dt><Cpu /> Hardware</dt><dd>{currentWorker.hardware}</dd></div><div><dt><Sparkles /> Role</dt><dd>{currentWorker.model}</dd></div><div><dt><Network /> Load</dt><dd>{currentWorker.load}</dd></div></dl><small>Illustrative representation. The actual role depends on the model, topology, and availability.</small></article>
-        </div>
-      </section>
-
-      <section className="rb-benefits" id="principles">
-        <div className="rb-benefits-inner rb-shell">
-          <div className="rb-section-title rb-section-title-wide"><p className="rb-kicker">06 — Principles</p><h2>The network behaves<br />like something alive.</h2></div>
-          <article className="rb-benefit rb-benefit-center"><span>01</span><div><p>Decentralized</p><h3>When one node goes dark,<br />the route grows again.</h3></div><NetworkThreads compact /></article>
-          <div className="rb-benefit-pair"><article className="rb-benefit rb-benefit-private"><ShieldCheck /><span>02</span><p>Private</p><h3>Your capacity is shared.<br />Your rules remain.</h3><div className="rb-privacy-flow"><b>device</b><i /><b>private network</b><i className="blocked" /><b>outside</b></div></article><article className="rb-benefit rb-benefit-scale"><span>03</span><p>Scalable</p><h3>Every new worker expands<br />the possible routes.</h3><div className="rb-spore-field">{Array.from({ length: 18 }, (_, i) => <i key={i} style={{ "--i": i } as CSSProperties} />)}</div></article></div>
-          <div className="rb-benefit-pair rb-benefit-modes">
-            <article className="rb-benefit rb-benefit-exact">
-              <span>04</span>
-              <p>Exact when it matters</p>
-              <h3>Distribution changes where the model is computed, <em>not the result it must produce.</em></h3>
-              <div className="rb-mode-foot"><ShieldCheck /><span>Verification and rollback</span></div>
-            </article>
-            <article className="rb-benefit rb-benefit-optin">
-              <span>05</span>
-              <p>Voluntary approximation</p>
-              <h3>Compression and alternative codecs are used only when chosen by the user, <em>and the degradation is measured.</em></h3>
-              <div className="rb-mode-foot"><Check /><span>Always opt-in</span></div>
-            </article>
+      <section className="rb-proof" id="evidence" aria-labelledby="rb-proof-title">
+        <div className="rb-shell rb-proof-inner">
+          <div className="rb-proof-copy rb-reveal">
+            <p className="rb-kicker"><i /><span>Evidence</span></p>
+            <h2 id="rb-proof-title">We are building<br /><em>in public.</em></h2>
+            <p>No simulation is called a global network. Every claim passes a reproducible test before it becomes a promise.</p>
           </div>
-          <p className="rb-modes-note">The architecture explicitly separates reference-equivalent inference from every approximate optimization. They are never mixed silently.</p>
-          <article className="rb-benefit rb-benefit-community"><span>06 — Community-built</span><h3>The answer does not belong to one machine.<br /><em>Many machines build it.</em></h3><div className="rb-contributors"><b>laptop</b><i /><b>workstation</b><i /><b>server</b><i /><strong>one answer</strong></div></article>
+          <div className="rb-board rb-reveal" aria-label="Build status">
+            {evidenceRows.map((row, index) => (
+              // `--i` staggers the row entrance; see .rb-board-row in the CSS.
+              <div className={`rb-board-row ${row.done ? "" : "active"}`} key={row.title} style={{ "--i": index } as CSSProperties}>
+                <i className={row.done ? "done" : "next"}>{row.done ? <Check /> : <CircleDot />}</i>
+                <div><strong>{row.title}</strong><small>{row.detail}</small></div>
+                <span>{row.status}</span>
+              </div>
+            ))}
+            <div className="rb-board-foot"><span>Next gate</span><strong>Multi-node · GPU · LAN</strong></div>
+          </div>
+        </div>
+
+        <div className="rb-shell rb-next-strip rb-reveal">
+          <span><Route />Unified model routing</span>
+          <span><Coins />Rewards for accepted work</span>
+          <span><Zap />Self-improving scheduler</span>
+          <b>VISION · NOT LIVE YET · no active token, no financial promise</b>
         </div>
       </section>
 
-      <EvidenceSection />
+      {/* Doubts are answered before the install ask, not after it: a reader who
+          has just been told what is still in testing has objections, and the
+          page loses them if it asks for the download first. */}
+      <QuestionsSection />
 
-      <section className="rb-hardware" id="hardware">
-        <div className="rb-hardware-inner rb-shell">
-          <div className="rb-hardware-copy"><p className="rb-kicker rb-kicker-light">08 — Your place in the network</p><h2>What kind of<br />worker would you be?</h2><p>Select an illustrative setup and discover the role it could play within the mycelium.</p><label htmlFor="hardware-select">Your hardware</label><div className="rb-select-wrap"><select id="hardware-select" value={hardware} onChange={(event) => setHardware(event.target.value as HardwareKey)}><option value="integrated">CPU / integrated graphics</option><option value="rtx-3060">NVIDIA RTX 3060 · 12 GB</option><option value="rtx-4090">NVIDIA RTX 4090 · 24 GB</option><option value="multi">Multiple machines</option></select><ChevronDown /></div><a className="rb-pill rb-pill-light" href="/downloads">Turn my machine into a worker <ArrowRight /></a></div>
-          <div className="rb-profile" key={hardware}><div className="rb-profile-top"><img src={brandLogo} alt="" /><span>Illustrative profile</span><i>available</i></div><div className="rb-profile-mushroom"><div className="rb-profile-cap" /><div className="rb-profile-stem" /><div className="rb-profile-roots" /></div><h3>{profile.label}</h3><p>{profile.type}</p><dl><div><dt><MemoryStick /> Capacity</dt><dd>{profile.capacity}</dd></div><div><dt><Sparkles /> Could run</dt><dd>{profile.models}</dd></div><div><dt><Cpu /> Compute</dt><dd>{profile.compute}</dd></div></dl><small>Reward estimates are not available yet.</small></div>
-        </div>
-      </section>
-
-      <InstallSection />
-
-      <RoadmapSection />
-
-      <section className="rb-participate rb-shell" aria-labelledby="rb-participate-title">
-        <div className="rb-section-title rb-reveal">
-          <p className="rb-kicker">11 — Build the network</p>
-          <h2 id="rb-participate-title">There is more than one way<br /><em>to take part.</em></h2>
-          <p>We are looking for the first machines, organizations, and people ready to turn a difficult idea into real infrastructure.</p>
-        </div>
-        <div className="rb-participate-grid">
-          {participateCards.map((audience, index) => (
-            <article className={`rb-participate-card rb-reveal ${index === 1 ? "featured" : ""}`} key={audience.label}>
-              <div className="rb-participate-icon">{index === 0 ? <Cpu /> : <Users />}</div>
-              <span>{audience.label}</span>
-              <h3>{audience.title}</h3>
-              <p>{audience.copy}</p>
-              <ul>{audience.bullets.map((bullet) => <li key={bullet}><Check />{bullet}</li>)}</ul>
-            </article>
-          ))}
-        </div>
-      </section>
+      <GetStartedSection />
 
       <section className="rb-closing" aria-labelledby="rb-closing-title">
         <div className="rb-closing-inner rb-shell rb-reveal">
           <Brand />
-          <p className="rb-kicker rb-kicker-light"><i /><span>Founding network</span></p>
           <h2 id="rb-closing-title">Many machines.<br /><em>One model.</em></h2>
-          <p>Join the first mycellios test network and help us prove that the next great machine can be a community.</p>
           <a className="rb-pill rb-pill-light" href="/join">Connect this device <Zap /></a>
           <small>Public test network · no login required</small>
         </div>
       </section>
 
+      <SponsorFooter />
       <footer className="rb-footer">
         <div className="rb-footer-inner rb-shell">
-          <div><Brand /><p>Distributed intelligence,<br />rooted in nature.</p></div>
-          <nav aria-label="Explore"><span>Explore</span><a href="#explainer">Start here</a><a href="#how-it-works">How it works</a><a href="#live-network">Live network</a><a href="#roadmap">Roadmap</a></nav>
-          <nav aria-label="Project"><span>Project</span><a href="/docs">Documentation</a><a href="/network">Network status</a><a href="/blog">Blog</a><a href="/mobile/">Mobile worker</a><a href="https://github.com/tych0s/mycellios"><GitBranch /> GitHub</a></nav>
-          <div className="rb-footer-note">
-            <div className="rb-footer-contact"><a href="/downloads">Downloads</a><a href={`mailto:${EMAIL}`}>{EMAIL}</a><span>© 2026 mycellios</span></div>
-            <a href="#rb-top">Back to top <ArrowDown /></a>
-          </div>
+          <div className="rb-footer-brand"><Brand /><p>Distributed intelligence built from the capacity already around us.</p></div>
+          <nav aria-label="Product"><span>Product</span><a href="/network?view=inference">Chat</a><a href="/create">Create</a><a href="/earn">Earn</a><a href="/spore">$ SPORE</a></nav>
+          <nav aria-label="Network"><span>Network</span><a href="#how-it-works">How it works</a><a href="/network">Network</a><a href="/downloads">Downloads</a><a href="/mobile/">Browser worker</a></nav>
+          <nav aria-label="Resources"><span>Resources</span><a href="/docs">Documentation</a><a href="/blog">Blog</a><a href={GITHUB_URL}><GitBranch /> GitHub</a><a href={`mailto:${EMAIL}`}>Contact</a></nav>
+          <div className="rb-footer-bottom"><span>© 2026 mycellios</span><a href="#rb-top">Back to top <ArrowDown /></a></div>
         </div>
       </footer>
       <SupportAssistant surface="landing" />
