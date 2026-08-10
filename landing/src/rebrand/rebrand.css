@@ -82,8 +82,15 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
    halo drifts behind the wordmark so the page ends in motion instead of on a
    still frame. One layer, transform + opacity only. */
 .rb-closing { position:relative; color:#f5f0e8; background:var(--rb-forest); text-align:center; overflow:hidden; }
-.rb-closing::before { content:""; position:absolute; left:50%; top:38%; width:min(780px,120vw); aspect-ratio:1; background:radial-gradient(circle,rgba(173,122,72,.24),transparent 62%); transform:translate(-50%,-50%); animation:rbHalo 11s ease-in-out infinite; pointer-events:none; }
-@keyframes rbHalo { 0%,100% { transform:translate(-50%,-50%) scale(.86); opacity:.55; } 50% { transform:translate(-50%,-50%) scale(1.1); opacity:1; } }
+/* The halo has to finish *inside* the section. `.rb-closing` clips overflow and
+   sits on the same forest green as `.rb-get` above it, so a halo wider than the
+   box does not fade out — it ends on a dead-straight horizontal line across the
+   seam, which reads as a rendering glitch rather than as light. Hence: centred
+   (top:50%, not 38%), sized so the visible disc still clears the edges at the
+   top of the breathe, and faded to a true transparent well before its own
+   radius. */
+.rb-closing::before { content:""; position:absolute; inset:0; background:radial-gradient(circle closest-side,rgba(173,122,72,.28),rgba(173,122,72,.09) 42%,transparent 70%); animation:rbHalo 11s ease-in-out infinite; pointer-events:none; }
+@keyframes rbHalo { 0%,100% { transform:scale(.88); opacity:.6; } 50% { transform:scale(1.12); opacity:1; } }
 .rb-closing-inner { position:relative; z-index:1; display:grid; justify-items:center; padding-block:130px; }
 .rb-closing .rb-brand { color:#f5f0e8; }
 .rb-closing .rb-kicker { margin-top:44px; justify-content:center; }
@@ -138,8 +145,26 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
    A tall section with a sticky viewport. `--p` (0→1, written by
    useStickyProgress) drives every mark, so the whole diagram is scrubbed by
    the reader rather than autoplayed at them. */
-.rb-story { position:relative; height:420vh; background:var(--rb-ivory); border-bottom:1px solid var(--rb-line); }
-.rb-story-sticky { position:sticky; top:0; height:100vh; min-height:640px; display:flex; align-items:center; overflow:hidden; }
+/* 240vh, not 420vh: at 420 the pinned travel was 2880px at 1440×900 — about 29
+   wheel notches to cross four beats, ~7 per beat, which read as a wall rather
+   than as a story. 240vh costs ~13 notches. Below ~200vh each beat lands in
+   under the ~0.75s the staggered transitions take to settle, so the diagram
+   would be overrun by the scroll instead of scrubbed by it. */
+.rb-story { position:relative; height:240vh; background:var(--rb-ivory); border-bottom:1px solid var(--rb-line); }
+/* Four per-beat progress tracks cut from the same 0→1 `--p`. Each one runs 0→1
+   across its own quarter and then holds, so marks can interpolate *inside* a
+   beat instead of snapping at the boundary. This is what makes the shortened
+   section feel richer rather than merely faster: before, `--p` drove a single
+   2px rule and everything else waited for the next `.beat-N` class, so most of
+   the scroll produced no visible change at all. */
+.rb-story-sticky { position:sticky; top:0; height:100vh; min-height:640px; display:flex; align-items:center; overflow:hidden;
+  --p0:clamp(0,calc(var(--p,0)*4),1);
+  --p1:clamp(0,calc((var(--p,0) - .25)*4),1);
+  --p2:clamp(0,calc((var(--p,0) - .5)*4),1);
+  /* ×5, not ×4: the answer is the payoff, so it must be fully arrived a little
+     before the section releases. At ×4 it only reached full opacity on the very
+     last pixel of travel, which the reader scrolls straight past. */
+  --p3:clamp(0,calc((var(--p,0) - .75)*5),1); }
 /* A hairline that tracks `--p` continuously, so the section reads as scrubbed
    rather than as four slides — the beats snap, this does not. */
 .rb-story-sticky::after { content:""; position:absolute; z-index:2; inset:auto 0 0 0; height:2px; background:var(--rb-bronze); transform:scaleX(var(--p,0)); transform-origin:0 50%; }
@@ -153,24 +178,34 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
    landing on the card edges. */
 .rb-stage { position:relative; align-self:center; width:100%; max-width:920px; height:min(46vh,380px); margin-inline:auto; }
 .rb-stage-ask,.rb-stage-answer { position:absolute; top:50%; display:grid; justify-items:center; gap:12px; width:120px; transform:translateY(-50%); }
-.rb-stage-ask { left:0; }
-.rb-stage-answer { right:0; opacity:.3; transform:translateY(-50%) scale(.94); transition:opacity .5s ease,transform .5s cubic-bezier(.22,.8,.2,1); }
+/* Beat 0 was the dead quarter: the reader scrolled and nothing moved, because
+   the request node was already in its final state. Now it grows in under
+   `--p0`, so the very first turn of the wheel produces motion. */
+.rb-stage-ask { left:0; opacity:calc(.35 + var(--p0) * .65); transform:translateY(-50%) scale(calc(.94 + var(--p0) * .06)); }
+/* The payoff mark: it grows in under `--p3` rather than popping at beat 3, so
+   the last stretch of scroll is the one that visibly delivers the answer. */
+.rb-stage-answer { right:0; opacity:calc(.3 + var(--p3) * .7); transform:translateY(-50%) scale(calc(.94 + var(--p3) * .06)); }
 .rb-stage-ask svg,.rb-stage-answer svg { width:22px; height:22px; padding:17px; border:1px solid rgba(30,42,34,.18); border-radius:50%; color:var(--rb-bronze); background:var(--rb-paper); box-sizing:content-box; }
 .rb-stage-answer svg { border-color:var(--rb-bronze); }
 .rb-stage-ask span,.rb-stage-answer span { color:#5e665f; font:500 11px "IBM Plex Mono",monospace; letter-spacing:.08em; text-align:center; }
-.beat-3 .rb-stage-answer { opacity:1; transform:translateY(-50%) scale(1); }
 
 /* The model: one bar that splits into three shards as the reader scrolls.
    Until beat 1 the three elements have to read as a *single* object, so they
    share one colour and only the outer corners are rounded — three touching
    blocks in three colours still read as three. */
-.rb-stage-model { position:absolute; left:50%; top:6%; display:flex; gap:0; width:min(310px,34%); height:16px; transform:translateX(-50%); }
-.rb-stage-model i { flex:1; height:100%; background:linear-gradient(90deg,#c58d55,#ad7a48); transition:margin .55s cubic-bezier(.22,.8,.2,1),border-radius .55s ease,background .55s ease; }
-.rb-stage-model i.shard-0 { border-radius:3px 0 0 3px; }
-.rb-stage-model i.shard-2 { border-radius:0 3px 3px 0; }
-.beat-1 .rb-stage-model i,.beat-2 .rb-stage-model i,.beat-3 .rb-stage-model i { margin-inline:5px; border-radius:3px; }
-.beat-1 .rb-stage-model i.shard-1,.beat-2 .rb-stage-model i.shard-1,.beat-3 .rb-stage-model i.shard-1 { background:linear-gradient(90deg,#8b9a86,#70806d); }
-.beat-1 .rb-stage-model i.shard-2,.beat-2 .rb-stage-model i.shard-2,.beat-3 .rb-stage-model i.shard-2 { background:linear-gradient(90deg,#d9c3a4,#c0a67f); }
+.rb-stage-model { position:absolute; left:50%; top:6%; display:flex; gap:0; width:min(310px,34%); height:11px; transform:translateX(-50%); }
+/* The split is scrubbed, not switched: the gap between shards is `--p1` × 5px,
+   so the bar comes apart under the reader's thumb across the whole of beat 1
+   rather than jumping open at its start. No transition on margin — `--p1`
+   already changes once per frame, and a 0.55s ease on top of a scrubbed value
+   only adds lag between the wheel and the mark. */
+/* The interior corners are what carry the "one object" reading: at --p1 = 0 the
+   three blocks butt together with square inner edges and look like one bar; as
+   the gap opens those corners round to match the outer ones. Order is
+   top-left / top-right / bottom-right / bottom-left. */
+.rb-stage-model i { flex:1; height:100%; margin-inline:calc(var(--p1) * 5px); background:linear-gradient(180deg,#b9834e,#a06f3f); border-radius:calc(var(--p1) * 2px); opacity:calc(1 - var(--p1) * var(--i) * .14); }
+.rb-stage-model i.shard-0 { border-radius:2px calc(var(--p1) * 2px) calc(var(--p1) * 2px) 2px; }
+.rb-stage-model i.shard-2 { border-radius:calc(var(--p1) * 2px) 2px 2px calc(var(--p1) * 2px); }
 
 /* Rows and gap are both percentages of the stage, so the three card centres sit
    at exactly 26% / 50% / 74% of its height at any size. The wire endpoints in
@@ -178,12 +213,16 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
 .rb-stage-devices { position:absolute; left:50%; top:50%; display:grid; grid-template-rows:repeat(3,1fr); gap:4%; width:min(230px,26%); height:66%; transform:translate(-50%,-50%); }
 /* The cards are present from the first beat, greyed and lifted, so the wires
    never converge on an empty middle. Beat 2 is what brings them forward. */
-.rb-stage-device { display:grid; grid-template-columns:auto 1fr auto; align-items:center; gap:4px 12px; padding:14px 16px; border:1px solid rgba(30,42,34,.1); border-radius:12px; background:var(--rb-paper); box-shadow:0 14px 30px rgba(30,42,34,.07); opacity:.32; transform:translateY(8px) scale(.97); transition:opacity .5s ease,transform .5s cubic-bezier(.22,.8,.2,1),border-color .3s ease; transition-delay:calc(var(--i)*.1s); }
+/* `--in` is `--p2` staggered per card: card 0 finishes arriving while card 2 is
+   still starting, so the three land in sequence under one continuous scroll
+   instead of snapping together at the beat boundary. Card 2 starts at .3, so
+   the factor must be ≥ 1/(1-.3) ≈ 1.43 for it to actually reach 1; at 1.6 it
+   completes at --p2 = .93, leaving a beat of settled diagram before beat 3. */
+.rb-stage-device { --in:clamp(0,calc((var(--p2) - var(--i) * .15) * 1.6),1); display:grid; grid-template-columns:auto 1fr auto; align-items:center; gap:4px 12px; padding:14px 16px; border:1px solid rgba(30,42,34,.1); border-radius:12px; background:var(--rb-paper); box-shadow:0 14px 30px rgba(30,42,34,.07); opacity:calc(.32 + var(--in) * .68); transform:translateY(calc((1 - var(--in)) * 8px)) scale(calc(.97 + var(--in) * .03)); transition:border-color .3s ease; }
 .rb-stage-device svg { grid-row:1/3; width:19px; height:19px; color:var(--rb-bronze); }
 .rb-stage-device strong { font:400 15px "Fraunces",serif; }
 .rb-stage-device small { color:#727a73; font:400 11px "IBM Plex Mono",monospace; }
 .rb-stage-device b { grid-column:2/4; color:#8a8272; font:500 9px "IBM Plex Mono",monospace; letter-spacing:.1em; text-transform:uppercase; }
-.beat-2 .rb-stage-device,.beat-3 .rb-stage-device { opacity:1; transform:none; }
 .beat-3 .rb-stage-device { border-color:rgba(173,122,72,.45); }
 
 /* Wires draw themselves in, then carry a travelling dash once lit. */
@@ -191,8 +230,14 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
    and the two end labels rather than crossing over them. */
 .rb-stage-wires { position:absolute; inset:0; z-index:0; width:100%; height:100%; overflow:visible; }
 .rb-stage-ask,.rb-stage-answer,.rb-stage-model,.rb-stage-devices { z-index:1; }
-.rb-stage-wires .wire { fill:none; stroke:rgba(30,42,34,.16); stroke-width:2; stroke-dasharray:6 9; transition:stroke .4s ease; }
-.beat-2 .rb-stage-wires .wire:not(.wire-out),.beat-3 .rb-stage-wires .wire { stroke:var(--rb-bronze); animation:rbWireFlow 1.15s linear infinite; }
+/* Each wire's colour is mixed continuously rather than switched at a beat: the
+   inbound wires light under `--p2` (as the machines take their stage) and the
+   outbound ones under `--p3` (as the answer comes back). `--lit` is the mix
+   amount, so one declaration serves both and the travelling dash below is the
+   only thing left that snaps. */
+.rb-stage-wires .wire { --lit:var(--p2); fill:none; stroke:color-mix(in srgb, var(--rb-bronze) calc(var(--lit) * 100%), rgba(30,42,34,.16)); stroke-width:2; stroke-dasharray:6 9; }
+.rb-stage-wires .wire-out { --lit:var(--p3); }
+.beat-2 .rb-stage-wires .wire:not(.wire-out),.beat-3 .rb-stage-wires .wire { animation:rbWireFlow 1.15s linear infinite; }
 @keyframes rbWireFlow { to { stroke-dashoffset:-30; } }
 
 .rb-story-foot { display:flex; align-items:flex-end; justify-content:space-between; gap:40px; }
@@ -331,7 +376,11 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
 /* Two doors out of the section, one per side of the exchange. */
 .rb-pay-actions { display:flex; flex-wrap:wrap; gap:12px; margin-top:34px; }
 .rb-pay-actions .rb-pill-ghost { margin-left:0; color:var(--rb-ink); border-color:var(--rb-line); }
-.rb-pill-dark { color:#f5f0e8; background:var(--rb-forest); border-color:transparent; }
+/* `!important` for the same reason as `.rb-pill-light`: `.rb-page a` sets
+   `color:inherit` at a higher specificity than a single class, so without it
+   this pill inherits the section's near-black ink and the label disappears
+   into the forest fill. */
+.rb-pill-dark { color:#f5f0e8!important; background:var(--rb-forest); border-color:transparent; }
 
 /* ── Local strip (half section) ───────────────────────────────────────── */
 /* Deliberately not a section: roughly half the vertical rhythm of its
@@ -477,7 +526,7 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
   .rb-mobile-nav a { display:flex; align-items:center; min-height:44px; }
   .rb-hero-copy { width:min(560px,58vw); }
   .rb-globe { right:4%; width:min(86vw,94vh); }
-  .rb-story { height:400vh; }
+  .rb-story { height:230vh; }
   .rb-stage-model { width:min(280px,42%); }
   .rb-stage-devices { width:min(210px,32%); }
   .rb-doors-grid,.rb-pay-rules { grid-template-columns:1fr; }
@@ -529,7 +578,10 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
   .rb-page h2 { font-size:clamp(34px,10vw,44px); }
   /* The three-column diagram cannot survive a phone, so the story stacks:
      request on top, devices in a row, answer underneath. */
-  .rb-story { height:340vh; }
+  /* Phones scroll in longer swipes than a wheel does, so the travel shrinks
+     less aggressively than the desktop figure: 200vh is ~5 notches-equivalent
+     and still leaves each beat a readable stretch. */
+  .rb-story { height:200vh; }
   .rb-story-sticky { min-height:0; }
   .rb-story-inner { padding-block:80px 40px; }
   /* Tall enough for the stacked layout now that each card carries a layer
@@ -538,8 +590,9 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
   .rb-stage-wires { display:none; }
   .rb-stage-ask,.rb-stage-answer { left:50%; right:auto; top:auto; width:130px; transform:translateX(-50%); }
   .rb-stage-ask { top:0; }
-  .rb-stage-answer { bottom:0; top:auto; transform:translateX(-50%) scale(.94); }
-  .beat-3 .rb-stage-answer { transform:translateX(-50%) scale(1); }
+  /* Same scrubbed growth as desktop, but around the phone's centring transform
+     rather than the vertical one. */
+  .rb-stage-answer { bottom:0; top:auto; transform:translateX(-50%) scale(calc(.94 + var(--p3) * .06)); }
   .rb-stage-model { top:110px; width:min(300px,80%); }
   .rb-stage-devices { top:auto; bottom:104px; grid-template-rows:none; grid-template-columns:repeat(3,1fr); gap:7px; width:100%; height:auto; transform:translateX(-50%); }
   .rb-stage-device { grid-template-columns:1fr; gap:3px; padding:11px 6px; text-align:center; justify-items:center; }
@@ -609,7 +662,10 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
   .rb-pay-bar i { transform:none; }
   .rb-pay-wire i { display:none; }
   .rb-story { height:auto; }
-  .rb-story-sticky { position:relative; height:auto; min-height:0; display:block; }
+  /* The four scrub tracks are pinned to 1 as well as `--p`: the stage is hidden
+     here, but any mark that survives must read as finished rather than as a
+     half-built diagram. */
+  .rb-story-sticky { position:relative; height:auto; min-height:0; display:block; --p0:1; --p1:1; --p2:1; --p3:1; }
   .rb-story-sticky::after { display:none; }
   .rb-stage,.rb-story-foot { display:none; }
   /* margin-inline stays `auto` so the list keeps the shell's centred gutter and

@@ -76,7 +76,7 @@ function webPage(name: string, description: string, path: string): JsonValue {
 
 export const SEO_PAGES = {
   "/": {
-    title: "mycellios — Intelligence grows through the network",
+    title: "mycellios — The open compute layer for distributed AI",
     description:
       "mycellios connects capacity across different machines to run AI models that cannot fit on a single device.",
     canonicalPath: "/",

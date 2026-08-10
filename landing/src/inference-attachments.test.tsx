@@ -17,6 +17,6 @@ describe("inference attachments", () => {
 
   it("rejects unsupported binary files instead of pretending the model can read them", async () => {
     const file = new File([new Uint8Array([0, 1, 2])], "archive.zip", { type: "application/zip" });
-    await expect(readInferenceAttachment(file, 18_000)).rejects.toThrow("no es compatible");
+    await expect(readInferenceAttachment(file, 18_000)).rejects.toThrow("is not supported");
   });
 });

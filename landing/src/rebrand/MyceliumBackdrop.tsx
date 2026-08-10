@@ -13,26 +13,55 @@ import "./mycelium-backdrop.css";
  * Three constraints shaped every decision here.
  *
  * 1. It must not compete with the content. The whole point is that it is felt
- *    and not looked at, so the ink stays under 10% alpha, filaments are pushed
+ *    before it is inspected, so the ink stays translucent and filaments are pushed
  *    out of the centre column where the copy lives (see `mycelium-field.ts`),
  *    and the band fades out at both ends rather than stopping at a hard edge.
  *
- * 2. It cannot touch the existing sections. Every band on this page paints its
- *    own opaque background, so a canvas behind `.rb-page` would simply be
- *    covered. Instead this is a fixed, full-viewport canvas layered *over* the
- *    light bands but under the text, painting ink so faint it reads as tint in
- *    the paper. That is why it must end before the forest-green install
- *    section: light ink on a dark band would invert into a smudge.
+ * 2. It must cross the existing sections. Every band paints its own opaque
+ *    background, so a canvas behind `.rb-page` would simply be covered. This is
+ *    a fixed, full-viewport canvas layered over the bands but under their copy.
+ *    Its ink changes from bronze on paper to pale gold on forest green.
  *
  * 3. It must be free. The geometry is generated once per size and only walked
  *    per frame; work is scheduled in rAF rather than done in the scroll
- *    handler; and the loop does not run at all while the band is off screen.
+ *    handler; and the renderer exits immediately while the band is off screen.
  */
 
-/** Alpha ceiling for a filament at full growth. Tint, not line art. */
-const INK_ALPHA = 0.093;
+/*
+ * Alpha ceiling for a filament at full growth. Visible texture, never body ink.
+ *
+ * This is deliberately low. The failure mode of the previous pass was not
+ * density but tone: a dark, desaturated ink multiplied into warm paper turns
+ * grey, and sparse grey lines on beige read as cracks or cobwebs — the page
+ * looked damaged rather than alive. The fix is the opposite of the intuitive
+ * one: warmer, lighter ink drawn *more* densely. Many faint warm filaments
+ * read as grain in the stock; few dark ones read as damage.
+ *
+ * The working range is narrow: 0.10 was nearly invisible on a bright screen,
+ * while values much beyond 0.15 start asserting themselves over the paper.
+ * This sits high enough to survive bright mobile displays while remaining a
+ * substrate rather than a foreground illustration.
+ */
+const INK_ALPHA = 0.14;
+const DARK_INK_MULTIPLIER = 1.35;
+/*
+ * Distance, in field pixels, over which a single filament is revealed. Long
+ * enough that a segment always takes several scrolled frames to appear — the
+ * reveal is what makes growth read as continuous rather than as strokes being
+ * switched on — and short enough that the frontier still tracks the reader.
+ */
+const REVEAL_PX = 90;
+const OCCLUDER_SELECTOR = [
+  ".rb-pay-card",
+  ".rb-pay-machines li",
+  ".rb-rule",
+  ".rb-local-term",
+  ".rb-local-switch",
+  ".rb-door",
+  ".rb-board",
+].join(",");
 const SPAN_START = "how-it-works"; // the colony takes root where the story begins
-const SPAN_END = "install"; // …and is gone before the dark download band
+const SPAN_END_SELECTOR = ".rb-sponsors"; // it dissolves after the dark install + closing sequence
 
 export function MyceliumBackdrop() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -44,7 +73,8 @@ export function MyceliumBackdrop() {
     if (!context) return;
 
     const start = document.getElementById(SPAN_START);
-    const end = document.getElementById(SPAN_END);
+    const end = document.querySelector<HTMLElement>(SPAN_END_SELECTOR);
+    const darkStartElement = document.getElementById("install");
     if (!start || !end) return;
 
     const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -55,6 +85,8 @@ export function MyceliumBackdrop() {
     let fieldHeight = 1;
     let spanTop = 0;
     let spanHeight = 1;
+    let darkStart = Number.POSITIVE_INFINITY;
+    let darkEnd = Number.NEGATIVE_INFINITY;
 
     const measure = () => {
       const ratio = Math.min(2, window.devicePixelRatio || 1);
@@ -70,6 +102,10 @@ export function MyceliumBackdrop() {
       const scrollY = window.scrollY;
       spanTop = start.getBoundingClientRect().top + scrollY;
       spanHeight = Math.max(1, end.getBoundingClientRect().top + scrollY - spanTop);
+      darkStart = darkStartElement
+        ? darkStartElement.getBoundingClientRect().top + scrollY - spanTop
+        : Number.POSITIVE_INFINITY;
+      darkEnd = end.getBoundingClientRect().top + scrollY - spanTop;
 
       // Generated in viewport-width × span-height pixels, once per size.
       fieldHeight = spanHeight;
@@ -83,6 +119,13 @@ export function MyceliumBackdrop() {
      */
     const render = () => {
       context.clearRect(0, 0, width, height);
+
+      // Keep the fixed canvas dormant before the story and after the install
+      // band. A passive scroll listener is still needed to notice when the
+      // viewport enters this long document-space range.
+      const viewportTop = window.scrollY;
+      const viewportBottom = viewportTop + height;
+      if (viewportBottom < spanTop || viewportTop > spanTop + spanHeight) return;
 
       const eye = window.scrollY + height * 0.5;
       const grown = Math.max(0, Math.min(1, (eye - spanTop) / spanHeight));
@@ -99,8 +142,16 @@ export function MyceliumBackdrop() {
 
         // The last stretch draws partially, so the tip advances smoothly
         // instead of snapping in one segment at a time.
+        //
+        // The reveal is spread over a fixed distance rather than over each
+        // segment's own vertical span. Measuring against the span alone meant a
+        // near-horizontal branch — which is most of them, since branches spread
+        // sideways — had almost no span to travel and therefore snapped from
+        // nothing to fully drawn between two frames. Dozens of those popping in
+        // at once is exactly the jumping this needed to remove.
         const span = hypha.y2 - hypha.y1;
-        const t = span <= 0 ? 1 : Math.max(0, Math.min(1, (frontier - hypha.y1) / span));
+        const reveal = Math.max(span, REVEAL_PX);
+        const t = Math.max(0, Math.min(1, (frontier - hypha.y1) / reveal));
         const y1 = hypha.y1 + offset;
         const x2 = hypha.x1 + (hypha.x2 - hypha.x1) * t;
         const y2 = y1 + span * t;
@@ -109,25 +160,49 @@ export function MyceliumBackdrop() {
         if ((y1 < -40 && y2 < -40) || (y1 > height + 40 && y2 > height + 40)) continue;
 
         // Older, thicker filaments carry the structure; branches fade back.
-        const depth = 1 - hypha.gen / 5;
-        context.globalAlpha = INK_ALPHA * (0.45 + depth * 0.55);
+        // Ink in as well as extend: a filament arrives at full strength only
+        // once it is fully drawn, so the growth frontier is a soft edge rather
+        // than a line of hard new strokes advancing down the page.
+        const depth = 1 - hypha.gen / 6;
+        const documentMidpoint = hypha.y1 + span * t * 0.5;
+        const overDarkBand = documentMidpoint >= darkStart && documentMidpoint < darkEnd;
+        context.globalAlpha = INK_ALPHA * (overDarkBand ? DARK_INK_MULTIPLIER : 1) * (0.5 + depth * 0.5) * (0.35 + t * 0.65);
         context.lineWidth = 0.75 + depth * 0.7;
-        context.strokeStyle = "#1e2a22";
+        // The ink adapts to the substrate: bronze deepens paper, while a pale
+        // gold keeps the same organism legible across the forest-green bands.
+        context.strokeStyle = overDarkBand
+          ? (hypha.gen > 1 ? "#dfc29d" : "#e7b77e")
+          : (hypha.gen > 1 ? "#c19a6e" : "#a8763f");
         context.beginPath();
         context.moveTo(hypha.x1, y1);
-        context.lineTo(x2, y2);
+        const cx = hypha.x1 + (hypha.cx - hypha.x1) * t;
+        const cy = y1 + (hypha.cy - hypha.y1) * t;
+        context.quadraticCurveTo(cx, cy, x2, y2);
         context.stroke();
 
         // A fork that has been reached gets a faint bronze node: the only
         // colour in the whole backdrop, and the thing that makes it read as a
         // network rather than as cracks in the paper.
-        if (hypha.fork && t >= 1) {
-          context.globalAlpha = INK_ALPHA * 2.1;
-          context.fillStyle = "#ad7a48";
+        // Fade the node in over the last stretch of its segment rather than
+        // switching it on at `t === 1`. A dot that appears at full strength in
+        // one frame is a step the eye catches, and dozens of them stepping in
+        // as the reader scrolls was a large part of why growth looked jumpy.
+        if (hypha.fork && t > 0.55) {
+          context.globalAlpha = Math.min(overDarkBand ? 0.28 : 0.2, INK_ALPHA * (overDarkBand ? 1.9 : 1.5)) * ((t - 0.55) / 0.45);
+          context.fillStyle = overDarkBand ? "#ecc18c" : "#ad7a48";
           context.beginPath();
-          context.arc(x2, y2, 1.6, 0, Math.PI * 2);
+          context.arc(x2, y2, 1.2, 0, Math.PI * 2);
           context.fill();
         }
+      }
+
+      // The organism belongs to the paper substrate. Opaque interface objects
+      // sit above it, with a small breathing margin, so no filament can look
+      // like a rendering defect drawn across a card.
+      for (const element of document.querySelectorAll<HTMLElement>(OCCLUDER_SELECTOR)) {
+        const rect = element.getBoundingClientRect();
+        if (rect.bottom < 0 || rect.top > height) continue;
+        context.clearRect(rect.left - 7, rect.top - 7, rect.width + 14, rect.height + 14);
       }
       context.globalAlpha = 1;
     };
@@ -139,7 +214,9 @@ export function MyceliumBackdrop() {
       const still = () => {
         measure();
         const saved = window.scrollY;
-        spanTop = saved - spanHeight * 0.5; // force progress to 1
+        // Place the synthetic eye exactly at the end of the field so render()
+        // draws the complete static colony without scroll-linked movement.
+        spanTop = saved + height * 0.5 - spanHeight;
         render();
       };
       still();
@@ -161,44 +238,18 @@ export function MyceliumBackdrop() {
       schedule();
     };
 
-    // The loop is only wired up while the span is actually on screen.
-    let listening = false;
-    const listen = (on: boolean) => {
-      if (on === listening) return;
-      listening = on;
-      if (on) {
-        window.addEventListener("scroll", schedule, { passive: true });
-        schedule();
-      } else {
-        window.removeEventListener("scroll", schedule);
-        context.clearRect(0, 0, width, height);
-      }
-    };
-
-    const visibility = new IntersectionObserver(
-      (entries) => entries.forEach((entry) => listen(entry.isIntersecting)),
-      { rootMargin: "20% 0px" },
-    );
-    // Observing a document-space proxy would need a wrapper element; the two
-    // anchors bracket the span, so watching both covers entering from either
-    // end and the long middle where neither is on screen.
-    visibility.observe(start);
-    visibility.observe(end);
-
     // Sections above the span change height on reveal, so the span is
     // re-measured rather than trusted from first paint.
     const layout = new ResizeObserver(remeasure);
     layout.observe(document.body);
     window.addEventListener("resize", remeasure);
 
-    // The span usually starts on screen at load in the middle of the page.
-    listen(true);
+    window.addEventListener("scroll", schedule, { passive: true });
     schedule();
 
     return () => {
       window.removeEventListener("scroll", schedule);
       window.removeEventListener("resize", remeasure);
-      visibility.disconnect();
       layout.disconnect();
       if (frame) window.cancelAnimationFrame(frame);
     };

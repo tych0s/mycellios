@@ -1495,13 +1495,17 @@ export async function createCoordinator(
     };
   });
 
-  app.get("/public/v1/snapshot", async () => {
+  app.get("/public/v1/snapshot", async (request) => {
     reconcileRequestedModels();
-    return publicSnapshot(store, scheduler, hub, mobileHub, activationManager, {
+    const snapshot = publicSnapshot(store, scheduler, hub, mobileHub, activationManager, {
       activationProgressForModel,
       activationStatusMessageForModel,
       activationIncidentForModel,
     }, runtimeVersion, coordinatorBuildIdentity);
+    const view = typeof (request.query as { view?: unknown }).view === "string"
+      ? (request.query as { view: string }).view
+      : null;
+    return view ? panelSnapshotForView(snapshot, view) : snapshot;
   });
 
   app.post("/internal/v1/diagnostics", async (request, reply) => {
@@ -3259,6 +3263,48 @@ function publicSnapshot(
     requestedModels,
     jobs,
   };
+}
+
+function panelSnapshotForView(
+  snapshot: ReturnType<typeof publicSnapshot>,
+  view: string,
+): ReturnType<typeof publicSnapshot> {
+  const lightweightRequests = snapshot.requestedModels.map((model) => ({
+    ...model,
+    activationProgress: [],
+  }));
+  const empty = {
+    workers: [],
+    models: [],
+    requestedModels: [],
+    jobs: [],
+  } satisfies Pick<ReturnType<typeof publicSnapshot>, "workers" | "models" | "requestedModels" | "jobs">;
+  if (view === "overview") return {
+    ...snapshot,
+    requestedModels: lightweightRequests,
+    jobs: snapshot.jobs.slice(0, 5),
+  };
+  if (view === "history" || view === "contribute" || view === "join" || view === "downloads" || view === "admin" || view === "settings") {
+    return { ...snapshot, ...empty };
+  }
+  if (view === "nodes") return {
+    ...snapshot,
+    requestedModels: lightweightRequests,
+    jobs: [],
+  };
+  if (view === "inference") return {
+    ...snapshot,
+    requestedModels: lightweightRequests,
+    jobs: [],
+  };
+  if (view === "models") return { ...snapshot, jobs: [] };
+  if (view === "jobs") return { ...snapshot, workers: [], models: [], requestedModels: [] };
+  if (view === "logs") return {
+    ...snapshot,
+    requestedModels: lightweightRequests,
+    jobs: snapshot.jobs.slice(0, 30),
+  };
+  return snapshot;
 }
 
 function networkTelemetrySample(

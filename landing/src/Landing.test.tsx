@@ -13,11 +13,10 @@ describe("Landing", () => {
   it("opens the hero on the headline and ends it at the prompt", () => {
     const html = renderToStaticMarkup(<RebrandLanding />);
 
-    // The headline has to name the category ("AI") and the problem it solves in
-    // the first line a stranger reads — an abstract line about intelligence and
-    // networks tested as pretty but uninformative.
-    expect(html).toContain("AI that outgrows");
-    expect(html).toContain("your <em>machine.</em>");
+    // The headline names the category explicitly and states the single-machine
+    // limit the network removes.
+    expect(html).toContain("The open compute layer");
+    expect(html).toContain("<em>for distributed AI.</em>");
     expect(html.match(/<h1/g)).toHaveLength(1);
     expect(html).toContain('href="/join"');
     // Nothing frames the headline and nothing follows the prompt: the status

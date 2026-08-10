@@ -273,12 +273,9 @@ export function RebrandLanding() {
         <HeroGlobe />
         <div className="rb-hero-inner rb-shell">
           <div className="rb-hero-copy">
-            {/* "Intelligence grows through the network" was true but told a
-                stranger nothing: it named neither the product nor the problem.
-                This says AI, states the exact thing no competitor can do, and
-                keeps "outgrows" so the growth metaphor the whole brand rests on
-                survives the rewrite. The lede resolves it in one line. */}
-            <h1 id="rb-hero-title" aria-label="AI that outgrows your machine.">AI that outgrows<br />your <em>machine.</em></h1>
+            {/* Name the category immediately, then state the product's defining
+                difference without repeating the story section's own headline. */}
+            <h1 id="rb-hero-title" aria-label="The open compute layer for distributed AI.">The open compute layer<br /><em>for distributed AI.</em></h1>
             {/* Kept under the lede's 470px measure so it sets as one line: the
                 longer version broke with "anyway." orphaned on its own. */}
             <p className="rb-lede">Mycellios splits the model across many machines.</p>

@@ -119,6 +119,45 @@ describe("requested model API activation flow", () => {
     });
   });
 
+  it("projects the public snapshot by panel view without changing the legacy full response", async () => {
+    const manager = new FakeActivationManager();
+    manager.progress.push({
+      phase: "queued",
+      state: "running",
+      message: "Activation accepted by the coordinator.",
+      at: "2026-01-01T00:00:00.000Z",
+    });
+    runtime = await createCoordinator({
+      host: "127.0.0.1",
+      port: 8_787,
+      databasePath: ":memory:",
+      requestTimeoutMs: 30_000,
+    }, { activationManager: manager });
+    runtime.store.upsertRequestedModel({
+      id: "panel-projection",
+      source: "Qwen/Qwen3-0.6B",
+      revision: null,
+      contextTokens: 4_096,
+      minimumNodes: 2,
+      autoActivate: false,
+    });
+
+    const full = await runtime.app.inject({ method: "GET", url: "/public/v1/snapshot" });
+    const overview = await runtime.app.inject({ method: "GET", url: "/public/v1/snapshot?view=overview" });
+    const history = await runtime.app.inject({ method: "GET", url: "/public/v1/snapshot?view=history" });
+
+    expect(full.statusCode).toBe(200);
+    expect(full.json().requestedModels[0].activationProgress).toHaveLength(1);
+    expect(overview.json().requestedModels[0].activationProgress).toEqual([]);
+    expect(history.json()).toMatchObject({
+      workers: [],
+      models: [],
+      requestedModels: [],
+      jobs: [],
+    });
+    expect(history.json().summary).toEqual(full.json().summary);
+  });
+
   it("recovers a previously stuck transient activation and exposes the retry in the live log", async () => {
     const manager = new FakeActivationManager();
     runtime = await createCoordinator({

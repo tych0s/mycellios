@@ -271,64 +271,64 @@ export function benchmarkComparisonNarrative(
 ): BenchmarkComparisonNarrative {
   if (comparison.verdict === "faster-code-signal") {
     return {
-      eyebrow: "SEÑAL DE MEJORA DEL CÓDIGO",
-      title: "Más rápido con la misma capacidad",
-      description: "Modelo, workload, backend, nodos y topología coinciden; ambas campañas son estables y sus bandas P5–P95 no se solapan.",
+      eyebrow: "CODE IMPROVEMENT SIGNAL",
+      title: "Faster with the same capacity",
+      description: "Model, workload, backend, nodes and topology match; both campaigns are stable and their P5–P95 bands do not overlap.",
     };
   }
   if (comparison.verdict === "slower-code-signal") {
     return {
-      eyebrow: "SEÑAL DE REGRESIÓN DEL CÓDIGO",
-      title: "Más lento con la misma capacidad",
-      description: "El escenario es idéntico y estable, pero toda la banda P5–P95 actual queda por debajo de la referencia.",
+      eyebrow: "CODE REGRESSION SIGNAL",
+      title: "Slower with the same capacity",
+      description: "The scenario is identical and stable, but the entire current P5–P95 band is below the reference.",
     };
   }
   if (comparison.verdict === "within-variation") {
     return {
-      eyebrow: "DENTRO DE LA VARIACIÓN",
+      eyebrow: "WITHIN VARIATION",
       title: "No hay una mejora demostrada",
-      description: "El escenario es idéntico y estable, pero las bandas P5–P95 se solapan. La diferencia puede ser ruido normal de ejecución.",
+      description: "The scenario is identical and stable, but the P5–P95 bands overlap. The difference may be normal execution noise.",
     };
   }
   if (comparison.verdict === "insufficient-confidence") {
     return {
-      eyebrow: "COMPARACIÓN INCONCLUSA",
-      title: "Mismo escenario, faltan muestras estables",
-      description: "La configuración coincide, pero la variación o la cobertura estadística todavía no permiten atribuir el cambio al código.",
+      eyebrow: "INCONCLUSIVE COMPARISON",
+      title: "Same scenario, stable samples missing",
+      description: "The configuration matches, but variation or statistical coverage cannot yet attribute the change to code.",
     };
   }
   if (comparison.mode === "capacity-change") {
     return {
       eyebrow: "CAMBIO DE CAPACIDAD",
-      title: "Ha cambiado el hardware o la topología",
-      description: "La velocidad total permite estudiar el escalado. Mira también tok/s por nodo y por GB: no se atribuye al código como mejora limpia.",
+      title: "Hardware or topology changed",
+      description: "Total speed can still show scaling. Also inspect tok/s per node and GB; this is not a clean code improvement.",
     };
   }
   if (comparison.mode === "configuration-change") {
     return {
-      eyebrow: "CONFIGURACIÓN DISTINTA",
+      eyebrow: "DIFFERENT CONFIGURATION",
       title: "Ha cambiado el backend o la carga",
-      description: "El modelo y la capacidad pueden coincidir, pero el fingerprint no. Los valores se muestran sin atribuir el cambio al código.",
+      description: "The model and capacity may match, but the fingerprint does not. Values are shown without attributing the change to code.",
     };
   }
   if (comparison.mode === "different-evidence") {
     return {
       eyebrow: "EVIDENCIA DISTINTA",
-      title: "Físico y loopback no se mezclan",
-      description: "Se muestran los valores reales de cada ejecución, pero no se calcula una mejora entre entornos diferentes.",
+      title: "Physical and loopback do not mix",
+      description: "Real values from each run are shown, but no improvement is calculated between different environments.",
     };
   }
   if (comparison.mode === "different-model") {
     return {
       eyebrow: "MODELOS DISTINTOS",
-      title: "Esta selección no es comparable",
-      description: "Selecciona una referencia del mismo modelo para medir evolución de velocidad y eficiencia.",
+      title: "This selection is not comparable",
+      description: "Select a reference from the same model to measure speed and efficiency over time.",
     };
   }
   return {
     eyebrow: "SIN REFERENCIA",
-    title: "Hace falta una segunda ejecución",
-    description: "Cuando haya otra prueba real podrás comparar versiones, nodos, VRAM, latencia y eficiencia.",
+    title: "A second run is required",
+    description: "Once another real test exists, you can compare versions, nodes, VRAM, latency and efficiency.",
   };
 }
 

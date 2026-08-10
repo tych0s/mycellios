@@ -31,12 +31,12 @@ describe("NetworkHistoryReport", () => {
 
     const html = renderToStaticMarkup(<NetworkHistoryReport history={history} />);
 
-    expect(html).toContain("Última muestra");
+    expect(html).toContain("Latest sample");
     expect(html).toContain("40 GB");
     expect(html).toContain("28 GB");
-    expect(html).toContain("+16384 desde el inicio");
-    expect(html).toContain("Últimas lecturas guardadas");
-    expect(html).toContain("Datos del coordinador, sin estimaciones");
+    expect(html).toContain("+16384 since start");
+    expect(html).toContain("Latest saved readings");
+    expect(html).toContain("Coordinator data, no estimates");
   });
 });
 

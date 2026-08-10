@@ -22,7 +22,6 @@ import {
   Globe2,
   HardDrive,
   History,
-  House,
   Laptop,
   LayoutDashboard,
   LoaderCircle,
@@ -264,7 +263,7 @@ const EMPTY: PublicSnapshot = {
 
 const sharedNavItems: Array<{ id: PanelView; label: string; icon: typeof Network }> = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
-  { id: "history", label: "Histórico", icon: History },
+  { id: "history", label: "History", icon: History },
   { id: "nodes", label: "Nodes", icon: Server },
   { id: "jobs", label: "Tasks", icon: Activity },
   { id: "tests", label: "Tests", icon: Gauge },
@@ -339,10 +338,6 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   const [menuOpen, setMenuOpen] = useState(false);
   const menuButtonRef = useRef<HTMLButtonElement>(null);
   const sidebarCloseButtonRef = useRef<HTMLButtonElement>(null);
-  const [contentScale, setContentScale] = useState(() => {
-    const saved = Number(window.localStorage.getItem("mycellios.content-scale"));
-    return Number.isFinite(saved) && saved >= 0.9 && saved <= 1.3 ? saved : 1;
-  });
   const [modelAdminToken, setModelAdminToken] = useState(() =>
     window.sessionStorage.getItem("mycellios-model-admin-token") ?? "",
   );
@@ -375,7 +370,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
         applyDesktopSnapshot(next);
         return;
       }
-      const response = await fetch("/public/v1/snapshot", { cache: "no-store" });
+      const response = await fetch(`/public/v1/snapshot?view=${encodeURIComponent(view)}`, { cache: "no-store" });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       setSnapshot(await response.json() as PublicSnapshot);
       setIssue(null);
@@ -387,13 +382,31 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     } finally {
       setLoading(false);
     }
-  }, [applyDesktopSnapshot, desktopBridge]);
+  }, [applyDesktopSnapshot, desktopBridge, view]);
 
   useEffect(() => {
+    let timer: number | undefined;
+    const liveViews = new Set<PanelView>(["overview", "nodes", "models", "jobs", "logs", "inference", "machine"]);
+    const intervalMs = liveViews.has(view) ? 5_000 : 15_000;
+    const schedule = () => {
+      if (document.visibilityState === "visible") timer = window.setInterval(() => void refresh(), intervalMs);
+    };
+    const handleVisibility = () => {
+      if (timer !== undefined) window.clearInterval(timer);
+      timer = undefined;
+      if (document.visibilityState === "visible") {
+        void refresh();
+        schedule();
+      }
+    };
     void refresh();
-    const timer = window.setInterval(() => void refresh(), 2_000);
-    return () => window.clearInterval(timer);
-  }, [refresh]);
+    schedule();
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => {
+      if (timer !== undefined) window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
+  }, [refresh, view]);
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -444,14 +457,6 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     });
     return () => { cancelled = true; };
   }, [desktop]);
-
-  function changeContentScale(delta: number) {
-    setContentScale((current) => {
-      const next = Math.min(1.3, Math.max(0.9, Math.round((current + delta) * 10) / 10));
-      window.localStorage.setItem("mycellios.content-scale", String(next));
-      return next;
-    });
-  }
 
   function changePanelMode(next: PanelMode) {
     setPanelMode(next);
@@ -670,7 +675,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     if (desktopBridge?.streamChat) return desktopBridge.streamChat({ model, messages, sessionId }, onUpdate ?? (() => undefined));
     if (desktopBridge) return desktopBridge.sendChat({ model, messages, sessionId });
     if (authConfig.apiAccessEnabled && !authSession) {
-      throw new Error("Inicia sesión para usar el saldo de inferencia de tu cuenta.");
+      throw new Error("Sign in to use your account's inference balance.");
     }
     const result = await consumeChatCompletionStreamWithRecovery(
       (_attempt, signal) => fetch("/v1/chat/completions", {
@@ -714,16 +719,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
 
   return (
     <div className="public-panel-viewport">
-      <div
-        className={`public-panel theme-${theme} panel-mode-${panelMode} ${desktop ? `desktop-panel platform-${desktopSnapshot?.platform ?? "loading"}` : ""}`}
-        style={{
-          width: `${100 / contentScale}%`,
-          height: `${100 / contentScale}vh`,
-          minHeight: `${100 / contentScale}vh`,
-          transform: `scale(${contentScale})`,
-          transformOrigin: "top left",
-        } as CSSProperties}
-      >
+      <div className={`public-panel theme-${theme} panel-mode-${panelMode} ${desktop ? `desktop-panel platform-${desktopSnapshot?.platform ?? "loading"}` : ""}`}>
       <aside id="panel-navigation" className={menuOpen ? "panel-sidebar open" : "panel-sidebar"} aria-label="Primary navigation">
         <button ref={sidebarCloseButtonRef} className="panel-sidebar-close" aria-label="Close navigation" onClick={closeNavigation}><X size={18} /></button>
         <a className="panel-brand" href={publicLink("/")} {...externalProps}><img src={brandIcon} alt="" /><div><strong>mycellios</strong><span>network control</span></div></a>
@@ -746,10 +742,6 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
           <span><strong>Developer mode</strong><small>{panelMode === "developer" ? "Advanced tools visible" : "Simple panel active"}</small></span>
           <i aria-hidden="true" />
         </button>
-        <div className="panel-sidebar-links">
-          <a href={publicLink("/mobile/")} {...externalProps}><Smartphone size={17} /><span>Mobile app</span><ExternalLink size={13} /></a>
-          <a href={publicLink("/")} {...externalProps}><House size={17} /><span>Landing</span><ExternalLink size={13} /></a>
-        </div>
         <div className={`panel-sidebar-status ${coordinatorError ? "degraded" : "healthy"}`}>
           <i />
           <div>
@@ -757,11 +749,6 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
             <strong>{coordinatorError ? "Degraded" : "Healthy"}</strong>
             <small>{coordinatorError ? "Coordinator unavailable" : "Coordinator operational"}</small>
           </div>
-        </div>
-        {!desktop && <button className="panel-sidebar-account" onClick={() => setAuthOpen(true)}><UserRound /><span><strong>{networkIdentity ? `@${networkIdentity.email?.split("@")[0] ?? "mycellios"}` : "Mycellios account"}</strong><small>{networkIdentity ? `${formatCompactTokens(apiAccount?.token_balance ?? 0)} tokens · View usage` : "Sign in · View usage"}</small></span><ChevronRight /></button>}
-        <div className="panel-sidebar-version" aria-label="Versiones">
-          {desktopSnapshot && <span><small>APP</small><strong>v{desktopSnapshot.appVersion}</strong></span>}
-          <span><small>API</small><strong>{snapshot.version}</strong></span>
         </div>
       </aside>
       {menuOpen && <button className="panel-menu-backdrop" aria-label="Close navigation overlay" onClick={closeNavigation} />}
@@ -778,20 +765,15 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
           ><Menu /></button>
           <div className="panel-topbar-status"><span className={`panel-live-dot ${coordinatorError ? "degraded" : ""}`} /><div><strong>{coordinatorError ? "Network degraded" : "Network healthy"}</strong><small>{snapshot.capturedAt === EMPTY.capturedAt ? "Waiting for snapshot" : `Updated ${relativeTime(snapshot.capturedAt)}`}</small></div></div>
           <div className="panel-top-actions">
-            <div className="panel-balance-group" aria-label="Saldos de la cuenta">
-              <span className="panel-balance-badge money" aria-label={`Saldo: ${apiAccount?.usd_balance ?? "0.00"} dólares`} title="Saldo monetario disponible">${apiAccount?.usd_balance ?? "0.00"}</span>
-              <span className="panel-balance-badge tokens" aria-label={`Tokens: ${apiAccount?.token_balance ?? 0}`} title="Tokens de inferencia disponibles"><Coins size={14} />{formatCompactTokens(apiAccount?.token_balance ?? 0)} TOK</span>
-            </div>
-            <button className="panel-theme-indicator" type="button" onClick={toggleTheme} aria-label={`Cambiar a modo ${theme === "dark" ? "claro" : "oscuro"}`} title={`Cambiar a modo ${theme === "dark" ? "claro" : "oscuro"}`}><SunMoon size={16} /></button>
-            {localProductionProxy && <span className="panel-environment-badge"><Globe2 size={13} /> Production via local</span>}
-            <div className="panel-zoom-controls" role="group" aria-label="Interface zoom">
-              <button type="button" aria-label="Reduce interface size" disabled={contentScale <= 0.9} onClick={() => changeContentScale(-0.1)}><Minus size={14} /></button>
-              <output aria-live="polite">{Math.round(contentScale * 100)}%</output>
-              <button type="button" aria-label="Increase interface size" disabled={contentScale >= 1.3} onClick={() => changeContentScale(0.1)}><Plus size={14} /></button>
-            </div>
+            {panelMode === "developer" && <div className="panel-balance-group" aria-label="Account balances">
+              <span className="panel-balance-badge money" aria-label={`Balance: ${apiAccount?.usd_balance ?? "0.00"} dollars`} title="Available monetary balance">${apiAccount?.usd_balance ?? "0.00"}</span>
+              <span className="panel-balance-badge tokens" aria-label={`Tokens: ${apiAccount?.token_balance ?? 0}`} title="Available inference tokens"><Coins size={14} />{formatCompactTokens(apiAccount?.token_balance ?? 0)} TOK</span>
+            </div>}
+            {panelMode === "developer" && <button className="panel-theme-indicator" type="button" onClick={toggleTheme} aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`} title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}><SunMoon size={16} /></button>}
+            {panelMode === "developer" && localProductionProxy && <span className="panel-environment-badge"><Globe2 size={13} /> Production via local</span>}
             {desktopSnapshot?.update.state === "ready" && <button className="panel-update-ready" onClick={() => void desktopBridge?.installUpdate()} title="Restart and install update"><Download size={15} /></button>}
-            {desktopSnapshot && <span title={buildIdentityTitle(desktopSnapshot.buildIdentity)}>App {shortBuildIdentity(desktopSnapshot.buildIdentity)}</span>}
-            <span title={buildIdentityTitle(snapshot.buildIdentity)}>API {shortBuildIdentity(snapshot.buildIdentity)}</span>
+            {panelMode === "developer" && desktopSnapshot && <span title={buildIdentityTitle(desktopSnapshot.buildIdentity)}>App {shortBuildIdentity(desktopSnapshot.buildIdentity)}</span>}
+            {panelMode === "developer" && <span title={buildIdentityTitle(snapshot.buildIdentity)}>API {shortBuildIdentity(snapshot.buildIdentity)}</span>}
             {!desktop && authConfig.enabled && (
               networkIdentity
                 ? <button className="panel-account-button signed-in" onClick={() => setAuthOpen(true)} title={networkIdentity.email ?? "Mycellios account"}><UserRound size={16} /><span>{networkIdentity.role ?? "member"}</span></button>
@@ -804,19 +786,17 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
               external={desktop}
               onOpenJoin={() => navigate("join")}
             />
-            <button onClick={() => void refresh()} aria-label="Refresh"><RefreshCw className={loading ? "spin" : ""} size={17} /></button>
-            {!desktop && <a href={mobileEntry ? "/mobile/" : "/network?view=contribute"}>This device <Zap size={15} /></a>}
+            {panelMode === "developer" && !desktop && <a href={mobileEntry ? "/mobile/" : "/network?view=contribute"}>This device <Zap size={15} /></a>}
             {desktopBridge && <div className="panel-window-controls"><button onClick={() => void desktopBridge.minimizeWindow()} aria-label="Minimize"><Minus size={16} /></button><button onClick={() => void desktopBridge.toggleMaximizeWindow()} aria-label="Maximize"><Maximize2 size={15} /></button><button className="close" onClick={() => void desktopBridge.closeWindow()} aria-label="Close"><X size={16} /></button></div>}
           </div>
         </header>
 
         {issue && <div className="panel-error" title={issue.message}><CircleAlert size={17} /> {issue.source === "coordinator" ? "Coordinator unavailable." : "This node could not join the network."} Retrying automatically.</div>}
         <main className="panel-content">
-          <div className="panel-content-scale">
-            {loading && snapshot.capturedAt === EMPTY.capturedAt ? <PanelLoading /> : (
-              <>
+          {loading && snapshot.capturedAt === EMPTY.capturedAt ? <PanelLoading /> : (
+            <>
               {view === "overview" && <Overview snapshot={snapshot} onNavigate={navigate} publicLink={publicLink} external={desktop} apiBaseUrl={apiBaseUrl} joinUrl={desktop ? publicLink("/join") : `${window.location.origin}/join`} localAcceleration={desktopSnapshot?.acceleration} localContributionState={desktopSnapshot?.contribution.state} localComputeMode={desktopSnapshot?.settings.computeMode} developerMode={panelMode === "developer"} />}
-              {view === "history" && <NetworkHistory endpoint={desktop ? `${publicOrigin}/public/v1/history` : "/public/v1/history"} />}
+              {view === "history" && <NetworkHistory endpoint={desktop ? `${publicOrigin}/public/v1/history` : "/public/v1/history"} compact={panelMode === "simple"} />}
               {view === "nodes" && <Nodes snapshot={snapshot} onRemove={removeWorker} onClearOffline={clearOfflineWorkers} onListCredentials={listWorkerCredentials} onRevokeCredential={revokeWorkerCredential} />}
               {view === "models" && <Models snapshot={snapshot} onSearch={searchHubModels} onRequest={requestModel} onRemove={removeRequestedModel} adminToken={modelAdminToken} requiresAdminToken={requiresModelAdminToken} secureTokenStorage={desktop} />}
               {view === "jobs" && <Jobs snapshot={snapshot} />}
@@ -839,9 +819,8 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
               />}
               {view === "machine" && desktopSnapshot && desktopBridge && <Machine snapshot={desktopSnapshot} bridge={desktopBridge} onSnapshot={applyDesktopSnapshot} />}
               {view === "settings" && desktopSnapshot && desktopBridge && <DesktopSettingsView snapshot={desktopSnapshot} bridge={desktopBridge} onSnapshot={applyDesktopSnapshot} developerMode={panelMode === "developer"} />}
-              </>
-            )}
-          </div>
+            </>
+          )}
         </main>
       </div>
       {desktopSnapshot && desktopBridge && !desktopSnapshot.settings.onboardingComplete && <DesktopOnboarding snapshot={desktopSnapshot} bridge={desktopBridge} onSnapshot={applyDesktopSnapshot} />}
@@ -1558,7 +1537,7 @@ function AssistantAdmin({
   );
 }
 
-export function LiveNetworkTelemetry({ snapshot }: { snapshot: PublicSnapshot }) {
+export function LiveNetworkTelemetry({ snapshot, compact = false }: { snapshot: PublicSnapshot; compact?: boolean }) {
   const onlineWorkers = snapshot.workers.filter((worker) => worker.connected && worker.status === "online");
   const activeVramMb = onlineWorkers.reduce((total, worker) => total + worker.offeredVramMb, 0);
   const activeGpus = onlineWorkers.flatMap((worker) => worker.gpus);
@@ -1572,33 +1551,33 @@ export function LiveNetworkTelemetry({ snapshot }: { snapshot: PublicSnapshot })
   const snapshotReady = snapshot.capturedAt !== EMPTY.capturedAt;
 
   return (
-    <section className="live-network-telemetry" aria-label="Current live network data" aria-live="polite">
+    <section className={`live-network-telemetry${compact ? " compact" : ""}`} aria-label="Current live network data" aria-live="polite">
       <div className="snapshot">
         <span><Radio size={12} />Snapshot</span>
         <strong><i />{snapshotReady ? "LIVE" : "WAITING"}</strong>
         <small>{snapshotReady ? `Updated ${relativeTime(snapshot.capturedAt)}` : "Waiting for coordinator"}</small>
       </div>
-      <div>
+      {!compact && <div>
         <span><Network size={12} />Coordinator</span>
         <strong>mycellios</strong>
         <small>Public API · v{snapshot.version}</small>
-      </div>
+      </div>}
       <div>
         <span><GitFork size={12} />Connected peers</span>
         <strong>{snapshot.summary.connected}</strong>
         <small>{snapshot.summary.online} online · {snapshot.summary.mobile} browser</small>
       </div>
-      <div>
+      {!compact && <div>
         <span><Boxes size={12} />Active models</span>
         <strong>{snapshot.models.length}</strong>
         <small>{replicas} replicas · {pipelines} pipelines</small>
-      </div>
-      <div className="vram">
+      </div>}
+      {!compact && <div className="vram">
         <span><MemoryStick size={12} />Mesh VRAM</span>
         <strong>{formatMemory(activeVramMb)}</strong>
         <small>{formatMemory(freeVramMb)} free · {onlineWorkers.length} peers</small>
         <i className="live-telemetry-meter" aria-label={`${Math.round(freeRatio * 100)}% free`}><b style={{ width: `${freeRatio * 100}%` }} /></i>
-      </div>
+      </div>}
       <div className="inflight">
         <span><Activity size={12} />Inflight</span>
         <strong>{inflightJobs.length}</strong>
@@ -1610,13 +1589,13 @@ export function LiveNetworkTelemetry({ snapshot }: { snapshot: PublicSnapshot })
 }
 
 const historyRangeLabels: Record<NetworkHistoryRange, string> = {
-  "24h": "24 horas",
-  "7d": "7 días",
-  "30d": "30 días",
-  "90d": "90 días",
+  "24h": "24 hours",
+  "7d": "7 days",
+  "30d": "30 days",
+  "90d": "90 days",
 };
 
-export function NetworkHistory({ endpoint }: { endpoint: string }) {
+export function NetworkHistory({ endpoint, compact = false }: { endpoint: string; compact?: boolean }) {
   const [range, setRange] = useState<NetworkHistoryRange>("24h");
   const [history, setHistory] = useState<NetworkTelemetryHistory | null>(null);
   const [loading, setLoading] = useState(true);
@@ -1645,13 +1624,13 @@ export function NetworkHistory({ endpoint }: { endpoint: string }) {
 
   return <section className="network-history-page">
     <PageTitle
-      eyebrow="TELEMETRÍA PERSISTENTE"
-      title="Histórico de la red"
-      copy="Evolución real de la capacidad compartida, los nodos, los modelos y las tareas. El coordinador guarda una muestra cada diez minutos."
-      actions={<button type="button" disabled={loading} onClick={() => void load()}>{loading ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}Actualizar</button>}
+      eyebrow="PERSISTENT TELEMETRY"
+      title="Network history"
+      copy="Real evolution of shared capacity, nodes, models and tasks. The coordinator stores one sample every ten minutes."
+      actions={<button type="button" disabled={loading} onClick={() => void load()}>{loading ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}Refresh</button>}
     />
     <div className="network-history-toolbar">
-      <div className="network-history-ranges" role="group" aria-label="Rango del histórico">
+      <div className="network-history-ranges" role="group" aria-label="History range">
         {(Object.keys(historyRangeLabels) as NetworkHistoryRange[]).map((value) => (
           <button
             type="button"
@@ -1662,108 +1641,119 @@ export function NetworkHistory({ endpoint }: { endpoint: string }) {
           >{historyRangeLabels[value]}</button>
         ))}
       </div>
-      <span><History size={15} />Cada {history?.intervalMinutes ?? 10} min · conservación {history?.retentionDays ?? 90} días</span>
+      <span><History size={15} />Every {history?.intervalMinutes ?? 10} min · retained for {history?.retentionDays ?? 90} days</span>
     </div>
-    {loadError && <div className="network-history-error"><CircleAlert size={17} /><span><strong>No se pudo cargar el histórico</strong>{loadError}</span></div>}
-    {loading && !history ? <div className="network-history-loading"><LoaderCircle className="spin" /><span>Leyendo las muestras guardadas…</span></div> : history && <NetworkHistoryReport history={history} />}
+    {loadError && <div className="network-history-error"><CircleAlert size={17} /><span><strong>Could not load network history</strong>{loadError}</span></div>}
+    {loading && !history ? <div className="network-history-loading"><LoaderCircle className="spin" /><span>Reading saved samples…</span></div> : history && <NetworkHistoryReport history={history} compact={compact} />}
   </section>;
 }
 
-export function NetworkHistoryReport({ history }: { history: NetworkTelemetryHistory }) {
+export function NetworkHistoryReport({ history, compact = false }: { history: NetworkTelemetryHistory; compact?: boolean }) {
   const latest = history.samples.at(-1);
   const first = history.samples[0];
   if (!latest) {
-    return <Empty icon={History} title="Todavía no hay muestras" copy="El coordinador guardará automáticamente la primera lectura y añadirá otra cada diez minutos." />;
+    return <Empty icon={History} title="No samples yet" copy="The coordinator will save the first reading automatically and add another every ten minutes." />;
   }
   return <>
-    <div className="network-history-summary" aria-label="Última muestra guardada">
+    <div className={`network-history-summary${compact ? " compact" : ""}`} aria-label="Latest saved sample">
       <HistorySummaryCard
         icon={MemoryStick}
-        label="VRAM total activa"
+        label="Active VRAM"
         value={formatMemory(latest.offeredVramMb)}
-        detail={`${formatMemory(latest.freeVramMb)} libres ahora`}
+        detail={`${formatMemory(latest.freeVramMb)} free now`}
         delta={historyDelta(latest.offeredVramMb, first?.offeredVramMb)}
         tone="blue"
       />
       <HistorySummaryCard
         icon={Server}
-        label="Nodos conectados"
+        label="Connected nodes"
         value={String(latest.connectedNodes)}
         detail={`${latest.onlineNodes} online · ${latest.browserNodes} browser`}
         delta={historyDelta(latest.connectedNodes, first?.connectedNodes)}
         tone="green"
       />
-      <HistorySummaryCard
+      {!compact && <HistorySummaryCard
         icon={Boxes}
-        label="Modelos activos"
+        label="Active models"
         value={String(latest.activeModels)}
-        detail={`${latest.modelReplicas} réplicas · ${latest.modelPipelines} pipelines`}
+        detail={`${latest.modelReplicas} replicas · ${latest.modelPipelines} pipelines`}
         delta={historyDelta(latest.activeModels, first?.activeModels)}
         tone="purple"
-      />
-      <HistorySummaryCard
+      />}
+      {!compact && <HistorySummaryCard
         icon={Activity}
-        label="Trabajos en curso"
+        label="Jobs in flight"
         value={String(latest.inflightJobs)}
-        detail={`${latest.runningJobs} ejecutándose`}
+        detail={`${latest.runningJobs} running`}
         delta={historyDelta(latest.inflightJobs, first?.inflightJobs)}
         tone="orange"
-      />
+      />}
     </div>
     <div className="network-history-meta">
-      <span><Radio />Última muestra <strong>{formatHistoryDate(latest.capturedAt)}</strong></span>
-      <span><ShieldCheck />Datos del coordinador, sin estimaciones</span>
-      <span><History />{history.samples.length} muestras en {historyRangeLabels[history.range]}</span>
+      <span><Radio />Latest sample <strong>{formatHistoryDate(latest.capturedAt)}</strong></span>
+      <span><ShieldCheck />Coordinator data, no estimates</span>
+      <span><History />{history.samples.length} samples in {historyRangeLabels[history.range]}</span>
     </div>
     <div className="network-history-charts">
       <NetworkHistoryChart
-        title="Capacidad de la red"
-        eyebrow="VRAM ACTIVA"
+        title="Network capacity"
+        eyebrow="ACTIVE VRAM"
         samples={history.samples}
         unit=""
         valueFormatter={formatMemory}
         series={[
-          { key: "offeredVramMb", label: "Total activa", tone: "blue" },
-          { key: "freeVramMb", label: "Libre", tone: "green" },
+          { key: "offeredVramMb", label: "Active total", tone: "blue" },
+          { key: "freeVramMb", label: "Free", tone: "green" },
         ]}
       />
       <NetworkHistoryChart
-        title="Disponibilidad de nodos"
+        title="Node availability"
         eyebrow="PEERS"
         samples={history.samples}
-        unit="nodos"
+        unit="nodes"
         valueFormatter={(value) => String(Math.round(value))}
         series={[
-          { key: "connectedNodes", label: "Conectados", tone: "blue" },
+          { key: "connectedNodes", label: "Connected", tone: "blue" },
           { key: "onlineNodes", label: "Online", tone: "green" },
           { key: "browserNodes", label: "Browser", tone: "purple" },
         ]}
       />
-      <NetworkHistoryChart
-        title="Modelos disponibles"
-        eyebrow="MODEL FABRIC"
-        samples={history.samples}
-        unit="modelos"
-        valueFormatter={(value) => String(Math.round(value))}
-        series={[
-          { key: "activeModels", label: "Modelos", tone: "purple" },
-          { key: "modelReplicas", label: "Réplicas", tone: "blue" },
-          { key: "modelPipelines", label: "Pipelines", tone: "green" },
-        ]}
-      />
-      <NetworkHistoryChart
-        title="Carga de inferencia"
-        eyebrow="ACTIVIDAD"
-        samples={history.samples}
-        unit="trabajos"
-        valueFormatter={(value) => String(Math.round(value))}
-        series={[
-          { key: "inflightJobs", label: "En curso", tone: "orange" },
-          { key: "runningJobs", label: "Ejecutándose", tone: "green" },
-        ]}
-      />
+      {!compact && <DetailedHistoryCharts history={history} />}
     </div>
-    <NetworkHistoryTable samples={history.samples} />
+    {compact ? (
+      <PanelDisclosure icon={Activity} eyebrow="ON DEMAND" title="Detailed telemetry" summary="Model availability, inference load, and the raw sample table.">
+        <div className="network-history-charts network-history-charts-detail"><DetailedHistoryCharts history={history} /></div>
+        <NetworkHistoryTable samples={history.samples} />
+      </PanelDisclosure>
+    ) : <NetworkHistoryTable samples={history.samples} />}
+  </>;
+}
+
+function DetailedHistoryCharts({ history }: { history: NetworkTelemetryHistory }) {
+  return <>
+    <NetworkHistoryChart
+      title="Available models"
+      eyebrow="MODEL FABRIC"
+      samples={history.samples}
+      unit="models"
+      valueFormatter={(value) => String(Math.round(value))}
+      series={[
+        { key: "activeModels", label: "Models", tone: "purple" },
+        { key: "modelReplicas", label: "Replicas", tone: "blue" },
+        { key: "modelPipelines", label: "Pipelines", tone: "green" },
+      ]}
+    />
+    <NetworkHistoryChart
+      title="Inference load"
+      eyebrow="ACTIVITY"
+      samples={history.samples}
+      unit="jobs"
+      valueFormatter={(value) => String(Math.round(value))}
+      series={[
+        { key: "inflightJobs", label: "In flight", tone: "orange" },
+        { key: "runningJobs", label: "Running", tone: "green" },
+      ]}
+    />
   </>;
 }
 
@@ -1818,7 +1808,7 @@ function NetworkHistoryChart({
   const labelEvery = Math.max(1, Math.ceil(points.length / 5));
   return <article className="network-history-chart">
     <header><div><span>{eyebrow}</span><h2>{title}</h2></div><div className="network-history-legend">{series.map((item) => <span className={item.tone} key={item.key}><i />{item.label}</span>)}</div></header>
-    <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${title}. ${samples.length} muestras reales.`}>
+    <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${title}. ${samples.length} real samples.`}>
       {[0, 0.5, 1].map((ratio) => <g key={ratio}>
         <line className="history-grid-line" x1={left} y1={top + ratio * (height - top - bottom)} x2={width - right} y2={top + ratio * (height - top - bottom)} />
         <text x={left - 8} y={top + ratio * (height - top - bottom) + 4} textAnchor="end">{valueFormatter(ceiling * (1 - ratio))}</text>
@@ -1832,7 +1822,7 @@ function NetworkHistoryChart({
         return <text className="history-x-label" x={x(index)} y={height - 13} textAnchor="middle" key={sample.capturedAt}>{formatHistoryChartTime(sample.capturedAt)}</text>;
       })}
     </svg>
-    <footer><span>{samples.length} muestras · cada 10 min</span>{series.map((item) => <strong key={item.key}>{item.label} {valueFormatter(points.at(-1)?.[item.key] ?? 0)} {unit && <small>{unit}</small>}</strong>)}</footer>
+    <footer><span>{samples.length} samples · every 10 min</span>{series.map((item) => <strong key={item.key}>{item.label} {valueFormatter(points.at(-1)?.[item.key] ?? 0)} {unit && <small>{unit}</small>}</strong>)}</footer>
   </article>;
 }
 
@@ -1854,17 +1844,17 @@ function HistorySummaryCard({
   return <article className={`network-history-summary-card ${tone}`}>
     <Icon />
     <span><small>{label}</small><strong>{value}</strong><em>{detail}</em></span>
-    <b className={delta > 0 ? "positive" : delta < 0 ? "negative" : "neutral"}>{delta > 0 ? "+" : ""}{delta} desde el inicio</b>
+    <b className={delta > 0 ? "positive" : delta < 0 ? "negative" : "neutral"}>{delta > 0 ? "+" : ""}{delta} since start</b>
   </article>;
 }
 
 function NetworkHistoryTable({ samples }: { samples: NetworkTelemetrySample[] }) {
   const visible = samples.slice(-24).reverse();
   return <article className="network-history-table-card">
-    <header><div><span>MUESTRAS EXACTAS</span><h2>Últimas lecturas guardadas</h2></div><small>Se muestran las 24 más recientes</small></header>
+    <header><div><span>EXACT SAMPLES</span><h2>Latest saved readings</h2></div><small>Showing the 24 most recent</small></header>
     <div className="network-history-table-scroll">
       <table>
-        <thead><tr><th>Momento</th><th>VRAM activa</th><th>VRAM libre</th><th>Nodos</th><th>Online</th><th>Modelos</th><th>Inflight</th><th>Completadas</th></tr></thead>
+        <thead><tr><th>Timestamp</th><th>Active VRAM</th><th>Free VRAM</th><th>Nodes</th><th>Online</th><th>Models</th><th>Inflight</th><th>Completed</th></tr></thead>
         <tbody>{visible.map((sample) => <tr key={sample.capturedAt}>
           <td><strong>{formatHistoryDate(sample.capturedAt)}</strong></td>
           <td>{formatMemory(sample.offeredVramMb)}</td>
@@ -1898,7 +1888,7 @@ function historyDelta(current: number, initial: number | undefined): number {
 }
 
 function formatHistoryDate(value: string): string {
-  return new Intl.DateTimeFormat("es-ES", {
+  return new Intl.DateTimeFormat("en-US", {
     day: "2-digit",
     month: "short",
     hour: "2-digit",
@@ -1907,7 +1897,7 @@ function formatHistoryDate(value: string): string {
 }
 
 function formatHistoryChartTime(value: string): string {
-  return new Intl.DateTimeFormat("es-ES", {
+  return new Intl.DateTimeFormat("en-US", {
     day: "2-digit",
     month: "short",
     hour: "2-digit",
@@ -2025,6 +2015,21 @@ function Overview({ snapshot, onNavigate, publicLink, external, apiBaseUrl, join
   const nativeNodes = operational.filter((worker) => worker.kind === "desktop").length;
   const browserNodes = operational.filter((worker) => worker.kind === "browser").length;
   const cellNodes = operational.filter((worker) => worker.kind === "cell").length;
+  const connectPanel = <DashboardConnect
+    apiBaseUrl={apiBaseUrl}
+    joinUrl={joinUrl}
+    downloadsUrl={publicLink("/downloads")}
+    browserUrl={publicLink("/mobile/?autostart=1")}
+    external={external}
+    onOpenJoin={() => onNavigate("join")}
+  />;
+  const recentActivity = <article className="activity-card">
+    <div className="card-heading"><div><span>RECENT ACTIVITY</span><h2>Network tasks</h2></div>{developerMode && <button onClick={() => onNavigate("jobs")}>View all</button>}</div>
+    <div className="activity-list">
+      {snapshot.jobs.slice(0, developerMode ? 5 : 3).map((job) => <div key={job.id}><i className={job.status} /><div><strong>{job.model}</strong><span>{shortId(job.id)} · {relativeTime(job.updatedAt)}</span></div><b>{job.status}</b></div>)}
+      {snapshot.jobs.length === 0 && <Empty icon={Activity} title="No tasks yet" copy="Tasks will appear here when you test a connected model." />}
+    </div>
+  </article>;
   return (
     <section className="overview-page">
       <PageTitle eyebrow="NETWORK CONTROL" title="Distributed AI network" copy="A live view of the capacity, models and tasks connected to your mycellios network." actions={developerMode ? <button onClick={() => onNavigate("nodes")}>Manage nodes</button> : undefined} />
@@ -2036,16 +2041,9 @@ function Overview({ snapshot, onNavigate, publicLink, external, apiBaseUrl, join
           <a href="https://github.com/tych0s/mycellios" target="_blank" rel="noreferrer"><GitFork size={15} />GitHub</a>
         </div>
       </aside>
-      <LiveNetworkTelemetry snapshot={snapshot} />
+      <LiveNetworkTelemetry snapshot={snapshot} compact={!developerMode} />
       {localAcceleration && shouldShowAccelerationBanner(localAcceleration) && <AcceleratorCompactBanner acceleration={localAcceleration} contributionState={localContributionState} computeMode={localComputeMode} onOpen={() => onNavigate("machine")} />}
-      <DashboardConnect
-        apiBaseUrl={apiBaseUrl}
-        joinUrl={joinUrl}
-        downloadsUrl={publicLink("/downloads")}
-        browserUrl={publicLink("/mobile/?autostart=1")}
-        external={external}
-        onOpenJoin={() => onNavigate("join")}
-      />
+      {developerMode ? connectPanel : <PanelDisclosure icon={Share2} eyebrow="OPTIONAL" title="Connect another device" summary="Open setup links only when you are ready to expand the network.">{connectPanel}</PanelDisclosure>}
       <article className="global-capacity-card">
         <div className="global-capacity-main">
           <div className="global-capacity-heading"><span>GLOBAL NODE CAPACITY</span><b><i /> LIVE</b></div>
@@ -2054,21 +2052,22 @@ function Overview({ snapshot, onNavigate, publicLink, external, apiBaseUrl, join
           <div className="global-capacity-bar" aria-label={`${Math.round(freeRatio * 100)}% of offered memory is free`}><i style={{ width: `${freeRatio * 100}%` }} /></div>
           <div className="global-capacity-legend"><span>{formatMemory(freeVramMb)} free now</span><span>{formatMemory(usedVramMb)} in use</span></div>
         </div>
-        <div className="global-capacity-metrics">
+        <div className={`global-capacity-metrics${developerMode ? "" : " compact"}`}>
           <CapacityMetric icon={Cpu} label="Runtime stages" value={execution.verified ? String(execution.unitCount) : "Unverified"} detail={execution.verified ? executionDetail(execution) : `${nativeNodes} native · ${browserNodes} browser · ${cellNodes} cells connected`} />
-          <CapacityMetric icon={Gauge} label="Average GPU load" value={averageUtilization === null ? "No telemetry" : `${averageUtilization.toFixed(0)}%`} detail={`${telemetryGpus.length} reporting engine${telemetryGpus.length === 1 ? "" : "s"}`} />
+          {developerMode && <CapacityMetric icon={Gauge} label="Average GPU load" value={averageUtilization === null ? "No telemetry" : `${averageUtilization.toFixed(0)}%`} detail={`${telemetryGpus.length} reporting engine${telemetryGpus.length === 1 ? "" : "s"}`} />}
           <CapacityMetric icon={Zap} label="Measured inference capacity" value={measuredThroughput > 0 ? `${formatCompactNumber(measuredThroughput)} tok/s` : "Not measured"} detail={measuredDeployments.length > 0 ? `${measuredDeployments.length} runtime${measuredDeployments.length === 1 ? "" : "s"} with completed inference` : activeDeployments.length > 0 ? "Measured after the first real inference" : "Requires an active model"} />
-          <CapacityMetric icon={Activity} label="Observed GPU draw" value={poweredGpus.length > 0 ? formatPower(observedPowerW) : "No telemetry"} detail={poweredGpus.length > 0 ? `${poweredGpus.length} physical reading${poweredGpus.length === 1 ? "" : "s"}` : telemetryGpus.length > 0 ? "GPU load is visible, but the driver does not expose watts" : "Never estimated"} />
+          {developerMode && <CapacityMetric icon={Activity} label="Observed GPU draw" value={poweredGpus.length > 0 ? formatPower(observedPowerW) : "No telemetry"} detail={poweredGpus.length > 0 ? `${poweredGpus.length} physical reading${poweredGpus.length === 1 ? "" : "s"}` : telemetryGpus.length > 0 ? "GPU load is visible, but the driver does not expose watts" : "Never estimated"} />}
         </div>
       </article>
-      <div className="panel-stat-grid">
+      {developerMode && <div className="panel-stat-grid">
         <Stat icon={Radio} label="Active nodes" value={String(snapshot.summary.connected)} detail={`${snapshot.summary.registered} registered`} />
         <Stat icon={HardDrive} label="Shared VRAM" value={formatMemory(activeOfferedVramMb)} detail={`${formatMemory(freeVramMb)} currently free`} tone="purple" />
         <Stat icon={Boxes} label="Available models" value={String(snapshot.models.length)} detail="Announced by live nodes" />
         <Stat icon={CheckCircle2} label="Tasks completed" value={String(snapshot.summary.completedJobs)} detail="Current coordinator history" />
-      </div>
-      <ConnectedPeersTable workers={snapshot.workers} />
-      <div className="overview-grid overview-grid-interactive">
+      </div>}
+      {developerMode ? <>
+        <ConnectedPeersTable workers={snapshot.workers} />
+        <div className="overview-grid overview-grid-interactive">
         <InteractiveMesh
           workers={active}
           registeredWorkers={snapshot.summary.registered}
@@ -2079,14 +2078,18 @@ function Overview({ snapshot, onNavigate, publicLink, external, apiBaseUrl, join
           onNavigate={onNavigate}
         />
         <NetworkModelCatalog snapshot={snapshot} developerMode={developerMode} onNavigate={onNavigate} />
-        <article className="activity-card">
-          <div className="card-heading"><div><span>RECENT ACTIVITY</span><h2>Network tasks</h2></div>{developerMode && <button onClick={() => onNavigate("jobs")}>View all</button>}</div>
-          <div className="activity-list">
-            {snapshot.jobs.slice(0, 5).map((job) => <div key={job.id}><i className={job.status} /><div><strong>{job.model}</strong><span>{shortId(job.id)} · {relativeTime(job.updatedAt)}</span></div><b>{job.status}</b></div>)}
-            {snapshot.jobs.length === 0 && <Empty icon={Activity} title="No tasks yet" copy="Tasks will appear here when you test a connected model." />}
-          </div>
-        </article>
-      </div>
+          {recentActivity}
+        </div>
+      </> : <div className="overview-disclosure-stack">
+        <PanelDisclosure icon={Network} eyebrow="NETWORK DETAIL" title="Nodes and topology" summary={`${operational.length} operational nodes. Open the full peer list and network map.`}>
+          <ConnectedPeersTable workers={snapshot.workers} />
+          <InteractiveMesh workers={active} registeredWorkers={snapshot.summary.registered} sharedVramMb={activeOfferedVramMb} publicLink={publicLink} external={external} developerMode={false} onNavigate={onNavigate} />
+        </PanelDisclosure>
+        <PanelDisclosure icon={Boxes} eyebrow="MODEL DETAIL" title="Available models" summary={`${snapshot.models.length} models announced by live nodes.`}>
+          <NetworkModelCatalog snapshot={snapshot} developerMode={false} onNavigate={onNavigate} />
+        </PanelDisclosure>
+        <PanelDisclosure icon={Activity} eyebrow="RECENT DETAIL" title="Network activity" summary={`${snapshot.jobs.length} tasks in the current coordinator history.`}>{recentActivity}</PanelDisclosure>
+      </div>}
     </section>
   );
 }
@@ -2516,9 +2519,9 @@ function InteractiveMesh({ workers, registeredWorkers, sharedVramMb, publicLink,
           <svg className="mesh-links" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
             <defs>
               <linearGradient id="mesh-link-gradient" x1="0%" y1="0%" x2="100%" y2="0%">
-                <stop offset="0%" stopColor="#3e79d8" stopOpacity=".24" />
-                <stop offset="48%" stopColor="#65b7ff" stopOpacity=".78" />
-                <stop offset="100%" stopColor="#7c67ff" stopOpacity=".28" />
+                <stop className="mesh-link-start" offset="0%" stopColor="#a8794d" stopOpacity=".24" />
+                <stop className="mesh-link-mid" offset="48%" stopColor="#d2a16c" stopOpacity=".78" />
+                <stop className="mesh-link-end" offset="100%" stopColor="#8a5f36" stopOpacity=".28" />
               </linearGradient>
               <filter id="mesh-packet-glow" x="-200%" y="-200%" width="500%" height="500%">
                 <feGaussianBlur stdDeviation=".8" result="blur" />
@@ -2661,7 +2664,7 @@ function Nodes({
   const measuredDeployments = activeDeployments.filter(isMeasuredDeployment);
   const measuredThroughput = measuredDeployments.reduce((total, deployment) => total + deployment.tokensPerSecond, 0);
   const sortedWorkers = [...snapshot.workers].sort((left, right) => nodeStateOrder(left) - nodeStateOrder(right));
-  const selectedWorker = snapshot.workers.find((worker) => worker.id === selectedWorkerId) ?? activeWorkers[0] ?? snapshot.workers[0] ?? null;
+  const selectedWorker = snapshot.workers.find((worker) => worker.id === selectedWorkerId) ?? null;
   async function remove(workerId: string) {
     setBusy(workerId);
     setActionError(null);
@@ -2698,7 +2701,7 @@ function Nodes({
   async function revokeCredential(credential: WorkerCredentialSummary) {
     if (
       !window.confirm(
-        `Revocar el acceso de ${credential.identityId}? El dispositivo se desconectará y no podrá volver a entrar con esta clave.`,
+        `Revoke access for ${credential.identityId}? This device will disconnect and cannot sign in again with this key.`,
       )
     ) return;
     setBusy(`credential:${credential.fingerprint}`);
@@ -2706,7 +2709,7 @@ function Nodes({
     try {
       await onRevokeCredential(
         credential,
-        "Revocada manualmente desde el panel de red",
+        "Manually revoked from the network panel",
       );
       setCredentials(await onListCredentials());
     } catch (error) {
@@ -2717,22 +2720,28 @@ function Nodes({
   }
   return (
     <section className="nodes-page">
-      <PageTitle eyebrow="RED DISTRIBUIDA" title="Red de nodos" copy="Dispositivos físicos, navegadores activos y celdas de cómputo conectadas a mycellios." actions={<button disabled={busy !== null} onClick={() => void clearOffline()}><Trash2 size={15} /> Limpiar inactivos</button>} />
+      <PageTitle eyebrow="DISTRIBUTED NETWORK" title="Node network" copy="Physical devices, active browsers and compute cells connected to mycellios." actions={<button disabled={busy !== null} onClick={() => void clearOffline()}><Trash2 size={15} /> Clear offline</button>} />
       {actionError && <div className="inline-error" role="alert"><CircleAlert size={17} />{actionError}</div>}
 
-      <div className="node-overview-grid">
-        <NodeOverviewStat icon={Server} label="Dispositivos activos" value={`${activePhysicalWorkers.length} / ${physicalWorkers.length}`} detail={`${connectedPhysicalWorkers.length} conectados ahora · ${cellWorkers.length} celdas`} progress={physicalWorkers.length > 0 ? activePhysicalWorkers.length / physicalWorkers.length : 0} tone="green" />
-        <NodeOverviewStat icon={MemoryStick} label="Memoria ofrecida" value={formatMemory(activeOfferedVramMb)} detail={`${formatMemory(freeVramMb)} disponibles para modelos`} progress={activeOfferedVramMb > 0 ? freeVramMb / activeOfferedVramMb : 0} tone="blue" />
-        <NodeOverviewStat icon={Gauge} label="Carga GPU media" value={averageUtilization === null ? "Sin datos" : `${averageUtilization.toFixed(0)}%`} detail={`${telemetryGpus.length} GPU${telemetryGpus.length === 1 ? "" : "s"} con telemetría`} progress={averageUtilization === null ? 0 : averageUtilization / 100} tone="purple" />
-        <NodeOverviewStat icon={Zap} label="Capacidad de inferencia medida" value={measuredThroughput > 0 ? `${formatCompactNumber(measuredThroughput)} tok/s` : "Sin medir"} detail={measuredDeployments.length > 0 ? `${measuredDeployments.length} runtime${measuredDeployments.length === 1 ? "" : "s"} con inferencias completadas` : activeDeployments.length > 0 ? "Se medirá tras la primera inferencia real" : "Requiere un modelo activo"} tone="violet" />
-        <NodeOverviewStat icon={Activity} label="GPU con telemetría" value={`${telemetryGpus.length} / ${activeGpus.length}`} detail={telemetryGpus.length > 0 ? `${telemetryGpus.length} GPU${telemetryGpus.length === 1 ? "" : "s"} enviando carga física` : "Ninguna GPU envía esta lectura"} progress={activeGpus.length > 0 ? telemetryGpus.length / activeGpus.length : 0} tone="cyan" />
-        <NodeOverviewStat icon={CirclePower} label="Consumo GPU observado" value={poweredGpus.length > 0 ? formatPower(observedPowerW) : "Sin datos"} detail={poweredGpus.length > 0 ? "Suma de vatios reportados por las GPU" : telemetryGpus.length > 0 ? "Hay carga real, pero el controlador no expone vatios" : "No se estima ni se inventa"} tone="orange" />
+      <div className="node-overview-grid compact">
+        <NodeOverviewStat icon={Server} label="Active devices" value={`${activePhysicalWorkers.length} / ${physicalWorkers.length}`} detail={`${connectedPhysicalWorkers.length} connected now · ${cellWorkers.length} cells`} progress={physicalWorkers.length > 0 ? activePhysicalWorkers.length / physicalWorkers.length : 0} tone="green" />
+        <NodeOverviewStat icon={MemoryStick} label="Offered memory" value={formatMemory(activeOfferedVramMb)} detail={`${formatMemory(freeVramMb)} available for models`} progress={activeOfferedVramMb > 0 ? freeVramMb / activeOfferedVramMb : 0} tone="blue" />
+        <NodeOverviewStat icon={Zap} label="Measured inference capacity" value={measuredThroughput > 0 ? `${formatCompactNumber(measuredThroughput)} tok/s` : "Not measured"} detail={measuredDeployments.length > 0 ? `${measuredDeployments.length} runtime${measuredDeployments.length === 1 ? "" : "s"} with completed inference` : activeDeployments.length > 0 ? "Measured after the first real inference" : "Requires an active model"} tone="violet" />
       </div>
 
+      <PanelDisclosure icon={Gauge} eyebrow="ON DEMAND" title="Physical telemetry" summary="GPU load, reporting coverage, and observed power.">
+        <div className="node-overview-grid compact">
+          <NodeOverviewStat icon={Gauge} label="Average GPU load" value={averageUtilization === null ? "No data" : `${averageUtilization.toFixed(0)}%`} detail={`${telemetryGpus.length} GPU${telemetryGpus.length === 1 ? "" : "s"} reporting telemetry`} progress={averageUtilization === null ? 0 : averageUtilization / 100} tone="purple" />
+          <NodeOverviewStat icon={Activity} label="GPUs with telemetry" value={`${telemetryGpus.length} / ${activeGpus.length}`} detail={telemetryGpus.length > 0 ? `${telemetryGpus.length} GPU${telemetryGpus.length === 1 ? "" : "s"} sending physical load` : "No GPU is reporting this reading"} progress={activeGpus.length > 0 ? telemetryGpus.length / activeGpus.length : 0} tone="cyan" />
+          <NodeOverviewStat icon={CirclePower} label="Observed GPU power" value={poweredGpus.length > 0 ? formatPower(observedPowerW) : "No data"} detail={poweredGpus.length > 0 ? "Sum of watts reported by GPUs" : telemetryGpus.length > 0 ? "Real load exists, but the driver exposes no wattage" : "Never estimated or invented"} tone="orange" />
+        </div>
+      </PanelDisclosure>
+
+      <PanelDisclosure icon={Network} eyebrow="ON DEMAND" title="Live topology" summary={`${activeWorkers.length} active connections. Open the network map when you need routing context.`}>
       <section className="node-topology-card">
         <header className="node-topology-head">
-          <div><span>TOPOLOGÍA EN VIVO</span><h2>Conexiones con el coordinador</h2><p>Cada línea representa una sesión real con mycellios.</p></div>
-          <div className="node-topology-legend"><span><i className="active" />Activo</span><span><i className="warning" />Atención</span><span><i className="offline" />Inactivo</span></div>
+          <div><span>LIVE TOPOLOGY</span><h2>Coordinator connections</h2><p>Each line represents a real session with mycellios.</p></div>
+          <div className="node-topology-legend"><span><i className="active" />Active</span><span><i className="warning" />Needs attention</span><span><i className="offline" />Offline</span></div>
         </header>
         <div className={`node-topology-map${snapshot.workers.length === 0 ? " empty" : ""}`}>
           <div className="node-topology-grid" />
@@ -2742,31 +2751,32 @@ function Nodes({
               return <line key={worker.id} className={`${nodeVisualState(worker)}${selectedWorker?.id === worker.id ? " selected" : ""}`} x1="50" y1="52" x2={position.x} y2={position.y} vectorEffect="non-scaling-stroke" />;
             })}
           </svg>
-          <div className="node-network-hub"><div><Network /></div><strong>mycellios</strong><span>{activeWorkers.length} activo{activeWorkers.length === 1 ? "" : "s"}</span><i /></div>
+          <div className="node-network-hub"><div><Network /></div><strong>mycellios</strong><span>{activeWorkers.length} active</span><i /></div>
           {sortedWorkers.map((worker, index) => {
             const position = topologyPosition(index, sortedWorkers.length);
             const label = workerLabel(worker);
             return <button
               type="button"
               key={worker.id}
-              aria-label={`Ver nodo ${label}`}
+              aria-label={`View node ${label}`}
               aria-pressed={selectedWorker?.id === worker.id}
               className={`topology-node ${nodeVisualState(worker)}${selectedWorker?.id === worker.id ? " selected" : ""}`}
               style={{ "--node-x": `${position.x}%`, "--node-y": `${position.y}%` } as CSSProperties}
               onClick={() => setSelectedWorkerId(worker.id)}
             ><div><WorkerKindIcon worker={worker} /><i /></div><span><strong>{label}</strong><small>{worker.region} · {nodeStatusLabel(worker)}</small></span></button>;
           })}
-          {snapshot.workers.length === 0 && <div className="node-topology-empty"><Server /><strong>Aún no hay nodos</strong><span>Conecta una máquina para verla aparecer en la red.</span></div>}
+          {snapshot.workers.length === 0 && <div className="node-topology-empty"><Server /><strong>No nodes yet</strong><span>Connect a machine to see it appear on the network.</span></div>}
         </div>
-        {selectedWorker && <NodeTopologyInspector worker={selectedWorker} snapshot={snapshot} />}
       </section>
+      </PanelDisclosure>
 
+      <PanelDisclosure icon={ShieldCheck} eyebrow="ADMINISTRATION" title="Device trust" summary="Signed identities and access revocation.">
       <section className="device-trust-card">
         <header>
           <div>
-            <span>CONFIANZA DE DISPOSITIVOS</span>
-            <h2>Identidades firmadas</h2>
-            <p>Inventario administrativo de claves enroladas. Revocar corta la sesión activa y bloquea nuevos registros.</p>
+            <span>DEVICE TRUST</span>
+            <h2>Signed identities</h2>
+            <p>Administrative inventory of enrolled keys. Revoking cuts the active session and blocks new registrations.</p>
           </div>
           <button
             type="button"
@@ -2774,15 +2784,15 @@ function Nodes({
             onClick={() => void loadCredentials()}
           >
             {busy === "credentials" ? <LoaderCircle className="spin" /> : <ShieldCheck />}
-            {credentials === null ? "Cargar identidades" : "Actualizar"}
+            {credentials === null ? "Load identities" : "Refresh"}
           </button>
         </header>
         {credentialError && <div className="inline-error" role="alert"><CircleAlert size={17} />{credentialError}</div>}
         {credentials !== null && credentials.length === 0 && (
           <div className="device-trust-empty">
             <ShieldCheck />
-            <strong>Aún no hay credenciales enroladas</strong>
-            <span>Los dispositivos aparecerán aquí después de completar su primer reto firmado.</span>
+            <strong>No enrolled credentials yet</strong>
+            <span>Devices appear here after completing their first signed challenge.</span>
           </div>
         )}
         {credentials !== null && credentials.length > 0 && (
@@ -2798,9 +2808,9 @@ function Nodes({
                   </span>
                 </div>
                 <div className="device-trust-meta">
-                  <span><small>Protocolo</small><strong>v{credential.protocolVersion}</strong></span>
-                  <span><small>Última prueba</small><strong>{relativeTimeEs(credential.lastSeenAt)}</strong></span>
-                  <span><small>Estado</small><strong className={credential.status}>{credential.status === "active" ? "Activa" : "Revocada"}</strong></span>
+                  <span><small>Protocol</small><strong>v{credential.protocolVersion}</strong></span>
+                  <span><small>Last seen</small><strong>{relativeTime(credential.lastSeenAt)}</strong></span>
+                  <span><small>Status</small><strong className={credential.status}>{credential.status === "active" ? "Active" : "Revoked"}</strong></span>
                 </div>
                 <div className="device-trust-action">
                   {credential.status === "active" ? (
@@ -2812,11 +2822,11 @@ function Nodes({
                       {busy === `credential:${credential.fingerprint}`
                         ? <LoaderCircle className="spin" />
                         : <CircleAlert />}
-                      Revocar acceso
+                      Revoke access
                     </button>
                   ) : (
                     <span title={credential.revocationReason ?? undefined}>
-                      {credential.revokedAt ? `Revocada ${relativeTimeEs(credential.revokedAt)}` : "Revocada"}
+                      {credential.revokedAt ? `Revoked ${relativeTime(credential.revokedAt)}` : "Revoked"}
                     </span>
                   )}
                 </div>
@@ -2825,27 +2835,30 @@ function Nodes({
           </div>
         )}
       </section>
+      </PanelDisclosure>
 
-      <NodeInventorySection eyebrow="DISPOSITIVOS INSTALADOS" title="Equipos físicos" workers={installedWorkers} snapshot={snapshot} busy={busy} onRemove={remove} />
-      {browserWorkers.length > 0 && <NodeInventorySection eyebrow="CAPACIDAD TEMPORAL" title="Navegadores activos" workers={browserWorkers} snapshot={snapshot} busy={busy} onRemove={remove} />}
-      {cellWorkers.length > 0 && <NodeInventorySection eyebrow="EJECUTORES DISTRIBUIDOS" title="Celdas de cómputo" workers={cellWorkers} snapshot={snapshot} busy={busy} onRemove={remove} />}
-      {snapshot.workers.length === 0 && <div className="node-card-grid"><div className="wide-empty"><Empty icon={Server} title="No hay nodos registrados" copy="Abre el worker móvil o instala mycellios para añadir la primera máquina." /><a href="/mobile/">Conectar un dispositivo <ArrowRight size={15} /></a></div></div>}
+      <NodeInventorySection eyebrow="INSTALLED DEVICES" title="Physical devices" workers={installedWorkers} snapshot={snapshot} busy={busy} onRemove={remove} onSelect={setSelectedWorkerId} />
+      {browserWorkers.length > 0 && <NodeInventorySection eyebrow="TEMPORARY CAPACITY" title="Active browsers" workers={browserWorkers} snapshot={snapshot} busy={busy} onRemove={remove} onSelect={setSelectedWorkerId} />}
+      {cellWorkers.length > 0 && <NodeInventorySection eyebrow="DISTRIBUTED EXECUTORS" title="Compute cells" workers={cellWorkers} snapshot={snapshot} busy={busy} onRemove={remove} onSelect={setSelectedWorkerId} />}
+      {snapshot.workers.length === 0 && <div className="node-card-grid"><div className="wide-empty"><Empty icon={Server} title="No registered nodes" copy="Open the mobile worker or install mycellios to add the first machine." /><a href="/mobile/">Connect a device <ArrowRight size={15} /></a></div></div>}
+      {selectedWorker && <NodeDetailsDrawer worker={selectedWorker} snapshot={snapshot} onClose={() => setSelectedWorkerId("")} />}
     </section>
   );
 }
 
-function NodeInventorySection({ eyebrow, title, workers, snapshot, busy, onRemove }: {
+function NodeInventorySection({ eyebrow, title, workers, snapshot, busy, onRemove, onSelect }: {
   eyebrow: string;
   title: string;
   workers: PublicWorker[];
   snapshot: PublicSnapshot;
   busy: string | null;
   onRemove: (workerId: string) => Promise<void>;
+  onSelect: (workerId: string) => void;
 }) {
   if (workers.length === 0) return null;
   return <>
-    <div className="node-list-heading"><div><span>{eyebrow}</span><h2>{title}</h2></div><strong>{workers.length} registrado{workers.length === 1 ? "" : "s"}</strong></div>
-    <div className="node-card-grid">
+    <div className="node-list-heading"><div><span>{eyebrow}</span><h2>{title}</h2></div><strong>{workers.length} registered</strong></div>
+    <div className="node-card-grid compact">
       {workers.map((worker) => {
         const execution = workerExecutionSummary(snapshot, worker);
         const remoteRepair = worker.acceleration;
@@ -2853,14 +2866,54 @@ function NodeInventorySection({ eyebrow, title, workers, snapshot, busy, onRemov
           || Boolean(remoteRepair?.retryable && remoteRepair.state !== "gpu-ready");
         return <article className="node-card" key={worker.id}>
         <div className="node-card-head"><div className={`node-device ${worker.kind}`}><WorkerKindIcon worker={worker} /></div><div><span>{workerKindLabel(worker)}</span><h2>{workerLabel(worker)}</h2><small>{shortId(worker.id)}</small></div><span className={`node-status ${worker.status}`}><i />{nodeStatusLabel(worker)}</span></div>
-        <div className={`node-runtime-state${autoRepair ? " repairing" : ""}`}><ExecutionBadge execution={execution} workers={snapshot.workers} /><span><strong>{remoteRepair?.retryable && remoteRepair.state !== "gpu-ready" ? `GPU autorepair · ${remoteRepair.phase} · ${remoteRepair.progressPct ?? 0}%` : autoRepair ? "Servicio mantenido en CPU · autoreparación activa" : execution.verified ? executionDetail(execution) : "No active model is reporting execution on this node"}</strong><small>{remoteRepair?.retryable && remoteRepair.state !== "gpu-ready" ? remoteRepair.issueSummary ?? "mycellios is rebuilding and revalidating the local GPU runtime." : autoRepair ? "mycellios revalidará la GPU y migrará esta etapa automáticamente." : execution.verified ? executionDeviceNames(execution) : "Detected GPU hardware is not counted as active compute."}</small></span></div>
-        {remoteRepair && <RemoteAccelerationDiagnostics diagnostics={remoteRepair} />}
-        {execution.stages.length > 0 && <ExecutionStages execution={execution} workers={snapshot.workers} compact />}
-        <div className="node-card-metrics"><Metric label={worker.kind === "cell" ? "Capacidad" : "Hardware"} value={worker.gpus[0]?.model ?? "Desconocido"} /><Metric label="Ofrecido" value={formatMemory(worker.offeredVramMb)} /><Metric label="Región" value={worker.region} /><Metric label="Completadas" value={String(worker.jobsCompleted)} /></div>
-        <div className="node-card-foot"><span>Visto {relativeTimeEs(worker.lastSeenAt)}</span><button disabled={busy === worker.id} onClick={() => void onRemove(worker.id)}>{busy === worker.id ? <LoaderCircle className="spin" /> : <Trash2 />} Eliminar</button></div>
+        <div className={`node-runtime-state${autoRepair ? " repairing" : ""}`}><ExecutionBadge execution={execution} workers={snapshot.workers} /><span><strong>{remoteRepair?.retryable && remoteRepair.state !== "gpu-ready" ? `GPU auto-repair · ${remoteRepair.phase} · ${remoteRepair.progressPct ?? 0}%` : autoRepair ? "Service maintained on CPU · auto-repair active" : execution.verified ? executionDetail(execution) : "No active model is reporting execution on this node"}</strong><small>{remoteRepair?.retryable && remoteRepair.state !== "gpu-ready" ? remoteRepair.issueSummary ?? "mycellios is rebuilding and revalidating the local GPU runtime." : autoRepair ? "mycellios will revalidate the GPU and migrate this stage automatically." : execution.verified ? executionDeviceNames(execution) : "Detected GPU hardware is not counted as active compute."}</small></span></div>
+        <div className="node-card-quick"><span><MemoryStick size={14} />{formatMemory(worker.offeredVramMb)} offered</span><span><Globe2 size={14} />{worker.region}</span></div>
+        <div className="node-card-foot"><span>Seen {relativeTime(worker.lastSeenAt)}</span><div><button type="button" onClick={() => onSelect(worker.id)}>View details</button><button disabled={busy === worker.id} onClick={() => void onRemove(worker.id)}>{busy === worker.id ? <LoaderCircle className="spin" /> : <Trash2 />} Remove</button></div></div>
       </article>;})}
     </div>
   </>;
+}
+
+function NodeDetailsDrawer({ worker, snapshot, onClose }: { worker: PublicWorker; snapshot: PublicSnapshot; onClose: () => void }) {
+  const drawerRef = useRef<HTMLElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    closeButtonRef.current?.focus();
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = drawerRef.current?.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      );
+      if (!focusable || focusable.length === 0) return;
+      const first = focusable.item(0);
+      const last = focusable.item(focusable.length - 1);
+      if (!first || !last) return;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      previouslyFocused?.focus();
+    };
+  }, [onClose]);
+  return createPortal(<div className="panel-drawer-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <aside ref={drawerRef} className="panel-detail-drawer" role="dialog" aria-modal="true" aria-label={`Node details for ${workerLabel(worker)}`}>
+      <header><span><small>NODE DETAILS</small><strong>{workerLabel(worker)}</strong></span><button ref={closeButtonRef} type="button" onClick={onClose} aria-label="Close node details"><X /></button></header>
+      <NodeTopologyInspector worker={worker} snapshot={snapshot} />
+    </aside>
+  </div>, document.querySelector(".public-panel") ?? document.body);
 }
 
 function NodeOverviewStat({ icon: Icon, label, value, detail, progress, tone }: { icon: typeof Server; label: string; value: string; detail: string; progress?: number; tone: "green" | "blue" | "purple" | "violet" | "cyan" | "orange" }) {
@@ -2882,30 +2935,30 @@ function NodeTopologyInspector({ worker, snapshot }: { worker: PublicWorker; sna
   const measuredDeployments = worker.deployments.filter(isMeasuredDeployment);
   const throughput = measuredDeployments.reduce((total, deployment) => total + deployment.tokensPerSecond, 0);
   const execution = workerExecutionSummary(snapshot, worker);
-  const kind = worker.kind === "cell" ? "Celda lógica" : worker.kind === "browser" ? "Navegador" : "Equipo instalado";
-  const computeMode = worker.computeMode ? computeModeLabel(worker.computeMode) : worker.kind === "cell" ? "Orquestado" : "No informado";
+  const kind = worker.kind === "cell" ? "Logical cell" : worker.kind === "browser" ? "Browser" : "Installed device";
+  const computeMode = worker.computeMode ? computeModeLabel(worker.computeMode) : worker.kind === "cell" ? "Orchestrated" : "Not reported";
   return <div className="node-topology-inspector">
-    <div className={`node-inspector-identity ${nodeVisualState(worker)}`}><div><WorkerKindIcon worker={worker} /></div><span><small>{worker.kind === "cell" ? "CELDA SELECCIONADA" : "NODO SELECCIONADO"}</small><strong>{workerLabel(worker)}</strong><em>{worker.region} · {shortId(worker.id)}</em><ExecutionBadge execution={execution} workers={snapshot.workers} /></span></div>
+    <div className={`node-inspector-identity ${nodeVisualState(worker)}`}><div><WorkerKindIcon worker={worker} /></div><span><small>{worker.kind === "cell" ? "SELECTED CELL" : "SELECTED NODE"}</small><strong>{workerLabel(worker)}</strong><em>{worker.region} · {shortId(worker.id)}</em><ExecutionBadge execution={execution} workers={snapshot.workers} /></span></div>
     <div className="node-inspector-metrics">
-      <Metric label="Estado" value={nodeStatusLabel(worker)} />
-      <Metric label="Tipo" value={kind} />
-      <Metric label="Región" value={worker.region} />
-      <Metric label="Última señal" value={relativeTimeEs(worker.lastSeenAt)} />
-      <Metric label="Fiabilidad" value={`${Math.round(Math.max(0, Math.min(1, worker.reliability)) * 100)}%`} />
-      <Metric label="Versión" value={worker.agentVersion ? `v${worker.agentVersion}` : "Legacy"} />
-      <Metric label="Build declarado" value={shortBuildIdentity(worker.buildIdentity)} />
-      <Metric label={worker.kind === "cell" ? "Capacidad agregada" : "VRAM física"} value={physicalVram > 0 ? formatMemory(physicalVram) : "Sin datos"} />
-      <Metric label="Memoria ofrecida" value={formatMemory(worker.offeredVramMb)} />
-      <Metric label="Memoria libre" value={formatMemory(free)} />
-      <Metric label="Carga física" value={utilization === null ? "Sin datos" : `${utilization.toFixed(0)}%`} />
-      <Metric label="Temperatura máx." value={maximumTemperature === null ? "Sin datos" : `${maximumTemperature.toFixed(0)} °C`} />
-      <Metric label="Consumo GPU" value={observedPower === null ? "Sin datos" : formatPower(observedPower)} />
-      <Metric label="Cómputo real" value={execution.verified ? executionShortLabel(execution) : "No verificado"} />
-      <Metric label="GPU runtime" value={worker.acceleration ? remoteAccelerationLabel(worker.acceleration) : "Sin diagnóstico"} />
-      <Metric label="Modo" value={computeMode} />
-      <Metric label="Inferencia medida" value={throughput > 0 ? `${formatCompactNumber(throughput)} tok/s` : "Sin medir"} />
-      <Metric label="Modelos" value={String(worker.deployments.length)} />
-      <Metric label="Completadas" value={String(worker.jobsCompleted)} />
+      <Metric label="Status" value={nodeStatusLabel(worker)} />
+      <Metric label="Type" value={kind} />
+      <Metric label="Region" value={worker.region} />
+      <Metric label="Last seen" value={relativeTimeEs(worker.lastSeenAt)} />
+      <Metric label="Reliability" value={`${Math.round(Math.max(0, Math.min(1, worker.reliability)) * 100)}%`} />
+      <Metric label="Version" value={worker.agentVersion ? `v${worker.agentVersion}` : "Legacy"} />
+      <Metric label="Declared build" value={shortBuildIdentity(worker.buildIdentity)} />
+      <Metric label={worker.kind === "cell" ? "Aggregated capacity" : "Physical VRAM"} value={physicalVram > 0 ? formatMemory(physicalVram) : "No data"} />
+      <Metric label="Offered memory" value={formatMemory(worker.offeredVramMb)} />
+      <Metric label="Free memory" value={formatMemory(free)} />
+      <Metric label="Physical load" value={utilization === null ? "No data" : `${utilization.toFixed(0)}%`} />
+      <Metric label="Max temperature" value={maximumTemperature === null ? "No data" : `${maximumTemperature.toFixed(0)} °C`} />
+      <Metric label="GPU power" value={observedPower === null ? "No data" : formatPower(observedPower)} />
+      <Metric label="Real compute" value={execution.verified ? executionShortLabel(execution) : "Unverified"} />
+      <Metric label="GPU runtime" value={worker.acceleration ? remoteAccelerationLabel(worker.acceleration) : "No diagnostics"} />
+      <Metric label="Mode" value={computeMode} />
+      <Metric label="Measured inference" value={throughput > 0 ? `${formatCompactNumber(throughput)} tok/s` : "Not measured"} />
+      <Metric label="Models" value={String(worker.deployments.length)} />
+      <Metric label="Completed" value={String(worker.jobsCompleted)} />
     </div>
     {worker.acceleration && <RemoteAccelerationDiagnostics diagnostics={worker.acceleration} />}
     {worker.isolation && <ExecutorIsolationDiagnostics isolation={worker.isolation} />}
@@ -2920,27 +2973,27 @@ function ExecutorIsolationDiagnostics({
   const jobObject = isolation.killOnClose === "windows-job-object";
   return <details className="executor-isolation-diagnostics">
     <summary>
-      <span><ShieldCheck />Aislamiento del ejecutor</span>
-      <strong>{jobObject ? "PARCIAL · JOB OBJECT" : "PARCIAL · POLÍTICA SELLADA"}</strong>
+      <span><ShieldCheck />Executor isolation</span>
+      <strong>{jobObject ? "PARTIAL · JOB OBJECT" : "PARTIAL · SEALED POLICY"}</strong>
       <ChevronDown />
     </summary>
     <div className="executor-isolation-body">
       <p className="executor-isolation-summary">
         <ShieldCheck />
-        <span><strong>Controles activos y verificables.</strong> El proceso recibe un entorno filtrado, un directorio temporal privado y un watchdog que detiene la ruta si supera sus límites.{jobObject ? " Windows además lo incorpora suspendido a un Job Object antes de ejecutarlo y cierra todo el árbol si muere la aplicación." : ""}</span>
+        <span><strong>Active, verifiable controls.</strong> The process receives a filtered environment, a private temporary directory and a watchdog that stops the route when it exceeds its limits.{jobObject ? " Windows also places it in a Job Object before execution and closes the entire tree if the application exits." : ""}</span>
       </p>
       <div className="executor-isolation-grid">
-        <Metric label="Entorno" value="Variables filtradas" />
-        <Metric label="Temporal privado" value={`Máx. ${formatMemory(isolation.maxWorkspaceBytes / (1024 * 1024))}`} />
-        <Metric label="Archivos temporales" value={`Máx. ${isolation.maxWorkspaceEntries.toLocaleString("es-ES")}`} />
-        <Metric label="Vigilancia" value={`Cada ${isolation.workspaceCheckIntervalMs} ms`} />
-        <Metric label="Árbol de procesos" value={jobObject ? "Job Object de Windows" : "Cierre best effort"} />
-        <Metric label="Al cerrar" value={jobObject ? "Terminación garantizada" : "Sin garantía del SO"} />
-        <Metric label="Política" value={isolation.launchPolicySchema.replace("gdlp-executor-isolation/", "v")} />
+        <Metric label="Environment" value="Filtered variables" />
+        <Metric label="Private temp space" value={`Max ${formatMemory(isolation.maxWorkspaceBytes / (1024 * 1024))}`} />
+        <Metric label="Temporary files" value={`Max ${isolation.maxWorkspaceEntries.toLocaleString("en-US")}`} />
+        <Metric label="Watchdog" value={`Every ${isolation.workspaceCheckIntervalMs} ms`} />
+        <Metric label="Process tree" value={jobObject ? "Windows Job Object" : "Best-effort close"} />
+        <Metric label="On close" value={jobObject ? "Guaranteed termination" : "No OS guarantee"} />
+        <Metric label="Policy" value={isolation.launchPolicySchema.replace("gdlp-executor-isolation/", "v")} />
       </div>
       <div className="executor-isolation-pending">
         <CircleAlert />
-        <span><strong>Aislamiento fuerte aún pendiente.</strong> Este nodo todavía no anuncia sandbox del sistema operativo ni cuotas duras de CPU/RAM/GPU{jobObject ? "." : " ni garantía kill-on-close."}</span>
+        <span><strong>Strong isolation still pending.</strong> This node does not yet announce an operating-system sandbox or hard CPU/RAM/GPU quotas{jobObject ? "." : " or a kill-on-close guarantee."}</span>
       </div>
     </div>
   </details>;
@@ -3044,7 +3097,7 @@ function Models({ snapshot, onSearch, onRequest, onRemove, adminToken: initialAd
     setCatalogLoadingMore(false);
     setCatalogError(null);
     const timer = window.setTimeout(() => {
-      void onSearch({ query, sort: catalogRemoteSort, limit: 50 }).then(
+      void onSearch({ query, sort: catalogRemoteSort, limit: 20 }).then(
         (page) => {
           if (searchSequence.current !== sequence) return;
           setCatalogModels(page.data);
@@ -3069,7 +3122,7 @@ function Models({ snapshot, onSearch, onRequest, onRemove, adminToken: initialAd
     setCatalogLoadingMore(true);
     setCatalogError(null);
     try {
-      const page = await onSearch({ query: catalogQuery.trim(), cursor: catalogNextCursor, sort: catalogRemoteSort, limit: 50 });
+      const page = await onSearch({ query: catalogQuery.trim(), cursor: catalogNextCursor, sort: catalogRemoteSort, limit: 20 });
       if (searchSequence.current !== sequence) return;
       setCatalogModels((current) => {
         const known = new Set(current.map((model) => model.id));
@@ -3154,7 +3207,7 @@ function Models({ snapshot, onSearch, onRequest, onRemove, adminToken: initialAd
             <td><button type="button" className="hub-table-select" disabled={!model.compatible} onClick={() => selectCatalogModel(model)}>{source === model.id ? <><CheckCircle2 /> Selected</> : "Select"}</button></td>
           </tr>;
         })}</tbody></table></div>}
-        {catalogModels.length > 0 && <div className="hub-catalog-pagination"><span>Results are loaded directly from Hugging Face in pages of 50.</span>{catalogNextCursor ? <button type="button" onClick={() => void loadMoreCatalog()} disabled={catalogLoadingMore}>{catalogLoadingMore ? <LoaderCircle className="spin" /> : <Plus />}{catalogLoadingMore ? "Loading…" : "Load 50 more"}</button> : <em>End of results</em>}</div>}
+        {catalogModels.length > 0 && <div className="hub-catalog-pagination"><span>Results are loaded directly from Hugging Face in pages of 20.</span>{catalogNextCursor ? <button type="button" onClick={() => void loadMoreCatalog()} disabled={catalogLoadingMore}>{catalogLoadingMore ? <LoaderCircle className="spin" /> : <Plus />}{catalogLoadingMore ? "Loading…" : "Load 20 more"}</button> : <em>End of results</em>}</div>}
       </>}
 
       {source && <div className="hub-selected-model"><CheckCircle2 /><span><small>SELECTED MODEL</small><strong>{source}</strong><em>It will be published as {modelId}{selectedCatalogModel && estimatedHubMemoryMiB(selectedCatalogModel) !== null ? ` · ≈ ${formatMemory(estimatedHubMemoryMiB(selectedCatalogModel)!)} required` : ""}</em></span><button type="button" onClick={() => setCatalogOpen(true)}>Change model</button></div>}
@@ -3184,6 +3237,7 @@ function Models({ snapshot, onSearch, onRequest, onRemove, adminToken: initialAd
 
 function RequestedModelCard({ model, onRemove }: { model: RequestedModelCapacity; onRemove: (modelId: string) => Promise<void> }) {
   const [removing, setRemoving] = useState(false);
+  const [detailsOpen, setDetailsOpen] = useState(false);
   const required = model.requiredVramMiB ?? 0;
   const vramProgress = required > 0 ? model.availableVramMiB / required : 0;
   const nodeProgress = model.requiredNodes > 0 ? model.availableNodes / model.requiredNodes : 0;
@@ -3195,15 +3249,21 @@ function RequestedModelCard({ model, onRemove }: { model: RequestedModelCapacity
   return <article className={`model-request-card ${model.status}`}>
     <div className="model-request-head"><div className="model-request-icon"><Boxes /></div><div><span>{model.source}</span><h2>{model.id}</h2><small>{model.adapterId ?? "Checking architecture"}</small></div><ModelStatus status={model.status} /></div>
     <p className="model-request-message">{model.message}</p>
-    {model.activationIncident && <ActivationIncidentPanel incident={model.activationIncident} />}
-    {(model.status === "activating" || model.status === "failed" || (model.activationProgress?.length ?? 0) > 0) && <ActivationProgressLog model={model} />}
     <div className="model-capacity-bar"><i style={{ width: `${progress}%` }} /></div>
-    <div className="model-capacity-grid">
-      <Metric label="Estimated need" value={model.requiredVramMiB === null ? "Calculating" : formatMemory(model.requiredVramMiB)} />
-      <Metric label="Available" value={formatMemory(model.availableVramMiB)} />
-      <Metric label="Estimated shortfall" value={model.missingVramMiB === null ? "—" : formatMemory(model.missingVramMiB)} />
-      <Metric label="Nodes" value={`${model.availableNodes} / ${model.requiredNodes}`} />
-    </div>
+    <div className="model-request-quick"><span><MemoryStick size={14} />{formatMemory(model.availableVramMiB)} available</span><span><Server size={14} />{model.availableNodes} / {model.requiredNodes} nodes</span><span><Activity size={14} />{model.activationProgress?.length ?? 0} events</span></div>
+    <details className="model-request-details" onToggle={(event) => setDetailsOpen(event.currentTarget.open)}>
+      <summary><Activity size={15} />Capacity and diagnostics<ChevronDown size={15} /></summary>
+      {detailsOpen && <div className="model-request-details-body">
+      <div className="model-capacity-grid">
+        <Metric label="Estimated need" value={model.requiredVramMiB === null ? "Calculating" : formatMemory(model.requiredVramMiB)} />
+        <Metric label="Available" value={formatMemory(model.availableVramMiB)} />
+        <Metric label="Estimated shortfall" value={model.missingVramMiB === null ? "—" : formatMemory(model.missingVramMiB)} />
+        <Metric label="Nodes" value={`${model.availableNodes} / ${model.requiredNodes}`} />
+      </div>
+      {model.activationIncident && <ActivationIncidentPanel incident={model.activationIncident} />}
+      {(model.status === "activating" || model.status === "failed" || (model.activationProgress?.length ?? 0) > 0) && <ActivationProgressLog model={model} />}
+      </div>}
+    </details>
     <div className="model-request-foot"><span>{model.autoActivate ? <><Zap size={14} /> Auto-activation armed</> : "Manual activation"}</span><button disabled={removing} onClick={() => void remove()}>{removing ? <LoaderCircle className="spin" /> : <Trash2 />} Remove</button></div>
   </article>;
 }
@@ -3254,11 +3314,15 @@ function ActivationIncidentPanel({
 }
 
 function Jobs({ snapshot }: { snapshot: PublicSnapshot }) {
+  const [visibleCount, setVisibleCount] = useState(20);
+  const visibleJobs = snapshot.jobs.slice(0, visibleCount);
   return <section><PageTitle eyebrow="EXECUTION LOG" title="Network jobs" copy="Recent inference requests and their execution state." />
     <div className="panel-table jobs-table"><div className="panel-table-head"><span>Request</span><span>Model</span><span>Tokens</span><span>Status</span></div>
-      {snapshot.jobs.map((job) => <div className="panel-table-row" key={job.id}><strong><Activity size={16} />{shortId(job.id)}<small>{relativeTime(job.createdAt)}</small></strong><span>{job.model}</span><span>{job.inputTokens + job.outputTokens}</span><b className={job.status}><i />{job.status}</b></div>)}
+      {visibleJobs.map((job) => <div className="panel-table-row" key={job.id}><strong><Activity size={16} />{shortId(job.id)}<small>{relativeTime(job.createdAt)}</small></strong><span>{job.model}</span><span>{job.inputTokens + job.outputTokens}</span><b className={job.status}><i />{job.status}</b></div>)}
       {snapshot.jobs.length === 0 && <Empty icon={Activity} title="No jobs yet" copy="Use the inference console when a model becomes available." />}
-    </div></section>;
+    </div>
+    {visibleCount < snapshot.jobs.length && <div className="panel-load-more"><span>Showing {visibleJobs.length} of {snapshot.jobs.length} tasks</span><button type="button" onClick={() => setVisibleCount((count) => count + 20)}><Plus size={15} />Load 20 more</button></div>}
+  </section>;
 }
 
 type SystemLogFilter = "important" | "errors" | "all";
@@ -3269,6 +3333,7 @@ function SystemLogs({ snapshot, bridge, connectionError }: { snapshot: PublicSna
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(Boolean(bridge));
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [visibleCount, setVisibleCount] = useState(30);
 
   const load = useCallback(async (silent = false) => {
     if (!bridge) return;
@@ -3304,34 +3369,38 @@ function SystemLogs({ snapshot, bridge, connectionError }: { snapshot: PublicSna
   });
   const warningCount = logSnapshot.entries.filter((entry) => entry.level === "warning").length;
   const errorCount = logSnapshot.entries.filter((entry) => entry.level === "error").length;
+  const renderedEntries = visibleEntries.slice(0, visibleCount);
+
+  useEffect(() => setVisibleCount(30), [filter, query]);
 
   return <section className="system-logs-page">
     <PageTitle
       eyebrow="SYSTEM DIAGNOSTICS"
-      title="Logs importantes"
-      copy={bridge ? "Eventos reales y saneados de la aplicación, el runtime, los workers y las actualizaciones." : "Actividad importante observable desde el coordinador, los nodos, los modelos y las tareas."}
-      actions={<button disabled={loading} onClick={() => void load()}>{loading ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}Actualizar</button>}
+      title="Important logs"
+      copy={bridge ? "Real, sanitized events from the application, runtime, workers and updates." : "Important activity observed across the coordinator, nodes, models and tasks."}
+      actions={<button disabled={loading} onClick={() => void load()}>{loading ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}Refresh</button>}
     />
     <div className="system-log-summary">
-      <article><ScrollText /><span><small>ENTRADAS CARGADAS</small><strong>{logSnapshot.entries.length}</strong><em>{bridge ? "Registro local seguro" : "Estado actual de la red"}</em></span></article>
-      <article className="warning"><CircleAlert /><span><small>AVISOS</small><strong>{warningCount}</strong><em>Reintentos y degradaciones</em></span></article>
-      <article className="error"><X /><span><small>ERRORES</small><strong>{errorCount}</strong><em>Eventos que requieren atención</em></span></article>
+      <article><ScrollText /><span><small>LOADED ENTRIES</small><strong>{logSnapshot.entries.length}</strong><em>{bridge ? "Safe local log" : "Current network status"}</em></span></article>
+      <article className="warning"><CircleAlert /><span><small>WARNINGS</small><strong>{warningCount}</strong><em>Retries and degradation</em></span></article>
+      <article className="error"><X /><span><small>ERRORS</small><strong>{errorCount}</strong><em>Events requiring attention</em></span></article>
     </div>
     <div className="system-log-toolbar">
-      <div className="system-log-filters" role="group" aria-label="Filtrar logs">
-        <button className={filter === "important" ? "active" : ""} onClick={() => setFilter("important")}>Importantes</button>
-        <button className={filter === "errors" ? "active" : ""} onClick={() => setFilter("errors")}>Solo errores</button>
-        <button className={filter === "all" ? "active" : ""} onClick={() => setFilter("all")}>Todos</button>
+      <div className="system-log-filters" role="group" aria-label="Filter logs">
+        <button className={filter === "important" ? "active" : ""} onClick={() => setFilter("important")}>Important</button>
+        <button className={filter === "errors" ? "active" : ""} onClick={() => setFilter("errors")}>Errors only</button>
+        <button className={filter === "all" ? "active" : ""} onClick={() => setFilter("all")}>All</button>
       </div>
-      <label className="system-log-search"><Search /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Buscar evento, origen o mensaje…" /></label>
+      <label className="system-log-search"><Search /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search event, source, or message…" /></label>
     </div>
-    {loadError && <div className="inline-error"><CircleAlert size={17} />No se pudieron leer los logs locales: {loadError}</div>}
-    {logSnapshot.truncated && <div className="system-log-notice"><CircleAlert />Se muestran únicamente las entradas más recientes para mantener el panel rápido y seguro.</div>}
+    {loadError && <div className="inline-error"><CircleAlert size={17} />Could not read local logs: {loadError}</div>}
+    {logSnapshot.truncated && <div className="system-log-notice"><CircleAlert />Only the most recent entries are shown to keep the panel fast and safe.</div>}
     <div className="system-log-list" aria-live="polite">
-      {loading && !desktopLogs ? <div className="system-log-loading"><LoaderCircle className="spin" /><span>Leyendo los eventos importantes…</span></div> : visibleEntries.map((entry) => <SystemLogRow entry={entry} key={entry.id} />)}
-      {!loading && visibleEntries.length === 0 && <Empty icon={ScrollText} title="No hay logs para este filtro" copy={normalizedQuery ? "Prueba otra búsqueda o muestra todos los niveles." : "No se han registrado eventos de este nivel."} />}
+      {loading && !desktopLogs ? <div className="system-log-loading"><LoaderCircle className="spin" /><span>Reading important events…</span></div> : renderedEntries.map((entry) => <SystemLogRow entry={entry} key={entry.id} />)}
+      {!loading && visibleEntries.length === 0 && <Empty icon={ScrollText} title="No logs for this filter" copy={normalizedQuery ? "Try another search or show all levels." : "No events have been recorded at this level."} />}
     </div>
-    <footer className="system-log-safety"><ShieldCheck /><span><strong>Lectura segura y limitada</strong><small>Las credenciales, tokens, contraseñas y secretos se ocultan antes de llegar a esta pantalla.</small></span></footer>
+    {visibleCount < visibleEntries.length && <div className="panel-load-more"><span>Showing {renderedEntries.length} of {visibleEntries.length} matching events</span><button type="button" onClick={() => setVisibleCount((count) => count + 30)}><Plus size={15} />Load 30 more</button></div>}
+    <footer className="system-log-safety"><ShieldCheck /><span><strong>Safe, limited read</strong><small>Credentials, tokens, passwords and secrets are redacted before reaching this screen.</small></span></footer>
   </section>;
 }
 
@@ -3341,7 +3410,7 @@ function SystemLogRow({ entry }: { entry: SystemLogEntry }) {
     <div className="system-log-row-content">
       <header><time dateTime={entry.at}>{formatSystemLogTime(entry.at)}</time><span className={`system-log-level ${entry.level}`}>{systemLogLevelLabel(entry.level)}</span><span className="system-log-source">{systemLogSourceLabel(entry.source)}</span></header>
       <div><strong>{humanizeSystemLogEvent(entry.event)}</strong><p>{entry.message}</p></div>
-      {entry.details && <details><summary>Detalles técnicos <ChevronDown /></summary><code>{entry.details}</code></details>}
+      {entry.details && <details><summary>Technical details <ChevronDown /></summary><code>{entry.details}</code></details>}
     </div>
   </article>;
 }
@@ -3365,7 +3434,7 @@ function networkSnapshotLogs(snapshot: PublicSnapshot, connectionError: string |
       level: "info",
       source: "coordinator",
       event: "coordinator-snapshot-ready",
-      message: `${snapshot.summary.connected} nodos conectados, ${snapshot.models.length} modelos disponibles y ${snapshot.summary.completedJobs} tareas completadas.`,
+      message: `${snapshot.summary.connected} connected nodes, ${snapshot.models.length} available models and ${snapshot.summary.completedJobs} completed tasks.`,
     });
   }
   for (const worker of snapshot.workers) {
@@ -3377,7 +3446,7 @@ function networkSnapshotLogs(snapshot: PublicSnapshot, connectionError: string |
       source: "worker",
       event: `worker-${state}`,
       message: `${workerLabel(worker)} · ${nodeStatusLabel(worker)} · ${worker.region}`,
-      details: `id=${shortId(worker.id)} · memoria=${formatMemory(worker.offeredVramMb)} · tareas=${worker.jobsCompleted}`,
+      details: `id=${shortId(worker.id)} · memory=${formatMemory(worker.offeredVramMb)} · tasks=${worker.jobsCompleted}`,
     });
   }
   for (const model of snapshot.requestedModels) {
@@ -3423,24 +3492,24 @@ function redactVisibleLogText(value: string): string {
 
 function formatSystemLogTime(value: string): string {
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "Hora desconocida";
-  return new Intl.DateTimeFormat("es-ES", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(date);
+  if (Number.isNaN(date.getTime())) return "Unknown time";
+  return new Intl.DateTimeFormat("en-US", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(date);
 }
 
 function systemLogLevelLabel(level: SystemLogEntry["level"]): string {
   if (level === "error") return "ERROR";
-  if (level === "warning") return "AVISO";
+  if (level === "warning") return "WARNING";
   return "INFO";
 }
 
 function systemLogSourceLabel(source: SystemLogEntry["source"]): string {
   const labels: Record<SystemLogEntry["source"], string> = {
-    desktop: "Aplicación",
-    coordinator: "Coordinador",
+    desktop: "Application",
+    coordinator: "Coordinator",
     worker: "Worker",
     runtime: "Runtime",
-    renderer: "Interfaz",
-    network: "Red",
+    renderer: "Interface",
+    network: "Network",
   };
   return labels[source];
 }
@@ -3548,41 +3617,41 @@ function Tests({ bridge }: { bridge: DesktopBridge | undefined }) {
     const snapshot = benchmarkRunSnapshot(run);
     return {
       value: run.runId,
-      label: `${run.trigger === "automatic-model-start" ? "Auto" : "Manual"} · ${snapshot?.measurement.model.label ?? run.triggerModelId ?? "modelo"} · v${run.version} · ${formatBenchmarkDate(run.finishedAt)}`,
+      label: `${run.trigger === "automatic-model-start" ? "Auto" : "Manual"} · ${snapshot?.measurement.model.label ?? run.triggerModelId ?? "model"} · v${run.version} · ${formatBenchmarkDate(run.finishedAt)}`,
     };
   });
   const comparisonOptions = [
-    { value: "", label: "Sin referencia comparable" },
+    { value: "", label: "No comparable reference" },
     ...filteredRuns.filter((run) => run.runId !== selected?.runId).map((run) => {
       const snapshot = benchmarkRunSnapshot(run);
       const comparable = snapshot?.scenarioFingerprint === selectedSnapshot?.scenarioFingerprint
         && snapshot?.scenarioComparable === true;
       return {
         value: run.runId,
-        label: `${comparable ? "Comparable" : "Configuración distinta"} · ${snapshot?.measurement.model.label ?? "modelo"} · ${snapshot ? snapshot.nodes : "Sin lectura"} nodos · v${run.version}`,
+        label: `${comparable ? "Comparable" : "Different configuration"} · ${snapshot?.measurement.model.label ?? "model"} · ${snapshot ? snapshot.nodes : "No reading"} nodes · v${run.version}`,
       };
     }),
   ];
 
   return <section className="tests-page">
-    <PageTitle eyebrow="PRUEBAS REALES AUTOMÁTICAS" title="¿Mycellios mejora de verdad?" copy="Compara velocidad, latencia y eficiencia sin mezclar modelos, capacidad, rutas o hardware diferentes." actions={<button disabled={running} onClick={() => void runNow()}>{running ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}{running ? "Midiendo…" : "Repetir prueba ahora"}</button>} />
-    <div className="benchmark-auto-notice"><Activity size={19} /><span><strong>Medición automática con evidencia real</strong>El banco calienta el modelo, repite peticiones y guarda su variación. Una lectura ausente aparece como “Sin lectura”; nunca se estima para rellenar la pantalla.</span></div>
-    {error && <div className="benchmark-error"><CircleAlert size={17} /><span><strong>No se pudo ejecutar la prueba</strong>{error}</span></div>}
+    <PageTitle eyebrow="AUTOMATED REAL TESTS" title="Does Mycellios really improve?" copy="Compare speed, latency and efficiency without mixing different models, capacity, routes or hardware." actions={<button disabled={running} onClick={() => void runNow()}>{running ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}{running ? "Measuring…" : "Run test again"}</button>} />
+    <div className="benchmark-auto-notice"><Activity size={19} /><span><strong>Automatic measurement with real evidence</strong>The bench warms the model, repeats requests and records its variation. A missing reading appears as “No reading”; it is never estimated to fill the screen.</span></div>
+    {error && <div className="benchmark-error"><CircleAlert size={17} /><span><strong>Test could not run</strong>{error}</span></div>}
     <div className="panel-stat-grid benchmark-stats">
       <Stat icon={Activity} label="Pruebas visibles" value={String(filteredRuns.length)} detail={`${runs.length} guardadas en total`} />
-      <Stat icon={Boxes} label="Modelo seleccionado" value={selectedMeasurement?.model.label ?? "Sin lectura"} detail={selected ? `v${selected.version} · ${formatBenchmarkDate(selected.finishedAt)}` : "Sin mediciones"} />
-      <Stat icon={Server} label="Nodos usados" value={selectedInventory ? String(selectedNodes) : "Sin lectura"} detail={selectedInventory ? `${selectedInventory.connectedDevices}/${selectedInventory.totalDevices} conectados` : "Sin inventario"} />
-      <Stat icon={Gauge} label="Mejor P50 comparable" value={formatBenchmark(bestThroughput, " tok/s")} detail={selectedMeasurement ? `${trendRuns.length} prueba${trendRuns.length === 1 ? "" : "s"} con el mismo fingerprint` : "Sin escenario seleccionado"} tone="purple" />
+      <Stat icon={Boxes} label="Selected model" value={selectedMeasurement?.model.label ?? "No reading"} detail={selected ? `v${selected.version} · ${formatBenchmarkDate(selected.finishedAt)}` : "No measurements"} />
+      <Stat icon={Server} label="Nodes used" value={selectedInventory ? String(selectedNodes) : "No reading"} detail={selectedInventory ? `${selectedInventory.connectedDevices}/${selectedInventory.totalDevices} connected` : "No inventory"} />
+      <Stat icon={Gauge} label="Best comparable P50" value={formatBenchmark(bestThroughput, " tok/s")} detail={selectedMeasurement ? `${trendRuns.length} test${trendRuns.length === 1 ? "" : "s"} with the same fingerprint` : "No scenario selected"} tone="purple" />
     </div>
     {selectedMeasurement && <div className="benchmark-capacity-strip">
-      <BenchmarkMetric icon={MemoryStick} label="Memoria ofrecida" value={formatBenchmark(selectedOfferedGb, " GB")} detail={formatBenchmark(selectedInventory?.physicalMemoryGb ?? null, " GB físicos")} />
-      <BenchmarkMetric icon={Zap} label="Potencia P50" value={selectedPower === null ? "Sin lectura" : formatPower(selectedPower)} detail={`P95 ${formatPowerReading(selectedMeasurement.metrics.powerWattsP95 ?? null)} · pico ${formatPowerReading(selectedMeasurement.metrics.powerWattsPeak ?? null)}`} />
+      <BenchmarkMetric icon={MemoryStick} label="Offered memory" value={formatBenchmark(selectedOfferedGb, " GB")} detail={formatBenchmark(selectedInventory?.physicalMemoryGb ?? null, " physical GB")} />
+      <BenchmarkMetric icon={Zap} label="P50 power" value={selectedPower === null ? "No reading" : formatPower(selectedPower)} detail={`P95 ${formatPowerReading(selectedMeasurement.metrics.powerWattsP95 ?? null)} · peak ${formatPowerReading(selectedMeasurement.metrics.powerWattsPeak ?? null)}`} />
       <BenchmarkMetric icon={Gauge} label="Velocidad P50" value={formatBenchmark(selectedMeasurement.metrics.tokensPerSecondP50 ?? selectedMeasurement.metrics.tokensPerSecond, " tok/s")} detail={`P5 ${formatBenchmark(selectedMeasurement.metrics.tokensPerSecondP5 ?? null, " tok/s")} · P95 ${formatBenchmark(selectedMeasurement.metrics.tokensPerSecondP95, " tok/s")}`} />
       <BenchmarkMetric icon={Timer} label="Primer token P95" value={formatBenchmark(selectedMeasurement.metrics.ttftMsP95, " ms")} detail={`P50 ${formatBenchmark(selectedMeasurement.metrics.ttftMsP50, " ms")}`} />
-      <BenchmarkMetric icon={ShieldCheck} label="Confianza estadística" value={benchmarkStabilityLabel(selectedMeasurement)} detail={`CV ${formatBenchmark(selectedMeasurement.metrics.coefficientOfVariationPct ?? null, "%")} · ±${formatBenchmark(selectedMeasurement.metrics.confidenceHalfWidthPct ?? null, "%")}`} />
-      <BenchmarkMetric icon={Activity} label="Energía medida" value={formatBenchmark(selectedMeasurement.metrics.energyWh ?? null, " Wh")} detail={`Cobertura ${formatBenchmark(selectedMeasurement.metrics.energyCoveragePct ?? null, "%")}`} />
+      <BenchmarkMetric icon={ShieldCheck} label="Statistical confidence" value={benchmarkStabilityLabel(selectedMeasurement)} detail={`CV ${formatBenchmark(selectedMeasurement.metrics.coefficientOfVariationPct ?? null, "%")} · ±${formatBenchmark(selectedMeasurement.metrics.confidenceHalfWidthPct ?? null, "%")}`} />
+      <BenchmarkMetric icon={Activity} label="Measured energy" value={formatBenchmark(selectedMeasurement.metrics.energyWh ?? null, " Wh")} detail={`Coverage ${formatBenchmark(selectedMeasurement.metrics.energyCoveragePct ?? null, "%")}`} />
     </div>}
-    {loading && runs.length === 0 ? <div className="benchmark-loading"><LoaderCircle className="spin" /><span>Cargando el historial real…</span></div> : runs.length === 0 ? <Empty icon={Gauge} title="Todavía no hay pruebas reales" copy="Arranca un modelo. La primera medición se guardará automáticamente cuando tenga una ruta física disponible." /> : <>
+    {loading && runs.length === 0 ? <div className="benchmark-loading"><LoaderCircle className="spin" /><span>Loading real history…</span></div> : runs.length === 0 ? <Empty icon={Gauge} title="No real tests yet" copy="Start a model. The first measurement is saved automatically when a physical route is available." /> : <>
       <BenchmarkFiltersPanel
         filters={filters}
         values={filterValues}
@@ -3594,19 +3663,19 @@ function Tests({ bridge }: { bridge: DesktopBridge | undefined }) {
           setComparisonRunId("");
         }}
       />
-      {filteredRuns.length === 0 ? <Empty icon={Search} title="No hay pruebas con esos filtros" copy="Cambia uno de los filtros para volver a ver el historial real guardado." /> : <>
+      {filteredRuns.length === 0 ? <Empty icon={Search} title="No tests match these filters" copy="Change one filter to see the saved real history again." /> : <>
       <div className="benchmark-toolbar">
         <div className="benchmark-toolbar-selects">
           <label>RESULTADO ACTUAL<AppSelect ariaLabel="Resultado actual" value={selected?.runId ?? ""} onChange={selectRun} options={runOptions} /></label>
           <label>COMPARAR CON<AppSelect ariaLabel="Resultado de referencia" value={comparisonRun?.runId ?? ""} onChange={setComparisonRunId} options={comparisonOptions} /></label>
         </div>
-        {selected && <div className={`benchmark-run-state ${selected.status}`}><i />{benchmarkStatusLabel(selected.status)}<span>{selected.trigger === "automatic-model-start" ? "arranque automático" : selected.suite === "physical-import" ? "campaña física" : "prueba manual"}</span></div>}
+        {selected && <div className={`benchmark-run-state ${selected.status}`}><i />{benchmarkStatusLabel(selected.status)}<span>{selected.trigger === "automatic-model-start" ? "automatic start" : selected.suite === "physical-import" ? "physical campaign" : "manual test"}</span></div>}
       </div>
       <BenchmarkComparisonPanel comparison={comparison} />
       <div className="benchmark-chart-grid">
         <BenchmarkTrend runs={trendRuns} metric="tokensPerSecond" label="Velocidad P50 e intervalo P5–P95" unit="tok/s" tone="blue" />
         <BenchmarkTrend runs={trendRuns} metric="ttftMsP95" label="Primer token P95" unit="ms" tone="purple" />
-        <BenchmarkTrend runs={trendRuns} metric="nodes" label="Nodos usados" unit=" nodos" tone="green" />
+        <BenchmarkTrend runs={trendRuns} metric="nodes" label="Nodes used" unit=" nodes" tone="green" />
         <BenchmarkTrend runs={trendRuns} metric="tokensPerSecondPerNode" label="Eficiencia por nodo" unit=" tok/s/nodo" tone="orange" />
       </div>
       <BenchmarkHistory runs={filteredRuns} selectedRunId={selected?.runId ?? ""} onSelect={selectRun} />
@@ -3630,17 +3699,17 @@ function BenchmarkFiltersPanel({
   onClear: () => void;
 }) {
   const activeFilters = Object.values(filters).filter(Boolean).length;
-  return <section className="benchmark-filters" aria-label="Filtros del banco de pruebas">
+  return <section className="benchmark-filters" aria-label="Benchmark filters">
     <div className="benchmark-filters-heading">
-      <div><SlidersHorizontal size={19} /><span><strong>Filtrar pruebas</strong><small>{visibleCount} resultado{visibleCount === 1 ? "" : "s"} visible{visibleCount === 1 ? "" : "s"}</small></span></div>
-      <button type="button" className="benchmark-clear-filters" disabled={activeFilters === 0} onClick={onClear}>Limpiar filtros{activeFilters > 0 ? ` (${activeFilters})` : ""}</button>
+      <div><SlidersHorizontal size={19} /><span><strong>Filter tests</strong><small>{visibleCount} visible result{visibleCount === 1 ? "" : "s"}</small></span></div>
+      <button type="button" className="benchmark-clear-filters" disabled={activeFilters === 0} onClick={onClear}>Clear filters{activeFilters > 0 ? ` (${activeFilters})` : ""}</button>
     </div>
     <div className="benchmark-filter-grid">
-      <label>MODELO<AppSelect ariaLabel="Filtrar por modelo" value={filters.model} onChange={(value) => onChange("model", value)} options={[{ value: "", label: "Todos los modelos" }, ...values.models]} /></label>
-      <label>VERSIÓN<AppSelect ariaLabel="Filtrar por versión" value={filters.version} onChange={(value) => onChange("version", value)} options={[{ value: "", label: "Todas las versiones" }, ...values.versions.map((version) => ({ value: version, label: `v${version}` }))]} /></label>
-      <label>ESTADO<AppSelect ariaLabel="Filtrar por estado" value={filters.status} onChange={(value) => onChange("status", value)} options={[{ value: "", label: "Todos los estados" }, ...values.statuses.map((status) => ({ value: status, label: benchmarkStatusLabel(status) }))]} /></label>
-      <label>BACKEND<AppSelect ariaLabel="Filtrar por backend" value={filters.backend} onChange={(value) => onChange("backend", value)} options={[{ value: "", label: "Todos los backends" }, ...values.backends.map((backend) => ({ value: backend, label: backend === "__without_reading__" ? "Sin lectura" : backend.toUpperCase() }))]} /></label>
-      <label>EVIDENCIA<AppSelect ariaLabel="Filtrar por evidencia" value={filters.evidence} onChange={(value) => onChange("evidence", value)} options={[{ value: "", label: "Toda la evidencia" }, ...values.evidence.map((evidence) => ({ value: evidence, label: evidence === "physical" ? "Física real" : "Loopback local" }))]} /></label>
+      <label>MODEL<AppSelect ariaLabel="Filter by model" value={filters.model} onChange={(value) => onChange("model", value)} options={[{ value: "", label: "All models" }, ...values.models]} /></label>
+      <label>VERSION<AppSelect ariaLabel="Filter by version" value={filters.version} onChange={(value) => onChange("version", value)} options={[{ value: "", label: "All versions" }, ...values.versions.map((version) => ({ value: version, label: `v${version}` }))]} /></label>
+      <label>STATUS<AppSelect ariaLabel="Filter by status" value={filters.status} onChange={(value) => onChange("status", value)} options={[{ value: "", label: "All statuses" }, ...values.statuses.map((status) => ({ value: status, label: benchmarkStatusLabel(status) }))]} /></label>
+      <label>BACKEND<AppSelect ariaLabel="Filter by backend" value={filters.backend} onChange={(value) => onChange("backend", value)} options={[{ value: "", label: "All backends" }, ...values.backends.map((backend) => ({ value: backend, label: backend === "__without_reading__" ? "No reading" : backend.toUpperCase() }))]} /></label>
+      <label>EVIDENCE<AppSelect ariaLabel="Filter by evidence" value={filters.evidence} onChange={(value) => onChange("evidence", value)} options={[{ value: "", label: "All evidence" }, ...values.evidence.map((evidence) => ({ value: evidence, label: evidence === "physical" ? "Real physical" : "Local loopback" }))]} /></label>
     </div>
   </section>;
 }
@@ -3668,8 +3737,8 @@ function BenchmarkTrend({ runs, metric, label, unit, tone }: { runs: BenchmarkRu
   const x = (index: number) => points.length === 1 ? (left + width - right) / 2 : left + (index / Math.max(points.length - 1, 1)) * (width - left - right);
   const y = (value: number) => top + (1 - value / ceiling) * (height - top - bottom);
   return <article className="benchmark-chart">
-    <div><span>MISMO FINGERPRINT · {points[0]?.snapshot.measurement.model.label ?? "SIN DATOS"}</span><h2>{label}</h2></div>
-    <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${label}. ${points.length} pruebas reales.`}>
+    <div><span>SAME FINGERPRINT · {points[0]?.snapshot.measurement.model.label ?? "NO DATA"}</span><h2>{label}</h2></div>
+    <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${label}. ${points.length} real tests.`}>
       <line className="benchmark-axis" x1={left} y1={height - bottom} x2={width - right} y2={height - bottom} />
       {[0, 0.5, 1].map((ratio) => <g key={ratio}><line className="benchmark-grid-line" x1={left} y1={top + ratio * (height - top - bottom)} x2={width - right} y2={top + ratio * (height - top - bottom)} /><text x={left - 8} y={top + ratio * (height - top - bottom) + 4} textAnchor="end">{formatBenchmark(ceiling * (1 - ratio), "")}</text></g>)}
       {metric === "tokensPerSecond" && points.length > 1 && points.every((point) => point.low !== null && point.high !== null) && <polygon
@@ -3691,7 +3760,7 @@ function BenchmarkTrend({ runs, metric, label, unit, tone }: { runs: BenchmarkRu
             y2={y(point.high)}
           />
         )}
-        {points.map((point, index) => <circle key={point.run.runId} cx={x(index)} cy={y(point.value)} r="5"><title>{`v${point.run.version} · ${formatBenchmarkDate(point.run.finishedAt)}: ${formatBenchmark(point.value, ` ${unit}`)}${point.low === null || point.high === null ? " · intervalo Sin lectura" : ` · P5 ${formatBenchmark(point.low, ` ${unit}`)} · P95 ${formatBenchmark(point.high, ` ${unit}`)}`}`}</title></circle>)}
+        {points.map((point, index) => <circle key={point.run.runId} cx={x(index)} cy={y(point.value)} r="5"><title>{`v${point.run.version} · ${formatBenchmarkDate(point.run.finishedAt)}: ${formatBenchmark(point.value, ` ${unit}`)}${point.low === null || point.high === null ? " · interval: No reading" : ` · P5 ${formatBenchmark(point.low, ` ${unit}`)} · P95 ${formatBenchmark(point.high, ` ${unit}`)}`}`}</title></circle>)}
       </g>
       {points.map((point, index) => {
         const labelEvery = Math.max(1, Math.ceil(points.length / 6));
@@ -3734,9 +3803,9 @@ function BenchmarkComparisonPanel({ comparison }: { comparison: BenchmarkRunComp
         delta={comparison.latencyImprovementPct}
       />
       <BenchmarkComparisonMetric
-        label="Nodos usados"
-        baseline={comparison.baseline ? String(comparison.baseline.nodes) : "Sin lectura"}
-        current={comparison.current ? String(comparison.current.nodes) : "Sin lectura"}
+        label="Nodes used"
+        baseline={comparison.baseline ? String(comparison.baseline.nodes) : "No reading"}
+        current={comparison.current ? String(comparison.current.nodes) : "No reading"}
         rawDelta={formatSignedBenchmark(comparison.nodesDelta, "")}
         neutral
       />
@@ -3779,7 +3848,7 @@ function BenchmarkComparisonMetric({ label, baseline, current, baselineDetail, c
       ? "neutral"
       : (delta ?? 0) >= 0 ? "positive" : "negative";
   const deltaLabel = rawDelta ?? (delta === null
-    ? "Sin comparación"
+    ? "No comparison"
     : claim
       ? delta >= 0 ? `+${delta.toFixed(1)}% mejor` : `${delta.toFixed(1)}% peor`
       : `${delta > 0 ? "+" : ""}${delta.toFixed(1)}% observado`);
@@ -3792,17 +3861,17 @@ function BenchmarkComparisonMetric({ label, baseline, current, baselineDetail, c
 
 function BenchmarkHistory({ runs, selectedRunId, onSelect }: { runs: BenchmarkRun[]; selectedRunId: string; onSelect: (runId: string) => void }) {
   return <article className="benchmark-history">
-    <div className="card-heading"><div><span>HISTORIAL DE EVOLUCIÓN</span><h2>Todas las pruebas reales</h2></div><small>Selecciona una fila para analizarla</small></div>
+    <div className="card-heading"><div><span>EVOLUTION HISTORY</span><h2>All real tests</h2></div><small>Select a row to analyze it</small></div>
     <div className="benchmark-history-table">
-      <div className="benchmark-history-head"><span>Versión / build</span><span>Modelo / evidencia</span><span>Nodos / topología</span><span>Capacidad</span><span>Velocidad P50</span><span>Confianza</span><span>Estado</span></div>
+      <div className="benchmark-history-head"><span>Version / build</span><span>Model / evidence</span><span>Nodes / topology</span><span>Capacity</span><span>P50 speed</span><span>Confidence</span><span>Status</span></div>
       {runs.map((run) => {
         const snapshot = benchmarkRunSnapshot(run);
         if (!snapshot) return null;
         return <button className={`benchmark-history-row ${run.runId === selectedRunId ? "selected" : ""}`} aria-pressed={run.runId === selectedRunId} key={run.runId} onClick={() => onSelect(run.runId)}>
           <span><strong>v{run.version}</strong><small>rev {benchmarkBuildRevision(run)} · src {shortSourceId(run.build.sourceId)} · {formatBenchmarkDate(run.finishedAt)}</small></span>
-          <span><strong>{snapshot.measurement.model.label}</strong><small>{snapshot.measurement.evidence === "physical" ? "Física real" : "Loopback"} · {formatBenchmarkBackend(snapshot.measurement)}</small></span>
+          <span><strong>{snapshot.measurement.model.label}</strong><small>{snapshot.measurement.evidence === "physical" ? "Real physical" : "Loopback"} · {formatBenchmarkBackend(snapshot.measurement)}</small></span>
           <span><strong>{snapshot.nodes}</strong><small>{formatTopologyDigest(snapshot.measurement.topology.digest)}</small></span>
-          <span><strong>{formatBenchmark(snapshot.offeredMemoryGb, " GB")}</strong><small>{formatBenchmark(snapshot.measurement.inventory.physicalMemoryGb ?? null, " GB físicos")}</small></span>
+          <span><strong>{formatBenchmark(snapshot.offeredMemoryGb, " GB")}</strong><small>{formatBenchmark(snapshot.measurement.inventory.physicalMemoryGb ?? null, " physical GB")}</small></span>
           <span><strong>{formatBenchmark(snapshot.tokensPerSecondP50, " tok/s")}</strong><small>{formatBenchmarkRange(snapshot)}</small></span>
           <span><strong>{benchmarkStabilityLabel(snapshot.measurement)}</strong><small>CV {formatBenchmark(snapshot.coefficientOfVariationPct, "%")} · TTFT {formatBenchmark(snapshot.ttftMsP95, " ms")}</small></span>
           <span><b className={run.status}><i />{benchmarkStatusLabel(run.status)}</b><ChevronRight size={15} /></span>
@@ -3814,7 +3883,7 @@ function BenchmarkHistory({ runs, selectedRunId, onSelect }: { runs: BenchmarkRu
 
 function BenchmarkRunDetails({ run }: { run: BenchmarkRun }) {
   return <div className="benchmark-results">
-    <div className="card-heading"><div><span>RESULTADO SELECCIONADO</span><h2>{run.triggerModelId ?? run.label}</h2></div><small>v{run.version} · revisión {benchmarkBuildRevision(run)} · fuente local {shortSourceId(run.build.sourceId)} · fuentes declaradas por nodos {run.build.participantSourceIds.map(shortSourceId).join(", ") || "sin declarar"} · {benchmarkDirtyLabel(run.gitDirty)}</small></div>
+    <div className="card-heading"><div><span>SELECTED RESULT</span><h2>{run.triggerModelId ?? run.label}</h2></div><small>v{run.version} · review {benchmarkBuildRevision(run)} · local source {shortSourceId(run.build.sourceId)} · node-declared sources {run.build.participantSourceIds.map(shortSourceId).join(", ") || "undeclared"} · {benchmarkDirtyLabel(run.gitDirty)}</small></div>
     <div className="benchmark-result-list">
       {run.measurements.map((measurement) => <BenchmarkResultCard measurement={measurement} run={run} key={measurement.id} />)}
     </div>
@@ -3840,45 +3909,45 @@ function BenchmarkResultCard({ measurement, run }: { measurement: BenchmarkMeasu
     ?? nullableBenchmarkMax(measurement.inventory.profiles.map((profile) => profile.temperatureC));
   return <article className="benchmark-result-card">
     <div className="benchmark-result-heading">
-      <div><span className="benchmark-result-icon"><Gauge size={18} /></span><span><small>{measurement.evidence === "physical" ? "EVIDENCIA FÍSICA REAL" : "RUNTIME LOCAL REAL"}</small><strong>{measurement.model.label}</strong><em>{measurement.model.precision} · modelo rev {measurement.model.revision?.slice(0, 12) ?? "Sin lectura"} · build rev {benchmarkBuildRevision(run)}</em></span></div>
+      <div><span className="benchmark-result-icon"><Gauge size={18} /></span><span><small>{measurement.evidence === "physical" ? "REAL PHYSICAL EVIDENCE" : "REAL LOCAL RUNTIME"}</small><strong>{measurement.model.label}</strong><em>{measurement.model.precision} · model rev {measurement.model.revision?.slice(0, 12) ?? "No reading"} · build rev {benchmarkBuildRevision(run)}</em></span></div>
       <b className={measurement.status}><i />{benchmarkStatusLabel(measurement.status)}</b>
     </div>
     <div className="benchmark-result-metrics">
-      <BenchmarkValue label="Nodos usados" value={String(measurement.inventory.selectedDevices)} detail={`${measurement.inventory.connectedDevices}/${measurement.inventory.totalDevices} conectados`} />
-      <BenchmarkValue label="VRAM ofrecida" value={formatBenchmark(offeredMemory, " GB")} detail={formatBenchmark(physicalMemory, " GB físicos")} />
-      <BenchmarkValue label="Potencia P50" value={formatPowerReading(power)} detail={`P95 ${formatPowerReading(measurement.metrics.powerWattsP95 ?? null)} · pico ${formatPowerReading(measurement.metrics.powerWattsPeak ?? null)}${powerLimit === null ? "" : ` · límite ${formatPower(powerLimit)}`}`} />
+      <BenchmarkValue label="Nodes used" value={String(measurement.inventory.selectedDevices)} detail={`${measurement.inventory.connectedDevices}/${measurement.inventory.totalDevices} connected`} />
+      <BenchmarkValue label="Offered VRAM" value={formatBenchmark(offeredMemory, " GB")} detail={formatBenchmark(physicalMemory, " physical GB")} />
+      <BenchmarkValue label="P50 power" value={formatPowerReading(power)} detail={`P95 ${formatPowerReading(measurement.metrics.powerWattsP95 ?? null)} · peak ${formatPowerReading(measurement.metrics.powerWattsPeak ?? null)}${powerLimit === null ? "" : ` · limit ${formatPower(powerLimit)}`}`} />
       <BenchmarkValue label="Tokens / segundo P50" value={formatBenchmark(measurement.metrics.tokensPerSecondP50 ?? measurement.metrics.tokensPerSecond, " tok/s")} detail={`P5 ${formatBenchmark(measurement.metrics.tokensPerSecondP5 ?? null, " tok/s")} · P95 ${formatBenchmark(measurement.metrics.tokensPerSecondP95, " tok/s")}`} accent />
       <BenchmarkValue label="Primer token" value={formatBenchmark(measurement.metrics.ttftMsP95, " ms")} detail={`P50 ${formatBenchmark(measurement.metrics.ttftMsP50, " ms")}`} />
       <BenchmarkValue label="Estabilidad" value={benchmarkStabilityLabel(measurement)} detail={`CV ${formatBenchmark(measurement.metrics.coefficientOfVariationPct ?? null, "%")} · IC ±${formatBenchmark(measurement.metrics.confidenceHalfWidthPct ?? null, "%")}`} tone={measurement.workload.statisticallyStable === false ? "negative" : measurement.workload.statisticallyStable === true ? "positive" : ""} />
-      <BenchmarkValue label="Energía" value={formatBenchmark(measurement.metrics.energyWh ?? null, " Wh")} detail={`Cobertura ${formatBenchmark(measurement.metrics.energyCoveragePct ?? null, "%")} · ${formatBenchmark(measurement.metrics.energyWhPerToken, " Wh/token")}`} />
-      <BenchmarkValue label="Temperatura pico" value={formatBenchmark(temperaturePeak, " °C")} detail={`Memoria usada pico ${formatBenchmark(measurement.metrics.usedMemoryGbPeak ?? null, " GB")}`} />
-      <BenchmarkValue label="Cambio guardado" value={delta === null ? "Sin comparación" : `${delta >= 0 ? "+" : ""}${delta.toFixed(2)}%`} detail={measurement.comparison.baselineRunId ? "Sólo válido con fingerprint idéntico" : "Sin ejecución comparable"} tone={delta === null ? "" : delta < 0 ? "negative" : "positive"} />
+      <BenchmarkValue label="Energy" value={formatBenchmark(measurement.metrics.energyWh ?? null, " Wh")} detail={`Coverage ${formatBenchmark(measurement.metrics.energyCoveragePct ?? null, "%")} · ${formatBenchmark(measurement.metrics.energyWhPerToken, " Wh/token")}`} />
+      <BenchmarkValue label="Peak temperature" value={formatBenchmark(temperaturePeak, " °C")} detail={`Peak used memory ${formatBenchmark(measurement.metrics.usedMemoryGbPeak ?? null, " GB")}`} />
+      <BenchmarkValue label="Saved change" value={delta === null ? "No comparison" : `${delta >= 0 ? "+" : ""}${delta.toFixed(2)}%`} detail={measurement.comparison.baselineRunId ? "Only valid with an identical fingerprint" : "No comparable run"} tone={delta === null ? "" : delta < 0 ? "negative" : "positive"} />
     </div>
     <div className="benchmark-node-list">
-      {measurement.inventory.profiles.map((profile) => <span key={profile.nodeId ?? profile.label}><Server size={16} /><strong>{profile.label}</strong><small>{profile.backend ?? "Sin lectura"} · {formatBenchmark(profile.offeredMemoryGb ?? profile.memoryGb, " GB")} · GPU {formatBenchmark(profile.utilizationPct ?? null, "%")} · {formatPowerReading(profile.observedPowerWatts ?? null)} · {formatBenchmark(profile.temperatureC ?? null, " °C")}</small></span>)}
+      {measurement.inventory.profiles.map((profile) => <span key={profile.nodeId ?? profile.label}><Server size={16} /><strong>{profile.label}</strong><small>{profile.backend ?? "No reading"} · {formatBenchmark(profile.offeredMemoryGb ?? profile.memoryGb, " GB")} · GPU {formatBenchmark(profile.utilizationPct ?? null, "%")} · {formatPowerReading(profile.observedPowerWatts ?? null)} · {formatBenchmark(profile.temperatureC ?? null, " °C")}</small></span>)}
     </div>
     <div className="benchmark-topology-summary">
-      <div><Network size={18} /><span><small>TOPOLOGÍA OBSERVADA</small><strong>{measurement.topology.stageCount === null ? "Sin lectura" : `${measurement.topology.stageCount} etapas`} · {formatTopologyDigest(measurement.topology.digest)}</strong></span></div>
+      <div><Network size={18} /><span><small>OBSERVED TOPOLOGY</small><strong>{measurement.topology.stageCount === null ? "No reading" : `${measurement.topology.stageCount} stages`} · {formatTopologyDigest(measurement.topology.digest)}</strong></span></div>
       <dl>
-        <div><dt>Nodos de la ruta</dt><dd>{measurement.topology.nodeIds.length > 0 ? measurement.topology.nodeIds.map(shortId).join(" → ") : "Sin lectura"}</dd></div>
-        <div><dt>Límites de capas</dt><dd>{measurement.topology.boundaries.length > 0 ? measurement.topology.boundaries.join(" · ") : "Sin lectura"}</dd></div>
-        <div><dt>Clases de ruta</dt><dd>{measurement.topology.routeClasses.length > 0 ? measurement.topology.routeClasses.join(" · ") : "Sin lectura"}</dd></div>
+        <div><dt>Route nodes</dt><dd>{measurement.topology.nodeIds.length > 0 ? measurement.topology.nodeIds.map(shortId).join(" → ") : "No reading"}</dd></div>
+        <div><dt>Layer boundaries</dt><dd>{measurement.topology.boundaries.length > 0 ? measurement.topology.boundaries.join(" · ") : "No reading"}</dd></div>
+        <div><dt>Route classes</dt><dd>{measurement.topology.routeClasses.length > 0 ? measurement.topology.routeClasses.join(" · ") : "No reading"}</dd></div>
       </dl>
     </div>
     <BenchmarkNetworkTrace traces={measurement.networkTraces ?? []} />
     <details className="benchmark-technical-details">
-      <summary>Ver todas las métricas de esta prueba</summary>
+      <summary>View all metrics for this test</summary>
       <div>
-        <BenchmarkValue label="Peticiones válidas" value={`${formatCountReading(measurement.workload.successfulRequests)} / ${formatCountReading(measurement.workload.requests)}`} detail={`Éxito ${formatRate(measurement.metrics.requestSuccessRate ?? null)}`} />
-        <BenchmarkValue label="Calentamiento" value={formatCountReading(measurement.workload.warmupRequests)} detail={`${formatCountReading(measurement.workload.recoveredFailures)} fallos recuperados`} />
-        <BenchmarkValue label="Tokens observados" value={formatCountReading(measurement.workload.observedOutputTokens)} detail={`${measurement.workload.outputTokens} solicitados por petición`} />
-        <BenchmarkValue label="Duración total" value={formatBenchmark(measurement.workload.durationMs ?? null, " ms")} detail={`Latencia P95 ${formatBenchmark(measurement.metrics.latencyMsP95 ?? null, " ms")}`} />
-        <BenchmarkValue label="Tiempo por token" value={formatBenchmark(measurement.metrics.tpotMsP95, " ms")} detail={`P50 ${formatBenchmark(measurement.metrics.tpotMsP50, " ms")}`} />
-        <BenchmarkValue label="Velocidad agregada" value={formatBenchmark(measurement.metrics.aggregateTokensPerSecond, " tok/s")} detail={(measurement.workload.routeClasses ?? []).join(", ") || "Sin ruta completada"} />
-        <BenchmarkValue label="Exactitud" value={formatRate(measurement.metrics.exactnessRate ?? null)} detail={`Consistencia ${formatRate(measurement.metrics.deterministicConsistencyRate ?? null)}`} />
-        <BenchmarkValue label="Especulación aceptada" value={formatRate(measurement.metrics.speculativeAcceptanceRate ?? null)} detail={`Aceptación heredada ${formatRate(measurement.metrics.acceptanceRate)}`} />
-        <BenchmarkValue label="Uso GPU P50" value={formatBenchmark(measurement.metrics.utilizationPctP50 ?? null, "%")} detail={`P95 ${formatBenchmark(measurement.metrics.utilizationPctP95 ?? null, "%")}`} />
-        <BenchmarkValue label="Fin de campaña" value={benchmarkCampaignStopLabel(measurement.workload.campaignStopReason)} detail={measurement.scenarioFingerprint ? measurement.scenarioFingerprint.slice(0, 19) : "Sin lectura"} />
+        <BenchmarkValue label="Valid requests" value={`${formatCountReading(measurement.workload.successfulRequests)} / ${formatCountReading(measurement.workload.requests)}`} detail={`Success ${formatRate(measurement.metrics.requestSuccessRate ?? null)}`} />
+        <BenchmarkValue label="Warmup" value={formatCountReading(measurement.workload.warmupRequests)} detail={`${formatCountReading(measurement.workload.recoveredFailures)} failures recovered`} />
+        <BenchmarkValue label="Observed tokens" value={formatCountReading(measurement.workload.observedOutputTokens)} detail={`${measurement.workload.outputTokens} requested per call`} />
+        <BenchmarkValue label="Total duration" value={formatBenchmark(measurement.workload.durationMs ?? null, " ms")} detail={`P95 latency ${formatBenchmark(measurement.metrics.latencyMsP95 ?? null, " ms")}`} />
+        <BenchmarkValue label="Time per token" value={formatBenchmark(measurement.metrics.tpotMsP95, " ms")} detail={`P50 ${formatBenchmark(measurement.metrics.tpotMsP50, " ms")}`} />
+        <BenchmarkValue label="Aggregate speed" value={formatBenchmark(measurement.metrics.aggregateTokensPerSecond, " tok/s")} detail={(measurement.workload.routeClasses ?? []).join(", ") || "No completed route"} />
+        <BenchmarkValue label="Exactness" value={formatRate(measurement.metrics.exactnessRate ?? null)} detail={`Consistency ${formatRate(measurement.metrics.deterministicConsistencyRate ?? null)}`} />
+        <BenchmarkValue label="Accepted speculation" value={formatRate(measurement.metrics.speculativeAcceptanceRate ?? null)} detail={`Inherited acceptance ${formatRate(measurement.metrics.acceptanceRate)}`} />
+        <BenchmarkValue label="P50 GPU usage" value={formatBenchmark(measurement.metrics.utilizationPctP50 ?? null, "%")} detail={`P95 ${formatBenchmark(measurement.metrics.utilizationPctP95 ?? null, "%")}`} />
+        <BenchmarkValue label="Campaign end" value={benchmarkCampaignStopLabel(measurement.workload.campaignStopReason)} detail={measurement.scenarioFingerprint ? measurement.scenarioFingerprint.slice(0, 19) : "No reading"} />
       </div>
       <ul>{measurement.notes.map((note) => <li key={note}>{note}</li>)}</ul>
     </details>
@@ -3889,46 +3958,46 @@ function BenchmarkNetworkTrace({ traces }: { traces: NetworkExecutionTrace[] }) 
   const trace = traces.at(-1) ?? null;
   if (!trace) {
     return <div className="benchmark-network-trace empty">
-      <div><Wifi size={18} /><span><small>TRAZA DE RED POR PETICIÓN</small><strong>Sin lectura</strong></span></div>
-      <p>Esta ejecución no entregó evidencia física de etapas, transporte, RTT ni bytes.</p>
+      <div><Wifi size={18} /><span><small>NETWORK TRACE PER REQUEST</small><strong>No reading</strong></span></div>
+      <p>This run provided no physical evidence for stages, transport, RTT or bytes.</p>
     </div>;
   }
   return <div className="benchmark-network-trace">
     <div className="benchmark-network-trace-heading">
-      <div><Wifi size={18} /><span><small>ÚLTIMA TRAZA DE RED · {traces.length} GUARDADAS</small><strong>{trace.stages.length} etapas observadas · {trace.physicalBoundaryCount === null ? "fronteras sin lectura" : `${trace.physicalBoundaryCount} fronteras físicas`}</strong></span></div>
-      <em>{trace.durationMs} ms · intento {trace.attempt}</em>
+      <div><Wifi size={18} /><span><small>LATEST NETWORK TRACE · {traces.length} SAVED</small><strong>{trace.stages.length} observed stages · {trace.physicalBoundaryCount === null ? "boundaries not read" : `${trace.physicalBoundaryCount} physical boundaries`}</strong></span></div>
+      <em>{trace.durationMs} ms · attempt {trace.attempt}</em>
     </div>
     <div className="benchmark-trace-stages">
       {trace.stages.length > 0
         ? trace.stages.map((stage, index) => <span key={`${stage.routeStageIndex}-${stage.stageIndex}-${index}`}>
             <b>{stage.stageIndex + 1}</b>
-            <strong>{stage.nodeId ? shortId(stage.nodeId) : "Nodo sin lectura"}</strong>
-            <small>{stage.layerStart === null || stage.layerEnd === null ? "Capas sin lectura" : `capas ${stage.layerStart}–${stage.layerEnd}`} · {stage.backend} · {stage.precision}</small>
-            <em>{stage.workerId ? `worker ${shortId(stage.workerId)}` : "worker sin lectura"} · despliegue {shortId(stage.deploymentId)} · tiempo sin lectura</em>
+            <strong>{stage.nodeId ? shortId(stage.nodeId) : "Node: No reading"}</strong>
+            <small>{stage.layerStart === null || stage.layerEnd === null ? "Layers: No reading" : `layers ${stage.layerStart}–${stage.layerEnd}`} · {stage.backend} · {stage.precision}</small>
+            <em>{stage.workerId ? `worker ${shortId(stage.workerId)}` : "worker: No reading"} · deployment {shortId(stage.deploymentId)} · time: No reading</em>
           </span>)
-        : <p>Las etapas físicas no fueron observadas por este runtime.</p>}
+        : <p>Physical stages were not observed by this runtime.</p>}
     </div>
     <div className="benchmark-trace-boundaries">
       {trace.boundaries.length > 0
         ? trace.boundaries.map((boundary) => <span key={boundary.boundaryIndex}>
             <strong>{networkTransportLabel(boundary.transport)}</strong>
-            <small>{boundary.sourceNodeId ? shortId(boundary.sourceNodeId) : "Sin lectura"} → {boundary.destinationNodeId ? shortId(boundary.destinationNodeId) : "Sin lectura"}</small>
+            <small>{boundary.sourceNodeId ? shortId(boundary.sourceNodeId) : "No reading"} → {boundary.destinationNodeId ? shortId(boundary.destinationNodeId) : "No reading"}</small>
             <em>RTT {formatBenchmark(boundary.connectRttMs, " ms")} · bytes observados ida {formatTraceBytes(boundary.bytesSourceToDestination)} · vuelta {formatTraceBytes(boundary.bytesDestinationToSource)} · ventana {formatBenchmark(boundary.observedOverlapMs, " ms")}</em>
           </span>)
-        : <p>Sin fronteras de transporte entre etapas.</p>}
+        : <p>No transport boundaries between stages.</p>}
     </div>
   </div>;
 }
 
 function networkTransportLabel(mode: NetworkExecutionTrace["boundaries"][number]["transport"]): string {
-  if (mode === "direct") return "Directo";
+  if (mode === "direct") return "Direct";
   if (mode === "relay") return "Relay";
   if (mode === "local") return "Local";
-  return "Sin lectura";
+  return "No reading";
 }
 
 function formatTraceBytes(value: number | null): string {
-  if (value === null || !Number.isFinite(value)) return "Sin lectura";
+  if (value === null || !Number.isFinite(value)) return "No reading";
   if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(2)} MB`;
   if (value >= 1024) return `${(value / 1024).toFixed(1)} KB`;
   return `${value} B`;
@@ -4056,7 +4125,7 @@ function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthent
         remainingChars -= attachment.text.length;
       }
       setAttachments((current) => [...current, ...next]);
-      if (fileList.length > availableSlots) setAttachmentError(`Solo se añadieron ${availableSlots} archivos; el límite es ${MAX_INFERENCE_FILES}.`);
+      if (fileList.length > availableSlots) setAttachmentError(`Only ${availableSlots} files were added; the limit is ${MAX_INFERENCE_FILES}.`);
     } catch (caught) {
       setAttachmentError(errorText(caught));
     } finally {
@@ -4103,7 +4172,7 @@ function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthent
       const response = await onSend(selectedModel, messages, sessionId, (update) => {
         setPendingTurn((current) => current ? { ...current, ...update } : current);
       });
-      if (!response.text.trim()) throw new Error("El modelo terminó sin devolver texto.");
+      if (!response.text.trim()) throw new Error("The model finished without returning text.");
       setTurns((current) => [...current, { id: response.requestId, prompt: displayPrompt, messageContent, attachments: attachmentSummaries, response }]);
     } catch (caught) {
       setPrompt(cleanPrompt);
@@ -4125,83 +4194,92 @@ function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthent
     setSessionId(newInferenceSessionId());
   }
 
-  return <section className="inference-page">
-    <PageTitle eyebrow="INFERENCIA REAL" title="Probar un modelo" copy="Habla con un modelo conectado y comprueba la ruta, la latencia y los tokens de cada respuesta." />
-    <ApiAccessPanel enabled={apiAccessEnabled} apiBaseUrl={apiBaseUrl} accessToken={accessToken} account={apiAccount} availableModels={realModels.length} onSignIn={onSignIn} />
-    {!modelAvailable && <div className="inference-unavailable">
+  const apiAccessPanel = <ApiAccessPanel enabled={apiAccessEnabled} apiBaseUrl={apiBaseUrl} accessToken={accessToken} account={apiAccount} availableModels={realModels.length} onSignIn={onSignIn} />;
+
+  if (!modelAvailable) return <section className="inference-page inference-empty-page">
+    <PageTitle eyebrow="REAL INFERENCE" title="Test a model" copy="Chat with a connected model when the network confirms a real runtime." />
+    {developerMode ? apiAccessPanel : <PanelDisclosure icon={Code2} eyebrow="OPTIONAL" title="API access" summary="Keys, usage, and the OpenAI-compatible endpoint.">{apiAccessPanel}</PanelDisclosure>}
+    <div className="inference-unavailable focused-empty">
       <div className="inference-unavailable-icon"><MessageSquareText /></div>
-      <div className="inference-unavailable-copy"><span>NO HAY MODELOS DE IA DISPONIBLES</span><h2>Ahora mismo no se puede hacer una inferencia real</h2><p>La red no tiene ningún runtime de IA real conectado. Un PC puede aparecer como nodo disponible sin inventar un modelo ni respuestas.</p>
-        {snapshot.requestedModels[0] && <div className="inference-request-state"><LoaderCircle className={snapshot.requestedModels[0].status === "active" ? "" : "spin"} /><span><strong>{snapshot.requestedModels[0].id}</strong>{snapshot.requestedModels[0].message}</span></div>}
-        <div className="inference-unavailable-actions"><button className="primary-button" onClick={() => onNavigate("models")}><Boxes size={16} />Ver y activar modelos</button></div>
+      <div className="inference-unavailable-copy"><span>NO AI MODELS AVAILABLE</span><h2>Connect a model to start chatting</h2><p>The network is healthy, but no verified inference runtime is available yet.</p>
+        {developerMode && snapshot.requestedModels[0] && <div className="inference-request-state"><LoaderCircle className={snapshot.requestedModels[0].status === "active" ? "" : "spin"} /><span><strong>{snapshot.requestedModels[0].id}</strong>{snapshot.requestedModels[0].message}</span></div>}
+        <div className="inference-unavailable-actions"><button className="primary-button" onClick={() => onNavigate("models")}><Boxes size={16} />View and activate models</button></div>
       </div>
-    </div>}
+    </div>
+  </section>;
+
+  return <section className="inference-page">
+    <PageTitle eyebrow="REAL INFERENCE" title="Test a model" copy="Chat with a connected model and inspect the route, latency and tokens for every response." />
+    {developerMode ? apiAccessPanel : <PanelDisclosure icon={Code2} eyebrow="OPTIONAL" title="API access" summary="Keys, usage, and the OpenAI-compatible endpoint.">{apiAccessPanel}</PanelDisclosure>}
     {modelAvailable && !accountAuthenticated && <div className="inference-unavailable account-required">
       <div className="inference-unavailable-icon"><LockKeyhole /></div>
-      <div className="inference-unavailable-copy"><span>CUENTA NECESARIA</span><h2>El modelo está conectado; inicia sesión para usarlo</h2><p>El envío utiliza el saldo y los límites de tu cuenta. El chat permanece visible para que puedas ver cómo funcionará.</p><div className="inference-unavailable-actions"><button className="primary-button" onClick={onSignIn}><UserRound size={16} />Iniciar sesión</button></div></div>
+      <div className="inference-unavailable-copy"><span>ACCOUNT REQUIRED</span><h2>The model is connected; sign in to use it</h2><p>Sending uses your account balance and limits. Chat remains visible so you can see how it works.</p><div className="inference-unavailable-actions"><button className="primary-button" onClick={onSignIn}><UserRound size={16} />Sign in</button></div></div>
     </div>}
     <div className={`inference-console${inferenceAvailable ? "" : " is-unavailable"}`} aria-disabled={!inferenceAvailable}>
       <div className="inference-toolbar">
-        <div className="inference-toolbar-title"><MessageSquareText /><span><strong>Chat</strong><small>Inferencia distribuida en tiempo real</small></span></div>
-        <div className="inference-toolbar-controls">
-          <span className="inference-toolbar-stat"><Network /><b>{selectedOption?.nodeCount ?? 0}</b> nodo{selectedOption?.nodeCount === 1 ? "" : "s"}</span>
-          <span className="inference-toolbar-stat"><MemoryStick /><b>{selectedOption && selectedOption.peerMemoryMb > 0 ? formatMemory(selectedOption.peerMemoryMb) : "—"}</b> memoria</span>
-        </div>
+        <div className="inference-toolbar-title"><MessageSquareText /><span><strong>Chat</strong><small>Real-time distributed inference</small></span></div>
+        {developerMode && <div className="inference-toolbar-controls">
+          <span className="inference-toolbar-stat"><Network /><b>{selectedOption?.nodeCount ?? 0}</b> node{selectedOption?.nodeCount === 1 ? "" : "s"}</span>
+          <span className="inference-toolbar-stat"><MemoryStick /><b>{selectedOption && selectedOption.peerMemoryMb > 0 ? formatMemory(selectedOption.peerMemoryMb) : "—"}</b> memory</span>
+        </div>}
       </div>
-      <div className="inference-route-strip">
+      {developerMode && <div className="inference-route-strip">
         {inferenceAvailable
-          ? <div className="inference-model-summary"><ExecutionBadge execution={selectedOption?.execution ?? unknownExecutionSummary()} workers={snapshot.workers} large /><span className="inference-live"><i />DISPONIBLE</span><span>{selectedOption?.routeLabel}</span><span>{selectedOption?.freeSlots ?? 0} hueco{selectedOption?.freeSlots === 1 ? "" : "s"} libre{selectedOption?.freeSlots === 1 ? "" : "s"}</span></div>
-          : <div className="inference-model-summary inference-offline"><LockKeyhole size={14} /><span>{modelAvailable ? "INICIA SESIÓN" : "SIN CONEXIÓN REAL"}</span></div>}
-      </div>
+          ? <div className="inference-model-summary"><ExecutionBadge execution={selectedOption?.execution ?? unknownExecutionSummary()} workers={snapshot.workers} large /><span className="inference-live"><i />AVAILABLE</span><span>{selectedOption?.routeLabel}</span><span>{selectedOption?.freeSlots ?? 0} free slot{selectedOption?.freeSlots === 1 ? "" : "s"}</span></div>
+          : <div className="inference-model-summary inference-offline"><LockKeyhole size={14} /><span>{modelAvailable ? "SIGN IN" : "NO REAL CONNECTION"}</span></div>}
+      </div>}
       <div className="inference-output" aria-live="polite" ref={outputRef}>
         {turns.length === 0 && !pendingTurn && !error && (inferenceAvailable
-          ? <div className="inference-welcome"><Sparkles /><h2>Escribe una pregunta</h2><p>La respuesta vendrá exclusivamente del despliegue nativo seleccionado de Mycellios.</p><div className="inference-suggestions">{["Resume cómo funciona esta red", "Explica una idea en tres frases", "Responde con una prueba corta"].map((suggestion) => <button key={suggestion} onClick={() => setPrompt(suggestion)}>{suggestion}</button>)}</div></div>
-          : <div className="inference-welcome inference-welcome-locked"><LockKeyhole /><h2>{modelAvailable ? "El chat está esperando tu cuenta" : "El chat está esperando un modelo"}</h2><p>{modelAvailable ? "Inicia sesión para activar el envío con tu saldo de tokens." : "Podrás escribir y enviar mensajes en cuanto la red confirme una conexión de inferencia real."}</p></div>)}
-        {turns.map((turn) => <InferenceCompletedTurn turn={turn} key={turn.id} />)}
-        {pendingTurn && <InferenceStreamingTurn turn={pendingTurn} />}
-        {error && <div className="inference-error"><CircleAlert /><div><strong>No se pudo completar la inferencia</strong><span>{friendlyInferenceError(error)}</span></div></div>}
+          ? <div className="inference-welcome"><Sparkles /><h2>Ask a question</h2><p>The response comes exclusively from the selected native Mycellios deployment.</p><div className="inference-suggestions">{["Summarize how this network works", "Explain an idea in three sentences", "Answer with a short proof"].map((suggestion) => <button key={suggestion} onClick={() => setPrompt(suggestion)}>{suggestion}</button>)}</div></div>
+          : <div className="inference-welcome inference-welcome-locked"><LockKeyhole /><h2>{modelAvailable ? "Chat is waiting for your account" : "Chat is waiting for a model"}</h2><p>{modelAvailable ? "Sign in to activate sending with your token balance." : "You can write and send messages once the network confirms a real inference connection."}</p></div>)}
+        {turns.map((turn) => <InferenceCompletedTurn turn={turn} compact={!developerMode} key={turn.id} />)}
+        {pendingTurn && <InferenceStreamingTurn turn={pendingTurn} compact={!developerMode} />}
+        {error && <div className="inference-error"><CircleAlert /><div><strong>Inference could not be completed</strong><span>{friendlyInferenceError(error)}</span></div></div>}
       </div>
       <div className="inference-input">
-        {attachments.length > 0 && <div className="inference-attachments" aria-label="Archivos adjuntos">{attachments.map((attachment) => <div key={attachment.id}><FileText /><span><strong>{attachment.name}</strong><small>{formatFileSize(attachment.size)} · {attachment.kind.toUpperCase()}{attachment.truncated ? " · contenido recortado" : ""}</small></span><button type="button" onClick={() => setAttachments((current) => current.filter((item) => item.id !== attachment.id))} aria-label={`Quitar ${attachment.name}`}><X /></button></div>)}</div>}
+        {attachments.length > 0 && <div className="inference-attachments" aria-label="Attached files">{attachments.map((attachment) => <div key={attachment.id}><FileText /><span><strong>{attachment.name}</strong><small>{formatFileSize(attachment.size)} · {attachment.kind.toUpperCase()}{attachment.truncated ? " · truncated" : ""}</small></span><button type="button" onClick={() => setAttachments((current) => current.filter((item) => item.id !== attachment.id))} aria-label={`Remove ${attachment.name}`}><X /></button></div>)}</div>}
         {attachmentError && <div className="inference-attachment-error"><CircleAlert />{attachmentError}</div>}
         <div className="inference-composer-row">
           <input ref={fileInputRef} hidden type="file" multiple accept={INFERENCE_FILE_ACCEPT} onChange={(event) => void addFiles(event.target.files)} />
-          <button type="button" className="inference-attach" disabled={!inferenceAvailable || pendingTurn !== null || filesBusy || attachments.length >= MAX_INFERENCE_FILES} onClick={() => fileInputRef.current?.click()} aria-label="Adjuntar documentos" title="PDF, DOCX, texto, código, CSV o JSON">{filesBusy ? <LoaderCircle className="spin" /> : <Paperclip />}</button>
-          <textarea aria-label="Mensaje" value={prompt} disabled={!inferenceAvailable || pendingTurn !== null} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder={inferenceAvailable ? `Escribe a ${model ? selectedModel : "la malla automática"}…` : modelAvailable ? "Inicia sesión para empezar a escribir…" : "Conecta un modelo real para empezar a escribir…"} />
+          <button type="button" className="inference-attach" disabled={!inferenceAvailable || pendingTurn !== null || filesBusy || attachments.length >= MAX_INFERENCE_FILES} onClick={() => fileInputRef.current?.click()} aria-label="Attach documents" title="PDF, DOCX, text, code, CSV or JSON">{filesBusy ? <LoaderCircle className="spin" /> : <Paperclip />}</button>
+          <textarea aria-label="Message" value={prompt} disabled={!inferenceAvailable || pendingTurn !== null} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder={inferenceAvailable ? `Write to ${model ? selectedModel : "automatic mesh"}…` : modelAvailable ? "Sign in to start writing…" : "Connect a real model to start writing…"} />
         </div>
         <div className="inference-input-foot"><div className="inference-composer-tools">
           <InferenceModelPicker options={realModels} value={model} onChange={(nextModel) => resetConversation(nextModel)} />
           <div className={`inference-instructions${instructionsOpen ? " open" : ""}`}>
-            <button type="button" aria-label="Instrucciones de esta conversación" aria-expanded={instructionsOpen} onClick={() => setInstructionsOpen((current) => !current)}><SlidersHorizontal />{instructions.trim() && <i />}</button>
-            {instructionsOpen && <div className="inference-instructions-popover"><header><strong>Instrucciones para esta conversación</strong><span>Se enviarán antes de cada mensaje.</span></header><textarea value={instructions} onChange={(event) => saveInstructions(event.target.value)} placeholder="Por ejemplo: responde en español claro y avisa cuando no estés seguro." maxLength={2_000} /><div className="inference-instruction-presets">{["Respuestas directas", "Paso a paso", "Código primero", "Resumen breve"].map((preset) => <button type="button" key={preset} onClick={() => saveInstructions(instructions.trim() ? `${instructions.trim()}\n${preset}.` : `${preset}.`)}>{preset}</button>)}</div><footer><button type="button" onClick={() => saveInstructions("")}>Limpiar</button><button type="button" onClick={() => setInstructionsOpen(false)}>Listo</button></footer></div>}
+            <button type="button" aria-label="Conversation instructions" aria-expanded={instructionsOpen} onClick={() => setInstructionsOpen((current) => !current)}><SlidersHorizontal />{instructions.trim() && <i />}</button>
+            {instructionsOpen && <div className="inference-instructions-popover"><header><strong>Conversation instructions</strong><span>Sent before each message.</span></header><textarea value={instructions} onChange={(event) => saveInstructions(event.target.value)} placeholder="For example: answer clearly and flag uncertainty." maxLength={2_000} /><div className="inference-instruction-presets">{["Direct answers", "Step by step", "Code first", "Short summary"].map((preset) => <button type="button" key={preset} onClick={() => saveInstructions(instructions.trim() ? `${instructions.trim()}\n${preset}.` : `${preset}.`)}>{preset}</button>)}</div><footer><button type="button" onClick={() => saveInstructions("")}>Clear</button><button type="button" onClick={() => setInstructionsOpen(false)}>Done</button></footer></div>}
           </div>
-          <span>{inferenceAvailable ? <><Paperclip size={12} />Archivos · <kbd>Enter</kbd> enviar</> : <><LockKeyhole size={12} />{modelAvailable ? "Inicia sesión para enviar" : "Conecta un modelo real"}</>}</span>
-        </div><div>{turns.length > 0 && <button className="inference-clear" onClick={() => resetConversation()}><Trash2 size={14} />Nueva conversación</button>}<button className="inference-send" disabled={!inferenceAvailable || (!prompt.trim() && attachments.length === 0) || pendingTurn !== null || filesBusy} onClick={() => void send()}>{pendingTurn ? <LoaderCircle className="spin" /> : <Send />}<span>Enviar</span></button></div></div>
+          <span>{inferenceAvailable ? <><Paperclip size={12} />Files · <kbd>Enter</kbd> send</> : <><LockKeyhole size={12} />{modelAvailable ? "Sign in to send" : "Connect a real model"}</>}</span>
+        </div><div>{turns.length > 0 && <button className="inference-clear" onClick={() => resetConversation()}><Trash2 size={14} />New conversation</button>}<button className="inference-send" disabled={!inferenceAvailable || (!prompt.trim() && attachments.length === 0) || pendingTurn !== null || filesBusy} onClick={() => void send()}>{pendingTurn ? <LoaderCircle className="spin" /> : <Send />}<span>Send</span></button></div></div>
       </div>
     </div>
   </section>;
 }
 
-function InferenceStreamingTurn({ turn }: { turn: InferencePendingTurn }) {
+function InferenceStreamingTurn({ turn, compact = false }: { turn: InferencePendingTurn; compact?: boolean }) {
   const content = splitStreamingContent(turn.text);
   const waitingStatus = inferenceWaitingStatus(turn);
   return <div className="inference-turn pending">
     <InferenceUserMessage prompt={turn.prompt} attachments={turn.attachments} />
     {turn.text ? <div className="inference-message streaming"><img src={brandIcon} alt="" /><div>
-      <div className="inference-stream-head"><span>{turn.model}</span><b><i />GENERANDO EN VIVO</b></div>
-      {turn.phase === "recovering" && <div className="inference-stream-recovery"><LoaderCircle className="spin" size={14} />{turn.statusMessage ?? "Reconectando y recuperando la respuesta…"} <small>intento {turn.attempt ?? 1} de {turn.maximumAttempts ?? 8}</small></div>}
-      {content.reasoning !== null && <div className="inference-live-reasoning"><span>RAZONAMIENTO</span><p>{content.reasoning}{content.answer === "" && <i className="stream-cursor" />}</p></div>}
+      <div className="inference-stream-head"><span>{turn.model}</span><b><i />GENERATING LIVE</b></div>
+      {turn.phase === "recovering" && <div className="inference-stream-recovery"><LoaderCircle className="spin" size={14} />{turn.statusMessage ?? "Reconnecting and recovering the response…"} <small>attempt {turn.attempt ?? 1} of {turn.maximumAttempts ?? 8}</small></div>}
+      {content.reasoning !== null && <div className="inference-live-reasoning"><span>REASONING</span><p>{content.reasoning}{content.answer === "" && <i className="stream-cursor" />}</p></div>}
       {content.answer && <p>{content.answer}<i className="stream-cursor" /></p>}
-      <div className="inference-response-metrics live"><span><b>{formatDuration(turn.ttftMs)}</b>primer token</span><span><b>{formatDuration(turn.elapsedMs)}</b>tiempo actual</span><span><b>{turn.outputTokens}</b>tokens recibidos</span><span><b>{formatLiveThroughput(turn)}</b>tokens/s ahora</span><span><b>{turn.routeClass}</b>ruta</span>{turn.affinityHit && <span><b>AFÍN</b>misma ruta</span>}</div>
-    </div></div> : <div className={`inference-thinking ${turn.phase === "recovering" ? "recovering" : ""}`}><LoaderCircle className="spin" /><span><strong>{waitingStatus}</strong><small>{formatDuration(turn.elapsedMs)}{(turn.attempt ?? 1) > 1 ? ` · intento ${turn.attempt} de ${turn.maximumAttempts ?? 8}` : ""}</small></span></div>}
+      {!compact && <div className="inference-response-metrics live"><span><b>{formatDuration(turn.ttftMs)}</b>first token</span><span><b>{formatDuration(turn.elapsedMs)}</b>current time</span><span><b>{turn.outputTokens}</b>tokens received</span><span><b>{formatLiveThroughput(turn)}</b>tokens/s now</span><span><b>{turn.routeClass}</b>route</span>{turn.affinityHit && <span><b>AFFINITY</b>same route</span>}</div>}
+    </div></div> : <div className={`inference-thinking ${turn.phase === "recovering" ? "recovering" : ""}`}><LoaderCircle className="spin" /><span><strong>{waitingStatus}</strong><small>{formatDuration(turn.elapsedMs)}{(turn.attempt ?? 1) > 1 ? ` · attempt ${turn.attempt} of ${turn.maximumAttempts ?? 8}` : ""}</small></span></div>}
   </div>;
 }
 
-function InferenceCompletedTurn({ turn }: { turn: InferenceTurn }) {
+function InferenceCompletedTurn({ turn, compact = false }: { turn: InferenceTurn; compact?: boolean }) {
   const content = splitThinkingContent(turn.response.text);
+  const metrics = <div className="inference-response-metrics"><span><b>{formatDuration(turn.response.ttftMs)}</b>first token</span><span><b>{formatDuration(turn.response.activeMs)}</b>total time</span><span><b>{turn.response.outputTokens}</b>output tokens</span><span><b>{formatResponseThroughput(turn.response)}</b>tokens/s</span><span><b>{turn.response.routeClass}</b>route</span>{turn.response.reusedKvTokens > 0 ? <span><b>{turn.response.reusedKvTokens}</b>KV tokens reused</span> : turn.response.affinityHit ? <span><b>AFFINITY</b>same route</span> : null}</div>;
   return <div className="inference-turn">
     <InferenceUserMessage prompt={turn.prompt} attachments={turn.attachments} />
-    {turn.response.activity && <InferenceActivitySummary activity={turn.response.activity} />}
-    <div className="inference-message"><img src={brandIcon} alt="" /><div><span>{turn.response.model}</span>{content.reasoning && <details className="inference-reasoning"><summary>Ver razonamiento del modelo</summary><p>{content.reasoning}</p></details>}<p>{content.answer}</p><div className="inference-response-metrics"><span><b>{formatDuration(turn.response.ttftMs)}</b>primer token</span><span><b>{formatDuration(turn.response.activeMs)}</b>tiempo total</span><span><b>{turn.response.outputTokens}</b>tokens salida</span><span><b>{formatResponseThroughput(turn.response)}</b>tokens/s</span><span><b>{turn.response.routeClass}</b>ruta</span>{turn.response.reusedKvTokens > 0 ? <span><b>{turn.response.reusedKvTokens}</b>tokens KV reutilizados</span> : turn.response.affinityHit ? <span><b>AFÍN</b>misma ruta</span> : null}</div></div></div>
+    {!compact && turn.response.activity && <InferenceActivitySummary activity={turn.response.activity} />}
+    <div className="inference-message"><img src={brandIcon} alt="" /><div><span>{turn.response.model}</span>{content.reasoning && <details className="inference-reasoning"><summary>View model reasoning</summary><p>{content.reasoning}</p></details>}<p>{content.answer}</p>{!compact && metrics}</div></div>
+    {compact && <details className="inference-evidence"><summary><Activity size={14} />Response details<ChevronDown size={14} /></summary>{turn.response.activity && <InferenceActivitySummary activity={turn.response.activity} />}{metrics}</details>}
   </div>;
 }
 
@@ -4223,7 +4301,7 @@ function InferenceActivitySummary({ activity }: { activity: NonNullable<ChatResp
 }
 
 function InferenceUserMessage({ prompt, attachments }: { prompt: string; attachments: InferenceAttachmentSummary[] }) {
-  return <div className="inference-user-message"><span>TÚ</span><p>{prompt}</p>{attachments.length > 0 && <div className="inference-message-files">{attachments.map((attachment) => <span key={attachment.id}><FileText /><b>{attachment.name}</b><small>{formatFileSize(attachment.size)}</small></span>)}</div>}</div>;
+  return <div className="inference-user-message"><span>YOU</span><p>{prompt}</p>{attachments.length > 0 && <div className="inference-message-files">{attachments.map((attachment) => <span key={attachment.id}><FileText /><b>{attachment.name}</b><small>{formatFileSize(attachment.size)}</small></span>)}</div>}</div>;
 }
 
 type InferenceModelOption = ReturnType<typeof inferenceModelOption>;
@@ -4232,25 +4310,25 @@ function InferenceModelPicker({ options, value, onChange }: { options: Inference
   const [open, setOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const selected = options.find((option) => option.id === value) ?? null;
-  const label = selected?.id ?? "Mesh — automático";
+  const label = selected?.id ?? "Mesh — automatic";
   return <div className={`inference-model-picker${open ? " open" : ""}`} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false); }}>
-    <button ref={triggerRef} type="button" aria-label="Seleccionar modelo de chat" aria-haspopup="listbox" aria-expanded={open} disabled={options.length === 0} onClick={() => setOpen((current) => !current)}>
-      <Cpu /><span><small>MODELO</small><strong>{label}</strong></span><ChevronDown />
+    <button ref={triggerRef} type="button" aria-label="Select chat model" aria-haspopup="listbox" aria-expanded={open} disabled={options.length === 0} onClick={() => setOpen((current) => !current)}>
+      <Cpu /><span><small>MODEL</small><strong>{label}</strong></span><ChevronDown />
     </button>
-    {open && <div className="inference-model-menu" role="listbox" aria-label="Modelos disponibles">
+    {open && <div className="inference-model-menu" role="listbox" aria-label="Available models">
       <button type="button" role="option" aria-selected={value === ""} className={value === "" ? "selected" : ""} onMouseDown={(event) => event.preventDefault()} onClick={() => { onChange(""); setOpen(false); triggerRef.current?.focus(); }}>
-        <span><strong>Mesh — automático</strong><small>La red elige la mejor ruta disponible</small></span><b className="auto"><i />AUTO</b>{value === "" && <Check />}
+        <span><strong>Mesh — automatic</strong><small>The network chooses the best available route</small></span><b className="auto"><i />AUTO</b>{value === "" && <Check />}
       </button>
       {options.map((option) => <button type="button" role="option" aria-selected={option.id === value} className={option.id === value ? "selected" : ""} key={option.id} onMouseDown={(event) => event.preventDefault()} onClick={() => { onChange(option.id); setOpen(false); triggerRef.current?.focus(); }}>
-        <span><strong>{option.id}</strong><small>{option.nodeCount} nodo{option.nodeCount === 1 ? "" : "s"} · {option.peerMemoryMb > 0 ? formatMemory(option.peerMemoryMb) : "memoria no reportada"}</small></span><b className={option.freeSlots > 0 ? "warm" : "ready"}><i />{option.freeSlots > 0 ? "WARM" : "READY"}</b>{option.id === value && <Check />}
+        <span><strong>{option.id}</strong><small>{option.nodeCount} node{option.nodeCount === 1 ? "" : "s"} · {option.peerMemoryMb > 0 ? formatMemory(option.peerMemoryMb) : "memory not reported"}</small></span><b className={option.freeSlots > 0 ? "warm" : "ready"}><i />{option.freeSlots > 0 ? "WARM" : "READY"}</b>{option.id === value && <Check />}
       </button>)}
     </div>}
   </div>;
 }
 
 export async function readInferenceAttachment(file: File, remainingChars: number): Promise<InferenceAttachment> {
-  if (file.size === 0) throw new Error(`${file.name} está vacío.`);
-  if (file.size > MAX_INFERENCE_FILE_BYTES) throw new Error(`${file.name} supera el límite de ${formatFileSize(MAX_INFERENCE_FILE_BYTES)}.`);
+  if (file.size === 0) throw new Error(`${file.name} is empty.`);
+  if (file.size > MAX_INFERENCE_FILE_BYTES) throw new Error(`${file.name} exceeds the ${formatFileSize(MAX_INFERENCE_FILE_BYTES)} limit.`);
   const extension = file.name.split(".").at(-1)?.toLowerCase() ?? "";
   let text = "";
   let kind: InferenceAttachment["kind"] = "text";
@@ -4263,7 +4341,7 @@ export async function readInferenceAttachment(file: File, remainingChars: number
     for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
       const page = await document.getPage(pageNumber);
       const content = await page.getTextContent();
-      pages.push(`[Página ${pageNumber}]\n${content.items.map((item) => "str" in item ? item.str : "").join(" ")}`);
+      pages.push(`[Page ${pageNumber}]\n${content.items.map((item) => "str" in item ? item.str : "").join(" ")}`);
       if (pages.join("\n\n").length >= Math.min(MAX_INFERENCE_FILE_CHARS, remainingChars)) break;
     }
     text = pages.join("\n\n");
@@ -4275,10 +4353,10 @@ export async function readInferenceAttachment(file: File, remainingChars: number
   } else if (file.type.startsWith("text/") || inferenceTextExtension(extension)) {
     text = await file.text();
   } else {
-    throw new Error(`${file.name} no es compatible. Usa PDF, DOCX, texto, Markdown, CSV, JSON o archivos de código.`);
+    throw new Error(`${file.name} is not supported. Use PDF, DOCX, text, Markdown, CSV, JSON or code files.`);
   }
   const normalized = text.replace(/\u0000/g, "").replace(/\r\n/g, "\n").trim();
-  if (!normalized) throw new Error(`No se pudo extraer texto de ${file.name}. Los PDF escaneados necesitan OCR antes de adjuntarlos.`);
+  if (!normalized) throw new Error(`Could not extract text from ${file.name}. Scanned PDFs need OCR before attaching.`);
   const limit = Math.max(1, Math.min(MAX_INFERENCE_FILE_CHARS, remainingChars));
   const truncated = normalized.length > limit;
   return {
@@ -4837,7 +4915,7 @@ interface AppSelectOption {
   label: string;
 }
 
-function AppSelect({ ariaLabel, value, options, onChange, placeholder = "Selecciona una opción" }: { ariaLabel: string; value: string; options: AppSelectOption[]; onChange: (value: string) => void; placeholder?: string }) {
+function AppSelect({ ariaLabel, value, options, onChange, placeholder = "Select an option" }: { ariaLabel: string; value: string; options: AppSelectOption[]; onChange: (value: string) => void; placeholder?: string }) {
   const [open, setOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const selectedIndex = Math.max(0, options.findIndex((option) => option.value === value));
@@ -4931,6 +5009,17 @@ function PageTitle({ eyebrow, title, copy, actions }: { eyebrow: string; title: 
   return <div className="panel-page-title"><div><span>{eyebrow}</span><h1>{title}</h1><p>{copy}</p></div>{actions && <div className="page-actions">{actions}</div>}</div>;
 }
 
+function PanelDisclosure({ icon: Icon, eyebrow, title, summary, children, defaultOpen = false }: { icon: typeof Activity; eyebrow: string; title: string; summary: string; children: React.ReactNode; defaultOpen?: boolean }) {
+  return <details className="panel-disclosure" open={defaultOpen}>
+    <summary>
+      <i className="panel-disclosure-icon"><Icon size={18} /></i>
+      <span><small>{eyebrow}</small><strong>{title}</strong><em>{summary}</em></span>
+      <ChevronDown className="panel-disclosure-chevron" size={18} aria-hidden="true" />
+    </summary>
+    <div className="panel-disclosure-body">{children}</div>
+  </details>;
+}
+
 function Stat({ icon: Icon, label, value, detail, tone = "blue" }: { icon: typeof Radio; label: string; value: string; detail: string; tone?: "blue" | "purple" }) { return <article className={`panel-stat ${tone}`}><div><Icon /></div><span>{label}</span><strong>{value}</strong><small>{detail}</small><i className="stat-accent" /></article>; }
 function CapacityMetric({ icon: Icon, label, value, detail }: { icon: typeof Cpu; label: string; value: string; detail: string }) { return <div className="global-capacity-metric"><i><Icon /></i><span><small>{label}</small><strong>{value}</strong><em>{detail}</em></span></div>; }
 function Metric({ label, value }: { label: string; value: string }) { return <div><span>{label}</span><strong>{value}</strong></div>; }
@@ -4942,9 +5031,9 @@ function WorkerKindIcon({ worker }: { worker: PublicWorker }) {
   return <Laptop />;
 }
 function workerKindLabel(worker: PublicWorker) {
-  if (worker.kind === "browser") return "SESIÓN DE NAVEGADOR ACTIVA";
-  if (worker.kind === "cell") return "CELDA DE CÓMPUTO";
-  return "DISPOSITIVO INSTALADO";
+  if (worker.kind === "browser") return "ACTIVE BROWSER SESSION";
+  if (worker.kind === "cell") return "COMPUTE CELL";
+  return "INSTALLED DEVICE";
 }
 function workerLabel(worker: PublicWorker) {
   if (worker.kind === "browser") return `Browser ${shortId(worker.id)}`;
@@ -4958,11 +5047,11 @@ function workerLabel(worker: PublicWorker) {
 function nodeVisualState(worker: PublicWorker): "active" | "warning" | "offline" { return worker.connected && worker.status === "online" ? "active" : worker.connected || worker.status === "suspect" || worker.status === "draining" ? "warning" : "offline"; }
 function nodeStateOrder(worker: PublicWorker): number { return nodeVisualState(worker) === "active" ? 0 : nodeVisualState(worker) === "warning" ? 1 : 2; }
 function nodeStatusLabel(worker: PublicWorker): string {
-  if (worker.connected && worker.status === "online") return "Activo";
-  if (worker.status === "suspect") return "Inestable";
-  if (worker.status === "draining") return "Finalizando";
-  if (worker.connected) return "Conectado";
-  return "Inactivo";
+  if (worker.connected && worker.status === "online") return "Active";
+  if (worker.status === "suspect") return "Unstable";
+  if (worker.status === "draining") return "Draining";
+  if (worker.connected) return "Connected";
+  return "Offline";
 }
 function topologyPosition(index: number, total: number): { x: number; y: number } {
   if (total <= 1) return { x: 50, y: 17 };
@@ -4976,11 +5065,11 @@ function topologyPosition(index: number, total: number): { x: number; y: number 
   const angle = -Math.PI / 2 + (slot / count) * Math.PI * 2;
   return { x: 50 + Math.cos(angle) * (inner ? 28 : 43), y: 52 + Math.sin(angle) * (inner ? 25 : 38) };
 }
-function formatCompactNumber(value: number): string { return new Intl.NumberFormat("es-ES", { maximumFractionDigits: value < 10 ? 1 : 0 }).format(value); }
+function formatCompactNumber(value: number): string { return new Intl.NumberFormat("en-US", { maximumFractionDigits: value < 10 ? 1 : 0 }).format(value); }
 function formatCompactTokens(value: number): string {
-  if (value >= 1_000_000) return `${new Intl.NumberFormat("es-ES", { maximumFractionDigits: 1 }).format(value / 1_000_000)}M`;
-  if (value >= 1_000) return `${new Intl.NumberFormat("es-ES", { maximumFractionDigits: 1 }).format(value / 1_000)}K`;
-  return new Intl.NumberFormat("es-ES").format(value);
+  if (value >= 1_000_000) return `${new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 }).format(value / 1_000_000)}M`;
+  if (value >= 1_000) return `${new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 }).format(value / 1_000)}K`;
+  return new Intl.NumberFormat("en-US").format(value);
 }
 function formatPower(watts: number): string { return watts >= 1_000 ? `${(watts / 1_000).toFixed(1)} kW` : `${Math.round(watts)} W`; }
 function shortId(value: string) { return value.length <= 10 ? value : `${value.slice(0, 6)}…${value.slice(-4)}`; }
@@ -5145,7 +5234,7 @@ function formatAccelerationLogTime(value: string): string {
   return date.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 function relativeTime(value: string) { const seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1_000)); if (seconds < 5) return "now"; if (seconds < 60) return `${seconds}s ago`; const minutes = Math.floor(seconds / 60); if (minutes < 60) return `${minutes}m ago`; return `${Math.floor(minutes / 60)}h ago`; }
-function relativeTimeEs(value: string) { const seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1_000)); if (seconds < 5) return "ahora"; if (seconds < 60) return `hace ${seconds} s`; const minutes = Math.floor(seconds / 60); if (minutes < 60) return `hace ${minutes} min`; return `hace ${Math.floor(minutes / 60)} h`; }
+function relativeTimeEs(value: string) { const seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1_000)); if (seconds < 5) return "now"; if (seconds < 60) return `${seconds} s ago`; const minutes = Math.floor(seconds / 60); if (minutes < 60) return `${minutes} min ago`; return `${Math.floor(minutes / 60)} h ago`; }
 
 type ExecutionTelemetry = NonNullable<DashboardDeployment["execution"]>;
 type ExecutionStageTelemetry = NonNullable<ExecutionTelemetry["stages"]>[number];
@@ -5285,26 +5374,26 @@ function ExecutionBadge({ execution, workers = [], large = false, interactive = 
       <div className="execution-diagnostic-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setDiagnosticsOpen(false); }}>
         <section className="execution-diagnostic-dialog" role="dialog" aria-modal="true" aria-labelledby={dialogTitleId}>
           <header className="execution-diagnostic-head">
-            <div><span>TELEMETRÍA REAL</span><h2 id={dialogTitleId}>Diagnóstico de ejecución</h2><p>Dispositivo y backend confirmados por cada proceso después de cargar el modelo.</p></div>
-            <button type="button" aria-label="Cerrar diagnóstico" onClick={() => setDiagnosticsOpen(false)}><X /></button>
+            <div><span>REAL TELEMETRY</span><h2 id={dialogTitleId}>Execution diagnostics</h2><p>Device and backend confirmed for each process after loading the model.</p></div>
+            <button type="button" aria-label="Close diagnostics" onClick={() => setDiagnosticsOpen(false)}><X /></button>
           </header>
           <div className="execution-diagnostic-summary">
             <div><small>ESTADO</small><strong>{executionShortLabel(execution)}</strong></div>
             <div><small>BACKENDS</small><strong>{execution.backends.map((backend) => backend.toUpperCase()).join(" + ")}</strong></div>
             <div><small>ETAPAS</small><strong>{execution.unitCount}</strong></div>
-            <div><small>FALLBACK</small><strong>{execution.fallback ? "Sí" : "No"}</strong></div>
+            <div><small>FALLBACK</small><strong>{execution.fallback ? "Yes" : "No"}</strong></div>
           </div>
           {execution.fallbackReasons.length > 0 && <div className="execution-diagnostic-alert"><CircleAlert /><span><small>MOTIVO DEL FALLBACK</small><strong>{execution.fallbackReasons.join(" · ")}</strong></span></div>}
-          {autoRepair && <div className="execution-diagnostic-repair"><RefreshCw /><span><small>AUTOREPARACIÓN ACTIVA</small><strong>La CPU mantiene el servicio mientras mycellios revalida la GPU. Cuando haya capacidad GPU verificada suficiente, el coordinador reconstruirá la ruta y ejecutará un canary real antes de publicarla.</strong></span></div>}
+          {autoRepair && <div className="execution-diagnostic-repair"><RefreshCw /><span><small>AUTO-REPAIR ACTIVE</small><strong>CPU keeps the service running while mycellios revalidates the GPU. When enough verified GPU capacity is available, the coordinator rebuilds the route and runs a real canary before publishing it.</strong></span></div>}
           <div className="execution-diagnostic-stages">
-            <div className="execution-diagnostic-section-title"><span>RUTA DEL MODELO</span><small>{execution.stages.length > 0 ? `${execution.stages.length} etapas verificadas` : "Runtime verificado"}</small></div>
+            <div className="execution-diagnostic-section-title"><span>MODEL ROUTE</span><small>{execution.stages.length > 0 ? `${execution.stages.length} verified stages` : "Verified runtime"}</small></div>
             {execution.stages.length > 0 ? execution.stages.map((stage) => {
               const host = executionWorkerForNode(workers, stage.nodeId);
               const stageSummary = summarizeExecutionStages([stage]);
               return <article className={`execution-diagnostic-stage${stage.fallback ? " fallback" : ""}`} key={`${stage.nodeId}-${stage.stageIndex}`}>
                 <div className="execution-diagnostic-stage-head"><span><b>{String(stage.stageIndex + 1).padStart(2, "0")}</b><span><small>ETAPA {stage.stageIndex + 1}</small><strong>Capas {stage.layerStart}–{stage.layerEnd}</strong></span></span><ExecutionBadge execution={stageSummary} interactive={false} /></div>
                 <div className="execution-diagnostic-stage-grid">
-                  <div><small>EQUIPO FÍSICO</small><strong>{host ? workerLabel(host) : "Equipo no identificado"}</strong></div>
+                  <div><small>PHYSICAL DEVICE</small><strong>{host ? workerLabel(host) : "Device not identified"}</strong></div>
                   <div><small>DISPOSITIVO USADO</small><strong>{stage.deviceName}</strong></div>
                   <div><small>BACKEND</small><strong>{stage.backend.toUpperCase()} · {stage.precision}</strong></div>
                   <div><small>NODO</small><code title={stage.nodeId}>{shortId(stage.nodeId)}</code></div>
@@ -5314,7 +5403,7 @@ function ExecutionBadge({ execution, workers = [], large = false, interactive = 
               </article>;
             }) : <article className="execution-diagnostic-runtime"><strong>{executionDeviceNames(execution)}</strong><span>{executionDetail(execution)}</span></article>}
           </div>
-          <footer className="execution-diagnostic-foot"><HardDrive /><span><strong>Registro completo en la máquina afectada</strong><small>Windows: <code>%APPDATA%\mycellios\mycellios.log</code>. En macOS y Linux se guarda como <code>mycellios.log</code> dentro de la carpeta de datos de la aplicación.</small></span></footer>
+          <footer className="execution-diagnostic-foot"><HardDrive /><span><strong>Complete log on the affected machine</strong><small>Windows: <code>%APPDATA%\mycellios\mycellios.log</code>. On macOS and Linux it is stored as <code>mycellios.log</code> inside the application data folder.</small></span></footer>
         </section>
       </div>,
       document.body,
@@ -5349,7 +5438,7 @@ function executionAutoRepairActive(
 function computeModeLabel(mode: NonNullable<PublicWorker["computeMode"]>): string {
   if (mode === "gpu-only") return "Solo GPU";
   if (mode === "cpu-only") return "Solo CPU";
-  return "Automático";
+  return "Automatic";
 }
 
 function inferenceModelOption(snapshot: PublicSnapshot, model: PublicSnapshot["models"][number]) {
@@ -5362,7 +5451,7 @@ function inferenceModelOption(snapshot: PublicSnapshot, model: PublicSnapshot["m
   const freeSlots = deployments.reduce((total, deployment) => total + deployment.freeSlots, 0);
   const routeLabel = model.pipelines > 0
     ? `${model.pipelines} pipeline${model.pipelines === 1 ? "" : "s"}`
-    : `${model.replicas} réplica${model.replicas === 1 ? "" : "s"}`;
+    : `${model.replicas} replica${model.replicas === 1 ? "" : "s"}`;
   return {
     ...model,
     legacyExternalRuntime,
@@ -5383,15 +5472,15 @@ function shortBuildIdentity(
 function shortSourceId(sourceId: string | null | undefined): string {
   return sourceId
     ? sourceId.slice("sha256:".length, "sha256:".length + 12)
-    : "sin declarar";
+    : "undeclared";
 }
 
 function buildIdentityTitle(
   identity: NativeBuildIdentity | null | undefined,
 ): string {
   return identity
-    ? `Fuente exacta ${identity.sourceId} · versión ${identity.version}`
-    : "Este runtime no ha publicado una identidad de fuente sellada.";
+    ? `Exact source ${identity.sourceId} · version ${identity.version}`
+    : "This runtime has not published a sealed source identity.";
 }
 
 function formatDuration(milliseconds: number): string {
@@ -5426,22 +5515,22 @@ function splitThinkingContent(text: string): { reasoning: string | null; answer:
   if (!match) return { reasoning: null, answer: text.trim() };
   const reasoning = match[1]?.trim() || null;
   const answer = text.slice(match[0].length).trim();
-  return { reasoning, answer: answer || "El modelo no devolvió contenido final." };
+  return { reasoning, answer: answer || "The model returned no final content." };
 }
 
 function friendlyInferenceError(message: string): string {
   const normalized = message.toLowerCase();
-  if (normalized.includes("first token")) return "La ruta no produjo ningún token después del reintento. El coordinador la ha marcado como degradada y activará su autorreparación.";
-  if (normalized.includes("disconnected from the distributed pipeline")) return "Un equipo de la ruta distribuida se desconectó. Se ha cancelado la petición de forma segura y la red está reconstruyendo la ruta.";
-  if (normalized.includes("no_candidates") || normalized.includes("no candidate") || normalized.includes("unavailable")) return "El modelo dejó de estar disponible. Comprueba el estado de sus nodos y vuelve a intentarlo.";
-  if (normalized.includes("timeout") || normalized.includes("deadline")) return "La red tardó demasiado en responder. La petición se ha cancelado sin inventar una respuesta.";
+  if (normalized.includes("first token")) return "The route produced no token after retrying. The coordinator marked it degraded and will activate auto-repair.";
+  if (normalized.includes("disconnected from the distributed pipeline")) return "A device in the distributed route disconnected. The request was safely cancelled while the network rebuilds the route.";
+  if (normalized.includes("no_candidates") || normalized.includes("no candidate") || normalized.includes("unavailable")) return "The model is no longer available. Check its nodes and try again.";
+  if (normalized.includes("timeout") || normalized.includes("deadline")) return "The network took too long to respond. The request was cancelled without inventing a response.";
   if (
     normalized.includes("401") ||
     normalized.includes("invalid_network_token") ||
     normalized.includes("invalid network token") ||
     normalized.includes("administrator token") ||
     normalized.includes("credential")
-  ) return "La red requiere una credencial válida para usar este modelo.";
+  ) return "The network requires a valid credential to use this model.";
   return message;
 }
 
@@ -5449,12 +5538,12 @@ function inferenceWaitingStatus(update: ChatStreamUpdate): string {
   if (update.phase === "recovering") {
     if (update.statusMessage) return update.statusMessage;
     return update.affectedNodeId
-      ? `Se desconectó el nodo ${shortId(update.affectedNodeId)}. Reconectando la ruta y reintentando…`
-      : "Una etapa perdió la conexión. Reconectando la ruta y reintentando…";
+      ? `Node ${shortId(update.affectedNodeId)} disconnected. Reconnecting the route and retrying…`
+      : "A stage lost its connection. Reconnecting the route and retrying…";
   }
-  if (update.phase === "connecting") return "Buscando una ruta disponible…";
-  if (update.phase === "waiting_first_token") return "Ruta preparada. Esperando el primer token…";
-  return "Esperando el primer token del modelo…";
+  if (update.phase === "connecting") return "Looking for an available route…";
+  if (update.phase === "waiting_first_token") return "Route ready. Waiting for the first token…";
+  return "Waiting for the model's first token…";
 }
 
 async function fetchBenchmarkRuns(): Promise<BenchmarkRun[]> {
@@ -5483,53 +5572,53 @@ function benchmarkSnapshotMetric(snapshot: BenchmarkRunSnapshot, metric: Benchma
 }
 
 function formatSignedBenchmark(value: number | null, suffix: string): string {
-  if (value === null || !Number.isFinite(value)) return "Sin comparación";
-  return `${value > 0 ? "+" : ""}${value.toLocaleString("es-ES", { maximumFractionDigits: 2 })}${suffix}`;
+  if (value === null || !Number.isFinite(value)) return "No comparison";
+  return `${value > 0 ? "+" : ""}${value.toLocaleString("en-US", { maximumFractionDigits: 2 })}${suffix}`;
 }
 
 function formatBenchmark(value: number | null, suffix: string): string {
-  if (value === null || !Number.isFinite(value)) return "Sin lectura";
+  if (value === null || !Number.isFinite(value)) return "No reading";
   return `${value.toLocaleString("en-US", { maximumFractionDigits: 2 })}${suffix}`;
 }
 
 function formatBenchmarkRange(snapshot: BenchmarkRunSnapshot | null | undefined): string {
   if (!snapshot || snapshot.tokensPerSecondP5 === null || snapshot.tokensPerSecondP95 === null) {
-    return "P5–P95 Sin lectura";
+    return "P5–P95 No reading";
   }
   return `P5 ${formatBenchmark(snapshot.tokensPerSecondP5, " tok/s")} · P95 ${formatBenchmark(snapshot.tokensPerSecondP95, " tok/s")}`;
 }
 
 function formatPowerReading(value: number | null): string {
-  return value === null || !Number.isFinite(value) ? "Sin lectura" : formatPower(value);
+  return value === null || !Number.isFinite(value) ? "No reading" : formatPower(value);
 }
 
 function benchmarkStabilityLabel(measurement: BenchmarkMeasurement): string {
-  if (measurement.workload.statisticallyStable === true) return "Estable";
-  if (measurement.workload.statisticallyStable === false) return "Inconclusa";
-  return "Sin lectura";
+  if (measurement.workload.statisticallyStable === true) return "Stable";
+  if (measurement.workload.statisticallyStable === false) return "Inconclusive";
+  return "No reading";
 }
 
 function benchmarkBuildRevision(run: BenchmarkRun): string {
   const revision = run.build.revision ?? run.gitCommit;
-  return revision?.trim() ? revision.trim().slice(0, 12) : "Sin lectura";
+  return revision?.trim() ? revision.trim().slice(0, 12) : "No reading";
 }
 
 function benchmarkDirtyLabel(dirty: boolean | null): string {
-  if (dirty === true) return "código con cambios locales";
-  if (dirty === false) return "build limpio";
-  return "limpieza del build Sin lectura";
+  if (dirty === true) return "code with local changes";
+  if (dirty === false) return "clean build";
+  return "build cleanliness: No reading";
 }
 
 function formatTopologyDigest(digest: string | null): string {
-  if (!digest?.trim()) return "topología Sin lectura";
+  if (!digest?.trim()) return "topology: No reading";
   const normalizedDigest = digest.trim().replace(/^sha256:/i, "");
-  return `topología ${normalizedDigest.slice(0, 12)}`;
+  return `topology: ${normalizedDigest.slice(0, 12)}`;
 }
 
 function formatBenchmarkBackend(measurement: BenchmarkMeasurement): string {
   const backends = measurementBackends(measurement);
   return backends[0] === "__without_reading__"
-    ? "Backend Sin lectura"
+    ? "Backend: No reading"
     : backends.map((backend) => backend.toUpperCase()).join(" + ");
 }
 
@@ -5542,23 +5631,23 @@ function nullableBenchmarkMax(values: Array<number | null | undefined>): number 
 
 function formatCountReading(value: number | null | undefined): string {
   return value === null || value === undefined || !Number.isFinite(value)
-    ? "Sin lectura"
-    : Math.round(value).toLocaleString("es-ES");
+    ? "No reading"
+    : Math.round(value).toLocaleString("en-US");
 }
 
 function formatRate(value: number | null): string {
   return value === null || !Number.isFinite(value)
-    ? "Sin lectura"
-    : `${(value * 100).toLocaleString("es-ES", { maximumFractionDigits: 2 })}%`;
+    ? "No reading"
+    : `${(value * 100).toLocaleString("en-US", { maximumFractionDigits: 2 })}%`;
 }
 
 function benchmarkCampaignStopLabel(
   reason: BenchmarkMeasurement["workload"]["campaignStopReason"],
 ): string {
-  if (reason === "confidence_reached") return "Confianza alcanzada";
-  if (reason === "maximum_samples") return "Máximo de muestras";
-  if (reason === "insufficient_samples") return "Muestras insuficientes";
-  return "Sin lectura";
+  if (reason === "confidence_reached") return "Confidence reached";
+  if (reason === "maximum_samples") return "Maximum samples";
+  if (reason === "insufficient_samples") return "Insufficient samples";
+  return "No reading";
 }
 
 function nullableBenchmarkSum(values: Array<number | null | undefined>): number | null {
@@ -5569,17 +5658,17 @@ function nullableBenchmarkSum(values: Array<number | null | undefined>): number 
 }
 
 function formatBenchmarkDate(value: string): string {
-  return new Date(value).toLocaleString("es-ES", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+  return new Date(value).toLocaleString("en-US", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
 }
 
 function formatBenchmarkChartTime(value: string): string {
-  return new Date(value).toLocaleString("es-ES", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+  return new Date(value).toLocaleString("en-US", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
 }
 
 function benchmarkStatusLabel(status: BenchmarkRun["status"]): string {
   if (status === "baseline") return "Referencia";
-  if (status === "passed") return "Válida";
-  if (status === "regression") return "Regresión";
+  if (status === "passed") return "Valid";
+  if (status === "regression") return "Regression";
   if (status === "inconclusive") return "Inconcluso";
   return "Fallido";
 }
