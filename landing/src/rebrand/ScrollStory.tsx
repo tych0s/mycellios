@@ -1,6 +1,6 @@
 import { Check, Cpu, Laptop, MemoryStick, Sparkles } from "lucide-react";
 import { useRef, type CSSProperties } from "react";
-import { useStickyProgress } from "./use-motion";
+import { useStoryProgress } from "./use-motion";
 
 /*
  * The one explainer on the page.
@@ -10,9 +10,15 @@ import { useStickyProgress } from "./use-motion";
  * told once, as a scrubbed scroll story, instead of being restated by an
  * explainer, a flow section, an architecture diagram and a pipeline card.
  *
- * The reader's scroll is the transport: `--p` runs 0→1 across the sticky
- * section and CSS interpolates every mark from it. React only re-renders when
- * the beat changes, which is at most four times for the whole section.
+ * `--p` runs 0→1 across the pinned section and CSS interpolates every mark from
+ * it. React only re-renders when the beat changes, which is at most four times
+ * for the whole section.
+ *
+ * The story plays itself once pinned rather than waiting to be cranked. Four
+ * beats behind three viewports of wheel travel made the reader work a rowing
+ * machine for four sentences; now the section holds them for a few seconds,
+ * tells its one sentence, and lets go. Scrolling still scrubs ahead for anyone
+ * who would rather not wait.
  */
 
 /* `step` is the name the beat carries in the rail under the diagram. Four
@@ -38,7 +44,7 @@ const DEVICES = [
 
 export function ScrollStory() {
   const sectionRef = useRef<HTMLElement>(null);
-  const beat = useStickyProgress(sectionRef, BEATS.length);
+  const beat = useStoryProgress(sectionRef, BEATS.length);
   const active = BEATS[beat] ?? BEATS[0];
 
   return (

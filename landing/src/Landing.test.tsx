@@ -13,9 +13,11 @@ describe("Landing", () => {
   it("opens the hero on the headline and ends it at the prompt", () => {
     const html = renderToStaticMarkup(<RebrandLanding />);
 
-    // The headline names the category explicitly and states the single-machine
-    // limit the network removes.
-    expect(html).toContain("The open compute layer");
+    // The headline names the open-compute category and the distributed-AI job
+    // it serves. Asserted with the line breaks in place: the three-line setting
+    // is what keeps the headline clear of the hero organism, so a two-line
+    // regression should fail here rather than silently overlap the artwork.
+    expect(html).toContain("The open compute<br/>layer<br/>");
     expect(html).toContain("<em>for distributed AI.</em>");
     expect(html.match(/<h1/g)).toHaveLength(1);
     expect(html).toContain('href="/join"');
@@ -35,6 +37,15 @@ describe("Landing", () => {
     expect(hero).toContain("rb-scroll-cue");
     expect(hero).toContain('href="#how-it-works"');
     expect(hero).toContain(">Scroll</span>");
+  });
+
+  it("plants a varied five-specimen colony along the hero ground", () => {
+    const html = renderToStaticMarkup(<RebrandLanding />);
+    const hero = html.slice(html.indexOf('class="rb-hero"'), html.indexOf('id="how-it-works"'));
+
+    expect(hero).toContain('class="rb-ground-colony"');
+    expect(hero.match(/class="rb-ground-mushroom /g)).toHaveLength(5);
+    expect(hero).toContain('aria-hidden="true"');
   });
 
   it("links the blog from the header navigation, not only the footer", () => {
@@ -227,6 +238,25 @@ describe("Landing", () => {
     expect(html).not.toContain("mycelium-story");
     expect(html).not.toContain("efficiency-curve-ai");
     expect(html).not.toContain("mycellios-live-network");
+  });
+
+  it("closes the page on the fruiting body, drawn into the served markup", () => {
+    const html = renderToStaticMarkup(<RebrandLanding />);
+    const closing = html.slice(html.indexOf('class="rb-closing"'));
+
+    // The mark is real geometry in the HTML, not a canvas the client fills in
+    // after hydration: this is the last thing on the page and it should be
+    // painted on the first frame.
+    expect(closing).toContain("rb-fruit-mark");
+    expect(closing).toContain("rb-fruit-cap");
+    expect(closing).toContain("rb-fruit-stipe");
+    expect(closing).toContain('d="M');
+    // Decorative only — the panel already says "Many machines. One model.",
+    // and announcing the same thing twice is noise on a screen reader.
+    expect(closing).toContain('aria-hidden="true"');
+    expect(closing).toContain("Many machines.");
+    // It stands above the wordmark and the final ask, not after them.
+    expect(closing.indexOf("rb-fruit-mark")).toBeLessThan(closing.indexOf('href="/join"'));
   });
 
   it("renders the network-only support assistant entry point", () => {

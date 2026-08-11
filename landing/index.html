@@ -36,6 +36,23 @@
     <link rel="icon" href="/assets/brand/favicon.png" type="image/png" sizes="32x32" />
     <link rel="shortcut icon" href="/assets/brand/favicon.png" type="image/png" />
     <link rel="apple-touch-icon" href="/assets/brand/app-icon.png" />
+    <style>
+      #mycellios-loader { position:fixed; z-index:1000; inset:0; display:grid; place-items:center; color:#eee9e2; background:#0b0f0c; transition:opacity 240ms ease-in,visibility 240ms ease-in; }
+      #mycellios-loader[data-state="leaving"] { opacity:0; visibility:hidden; }
+      .mycellios-loader__mark { width:68px; height:68px; overflow:visible; filter:drop-shadow(0 0 20px rgba(173,122,72,.22)); }
+      .mycellios-loader__cap,.mycellios-loader__stem,.mycellios-loader__gills { fill:none; stroke:currentColor; stroke-linecap:round; stroke-linejoin:round; }
+      .mycellios-loader__cap { stroke-width:1.7; stroke-dasharray:72; animation:mycellios-cap-grow 1.5s cubic-bezier(.2,.75,.2,1) infinite; }
+      .mycellios-loader__stem { stroke:#ad7a48; stroke-width:1.7; stroke-dasharray:30; animation:mycellios-stem-grow 1.5s cubic-bezier(.2,.75,.2,1) infinite; }
+      .mycellios-loader__gills { stroke:rgba(238,233,226,.48); stroke-width:1; animation:mycellios-gills-breathe 1.5s ease-in-out infinite; }
+      .mycellios-loader__spore { fill:#ad7a48; transform-box:fill-box; transform-origin:center; animation:mycellios-spore-rise 1.8s ease-in-out infinite; }
+      .mycellios-loader__spore:nth-child(2) { animation-delay:-.6s; }
+      .mycellios-loader__spore:nth-child(3) { animation-delay:-1.15s; }
+      @keyframes mycellios-cap-grow { 0% { stroke-dashoffset:72; opacity:.2; } 44%,78% { stroke-dashoffset:0; opacity:1; } 100% { stroke-dashoffset:-72; opacity:.12; } }
+      @keyframes mycellios-stem-grow { 0%,14% { stroke-dashoffset:30; opacity:.15; } 54%,80% { stroke-dashoffset:0; opacity:1; } 100% { stroke-dashoffset:-30; opacity:.12; } }
+      @keyframes mycellios-gills-breathe { 0%,34%,100% { opacity:0; } 58%,82% { opacity:1; } }
+      @keyframes mycellios-spore-rise { 0%,100% { opacity:.12; transform:translateY(4px) scale(.7); } 48% { opacity:.85; transform:translateY(-5px) scale(1); } }
+      @media (prefers-reduced-motion:reduce) { #mycellios-loader { transition-duration:80ms; } .mycellios-loader__cap,.mycellios-loader__stem,.mycellios-loader__gills,.mycellios-loader__spore { animation:none; } }
+    </style>
     <script id="seo-structured-data" type="application/ld+json">
       {
         "@context": "https://schema.org",
@@ -85,6 +102,14 @@
     <title>mycellios — The open compute layer for distributed AI</title>
   </head>
   <body>
+    <div id="mycellios-loader" role="status" aria-live="polite" aria-label="Loading mycellios">
+      <svg class="mycellios-loader__mark" viewBox="0 0 68 68" aria-hidden="true">
+        <g><circle class="mycellios-loader__spore" cx="18" cy="22" r="1.15" /><circle class="mycellios-loader__spore" cx="49" cy="18" r=".9" /><circle class="mycellios-loader__spore" cx="54" cy="31" r=".7" /></g>
+        <path class="mycellios-loader__cap" pathLength="72" d="M17 35.5C18.8 25.4 25 20 34 20s15.2 5.4 17 15.5c-8.7-2.6-25.3-2.6-34 0Z" />
+        <path class="mycellios-loader__stem" pathLength="30" d="M29.8 35.2c.3 5.8-.8 10.8-3.7 15.5 4.9 2.4 10.9 2.4 15.8 0-2.9-4.7-4-9.7-3.7-15.5" />
+        <path class="mycellios-loader__gills" d="m21.5 34.4 8.9 5.2M46.5 34.4l-8.9 5.2M27 33.5l4.7 6.8m9.3-6.8-4.7 6.8M34 33.2v8" />
+      </svg>
+    </div>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

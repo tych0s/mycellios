@@ -47,27 +47,54 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
 /* The hero fills exactly one screen — no cap — so the next section never peeks
    in under the fold. svh keeps mobile browser chrome from cropping the prompt. */
 .rb-hero { position:relative; min-height:100vh; min-height:100svh; display:flex; align-items:center; overflow:hidden; border-bottom:1px solid rgba(238,233,226,.1); background:#0b0f0c; color:#eee9e2; }
-.rb-hero::after { content:""; position:absolute; inset:0; z-index:2; background:radial-gradient(105% 85% at 10% 50%,rgba(11,15,12,.95) 0%,rgba(11,15,12,.74) 34%,rgba(11,15,12,.2) 58%,transparent 78%); pointer-events:none; }
-.rb-globe { position:absolute; z-index:1; top:50%; right:-3%; width:min(1120px,66vw,94vh); aspect-ratio:1; transform:translateY(-50%); }
-.rb-globe canvas { width:100%; height:100%; display:block; }
+.rb-hero::after { content:""; position:absolute; inset:0; z-index:3; background:radial-gradient(105% 85% at 10% 50%,rgba(11,15,12,.95) 0%,rgba(11,15,12,.74) 34%,rgba(11,15,12,.2) 58%,transparent 78%); pointer-events:none; }
+.rb-globe { position:absolute; z-index:2; top:50%; right:-3%; width:min(1120px,66vw,94vh); aspect-ratio:1; transform:translateY(-50%); }
+.rb-globe canvas { width:100%; height:100%; display:block; background:radial-gradient(circle at 50% 50%,rgba(11,15,12,.96) 0 67%,rgba(11,15,12,.78) 69%,transparent 71%); }
+/* The standing fruiting body is planted at the viewport edge beside SCROLL.
+   Its base is the page-wide mycelium's real origin, while the smaller scale
+   keeps the cue readable and returns the headline to an unobstructed plane. */
+/* three.js and its shader compilation cannot be made instant, so the arrival is
+   dressed rather than hidden: the organism fades and rises into place once it
+   has drawn its first frame (`.is-grown`, set on the element's mushroom-ready
+   event). Popping into existence a second after the headline read as a fault;
+   growing in reads as the thing the brand is about. The shade plate is on the
+   same element, so it waits too — a shadow with nothing casting it was the
+   other half of what looked wrong. */
+.rb-hero-mushroom { position:absolute; z-index:4; left:calc(50% + 110px); bottom:-8px; width:min(700px,56vw); height:min(600px,68vh,48vw); opacity:0; transform:translateX(-50%) translateY(14px) scale(.988); transition:opacity .6s ease-out,transform .8s cubic-bezier(.22,.8,.2,1); pointer-events:none; -webkit-mask-image:linear-gradient(180deg,#000 0,#000 88%,transparent 100%); mask-image:linear-gradient(180deg,#000 0,#000 88%,transparent 100%); }
+.rb-hero-mushroom.is-grown { opacity:1; transform:translateX(-50%); }
+.rb-hero-mushroom::after { content:""; position:absolute; inset:0; background:linear-gradient(90deg,rgba(11,15,12,.08),rgba(11,15,12,.24) 72%,rgba(11,15,12,.1)); pointer-events:none; }
+.rb-ground-colony { position:absolute; z-index:4; inset:0; overflow:hidden; pointer-events:none; }
+.rb-ground-mushroom { position:absolute; bottom:-5px; display:block; width:var(--rb-mini-size); height:calc(var(--rb-mini-size) * 1.4); opacity:var(--rb-mini-opacity,.76); filter:drop-shadow(0 -5px 14px rgba(188,132,75,.16)); transform:translateX(-50%) rotate(var(--rb-mini-lean,0deg)); transform-origin:50% 100%; }
+.rb-ground-mushroom svg { width:100%; height:100%; display:block; overflow:visible; transform-origin:50% 100%; animation:rbMiniMushroomSway var(--rb-mini-speed,8s) ease-in-out var(--rb-mini-delay,0s) infinite alternate; }
+.rb-ground-mushroom-a { left:5%; --rb-mini-size:74px; --rb-mini-lean:-4deg; --rb-mini-opacity:.66; --rb-mini-speed:9.4s; --rb-mini-delay:-2.1s; }
+.rb-ground-mushroom-b { left:27%; --rb-mini-size:38px; --rb-mini-lean:5deg; --rb-mini-opacity:.58; --rb-mini-speed:7.8s; --rb-mini-delay:-5s; }
+.rb-ground-mushroom-c { left:47%; --rb-mini-size:48px; --rb-mini-lean:-3deg; --rb-mini-opacity:.72; --rb-mini-speed:8.7s; --rb-mini-delay:-3.3s; }
+.rb-ground-mushroom-d { left:82%; --rb-mini-size:88px; --rb-mini-lean:4deg; --rb-mini-opacity:.7; --rb-mini-speed:10.2s; --rb-mini-delay:-6.4s; }
+.rb-ground-mushroom-e { left:71%; --rb-mini-size:52px; --rb-mini-lean:-6deg; --rb-mini-opacity:.6; --rb-mini-speed:8.2s; --rb-mini-delay:-1.4s; }
+@keyframes rbMiniMushroomSway { from { transform:rotate(-1.2deg) scaleY(.995); } to { transform:rotate(1.2deg) scaleY(1.008); } }
 /* Bottom-centred scroll affordance. The arrow breathes rather than bounces so
    it reads as an invitation, not an alert. */
 .rb-scroll-cue { position:absolute; z-index:6; left:50%; bottom:34px; display:flex; flex-direction:column; align-items:center; gap:9px; color:rgba(238,233,226,.5); font:500 10px "IBM Plex Mono",monospace; letter-spacing:.28em; text-transform:uppercase; transform:translateX(-50%); transition:color .2s ease; }
 .rb-scroll-cue svg { width:15px; height:15px; animation:rbScrollCue 2.6s ease-in-out infinite; }
 .rb-scroll-cue:hover,.rb-scroll-cue:focus-visible { color:#f4f1ea; }
 @keyframes rbScrollCue { 0%,100% { transform:translateY(-3px); opacity:.55; } 50% { transform:translateY(3px); opacity:1; } }
-.rb-hero-inner { position:relative; z-index:3; min-height:inherit; display:flex; align-items:center; }
-.rb-hero-copy { position:relative; z-index:5; width:min(620px,50vw); padding-top:40px; }
+.rb-hero-inner { position:relative; z-index:5; min-height:inherit; display:flex; align-items:center; }
+.rb-hero-copy { position:relative; z-index:5; width:min(620px,50vw); padding-top:40px; transform:translateY(-160px); }
+.rb-hero-copy > h1,.rb-hero-copy > .rb-lede,.rb-hero-copy > .rb-hero-prompt { position:relative; z-index:1; }
 .rb-kicker { display:flex; align-items:center; gap:10px; margin:0 0 25px; color:#6b594b; font:500 12px/1.5 "IBM Plex Mono",monospace; letter-spacing:.07em; text-transform:uppercase; }
 .rb-kicker-light { color:#9eaa9f; }
 .rb-kicker i { width:6px; height:6px; border-radius:50%; background:var(--rb-bronze); box-shadow:0 0 0 5px rgba(173,122,72,.1); }
-.rb-hero h1 { margin:0; color:#f4f1ea; font:400 clamp(48px,5.2vw,84px)/1.02 "Fraunces",serif; letter-spacing:-.045em; }
+/* The text-shadow is not decoration: the specimen now stands behind the first
+   words, and a serif at this weight loses its thin strokes against a lit cap
+   without it. It is a glow of the hero's own background, so it reads as depth
+   rather than as an outline. */
+.rb-hero h1 { margin:0; color:#f4f1ea; font:400 clamp(48px,5.2vw,84px)/1.02 "Fraunces",serif; letter-spacing:-.045em; text-shadow:0 2px 34px rgba(11,15,12,.85); }
 .rb-hero h1 em { color:var(--rb-bronze); font-style:italic; font-weight:300; }
 .rb-page h2 em,.rb-page h3 em { color:var(--rb-bronze); font-style:italic; font-weight:300; }
-.rb-lede { max-width:470px; margin:26px 0 0; color:rgba(238,233,226,.68); font-size:16px; line-height:1.75; }
+.rb-lede { max-width:470px; margin:16px 0 0; color:rgba(238,233,226,.68); font-size:16px; line-height:1.75; text-shadow:0 2px 22px rgba(11,15,12,.8); }
 /* Prompt entry: the primary hero action. Submitting hands the text to the
    panel chat, so this is styled as an input, not a decorative search bar. */
-.rb-hero-prompt { display:flex; align-items:center; gap:10px; margin-top:34px; max-width:520px; }
+.rb-hero-prompt { display:flex; align-items:center; gap:10px; margin-top:20px; max-width:520px; }
 .rb-hero-prompt input { flex:1; min-width:0; height:56px; padding:0 20px; border:1px solid rgba(238,233,226,.22); border-radius:12px; background:rgba(238,233,226,.05); color:#f4f1ea; font:400 15px "Manrope",sans-serif; transition:border-color .18s ease,background .18s ease; }
 .rb-hero-prompt input::placeholder { color:rgba(238,233,226,.45); }
 .rb-hero-prompt input:hover { border-color:rgba(238,233,226,.34); }
@@ -92,6 +119,45 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
 .rb-closing::before { content:""; position:absolute; inset:0; background:radial-gradient(circle closest-side,rgba(173,122,72,.28),rgba(173,122,72,.09) 42%,transparent 70%); animation:rbHalo 11s ease-in-out infinite; pointer-events:none; }
 @keyframes rbHalo { 0%,100% { transform:scale(.88); opacity:.6; } 50% { transform:scale(1.12); opacity:1; } }
 .rb-closing-inner { position:relative; z-index:1; display:grid; justify-items:center; padding-block:130px; }
+/* The fruiting body that closes the page. Same generator as the hero globe and
+   the scroll backdrop; this is the one that stands still, at the end of the
+   scroll, over the final ask.
+
+   It draws itself once, on reveal: the three strokes are dashed to their own
+   length and the offset runs to zero, so the outline is traced from the base of
+   the stalk to the rim rather than faded in. That is the same "it grew" claim
+   the other two make with real growth, made here without a per-frame loop —
+   this is the last paint on the page and it should cost nothing. */
+.rb-fruit-mark { width:clamp(76px,8vw,112px); height:auto; margin-bottom:30px; overflow:visible; fill:none; stroke-linecap:round; stroke-linejoin:round; }
+.rb-fruit-mark path { stroke-dasharray:var(--len) var(--len); stroke-dashoffset:var(--len); }
+.rb-reveal.is-visible .rb-fruit-mark path { animation:rbFruitDraw 1.5s cubic-bezier(.3,.8,.35,1) forwards; }
+@keyframes rbFruitDraw { to { stroke-dashoffset:0; } }
+@keyframes rbFruitFill { to { fill-opacity:1; } }
+/* Each stroke gets its own length so all three finish together, and the cap is
+   held back until the stalk is most of the way up — the button-then-cap order
+   the geometry itself grows in. */
+/* Lengths are the measured path lengths at this scale, rounded up: a dash
+   pattern shorter than its path leaves a permanent gap in the outline. */
+/* Thick, because a stalk has width. At 2.4 against a 106-wide cap this was a
+   wire holding up a canopy — a parasol handle — and no amount of cap tuning
+   fixes that; the stipe is roughly a tenth of the cap's span on a real body
+   and it has to be here too. Butt-capped so its top edge sits flat under the
+   fill instead of bulging a round end through the cap. */
+.rb-fruit-stipe { --len:80; stroke:#e2d6c3; stroke-width:11; stroke-linecap:butt; }
+.rb-fruit-cap { --len:152; stroke:#c9a072; stroke-width:2.6; fill:#b8834b; fill-opacity:0; }
+/* The cap fills once its outline has closed. Stroking alone leaves an arc, and
+   an arc over a stalk is an umbrella — the solid is what makes it a cap, and
+   what gives the gills something to sit on rather than dangle from. */
+/* Selector has to out-specify the blanket `.rb-fruit-mark path` rule above,
+   which is why the class is qualified rather than written on its own. */
+.rb-reveal.is-visible .rb-fruit-mark path.rb-fruit-cap {
+  animation:rbFruitDraw 1.5s cubic-bezier(.3,.8,.35,1) .34s forwards, rbFruitFill .8s ease-out 1.25s forwards;
+}
+/* Darker than the cap, not lighter. Pale lines radiating across a bronze dome
+   are the ribs of a parasol; the underside of a cap is in shadow, so drawing
+   them as shade sinks them into the fill instead of sitting on top of it. */
+.rb-fruit-gills { --len:48; stroke:rgba(74,45,22,.32); stroke-width:1.6; }
+.rb-fruit-gills path { animation-delay:1.5s; }
 .rb-closing .rb-brand { color:#f5f0e8; }
 .rb-closing .rb-kicker { margin-top:44px; justify-content:center; }
 .rb-page .rb-closing h2 { margin:0; font:400 clamp(50px,6.4vw,96px)/.96 "Fraunces",serif; letter-spacing:-.05em; }
@@ -142,15 +208,18 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
 .rb-page h3 { margin:0; font:400 26px/1.2 "Fraunces",serif; letter-spacing:-.02em; }
 
 /* ── Scroll story ─────────────────────────────────────────────────────────
-   A tall section with a sticky viewport. `--p` (0→1, written by
-   useStickyProgress) drives every mark, so the whole diagram is scrubbed by
-   the reader rather than autoplayed at them. */
-/* 240vh, not 420vh: at 420 the pinned travel was 2880px at 1440×900 — about 29
-   wheel notches to cross four beats, ~7 per beat, which read as a wall rather
-   than as a story. 240vh costs ~13 notches. Below ~200vh each beat lands in
-   under the ~0.75s the staggered transitions take to settle, so the diagram
-   would be overrun by the scroll instead of scrubbed by it. */
-.rb-story { position:relative; height:240vh; background:var(--rb-ivory); border-bottom:1px solid var(--rb-line); }
+   A pinned section. `--p` (0→1, written by useStoryProgress) drives every
+   mark. The height is what the reader pays in wheel travel, so it buys exactly
+   one viewport of pin: at 420vh the four beats sat behind three-plus viewports
+   of scrolling, which is around thirty wheel notches for four sentences.
+
+   200vh rather than the 240vh that came from main: the story now plays itself
+   once pinned, so the height no longer has to *power* the animation, only hold
+   the reader long enough to see it. The old floor — "below ~200vh each beat
+   lands in under the 0.75s the transitions take to settle" — was a constraint
+   of scroll being the only transport. With the clock driving the floor, the
+   beats take their own time regardless of how fast the reader crosses. */
+.rb-story { position:relative; height:200vh; background:var(--rb-ivory); border-bottom:1px solid var(--rb-line); }
 /* Four per-beat progress tracks cut from the same 0→1 `--p`. Each one runs 0→1
    across its own quarter and then holds, so marks can interpolate *inside* a
    beat instead of snapping at the boundary. This is what makes the shortened
@@ -192,13 +261,19 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
 /* The model: one bar that splits into three shards as the reader scrolls.
    Until beat 1 the three elements have to read as a *single* object, so they
    share one colour and only the outer corners are rounded — three touching
-   blocks in three colours still read as three. */
+   blocks in three colours still read as three.
+
+   The gradient runs vertically, not along the bar: a 90deg gradient restarts
+   inside each shard, so three touching blocks showed two sawtooth seams and
+   read as three even before the split. A 180deg gradient is constant at every
+   x, so the seams vanish and the bar is genuinely one object. */
 .rb-stage-model { position:absolute; left:50%; top:6%; display:flex; gap:0; width:min(310px,34%); height:11px; transform:translateX(-50%); }
 /* The split is scrubbed, not switched: the gap between shards is `--p1` × 5px,
-   so the bar comes apart under the reader's thumb across the whole of beat 1
-   rather than jumping open at its start. No transition on margin — `--p1`
-   already changes once per frame, and a 0.55s ease on top of a scrubbed value
-   only adds lag between the wheel and the mark. */
+   so the bar comes apart across the whole of beat 1 rather than jumping open at
+   its start. No transition on margin — `--p1` already changes once per frame
+   (from scroll or from the autoplay clock, whichever is further along), and a
+   0.55s ease on top of a scrubbed value only adds lag between the transport and
+   the mark. */
 /* The interior corners are what carry the "one object" reading: at --p1 = 0 the
    three blocks butt together with square inner edges and look like one bar; as
    the gap opens those corners round to match the outer ones. Order is
@@ -524,9 +599,10 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
   .rb-menu svg { width:19px; }
   .rb-mobile-nav { position:absolute; z-index:40; display:flex; flex-direction:column; gap:20px; top:78px; left:var(--rb-gutter); right:var(--rb-gutter); padding:24px; border:1px solid var(--rb-line); border-radius:14px; color:var(--rb-ink); background:#f8f5f0; box-shadow:0 20px 60px rgba(30,42,34,.12); animation:rbFade .2s ease-out both; }
   .rb-mobile-nav a { display:flex; align-items:center; min-height:44px; }
-  .rb-hero-copy { width:min(560px,58vw); }
+  .rb-hero-copy { width:min(560px,58vw); transform:translateY(-150px); }
+  .rb-hero-mushroom { left:calc(50% + 82px); width:min(580px,68vw); height:min(500px,60vh,60vw); }
   .rb-globe { right:4%; width:min(86vw,94vh); }
-  .rb-story { height:230vh; }
+  .rb-story { height:190vh; }
   .rb-stage-model { width:min(280px,42%); }
   .rb-stage-devices { width:min(210px,32%); }
   .rb-doors-grid,.rb-pay-rules { grid-template-columns:1fr; }
@@ -566,7 +642,13 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
      against the globe. On a phone the globe stacks above the copy instead, so
      inheriting it added a full extra viewport of empty scroll. */
   .rb-hero-inner { display:block; min-height:0; }
-  .rb-hero-copy { width:auto; padding-top:0; }
+  .rb-hero-copy { width:auto; padding-top:0; transform:none; }
+  /* The renderer declines to mount below 720px — a WebGL specimen with a bloom
+     chain is not what a phone should spend its first frames on. The host then
+     has nothing in it, so hide the box too: otherwise its shade plate paints a
+     diagonal smear across the headline with no organism to justify it. */
+  .rb-hero-mushroom { display:none; }
+  .rb-ground-colony { display:none; }
   .rb-hero h1 { font-size:clamp(40px,12.5vw,54px); }
   .rb-hero-prompt { max-width:none; }
   .rb-hero::after { background:radial-gradient(90% 46% at 50% 16%,transparent 0%,rgba(11,15,12,.55) 55%,rgba(11,15,12,.95) 78%); }
@@ -578,10 +660,9 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
   .rb-page h2 { font-size:clamp(34px,10vw,44px); }
   /* The three-column diagram cannot survive a phone, so the story stacks:
      request on top, devices in a row, answer underneath. */
-  /* Phones scroll in longer swipes than a wheel does, so the travel shrinks
-     less aggressively than the desktop figure: 200vh is ~5 notches-equivalent
-     and still leaves each beat a readable stretch. */
-  .rb-story { height:200vh; }
+  /* Phones swipe in longer strokes than a wheel turns, but the section plays
+     itself here too, so the height only has to hold the reader — 180vh. */
+  .rb-story { height:180vh; }
   .rb-story-sticky { min-height:0; }
   .rb-story-inner { padding-block:80px 40px; }
   /* Tall enough for the stacked layout now that each card carries a layer
@@ -647,6 +728,7 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
 /* Reduced motion: no scrubbing, no travelling dashes. The story collapses to
    its static list and every scroll-triggered entrance starts already finished. */
 @media(prefers-reduced-motion:reduce){
+  .rb-ground-mushroom svg { animation:none; }
   html { scroll-behavior:auto; }
   .rb-page *,.rb-page *::before,.rb-page *::after { animation-duration:.01ms!important; animation-iteration-count:1!important; transition-duration:.01ms!important; }
   .rb-reveal { opacity:1; transform:none; }
@@ -685,4 +767,9 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
   .rb-models-panel,.rb-models-list li,.rb-model-boxes i { opacity:1; transform:none; }
   .rb-model-track i { transform:none; }
   .rb-models-live i { animation:none; }
+  /* The closing mark is simply drawn. The dash is removed outright rather than
+     animated at .01ms: an interrupted trace would leave a gap in the outline,
+     which on this shape reads as a broken cap rather than as a still frame. */
+  .rb-fruit-mark path { animation:none; stroke-dasharray:none; stroke-dashoffset:0; }
+  .rb-fruit-cap { fill-opacity:1; }
 }

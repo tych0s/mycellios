@@ -17,12 +17,54 @@ function prefersReducedMotion(): boolean {
   return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 }
 
+/** How long the whole story takes to play by itself, once it is pinned. */
+export const STORY_SECONDS = 4.4;
+
+/* A frame delta is never trusted beyond this. Background tabs suspend
+   requestAnimationFrame, so the first frame after the reader returns can carry
+   a delta of many seconds — without a clamp that single frame would jump the
+   story straight to its end. */
+const MAX_FRAME_SECONDS = 0.1;
+
+/* Scroll travel reaches 1 at this fraction of the pin, leaving the rest as a
+   settled tail. A reader who crosses the section quickly still sees the payoff
+   land with room to spare instead of at the final pixel. */
+const SETTLE = 0.82;
+
 /**
- * Scrubs a tall sticky section: writes 0→1 travel into `--p` on the element and
+ * Advances the autoplay clock by one frame. Exported for its own sake: this is
+ * the rule that decides whether the reader has to work for the story.
+ */
+export function nextPlayed(played: number, deltaSeconds: number, pinned: boolean): number {
+  if (!pinned || played >= 1) return Math.min(1, played);
+  const step = Math.min(Math.max(0, deltaSeconds), MAX_FRAME_SECONDS) / STORY_SECONDS;
+  return Math.min(1, played + step);
+}
+
+/** Maps 0→1 travel onto a beat index, with the last beat reached before 1. */
+export function beatFor(progress: number, beats: number): number {
+  return Math.min(beats - 1, Math.max(0, Math.floor(progress * beats)));
+}
+
+/** Fraction of the pin the reader has scrolled through, with the settled tail. */
+export function scrollTravel(top: number, height: number, viewport: number): number {
+  const distance = Math.max(1, height - viewport);
+  return Math.min(1, Math.max(0, -top / distance / SETTLE));
+}
+
+/**
+ * Drives a pinned story section: writes 0→1 into `--p` on the element and
  * returns the current beat index. React only re-renders on beat changes, so the
  * per-frame cost stays in CSS.
+ *
+ * The section plays *itself*. As soon as it is pinned an autoplay clock starts,
+ * and progress is the further of the clock and the reader's own scroll — so
+ * standing still shows the whole story in {@link STORY_SECONDS}, while a reader
+ * who wants to move on can scrub past it at their own speed. Neither one can
+ * pull the story backwards, which is what made the section feel like a toll
+ * gate when scroll was the only transport.
  */
-export function useStickyProgress(ref: RefObject<HTMLElement | null>, beats: number): number {
+export function useStoryProgress(ref: RefObject<HTMLElement | null>, beats: number): number {
   const [beat, setBeat] = useState(0);
 
   useEffect(() => {
@@ -35,19 +77,34 @@ export function useStickyProgress(ref: RefObject<HTMLElement | null>, beats: num
     }
 
     let frame = 0;
-    const update = () => {
+    let played = 0;
+    let last = 0;
+
+    const update = (now: number) => {
       frame = 0;
       const rect = element.getBoundingClientRect();
-      const distance = Math.max(1, element.offsetHeight - window.innerHeight);
-      const progress = Math.min(1, Math.max(0, -rect.top / distance));
+      const viewport = window.innerHeight;
+      // Pinned means the sticky child fills the viewport, which is exactly the
+      // window in which the reader is being held — and so the only window in
+      // which playing at them is fair.
+      const pinned = rect.top <= 0 && rect.bottom >= viewport;
+      played = nextPlayed(played, last ? (now - last) / 1000 : 0, pinned);
+      last = now;
+
+      const progress = Math.max(scrollTravel(rect.top, element.offsetHeight, viewport), played);
       element.style.setProperty("--p", progress.toFixed(4));
-      setBeat(Math.min(beats - 1, Math.floor(progress * beats)));
+      setBeat(beatFor(progress, beats));
+
+      // The loop sustains itself only while there is something left to play;
+      // after that the scroll listener alone keeps `--p` honest.
+      if (pinned && played < 1) frame = window.requestAnimationFrame(update);
+      else last = 0;
     };
     const schedule = () => {
       if (!frame) frame = window.requestAnimationFrame(update);
     };
 
-    update();
+    schedule();
     window.addEventListener("scroll", schedule, { passive: true });
     window.addEventListener("resize", schedule);
     return () => {

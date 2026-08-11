@@ -1,0 +1,64 @@
+/* ── The mycelium network ──────────────────────────────────────────────
+ *
+ * Absolute over the whole document rather than fixed to the viewport: the
+ * colony is one continuous organism spanning the page, and its geometry is
+ * generated once in document space. The renderer's own growth canvas is
+ * absolute inside this host and scrolls with the page; the glint canvas it
+ * creates is fixed to the viewport and is what makes the pulses travel.
+ *
+ * The layering problem is the whole story here. Every band on this page paints
+ * its own opaque background, so a canvas *behind* `.rb-page` is painted over
+ * and never seen. The old backdrop solved that with `mix-blend-mode: multiply`
+ * at 9% ink, which worked but is precisely why it was invisible.
+ *
+ * This layer sits above the bands instead, at z-index 1. The sections are
+ * `position: relative` with no z-index of their own, so they paint in the
+ * auto/0 level and the network lands on top of their backgrounds — while
+ * staying below the header (30) and the support assistant (40+), which is
+ * where the interactive chrome has to be.
+ *
+ * `pointer-events: none` keeps it out of every gesture, and it is aria-hidden
+ * at the element, so nothing here is reachable by a pointer or a screen reader.
+ */
+
+.rb-myco-net {
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+/* Dissolve only the document-space roots. Applying this mask to the host also
+   masks its fixed viewport canvas, which made the ambient spores disappear
+   throughout the hero despite being drawn correctly. */
+.rb-myco-net mycelium-field > canvas:first-child {
+  -webkit-mask-image: linear-gradient(180deg, transparent 0, #000 9%);
+  mask-image: linear-gradient(180deg, transparent 0, #000 9%);
+}
+
+/* The page has to establish a containing block for a full-document absolute
+   layer, and it must not clip it. `.rb-page` already sets `overflow: clip`
+   for the horizontal overflow of the section decorations; the network is
+   inside that box, so it is clipped correctly rather than extending the
+   scroll area. */
+.rb-page {
+  position: relative;
+}
+
+/* Section backgrounds stay below the colony, but every real content wrapper
+   sits above it. This keeps the organism visible in the page gutters while
+   guaranteeing that typography, diagrams, cards and controls are never
+   crossed by a filament. The hero has its own explicit layer system. */
+.rb-page > section:not(.rb-hero):not(.rb-story) > * {
+  position: relative;
+  z-index: 2;
+}
+
+/* The story wrapper is already `position: sticky`. Do not assign a position
+   here: doing so would collapse its four-viewport scroll sequence into a
+   normal document block. It only needs the higher painting layer. */
+.rb-story > .rb-story-sticky {
+  z-index: 2;
+}

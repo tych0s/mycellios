@@ -21,8 +21,11 @@ import {
 import { useEffect, useRef, useState, type CSSProperties, type FormEvent, type PointerEvent } from "react";
 import { applySeoMetadata } from "../seo";
 import { SupportAssistant } from "../SupportAssistant";
+import { FruitingMark } from "./FruitingMark";
 import { HeroGlobe } from "./HeroGlobe";
-import { MyceliumBackdrop } from "./MyceliumBackdrop";
+import { HeroGroundColony } from "./HeroGroundColony";
+import { HeroMushroom } from "./HeroMushroom";
+import { MyceliumNetwork } from "./MyceliumNetwork";
 import { LocalStrip } from "./LocalStrip";
 import { ModelsSection } from "./ModelsSection";
 import { PaymentsSection } from "./PaymentsSection";
@@ -246,11 +249,11 @@ export function RebrandLanding() {
 
   return (
     <main className="rb-page" id="rb-top" ref={pageRef}>
-      {/* The brand is a fungal network, so the page grows one while you read:
-          a colony that branches from the story down to the download ask. It is
-          scrubbed by the scroll, never autoplayed, and kept under 10% ink so it
-          is felt rather than looked at. */}
-      <MyceliumBackdrop />
+      {/* The brand is a fungal network, so the page grows one while you read.
+          It is anchored to the base of the hero's mushroom and descends the
+          whole document from there — roots of the organism above it, not a
+          decoration that happens to be nearby. */}
+      <MyceliumNetwork />
 
       <header className="rb-header">
         <div className="rb-header-inner rb-shell">
@@ -271,11 +274,19 @@ export function RebrandLanding() {
 
       <section className="rb-hero" aria-labelledby="rb-hero-title">
         <HeroGlobe />
+        {/* A grounded fruiting body beside the scroll cue. Its foot meets the
+            viewport edge, so the page-wide mycelium can grow from a believable
+            origin instead of from artwork floating behind the headline. */}
+        <HeroMushroom />
+        <HeroGroundColony />
         <div className="rb-hero-inner rb-shell">
           <div className="rb-hero-copy">
             {/* Name the category immediately, then state the product's defining
-                difference without repeating the story section's own headline. */}
-            <h1 id="rb-hero-title" aria-label="The open compute layer for distributed AI.">The open compute layer<br /><em>for distributed AI.</em></h1>
+                difference without repeating the story section's own headline.
+                Broken across three lines rather than two: the copy column is
+                50vw and the hero organism starts at 50% + 110px, so the
+                two-line setting ran the headline under the mushroom. */}
+            <h1 id="rb-hero-title" aria-label="The open compute layer for distributed AI.">The open compute<br />layer<br /><em>for distributed AI.</em></h1>
             {/* Kept under the lede's 470px measure so it sets as one line: the
                 longer version broke with "anyway." orphaned on its own. */}
             <p className="rb-lede">Mycellios splits the model across many machines.</p>
@@ -367,6 +378,12 @@ export function RebrandLanding() {
 
       <section className="rb-closing" aria-labelledby="rb-closing-title">
         <div className="rb-closing-inner rb-shell rb-reveal">
+          {/* Third and last appearance of the fruiting body, and the only still
+              one: the globe shows the network fruiting, the backdrop grows one
+              as you read, and the page ends on the finished organism. Three
+              scales of the same shape from one generator — the payoff of the
+              scroll, standing over the final ask. */}
+          <FruitingMark />
           <Brand />
           <h2 id="rb-closing-title">Many machines.<br /><em>One model.</em></h2>
           <a className="rb-pill rb-pill-light" href="/join">Connect this device <Zap /></a>
