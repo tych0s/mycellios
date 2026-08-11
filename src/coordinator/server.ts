@@ -173,9 +173,64 @@ import {
   verifyWorkerSessionToken,
 } from "./worker-session-token.js";
 import { FleetContributionController } from "./fleet-contribution-control.js";
+import { BillingManager } from "./billing.js";
+import { StablecoinBillingInbound, StripeBillingInbound } from "./billing-inbound.js";
+import {
+  registerBillingInboundRoutes,
+  type BillingInboundRoutesOptions,
+} from "./billing-http.js";
+import {
+  BillingCheckoutError,
+  BillingCheckoutService,
+  StripeRestGateway,
+  type BillingCheckoutServiceConfig,
+  type StripeCheckoutGateway,
+} from "./billing-checkout.js";
+import {
+  StablecoinCheckoutService,
+  type StablecoinCheckoutConfig,
+  type StablecoinPaymentGateway,
+} from "./stablecoin-checkout.js";
+import { BillingOperationsMonitor } from "./billing-operations.js";
+import { SellerEarningsError, SellerEarningsManager } from "./seller-earnings.js";
+import { PayoutError, PayoutManager, type PayoutBatch, type PayoutPolicy } from "./payouts.js";
+import {
+  SellerDestinationError,
+  SellerDestinationManager,
+  type SellerDestinationAttestation,
+} from "./seller-destinations.js";
+import {
+  PayoutDispatchService,
+  type PayoutGateway,
+} from "./payout-dispatch.js";
+import { StripeConnectPayoutGateway } from "./stripe-connect-payout.js";
+import {
+  PayoutSettlementError,
+  PayoutSettlementVerifier,
+  type PayoutSettlementAttestation,
+} from "./payout-settlement.js";
+import {
+  SporeConversionError,
+  SporeConversionQuoteStore,
+  SporeConversionQuoteVerifier,
+  type SporeConversionQuote,
+} from "./spore-conversion.js";
 
 export function automaticActivationFailureIsTransient(message: string): boolean {
   return activationFailureIsTransient(message);
+}
+
+function sellerPayoutJson(batch: PayoutBatch): Omit<PayoutBatch, "destinationReference"> {
+  const { destinationReference: _privateDestinationReference, ...safe } = batch;
+  return safe;
+}
+
+function safeSporeQuote(quote: SporeConversionQuote) {
+  const { signature, sellerId: _sellerId, ...safe } = quote;
+  return {
+    ...safe,
+    signatureDigest: createHash("sha256").update(signature, "utf8").digest("hex"),
+  };
 }
 
 export const DEFAULT_AUTOMATIC_ACTIVATION_RETRY_DELAYS_MS = [
@@ -240,6 +295,15 @@ export interface CoordinatorRuntime {
   mobileHub: MobileComputeHub;
   service: MeshService;
   apiAccess: ApiAccessManager;
+  billing: BillingManager;
+  billingCheckout: BillingCheckoutService | null;
+  stablecoinCheckout: StablecoinCheckoutService | null;
+  billingOperations: BillingOperationsMonitor;
+  sellerEarnings: SellerEarningsManager;
+  sellerPayouts: PayoutManager | null;
+  sellerDestinations: SellerDestinationManager;
+  payoutDispatch: PayoutDispatchService | null;
+  sporeConversionQuotes: SporeConversionQuoteStore | null;
   economicLedger: EconomicLedger;
   executionReceipts: ExecutionReceiptStore;
   physicalContributionEvidence: PhysicalContributionEvidenceAuthority;
@@ -269,6 +333,20 @@ export async function createCoordinator(
     releaseTransactionRoot?: string;
     releaseChunkBodyLimitBytes?: number;
     supabaseAuthService?: SupabaseAuthService;
+    billingInbound?: Omit<BillingInboundRoutesOptions, "manager">;
+    billingCheckout?: {
+      gateway: StripeCheckoutGateway;
+      config: BillingCheckoutServiceConfig;
+    };
+    stablecoinCheckout?: {
+      gateway: StablecoinPaymentGateway;
+      config: StablecoinCheckoutConfig;
+    };
+    sellerPayoutPolicy?: PayoutPolicy;
+    sellerDestinationVerifierKeys?: ReadonlyMap<string, string>;
+    stablePayoutGateway?: PayoutGateway;
+    sporePayoutGateway?: PayoutGateway;
+    payoutSettlementVerifier?: PayoutSettlementVerifier;
     modelCapacityInspector?: typeof inspectHubModelCapacity;
   } = {},
 ): Promise<CoordinatorRuntime> {
@@ -531,11 +609,135 @@ export async function createCoordinator(
     maxConcurrent: config.apiMaxConcurrent ?? 2,
     maxActiveKeys: config.apiMaxActiveKeys ?? 10,
   });
+  const billing = new BillingManager(database, apiAccess);
+  const sellerEarnings = new SellerEarningsManager(database, new Map());
+  const sellerDestinationVerifierKeys = options.sellerDestinationVerifierKeys
+    ?? new Map(config.sellerPayout?.destinationVerifierKeys.map(
+      (entry) => [entry.keyId, entry.publicKey] as const,
+    ) ?? []);
+  const sellerDestinations = new SellerDestinationManager(database, sellerDestinationVerifierKeys);
+  const configuredSellerPayoutPolicy = options.sellerPayoutPolicy ?? (config.sellerPayout
+    ? {
+        minimumUsdMicros: config.sellerPayout.minimumUsdMicros,
+        spore: config.sellerPayout.spore,
+      }
+    : null);
+  const sellerPayouts = configuredSellerPayoutPolicy
+    ? new PayoutManager(database, {
+        ...configuredSellerPayoutPolicy,
+        requireVerifiedDestination: true,
+      })
+    : null;
+  const stablePayoutGateway = options.stablePayoutGateway ?? (config.stripeConnectPayout
+    ? new StripeConnectPayoutGateway(config.stripeConnectPayout)
+    : null);
+  const payoutSettlementVerifier = options.payoutSettlementVerifier ?? (config.sellerPayout
+    ? new PayoutSettlementVerifier(
+        new Map(config.sellerPayout.settlementVerifierKeys.map(
+          (entry) => [entry.keyId, entry.publicKey] as const,
+        )),
+        config.sellerPayout.settlementEvidenceMaxAgeMs,
+      )
+    : null);
+  const sporeConversionQuotes = config.sellerPayout?.sporeConversion
+    ? new SporeConversionQuoteStore(database, new SporeConversionQuoteVerifier({
+        trustedOracleKeys: new Map(config.sellerPayout.sporeConversion.trustedOracleKeys.map(
+          (entry) => [entry.keyId, entry.publicKey] as const,
+        )),
+        approvedAssets: new Map(config.sellerPayout.sporeConversion.approvedAssets.map(
+          (asset) => [`${asset.chainId}:${asset.assetId}`, { tokenDecimals: asset.tokenDecimals }] as const,
+        )),
+        maxQuoteAgeMs: config.sellerPayout.sporeConversion.maxQuoteAgeMs,
+      }))
+    : null;
+  const payoutGateways = {
+    ...(stablePayoutGateway ? { stable: stablePayoutGateway } : {}),
+    ...(options.sporePayoutGateway ? { spore: options.sporePayoutGateway } : {}),
+  };
+  const payoutDispatch = sellerPayouts && Object.keys(payoutGateways).length > 0
+    ? new PayoutDispatchService(database, sellerPayouts, payoutGateways, sporeConversionQuotes)
+    : null;
+  const billingOperations = new BillingOperationsMonitor(database, {
+    stablecoinAllocationStuckMs: 5 * 60_000,
+    payoutDispatchStuckMs: 15 * 60_000,
+    payoutSettlementStuckMs: 7 * 24 * 60 * 60_000,
+  });
+  const configuredBillingInbound = {
+    ...(config.stripeWebhookSecrets && config.stripeWebhookLivemode !== undefined
+      ? {
+          stripe: new StripeBillingInbound({
+            endpointSecrets: config.stripeWebhookSecrets,
+            expectedLivemode: config.stripeWebhookLivemode,
+          }),
+        }
+      : {}),
+    ...(config.stablecoinWatcher
+      ? {
+          stablecoin: new StablecoinBillingInbound({
+            trustedWatcherKeys: new Map(config.stablecoinWatcher.trustedWatcherKeys.map(
+              (entry) => [entry.keyId, entry.publicKey],
+            )),
+            chains: new Map(config.stablecoinWatcher.chains.map(
+              (entry) => [entry.chainId, {
+                asset: entry.asset,
+                minimumConfirmations: entry.minimumConfirmations,
+              }],
+            )),
+          }),
+        }
+      : {}),
+    ...options.billingInbound,
+  };
+  await registerBillingInboundRoutes(app, {
+    manager: billing,
+    ...configuredBillingInbound,
+  });
+  const configuredCheckout = options.billingCheckout ?? (config.stripeCheckout
+    ? {
+        gateway: new StripeRestGateway({ secretKey: config.stripeCheckout.secretKey }),
+        config: {
+          planId: "mycellios-go",
+          planVersion: 1,
+          subscriptionPriceId: config.stripeCheckout.subscriptionPriceId,
+          successUrl: config.stripeCheckout.successUrl,
+          cancelUrl: config.stripeCheckout.cancelUrl,
+          portalReturnUrl: config.stripeCheckout.portalReturnUrl,
+          topUpPacks: config.stripeCheckout.topUpPacks,
+        },
+      }
+    : null);
+  if (config.stripeCheckout) {
+    billing.registerPlan({
+      planId: "mycellios-go",
+      version: 1,
+      priceCurrency: "EUR",
+      priceMicros: 10_000_000,
+      includedTokens: config.stripeCheckout.includedTokens,
+      status: "active",
+    });
+  }
+  const billingCheckout = configuredCheckout
+    ? new BillingCheckoutService(
+        database,
+        billing,
+        configuredCheckout.gateway,
+        configuredCheckout.config,
+      )
+    : null;
+  const stablecoinCheckout = options.stablecoinCheckout
+    ? new StablecoinCheckoutService(
+        database,
+        billing,
+        options.stablecoinCheckout.gateway,
+        options.stablecoinCheckout.config,
+      )
+    : null;
   type ApiRequestPrincipal =
     | { kind: "system" }
     | {
         kind: "user";
         userId: string;
+        email: string | null;
         role: AuthenticatedNetworkUser["role"];
       }
     | ApiKeyPrincipal;
@@ -594,7 +796,12 @@ export async function createCoordinator(
         });
       }
       apiAccess.getOrCreateAccount(user.id);
-      apiPrincipals.set(request, { kind: "user", userId: user.id, role: user.role });
+      apiPrincipals.set(request, {
+        kind: "user",
+        userId: user.id,
+        email: user.email,
+        role: user.role,
+      });
     } catch (error) {
       app.log.warn(
         { error: error instanceof Error ? error.message : String(error) },
@@ -2006,6 +2213,472 @@ export async function createCoordinator(
     ) };
   });
 
+  const billingSessionPrincipal = (request: FastifyRequest) => {
+    const principal = principalFor(request);
+    return principal.kind === "user" ? principal : null;
+  };
+  app.get("/v1/billing/account", async (request, reply) => {
+    const principal = billingSessionPrincipal(request);
+    if (!principal) {
+      return reply.code(403).send({
+        error: {
+          code: "account_session_required",
+          message: "Billing can only be viewed from a signed-in account session.",
+        },
+      });
+    }
+    const plan = billing.getPlan("mycellios-go", 1);
+    const subscription = billing.getSubscription(principal.userId);
+    return {
+      object: "billing_account",
+      checkoutAvailable: Boolean(billingCheckout),
+      portalAvailable: Boolean(billingCheckout?.hasCustomer(principal.userId)),
+      topUpsAvailable: billingCheckout?.hasTopUpPacks() ?? false,
+      tokenDebt: billing.getTokenDebt(principal.userId),
+      plan: plan ? {
+        id: plan.planId,
+        version: plan.version,
+        currency: plan.priceCurrency,
+        amountMicros: plan.priceMicros,
+        includedTokens: plan.includedTokens,
+        status: plan.status,
+      } : null,
+      subscription: subscription ? {
+        planId: subscription.planId,
+        planVersion: subscription.planVersion,
+        provider: subscription.provider,
+        status: subscription.status,
+        periodStart: subscription.periodStart,
+        periodEnd: subscription.periodEnd,
+        statusChangedAt: subscription.statusChangedAt,
+      } : null,
+    };
+  });
+  const billingIdempotencyKey = (request: FastifyRequest): string | null =>
+    parseIdempotencyKey(request.headers["idempotency-key"]) ?? null;
+  const billingRouteContext = (request: FastifyRequest, reply: FastifyReply) => {
+    const principal = billingSessionPrincipal(request);
+    if (!principal) {
+      void reply.code(403).send({
+        error: {
+          code: "account_session_required",
+          message: "Billing can only be managed from a signed-in account session.",
+        },
+      });
+      return null;
+    }
+    const idempotencyKey = billingIdempotencyKey(request);
+    if (!idempotencyKey) {
+      void reply.code(400).send({
+        error: {
+          code: "idempotency_key_required",
+          message: "Billing mutations require an Idempotency-Key header.",
+        },
+      });
+      return null;
+    }
+    if (!billingCheckout) {
+      void reply.code(503).send({
+        error: {
+          code: "stripe_checkout_not_configured",
+          message: "Stripe Checkout is not configured on this coordinator.",
+        },
+      });
+      return null;
+    }
+    return { principal, idempotencyKey, checkout: billingCheckout };
+  };
+
+  app.post("/v1/billing/checkout/subscription", async (request, reply) => {
+    const context = billingRouteContext(request, reply);
+    if (!context) return;
+    try {
+      const result = await context.checkout.createSubscription({
+        userId: context.principal.userId,
+        email: context.principal.email,
+        idempotencyKey: context.idempotencyKey,
+      });
+      return reply.code(result.duplicate ? 200 : 201).send({
+        object: "billing_checkout_session",
+        ...result,
+      });
+    } catch (error) {
+      if (error instanceof BillingCheckoutError) {
+        return reply.code(error.statusCode).send({ error: { code: error.code, message: error.message } });
+      }
+      throw error;
+    }
+  });
+
+  app.post("/v1/billing/checkout/topup", async (request, reply) => {
+    const context = billingRouteContext(request, reply);
+    if (!context) return;
+    const body = z.object({
+      packId: z.string().min(1).max(64),
+    }).strict().parse(request.body);
+    try {
+      const result = await context.checkout.createTopUp({
+        userId: context.principal.userId,
+        email: context.principal.email,
+        packId: body.packId,
+        idempotencyKey: context.idempotencyKey,
+      });
+      return reply.code(result.duplicate ? 200 : 201).send({
+        object: "billing_checkout_session",
+        ...result,
+      });
+    } catch (error) {
+      if (error instanceof BillingCheckoutError) {
+        return reply.code(error.statusCode).send({ error: { code: error.code, message: error.message } });
+      }
+      throw error;
+    }
+  });
+
+  app.post("/v1/billing/portal", async (request, reply) => {
+    const context = billingRouteContext(request, reply);
+    if (!context) return;
+    try {
+      const result = await context.checkout.createPortal({
+        userId: context.principal.userId,
+        email: context.principal.email,
+        idempotencyKey: context.idempotencyKey,
+      });
+      return reply.code(result.duplicate ? 200 : 201).send({
+        object: "billing_portal_session",
+        ...result,
+      });
+    } catch (error) {
+      if (error instanceof BillingCheckoutError) {
+        return reply.code(error.statusCode).send({ error: { code: error.code, message: error.message } });
+      }
+      throw error;
+    }
+  });
+
+  const stablecoinRouteContext = (request: FastifyRequest, reply: FastifyReply) => {
+    const principal = billingSessionPrincipal(request);
+    if (!principal) {
+      void reply.code(403).send({
+        error: {
+          code: "account_session_required",
+          message: "Billing can only be managed from a signed-in account session.",
+        },
+      });
+      return null;
+    }
+    const idempotencyKey = billingIdempotencyKey(request);
+    if (!idempotencyKey) {
+      void reply.code(400).send({
+        error: {
+          code: "idempotency_key_required",
+          message: "Billing mutations require an Idempotency-Key header.",
+        },
+      });
+      return null;
+    }
+    if (!stablecoinCheckout) {
+      void reply.code(503).send({
+        error: {
+          code: "stablecoin_checkout_not_configured",
+          message: "Stablecoin checkout is not configured on this coordinator.",
+        },
+      });
+      return null;
+    }
+    return { principal, idempotencyKey, checkout: stablecoinCheckout };
+  };
+
+  app.post("/v1/billing/crypto/subscription", async (request, reply) => {
+    const context = stablecoinRouteContext(request, reply);
+    if (!context) return;
+    try {
+      const result = await context.checkout.createSubscription({
+        userId: context.principal.userId,
+        idempotencyKey: context.idempotencyKey,
+      });
+      return reply.code(result.duplicate ? 200 : 201).send({
+        object: "stablecoin_payment_intent",
+        ...result,
+      });
+    } catch (error) {
+      if (error instanceof BillingCheckoutError) {
+        return reply.code(error.statusCode).send({ error: { code: error.code, message: error.message } });
+      }
+      throw error;
+    }
+  });
+
+  app.post("/v1/billing/crypto/topup", async (request, reply) => {
+    const context = stablecoinRouteContext(request, reply);
+    if (!context) return;
+    const body = z.object({ packId: z.string().min(1).max(64) }).strict().parse(request.body);
+    try {
+      const result = await context.checkout.createTopUp({
+        userId: context.principal.userId,
+        packId: body.packId,
+        idempotencyKey: context.idempotencyKey,
+      });
+      return reply.code(result.duplicate ? 200 : 201).send({
+        object: "stablecoin_payment_intent",
+        ...result,
+      });
+    } catch (error) {
+      if (error instanceof BillingCheckoutError) {
+        return reply.code(error.statusCode).send({ error: { code: error.code, message: error.message } });
+      }
+      throw error;
+    }
+  });
+
+  const sellerSessionPrincipal = (request: FastifyRequest, reply: FastifyReply) => {
+    const principal = billingSessionPrincipal(request);
+    if (!principal) {
+      void reply.code(403).send({
+        error: {
+          code: "account_session_required",
+          message: "Seller finances can only be managed from a signed-in account session.",
+        },
+      });
+      return null;
+    }
+    return principal;
+  };
+
+  app.get("/v1/seller", async (request, reply) => {
+    const principal = sellerSessionPrincipal(request, reply);
+    if (!principal) return;
+    const available = sellerEarnings.listAvailable(principal.userId);
+    return {
+      object: "seller_account",
+      sellerId: principal.userId,
+      payoutPreference: sellerEarnings.getPayoutPreference(principal.userId),
+      availableUsdMicros: available.reduce((sum, earning) => sum + earning.amountUsdMicros, 0),
+      debtUsdMicros: sellerEarnings.getSellerDebt(principal.userId),
+    };
+  });
+
+  app.get("/v1/seller/earnings", async (request, reply) => {
+    const principal = sellerSessionPrincipal(request, reply);
+    if (!principal) return;
+    const query = z.object({
+      limit: z.coerce.number().int().min(1).max(100).default(50),
+    }).parse(request.query);
+    return {
+      object: "list",
+      data: sellerEarnings.list(principal.userId, query.limit),
+    };
+  });
+
+  app.put("/v1/seller/payout-preference", async (request, reply) => {
+    const principal = sellerSessionPrincipal(request, reply);
+    if (!principal) return;
+    const body = z.object({ method: z.enum(["stable", "spore"]) }).strict().parse(request.body);
+    if (body.method === "spore") {
+      if (!sellerPayouts) {
+        return reply.code(503).send({
+          error: {
+            code: "seller_payouts_not_configured",
+            message: "Seller payout policy is not configured on this coordinator.",
+          },
+        });
+      }
+      try {
+        sellerPayouts.assertPayoutMethodEnabled("spore");
+      } catch (error) {
+        if (error instanceof PayoutError) {
+          return reply.code(409).send({ error: { code: error.code, message: error.message } });
+        }
+        throw error;
+      }
+    }
+    sellerEarnings.setPayoutPreference(principal.userId, body.method);
+    return {
+      object: "seller_payout_preference",
+      sellerId: principal.userId,
+      method: sellerEarnings.getPayoutPreference(principal.userId),
+      appliesTo: "future_earnings",
+    };
+  });
+
+  app.get("/v1/seller/payout-destinations", async (request, reply) => {
+    const principal = sellerSessionPrincipal(request, reply);
+    if (!principal) return;
+    const data = (["stable", "spore"] as const).flatMap((method) => {
+      const destination = sellerDestinations.active(principal.userId, method);
+      return destination ? [{
+        id: destination.id,
+        payoutMethod: destination.payoutMethod,
+        destinationKind: destination.destinationKind,
+        destinationFingerprint: destination.destinationFingerprint,
+        verifiedAt: destination.verifiedAt,
+        expiresAt: destination.expiresAt,
+      }] : [];
+    });
+    return { object: "list", data };
+  });
+
+  app.put("/v1/seller/payout-destinations", async (request, reply) => {
+    const principal = sellerSessionPrincipal(request, reply);
+    if (!principal) return;
+    if (sellerDestinationVerifierKeys.size === 0) {
+      return reply.code(503).send({ error: { code: "destination_verification_not_configured" } });
+    }
+    const body = z.object({
+      schema: z.literal("mycellios.seller-destination.v1"),
+      destinationId: z.string().min(1).max(192),
+      sellerId: z.string().min(1).max(192),
+      payoutMethod: z.enum(["stable", "spore"]),
+      destinationKind: z.enum(["provider_account", "wallet"]),
+      destinationReference: z.string().min(4).max(512),
+      destinationFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+      verifiedAt: z.number().int().positive(),
+      expiresAt: z.number().int().positive(),
+      verifierKeyId: z.string().min(1).max(192),
+      signature: z.string().min(16).max(1024),
+    }).strict().parse(request.body) as SellerDestinationAttestation;
+    if (body.sellerId !== principal.userId) {
+      return reply.code(403).send({ error: { code: "destination_owner_conflict" } });
+    }
+    try {
+      const destination = sellerDestinations.record(body);
+      return reply.code(201).send({
+        object: "seller_payout_destination",
+        id: destination.id,
+        payoutMethod: destination.payoutMethod,
+        destinationKind: destination.destinationKind,
+        destinationFingerprint: destination.destinationFingerprint,
+        verifiedAt: destination.verifiedAt,
+        expiresAt: destination.expiresAt,
+      });
+    } catch (error) {
+      if (error instanceof SellerDestinationError) {
+        return reply.code(409).send({ error: { code: error.code, message: error.message } });
+      }
+      throw error;
+    }
+  });
+
+  app.delete("/v1/seller/payout-destinations/:method", async (request, reply) => {
+    const principal = sellerSessionPrincipal(request, reply);
+    if (!principal) return;
+    const { method } = z.object({ method: z.enum(["stable", "spore"]) }).parse(request.params);
+    if (!sellerDestinations.revoke(principal.userId, method)) {
+      return reply.code(404).send({ error: { code: "payout_destination_not_found" } });
+    }
+    return reply.code(204).send();
+  });
+
+  app.get("/v1/seller/payouts", async (request, reply) => {
+    const principal = sellerSessionPrincipal(request, reply);
+    if (!principal) return;
+    if (!sellerPayouts) {
+      return reply.code(503).send({ error: { code: "seller_payouts_not_configured" } });
+    }
+    const query = z.object({
+      limit: z.coerce.number().int().min(1).max(100).default(50),
+    }).parse(request.query);
+    return {
+      object: "list",
+      data: sellerPayouts.listSellerBatches(principal.userId, query.limit).map(sellerPayoutJson),
+    };
+  });
+
+  app.post("/v1/seller/payouts", async (request, reply) => {
+    const principal = sellerSessionPrincipal(request, reply);
+    if (!principal) return;
+    if (!sellerPayouts) {
+      return reply.code(503).send({ error: { code: "seller_payouts_not_configured" } });
+    }
+    const idempotencyKey = billingIdempotencyKey(request);
+    if (!idempotencyKey) {
+      return reply.code(400).send({ error: { code: "idempotency_key_required" } });
+    }
+    const body = z.object({
+      payoutMethod: z.enum(["stable", "spore"]),
+      earningIds: z.array(z.string().min(1).max(192)).min(1).max(1_000),
+    }).strict().parse(request.body);
+    let result;
+    try {
+      result = sellerPayouts.prepare({
+        sellerId: principal.userId,
+        payoutMethod: body.payoutMethod,
+        earningIds: body.earningIds,
+        idempotencyKey,
+      });
+    } catch (error) {
+      if (error instanceof PayoutError) {
+        return reply.code(error.code.startsWith("invalid_") ? 400 : 409).send({
+          error: { code: error.code, message: error.message },
+        });
+      }
+      throw error;
+    }
+    return reply.code(result.duplicate ? 200 : 201).send({
+      object: "seller_payout",
+      duplicate: result.duplicate,
+      batch: sellerPayoutJson(result.batch),
+    });
+  });
+
+  app.get("/v1/seller/payouts/:batchId", async (request, reply) => {
+    const principal = sellerSessionPrincipal(request, reply);
+    if (!principal) return;
+    if (!sellerPayouts) {
+      return reply.code(503).send({ error: { code: "seller_payouts_not_configured" } });
+    }
+    const { batchId } = z.object({ batchId: z.string().min(1).max(192) }).parse(request.params);
+    const batch = sellerPayouts.getBatch(batchId);
+    if (!batch || batch.sellerId !== principal.userId) {
+      return reply.code(404).send({ error: { code: "payout_not_found" } });
+    }
+    return { object: "seller_payout", batch: sellerPayoutJson(batch) };
+  });
+
+  app.get("/v1/seller/payouts/:batchId/spore-quote", async (request, reply) => {
+    const principal = sellerSessionPrincipal(request, reply);
+    if (!principal) return;
+    if (!sellerPayouts || !sporeConversionQuotes) {
+      return reply.code(503).send({ error: { code: "spore_conversion_not_configured" } });
+    }
+    const { batchId } = z.object({ batchId: z.string().min(1).max(192) }).parse(request.params);
+    const batch = sellerPayouts.getBatch(batchId);
+    if (!batch || batch.sellerId !== principal.userId || batch.payoutMethod !== "spore") {
+      return reply.code(404).send({ error: { code: "payout_not_found" } });
+    }
+    const quote = sporeConversionQuotes.getByBatchId(batchId);
+    if (!quote) return reply.code(404).send({ error: { code: "spore_quote_not_found" } });
+    return {
+      object: "spore_conversion_quote",
+      quote: { ...safeSporeQuote(quote), expired: quote.expiresAt <= Date.now() },
+    };
+  });
+
+  app.delete("/v1/seller/payouts/:batchId", async (request, reply) => {
+    const principal = sellerSessionPrincipal(request, reply);
+    if (!principal) return;
+    if (!sellerPayouts) {
+      return reply.code(503).send({ error: { code: "seller_payouts_not_configured" } });
+    }
+    const { batchId } = z.object({ batchId: z.string().min(1).max(192) }).parse(request.params);
+    const existing = sellerPayouts.getBatch(batchId);
+    if (!existing || existing.sellerId !== principal.userId) {
+      return reply.code(404).send({ error: { code: "payout_not_found" } });
+    }
+    try {
+      const result = sellerPayouts.cancelPrepared(batchId);
+      return {
+        object: "seller_payout",
+        duplicate: result.duplicate,
+        batch: sellerPayoutJson(result.batch),
+      };
+    } catch (error) {
+      if (error instanceof PayoutError) {
+        return reply.code(409).send({ error: { code: error.code, message: error.message } });
+      }
+      throw error;
+    }
+  });
   app.post("/v1/nodes/enrollments", async (request, reply) => {
     const principal = principalFor(request);
     if (principal.kind !== "user") {
@@ -2426,6 +3099,183 @@ export async function createCoordinator(
         ...(query.sourceId ? { sourceId: query.sourceId } : {}),
         ...(query.since ? { since: query.since } : {}),
       }),
+    };
+  });
+
+  app.get("/public/v1/admin/billing-operations", async (request, reply) => {
+    if (!await authorizeAdministrativeMutation(request, reply, ["owner", "admin"])) return;
+    return billingOperations.snapshot();
+  });
+
+  app.post("/public/v1/admin/seller-payouts/:batchId/dispatch", async (request, reply) => {
+    if (!await authorizeAdministrativeMutation(request, reply, ["owner", "admin"])) return;
+    if (!payoutDispatch) {
+      return reply.code(503).send({ error: { code: "stable_payout_gateway_not_configured" } });
+    }
+    const { batchId } = z.object({ batchId: z.string().min(1).max(192) }).parse(request.params);
+    try {
+      const result = await payoutDispatch.dispatch(batchId);
+      return reply.code(result.duplicate ? 200 : 202).send({
+        object: "payout_dispatch",
+        operation: result.operation,
+        batch: sellerPayoutJson(result.batch),
+      });
+    } catch (error) {
+      if (error instanceof PayoutError) {
+        return reply.code(error.code === "payout_not_found" ? 404 : 409).send({
+          error: { code: error.code, message: error.message },
+        });
+      }
+      throw error;
+    }
+  });
+
+  app.get("/public/v1/admin/seller-payouts/:batchId/dispatch", async (request, reply) => {
+    if (!await authorizeAdministrativeMutation(request, reply, ["owner", "admin"])) return;
+    if (!payoutDispatch) {
+      return reply.code(503).send({ error: { code: "payout_gateway_not_configured" } });
+    }
+    const { batchId } = z.object({ batchId: z.string().min(1).max(192) }).parse(request.params);
+    const operation = payoutDispatch.getByBatchId(batchId);
+    if (!operation) return reply.code(404).send({ error: { code: "payout_dispatch_not_found" } });
+    return { object: "payout_dispatch", operation };
+  });
+
+  app.post("/public/v1/admin/seller-payouts/:batchId/reconcile", async (request, reply) => {
+    if (!await authorizeAdministrativeMutation(request, reply, ["owner", "admin"])) return;
+    if (!payoutDispatch) {
+      return reply.code(503).send({ error: { code: "stable_payout_gateway_not_configured" } });
+    }
+    const { batchId } = z.object({ batchId: z.string().min(1).max(192) }).parse(request.params);
+    try {
+      const result = await payoutDispatch.reconcile(batchId);
+      return {
+        object: "payout_dispatch",
+        operation: result.operation,
+        batch: sellerPayoutJson(result.batch),
+      };
+    } catch (error) {
+      if (error instanceof PayoutError) {
+        return reply.code(error.code.includes("not_found") ? 404 : 409).send({
+          error: { code: error.code, message: error.message },
+        });
+      }
+      throw error;
+    }
+  });
+
+  app.post("/public/v1/admin/seller-payouts/:batchId/settlement", async (request, reply) => {
+    if (!await authorizeAdministrativeMutation(request, reply, ["owner", "admin"])) return;
+    if (!payoutDispatch || !payoutSettlementVerifier) {
+      return reply.code(503).send({ error: { code: "payout_settlement_verifier_not_configured" } });
+    }
+    const { batchId } = z.object({ batchId: z.string().min(1).max(192) }).parse(request.params);
+    const evidence = request.body as PayoutSettlementAttestation;
+    try {
+      const verified = payoutSettlementVerifier.verify(evidence);
+      if (verified.batchId !== batchId) {
+        return reply.code(409).send({ error: { code: "payout_settlement_batch_conflict" } });
+      }
+      const result = payoutDispatch.recordSettlement(verified);
+      return reply.code(result.duplicate ? 200 : 202).send({
+        object: "payout_settlement",
+        operation: result.operation,
+        batch: sellerPayoutJson(result.batch),
+      });
+    } catch (error) {
+      if (error instanceof PayoutSettlementError || error instanceof PayoutError) {
+        return reply.code(error.code.includes("not_found") ? 404 : 409).send({
+          error: { code: error.code, message: error.message },
+        });
+      }
+      throw error;
+    }
+  });
+
+  app.get("/public/v1/admin/seller-payouts/:batchId/settlement", async (request, reply) => {
+    if (!await authorizeAdministrativeMutation(request, reply, ["owner", "admin"])) return;
+    if (!payoutDispatch) {
+      return reply.code(503).send({ error: { code: "stable_payout_gateway_not_configured" } });
+    }
+    const { batchId } = z.object({ batchId: z.string().min(1).max(192) }).parse(request.params);
+    const evidence = payoutDispatch.getSettlementEvidence(batchId);
+    if (!evidence) return reply.code(404).send({ error: { code: "payout_settlement_not_found" } });
+    const { signature, ...safeEvidence } = evidence;
+    return {
+      object: "payout_settlement_evidence",
+      evidence: {
+        ...safeEvidence,
+        signatureDigest: createHash("sha256").update(signature, "utf8").digest("hex"),
+      },
+    };
+  });
+
+  app.post("/public/v1/admin/seller-payouts/:batchId/spore-quote", async (request, reply) => {
+    if (!await authorizeAdministrativeMutation(request, reply, ["owner", "admin"])) return;
+    if (!sporeConversionQuotes) {
+      return reply.code(503).send({ error: { code: "spore_conversion_not_configured" } });
+    }
+    const { batchId } = z.object({ batchId: z.string().min(1).max(192) }).parse(request.params);
+    try {
+      const input = request.body as SporeConversionQuote;
+      if (input.batchId !== batchId) {
+        return reply.code(409).send({ error: { code: "spore_quote_batch_conflict" } });
+      }
+      const result = sporeConversionQuotes.record(input);
+      return reply.code(result.duplicate ? 200 : 201).send({
+        object: "spore_conversion_quote",
+        duplicate: result.duplicate,
+        quote: safeSporeQuote(result.quote),
+      });
+    } catch (error) {
+      if (error instanceof SporeConversionError) {
+        return reply.code(error.code.endsWith("not_found") ? 404 : 409).send({
+          error: { code: error.code, message: error.message },
+        });
+      }
+      throw error;
+    }
+  });
+
+  app.get("/public/v1/admin/seller-payouts/:batchId/spore-quote", async (request, reply) => {
+    if (!await authorizeAdministrativeMutation(request, reply, ["owner", "admin"])) return;
+    if (!sporeConversionQuotes) {
+      return reply.code(503).send({ error: { code: "spore_conversion_not_configured" } });
+    }
+    const { batchId } = z.object({ batchId: z.string().min(1).max(192) }).parse(request.params);
+    const quote = sporeConversionQuotes.getByBatchId(batchId);
+    if (!quote) return reply.code(404).send({ error: { code: "spore_quote_not_found" } });
+    return { object: "spore_conversion_quote", quote: safeSporeQuote(quote) };
+  });
+
+  app.get("/public/v1/admin/seller-payouts/:batchId/spore-quote-history", async (request, reply) => {
+    if (!await authorizeAdministrativeMutation(request, reply, ["owner", "admin"])) return;
+    if (!sporeConversionQuotes) {
+      return reply.code(503).send({ error: { code: "spore_conversion_not_configured" } });
+    }
+    const { batchId } = z.object({ batchId: z.string().min(1).max(192) }).parse(request.params);
+    const query = z.object({
+      limit: z.coerce.number().int().min(1).max(100).default(50),
+      afterRecordedAt: z.coerce.number().int().nonnegative().optional(),
+      afterQuoteId: z.string().min(1).max(192).optional(),
+    }).refine(
+      (value) => (value.afterRecordedAt === undefined) === (value.afterQuoteId === undefined),
+      { message: "Both cursor fields are required." },
+    ).parse(request.query);
+    const after = query.afterRecordedAt === undefined ? undefined : {
+      recordedAt: query.afterRecordedAt,
+      quoteId: query.afterQuoteId!,
+    };
+    const history = sporeConversionQuotes.listHistoryByBatchId(batchId, query.limit + 1, after);
+    const hasMore = history.length > query.limit;
+    const quotes = history.slice(0, query.limit);
+    if (quotes.length === 0) return reply.code(404).send({ error: { code: "spore_quote_history_not_found" } });
+    const last = quotes.at(-1)!;
+    return {
+      object: "spore_conversion_quote_history",
+      hasMore,
+      nextCursor: hasMore ? { recordedAt: last.recordedAt, quoteId: last.quoteId } : null,
+      quotes: quotes.map((quote) => safeSporeQuote(quote)),
     };
   });
 
@@ -3929,6 +4779,29 @@ export async function createCoordinator(
         error: { code: error.code, message: error.message },
       });
     }
+    if (error instanceof BillingCheckoutError) {
+      return reply.code(error.statusCode).send({
+        error: { code: error.code, message: error.message },
+      });
+    }
+    if (
+      error instanceof PayoutError
+      || (error instanceof Error
+        && error.name === "PayoutError"
+        && typeof (error as Error & { code?: unknown }).code === "string")
+    ) {
+      const payoutError = error as PayoutError;
+      const statusCode = payoutError.code === "payout_not_found" ? 404
+        : payoutError.code === "payout_gateway_unavailable" ? 503
+          : payoutError.code.startsWith("invalid_") ? 400
+            : 409;
+      return reply.code(statusCode).send({
+        error: { code: payoutError.code, message: payoutError.message },
+      });
+    }
+    if (error instanceof SellerEarningsError) {
+      return reply.code(400).send({ error: { code: error.code, message: error.message } });
+    }
     if (error instanceof WorkerAdmissionError) {
       return reply.code(error.statusCode).send({
         error: { code: error.code, message: error.message },
@@ -3949,6 +4822,15 @@ export async function createCoordinator(
     mobileHub,
     service,
     apiAccess,
+    billing,
+    billingCheckout,
+    stablecoinCheckout,
+    billingOperations,
+    sellerEarnings,
+    sellerPayouts,
+    sellerDestinations,
+    payoutDispatch,
+    sporeConversionQuotes,
     economicLedger,
     executionReceipts,
     physicalContributionEvidence,

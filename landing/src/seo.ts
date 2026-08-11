@@ -163,6 +163,12 @@ export const SEO_PAGES = {
     canonicalPath: "/admin",
     robots: "noindex, nofollow, noarchive",
   },
+  "/account": {
+    title: "Account and subscription | mycellios",
+    description: "Secure account, subscription, billing and usage management for mycellios.",
+    canonicalPath: "/account",
+    robots: "noindex, nofollow, noarchive",
+  },
 } as const satisfies Record<string, SeoPage>;
 
 export type SeoPath = keyof typeof SEO_PAGES;

@@ -27,7 +27,7 @@ const page = path === "/create" ? <CreateStudio />
   : path === "/earn" ? <EarnStudio />
   : path.startsWith("/spore") ? <SporeStudio />
   : surface === "network" ? <NetworkPage />
-  : surface === "panel" ? <Panel />
+  : surface === "panel" ? <Panel accountEntry={path === "/account"} />
   : <RebrandLanding />;
 
 /*

@@ -116,6 +116,7 @@ import {
   type PublicAuthConfig,
 } from "./auth";
 import { ApiAccessPanel } from "./ApiAccessPanel";
+import { BillingAccountPanel } from "./BillingAccountPanel";
 import {
   loadApiAccount,
   loadApiUsage,
@@ -134,6 +135,7 @@ type PanelMode = "simple" | "developer";
 
 interface PanelProps {
   mobileEntry?: boolean;
+  accountEntry?: boolean;
 }
 
 interface PublicGpu {
@@ -330,7 +332,7 @@ export function ApiQuotaBadge({ account }: { account: ApiAccount | null }) {
   ><Coins size={14} />{formatCompactTokens(account.token_balance)} API tokens</span>;
 }
 
-function Panel({ mobileEntry = false }: PanelProps = {}) {
+function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
   const localBrowser = ["localhost", "127.0.0.1", "::1", "[::1]"].includes(window.location.hostname);
   const localProductionProxy = localBrowser && window.location.port === "4174";
   const [panelMode, setPanelMode] = useState<PanelMode>(initialPanelMode);
@@ -356,7 +358,7 @@ function Panel({ mobileEntry = false }: PanelProps = {}) {
   const [networkIdentity, setNetworkIdentity] = useState<NetworkIdentity | null>(null);
   const [authReady, setAuthReady] = useState(false);
   const [apiAccount, setApiAccount] = useState<ApiAccount | null>(null);
-  const [authOpen, setAuthOpen] = useState(false);
+  const [authOpen, setAuthOpen] = useState(accountEntry);
   const [theme, setTheme] = useState<"dark" | "light">(() => {
     const saved = window.localStorage.getItem("mycellios.theme");
     if (saved === "light" || saved === "dark") return saved;
@@ -879,6 +881,7 @@ function Panel({ mobileEntry = false }: PanelProps = {}) {
           setAuthOpen(false);
         }}
         onSignOut={() => void disconnectAccount().finally(() => setAuthOpen(false))}
+        initialTab={accountEntry ? "billing" : "account"}
         onClose={() => setAuthOpen(false)}
       />}
       </div>
@@ -1008,6 +1011,7 @@ function AccountModal({
   account,
   onAuthenticated,
   onSignOut,
+  initialTab = "account",
   onClose,
 }: {
   config: PublicAuthConfig;
@@ -1016,6 +1020,7 @@ function AccountModal({
   account: ApiAccount | null;
   onAuthenticated: (session: AuthSession, identity: NetworkIdentity) => void;
   onSignOut: () => void;
+  initialTab?: "account" | "billing" | "usage";
   onClose: () => void;
 }) {
   const [mode, setMode] = useState<"signin" | "signup">("signin");
@@ -1024,7 +1029,7 @@ function AccountModal({
   const [busy, setBusy] = useState(false);
   const [providerBusy, setProviderBusy] = useState<"x" | "metamask" | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [accountTab, setAccountTab] = useState<"account" | "usage">("account");
+  const [accountTab, setAccountTab] = useState<"account" | "billing" | "usage">(initialTab);
   const [usage, setUsage] = useState<ApiUsage[]>([]);
   const [usageBusy, setUsageBusy] = useState(false);
   const dialogRef = useRef<HTMLElement>(null);
@@ -1123,7 +1128,7 @@ function AccountModal({
       <button className="account-modal-close" aria-label="Close" onClick={onClose}><X size={18} /></button>
       <div className="account-modal-brand"><img src={brandIcon} alt="" /><span>MYCELLIOS ID</span></div>
       {session && identity ? <>
-        <div className="account-detail-tabs"><button className={accountTab === "account" ? "active" : ""} onClick={() => setAccountTab("account")}>Account</button><button className={accountTab === "usage" ? "active" : ""} onClick={() => setAccountTab("usage")}>Usage</button></div>
+        <div className="account-detail-tabs"><button className={accountTab === "account" ? "active" : ""} onClick={() => setAccountTab("account")}>Account</button><button className={accountTab === "billing" ? "active" : ""} onClick={() => setAccountTab("billing")}>Plan</button><button className={accountTab === "usage" ? "active" : ""} onClick={() => setAccountTab("usage")}>Usage</button></div>
         <AccountDetails tab={accountTab} titleId={titleId} session={session} identity={identity} account={account} usage={usage} usageBusy={usageBusy} onSignOut={onSignOut} />
       </> : <>
         <h2 id={titleId}>{mode === "signin" ? "Welcome back" : "Create your account"}</h2>
@@ -1152,7 +1157,7 @@ function AccountModal({
 }
 
 export function AccountDetails({ tab, titleId, session, identity, account, usage, usageBusy, onSignOut }: {
-  tab: "account" | "usage";
+  tab: "account" | "billing" | "usage";
   titleId: string;
   session: AuthSession;
   identity: NetworkIdentity;
@@ -1175,6 +1180,8 @@ export function AccountDetails({ tab, titleId, session, identity, account, usage
     <div className="account-facts"><span><small>MEMBER SINCE</small><strong>{account ? new Date(account.created_at).toLocaleDateString() : "—"}</strong></span><span><small>PROMPTS SENT</small><strong>{account?.request_count ?? 0}</strong></span><span><small>API TOKEN BALANCE</small><strong>{formatCompactTokens(account?.token_balance ?? 0)} tokens</strong></span></div>
     <button className="account-signout" onClick={onSignOut}><LogOut size={16} />Sign out</button>
   </>;
+
+  if (tab === "billing") return <BillingAccountPanel session={session} titleId={titleId} />;
 
   return <>
     <h2 id={titleId}>Usage</h2>

@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
 import { generateKeyPairSync } from "node:crypto";
+import { describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -63,6 +63,187 @@ describe("coordinator network configuration security", () => {
     );
   });
 
+  it("requires a complete server-side Stripe Checkout configuration", () => {
+    expect(() => loadCoordinatorConfig({
+      GPU_MESH_DB: ":memory:",
+      MYCELLIOS_STRIPE_SECRET_KEY: "sk_test_1234567890abcdef",
+    })).toThrow("Stripe Checkout requires");
+
+    const config = loadCoordinatorConfig({
+      GPU_MESH_DB: ":memory:",
+      MYCELLIOS_STRIPE_SECRET_KEY: "sk_test_1234567890abcdef",
+      MYCELLIOS_STRIPE_GO_PRICE_ID: "price_go_1",
+      MYCELLIOS_GO_INCLUDED_TOKENS: "50000",
+      MYCELLIOS_BILLING_SUCCESS_URL: "https://mycellios.com/account?checkout=success",
+      MYCELLIOS_BILLING_CANCEL_URL: "https://mycellios.com/account?checkout=cancelled",
+      MYCELLIOS_BILLING_PORTAL_RETURN_URL: "https://mycellios.com/account",
+      MYCELLIOS_BILLING_TOPUP_PACKS_JSON: JSON.stringify([{
+        packId: "boost-5",
+        amountMicros: 5_000_000,
+        currency: "EUR",
+        tokenAmount: 20_000,
+        stripePriceId: "price_boost_5",
+      }]),
+    });
+    expect(config.stripeCheckout).toMatchObject({
+      subscriptionPriceId: "price_go_1",
+      includedTokens: 50_000,
+      topUpPacks: [{ packId: "boost-5", tokenAmount: 20_000 }],
+    });
+  });
+
+  it("loads stablecoin watcher trust and finality policy from configuration", () => {
+    const publicKey = generateKeyPairSync("ed25519").publicKey
+      .export({ type: "spki", format: "pem" }).toString();
+    const config = loadCoordinatorConfig({
+      GPU_MESH_DB: ":memory:",
+      MYCELLIOS_STABLECOIN_WATCHER_CONFIG_JSON: JSON.stringify({
+        trustedWatcherKeys: [{ keyId: "watcher-primary", publicKey }],
+        chains: [{ chainId: "base-mainnet", asset: "USDC", minimumConfirmations: 20 }],
+      }),
+    });
+    expect(config.stablecoinWatcher).toMatchObject({
+      trustedWatcherKeys: [{ keyId: "watcher-primary" }],
+      chains: [{ chainId: "base-mainnet", asset: "USDC", minimumConfirmations: 20 }],
+    });
+    expect(() => loadCoordinatorConfig({
+      GPU_MESH_DB: ":memory:",
+      MYCELLIOS_STABLECOIN_WATCHER_CONFIG_JSON: "[]",
+    })).toThrow("must contain an object");
+  });
+
+  it("loads seller payout policy and verifier keys as one fail-closed bundle", () => {
+    const publicKey = generateKeyPairSync("ed25519").publicKey
+      .export({ type: "spki", format: "pem" }).toString();
+    const config = loadCoordinatorConfig({
+      GPU_MESH_DB: ":memory:",
+      MYCELLIOS_SELLER_PAYOUT_CONFIG_JSON: JSON.stringify({
+        minimumUsdMicros: 10_000_000,
+        spore: {
+          legalApproved: false,
+          custodyApproved: false,
+          liquidityApproved: false,
+          antifraudApproved: false,
+        },
+        destinationVerifierKeys: [{ keyId: "payout-kyc-primary", publicKey }],
+        settlementVerifierKeys: [{ keyId: "payout-settlement-primary", publicKey }],
+        settlementEvidenceMaxAgeMs: 900_000,
+      }),
+    });
+    expect(config.sellerPayout).toMatchObject({
+      minimumUsdMicros: 10_000_000,
+      spore: { legalApproved: false, antifraudApproved: false },
+      destinationVerifierKeys: [{ keyId: "payout-kyc-primary" }],
+      settlementVerifierKeys: [{ keyId: "payout-settlement-primary" }],
+      settlementEvidenceMaxAgeMs: 900_000,
+    });
+    const payoutBundle = JSON.stringify({
+      minimumUsdMicros: 10_000_000,
+      spore: {
+        legalApproved: false, custodyApproved: false,
+        liquidityApproved: false, antifraudApproved: false,
+      },
+      destinationVerifierKeys: [{ keyId: "payout-kyc-primary", publicKey }],
+      settlementVerifierKeys: [{ keyId: "payout-settlement-primary", publicKey }],
+      settlementEvidenceMaxAgeMs: 900_000,
+    });
+    expect(loadCoordinatorConfig({
+      GPU_MESH_DB: ":memory:",
+      MYCELLIOS_SELLER_PAYOUT_CONFIG_JSON: payoutBundle,
+      MYCELLIOS_STRIPE_CONNECT_SECRET_KEY: "sk_test_1234567890abcdef",
+      MYCELLIOS_STRIPE_CONNECT_API_VERSION: "2025-10-29.clover",
+    }).stripeConnectPayout).toMatchObject({ apiVersion: "2025-10-29.clover" });
+    expect(() => loadCoordinatorConfig({
+      GPU_MESH_DB: ":memory:",
+      MYCELLIOS_SELLER_PAYOUT_CONFIG_JSON: payoutBundle,
+      MYCELLIOS_STRIPE_CONNECT_SECRET_KEY: "sk_test_1234567890abcdef",
+    })).toThrow("and MYCELLIOS_STRIPE_CONNECT_API_VERSION together");
+
+    expect(() => loadCoordinatorConfig({
+      GPU_MESH_DB: ":memory:",
+      MYCELLIOS_SELLER_PAYOUT_CONFIG_JSON: JSON.stringify({
+        minimumUsdMicros: 10_000_000,
+        spore: { legalApproved: false },
+        destinationVerifierKeys: [{ keyId: "payout-kyc-primary", publicKey }],
+        settlementVerifierKeys: [{ keyId: "payout-settlement-primary", publicKey }],
+        settlementEvidenceMaxAgeMs: 900_000,
+      }),
+    })).toThrow("all SPORE gates");
+    expect(() => loadCoordinatorConfig({
+      GPU_MESH_DB: ":memory:",
+      MYCELLIOS_SELLER_PAYOUT_CONFIG_JSON: JSON.stringify({
+        minimumUsdMicros: 10_000_000,
+        spore: {
+          legalApproved: false, custodyApproved: false,
+          liquidityApproved: false, antifraudApproved: false,
+        },
+        destinationVerifierKeys: [],
+        settlementVerifierKeys: [{ keyId: "payout-settlement-primary", publicKey }],
+        settlementEvidenceMaxAgeMs: 900_000,
+      }),
+    })).toThrow("at least one destination verifier key");
+    expect(() => loadCoordinatorConfig({
+      GPU_MESH_DB: ":memory:",
+      MYCELLIOS_SELLER_PAYOUT_CONFIG_JSON: JSON.stringify({
+        minimumUsdMicros: 10_000_000,
+        spore: {
+          legalApproved: false, custodyApproved: false,
+          liquidityApproved: false, antifraudApproved: false,
+        },
+        destinationVerifierKeys: [{ keyId: "bad-key", publicKey: "x".repeat(64) }],
+        settlementVerifierKeys: [{ keyId: "payout-settlement-primary", publicKey }],
+        settlementEvidenceMaxAgeMs: 900_000,
+      }),
+    })).toThrow("valid Ed25519 public keys");
+    expect(() => loadCoordinatorConfig({
+      GPU_MESH_DB: ":memory:",
+      MYCELLIOS_SELLER_PAYOUT_CONFIG_JSON: JSON.stringify({
+        minimumUsdMicros: 10_000_000,
+        spore: {
+          legalApproved: false, custodyApproved: false,
+          liquidityApproved: false, antifraudApproved: false,
+        },
+        destinationVerifierKeys: [{ keyId: "payout-kyc-primary", publicKey }],
+        settlementVerifierKeys: [],
+        settlementEvidenceMaxAgeMs: 900_000,
+      }),
+    })).toThrow("at least one settlement verifier key");
+    expect(() => loadCoordinatorConfig({
+      GPU_MESH_DB: ":memory:",
+      MYCELLIOS_SELLER_PAYOUT_CONFIG_JSON: JSON.stringify({
+        minimumUsdMicros: 10_000_000,
+        spore: {
+          legalApproved: false, custodyApproved: false,
+          liquidityApproved: false, antifraudApproved: false,
+        },
+        destinationVerifierKeys: [{ keyId: "payout-kyc-primary", publicKey }],
+        settlementVerifierKeys: [{ keyId: "payout-settlement-primary", publicKey }],
+        settlementEvidenceMaxAgeMs: 30_000,
+      }),
+    })).toThrow("between 60000 and 86400000");
+
+    const sporeBundle = JSON.parse(payoutBundle) as Record<string, unknown>;
+    sporeBundle.spore = {
+      legalApproved: true, custodyApproved: true,
+      liquidityApproved: true, antifraudApproved: true,
+    };
+    expect(() => loadCoordinatorConfig({
+      GPU_MESH_DB: ":memory:",
+      MYCELLIOS_SELLER_PAYOUT_CONFIG_JSON: JSON.stringify(sporeBundle),
+    })).toThrow("requires a complete sporeConversion policy");
+    sporeBundle.sporeConversion = {
+      trustedOracleKeys: [{ keyId: "spore-oracle-primary", publicKey }],
+      approvedAssets: [{ chainId: "base", assetId: "spore-contract-1", tokenDecimals: 18 }],
+      maxQuoteAgeMs: 300_000,
+    };
+    expect(loadCoordinatorConfig({
+      GPU_MESH_DB: ":memory:",
+      MYCELLIOS_SELLER_PAYOUT_CONFIG_JSON: JSON.stringify(sporeBundle),
+    }).sellerPayout?.sporeConversion).toMatchObject({
+      approvedAssets: [{ chainId: "base", tokenDecimals: 18 }],
+      trustedOracleKeys: [{ keyId: "spore-oracle-primary" }],
+    });
+  });
   it("loads an Ed25519 component-update keyring for safe key rotation", () => {
     const root = mkdtempSync(join(tmpdir(), "mycellios-keyring-"));
     try {

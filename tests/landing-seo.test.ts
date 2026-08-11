@@ -18,6 +18,7 @@ describe("landing SEO contract", () => {
     expect(new Set(titles).size).toBe(titles.length);
     expect(new Set(canonicals).size).toBe(canonicals.length);
     expect(SEO_PAGES["/admin"].robots).toContain("noindex");
+    expect(SEO_PAGES["/account"].robots).toContain("noindex");
     for (const path of INDEXABLE_SEO_PATHS) {
       expect(SEO_PAGES[path].robots).toMatch(/^index,/);
       expect(SEO_PAGES[path].structuredData).toBeDefined();

@@ -46,6 +46,44 @@ describe("coordinator crash recovery", () => {
     database.close();
   });
 
+  it("migrates schema v30 dispatch operations with nullable SPORE quote audit fields", () => {
+    const directory = mkdtempSync(join(tmpdir(), "gpu-mesh-v30-migration-"));
+    directories.push(directory);
+    const path = join(directory, "mesh.db");
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`
+      CREATE TABLE schema_meta (version INTEGER NOT NULL);
+      INSERT INTO schema_meta(version) VALUES (30);
+      CREATE TABLE payout_dispatch_operations (
+        id TEXT PRIMARY KEY,
+        batch_id TEXT NOT NULL UNIQUE,
+        payout_method TEXT NOT NULL,
+        dispatch_key TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL,
+        external_reference TEXT,
+        settlement_reference TEXT,
+        last_error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        reconciled_at INTEGER
+      );
+      INSERT INTO payout_dispatch_operations(
+        id, batch_id, payout_method, dispatch_key, state, created_at, updated_at
+      ) VALUES ('dispatch-legacy', 'batch-legacy', 'stable', 'payout:batch-legacy',
+                'submitted', 1, 1);
+    `);
+    legacy.close();
+
+    const migrated = new MeshDatabase(path);
+    expect((migrated.raw.prepare("SELECT version FROM schema_meta").get() as { version: number }).version)
+      .toBe(31);
+    expect(migrated.raw.prepare(
+      `SELECT spore_quote_id, spore_quote_attestation_digest
+       FROM payout_dispatch_operations WHERE id = 'dispatch-legacy'`,
+    ).get()).toEqual({ spore_quote_id: null, spore_quote_attestation_digest: null });
+    migrated.close();
+  });
+
   it("migrates a version 2 worker database without losing registered rows", () => {
     const directory = mkdtempSync(join(tmpdir(), "gpu-mesh-v2-migration-"));
     directories.push(directory);
@@ -77,7 +115,11 @@ describe("coordinator crash recovery", () => {
     const row = migrated.raw
       .prepare("SELECT id, deregistered FROM workers WHERE id = 'wrk-existing'")
       .get() as { id: string; deregistered: number };
-    expect(version.version).toBe(26);
+    expect(version.version).toBe(31);
+    expect(migrated.raw.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'payout_settlement_evidence'",
+    ).get()).toEqual({ name: "payout_settlement_evidence" });
+    expect(version.version).toBe(31);
     expect(row).toEqual({ id: "wrk-existing", deregistered: 1 });
     migrated.close();
   });
@@ -114,7 +156,7 @@ describe("coordinator crash recovery", () => {
     const row = migrated.raw
       .prepare("SELECT id, deregistered FROM workers WHERE id = 'wrk-partially-migrated'")
       .get() as { id: string; deregistered: number };
-    expect(version.version).toBe(26);
+    expect(version.version).toBe(31);
     expect(row).toEqual({ id: "wrk-partially-migrated", deregistered: 1 });
     migrated.close();
 
@@ -122,7 +164,7 @@ describe("coordinator crash recovery", () => {
     expect(
       (reopened.raw.prepare("SELECT version FROM schema_meta").get() as { version: number })
         .version,
-    ).toBe(26);
+    ).toBe(31);
     reopened.close();
   });
 
@@ -158,7 +200,7 @@ describe("coordinator crash recovery", () => {
     expect(columns.some((column) => column.name === "activation_error")).toBe(true);
     expect(
       (migrated.raw.prepare("SELECT version FROM schema_meta").get() as { version: number }).version,
-    ).toBe(26);
+    ).toBe(31);
     migrated.close();
   });
 
@@ -183,7 +225,7 @@ describe("coordinator crash recovery", () => {
     const migrated = new MeshDatabase(path);
     const columns = migrated.raw.prepare("PRAGMA table_info(economic_settlements)").all() as Array<{ name: string }>;
     expect(columns.some(({ name }) => name === "contribution_evidence_id")).toBe(true);
-    expect((migrated.raw.prepare("SELECT version FROM schema_meta").get() as { version: number }).version).toBe(26);
+    expect((migrated.raw.prepare("SELECT version FROM schema_meta").get() as { version: number }).version).toBe(31);
     migrated.close();
   });
 

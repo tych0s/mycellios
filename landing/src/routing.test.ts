@@ -6,6 +6,7 @@ import {
   panelLocation,
   panelRoute,
   panelViewFromLocation,
+  resolveLandingSurface,
   visiblePanelRoutes,
 } from "./routing";
 
@@ -44,6 +45,11 @@ describe("panel information architecture", () => {
     expect(normalizePanelView("unknown")).toBeNull();
     expect(panelLocation("overview")).toBe("/network?view=overview");
     expect(normalizePanelView("settings")).toBeNull();
+  });
+
+  it("routes Stripe returns to the account surface", () => {
+    expect(resolveLandingSurface("/account", "?checkout=success")).toBe("panel");
+    expect(panelViewFromLocation("/account", "?checkout=success")).toBe("overview");
   });
 
   it("keeps the web contribution route and exposes no retired desktop views", () => {

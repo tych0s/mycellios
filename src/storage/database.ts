@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-const SCHEMA_VERSION = 26;
+const SCHEMA_VERSION = 31;
 
 export interface PersistenceOutboxRow {
   id: number;
@@ -414,6 +414,361 @@ export class MeshDatabase {
       ON api_usage(job_id)
       WHERE job_id IS NOT NULL;
 
+      CREATE TABLE IF NOT EXISTS billing_plans (
+        plan_id TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK(version > 0),
+        price_currency TEXT NOT NULL,
+        price_micros INTEGER NOT NULL CHECK(price_micros > 0),
+        included_tokens INTEGER NOT NULL CHECK(included_tokens > 0),
+        status TEXT NOT NULL CHECK(status IN ('draft', 'active', 'retired')),
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY(plan_id, version)
+      );
+
+      CREATE TABLE IF NOT EXISTS billing_subscriptions (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES api_accounts(user_id) ON DELETE CASCADE,
+        plan_id TEXT NOT NULL,
+        plan_version INTEGER NOT NULL,
+        provider TEXT NOT NULL CHECK(provider IN ('stripe', 'stablecoin')),
+        provider_subscription_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('active', 'past_due', 'cancelled')),
+        period_start INTEGER NOT NULL,
+        period_end INTEGER NOT NULL,
+        status_changed_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY(plan_id, plan_version) REFERENCES billing_plans(plan_id, version),
+        UNIQUE(provider, provider_subscription_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS billing_subscriptions_user_status
+      ON billing_subscriptions(user_id, status, period_end);
+
+      CREATE TABLE IF NOT EXISTS billing_events (
+        id TEXT PRIMARY KEY,
+        provider TEXT NOT NULL CHECK(provider IN ('stripe', 'stablecoin')),
+        provider_event_id TEXT NOT NULL,
+        event_type TEXT NOT NULL CHECK(event_type IN ('subscription_paid', 'topup_paid')),
+        user_id TEXT NOT NULL REFERENCES api_accounts(user_id) ON DELETE CASCADE,
+        event_digest TEXT NOT NULL,
+        external_reference TEXT NOT NULL,
+        amount_micros INTEGER NOT NULL CHECK(amount_micros > 0),
+        currency TEXT NOT NULL,
+        occurred_at INTEGER NOT NULL,
+        processed_at INTEGER NOT NULL,
+        UNIQUE(provider, provider_event_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS billing_events_user_occurred
+      ON billing_events(user_id, occurred_at DESC);
+
+      CREATE TABLE IF NOT EXISTS billing_topup_quotes (
+        quote_id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES api_accounts(user_id) ON DELETE CASCADE,
+        amount_micros INTEGER NOT NULL CHECK(amount_micros > 0),
+        currency TEXT NOT NULL,
+        token_amount INTEGER NOT NULL CHECK(token_amount > 0),
+        status TEXT NOT NULL CHECK(status IN ('open', 'consumed')),
+        consumed_event_key TEXT UNIQUE,
+        expires_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        consumed_at INTEGER
+      );
+
+      CREATE INDEX IF NOT EXISTS billing_topup_quotes_user_status
+      ON billing_topup_quotes(user_id, status, expires_at);
+
+      CREATE TABLE IF NOT EXISTS billing_customers (
+        provider TEXT NOT NULL CHECK(provider IN ('stripe')),
+        user_id TEXT NOT NULL REFERENCES api_accounts(user_id) ON DELETE CASCADE,
+        provider_customer_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(provider, user_id),
+        UNIQUE(provider, provider_customer_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS billing_checkout_operations (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES api_accounts(user_id) ON DELETE CASCADE,
+        idempotency_key TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('subscription', 'topup', 'portal')),
+        request_digest TEXT NOT NULL,
+        quote_id TEXT REFERENCES billing_topup_quotes(quote_id),
+        status TEXT NOT NULL CHECK(status IN ('pending', 'completed')),
+        provider_session_id TEXT,
+        provider_url TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(user_id, idempotency_key)
+      );
+
+      CREATE INDEX IF NOT EXISTS billing_checkout_operations_user_created
+      ON billing_checkout_operations(user_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS billing_stablecoin_intents (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES api_accounts(user_id) ON DELETE CASCADE,
+        idempotency_key TEXT NOT NULL,
+        request_digest TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('subscription', 'topup')),
+        quote_id TEXT REFERENCES billing_topup_quotes(quote_id),
+        plan_id TEXT,
+        plan_version INTEGER,
+        subscription_id TEXT,
+        period_duration_ms INTEGER,
+        amount_micros INTEGER NOT NULL CHECK(amount_micros > 0),
+        currency TEXT NOT NULL,
+        chain_id TEXT NOT NULL,
+        asset TEXT NOT NULL,
+        asset_atomic_amount TEXT NOT NULL,
+        recipient TEXT,
+        provider_reference TEXT,
+        checkout_url TEXT,
+        status TEXT NOT NULL CHECK(status IN ('allocating', 'awaiting_payment', 'consumed')),
+        consumed_event_key TEXT UNIQUE,
+        expires_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        consumed_at INTEGER,
+        UNIQUE(user_id, idempotency_key),
+        UNIQUE(chain_id, provider_reference)
+      );
+
+      CREATE INDEX IF NOT EXISTS billing_stablecoin_intents_user_status
+      ON billing_stablecoin_intents(user_id, status, expires_at);
+
+      CREATE TABLE IF NOT EXISTS credit_grants (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES api_accounts(user_id) ON DELETE CASCADE,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        source_type TEXT NOT NULL CHECK(source_type IN ('subscription', 'topup')),
+        source_event_id TEXT NOT NULL REFERENCES billing_events(id),
+        token_amount INTEGER NOT NULL CHECK(token_amount > 0),
+        debt_repaid_tokens INTEGER NOT NULL DEFAULT 0 CHECK(debt_repaid_tokens >= 0),
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS credit_grants_user_created
+      ON credit_grants(user_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS account_credit_debts (
+        user_id TEXT PRIMARY KEY REFERENCES api_accounts(user_id) ON DELETE CASCADE,
+        token_debt INTEGER NOT NULL DEFAULT 0 CHECK(token_debt >= 0),
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS billing_reversals (
+        id TEXT PRIMARY KEY,
+        provider TEXT NOT NULL CHECK(provider IN ('stripe', 'stablecoin')),
+        provider_event_id TEXT NOT NULL,
+        original_event_id TEXT NOT NULL REFERENCES billing_events(id),
+        user_id TEXT NOT NULL REFERENCES api_accounts(user_id) ON DELETE CASCADE,
+        reason TEXT NOT NULL CHECK(reason IN ('refund', 'dispute', 'stablecoin_reorg')),
+        event_digest TEXT NOT NULL,
+        token_amount INTEGER NOT NULL CHECK(token_amount > 0),
+        recovered_tokens INTEGER NOT NULL CHECK(recovered_tokens >= 0),
+        debt_tokens INTEGER NOT NULL CHECK(debt_tokens >= 0),
+        occurred_at INTEGER NOT NULL,
+        processed_at INTEGER NOT NULL,
+        UNIQUE(provider, provider_event_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS billing_reversals_original_event
+      ON billing_reversals(original_event_id, processed_at);
+
+      CREATE TABLE IF NOT EXISTS billing_subscription_events (
+        id TEXT PRIMARY KEY,
+        provider TEXT NOT NULL CHECK(provider IN ('stripe', 'stablecoin')),
+        provider_event_id TEXT NOT NULL,
+        provider_subscription_id TEXT NOT NULL,
+        user_id TEXT NOT NULL REFERENCES api_accounts(user_id) ON DELETE CASCADE,
+        status TEXT NOT NULL CHECK(status IN ('past_due', 'cancelled')),
+        event_digest TEXT NOT NULL,
+        occurred_at INTEGER NOT NULL,
+        processed_at INTEGER NOT NULL,
+        applied INTEGER NOT NULL CHECK(applied IN (0, 1)),
+        UNIQUE(provider, provider_event_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS billing_subscription_events_subscription
+      ON billing_subscription_events(provider, provider_subscription_id, occurred_at);
+
+      CREATE TABLE IF NOT EXISTS seller_payout_preferences (
+        seller_id TEXT PRIMARY KEY,
+        method TEXT NOT NULL CHECK(method IN ('stable', 'spore')),
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS verified_work_receipts (
+        receipt_id TEXT PRIMARY KEY,
+        seller_id TEXT NOT NULL,
+        worker_id TEXT NOT NULL,
+        job_id TEXT NOT NULL,
+        stage_id TEXT NOT NULL,
+        pricing_version TEXT NOT NULL,
+        amount_usd_micros INTEGER NOT NULL CHECK(amount_usd_micros > 0),
+        evidence_digest TEXT NOT NULL,
+        accepted_at INTEGER NOT NULL,
+        verifier_key_id TEXT NOT NULL,
+        signature TEXT NOT NULL,
+        recorded_at INTEGER NOT NULL,
+        UNIQUE(job_id, stage_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS verified_work_receipts_seller_accepted
+      ON verified_work_receipts(seller_id, accepted_at DESC);
+
+      CREATE TABLE IF NOT EXISTS seller_earnings (
+        id TEXT PRIMARY KEY,
+        seller_id TEXT NOT NULL,
+        receipt_id TEXT NOT NULL UNIQUE REFERENCES verified_work_receipts(receipt_id),
+        amount_usd_micros INTEGER NOT NULL CHECK(amount_usd_micros > 0),
+        payout_method TEXT NOT NULL CHECK(payout_method IN ('stable', 'spore')),
+        status TEXT NOT NULL CHECK(status IN ('available', 'batched', 'paid', 'reversed')),
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS seller_earnings_seller_status
+      ON seller_earnings(seller_id, status, created_at);
+
+      CREATE TABLE IF NOT EXISTS seller_payout_destinations (
+        id TEXT PRIMARY KEY,
+        seller_id TEXT NOT NULL,
+        payout_method TEXT NOT NULL CHECK(payout_method IN ('stable', 'spore')),
+        destination_kind TEXT NOT NULL CHECK(destination_kind IN ('provider_account', 'wallet')),
+        destination_reference TEXT NOT NULL,
+        destination_fingerprint TEXT NOT NULL,
+        verifier_key_id TEXT NOT NULL,
+        attestation_signature TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('active', 'revoked')),
+        verified_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        revoked_at INTEGER
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS seller_payout_destinations_active
+      ON seller_payout_destinations(seller_id, payout_method) WHERE status = 'active';
+
+      CREATE TABLE IF NOT EXISTS payout_batches (
+        id TEXT PRIMARY KEY,
+        seller_id TEXT NOT NULL,
+        payout_method TEXT NOT NULL CHECK(payout_method IN ('stable', 'spore')),
+        idempotency_key TEXT NOT NULL UNIQUE,
+        request_digest TEXT NOT NULL,
+        gross_usd_micros INTEGER NOT NULL CHECK(gross_usd_micros > 0),
+        debt_offset_usd_micros INTEGER NOT NULL DEFAULT 0 CHECK(debt_offset_usd_micros >= 0),
+        amount_usd_micros INTEGER NOT NULL CHECK(amount_usd_micros > 0),
+        destination_id TEXT REFERENCES seller_payout_destinations(id),
+        destination_reference TEXT,
+        destination_fingerprint TEXT,
+        status TEXT NOT NULL CHECK(status IN ('prepared', 'submitted', 'paid', 'cancelled')),
+        dispatch_key TEXT,
+        external_reference TEXT,
+        settlement_reference TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        submitted_at INTEGER,
+        paid_at INTEGER,
+        cancelled_at INTEGER
+      );
+
+      CREATE INDEX IF NOT EXISTS payout_batches_seller_status
+      ON payout_batches(seller_id, status, created_at);
+
+      CREATE UNIQUE INDEX IF NOT EXISTS payout_batches_dispatch_key
+      ON payout_batches(dispatch_key) WHERE dispatch_key IS NOT NULL;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS payout_batches_external_reference
+      ON payout_batches(external_reference) WHERE external_reference IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS payout_dispatch_operations (
+        id TEXT PRIMARY KEY,
+        batch_id TEXT NOT NULL UNIQUE REFERENCES payout_batches(id) ON DELETE CASCADE,
+        payout_method TEXT NOT NULL CHECK(payout_method IN ('stable', 'spore')),
+        dispatch_key TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL CHECK(state IN ('dispatching', 'uncertain', 'submitted', 'paid', 'rejected')),
+        external_reference TEXT,
+        settlement_reference TEXT,
+        spore_quote_id TEXT,
+        spore_quote_attestation_digest TEXT,
+        last_error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        reconciled_at INTEGER
+      );
+
+      CREATE INDEX IF NOT EXISTS payout_dispatch_operations_state
+      ON payout_dispatch_operations(state, updated_at);
+
+      CREATE TABLE IF NOT EXISTS payout_settlement_evidence (
+        batch_id TEXT PRIMARY KEY REFERENCES payout_batches(id) ON DELETE CASCADE,
+        schema_name TEXT NOT NULL CHECK(schema_name = 'mycellios.payout-settlement.v1'),
+        external_reference TEXT NOT NULL,
+        settlement_reference TEXT NOT NULL UNIQUE,
+        paid_at INTEGER NOT NULL,
+        issued_at INTEGER NOT NULL,
+        verifier_key_id TEXT NOT NULL,
+        signature TEXT NOT NULL,
+        recorded_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS spore_conversion_quotes (
+        quote_id TEXT PRIMARY KEY,
+        batch_id TEXT NOT NULL REFERENCES payout_batches(id) ON DELETE CASCADE,
+        seller_id TEXT NOT NULL,
+        usd_micros INTEGER NOT NULL CHECK(usd_micros > 0),
+        chain_id TEXT NOT NULL,
+        asset_id TEXT NOT NULL,
+        token_decimals INTEGER NOT NULL,
+        token_atomic_amount TEXT NOT NULL,
+        destination_fingerprint TEXT NOT NULL,
+        issued_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        oracle_key_id TEXT NOT NULL,
+        signature TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('active', 'superseded')),
+        recorded_at INTEGER NOT NULL,
+        replaced_at INTEGER
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS spore_conversion_quotes_active_batch
+      ON spore_conversion_quotes(batch_id) WHERE status = 'active';
+
+      CREATE TABLE IF NOT EXISTS payout_batch_items (
+        batch_id TEXT NOT NULL REFERENCES payout_batches(id) ON DELETE CASCADE,
+        earning_id TEXT NOT NULL REFERENCES seller_earnings(id),
+        amount_usd_micros INTEGER NOT NULL CHECK(amount_usd_micros > 0),
+        PRIMARY KEY(batch_id, earning_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS seller_earning_reversals (
+        id TEXT PRIMARY KEY,
+        reversal_id TEXT NOT NULL UNIQUE,
+        earning_id TEXT NOT NULL UNIQUE REFERENCES seller_earnings(id),
+        seller_id TEXT NOT NULL,
+        reason TEXT NOT NULL CHECK(reason IN ('fraud', 'verification_error', 'buyer_dispute')),
+        evidence_digest TEXT NOT NULL,
+        verifier_key_id TEXT NOT NULL,
+        signature TEXT NOT NULL,
+        amount_usd_micros INTEGER NOT NULL CHECK(amount_usd_micros > 0),
+        state TEXT NOT NULL CHECK(state IN ('applied', 'seller_debt', 'pending_payout')),
+        reversed_at INTEGER NOT NULL,
+        recorded_at INTEGER NOT NULL,
+        resolved_at INTEGER
+      );
+
+      CREATE INDEX IF NOT EXISTS seller_earning_reversals_seller_state
+      ON seller_earning_reversals(seller_id, state, recorded_at);
+
+      CREATE TABLE IF NOT EXISTS seller_debts (
+        seller_id TEXT PRIMARY KEY,
+        amount_usd_micros INTEGER NOT NULL DEFAULT 0 CHECK(amount_usd_micros >= 0),
+        updated_at INTEGER NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS network_telemetry_history (
         captured_at INTEGER PRIMARY KEY,
         registered_nodes INTEGER NOT NULL,
@@ -738,6 +1093,14 @@ export class MeshDatabase {
       ON node_snapshot_history(node_id, sequence);
 
     `);
+
+    if (currentVersion < 27) {
+      const payoutColumns = this.raw.prepare("PRAGMA table_info(payout_batches)").all() as Array<{ name: string }>;
+      const names = new Set(payoutColumns.map((column) => column.name));
+      if (!names.has("destination_id")) this.raw.exec("ALTER TABLE payout_batches ADD COLUMN destination_id TEXT");
+      if (!names.has("destination_reference")) this.raw.exec("ALTER TABLE payout_batches ADD COLUMN destination_reference TEXT");
+      if (!names.has("destination_fingerprint")) this.raw.exec("ALTER TABLE payout_batches ADD COLUMN destination_fingerprint TEXT");
+    }
     if (currentVersion >= 2 && currentVersion < 3) {
       const columns = this.raw.prepare("PRAGMA table_info(workers)").all() as Array<{
         name: string;
@@ -756,6 +1119,102 @@ export class MeshDatabase {
       }
     }
     if (currentVersion < 6) this.migrateWorkerIdentities();
+    if (currentVersion < 17) {
+      const columns = this.raw.prepare("PRAGMA table_info(credit_grants)").all() as Array<{
+        name: string;
+      }>;
+      if (!columns.some((column) => column.name === "debt_repaid_tokens")) {
+        this.raw.exec(
+          "ALTER TABLE credit_grants ADD COLUMN debt_repaid_tokens INTEGER NOT NULL DEFAULT 0 CHECK(debt_repaid_tokens >= 0)",
+        );
+      }
+    }
+    if (currentVersion < 18) {
+      const columns = this.raw.prepare("PRAGMA table_info(billing_subscriptions)").all() as Array<{
+        name: string;
+      }>;
+      if (!columns.some((column) => column.name === "status_changed_at")) {
+        this.raw.exec(
+          "ALTER TABLE billing_subscriptions ADD COLUMN status_changed_at INTEGER NOT NULL DEFAULT 0",
+        );
+        this.raw.exec(
+          "UPDATE billing_subscriptions SET status_changed_at = updated_at WHERE status_changed_at = 0",
+        );
+      }
+    }
+    if (currentVersion === 19) {
+      this.raw.exec("PRAGMA foreign_keys = OFF");
+      this.raw.exec(`
+        ALTER TABLE payout_batch_items RENAME TO payout_batch_items_v19;
+        CREATE TABLE payout_batch_items (
+          batch_id TEXT NOT NULL REFERENCES payout_batches(id) ON DELETE CASCADE,
+          earning_id TEXT NOT NULL REFERENCES seller_earnings(id),
+          amount_usd_micros INTEGER NOT NULL CHECK(amount_usd_micros > 0),
+          PRIMARY KEY(batch_id, earning_id)
+        );
+        INSERT INTO payout_batch_items(batch_id, earning_id, amount_usd_micros)
+        SELECT batch_id, earning_id, amount_usd_micros FROM payout_batch_items_v19;
+        DROP TABLE payout_batch_items_v19;
+      `);
+      this.raw.exec("PRAGMA foreign_keys = ON");
+    }
+    if (currentVersion < 22) {
+      const columns = this.raw.prepare("PRAGMA table_info(payout_batches)").all() as Array<{
+        name: string;
+      }>;
+      if (!columns.some((column) => column.name === "gross_usd_micros")) {
+        this.raw.exec(
+          "ALTER TABLE payout_batches ADD COLUMN gross_usd_micros INTEGER NOT NULL DEFAULT 0 CHECK(gross_usd_micros >= 0)",
+        );
+        this.raw.exec("UPDATE payout_batches SET gross_usd_micros = amount_usd_micros");
+      }
+      if (!columns.some((column) => column.name === "debt_offset_usd_micros")) {
+        this.raw.exec(
+          "ALTER TABLE payout_batches ADD COLUMN debt_offset_usd_micros INTEGER NOT NULL DEFAULT 0 CHECK(debt_offset_usd_micros >= 0)",
+        );
+      }
+    }
+    if (currentVersion === 29) {
+      this.raw.exec("PRAGMA foreign_keys = OFF");
+      this.raw.exec(`
+        DROP INDEX IF EXISTS spore_conversion_quotes_active_batch;
+        ALTER TABLE spore_conversion_quotes RENAME TO spore_conversion_quotes_v29;
+        CREATE TABLE spore_conversion_quotes (
+          quote_id TEXT PRIMARY KEY,
+          batch_id TEXT NOT NULL REFERENCES payout_batches(id) ON DELETE CASCADE,
+          seller_id TEXT NOT NULL,
+          usd_micros INTEGER NOT NULL CHECK(usd_micros > 0),
+          chain_id TEXT NOT NULL,
+          asset_id TEXT NOT NULL,
+          token_decimals INTEGER NOT NULL,
+          token_atomic_amount TEXT NOT NULL,
+          destination_fingerprint TEXT NOT NULL,
+          issued_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL,
+          oracle_key_id TEXT NOT NULL,
+          signature TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('active', 'superseded')),
+          recorded_at INTEGER NOT NULL,
+          replaced_at INTEGER
+        );
+        INSERT INTO spore_conversion_quotes(
+          quote_id, batch_id, seller_id, usd_micros, chain_id, asset_id,
+          token_decimals, token_atomic_amount, destination_fingerprint,
+          issued_at, expires_at, oracle_key_id, signature, status, recorded_at
+        ) SELECT quote_id, batch_id, seller_id, usd_micros, chain_id, asset_id,
+                 token_decimals, token_atomic_amount, destination_fingerprint,
+                 issued_at, expires_at, oracle_key_id, signature, 'active', recorded_at
+          FROM spore_conversion_quotes_v29;
+        DROP TABLE spore_conversion_quotes_v29;
+        CREATE UNIQUE INDEX spore_conversion_quotes_active_batch
+        ON spore_conversion_quotes(batch_id) WHERE status = 'active';
+      `);
+      this.raw.exec("PRAGMA foreign_keys = ON");
+    }
+    if (currentVersion === 30) {
+      this.raw.exec("ALTER TABLE payout_dispatch_operations ADD COLUMN spore_quote_id TEXT");
+      this.raw.exec("ALTER TABLE payout_dispatch_operations ADD COLUMN spore_quote_attestation_digest TEXT");
+    }
     if (currentVersion >= 18 && currentVersion < 19) {
       const columns = this.raw.prepare("PRAGMA table_info(economic_settlements)").all() as Array<{ name: string }>;
       if (!columns.some((column) => column.name === "contribution_evidence_id")) {
@@ -771,6 +1230,672 @@ export class MeshDatabase {
       CREATE UNIQUE INDEX IF NOT EXISTS workers_identity_unique
       ON workers(identity_kind, identity_id)
       WHERE identity_kind IS NOT NULL AND identity_id IS NOT NULL;
+
+      CREATE TRIGGER IF NOT EXISTS payout_dispatch_spore_quote_insert_guard
+      BEFORE INSERT ON payout_dispatch_operations
+      WHEN (NEW.payout_method = 'spore' AND (
+              NEW.spore_quote_id IS NULL OR NEW.spore_quote_attestation_digest IS NULL
+            ))
+        OR (NEW.payout_method = 'stable' AND (
+              NEW.spore_quote_id IS NOT NULL OR NEW.spore_quote_attestation_digest IS NOT NULL
+            ))
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_payout_dispatch_spore_quote_audit');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_dispatch_time_insert_guard
+      BEFORE INSERT ON payout_dispatch_operations
+      WHEN NEW.created_at <= 0 OR NEW.updated_at < NEW.created_at
+        OR (NEW.reconciled_at IS NOT NULL
+          AND (NEW.reconciled_at < NEW.created_at OR NEW.reconciled_at > NEW.updated_at))
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_payout_dispatch_time');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_dispatch_time_update_guard
+      BEFORE UPDATE OF created_at, updated_at, reconciled_at
+      ON payout_dispatch_operations
+      WHEN NEW.created_at <> OLD.created_at
+        OR NEW.updated_at < OLD.updated_at
+        OR NEW.updated_at < NEW.created_at
+        OR (NEW.reconciled_at IS NOT NULL
+          AND (NEW.reconciled_at < NEW.created_at OR NEW.reconciled_at > NEW.updated_at))
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_payout_dispatch_time');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_dispatch_batch_binding_insert_guard
+      BEFORE INSERT ON payout_dispatch_operations
+      WHEN NOT EXISTS (
+        SELECT 1 FROM payout_batches batch
+        WHERE batch.id = NEW.batch_id
+          AND batch.payout_method = NEW.payout_method
+          AND NEW.dispatch_key = 'payout:' || batch.id
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_payout_dispatch_batch_binding');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_dispatch_economic_composition_insert_guard
+      BEFORE INSERT ON payout_dispatch_operations
+      WHEN NOT EXISTS (
+        SELECT 1 FROM payout_batches batch
+        WHERE batch.id = NEW.batch_id
+          AND batch.gross_usd_micros = (
+            SELECT COALESCE(SUM(item.amount_usd_micros), 0)
+            FROM payout_batch_items item WHERE item.batch_id = batch.id
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM payout_batch_items item
+            JOIN seller_earnings earning ON earning.id = item.earning_id
+            WHERE item.batch_id = batch.id
+              AND (earning.status <> 'batched'
+                OR earning.seller_id <> batch.seller_id
+                OR earning.payout_method <> batch.payout_method
+                OR earning.amount_usd_micros <> item.amount_usd_micros)
+          )
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_payout_dispatch_economic_composition');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_dispatch_spore_quote_binding_insert_guard
+      BEFORE INSERT ON payout_dispatch_operations
+      WHEN NEW.payout_method = 'spore'
+        AND NEW.spore_quote_id IS NOT NULL
+        AND NEW.spore_quote_attestation_digest IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM spore_conversion_quotes quote
+          WHERE quote.quote_id = NEW.spore_quote_id
+            AND quote.batch_id = NEW.batch_id
+            AND quote.status = 'active'
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_payout_dispatch_spore_quote_binding');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_dispatch_spore_quote_update_guard
+      BEFORE UPDATE OF payout_method, spore_quote_id, spore_quote_attestation_digest
+      ON payout_dispatch_operations
+      WHEN (NEW.payout_method = 'spore' AND (
+              NEW.spore_quote_id IS NULL OR NEW.spore_quote_attestation_digest IS NULL
+            ))
+        OR (NEW.payout_method = 'stable' AND (
+              NEW.spore_quote_id IS NOT NULL OR NEW.spore_quote_attestation_digest IS NOT NULL
+            ))
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_payout_dispatch_spore_quote_audit');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_dispatch_spore_quote_immutable_guard
+      BEFORE UPDATE OF payout_method, spore_quote_id, spore_quote_attestation_digest
+      ON payout_dispatch_operations
+      WHEN OLD.payout_method IS NOT NEW.payout_method
+        OR OLD.spore_quote_id IS NOT NEW.spore_quote_id
+        OR OLD.spore_quote_attestation_digest IS NOT NEW.spore_quote_attestation_digest
+      BEGIN
+        SELECT RAISE(ABORT, 'immutable_payout_dispatch_spore_quote_audit');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_dispatch_provider_identity_immutable_guard
+      BEFORE UPDATE OF batch_id, dispatch_key, external_reference, settlement_reference
+      ON payout_dispatch_operations
+      WHEN OLD.batch_id IS NOT NEW.batch_id
+        OR OLD.dispatch_key IS NOT NEW.dispatch_key
+        OR (OLD.external_reference IS NOT NULL
+            AND OLD.external_reference IS NOT NEW.external_reference)
+        OR (OLD.state IN ('paid', 'rejected')
+            AND OLD.external_reference IS NOT NEW.external_reference)
+        OR (OLD.settlement_reference IS NOT NULL
+            AND OLD.settlement_reference IS NOT NEW.settlement_reference)
+      BEGIN
+        SELECT RAISE(ABORT, 'immutable_payout_dispatch_provider_identity');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_settlement_evidence_immutable_guard
+      BEFORE UPDATE ON payout_settlement_evidence
+      BEGIN
+        SELECT RAISE(ABORT, 'immutable_payout_settlement_evidence');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_settlement_evidence_insert_guard
+      BEFORE INSERT ON payout_settlement_evidence
+      WHEN NEW.paid_at <= 0 OR NEW.issued_at <= 0 OR NEW.recorded_at <= 0
+        OR NEW.paid_at > NEW.issued_at + 60000
+        OR NEW.issued_at > NEW.recorded_at + 60000
+        OR NOT EXISTS (
+          SELECT 1
+          FROM payout_batches batch
+          JOIN payout_dispatch_operations operation ON operation.batch_id = batch.id
+          WHERE batch.id = NEW.batch_id
+            AND batch.status IN ('submitted', 'paid')
+            AND operation.state IN ('submitted', 'uncertain', 'paid')
+            AND batch.external_reference = NEW.external_reference
+            AND operation.external_reference = NEW.external_reference
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_payout_settlement_evidence_binding');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_dispatch_settlement_evidence_binding_guard
+      BEFORE UPDATE OF state, external_reference, settlement_reference
+      ON payout_dispatch_operations
+      WHEN NEW.state = 'paid' AND EXISTS (
+        SELECT 1 FROM payout_settlement_evidence evidence
+        WHERE evidence.batch_id = NEW.batch_id
+          AND (evidence.external_reference <> NEW.external_reference
+            OR evidence.settlement_reference <> NEW.settlement_reference)
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_payout_settlement_evidence_binding');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_batch_settlement_evidence_binding_guard
+      BEFORE UPDATE OF status, external_reference, settlement_reference, paid_at
+      ON payout_batches
+      WHEN NEW.status = 'paid' AND EXISTS (
+        SELECT 1 FROM payout_settlement_evidence evidence
+        WHERE evidence.batch_id = NEW.id
+          AND (evidence.external_reference <> NEW.external_reference
+            OR evidence.settlement_reference <> NEW.settlement_reference
+            OR evidence.paid_at <> NEW.paid_at)
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_payout_settlement_evidence_binding');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_dispatch_state_transition_guard
+      BEFORE UPDATE OF state ON payout_dispatch_operations
+      WHEN NOT (
+        OLD.state = NEW.state
+        OR (OLD.state IN ('dispatching', 'uncertain', 'submitted')
+            AND NEW.state IN ('uncertain', 'submitted', 'paid', 'rejected'))
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_payout_dispatch_state_transition');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_dispatch_state_evidence_insert_guard
+      BEFORE INSERT ON payout_dispatch_operations
+      WHEN (NEW.state IN ('submitted', 'paid') AND NEW.external_reference IS NULL)
+        OR (NEW.state = 'paid' AND NEW.settlement_reference IS NULL)
+        OR (NEW.state <> 'paid' AND NEW.settlement_reference IS NOT NULL)
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_payout_dispatch_state_evidence');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_dispatch_batch_projection_insert_guard
+      BEFORE INSERT ON payout_dispatch_operations
+      WHEN NOT EXISTS (
+        SELECT 1 FROM payout_batches batch
+        WHERE batch.id = NEW.batch_id AND (
+          (NEW.state = 'dispatching'
+            AND NEW.external_reference IS NULL
+            AND batch.status = 'prepared')
+          OR (NEW.state = 'uncertain' AND (
+            (NEW.external_reference IS NULL AND batch.status = 'prepared')
+            OR (NEW.external_reference IS NOT NULL
+              AND batch.status = 'submitted'
+              AND batch.dispatch_key = NEW.dispatch_key
+              AND batch.external_reference = NEW.external_reference)
+          ))
+          OR (NEW.state = 'submitted'
+            AND batch.status = 'submitted'
+            AND batch.dispatch_key = NEW.dispatch_key
+            AND batch.external_reference = NEW.external_reference)
+          OR (NEW.state = 'paid'
+            AND batch.status = 'paid'
+            AND batch.dispatch_key = NEW.dispatch_key
+            AND batch.external_reference = NEW.external_reference
+            AND batch.settlement_reference = NEW.settlement_reference)
+          OR (NEW.state = 'rejected' AND (
+            (NEW.external_reference IS NULL AND batch.status IN ('prepared', 'cancelled'))
+            OR (NEW.external_reference IS NOT NULL
+              AND batch.status = 'submitted'
+              AND batch.dispatch_key = NEW.dispatch_key
+              AND batch.external_reference = NEW.external_reference)
+          ))
+        )
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_payout_dispatch_batch_projection');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_dispatch_batch_projection_update_guard
+      BEFORE UPDATE OF state, external_reference, settlement_reference
+      ON payout_dispatch_operations
+      WHEN NOT EXISTS (
+        SELECT 1 FROM payout_batches batch
+        WHERE batch.id = NEW.batch_id AND (
+          (NEW.state = 'dispatching'
+            AND NEW.external_reference IS NULL
+            AND batch.status = 'prepared')
+          OR (NEW.state = 'uncertain' AND (
+            (NEW.external_reference IS NULL AND batch.status = 'prepared')
+            OR (NEW.external_reference IS NOT NULL
+              AND batch.status = 'submitted'
+              AND batch.dispatch_key = NEW.dispatch_key
+              AND batch.external_reference = NEW.external_reference)
+          ))
+          OR (NEW.state = 'submitted'
+            AND batch.status = 'submitted'
+            AND batch.dispatch_key = NEW.dispatch_key
+            AND batch.external_reference = NEW.external_reference)
+          OR (NEW.state = 'paid'
+            AND batch.status = 'paid'
+            AND batch.dispatch_key = NEW.dispatch_key
+            AND batch.external_reference = NEW.external_reference
+            AND batch.settlement_reference = NEW.settlement_reference)
+          OR (NEW.state = 'rejected' AND (
+            (NEW.external_reference IS NULL AND batch.status IN ('prepared', 'cancelled'))
+            OR (NEW.external_reference IS NOT NULL
+              AND batch.status = 'submitted'
+              AND batch.dispatch_key = NEW.dispatch_key
+              AND batch.external_reference = NEW.external_reference)
+          ))
+        )
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_payout_dispatch_batch_projection');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_dispatch_state_evidence_update_guard
+      BEFORE UPDATE OF state, external_reference, settlement_reference
+      ON payout_dispatch_operations
+      WHEN (NEW.state IN ('submitted', 'paid') AND NEW.external_reference IS NULL)
+        OR (NEW.state = 'paid' AND NEW.settlement_reference IS NULL)
+        OR (NEW.state <> 'paid' AND NEW.settlement_reference IS NOT NULL)
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_payout_dispatch_state_evidence');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_dispatch_operation_delete_guard
+      BEFORE DELETE ON payout_dispatch_operations
+      BEGIN
+        SELECT RAISE(ABORT, 'immutable_payout_dispatch_operation');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_settlement_evidence_delete_guard
+      BEFORE DELETE ON payout_settlement_evidence
+      BEGIN
+        SELECT RAISE(ABORT, 'immutable_payout_settlement_evidence');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS spore_conversion_quote_content_immutable_guard
+      BEFORE UPDATE OF quote_id, batch_id, seller_id, usd_micros, chain_id,
+        asset_id, token_decimals, token_atomic_amount, destination_fingerprint,
+        issued_at, expires_at, oracle_key_id, signature, recorded_at
+      ON spore_conversion_quotes
+      BEGIN
+        SELECT RAISE(ABORT, 'immutable_spore_conversion_quote_content');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS spore_conversion_quote_batch_binding_insert_guard
+      BEFORE INSERT ON spore_conversion_quotes
+      WHEN NOT EXISTS (
+        SELECT 1 FROM payout_batches batch
+        WHERE batch.id = NEW.batch_id
+          AND batch.payout_method = 'spore'
+          AND batch.status = 'prepared'
+          AND batch.seller_id = NEW.seller_id
+          AND batch.amount_usd_micros = NEW.usd_micros
+          AND batch.destination_fingerprint = NEW.destination_fingerprint
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_spore_conversion_quote_batch_binding');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS spore_conversion_quote_lifecycle_guard
+      BEFORE UPDATE OF status, replaced_at ON spore_conversion_quotes
+      WHEN NOT (
+        (OLD.status = NEW.status AND OLD.replaced_at IS NEW.replaced_at)
+        OR (OLD.status = 'active' AND NEW.status = 'superseded'
+            AND OLD.replaced_at IS NULL AND NEW.replaced_at IS NOT NULL)
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_spore_conversion_quote_lifecycle');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS spore_conversion_quote_delete_guard
+      BEFORE DELETE ON spore_conversion_quotes
+      BEGIN
+        SELECT RAISE(ABORT, 'immutable_spore_conversion_quote');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_batch_economic_snapshot_immutable_guard
+      BEFORE UPDATE OF id, seller_id, payout_method, idempotency_key,
+        request_digest, gross_usd_micros, debt_offset_usd_micros,
+        amount_usd_micros, destination_id, destination_reference,
+        destination_fingerprint, created_at
+      ON payout_batches
+      BEGIN
+        SELECT RAISE(ABORT, 'immutable_payout_batch_economic_snapshot');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_batch_amount_equation_insert_guard
+      BEFORE INSERT ON payout_batches
+      WHEN NEW.debt_offset_usd_micros > NEW.gross_usd_micros
+        OR NEW.amount_usd_micros <> NEW.gross_usd_micros - NEW.debt_offset_usd_micros
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_payout_batch_amount_equation');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_batch_destination_binding_insert_guard
+      BEFORE INSERT ON payout_batches
+      WHEN (
+        NEW.destination_id IS NULL
+        AND (NEW.destination_reference IS NOT NULL OR NEW.destination_fingerprint IS NOT NULL)
+      ) OR (
+        NEW.destination_id IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM seller_payout_destinations destination
+          WHERE destination.id = NEW.destination_id
+            AND destination.seller_id = NEW.seller_id
+            AND destination.payout_method = NEW.payout_method
+            AND destination.destination_reference = NEW.destination_reference
+            AND destination.destination_fingerprint = NEW.destination_fingerprint
+            AND destination.status = 'active'
+        )
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_payout_batch_destination_binding');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_batch_state_transition_guard
+      BEFORE UPDATE OF status ON payout_batches
+      WHEN NOT (
+        OLD.status = NEW.status
+        OR (OLD.status = 'prepared' AND NEW.status IN ('submitted', 'cancelled'))
+        OR (OLD.status = 'submitted' AND NEW.status = 'paid')
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_payout_batch_state_transition');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_batch_dispatched_cancellation_guard
+      BEFORE UPDATE OF status ON payout_batches
+      WHEN NEW.status = 'cancelled'
+        AND EXISTS (
+          SELECT 1 FROM payout_dispatch_operations operation
+          WHERE operation.batch_id = NEW.id
+            AND NOT (
+              operation.state = 'rejected'
+              AND operation.external_reference IS NULL
+              AND operation.settlement_reference IS NULL
+            )
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'payout_cancellation_unsafe');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_batch_state_evidence_insert_guard
+      BEFORE INSERT ON payout_batches
+      WHEN NOT (
+        NEW.status = 'prepared'
+        AND NEW.dispatch_key IS NULL
+        AND NEW.external_reference IS NULL
+        AND NEW.settlement_reference IS NULL
+        AND NEW.submitted_at IS NULL
+        AND NEW.paid_at IS NULL
+        AND NEW.cancelled_at IS NULL
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_payout_batch_state_evidence');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_batch_state_evidence_update_guard
+      BEFORE UPDATE OF status, dispatch_key, external_reference,
+        settlement_reference, submitted_at, paid_at, cancelled_at
+      ON payout_batches
+      WHEN NOT (
+        (NEW.status = 'prepared'
+          AND NEW.dispatch_key IS NULL AND NEW.external_reference IS NULL
+          AND NEW.settlement_reference IS NULL AND NEW.submitted_at IS NULL
+          AND NEW.paid_at IS NULL AND NEW.cancelled_at IS NULL)
+        OR (NEW.status = 'submitted'
+          AND NEW.dispatch_key IS NOT NULL AND NEW.external_reference IS NOT NULL
+          AND NEW.settlement_reference IS NULL AND NEW.submitted_at IS NOT NULL
+          AND NEW.paid_at IS NULL AND NEW.cancelled_at IS NULL)
+        OR (NEW.status = 'paid'
+          AND NEW.dispatch_key IS NOT NULL AND NEW.external_reference IS NOT NULL
+          AND NEW.settlement_reference IS NOT NULL AND NEW.submitted_at IS NOT NULL
+          AND NEW.paid_at IS NOT NULL AND NEW.cancelled_at IS NULL)
+        OR (NEW.status = 'cancelled'
+          AND NEW.dispatch_key IS NULL AND NEW.external_reference IS NULL
+          AND NEW.settlement_reference IS NULL AND NEW.submitted_at IS NULL
+          AND NEW.paid_at IS NULL AND NEW.cancelled_at IS NOT NULL)
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_payout_batch_state_evidence');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_batch_provider_identity_immutable_guard
+      BEFORE UPDATE OF dispatch_key, external_reference, settlement_reference
+      ON payout_batches
+      WHEN (OLD.dispatch_key IS NOT NULL AND OLD.dispatch_key IS NOT NEW.dispatch_key)
+        OR (OLD.external_reference IS NOT NULL
+            AND OLD.external_reference IS NOT NEW.external_reference)
+        OR (OLD.settlement_reference IS NOT NULL
+            AND OLD.settlement_reference IS NOT NEW.settlement_reference)
+      BEGIN
+        SELECT RAISE(ABORT, 'immutable_payout_batch_provider_identity');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_batch_time_insert_guard
+      BEFORE INSERT ON payout_batches
+      WHEN NEW.created_at <= 0
+        OR NEW.updated_at < NEW.created_at
+        OR (NEW.submitted_at IS NOT NULL AND (
+          NEW.submitted_at < NEW.created_at OR NEW.submitted_at > NEW.updated_at
+        ))
+        OR (NEW.cancelled_at IS NOT NULL AND (
+          NEW.cancelled_at < NEW.created_at OR NEW.cancelled_at > NEW.updated_at
+        ))
+        OR (NEW.paid_at IS NOT NULL AND NEW.paid_at <= 0)
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_payout_batch_time');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_batch_time_update_guard
+      BEFORE UPDATE OF created_at, updated_at, submitted_at, paid_at, cancelled_at
+      ON payout_batches
+      WHEN NEW.created_at <> OLD.created_at
+        OR NEW.updated_at < OLD.updated_at
+        OR NEW.updated_at < NEW.created_at
+        OR (OLD.submitted_at IS NOT NULL AND NEW.submitted_at IS NOT OLD.submitted_at)
+        OR (OLD.paid_at IS NOT NULL AND NEW.paid_at IS NOT OLD.paid_at)
+        OR (OLD.cancelled_at IS NOT NULL AND NEW.cancelled_at IS NOT OLD.cancelled_at)
+        OR (NEW.submitted_at IS NOT NULL AND (
+          NEW.submitted_at < NEW.created_at OR NEW.submitted_at > NEW.updated_at
+        ))
+        OR (NEW.cancelled_at IS NOT NULL AND (
+          NEW.cancelled_at < NEW.created_at OR NEW.cancelled_at > NEW.updated_at
+        ))
+        OR (NEW.paid_at IS NOT NULL AND NEW.paid_at <= 0)
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_payout_batch_time');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_batch_item_insert_guard
+      BEFORE INSERT ON payout_batch_items
+      WHEN NOT EXISTS (
+        SELECT 1
+        FROM payout_batches b
+        JOIN seller_earnings e ON e.id = NEW.earning_id
+        WHERE b.id = NEW.batch_id
+          AND b.status = 'prepared'
+          AND e.status = 'available'
+          AND e.seller_id = b.seller_id
+          AND e.payout_method = b.payout_method
+          AND e.amount_usd_micros = NEW.amount_usd_micros
+          AND NOT EXISTS (
+            SELECT 1
+            FROM payout_batch_items existing_item
+            JOIN payout_batches existing_batch ON existing_batch.id = existing_item.batch_id
+            WHERE existing_item.earning_id = NEW.earning_id
+              AND existing_batch.status <> 'cancelled'
+          )
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_payout_batch_item');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_batch_item_update_guard
+      BEFORE UPDATE ON payout_batch_items
+      BEGIN
+        SELECT RAISE(ABORT, 'immutable_payout_batch_item');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS payout_batch_item_delete_guard
+      BEFORE DELETE ON payout_batch_items
+      BEGIN
+        SELECT RAISE(ABORT, 'immutable_payout_batch_item');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS seller_earning_status_transition_guard
+      BEFORE UPDATE OF status ON seller_earnings
+      WHEN NOT (
+        OLD.status = NEW.status
+        OR (OLD.status = 'available' AND NEW.status = 'reversed')
+        OR (OLD.status = 'paid' AND NEW.status = 'reversed')
+        OR (OLD.status = 'available' AND NEW.status = 'batched' AND EXISTS (
+          SELECT 1 FROM payout_batch_items i
+          JOIN payout_batches b ON b.id = i.batch_id
+          WHERE i.earning_id = OLD.id AND b.status = 'prepared'
+        ))
+        OR (OLD.status = 'batched' AND NEW.status = 'available' AND NOT EXISTS (
+          SELECT 1 FROM payout_batch_items i
+          JOIN payout_batches b ON b.id = i.batch_id
+          WHERE i.earning_id = OLD.id AND b.status <> 'cancelled'
+        ))
+        OR (OLD.status = 'batched' AND NEW.status = 'paid' AND EXISTS (
+          SELECT 1 FROM payout_batch_items i
+          JOIN payout_batches b ON b.id = i.batch_id
+          WHERE i.earning_id = OLD.id AND b.status = 'paid'
+        ))
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_seller_earning_status_transition');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS verified_work_receipt_immutable_guard
+      BEFORE UPDATE ON verified_work_receipts
+      BEGIN
+        SELECT RAISE(ABORT, 'immutable_verified_work_receipt');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS verified_work_receipt_delete_guard
+      BEFORE DELETE ON verified_work_receipts
+      BEGIN
+        SELECT RAISE(ABORT, 'immutable_verified_work_receipt');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS seller_payout_destination_insert_guard
+      BEFORE INSERT ON seller_payout_destinations
+      WHEN NEW.status <> 'active' OR NEW.revoked_at IS NOT NULL
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_seller_payout_destination_state');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS seller_payout_destination_content_immutable_guard
+      BEFORE UPDATE OF id, seller_id, payout_method, destination_kind,
+        destination_reference, destination_fingerprint, verifier_key_id,
+        attestation_signature, verified_at, expires_at, created_at
+      ON seller_payout_destinations
+      BEGIN
+        SELECT RAISE(ABORT, 'immutable_seller_payout_destination_content');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS seller_payout_destination_lifecycle_guard
+      BEFORE UPDATE OF status, revoked_at ON seller_payout_destinations
+      WHEN NOT (
+        (OLD.status = NEW.status AND OLD.revoked_at IS NEW.revoked_at)
+        OR (OLD.status = 'active' AND NEW.status = 'revoked'
+            AND OLD.revoked_at IS NULL AND NEW.revoked_at IS NOT NULL)
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_seller_payout_destination_lifecycle');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS seller_payout_destination_delete_guard
+      BEFORE DELETE ON seller_payout_destinations
+      BEGIN
+        SELECT RAISE(ABORT, 'immutable_seller_payout_destination');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS seller_earning_insert_binding_guard
+      BEFORE INSERT ON seller_earnings
+      WHEN NEW.status <> 'available' OR NOT EXISTS (
+        SELECT 1 FROM verified_work_receipts receipt
+        WHERE receipt.receipt_id = NEW.receipt_id
+          AND receipt.seller_id = NEW.seller_id
+          AND receipt.amount_usd_micros = NEW.amount_usd_micros
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_seller_earning_receipt_binding');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS seller_earning_economic_immutable_guard
+      BEFORE UPDATE OF id, seller_id, receipt_id, amount_usd_micros,
+        payout_method, created_at
+      ON seller_earnings
+      BEGIN
+        SELECT RAISE(ABORT, 'immutable_seller_earning_economic_snapshot');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS seller_earning_delete_guard
+      BEFORE DELETE ON seller_earnings
+      BEGIN
+        SELECT RAISE(ABORT, 'immutable_seller_earning');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS seller_earning_reversal_insert_guard
+      BEFORE INSERT ON seller_earning_reversals
+      WHEN (NEW.state = 'pending_payout' AND NEW.resolved_at IS NOT NULL)
+        OR (NEW.state IN ('applied', 'seller_debt') AND NEW.resolved_at IS NULL)
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_seller_earning_reversal_state');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS seller_earning_reversal_content_immutable_guard
+      BEFORE UPDATE OF id, reversal_id, earning_id, seller_id, reason,
+        evidence_digest, verifier_key_id, signature, amount_usd_micros,
+        reversed_at, recorded_at
+      ON seller_earning_reversals
+      BEGIN
+        SELECT RAISE(ABORT, 'immutable_seller_earning_reversal_content');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS seller_earning_reversal_lifecycle_guard
+      BEFORE UPDATE OF state, resolved_at ON seller_earning_reversals
+      WHEN NOT (
+        (OLD.state = NEW.state AND OLD.resolved_at IS NEW.resolved_at)
+        OR (OLD.state = 'pending_payout' AND NEW.state = 'seller_debt'
+            AND OLD.resolved_at IS NULL AND NEW.resolved_at IS NOT NULL)
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_seller_earning_reversal_lifecycle');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS seller_earning_reversal_delete_guard
+      BEFORE DELETE ON seller_earning_reversals
+      BEGIN
+        SELECT RAISE(ABORT, 'immutable_seller_earning_reversal');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS seller_debt_identity_time_guard
+      BEFORE UPDATE OF seller_id, updated_at ON seller_debts
+      WHEN OLD.seller_id IS NOT NEW.seller_id OR NEW.updated_at < OLD.updated_at
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid_seller_debt_identity_time');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS seller_debt_delete_guard
+      BEFORE DELETE ON seller_debts
+      BEGIN
+        SELECT RAISE(ABORT, 'immutable_seller_debt');
+      END;
       CREATE UNIQUE INDEX IF NOT EXISTS economic_settlements_contribution_evidence_unique
       ON economic_settlements(contribution_evidence_id)
       WHERE contribution_evidence_id IS NOT NULL;

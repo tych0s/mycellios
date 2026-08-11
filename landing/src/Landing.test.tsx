@@ -111,9 +111,11 @@ describe("Landing", () => {
     expect(html).toContain('id="payments"');
     // Buyer and seller each have to be named: a payment section that only says
     // "you get paid" is an earnings pitch, not an exchange.
-    expect(html).toContain("Buyers pay for answers.");
-    expect(html).toContain("Machines get paid for work.");
-    expect(html).toContain("Buy compute");
+    expect(html).toContain("Subscribe for ongoing access.");
+    expect(html).toContain("Machines earn from verified work.");
+    expect(html).toContain("Choose Mycellios Go");
+    expect(html).toContain('href="/account"');
+    expect(html).not.toContain("$0.0240");
     expect(html).toContain("Sell your idle machine");
     // The split is the same memory split the diagram above shows, so the three
     // layer ranges reappear here as shares of one payment.
@@ -122,11 +124,11 @@ describe("Landing", () => {
     expect(html).toContain("13%");
     expect(html).toContain("35%");
     expect(html).toContain("receipt signed");
-    expect(html).toContain("settled in USDC");
+    expect(html).toContain("accepted stages · signed receipts");
     // Nothing here may read as a promise: the split is illustrative and no
     // payout is live.
-    expect(html).toContain("not a live rate");
-    expect(html).toContain("no token is live and no payout is promised yet");
+    expect(html).toContain("not subscription pricing or a guaranteed payout");
+    expect(html).toContain("contributor payouts and $SPORE are not live yet");
   });
 
   it("renders the doors, evidence and install sections without crashing", () => {
