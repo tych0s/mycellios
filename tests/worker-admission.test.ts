@@ -5,6 +5,7 @@ import { workerRegistrationDigest } from "../src/core/worker-admission-digest.js
 import {
   WorkerAdmissionAuthority,
   WorkerAdmissionError,
+  workerAdmissionPublicKeyFingerprint,
 } from "../src/coordinator/worker-admission.js";
 import { MeshDatabase } from "../src/storage/database.js";
 import {
@@ -121,6 +122,27 @@ describe("signed worker admission", () => {
     );
   });
 
+  it("enforces the explicitly enrolled ownership fingerprint", () => {
+    const authority = createAuthority();
+    const signer = workerAdmissionSigner(generateWorkerAdmissionCredential());
+    const database = databases.at(-1)!;
+    bindOwnership(database, "desktop-owned", `sha256:${"f".repeat(64)}`);
+
+    expect(() => admit(authority, signer, "desktop-owned")).toThrowError(
+      expect.objectContaining({ code: "worker_ownership_fingerprint_mismatch" }),
+    );
+    expect(database.getWorkerAdmissionCredential("device", "desktop-owned")).toBeNull();
+  });
+
+  it("admits the key explicitly bound by node enrollment", () => {
+    const authority = createAuthority();
+    const signer = workerAdmissionSigner(generateWorkerAdmissionCredential());
+    const database = databases.at(-1)!;
+    bindOwnership(database, "desktop-owned-valid", workerAdmissionPublicKeyFingerprint(signer.publicKey));
+
+    expect(admit(authority, signer, "desktop-owned-valid").enrollment).toBe("enrolled");
+  });
+
   it("accepts the persistent ECDSA P-256 proof used by browser workers", () => {
     const authority = createAuthority();
     const { publicKey, privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
@@ -168,6 +190,8 @@ describe("signed worker admission", () => {
     const current = workerAdmissionSigner(generateWorkerAdmissionCredential());
     const next = workerAdmissionSigner(generateWorkerAdmissionCredential());
     const enrolled = admit(authority, current, "desktop-rotate");
+    const database = databases.at(-1)!;
+    bindOwnership(database, "desktop-rotate", enrolled.credentialFingerprint);
     const identity = { kind: "device" as const, id: "desktop-rotate" };
     const challenge = authority.issueRotation({
       identity,
@@ -187,9 +211,14 @@ describe("signed worker admission", () => {
 
     expect(rotated.previousFingerprint).toBe(enrolled.credentialFingerprint);
     expect(rotated.credentialFingerprint).not.toBe(enrolled.credentialFingerprint);
+    expect(database.getNodeOwnership("device", "desktop-rotate")).toMatchObject({
+      credentialFingerprint: rotated.credentialFingerprint,
+      status: "active",
+      generation: 2,
+    });
     expect(admit(authority, next, "desktop-rotate").enrollment).toBe("accepted");
     expect(() => admit(authority, current, "desktop-rotate")).toThrowError(
-      expect.objectContaining({ code: "worker_identity_key_mismatch" }),
+      expect.objectContaining({ code: "worker_ownership_fingerprint_mismatch" }),
     );
   });
 
@@ -198,6 +227,7 @@ describe("signed worker admission", () => {
     const current = workerAdmissionSigner(generateWorkerAdmissionCredential());
     const enrolled = admit(authority, current, "desktop-revoked");
     const database = databases.at(-1)!;
+    bindOwnership(database, "desktop-revoked", enrolled.credentialFingerprint);
     const first = database.revokeWorkerAdmissionCredential({
       identityKind: "device",
       identityId: "desktop-revoked",
@@ -213,8 +243,13 @@ describe("signed worker admission", () => {
 
     expect(first.state).toBe("revoked");
     expect(second.state).toBe("already_revoked");
+    expect(database.getNodeOwnership("device", "desktop-revoked")).toMatchObject({
+      credentialFingerprint: enrolled.credentialFingerprint,
+      status: "revoked",
+      generation: 2,
+    });
     expect(() => admit(authority, current, "desktop-revoked")).toThrowError(
-      expect.objectContaining({ code: "worker_credential_revoked" }),
+      expect.objectContaining({ code: "worker_ownership_revoked" }),
     );
     expect(() => authority.issueRotation({
       identity: { kind: "device", id: "desktop-revoked" },
@@ -224,6 +259,33 @@ describe("signed worker admission", () => {
     })).toThrowError(
       expect.objectContaining({ code: "worker_credential_revoked" }),
     );
+  });
+
+  it("recovers a lost key only with the owner account and replacement-key proof", () => {
+    const authority = createAuthority();
+    const current = workerAdmissionSigner(generateWorkerAdmissionCredential());
+    const next = workerAdmissionSigner(generateWorkerAdmissionCredential());
+    const enrolled = admit(authority, current, "desktop-recover");
+    const database = databases.at(-1)!;
+    bindOwnership(database, "desktop-recover", enrolled.credentialFingerprint);
+    const identity = { kind: "device" as const, id: "desktop-recover" };
+    expect(() => authority.issueRecovery({ identity, nextPublicKey: next.publicKey, protocol: { min: 1, max: 1 } }, "account-2"))
+      .toThrowError(expect.objectContaining({ code: "worker_recovery_owner_mismatch" }));
+
+    const challenge = authority.issueRecovery({ identity, nextPublicKey: next.publicKey, protocol: { min: 1, max: 1 } }, "account-1");
+    expect(() => authority.verifyRecovery(identity, { challengeId: challenge.challengeId, nextSignature: current.sign(challenge.signingPayload) }, "account-1"))
+      .toThrowError(expect.objectContaining({ code: "worker_recovery_signature_invalid" }));
+    const retry = authority.issueRecovery({ identity, nextPublicKey: next.publicKey, protocol: { min: 1, max: 1 } }, "account-1");
+    const recovered = authority.verifyRecovery(identity, { challengeId: retry.challengeId, nextSignature: next.sign(retry.signingPayload) }, "account-1");
+    expect(recovered.generation).toBe(2);
+    expect(database.getNodeOwnership("device", identity.id)).toMatchObject({
+      accountId: "account-1", status: "active", generation: 2,
+      credentialFingerprint: recovered.credentialFingerprint,
+    });
+    expect(() => admit(authority, current, identity.id)).toThrowError(expect.objectContaining({ code: "worker_ownership_fingerprint_mismatch" }));
+    expect(admit(authority, next, identity.id).enrollment).toBe("accepted");
+    expect((database.raw.prepare("SELECT event_type, generation, actor_kind FROM node_identity_events WHERE identity_id = ? ORDER BY sequence").all(identity.id) as Array<Record<string, unknown>>))
+      .toMatchObject([{ event_type: "credential.recovered", generation: 2, actor_kind: "account" }]);
   });
 
   it("rejects protocol ranges that do not overlap the coordinator", () => {
@@ -247,6 +309,16 @@ function createAuthority(): WorkerAdmissionAuthority {
   const database = new MeshDatabase(":memory:");
   databases.push(database);
   return new WorkerAdmissionAuthority(database);
+}
+
+function bindOwnership(database: MeshDatabase, identityId: string, fingerprint: string): void {
+  const now = Date.now();
+  database.raw.prepare(
+    `INSERT INTO node_ownership(
+       identity_kind, identity_id, account_id, credential_fingerprint,
+       status, generation, created_at, updated_at
+     ) VALUES ('device', ?, 'account-1', ?, 'active', 1, ?, ?)`,
+  ).run(identityId, fingerprint, now, now);
 }
 
 function admit(

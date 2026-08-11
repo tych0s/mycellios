@@ -4,7 +4,7 @@ import {
   activationFailureIsTransient,
   classifyActivationIncident,
   formatExhaustedActivationFailure,
-} from "../src/coordinator/activation-incident.js";
+} from "../src/contracts/activation-incident.js";
 
 describe("activation incident classification", () => {
   it("retries while two connected desktops finish executor verification", () => {

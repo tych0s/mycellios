@@ -45,6 +45,7 @@ export interface DynamicActivationRouteStage {
   layerEnd: number;
   memoryMiB: number;
   capacityMiB: number;
+  artifactBytes: number;
 }
 
 export interface DynamicModelActivationManagerOptions {
@@ -63,6 +64,8 @@ export interface DynamicModelActivationManagerOptions {
     modelId: string,
     stages: readonly DynamicActivationRouteStage[],
   ): string | Promise<string>;
+  onPlanHeartbeat?(modelId: string, reservationId: string): boolean | Promise<boolean>;
+  reservationHeartbeatMs?: number;
   onActivated?(
     modelId: string,
     reservationId: string | null,
@@ -323,10 +326,11 @@ export class DynamicModelActivationManager implements ModelActivationManager {
         compilation = compileAutoDistribution(config, profile);
       }
       await writeAutoDistributionArtifacts(config, compilation, cwd);
+      const reservationStages = routeStagesForReservation(config, compilation);
       const routeReservationId = this.options.onPlanPrepared
         ? await this.options.onPlanPrepared(
             model.id,
-            routeStagesForReservation(config, compilation),
+            reservationStages,
           )
         : null;
       this.appendProgress(
@@ -338,12 +342,15 @@ export class DynamicModelActivationManager implements ModelActivationManager {
           details: compilation.manifest.plans.decode.stages.map((stage, index, stages) => (
             `Stage ${index + 1}/${stages.length}: layers ${stage.layerStart}–`
             + `${Math.max(stage.layerStart, stage.layerEnd - 1)} of ${profile.model.layers.length} · `
-            + `node ${stage.anchor.memberId}`
+            + `node ${stage.anchor.memberId} · `
+            + `${reservationStages
+              .filter((reservation) => reservation.stageIndex === stage.index)
+              .reduce((total, reservation) => total + (reservation.artifactBytes ?? 0), 0)} artifact bytes`
           )),
         },
       );
       if (controller.signal.aborted) return;
-      await runAutoDistribution(config, compilation, cwd, environment, controller.signal, {
+      const activation = runAutoDistribution(config, compilation, cwd, environment, controller.signal, {
         resolveManagedAgent: (nodeId, launch) => this.options.resolveManagedAgent(nodeId, launch),
         onProgress: (event) => this.appendRuntimeProgress(model.id, event),
         ...(this.options.workerBuildIdentity
@@ -359,6 +366,14 @@ export class DynamicModelActivationManager implements ModelActivationManager {
             }
           : {}),
       });
+      await (routeReservationId && this.options.onPlanHeartbeat
+        ? runWithReservationHeartbeat(
+            activation,
+            () => this.options.onPlanHeartbeat!(model.id, routeReservationId),
+            this.options.reservationHeartbeatMs ?? 30_000,
+            (error) => controller.abort(error),
+          )
+        : activation);
     })().catch((error: unknown) => {
       this.failProgress(model.id, error instanceof Error ? error.message : String(error));
       throw error;
@@ -432,15 +447,71 @@ export class DynamicModelActivationManager implements ModelActivationManager {
   }
 }
 
+export async function runWithReservationHeartbeat<T>(
+  task: Promise<T>,
+  renew: () => boolean | Promise<boolean>,
+  intervalMs: number,
+  onFailure: (error: Error) => void = () => undefined,
+): Promise<T> {
+  if (!Number.isSafeInteger(intervalMs) || intervalMs < 100) {
+    throw new Error("route_reservation_heartbeat_interval_is_invalid");
+  }
+  let rejectFailure!: (error: Error) => void;
+  const failure = new Promise<never>((_resolve, reject) => { rejectFailure = reject; });
+  let renewing = false;
+  const timer = setInterval(() => {
+    if (renewing) return;
+    renewing = true;
+    void Promise.resolve(renew()).then(
+      (renewed) => {
+        renewing = false;
+        if (renewed) return;
+        const error = new Error("route_reservation_heartbeat_rejected");
+        onFailure(error);
+        rejectFailure(error);
+      },
+      (cause: unknown) => {
+        renewing = false;
+        const error = cause instanceof Error
+          ? cause
+          : new Error(`route_reservation_heartbeat_failed:${String(cause)}`);
+        onFailure(error);
+        rejectFailure(error);
+      },
+    );
+  }, intervalMs);
+  timer.unref?.();
+  try {
+    return await Promise.race([task, failure]);
+  } finally {
+    clearInterval(timer);
+  }
+}
+
 function routeStagesForReservation(
   config: AutoDistributionConfig,
   compilation: ReturnType<typeof compileAutoDistribution>,
 ): DynamicActivationRouteStage[] {
   const nodes = new Map(config.nodes.map((node) => [node.id, node]));
+  const model = compilation.profile.model;
   return compilation.manifest.plans.decode.stages.flatMap((stage) =>
-    stage.members.map((member) => {
+    stage.members.map((member, memberIndex, members) => {
       const node = nodes.get(member.nodeId);
       if (!node) throw new Error(`distribution_plan_references_unknown_node:${member.nodeId}`);
+      const stageArtifactBytes = plannedStageArtifactBytes(
+        model,
+        stage.layerStart,
+        stage.layerEnd,
+      );
+      const assignedTotal = members.reduce(
+        (total, candidate) => total + candidate.assignedMemoryBytes,
+        0,
+      );
+      const assignedBefore = members.slice(0, memberIndex).reduce(
+        (total, candidate) => total + candidate.assignedMemoryBytes,
+        0,
+      );
+      const assignedThrough = assignedBefore + member.assignedMemoryBytes;
       return {
         nodeId: member.nodeId,
         stageIndex: stage.index,
@@ -448,9 +519,40 @@ function routeStagesForReservation(
         layerEnd: stage.layerEnd,
         memoryMiB: Math.ceil(member.assignedMemoryBytes / (1024 * 1024)),
         capacityMiB: Math.max(0, node.memoryMiB - node.reserveMiB),
+        artifactBytes: assignedTotal === 0
+          ? memberIndex === 0 ? stageArtifactBytes : 0
+          : Math.floor(stageArtifactBytes * assignedThrough / assignedTotal)
+            - Math.floor(stageArtifactBytes * assignedBefore / assignedTotal),
       };
     })
   );
+}
+
+export function plannedStageArtifactBytes(
+  model: import("../distribution/types.js").DistributedModelProfile,
+  layerStart: number,
+  layerEnd: number,
+): number {
+  if (
+    !Number.isInteger(layerStart)
+    || !Number.isInteger(layerEnd)
+    || layerStart < 0
+    || layerEnd <= layerStart
+    || layerEnd > model.layers.length
+  ) {
+    throw new Error("planned_stage_artifact_range_is_invalid");
+  }
+  let bytes = model.layers
+    .slice(layerStart, layerEnd)
+    .reduce((total, layer) => total + layer.weightBytes, 0);
+  if (layerStart === 0) bytes += model.embeddingBytes;
+  if (layerEnd === model.layers.length) {
+    if (!(model.tiedEmbeddingAndHead && layerStart === 0)) bytes += model.lmHeadBytes;
+  }
+  if (!Number.isSafeInteger(bytes) || bytes < 0) {
+    throw new Error("planned_stage_artifact_bytes_are_invalid");
+  }
+  return bytes;
 }
 
 function modelArtifactsDirectory(base: AutoDistributionConfig, modelId: string): string {

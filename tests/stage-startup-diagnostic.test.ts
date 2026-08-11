@@ -3,7 +3,7 @@ import type {
   LaunchCapturedOutput,
   LaunchProcessHandle,
 } from "../src/distribution/launch-supervisor.js";
-import { stageStartupDiagnostic } from "../src/desktop/stage-startup-diagnostic.js";
+import { stageStartupDiagnostic } from "../src/node/stage-startup-diagnostic.js";
 
 describe("stageStartupDiagnostic", () => {
   it("keeps the bounded tail that explains an early Python exit", () => {

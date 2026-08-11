@@ -35,6 +35,7 @@ from .engine import (
     GenerationOutput,
     MAX_SPECULATIVE_INFLIGHT_BYTES,
     MAX_SPECULATIVE_INFLIGHT_WAVES,
+    LocalPipelineEngine,
     PipelineEngineConfig,
     QueueFullError,
     balanced_boundaries,
@@ -154,7 +155,7 @@ class ContinuousMicroBatcher:
 
     def __init__(
         self,
-        engine: DistributedPipelineEngine | RecoveringPipelineEngine,
+        engine: DistributedPipelineEngine | LocalPipelineEngine | RecoveringPipelineEngine,
         *,
         max_batch_size: int,
         batch_window_ms: float,
@@ -363,7 +364,7 @@ class IncrementalTokenDecoder:
 class DistributedMycelliosServer:
     def __init__(
         self,
-        engine: DistributedPipelineEngine | RecoveringPipelineEngine,
+        engine: DistributedPipelineEngine | LocalPipelineEngine | RecoveringPipelineEngine,
         tokenizer: Any,
         *,
         public_model_name: str,
@@ -1428,16 +1429,6 @@ def build_server(args: argparse.Namespace) -> DistributedMycelliosServer:
     remote = remote_requested
     if remote and (args.first_stage_host is None or args.first_stage_port is None):
         raise ValueError("remote mode requires both first-stage-host and first-stage-port")
-    if ram_backed_moe is not None and not remote:
-        raise ValueError(
-            "server CLI RAM-backed MoE requires remote child stages with their "
-            "own sealed bindings"
-        )
-    if native_gguf is not None and not remote:
-        raise ValueError(
-            "server CLI native GGUF requires remote child stages with their "
-            "own authenticated Mycellios packages"
-        )
     native_package = (
         None
         if native_gguf is None
@@ -1484,6 +1475,16 @@ def build_server(args: argparse.Namespace) -> DistributedMycelliosServer:
         if args.boundaries
         else balanced_boundaries(total_layers, args.stages)
     )
+    if len(boundaries) > 2 and ram_backed_moe is not None and not remote:
+        raise ValueError(
+            "multi-stage CLI RAM-backed MoE requires remote child stages with "
+            "their own sealed bindings"
+        )
+    if len(boundaries) > 2 and native_gguf is not None and not remote:
+        raise ValueError(
+            "multi-stage CLI native GGUF requires remote child stages with "
+            "their own authenticated Mycellios packages"
+        )
     tokenizer = load_tokenizer(tokenizer_snapshot)
     if native_package is not None:
         verify_native_gguf_stage(
@@ -1580,7 +1581,13 @@ def build_server(args: argparse.Namespace) -> DistributedMycelliosServer:
         )
     )
 
-    def make_engine(config: PipelineEngineConfig = engine_config) -> DistributedPipelineEngine:
+    def make_engine(
+        config: PipelineEngineConfig = engine_config,
+    ) -> DistributedPipelineEngine | LocalPipelineEngine:
+        if len(config.boundaries) == 2:
+            if draft_provider is not None or tree_draft_provider_from_args(args) is not None:
+                raise ValueError("single-stage routes do not accept a draft provider")
+            return LocalPipelineEngine(config)
         tree_provider = tree_draft_provider_from_args(args)
         return DistributedPipelineEngine(
             config,
@@ -1590,8 +1597,11 @@ def build_server(args: argparse.Namespace) -> DistributedMycelliosServer:
 
     engine_factory = make_engine
     initial_engine = engine_factory()
-    engine: DistributedPipelineEngine | RecoveringPipelineEngine
+    engine: DistributedPipelineEngine | LocalPipelineEngine | RecoveringPipelineEngine
     if args.recovery_max_retries > 0:
+        if isinstance(initial_engine, LocalPipelineEngine):
+            initial_engine.close()
+            raise ValueError("single-stage recovery does not use remote standby routes")
         expected_executor_ids = initial_engine.recovery_identity.stage_executor_ids
         standby_factories: list[RemoteRecoveryStandbyEngineFactory] = []
         for route in standby_routes:

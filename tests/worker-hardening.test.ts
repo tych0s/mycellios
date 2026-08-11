@@ -1,4 +1,5 @@
 import { createServer, type RequestListener, type Server } from "node:http";
+import { createConnection } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import type { InferenceAdapter } from "../src/adapters/base.js";
 import { MycelliosPipelineAdapter } from "../src/adapters/mycellios-pipeline.js";
@@ -14,6 +15,12 @@ import {
   WorkerAgent,
 } from "../src/worker/agent.js";
 import { sha256Text } from "../src/core/json.js";
+import type {
+  LaunchAgent,
+  LaunchProcessHandle,
+} from "../src/distribution/launch-supervisor.js";
+import { normalizeExecutorIsolationPolicy } from "../src/distribution/process-environment.js";
+import type { PythonLaunchProcess } from "../src/distribution/python-launcher.js";
 
 const CELL_MODEL_DIGEST = `sha256:${"b".repeat(64)}`;
 const CELL_ACTIVATION_ID = "pipeline-activation-7";
@@ -34,6 +41,102 @@ describe("worker boundary hardening", () => {
     expect(() => validateCoordinatorUrl("ws://coordinator.example")).toThrow(/HTTPS\/WSS/);
     expect(validateCoordinatorUrl("http://127.0.0.1:8080").protocol).toBe("http:");
     expect(validateCoordinatorUrl("https://coordinator.example").protocol).toBe("https:");
+  });
+
+  it("cancels registration before a stopped worker can connect or retain its direct listener", async () => {
+    let releaseRegistration!: () => void;
+    const registrationRelease = new Promise<void>((resolve) => {
+      releaseRegistration = resolve;
+    });
+    let registrationReceived!: () => void;
+    const sawRegistration = new Promise<void>((resolve) => {
+      registrationReceived = resolve;
+    });
+    let advertisedPort: number | undefined;
+    let websocketUpgrades = 0;
+    const coordinatorUrl = await listen(servers, (request, response) => {
+      if (request.url !== "/internal/v1/workers/register") {
+        response.statusCode = 404;
+        response.end();
+        return;
+      }
+      void (async () => {
+        const chunks: Buffer[] = [];
+        for await (const chunk of request) chunks.push(Buffer.from(chunk));
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+          capabilities?: {
+            distributedExecutor?: {
+              directTransport?: { candidates?: Array<{ port?: number }> };
+            };
+          };
+        };
+        advertisedPort = body.capabilities?.distributedExecutor?.directTransport
+          ?.candidates?.[0]?.port;
+        registrationReceived();
+        await registrationRelease;
+        if (response.destroyed) return;
+        response.statusCode = 201;
+        response.setHeader("content-type", "application/json");
+        response.end(JSON.stringify({
+          workerId: "worker-start-stop-race",
+          protocolVersion: 1,
+        }));
+      })().catch((error: unknown) => {
+        if (!response.destroyed) response.destroy(error as Error);
+      });
+    });
+    servers.at(-1)!.on("upgrade", (_request, socket) => {
+      websocketUpgrades += 1;
+      socket.destroy();
+    });
+    const launchAgent: LaunchAgent = {
+      id: "unused-start-stop-race-agent",
+      async start() {
+        throw new Error("The registration race must not launch a runtime");
+      },
+    };
+    const agent = new WorkerAgent(baseConfig(), {
+      coordinatorUrl,
+      reconnect: false,
+      advertiseDeployment: false,
+      hardwareProbe: async () => ({
+        hostname: "start-stop-race-worker",
+        platform: process.platform,
+        ramMb: 8_192,
+        gpus: [],
+      }),
+      distributedExecutor: {
+        nodeId: "start-stop-race-node",
+        stageHost: "start-stop-race-node.relay",
+        stagePort: 9_850,
+        launchAgent,
+        computeMode: "cpu-only",
+        cpuEligible: true,
+        directTransport: {
+          enabled: true,
+          listenHost: "127.0.0.1",
+          candidateHosts: ["127.0.0.1"],
+          publicPortMapping: false,
+        },
+      },
+      logger: { info() {}, warn() {}, error() {} },
+    });
+
+    const run = agent.start();
+    await sawRegistration;
+    expect(advertisedPort).toBeTypeOf("number");
+    expect(await portAcceptsConnections(advertisedPort!)).toBe(true);
+
+    const stopped = agent.stop();
+    releaseRegistration();
+    await stopped;
+    await run;
+
+    expect(websocketUpgrades).toBe(0);
+    expect(agent.workerId).toBeUndefined();
+    expect(agent.isConnected).toBe(false);
+    expect(agent.isReady).toBe(false);
+    await expectPortClosed(advertisedPort!);
   });
 
   it("rejects malformed or oversized logical coordinator messages", () => {
@@ -359,17 +462,144 @@ describe("worker boundary hardening", () => {
     sent.length = 0;
     await harness.execute({ ...accepted, leaseId: "lease-second" });
     expect(messagePayload(sent, "lease.reject")).toMatchObject({ reason: "duplicate_job" });
+
+    sent.length = 0;
+    await harness.execute(payload({ jobId: "expired", deadlineAt: Date.now() - 1 }));
+    expect(messagePayload(sent, "lease.reject")).toMatchObject({
+      jobId: "expired",
+      reason: "deadline_exceeded",
+    });
+  });
+
+  it("enforces local schedule and model policy before accepting a lease", async () => {
+    const agent = new WorkerAgent(baseConfig(), {
+      coordinatorUrl: "http://127.0.0.1:9999",
+      reconnect: false,
+      workAdmissionPolicy: (model) => model === null ? null : model === "test-model" ? "node_schedule_closed" : "node_model_not_allowed",
+      logger: { info() {}, warn() {}, error() {} },
+    });
+    const sent: WorkerEnvelope[] = [];
+    const harness = agent as unknown as AgentHarness;
+    harness.registeredWorkerId = "worker-policy";
+    harness.capabilities = capabilities();
+    harness.socket = { readyState: 1, send(serialized) { sent.push(JSON.parse(serialized) as WorkerEnvelope); } };
+    await harness.execute(payload({ jobId: "policy-denied", modelDigest: "sha256:test" }));
+    expect(messagePayload(sent, "lease.reject")).toMatchObject({ jobId: "policy-denied", reason: "node_schedule_closed" });
+    expect(sent.some((message) => message.type === "lease.accept")).toBe(false);
+  });
+
+  it("replays an identical runtime start idempotently and tears down the original handle", async () => {
+    let starts = 0;
+    let stops = 0;
+    let resolveExit!: (exit: { code: number | null; signal: NodeJS.Signals | null }) => void;
+    const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+      resolveExit = resolve;
+    });
+    const handle: LaunchProcessHandle = {
+      ready: Promise.resolve(),
+      exited,
+      async stop() {
+        stops += 1;
+        resolveExit({ code: 0, signal: null });
+      },
+      output: () => ({
+        stdout: "ready\n",
+        stderr: "",
+        stdoutTruncated: false,
+        stderrTruncated: false,
+      }),
+    };
+    const launchAgent: LaunchAgent = {
+      id: "runtime-idempotency",
+      async start() {
+        starts += 1;
+        return handle;
+      },
+    };
+    const agent = new WorkerAgent(baseConfig(), {
+      coordinatorUrl: "http://127.0.0.1:9999",
+      reconnect: false,
+      advertiseDeployment: false,
+      distributedExecutor: {
+        nodeId: "node-a",
+        stageHost: "node-a.relay",
+        stagePort: 9_850,
+        launchAgent,
+        computeMode: "cpu-only",
+        cpuEligible: true,
+      },
+      logger: { info() {}, warn() {}, error() {} },
+    });
+    const sent: WorkerEnvelope[] = [];
+    const closed: Array<{ code: number | undefined; reason: string | undefined }> = [];
+    const harness = agent as unknown as AgentHarness;
+    harness.registeredWorkerId = "worker-runtime";
+    harness.socket = {
+      readyState: 1,
+      send(serialized) { sent.push(JSON.parse(serialized) as WorkerEnvelope); },
+      close(code, reason) { closed.push({ code, reason }); },
+    };
+    const process = {
+      kind: "root-engine",
+      processId: "root-a",
+      anchor: { memberId: "node-a", endpoint: { host: "node-a.relay", port: 9_850 } },
+      command: { executable: "python", args: ["-m", "runtime"] },
+      isolation: normalizeExecutorIsolationPolicy(),
+    } as PythonLaunchProcess;
+    const request = {
+      launchId: "launch-a",
+      pipelineId: "pipeline-a",
+      nodeId: "node-a",
+      process,
+    };
+    harness.authorizedRuntimeProcesses.set(process.processId, JSON.stringify(process));
+    harness.preparedRuntimeProcesses.set(process.processId, process);
+
+    await harness.startDistributedRuntime("request-a", request);
+    await Promise.resolve();
+    await harness.startDistributedRuntime("request-a", structuredClone(request));
+
+    expect(starts).toBe(1);
+    expect(sent.filter((message) => message.type === "runtime.ready")).toHaveLength(2);
+    expect(harness.runtimeProcesses.size).toBe(1);
+
+    await harness.startDistributedRuntime("request-a", {
+      ...request,
+      launchId: "conflicting-launch",
+    });
+    expect(starts).toBe(1);
+    expect(harness.runtimeProcesses.size).toBe(1);
+    expect(closed).toEqual([{ code: 4400, reason: "runtime start identity conflict" }]);
+
+    await harness.resetDistributedRuntime("test_teardown");
+    expect(stops).toBe(1);
+    expect(harness.runtimeProcesses.size).toBe(0);
+    expect(harness.runtimeStartRequests.size).toBe(0);
+    expect(harness.readyRuntimeOutputs.size).toBe(0);
+    await harness.runtimeTunnel?.close();
   });
 });
 
 interface AgentHarness {
   registeredWorkerId?: string;
   capabilities: WorkerCapabilities;
-  socket: { readyState: number; send(serialized: string): void };
+  socket: {
+    readyState: number;
+    send(serialized: string): void;
+    close?(code?: number, reason?: string): void;
+  };
   adapter: InferenceAdapter;
   execute(payload: JobPayload): Promise<void>;
   buildCapabilities(): Promise<WorkerCapabilities>;
   handleEvidenceChallenge(challenge: unknown): Promise<void>;
+  authorizedRuntimeProcesses: Map<string, string>;
+  preparedRuntimeProcesses: Map<string, PythonLaunchProcess>;
+  runtimeProcesses: Map<string, LaunchProcessHandle>;
+  runtimeStartRequests: Map<string, string>;
+  readyRuntimeOutputs: Map<string, unknown>;
+  runtimeTunnel: { close(): Promise<void> } | null;
+  startDistributedRuntime(requestId: string, input: unknown): Promise<void>;
+  resetDistributedRuntime(reason: string): Promise<void>;
 }
 
 function baseConfig() {
@@ -489,4 +719,31 @@ async function listen(servers: Server[], handler: RequestListener): Promise<stri
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("Expected a TCP address");
   return `http://127.0.0.1:${address.port}`;
+}
+
+async function expectPortClosed(port: number): Promise<void> {
+  const deadline = Date.now() + 1_000;
+  while (await portAcceptsConnections(port)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Expected direct listener ${port} to be closed`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function portAcceptsConnections(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = createConnection({ host: "127.0.0.1", port });
+    let settled = false;
+    const finish = (connected: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      socket.destroy();
+      resolve(connected);
+    };
+    const timeout = setTimeout(() => finish(false), 250);
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+  });
 }

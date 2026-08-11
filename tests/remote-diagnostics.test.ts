@@ -7,7 +7,7 @@ import {
 import {
   RemoteDiagnosticsUploader,
   remoteDiagnosticEvents,
-} from "../src/desktop/remote-diagnostics.js";
+} from "../src/node/remote-diagnostics.js";
 import { MeshDatabase } from "../src/storage/database.js";
 import { MeshStore } from "../src/storage/store.js";
 

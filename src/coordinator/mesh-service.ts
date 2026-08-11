@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import type {
   ChatCompletionRequest,
   CompletionResult,
+  ExecutionRouteDecisionRecord,
   JobPayload,
   NetworkExecutionTrace,
   ScheduledRoute,
@@ -11,6 +12,7 @@ import type {
 import { AsyncQueue } from "../core/async-queue.js";
 import { newId } from "../core/ids.js";
 import { estimateInputTokens, inputHashForRequest } from "../core/request.js";
+import { sha256CanonicalEvidence } from "../core/json.js";
 import { Scheduler } from "../scheduler/scheduler.js";
 import type { MeshStore, StoredJob } from "../storage/store.js";
 import type { WorkerHub } from "./worker-hub.js";
@@ -29,6 +31,7 @@ export type JobStreamEvent =
       attempt: number;
       workerId?: string;
       nodeId?: string;
+      recoveryMode?: "prompt-replay" | "deterministic-prefix-replay";
     }
   | { type: "token"; token: TokenEvent }
   | { type: "completed"; result: CompletionResult }
@@ -44,12 +47,17 @@ interface RuntimeJob {
   request: ChatCompletionRequest;
   route: ScheduledRoute;
   routePlan: ScheduledRoute[];
+  routeDecision: ExecutionRouteDecisionRecord;
   routeIndex: number;
   promptCheckpoint: PromptCheckpoint;
   queue: AsyncQueue<JobStreamEvent>;
   output: string;
+  outputTokens: string[];
   outputBytes: number;
   nextTokenIndex: number;
+  replayPrefix: { tokens: string[]; nextIndex: number } | null;
+  recoveryMode: "none" | "prompt-replay" | "deterministic-prefix-replay";
+  replayedTokenEvents: number;
   timeout: NodeJS.Timeout;
   leaseTimer: NodeJS.Timeout | null;
   firstTokenTimer: NodeJS.Timeout | null;
@@ -153,13 +161,23 @@ export class MeshService extends EventEmitter<MeshServiceEvents> {
       }
     });
 
+    const routeOptions = routeOptionsForRequest(stableRequest, this.hub.connectedWorkerIds());
     const routePlan = this.scheduler.selectRoutePlan(stableRequest, sessionId, {
-      connectedWorkerIds: this.hub.connectedWorkerIds(),
+      ...routeOptions,
       allowPipeline: false,
       maxStandbyRoutes: 2,
     });
     if (!routePlan) {
       this.store.setJobStatus(jobId, "failed", "no_capacity");
+      const decision = this.scheduler.selectExecutionRouteDecision(stableRequest, sessionId, {
+        ...routeOptions,
+        allowPipeline: false,
+      });
+      const privacyFailure = privacyFailureFor(decision.reasons);
+      if (privacyFailure) {
+        this.store.setJobStatus(jobId, "failed", privacyFailure.code);
+        throw new MeshServiceError(privacyFailure.code, privacyFailure.message, 503);
+      }
       throw new MeshServiceError(
         "no_capacity",
         `No healthy replica is currently available for ${stableRequest.model}`,
@@ -177,12 +195,17 @@ export class MeshService extends EventEmitter<MeshServiceEvents> {
       request: stableRequest,
       route,
       routePlan: [routePlan.primary, ...routePlan.standbys],
+      routeDecision: structuredClone(routePlan.decision),
       routeIndex: 0,
       promptCheckpoint: createPromptCheckpoint(stableRequest),
       queue,
       output: "",
+      outputTokens: [],
       outputBytes: 0,
       nextTokenIndex: 0,
+      replayPrefix: null,
+      recoveryMode: "none",
+      replayedTokenEvents: 0,
       timeout,
       leaseTimer: null,
       firstTokenTimer: null,
@@ -226,7 +249,7 @@ export class MeshService extends EventEmitter<MeshServiceEvents> {
   hasCapacity(request: ChatCompletionRequest, requestedSessionId?: string): boolean {
     const sessionId = requestedSessionId ?? request.session_id ?? newId("capacity");
     return this.scheduler.selectRoutePlan(cloneRequest(request), sessionId, {
-      connectedWorkerIds: this.hub.connectedWorkerIds(),
+      ...routeOptionsForRequest(request, this.hub.connectedWorkerIds()),
       allowPipeline: false,
       maxStandbyRoutes: 2,
     }) !== null;
@@ -244,7 +267,7 @@ export class MeshService extends EventEmitter<MeshServiceEvents> {
     return true;
   }
 
-  private dispatch(jobId: string, runtime: RuntimeJob): void {
+  private dispatch(jobId: string, runtime: RuntimeJob, promote = false): void {
     if (
       inputHashForRequest(runtime.promptCheckpoint.request) !==
       runtime.promptCheckpoint.requestHash
@@ -262,7 +285,8 @@ export class MeshService extends EventEmitter<MeshServiceEvents> {
       return;
     }
     const leaseId = newId("lea");
-    this.store.setJobRoute(jobId, runtime.route, leaseId);
+    if (promote) this.store.promoteJobRoute(jobId, runtime.route, leaseId);
+    else this.store.setJobRoute(jobId, runtime.route, leaseId);
     const job = this.store.getJob(jobId);
     if (!job) return;
     const payload: JobPayload = {
@@ -320,7 +344,7 @@ export class MeshService extends EventEmitter<MeshServiceEvents> {
         });
         runtime.firstTokenTimer = setTimeout(() => {
           const active = this.runtimes.get(job.id);
-          if (!active || active.nextTokenIndex > 0) return;
+          if (!active || (active.nextTokenIndex > 0 && !active.replayPrefix)) return;
           this.retryOrFail(
             job.id,
             "first_token_timeout",
@@ -351,6 +375,22 @@ export class MeshService extends EventEmitter<MeshServiceEvents> {
     runtime.leaseTimer = null;
     if (runtime.firstTokenTimer) clearTimeout(runtime.firstTokenTimer);
     runtime.firstTokenTimer = null;
+    if (runtime.replayPrefix) {
+      const expected = runtime.replayPrefix.tokens[runtime.replayPrefix.nextIndex];
+      if (payload.index !== runtime.replayPrefix.nextIndex || payload.text !== expected) {
+        this.failRuntime(
+          payload.jobId,
+          "replay_prefix_mismatch",
+          "The exact-revision standby diverged while replaying the committed output prefix",
+        );
+        return;
+      }
+      runtime.replayPrefix.nextIndex += 1;
+      if (runtime.replayPrefix.nextIndex === runtime.replayPrefix.tokens.length) {
+        runtime.replayPrefix = null;
+      }
+      return;
+    }
     const chunkBytes = Buffer.byteLength(payload.text, "utf8");
     const maxOutputBytes = Math.min(
       2 * 1024 * 1024,
@@ -367,6 +407,7 @@ export class MeshService extends EventEmitter<MeshServiceEvents> {
     }
     runtime.nextTokenIndex += 1;
     runtime.output += payload.text;
+    runtime.outputTokens.push(payload.text);
     runtime.outputBytes += chunkBytes;
     if (runtime.nextTokenIndex === 1) this.store.setJobStatus(payload.jobId, "streaming");
     runtime.queue.push({ type: "token", token: { index: payload.index, text: payload.text } });
@@ -381,6 +422,14 @@ export class MeshService extends EventEmitter<MeshServiceEvents> {
     );
     const runtime = this.runtimes.get(result.jobId);
     if (!job || !runtime) return;
+    if (runtime.replayPrefix) {
+      this.failRuntime(
+        job.id,
+        "replay_prefix_incomplete",
+        "The exact-revision standby completed before reproducing the committed output prefix",
+      );
+      return;
+    }
     const validation = this.validateCompletion(job, runtime, result);
     if (!validation.ok) {
       this.failRuntime(job.id, "invalid_completion", validation.reason);
@@ -407,7 +456,11 @@ export class MeshService extends EventEmitter<MeshServiceEvents> {
     });
     runtime.queue.push({
       type: "completed",
-      result: { ...result, text: runtime.output, networkTrace },
+      result: { ...result, text: runtime.output, networkTrace, recovery: {
+        mode: runtime.recoveryMode,
+        attempts: runtime.attempt,
+        replayedTokenEvents: runtime.replayedTokenEvents,
+      }, privacy: executionPrivacyTrace(runtime.request) },
     });
     this.emit("healthy", {
       jobId: job.id,
@@ -426,10 +479,7 @@ export class MeshService extends EventEmitter<MeshServiceEvents> {
     };
     if (!this.validJobEnvelope(envelope.workerId, payload.jobId, payload.leaseId)) return;
     const runtime = this.runtimes.get(payload.jobId);
-    if (runtime?.nextTokenIndex === 0) {
-      this.retryOrFail(payload.jobId, payload.code ?? "worker_failed", payload.message);
-    }
-    else this.failRuntime(payload.jobId, payload.code ?? "worker_failed", payload.message);
+    this.retryOrFail(payload.jobId, payload.code ?? "worker_failed", payload.message);
   }
 
   private handleWorkerDisconnect(workerId: string): void {
@@ -437,8 +487,7 @@ export class MeshService extends EventEmitter<MeshServiceEvents> {
     for (const job of this.store.listActiveJobsForWorker(workerId)) {
       handledJobs.add(job.id);
       const runtime = this.runtimes.get(job.id);
-      if (runtime?.nextTokenIndex === 0) this.retryOrFail(job.id, "worker_disconnected");
-      else this.failRuntime(job.id, "worker_lost_midstream", "Worker disconnected after streaming began");
+      if (runtime) this.retryOrFail(job.id, "worker_disconnected", "Worker disconnected after streaming began");
     }
     const disconnectedWorker = this.store.getWorker(workerId);
     const disconnectedNodeId = disconnectedWorker?.capabilities.distributedExecutor?.nodeId;
@@ -464,11 +513,7 @@ export class MeshService extends EventEmitter<MeshServiceEvents> {
         workerId,
         nodeId: disconnectedNodeId,
       });
-      if (runtime.nextTokenIndex === 0) {
-        this.retryOrFail(jobId, "pipeline_stage_disconnected", message);
-      } else {
-        this.failRuntime(jobId, "pipeline_stage_lost_midstream", message);
-      }
+      this.retryOrFail(jobId, "pipeline_stage_disconnected", message);
     }
   }
 
@@ -480,24 +525,37 @@ export class MeshService extends EventEmitter<MeshServiceEvents> {
     runtime.leaseTimer = null;
     if (runtime.firstTokenTimer) clearTimeout(runtime.firstTokenTimer);
     runtime.firstTokenTimer = null;
-    if (runtime.nextTokenIndex > 0) {
+    const replayingCommittedPrefix = runtime.nextTokenIndex > 0;
+    if (replayingCommittedPrefix && !Number.isSafeInteger(runtime.request.seed)) {
       this.failRuntime(
         jobId,
         reason,
-        "Streaming already began; output and KV failover are not implemented",
+        "Streaming already began and exact replay requires an explicit deterministic seed",
       );
       return;
     }
     const previousWorkerId = job.workerId;
     if (previousWorkerId) this.hub.send(previousWorkerId, "task.cancel", { jobId });
     this.recordTransportUsage(jobId, runtime, Date.now());
-    this.store.requeueJob(jobId, reason);
-
     while (runtime.routeIndex + 1 < runtime.routePlan.length) {
       runtime.routeIndex += 1;
       const route = runtime.routePlan[runtime.routeIndex]!;
       if (!route.stages.every((stage) => this.hub.isConnected(stage.workerId))) continue;
+      if (!this.scheduler.isRouteCurrentlyEligible(
+        runtime.request,
+        job.sessionId,
+        route,
+        { ...routeOptionsForRequest(runtime.request, this.hub.connectedWorkerIds()), allowPipeline: false },
+      )) continue;
       runtime.route = route;
+      runtime.replayPrefix = replayingCommittedPrefix
+        ? { tokens: [...runtime.outputTokens], nextIndex: 0 }
+        : null;
+      runtime.recoveryMode = replayingCommittedPrefix
+        ? "deterministic-prefix-replay"
+        : "prompt-replay";
+      if (replayingCommittedPrefix) runtime.replayedTokenEvents += runtime.outputTokens.length;
+      selectFallbackDecision(runtime.routeDecision, route);
       runtime.attempt += 1;
       runtime.attemptStartedAt = Date.now();
       runtime.attemptTransportStart = this.captureRuntimeTransportSnapshot();
@@ -508,17 +566,24 @@ export class MeshService extends EventEmitter<MeshServiceEvents> {
       runtime.queue.push({
         type: "progress",
         phase: "recovering",
-        message: "The route failed before token zero. Retrying on an exact-model standby.",
+        message: replayingCommittedPrefix
+          ? `Replaying ${runtime.outputTokens.length} committed token event(s) on an exact-revision standby; duplicate output is suppressed.`
+          : "The route failed before token zero. Retrying on an exact-model standby.",
         attempt: runtime.attempt,
+        recoveryMode: replayingCommittedPrefix
+          ? "deterministic-prefix-replay"
+          : "prompt-replay",
         ...(previousWorkerId ? { workerId: previousWorkerId } : {}),
       });
-      this.dispatch(jobId, runtime);
+      this.dispatch(jobId, runtime, true);
       return;
     }
     this.failRuntime(
       jobId,
       reason,
-      failureMessage ?? "No exact-model preplanned standby remains for prompt recomputation",
+      failureMessage ?? (replayingCommittedPrefix
+        ? "No exact-model preplanned standby remains for deterministic prefix replay"
+        : "No exact-model preplanned standby remains for prompt recomputation"),
     );
   }
 
@@ -583,6 +648,7 @@ export class MeshService extends EventEmitter<MeshServiceEvents> {
       jobId,
       attempt: runtime.attempt,
       route: runtime.route,
+      routeDecision: runtime.routeDecision,
       observedFrom: runtime.attemptStartedAt,
       observedUntil,
     };
@@ -756,6 +822,46 @@ export class MeshService extends EventEmitter<MeshServiceEvents> {
   }
 }
 
+function routeOptionsForRequest(request: ChatCompletionRequest, connectedWorkerIds: ReadonlySet<string>) {
+  const pinned = request.privacy?.boundary === "pinned-edges"
+    ? new Set(request.privacy.pinned_identity_ids ?? [])
+    : undefined;
+  return {
+    connectedWorkerIds,
+    routePolicy: {
+      requireTrustedBoundaryIdentity: true,
+      requireTrustedIdentity: request.privacy?.trust === "trusted-only",
+      ...(pinned ? { pinnedBoundaryIdentityIds: pinned } : {}),
+    },
+  };
+}
+
+function privacyFailureFor(reasons: readonly string[]): { code: string; message: string } | null {
+  if (reasons.includes("candidate_boundary_pin_rejected")) return {
+    code: "boundary_pin_unavailable",
+    message: "No route keeps every sensitive edge on an explicitly pinned trusted identity",
+  };
+  if (reasons.includes("candidate_trust_rejected")) return {
+    code: "trusted_route_unavailable",
+    message: "No route satisfies the request's trusted-only policy",
+  };
+  if (reasons.includes("candidate_boundary_trust_rejected")) return {
+    code: "trusted_boundary_unavailable",
+    message: "No route keeps the sensitive input and output boundaries on trusted identities",
+  };
+  return null;
+}
+
+function executionPrivacyTrace(request: ChatCompletionRequest) {
+  return {
+    trust: request.privacy?.trust ?? "default",
+    boundary: request.privacy?.boundary ?? "trusted-edges",
+    pinnedIdentityHashes: [...new Set(request.privacy?.pinned_identity_ids ?? [])]
+      .map((id) => sha256CanonicalEvidence({ kind: "worker-identity", id }))
+      .sort(),
+  } as const;
+}
+
 export class MeshServiceError extends Error {
   constructor(
     readonly code: string,
@@ -767,6 +873,23 @@ export class MeshServiceError extends Error {
   }
 }
 
+function selectFallbackDecision(
+  decision: ExecutionRouteDecisionRecord,
+  route: ScheduledRoute,
+): void {
+  const candidateId = route.stages
+    .map((stage) => `${stage.workerId}:${stage.deploymentId}:${stage.modelDigest}:${stage.stageIndex}`)
+    .join("|");
+  const fallback = decision.fallbacks.find((candidate) => candidate.candidateId === candidateId);
+  if (!fallback) return;
+  decision.selected = { ...fallback, reason: "selected_fallback_after_failure" };
+  decision.selectedKind = fallback.kind;
+  decision.fallbacks = decision.fallbacks.filter(
+    (candidate) => candidate.candidateId !== candidateId,
+  );
+  decision.reasons = ["selected_fallback_after_failure"];
+}
+
 function generationOnlyRequest(request: ChatCompletionRequest): ChatCompletionRequest {
   return {
     model: request.model,
@@ -776,6 +899,12 @@ function generationOnlyRequest(request: ChatCompletionRequest): ChatCompletionRe
     ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
     ...(request.top_p === undefined ? {} : { top_p: request.top_p }),
     ...(request.seed === undefined ? {} : { seed: request.seed }),
+    ...(request.privacy === undefined ? {} : { privacy: {
+      ...request.privacy,
+      ...(request.privacy.pinned_identity_ids
+        ? { pinned_identity_ids: [...request.privacy.pinned_identity_ids] }
+        : {}),
+    } }),
   };
 }
 

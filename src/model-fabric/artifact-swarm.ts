@@ -17,7 +17,7 @@ import {
 } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 
-export const ARTIFACT_SWARM_SCHEMA = "mycellios-artifact-swarm/1" as const;
+export const ARTIFACT_SWARM_SCHEMA = "mycellios-artifact-swarm/2" as const;
 
 const MAX_PACKAGES = 256;
 const MAX_BLOBS_PER_PACKAGE = 16;
@@ -40,6 +40,7 @@ export interface ArtifactBlobDescriptor {
 
 export interface ArtifactPackageDescriptor {
   packageId: string;
+  artifactIds: string[];
   layerStart: number;
   layerEnd: number;
   manifest: ArtifactBlobDescriptor;
@@ -49,6 +50,7 @@ export interface ArtifactPackageDescriptor {
 export interface UnsignedArtifactSwarmManifest {
   schema: typeof ARTIFACT_SWARM_SCHEMA;
   modelIdentity: string;
+  distributionManifestId: string;
   sourceRevision: string;
   tensorAbi: string;
   packages: ArtifactPackageDescriptor[];
@@ -85,7 +87,7 @@ export interface ArtifactChunkRequest {
 /**
  * Structural copy of the pinned-artifact contract used by the desktop
  * provisioner. Keeping it here prevents the model-fabric layer from depending
- * on Electron while still allowing the production downloader to use it
+ * on a UI shell while still allowing the production downloader to use it
  * directly.
  */
 export interface ArtifactSwarmPinnedArtifact {
@@ -188,6 +190,7 @@ export function verifyArtifactSwarmManifest(
   const record = strictRecord(value, [
     "schema",
     "modelIdentity",
+    "distributionManifestId",
     "sourceRevision",
     "tensorAbi",
     "packages",
@@ -198,6 +201,7 @@ export function verifyArtifactSwarmManifest(
   const normalized = validateUnsignedManifest({
     schema: record.schema as typeof ARTIFACT_SWARM_SCHEMA,
     modelIdentity: record.modelIdentity as string,
+    distributionManifestId: record.distributionManifestId as string,
     sourceRevision: record.sourceRevision as string,
     tensorAbi: record.tensorAbi as string,
     packages: record.packages as ArtifactPackageDescriptor[],
@@ -242,9 +246,22 @@ export function verifyArtifactSwarmManifest(
 export class ArtifactSwarmRegistry {
   private readonly manifests = new Map<string, SignedArtifactSwarmManifest>();
   private readonly peers = new Map<string, StoredPeer>();
+  private readonly trustedPublisherKeys: ReadonlySet<string>;
+
+  constructor(options: { trustedPublisherKeys: readonly KeyLike[] }) {
+    if (options.trustedPublisherKeys.length === 0) throw new Error("artifact_swarm_trusted_publisher_is_missing");
+    this.trustedPublisherKeys = new Set(options.trustedPublisherKeys.map((key) => {
+      const publicKey = isPublicKeyObject(key) ? key : createPublicKey(key);
+      if (publicKey.asymmetricKeyType !== "ed25519") throw new Error("artifact_swarm_trusted_publisher_is_invalid");
+      return publicKey.export({ format: "der", type: "spki" }).toString("base64url");
+    }));
+  }
 
   publish(value: SignedArtifactSwarmManifest): SignedArtifactSwarmManifest {
     const manifest = verifyArtifactSwarmManifest(value);
+    if (!this.trustedPublisherKeys.has(manifest.publisherPublicKey)) {
+      throw new Error("artifact_swarm_publisher_is_not_trusted");
+    }
     const existing = this.manifests.get(manifest.manifestId);
     if (existing && canonicalJson(existing) !== canonicalJson(manifest)) {
       throw new Error("artifact_swarm_manifest_identity_collision");
@@ -429,7 +446,7 @@ export function createArtifactSwarmDownloader(
       onProgress(completedSwarmTransfer(normalizedArtifact.sizeBytes, false));
       return cache.target;
     }
-    await rm(cache.target, { force: true });
+    await quarantineInvalidArtifact(cache.target, cache.artifactDirectory);
 
     const selection = selectArtifactBlob(
       options.registry.getManifest(options.manifestId),
@@ -557,6 +574,20 @@ export function createArtifactSwarmDownloader(
   };
 }
 
+async function quarantineInvalidArtifact(target: string, artifactDirectory: string): Promise<void> {
+  try {
+    await stat(target);
+  } catch {
+    return;
+  }
+  const quarantine = resolve(
+    artifactDirectory,
+    `.quarantine-${basename(target)}-${randomUUID()}`,
+  );
+  assertDirectChild(artifactDirectory, quarantine, "artifact_swarm_cache_path_escaped");
+  await rename(target, quarantine);
+}
+
 export function artifactChunkId(blobSha256: string, chunkIndex: number): string {
   const digest = sha256Text(blobSha256, "artifact_swarm_blob_digest_is_invalid");
   const index = boundedInteger(
@@ -574,6 +605,7 @@ function validateUnsignedManifest(
   const record = strictRecord(value, [
     "schema",
     "modelIdentity",
+    "distributionManifestId",
     "sourceRevision",
     "tensorAbi",
     "packages",
@@ -584,6 +616,10 @@ function validateUnsignedManifest(
   const modelIdentity = sha256IdentityText(
     record.modelIdentity,
     "artifact_swarm_model_identity_is_invalid",
+  );
+  const distributionManifestId = sha256IdentityText(
+    record.distributionManifestId,
+    "artifact_swarm_distribution_manifest_id_is_invalid",
   );
   const sourceRevision = text(
     record.sourceRevision,
@@ -610,6 +646,7 @@ function validateUnsignedManifest(
   return {
     schema: ARTIFACT_SWARM_SCHEMA,
     modelIdentity,
+    distributionManifestId,
     sourceRevision,
     tensorAbi,
     packages,
@@ -619,6 +656,7 @@ function validateUnsignedManifest(
 function validatePackage(value: unknown): ArtifactPackageDescriptor {
   const record = strictRecord(value, [
     "packageId",
+    "artifactIds",
     "layerStart",
     "layerEnd",
     "manifest",
@@ -628,6 +666,20 @@ function validatePackage(value: unknown): ArtifactPackageDescriptor {
     record.packageId,
     "artifact_swarm_package_id_is_invalid",
   );
+  if (
+    !Array.isArray(record.artifactIds)
+    || record.artifactIds.length < 1
+    || record.artifactIds.length > 1_024
+    || !record.artifactIds.every((value) => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._+/-]{0,255}$/.test(value))
+  ) throw new Error("artifact_swarm_package_artifact_ids_are_invalid");
+  const declaredArtifactIds = record.artifactIds as string[];
+  if (new Set(declaredArtifactIds).size !== declaredArtifactIds.length) {
+    throw new Error("artifact_swarm_package_artifact_ids_are_invalid");
+  }
+  const artifactIds = [...declaredArtifactIds].sort();
+  if (artifactIds.some((value, index) => value !== declaredArtifactIds[index])) {
+    throw new Error("artifact_swarm_package_artifact_ids_are_not_canonical");
+  }
   const layerStart = boundedInteger(
     record.layerStart,
     0,
@@ -650,7 +702,35 @@ function validatePackage(value: unknown): ArtifactPackageDescriptor {
   if (digests.size !== blobs.length + 1) {
     throw new Error("artifact_swarm_blob_is_duplicated");
   }
-  return { packageId, layerStart, layerEnd, manifest, blobs };
+  return { packageId, artifactIds, layerStart, layerEnd, manifest, blobs };
+}
+
+export function selectArtifactSwarmPackages(
+  manifest: SignedArtifactSwarmManifest,
+  distributionManifestId: string,
+  selectedArtifactIds: readonly string[],
+): string[] {
+  const verified = verifyArtifactSwarmManifest(manifest);
+  if (verified.distributionManifestId !== distributionManifestId) {
+    throw new Error("artifact_swarm_distribution_manifest_mismatch");
+  }
+  const requested = new Set(selectedArtifactIds);
+  if (requested.size !== selectedArtifactIds.length || requested.size === 0) {
+    throw new Error("artifact_swarm_selected_artifact_ids_are_invalid");
+  }
+  const packages = verified.packages.filter((entry) =>
+    entry.artifactIds.some((artifactId) => requested.has(artifactId))
+  );
+  const covered = new Set(packages.flatMap(({ artifactIds }) => artifactIds));
+  for (const artifactId of covered) {
+    if (!requested.has(artifactId)) {
+      throw new Error("artifact_swarm_package_contains_unassigned_artifact");
+    }
+  }
+  for (const artifactId of requested) {
+    if (!covered.has(artifactId)) throw new Error("artifact_swarm_selected_artifact_is_missing");
+  }
+  return packages.map(({ packageId }) => packageId);
 }
 
 function validateBlob(value: unknown): ArtifactBlobDescriptor {
@@ -916,19 +996,35 @@ async function fetchVerifiedPeerChunk(
   request: ArtifactChunkRequest,
   chunkDirectory: string,
 ): Promise<void> {
+  const target = chunkPath(chunkDirectory, request.chunk);
+  const partial = `${target}.partial`;
+  assertDirectChild(chunkDirectory, partial, "artifact_swarm_cache_path_escaped");
+  let partialBytes = 0;
+  const digest = createHash("sha256");
+  try {
+    const metadata = await stat(partial);
+    if (!metadata.isFile() || metadata.size >= request.chunk.sizeBytes) {
+      await rm(partial, { force: true });
+    } else {
+      partialBytes = metadata.size;
+      for await (const value of createReadStream(partial)) digest.update(value as Buffer);
+    }
+  } catch {
+    partialBytes = 0;
+  }
   const response = await client.fetchChunk({
     peerId,
     packageId: request.packageId,
     blobSha256: request.blobSha256,
     chunkId: request.chunkId,
-    offset: request.chunk.offset,
-    sizeBytes: request.chunk.sizeBytes,
+    offset: request.chunk.offset + partialBytes,
+    sizeBytes: request.chunk.sizeBytes - partialBytes,
   });
   if (
     response.contentLength !== undefined
     && (
       !Number.isSafeInteger(response.contentLength)
-      || response.contentLength !== request.chunk.sizeBytes
+      || response.contentLength !== request.chunk.sizeBytes - partialBytes
     )
   ) {
     throw new ArtifactPeerCorruptionError(
@@ -945,19 +1041,8 @@ async function fetchVerifiedPeerChunk(
     );
   }
 
-  const target = chunkPath(chunkDirectory, request.chunk);
-  const temporary = resolve(
-    chunkDirectory,
-    `.${basename(target)}.${randomUUID()}.tmp`,
-  );
-  assertDirectChild(
-    chunkDirectory,
-    temporary,
-    "artifact_swarm_cache_path_escaped",
-  );
-  const writer = await open(temporary, "wx");
-  const digest = createHash("sha256");
-  let bytesRead = 0;
+  const writer = await open(partial, partialBytes === 0 ? "w" : "a");
+  let bytesRead = partialBytes;
   try {
     for await (const value of response.body) {
       if (!(value instanceof Uint8Array)) {
@@ -978,7 +1063,7 @@ async function fetchVerifiedPeerChunk(
     await writer.sync();
   } catch (error) {
     await writer.close().catch(() => undefined);
-    await rm(temporary, { force: true });
+    // A bounded prefix remains resumable by absolute artifact offset.
     throw error;
   }
   await writer.close();
@@ -986,18 +1071,18 @@ async function fetchVerifiedPeerChunk(
     bytesRead !== request.chunk.sizeBytes
     || digest.digest("hex") !== request.chunk.sha256
   ) {
-    await rm(temporary, { force: true });
+    await rm(partial, { force: true });
     throw new ArtifactPeerCorruptionError(
       "artifact_swarm_peer_chunk_digest_mismatch",
     );
   }
 
   if (await verifiedPath(target, request.chunk.sizeBytes, request.chunk.sha256)) {
-    await rm(temporary, { force: true });
+    await rm(partial, { force: true });
     return;
   }
   await rm(target, { force: true });
-  await rename(temporary, target);
+  await rename(partial, target);
 }
 
 async function assembleVerifiedArtifact(

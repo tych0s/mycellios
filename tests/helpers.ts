@@ -25,11 +25,14 @@ export function addWorker(
     execution?: ModelDeployment["execution"];
     distributedExecutor?: WorkerCapabilities["distributedExecutor"];
     identity?: WorkerRegistration["identity"];
+    trusted?: boolean;
   },
 ): StoredWorker {
   const mode = input.mode ?? "replica";
   const registration: WorkerRegistration = {
-    ...(input.identity ? { identity: input.identity } : {}),
+    ...(input.identity ? { identity: input.identity }
+      : input.trusted === false ? {}
+      : { identity: { kind: "cell" as const, id: `test-${input.id}` } }),
     capabilities: {
       region: input.region ?? "es-mad",
       agentVersion: "test",

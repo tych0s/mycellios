@@ -15,7 +15,7 @@ afterEach(() => {
 });
 
 describe("public release transaction CLI", () => {
-  it("hashes the one exact eight-asset release set in canonical order", async () => {
+  it("hashes the exact four-asset native node release set in canonical order", async () => {
     const root = fixture();
     writeChecksums(root);
     const outputPath = join(root, "manifest.json");
@@ -29,19 +29,13 @@ describe("public release transaction CLI", () => {
       version: "0.2.19",
     });
 
-    // Ocho, no nueve: macOS Intel se retiro el 26-07-2026 y su DMG ya no
-    // forma parte del conjunto publicado.
-    expect(manifest.assets).toHaveLength(8);
+    expect(manifest.assets).toHaveLength(4);
     expect(manifest.assets.map(({ channel, fileName }) => `${channel}/${fileName}`))
       .toEqual([
-        "downloads/mycellios-linux-x64.deb",
-        "downloads/mycellios-linux-x64.rpm",
-        "downloads/mycellios-macos-arm64.dmg",
-        "downloads/mycellios-windows-x64.exe",
-        "updates/RELEASES",
-        "updates/latest.json",
-        "updates/mycellios-0.2.19-full.nupkg",
-        "updates/mycellios-setup.exe",
+        "downloads/mycellios-node-linux-x64.tar.gz",
+        "downloads/mycellios-node-macos-arm64.tar.gz",
+        "downloads/mycellios-node-windows-x64.zip",
+        "updates/mycellios-node-latest.json",
       ]);
     expect(
       parseReleaseTransactionManifest(
@@ -52,7 +46,7 @@ describe("public release transaction CLI", () => {
 
   it("fails closed on a missing or unexpected release asset", async () => {
     const root = fixture();
-    rmSync(join(root, "mycellios-linux-x64.rpm"));
+    rmSync(join(root, "mycellios-node-linux-x64.tar.gz"));
     writeFileSync(join(root, "unexpected.exe"), "unexpected");
 
     await expect(preparePublicReleaseTransaction({
@@ -67,7 +61,7 @@ describe("public release transaction CLI", () => {
 
   it("rejects a human checksum list that does not match the sealed assets", async () => {
     const root = fixture();
-    writeFileSync(join(root, "sha256sums.txt"), `${"0".repeat(64)}  mycellios-setup.exe\n`);
+    writeFileSync(join(root, "sha256sums.txt"), `${"0".repeat(64)}  mycellios-node-windows-x64.zip\n`);
 
     await expect(preparePublicReleaseTransaction({
       assetsRoot: root,
@@ -84,14 +78,10 @@ function fixture(): string {
   const root = mkdtempSync(join(tmpdir(), "mycellios-public-release-"));
   roots.push(root);
   const names = [
-    "RELEASES",
-    "latest.json",
-    "mycellios-0.2.19-full.nupkg",
-    "mycellios-setup.exe",
-    "mycellios-windows-x64.exe",
-    "mycellios-macos-arm64.dmg",
-    "mycellios-linux-x64.deb",
-    "mycellios-linux-x64.rpm",
+    "mycellios-node-latest.json",
+    "mycellios-node-windows-x64.zip",
+    "mycellios-node-macos-arm64.tar.gz",
+    "mycellios-node-linux-x64.tar.gz",
   ];
   for (const name of names) writeFileSync(join(root, name), `fixture:${name}`);
   return root;
@@ -99,12 +89,10 @@ function fixture(): string {
 
 function writeChecksums(root: string): void {
   const names = [
-    "mycellios-0.2.19-full.nupkg",
-    "mycellios-linux-x64.deb",
-    "mycellios-linux-x64.rpm",
-    "mycellios-macos-arm64.dmg",
-    "mycellios-setup.exe",
-    "mycellios-windows-x64.exe",
+    "mycellios-node-latest.json",
+    "mycellios-node-linux-x64.tar.gz",
+    "mycellios-node-macos-arm64.tar.gz",
+    "mycellios-node-windows-x64.zip",
   ];
   const content = names.map((name) => {
     const bytes = readFileSync(join(root, name));

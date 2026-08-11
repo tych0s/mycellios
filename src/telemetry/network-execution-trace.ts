@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type {
+  ExecutionRouteDecisionRecord,
   ModelDeployment,
   NetworkExecutionBoundaryTrace,
   NetworkExecutionTrace,
@@ -7,7 +8,7 @@ import type {
   ScheduledRoute,
 } from "../contracts/types.js";
 import type { StoredWorker } from "../storage/store.js";
-import type { RuntimeTransportSnapshot } from "../coordinator/worker-hub.js";
+import type { RuntimeTransportSnapshot } from "../contracts/runtime-transport.js";
 
 export const NETWORK_EXECUTION_TRACE_SCHEMA =
   "mycellios-network-execution-trace/1" as const;
@@ -175,6 +176,66 @@ const boundarySchema = z.object({
   }
 });
 
+const routeKindSchema = z.enum([
+  "local-complete",
+  "remote-replica",
+  "distributed-pipeline",
+  "unavailable",
+]);
+const selectableRouteKindSchema = z.enum([
+  "local-complete",
+  "remote-replica",
+  "distributed-pipeline",
+]);
+const routeReasonSchema = z.enum([
+  "selected_best_service",
+  "selected_kv_affinity",
+  "selected_fallback_after_failure",
+  "candidate_not_ready",
+  "candidate_slo_exceeded",
+  "candidate_evidence_missing",
+  "candidate_capacity_exhausted",
+  "candidate_context_exceeded",
+  "candidate_trust_rejected",
+  "candidate_residency_rejected",
+  "candidate_failure_domain_rejected",
+  "candidate_cost_exceeded",
+  "no_candidate_routes",
+]);
+const routeSelectionSchema = z.object({
+  candidateId: identifier,
+  kind: selectableRouteKindSchema,
+  score: z.number().nonnegative().finite(),
+  nodeCount: z.number().int().positive(),
+  reason: z.enum([
+    "selected_best_service",
+    "selected_kv_affinity",
+    "selected_fallback_after_failure",
+  ]),
+}).strict();
+const routeDecisionSchema = z.object({
+  recommendation: routeSelectionSchema.nullable(),
+  selected: routeSelectionSchema.nullable(),
+  selectedKind: routeKindSchema,
+  fallbacks: z.array(routeSelectionSchema).max(64),
+  standbys: z.array(z.object({
+    candidateId: identifier,
+    kind: selectableRouteKindSchema,
+    compatibility: z.literal("exact-model-revision-and-stage-contract"),
+    stageCount: z.number().int().positive(),
+    modelDigests: z.array(identifier).min(1).max(64),
+  }).strict()).max(8).default([]),
+  reasons: z.array(routeReasonSchema).max(64),
+  evaluations: z.array(z.object({
+    candidateId: identifier,
+    kind: selectableRouteKindSchema,
+    eligible: z.boolean(),
+    score: z.number().nonnegative().finite(),
+    nodeCount: z.number().int().positive(),
+    reasons: z.array(routeReasonSchema).max(64),
+  }).strict()).max(128),
+}).strict();
+
 export const networkExecutionTraceSchema = z.object({
   schema: z.literal(NETWORK_EXECUTION_TRACE_SCHEMA),
   jobId: identifier,
@@ -184,6 +245,7 @@ export const networkExecutionTraceSchema = z.object({
   durationMs: z.number().int().nonnegative(),
   routeClass: z.enum(["replica", "pipeline"]),
   affinityHit: z.boolean(),
+  routeDecision: routeDecisionSchema.nullable().default(null),
   selectedRoute: z.array(z.object({
     routeStageIndex: z.number().int().nonnegative(),
     workerId: identifier,
@@ -293,6 +355,7 @@ export interface BuildNetworkExecutionTraceInput {
   endTransports: readonly RuntimeTransportSnapshot[];
   /** Directed `source\0destination` keys used by another overlapping job. */
   contendedBoundaryKeys?: ReadonlySet<string>;
+  routeDecision?: ExecutionRouteDecisionRecord | null;
 }
 
 export function buildNetworkExecutionTrace(
@@ -333,6 +396,7 @@ export function buildNetworkExecutionTrace(
     durationMs: observedUntil - observedFrom,
     routeClass: input.route.routeClass,
     affinityHit: input.route.affinityHit,
+    routeDecision: input.routeDecision ?? null,
     selectedRoute: input.route.stages.map((stage, routeStageIndex) => ({
       routeStageIndex,
       workerId: stage.workerId,

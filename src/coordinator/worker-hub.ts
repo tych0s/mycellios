@@ -10,11 +10,19 @@ import {
   workerEnvelopeValidationIssues,
   type WorkerHeartbeatPayload,
 } from "../contracts/worker-protocol.js";
-import type { MeshStore } from "../storage/store.js";
+import type { MeshStore, StoredWorker } from "../storage/store.js";
 import type {
   ModelDeployment,
   WorkerCapabilities,
 } from "../contracts/types.js";
+import type {
+  RuntimeProxyHandle,
+  RuntimeTransportSnapshot,
+} from "../contracts/runtime-transport.js";
+export type {
+  RuntimeProxyHandle,
+  RuntimeTransportSnapshot,
+} from "../contracts/runtime-transport.js";
 import {
   createCoordinatorDeploymentCanaryEvidence,
   deploymentMetricsFromCanaryEvidence,
@@ -52,10 +60,19 @@ interface HubEvents {
   disconnect: [string];
 }
 
+export interface AuthorizedWorkerSession {
+  workerId: string;
+  identityKind: "device" | "cell";
+  identityId: string;
+  credentialFingerprint: string;
+  generation: number | null;
+}
+
 interface ConnectionState {
   socket: WebSocket;
   workerId: string | null;
   authorizedWorkerId?: string | null;
+  authorizedSession?: AuthorizedWorkerSession | null;
   ready: boolean;
   helloTimer: NodeJS.Timeout;
   pending: boolean;
@@ -119,21 +136,6 @@ interface RuntimeStreamSession {
   endedAt: number | null;
 }
 
-export interface RuntimeTransportSnapshot {
-  streamId: string;
-  sourceNodeId: string | null;
-  destinationNodeId: string;
-  targetPort: number;
-  mode: "direct" | "relay";
-  state: "negotiating" | "active" | "suspended" | "closed";
-  bytesSourceToDestination: number;
-  bytesDestinationToSource: number;
-  createdAt: number;
-  connectedAt: number | null;
-  endedAt: number | null;
-  connectRttMs: number | null;
-}
-
 interface RuntimeStreamRecoveryReport {
   sendOffset: number;
   acknowledgedOffset: number;
@@ -160,12 +162,6 @@ interface RuntimeLinkProbeSession {
   timeout: NodeJS.Timeout;
 }
 
-export interface RuntimeProxyHandle {
-  host: "127.0.0.1";
-  port: number;
-  close(): Promise<void>;
-}
-
 const MAX_RUNTIME_STREAMS = 1_024;
 const MAX_RUNTIME_STREAM_BUFFERED_BYTES = 8 * 1024 * 1024;
 const MAX_WEBSOCKET_BUFFERED_BYTES = 8 * 1024 * 1024;
@@ -181,6 +177,29 @@ const DIRECT_GRANT_TTL_MS = 10_000;
 const DIRECT_ROUTE_MAX_LIFETIME_MS = 4 * 60 * 60 * 1_000;
 const EVIDENCE_RETRY_AFTER_MS = 60_000;
 const MAX_PENDING_EVIDENCE_CHALLENGES = 1_024;
+const WORKER_HEARTBEAT_GRACE_MS = 10_000;
+
+/**
+ * Registration and the first heartbeat are separate messages. A freshly
+ * authenticated socket may therefore still have the persisted offline status
+ * for a few milliseconds and must not be reaped by the stale-worker sweep.
+ */
+export function workerConnectionIsHeartbeatStale(
+  worker: Pick<StoredWorker, "status" | "lastSeenAt"> | null,
+  now = Date.now(),
+): boolean {
+  if (!worker) return true;
+  if (worker.status !== "suspect" && worker.status !== "offline") return false;
+  return worker.lastSeenAt < now - WORKER_HEARTBEAT_GRACE_MS;
+}
+
+export function workerSessionSupersedes(previous: AuthorizedWorkerSession, incoming: AuthorizedWorkerSession): boolean {
+  return previous.identityKind === incoming.identityKind
+    && previous.identityId === incoming.identityId
+    && previous.generation !== null
+    && incoming.generation !== null
+    && incoming.generation > previous.generation;
+}
 
 export class WorkerHub extends EventEmitter<HubEvents> {
   private readonly connections = new Map<string, ConnectionState>();
@@ -197,6 +216,7 @@ export class WorkerHub extends EventEmitter<HubEvents> {
   private runtimeLinkProbeCursor = 0;
   private readonly evidenceChallenges = new Map<string, PendingEvidenceChallenge>();
   private readonly evidenceRetryAfter = new Map<string, number>();
+  private sessionIsCurrent: ((session: AuthorizedWorkerSession) => boolean) | undefined;
 
   constructor(private readonly store: MeshStore) {
     super();
@@ -206,9 +226,12 @@ export class WorkerHub extends EventEmitter<HubEvents> {
     app: FastifyInstance,
     options: {
       authorizedWorkerId?: (request: FastifyRequest) => string | null;
+      authorizedSession?: (request: FastifyRequest) => AuthorizedWorkerSession | null;
+      sessionIsCurrent?: (session: AuthorizedWorkerSession) => boolean;
     } = {},
   ): void {
     this.logger = app.log;
+    this.sessionIsCurrent = options.sessionIsCurrent;
     app.get("/internal/v1/workers/connect", { websocket: true }, (socket, request) => {
       if (this.pendingConnections >= 256) {
         socket.close(4429, "too many pending connections");
@@ -218,6 +241,7 @@ export class WorkerHub extends EventEmitter<HubEvents> {
         socket,
         workerId: null,
         authorizedWorkerId: options.authorizedWorkerId?.(request) ?? null,
+        authorizedSession: options.authorizedSession?.(request) ?? null,
         ready: false,
         helloTimer: setTimeout(() => socket.close(4408, "worker hello timeout"), 5_000),
         pending: true,
@@ -344,17 +368,18 @@ export class WorkerHub extends EventEmitter<HubEvents> {
     return started;
   }
 
-  removeWorker(workerId: string): boolean {
+  removeWorker(workerId: string, closeReason = "removed from mycellios panel"): boolean {
     const existed = Boolean(this.store.getWorker(workerId));
     const state = this.connections.get(workerId);
     if (state) {
-      this.connections.delete(workerId);
-      state.ready = false;
-      state.workerId = null;
+      // Disconnect handling owns lease recovery, stream teardown and the
+      // scheduler notification. Run it synchronously before acknowledging a
+      // security-sensitive eviction; the later socket close is idempotent.
+      this.handleClose(state);
       try {
-        state.socket.close(4000, "removed from mycellios panel");
+        state.socket.close(4403, closeReason);
       } catch {
-        this.handleClose(state);
+        // State was already detached above.
       }
     }
     return this.store.deregisterWorker(workerId) || existed;
@@ -434,9 +459,10 @@ export class WorkerHub extends EventEmitter<HubEvents> {
 
   closeStaleConnections(): number {
     let closed = 0;
+    const now = Date.now();
     for (const [workerId, state] of this.connections) {
       const worker = this.store.getWorker(workerId);
-      if (worker && worker.status !== "suspect" && worker.status !== "offline") continue;
+      if (!workerConnectionIsHeartbeatStale(worker, now)) continue;
       closed += 1;
       try {
         state.socket.close(4410, "worker heartbeat stale");
@@ -477,6 +503,15 @@ export class WorkerHub extends EventEmitter<HubEvents> {
         this.closeInvalid(state, "invalid worker message");
         return;
       }
+      if (
+        state.authorizedSession
+        && (envelope.type === "worker.hello" || envelope.type === "worker.heartbeat")
+        && this.sessionIsCurrent
+        && !this.sessionIsCurrent(state.authorizedSession)
+      ) {
+        this.closeInvalid(state, "worker session superseded", 4403);
+        return;
+      }
 
       if (!state.workerId) {
         if (
@@ -491,11 +526,15 @@ export class WorkerHub extends EventEmitter<HubEvents> {
           return;
         }
         const previous = this.connections.get(envelope.workerId);
+        const incomingSupersedes = previous?.authorizedSession && state.authorizedSession
+          ? workerSessionSupersedes(previous.authorizedSession, state.authorizedSession)
+          : false;
         if (
           previous &&
           previous !== state &&
           previous.ready &&
-          previous.socket.readyState === previous.socket.OPEN
+          previous.socket.readyState === previous.socket.OPEN &&
+          !incomingSupersedes
         ) {
           // Two desktop starts can briefly overlap around an application
           // update. Keep the already-healthy connection authoritative so the

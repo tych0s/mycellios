@@ -13,6 +13,7 @@ import {
   WORKER_PROTOCOL_MIN,
   workerAdmissionProofSchema,
   workerCredentialRotationProofSchema,
+  workerCredentialRecoveryProofSchema,
   type WorkerAdmissionChallengeRequest,
   type WorkerAdmissionChallengeResponse,
   type WorkerAdmissionIdentity,
@@ -21,6 +22,8 @@ import {
   type WorkerProtocolRange,
   type WorkerCredentialRotationChallengeRequest,
   type WorkerCredentialRotationProof,
+  type WorkerCredentialRecoveryChallengeRequest,
+  type WorkerCredentialRecoveryProof,
 } from "../contracts/worker-admission.js";
 
 const BASE64URL = /^[A-Za-z0-9_-]+$/;
@@ -51,6 +54,16 @@ interface PendingRotationChallenge {
   signingPayload: string;
   expiresAt: number;
 }
+interface PendingRecoveryChallenge {
+  accountId: string;
+  identity: WorkerAdmissionIdentity;
+  nextKey: KeyObject;
+  nextPublicKey: WorkerAdmissionPublicKey;
+  nextFingerprint: string;
+  protocolVersion: number;
+  signingPayload: string;
+  expiresAt: number;
+}
 
 export class WorkerAdmissionError extends Error {
   constructor(
@@ -66,6 +79,7 @@ export class WorkerAdmissionError extends Error {
 export class WorkerAdmissionAuthority {
   private readonly challenges = new Map<string, PendingChallenge>();
   private readonly rotationChallenges = new Map<string, PendingRotationChallenge>();
+  private readonly recoveryChallenges = new Map<string, PendingRecoveryChallenge>();
 
   constructor(
     private readonly database: MeshDatabase,
@@ -205,6 +219,51 @@ export class WorkerAdmissionAuthority {
       protocolVersion,
       signingPayload,
     };
+  }
+
+  issueRecovery(input: WorkerCredentialRecoveryChallengeRequest, accountId: string): WorkerAdmissionChallengeResponse {
+    this.pruneExpired();
+    if (this.challenges.size + this.rotationChallenges.size + this.recoveryChallenges.size >= MAX_PENDING_WORKER_ADMISSION_CHALLENGES) {
+      throw new WorkerAdmissionError("worker_admission_busy", "The coordinator has too many pending worker admission challenges.", 429);
+    }
+    const ownership = this.database.getNodeOwnership("device", input.identity.id);
+    if (!ownership) throw new WorkerAdmissionError("worker_ownership_unknown", "This node identity has not been enrolled.", 404);
+    if (ownership.accountId !== accountId) throw new WorkerAdmissionError("worker_recovery_owner_mismatch", "Only the current node owner can recover its credential.", 403);
+    const next = normalizePublicKey(input.nextPublicKey);
+    if (next.fingerprint === ownership.credentialFingerprint) throw new WorkerAdmissionError("worker_recovery_key_unchanged", "Recovery requires a new device key.", 409);
+    const protocolVersion = selectWorkerProtocolVersion(input.protocol);
+    const challengeId = randomUUID();
+    const expiresAt = this.now() + WORKER_ADMISSION_CHALLENGE_TTL_MS;
+    const signingPayload = canonicalEvidenceJson({
+      schema: "mycellios-worker-credential-recovery/1", challengeId,
+      nonce: randomBytes(32).toString("base64url"), accountId, identity: input.identity,
+      nextPublicKey: next.publicKey, nextFingerprint: next.fingerprint,
+      protocol: input.protocol, protocolVersion, previousGeneration: ownership.generation, expiresAt,
+    });
+    this.recoveryChallenges.set(challengeId, { accountId, identity: input.identity, nextKey: next.key, nextPublicKey: next.publicKey, nextFingerprint: next.fingerprint, protocolVersion, signingPayload, expiresAt });
+    return { challengeId, expiresAt: new Date(expiresAt).toISOString(), protocolVersion, signingPayload };
+  }
+
+  verifyRecovery(identity: WorkerAdmissionIdentity, proof: WorkerCredentialRecoveryProof, accountId: string) {
+    const parsedProof = workerCredentialRecoveryProofSchema.parse(proof);
+    const challenge = this.recoveryChallenges.get(parsedProof.challengeId);
+    this.recoveryChallenges.delete(parsedProof.challengeId);
+    if (!challenge) throw new WorkerAdmissionError("worker_recovery_challenge_unknown", "The recovery challenge is unknown or already consumed.", 404);
+    if (challenge.expiresAt <= this.now()) throw new WorkerAdmissionError("worker_recovery_challenge_expired", "The recovery challenge expired.", 401);
+    if (challenge.accountId !== accountId || challenge.identity.kind !== identity.kind || challenge.identity.id !== identity.id) {
+      throw new WorkerAdmissionError("worker_recovery_proof_mismatch", "The recovery proof does not match its owner or identity.", 403);
+    }
+    if (!verifyAdmissionSignature(challenge.nextKey, challenge.nextPublicKey.algorithm, challenge.signingPayload, parsedProof.nextSignature)) {
+      throw new WorkerAdmissionError("worker_recovery_signature_invalid", "Recovery requires proof of possession of the replacement key.", 401);
+    }
+    const result = this.database.recoverWorkerAdmissionCredential({ identityKind: "device", identityId: identity.id, accountId,
+      algorithm: challenge.nextPublicKey.algorithm, publicKey: challenge.nextPublicKey.spki,
+      fingerprint: challenge.nextFingerprint, protocolVersion: challenge.protocolVersion });
+    if (result.state === "not_found") throw new WorkerAdmissionError("worker_ownership_unknown", "This node identity has not been enrolled.", 404);
+    if (result.state === "owner_mismatch") throw new WorkerAdmissionError("worker_recovery_owner_mismatch", "Only the current node owner can recover its credential.", 403);
+    if (result.state === "fingerprint_in_use") throw new WorkerAdmissionError("worker_credential_reused", "This device key belongs to another identity.", 409);
+    if (result.state !== "recovered") throw new Error("worker_recovery_result_invalid");
+    return { credentialFingerprint: result.credential.fingerprint, generation: result.generation };
   }
 
   verifyRotation(input: {
@@ -383,6 +442,24 @@ export class WorkerAdmissionAuthority {
         401,
       );
     }
+    if (input.identity.kind !== "browser") {
+      const ownership = this.database.getNodeOwnership(
+        input.identity.kind,
+        input.identity.id,
+      );
+      if (ownership && (
+        ownership.status !== "active"
+        || ownership.credentialFingerprint !== challenge.fingerprint
+      )) {
+        throw new WorkerAdmissionError(
+          ownership.status === "revoked"
+            ? "worker_ownership_revoked"
+            : "worker_ownership_fingerprint_mismatch",
+          "The worker key does not match the explicitly enrolled node owner.",
+          403,
+        );
+      }
+    }
 
     const admission = this.database.admitWorkerCredential({
       identityKind: input.identity.kind,
@@ -427,6 +504,9 @@ export class WorkerAdmissionAuthority {
     }
     for (const [challengeId, challenge] of this.rotationChallenges) {
       if (challenge.expiresAt <= now) this.rotationChallenges.delete(challengeId);
+    }
+    for (const [challengeId, challenge] of this.recoveryChallenges) {
+      if (challenge.expiresAt <= now) this.recoveryChallenges.delete(challengeId);
     }
   }
 }
@@ -493,6 +573,12 @@ function normalizePublicKey(input: WorkerAdmissionPublicKey): {
     fingerprint: `sha256:${createHash("sha256").update(canonicalDer).digest("hex")}`,
     key,
   };
+}
+
+export function workerAdmissionPublicKeyFingerprint(
+  input: WorkerAdmissionPublicKey,
+): string {
+  return normalizePublicKey(input).fingerprint;
 }
 
 function verifyAdmissionSignature(

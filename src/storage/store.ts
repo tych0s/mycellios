@@ -590,6 +590,30 @@ export class MeshStore {
     });
   }
 
+  promoteJobRoute(jobId: string, route: ScheduledRoute, leaseId: string): void {
+    const first = route.stages[0];
+    if (!first) throw new Error("Cannot promote an empty route");
+    this.database.transaction(() => {
+      const result = this.database.raw
+        .prepare(
+          `UPDATE jobs
+           SET status = 'leasing', worker_id = ?, deployment_id = ?, lease_id = ?,
+               model_digest = ?, failure_code = NULL, updated_at = ?
+           WHERE id = ? AND status NOT IN ('completed', 'cancelled', 'expired', 'failed')`,
+        )
+        .run(
+          first.workerId,
+          first.deploymentId,
+          leaseId,
+          first.modelDigest,
+          Date.now(),
+          jobId,
+        );
+      if (result.changes !== 1) throw new Error("job_route_promotion_conflict");
+      this.queueJob(jobId);
+    });
+  }
+
   setJobStatus(jobId: string, status: JobStatus, failureCode?: string): void {
     this.database.transaction(() => {
       this.database.raw

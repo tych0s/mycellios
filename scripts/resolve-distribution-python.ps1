@@ -20,4 +20,4 @@ foreach ($candidate in $candidates) {
     }
 }
 
-throw "Distribution runtime is missing. Run npm run desktop:runtime first."
+throw "Distribution runtime is missing. Run npm run node:runtime first."

@@ -1,0 +1,1 @@
+export function verifyNodeReleaseEvidence(input: { artifact: string; stagedRoot: string; evidencePath: string; sbomPath: string; checksumPath: string; requireSigned?: boolean }): Promise<Record<string, unknown>>;

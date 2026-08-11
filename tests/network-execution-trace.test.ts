@@ -182,7 +182,10 @@ describe("MeshService route evidence", () => {
     databases.push(database);
     const store = new MeshStore(database);
     for (const worker of workers()) {
-      store.registerWorker({ capabilities: worker.capabilities });
+      store.registerWorker({
+        identity: { kind: "device", id: worker.identityId ?? worker.id },
+        capabilities: worker.capabilities,
+      });
     }
     const registered = store.listWorkers();
     const workerA = registered.find(
@@ -277,6 +280,12 @@ describe("MeshService route evidence", () => {
       result: {
         networkTrace: {
           jobId: handle.jobId,
+          routeDecision: {
+            recommendation: { kind: "remote-replica" },
+            selected: { kind: "remote-replica", reason: "selected_best_service" },
+            selectedKind: "remote-replica",
+            reasons: ["selected_best_service"],
+          },
           stages: [
             { nodeId: "node-a", workerId: workerA.id },
             { nodeId: "node-b", workerId: workerB.id },

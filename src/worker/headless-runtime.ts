@@ -6,7 +6,17 @@ import type {
   WorkerPhysicalIdentity,
 } from "../contracts/types.js";
 import { sha256Text } from "../core/json.js";
-import { LocalProcessAgent } from "../distribution/launch-supervisor.js";
+import {
+  LocalProcessAgent,
+  type LaunchAgent,
+  type LaunchAgentStartRequest,
+  type LaunchProcessHandle,
+  type RuntimePreparationProgressEvent,
+} from "../distribution/launch-supervisor.js";
+import type {
+  PythonLaunchProcess,
+  PythonPipelineLaunchDescription,
+} from "../distribution/python-launcher.js";
 import {
   PythonPhysicalProbe,
   type PhysicalProbeCollector,
@@ -14,6 +24,11 @@ import {
 } from "../distribution/physical-probe.js";
 import type { WorkerAgentOptions } from "./agent.js";
 import type { VerifiedGpuRuntimeEvidence } from "./hardware.js";
+import type { NodeConfiguration } from "../contracts/node-configuration.js";
+import {
+  prepareNodeStageArtifacts,
+  type StageArtifactPreparationOptions,
+} from "./stage-artifact-preparer.js";
 
 const NODE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
@@ -30,6 +45,8 @@ export interface HeadlessWorkerEnvironment {
   pythonExecutable: string;
   pythonPath: string;
   cachePath: string;
+  maxWorkspaceBytes: number;
+  windowsJobBrokerExecutable?: string;
   appVersion: string;
 }
 
@@ -39,6 +56,85 @@ export interface HeadlessRuntime {
   preferredHardwareGpu: NonNullable<WorkerAgentOptions["preferredHardwareGpu"]>;
   acceleration: WorkerAcceleratorDiagnostics;
   physicalProbe: PhysicalProbeV1;
+}
+
+export function headlessEnvironmentFromNodeConfiguration(
+  config: NodeConfiguration,
+  appVersion: string,
+): HeadlessWorkerEnvironment {
+  return {
+    configPath: config.worker.configPath,
+    coordinatorUrl: config.coordinator.url.replace(/\/$/, ""),
+    nodeId: config.nodeId,
+    provider: "generic",
+    providerMachineId: config.nodeId,
+    stagePort: config.runtime.stagePort,
+    pythonExecutable: config.runtime.pythonExecutable,
+    pythonPath: config.runtime.pythonPath,
+    cachePath: config.runtime.cachePath,
+    maxWorkspaceBytes: config.limits.maxDiskMiB * 1024 * 1024,
+    ...(config.isolation.mode === "windows-job-object"
+      ? { windowsJobBrokerExecutable: config.isolation.brokerExecutable }
+      : {}),
+    appVersion,
+  };
+}
+
+type StageArtifactPreparer = (
+  description: PythonPipelineLaunchDescription,
+  options: StageArtifactPreparationOptions,
+) => Promise<PythonLaunchProcess[]>;
+
+/**
+ * Product node launch boundary: materialize and verify only this node's sealed
+ * stage ranges before allowing any process from the plan to start.
+ */
+export class HeadlessStageLaunchAgent implements LaunchAgent {
+  readonly id: string;
+
+  constructor(
+    private readonly processAgent: LaunchAgent,
+    private readonly config: Pick<
+      HeadlessWorkerEnvironment,
+      "nodeId" | "pythonExecutable" | "pythonPath" | "cachePath"
+    >,
+    private readonly prepareArtifacts: StageArtifactPreparer = prepareNodeStageArtifacts,
+  ) {
+    this.id = `headless-stage:${config.nodeId}`;
+  }
+
+  async prepareRuntime(
+    description: PythonPipelineLaunchDescription,
+    nodeId: string,
+    onProgress?: (event: RuntimePreparationProgressEvent) => void,
+  ): Promise<readonly PythonLaunchProcess[]> {
+    if (nodeId !== this.config.nodeId) {
+      throw new Error("headless_stage_artifact_node_mismatch");
+    }
+    return await this.prepareArtifacts(description, {
+      nodeId,
+      pythonExecutable: this.config.pythonExecutable,
+      cacheDirectory: this.config.cachePath,
+      cwd: process.cwd(),
+      environment: {
+        PYTHONPATH: this.config.pythonPath,
+        HF_HOME: this.config.cachePath,
+        TOKENIZERS_PARALLELISM: "false",
+      },
+      ...(onProgress ? { onProgress } : {}),
+    });
+  }
+
+  async start(
+    request: LaunchAgentStartRequest,
+    signal: AbortSignal,
+  ): Promise<LaunchProcessHandle> {
+    return await this.processAgent.start(request, signal);
+  }
+
+  async close(): Promise<void> {
+    await this.processAgent.close?.();
+  }
 }
 
 export function loadHeadlessWorkerEnvironment(
@@ -104,6 +200,7 @@ export function loadHeadlessWorkerEnvironment(
       cwd,
       environment.HF_HOME?.trim() || "/var/cache/mycellios/huggingface",
     ),
+    maxWorkspaceBytes: 4 * 1024 * 1024 * 1024,
     appVersion: environment.MYCELLIOS_VERSION?.trim() || packageVersion(),
   };
 }
@@ -159,12 +256,18 @@ export async function createHeadlessRuntime(
       message: "Physical GPU probe passed; headless shard executor is ready.",
     }],
   };
-  const launchAgent = new LocalProcessAgent({
+  const processAgent = new LocalProcessAgent({
     id: `headless-shard-executor:${config.nodeId}`,
     cwd: process.cwd(),
     env: runtimeEnvironment,
     allowedExecutables: [config.pythonExecutable],
+    workspaceRoot: resolve(config.cachePath, "process-workspaces"),
+    maxWorkspaceBytes: config.maxWorkspaceBytes,
+    ...(config.windowsJobBrokerExecutable
+      ? { windowsJobBrokerExecutable: config.windowsJobBrokerExecutable }
+      : {}),
   });
+  const launchAgent = new HeadlessStageLaunchAgent(processAgent, config);
   return {
     executor: {
       nodeId: config.nodeId,

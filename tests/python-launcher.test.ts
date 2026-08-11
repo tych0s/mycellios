@@ -2379,10 +2379,20 @@ describe("GDLP/2 Python launch compiler", () => {
     expect(() => compile(current)).toThrow("python_server_requires_in_place_kv");
   });
 
-  it("rejects a one-stage plan because the distributed engine requires a remote stage", () => {
-    expect(() => compile(oneStageManifest())).toThrow(
-      "python_distributed_runtime_requires_two_stages",
-    );
+  it("compiles a complete one-stage route without a synthetic remote hop", () => {
+    const description = compile(oneStageManifest());
+    const rootLaunch = root(description);
+    expect(description.launchOrder).toHaveLength(1);
+    expect(description.route.remoteStageProcessIds).toEqual([]);
+    expect(rootLaunch.boundaries).toEqual([0, 6]);
+    expect(rootLaunch.firstRemoteStage).toBeNull();
+    expect(rootLaunch.command.args).not.toContain("--first-stage-host");
+    expect(rootLaunch.command.args).not.toContain("--first-stage-port");
+    expect(argumentValue(rootLaunch.command.args, "--max-retained-sessions")).toBe("0");
+    expect(
+      argumentValue(rootLaunch.command.args, "--max-retained-session-tokens"),
+    ).toBe("0");
+    expect(() => validatePythonLaunchDescription(description)).not.toThrow();
   });
 
   it("rejects an unsealed cooperative-stage mutation", () => {

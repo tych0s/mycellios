@@ -273,13 +273,15 @@ export class RuntimeStreamTunnel {
       if (process.kind === "root-engine") {
         this.allowedTargetPorts.add(process.apiEndpoint.port);
         this.allowedTargetPorts.add(process.returnEndpoint.port);
-        const firstStage = await this.createEgressProxy(
-          process.firstRemoteStage.anchorMemberId,
-          process.firstRemoteStage.endpoint.port,
-        );
         values.set("--host", LOOPBACK);
-        values.set("--first-stage-host", LOOPBACK);
-        values.set("--first-stage-port", String(firstStage));
+        if (process.firstRemoteStage) {
+          const firstStage = await this.createEgressProxy(
+            process.firstRemoteStage.anchorMemberId,
+            process.firstRemoteStage.endpoint.port,
+          );
+          values.set("--first-stage-host", LOOPBACK);
+          values.set("--first-stage-port", String(firstStage));
+        }
         values.set("--return-bind-host", LOOPBACK);
         values.set("--return-advertise-host", LOOPBACK);
       } else if (process.kind === "remote-stage") {

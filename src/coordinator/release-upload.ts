@@ -75,8 +75,8 @@ const COMMIT_SCHEMA = "mycellios-native-release-commit/1";
 const ACTIVE_SCHEMA = "mycellios-native-release-active/1";
 const ROLLBACK_SCHEMA = "mycellios-native-release-rollback/1";
 
-const UPDATE_FILE = /^(?:RELEASES|latest\.json|mycellios-setup\.exe|mycellios-\d+\.\d+\.\d+-full\.nupkg)$/;
-const DOWNLOAD_FILE = /^mycellios-(?:windows-x64\.exe|macos-arm64\.dmg|linux-x64\.(?:deb|rpm))$/;
+const UPDATE_FILE = /^mycellios-node-latest\.json$/;
+const DOWNLOAD_FILE = /^mycellios-node-(?:windows-x64\.zip|macos-arm64\.tar\.gz|linux-x64\.tar\.gz)$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const MAX_RELEASE_FILE_SIZE = 1_500_000_000;
 const MAX_RELEASE_CHUNKS = 2_048;
@@ -893,14 +893,10 @@ export function expectedPublicReleaseAssets(version: string): Array<{
   fileName: string;
 }> {
   return [
-    { channel: "downloads", fileName: "mycellios-linux-x64.deb" },
-    { channel: "downloads", fileName: "mycellios-linux-x64.rpm" },
-    { channel: "downloads", fileName: "mycellios-macos-arm64.dmg" },
-    { channel: "downloads", fileName: "mycellios-windows-x64.exe" },
-    { channel: "updates", fileName: "RELEASES" },
-    { channel: "updates", fileName: "latest.json" },
-    { channel: "updates", fileName: `mycellios-${version}-full.nupkg` },
-    { channel: "updates", fileName: "mycellios-setup.exe" },
+    { channel: "downloads", fileName: "mycellios-node-linux-x64.tar.gz" },
+    { channel: "downloads", fileName: "mycellios-node-macos-arm64.tar.gz" },
+    { channel: "downloads", fileName: "mycellios-node-windows-x64.zip" },
+    { channel: "updates", fileName: "mycellios-node-latest.json" },
   ];
 }
 
@@ -1198,36 +1194,11 @@ async function verifyFeedCoherence(
   assetsRoot: string,
   observed: Map<string, FileEvidence>,
 ): Promise<void> {
-  const versionedName = `mycellios-${manifest.version}-full.nupkg`;
-  const nupkg = observed.get(`updates/${versionedName}`);
-  const setup = observed.get("updates/mycellios-setup.exe");
-  const publicWindows = observed.get("downloads/mycellios-windows-x64.exe");
-  if (!nupkg || !setup || !publicWindows) {
-    throw new Error("release_transaction_windows_assets_missing");
-  }
-  if (
-    setup.bytes !== publicWindows.bytes
-    || setup.sha256 !== publicWindows.sha256
-  ) {
-    throw new Error("release_transaction_windows_installer_alias_mismatch");
-  }
-
-  const releases = parseSquirrelReleaseRecord(
-    await readFile(resolveInside(assetsRoot, "updates/RELEASES")),
-  );
-  if (
-    releases.sha1.toLowerCase() !== nupkg.sha1
-    || releases.name !== versionedName
-    || releases.size !== BigInt(nupkg.bytes)
-  ) {
-    throw new Error("release_transaction_releases_feed_mismatch");
-  }
-
   let latest: unknown;
   try {
     latest = JSON.parse(
       await readFile(
-        resolveInside(assetsRoot, "updates/latest.json"),
+        resolveInside(assetsRoot, "updates/mycellios-node-latest.json"),
         "utf8",
       ),
     );
@@ -1237,11 +1208,11 @@ async function verifyFeedCoherence(
   assertPlainObject(latest, "release_latest_json");
   assertExactKeys(
     latest,
-    ["files", "publishedAt", "schema", "version"],
+    ["packages", "publishedAt", "schema", "version"],
     "release_latest_json",
   );
   if (
-    latest.schema !== "mycellios-windows-update-feed/1"
+    latest.schema !== "mycellios-node-update-feed/1"
     || latest.version !== manifest.version
   ) {
     throw new Error("release_transaction_latest_version_mismatch");
@@ -1253,69 +1224,28 @@ async function verifyFeedCoherence(
   ) {
     throw new Error("release_transaction_latest_published_at_invalid");
   }
-  if (!Array.isArray(latest.files)) {
-    throw new Error("release_transaction_latest_files_invalid");
+  if (!Array.isArray(latest.packages)) {
+    throw new Error("release_transaction_latest_packages_invalid");
   }
-  const latestFiles = [
-    ["RELEASES", observed.get("updates/RELEASES")],
-    ["mycellios-setup.exe", setup],
-    [versionedName, nupkg],
-  ].map(([name, evidence]) => {
-    if (typeof name !== "string" || !evidence || typeof evidence === "string") {
-      throw new Error("release_transaction_latest_files_invalid");
+  const latestPackages = [
+    ["linux-x64", "mycellios-node-linux-x64.tar.gz"],
+    ["macos-arm64", "mycellios-node-macos-arm64.tar.gz"],
+    ["windows-x64", "mycellios-node-windows-x64.zip"],
+  ].map(([target, name]) => {
+    const evidence = observed.get(`downloads/${name}`);
+    if (!target || !name || !evidence) {
+      throw new Error("release_transaction_latest_packages_invalid");
     }
     return {
+      target,
       name,
       bytes: evidence.bytes,
       sha256: evidence.sha256,
     };
   });
-  if (canonicalJson(latest.files) !== canonicalJson(latestFiles)) {
-    throw new Error("release_transaction_latest_files_mismatch");
+  if (canonicalJson(latest.packages) !== canonicalJson(latestPackages)) {
+    throw new Error("release_transaction_latest_packages_mismatch");
   }
-}
-
-function parseSquirrelReleaseRecord(bytes: Buffer): {
-  sha1: string;
-  name: string;
-  size: bigint;
-} {
-  let text: string;
-  try {
-    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-  } catch {
-    throw new Error("release_transaction_releases_feed_invalid_utf8");
-  }
-  if (
-    text.startsWith("\uFEFF")
-    || /[\u0000-\u0009\u000B\u000C\u000E-\u001F\u007F-\u009F]/u.test(text)
-  ) {
-    throw new Error("release_transaction_releases_feed_control_bytes");
-  }
-  if (text.endsWith("\r\n")) text = text.slice(0, -2);
-  else if (text.endsWith("\n")) text = text.slice(0, -1);
-  if (text.includes("\r") || text.includes("\n") || text.trim() !== text) {
-    throw new Error("release_transaction_releases_feed_not_single_line");
-  }
-  const match = /^([0-9A-Fa-f]{40}) +([^ \t]+) +([0-9]+)$/.exec(text);
-  if (!match) throw new Error("release_transaction_releases_feed_format_invalid");
-  const [, sha1, name, sizeText] = match;
-  if (
-    name === undefined
-    || sha1 === undefined
-    || sizeText === undefined
-    || name.includes("/")
-    || name.includes("\\")
-    || name === "."
-    || name === ".."
-  ) {
-    throw new Error("release_transaction_releases_feed_name_invalid");
-  }
-  return {
-    sha1,
-    name,
-    size: BigInt(sizeText),
-  };
 }
 
 function parseCommitDocument(candidate: unknown): CommitDocument {

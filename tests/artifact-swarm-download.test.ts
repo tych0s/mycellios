@@ -127,6 +127,53 @@ describe("native artifact swarm downloader", () => {
     expect(progress.some((event) => event.resumed)).toBe(true);
   });
 
+  it("quarantines a corrupt committed artifact before atomically replacing it", async () => {
+    const fixture = createFixture(Buffer.from("replace-corrupt-artifact"), [7, 9, 8]);
+    const artifactDirectory = join(fixture.cacheRoot, fixture.artifact.sha256);
+    await mkdir(artifactDirectory, { recursive: true });
+    const target = join(artifactDirectory, basename(new URL(fixture.artifact.url).pathname));
+    writeFileSync(target, "corrupt");
+    const peer = await startPeerServer((_peerId, chunkId) => fixture.chunkBytes.get(chunkId) ?? null);
+    announce(fixture, "repair-peer");
+    const downloader = createArtifactSwarmDownloader({
+      registry: fixture.registry,
+      manifestId: fixture.manifestId,
+      requesterPeerId: "requester",
+      peerClient: peer.client,
+      originDownloader: async () => { throw new Error("origin_must_not_be_used"); },
+    });
+    expect(readFileSync(await downloader(fixture.artifact, fixture.cacheRoot, () => undefined))).toEqual(fixture.bytes);
+    expect(readdirSync(artifactDirectory).some((entry) => entry.startsWith(".quarantine-"))).toBe(true);
+  });
+
+  it("resumes a stable .partial chunk from its declared artifact offset", async () => {
+    const fixture = createFixture(Buffer.from("offset-resumable-download"), [10, 15]);
+    const chunk = fixture.blob.chunks[0]!;
+    const chunkDirectory = join(fixture.cacheRoot, fixture.artifact.sha256, ".swarm-chunks");
+    await mkdir(chunkDirectory, { recursive: true });
+    const partial = join(chunkDirectory, `${String(chunk.index).padStart(8, "0")}-${chunk.sha256}.chunk.partial`);
+    writeFileSync(partial, fixture.bytes.subarray(0, 3));
+    const observedOffsets: number[] = [];
+    const peerClient: ArtifactPeerChunkClient = {
+      async fetchChunk(request) {
+        observedOffsets.push(request.offset);
+        const body = fixture.bytes.subarray(request.offset, request.offset + request.sizeBytes);
+        return { contentLength: body.length, body: (async function* () { yield body; })() };
+      },
+    };
+    announce(fixture, "range-peer");
+    const downloader = createArtifactSwarmDownloader({
+      registry: fixture.registry,
+      manifestId: fixture.manifestId,
+      requesterPeerId: "requester",
+      peerClient,
+      originDownloader: async () => { throw new Error("origin_must_not_be_used"); },
+    });
+    expect(readFileSync(await downloader(fixture.artifact, fixture.cacheRoot, () => undefined))).toEqual(fixture.bytes);
+    expect(observedOffsets).toContain(3);
+    expect(existsSync(partial)).toBe(false);
+  });
+
   it("penalizes and quarantines a corrupt peer while accepting verified bytes from a healthy peer", async () => {
     const fixture = createFixture(Buffer.from("corrupt-peer-cannot-poison-cache"), [9, 9, 14]);
     const peer = await startPeerServer((peerId, chunkId) => {
@@ -229,14 +276,16 @@ function createFixture(bytes: Buffer, chunkSizes: number[]) {
   const packageManifest = blobFromBytes(Buffer.from("sealed-package-contract"), [23]);
   const packageId = digest(Buffer.from("native-artifact-package"));
   const keys = generateKeyPairSync("ed25519");
-  const registry = new ArtifactSwarmRegistry();
+  const registry = new ArtifactSwarmRegistry({ trustedPublisherKeys: [keys.publicKey] });
   const signed = registry.publish(signArtifactSwarmManifest({
     schema: ARTIFACT_SWARM_SCHEMA,
     modelIdentity: `sha256:${digest(Buffer.from("native-artifact-model"))}`,
+    distributionManifestId: `sha256:${digest(Buffer.from("native-distribution-manifest"))}`,
     sourceRevision: "mycellios-native-runtime-1",
     tensorAbi: "mycellios-native-artifact-bytes/1",
     packages: [{
       packageId,
+      artifactIds: ["runtime-wheel"],
       layerStart: 0,
       layerEnd: 1,
       manifest: packageManifest,

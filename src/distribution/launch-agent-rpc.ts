@@ -1318,7 +1318,17 @@ function validateRootEngine(value: Record<string, unknown>): void {
   if (value.stageIndex !== 0) throw new Error("root_engine_stage_index_is_invalid");
   if (value.nativeGguf !== null) validateNativeGgufStage(value.nativeGguf, value);
   assertIntegerArray(value.boundaries, "boundaries", 2);
-  validateDownstream(value.firstRemoteStage, "firstRemoteStage");
+  const boundaries = value.boundaries as unknown[];
+  if (value.firstRemoteStage === null) {
+    if (boundaries.length !== 2) {
+      throw new Error("root_engine_remote_stage_is_missing");
+    }
+  } else {
+    if (boundaries.length < 3) {
+      throw new Error("root_engine_remote_stage_is_unexpected");
+    }
+    validateDownstream(value.firstRemoteStage, "firstRemoteStage");
+  }
   validateEndpoint(value.apiEndpoint, "apiEndpoint");
   assertPath(value.returnBindHost, "returnBindHost");
   validateEndpoint(value.returnEndpoint, "returnEndpoint");

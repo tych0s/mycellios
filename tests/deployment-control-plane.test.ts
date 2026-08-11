@@ -175,6 +175,47 @@ describe("durable deployment control plane", () => {
     expect(controller.listDueStates(12_000)).toHaveLength(1);
     database.close();
   });
+
+  it("releases every prepared stage lease immediately when activation fails", () => {
+    const database = new MeshDatabase(":memory:");
+    const store = new MeshStore(database);
+    addModel(store, "failed-route");
+    addModel(store, "replacement-route");
+    const controller = new DeploymentControlPlane(store, "controller-a");
+    controller.initialize(1_000);
+    const failed = controller.claimOperation("failed-route", "activate", { now: 2_000 })!;
+    const reservation = controller.prepareRoute(failed.id, [{
+      nodeId: "node-a",
+      stageIndex: 0,
+      layerStart: 0,
+      layerEnd: 8,
+      memoryMiB: 900,
+      capacityMiB: 1_000,
+    }], 60_000, 2_100);
+
+    expect(controller.failOperation(
+      failed.id,
+      "launch_failed",
+      "downstream stage did not become ready",
+      { now: 2_200 },
+    )).toBe(true);
+    expect(controller.getReservation(reservation.id)).toMatchObject({
+      status: "failed",
+      error: "downstream stage did not become ready",
+      releasedAt: 2_200,
+    });
+
+    const replacement = controller.claimOperation("replacement-route", "activate", { now: 2_300 })!;
+    expect(controller.prepareRoute(replacement.id, [{
+      nodeId: "node-a",
+      stageIndex: 0,
+      layerStart: 0,
+      layerEnd: 8,
+      memoryMiB: 900,
+      capacityMiB: 1_000,
+    }], 60_000, 2_400).status).toBe("prepared");
+    database.close();
+  });
 });
 
 function addModel(store: MeshStore, id: string) {

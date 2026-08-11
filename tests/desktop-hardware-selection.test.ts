@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { selectDesktopHardwareGpu, selectWorkerCapacityHardware } from "../src/desktop/hardware-selection.js";
+import { selectDesktopHardwareGpu, selectWorkerCapacityHardware } from "../src/node/hardware-selection.js";
 import {
   mergeHardwareGpuProbes,
   selectHardwareGpu,

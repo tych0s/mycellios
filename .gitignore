@@ -45,6 +45,7 @@ __pycache__/
 .codex-runtime/
 .cache/
 updates/
+/src/graphify-out/
 
 # Configuración específica de pilotos locales (las plantillas sí se versionan)
 config/*.local.json

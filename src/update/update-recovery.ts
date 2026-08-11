@@ -1,0 +1,76 @@
+export interface AutomaticUpdateInstallState {
+  updateReady: boolean;
+  quitting: boolean;
+  activeJobs: number;
+  activeStages: number;
+  componentUpdateBusy: boolean;
+}
+
+/**
+ * Downloaded updates may repair a broken accelerator pack, but must never
+ * interrupt an inference request or a distributed stage that is still alive.
+ */
+export function canInstallAutomaticUpdate(state: AutomaticUpdateInstallState): boolean {
+  return state.updateReady
+    && !state.quitting
+    && state.activeJobs === 0
+    && state.activeStages === 0
+    && !state.componentUpdateBusy;
+}
+
+export interface TrackedStageHandle {
+  exited: Promise<unknown>;
+}
+
+/**
+ * Track a distributed stage from the instant it starts, rather than only after
+ * it becomes ready. Startup failures otherwise remain in the active set and
+ * can strand a downloaded repair forever.
+ */
+export function trackActiveStage<T extends TrackedStageHandle>(
+  activeStages: Set<T>,
+  handle: T,
+  onIdle: () => void,
+): void {
+  activeStages.add(handle);
+  const release = () => {
+    if (!activeStages.delete(handle) || activeStages.size !== 0) return;
+    onIdle();
+  };
+  void handle.exited.then(release, release);
+}
+
+export const AUTOMATIC_UPDATE_GRACE_MS = 60_000;
+export const AUTOMATIC_UPDATE_IDLE_RECHECK_MS = 30_000;
+// An unattended node must discover repairs promptly. The feed is a tiny local
+// JSON file with no-store headers, so a 15 minute cadence is inexpensive while
+// avoiding the previous four-hour recovery window.
+export const AUTOMATIC_UPDATE_CHECK_INTERVAL_MS = 15 * 60_000;
+
+const AUTOMATIC_UPDATE_RETRY_DELAYS_MS = [
+  30_000,
+  2 * 60_000,
+  5 * 60_000,
+  15 * 60_000,
+  30 * 60_000,
+] as const;
+
+/**
+ * Update checks are allowed to fail transiently under memory pressure or while
+ * the public feed is being replaced. Keep retrying forever with a bounded
+ * delay; a single failed check must not strand an unattended worker.
+ */
+export function automaticUpdateRetryDelayMs(attempt: number): number {
+  const normalized = Number.isFinite(attempt) ? Math.max(0, Math.floor(attempt)) : 0;
+  return AUTOMATIC_UPDATE_RETRY_DELAYS_MS[
+    Math.min(normalized, AUTOMATIC_UPDATE_RETRY_DELAYS_MS.length - 1)
+  ]!;
+}
+
+export function summarizeAutomaticUpdateError(message: string): string {
+  const normalized = message.replace(/\s+/g, " ").trim();
+  if (/OutOfMemoryException/i.test(normalized)) {
+    return "The Windows updater ran out of memory while checking the feed.";
+  }
+  return normalized.slice(0, 320) || "The update check failed.";
+}

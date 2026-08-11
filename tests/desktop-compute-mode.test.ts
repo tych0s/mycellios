@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   desktopExecutorPolicy,
   normalizeComputeMode,
-} from "../src/desktop/compute-mode.js";
+} from "../src/node/compute-mode.js";
 
 describe("desktop compute mode", () => {
   it("keeps Automatic on GPU while GPU preparation can still succeed", () => {

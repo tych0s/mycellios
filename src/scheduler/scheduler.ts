@@ -1,5 +1,6 @@
 import type {
   ChatCompletionRequest,
+  ExecutionRouteDecisionRecord,
   ModelDeployment,
   RouteStage,
   ScheduledRoute,
@@ -8,14 +9,30 @@ import type {
 import { estimateInputTokens } from "../core/request.js";
 import { safeVramBudget } from "../core/tiers.js";
 import type { MeshStore, StoredWorker } from "../storage/store.js";
-import type { RuntimeLinkObservation } from "../coordinator/runtime-link-observations.js";
+import type { RuntimeLinkObservation } from "../distribution/runtime-link-observations.js";
 import { deploymentMetricsFromCanaryEvidence } from "../contracts/deployment-canary.js";
+import {
+  decideExecutionRoute,
+  type ExecutionRouteCandidate,
+  type ExecutionRouteDecision,
+  type ExecutionRouteReasonCode,
+} from "../distribution/execution-route-policy.js";
 
 export interface SchedulerOptions {
   connectedWorkerIds?: ReadonlySet<string>;
   excludeWorkerIds?: ReadonlySet<string>;
   now?: number;
   allowPipeline?: boolean;
+  /** Worker colocated with the request origin, when the caller can prove it. */
+  originWorkerId?: string;
+  routePolicy?: {
+    requireTrustedIdentity?: boolean;
+    requireTrustedBoundaryIdentity?: boolean;
+    pinnedBoundaryIdentityIds?: ReadonlySet<string>;
+    residencyRegion?: string;
+    excludedFailureDomainIds?: ReadonlySet<string>;
+    maxNormalizedCost?: number;
+  };
 }
 
 export interface RoutePlanOptions extends SchedulerOptions {
@@ -38,6 +55,14 @@ interface Candidate {
   score: number;
 }
 
+interface EvaluatedCandidate extends Candidate {
+  rejectionReasons: ExecutionRouteReasonCode[];
+}
+
+const MIN_RUNTIME_LINK_SAMPLES = 3;
+const MIN_RUNTIME_LINK_AVAILABILITY = 0.8;
+const MIN_RUNTIME_LINK_CONFIDENCE = 0.8;
+
 export interface AvailableModel {
   id: string;
   replicas: number;
@@ -55,6 +80,32 @@ export class Scheduler {
     sessionId: string,
     options: SchedulerOptions = {},
   ): ScheduledRoute | null {
+    return this.selectExecutionRouteDecision(request, sessionId, options).selected?.route ?? null;
+  }
+
+  isRouteCurrentlyEligible(
+    request: ChatCompletionRequest,
+    sessionId: string,
+    route: ScheduledRoute,
+    options: SchedulerOptions = {},
+  ): boolean {
+    const candidateId = routeCandidateId(route);
+    return this.selectExecutionRouteDecision(request, sessionId, options)
+      .evaluations.some((candidate) => candidate.candidateId === candidateId && candidate.eligible);
+  }
+
+  selectExecutionRouteDecision(
+    request: ChatCompletionRequest,
+    sessionId: string,
+    options: SchedulerOptions = {},
+  ): ExecutionRouteDecision<ScheduledRoute> {
+    const maxNormalizedCost = options.routePolicy?.maxNormalizedCost;
+    if (
+      maxNormalizedCost !== undefined
+      && (!Number.isFinite(maxNormalizedCost) || maxNormalizedCost < 0)
+    ) {
+      throw new RangeError("maxNormalizedCost must be a finite non-negative number");
+    }
     const now = options.now ?? Date.now();
     const workers = this.store
       .listSchedulableWorkers(now)
@@ -62,31 +113,71 @@ export class Scheduler {
       .filter((worker) => !options.excludeWorkerIds?.has(worker.id));
 
     const affinity = this.store.getSessionRoute(sessionId, request.model);
-    if (
+    const affinityEligible = Boolean(
       affinity
       && this.routeStillValid(affinity, request, workers)
       && !this.routeIsSaturated(affinity, workers)
-    ) {
-      return { ...affinity, affinityHit: true };
-    }
+    );
 
-    const replicas = this.replicaCandidates(request, workers);
-    if (replicas.length > 0) {
-      const chosen = replicas[0]!;
-      return {
+    const replicas = this.replicaCandidatesWithReasons(request, workers);
+    const routes: ScheduledRoute[] = replicas.map((candidate) => ({
         routeClass: "replica",
         model: request.model,
-        region: chosen.worker.capabilities.region,
-        stages: [this.toRouteStage(chosen, 0)],
-        score: chosen.score,
+        region: candidate.worker.capabilities.region,
+        stages: [this.toRouteStage(candidate, 0)],
+        score: candidate.score,
         affinityHit: false,
+      }));
+    const eligibilityRejections = new Map(
+      replicas.map((candidate, index) => [
+        routeCandidateId(routes[index]!),
+        candidate.rejectionReasons,
+      ]),
+    );
+    if (options.allowPipeline) {
+      routes.push(...this.buildPipelineRoutes(request, workers, now));
+    }
+    if (affinityEligible && affinity) {
+      routes.push({ ...affinity, affinityHit: false });
+    }
+    const uniqueRoutes = new Map(routes.map((route) => [routeCandidateId(route), route]));
+    const workerById = new Map(workers.map((worker) => [worker.id, worker]));
+    const candidates: ExecutionRouteCandidate<ScheduledRoute>[] = [...uniqueRoutes.values()].map(
+      (route) => {
+        const rejectionReasons = [
+          ...(eligibilityRejections.get(routeCandidateId(route)) ?? []),
+          ...routePolicyRejections(route, workerById, options),
+        ];
+        return {
+          id: routeCandidateId(route),
+          kind: executionRouteKind(route, workerById, options.originWorkerId),
+          route,
+          score: route.score,
+          nodeCount: new Set(route.stages.map((stage) => stage.workerId)).size,
+          meetsSlo: estimatedRouteServiceMs(route, workerById, request)
+            <= (request.deadline_ms ?? 120_000),
+          eligible: rejectionReasons.length === 0,
+          rejectionReasons,
+        };
+      },
+    );
+    const affinityCandidateId = affinityEligible && affinity
+      ? routeCandidateId(affinity)
+      : undefined;
+    const decision = decideExecutionRoute({
+      candidates,
+      ...(affinityCandidateId ? { affinityCandidateId } : {}),
+      // Existing session semantics retain any healthy, unsaturated exact route.
+      maxAffinityScorePenalty: Number.MAX_SAFE_INTEGER,
+    });
+    if (decision.selected) {
+      decision.selected.route = {
+        ...decision.selected.route,
+        affinityHit: decision.selected.reason === "selected_kv_affinity"
+          || decision.selected.candidateId === affinityCandidateId,
       };
     }
-
-    if (options.allowPipeline) {
-      return this.buildPipelineRoute(request, workers);
-    }
-    return null;
+    return decision;
   }
 
   selectRoutePlan(
@@ -104,9 +195,12 @@ export class Scheduler {
       ...(options.connectedWorkerIds ? { connectedWorkerIds: options.connectedWorkerIds } : {}),
       ...(options.now === undefined ? {} : { now: options.now }),
       ...(options.allowPipeline === undefined ? {} : { allowPipeline: options.allowPipeline }),
+      ...(options.originWorkerId === undefined ? {} : { originWorkerId: options.originWorkerId }),
+      ...(options.routePolicy === undefined ? {} : { routePolicy: options.routePolicy }),
       excludeWorkerIds: excludedWorkerIds,
     };
-    const primary = this.selectRoute(request, sessionId, routeOptions);
+    const initialDecision = this.selectExecutionRouteDecision(request, sessionId, routeOptions);
+    const primary = initialDecision.selected?.route;
     if (!primary) return null;
 
     const standbys: ScheduledRoute[] = [];
@@ -122,7 +216,7 @@ export class Scheduler {
       this.excludeRouteWorkers(candidate, excludedWorkerIds);
       if (this.hasExactRecoveryContract(primary, candidate)) standbys.push(candidate);
     }
-    return { primary, standbys };
+    return { primary, standbys, decision: decisionRecord(initialDecision, standbys) };
   }
 
   listAvailableModels(options: SchedulerOptions = {}): AvailableModel[] {
@@ -209,7 +303,16 @@ export class Scheduler {
   buildPipelineRoute(
     request: ChatCompletionRequest,
     workers: StoredWorker[],
+    now = Date.now(),
   ): ScheduledRoute | null {
+    return this.buildPipelineRoutes(request, workers, now)[0] ?? null;
+  }
+
+  private buildPipelineRoutes(
+    request: ChatCompletionRequest,
+    workers: StoredWorker[],
+    now: number,
+  ): ScheduledRoute[] {
     const candidates = workers.flatMap((worker) =>
       worker.capabilities.deployments
         .filter((deployment) => deployment.model === request.model && deployment.mode === "pipeline")
@@ -224,7 +327,7 @@ export class Scheduler {
       .filter((value): value is number => value !== undefined)
       .sort((left, right) => left - right);
 
-    let best: ScheduledRoute | null = null;
+    const completeRoutes: ScheduledRoute[] = [];
     for (const total of totals) {
       const stageCandidates = Array.from({ length: total }, (_, index) =>
         candidates.filter(
@@ -250,7 +353,7 @@ export class Scheduler {
             const sameRegion = path.region === candidate.worker.capabilities.region;
             if (request.workload_class === "interactive" && !sameRegion) continue;
             const previous = path.stages.at(-1)!;
-            const linkPenalty = this.linkPenalty(previous.worker, candidate.worker);
+            const linkPenalty = this.linkPenalty(previous.worker, candidate.worker, now);
             if (!Number.isFinite(linkPenalty)) continue;
             next.push({
               stages: [...path.stages, candidate],
@@ -268,6 +371,7 @@ export class Scheduler {
       const returnPenalty = this.linkPenalty(
         path.stages.at(-1)!.worker,
         path.stages[0]!.worker,
+        now,
       );
       if (!Number.isFinite(returnPenalty)) continue;
       const route: ScheduledRoute = {
@@ -278,26 +382,35 @@ export class Scheduler {
         score: path.cost + returnPenalty,
         affinityHit: false,
       };
-      if (!best || route.score < best.score) best = route;
+      completeRoutes.push(route);
     }
-    return best;
+    return completeRoutes.sort(
+      (left, right) => left.score - right.score
+        || left.stages.length - right.stages.length
+        || routeCandidateId(left).localeCompare(routeCandidateId(right)),
+    );
   }
 
-  private replicaCandidates(
+  private replicaCandidatesWithReasons(
     request: ChatCompletionRequest,
     workers: StoredWorker[],
-  ): Candidate[] {
+  ): EvaluatedCandidate[] {
     return workers
       .flatMap((worker) =>
         worker.capabilities.deployments
           .filter((deployment) => deployment.model === request.model && deployment.mode === "replica")
-          .filter((deployment) => this.isEligible(worker, deployment, request))
-          .filter((deployment) => this.internalPipelineDependenciesConnected(deployment, workers))
-          .map((deployment) => ({
-            worker,
-            deployment,
-            score: this.scoreWorker(worker, deployment, request),
-          })),
+          .map((deployment) => {
+            const rejectionReasons = this.eligibilityRejections(worker, deployment, request);
+            if (!this.internalPipelineDependenciesConnected(deployment, workers)) {
+              rejectionReasons.push("candidate_not_ready");
+            }
+            return {
+              worker,
+              deployment,
+              score: this.scoreWorker(worker, deployment, request),
+              rejectionReasons: [...new Set(rejectionReasons)],
+            };
+          }),
       )
       .sort((left, right) => left.score - right.score);
   }
@@ -307,22 +420,36 @@ export class Scheduler {
     deployment: ModelDeployment,
     request: ChatCompletionRequest,
   ): boolean {
-    if (worker.status !== "online" || deployment.freeSlots < 1) return false;
-    if (!this.deploymentEvidenceIsEligible(worker, deployment)) return false;
+    return this.eligibilityRejections(worker, deployment, request).length === 0;
+  }
+
+  private eligibilityRejections(
+    worker: StoredWorker,
+    deployment: ModelDeployment,
+    request: ChatCompletionRequest,
+  ): ExecutionRouteReasonCode[] {
+    const reasons: ExecutionRouteReasonCode[] = [];
+    if (worker.status !== "online") reasons.push("candidate_not_ready");
+    if (deployment.freeSlots < 1) reasons.push("candidate_capacity_exhausted");
+    if (!this.deploymentEvidenceIsEligible(worker, deployment)) {
+      reasons.push("candidate_evidence_missing");
+    }
     if (estimateInputTokens(request) + (request.max_tokens ?? 256) > deployment.contextLimit) {
-      return false;
+      reasons.push("candidate_context_exceeded");
     }
     const active = this.store.countActiveJobs(worker.id);
     const concurrency = Math.min(
       worker.capabilities.limits.maxConcurrency,
       deployment.maxConcurrency,
     );
-    if (active >= concurrency) return false;
-    return worker.capabilities.gpus.some(
+    if (active >= concurrency) reasons.push("candidate_capacity_exhausted");
+    const fitsMemory = worker.capabilities.gpus.some(
       (gpu) =>
         safeVramBudget(gpu.offeredVramMb) >= deployment.peakVramMb &&
         gpu.freeOfferedVramMb >= deployment.peakVramMb,
     );
+    if (!fitsMemory) reasons.push("candidate_capacity_exhausted");
+    return [...new Set(reasons)];
   }
 
   private routeStillValid(
@@ -397,7 +524,7 @@ export class Scheduler {
     };
   }
 
-  private linkPenalty(left: StoredWorker, right: StoredWorker): number {
+  private linkPenalty(left: StoredWorker, right: StoredWorker, now: number): number {
     const observations = this.evidence.runtimeLinkObservations?.();
     if (observations) {
       const leftNodeId = left.capabilities.distributedExecutor?.nodeId;
@@ -410,10 +537,16 @@ export class Scheduler {
         );
         if (
           observation
-          && observation.successfulSamples > 0
-          && observation.availability > 0
+          && observation.measuredAt <= now
+          && observation.validUntil > now
+          && observation.successfulSamples >= MIN_RUNTIME_LINK_SAMPLES
+          && observation.availability >= MIN_RUNTIME_LINK_AVAILABILITY
+          && observation.confidence >= MIN_RUNTIME_LINK_CONFIDENCE
         ) {
-          const latencyPenalty = Math.min(1, observation.rttP95Ms / 500);
+          const latencyPenalty = Math.min(
+            1,
+            (observation.rttP95Ms + observation.jitterP95Ms) / 500,
+          );
           const bandwidthPenalty = Math.min(1, 20 / observation.goodputMbpsP50);
           const availabilityPenalty = 1 - Math.min(1, observation.availability);
           return (
@@ -511,4 +644,147 @@ export class Scheduler {
       return indexes.size === total;
     }).length;
   }
+}
+
+function routeCandidateId(route: ScheduledRoute): string {
+  return route.stages
+    .map((stage) => `${stage.workerId}:${stage.deploymentId}:${stage.modelDigest}:${stage.stageIndex}`)
+    .join("|");
+}
+
+function executionRouteKind(
+  route: ScheduledRoute,
+  workerById: ReadonlyMap<string, StoredWorker>,
+  originWorkerId: string | undefined,
+): ExecutionRouteCandidate<ScheduledRoute>["kind"] {
+  if (route.routeClass === "pipeline") return "distributed-pipeline";
+  const stage = route.stages.length === 1 ? route.stages[0] : undefined;
+  if (!stage) return "remote-replica";
+  if (stage.workerId === originWorkerId) return "local-complete";
+  const worker = workerById.get(stage.workerId);
+  const deployment = worker?.capabilities.deployments.find(
+    (candidate) => candidate.deploymentId === stage.deploymentId,
+  );
+  return deployment?.internalPipeline?.stageCount === 1
+    ? "local-complete"
+    : "remote-replica";
+}
+
+function routePolicyRejections(
+  route: ScheduledRoute,
+  workerById: ReadonlyMap<string, StoredWorker>,
+  options: SchedulerOptions,
+): ExecutionRouteReasonCode[] {
+  const policy = options.routePolicy;
+  if (!policy) return [];
+  const workers = route.stages
+    .map((stage) => workerById.get(stage.workerId))
+    .filter((worker): worker is StoredWorker => worker !== undefined);
+  const reasons: ExecutionRouteReasonCode[] = [];
+  if (
+    policy.requireTrustedIdentity
+    && workers.some((worker) => !workerHasTrustedIdentity(worker))
+  ) {
+    reasons.push("candidate_trust_rejected");
+  }
+  const boundaryWorkers = route.stages.length === 0
+    ? []
+    : [route.stages[0]!, route.stages.at(-1)!]
+      .map((stage) => workerById.get(stage.workerId))
+      .filter((worker): worker is StoredWorker => worker !== undefined);
+  if (policy.requireTrustedBoundaryIdentity && boundaryWorkers.some((worker) => !workerHasTrustedIdentity(worker))) {
+    reasons.push("candidate_boundary_trust_rejected");
+  }
+  if (policy.pinnedBoundaryIdentityIds && boundaryWorkers.some(
+    (worker) => !worker.identityId || !policy.pinnedBoundaryIdentityIds!.has(worker.identityId),
+  )) {
+    reasons.push("candidate_boundary_pin_rejected");
+  }
+  if (
+    policy.residencyRegion
+    && workers.some((worker) => worker.capabilities.region !== policy.residencyRegion)
+  ) {
+    reasons.push("candidate_residency_rejected");
+  }
+  if (
+    policy.excludedFailureDomainIds
+    && workers.some(
+      (worker) => worker.identityId && policy.excludedFailureDomainIds!.has(worker.identityId),
+    )
+  ) {
+    reasons.push("candidate_failure_domain_rejected");
+  }
+  if (
+    policy.maxNormalizedCost !== undefined
+    && route.score > policy.maxNormalizedCost
+  ) {
+    reasons.push("candidate_cost_exceeded");
+  }
+  return reasons;
+}
+
+function workerHasTrustedIdentity(worker: StoredWorker): boolean {
+  return (worker.identityKind === "device" || worker.identityKind === "cell") && worker.identityId !== null;
+}
+
+function estimatedRouteServiceMs(
+  route: ScheduledRoute,
+  workerById: ReadonlyMap<string, StoredWorker>,
+  request: ChatCompletionRequest,
+): number {
+  const deployments = route.stages.flatMap((stage) => {
+    const worker = workerById.get(stage.workerId);
+    const deployment = worker?.capabilities.deployments.find(
+      (candidate) => candidate.deploymentId === stage.deploymentId,
+    );
+    return deployment ? [deployment] : [];
+  });
+  if (deployments.length !== route.stages.length) return Number.POSITIVE_INFINITY;
+  const outputTokens = request.max_tokens ?? 256;
+  const ttftMs = deployments.reduce((total, deployment) => total + deployment.ttftMs, 0);
+  const generationMs = Math.max(
+    ...deployments.map((deployment) => outputTokens / deployment.tokensPerSecond * 1_000),
+  );
+  return ttftMs + generationMs;
+}
+
+function decisionRecord(
+  decision: ExecutionRouteDecision<ScheduledRoute>,
+  standbys: readonly ScheduledRoute[],
+): ExecutionRouteDecisionRecord {
+  const compact = (
+    selection: NonNullable<ExecutionRouteDecision<ScheduledRoute>["selected"]>,
+  ) => ({
+    candidateId: selection.candidateId,
+    kind: selection.kind,
+    score: selection.score,
+    nodeCount: selection.nodeCount,
+    reason: selection.reason,
+  });
+  return {
+    recommendation: decision.recommendation ? compact(decision.recommendation) : null,
+    selected: decision.selected ? compact(decision.selected) : null,
+    selectedKind: decision.selectedKind,
+    fallbacks: decision.fallbacks.map(compact),
+    standbys: standbys.map((route) => {
+      const candidateId = routeCandidateId(route);
+      const evaluation = decision.evaluations.find(
+        (candidate) => candidate.candidateId === candidateId,
+      );
+      return {
+        candidateId,
+        kind: evaluation?.kind ?? (route.routeClass === "pipeline"
+          ? "distributed-pipeline"
+          : "remote-replica"),
+        compatibility: "exact-model-revision-and-stage-contract" as const,
+        stageCount: route.stages.length,
+        modelDigests: [...new Set(route.stages.map((stage) => stage.modelDigest))],
+      };
+    }),
+    reasons: [...decision.reasons],
+    evaluations: decision.evaluations.map((evaluation) => ({
+      ...evaluation,
+      reasons: [...evaluation.reasons],
+    })),
+  };
 }

@@ -8,6 +8,7 @@ import {
   generateWorkerAdmissionCredential,
   workerAdmissionSigner,
 } from "../src/worker/admission-credential.js";
+import { verifyExecutionReceipt } from "../src/contracts/execution-receipt.js";
 
 describe("inference-only coordinator and worker", () => {
   const cleanup: Array<() => Promise<void> | void> = [];
@@ -50,6 +51,10 @@ describe("inference-only coordinator and worker", () => {
           stages: unknown[];
           physicalBoundaryCount: number | null;
         };
+        recovery_mode: string;
+        recovery_attempts: number;
+        replayed_token_events: number;
+        execution_receipt_id: string;
       };
     };
     expect(response.status).toBe(200);
@@ -57,6 +62,21 @@ describe("inference-only coordinator and worker", () => {
     expect(body.usage.prompt_tokens).toBeGreaterThan(0);
     expect(body.usage.completion_tokens).toBeGreaterThan(0);
     expect(body.x_network.active_ms).toBeGreaterThan(0);
+    expect(body.x_network).toMatchObject({ recovery_mode: "none", recovery_attempts: 1, replayed_token_events: 0 });
+    expect(body.x_network.execution_receipt_id).toMatch(/^sha256:[a-f0-9]{64}$/);
+    const [receiptResponse, receiptKeyResponse] = await Promise.all([
+      fetch(new URL(`v1/requests/${encodeURIComponent(body.id)}/receipt`, `${address}/`)),
+      fetch(new URL("v1/execution-receipt-key", `${address}/`)),
+    ]);
+    expect(receiptResponse.status).toBe(200);
+    expect(receiptKeyResponse.status).toBe(200);
+    const receipt = await receiptResponse.json();
+    const receiptKey = await receiptKeyResponse.json() as { keyId: string; spki: string };
+    expect(verifyExecutionReceipt(receipt, receiptKey)).toMatchObject({
+      receiptId: body.x_network.execution_receipt_id,
+      jobId: body.id,
+      recovery: { mode: "none", attempts: 1, replayedTokenEvents: 0 },
+    });
     expect(body.x_network.execution_trace).toMatchObject({
       schema: "mycellios-network-execution-trace/1",
       jobId: body.id,
@@ -175,7 +195,7 @@ describe("inference-only coordinator and worker", () => {
     expect(await response.text()).toContain("mycellios test network");
   });
 
-  it("connects a signed public worker without exposing the global network token", async () => {
+  it("connects a signed public cell worker without exposing the global network token", async () => {
     const { runtime, agent, run } = await startNetwork({
       networkToken: "server-only-network-token",
       signedPublic: true,
@@ -253,12 +273,10 @@ async function startNetwork(options: {
       ...(options.networkToken && !options.signedPublic
         ? { networkToken: options.networkToken }
         : {}),
-      ...(options.signedPublic
-        ? {
-            identity: { kind: "device" as const, id: "signed-e2e-worker" },
-            admissionSigner: workerAdmissionSigner(generateWorkerAdmissionCredential()),
-          }
-        : {}),
+      // Every execution fixture uses the same signed cell identity required
+      // for sensitive input/output boundaries; loopback is not a trust root.
+      identity: { kind: "cell" as const, id: "signed-e2e-worker" },
+      admissionSigner: workerAdmissionSigner(generateWorkerAdmissionCredential()),
     },
   );
   const run = agent.start();

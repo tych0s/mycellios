@@ -1,7 +1,7 @@
 import websocket from "@fastify/websocket";
 import staticFiles from "@fastify/static";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, generateKeyPairSync, timingSafeEqual } from "node:crypto";
 import {
   createReadStream,
   existsSync,
@@ -42,14 +42,24 @@ import {
   workerAdmissionIdentitySchema,
   workerCredentialRotationChallengeRequestSchema,
   workerCredentialRotationProofSchema,
+  workerCredentialRecoveryChallengeRequestSchema,
+  workerCredentialRecoveryProofSchema,
 } from "../contracts/worker-admission.js";
 import { contributionAckEnvelopeSchema } from "../contracts/worker-protocol.js";
 import {
   type NativeBuildIdentity,
 } from "../contracts/build-identity.js";
+import {
+  developmentLabCreateRequestSchema,
+  developmentLabIdSchema,
+  developmentLabRedeemRequestSchema,
+  developmentLabReinviteRequestSchema,
+} from "../contracts/development-lab.js";
+import { MAX_COMPONENT_ARTIFACT_BYTES } from "../contracts/component-update-policy.js";
 import type { ChatCompletionRequest } from "../contracts/types.js";
 import {
   assertCoordinatorNetworkSecurity,
+  isCoordinatorLoopbackHost,
   type CoordinatorConfig,
 } from "../core/config.js";
 import {
@@ -59,6 +69,9 @@ import {
 import { workerRegistrationDigest } from "../core/worker-admission-digest.js";
 import { Scheduler } from "../scheduler/scheduler.js";
 import { MeshDatabase } from "../storage/database.js";
+import { EconomicLedger } from "../economy/economic-ledger.js";
+import { PhysicalContributionEvidenceAuthority } from "../economy/physical-contribution-evidence.js";
+import { sha256CanonicalEvidence } from "../core/json.js";
 import {
   MeshStore,
   type StoredNetworkTelemetrySample,
@@ -94,7 +107,17 @@ import {
   validateReleaseAssetName,
   type ReleaseAssetChannel,
 } from "./release-upload.js";
+import {
+  ComponentReleaseStore,
+  ComponentReleaseStoreError,
+} from "./component-release-store.js";
+import {
+  DevelopmentLabStore,
+  DevelopmentLabStoreError,
+} from "./development-lab-store.js";
 import { WorkerHub } from "./worker-hub.js";
+import { ExecutionReceiptStore } from "./execution-receipt-store.js";
+import { ModelCertificationRegistry } from "./model-certification-registry.js";
 import {
   modelHasGpuFallback,
   verifiedGpuCapacityCanRepairModel,
@@ -115,7 +138,7 @@ import {
   classifyActivationIncident,
   formatExhaustedActivationFailure,
   type ActivationIncident,
-} from "./activation-incident.js";
+} from "../contracts/activation-incident.js";
 import type { AuthenticatedNetworkUser } from "./supabase-auth.js";
 import {
   API_KEY_PREFIX,
@@ -131,7 +154,19 @@ import {
   WorkerAdmissionError,
   admissionCredentialSummary,
   selectWorkerProtocolVersion,
+  workerAdmissionPublicKeyFingerprint,
 } from "./worker-admission.js";
+import { NodeEnrollmentStore } from "./node-enrollment-store.js";
+import { NodeCommandStore } from "./node-command-store.js";
+import { NodeReconciliationStore } from "./node-reconciliation-store.js";
+import { NodeOwnershipTransferStore } from "./node-ownership-transfer-store.js";
+import {
+  nodeCommandResultSchema,
+  nodeCommandSchema,
+  nodeEnrollmentCreateSchema,
+  nodeEnrollmentRedeemSchema,
+  nodeSnapshotSchema,
+} from "../contracts/node-control.js";
 import {
   WORKER_SESSION_TOKEN_PREFIX,
   issueWorkerSessionToken,
@@ -155,12 +190,14 @@ export const NETWORK_TELEMETRY_INTERVAL_MS = 10 * 60_000;
 export const NETWORK_TELEMETRY_RETENTION_DAYS = 90;
 
 const SIGNED_WORKER_ADMISSION_PATHS = new Set([
+  "/internal/v1/nodes/enrollments/redeem",
   "/internal/v1/workers/admission-challenge",
   "/internal/v1/workers/credential-rotation-challenge",
   "/internal/v1/workers/credential-rotation",
   "/internal/v1/workers/register",
 ]);
 const WORKER_CONNECT_PATH = "/internal/v1/workers/connect";
+const WORKER_NODE_CONTROL_PATH = /^\/internal\/v1\/nodes\/([^/]+)\/(?:commands(?:\/results)?|snapshot)$/;
 
 const networkHistoryRanges = {
   "24h": 24,
@@ -203,6 +240,9 @@ export interface CoordinatorRuntime {
   mobileHub: MobileComputeHub;
   service: MeshService;
   apiAccess: ApiAccessManager;
+  economicLedger: EconomicLedger;
+  executionReceipts: ExecutionReceiptStore;
+  physicalContributionEvidence: PhysicalContributionEvidenceAuthority;
   persistence: SupabasePersistence | null;
   deploymentController: DeploymentControlPlane;
   close(): Promise<void>;
@@ -229,6 +269,7 @@ export async function createCoordinator(
     releaseTransactionRoot?: string;
     releaseChunkBodyLimitBytes?: number;
     supabaseAuthService?: SupabaseAuthService;
+    modelCapacityInspector?: typeof inspectHubModelCapacity;
   } = {},
 ): Promise<CoordinatorRuntime> {
   assertCoordinatorNetworkSecurity(config);
@@ -314,7 +355,7 @@ export async function createCoordinator(
       // would make the route impossible to use when the tokens differ.
       if (path.startsWith("/internal/v1/mobile/experts/")) return;
       if (
-        path === WORKER_CONNECT_PATH
+        (path === WORKER_CONNECT_PATH || WORKER_NODE_CONTROL_PATH.test(path))
         && received?.startsWith(`${WORKER_SESSION_TOKEN_PREFIX}.`)
       ) return;
       if (!received || !constantTimeEqual(received, expectedToken)) {
@@ -325,14 +366,24 @@ export async function createCoordinator(
   const supabaseAuth = options.supabaseAuthService ?? (config.supabaseUrl && config.supabaseServiceRoleKey
     ? new SupabaseAuthService(config.supabaseUrl, config.supabaseServiceRoleKey)
     : null);
+  const authorizedAdministrativeRequests = new WeakSet<FastifyRequest>();
+  const markAdministrativeRequestAuthorized = (
+    request: FastifyRequest,
+  ): true => {
+    authorizedAdministrativeRequests.add(request);
+    return true;
+  };
   const authorizeAdministrativeMutation = async (
     request: FastifyRequest,
     reply: FastifyReply,
     allowedRoles: readonly NonNullable<AuthenticatedNetworkUser["role"]>[] =
       ["owner", "admin", "operator"],
   ): Promise<boolean> => {
+    if (authorizedAdministrativeRequests.has(request)) return true;
     const expected = config.modelAdminToken;
-    if (!expected && isTrustedLocalRequest(request)) return true;
+    if (!expected && isTrustedLocalRequest(request)) {
+      return markAdministrativeRequestAuthorized(request);
+    }
     const legacyHeader = request.headers["x-mycellios-admin-token"];
     const legacyToken = typeof legacyHeader === "string"
       ? legacyHeader.trim()
@@ -341,11 +392,13 @@ export async function createCoordinator(
     if (expected && (
       (legacyToken && constantTimeEqual(legacyToken, expected))
       || (bearer && constantTimeEqual(bearer, expected))
-    )) return true;
+    )) return markAdministrativeRequestAuthorized(request);
     if (bearer && supabaseAuth) {
       try {
         const user = await supabaseAuth.authenticate(bearer);
-        if (user?.role && allowedRoles.includes(user.role)) return true;
+        if (user?.role && allowedRoles.includes(user.role)) {
+          return markAdministrativeRequestAuthorized(request);
+        }
         if (user) {
           void reply.code(403).send({
             error: {
@@ -379,35 +432,97 @@ export async function createCoordinator(
     });
     return false;
   };
+  const requireRecentAdministrativeReauth = (
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ): boolean => {
+    const configuredSecret = config.modelAdminToken;
+    const legacyHeader = request.headers["x-mycellios-admin-token"];
+    const legacyToken = typeof legacyHeader === "string"
+      ? legacyHeader.trim()
+      : Array.isArray(legacyHeader) ? legacyHeader[0]?.trim() : undefined;
+    const bearer = parseBearerToken(request.headers.authorization);
+    if (configuredSecret && (
+      (legacyToken && constantTimeEqual(legacyToken, configuredSecret))
+      || (bearer && constantTimeEqual(bearer, configuredSecret))
+    )) return true;
+    if (!bearer && isTrustedLocalRequest(request)) return true;
+    if (bearer && recentAal2ClaimsAreValid(bearer)) return true;
+    void reply.code(403).send({ error: {
+      code: "recent_aal2_reauthentication_required",
+      message: "Publishing update artifacts or channels requires a recent MFA-backed sign-in.",
+    } });
+    return false;
+  };
   app.addContentTypeParser(
     "application/octet-stream",
     { parseAs: "buffer", bodyLimit: 512 * 1024 * 1024 },
     (_request, body, done) => done(null, body),
   );
   const database = new MeshDatabase(config.databasePath);
+  if (
+    !isCoordinatorLoopbackHost(config.host)
+    && (!config.economicReceiptSigningKeyId || !config.economicReceiptSigningPrivateKey)
+  ) throw new Error("receipt_signing_key_required_for_public_coordinator");
+  const developmentEconomicKey = config.economicReceiptSigningPrivateKey
+    ? null
+    : generateKeyPairSync("ed25519").privateKey;
+  const receiptSigning = {
+    keyId: config.economicReceiptSigningKeyId ?? "economic-loopback-ephemeral",
+    privateKey: config.economicReceiptSigningPrivateKey ?? developmentEconomicKey!,
+  };
+  const economicLedger = new EconomicLedger(database, { receiptSigning });
+  const executionReceipts = new ExecutionReceiptStore(database, receiptSigning);
+  const modelCertifications = config.modelCertificationPinnedKeys?.length
+    ? new ModelCertificationRegistry(database, config.modelCertificationPinnedKeys) : null;
+  const physicalContributionEvidence = new PhysicalContributionEvidenceAuthority(database);
+  economicLedger.registerDefaultInternalPricing();
   const workerAdmission = new WorkerAdmissionAuthority(database);
+  const nodeEnrollments = new NodeEnrollmentStore(database);
+  const nodeCommands = new NodeCommandStore(database);
+  const nodeReconciliation = new NodeReconciliationStore(database, nodeCommands);
+  const nodeOwnershipTransfers = new NodeOwnershipTransferStore(database);
   const workerSessionPrincipals = new WeakMap<FastifyRequest, string>();
+  const workerSessionContexts = new WeakMap<FastifyRequest, {
+    workerId: string; identityKind: "device" | "cell"; identityId: string;
+    credentialFingerprint: string; generation: number | null;
+  }>();
   if (config.networkToken) {
     app.addHook("onRequest", async (request, reply) => {
       const path = request.url.split("?", 1)[0] ?? request.url;
-      if (path !== WORKER_CONNECT_PATH) return;
+      const nodeControlPath = WORKER_NODE_CONTROL_PATH.exec(path);
+      if (path !== WORKER_CONNECT_PATH && !nodeControlPath) return;
       const token = parseBearerToken(request.headers.authorization);
       if (token && constantTimeEqual(token, config.networkToken!)) return;
       const claims = token ? verifyWorkerSessionToken(config.networkToken!, token) : null;
       const credential = claims
         ? database.getWorkerAdmissionCredential(claims.identityKind, claims.identityId)
         : null;
+      const ownership = claims?.identityKind === "device"
+        ? database.getNodeOwnership("device", claims.identityId)
+        : null;
       if (
         !claims
         || !credential
         || credential.status !== "active"
         || credential.fingerprint !== claims.credentialFingerprint
+        || (claims.identityKind === "device" && (
+          !ownership || ownership.status !== "active" || ownership.credentialFingerprint !== claims.credentialFingerprint
+        ))
       ) {
         return reply.code(401).send({
           error: { code: "invalid_worker_session_token" },
         });
       }
-      workerSessionPrincipals.set(request, claims.workerId);
+      if (nodeControlPath && (claims.identityKind !== "device" || claims.identityId !== decodeURIComponent(nodeControlPath[1]!))) {
+        return reply.code(403).send({ error: { code: "worker_session_wrong_node" } });
+      }
+      workerSessionPrincipals.set(request, nodeControlPath ? claims.identityId : claims.workerId);
+      workerSessionContexts.set(request, {
+        workerId: claims.workerId, identityKind: claims.identityKind, identityId: claims.identityId,
+        credentialFingerprint: claims.credentialFingerprint,
+        generation: ownership?.generation ?? null,
+      });
     });
   }
   const apiAccess = new ApiAccessManager(database, {
@@ -520,8 +635,8 @@ export async function createCoordinator(
     });
     app.get("/mobile", async (_request, reply) => reply.redirect("/mobile/"));
   }
-  const desktopUpdatesPath = resolveDesktopUpdatesPath(
-    config.desktopUpdatesPath,
+  const nodeUpdatesPath = resolveNodeUpdatesPath(
+    config.nodeUpdatesPath,
     runtimeMetadata.root,
   );
   const releaseDownloadsPath = resolveReleaseDownloadsPath(
@@ -532,14 +647,14 @@ export async function createCoordinator(
   const publicAssetVersion = runtimeVersion;
   const uploadUpdatesRoot = releaseAssetRoot(
     "updates",
-    config.desktopUpdatesPath,
+    config.nodeUpdatesPath,
     config.releaseDownloadsPath,
     config.landingAssetsPath,
     runtimeMetadata.root,
   );
   const uploadDownloadsRoot = releaseAssetRoot(
     "downloads",
-    config.desktopUpdatesPath,
+    config.nodeUpdatesPath,
     config.releaseDownloadsPath,
     config.landingAssetsPath,
     runtimeMetadata.root,
@@ -552,7 +667,7 @@ export async function createCoordinator(
           uploadDownloadsRoot,
           runtimeMetadata.root,
         ),
-      legacyUpdatesRoot: desktopUpdatesPath,
+      legacyUpdatesRoot: nodeUpdatesPath,
       legacyDownloadsRoot: releaseDownloadsPath,
       sourceId: coordinatorBuildIdentity.sourceId,
       revision: runtimeRevision,
@@ -560,7 +675,452 @@ export async function createCoordinator(
     })
     : null;
   await releaseTransactions?.initialize();
-  app.get("/updates/win32/x64/:fileName", async (request, reply) => {
+  const componentReleases =
+    config.componentUpdatesPath && config.componentUpdatePinnedKeys
+      ? new ComponentReleaseStore({
+          root: config.componentUpdatesPath,
+          verification: {
+            pinnedKeys: config.componentUpdatePinnedKeys,
+          },
+        })
+      : null;
+  const developmentLabs = config.componentUpdatesPath
+    ? new DevelopmentLabStore({ root: config.componentUpdatesPath })
+    : null;
+  await developmentLabs?.initialize();
+  const componentTargetSchema = z
+    .object({
+      channel: z.enum(["dev", "stable"]),
+      platform: z.enum(["win32", "linux", "darwin"]),
+      arch: z.enum(["x64", "arm64"]),
+    })
+    .strict();
+  app.get(
+    "/updates/v1/:channel/:platform/:arch/manifest.json",
+    async (request, reply) => {
+      if (!componentReleases) return reply.code(404).send();
+      const target = componentTargetSchema.parse(request.params);
+      let manifest;
+      try {
+        manifest = await componentReleases.readPublishedManifest(target, {
+          verifyArtifacts: false,
+        });
+      } catch (error) {
+        return sendComponentReleaseError(reply, error, "public");
+      }
+      if (!manifest) return reply.code(404).send();
+      reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
+      return reply.send(manifest);
+    },
+  );
+  app.get(
+    "/updates/v1/artifacts/:digest",
+    async (request, reply) => {
+      if (!componentReleases) return reply.code(404).send();
+      const { digest } = z
+        .object({ digest: z.string().regex(/^[0-9a-f]{64}$/) })
+        .strict()
+        .parse(request.params);
+      let artifact;
+      try {
+        artifact = await componentReleases.openArtifact({
+          sha256: `sha256:${digest}`,
+        });
+      } catch (error) {
+        return sendComponentReleaseError(reply, error, "public");
+      }
+      reply.header("Cache-Control", "public, max-age=31536000, immutable");
+      reply.header("ETag", `"sha256:${digest}"`);
+      reply.header("Content-Length", artifact.bytes);
+      reply.type("application/octet-stream");
+      return reply.send(artifact.handle.createReadStream({ autoClose: true }));
+    },
+  );
+  app.put(
+    "/public/v1/admin/component-updates/artifacts/:digest",
+    {
+      bodyLimit: MAX_COMPONENT_ARTIFACT_BYTES,
+      onRequest: async (request, reply) => {
+        if (!await authorizeAdministrativeMutation(request, reply)) return reply;
+        if (!requireRecentAdministrativeReauth(request, reply)) return reply;
+      },
+    },
+    async (request, reply) => {
+      if (!authorizedAdministrativeRequests.has(request)) return;
+      if (!componentReleases) {
+        return reply.code(503).send({
+          error: {
+            code: "component_updates_not_configured",
+            message:
+              "Configure MYCELLIOS_COMPONENT_UPDATES_DIST and a pinned channel public key.",
+          },
+        });
+      }
+      const { digest } = z
+        .object({ digest: z.string().regex(/^[0-9a-f]{64}$/) })
+        .strict()
+        .parse(request.params);
+      if (!Buffer.isBuffer(request.body) || request.body.length < 1) {
+        return reply.code(400).send({
+          error: { code: "component_update_artifact_body_invalid" },
+        });
+      }
+      let stored;
+      try {
+        stored = await componentReleases.putArtifact({
+          sha256: `sha256:${digest}`,
+          bytes: request.body.length,
+          body: request.body,
+        });
+      } catch (error) {
+        return sendComponentReleaseError(reply, error, "admin");
+      }
+      return reply.code(stored.alreadyStored ? 200 : 201).send({
+        data: stored,
+      });
+    },
+  );
+  app.put(
+    "/public/v1/admin/component-updates/:channel/:platform/:arch/manifest",
+    {
+      bodyLimit: 2 * 1024 * 1024,
+      onRequest: async (request, reply) => {
+        if (!await authorizeAdministrativeMutation(request, reply)) return reply;
+        if (!requireRecentAdministrativeReauth(request, reply)) return reply;
+      },
+    },
+    async (request, reply) => {
+      if (!authorizedAdministrativeRequests.has(request)) return;
+      if (!componentReleases) {
+        return reply.code(503).send({
+          error: {
+            code: "component_updates_not_configured",
+            message:
+              "Configure MYCELLIOS_COMPONENT_UPDATES_DIST and a pinned channel public key.",
+          },
+        });
+      }
+      const target = componentTargetSchema.parse(request.params);
+      let published;
+      try {
+        published = await componentReleases.publishManifest({
+          target,
+          manifest: request.body,
+        });
+        await componentReleases.collectGarbage().catch((error: unknown) => {
+          app.log.warn(
+            { error: error instanceof Error ? error.message : String(error) },
+            "Component release garbage collection failed",
+          );
+        });
+      } catch (error) {
+        return sendComponentReleaseError(reply, error, "admin");
+      }
+      return reply.code(published.alreadyPublished ? 200 : 201).send({
+        data: {
+          manifestId: published.manifest.manifestId,
+          sequence: published.manifest.sequence,
+          alreadyPublished: published.alreadyPublished,
+          previousManifestId: published.previousManifestId,
+        },
+      });
+    },
+  );
+  const developmentLabParamsSchema = z.object({
+    labId: developmentLabIdSchema,
+  }).strict();
+  const developmentLabTargetSchema = z.object({
+    labId: developmentLabIdSchema,
+    channel: z.literal("dev"),
+    platform: z.enum(["win32", "linux", "darwin"]),
+    arch: z.enum(["x64", "arm64"]),
+  }).strict();
+  const developmentLabDigestSchema = z.object({
+    labId: developmentLabIdSchema,
+    digest: z.string().regex(/^[0-9a-f]{64}$/),
+  }).strict();
+  const labFeedBaseUrl = (
+    request: FastifyRequest,
+    labId: string,
+  ): string => {
+    const configured = config.publicApiBaseUrl?.trim().replace(/\/+$/, "");
+    const base = configured
+      || `${request.protocol}://${request.headers.host ?? request.hostname}`;
+    return new URL(
+      `development-labs/${encodeURIComponent(labId)}/`,
+      `${base}/`,
+    ).toString();
+  };
+
+  app.post(
+    "/public/v1/admin/development-labs",
+    {
+      onRequest: async (request, reply) => {
+        if (!await authorizeAdministrativeMutation(request, reply)) return reply;
+      },
+    },
+    async (request, reply) => {
+      if (!authorizedAdministrativeRequests.has(request)) return;
+      if (!developmentLabs) {
+        return reply.code(503).send({
+          error: { code: "development_labs_not_configured" },
+        });
+      }
+      const input = developmentLabCreateRequestSchema.parse(request.body);
+      try {
+        const created = await developmentLabs.createLab(input);
+        return reply.code(201).send({
+          data: {
+            ...created.lab,
+            feedBaseUrl: labFeedBaseUrl(request, created.lab.labId),
+            invitation: {
+              token: created.token,
+              expiresAt: created.expiresAt,
+            },
+          },
+        });
+      } catch (error) {
+        return sendDevelopmentLabError(reply, error);
+      }
+    },
+  );
+
+  app.post(
+    "/development-labs/:labId/public/v1/admin/invitations",
+    {
+      onRequest: async (request, reply) => {
+        if (!await authorizeAdministrativeMutation(request, reply)) return reply;
+      },
+    },
+    async (request, reply) => {
+      if (!authorizedAdministrativeRequests.has(request)) return;
+      if (!developmentLabs) {
+        return reply.code(503).send({
+          error: { code: "development_labs_not_configured" },
+        });
+      }
+      const { labId } = developmentLabParamsSchema.parse(request.params);
+      const input = developmentLabReinviteRequestSchema.parse(
+        request.body ?? {},
+      );
+      try {
+        const created = await developmentLabs.createInvitation(
+          labId,
+          input.ttlSeconds,
+        );
+        return reply.code(201).send({
+          data: {
+            ...created.lab,
+            feedBaseUrl: labFeedBaseUrl(request, created.lab.labId),
+            invitation: {
+              token: created.token,
+              expiresAt: created.expiresAt,
+            },
+          },
+        });
+      } catch (error) {
+        return sendDevelopmentLabError(reply, error);
+      }
+    },
+  );
+
+  app.post(
+    "/development-labs/:labId/public/v1/admin/revoke",
+    {
+      onRequest: async (request, reply) => {
+        if (!await authorizeAdministrativeMutation(request, reply)) return reply;
+      },
+    },
+    async (request, reply) => {
+      if (!authorizedAdministrativeRequests.has(request)) return;
+      if (!developmentLabs) {
+        return reply.code(503).send({
+          error: { code: "development_labs_not_configured" },
+        });
+      }
+      const { labId } = developmentLabParamsSchema.parse(request.params);
+      try {
+        return reply.send({
+          data: await developmentLabs.revokeLab(labId),
+        });
+      } catch (error) {
+        return sendDevelopmentLabError(reply, error);
+      }
+    },
+  );
+
+  app.post(
+    "/development-labs/v1/join",
+    async (request, reply) => {
+      if (!developmentLabs) {
+        return reply.code(503).send({
+          error: { code: "development_labs_not_configured" },
+        });
+      }
+      const input = developmentLabRedeemRequestSchema.parse(request.body);
+      try {
+        const lab = await developmentLabs.redeemInvitation(
+          input.labId,
+          input.token,
+        );
+        reply.header("Cache-Control", "no-store");
+        return reply.send({
+          data: {
+            ...lab,
+            feedBaseUrl: labFeedBaseUrl(request, lab.labId),
+          },
+        });
+      } catch (error) {
+        return sendDevelopmentLabError(reply, error);
+      }
+    },
+  );
+
+  app.get(
+    "/development-labs/:labId/updates/v1/:channel/:platform/:arch/manifest.json",
+    async (request, reply) => {
+      if (!developmentLabs) return reply.code(404).send();
+      const params = developmentLabTargetSchema.parse(request.params);
+      try {
+        const releases = await developmentLabs.releaseStore(params.labId);
+        const manifest = await releases.readPublishedManifest({
+          channel: params.channel,
+          platform: params.platform,
+          arch: params.arch,
+        }, { verifyArtifacts: false });
+        if (!manifest) return reply.code(404).send();
+        reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
+        return reply.send(manifest);
+      } catch (error) {
+        if (error instanceof DevelopmentLabStoreError) {
+          return sendDevelopmentLabError(reply, error);
+        }
+        return sendComponentReleaseError(reply, error, "public");
+      }
+    },
+  );
+
+  app.get(
+    "/development-labs/:labId/updates/v1/artifacts/:digest",
+    async (request, reply) => {
+      if (!developmentLabs) return reply.code(404).send();
+      const { labId, digest } = developmentLabDigestSchema.parse(
+        request.params,
+      );
+      try {
+        const releases = await developmentLabs.releaseStore(labId);
+        const artifact = await releases.openArtifact({
+          sha256: `sha256:${digest}`,
+        });
+        reply.header("Cache-Control", "public, max-age=31536000, immutable");
+        reply.header("ETag", `"sha256:${digest}"`);
+        reply.header("Content-Length", artifact.bytes);
+        reply.type("application/octet-stream");
+        return reply.send(
+          artifact.handle.createReadStream({ autoClose: true }),
+        );
+      } catch (error) {
+        if (error instanceof DevelopmentLabStoreError) {
+          return sendDevelopmentLabError(reply, error);
+        }
+        return sendComponentReleaseError(reply, error, "public");
+      }
+    },
+  );
+
+  app.put(
+    "/development-labs/:labId/public/v1/admin/component-updates/artifacts/:digest",
+    {
+      bodyLimit: MAX_COMPONENT_ARTIFACT_BYTES,
+      onRequest: async (request, reply) => {
+        if (!await authorizeAdministrativeMutation(request, reply)) return reply;
+        if (!requireRecentAdministrativeReauth(request, reply)) return reply;
+      },
+    },
+    async (request, reply) => {
+      if (!authorizedAdministrativeRequests.has(request)) return;
+      if (!developmentLabs) {
+        return reply.code(503).send({
+          error: { code: "development_labs_not_configured" },
+        });
+      }
+      const { labId, digest } = developmentLabDigestSchema.parse(
+        request.params,
+      );
+      if (!Buffer.isBuffer(request.body) || request.body.length < 1) {
+        return reply.code(400).send({
+          error: { code: "component_update_artifact_body_invalid" },
+        });
+      }
+      try {
+        const releases = await developmentLabs.releaseStore(labId);
+        const stored = await releases.putArtifact({
+          sha256: `sha256:${digest}`,
+          bytes: request.body.length,
+          body: request.body,
+        });
+        return reply.code(stored.alreadyStored ? 200 : 201).send({
+          data: stored,
+        });
+      } catch (error) {
+        if (error instanceof DevelopmentLabStoreError) {
+          return sendDevelopmentLabError(reply, error);
+        }
+        return sendComponentReleaseError(reply, error, "admin");
+      }
+    },
+  );
+
+  app.put(
+    "/development-labs/:labId/public/v1/admin/component-updates/:channel/:platform/:arch/manifest",
+    {
+      bodyLimit: 2 * 1024 * 1024,
+      onRequest: async (request, reply) => {
+        if (!await authorizeAdministrativeMutation(request, reply)) return reply;
+        if (!requireRecentAdministrativeReauth(request, reply)) return reply;
+      },
+    },
+    async (request, reply) => {
+      if (!authorizedAdministrativeRequests.has(request)) return;
+      if (!developmentLabs) {
+        return reply.code(503).send({
+          error: { code: "development_labs_not_configured" },
+        });
+      }
+      const params = developmentLabTargetSchema.parse(request.params);
+      try {
+        const releases = await developmentLabs.releaseStore(params.labId);
+        const published = await releases.publishManifest({
+          target: {
+            channel: params.channel,
+            platform: params.platform,
+            arch: params.arch,
+          },
+          manifest: request.body,
+        });
+        await releases.collectGarbage().catch((error: unknown) => {
+          app.log.warn(
+            { error: error instanceof Error ? error.message : String(error) },
+            "Development lab component garbage collection failed",
+          );
+        });
+        return reply.code(published.alreadyPublished ? 200 : 201).send({
+          data: {
+            manifestId: published.manifest.manifestId,
+            sequence: published.manifest.sequence,
+            alreadyPublished: published.alreadyPublished,
+            previousManifestId: published.previousManifestId,
+          },
+        });
+      } catch (error) {
+        if (error instanceof DevelopmentLabStoreError) {
+          return sendDevelopmentLabError(reply, error);
+        }
+        return sendComponentReleaseError(reply, error, "admin");
+      }
+    },
+  );
+  app.get("/updates/node/:fileName", async (request, reply) => {
     const { fileName } = z.object({
       fileName: z.string().min(1).max(160),
     }).parse(request.params);
@@ -571,7 +1131,7 @@ export async function createCoordinator(
         releaseTransactions,
         "updates",
         fileName,
-        desktopUpdatesPath,
+        nodeUpdatesPath,
       ),
     );
   });
@@ -593,12 +1153,22 @@ export async function createCoordinator(
   });
   app.get("/downloads/windows", async (_request, reply) => {
     reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
-    return reply.redirect(`/updates/win32/x64/mycellios-setup.exe?v=${publicAssetVersion}`);
+    return reply.redirect(`/downloads/mycellios-node-windows-x64.zip?v=${publicAssetVersion}`);
   });
   const hub = new WorkerHub(store);
   const fleetContribution = new FleetContributionController(store, hub);
   hub.attach(app, {
     authorizedWorkerId: (request) => workerSessionPrincipals.get(request) ?? null,
+    authorizedSession: (request) => workerSessionContexts.get(request) ?? null,
+    sessionIsCurrent: (session) => {
+      const credential = database.getWorkerAdmissionCredential(session.identityKind, session.identityId);
+      if (!credential || credential.status !== "active" || credential.fingerprint !== session.credentialFingerprint) return false;
+      if (session.identityKind !== "device") return true;
+      const ownership = database.getNodeOwnership("device", session.identityId);
+      return Boolean(ownership && ownership.status === "active"
+        && ownership.credentialFingerprint === session.credentialFingerprint
+        && ownership.generation === session.generation);
+    },
   });
   const scheduler = new Scheduler(store, {
     runtimeLinkObservations: () => hub.runtimeLinkObservations(),
@@ -620,6 +1190,36 @@ export async function createCoordinator(
     queueExistingMobileArtifacts(persistence, config.mobileExpertArtifactsPath);
   }
   const service = new MeshService(store, scheduler, hub, config.requestTimeoutMs);
+  const attachExecutionReceipt = (
+    event: Extract<JobStreamEvent, { type: "completed" }>,
+    modelId: string,
+    routeClass: "replica" | "pipeline",
+  ): Extract<JobStreamEvent, { type: "completed" }> => {
+    if (!event.result.networkTrace || !event.result.recovery || !event.result.privacy) throw new Error("execution_receipt_evidence_is_incomplete");
+    const job = store.getJob(event.result.jobId);
+    if (!job || job.status !== "completed") throw new Error("execution_receipt_job_is_not_completed");
+    const receiptBody = {
+      schema: "mycellios-execution-receipt/1",
+      jobId: event.result.jobId,
+      modelIdHash: sha256CanonicalEvidence({ kind: "model", id: modelId }),
+      routeClass,
+      metrics: {
+        inputTokens: event.result.metrics.inputTokens,
+        outputTokens: event.result.metrics.outputTokens,
+        ttftMs: event.result.metrics.ttftMs,
+        activeMs: event.result.metrics.activeMs,
+      },
+      networkTraceDigest: sha256CanonicalEvidence(event.result.networkTrace),
+      recovery: event.result.recovery,
+      privacy: event.result.privacy,
+      completedAt: job.updatedAt,
+    } as const;
+    const receipt = executionReceipts.record(receiptBody, {
+      trace: event.result.networkTrace,
+      regionForWorker: (workerId) => store.getWorker(workerId)?.capabilities.region ?? null,
+    });
+    return { ...event, result: { ...event.result, executionReceiptId: receipt.receiptId } };
+  };
   const supportAssistantRateLimits = new Map<string, SupportAssistantRateState>();
   const publicCatalogRateLimits = new Map<string, PublicCatalogRateState>();
   let activeSupportAssistantRequests = 0;
@@ -1346,7 +1946,7 @@ export async function createCoordinator(
       },
       mobilePwa: mobileAssetsPath ? "/mobile/" : null,
       landing: config.landingAssetsPath ? "/" : null,
-      desktopUpdates: desktopUpdatesPath ? "/updates/win32/x64/" : null,
+      nodeUpdates: nodeUpdatesPath ? "/updates/node/" : null,
       downloads: releaseDownloadsPath ? "/downloads/" : null,
       features: {
         distributedActivation: activationManager !== undefined,
@@ -1406,6 +2006,234 @@ export async function createCoordinator(
     ) };
   });
 
+  app.post("/v1/nodes/enrollments", async (request, reply) => {
+    const principal = principalFor(request);
+    if (principal.kind !== "user") {
+      return reply.code(403).send({ error: { code: "account_session_required" } });
+    }
+    const input = nodeEnrollmentCreateSchema.parse(request.body);
+    if (input.accountId !== principal.userId) {
+      return reply.code(403).send({ error: { code: "node_enrollment_account_mismatch" } });
+    }
+    try {
+      return reply.code(201).send(nodeEnrollments.issue({
+        accountId: principal.userId,
+        actor: {
+          kind: "account",
+          id: principal.userId,
+          scopes: ["node:identity"],
+        },
+        expiresInSeconds: input.expiresInSeconds,
+      }));
+    } catch (error) {
+      return sendNodeEnrollmentError(reply, error);
+    }
+  });
+
+  app.post("/v1/nodes/enrollments/:enrollmentId/confirm", async (request, reply) => {
+    const principal = principalFor(request);
+    if (principal.kind !== "user") {
+      return reply.code(403).send({ error: { code: "account_session_required" } });
+    }
+    const { enrollmentId } = z.object({ enrollmentId: z.string().uuid() }).strict().parse(request.params);
+    try {
+      nodeEnrollments.confirm({
+        enrollmentId,
+        accountId: principal.userId,
+        actorId: principal.userId,
+      });
+      return reply.code(204).send();
+    } catch (error) {
+      return sendNodeEnrollmentError(reply, error);
+    }
+  });
+
+  app.post("/v1/nodes/:identityId/credential-recovery-challenge", async (request, reply) => {
+    const principal = principalFor(request);
+    if (principal.kind !== "user") return reply.code(403).send({ error: { code: "account_session_required" } });
+    const { identityId } = z.object({ identityId: z.string().min(1).max(128) }).strict().parse(request.params);
+    const input = workerCredentialRecoveryChallengeRequestSchema.parse(request.body);
+    if (input.identity.id !== identityId) return reply.code(403).send({ error: { code: "worker_recovery_identity_mismatch" } });
+    try {
+      return reply.code(201).send(workerAdmission.issueRecovery(input, principal.userId));
+    } catch (error) {
+      if (!(error instanceof WorkerAdmissionError)) throw error;
+      return reply.code(error.statusCode).send({ error: { code: error.code, message: error.message } });
+    }
+  });
+
+  app.post("/v1/nodes/:identityId/credential-recovery", async (request, reply) => {
+    const principal = principalFor(request);
+    if (principal.kind !== "user") return reply.code(403).send({ error: { code: "account_session_required" } });
+    const { identityId } = z.object({ identityId: z.string().min(1).max(128) }).strict().parse(request.params);
+    const input = z.object({
+      identity: workerAdmissionIdentitySchema,
+      proof: workerCredentialRecoveryProofSchema,
+    }).strict().parse(request.body);
+    if (input.identity.kind !== "device" || input.identity.id !== identityId) return reply.code(403).send({ error: { code: "worker_recovery_identity_mismatch" } });
+    try {
+      return reply.code(200).send(workerAdmission.verifyRecovery(input.identity, input.proof, principal.userId));
+    } catch (error) {
+      if (!(error instanceof WorkerAdmissionError)) throw error;
+      return reply.code(error.statusCode).send({ error: { code: error.code, message: error.message } });
+    }
+  });
+
+  app.post("/v1/nodes/:identityId/revoke", async (request, reply) => {
+    const principal = principalFor(request);
+    if (principal.kind !== "user") return reply.code(403).send({ error: { code: "account_session_required" } });
+    if (!requireRecentAal2(request, reply)) return;
+    const { identityId } = z.object({ identityId: z.string().min(1).max(128) }).strict().parse(request.params);
+    const body = z.object({
+      expectedFingerprint: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+      reason: z.string().trim().min(3).max(300),
+      confirmation: z.string().min(1).max(128),
+    }).strict().parse(request.body);
+    if (body.confirmation !== identityId) return reply.code(400).send({ error: { code: "node_revocation_confirmation_mismatch" } });
+    const ownership = database.getNodeOwnership("device", identityId);
+    if (!ownership || ownership.accountId !== principal.userId) return reply.code(404).send({ error: { code: "node_not_found" } });
+    const result = database.revokeWorkerAdmissionCredential({ identityKind: "device", identityId,
+      expectedFingerprint: body.expectedFingerprint, reason: body.reason,
+      actor: { kind: "account", id: principal.userId } });
+    if (result.state === "not_found") return reply.code(404).send({ error: { code: "worker_credential_unknown" } });
+    if (result.state === "fingerprint_mismatch") return reply.code(409).send({ error: { code: "worker_credential_changed" } });
+    let disconnected = 0;
+    let affectedLeases = 0;
+    for (const worker of store.listWorkers()) {
+      if (worker.identityKind !== "device" || worker.identityId !== identityId) continue;
+      affectedLeases += store.listActiveJobsForWorker(worker.id).length;
+      if (hub.removeWorker(worker.id, "node credential revoked")) disconnected += 1;
+    }
+    return reply.code(200).send({ state: result.state, identityId,
+      generation: database.getNodeOwnership("device", identityId)?.generation,
+      disconnected, affectedLeases });
+  });
+
+  app.post("/v1/nodes/:identityId/ownership-transfers", async (request, reply) => {
+    const principal = principalFor(request);
+    if (principal.kind !== "user") return reply.code(403).send({ error: { code: "account_session_required" } });
+    if (!requireRecentAal2(request, reply)) return;
+    const { identityId } = z.object({ identityId: z.string().min(1).max(128) }).strict().parse(request.params);
+    const body = z.object({
+      targetAccountId: z.string().min(1).max(128),
+      expectedGeneration: z.number().int().positive(),
+      confirmation: z.string().min(1).max(128),
+      expiresInSeconds: z.number().int().min(300).max(86_400).default(900),
+    }).strict().parse(request.body);
+    if (body.confirmation !== identityId) return reply.code(400).send({ error: { code: "node_transfer_confirmation_mismatch" } });
+    try {
+      return reply.code(201).send(nodeOwnershipTransfers.create({ nodeId: identityId,
+        sourceAccountId: principal.userId, targetAccountId: body.targetAccountId,
+        expectedGeneration: body.expectedGeneration, expiresInSeconds: body.expiresInSeconds }));
+    } catch (error) {
+      const code = error instanceof Error ? error.message : "node_transfer_failed";
+      const status = code.endsWith("_mismatch") ? 404 : code.endsWith("_conflict") ? 409 : 400;
+      return reply.code(status).send({ error: { code } });
+    }
+  });
+
+  app.post("/v1/node-ownership-transfers/:transferId/accept", async (request, reply) => {
+    const principal = principalFor(request);
+    if (principal.kind !== "user") return reply.code(403).send({ error: { code: "account_session_required" } });
+    if (!requireRecentAal2(request, reply)) return;
+    const { transferId } = z.object({ transferId: z.string().uuid() }).strict().parse(request.params);
+    const body = z.object({ nodeId: z.string().min(1).max(128), transferToken: z.string().min(32).max(256), confirmation: z.string().min(1).max(128) }).strict().parse(request.body);
+    if (body.confirmation !== body.nodeId) return reply.code(400).send({ error: { code: "node_transfer_confirmation_mismatch" } });
+    try {
+      const result = nodeOwnershipTransfers.accept({ transferId, transferToken: body.transferToken,
+        targetAccountId: principal.userId, nodeId: body.nodeId });
+      for (const worker of store.listWorkers()) {
+        if (worker.identityKind === "device" && worker.identityId === body.nodeId) hub.removeWorker(worker.id, "node ownership transferred");
+      }
+      return reply.code(200).send(result);
+    } catch (error) {
+      const code = error instanceof Error ? error.message : "node_transfer_failed";
+      const status = code === "node_transfer_unknown" ? 404
+        : code === "node_transfer_expired" ? 410
+          : code.endsWith("_conflict") || code === "node_transfer_already_accepted" ? 409 : 403;
+      return reply.code(status).send({ error: { code } });
+    }
+  });
+
+  app.post("/v1/nodes/:identityId/commands", async (request, reply) => {
+    const principal = principalFor(request);
+    if (principal.kind !== "user") return reply.code(403).send({ error: { code: "account_session_required" } });
+    const { identityId } = z.object({ identityId: z.string().min(1).max(256) }).strict().parse(request.params);
+    const ownership = database.getNodeOwnership("device", identityId);
+    if (!ownership || ownership.accountId !== principal.userId || ownership.status !== "active") {
+      return reply.code(404).send({ error: { code: "node_not_found" } });
+    }
+    const command = nodeCommandSchema.parse(request.body);
+    if ((command.type === "uninstall" || command.type === "revoke") && !requireRecentAal2(request, reply)) return;
+    if (command.nodeId !== identityId || command.actor.kind !== "account" || command.actor.id !== principal.userId) {
+      return reply.code(403).send({ error: { code: "node_command_actor_mismatch" } });
+    }
+    try {
+      return reply.code(202).send(nodeCommands.enqueue(command, ownership.generation));
+    } catch (error) {
+      const code = error instanceof Error ? error.message : "node_command_invalid";
+      return reply.code(code.endsWith("conflict") || code.endsWith("replay") ? 409 : 400).send({ error: { code } });
+    }
+  });
+
+  app.get("/v1/nodes/:identityId/events", async (request, reply) => {
+    const principal = principalFor(request);
+    if (principal.kind !== "user") return reply.code(403).send({ error: { code: "account_session_required" } });
+    const { identityId } = z.object({ identityId: z.string().min(1).max(256) }).strict().parse(request.params);
+    const ownership = database.getNodeOwnership("device", identityId);
+    if (!ownership || ownership.accountId !== principal.userId) return reply.code(404).send({ error: { code: "node_not_found" } });
+    const query = z.object({ cursor: z.string().optional(), limit: z.coerce.number().int().min(1).max(1_000).default(100) }).parse(request.query);
+    try {
+      const data = nodeCommands.eventsAfter(identityId, query.cursor ?? null, query.limit);
+      return { object: "list", data, nextCursor: data.at(-1)?.cursor ?? query.cursor ?? null };
+    } catch (error) {
+      return reply.code(400).send({ error: { code: error instanceof Error ? error.message : "node_event_cursor_invalid" } });
+    }
+  });
+
+  app.get("/v1/nodes", async (request, reply) => {
+    const principal = principalFor(request);
+    if (principal.kind !== "user") return reply.code(403).send({ error: { code: "account_session_required" } });
+    const ownershipRows = database.raw.prepare(
+      `SELECT identity_id FROM node_ownership
+       WHERE identity_kind = 'device' AND account_id = ? ORDER BY updated_at DESC`,
+    ).all(principal.userId) as Array<{ identity_id: string }>;
+    const workers = store.listWorkers();
+    return { object: "list", data: ownershipRows.map(({ identity_id: nodeId }) => {
+      const ownership = database.getNodeOwnership("device", nodeId)!;
+      const worker = workers.find((candidate) => candidate.identityKind === "device" && candidate.identityId === nodeId);
+      return {
+        nodeId, status: ownership.status, generation: ownership.generation,
+        credentialFingerprint: ownership.credentialFingerprint,
+        connected: worker ? hub.isConnected(worker.id) : false,
+        workerId: worker?.id ?? null,
+        observed: nodeReconciliation.latestSnapshot(nodeId),
+        desired: nodeReconciliation.desiredState(nodeId),
+        commands: (database.raw.prepare(
+          `SELECT id, command_json, state, created_at, completed_at FROM node_commands
+           WHERE node_id = ? ORDER BY created_at DESC, id DESC LIMIT 20`,
+        ).all(nodeId) as Array<{ id: string; command_json: string; state: string; created_at: number; completed_at: number | null }>)
+          .map((row) => ({ id: row.id, type: nodeCommandSchema.parse(JSON.parse(row.command_json)).type,
+            state: row.state, createdAt: new Date(row.created_at).toISOString(),
+            completedAt: row.completed_at === null ? null : new Date(row.completed_at).toISOString() })),
+      };
+    }) };
+  });
+
+  app.get("/v1/nodes/:identityId/identity-events", async (request, reply) => {
+    const principal = principalFor(request);
+    if (principal.kind !== "user") return reply.code(403).send({ error: { code: "account_session_required" } });
+    const { identityId } = z.object({ identityId: z.string().min(1).max(128) }).strict().parse(request.params);
+    const ownership = database.getNodeOwnership("device", identityId);
+    if (!ownership || ownership.accountId !== principal.userId) return reply.code(404).send({ error: { code: "node_not_found" } });
+    try {
+      return { object: "list", data: database.nodeIdentityEvents("device", identityId) };
+    } catch (error) {
+      const code = error instanceof Error ? error.message : "node_identity_audit_invalid";
+      return reply.code(500).send({ error: { code } });
+    }
+  });
+
   app.get("/v1/account/usage", async (request) => {
     const principal = principalFor(request);
     if (principal.kind === "system") return { object: "list", data: [] };
@@ -1416,6 +2244,51 @@ export async function createCoordinator(
       object: "list",
       data: apiAccess.listUsage(principal.userId, query.limit).map(apiUsageJson),
     };
+  });
+
+  app.get("/v1/account/economy", async (request, reply) => {
+    const principal = principalFor(request);
+    if (principal.kind === "system") return reply.code(403).send({ error: { code: "account_session_required" } });
+    return { object: "economic_account", ...economicLedger.summary("account", principal.userId) };
+  });
+
+  app.get("/v1/economy/receipt-key", async () => ({
+    object: "economic_receipt_key",
+    ...economicLedger.receiptVerificationKey(),
+  }));
+
+  app.get("/v1/execution-receipt-key", async () => ({
+    object: "execution_receipt_key",
+    ...executionReceipts.verificationKey(),
+  }));
+
+  app.get("/v1/economy/settlements/:settlementId/receipt", async (request, reply) => {
+    const principal = principalFor(request);
+    if (principal.kind === "system") return reply.code(403).send({ error: { code: "account_session_required" } });
+    const { settlementId } = z.object({ settlementId: z.string().regex(/^sha256:[0-9a-f]{64}$/) }).strict().parse(request.params);
+    const receipt = economicLedger.settlementReceiptForPayer(settlementId, principal.userId);
+    return receipt ?? reply.code(404).send({ error: { code: "settlement_not_found" } });
+  });
+
+  app.get("/v1/nodes/:identityId/earnings", async (request, reply) => {
+    const principal = principalFor(request);
+    if (principal.kind !== "user") return reply.code(403).send({ error: { code: "account_session_required" } });
+    const { identityId } = z.object({ identityId: z.string().min(1).max(256) }).strict().parse(request.params);
+    const ownership = database.getNodeOwnership("device", identityId);
+    if (!ownership || ownership.accountId !== principal.userId) return reply.code(404).send({ error: { code: "node_not_found" } });
+    return {
+      object: "node_earnings", node_id: identityId,
+      asset_scope: "internal-ledger-only",
+      public_earnings_enabled: false,
+      payout_enabled: false,
+      ...economicLedger.summary("node", identityId),
+      reputation: economicLedger.nodeReputation(identityId),
+    };
+  });
+
+  app.post("/internal/v1/economy/pricing", async (request, reply) => {
+    if (!await authorizeAdministrativeMutation(request, reply)) return;
+    return reply.code(201).send({ object: "pricing_policy", ...economicLedger.registerPricingPolicy(request.body) });
   });
 
   app.get("/v1/api-keys", async (request, reply) => {
@@ -1554,6 +2427,49 @@ export async function createCoordinator(
         ...(query.since ? { since: query.since } : {}),
       }),
     };
+  });
+
+  app.get("/public/v1/admin/operations", async (request, reply) => {
+    if (!await authorizeAdministrativeMutation(request, reply, ["owner", "admin", "operator"])) return;
+    const snapshot = publicSnapshot(store, scheduler, hub, mobileHub, activationManager, {
+      activationProgressForModel, activationStatusMessageForModel, activationIncidentForModel,
+    }, runtimeVersion, coordinatorBuildIdentity);
+    const releases: Array<{ channel: string; platform: string; arch: string; manifestId: string; sequence: number }> = [];
+    if (componentReleases) {
+      for (const channel of ["dev", "stable"] as const) for (const platform of ["any", "win32", "linux", "darwin"] as const) {
+        for (const arch of ["any", "x64", "arm64"] as const) {
+          const manifest = await componentReleases.readPublishedManifest({ channel, platform, arch }, { verifyArtifacts: false }).catch(() => null);
+          if (manifest) releases.push({ channel, platform, arch, manifestId: manifest.manifestId, sequence: manifest.sequence });
+        }
+      }
+    }
+    return {
+      capturedAt: new Date().toISOString(),
+      incidents: snapshot.requestedModels.flatMap((model) => model.activationIncident ? [{ modelId: model.id, incident: model.activationIncident }] : []),
+      releases: { configured: componentReleases !== null, items: releases },
+      certifications: { configured: modelCertifications !== null,
+        items: modelCertifications?.list(100).map((certification) => ({ certificationId: certification.certificationId,
+          modelFamily: certification.modelFamily, decision: certification.decision, topology: certification.topology.kind,
+          platform: certification.hardware.platform, backend: certification.hardware.backend,
+          evidenceReceiptId: certification.evidence.receiptId, reviewedAt: certification.review.reviewedAt,
+          expiresAt: certification.expiresAt })) ?? [],
+        blocker: modelCertifications ? null : "durable_model_certification_registry_not_configured" },
+      receipts: executionReceipts.listRecent(20).map((receipt) => ({ receiptId: receipt.receiptId, jobId: receipt.jobId,
+        routeClass: receipt.routeClass, recoveryMode: receipt.recovery.mode, traceDigest: receipt.networkTraceDigest,
+        completedAt: receipt.completedAt })),
+    };
+  });
+
+  app.put("/public/v1/admin/model-certifications", async (request, reply) => {
+    if (!await authorizeAdministrativeMutation(request, reply, ["owner", "admin"])) return;
+    if (!modelCertifications) return reply.code(503).send({ error: { code: "model_certification_registry_not_configured" } });
+    try {
+      const published = modelCertifications.publish(request.body);
+      return reply.code(published.alreadyPublished ? 200 : 201).send({ data: published });
+    } catch (error) {
+      return reply.code(400).send({ error: { code: "model_certification_rejected",
+        message: error instanceof Error ? error.message : "model_certification_rejected" } });
+    }
   });
 
   const availableSupportAssistantModels = (): string[] =>
@@ -1725,9 +2641,10 @@ export async function createCoordinator(
 
       let finished = false;
       let streamedText = "";
-      let streamedRouteClass = "replica";
+      let streamedRouteClass: "replica" | "pipeline" = "replica";
       let streamedResult: Extract<JobStreamEvent, { type: "completed" }> | null = null;
       let streamedFailure: Extract<JobStreamEvent, { type: "failed" }> | null = null;
+      let streamedRecoveryMode: Extract<JobStreamEvent, { type: "progress" }>["recoveryMode"];
       reply.raw.once("close", () => {
         if (!finished) service.cancel(handle.jobId);
       });
@@ -1741,9 +2658,10 @@ export async function createCoordinator(
         for await (const event of handle.events) {
           if (event.type === "accepted") streamedRouteClass = event.route.routeClass;
           if (event.type === "token") streamedText += event.token.text;
-          if (event.type === "completed") streamedResult = event;
+          if (event.type === "completed") streamedResult = attachExecutionReceipt(event, parsed.model, streamedRouteClass);
           if (event.type === "failed") streamedFailure = event;
-          writeMycelliosEvent(reply.raw, event, parsed.model, handle.jobId);
+          if (event.type === "progress" && event.recoveryMode) streamedRecoveryMode = event.recoveryMode;
+          writeMycelliosEvent(reply.raw, streamedResult && event.type === "completed" ? streamedResult : event, parsed.model, handle.jobId);
         }
       } finally {
         clearInterval(heartbeatTimer);
@@ -1765,6 +2683,11 @@ export async function createCoordinator(
               finish_reason: streamedResult?.result.finishReason ?? null,
               assistant: true,
               provider: "mycellios-network",
+              recovery_mode: streamedResult?.result.recovery?.mode ?? streamedRecoveryMode ?? "none",
+              recovery_attempts: streamedResult?.result.recovery?.attempts ?? 1,
+              replayed_token_events: streamedResult?.result.recovery?.replayedTokenEvents ?? 0,
+              execution_receipt_id: streamedResult?.result.executionReceiptId ?? null,
+              execution_privacy: streamedResult?.result.privacy ?? null,
             },
       });
       void persistence?.flush();
@@ -1833,7 +2756,7 @@ export async function createCoordinator(
       stored.autoActivate ? "active" : "inactive",
     );
     try {
-      const profile = await inspectHubModelCapacity({
+      const profile = await (options.modelCapacityInspector ?? inspectHubModelCapacity)({
         source: stored.source,
         revision: stored.revision,
         contextTokens: stored.contextTokens,
@@ -2053,6 +2976,84 @@ export async function createCoordinator(
     }
   });
 
+  app.post("/internal/v1/nodes/enrollments/redeem", async (request, reply) => {
+    const input = nodeEnrollmentRedeemSchema.parse(request.body);
+    let fingerprint: string;
+    try {
+      fingerprint = workerAdmissionPublicKeyFingerprint(input.publicKey);
+    } catch (error) {
+      if (!(error instanceof WorkerAdmissionError)) throw error;
+      return reply.code(error.statusCode).send({ error: { code: error.code, message: error.message } });
+    }
+    const consumed = nodeEnrollments.consume({
+      enrollmentToken: input.enrollmentToken,
+      nonce: input.nonce,
+      identityKind: input.identity.kind === "browser" ? "cell" : input.identity.kind,
+      identityId: input.identity.id,
+      publicKeyFingerprint: fingerprint as `sha256:${string}`,
+    });
+    if (consumed.state !== "consumed") {
+      const status = consumed.state === "unknown" ? 404
+        : consumed.state === "already-consumed" ? 409
+          : consumed.state === "expired" ? 410
+            : 401;
+      return reply.code(status).send({ error: { code: `node_enrollment_${consumed.state}` } });
+    }
+    return reply.code(200).send({
+      enrollmentId: consumed.enrollmentId,
+      accountId: consumed.accountId,
+      identity: input.identity,
+      credentialFingerprint: fingerprint,
+    });
+  });
+
+  app.get("/internal/v1/nodes/:identityId/commands", async (request, reply) => {
+    const { identityId } = z.object({ identityId: z.string().min(1).max(256) }).strict().parse(request.params);
+    if (workerSessionPrincipals.get(request) !== identityId) return reply.code(401).send({ error: { code: "worker_session_required" } });
+    const query = z.object({ generation: z.coerce.number().int().positive(), limit: z.coerce.number().int().min(1).max(256).default(32) }).parse(request.query);
+    const ownership = database.getNodeOwnership("device", identityId);
+    if (!ownership || ownership.status !== "active" || ownership.generation !== query.generation) {
+      return reply.code(409).send({ error: { code: "node_generation_mismatch" } });
+    }
+    return { object: "list", data: nodeCommands.pull(identityId, query.generation, query.limit) };
+  });
+
+  app.post("/internal/v1/nodes/:identityId/commands/results", async (request, reply) => {
+    const { identityId } = z.object({ identityId: z.string().min(1).max(256) }).strict().parse(request.params);
+    if (workerSessionPrincipals.get(request) !== identityId) return reply.code(401).send({ error: { code: "worker_session_required" } });
+    const result = nodeCommandResultSchema.parse(request.body);
+    if (result.nodeId !== identityId) return reply.code(403).send({ error: { code: "node_command_result_wrong_node" } });
+    try {
+      const recorded = nodeCommands.recordResult(result);
+      reply.header("x-mycellios-node-event-cursor", nodeCommands.latestCursor(identityId));
+      return reply.code(200).send(recorded);
+    } catch (error) {
+      const code = error instanceof Error ? error.message : "node_command_result_invalid";
+      return reply.code(code.endsWith("conflict") ? 409 : 400).send({ error: { code } });
+    }
+  });
+
+  app.post("/internal/v1/nodes/:identityId/snapshot", async (request, reply) => {
+    const { identityId } = z.object({ identityId: z.string().min(1).max(256) }).strict().parse(request.params);
+    if (workerSessionPrincipals.get(request) !== identityId) return reply.code(401).send({ error: { code: "worker_session_required" } });
+    const snapshot = nodeSnapshotSchema.parse(request.body);
+    if (snapshot.nodeId !== identityId) return reply.code(403).send({ error: { code: "node_snapshot_wrong_node" } });
+    const ownership = database.getNodeOwnership("device", identityId);
+    if (!ownership || ownership.status !== "active" || ownership.generation !== snapshot.generation) {
+      return reply.code(409).send({ error: { code: "node_generation_mismatch" } });
+    }
+    try {
+      return reply.code(200).send({
+        ...nodeReconciliation.reconcile(snapshot),
+        acknowledgedCommandIds: nodeCommands.acknowledgedCommandIds(identityId, snapshot.generation),
+      });
+    } catch (error) {
+      const code = error instanceof Error ? error.message : "node_snapshot_invalid";
+      const conflict = code.includes("regression") || code.includes("mismatch") || code.includes("downgrade");
+      return reply.code(conflict ? 409 : 400).send({ error: { code } });
+    }
+  });
+
   app.post("/internal/v1/workers/credential-rotation-challenge", async (request, reply) => {
     const rotation = workerCredentialRotationChallengeRequestSchema.parse(request.body);
     try {
@@ -2164,6 +3165,9 @@ export async function createCoordinator(
           credentialFingerprint: admission.credentialFingerprint,
         })
       : undefined;
+    const nodeOwnership = registration.identity?.kind === "device"
+      ? database.getNodeOwnership("device", registration.identity.id)
+      : null;
     return reply.code(201).send({
       workerId: worker.id,
       protocolVersion: admission.protocolVersion,
@@ -2171,6 +3175,7 @@ export async function createCoordinator(
         ? { credentialFingerprint: admission.credentialFingerprint }
         : {}),
       ...(workerSessionToken ? { workerSessionToken } : {}),
+      ...(nodeOwnership?.status === "active" ? { nodeGeneration: nodeOwnership.generation } : {}),
       enrollment: admission.enrollment,
     });
   });
@@ -2301,6 +3306,61 @@ export async function createCoordinator(
     };
   });
 
+  const settleCompletedInference = (input: {
+    userId: string;
+    jobId: string;
+    modelId: string;
+    routeClass: "replica" | "pipeline";
+    inputTokens: number;
+    outputTokens: number;
+    networkTrace: NonNullable<Extract<JobStreamEvent, { type: "completed" }>["result"]["networkTrace"]>;
+    recovery: NonNullable<Extract<JobStreamEvent, { type: "completed" }>["result"]["recovery"]>;
+    executionReceiptId: string;
+  }): void => {
+    const pricingRoute = input.routeClass === "pipeline"
+      ? "distributed-pipeline" as const
+      : "remote-replica" as const;
+    const createdAt = Date.now();
+    const policy = economicLedger.resolvePricingPolicy(input.modelId, pricingRoute, createdAt);
+    if (!policy) return;
+    const weights = new Map<string, number>();
+    for (const stage of input.networkTrace.stages) {
+      const nodeId = stage.nodeId ?? stage.workerId;
+      if (nodeId) weights.set(nodeId, (weights.get(nodeId) ?? 0) + 1);
+    }
+    if (weights.size === 0) {
+      app.log.error({ jobId: input.jobId }, "Economic settlement lacks an attributable execution node");
+      return;
+    }
+    const executionReceiptId = input.executionReceiptId;
+    try {
+      const contributionEvidence = physicalContributionEvidence.certify({
+        jobId: input.jobId,
+        executionReceiptId,
+        trace: input.networkTrace,
+        workers: store.listWorkers(),
+        createdAt,
+      });
+      economicLedger.settle({
+        jobId: input.jobId,
+        executionReceiptId,
+        contributionEvidenceId: contributionEvidence.id,
+        pricingPolicyId: policy.id,
+        executionRecovery: input.recovery,
+        payerAccountId: input.userId,
+        inputTokens: input.inputTokens,
+        outputTokens: input.outputTokens,
+        contributors: [...weights].map(([nodeId, weight]) => ({ nodeId, weight })),
+        createdAt,
+      });
+    } catch (error) {
+      app.log.error({
+        jobId: input.jobId,
+        error: error instanceof Error ? error.message : String(error),
+      }, "Economic settlement rejected because physical contribution was not verified");
+    }
+  };
+
   app.post("/v1/chat/completions", async (request, reply) => {
     const parsed = chatCompletionRequestSchema.parse(request.body) as ChatCompletionRequest;
     const principal: ApiRequestPrincipal = apiAccessEnabled
@@ -2321,7 +3381,7 @@ export async function createCoordinator(
     if (parsed.stream && !service.hasCapacity(parsed, parsed.session_id)) {
       // A reconnect can race both route rebuilding and the automatic startup
       // benchmark. Keep the fetch pending while capacity returns instead of
-      // making the installed desktop surface a transient 503.
+      // making the installed web surface a transient 503.
       await waitForChatCapacity(service, parsed, parsed.session_id, 45_000);
     }
     const usage = principal.kind === "system"
@@ -2382,9 +3442,13 @@ export async function createCoordinator(
         for await (const event of handle.events) {
           if (event.type === "accepted") streamedRouteClass = event.route.routeClass;
           if (event.type === "token") streamedText += event.token.text;
-          if (event.type === "completed") streamedResult = event;
+          if (event.type === "completed") streamedResult = attachExecutionReceipt(
+            event,
+            parsed.model,
+            streamedRouteClass as "replica" | "pipeline",
+          );
           if (event.type === "failed") streamedFailure = event;
-          writeMycelliosEvent(reply.raw, event, parsed.model, handle.jobId);
+          writeMycelliosEvent(reply.raw, streamedResult && event.type === "completed" ? streamedResult : event, parsed.model, handle.jobId);
         }
       } catch (error) {
         streamError = error;
@@ -2400,6 +3464,17 @@ export async function createCoordinator(
             streamedResult.result.metrics.outputTokens,
           );
           void account;
+          if (streamedResult.result.networkTrace) settleCompletedInference({
+            userId: usage.userId,
+            jobId: handle.jobId,
+            modelId: parsed.model,
+            routeClass: streamedRouteClass as "replica" | "pipeline",
+            inputTokens: streamedResult.result.metrics.inputTokens,
+            outputTokens: streamedResult.result.metrics.outputTokens,
+            networkTrace: streamedResult.result.networkTrace,
+            recovery: streamedResult.result.recovery ?? { mode: "none", attempts: 1, replayedTokenEvents: 0 },
+            executionReceiptId: streamedResult.result.executionReceiptId!,
+          });
         } else {
           apiAccess.failUsage(
             usage.id,
@@ -2426,6 +3501,9 @@ export async function createCoordinator(
           : {
               finish_reason: streamedResult?.result.finishReason ?? null,
               execution_trace: streamedResult?.result.networkTrace ?? null,
+              execution_recovery: streamedResult?.result.recovery ?? null,
+              execution_receipt_id: streamedResult?.result.executionReceiptId ?? null,
+              execution_privacy: streamedResult?.result.privacy ?? null,
             },
       });
       void persistence?.flush();
@@ -2443,7 +3521,7 @@ export async function createCoordinator(
     }
 
     let result: Extract<JobStreamEvent, { type: "completed" }> | null = null;
-    let routeClass = "replica";
+    let routeClass: "replica" | "pipeline" = "replica";
     let affinityHit = false;
     try {
       for await (const event of handle.events) {
@@ -2454,7 +3532,7 @@ export async function createCoordinator(
         if (event.type === "failed") {
           throw new MeshServiceError(event.code, event.message, 502);
         }
-        if (event.type === "completed") result = event;
+        if (event.type === "completed") result = attachExecutionReceipt(event, parsed.model, routeClass);
       }
       if (!result) {
         throw new MeshServiceError("missing_result", "Worker stream ended without a result", 502);
@@ -2475,6 +3553,17 @@ export async function createCoordinator(
         result.result.metrics.outputTokens,
       );
       if (account) reply.header("x-token-balance", account.tokenBalance);
+      if (result.result.networkTrace) settleCompletedInference({
+        userId: usage.userId,
+        jobId: handle.jobId,
+        modelId: parsed.model,
+        routeClass,
+        inputTokens: result.result.metrics.inputTokens,
+        outputTokens: result.result.metrics.outputTokens,
+        networkTrace: result.result.networkTrace,
+        recovery: result.result.recovery ?? { mode: "none", attempts: 1, replayedTokenEvents: 0 },
+        executionReceiptId: result.result.executionReceiptId!,
+      });
     }
     reply.header("x-route-class", routeClass);
     store.appendInferenceMessage({
@@ -2493,6 +3582,9 @@ export async function createCoordinator(
         ttft_ms: result.result.metrics.ttftMs,
         reused_kv_tokens: result.result.metrics.reusedKvTokens ?? 0,
         execution_trace: result.result.networkTrace ?? null,
+        execution_recovery: result.result.recovery ?? null,
+        execution_receipt_id: result.result.executionReceiptId ?? null,
+        execution_privacy: result.result.privacy ?? null,
       },
     });
     void persistence?.flush();
@@ -2521,6 +3613,13 @@ export async function createCoordinator(
         ttft_ms: result.result.metrics.ttftMs,
         active_ms: result.result.metrics.activeMs,
         execution_trace: result.result.networkTrace ?? null,
+        recovery_mode: result.result.recovery?.mode ?? "none",
+        recovery_attempts: result.result.recovery?.attempts ?? 1,
+        replayed_token_events: result.result.recovery?.replayedTokenEvents ?? 0,
+        execution_receipt_id: result.result.executionReceiptId ?? null,
+        trust_policy: result.result.privacy?.trust ?? "default",
+        boundary_policy: result.result.privacy?.boundary ?? "trusted-edges",
+        pinned_identity_count: result.result.privacy?.pinnedIdentityHashes.length ?? 0,
       },
     };
   });
@@ -2548,6 +3647,26 @@ export async function createCoordinator(
       created_at: new Date(job.createdAt).toISOString(),
       updated_at: new Date(job.updatedAt).toISOString(),
     };
+  });
+
+  app.get("/v1/requests/:jobId/receipt", async (request, reply) => {
+    const { jobId } = jobIdParamsSchema.parse(request.params);
+    const principal = apiAccessEnabled ? principalFor(request) : { kind: "system" as const };
+    if (principal.kind !== "system" && !apiAccess.userOwnsJob(principal.userId, jobId)) {
+      return reply.code(404).send({ error: { code: "not_found" } });
+    }
+    const receipt = executionReceipts.forJob(jobId);
+    return receipt ?? reply.code(404).send({ error: { code: "receipt_not_found" } });
+  });
+
+  app.get("/v1/requests/:jobId/topology", async (request, reply) => {
+    const { jobId } = jobIdParamsSchema.parse(request.params);
+    const principal = apiAccessEnabled ? principalFor(request) : { kind: "system" as const };
+    if (principal.kind !== "system" && !apiAccess.userOwnsJob(principal.userId, jobId)) {
+      return reply.code(404).send({ error: { code: "not_found" } });
+    }
+    const topology = executionReceipts.topologyForJob(jobId);
+    return topology ?? reply.code(404).send({ error: { code: "topology_not_found" } });
   });
 
   app.get("/v1/conversations/:sessionId/messages", async (request, reply) => {
@@ -2743,15 +3862,11 @@ export async function createCoordinator(
   );
   app.get("/downloads/macos-arm64", async (_request, reply) => {
     reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
-    return reply.redirect(`/downloads/mycellios-macos-arm64.dmg?v=${publicAssetVersion}`);
+    return reply.redirect(`/downloads/mycellios-node-macos-arm64.tar.gz?v=${publicAssetVersion}`);
   });
-  app.get("/downloads/linux-deb", async (_request, reply) => {
+  app.get("/downloads/linux", async (_request, reply) => {
     reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
-    return reply.redirect(`/downloads/mycellios-linux-x64.deb?v=${publicAssetVersion}`);
-  });
-  app.get("/downloads/linux-rpm", async (_request, reply) => {
-    reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
-    return reply.redirect(`/downloads/mycellios-linux-x64.rpm?v=${publicAssetVersion}`);
+    return reply.redirect(`/downloads/mycellios-node-linux-x64.tar.gz?v=${publicAssetVersion}`);
   });
   const contentHubClient = config.contentHubApiUrl
     ? new ContentHubClient({ baseUrl: config.contentHubApiUrl })
@@ -2787,11 +3902,21 @@ export async function createCoordinator(
     }
   }
 
-  app.setErrorHandler((error, _request, reply) => {
+  app.setErrorHandler((error, request, reply) => {
     if (error instanceof ZodError) {
       return reply.code(400).send({
         error: { code: "invalid_request", message: "Request validation failed", details: error.issues },
       });
+    }
+    if (error instanceof ComponentReleaseStoreError) {
+      const path = request.url.split("?", 1)[0] ?? request.url;
+      return sendComponentReleaseError(
+        reply,
+        error,
+        request.method === "GET" && path.startsWith("/updates/v1/")
+          ? "public"
+          : "admin",
+      );
     }
     if (error instanceof MeshServiceError) {
       return reply.code(error.statusCode).send({ error: { code: error.code, message: error.message } });
@@ -2824,6 +3949,9 @@ export async function createCoordinator(
     mobileHub,
     service,
     apiAccess,
+    economicLedger,
+    executionReceipts,
+    physicalContributionEvidence,
     persistence,
     deploymentController,
     async close() {
@@ -2840,6 +3968,64 @@ export async function createCoordinator(
       database.close();
     },
   };
+}
+
+function sendComponentReleaseError(
+  reply: FastifyReply,
+  error: unknown,
+  context: "public" | "admin",
+): FastifyReply {
+  if (!(error instanceof ComponentReleaseStoreError)) throw error;
+  const statusCode = error.code.endsWith("_missing")
+    ? 404
+    : error.code.endsWith("_configuration_invalid")
+      ? 503
+      : context === "public"
+        ? 500
+        : error.code.endsWith("_rollback_rejected")
+          || error.code.endsWith("_sequence_conflict")
+          ? 409
+          : error.code.endsWith("_io_failed")
+            || error.code.endsWith("_corrupt")
+            ? 500
+            : 400;
+  return reply.code(statusCode).send({
+    error: {
+      code: error.code,
+      message:
+        statusCode >= 500
+          ? "The signed component release store is unavailable."
+          : "The signed component release request was rejected.",
+    },
+  });
+}
+
+function sendDevelopmentLabError(
+  reply: FastifyReply,
+  error: unknown,
+): FastifyReply {
+  if (!(error instanceof DevelopmentLabStoreError)) throw error;
+  const statusCode =
+    error.code === "development_labs_not_configured"
+      ? 503
+      : error.code === "development_lab_not_found"
+        ? 404
+        : error.code === "development_lab_revoked"
+          || error.code === "development_lab_invitation_expired"
+          || error.code === "development_lab_invitation_used"
+          ? 410
+          : error.code === "development_lab_io_failed"
+            || error.code === "development_lab_state_invalid"
+            ? 500
+            : 400;
+  return reply.code(statusCode).send({
+    error: {
+      code: error.code,
+      message: statusCode >= 500
+        ? "The development lab service is unavailable."
+        : "The development lab request was rejected.",
+    },
+  });
 }
 
 function queueExistingMobileArtifacts(
@@ -2953,9 +4139,7 @@ function setPublicAssetCacheHeaders(
     normalized.endsWith("/sw.js") ||
     normalized.endsWith("/manifest.webmanifest") ||
     normalized.includes("/downloads/") ||
-    normalized.endsWith("/RELEASES") ||
-    normalized.endsWith("-setup.exe") ||
-    normalized.endsWith("/latest.json")
+    normalized.endsWith("/mycellios-node-latest.json")
   ) {
     reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
     return;
@@ -2964,21 +4148,21 @@ function setPublicAssetCacheHeaders(
     reply.header("Cache-Control", "public, max-age=31536000, immutable");
     return;
   }
-  if (normalized.endsWith(".nupkg")) {
+  if (normalized.endsWith(".zip") || normalized.endsWith(".tar.gz")) {
     reply.header("Cache-Control", "public, max-age=31536000, immutable");
     return;
   }
   reply.header("Cache-Control", "public, max-age=3600");
 }
 
-function resolveDesktopUpdatesPath(
+function resolveNodeUpdatesPath(
   configured: string | undefined,
   runtimeRoot: string,
 ): string | null {
-  const candidates = [configured, resolve(runtimeRoot, "updates", "win32", "x64")].filter(
+  const candidates = [configured, resolve(runtimeRoot, "updates", "node")].filter(
     (candidate): candidate is string => Boolean(candidate),
   );
-  return candidates.find((candidate) => existsSync(resolve(candidate, "RELEASES"))) ?? null;
+  return candidates.find((candidate) => existsSync(resolve(candidate, "mycellios-node-latest.json"))) ?? null;
 }
 
 function releaseAssetRoot(
@@ -2989,7 +4173,7 @@ function releaseAssetRoot(
   runtimeRoot: string,
 ): string {
   if (channel === "updates") {
-    return resolve(configuredUpdates ?? resolve(runtimeRoot, "updates", "win32", "x64"));
+    return resolve(configuredUpdates ?? resolve(runtimeRoot, "updates", "node"));
   }
   if (configuredDownloads) return resolve(configuredDownloads);
   return resolve(
@@ -3182,14 +4366,14 @@ function dashboardWorkers(store: MeshStore, hub: WorkerHub, mobileHub: MobileCom
   ];
 }
 
-function storedWorkerKind(worker: StoredWorker): "desktop" | "cell" {
+function storedWorkerKind(worker: StoredWorker): "node" | "cell" {
   if (
     worker.identityKind === "cell" ||
     worker.capabilities.gpus.some((gpu) => gpu.vendor === "sidecar-cell")
   ) {
     return "cell";
   }
-  return "desktop";
+  return "node";
 }
 
 function storedWorkerIsVisible(worker: StoredWorker, hub: WorkerHub): boolean {
@@ -3511,6 +4695,52 @@ function parseBearerToken(header: string | undefined): string | undefined {
   return match?.[1]?.trim() || undefined;
 }
 
+function sendNodeEnrollmentError(reply: FastifyReply, error: unknown) {
+  const code = error instanceof Error ? error.message : "node_enrollment_failed";
+  const status = code === "node_enrollment_unknown" ? 404
+    : code === "node_enrollment_expired" ? 410
+      : code === "node_enrollment_already_consumed" ? 409
+        : code.endsWith("_denied") || code.endsWith("_mismatch") ? 403
+          : 400;
+  return reply.code(status).send({ error: { code } });
+}
+
+export function recentAal2ClaimsAreValid(token: string, now = Date.now()): boolean {
+  const [, payload] = token.split(".");
+  if (!payload || !/^[A-Za-z0-9_-]+$/.test(payload)) return false;
+  try {
+    const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as Record<string, unknown>;
+    const amrTimes = Array.isArray(claims.amr) ? claims.amr.flatMap((entry) => {
+      if (!entry || typeof entry !== "object") return [];
+      const record = entry as Record<string, unknown>;
+      return typeof record.timestamp === "number" && record.method !== "token_refresh"
+        ? [record.timestamp] : [];
+    }) : [];
+    const authenticationTimes = [
+      ...(typeof claims.auth_time === "number" ? [claims.auth_time] : []),
+      ...amrTimes,
+    ];
+    const authenticationTime = authenticationTimes.length > 0 ? Math.max(...authenticationTimes) : null;
+    return claims.aal === "aal2"
+      && typeof authenticationTime === "number"
+      && Number.isInteger(authenticationTime)
+      && authenticationTime * 1_000 <= now + 30_000
+      && authenticationTime * 1_000 >= now - 5 * 60_000;
+  } catch {
+    return false;
+  }
+}
+
+function requireRecentAal2(request: FastifyRequest, reply: FastifyReply): boolean {
+  const token = parseBearerToken(request.headers.authorization);
+  if (token && recentAal2ClaimsAreValid(token)) return true;
+  void reply.code(403).send({ error: {
+    code: "recent_aal2_reauthentication_required",
+    message: "Confirm this sensitive action with a recent MFA-backed sign-in.",
+  } });
+  return false;
+}
+
 function constantTimeEqual(received: string, expected: string): boolean {
   const left = Buffer.from(received);
   const right = Buffer.from(expected);
@@ -3552,6 +4782,7 @@ function writeMycelliosEvent(
           attempt: event.attempt,
           ...(event.workerId ? { affected_worker_id: event.workerId } : {}),
           ...(event.nodeId ? { affected_node_id: event.nodeId } : {}),
+          ...(event.recoveryMode ? { recovery_mode: event.recoveryMode } : {}),
         },
       })}\n\n`,
     );
@@ -3584,6 +4815,13 @@ function writeMycelliosEvent(
           active_ms: event.result.metrics.activeMs,
           reused_kv_tokens: event.result.metrics.reusedKvTokens ?? 0,
           execution_trace: event.result.networkTrace ?? null,
+          recovery_mode: event.result.recovery?.mode ?? "none",
+          recovery_attempts: event.result.recovery?.attempts ?? 1,
+          replayed_token_events: event.result.recovery?.replayedTokenEvents ?? 0,
+          execution_receipt_id: event.result.executionReceiptId ?? null,
+          trust_policy: event.result.privacy?.trust ?? "default",
+          boundary_policy: event.result.privacy?.boundary ?? "trusted-edges",
+          pinned_identity_count: event.result.privacy?.pinnedIdentityHashes.length ?? 0,
         },
       })}\n\n`,
     );

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { SingleFlight } from "../src/desktop/single-flight.js";
+import { SingleFlight } from "../src/core/single-flight.js";
 
 describe("SingleFlight", () => {
   it("shares one in-flight initialization across concurrent callers", async () => {

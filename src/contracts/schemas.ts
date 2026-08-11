@@ -96,6 +96,18 @@ export const chatCompletionRequestSchema = z.object({
   workload_class: z.enum(["interactive", "batch", "benchmark"]).default("interactive"),
   preferred_region: z.string().min(1).optional(),
   deadline_ms: z.number().int().min(1_000).max(3_600_000).default(120_000),
+  privacy: z.object({
+    trust: z.enum(["default", "trusted-only"]).default("default"),
+    boundary: z.enum(["trusted-edges", "pinned-edges"]).default("trusted-edges"),
+    pinned_identity_ids: z.array(z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/)).min(1).max(64).optional(),
+  }).strict().superRefine((privacy, context) => {
+    if (privacy.boundary === "pinned-edges" && !privacy.pinned_identity_ids) {
+      context.addIssue({ code: "custom", path: ["pinned_identity_ids"], message: "pinned-edges requires explicit trusted identities" });
+    }
+    if (privacy.boundary !== "pinned-edges" && privacy.pinned_identity_ids) {
+      context.addIssue({ code: "custom", path: ["pinned_identity_ids"], message: "Pinned identities require pinned-edges" });
+    }
+  }).optional(),
 }).strict();
 
 export const deploymentSchema = z

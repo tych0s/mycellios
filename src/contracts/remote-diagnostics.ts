@@ -5,11 +5,11 @@ const SENSITIVE_DIAGNOSTIC_KEY =
 
 export const REMOTE_DIAGNOSTIC_LEVELS = ["info", "warning", "error"] as const;
 export const REMOTE_DIAGNOSTIC_SOURCES = [
-  "desktop",
+  "node",
   "coordinator",
   "worker",
   "runtime",
-  "renderer",
+  "control-ui",
   "network",
 ] as const;
 

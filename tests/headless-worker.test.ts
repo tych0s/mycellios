@@ -1,9 +1,19 @@
 import { describe, expect, it } from "vitest";
 import { resolve } from "node:path";
 import type { PhysicalProbeV1 } from "../src/distribution/physical-probe.js";
+import type {
+  LaunchAgent,
+  LaunchAgentStartRequest,
+  LaunchProcessHandle,
+} from "../src/distribution/launch-supervisor.js";
+import type {
+  PythonLaunchProcess,
+  PythonPipelineLaunchDescription,
+} from "../src/distribution/python-launcher.js";
 import {
   buildPhysicalIdentity,
   createHeadlessRuntime,
+  HeadlessStageLaunchAgent,
   loadHeadlessWorkerEnvironment,
 } from "../src/worker/headless-runtime.js";
 
@@ -134,6 +144,86 @@ describe("headless GpuCloud worker", () => {
       state: "gpu-ready",
       phase: "ready",
     });
+    expect(runtime.executor.launchAgent).toBeInstanceOf(HeadlessStageLaunchAgent);
+  });
+
+  it("prepares this node's assigned artifacts before delegating process start", async () => {
+    const calls: string[] = [];
+    const base: LaunchAgent = {
+      id: "base",
+      async start(_request: LaunchAgentStartRequest, _signal: AbortSignal): Promise<LaunchProcessHandle> {
+        calls.push("start");
+        return {
+          ready: Promise.resolve(),
+          exited: Promise.resolve({ code: 0, signal: null }),
+          stop: async () => undefined,
+        };
+      },
+    };
+    const localProcess = {
+      processId: "stage-1-node-a",
+      anchor: { memberId: "node-a" },
+      stageIndex: 1,
+      layerStart: 4,
+      layerEnd: 8,
+    } as PythonLaunchProcess;
+    const description = {
+      launchOrder: [localProcess, {
+        ...localProcess,
+        processId: "stage-0-node-b",
+        anchor: { memberId: "node-b" },
+        stageIndex: 0,
+        layerStart: 0,
+        layerEnd: 4,
+      }],
+    } as PythonPipelineLaunchDescription;
+    const progress: number[] = [];
+    const agent = new HeadlessStageLaunchAgent(
+      base,
+      {
+        nodeId: "node-a",
+        pythonExecutable: "/opt/mycellios/python",
+        pythonPath: "/opt/mycellios/runtime",
+        cachePath: "/var/cache/mycellios",
+      },
+      async (received, options) => {
+        calls.push("prepare");
+        expect(received).toBe(description);
+        expect(options).toMatchObject({
+          nodeId: "node-a",
+          pythonExecutable: "/opt/mycellios/python",
+          cacheDirectory: "/var/cache/mycellios",
+          environment: {
+            PYTHONPATH: "/opt/mycellios/runtime",
+            HF_HOME: "/var/cache/mycellios",
+          },
+        });
+        options.onProgress?.({
+          stageIndex: 1,
+          layerStart: 4,
+          layerEnd: 8,
+          state: "ready",
+          packageId: "a".repeat(64),
+          weightsSizeBytes: 4096,
+        });
+        return [localProcess];
+      },
+    );
+    const prepared = await agent.prepareRuntime(description, "node-a", (event) => {
+      progress.push(event.weightsSizeBytes ?? 0);
+    });
+    await agent.start({
+      launchId: "launch-1",
+      pipelineId: "pipeline-1",
+      nodeId: "node-a",
+      process: prepared[0]!,
+    }, new AbortController().signal);
+    expect(prepared).toEqual([localProcess]);
+    expect(progress).toEqual([4096]);
+    expect(calls).toEqual(["prepare", "start"]);
+    await expect(agent.prepareRuntime(description, "node-b")).rejects.toThrow(
+      "headless_stage_artifact_node_mismatch",
+    );
   });
 
   it("fails closed when the container cannot prove a CUDA device", async () => {

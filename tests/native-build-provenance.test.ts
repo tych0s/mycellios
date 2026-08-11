@@ -7,7 +7,7 @@ import {
   verifyNativeBuildProvenanceDocument,
 } from "../scripts/native-build-provenance.mjs";
 
-describe("native desktop source provenance", () => {
+describe("native node source provenance", () => {
   it("seals every application build input deterministically", () => {
     const provenance = buildNativeSourceProvenance(resolve("."));
     expect(provenance.schema).toBe(NATIVE_BUILD_PROVENANCE_SCHEMA);
@@ -15,14 +15,13 @@ describe("native desktop source provenance", () => {
     expect(provenance.files.map(({ path }) => path)).toEqual(
       expect.arrayContaining([
         ".gitattributes",
-        "forge.config.ts",
         "package.json",
         "python/requirements-distribution.txt",
-        "src/desktop/main.ts",
+        "src/node/main.ts",
         "src/distribution/python-launcher.ts",
         "landing/src/main.tsx",
         "python/distributed_runtime/draft_model.py",
-        ".github/workflows/desktop-build.yml",
+        ".github/workflows/node-build.yml",
       ]),
     );
     expect(

@@ -22,6 +22,7 @@ import {
   Globe2,
   HardDrive,
   History,
+  House,
   Laptop,
   LayoutDashboard,
   LoaderCircle,
@@ -58,18 +59,12 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type FormEvent } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import "@fontsource-variable/manrope";
 import type {
-  DashboardSnapshot,
   DashboardDeployment,
-  ChatResponse,
-  ChatStreamUpdate,
-  DesktopAccelerationStatus,
-  DesktopBridge,
-  DesktopSettings,
-  DesktopUpdateStatus,
+  DashboardWorker,
   FleetContributionCommandResponse,
   FleetContributionStatus,
   HubCatalogModel,
@@ -81,9 +76,12 @@ import type {
   SystemLogEntry,
   SystemLogSnapshot,
   WorkerCredentialSummary,
-} from "../../src/desktop/contracts";
-import { consumeChatCompletionStreamWithRecovery } from "../../src/desktop/chat-stream";
+} from "../../src/contracts/dashboard";
+import type { ChatResponse, ChatStreamUpdate } from "../../src/contracts/chat";
+import { consumeChatCompletionStreamWithRecovery } from "../../src/core/chat-stream";
 import type { ChatMessage, NetworkExecutionTrace } from "../../src/contracts/types";
+import { projectObservedTopology } from "./network-topology";
+import { type ProductStatePresentation } from "./product-state";
 import type { NativeBuildIdentity } from "../../src/contracts/build-identity";
 import type { BenchmarkMeasurement, BenchmarkRun } from "../../src/benchlab/types";
 import { Contribute } from "./Contribute";
@@ -103,7 +101,6 @@ import {
   type BenchmarkRunComparison,
   type BenchmarkRunSnapshot,
 } from "./benchmark-comparison";
-import { isAdvertisedGpuSelected } from "./panel-hardware";
 import { applySeoMetadata } from "./seo";
 import {
   loadAuthConfig,
@@ -122,24 +119,22 @@ import { ApiAccessPanel } from "./ApiAccessPanel";
 import {
   loadApiAccount,
   loadApiUsage,
+  loadOperatorEvidence,
   type ApiAccount,
   type ApiUsage,
+  type OperatorEvidenceSnapshot,
 } from "./api-access";
 import "./panel.css";
 
-const PUBLIC_COORDINATOR_URL = "https://www.mycellios.com";
 import "./panel-downloads.css";
 import "./panel-desktop.css";
 
-type PanelView = "overview" | "history" | "nodes" | "models" | "jobs" | "tests" | "logs" | "inference" | "contribute" | "join" | "downloads" | "machine" | "settings" | "admin";
+type PanelView = "overview" | "history" | "nodes" | "models" | "jobs" | "tests" | "logs" | "inference" | "contribute" | "join" | "downloads" | "admin";
 type PanelMode = "simple" | "developer";
 
 interface PanelProps {
-  desktopBridge?: DesktopBridge;
   mobileEntry?: boolean;
 }
-
-type AcceleratorProgressSnapshot = DesktopAccelerationStatus;
 
 interface PublicGpu {
   id: string;
@@ -176,14 +171,22 @@ interface PublicWorker {
   reliability: number;
   jobsCompleted: number;
   lastSeenAt: string;
+  quarantined: boolean;
+  quarantineExpiresAt: string | null;
   gpus: PublicGpu[];
   deployments: PublicDeployment[];
   executionNodeId?: string;
-  computeMode?: DesktopSettings["computeMode"];
+  computeMode?: DashboardWorker["computeMode"];
   agentVersion?: string;
   buildIdentity?: NativeBuildIdentity;
-  acceleration?: DashboardSnapshot["workers"][number]["acceleration"];
-  isolation?: DashboardSnapshot["workers"][number]["isolation"];
+  acceleration?: DashboardWorker["acceleration"];
+  isolation?: DashboardWorker["isolation"];
+  observedCapability?: {
+    schema: "mycellios-observed-node-capability/1";
+    probe: { state: "missing" | "verified" | "stale" | "invalid"; validUntil: string | null };
+    canary: { state: "missing" | "verified" | "stale" | "invalid"; verifiedDeployments: Array<{ deploymentId: string }> };
+    eligibility: { activation: boolean; serving: boolean; reasons: string[] };
+  };
   mobile?: {
     platform: string;
     backend: "webgpu" | "cpu";
@@ -222,6 +225,7 @@ interface PublicSnapshot {
   models: Array<{ id: string; replicas: number; pipelines: number }>;
   requestedModels: RequestedModelCapacity[];
   jobs: PublicJob[];
+  recentNetworkTraces?: NetworkExecutionTrace[];
 }
 
 type NetworkHistoryRange = "24h" | "7d" | "30d" | "90d";
@@ -259,6 +263,7 @@ const EMPTY: PublicSnapshot = {
   models: [],
   requestedModels: [],
   jobs: [],
+  recentNetworkTraces: [],
 };
 
 const sharedNavItems: Array<{ id: PanelView; label: string; icon: typeof Network }> = [
@@ -275,7 +280,7 @@ const sharedNavItems: Array<{ id: PanelView; label: string; icon: typeof Network
   { id: "admin", label: "Admin", icon: ShieldCheck },
 ];
 
-const simplePanelViews = new Set<PanelView>(["overview", "history", "inference", "contribute", "downloads", "machine", "settings"]);
+const simplePanelViews = new Set<PanelView>(["overview", "history", "inference", "contribute", "downloads"]);
 const developerPanelViews = new Set<PanelView>(["nodes", "jobs", "tests", "logs", "models"]);
 
 function initialPanelMode(): PanelMode {
@@ -284,15 +289,22 @@ function initialPanelMode(): PanelMode {
   return window.localStorage.getItem("mycellios.panel-mode") === "developer" ? "developer" : "simple";
 }
 
-function initialView(desktop: boolean, mobileEntry: boolean): PanelView {
-  if (desktop) return "overview";
-  const requested = new URLSearchParams(window.location.search).get("view");
+function initialView(mobileEntry: boolean): PanelView {
+  return panelViewFromLocation(window.location.pathname, window.location.search, mobileEntry);
+}
+
+export function panelViewFromLocation(pathname: string, search: string, mobileEntry = false): PanelView {
+  const requested = new URLSearchParams(search).get("view");
   if (sharedNavItems.some((item) => item.id === requested)) return requested as PanelView;
-  if (mobileEntry || window.location.pathname.startsWith("/mobile")) return "contribute";
-  if (window.location.pathname === "/join") return "join";
-  if (window.location.pathname === "/downloads") return "downloads";
-  if (window.location.pathname === "/admin") return "admin";
+  if (mobileEntry || pathname.startsWith("/mobile")) return "contribute";
+  if (pathname === "/join") return "join";
+  if (pathname === "/downloads") return "downloads";
+  if (pathname === "/admin") return "admin";
   return "overview";
+}
+
+export function panelViewAllowed(view: PanelView, advancedAccess: boolean): boolean {
+  return view !== "admin" && !developerPanelViews.has(view) || advancedAccess;
 }
 
 export type PanelIssue = {
@@ -309,28 +321,21 @@ export function panelIssueForErrors(
   return null;
 }
 
-function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
-  const desktop = desktopBridge !== undefined;
-  const localBrowser = !desktop && ["localhost", "127.0.0.1", "::1", "[::1]"].includes(window.location.hostname);
+export function ApiQuotaBadge({ account }: { account: ApiAccount | null }) {
+  if (!account) return null;
+  return <span
+    className="panel-balance-badge tokens"
+    aria-label={`API token balance: ${account.token_balance}`}
+    title="Current inference token balance; not money or compute credit"
+  ><Coins size={14} />{formatCompactTokens(account.token_balance)} API tokens</span>;
+}
+
+function Panel({ mobileEntry = false }: PanelProps = {}) {
+  const localBrowser = ["localhost", "127.0.0.1", "::1", "[::1]"].includes(window.location.hostname);
   const localProductionProxy = localBrowser && window.location.port === "4174";
   const [panelMode, setPanelMode] = useState<PanelMode>(initialPanelMode);
-  const navItems = useMemo(() => {
-    const desktopItems = sharedNavItems.filter((item) => item.id !== "contribute");
-    const allItems = !desktop
-      ? sharedNavItems
-      : [
-        ...desktopItems.slice(0, 1),
-        { id: "machine" as const, label: "This device", icon: Cpu },
-        ...desktopItems.slice(1),
-        { id: "settings" as const, label: "Settings", icon: Settings },
-      ];
-    return panelMode === "developer"
-      ? allItems
-      : allItems.filter((item) => simplePanelViews.has(item.id));
-  }, [desktop, panelMode]);
-  const [view, setView] = useState<PanelView>(() => initialView(desktop, mobileEntry));
+  const [view, setView] = useState<PanelView>(() => initialView(mobileEntry));
   const [snapshot, setSnapshot] = useState<PublicSnapshot>(EMPTY);
-  const [desktopSnapshot, setDesktopSnapshot] = useState<DashboardSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [issue, setIssue] = useState<PanelIssue | null>(null);
   const coordinatorError = issue?.source === "coordinator" ? issue.message : null;
@@ -338,12 +343,18 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   const [menuOpen, setMenuOpen] = useState(false);
   const menuButtonRef = useRef<HTMLButtonElement>(null);
   const sidebarCloseButtonRef = useRef<HTMLButtonElement>(null);
+  const mainContentRef = useRef<HTMLElement>(null);
+  const [contentScale, setContentScale] = useState(() => {
+    const saved = Number(window.localStorage.getItem("mycellios.content-scale"));
+    return Number.isFinite(saved) && saved >= 0.9 && saved <= 1.3 ? saved : 1;
+  });
   const [modelAdminToken, setModelAdminToken] = useState(() =>
     window.sessionStorage.getItem("mycellios-model-admin-token") ?? "",
   );
   const [authConfig, setAuthConfig] = useState<PublicAuthConfig>({ enabled: false });
   const [authSession, setAuthSession] = useState<AuthSession | null>(null);
   const [networkIdentity, setNetworkIdentity] = useState<NetworkIdentity | null>(null);
+  const [authReady, setAuthReady] = useState(false);
   const [apiAccount, setApiAccount] = useState<ApiAccount | null>(null);
   const [authOpen, setAuthOpen] = useState(false);
   const [theme, setTheme] = useState<"dark" | "light">(() => {
@@ -351,26 +362,27 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     if (saved === "light" || saved === "dark") return saved;
     return window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark";
   });
+
+  function changeContentScale(delta: number) {
+    setContentScale((current) => {
+      const next = Math.min(1.3, Math.max(0.9, Math.round((current + delta) * 10) / 10));
+      window.localStorage.setItem("mycellios.content-scale", String(next));
+      return next;
+    });
+  }
   const canManageModels = networkIdentity?.role === "owner"
     || networkIdentity?.role === "admin"
     || networkIdentity?.role === "operator";
-  const requiresModelAdminToken = desktop
-    ? desktopSnapshot?.settings.coordinatorMode !== "local" && !desktopSnapshot?.modelAdminAuthorization.configured
-    : (!localBrowser || localProductionProxy) && !canManageModels;
-  const applyDesktopSnapshot = useCallback((next: DashboardSnapshot) => {
-    setDesktopSnapshot(next);
-    setSnapshot(desktopToPublicSnapshot(next));
-    setIssue(panelIssueForErrors(next.connectionError, next.runtimeError));
-  }, []);
-
+  const advancedAccess = (localBrowser && !localProductionProxy) || canManageModels;
+  const navItems = useMemo(() => {
+    return sharedNavItems.filter((item) =>
+      panelViewAllowed(item.id, advancedAccess)
+      && (panelMode === "developer" || simplePanelViews.has(item.id)));
+  }, [advancedAccess, panelMode]);
+  const requiresModelAdminToken = (!localBrowser || localProductionProxy) && !canManageModels;
   const refresh = useCallback(async () => {
     try {
-      if (desktopBridge) {
-        const next = await desktopBridge.getSnapshot();
-        applyDesktopSnapshot(next);
-        return;
-      }
-      const response = await fetch(`/public/v1/snapshot?view=${encodeURIComponent(view)}`, { cache: "no-store" });
+      const response = await fetch("/public/v1/snapshot", { cache: "no-store" });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       setSnapshot(await response.json() as PublicSnapshot);
       setIssue(null);
@@ -382,11 +394,11 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     } finally {
       setLoading(false);
     }
-  }, [applyDesktopSnapshot, desktopBridge, view]);
+  }, []);
 
   useEffect(() => {
     let timer: number | undefined;
-    const liveViews = new Set<PanelView>(["overview", "nodes", "models", "jobs", "logs", "inference", "machine"]);
+    const liveViews = new Set<PanelView>(["overview", "nodes", "models", "jobs", "logs", "inference"]);
     const intervalMs = liveViews.has(view) ? 5_000 : 15_000;
     const schedule = () => {
       if (document.visibilityState === "visible") timer = window.setInterval(() => void refresh(), intervalMs);
@@ -431,15 +443,15 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   }, [menuOpen]);
 
   useEffect(() => {
-    if (desktop) return;
     let cancelled = false;
-    void loadAuthConfig().then(async (config) => {
-      if (cancelled) return;
-      setAuthConfig(config);
-      const session = await restoreAuthSession(config);
-      if (cancelled || !session) return;
-      setAuthSession(session);
+    void (async () => {
       try {
+        const config = await loadAuthConfig();
+        if (cancelled) return;
+        setAuthConfig(config);
+        const session = await restoreAuthSession(config);
+        if (cancelled || !session) return;
+        setAuthSession(session);
         const identity = await loadNetworkIdentity(session.accessToken);
         if (!cancelled) {
           setNetworkIdentity(identity);
@@ -453,10 +465,41 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
           setNetworkIdentity(null);
           setApiAccount(null);
         }
+      } finally {
+        if (!cancelled) setAuthReady(true);
       }
-    });
+    })();
     return () => { cancelled = true; };
-  }, [desktop]);
+  }, []);
+
+  useEffect(() => {
+    if (!authReady || advancedAccess) return;
+    if (panelMode === "developer") {
+      setPanelMode("simple");
+      window.localStorage.setItem("mycellios.panel-mode", "simple");
+    }
+    if (!panelViewAllowed(view, false)) {
+      setView("overview");
+      window.history.replaceState({}, "", "/network");
+    }
+  }, [advancedAccess, authReady, panelMode, view]);
+
+  useEffect(() => {
+    const onPopState = () => {
+      const requested = panelViewFromLocation(
+        window.location.pathname,
+        window.location.search,
+        mobileEntry,
+      );
+      const next = panelViewAllowed(requested, advancedAccess) ? requested : "overview";
+      setView(next);
+      setMenuOpen(false);
+      if (next !== requested) window.history.replaceState({}, "", "/network");
+      window.requestAnimationFrame(() => mainContentRef.current?.focus());
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, [advancedAccess, mobileEntry]);
 
   function changePanelMode(next: PanelMode) {
     setPanelMode(next);
@@ -473,16 +516,19 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   }
 
   function navigate(next: PanelView) {
+    if (!panelViewAllowed(next, advancedAccess)) next = "overview";
     setView(next);
     setMenuOpen(false);
-    if (!desktop) {
-      const path = mobileEntry ? "/mobile/" : next === "join" ? "/join" : next === "downloads" ? "/downloads" : next === "admin" ? "/admin" : "/network";
-      const query = mobileEntry
-        ? next === "contribute" ? "" : `?view=${next}`
-        : next === "overview" || next === "join" || next === "downloads" || next === "admin" ? "" : `?view=${next}`;
-      window.history.replaceState({}, "", `${path}${query}`);
-      applySeoMetadata(path);
+    const path = mobileEntry ? "/mobile/" : next === "join" ? "/join" : next === "downloads" ? "/downloads" : next === "admin" ? "/admin" : "/network";
+    const query = mobileEntry
+      ? next === "contribute" ? "" : `?view=${next}`
+      : next === "overview" || next === "join" || next === "downloads" || next === "admin" ? "" : `?view=${next}`;
+    const target = `${path}${query}`;
+    if (`${window.location.pathname}${window.location.search}` !== target) {
+      window.history.pushState({}, "", target);
     }
+    applySeoMetadata(path);
+    window.requestAnimationFrame(() => mainContentRef.current?.focus());
   }
 
   function closeNavigation() {
@@ -514,11 +560,6 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   }
 
   async function removeWorker(workerId: string) {
-    if (desktopBridge) {
-      const next = await desktopBridge.removeWorker(workerId);
-      applyDesktopSnapshot(next);
-      return;
-    }
     const response = await fetch(`/public/v1/workers/${encodeURIComponent(workerId)}`, {
       method: "DELETE",
       headers: administrativeRequestHeaders(),
@@ -531,11 +572,6 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   }
 
   async function clearOfflineWorkers() {
-    if (desktopBridge) {
-      const next = await desktopBridge.clearOfflineWorkers();
-      applyDesktopSnapshot(next);
-      return;
-    }
     const response = await fetch("/public/v1/workers/clear-offline", {
       method: "POST",
       headers: administrativeRequestHeaders(),
@@ -548,9 +584,6 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   }
 
   async function listWorkerCredentials(): Promise<WorkerCredentialSummary[]> {
-    if (desktopBridge) {
-      return desktopBridge.listWorkerCredentials(modelAdminToken.trim() || undefined);
-    }
     const response = await fetch("/public/v1/worker-credentials", {
       cache: "no-store",
       headers: administrativeRequestHeaders(),
@@ -569,14 +602,7 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     credential: Pick<WorkerCredentialSummary, "identityKind" | "identityId" | "fingerprint">,
     reason: string,
   ): Promise<void> {
-    if (desktopBridge) {
-      await desktopBridge.revokeWorkerCredential(
-        credential,
-        reason,
-        modelAdminToken.trim() || undefined,
-      );
-    } else {
-      const response = await fetch(
+    const response = await fetch(
         `/public/v1/worker-credentials/${encodeURIComponent(credential.identityKind)}/${encodeURIComponent(credential.identityId)}/revoke`,
         {
           method: "POST",
@@ -590,12 +616,11 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
           }),
         },
       );
-      if (!response.ok) {
+    if (!response.ok) {
         const body = await response.json().catch(() => null) as {
           error?: { message?: string };
         } | null;
         throw new Error(body?.error?.message ?? `HTTP ${response.status}`);
-      }
     }
     await refresh();
   }
@@ -606,10 +631,6 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     if (token) {
       window.sessionStorage.setItem("mycellios-model-admin-token", token);
       setModelAdminToken(token);
-    }
-    if (desktopBridge) {
-      applyDesktopSnapshot(await desktopBridge.requestModel(input, token));
-      return;
     }
     const response = await fetch("/public/v1/requested-models", {
       method: "POST",
@@ -632,7 +653,6 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   }
 
   const searchHubModels = useCallback(async (input: HubCatalogSearchInput): Promise<HubCatalogPage> => {
-    if (desktopBridge) return desktopBridge.searchHubModels(input);
     const parameters = new URLSearchParams({
       q: input.query,
       sort: input.sort ?? "downloads",
@@ -645,15 +665,11 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
       throw new Error(body?.error?.message ?? `HTTP ${response.status}`);
     }
     return response.json() as Promise<HubCatalogPage>;
-  }, [desktopBridge]);
+  }, []);
 
   async function removeRequestedModel(modelId: string, adminToken: string) {
     const token = adminToken.trim();
     if (requiresModelAdminToken && !token) throw new Error("Enter the network administrator token.");
-    if (desktopBridge) {
-      applyDesktopSnapshot(await desktopBridge.removeRequestedModel(modelId, token));
-      return;
-    }
     const response = await fetch(`/public/v1/requested-models/${encodeURIComponent(modelId)}`, {
       method: "DELETE",
       ...((authSession || token)
@@ -672,8 +688,6 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
   }
 
   async function sendPrompt(model: string, messages: ChatMessage[], sessionId: string, onUpdate?: (update: ChatStreamUpdate) => void): Promise<ChatResponse> {
-    if (desktopBridge?.streamChat) return desktopBridge.streamChat({ model, messages, sessionId }, onUpdate ?? (() => undefined));
-    if (desktopBridge) return desktopBridge.sendChat({ model, messages, sessionId });
     if (authConfig.apiAccessEnabled && !authSession) {
       throw new Error("Sign in to use your account's inference balance.");
     }
@@ -698,17 +712,11 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
     return result;
   }
 
-  const publicOrigin = desktopSnapshot?.coordinatorUrl
-    ? desktopSnapshot.coordinatorUrl.replace(/\/$/, "")
-    : PUBLIC_COORDINATOR_URL;
-  const publicLink = (path: string) => desktop ? `${publicOrigin}${path}` : path;
+  const publicLink = (path: string) => path;
   const configuredApiBase = authConfig.publicApiBaseUrl ?? "/v1";
-  const apiBaseUrl = desktop
-    ? `${publicOrigin}/v1`
-    : configuredApiBase.startsWith("http")
-      ? configuredApiBase
-      : `${window.location.origin}${configuredApiBase.startsWith("/") ? "" : "/"}${configuredApiBase}`;
-  const externalProps = desktop ? { target: "_blank", rel: "noreferrer" } as const : {};
+  const apiBaseUrl = configuredApiBase.startsWith("http")
+    ? configuredApiBase
+    : `${window.location.origin}${configuredApiBase.startsWith("/") ? "" : "/"}${configuredApiBase}`;
 
   async function disconnectAccount() {
     if (authSession) await signOut(authConfig, authSession);
@@ -719,19 +727,29 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
 
   return (
     <div className="public-panel-viewport">
-      <div className={`public-panel theme-${theme} panel-mode-${panelMode} ${desktop ? `desktop-panel platform-${desktopSnapshot?.platform ?? "loading"}` : ""}`}>
+      <div
+        className={`public-panel theme-${theme} panel-mode-${panelMode}`}
+        style={{
+          width: `${100 / contentScale}%`,
+          height: `${100 / contentScale}vh`,
+          minHeight: `${100 / contentScale}vh`,
+          transform: `scale(${contentScale})`,
+          transformOrigin: "top left",
+        } as CSSProperties}
+      >
+      <a className="panel-skip-link" href="#panel-main-content">Skip to main content</a>
       <aside id="panel-navigation" className={menuOpen ? "panel-sidebar open" : "panel-sidebar"} aria-label="Primary navigation">
         <button ref={sidebarCloseButtonRef} className="panel-sidebar-close" aria-label="Close navigation" onClick={closeNavigation}><X size={18} /></button>
-        <a className="panel-brand" href={publicLink("/")} {...externalProps}><img src={brandIcon} alt="" /><div><strong>mycellios</strong><span>network control</span></div></a>
+        <a className="panel-brand" href={publicLink("/")}><img src={brandIcon} alt="" /><div><strong>mycellios</strong><span>network control</span></div></a>
         <nav>
           <span className="panel-nav-label">{panelMode === "developer" ? "DEVELOPER TOOLS" : "MYCELLIOS"}</span>
           {navItems.map(({ id, label, icon: Icon }) => (
-            <button key={id} className={view === id ? "active" : ""} title={label} aria-label={label} onClick={() => navigate(id)}>
+            <button key={id} className={view === id ? "active" : ""} title={label} aria-label={label} aria-current={view === id ? "page" : undefined} onClick={() => navigate(id)}>
               <Icon size={18} /><span>{label}</span>{id === "nodes" && <b>{snapshot.summary.connected}</b>}
             </button>
           ))}
         </nav>
-        <button
+        {advancedAccess && <button
           type="button"
           className={`panel-mode-toggle ${panelMode === "developer" ? "active" : ""}`}
           aria-pressed={panelMode === "developer"}
@@ -741,7 +759,11 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
           <Code2 size={18} />
           <span><strong>Developer mode</strong><small>{panelMode === "developer" ? "Advanced tools visible" : "Simple panel active"}</small></span>
           <i aria-hidden="true" />
-        </button>
+        </button>}
+        <div className="panel-sidebar-links">
+          <a href={publicLink("/mobile/")}><Smartphone size={17} /><span>Mobile app</span><ExternalLink size={13} /></a>
+          <a href={publicLink("/")}><House size={17} /><span>Landing</span><ExternalLink size={13} /></a>
+        </div>
         <div className={`panel-sidebar-status ${coordinatorError ? "degraded" : "healthy"}`}>
           <i />
           <div>
@@ -749,6 +771,10 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
             <strong>{coordinatorError ? "Degraded" : "Healthy"}</strong>
             <small>{coordinatorError ? "Coordinator unavailable" : "Coordinator operational"}</small>
           </div>
+        </div>
+        {networkIdentity && <button className="panel-sidebar-account" onClick={() => setAuthOpen(true)}><UserRound /><span><strong>@{networkIdentity.email?.split("@")[0] ?? "mycellios"}</strong><small>{apiAccount ? `${formatCompactTokens(apiAccount.token_balance)} API tokens` : "Account"}</small></span><ChevronRight /></button>}
+        <div className="panel-sidebar-version" aria-label="Versiones">
+          <span><small>API</small><strong>{snapshot.version}</strong></span>
         </div>
       </aside>
       {menuOpen && <button className="panel-menu-backdrop" aria-label="Close navigation overlay" onClick={closeNavigation} />}
@@ -765,66 +791,81 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
           ><Menu /></button>
           <div className="panel-topbar-status"><span className={`panel-live-dot ${coordinatorError ? "degraded" : ""}`} /><div><strong>{coordinatorError ? "Network degraded" : "Network healthy"}</strong><small>{snapshot.capturedAt === EMPTY.capturedAt ? "Waiting for snapshot" : `Updated ${relativeTime(snapshot.capturedAt)}`}</small></div></div>
           <div className="panel-top-actions">
-            {panelMode === "developer" && <div className="panel-balance-group" aria-label="Account balances">
-              <span className="panel-balance-badge money" aria-label={`Balance: ${apiAccount?.usd_balance ?? "0.00"} dollars`} title="Available monetary balance">${apiAccount?.usd_balance ?? "0.00"}</span>
-              <span className="panel-balance-badge tokens" aria-label={`Tokens: ${apiAccount?.token_balance ?? 0}`} title="Available inference tokens"><Coins size={14} />{formatCompactTokens(apiAccount?.token_balance ?? 0)} TOK</span>
-            </div>}
-            {panelMode === "developer" && <button className="panel-theme-indicator" type="button" onClick={toggleTheme} aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`} title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}><SunMoon size={16} /></button>}
-            {panelMode === "developer" && localProductionProxy && <span className="panel-environment-badge"><Globe2 size={13} /> Production via local</span>}
-            {desktopSnapshot?.update.state === "ready" && <button className="panel-update-ready" onClick={() => void desktopBridge?.installUpdate()} title="Restart and install update"><Download size={15} /></button>}
-            {panelMode === "developer" && desktopSnapshot && <span title={buildIdentityTitle(desktopSnapshot.buildIdentity)}>App {shortBuildIdentity(desktopSnapshot.buildIdentity)}</span>}
-            {panelMode === "developer" && <span title={buildIdentityTitle(snapshot.buildIdentity)}>API {shortBuildIdentity(snapshot.buildIdentity)}</span>}
-            {!desktop && authConfig.enabled && (
+            <ApiQuotaBadge account={apiAccount} />
+            <button className="panel-theme-indicator" type="button" onClick={toggleTheme} aria-label={`Cambiar a modo ${theme === "dark" ? "claro" : "oscuro"}`} title={`Cambiar a modo ${theme === "dark" ? "claro" : "oscuro"}`}><SunMoon size={16} /></button>
+            {localProductionProxy && <span className="panel-environment-badge"><Globe2 size={13} /> Production via local</span>}
+            <div className="panel-zoom-controls" role="group" aria-label="Interface zoom">
+              <button type="button" aria-label="Reduce interface size" disabled={contentScale <= 0.9} onClick={() => changeContentScale(-0.1)}><Minus size={14} /></button>
+              <output aria-live="polite">{Math.round(contentScale * 100)}%</output>
+              <button type="button" aria-label="Increase interface size" disabled={contentScale >= 1.3} onClick={() => changeContentScale(0.1)}><Plus size={14} /></button>
+            </div>
+            <span title={buildIdentityTitle(snapshot.buildIdentity)}>API {shortBuildIdentity(snapshot.buildIdentity)}</span>
+            {authConfig.enabled && (
               networkIdentity
                 ? <button className="panel-account-button signed-in" onClick={() => setAuthOpen(true)} title={networkIdentity.email ?? "Mycellios account"}><UserRound size={16} /><span>{networkIdentity.role ?? "member"}</span></button>
                 : <button className="panel-account-button" onClick={() => setAuthOpen(true)}><UserRound size={16} /><span>Sign in</span></button>
             )}
             <JoinQuickMenu
-              inviteUrl={desktop ? publicLink("/join") : `${window.location.origin}/join`}
+              inviteUrl={`${window.location.origin}/join`}
               browserUrl={publicLink("/mobile/?autostart=1")}
               downloadsUrl={publicLink("/downloads")}
-              external={desktop}
+              external={false}
               onOpenJoin={() => navigate("join")}
             />
-            {panelMode === "developer" && !desktop && <a href={mobileEntry ? "/mobile/" : "/network?view=contribute"}>This device <Zap size={15} /></a>}
-            {desktopBridge && <div className="panel-window-controls"><button onClick={() => void desktopBridge.minimizeWindow()} aria-label="Minimize"><Minus size={16} /></button><button onClick={() => void desktopBridge.toggleMaximizeWindow()} aria-label="Maximize"><Maximize2 size={15} /></button><button className="close" onClick={() => void desktopBridge.closeWindow()} aria-label="Close"><X size={16} /></button></div>}
+            <button onClick={() => void refresh()} aria-label="Refresh"><RefreshCw className={loading ? "spin" : ""} size={17} /></button>
+            <a href={mobileEntry ? "/mobile/" : "/network?view=contribute"}>This device <Zap size={15} /></a>
           </div>
         </header>
 
-        {issue && <div className="panel-error" title={issue.message}><CircleAlert size={17} /> {issue.source === "coordinator" ? "Coordinator unavailable." : "This node could not join the network."} Retrying automatically.</div>}
-        <main className="panel-content">
-          {loading && snapshot.capturedAt === EMPTY.capturedAt ? <PanelLoading /> : (
-            <>
-              {view === "overview" && <Overview snapshot={snapshot} onNavigate={navigate} publicLink={publicLink} external={desktop} apiBaseUrl={apiBaseUrl} joinUrl={desktop ? publicLink("/join") : `${window.location.origin}/join`} localAcceleration={desktopSnapshot?.acceleration} localContributionState={desktopSnapshot?.contribution.state} localComputeMode={desktopSnapshot?.settings.computeMode} developerMode={panelMode === "developer"} />}
-              {view === "history" && <NetworkHistory endpoint={desktop ? `${publicOrigin}/public/v1/history` : "/public/v1/history"} compact={panelMode === "simple"} />}
-              {view === "nodes" && <Nodes snapshot={snapshot} onRemove={removeWorker} onClearOffline={clearOfflineWorkers} onListCredentials={listWorkerCredentials} onRevokeCredential={revokeWorkerCredential} />}
-              {view === "models" && <Models snapshot={snapshot} onSearch={searchHubModels} onRequest={requestModel} onRemove={removeRequestedModel} adminToken={modelAdminToken} requiresAdminToken={requiresModelAdminToken} secureTokenStorage={desktop} />}
-              {view === "jobs" && <Jobs snapshot={snapshot} />}
-              {view === "tests" && <Tests bridge={desktopBridge} />}
-              {view === "logs" && <SystemLogs snapshot={snapshot} bridge={desktopBridge} connectionError={coordinatorError} />}
-              {view === "inference" && <Inference snapshot={snapshot} onSend={sendPrompt} onNavigate={navigate} developerMode={panelMode === "developer"} accountAuthenticated={desktop || !authConfig.apiAccessEnabled || authSession !== null} onSignIn={() => setAuthOpen(true)} apiAccessEnabled={authConfig.apiAccessEnabled ?? false} apiBaseUrl={apiBaseUrl} accessToken={authSession?.accessToken ?? null} apiAccount={apiAccount} />}
-              {view === "contribute" && <Contribute />}
-              {view === "join" && <JoinNetwork publicLink={publicLink} external={desktop} />}
-              {view === "downloads" && <Downloads publicLink={publicLink} external={desktop} />}
-              {view === "admin" && <AssistantAdmin
-                apiOrigin={desktop ? publicOrigin : ""}
+        {issue && <div className="panel-error" role="alert" aria-live="assertive" title={issue.message}><CircleAlert size={17} /> {issue.source === "coordinator" ? "Coordinator unavailable." : "This node could not join the network."} Retrying automatically.</div>}
+        <main id="panel-main-content" ref={mainContentRef} className="panel-content" tabIndex={-1}>
+          <div className="panel-content-scale">
+            {loading && snapshot.capturedAt === EMPTY.capturedAt ? <PanelLoading /> : (
+              <>
+              {view === "overview" && <Overview snapshot={snapshot} connectionError={coordinatorError} onNavigate={navigate} publicLink={publicLink} external={false} apiBaseUrl={apiBaseUrl} joinUrl={`${window.location.origin}/join`} developerMode={panelMode === "developer"} />}
+              {view === "history" && <NetworkHistory endpoint="/public/v1/history" />}
+              {view === "nodes" && advancedAccess && <Nodes snapshot={snapshot} onRemove={removeWorker} onClearOffline={clearOfflineWorkers} onListCredentials={listWorkerCredentials} onRevokeCredential={revokeWorkerCredential} />}
+              {view === "models" && advancedAccess && <Models snapshot={snapshot} onSearch={searchHubModels} onRequest={requestModel} onRemove={removeRequestedModel} adminToken={modelAdminToken} requiresAdminToken={requiresModelAdminToken} secureTokenStorage={false} />}
+              {view === "jobs" && advancedAccess && <Jobs
+                snapshot={snapshot}
+                operatorAccess={canManageModels}
+                accessToken={authSession?.accessToken ?? null}
+              />}
+              {view === "tests" && advancedAccess && <Tests />}
+              {view === "logs" && advancedAccess && <SystemLogs snapshot={snapshot} connectionError={coordinatorError} />}
+              {view === "inference" && <Inference snapshot={snapshot} onSend={sendPrompt} onNavigate={navigate} developerMode={panelMode === "developer"} accountAuthenticated={!authConfig.apiAccessEnabled || authSession !== null} onSignIn={() => setAuthOpen(true)} apiAccessEnabled={authConfig.apiAccessEnabled ?? false} apiBaseUrl={apiBaseUrl} accessToken={authSession?.accessToken ?? null} apiAccount={apiAccount} />}
+              {view === "contribute" && <Contribute
+                accessToken={authSession?.accessToken ?? null}
+                authConfig={authConfig}
+                authSession={authSession}
+                onSessionElevated={setAuthSession}
+                onSignIn={() => setAuthOpen(true)}
+                onOpenAccount={() => setAuthOpen(true)}
+                onNavigate={navigate}
+                network={{
+                  connectedNodes: snapshot.summary.connected,
+                  completedJobs: snapshot.summary.completedJobs,
+                  traceCount: snapshot.recentNetworkTraces?.length ?? 0,
+                }}
+              />}
+              {view === "join" && <JoinNetwork publicLink={publicLink} external={false} />}
+              {view === "downloads" && <Downloads publicLink={publicLink} external={false} />}
+              {view === "admin" && advancedAccess && <AssistantAdmin
+                apiOrigin=""
                 adminToken={modelAdminToken}
                 authSession={authSession}
-                {...(desktopBridge ? { desktopBridge } : {})}
                 onAdminTokenChange={(token) => {
                   setModelAdminToken(token);
                   if (token) window.sessionStorage.setItem("mycellios-model-admin-token", token);
                   else window.sessionStorage.removeItem("mycellios-model-admin-token");
                 }}
               />}
-              {view === "machine" && desktopSnapshot && desktopBridge && <Machine snapshot={desktopSnapshot} bridge={desktopBridge} onSnapshot={applyDesktopSnapshot} />}
-              {view === "settings" && desktopSnapshot && desktopBridge && <DesktopSettingsView snapshot={desktopSnapshot} bridge={desktopBridge} onSnapshot={applyDesktopSnapshot} developerMode={panelMode === "developer"} />}
-            </>
-          )}
+              </>
+            )}
+          </div>
         </main>
       </div>
-      {desktopSnapshot && desktopBridge && !desktopSnapshot.settings.onboardingComplete && <DesktopOnboarding snapshot={desktopSnapshot} bridge={desktopBridge} onSnapshot={applyDesktopSnapshot} />}
-      {!desktop && authOpen && <AccountModal
+      {authOpen && <AccountModal
         config={authConfig}
         session={authSession}
         identity={networkIdentity}
@@ -843,22 +884,8 @@ function Panel({ desktopBridge, mobileEntry = false }: PanelProps = {}) {
       </div>
       <SupportAssistant
         surface="panel"
-        apiOrigin={desktop ? publicOrigin : ""}
-        {...(desktopBridge ? { desktopBridge } : {})}
-        onNavigate={(destination) => navigate(
-          destination === "machine"
-            ? desktop ? "machine" : "contribute"
-            : destination,
-        )}
-        {...(desktopSnapshot && desktopBridge ? {
-          deviceControl: {
-            currentMode: desktopSnapshot.settings.computeMode,
-            onChange: async (computeMode: DesktopSettings["computeMode"]) => {
-              const next = await desktopBridge.saveSettings({ ...desktopSnapshot.settings, computeMode });
-              applyDesktopSnapshot(next);
-            },
-          },
-        } : {})}
+        apiOrigin=""
+        onNavigate={navigate}
       />
     </div>
   );
@@ -946,7 +973,7 @@ function JoinQuickMenu({
               </button>
             </div>
             <code><span>$</span>{inviteUrl}</code>
-            <small>Anyone with this link can choose a browser node or install the desktop client.</small>
+            <small>Anyone with this link can choose a browser node or install mycellios-node.</small>
           </div>
           <div className="panel-join-quick-actions">
             <button type="button" onClick={() => { setOpen(false); onOpenJoin(); }}>
@@ -1000,21 +1027,54 @@ function AccountModal({
   const [accountTab, setAccountTab] = useState<"account" | "usage">("account");
   const [usage, setUsage] = useState<ApiUsage[]>([]);
   const [usageBusy, setUsageBusy] = useState(false);
+  const dialogRef = useRef<HTMLElement>(null);
+  const titleId = useId();
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const activeDialog: HTMLElement = dialog;
+    const focusableSelector = 'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const focusable = [...dialog.querySelectorAll<HTMLElement>(focusableSelector)];
+    (focusable[0] ?? dialog).focus();
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const controls = [...activeDialog.querySelectorAll<HTMLElement>(focusableSelector)];
+      if (controls.length === 0) {
+        event.preventDefault();
+        activeDialog.focus();
+        return;
+      }
+      const first = controls[0];
+      const last = controls.at(-1);
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last?.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first?.focus();
+      }
+    }
+
+    dialog.addEventListener("keydown", handleKeyDown);
+    return () => {
+      dialog.removeEventListener("keydown", handleKeyDown);
+      previouslyFocused?.focus();
+    };
+  }, [onClose]);
 
   useEffect(() => {
     if (!session || accountTab !== "usage") return;
     setUsageBusy(true);
     void loadApiUsage(session.accessToken).then(setUsage).catch((caught) => setError(errorText(caught))).finally(() => setUsageBusy(false));
   }, [accountTab, session]);
-
-  const usageByModel = useMemo(() => {
-    const totals = new Map<string, { requests: number; tokens: number }>();
-    for (const entry of usage) {
-      const current = totals.get(entry.model) ?? { requests: 0, tokens: 0 };
-      totals.set(entry.model, { requests: current.requests + 1, tokens: current.tokens + entry.total_tokens });
-    }
-    return [...totals.entries()].sort((left, right) => right[1].tokens - left[1].tokens);
-  }, [usage]);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -1059,14 +1119,14 @@ function AccountModal({
   }
 
   return <div className="modal-backdrop account-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) onClose(); }}>
-    <section className="account-modal" role="dialog" aria-modal="true" aria-label="Mycellios account">
+    <section ref={dialogRef} className="account-modal" role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1}>
       <button className="account-modal-close" aria-label="Close" onClick={onClose}><X size={18} /></button>
       <div className="account-modal-brand"><img src={brandIcon} alt="" /><span>MYCELLIOS ID</span></div>
       {session && identity ? <>
         <div className="account-detail-tabs"><button className={accountTab === "account" ? "active" : ""} onClick={() => setAccountTab("account")}>Account</button><button className={accountTab === "usage" ? "active" : ""} onClick={() => setAccountTab("usage")}>Usage</button></div>
-        {accountTab === "account" ? <><h2>Your network identity</h2><p>History and permissions follow this account across devices.</p><div className="account-identity-card"><UserRound /><span><strong>{identity.email ?? session.user.email ?? identity.id}</strong><small>{identity.role ?? "member"} · public network</small></span></div><div className="account-facts"><span><small>MEMBER SINCE</small><strong>{account ? new Date(account.created_at).toLocaleDateString() : "—"}</strong></span><span><small>PROMPTS SENT</small><strong>{account?.request_count ?? 0}</strong></span><span><small>AVAILABLE</small><strong>{formatCompactTokens(account?.token_balance ?? 0)} tokens</strong></span></div><button className="account-signout" onClick={onSignOut}><LogOut size={16} />Sign out</button></> : <><h2>Usage</h2><p>Real requests and tokens across chat and the API.</p><div className="account-usage-summary"><span><small>REQUESTS</small><strong>{account?.request_count ?? 0}</strong></span><span><small>INPUT TOKENS</small><strong>{formatCompactTokens(account?.lifetime_input_tokens ?? 0)}</strong></span><span><small>OUTPUT TOKENS</small><strong>{formatCompactTokens(account?.lifetime_output_tokens ?? 0)}</strong></span></div><div className="account-usage-models"><span>BY MODEL</span>{usageBusy ? <div className="account-usage-empty"><LoaderCircle className="spin" />Loading usage…</div> : usageByModel.length === 0 ? <div className="account-usage-empty">No usage recorded yet.</div> : usageByModel.map(([model, total]) => <div key={model}><strong>{model}</strong><span>{total.requests} request{total.requests === 1 ? "" : "s"}</span><b>{formatCompactTokens(total.tokens)} tokens</b></div>)}</div></>}
+        <AccountDetails tab={accountTab} titleId={titleId} session={session} identity={identity} account={account} usage={usage} usageBusy={usageBusy} onSignOut={onSignOut} />
       </> : <>
-        <h2>{mode === "signin" ? "Welcome back" : "Create your account"}</h2>
+        <h2 id={titleId}>{mode === "signin" ? "Welcome back" : "Create your account"}</h2>
         <p>Use one identity for network access, history and administration.</p>
         <div className="account-provider-actions">
           <button type="button" className="account-provider-x" disabled={providerBusy !== null || busy} onClick={continueWithX}>
@@ -1083,12 +1143,45 @@ function AccountModal({
         <form onSubmit={(event) => void submit(event)}>
           <label>Email<input type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} required /></label>
           <label>Password<input type="password" autoComplete={mode === "signin" ? "current-password" : "new-password"} minLength={8} value={password} onChange={(event) => setPassword(event.target.value)} required /></label>
-          {error && <div className="account-auth-error"><CircleAlert size={16} />{error}</div>}
+          {error && <div className="account-auth-error" role="alert"><CircleAlert size={16} />{error}</div>}
           <button className="account-submit" disabled={busy}>{busy ? <LoaderCircle className="spin" /> : <ShieldCheck />}{busy ? "Connecting…" : mode === "signin" ? "Sign in securely" : "Create account"}</button>
         </form>
       </>}
     </section>
   </div>;
+}
+
+export function AccountDetails({ tab, titleId, session, identity, account, usage, usageBusy, onSignOut }: {
+  tab: "account" | "usage";
+  titleId: string;
+  session: AuthSession;
+  identity: NetworkIdentity;
+  account: ApiAccount | null;
+  usage: ApiUsage[];
+  usageBusy: boolean;
+  onSignOut: () => void;
+}) {
+  const totals = new Map<string, { requests: number; tokens: number }>();
+  for (const entry of usage) {
+    const current = totals.get(entry.model) ?? { requests: 0, tokens: 0 };
+    totals.set(entry.model, { requests: current.requests + 1, tokens: current.tokens + entry.total_tokens });
+  }
+  const usageByModel = [...totals.entries()].sort((left, right) => right[1].tokens - left[1].tokens);
+
+  if (tab === "account") return <>
+    <h2 id={titleId}>Your network identity</h2>
+    <p>History and permissions follow this account across devices.</p>
+    <div className="account-identity-card"><UserRound /><span><strong>{identity.email ?? session.user.email ?? identity.id}</strong><small>{identity.role ?? "member"} · hosted network</small></span></div>
+    <div className="account-facts"><span><small>MEMBER SINCE</small><strong>{account ? new Date(account.created_at).toLocaleDateString() : "—"}</strong></span><span><small>PROMPTS SENT</small><strong>{account?.request_count ?? 0}</strong></span><span><small>API TOKEN BALANCE</small><strong>{formatCompactTokens(account?.token_balance ?? 0)} tokens</strong></span></div>
+    <button className="account-signout" onClick={onSignOut}><LogOut size={16} />Sign out</button>
+  </>;
+
+  return <>
+    <h2 id={titleId}>Usage</h2>
+    <p>Real requests and tokens across chat and the API.</p>
+    <div className="account-usage-summary"><span><small>REQUESTS</small><strong>{account?.request_count ?? 0}</strong></span><span><small>INPUT TOKENS</small><strong>{formatCompactTokens(account?.lifetime_input_tokens ?? 0)}</strong></span><span><small>OUTPUT TOKENS</small><strong>{formatCompactTokens(account?.lifetime_output_tokens ?? 0)}</strong></span></div>
+    <div className="account-usage-models"><span>BY MODEL</span>{usageBusy ? <div className="account-usage-empty" role="status"><LoaderCircle className="spin" />Loading usage…</div> : usageByModel.length === 0 ? <div className="account-usage-empty">No usage recorded yet.</div> : usageByModel.map(([model, total]) => <div key={model}><strong>{model}</strong><span>{total.requests} request{total.requests === 1 ? "" : "s"}</span><b>{formatCompactTokens(total.tokens)} tokens</b></div>)}</div>
+  </>;
 }
 
 interface AssistantAdminSettings {
@@ -1125,13 +1218,11 @@ function AssistantAdmin({
   apiOrigin,
   adminToken,
   authSession,
-  desktopBridge,
   onAdminTokenChange,
 }: {
   apiOrigin: string;
   adminToken: string;
   authSession: AuthSession | null;
-  desktopBridge?: DesktopBridge;
   onAdminTokenChange: (token: string) => void;
 }) {
   const [draftToken, setDraftToken] = useState(adminToken);
@@ -1166,9 +1257,6 @@ function AssistantAdmin({
   }
 
   async function requestFleetStatus(token = draftToken): Promise<FleetContributionStatus> {
-    if (desktopBridge) {
-      return desktopBridge.getFleetContributionAdmin(token.trim() || undefined);
-    }
     return fetch(`${apiOrigin}/public/v1/admin/fleet-contribution`, {
       cache: "no-store",
       headers: authorizationHeaders(token),
@@ -1186,9 +1274,7 @@ function AssistantAdmin({
     setError(null);
     setSaved(false);
     try {
-      const assistantRequest = desktopBridge
-        ? desktopBridge.getSupportAssistantAdmin(token.trim() || undefined)
-        : fetch(`${apiOrigin}/public/v1/admin/assistant`, {
+      const assistantRequest = fetch(`${apiOrigin}/public/v1/admin/assistant`, {
             cache: "no-store",
             headers: authorizationHeaders(token),
           }).then(async (response) => {
@@ -1218,7 +1304,7 @@ function AssistantAdmin({
 
   useEffect(() => {
     void load(adminToken);
-  }, [apiOrigin, authSession?.accessToken, desktopBridge]);
+  }, [apiOrigin, authSession?.accessToken]);
 
   useEffect(() => {
     if (!settings) return;
@@ -1226,7 +1312,7 @@ function AssistantAdmin({
       void requestFleetStatus().then(setFleet).catch(() => undefined);
     }, 5_000);
     return () => window.clearInterval(interval);
-  }, [settings, apiOrigin, authSession?.accessToken, desktopBridge, draftToken]);
+  }, [settings, apiOrigin, authSession?.accessToken, draftToken]);
 
   function update<K extends keyof AssistantAdminSettings>(key: K, value: AssistantAdminSettings[K]) {
     setSettings((current) => current ? { ...current, [key]: value } : current);
@@ -1255,9 +1341,7 @@ function AssistantAdmin({
         temperature: settings.temperature,
         allowDeviceControl: settings.allowDeviceControl,
       };
-      const result = desktopBridge
-        ? await desktopBridge.saveSupportAssistantAdmin(payload, draftToken.trim() || undefined)
-        : await fetch(`${apiOrigin}/public/v1/admin/assistant`, {
+      const result = await fetch(`${apiOrigin}/public/v1/admin/assistant`, {
             method: "PUT",
             headers: {
               "content-type": "application/json",
@@ -1287,12 +1371,7 @@ function AssistantAdmin({
     setFleetError(null);
     setFleetResult(null);
     try {
-      const result = desktopBridge
-        ? await desktopBridge.setFleetContributionAdmin(
-            enabled,
-            draftToken.trim() || undefined,
-          )
-        : await fetch(`${apiOrigin}/public/v1/admin/fleet-contribution`, {
+      const result = await fetch(`${apiOrigin}/public/v1/admin/fleet-contribution`, {
             method: "POST",
             headers: {
               "content-type": "application/json",
@@ -1334,7 +1413,7 @@ function AssistantAdmin({
       <PageTitle
         eyebrow="NETWORK ADMINISTRATION"
         title="Network administration"
-        copy="Control connected desktop contributors and the support assistant from one protected workspace."
+        copy="Control connected native nodes and the support assistant from one protected workspace."
         actions={<span className="assistant-network-only"><ShieldCheck size={15} /> Owner controls</span>}
       />
 
@@ -1359,7 +1438,7 @@ function AssistantAdmin({
         </div>
       </article>
 
-      {error && <div className="assistant-admin-error"><CircleAlert size={17} /><span>{error}</span></div>}
+      {error && <div className="assistant-admin-error" role="alert"><CircleAlert size={17} /><span>{error}</span></div>}
 
       {loading && !settings ? (
         <div className="assistant-admin-loading"><LoaderCircle className="spin" /><strong>Loading private assistant configuration…</strong></div>
@@ -1393,7 +1472,7 @@ function AssistantAdmin({
 
             <div className="fleet-control-actions">
               <div>
-                <strong>{fleet.summary.connected} of {fleet.summary.desktopNodes} desktop nodes connected</strong>
+                <strong>{fleet.summary.connected} of {fleet.summary.desktopNodes} native nodes connected</strong>
                 <small>This controls Mycellios contribution, not the computer's physical power.</small>
               </div>
               <button
@@ -1434,7 +1513,7 @@ function AssistantAdmin({
               </div>
             )}
 
-            {fleetError && <div className="fleet-control-message error"><CircleAlert size={16} />{fleetError}</div>}
+            {fleetError && <div className="fleet-control-message error" role="alert"><CircleAlert size={16} />{fleetError}</div>}
             {fleetResult && (
               <div className={`fleet-control-message ${failedFleetResults > 0 ? "warning" : "success"}`}>
                 {failedFleetResults > 0 ? <CircleAlert size={16} /> : <CheckCircle2 size={16} />}
@@ -1537,48 +1616,30 @@ function AssistantAdmin({
   );
 }
 
-export function LiveNetworkTelemetry({ snapshot, compact = false }: { snapshot: PublicSnapshot; compact?: boolean }) {
-  const onlineWorkers = snapshot.workers.filter((worker) => worker.connected && worker.status === "online");
-  const activeVramMb = onlineWorkers.reduce((total, worker) => total + worker.offeredVramMb, 0);
-  const activeGpus = onlineWorkers.flatMap((worker) => worker.gpus);
-  const freeVramMb = activeGpus.reduce((total, gpu) => total + gpu.freeOfferedVramMb, 0);
-  const freeRatio = activeVramMb > 0 ? Math.min(1, freeVramMb / activeVramMb) : 0;
+export function LiveNetworkTelemetry({ snapshot, evidence = overviewSnapshotEvidence(snapshot.capturedAt, null) }: { snapshot: PublicSnapshot; evidence?: OverviewSnapshotEvidence }) {
   const replicas = snapshot.models.reduce((total, model) => total + model.replicas, 0);
   const pipelines = snapshot.models.reduce((total, model) => total + model.pipelines, 0);
   const inflightJobs = snapshot.jobs.filter((job) => ["queued", "leasing", "running", "streaming"].includes(job.status));
   const runningJobs = inflightJobs.filter((job) => job.status === "running" || job.status === "streaming").length;
   const queuedJobs = inflightJobs.length - runningJobs;
-  const snapshotReady = snapshot.capturedAt !== EMPTY.capturedAt;
-
   return (
-    <section className={`live-network-telemetry${compact ? " compact" : ""}`} aria-label="Current live network data" aria-live="polite">
-      <div className="snapshot">
+    <section className="live-network-telemetry" aria-label="Current live network data" aria-live="polite" data-period="current" data-evidence="coordinator-snapshot">
+      <div className="snapshot" data-kpi="snapshot">
         <span><Radio size={12} />Snapshot</span>
-        <strong><i />{snapshotReady ? "LIVE" : "WAITING"}</strong>
-        <small>{snapshotReady ? `Updated ${relativeTime(snapshot.capturedAt)}` : "Waiting for coordinator"}</small>
+        <strong className={evidence.state}><i />{evidence.label}</strong>
+        <small>{evidence.detail}</small>
       </div>
-      {!compact && <div>
-        <span><Network size={12} />Coordinator</span>
-        <strong>mycellios</strong>
-        <small>Public API · v{snapshot.version}</small>
-      </div>}
-      <div>
+      <div data-kpi="connected-peers">
         <span><GitFork size={12} />Connected peers</span>
         <strong>{snapshot.summary.connected}</strong>
         <small>{snapshot.summary.online} online · {snapshot.summary.mobile} browser</small>
       </div>
-      {!compact && <div>
+      <div data-kpi="active-models">
         <span><Boxes size={12} />Active models</span>
         <strong>{snapshot.models.length}</strong>
         <small>{replicas} replicas · {pipelines} pipelines</small>
-      </div>}
-      {!compact && <div className="vram">
-        <span><MemoryStick size={12} />Mesh VRAM</span>
-        <strong>{formatMemory(activeVramMb)}</strong>
-        <small>{formatMemory(freeVramMb)} free · {onlineWorkers.length} peers</small>
-        <i className="live-telemetry-meter" aria-label={`${Math.round(freeRatio * 100)}% free`}><b style={{ width: `${freeRatio * 100}%` }} /></i>
-      </div>}
-      <div className="inflight">
+      </div>
+      <div className="inflight" data-kpi="inflight-jobs">
         <span><Activity size={12} />Inflight</span>
         <strong>{inflightJobs.length}</strong>
         <small>{runningJobs} running · {queuedJobs} queued</small>
@@ -1643,8 +1704,8 @@ export function NetworkHistory({ endpoint, compact = false }: { endpoint: string
       </div>
       <span><History size={15} />Every {history?.intervalMinutes ?? 10} min · retained for {history?.retentionDays ?? 90} days</span>
     </div>
-    {loadError && <div className="network-history-error"><CircleAlert size={17} /><span><strong>Could not load network history</strong>{loadError}</span></div>}
-    {loading && !history ? <div className="network-history-loading"><LoaderCircle className="spin" /><span>Reading saved samples…</span></div> : history && <NetworkHistoryReport history={history} compact={compact} />}
+    {loadError && <div className="network-history-error" role="alert"><CircleAlert size={17} /><span><strong>No se pudo cargar el histórico</strong>{loadError}</span></div>}
+    {loading && !history ? <div className="network-history-loading"><LoaderCircle className="spin" /><span>Leyendo las muestras guardadas…</span></div> : history && <NetworkHistoryReport history={history} />}
   </section>;
 }
 
@@ -1655,7 +1716,7 @@ export function NetworkHistoryReport({ history, compact = false }: { history: Ne
     return <Empty icon={History} title="No samples yet" copy="The coordinator will save the first reading automatically and add another every ten minutes." />;
   }
   return <>
-    <div className={`network-history-summary${compact ? " compact" : ""}`} aria-label="Latest saved sample">
+    <div className="network-history-summary" aria-label="Latest sample">
       <HistorySummaryCard
         icon={MemoryStick}
         label="Active VRAM"
@@ -1692,7 +1753,7 @@ export function NetworkHistoryReport({ history, compact = false }: { history: Ne
     <div className="network-history-meta">
       <span><Radio />Latest sample <strong>{formatHistoryDate(latest.capturedAt)}</strong></span>
       <span><ShieldCheck />Coordinator data, no estimates</span>
-      <span><History />{history.samples.length} samples in {historyRangeLabels[history.range]}</span>
+      <span><History />{history.samples.length} muestras en {historyRangeLabels[history.range]}</span>
     </div>
     <div className="network-history-charts">
       <NetworkHistoryChart
@@ -1905,7 +1966,7 @@ function formatHistoryChartTime(value: string): string {
   }).format(new Date(value)).replace(",", "");
 }
 
-function DashboardConnect({
+export function DashboardConnect({
   apiBaseUrl,
   joinUrl,
   downloadsUrl,
@@ -1951,7 +2012,7 @@ function DashboardConnect({
   return (
     <article className="dashboard-connect" aria-labelledby={titleId}>
       <header>
-        <div><strong id={titleId}>Connect</strong><span>· join the public mycellios network</span></div>
+        <div><strong id={titleId}>Connect</strong><span>· join the configured mycellios network</span></div>
         <a href="https://github.com/tych0s/mycellios#readme" target="_blank" rel="noreferrer">Full docs <ArrowRight size={13} /></a>
       </header>
       <div className="dashboard-connect-grid">
@@ -1977,13 +2038,13 @@ function DashboardConnect({
         <section className="dashboard-connect-join">
           <span>2 · JOIN</span>
           <div className="dashboard-connect-command">
-            <code><i>$</i>{joinUrl}</code>
+            <code>{joinUrl}</code>
             <button type="button" className={copyError === "join" ? "error" : copied === "join" ? "copied" : ""} onClick={() => void copyValue("join", joinUrl)}>
               {copied === "join" ? <Check size={14} /> : <Copy size={14} />}
               {copyLabel("join")}
             </button>
           </div>
-          <p>Share the public link, connect in a browser, or install the desktop client. The configured API uses the OpenAI-compatible <code>/v1</code> interface.</p>
+          <p>Share the public link, connect in a browser, or install mycellios-node. The configured API uses the OpenAI-compatible <code>/v1</code> interface.</p>
         </section>
       </div>
       <footer>
@@ -1994,7 +2055,40 @@ function DashboardConnect({
   );
 }
 
-function Overview({ snapshot, onNavigate, publicLink, external, apiBaseUrl, joinUrl, localAcceleration, localContributionState, localComputeMode, developerMode }: { snapshot: PublicSnapshot; onNavigate: (view: PanelView) => void; publicLink: (path: string) => string; external: boolean; apiBaseUrl: string; joinUrl: string; localAcceleration: AcceleratorProgressSnapshot | undefined; localContributionState: DashboardSnapshot["contribution"]["state"] | undefined; localComputeMode: DesktopSettings["computeMode"] | undefined; developerMode: boolean }) {
+export interface OverviewSnapshotEvidence {
+  state: "waiting" | "fresh" | "delayed" | "stale" | "degraded";
+  label: string;
+  detail: string;
+  capturedAt: string | null;
+  ageMs: number | null;
+}
+
+export function overviewSnapshotEvidence(
+  capturedAt: string,
+  connectionError: string | null,
+  now = Date.now(),
+): OverviewSnapshotEvidence {
+  const captured = Date.parse(capturedAt);
+  if (!Number.isFinite(captured) || capturedAt === EMPTY.capturedAt) {
+    return {
+      state: "waiting",
+      label: "WAITING FOR EVIDENCE",
+      detail: connectionError ? "Coordinator unavailable; no verified snapshot received" : "No verified snapshot received yet",
+      capturedAt: null,
+      ageMs: null,
+    };
+  }
+  const ageMs = Math.max(0, now - captured);
+  if (connectionError) {
+    return { state: "degraded", label: "LAST VERIFIED", detail: `Coordinator unavailable · captured ${relativeTime(capturedAt, now)}`, capturedAt, ageMs };
+  }
+  if (ageMs <= 10_000) return { state: "fresh", label: "LIVE SNAPSHOT", detail: `Captured ${relativeTime(capturedAt, now)}`, capturedAt, ageMs };
+  if (ageMs <= 30_000) return { state: "delayed", label: "DELAYED SNAPSHOT", detail: `Captured ${relativeTime(capturedAt, now)}`, capturedAt, ageMs };
+  return { state: "stale", label: "STALE SNAPSHOT", detail: `Captured ${relativeTime(capturedAt, now)}`, capturedAt, ageMs };
+}
+
+function Overview({ snapshot, connectionError, onNavigate, publicLink, external, apiBaseUrl, joinUrl, developerMode }: { snapshot: PublicSnapshot; connectionError: string | null; onNavigate: (view: PanelView) => void; publicLink: (path: string) => string; external: boolean; apiBaseUrl: string; joinUrl: string; developerMode: boolean }) {
+  const evidence = overviewSnapshotEvidence(snapshot.capturedAt, connectionError);
   const active = snapshot.workers.filter((worker) => worker.connected);
   const operational = active.filter((worker) => worker.status === "online");
   const activeGpus = operational.flatMap((worker) => worker.gpus);
@@ -2033,20 +2127,28 @@ function Overview({ snapshot, onNavigate, publicLink, external, apiBaseUrl, join
   return (
     <section className="overview-page">
       <PageTitle eyebrow="NETWORK CONTROL" title="Distributed AI network" copy="A live view of the capacity, models and tasks connected to your mycellios network." actions={developerMode ? <button onClick={() => onNavigate("nodes")}>Manage nodes</button> : undefined} />
-      <aside className="overview-announcement" aria-label="Contribute to the public mycellios network">
+      <aside className="overview-announcement" aria-label="Contribute to the configured mycellios network">
         <div className="announcement-icon"><Network size={21} /></div>
-        <div><strong>Welcome to the public mesh</strong><span>Run open models with shared community capacity. Contribute from this browser or install a local node; you choose the resources and can pause at any time.</span></div>
+        <div><strong>Welcome to the founding mesh</strong><span>Run open models with approved shared capacity. Contribute from this browser or install a local node; you choose the resources and can pause at any time.</span></div>
         <div className="overview-announcement-actions">
-          <button onClick={() => onNavigate(external ? "machine" : "contribute")}>Contribute now <ArrowRight size={15} /></button>
+          <button onClick={() => onNavigate("contribute")}>Contribute now <ArrowRight size={15} /></button>
           <a href="https://github.com/tych0s/mycellios" target="_blank" rel="noreferrer"><GitFork size={15} />GitHub</a>
         </div>
       </aside>
-      <LiveNetworkTelemetry snapshot={snapshot} compact={!developerMode} />
-      {localAcceleration && shouldShowAccelerationBanner(localAcceleration) && <AcceleratorCompactBanner acceleration={localAcceleration} contributionState={localContributionState} computeMode={localComputeMode} onOpen={() => onNavigate("machine")} />}
-      {developerMode ? connectPanel : <PanelDisclosure icon={Share2} eyebrow="OPTIONAL" title="Connect another device" summary="Open setup links only when you are ready to expand the network.">{connectPanel}</PanelDisclosure>}
+      <div className={`overview-evidence ${evidence.state}`} role="status"><span><Radio />{evidence.label}</span><strong>Point-in-time coordinator snapshot</strong><small>{evidence.detail}</small></div>
+      {evidence.state === "waiting" ? <article className="overview-no-evidence"><CircleAlert /><div><span>NO VERIFIED NETWORK DATA</span><h2>Overview is waiting for the coordinator</h2><p>Capacity, models, tasks and performance remain hidden until a real snapshot arrives. Retrying automatically.</p></div></article> : <>
+      <LiveNetworkTelemetry snapshot={snapshot} evidence={evidence} />
+      <DashboardConnect
+        apiBaseUrl={apiBaseUrl}
+        joinUrl={joinUrl}
+        downloadsUrl={publicLink("/downloads")}
+        browserUrl={publicLink("/mobile/?autostart=1")}
+        external={external}
+        onOpenJoin={() => onNavigate("join")}
+      />
       <article className="global-capacity-card">
         <div className="global-capacity-main">
-          <div className="global-capacity-heading"><span>GLOBAL NODE CAPACITY</span><b><i /> LIVE</b></div>
+          <div className="global-capacity-heading"><span>GLOBAL NODE CAPACITY</span><b className={evidence.state}><i /> {evidence.label}</b></div>
           <div className="execution-overview"><ExecutionBadge execution={execution} workers={snapshot.workers} large /><span><strong>Effective inference device</strong><small>Reported by the runtime after loading the model, never inferred from detected hardware.</small></span></div>
           <div className="global-capacity-total"><strong>{formatMemory(activeOfferedVramMb)}</strong><div><b>Active usable memory</b><small>Offered by {operational.length} operational node{operational.length === 1 ? "" : "s"}</small></div></div>
           <div className="global-capacity-bar" aria-label={`${Math.round(freeRatio * 100)}% of offered memory is free`}><i style={{ width: `${freeRatio * 100}%` }} /></div>
@@ -2059,17 +2161,17 @@ function Overview({ snapshot, onNavigate, publicLink, external, apiBaseUrl, join
           {developerMode && <CapacityMetric icon={Activity} label="Observed GPU draw" value={poweredGpus.length > 0 ? formatPower(observedPowerW) : "No telemetry"} detail={poweredGpus.length > 0 ? `${poweredGpus.length} physical reading${poweredGpus.length === 1 ? "" : "s"}` : telemetryGpus.length > 0 ? "GPU load is visible, but the driver does not expose watts" : "Never estimated"} />}
         </div>
       </article>
-      {developerMode && <div className="panel-stat-grid">
-        <Stat icon={Radio} label="Active nodes" value={String(snapshot.summary.connected)} detail={`${snapshot.summary.registered} registered`} />
-        <Stat icon={HardDrive} label="Shared VRAM" value={formatMemory(activeOfferedVramMb)} detail={`${formatMemory(freeVramMb)} currently free`} tone="purple" />
-        <Stat icon={Boxes} label="Available models" value={String(snapshot.models.length)} detail="Announced by live nodes" />
-        <Stat icon={CheckCircle2} label="Tasks completed" value={String(snapshot.summary.completedJobs)} detail="Current coordinator history" />
-      </div>}
-      {developerMode ? <>
-        <ConnectedPeersTable workers={snapshot.workers} />
-        <div className="overview-grid overview-grid-interactive">
-        <InteractiveMesh
-          workers={active}
+      <div className="panel-stat-grid">
+        <Stat icon={Radio} label="Active nodes" value={String(snapshot.summary.connected)} detail={`${snapshot.summary.registered} registered · snapshot`} />
+        <Stat icon={HardDrive} label="Shared VRAM" value={formatMemory(activeOfferedVramMb)} detail={`${formatMemory(freeVramMb)} free · snapshot`} tone="purple" />
+        <Stat icon={Boxes} label="Available models" value={String(snapshot.models.length)} detail="Announced in this snapshot" />
+        <Stat icon={CheckCircle2} label="Tasks completed" value={String(snapshot.summary.completedJobs)} detail="Coordinator history at capture" />
+      </div>
+      <ConnectedPeersTable workers={snapshot.workers} />
+      <div className="overview-grid overview-grid-interactive">
+      <InteractiveMesh
+        workers={active}
+        traces={snapshot.recentNetworkTraces ?? []}
           registeredWorkers={snapshot.summary.registered}
           sharedVramMb={activeOfferedVramMb}
           publicLink={publicLink}
@@ -2078,18 +2180,15 @@ function Overview({ snapshot, onNavigate, publicLink, external, apiBaseUrl, join
           onNavigate={onNavigate}
         />
         <NetworkModelCatalog snapshot={snapshot} developerMode={developerMode} onNavigate={onNavigate} />
-          {recentActivity}
-        </div>
-      </> : <div className="overview-disclosure-stack">
-        <PanelDisclosure icon={Network} eyebrow="NETWORK DETAIL" title="Nodes and topology" summary={`${operational.length} operational nodes. Open the full peer list and network map.`}>
-          <ConnectedPeersTable workers={snapshot.workers} />
-          <InteractiveMesh workers={active} registeredWorkers={snapshot.summary.registered} sharedVramMb={activeOfferedVramMb} publicLink={publicLink} external={external} developerMode={false} onNavigate={onNavigate} />
-        </PanelDisclosure>
-        <PanelDisclosure icon={Boxes} eyebrow="MODEL DETAIL" title="Available models" summary={`${snapshot.models.length} models announced by live nodes.`}>
-          <NetworkModelCatalog snapshot={snapshot} developerMode={false} onNavigate={onNavigate} />
-        </PanelDisclosure>
-        <PanelDisclosure icon={Activity} eyebrow="RECENT DETAIL" title="Network activity" summary={`${snapshot.jobs.length} tasks in the current coordinator history.`}>{recentActivity}</PanelDisclosure>
-      </div>}
+        <article className="activity-card">
+          <div className="card-heading"><div><span>RECENT ACTIVITY</span><h2>Network tasks</h2></div>{developerMode && <button onClick={() => onNavigate("jobs")}>View all</button>}</div>
+          <div className="activity-list">
+            {snapshot.jobs.slice(0, 5).map((job) => <div key={job.id}><i className={job.status} /><div><strong>{job.model}</strong><span>{shortId(job.id)} · {relativeTime(job.updatedAt)}</span></div><b>{job.status}</b></div>)}
+            {snapshot.jobs.length === 0 && <Empty icon={Activity} title="No tasks yet" copy="Tasks will appear here when you test a connected model." />}
+          </div>
+        </article>
+      </div>
+      </>}
     </section>
   );
 }
@@ -2261,6 +2360,7 @@ function NetworkModelCatalog({ snapshot, developerMode, onNavigate }: {
   onNavigate: (view: PanelView) => void;
 }) {
   const [selectedModelId, setSelectedModelId] = useState("");
+  const closeSelectedModel = useCallback(() => setSelectedModelId(""), []);
   const drawerTitleId = useId();
   const entries = useMemo<NetworkCatalogEntry[]>(() => {
     const active = snapshot.models.map((model) => ({
@@ -2283,15 +2383,6 @@ function NetworkModelCatalog({ snapshot, developerMode, onNavigate }: {
     return [...active, ...queued];
   }, [snapshot.models, snapshot.requestedModels]);
   const selectedEntry = entries.find((entry) => entry.id === selectedModelId) ?? null;
-
-  useEffect(() => {
-    if (!selectedEntry) return;
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setSelectedModelId("");
-    };
-    window.addEventListener("keydown", closeOnEscape);
-    return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [selectedEntry]);
 
   return <>
     <article className="network-model-catalog">
@@ -2319,7 +2410,7 @@ function NetworkModelCatalog({ snapshot, developerMode, onNavigate }: {
       </div>
     </article>
     {selectedEntry && createPortal(
-      <NetworkModelDrawer entry={selectedEntry} snapshot={snapshot} titleId={drawerTitleId} onClose={() => setSelectedModelId("")} />,
+      <NetworkModelDrawer entry={selectedEntry} snapshot={snapshot} titleId={drawerTitleId} onClose={closeSelectedModel} />,
       document.body,
     )}
   </>;
@@ -2331,13 +2422,32 @@ function NetworkModelDrawer({ entry, snapshot, titleId, onClose }: {
   titleId: string;
   onClose: () => void;
 }) {
+  const dialogRef = useRef<HTMLElement>(null);
   const telemetry = networkModelTelemetry(snapshot, entry.id);
   const execution = modelExecutionSummary(snapshot, entry.id);
   const inputTokens = telemetry.jobs.reduce((total, job) => total + job.inputTokens, 0);
   const outputTokens = telemetry.jobs.reduce((total, job) => total + job.outputTokens, 0);
   const completedRequests = telemetry.jobs.filter((job) => job.status === "completed").length;
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    window.requestAnimationFrame(() => firstFocusable(dialog)?.focus() ?? dialog.focus());
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { event.preventDefault(); onClose(); return; }
+      trapDialogTab(event, dialog);
+    };
+    window.addEventListener("keydown", keydown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", keydown);
+      previous?.focus();
+    };
+  }, [onClose]);
   return <div className="model-detail-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) onClose(); }}>
-    <aside className="model-detail-drawer" role="dialog" aria-modal="true" aria-labelledby={titleId}>
+    <aside ref={dialogRef} className="model-detail-drawer" role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1}>
       <header className="model-detail-head">
         <div className="model-detail-icon"><Boxes /></div>
         <div><span>NETWORK MODEL</span><h2 id={titleId}>{entry.id}</h2><small>{networkModelRuntimeLabel(telemetry.deployments)}</small></div>
@@ -2433,8 +2543,9 @@ const MESH_AMBIENT_SPORES = [
   { x: 94, y: 28 }, { x: 7, y: 77 },
 ] as const;
 
-function InteractiveMesh({ workers, registeredWorkers, sharedVramMb, publicLink, external, developerMode, onNavigate }: {
+function InteractiveMesh({ workers, traces, registeredWorkers, sharedVramMb, publicLink, external, developerMode, onNavigate }: {
   workers: PublicWorker[];
+  traces: NetworkExecutionTrace[];
   registeredWorkers: number;
   sharedVramMb: number;
   publicLink: (path: string) => string;
@@ -2453,12 +2564,18 @@ function InteractiveMesh({ workers, registeredWorkers, sharedVramMb, publicLink,
   const selectedWorkerPosition = selectedWorkerIndex >= 0 ? MESH_OVERVIEW_POSITIONS[selectedWorkerIndex] ?? { x: 50, y: 50 } : null;
   const visibleOfferedVramMb = visibleWorkers.reduce((total, worker) => total + worker.offeredVramMb, 0);
   const selectedSharePercent = selectedWorker && visibleOfferedVramMb > 0 ? selectedWorker.offeredVramMb / visibleOfferedVramMb * 100 : 0;
-  const links = visibleWorkers.map((worker, index) => {
-    const target = MESH_OVERVIEW_POSITIONS[index] ?? { x: 50, y: 50 };
-    if (index < 2) return { worker, target, source: { x: 50, y: 50 } };
-    const parentIndex = Math.floor((index - 2) / 2);
-    return { worker, target, source: MESH_OVERVIEW_POSITIONS[parentIndex] ?? { x: 50, y: 50 } };
+  const positions = new Map<string, { x: number; y: number }>();
+  visibleWorkers.forEach((worker, index) => {
+    const position = MESH_OVERVIEW_POSITIONS[index] ?? { x: 50, y: 50 };
+    positions.set(worker.id, position);
+    if (worker.executionNodeId) positions.set(worker.executionNodeId, position);
   });
+  const links = projectObservedTopology(visibleWorkers, traces).flatMap((link) => {
+    const source = positions.get(link.sourceNodeId);
+    const target = positions.get(link.destinationNodeId);
+    return source && target ? [{ link, source, target }] : [];
+  });
+  const physicalLinks = links.filter(({ link }) => link.evidenceClass === "physical").length;
 
   useEffect(() => {
     const updateFullscreen = () => setFullscreen(document.fullscreenElement === cardRef.current);
@@ -2489,10 +2606,10 @@ function InteractiveMesh({ workers, registeredWorkers, sharedVramMb, publicLink,
     <article className={`network-canvas interactive-mesh${fullscreen ? " fullscreen" : ""}`} ref={cardRef}>
       <div className="canvas-head mesh-canvas-head">
         <div><span>LIVE TOPOLOGY</span><strong>Explore the network</strong></div>
-        <div className="mesh-head-status" aria-label={`${visibleWorkers.length} live nodes and ${links.length} active links`}>
-          <b><i /> LIVE</b>
+        <div className="mesh-head-status" aria-label={`${visibleWorkers.length} observed nodes and ${links.length} evidenced routes`}>
+          <b><i /> OBSERVED</b>
           <span>{visibleWorkers.length} NODES</span>
-          <span>{links.length} LINKS</span>
+          <span>{links.length} ROUTES</span>
         </div>
         <div className="mesh-head-actions">
           {developerMode && <button className="canvas-link" onClick={() => onNavigate("nodes")}>Node details</button>}
@@ -2528,13 +2645,10 @@ function InteractiveMesh({ workers, registeredWorkers, sharedVramMb, publicLink,
                 <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
               </filter>
             </defs>
-            {links.map(({ worker, source, target }, index) => {
+            {links.map(({ link, source, target }) => {
               const path = `M ${source.x} ${source.y} L ${target.x} ${target.y}`;
-              return <g key={worker.id} className={selectedWorkerId === worker.id ? "selected" : ""}>
+              return <g key={`${link.sourceNodeId}:${link.destinationNodeId}:${link.transport}`} className={`mesh-link-${link.evidenceClass}`}>
                 <path d={path} pathLength="1" />
-                <circle className="mesh-packet" r=".62" filter="url(#mesh-packet-glow)">
-                  <animateMotion dur={`${3.6 + (index % 4) * 0.7}s`} begin={`${index * -0.73}s`} path={path} repeatCount="indefinite" />
-                </circle>
               </g>;
             })}
           </svg>
@@ -2564,7 +2678,7 @@ function InteractiveMesh({ workers, registeredWorkers, sharedVramMb, publicLink,
           })}
         </div>
         {visibleWorkers.length === 0 && <div className="network-empty interactive-empty"><Wifi size={28} /><strong>The mesh is ready for its first node</strong><span>Every connected device becomes part of the live topology.</span><a href={publicLink("/mobile/")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}>Connect this device <ArrowRight size={13} /></a></div>}
-        <div className="mesh-stage-legend"><b><i /> LIVE</b><span>{visibleWorkers.length} nodes</span><span>Encrypted peer links</span></div>
+        <div className="mesh-stage-legend"><b><i /> OBSERVED</b><span>{physicalLinks} physical</span><span>{links.length - physicalLinks} declared/simulated</span>{links.length === 0 && <span>No route observed yet</span>}</div>
         {selectedWorker && selectedWorkerPosition && <MeshNodePopover worker={selectedWorker} position={selectedWorkerPosition} sharePercent={selectedSharePercent} onClose={() => setSelectedWorkerId("")} />}
         {visibleWorkers.length > 0 && <div className="mesh-zoom-controls" aria-label="Network zoom controls">
           <button onClick={() => setZoom((value) => Math.min(1.35, value + 0.12))} disabled={zoom >= 1.35} aria-label="Zoom in"><Plus /></button>
@@ -2574,7 +2688,7 @@ function InteractiveMesh({ workers, registeredWorkers, sharedVramMb, publicLink,
       </div>
       <div className="network-summary mesh-network-summary">
         <div><span>Nodes online</span><strong>{workers.length} / {registeredWorkers}</strong></div>
-        <div><span>Active links</span><strong>{links.length}</strong></div>
+        <div><span>Evidenced routes</span><strong>{links.length}</strong></div>
         <div><span>Shared VRAM</span><strong>{formatMemory(sharedVramMb)}</strong></div>
       </div>
     </article>
@@ -2587,13 +2701,34 @@ export function MeshNodePopover({ worker, position, sharePercent, onClose }: {
   sharePercent: number;
   onClose: () => void;
 }) {
+  const dialogRef = useRef<HTMLElement>(null);
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
   const models = [...new Set(worker.deployments.map((deployment) => deployment.model))];
   const status = workerPeerStatus(worker);
   const role = workerPeerRole(worker);
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    window.requestAnimationFrame(() => firstFocusable(dialog)?.focus() ?? dialog.focus());
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      closeRef.current();
+    };
+    window.addEventListener("keydown", keydown);
+    return () => {
+      window.removeEventListener("keydown", keydown);
+      previous?.focus();
+    };
+  }, []);
   return <aside
+    ref={dialogRef}
     className={`mesh-node-popover ${position.y < 44 ? "below" : "above"}`}
     role="dialog"
     aria-label={`Node details for ${workerLabel(worker)}`}
+    tabIndex={-1}
     style={{
       "--mesh-popover-x": `${Math.max(18, Math.min(82, position.x))}%`,
       "--mesh-popover-y": `${position.y}%`,
@@ -2940,29 +3075,41 @@ function NodeTopologyInspector({ worker, snapshot }: { worker: PublicWorker; sna
   return <div className="node-topology-inspector">
     <div className={`node-inspector-identity ${nodeVisualState(worker)}`}><div><WorkerKindIcon worker={worker} /></div><span><small>{worker.kind === "cell" ? "SELECTED CELL" : "SELECTED NODE"}</small><strong>{workerLabel(worker)}</strong><em>{worker.region} · {shortId(worker.id)}</em><ExecutionBadge execution={execution} workers={snapshot.workers} /></span></div>
     <div className="node-inspector-metrics">
-      <Metric label="Status" value={nodeStatusLabel(worker)} />
-      <Metric label="Type" value={kind} />
-      <Metric label="Region" value={worker.region} />
-      <Metric label="Last seen" value={relativeTimeEs(worker.lastSeenAt)} />
-      <Metric label="Reliability" value={`${Math.round(Math.max(0, Math.min(1, worker.reliability)) * 100)}%`} />
-      <Metric label="Version" value={worker.agentVersion ? `v${worker.agentVersion}` : "Legacy"} />
-      <Metric label="Declared build" value={shortBuildIdentity(worker.buildIdentity)} />
-      <Metric label={worker.kind === "cell" ? "Aggregated capacity" : "Physical VRAM"} value={physicalVram > 0 ? formatMemory(physicalVram) : "No data"} />
-      <Metric label="Offered memory" value={formatMemory(worker.offeredVramMb)} />
-      <Metric label="Free memory" value={formatMemory(free)} />
-      <Metric label="Physical load" value={utilization === null ? "No data" : `${utilization.toFixed(0)}%`} />
-      <Metric label="Max temperature" value={maximumTemperature === null ? "No data" : `${maximumTemperature.toFixed(0)} °C`} />
-      <Metric label="GPU power" value={observedPower === null ? "No data" : formatPower(observedPower)} />
-      <Metric label="Real compute" value={execution.verified ? executionShortLabel(execution) : "Unverified"} />
-      <Metric label="GPU runtime" value={worker.acceleration ? remoteAccelerationLabel(worker.acceleration) : "No diagnostics"} />
-      <Metric label="Mode" value={computeMode} />
-      <Metric label="Measured inference" value={throughput > 0 ? `${formatCompactNumber(throughput)} tok/s` : "Not measured"} />
-      <Metric label="Models" value={String(worker.deployments.length)} />
-      <Metric label="Completed" value={String(worker.jobsCompleted)} />
+      <Metric label="Estado" value={nodeStatusLabel(worker)} />
+      <Metric label="Tipo" value={kind} />
+      <Metric label="Región" value={worker.region} />
+      <Metric label="Última señal" value={relativeTimeEs(worker.lastSeenAt)} />
+      <Metric label="Fiabilidad" value={`${Math.round(Math.max(0, Math.min(1, worker.reliability)) * 100)}%`} />
+      <Metric label="Versión" value={worker.agentVersion ? `v${worker.agentVersion}` : "Legacy"} />
+      <Metric label="Build declarado" value={shortBuildIdentity(worker.buildIdentity)} />
+      <Metric label={worker.kind === "cell" ? "Capacidad agregada" : "VRAM física"} value={physicalVram > 0 ? formatMemory(physicalVram) : "Sin datos"} />
+      <Metric label="Memoria ofrecida" value={formatMemory(worker.offeredVramMb)} />
+      <Metric label="Memoria libre" value={formatMemory(free)} />
+      <Metric label="Carga física" value={utilization === null ? "Sin datos" : `${utilization.toFixed(0)}%`} />
+      <Metric label="Temperatura máx." value={maximumTemperature === null ? "Sin datos" : `${maximumTemperature.toFixed(0)} °C`} />
+      <Metric label="Consumo GPU" value={observedPower === null ? "Sin datos" : formatPower(observedPower)} />
+      <Metric label="Cómputo real" value={execution.verified ? executionShortLabel(execution) : "No verificado"} />
+      <Metric label="Prueba física" value={capabilityStateLabel(worker.observedCapability?.probe.state)} />
+      <Metric label="Canary" value={capabilityStateLabel(worker.observedCapability?.canary.state)} />
+      <Metric label="Elegibilidad" value={worker.observedCapability?.eligibility.serving ? "Serving verificado" : worker.observedCapability?.eligibility.activation ? "Listo para activar" : "Sólo claim"} />
+      <Metric label="GPU runtime" value={worker.acceleration ? remoteAccelerationLabel(worker.acceleration) : "Sin diagnóstico"} />
+      <Metric label="Modo" value={computeMode} />
+      <Metric label="Inferencia medida" value={throughput > 0 ? `${formatCompactNumber(throughput)} tok/s` : "Sin medir"} />
+      <Metric label="Modelos" value={String(worker.deployments.length)} />
+      <Metric label="Completadas" value={String(worker.jobsCompleted)} />
     </div>
     {worker.acceleration && <RemoteAccelerationDiagnostics diagnostics={worker.acceleration} />}
     {worker.isolation && <ExecutorIsolationDiagnostics isolation={worker.isolation} />}
   </div>;
+}
+
+function capabilityStateLabel(
+  state: "missing" | "verified" | "stale" | "invalid" | undefined,
+): string {
+  if (state === "verified") return "Verificada";
+  if (state === "stale") return "Caducada";
+  if (state === "invalid") return "Inválida";
+  return "Pendiente";
 }
 
 function ExecutorIsolationDiagnostics({
@@ -3189,7 +3336,7 @@ function Models({ snapshot, onSearch, onRequest, onRemove, adminToken: initialAd
           <label><span>SORT BY</span><AppSelect ariaLabel="Sort Hugging Face models" value={catalogSort} onChange={(value) => setCatalogSort(value as typeof catalogSort)} options={[{ value: "downloads", label: "Most downloaded" }, { value: "likes", label: "Most liked" }, { value: "lastModified", label: "Recently updated" }, { value: "name", label: "Name A–Z" }, { value: "memory", label: "Memory low–high" }]} /></label>
         </div>
         <div className="hub-catalog-heading"><span>{visibleCatalogModels.length} SHOWN · {catalogModels.length} LOADED FROM HUGGING FACE</span><a href="https://huggingface.co/models?pipeline_tag=text-generation" target="_blank" rel="noreferrer">Explore Hugging Face <ExternalLink size={12} /></a></div>
-        {catalogError && <div className="hub-catalog-state error"><CircleAlert size={15} />Catalog unavailable. You can still enter a model manually below.</div>}
+        {catalogError && <div className="hub-catalog-state error" role="alert"><CircleAlert size={15} />Catalog unavailable. You can still enter a model manually below.</div>}
         {!catalogError && !catalogBusy && catalogModels.length === 0 && <div className="hub-catalog-state">{catalogQuery.trim().length === 1 ? "Type at least two characters to search." : "No matching models found."}</div>}
         {!catalogError && !catalogBusy && catalogModels.length > 0 && visibleCatalogModels.length === 0 && <div className="hub-catalog-state">No loaded models match these filters. Change a filter or load more results.</div>}
         {visibleCatalogModels.length > 0 && <div className="hub-model-table-wrap"><table className="hub-model-table">
@@ -3218,7 +3365,7 @@ function Models({ snapshot, onSearch, onRequest, onRemove, adminToken: initialAd
         <label className="model-auto-toggle"><input type="checkbox" checked={autoActivate} onChange={(event) => setAutoActivate(event.target.checked)} /><span><strong>Activate automatically</strong><small>Start as soon as compatible capacity reaches the requirement.</small></span></label>
         <button className="model-submit" disabled={busy || !source.trim() || !modelId.trim() || (requiresAdminToken && !adminToken.trim())}>{busy ? <LoaderCircle className="spin" /> : <Play size={16} />}{busy ? "Inspecting model…" : "Calculate and prepare"}</button>
       </div>
-      {formError && <div className="model-form-error"><CircleAlert size={16} />{formError}</div>}
+      {formError && <div className="model-form-error" role="alert"><CircleAlert size={16} />{formError}</div>}
     </form>
 
     <div className="model-request-list">
@@ -3313,53 +3460,86 @@ function ActivationIncidentPanel({
   </aside>;
 }
 
-function Jobs({ snapshot }: { snapshot: PublicSnapshot }) {
-  const [visibleCount, setVisibleCount] = useState(20);
-  const visibleJobs = snapshot.jobs.slice(0, visibleCount);
+export function Jobs({ snapshot, operatorAccess = false, accessToken = null }: {
+  snapshot: PublicSnapshot;
+  operatorAccess?: boolean;
+  accessToken?: string | null;
+}) {
+  const [evidence, setEvidence] = useState<OperatorEvidenceSnapshot | null>(null);
+  const [evidenceError, setEvidenceError] = useState<string | null>(null);
+  const [evidenceBusy, setEvidenceBusy] = useState(false);
+  const loadEvidence = useCallback(async () => {
+    if (!operatorAccess || !accessToken) return;
+    setEvidenceBusy(true);
+    try {
+      setEvidence(await loadOperatorEvidence(accessToken));
+      setEvidenceError(null);
+    } catch (caught) {
+      setEvidenceError(errorText(caught));
+    } finally {
+      setEvidenceBusy(false);
+    }
+  }, [accessToken, operatorAccess]);
+
+  useEffect(() => { void loadEvidence(); }, [loadEvidence]);
+  const receiptJobs = new Set(evidence?.receipts.map((receipt) => receipt.jobId) ?? []);
   return <section><PageTitle eyebrow="EXECUTION LOG" title="Network jobs" copy="Recent inference requests and their execution state." />
     <div className="panel-table jobs-table"><div className="panel-table-head"><span>Request</span><span>Model</span><span>Tokens</span><span>Status</span></div>
-      {visibleJobs.map((job) => <div className="panel-table-row" key={job.id}><strong><Activity size={16} />{shortId(job.id)}<small>{relativeTime(job.createdAt)}</small></strong><span>{job.model}</span><span>{job.inputTokens + job.outputTokens}</span><b className={job.status}><i />{job.status}</b></div>)}
+      {snapshot.jobs.map((job) => <div className="panel-table-row" key={job.id}><strong><Activity size={16} />{shortId(job.id)}<small>{relativeTime(job.createdAt)}{receiptJobs.has(job.id) ? " · receipt verified" : ""}</small></strong><span>{job.model}</span><span>{job.inputTokens + job.outputTokens}</span><b className={job.status}><i />{job.status}</b></div>)}
       {snapshot.jobs.length === 0 && <Empty icon={Activity} title="No jobs yet" copy="Use the inference console when a model becomes available." />}
     </div>
-    {visibleCount < snapshot.jobs.length && <div className="panel-load-more"><span>Showing {visibleJobs.length} of {snapshot.jobs.length} tasks</span><button type="button" onClick={() => setVisibleCount((count) => count + 20)}><Plus size={15} />Load 20 more</button></div>}
+    {operatorAccess && accessToken && <OperatorEvidence evidence={evidence} busy={evidenceBusy} error={evidenceError} onRefresh={loadEvidence} />}
   </section>;
+}
+
+function OperatorEvidence({ evidence, busy, error, onRefresh }: {
+  evidence: OperatorEvidenceSnapshot | null;
+  busy: boolean;
+  error: string | null;
+  onRefresh: () => Promise<void>;
+}) {
+  return <section className="operator-evidence-console" aria-labelledby="operator-evidence-title" aria-busy={busy}>
+    <header><div><small>READ-ONLY · ROLE RESTRICTED</small><h2 id="operator-evidence-title">Operator evidence</h2><span>Incidents, signed releases, certifications and receipts from canonical stores.</span></div>
+      <button type="button" disabled={busy} onClick={() => void onRefresh()}>{busy ? <LoaderCircle className="spin" /> : <RefreshCw />}Refresh</button></header>
+    {error && <div className="operator-evidence-error" role="alert"><CircleAlert />Evidence unavailable: {error}</div>}
+    {!evidence && busy && <div className="operator-evidence-loading" role="status" aria-live="polite"><LoaderCircle className="spin" />Verifying operational evidence…</div>}
+    {evidence && <div className="operator-evidence-grid" aria-live="polite">
+      <EvidenceLane title="Incidents" count={evidence.incidents.length} state={evidence.incidents.length ? "attention" : "clear"}>
+        {evidence.incidents.slice(0, 4).map(({ modelId, incident }) => <article key={`${modelId}-${incident.code}`}><b>{incident.title}</b><span>{modelId} · {incident.repairState}</span><small>{incident.summary}</small></article>)}
+        {evidence.incidents.length === 0 && <p>No active activation incidents.</p>}
+      </EvidenceLane>
+      <EvidenceLane title="Releases" count={evidence.releases.items.length} state={evidence.releases.configured ? "clear" : "blocked"}>
+        {evidence.releases.items.slice(0, 4).map((release) => <article key={`${release.channel}-${release.platform}-${release.arch}`}><b>{release.channel} · sequence {release.sequence}</b><span>{release.platform}/{release.arch}</span><small>{shortId(release.manifestId)}</small></article>)}
+        {evidence.releases.items.length === 0 && <p>{evidence.releases.configured ? "No signed manifest published." : "Component release store is not configured."}</p>}
+      </EvidenceLane>
+      <EvidenceLane title="Certifications" count={evidence.certifications.items.length} state={evidence.certifications.configured ? "clear" : "blocked"}>
+        {evidence.certifications.items.slice(0, 4).map((certification) => <article key={certification.certificationId}><b>{certification.modelFamily} · {certification.decision}</b><span>{certification.topology} · {certification.platform}/{certification.backend}</span><small>{shortId(certification.certificationId)}</small></article>)}
+        {evidence.certifications.items.length === 0 && <p>{evidence.certifications.configured ? "No signed model certification published." : "Durable certification registry is not configured."}</p>}
+      </EvidenceLane>
+      <EvidenceLane title="Receipts" count={evidence.receipts.length} state="clear">
+        {evidence.receipts.slice(0, 4).map((receipt) => <article key={receipt.receiptId}><b>{shortId(receipt.jobId)} · {receipt.routeClass}</b><span>{receipt.recoveryMode}</span><small>{shortId(receipt.receiptId)}</small></article>)}
+        {evidence.receipts.length === 0 && <p>No signed execution receipt yet.</p>}
+      </EvidenceLane>
+    </div>}
+  </section>;
+}
+
+function EvidenceLane({ title, count, state, children }: { title: string; count: number; state: "clear" | "attention" | "blocked"; children: ReactNode }) {
+  return <section className={`operator-evidence-lane ${state}`}><header><h3>{title}</h3><b aria-label={`${count} ${title.toLowerCase()}`}>{count}</b></header><div>{children}</div></section>;
 }
 
 type SystemLogFilter = "important" | "errors" | "all";
 
-function SystemLogs({ snapshot, bridge, connectionError }: { snapshot: PublicSnapshot; bridge: DesktopBridge | undefined; connectionError: string | null }) {
-  const [desktopLogs, setDesktopLogs] = useState<SystemLogSnapshot | null>(null);
+function SystemLogs({ snapshot, connectionError }: { snapshot: PublicSnapshot; connectionError: string | null }) {
   const [filter, setFilter] = useState<SystemLogFilter>("important");
   const [query, setQuery] = useState("");
-  const [loading, setLoading] = useState(Boolean(bridge));
-  const [loadError, setLoadError] = useState<string | null>(null);
   const [visibleCount, setVisibleCount] = useState(30);
-
-  const load = useCallback(async (silent = false) => {
-    if (!bridge) return;
-    if (!silent) setLoading(true);
-    try {
-      setDesktopLogs(await bridge.getSystemLogs());
-      setLoadError(null);
-    } catch (caught) {
-      if (!silent) setLoadError(errorText(caught));
-    } finally {
-      if (!silent) setLoading(false);
-    }
-  }, [bridge]);
-
-  useEffect(() => {
-    if (!bridge) return;
-    void load();
-    const timer = window.setInterval(() => void load(true), 5_000);
-    return () => window.clearInterval(timer);
-  }, [bridge, load]);
 
   const networkLogs = useMemo(
     () => networkSnapshotLogs(snapshot, connectionError),
     [connectionError, snapshot],
   );
-  const logSnapshot = desktopLogs ?? networkLogs;
+  const logSnapshot = networkLogs;
   const normalizedQuery = query.trim().toLowerCase();
   const visibleEntries = logSnapshot.entries.filter((entry) => {
     if (filter === "errors" && entry.level !== "error") return false;
@@ -3376,14 +3556,13 @@ function SystemLogs({ snapshot, bridge, connectionError }: { snapshot: PublicSna
   return <section className="system-logs-page">
     <PageTitle
       eyebrow="SYSTEM DIAGNOSTICS"
-      title="Important logs"
-      copy={bridge ? "Real, sanitized events from the application, runtime, workers and updates." : "Important activity observed across the coordinator, nodes, models and tasks."}
-      actions={<button disabled={loading} onClick={() => void load()}>{loading ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}Refresh</button>}
+      title="Logs importantes"
+      copy="Actividad importante observable desde el coordinador, los nodos, los modelos y las tareas."
     />
     <div className="system-log-summary">
-      <article><ScrollText /><span><small>LOADED ENTRIES</small><strong>{logSnapshot.entries.length}</strong><em>{bridge ? "Safe local log" : "Current network status"}</em></span></article>
-      <article className="warning"><CircleAlert /><span><small>WARNINGS</small><strong>{warningCount}</strong><em>Retries and degradation</em></span></article>
-      <article className="error"><X /><span><small>ERRORS</small><strong>{errorCount}</strong><em>Events requiring attention</em></span></article>
+      <article><ScrollText /><span><small>ENTRADAS CARGADAS</small><strong>{logSnapshot.entries.length}</strong><em>Estado actual de la red</em></span></article>
+      <article className="warning"><CircleAlert /><span><small>AVISOS</small><strong>{warningCount}</strong><em>Reintentos y degradaciones</em></span></article>
+      <article className="error"><X /><span><small>ERRORES</small><strong>{errorCount}</strong><em>Eventos que requieren atención</em></span></article>
     </div>
     <div className="system-log-toolbar">
       <div className="system-log-filters" role="group" aria-label="Filter logs">
@@ -3393,11 +3572,10 @@ function SystemLogs({ snapshot, bridge, connectionError }: { snapshot: PublicSna
       </div>
       <label className="system-log-search"><Search /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search event, source, or message…" /></label>
     </div>
-    {loadError && <div className="inline-error"><CircleAlert size={17} />Could not read local logs: {loadError}</div>}
-    {logSnapshot.truncated && <div className="system-log-notice"><CircleAlert />Only the most recent entries are shown to keep the panel fast and safe.</div>}
+    {logSnapshot.truncated && <div className="system-log-notice"><CircleAlert />Se muestran únicamente las entradas más recientes para mantener el panel rápido y seguro.</div>}
     <div className="system-log-list" aria-live="polite">
-      {loading && !desktopLogs ? <div className="system-log-loading"><LoaderCircle className="spin" /><span>Reading important events…</span></div> : renderedEntries.map((entry) => <SystemLogRow entry={entry} key={entry.id} />)}
-      {!loading && visibleEntries.length === 0 && <Empty icon={ScrollText} title="No logs for this filter" copy={normalizedQuery ? "Try another search or show all levels." : "No events have been recorded at this level."} />}
+      {visibleEntries.map((entry) => <SystemLogRow entry={entry} key={entry.id} />)}
+      {visibleEntries.length === 0 && <Empty icon={ScrollText} title="No hay logs para este filtro" copy={normalizedQuery ? "Prueba otra búsqueda o muestra todos los niveles." : "No se han registrado eventos de este nivel."} />}
     </div>
     {visibleCount < visibleEntries.length && <div className="panel-load-more"><span>Showing {renderedEntries.length} of {visibleEntries.length} matching events</span><button type="button" onClick={() => setVisibleCount((count) => count + 30)}><Plus size={15} />Load 30 more</button></div>}
     <footer className="system-log-safety"><ShieldCheck /><span><strong>Safe, limited read</strong><small>Credentials, tokens, passwords and secrets are redacted before reaching this screen.</small></span></footer>
@@ -3518,7 +3696,7 @@ function humanizeSystemLogEvent(event: string): string {
   return event.replace(/[-_.]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
-function Tests({ bridge }: { bridge: DesktopBridge | undefined }) {
+function Tests() {
   const [runs, setRuns] = useState<BenchmarkRun[]>([]);
   const [selectedRunId, setSelectedRunId] = useState("");
   const [comparisonRunId, setComparisonRunId] = useState("");
@@ -3530,7 +3708,7 @@ function Tests({ bridge }: { bridge: DesktopBridge | undefined }) {
   const loadRuns = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     try {
-      const next = bridge ? await bridge.getBenchmarkRuns() : await fetchBenchmarkRuns();
+      const next = await fetchBenchmarkRuns();
       setRuns(next);
       setSelectedRunId((current) => next.some((run) => run.runId === current) ? current : next[0]?.runId ?? "");
       setError(null);
@@ -3539,7 +3717,7 @@ function Tests({ bridge }: { bridge: DesktopBridge | undefined }) {
     } finally {
       if (!silent) setLoading(false);
     }
-  }, [bridge]);
+  }, []);
 
   useEffect(() => {
     void loadRuns();
@@ -3551,7 +3729,7 @@ function Tests({ bridge }: { bridge: DesktopBridge | undefined }) {
     setRunning(true);
     setError(null);
     try {
-      const run = bridge ? await bridge.runBenchmark() : await requestBenchmarkRun();
+      const run = await requestBenchmarkRun();
       setRuns((current) => [run, ...current.filter((item) => item.runId !== run.runId)]);
       setSelectedRunId(run.runId);
       setComparisonRunId("");
@@ -3634,9 +3812,9 @@ function Tests({ bridge }: { bridge: DesktopBridge | undefined }) {
   ];
 
   return <section className="tests-page">
-    <PageTitle eyebrow="AUTOMATED REAL TESTS" title="Does Mycellios really improve?" copy="Compare speed, latency and efficiency without mixing different models, capacity, routes or hardware." actions={<button disabled={running} onClick={() => void runNow()}>{running ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}{running ? "Measuring…" : "Run test again"}</button>} />
-    <div className="benchmark-auto-notice"><Activity size={19} /><span><strong>Automatic measurement with real evidence</strong>The bench warms the model, repeats requests and records its variation. A missing reading appears as “No reading”; it is never estimated to fill the screen.</span></div>
-    {error && <div className="benchmark-error"><CircleAlert size={17} /><span><strong>Test could not run</strong>{error}</span></div>}
+    <PageTitle eyebrow="PRUEBAS REALES AUTOMÁTICAS" title="¿Mycellios mejora de verdad?" copy="Compara velocidad, latencia y eficiencia sin mezclar modelos, capacidad, rutas o hardware diferentes." actions={<button disabled={running} onClick={() => void runNow()}>{running ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}{running ? "Midiendo…" : "Repetir prueba ahora"}</button>} />
+    <div className="benchmark-auto-notice"><Activity size={19} /><span><strong>Medición automática con evidencia real</strong>El banco calienta el modelo, repite peticiones y guarda su variación. Una lectura ausente aparece como “Sin lectura”; nunca se estima para rellenar la pantalla.</span></div>
+    {error && <div className="benchmark-error" role="alert"><CircleAlert size={17} /><span><strong>No se pudo ejecutar la prueba</strong>{error}</span></div>}
     <div className="panel-stat-grid benchmark-stats">
       <Stat icon={Activity} label="Pruebas visibles" value={String(filteredRuns.length)} detail={`${runs.length} guardadas en total`} />
       <Stat icon={Boxes} label="Selected model" value={selectedMeasurement?.model.label ?? "No reading"} detail={selected ? `v${selected.version} · ${formatBenchmarkDate(selected.finishedAt)}` : "No measurements"} />
@@ -4217,11 +4395,11 @@ function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthent
     </div>}
     <div className={`inference-console${inferenceAvailable ? "" : " is-unavailable"}`} aria-disabled={!inferenceAvailable}>
       <div className="inference-toolbar">
-        <div className="inference-toolbar-title"><MessageSquareText /><span><strong>Chat</strong><small>Real-time distributed inference</small></span></div>
-        {developerMode && <div className="inference-toolbar-controls">
-          <span className="inference-toolbar-stat"><Network /><b>{selectedOption?.nodeCount ?? 0}</b> node{selectedOption?.nodeCount === 1 ? "" : "s"}</span>
-          <span className="inference-toolbar-stat"><MemoryStick /><b>{selectedOption && selectedOption.peerMemoryMb > 0 ? formatMemory(selectedOption.peerMemoryMb) : "—"}</b> memory</span>
-        </div>}
+        <div className="inference-toolbar-title"><MessageSquareText /><span><strong>Chat</strong><small>Inferencia distribuida en tiempo real</small></span></div>
+        <div className="inference-toolbar-controls">
+          <span className="inference-toolbar-stat"><Network /><b>{selectedOption?.nodeCount ?? 0}</b> nodo{selectedOption?.nodeCount === 1 ? "" : "s"}</span>
+          <span className="inference-toolbar-stat"><MemoryStick /><b>{selectedOption && selectedOption.peerMemoryMb > 0 ? formatMemory(selectedOption.peerMemoryMb) : "—"}</b> memoria</span>
+        </div>
       </div>
       {developerMode && <div className="inference-route-strip">
         {inferenceAvailable
@@ -4230,15 +4408,15 @@ function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthent
       </div>}
       <div className="inference-output" aria-live="polite" ref={outputRef}>
         {turns.length === 0 && !pendingTurn && !error && (inferenceAvailable
-          ? <div className="inference-welcome"><Sparkles /><h2>Ask a question</h2><p>The response comes exclusively from the selected native Mycellios deployment.</p><div className="inference-suggestions">{["Summarize how this network works", "Explain an idea in three sentences", "Answer with a short proof"].map((suggestion) => <button key={suggestion} onClick={() => setPrompt(suggestion)}>{suggestion}</button>)}</div></div>
-          : <div className="inference-welcome inference-welcome-locked"><LockKeyhole /><h2>{modelAvailable ? "Chat is waiting for your account" : "Chat is waiting for a model"}</h2><p>{modelAvailable ? "Sign in to activate sending with your token balance." : "You can write and send messages once the network confirms a real inference connection."}</p></div>)}
-        {turns.map((turn) => <InferenceCompletedTurn turn={turn} compact={!developerMode} key={turn.id} />)}
-        {pendingTurn && <InferenceStreamingTurn turn={pendingTurn} compact={!developerMode} />}
-        {error && <div className="inference-error"><CircleAlert /><div><strong>Inference could not be completed</strong><span>{friendlyInferenceError(error)}</span></div></div>}
+          ? <div className="inference-welcome"><Sparkles /><h2>Escribe una pregunta</h2><p>La respuesta vendrá exclusivamente del despliegue nativo seleccionado de Mycellios.</p><div className="inference-suggestions">{["Resume cómo funciona esta red", "Explica una idea en tres frases", "Responde con una prueba corta"].map((suggestion) => <button key={suggestion} onClick={() => setPrompt(suggestion)}>{suggestion}</button>)}</div></div>
+          : <div className="inference-welcome inference-welcome-locked"><LockKeyhole /><h2>{modelAvailable ? "El chat está esperando tu cuenta" : "El chat está esperando un modelo"}</h2><p>{modelAvailable ? "Inicia sesión para activar el envío con tu saldo de tokens." : "Podrás escribir y enviar mensajes en cuanto la red confirme una conexión de inferencia real."}</p></div>)}
+        {turns.map((turn) => <InferenceCompletedTurn turn={turn} key={turn.id} />)}
+        {pendingTurn && <InferenceStreamingTurn turn={pendingTurn} />}
+        {error && <div className="inference-error" role="alert"><CircleAlert /><div><strong>No se pudo completar la inferencia</strong><span>{friendlyInferenceError(error)}</span></div></div>}
       </div>
       <div className="inference-input">
-        {attachments.length > 0 && <div className="inference-attachments" aria-label="Attached files">{attachments.map((attachment) => <div key={attachment.id}><FileText /><span><strong>{attachment.name}</strong><small>{formatFileSize(attachment.size)} · {attachment.kind.toUpperCase()}{attachment.truncated ? " · truncated" : ""}</small></span><button type="button" onClick={() => setAttachments((current) => current.filter((item) => item.id !== attachment.id))} aria-label={`Remove ${attachment.name}`}><X /></button></div>)}</div>}
-        {attachmentError && <div className="inference-attachment-error"><CircleAlert />{attachmentError}</div>}
+        {attachments.length > 0 && <div className="inference-attachments" aria-label="Archivos adjuntos">{attachments.map((attachment) => <div key={attachment.id}><FileText /><span><strong>{attachment.name}</strong><small>{formatFileSize(attachment.size)} · {attachment.kind.toUpperCase()}{attachment.truncated ? " · contenido recortado" : ""}</small></span><button type="button" onClick={() => setAttachments((current) => current.filter((item) => item.id !== attachment.id))} aria-label={`Quitar ${attachment.name}`}><X /></button></div>)}</div>}
+        {attachmentError && <div className="inference-attachment-error" role="alert"><CircleAlert />{attachmentError}</div>}
         <div className="inference-composer-row">
           <input ref={fileInputRef} hidden type="file" multiple accept={INFERENCE_FILE_ACCEPT} onChange={(event) => void addFiles(event.target.files)} />
           <button type="button" className="inference-attach" disabled={!inferenceAvailable || pendingTurn !== null || filesBusy || attachments.length >= MAX_INFERENCE_FILES} onClick={() => fileInputRef.current?.click()} aria-label="Attach documents" title="PDF, DOCX, text, code, CSV or JSON">{filesBusy ? <LoaderCircle className="spin" /> : <Paperclip />}</button>
@@ -4247,11 +4425,11 @@ function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthent
         <div className="inference-input-foot"><div className="inference-composer-tools">
           <InferenceModelPicker options={realModels} value={model} onChange={(nextModel) => resetConversation(nextModel)} />
           <div className={`inference-instructions${instructionsOpen ? " open" : ""}`}>
-            <button type="button" aria-label="Conversation instructions" aria-expanded={instructionsOpen} onClick={() => setInstructionsOpen((current) => !current)}><SlidersHorizontal />{instructions.trim() && <i />}</button>
-            {instructionsOpen && <div className="inference-instructions-popover"><header><strong>Conversation instructions</strong><span>Sent before each message.</span></header><textarea value={instructions} onChange={(event) => saveInstructions(event.target.value)} placeholder="For example: answer clearly and flag uncertainty." maxLength={2_000} /><div className="inference-instruction-presets">{["Direct answers", "Step by step", "Code first", "Short summary"].map((preset) => <button type="button" key={preset} onClick={() => saveInstructions(instructions.trim() ? `${instructions.trim()}\n${preset}.` : `${preset}.`)}>{preset}</button>)}</div><footer><button type="button" onClick={() => saveInstructions("")}>Clear</button><button type="button" onClick={() => setInstructionsOpen(false)}>Done</button></footer></div>}
+            <button type="button" aria-label="Instrucciones de esta conversación" aria-expanded={instructionsOpen} onClick={() => setInstructionsOpen((current) => !current)}><SlidersHorizontal />{instructions.trim() && <i />}</button>
+            {instructionsOpen && <div className="inference-instructions-popover"><header><strong>Instrucciones para esta conversación</strong><span>Se enviarán antes de cada mensaje.</span></header><textarea value={instructions} onChange={(event) => saveInstructions(event.target.value)} placeholder="Por ejemplo: responde en español claro y avisa cuando no estés seguro." maxLength={2_000} /><div className="inference-instruction-presets">{["Respuestas directas", "Paso a paso", "Código primero", "Resumen breve"].map((preset) => <button type="button" key={preset} onClick={() => saveInstructions(instructions.trim() ? `${instructions.trim()}\n${preset}.` : `${preset}.`)}>{preset}</button>)}</div><footer><button type="button" onClick={() => saveInstructions("")}>Limpiar</button><button type="button" onClick={() => setInstructionsOpen(false)}>Listo</button></footer></div>}
           </div>
-          <span>{inferenceAvailable ? <><Paperclip size={12} />Files · <kbd>Enter</kbd> send</> : <><LockKeyhole size={12} />{modelAvailable ? "Sign in to send" : "Connect a real model"}</>}</span>
-        </div><div>{turns.length > 0 && <button className="inference-clear" onClick={() => resetConversation()}><Trash2 size={14} />New conversation</button>}<button className="inference-send" disabled={!inferenceAvailable || (!prompt.trim() && attachments.length === 0) || pendingTurn !== null || filesBusy} onClick={() => void send()}>{pendingTurn ? <LoaderCircle className="spin" /> : <Send />}<span>Send</span></button></div></div>
+          <span>{inferenceAvailable ? <><Paperclip size={12} />Archivos · <kbd>Enter</kbd> enviar</> : <><LockKeyhole size={12} />{modelAvailable ? "Inicia sesión para enviar" : "Conecta un modelo real"}</>}</span>
+        </div><div>{turns.length > 0 && <button className="inference-clear" onClick={() => resetConversation()}><Trash2 size={14} />Nueva conversación</button>}<button className="inference-send" disabled={!inferenceAvailable || (!prompt.trim() && attachments.length === 0) || pendingTurn !== null || filesBusy} onClick={() => void send()}>{pendingTurn ? <LoaderCircle className="spin" /> : <Send />}<span>Enviar</span></button></div></div>
       </div>
     </div>
   </section>;
@@ -4263,9 +4441,9 @@ function InferenceStreamingTurn({ turn, compact = false }: { turn: InferencePend
   return <div className="inference-turn pending">
     <InferenceUserMessage prompt={turn.prompt} attachments={turn.attachments} />
     {turn.text ? <div className="inference-message streaming"><img src={brandIcon} alt="" /><div>
-      <div className="inference-stream-head"><span>{turn.model}</span><b><i />GENERATING LIVE</b></div>
-      {turn.phase === "recovering" && <div className="inference-stream-recovery"><LoaderCircle className="spin" size={14} />{turn.statusMessage ?? "Reconnecting and recovering the response…"} <small>attempt {turn.attempt ?? 1} of {turn.maximumAttempts ?? 8}</small></div>}
-      {content.reasoning !== null && <div className="inference-live-reasoning"><span>REASONING</span><p>{content.reasoning}{content.answer === "" && <i className="stream-cursor" />}</p></div>}
+      <div className="inference-stream-head"><span>{turn.model}</span><b><i />GENERANDO EN VIVO</b></div>
+      {turn.phase === "recovering" && <div className="inference-stream-recovery"><LoaderCircle className="spin" size={14} />{turn.statusMessage ?? "Reintentando la petición completa antes del primer token…"} <small>intento {turn.attempt ?? 1} de {turn.maximumAttempts ?? 8}</small></div>}
+      {content.reasoning !== null && <div className="inference-live-reasoning"><span>RAZONAMIENTO</span><p>{content.reasoning}{content.answer === "" && <i className="stream-cursor" />}</p></div>}
       {content.answer && <p>{content.answer}<i className="stream-cursor" /></p>}
       {!compact && <div className="inference-response-metrics live"><span><b>{formatDuration(turn.ttftMs)}</b>first token</span><span><b>{formatDuration(turn.elapsedMs)}</b>current time</span><span><b>{turn.outputTokens}</b>tokens received</span><span><b>{formatLiveThroughput(turn)}</b>tokens/s now</span><span><b>{turn.routeClass}</b>route</span>{turn.affinityHit && <span><b>AFFINITY</b>same route</span>}</div>}
     </div></div> : <div className={`inference-thinking ${turn.phase === "recovering" ? "recovering" : ""}`}><LoaderCircle className="spin" /><span><strong>{waitingStatus}</strong><small>{formatDuration(turn.elapsedMs)}{(turn.attempt ?? 1) > 1 ? ` · attempt ${turn.attempt} of ${turn.maximumAttempts ?? 8}` : ""}</small></span></div>}
@@ -4277,9 +4455,8 @@ function InferenceCompletedTurn({ turn, compact = false }: { turn: InferenceTurn
   const metrics = <div className="inference-response-metrics"><span><b>{formatDuration(turn.response.ttftMs)}</b>first token</span><span><b>{formatDuration(turn.response.activeMs)}</b>total time</span><span><b>{turn.response.outputTokens}</b>output tokens</span><span><b>{formatResponseThroughput(turn.response)}</b>tokens/s</span><span><b>{turn.response.routeClass}</b>route</span>{turn.response.reusedKvTokens > 0 ? <span><b>{turn.response.reusedKvTokens}</b>KV tokens reused</span> : turn.response.affinityHit ? <span><b>AFFINITY</b>same route</span> : null}</div>;
   return <div className="inference-turn">
     <InferenceUserMessage prompt={turn.prompt} attachments={turn.attachments} />
-    {!compact && turn.response.activity && <InferenceActivitySummary activity={turn.response.activity} />}
-    <div className="inference-message"><img src={brandIcon} alt="" /><div><span>{turn.response.model}</span>{content.reasoning && <details className="inference-reasoning"><summary>View model reasoning</summary><p>{content.reasoning}</p></details>}<p>{content.answer}</p>{!compact && metrics}</div></div>
-    {compact && <details className="inference-evidence"><summary><Activity size={14} />Response details<ChevronDown size={14} /></summary>{turn.response.activity && <InferenceActivitySummary activity={turn.response.activity} />}{metrics}</details>}
+    {turn.response.activity && <InferenceActivitySummary activity={turn.response.activity} />}
+    <div className="inference-message"><img src={brandIcon} alt="" /><div><span>{turn.response.model}</span>{content.reasoning && <details className="inference-reasoning"><summary>Ver razonamiento del modelo</summary><p>{content.reasoning}</p></details>}<p>{content.answer}</p><div className="inference-response-metrics"><span><b>{formatDuration(turn.response.ttftMs)}</b>primer token</span><span><b>{formatDuration(turn.response.activeMs)}</b>tiempo total</span><span><b>{turn.response.outputTokens}</b>tokens salida</span><span><b>{formatResponseThroughput(turn.response)}</b>tokens/s</span><span><b>{turn.response.routeClass}</b>ruta</span>{turn.response.recoveryTrace && turn.response.recoveryTrace.finalMode !== "initial" && <span><b>{turn.response.recoveryTrace.finalMode === "full_retry" ? "REINTENTO COMPLETO" : turn.response.recoveryTrace.finalMode.replaceAll("_", " ").toUpperCase()}</b>{turn.response.recoveryTrace.attempts.length} intentos · {turn.response.recoveryTrace.attempts.at(-1)?.restoredTokenCount ?? 0} tokens restaurados</span>}{turn.response.runtimeRecovery && <span title={`Checkpoint ${turn.response.runtimeRecovery.checkpointId}`}><b>RUTA RECONSTRUIDA</b>{turn.response.runtimeRecovery.attempts} intentos · {turn.response.runtimeRecovery.restoredTokenCount} tokens de prefijo · sin traslado KV</span>}{turn.response.reusedKvTokens > 0 ? <span><b>{turn.response.reusedKvTokens}</b>tokens KV reutilizados</span> : turn.response.affinityHit ? <span><b>AFÍN</b>misma ruta</span> : null}</div></div></div>
   </div>;
 }
 
@@ -4353,7 +4530,7 @@ export async function readInferenceAttachment(file: File, remainingChars: number
   } else if (file.type.startsWith("text/") || inferenceTextExtension(extension)) {
     text = await file.text();
   } else {
-    throw new Error(`${file.name} is not supported. Use PDF, DOCX, text, Markdown, CSV, JSON or code files.`);
+    throw new Error(`${file.name} is not supported. Use PDF, DOCX, text, Markdown, CSV, JSON or source files.`);
   }
   const normalized = text.replace(/\u0000/g, "").replace(/\r\n/g, "\n").trim();
   if (!normalized) throw new Error(`Could not extract text from ${file.name}. Scanned PDFs need OCR before attaching.`);
@@ -4390,104 +4567,16 @@ function formatFileSize(bytes: number): string {
 }
 
 function JoinNetwork({ publicLink, external }: { publicLink: (path: string) => string; external: boolean }) {
-  return <section><PageTitle eyebrow="ZERO-CONFIG JOIN" title="Join the network" copy="No account, invitation or terminal. Choose an option, review the detected hardware and confirm participation." />
+  return <section><PageTitle eyebrow="ZERO-CONFIG JOIN" title="Join the network" copy="No terminal required. Open an approved enrollment handoff, review the detected hardware and confirm participation." />
     <div className="join-grid"><a className="join-card featured" href={publicLink("/mobile/?autostart=1")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><div><Smartphone /><span>INSTANT</span></div><h2>Use this browser</h2><p>Works on modern Android, iPhone, tablet and desktop browsers. Keep the page visible while contributing.</p><ul><li><CheckCircle2 />WebGPU when available</li><li><CheckCircle2 />Automatic CPU fallback</li><li><CheckCircle2 />One explicit confirmation</li></ul><strong>Open and confirm <ArrowRight /></strong></a>
-      <a className="join-card" href={publicLink("/downloads")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><div><Laptop /><span>WINDOWS · MACOS · LINUX</span></div><h2>Install the desktop agent</h2><p>Detects the hardware, prepares the certified runtime automatically and contributes on CPU while GPU setup finishes.</p><ul><li><CheckCircle2 />Windows CUDA/ROCm and Apple Silicon MPS when certified</li><li><CheckCircle2 />Automatic verified downloads</li><li><CheckCircle2 />Safe CPU fallback</li></ul><strong>Choose your computer <Download /></strong></a></div>
+      <a className="join-card" href={publicLink("/downloads")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><div><Laptop /><span>WINDOWS · MACOS · LINUX</span></div><h2>Install mycellios-node</h2><p>Runs as a native service, detects the hardware, prepares certified runtimes automatically and contributes on CPU while GPU setup finishes.</p><ul><li><CheckCircle2 />Windows CUDA/ROCm and Apple Silicon MPS when certified</li><li><CheckCircle2 />Automatic verified downloads</li><li><CheckCircle2 />Safe CPU fallback</li></ul><strong>Choose your computer <Download /></strong></a></div>
   </section>;
 }
 
 function Downloads({ publicLink, external }: { publicLink: (path: string) => string; external: boolean }) {
   return <section><PageTitle eyebrow="CLIENTS" title="Downloads" copy="Install the native client or enter immediately through the universal browser worker." />
-    <div className="download-grid"><a className="download-card ready" href={publicLink("/downloads/windows")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Laptop />WINDOWS</span><h2>Windows 10/11</h2><p>x64 installer · automatic CPU runtime, CUDA verification and ROCm on certified Windows 11 hardware</p><strong>Download installer <Download /></strong></a><a className="download-card ready" href={publicLink("/downloads/macos-arm64")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Cpu />MACOS · APPLE SILICON</span><h2>Mac M1 or newer</h2><p>macOS 14+ arm64 DMG · bundled PyTorch runtime with automatic Metal / MPS verification</p><strong>Download DMG <Download /></strong></a><a className="download-card ready" href={publicLink("/downloads/linux-deb")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Cpu />LINUX · DEBIAN</span><h2>Ubuntu / Debian</h2><p>x64 DEB · automatic certified CPU runtime; compatible GPUs can contribute through the browser worker</p><strong>Download DEB <Download /></strong></a><a className="download-card ready" href={publicLink("/downloads/linux-rpm")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Cpu />LINUX · RPM</span><h2>Fedora / RHEL</h2><p>x64 RPM · automatic certified CPU runtime; compatible GPUs can contribute through the browser worker</p><strong>Download RPM <Download /></strong></a><a className="download-card ready" href={publicLink("/mobile/?autostart=1")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Globe2 />UNIVERSAL</span><h2>Browser worker</h2><p>Android, iOS and desktops · real WebGPU probe with automatic CPU fallback after confirmation</p><strong>Open and confirm <ExternalLink /></strong></a></div>
+    <div className="download-grid"><a className="download-card ready" href={publicLink("/downloads/windows")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Laptop />WINDOWS · ZIP</span><h2>Windows 10/11</h2><p>Versioned x64 bootstrapper · extract the verified package and run MycelliosNodeSetup.exe</p><strong>Download ZIP <Download /></strong></a><a className="download-card ready" href={publicLink("/downloads/macos-arm64")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Cpu />MACOS · PKG</span><h2>Mac M1 or newer</h2><p>Versioned arm64 native-node package · signature and package receipt required before release</p><strong>Download PKG <Download /></strong></a><a className="download-card ready" href={publicLink("/downloads/linux-deb")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Cpu />LINUX · DEB</span><h2>Ubuntu / Debian</h2><p>Versioned amd64 native-node package · served only from the certified download root</p><strong>Download DEB <Download /></strong></a><a className="download-card ready" href={publicLink("/mobile/?autostart=1")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Globe2 />UNIVERSAL</span><h2>Browser worker</h2><p>Android, iOS and desktops · real WebGPU probe with automatic CPU fallback after confirmation</p><strong>Open and confirm <ExternalLink /></strong></a></div>
   </section>;
-}
-
-function Machine({ snapshot, bridge, onSnapshot }: { snapshot: DashboardSnapshot; bridge: DesktopBridge; onSnapshot: (snapshot: DashboardSnapshot) => void }) {
-  const [busy, setBusy] = useState(false);
-  const localWorker = snapshot.workers.find((worker) => worker.id === snapshot.contribution.workerId);
-  const advertisedGpu = localWorker?.gpus[0];
-  const contributionLabel = snapshot.contribution.state === "connected"
-    ? "Connected"
-    : snapshot.contribution.state === "connecting"
-      ? "Connecting…"
-      : snapshot.contribution.state === "error"
-        ? "Connection error"
-        : "Paused";
-  async function toggleContribution() {
-    setBusy(true);
-    try { onSnapshot(await bridge.setContribution(!snapshot.settings.contributionEnabled)); }
-    finally { setBusy(false); }
-  }
-  async function selectComputeMode(computeMode: DesktopSettings["computeMode"]) {
-    if (computeMode === snapshot.settings.computeMode) return;
-    setBusy(true);
-    try { onSnapshot(await bridge.saveSettings({ ...snapshot.settings, computeMode })); }
-    finally { setBusy(false); }
-  }
-  const computeModes: Array<{
-    value: DesktopSettings["computeMode"];
-    label: string;
-    detail: string;
-    Icon: typeof Cpu;
-  }> = [
-    { value: "automatic", label: "Automatic", detail: "Prefer the verified GPU; use CPU only when GPU execution is unavailable.", Icon: Sparkles },
-    { value: "gpu-only", label: "GPU only", detail: "Wait for CUDA, ROCm or MPS. Never run model stages on CPU.", Icon: Zap },
-    { value: "cpu-only", label: "CPU only", detail: "Do not prepare or use the GPU. Contribute with system memory and CPU.", Icon: Cpu },
-  ];
-  return <section className="content-page">
-    <PageTitle eyebrow="NATIVE NODE" title="This device" copy="Hardware detected on this computer and the resources offered to mycellios." actions={<button disabled={busy} onClick={() => void toggleContribution()}><CirclePower size={16} />{snapshot.settings.contributionEnabled ? "Pause contribution" : "Start contributing"}</button>} />
-    <div className="hardware-hero">
-      <div className="device-orb"><Cpu size={42} /></div>
-      <div><span className="eyebrow">{snapshot.platform.toUpperCase()}</span><h2>{snapshot.localHardware.hostname}</h2><p>{snapshot.localHardware.gpus.length} accelerator(s) · {formatMemory(snapshot.localHardware.ramMb)} RAM</p></div>
-      <span className={`state-badge ${snapshot.contribution.state === "connected" ? "online" : snapshot.contribution.state}`}>{contributionLabel}</span>
-    </div>
-    <article className="compute-mode-panel">
-      <div className="compute-mode-heading"><div><span>COMPUTE PREFERENCE</span><h2>Choose how this device contributes</h2><p>The coordinator will only use CPU when this device explicitly allows it.</p></div><b>{snapshot.settings.computeMode === "automatic" ? "RECOMMENDED" : "USER SELECTED"}</b></div>
-      <div className="compute-mode-grid" role="radiogroup" aria-label="Compute preference">
-        {computeModes.map(({ value, label, detail, Icon }) => <button type="button" role="radio" aria-checked={snapshot.settings.computeMode === value} className={snapshot.settings.computeMode === value ? "active" : ""} disabled={busy} onClick={() => void selectComputeMode(value)} key={value}><span><Icon /></span><strong>{label}</strong><small>{detail}</small>{snapshot.settings.computeMode === value && <CheckCircle2 />}</button>)}
-      </div>
-    </article>
-    <AcceleratorProgressPanel acceleration={snapshot.acceleration} contributionState={snapshot.contribution.state} computeMode={snapshot.settings.computeMode} />
-    <div className="cards-grid">
-      {snapshot.localHardware.gpus.map((gpu) => {
-        const selected = isAdvertisedGpuSelected(gpu, advertisedGpu);
-        const offered = selected && advertisedGpu ? advertisedGpu.offeredVramMb : 0;
-        const budget = gpu.physicalVramMb + (gpu.sharedMemoryMb ?? 0);
-        return <article className={`hardware-card ${selected ? "selected" : ""}`} key={gpu.id}><div className="hardware-card-icon"><Gauge size={23} /></div><span className="card-kicker">{gpu.vendor} · {selected ? "SELECTED" : "DETECTED"}</span><h3>{gpu.model}</h3><div className="capacity-line"><span style={{ width: `${budget > 0 ? Math.min(100, offered / budget * 100) : 0}%` }} /></div><div className="hardware-metrics"><DesktopMetric label="Physical VRAM" value={formatMemory(gpu.physicalVramMb)} /><DesktopMetric label="Offered" value={selected ? formatMemory(offered) : "—"} /><DesktopMetric label="Utilization" value={`${gpu.utilizationPct ?? 0}%`} /><DesktopMetric label="Temperature" value={gpu.temperatureC === undefined ? "—" : `${gpu.temperatureC} °C`} /></div></article>;
-      })}
-      {snapshot.localHardware.gpus.length === 0 && <div className="wide-empty"><Empty icon={Cpu} title="No GPU detected" copy="This machine can register its real hardware, but it will not advertise a model until a compatible runtime is active." /></div>}
-    </div>
-  </section>;
-}
-
-function AcceleratorCompactBanner({ acceleration, contributionState, computeMode, onOpen }: { acceleration: AcceleratorProgressSnapshot; contributionState: DashboardSnapshot["contribution"]["state"] | undefined; computeMode: DesktopSettings["computeMode"] | undefined; onOpen: () => void }) {
-  const cpuLabel = accelerationCpuLabel(acceleration, contributionState, computeMode);
-  const cpuUnavailable = acceleration.cpu?.state === "unavailable";
-  const cpuStandby = computeMode === "gpu-only" && (acceleration.cpu?.activeStages ?? 0) === 0;
-  const cpuVisualState = (acceleration.cpu?.activeStages ?? 0) > 0 ? "active" : cpuUnavailable ? "unavailable" : contributionState === "error" ? "error" : "ready";
-  const gpuLabel = accelerationGpuLabel(acceleration);
-  const gpuPreparing = isGpuPreparing(acceleration.gpu?.state);
-  const progress = visibleAccelerationProgress(acceleration);
-  const gpuName = accelerationGpuName(acceleration);
-  const detail = acceleration.preparation?.issue?.message
-    ?? acceleration.message
-    ?? "Preparing the local accelerator runtime.";
-  return <article className={`accelerator-compact-banner gpu-${acceleration.gpu?.state ?? "checking"}${gpuPreparing ? "" : " progress-hidden"}`} aria-label="Local compute transition">
-    <div className={`accelerator-compact-engine cpu ${cpuVisualState}`}>
-      <span className="accelerator-compact-icon"><Cpu /></span>
-      <span><small>{cpuUnavailable ? "NEEDS ATTENTION" : cpuStandby ? "STANDBY" : "AVAILABLE NOW"}</small><strong>{cpuLabel}</strong><em>{acceleration.cpu?.deviceName || "Local CPU runtime"}</em></span>
-    </div>
-    <ArrowRight className="accelerator-transition-arrow" aria-hidden="true" />
-    <div className="accelerator-compact-gpu">
-      <span className="accelerator-compact-icon">{gpuPreparing ? <LoaderCircle className="spin" /> : acceleration.preparation?.issue ? <CircleAlert /> : <Zap />}</span>
-      <span className="accelerator-compact-copy" aria-live="polite" aria-atomic="true"><small>{gpuLabel}</small><strong>{gpuName}</strong><em title={detail}>{detail}</em></span>
-      {progress !== null && <b>{progress}%</b>}
-    </div>
-    {gpuPreparing && <div className={`accelerator-compact-progress ${progress === null ? "indeterminate" : ""}`} role="progressbar" aria-label="GPU runtime preparation" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress ?? undefined}>
-      <i style={progress === null ? undefined : { width: `${progress}%` }} />
-    </div>}
-    <button type="button" onClick={onOpen} aria-label="Open GPU setup details">View setup <ChevronRight /></button>
-  </article>;
 }
 
 function ActivationProgressLog({ model }: { model: RequestedModelCapacity }) {
@@ -4706,209 +4795,17 @@ function newInferenceSessionId(): string {
   return id ? `chat-${id}` : `chat-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-function AcceleratorProgressPanel({ acceleration, contributionState, computeMode }: { acceleration: AcceleratorProgressSnapshot; contributionState: DashboardSnapshot["contribution"]["state"]; computeMode: DesktopSettings["computeMode"] }) {
-  const cpuActive = (acceleration.cpu?.activeStages ?? 0) > 0;
-  const cpuUnavailable = acceleration.cpu?.state === "unavailable";
-  const cpuStandby = computeMode === "gpu-only" && !cpuActive;
-  const connectionError = contributionState === "error";
-  const gpuPreparing = isGpuPreparing(acceleration.gpu?.state);
-  const gpuActive = acceleration.gpu?.state === "ready" && (acceleration.gpu?.activeStages ?? 0) > 0;
-  const progress = visibleAccelerationProgress(acceleration);
-  const issue = acceleration.preparation?.issue ?? null;
-  const log = (acceleration.preparation?.log ?? []).slice(-50);
-  const gpuName = accelerationGpuName(acceleration);
-  const backend = acceleration.gpu?.state === "not-detected" || acceleration.gpu?.state === "unsupported"
-    ? "NOT AVAILABLE"
-    : acceleration.gpu?.backend?.toUpperCase() ?? acceleration.requestedBackend?.toUpperCase() ?? "NOT SELECTED";
-  const phase = acceleration.preparation?.phase || acceleration.gpu?.state || acceleration.state;
-  const phaseLabel = humanizeAccelerationPhase(phase);
-  const phaseMessage = issue?.message ?? acceleration.message;
-  const panelTitle = accelerationPanelTitle(acceleration, contributionState, computeMode);
-  const panelCopy = accelerationPanelCopy(acceleration, contributionState, computeMode);
-  const showProgress = gpuPreparing || progress !== null;
-  return <article className={`accelerator-progress-panel gpu-${acceleration.gpu?.state ?? "not-detected"}`}>
-    <header className="accelerator-progress-header">
-      <div className="accelerator-progress-heading">
-        <span className="accelerator-runtime-icon">{gpuPreparing ? <LoaderCircle className="spin" /> : gpuActive ? <Zap /> : issue ? <CircleAlert /> : <Cpu />}</span>
-        <div><span>LOCAL COMPUTE TRANSITION</span><h2>{panelTitle}</h2><p>{panelCopy}</p></div>
-      </div>
-      <span className={`accelerator-overall-badge ${gpuActive ? "gpu-active" : cpuActive ? "cpu-active" : cpuUnavailable ? "unavailable" : connectionError ? "connection-error" : "cpu-ready"}`}><i />{gpuActive ? "GPU ACTIVE" : cpuActive ? "CPU ACTIVE" : cpuUnavailable ? "CPU UNAVAILABLE" : cpuStandby ? "CPU STANDBY · GPU ONLY" : contributionState === "connected" ? "CPU READY · NODE ONLINE" : contributionState === "connecting" ? "CPU READY · CONNECTING" : connectionError ? "CPU READY · CONNECTION ERROR" : "CPU READY · CONTRIBUTION PAUSED"}</span>
-    </header>
-
-    <div className="accelerator-engine-grid">
-      <section className={`accelerator-engine-card cpu ${cpuActive ? "active" : cpuUnavailable ? "unavailable" : connectionError ? "connection-error" : "ready"}`} aria-label="CPU runtime status">
-        <div className="accelerator-engine-title"><span><Cpu /></span><div><small>CPU RUNTIME</small><strong>{accelerationCpuLabel(acceleration, contributionState, computeMode)}</strong></div><b>{acceleration.cpu?.precision?.toUpperCase() ?? "FP32"}</b></div>
-        <h3>{acceleration.cpu?.deviceName || "Local CPU"}</h3>
-        <p>{accelerationCpuCopy(acceleration, contributionState, computeMode)}</p>
-        <div className="accelerator-engine-foot"><span><i />{cpuActive ? `${acceleration.cpu.activeStages} active stage${acceleration.cpu.activeStages === 1 ? "" : "s"}` : cpuUnavailable ? "Runtime unavailable" : cpuStandby ? "Disabled for model stages by GPU-only mode" : contributionState === "connected" ? "Ready for network work" : contributionState === "connecting" ? "Connecting to the network" : connectionError ? "Network connection needs attention" : "Ready when contribution resumes"}</span></div>
-      </section>
-
-      <section className={`accelerator-engine-card gpu ${acceleration.gpu?.state ?? "not-detected"}`} aria-label="GPU runtime status">
-        <div className="accelerator-engine-title"><span>{gpuPreparing ? <LoaderCircle className="spin" /> : <Zap />}</span><div><small>GPU ACCELERATOR</small><strong aria-live="polite" aria-atomic="true">{accelerationGpuLabel(acceleration)}</strong></div><b>{backend}</b></div>
-        <h3>{gpuName}</h3>
-        <p>{acceleration.gpu?.vendor ? `${acceleration.gpu.vendor} · ` : ""}{gpuActive ? `${acceleration.gpu.activeStages} verified stage${acceleration.gpu.activeStages === 1 ? "" : "s"} running now.` : phaseMessage}</p>
-        <div className="accelerator-engine-foot"><span><i />{gpuActive ? "Model weights verified on device" : gpuPreparing ? "Automatic setup in progress" : accelerationGpuLabel(acceleration)}</span></div>
-      </section>
-    </div>
-
-    {showProgress && <section className="accelerator-preparation" aria-label="GPU runtime preparation progress">
-      <div className="accelerator-preparation-head">
-        <div role="status" aria-live="polite" aria-atomic="true"><span>CURRENT STEP</span><strong>{phaseLabel}</strong><small>{acceleration.preparation?.currentArtifact ? `Preparing ${acceleration.preparation.currentArtifact}` : phaseMessage}</small></div>
-        <div className="accelerator-preparation-value"><strong>{progress === null ? "Working" : `${progress}%`}</strong><small>{formatAccelerationEta(acceleration.preparation?.etaSeconds ?? null, phase)}</small></div>
-      </div>
-      <div className={`accelerator-progress-track ${progress === null ? "indeterminate" : ""}`} role="progressbar" aria-label={`${phaseLabel} progress`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress ?? undefined}>
-        <i style={progress === null ? undefined : { width: `${progress}%` }} />
-      </div>
-      <div className="accelerator-progress-meta">
-        <span><small>TRANSFERRED</small><strong>{formatAccelerationTransfer(acceleration.preparation)}</strong></span>
-        <span><small>SPEED</small><strong>{formatAccelerationRate(acceleration.preparation?.bytesPerSecond ?? null)}</strong></span>
-        <span><small>PACKAGE</small><strong>{formatAccelerationArtifact(acceleration.preparation)}</strong></span>
-        <span><small>ESTIMATED TIME</small><strong>{formatAccelerationEta(acceleration.preparation?.etaSeconds ?? null, phase)}</strong></span>
-      </div>
-    </section>}
-
-    {issue && <section className="accelerator-requirement" role="alert">
-      <span><CircleAlert /></span>
-      <div><small>{issue.retryable ? "SETUP NEEDS ATTENTION" : "GPU REQUIREMENT"}</small><strong>{issue.message}</strong><p><b>What to do:</b> {issue.action}</p></div>
-      {(issue.requiredBytes !== undefined || issue.availableBytes !== undefined) && <div className="accelerator-requirement-space">
-        {issue.requiredBytes !== undefined && <span><small>REQUIRED</small><strong>{formatAccelerationBytes(issue.requiredBytes)}</strong></span>}
-        {issue.availableBytes !== undefined && <span><small>AVAILABLE</small><strong>{formatAccelerationBytes(issue.availableBytes)}</strong></span>}
-      </div>}
-      {!issue.retryable && (issue.code === "unsupported-platform" || issue.code === "unsupported-gpu" || issue.code === "installation-required") && <a className="accelerator-browser-fallback" href={`${PUBLIC_COORDINATOR_URL}/mobile/?autostart=1`} target="_blank" rel="noreferrer"><Globe2 />Start WebGPU in your browser <ExternalLink /></a>}
-    </section>}
-
-    <details className="accelerator-log">
-      <summary><Activity /> GPU setup log <span>{log.length} event{log.length === 1 ? "" : "s"}</span><ChevronDown /></summary>
-      <div className="accelerator-log-body" aria-label="GPU setup event log">
-        {log.length > 0 ? <ol>{log.map((entry, index) => <li className={entry.level} key={`${entry.at}-${index}`}><i /><time dateTime={entry.at}>{formatAccelerationLogTime(entry.at)}</time><span>{entry.message}</span></li>)}</ol> : <p>Waiting for the first GPU setup event. CPU availability is unaffected.</p>}
-      </div>
-    </details>
-
-    <footer className="accelerator-evidence-note"><ShieldCheck /><span><strong>No guessed GPU status.</strong> GPU ACTIVE appears only after model weights load on this device and the distributed canary succeeds.</span></footer>
-  </article>;
+export function ProductStateBanner({ presentation, subject }: {
+  presentation: ProductStatePresentation;
+  subject: string;
+}) {
+  return <div className={`product-state-banner tone-${presentation.tone} state-${presentation.id}`} role="status" aria-label={`${subject}: ${presentation.label}`}>
+    <i aria-hidden="true" />
+    <span><small>{subject.toUpperCase()} · {presentation.label.toUpperCase()}</small><strong>{presentation.title}</strong><em>{presentation.copy}</em></span>
+    <b>{presentation.nextAction}</b>
+  </div>;
 }
 
-function DesktopSettingsView({ snapshot, bridge, onSnapshot, developerMode }: { snapshot: DashboardSnapshot; bridge: DesktopBridge; onSnapshot: (snapshot: DashboardSnapshot) => void; developerMode: boolean }) {
-  const [settingsTab, setSettingsTab] = useState<"general" | "node" | "updates" | "developer">("general");
-  const [draft, setDraft] = useState(snapshot.settings);
-  const [dirty, setDirty] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [checkingUpdate, setCheckingUpdate] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  useEffect(() => {
-    if (!dirty) setDraft(snapshot.settings);
-  }, [dirty, snapshot.settings]);
-  function update<K extends keyof DesktopSettings>(key: K, value: DesktopSettings[K]) {
-    setDirty(true);
-    setDraft((current) => ({ ...current, [key]: value }));
-  }
-  function updateCoordinatorMode(value: DesktopSettings["coordinatorMode"]) {
-    setDirty(true);
-    setDraft((current) => ({
-      ...current,
-      coordinatorMode: value,
-      ...(value === "remote" && current.coordinatorMode !== "remote"
-        ? { remoteCoordinatorUrl: PUBLIC_COORDINATOR_URL }
-        : {}),
-    }));
-  }
-  async function save() {
-    setSaving(true); setError(null);
-    try {
-      const next = await bridge.saveSettings(draft);
-      onSnapshot(next);
-      setDraft(next.settings);
-      setDirty(false);
-    }
-    catch (caught) { setError(errorText(caught)); }
-    finally { setSaving(false); }
-  }
-  async function checkUpdate() {
-    setCheckingUpdate(true); setError(null);
-    try {
-      const nextUpdate = await bridge.checkForUpdates();
-      onSnapshot({ ...snapshot, update: nextUpdate });
-    } catch (caught) { setError(errorText(caught)); }
-    finally { setCheckingUpdate(false); }
-  }
-  return <section className="content-page settings-page">
-    <PageTitle eyebrow={developerMode ? "DEVELOPER PREFERENCES" : "DESKTOP PREFERENCES"} title="Settings" copy={developerMode ? "Coordinator, runtime, contribution, background behavior and updates for this computer." : "The everyday application and update preferences for this computer."} />
-    <div className={`settings-workspace show-${settingsTab}`}>
-      <nav className="settings-local-nav" aria-label="Settings sections">
-        <button className={settingsTab === "general" ? "active" : ""} onClick={() => setSettingsTab("general")}><UserRound />General</button>
-        <button className={settingsTab === "node" ? "active" : ""} onClick={() => setSettingsTab("node")}><Cpu />Node</button>
-        <button className={settingsTab === "updates" ? "active" : ""} onClick={() => setSettingsTab("updates")}><Download />Updates</button>
-        {developerMode && <button className={settingsTab === "developer" ? "active" : ""} onClick={() => setSettingsTab("developer")}><Code2 />Developer</button>}
-      </nav>
-      <div className="settings-local-content">
-    {error && <div className="inline-error"><CircleAlert size={17} />{error}</div>}
-    <div className="settings-section" data-settings-group="general"><div><Globe2 size={20} /><div><h3>Coordinator</h3><p>Use the public network or host an isolated local coordinator.</p></div></div><div className="settings-fields"><label>Mode<AppSelect ariaLabel="Coordinator mode" value={draft.coordinatorMode} onChange={(value) => updateCoordinatorMode(value as DesktopSettings["coordinatorMode"])} options={[{ value: "remote", label: "Public mycellios network" }, { value: "local", label: "Local network on this machine" }]} /></label>{draft.coordinatorMode === "remote" && <label>Coordinator URL<input value={draft.remoteCoordinatorUrl} onChange={(event) => update("remoteCoordinatorUrl", event.target.value)} /></label>}<label>Region<input value={draft.region} onChange={(event) => update("region", event.target.value)} placeholder="auto" /></label></div></div>
-    <div className="settings-section" data-settings-group="node">
-      <div><Gauge size={20} /><div><h3>Contribution</h3><p>This computer always uses the built-in Mycellios runtime. Models appear only after a verified native deployment starts.</p></div></div>
-      <div className="settings-fields">
-        <label>Compute mode<AppSelect ariaLabel="Compute mode" value={draft.computeMode} onChange={(value) => update("computeMode", value as DesktopSettings["computeMode"])} options={[{ value: "automatic", label: "Automatic · GPU preferred" }, { value: "gpu-only", label: "GPU only · never CPU" }, { value: "cpu-only", label: "CPU only · GPU disabled" }]} /></label>
-        <label>Offered memory (GB)<input type="number" min="1" step="1" value={draft.offeredVramMb / 1_024} onChange={(event) => update("offeredVramMb", Math.round(Number(event.target.value) * 1_024))} /></label>
-        <div className="settings-native-runtime" role="status" aria-label="Contribution runtime">
-          <ShieldCheck size={17} />
-          <span><small>RUNTIME</small><strong>Mycellios native</strong><em>No external model service</em></span>
-        </div>
-      </div>
-    </div>
-    <div className="settings-section compact-settings" data-settings-group="general"><div><SlidersHorizontal size={20} /><div><h3>Application</h3><p>Startup and background contribution.</p></div></div><div className="toggle-list"><Toggle label="Start with the system" checked={draft.launchAtLogin} onChange={(value) => update("launchAtLogin", value)} /><Toggle label="Keep running in the tray" checked={draft.closeToTray} onChange={(value) => update("closeToTray", value)} /><Toggle label="Contribute resources" checked={draft.contributionEnabled} onChange={(value) => update("contributionEnabled", value)} /></div></div>
-    <div className="settings-section" data-settings-group="updates"><div><Download size={20} /><div><h3>Automatic updates</h3><p>Desktop releases download in the background and install automatically as soon as active inference is idle.</p></div></div><div className="update-settings"><div><span className={`update-state ${snapshot.update.state}`}>{updateStateLabel(snapshot.update.state)}</span><strong>Version {snapshot.appVersion}</strong><p>{snapshot.update.message}</p><p title={buildIdentityTitle(snapshot.buildIdentity)}>Exact build: {shortBuildIdentity(snapshot.buildIdentity)}</p></div><div className="update-actions"><button className="secondary-button" disabled={checkingUpdate || snapshot.update.state === "checking" || snapshot.update.state === "downloading"} onClick={() => void checkUpdate()}><RefreshCw className={checkingUpdate ? "spin" : ""} size={15} />Check now</button>{snapshot.update.state === "ready" && <button className="primary-button" onClick={() => void bridge.installUpdate()}><Download size={15} />Restart now</button>}</div></div></div>
-    <div className="settings-footer"><button className="primary-button" disabled={saving} onClick={() => void save()}>{saving ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}Save and reconnect</button></div>
-      </div>
-    </div>
-  </section>;
-}
-
-function DesktopOnboarding({ snapshot, bridge, onSnapshot }: { snapshot: DashboardSnapshot; bridge: DesktopBridge; onSnapshot: (snapshot: DashboardSnapshot) => void }) {
-  const [contribute, setContribute] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  async function complete() {
-    setSaving(true); setError(null);
-    try { onSnapshot(await bridge.saveSettings({ ...snapshot.settings, coordinatorMode: "remote", remoteCoordinatorUrl: PUBLIC_COORDINATOR_URL, remoteCoordinatorToken: "", contributionEnabled: contribute, onboardingComplete: true })); }
-    catch (caught) { setError(errorText(caught)); }
-    finally { setSaving(false); }
-  }
-  return <div className="modal-backdrop"><div className="onboarding-card"><div className="onboarding-brand"><img src={brandIcon} alt="" /><span>GET STARTED</span></div><h1>Connect this machine to mycellios</h1><p>The desktop agent and the web panel will show the same public network.</p><div className="mode-grid single-mode"><button className="selected"><Globe2 size={23} /><strong>Public mycellios network</strong><span>{PUBLIC_COORDINATOR_URL}</span><Check size={16} className="mode-check" /></button></div><label className="contribute-choice"><input type="checkbox" checked={contribute} onChange={(event) => setContribute(event.target.checked)} /><span><strong>Contribute this machine's resources</strong><small>Register real hardware only; models appear only when a verified runtime is active.</small></span></label>{error && <div className="inline-error"><CircleAlert size={17} />{error}</div>}<button className="primary-button onboarding-submit" disabled={saving} onClick={() => void complete()}>{saving ? <LoaderCircle className="spin" size={18} /> : <Sparkles size={18} />}Enter mycellios <ChevronRight size={18} /></button><div className="onboarding-security"><ShieldCheck size={15} />Connected through HTTPS/WSS to the public coordinator.</div></div></div>;
-}
-
-function desktopToPublicSnapshot(snapshot: DashboardSnapshot): PublicSnapshot {
-  return {
-    capturedAt: snapshot.capturedAt,
-    version: snapshot.health?.version ?? "—",
-    buildIdentity: snapshot.health?.buildIdentity ?? null,
-    summary: {
-      registered: snapshot.health?.workers.registered ?? snapshot.workers.length,
-      connected: snapshot.health?.workers.connected ?? snapshot.workers.filter((worker) => worker.connected).length,
-      online: snapshot.health?.workers.online ?? snapshot.workers.filter((worker) => worker.status === "online").length,
-      mobile: snapshot.workers.filter((worker) => worker.kind === "browser").length,
-      offeredVramMb: snapshot.workers.reduce((sum, worker) => sum + worker.offeredVramMb, 0),
-      completedJobs: snapshot.jobs.filter((job) => job.status === "completed").length,
-    },
-    workers: snapshot.workers,
-    models: snapshot.models,
-    requestedModels: snapshot.requestedModels,
-    jobs: snapshot.jobs,
-  };
-}
-
-function updateStateLabel(state: DesktopUpdateStatus["state"]): string {
-  switch (state) {
-    case "checking": return "Checking";
-    case "downloading": return "Downloading";
-    case "ready": return "Ready to install";
-    case "up-to-date": return "Up to date";
-    case "error": return "Check failed";
-    case "unsupported": return "Managed externally";
-    case "development": return "Development mode";
-    default: return "Automatic";
-  }
-}
-
-function DesktopMetric({ label, value }: { label: string; value: string }) { return <div className="metric"><span>{label}</span><strong>{value}</strong></div>; }
 
 interface AppSelectOption {
   value: string;
@@ -5024,7 +4921,31 @@ function Stat({ icon: Icon, label, value, detail, tone = "blue" }: { icon: typeo
 function CapacityMetric({ icon: Icon, label, value, detail }: { icon: typeof Cpu; label: string; value: string; detail: string }) { return <div className="global-capacity-metric"><i><Icon /></i><span><small>{label}</small><strong>{value}</strong><em>{detail}</em></span></div>; }
 function Metric({ label, value }: { label: string; value: string }) { return <div><span>{label}</span><strong>{value}</strong></div>; }
 function Empty({ icon: Icon, title, copy }: { icon: typeof Activity; title: string; copy: string }) { return <div className="panel-empty"><Icon /><strong>{title}</strong><p>{copy}</p></div>; }
-function PanelLoading() { return <div className="panel-loading"><LoaderCircle className="spin" /><strong>Connecting to mycellios</strong><span>Loading the public network snapshot…</span></div>; }
+const DIALOG_FOCUS_SELECTOR = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+function dialogFocusables(dialog: HTMLElement): HTMLElement[] {
+  return [...dialog.querySelectorAll<HTMLElement>(DIALOG_FOCUS_SELECTOR)]
+    .filter((element) => !element.hasAttribute("hidden") && element.getAttribute("aria-hidden") !== "true");
+}
+
+function firstFocusable(dialog: HTMLElement): HTMLElement | null {
+  return dialogFocusables(dialog)[0] ?? null;
+}
+
+function trapDialogTab(event: KeyboardEvent, dialog: HTMLElement): void {
+  if (event.key !== "Tab") return;
+  const controls = dialogFocusables(dialog);
+  const first = controls[0];
+  const last = controls.at(-1);
+  if (!first || !last) { event.preventDefault(); dialog.focus(); return; }
+  if (event.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) {
+    event.preventDefault(); last.focus();
+  } else if (!event.shiftKey && (document.activeElement === last || !dialog.contains(document.activeElement))) {
+    event.preventDefault(); first.focus();
+  }
+}
+
+function PanelLoading() { return <div className="panel-loading" role="status" aria-live="polite" aria-atomic="true"><LoaderCircle className="spin" /><strong>Connecting to mycellios</strong><span>Loading the configured network snapshot…</span></div>; }
 function WorkerKindIcon({ worker }: { worker: PublicWorker }) {
   if (worker.kind === "browser") return <Smartphone />;
   if (worker.kind === "cell") return <Boxes />;
@@ -5042,16 +4963,17 @@ function workerLabel(worker: PublicWorker) {
       ?? worker.gpus[0]?.model.replace(/^Aggregate capacity exposed by /, "")
       ?? `Cell ${shortId(worker.id)}`;
   }
-  return worker.gpus[0]?.model || `Desktop ${shortId(worker.id)}`;
+  return worker.gpus[0]?.model || `Native node ${shortId(worker.id)}`;
 }
-function nodeVisualState(worker: PublicWorker): "active" | "warning" | "offline" { return worker.connected && worker.status === "online" ? "active" : worker.connected || worker.status === "suspect" || worker.status === "draining" ? "warning" : "offline"; }
+function nodeVisualState(worker: PublicWorker): "active" | "warning" | "offline" { return !worker.quarantined && worker.connected && worker.status === "online" ? "active" : worker.quarantined || worker.connected || worker.status === "suspect" || worker.status === "draining" ? "warning" : "offline"; }
 function nodeStateOrder(worker: PublicWorker): number { return nodeVisualState(worker) === "active" ? 0 : nodeVisualState(worker) === "warning" ? 1 : 2; }
 function nodeStatusLabel(worker: PublicWorker): string {
-  if (worker.connected && worker.status === "online") return "Active";
-  if (worker.status === "suspect") return "Unstable";
-  if (worker.status === "draining") return "Draining";
-  if (worker.connected) return "Connected";
-  return "Offline";
+  if (worker.quarantined) return "En cuarentena";
+  if (worker.connected && worker.status === "online") return "Activo";
+  if (worker.status === "suspect") return "Inestable";
+  if (worker.status === "draining") return "Finalizando";
+  if (worker.connected) return "Conectado";
+  return "Inactivo";
 }
 function topologyPosition(index: number, total: number): { x: number; y: number } {
   if (total <= 1) return { x: 50, y: 17 };
@@ -5085,156 +5007,8 @@ function credentialKindLabel(kind: WorkerCredentialSummary["identityKind"]) {
       : "DISPOSITIVO INSTALADO";
 }
 function formatMemory(value: number) { return value >= 1_024 ? `${(value / 1_024).toFixed(value >= 10_240 ? 0 : 1)} GB` : `${Math.round(value)} MB`; }
-function shouldShowAccelerationBanner(acceleration: AcceleratorProgressSnapshot): boolean {
-  return acceleration.state !== "idle"
-    || acceleration.cpu?.state !== "unavailable"
-    || acceleration.preparation?.phase !== "idle";
-}
-
-function isGpuPreparing(state: AcceleratorProgressSnapshot["gpu"]["state"] | undefined): boolean {
-  return state === "checking" || state === "downloading" || state === "installing" || state === "verifying";
-}
-
-function accelerationProgress(acceleration: AcceleratorProgressSnapshot): number | null {
-  const value = acceleration.preparation?.progressPct;
-  return typeof value === "number" && Number.isFinite(value)
-    ? Math.max(0, Math.min(100, Math.round(value)))
-    : null;
-}
-
-function visibleAccelerationProgress(acceleration: AcceleratorProgressSnapshot): number | null {
-  const progress = accelerationProgress(acceleration);
-  const state = acceleration.gpu?.state;
-  if (state === "fallback" || state === "error" || state === "unsupported" || state === "not-detected") return null;
-  return progress;
-}
-
-function accelerationCpuLabel(acceleration: AcceleratorProgressSnapshot, contributionState?: DashboardSnapshot["contribution"]["state"], computeMode?: DesktopSettings["computeMode"]): string {
-  if ((acceleration.cpu?.activeStages ?? 0) > 0) return "CPU ACTIVE";
-  if (acceleration.cpu?.state === "unavailable") return "CPU UNAVAILABLE";
-  if (computeMode === "gpu-only") return "CPU STANDBY · GPU ONLY";
-  if (contributionState === "connected") return "CPU READY · NODE ONLINE";
-  if (contributionState === "connecting") return "CPU READY · CONNECTING";
-  if (contributionState === "error") return "CPU READY · CONNECTION ERROR";
-  return "CPU READY · CONTRIBUTION PAUSED";
-}
-
-function accelerationCpuCopy(acceleration: AcceleratorProgressSnapshot, contributionState: DashboardSnapshot["contribution"]["state"], computeMode?: DesktopSettings["computeMode"]): string {
-  if (acceleration.cpu?.state === "unavailable") return "The certified CPU runtime could not start. Open the runtime log, then restart or update mycellios.";
-  if (computeMode === "gpu-only" && (acceleration.cpu?.activeStages ?? 0) === 0) return "The CPU runtime is installed but excluded from model execution because GPU-only mode is selected.";
-  if (contributionState === "error") return "The CPU runtime is ready, but this worker is not connected to the network. mycellios will keep retrying the connection.";
-  if (contributionState === "paused") return "The CPU runtime is installed and ready; contribution is currently paused.";
-  return acceleration.cpu?.message || "The CPU runtime is available while GPU setup continues.";
-}
-
-function accelerationGpuLabel(acceleration: AcceleratorProgressSnapshot): string {
-  const state = acceleration.gpu?.state;
-  if (state === "ready" && (acceleration.gpu?.activeStages ?? 0) > 0) return "GPU ACTIVE";
-  if (state === "ready") return "GPU READY";
-  if (isGpuPreparing(state)) return "GPU PREPARING";
-  if (state === "fallback") return "CPU FALLBACK";
-  if (state === "unsupported") return "GPU NOT SUPPORTED YET";
-  if (state === "error") return "GPU SETUP FAILED";
-  if (state === "not-detected") return "NO GPU DETECTED";
-  return "GPU CHECKING";
-}
-
-function accelerationGpuName(acceleration: AcceleratorProgressSnapshot): string {
-  if (acceleration.gpu?.state === "not-detected") return "No physical GPU detected";
-  if (acceleration.gpu?.state === "unsupported") return acceleration.gpu.model ?? "Unsupported GPU";
-  return acceleration.gpu?.model ?? acceleration.deviceName ?? "GPU accelerator";
-}
-
-function accelerationPanelTitle(acceleration: AcceleratorProgressSnapshot, contributionState: DashboardSnapshot["contribution"]["state"], computeMode?: DesktopSettings["computeMode"]): string {
-  const gpuState = acceleration.gpu?.state;
-  if (acceleration.cpu?.state === "unavailable") return "The local compute runtime needs attention.";
-  if (computeMode === "gpu-only" && (gpuState === "fallback" || gpuState === "error")) return "GPU-only mode is waiting for a verified accelerator.";
-  if (contributionState === "error") return "CPU ready. Network connection needs attention.";
-  if (contributionState === "paused" && isGpuPreparing(gpuState)) return "Contribution paused. GPU setup continues safely.";
-  if (contributionState === "paused") return "CPU ready. Contribution is paused.";
-  if (gpuState === "ready" && (acceleration.gpu?.activeStages ?? 0) > 0) return "GPU acceleration is active.";
-  if (gpuState === "ready") return "GPU acceleration is ready for the next stage.";
-  if (isGpuPreparing(gpuState)) return "CPU online. GPU acceleration is preparing automatically.";
-  if (gpuState === "fallback" || gpuState === "error") return "CPU remains online. GPU setup needs attention.";
-  if (gpuState === "unsupported") return "CPU online. This GPU is not supported yet.";
-  return "CPU online. No compatible GPU was detected.";
-}
-
-function accelerationPanelCopy(acceleration: AcceleratorProgressSnapshot, contributionState: DashboardSnapshot["contribution"]["state"], computeMode?: DesktopSettings["computeMode"]): string {
-  const gpuState = acceleration.gpu?.state;
-  if (acceleration.cpu?.state === "unavailable") return "The certified CPU runtime is not available. Review the runtime log before contributing from this device.";
-  if (computeMode === "gpu-only" && gpuState !== "ready") return "This node stays connected, but it will not execute CPU model stages while GPU-only mode is selected.";
-  if (contributionState === "error") return "The CPU runtime remains ready, but the worker could not connect. mycellios will keep retrying the network connection.";
-  if (contributionState === "paused" && isGpuPreparing(gpuState)) return "The CPU runtime stays ready and the current GPU setup can finish, but this device will not accept network work until contribution resumes.";
-  if (contributionState === "paused") return "Installed runtimes remain ready, but this device will not accept network work until contribution resumes.";
-  if (gpuState === "ready") return "The physical accelerator probe passed; model execution remains visible separately from hardware readiness.";
-  if (isGpuPreparing(gpuState)) return "The CPU runtime stays available while mycellios installs and verifies the best runtime for this machine.";
-  if (gpuState === "fallback" || gpuState === "error") return "CPU service is preserved; follow the requirement below to make GPU acceleration available.";
-  if (gpuState === "unsupported") return "This release will continue safely on CPU until a certified accelerator pack is available.";
-  return "The certified CPU runtime remains available for network work.";
-}
-
-function humanizeAccelerationPhase(value: string): string {
-  const normalized = value.trim().replace(/[_-]+/g, " ");
-  if (!normalized) return "Checking accelerator";
-  return normalized.replace(/\b\w/g, (letter) => letter.toUpperCase());
-}
-
-function formatAccelerationBytes(value: number): string {
-  if (!Number.isFinite(value) || value < 0) return "—";
-  if (value < 1_024) return `${Math.round(value)} B`;
-  const units = ["KB", "MB", "GB", "TB"];
-  let amount = value;
-  let unit = -1;
-  do { amount /= 1_024; unit += 1; } while (amount >= 1_024 && unit < units.length - 1);
-  return `${amount.toFixed(amount >= 100 ? 0 : amount >= 10 ? 1 : 2)} ${units[unit]}`;
-}
-
-function formatAccelerationTransfer(preparation: AcceleratorProgressSnapshot["preparation"]): string {
-  const completed = preparation?.bytesCompleted;
-  const total = preparation?.bytesTotal;
-  if (completed === null || completed === undefined) return total === null || total === undefined ? "Calculating…" : `0 B / ${formatAccelerationBytes(total)}`;
-  return total === null || total === undefined
-    ? formatAccelerationBytes(completed)
-    : `${formatAccelerationBytes(completed)} / ${formatAccelerationBytes(total)}`;
-}
-
-function formatAccelerationRate(value: number | null): string {
-  return value !== null && Number.isFinite(value) && value > 0
-    ? `${formatAccelerationBytes(value)}/s`
-    : "Calculating…";
-}
-
-function formatAccelerationEta(value: number | null, phase = "downloading"): string {
-  if (value === null || !Number.isFinite(value) || value < 0) {
-    if (phase === "installing" || phase === "copying-base") return "Finishing installation…";
-    if (phase === "physical-probe" || phase === "activating") return "Running verification…";
-    if (phase === "verifying-package") return "Checking package…";
-    return "Estimating…";
-  }
-  const seconds = Math.ceil(value);
-  if (seconds < 60) return `${seconds}s remaining`;
-  const minutes = Math.ceil(seconds / 60);
-  if (minutes < 60) return `~${minutes}m remaining`;
-  const hours = Math.floor(minutes / 60);
-  const rest = minutes % 60;
-  return `~${hours}h${rest > 0 ? ` ${rest}m` : ""} remaining`;
-}
-
-function formatAccelerationArtifact(preparation: AcceleratorProgressSnapshot["preparation"]): string {
-  const index = preparation?.artifactIndex;
-  const count = preparation?.artifactCount;
-  if (index !== null && index !== undefined && count !== null && count !== undefined) return `${Math.max(0, index)} of ${Math.max(0, count)}`;
-  return preparation?.currentArtifact ?? "Preparing…";
-}
-
-function formatAccelerationLogTime(value: string): string {
-  const date = new Date(value);
-  if (!Number.isFinite(date.getTime())) return "—";
-  return date.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-}
-function relativeTime(value: string) { const seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1_000)); if (seconds < 5) return "now"; if (seconds < 60) return `${seconds}s ago`; const minutes = Math.floor(seconds / 60); if (minutes < 60) return `${minutes}m ago`; return `${Math.floor(minutes / 60)}h ago`; }
-function relativeTimeEs(value: string) { const seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1_000)); if (seconds < 5) return "now"; if (seconds < 60) return `${seconds} s ago`; const minutes = Math.floor(seconds / 60); if (minutes < 60) return `${minutes} min ago`; return `${Math.floor(minutes / 60)} h ago`; }
+function relativeTime(value: string, now = Date.now()) { const seconds = Math.max(0, Math.floor((now - new Date(value).getTime()) / 1_000)); if (seconds < 5) return "now"; if (seconds < 60) return `${seconds}s ago`; const minutes = Math.floor(seconds / 60); if (minutes < 60) return `${minutes}m ago`; return `${Math.floor(minutes / 60)}h ago`; }
+function relativeTimeEs(value: string) { const seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1_000)); if (seconds < 5) return "ahora"; if (seconds < 60) return `hace ${seconds} s`; const minutes = Math.floor(seconds / 60); if (minutes < 60) return `hace ${minutes} min`; return `hace ${Math.floor(minutes / 60)} h`; }
 
 type ExecutionTelemetry = NonNullable<DashboardDeployment["execution"]>;
 type ExecutionStageTelemetry = NonNullable<ExecutionTelemetry["stages"]>[number];
@@ -5345,6 +5119,7 @@ function ExecutionBadge({ execution, workers = [], large = false, interactive = 
   interactive?: boolean;
 }) {
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const diagnosticsRef = useRef<HTMLElement>(null);
   const dialogTitleId = useId();
   const Icon = execution.deviceType === "gpu" ? Zap : execution.deviceType === "mixed" ? Network : Cpu;
   const title = execution.fallbackReasons.length > 0 ? execution.fallbackReasons.join(" · ") : executionDetail(execution);
@@ -5355,15 +5130,20 @@ function ExecutionBadge({ execution, workers = [], large = false, interactive = 
 
   useEffect(() => {
     if (!diagnosticsOpen) return;
+    const dialog = diagnosticsRef.current;
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const previousOverflow = document.body.style.overflow;
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setDiagnosticsOpen(false);
+      if (event.key === "Escape") { event.preventDefault(); setDiagnosticsOpen(false); return; }
+      if (dialog) trapDialogTab(event, dialog);
     };
     document.body.style.overflow = "hidden";
+    if (dialog) window.requestAnimationFrame(() => firstFocusable(dialog)?.focus() ?? dialog.focus());
     window.addEventListener("keydown", closeOnEscape);
     return () => {
       document.body.style.overflow = previousOverflow;
       window.removeEventListener("keydown", closeOnEscape);
+      previous?.focus();
     };
   }, [diagnosticsOpen]);
 
@@ -5372,7 +5152,7 @@ function ExecutionBadge({ execution, workers = [], large = false, interactive = 
     <button type="button" className={className} title={title} aria-haspopup="dialog" aria-expanded={diagnosticsOpen} onClick={() => setDiagnosticsOpen(true)}>{contents}</button>
     {diagnosticsOpen && createPortal(
       <div className="execution-diagnostic-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setDiagnosticsOpen(false); }}>
-        <section className="execution-diagnostic-dialog" role="dialog" aria-modal="true" aria-labelledby={dialogTitleId}>
+        <section ref={diagnosticsRef} className="execution-diagnostic-dialog" role="dialog" aria-modal="true" aria-labelledby={dialogTitleId} tabIndex={-1}>
           <header className="execution-diagnostic-head">
             <div><span>REAL TELEMETRY</span><h2 id={dialogTitleId}>Execution diagnostics</h2><p>Device and backend confirmed for each process after loading the model.</p></div>
             <button type="button" aria-label="Close diagnostics" onClick={() => setDiagnosticsOpen(false)}><X /></button>
@@ -5491,6 +5271,12 @@ function formatDuration(milliseconds: number): string {
 function formatResponseThroughput(response: ChatResponse): string {
   if (response.activeMs <= 0 || response.outputTokens <= 0) return "—";
   return (response.outputTokens / (response.activeMs / 1_000)).toFixed(2);
+}
+
+export function formatRecoveryMode(mode: "none" | "prompt-replay" | "deterministic-prefix-replay"): string {
+  if (mode === "deterministic-prefix-replay") return "Exact prefix replay";
+  if (mode === "prompt-replay") return "Prompt replay";
+  return "No recovery";
 }
 
 function formatLiveThroughput(update: ChatStreamUpdate): string {

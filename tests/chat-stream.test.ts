@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   consumeChatCompletionStream,
   consumeChatCompletionStreamWithRecovery,
-} from "../src/desktop/chat-stream.js";
-import type { ChatStreamUpdate } from "../src/desktop/contracts.js";
+} from "../src/core/chat-stream.js";
+import type { ChatStreamUpdate } from "../src/contracts/control-api.js";
 
 describe("chat completion stream", () => {
   it("publishes every token before returning the final metrics", async () => {
@@ -11,7 +11,7 @@ describe("chat completion stream", () => {
       'data: {"id":"job_live","model":"qwen","choices":[{"delta":{"role":"assistant"}}],"x_network":{"session_id":"chat-stable","route_class":"replica","affinity_hit":true}}\n\n',
       'data: {"id":"job_live","model":"qwen","choices":[{"delta":{"content":"hola "}}],"x_network":{"token_index":0}}\n\n',
       'data: {"id":"job_live","model":"qwen","choices":[{"delta":{"content":"mundo"}}],"x_network":{"token_index":1}}\n\n',
-      'data: {"id":"job_live","model":"qwen","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6},"x_network":{"ttft_ms":120,"active_ms":500,"reused_kv_tokens":3}}\n\n',
+      `data: {"id":"job_live","model":"qwen","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6},"x_network":{"ttft_ms":120,"active_ms":500,"reused_kv_tokens":3,"execution_receipt_id":"sha256:${"a".repeat(64)}","trust_policy":"trusted-only","boundary_policy":"pinned-edges","pinned_identity_count":2}}\n\n`,
       "data: [DONE]\n\n",
     ].join("");
     const response = streamingResponse([source.slice(0, 37), source.slice(37, 181), source.slice(181)]);
@@ -35,6 +35,15 @@ describe("chat completion stream", () => {
       reusedKvTokens: 3,
       ttftMs: 120,
       activeMs: 500,
+      executionReceiptId: `sha256:${"a".repeat(64)}`,
+      trustPolicy: "trusted-only",
+      boundaryPolicy: "pinned-edges",
+      pinnedIdentityCount: 2,
+    });
+    expect(updates.at(-1)).toMatchObject({
+      trustPolicy: "trusted-only",
+      boundaryPolicy: "pinned-edges",
+      pinnedIdentityCount: 2,
     });
   });
 
@@ -44,6 +53,26 @@ describe("chat completion stream", () => {
       "data: [DONE]\n\n",
     ]);
     await expect(consumeChatCompletionStream(response, "qwen", () => undefined)).rejects.toThrow("El worker perdió el modelo");
+  });
+
+  it("preserves the declared recovery mode through progress and completion", async () => {
+    const response = streamingResponse([
+      'data: {"id":"job-recovery","model":"qwen","choices":[{"delta":{}}],"x_network":{"phase":"recovering","status_message":"Replaying prefix","attempt":2,"recovery_mode":"deterministic-prefix-replay"}}\n\n',
+      'data: {"id":"job-recovery","model":"qwen","choices":[{"delta":{"content":"ok"}}],"x_network":{"token_index":0}}\n\n',
+      'data: {"id":"job-recovery","model":"qwen","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4},"x_network":{"ttft_ms":30,"active_ms":60,"recovery_mode":"deterministic-prefix-replay","recovery_attempts":2,"replayed_token_events":4}}\n\n',
+      "data: [DONE]\n\n",
+    ]);
+    const updates: ChatStreamUpdate[] = [];
+    const result = await consumeChatCompletionStream(response, "fallback", (update) => updates.push(update));
+    expect(updates).toContainEqual(expect.objectContaining({
+      phase: "recovering",
+      recoveryMode: "deterministic-prefix-replay",
+    }));
+    expect(result).toMatchObject({
+      recoveryMode: "deterministic-prefix-replay",
+      recoveryAttempts: 2,
+      replayedTokenEvents: 4,
+    });
   });
 
   it("retries once before token zero when a distributed stage disconnects", async () => {

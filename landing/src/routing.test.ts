@@ -1,0 +1,54 @@
+import { describe, expect, it } from "vitest";
+import {
+  PANEL_ROUTES,
+  canInspectOperationalEvidence,
+  normalizePanelView,
+  panelLocation,
+  panelRoute,
+  panelViewFromLocation,
+  visiblePanelRoutes,
+} from "./routing";
+
+describe("panel information architecture", () => {
+  it("requires an authenticated operational role for signed evidence", () => {
+    expect(canInspectOperationalEvidence("viewer", "token")).toBe(false);
+    expect(canInspectOperationalEvidence("operator", null)).toBe(false);
+    expect(canInspectOperationalEvidence("operator", "token")).toBe(true);
+    expect(canInspectOperationalEvidence("admin", "token")).toBe(true);
+    expect(canInspectOperationalEvidence("owner", "token")).toBe(true);
+  });
+  it("defines every required product view with one primary action and a stable width", () => {
+    const required = ["overview", "nodes", "network", "models", "jobs", "inference", "tests", "downloads"];
+    expect(PANEL_ROUTES.filter((route) => required.includes(route.id)).map((route) => route.id)).toEqual(required);
+    for (const id of required) {
+      expect(panelRoute(id as Parameters<typeof panelRoute>[0]).primaryAction).not.toBe("");
+      expect(["compact", "standard", "wide"]).toContain(panelRoute(id as Parameters<typeof panelRoute>[0]).width);
+    }
+  });
+
+  it("keeps privileged surfaces out of unauthorized navigation", () => {
+    const publicViews = visiblePanelRoutes("developer", "public").map((route) => route.id);
+    const operatorViews = visiblePanelRoutes("developer", "operator").map((route) => route.id);
+    const ownerViews = visiblePanelRoutes("developer", "owner").map((route) => route.id);
+    expect(publicViews).not.toContain("logs");
+    expect(publicViews).not.toContain("admin");
+    expect(operatorViews).toContain("logs");
+    expect(operatorViews).not.toContain("admin");
+    expect(ownerViews).toContain("admin");
+  });
+
+  it("resolves canonical and legacy deep links without losing bare Network", () => {
+    expect(panelViewFromLocation("/network", "?view=network")).toBe("network");
+    expect(panelViewFromLocation("/network", "?view=history")).toBe("network");
+    expect(panelViewFromLocation("/network", "?view=tasks")).toBe("jobs");
+    expect(normalizePanelView("unknown")).toBeNull();
+    expect(panelLocation("overview")).toBe("/network?view=overview");
+    expect(normalizePanelView("settings")).toBeNull();
+  });
+
+  it("keeps the web contribution route and exposes no retired desktop views", () => {
+    expect(visiblePanelRoutes("simple", "owner").map((route) => route.id)).toContain("contribute");
+    expect(PANEL_ROUTES.map((route) => route.id)).not.toContain("machine");
+    expect(PANEL_ROUTES.map((route) => route.id)).not.toContain("settings");
+  });
+});

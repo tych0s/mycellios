@@ -47,7 +47,7 @@ if (dirname(output) !== resolvedBuild || dirname(archive) !== resolvedBuild) {
 
 const standalonePython = join(standalone, ...spec.pythonExecutable.split("/"));
 if (!existsSync(standalonePython)) {
-  throw new Error("Standalone distribution Python is missing; run npm run desktop:runtime:setup first.");
+  throw new Error("Standalone distribution Python is missing; run npm run node:runtime:setup first.");
 }
 const provenancePath = join(standalone, PORTABLE_PYTHON_PROVENANCE_FILE);
 if (!existsSync(provenancePath)) {
@@ -72,6 +72,12 @@ mkdirSync(resolvedBuild, { recursive: true });
 cpSync(standalone, output, { recursive: true, verbatimSymlinks: true });
 normalizeCopiedInternalAbsoluteSymlinks(output, standalone);
 assertNoEscapingSymlinks(output);
+
+// CPython's Unix distribution carries a terminal database with entries that
+// differ only by case (for example 2621a/2621A). The headless inference runtime
+// does not consume terminfo, and retaining it would make the sealed installer
+// impossible to verify or move safely across case-insensitive filesystems.
+rmSync(join(output, "share", "terminfo"), { recursive: true, force: true });
 
 const packagedPython = join(output, ...spec.pythonExecutable.split("/"));
 if (!existsSync(packagedPython)) {

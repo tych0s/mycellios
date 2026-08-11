@@ -1,8 +1,9 @@
 import { mkdirSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-const SCHEMA_VERSION = 15;
+const SCHEMA_VERSION = 26;
 
 export interface PersistenceOutboxRow {
   id: number;
@@ -43,6 +44,17 @@ export interface WorkerAdmissionCredentialRow {
   revocationReason: string | null;
 }
 
+export interface NodeOwnershipRow {
+  identityKind: "device" | "cell";
+  identityId: string;
+  accountId: string;
+  credentialFingerprint: string;
+  status: "active" | "revoked";
+  generation: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export type WorkerAdmissionResult =
   | { state: "enrolled" | "accepted"; credential: WorkerAdmissionCredentialRow }
   | { state: "revoked" | "key_mismatch" | "fingerprint_in_use"; credential: WorkerAdmissionCredentialRow };
@@ -57,6 +69,9 @@ export type WorkerCredentialRotationResult =
     state: "not_found" | "revoked" | "fingerprint_mismatch" | "fingerprint_in_use";
     credential?: WorkerAdmissionCredentialRow;
   };
+export type WorkerCredentialRecoveryResult =
+  | { state: "recovered"; credential: WorkerAdmissionCredentialRow; generation: number }
+  | { state: "not_found" | "owner_mismatch" | "fingerprint_in_use"; credential?: WorkerAdmissionCredentialRow };
 
 export class MeshDatabase {
   readonly raw: DatabaseSync;
@@ -458,6 +473,270 @@ export class MeshDatabase {
       CREATE INDEX IF NOT EXISTS worker_admission_credentials_status
       ON worker_admission_credentials(status, last_seen_at);
 
+      CREATE TABLE IF NOT EXISTS node_enrollments (
+        id TEXT PRIMARY KEY,
+        token_hash TEXT NOT NULL UNIQUE,
+        nonce_hash TEXT NOT NULL,
+        account_id TEXT NOT NULL,
+        created_by_kind TEXT NOT NULL,
+        created_by_id TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        confirmed_at INTEGER,
+        confirmed_by TEXT,
+        consumed_at INTEGER,
+        identity_kind TEXT,
+        identity_id TEXT,
+        public_key_fingerprint TEXT,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS node_enrollments_account_created
+      ON node_enrollments(account_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS node_enrollment_events (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        enrollment_id TEXT NOT NULL REFERENCES node_enrollments(id) ON DELETE CASCADE,
+        actor_kind TEXT NOT NULL,
+        actor_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        details_json TEXT NOT NULL,
+        occurred_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS node_enrollment_events_enrollment
+      ON node_enrollment_events(enrollment_id, sequence);
+
+      CREATE TABLE IF NOT EXISTS node_ownership (
+        identity_kind TEXT NOT NULL CHECK(identity_kind IN ('device', 'cell')),
+        identity_id TEXT NOT NULL,
+        account_id TEXT NOT NULL,
+        credential_fingerprint TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('active', 'revoked')),
+        generation INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(identity_kind, identity_id),
+        UNIQUE(credential_fingerprint)
+      );
+
+      CREATE TABLE IF NOT EXISTS economic_accounts (
+        id TEXT PRIMARY KEY,
+        owner_kind TEXT NOT NULL CHECK(owner_kind IN ('account', 'node', 'platform')),
+        owner_id TEXT NOT NULL,
+        asset TEXT NOT NULL CHECK(asset = 'MYC_MICROCREDITS'),
+        created_at INTEGER NOT NULL,
+        UNIQUE(owner_kind, owner_id, asset)
+      );
+
+      CREATE TABLE IF NOT EXISTS pricing_policies (
+        id TEXT PRIMARY KEY,
+        model_id TEXT NOT NULL,
+        route_class TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK(version > 0),
+        input_microunits_per_token INTEGER NOT NULL CHECK(input_microunits_per_token >= 0),
+        output_microunits_per_token INTEGER NOT NULL CHECK(output_microunits_per_token >= 0),
+        platform_fee_bps INTEGER NOT NULL CHECK(platform_fee_bps BETWEEN 0 AND 10000),
+        effective_at INTEGER NOT NULL,
+        retired_at INTEGER,
+        UNIQUE(model_id, route_class, version)
+      );
+
+      CREATE TABLE IF NOT EXISTS economic_settlements (
+        id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL UNIQUE,
+        execution_receipt_id TEXT NOT NULL UNIQUE,
+        contribution_evidence_id TEXT NOT NULL UNIQUE REFERENCES economic_contribution_evidence(id),
+        pricing_policy_id TEXT NOT NULL REFERENCES pricing_policies(id),
+        payer_account_id TEXT NOT NULL,
+        input_tokens INTEGER NOT NULL CHECK(input_tokens >= 0),
+        output_tokens INTEGER NOT NULL CHECK(output_tokens >= 0),
+        gross_microunits INTEGER NOT NULL CHECK(gross_microunits >= 0),
+        provider_microunits INTEGER NOT NULL CHECK(provider_microunits >= 0),
+        platform_microunits INTEGER NOT NULL CHECK(platform_microunits >= 0),
+        request_digest TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        CHECK(gross_microunits = provider_microunits + platform_microunits)
+      );
+
+      CREATE TABLE IF NOT EXISTS economic_ledger_entries (
+        id TEXT PRIMARY KEY,
+        settlement_id TEXT NOT NULL REFERENCES economic_settlements(id),
+        account_id TEXT NOT NULL REFERENCES economic_accounts(id),
+        category TEXT NOT NULL CHECK(category IN ('usage', 'work', 'platform_fee')),
+        amount_microunits INTEGER NOT NULL CHECK(amount_microunits != 0),
+        created_at INTEGER NOT NULL,
+        UNIQUE(settlement_id, account_id, category)
+      );
+
+      CREATE INDEX IF NOT EXISTS economic_ledger_account_created
+      ON economic_ledger_entries(account_id, created_at);
+
+      CREATE TABLE IF NOT EXISTS economic_settlement_receipts (
+        settlement_id TEXT PRIMARY KEY REFERENCES economic_settlements(id),
+        receipt_id TEXT NOT NULL UNIQUE,
+        key_id TEXT NOT NULL,
+        receipt_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS execution_receipts (
+        job_id TEXT PRIMARY KEY REFERENCES jobs(id),
+        receipt_id TEXT NOT NULL UNIQUE,
+        key_id TEXT NOT NULL,
+        receipt_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS execution_topologies (
+        job_id TEXT PRIMARY KEY REFERENCES execution_receipts(job_id),
+        receipt_id TEXT NOT NULL UNIQUE REFERENCES execution_receipts(receipt_id),
+        trace_digest TEXT NOT NULL UNIQUE,
+        topology_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS model_certifications (
+        certification_id TEXT PRIMARY KEY,
+        model_family TEXT NOT NULL,
+        decision TEXT NOT NULL CHECK(decision IN ('certified', 'revoked')),
+        topology_kind TEXT NOT NULL,
+        platform TEXT NOT NULL,
+        backend TEXT NOT NULL,
+        certification_json TEXT NOT NULL,
+        reviewed_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS model_certifications_family_reviewed
+      ON model_certifications(model_family, reviewed_at DESC);
+
+      CREATE TABLE IF NOT EXISTS economic_contribution_evidence (
+        id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL UNIQUE,
+        execution_receipt_id TEXT NOT NULL UNIQUE,
+        trace_digest TEXT NOT NULL UNIQUE,
+        evidence_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS economic_node_reputation (
+        node_id TEXT PRIMARY KEY,
+        verified_jobs INTEGER NOT NULL CHECK(verified_jobs >= 0),
+        verified_stage_count INTEGER NOT NULL CHECK(verified_stage_count >= 0),
+        verified_physical_boundaries INTEGER NOT NULL CHECK(verified_physical_boundaries >= 0),
+        earned_microunits INTEGER NOT NULL CHECK(earned_microunits >= 0),
+        last_evidence_id TEXT NOT NULL REFERENCES economic_contribution_evidence(id),
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS node_ownership_account
+      ON node_ownership(account_id, status, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS node_ownership_transfers (
+        id TEXT PRIMARY KEY,
+        identity_id TEXT NOT NULL,
+        source_account_id TEXT NOT NULL,
+        target_account_id TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        expected_generation INTEGER NOT NULL CHECK(expected_generation > 0),
+        expires_at INTEGER NOT NULL,
+        accepted_at INTEGER,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS node_ownership_transfers_target
+      ON node_ownership_transfers(target_account_id, expires_at DESC);
+
+      CREATE TABLE IF NOT EXISTS node_identity_events (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        identity_kind TEXT NOT NULL CHECK(identity_kind IN ('device', 'cell')),
+        identity_id TEXT NOT NULL,
+        generation INTEGER NOT NULL CHECK(generation > 0),
+        actor_kind TEXT NOT NULL CHECK(actor_kind IN ('account', 'node', 'operator')),
+        actor_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        details_json TEXT NOT NULL,
+        previous_event_digest TEXT,
+        event_digest TEXT NOT NULL UNIQUE,
+        occurred_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS node_identity_events_identity_sequence
+      ON node_identity_events(identity_kind, identity_id, sequence);
+
+      CREATE TABLE IF NOT EXISTS node_commands (
+        id TEXT PRIMARY KEY,
+        node_id TEXT NOT NULL,
+        generation INTEGER NOT NULL CHECK(generation > 0),
+        nonce TEXT NOT NULL,
+        command_json TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('queued', 'delivered', 'applied', 'rejected', 'expired')),
+        issued_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        delivered_at INTEGER,
+        completed_at INTEGER,
+        UNIQUE(node_id, nonce)
+      );
+
+      CREATE INDEX IF NOT EXISTS node_commands_pending
+      ON node_commands(node_id, generation, state, created_at);
+
+      CREATE TABLE IF NOT EXISTS node_command_results (
+        id TEXT PRIMARY KEY,
+        command_id TEXT NOT NULL UNIQUE REFERENCES node_commands(id) ON DELETE CASCADE,
+        node_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        result_digest TEXT NOT NULL,
+        result_json TEXT NOT NULL,
+        observed_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS node_control_events (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        node_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        actor_json TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        payload_digest TEXT NOT NULL,
+        previous_event_digest TEXT,
+        event_digest TEXT NOT NULL UNIQUE,
+        occurred_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS node_control_events_node_sequence
+      ON node_control_events(node_id, sequence);
+
+      CREATE TABLE IF NOT EXISTS node_desired_states (
+        node_id TEXT PRIMARY KEY,
+        generation INTEGER NOT NULL CHECK(generation > 0),
+        desired_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS node_snapshots (
+        node_id TEXT PRIMARY KEY,
+        generation INTEGER NOT NULL CHECK(generation > 0),
+        cursor_sequence INTEGER NOT NULL CHECK(cursor_sequence >= 0),
+        snapshot_json TEXT NOT NULL,
+        observed_at INTEGER NOT NULL,
+        received_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS node_snapshot_history (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        node_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        cursor_sequence INTEGER NOT NULL,
+        snapshot_digest TEXT NOT NULL,
+        snapshot_json TEXT NOT NULL,
+        received_at INTEGER NOT NULL,
+        UNIQUE(node_id, snapshot_digest)
+      );
+
+      CREATE INDEX IF NOT EXISTS node_snapshot_history_node_sequence
+      ON node_snapshot_history(node_id, sequence);
+
     `);
     if (currentVersion >= 2 && currentVersion < 3) {
       const columns = this.raw.prepare("PRAGMA table_info(workers)").all() as Array<{
@@ -477,10 +756,24 @@ export class MeshDatabase {
       }
     }
     if (currentVersion < 6) this.migrateWorkerIdentities();
+    if (currentVersion >= 18 && currentVersion < 19) {
+      const columns = this.raw.prepare("PRAGMA table_info(economic_settlements)").all() as Array<{ name: string }>;
+      if (!columns.some((column) => column.name === "contribution_evidence_id")) {
+        this.raw.exec("ALTER TABLE economic_settlements ADD COLUMN contribution_evidence_id TEXT REFERENCES economic_contribution_evidence(id)");
+      }
+      this.raw.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS economic_settlements_contribution_evidence_unique
+        ON economic_settlements(contribution_evidence_id)
+        WHERE contribution_evidence_id IS NOT NULL
+      `);
+    }
     this.raw.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS workers_identity_unique
       ON workers(identity_kind, identity_id)
       WHERE identity_kind IS NOT NULL AND identity_id IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS economic_settlements_contribution_evidence_unique
+      ON economic_settlements(contribution_evidence_id)
+      WHERE contribution_evidence_id IS NOT NULL;
     `);
     this.raw.prepare("UPDATE schema_meta SET version = ?").run(SCHEMA_VERSION);
   }
@@ -612,11 +905,105 @@ export class MeshDatabase {
     );
   }
 
+  getNodeOwnership(
+    identityKind: NodeOwnershipRow["identityKind"],
+    identityId: string,
+  ): NodeOwnershipRow | null {
+    const row = this.raw.prepare(
+      `SELECT identity_kind, identity_id, account_id, credential_fingerprint,
+              status, generation, created_at, updated_at
+       FROM node_ownership WHERE identity_kind = ? AND identity_id = ?`,
+    ).get(identityKind, identityId) as Record<string, unknown> | undefined;
+    return row ? {
+      identityKind: String(row.identity_kind) as NodeOwnershipRow["identityKind"],
+      identityId: String(row.identity_id),
+      accountId: String(row.account_id),
+      credentialFingerprint: String(row.credential_fingerprint),
+      status: String(row.status) as NodeOwnershipRow["status"],
+      generation: Number(row.generation),
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+    } : null;
+  }
+
+  getNodeOwnershipByCredentialFingerprint(credentialFingerprint: string): NodeOwnershipRow | null {
+    const row = this.raw.prepare(
+      `SELECT identity_kind, identity_id, account_id, credential_fingerprint,
+              status, generation, created_at, updated_at
+       FROM node_ownership WHERE credential_fingerprint = ?`,
+    ).get(credentialFingerprint) as Record<string, unknown> | undefined;
+    return row ? {
+      identityKind: String(row.identity_kind) as NodeOwnershipRow["identityKind"],
+      identityId: String(row.identity_id),
+      accountId: String(row.account_id),
+      credentialFingerprint: String(row.credential_fingerprint),
+      status: String(row.status) as NodeOwnershipRow["status"],
+      generation: Number(row.generation),
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+    } : null;
+  }
+
+  appendNodeIdentityEvent(input: {
+    identityKind: NodeOwnershipRow["identityKind"];
+    identityId: string;
+    generation: number;
+    actorKind: "account" | "node" | "operator";
+    actorId: string;
+    eventType: string;
+    details: Record<string, unknown>;
+  }): string {
+    const previous = this.raw.prepare(
+      `SELECT event_digest FROM node_identity_events
+       WHERE identity_kind = ? AND identity_id = ? ORDER BY sequence DESC LIMIT 1`,
+    ).get(input.identityKind, input.identityId) as { event_digest: string } | undefined;
+    const occurredAt = Date.now();
+    const detailsJson = JSON.stringify(input.details);
+    const eventDigest = nodeIdentityEventDigest({ identityKind: input.identityKind, identityId: input.identityId,
+      generation: input.generation, actorKind: input.actorKind, actorId: input.actorId, eventType: input.eventType,
+      detailsJson, previousEventDigest: previous?.event_digest ?? null, occurredAt });
+    this.raw.prepare(
+      `INSERT INTO node_identity_events(
+         identity_kind, identity_id, generation, actor_kind, actor_id,
+         event_type, details_json, previous_event_digest, event_digest, occurred_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(input.identityKind, input.identityId, input.generation, input.actorKind, input.actorId,
+      input.eventType, detailsJson, previous?.event_digest ?? null, eventDigest, occurredAt);
+    return eventDigest;
+  }
+
+  nodeIdentityEvents(identityKind: NodeOwnershipRow["identityKind"], identityId: string): Array<{
+    sequence: number; generation: number; actorKind: string; actorId: string; eventType: string;
+    details: Record<string, unknown>; previousEventDigest: string | null; eventDigest: string; occurredAt: string;
+  }> {
+    const rows = this.raw.prepare(
+      `SELECT sequence, identity_kind, identity_id, generation, actor_kind, actor_id,
+              event_type, details_json, previous_event_digest, event_digest, occurred_at
+       FROM node_identity_events WHERE identity_kind = ? AND identity_id = ? ORDER BY sequence`,
+    ).all(identityKind, identityId) as Array<Record<string, unknown>>;
+    let previous: string | null = null;
+    return rows.map((row) => {
+      const previousEventDigest = row.previous_event_digest === null ? null : String(row.previous_event_digest);
+      if (previousEventDigest !== previous) throw new Error("node_identity_event_chain_broken");
+      const expected = nodeIdentityEventDigest({ identityKind: String(row.identity_kind), identityId: String(row.identity_id),
+        generation: Number(row.generation), actorKind: String(row.actor_kind), actorId: String(row.actor_id),
+        eventType: String(row.event_type), detailsJson: String(row.details_json), previousEventDigest,
+        occurredAt: Number(row.occurred_at) });
+      if (expected !== String(row.event_digest)) throw new Error("node_identity_event_digest_mismatch");
+      previous = expected;
+      return { sequence: Number(row.sequence), generation: Number(row.generation), actorKind: String(row.actor_kind),
+        actorId: String(row.actor_id), eventType: String(row.event_type),
+        details: JSON.parse(String(row.details_json)) as Record<string, unknown>, previousEventDigest,
+        eventDigest: expected, occurredAt: new Date(Number(row.occurred_at)).toISOString() };
+    });
+  }
+
   revokeWorkerAdmissionCredential(input: {
     identityKind: WorkerAdmissionCredentialRow["identityKind"];
     identityId: string;
     expectedFingerprint: string;
     reason: string;
+    actor?: { kind: "account" | "operator"; id: string };
   }): WorkerCredentialRevocationResult {
     return this.transaction(() => {
       const existing = this.getWorkerAdmissionCredential(input.identityKind, input.identityId);
@@ -640,6 +1027,20 @@ export class MeshDatabase {
         input.identityId,
         input.expectedFingerprint,
       );
+      this.raw.prepare(
+        `UPDATE node_ownership SET status = 'revoked', generation = generation + 1,
+             updated_at = ?
+         WHERE identity_kind = ? AND identity_id = ? AND credential_fingerprint = ?`,
+      ).run(
+        now,
+        input.identityKind === "browser" ? "cell" : input.identityKind,
+        input.identityId,
+        input.expectedFingerprint,
+      );
+      const ownership = this.getNodeOwnership(input.identityKind === "browser" ? "cell" : input.identityKind, input.identityId);
+      if (ownership) this.appendNodeIdentityEvent({ identityKind: ownership.identityKind, identityId: ownership.identityId,
+        generation: ownership.generation, actorKind: input.actor?.kind ?? "operator", actorId: input.actor?.id ?? "coordinator", eventType: "credential.revoked",
+        details: { credentialFingerprint: existing.fingerprint, reason: input.reason } });
       return {
         state: "revoked",
         credential: {
@@ -702,6 +1103,23 @@ export class MeshDatabase {
         input.identityId,
         input.expectedFingerprint,
       );
+      this.raw.prepare(
+        `UPDATE node_ownership
+         SET credential_fingerprint = ?, generation = generation + 1,
+             status = 'active', updated_at = ?
+         WHERE identity_kind = ? AND identity_id = ?
+           AND credential_fingerprint = ?`,
+      ).run(
+        input.fingerprint,
+        now,
+        input.identityKind === "browser" ? "cell" : input.identityKind,
+        input.identityId,
+        input.expectedFingerprint,
+      );
+      const ownership = input.identityKind === "browser" ? null : this.getNodeOwnership(input.identityKind, input.identityId);
+      if (ownership) this.appendNodeIdentityEvent({ identityKind: ownership.identityKind, identityId: ownership.identityId,
+        generation: ownership.generation, actorKind: "node", actorId: input.identityId, eventType: "credential.rotated",
+        details: { previousFingerprint: input.expectedFingerprint, credentialFingerprint: input.fingerprint } });
       return {
         state: "rotated",
         credential: {
@@ -716,6 +1134,52 @@ export class MeshDatabase {
           revocationReason: null,
         },
       };
+    });
+  }
+
+  recoverWorkerAdmissionCredential(input: {
+    identityKind: "device";
+    identityId: string;
+    accountId: string;
+    algorithm: WorkerAdmissionCredentialRow["algorithm"];
+    publicKey: string;
+    fingerprint: string;
+    protocolVersion: number;
+  }): WorkerCredentialRecoveryResult {
+    return this.transaction(() => {
+      const ownership = this.getNodeOwnership(input.identityKind, input.identityId);
+      const existing = this.getWorkerAdmissionCredential(input.identityKind, input.identityId);
+      if (!ownership || !existing) return { state: "not_found" };
+      if (ownership.accountId !== input.accountId) return { state: "owner_mismatch", credential: existing };
+      const reused = this.readWorkerAdmissionCredential(this.raw.prepare(
+        `SELECT identity_kind, identity_id, algorithm, public_key, fingerprint,
+                status, protocol_version, created_at, updated_at, last_seen_at,
+                revoked_at, revocation_reason
+         FROM worker_admission_credentials WHERE fingerprint = ?`,
+      ).get(input.fingerprint));
+      if (reused && (reused.identityKind !== input.identityKind || reused.identityId !== input.identityId)) {
+        return { state: "fingerprint_in_use", credential: reused };
+      }
+      const now = Date.now();
+      this.raw.prepare(
+        `UPDATE worker_admission_credentials SET
+           algorithm = ?, public_key = ?, fingerprint = ?, status = 'active',
+           protocol_version = ?, updated_at = ?, last_seen_at = ?,
+           revoked_at = NULL, revocation_reason = NULL
+         WHERE identity_kind = ? AND identity_id = ?`,
+      ).run(input.algorithm, input.publicKey, input.fingerprint, input.protocolVersion, now, now, input.identityKind, input.identityId);
+      this.raw.prepare(
+        `UPDATE node_ownership SET credential_fingerprint = ?, status = 'active',
+             generation = generation + 1, updated_at = ?
+         WHERE identity_kind = ? AND identity_id = ? AND account_id = ?`,
+      ).run(input.fingerprint, now, input.identityKind, input.identityId, input.accountId);
+      const recovered = this.getWorkerAdmissionCredential(input.identityKind, input.identityId);
+      const updatedOwnership = this.getNodeOwnership(input.identityKind, input.identityId);
+      if (!recovered || !updatedOwnership) throw new Error("worker_recovery_persistence_failed");
+      this.appendNodeIdentityEvent({ identityKind: input.identityKind, identityId: input.identityId,
+        generation: updatedOwnership.generation, actorKind: "account", actorId: input.accountId,
+        eventType: "credential.recovered", details: { previousFingerprint: existing.fingerprint, credentialFingerprint: input.fingerprint } });
+      return { state: "recovered", credential: recovered, generation: updatedOwnership.generation };
     });
   }
 
@@ -1012,4 +1476,15 @@ function workerMigrationPriority(row: { status: string; deregistered: number }):
   if (row.status === "online") return 3;
   if (row.status === "suspect" || row.status === "draining") return 2;
   return 1;
+}
+
+function nodeIdentityEventDigest(input: {
+  identityKind: string; identityId: string; generation: number; actorKind: string; actorId: string;
+  eventType: string; detailsJson: string; previousEventDigest: string | null; occurredAt: number;
+}): string {
+  return `sha256:${createHash("sha256").update(JSON.stringify({
+    schema: "mycellios-node-identity-event/1", identityKind: input.identityKind, identityId: input.identityId,
+    generation: input.generation, actorKind: input.actorKind, actorId: input.actorId, eventType: input.eventType,
+    detailsJson: input.detailsJson, previousEventDigest: input.previousEventDigest, occurredAt: input.occurredAt,
+  })).digest("hex")}`;
 }

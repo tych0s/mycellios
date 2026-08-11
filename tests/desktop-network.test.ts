@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { selectPreferredLanAddress } from "../src/desktop/network.js";
+import { selectPreferredLanAddress } from "../src/core/network.js";
 
 describe("desktop network selection", () => {
   it("prefers a physical LAN adapter over an earlier VPN adapter", () => {

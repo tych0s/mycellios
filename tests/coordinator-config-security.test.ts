@@ -1,4 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { generateKeyPairSync } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import {
   assertCoordinatorNetworkSecurity,
   isCoordinatorLoopbackHost,
@@ -57,5 +61,86 @@ describe("coordinator network configuration security", () => {
     })).toThrow(
       "MYCELLIOS_NETWORK_TOKEN is required when GPU_MESH_HOST is not loopback.",
     );
+  });
+
+  it("loads an Ed25519 component-update keyring for safe key rotation", () => {
+    const root = mkdtempSync(join(tmpdir(), "mycellios-keyring-"));
+    try {
+      const spki = generateKeyPairSync("ed25519").publicKey.export({
+        format: "der",
+        type: "spki",
+      }).toString("base64url");
+      const keyring = join(root, "dev-keys.json");
+      writeFileSync(keyring, JSON.stringify([
+        { keyId: "mycellios-dev-old", spki },
+        { keyId: "mycellios-dev-new", spki },
+      ]));
+
+      const config = loadCoordinatorConfig({
+        GPU_MESH_DB: ":memory:",
+        MYCELLIOS_COMPONENT_UPDATE_DEV_KEYRING_FILE: keyring,
+      });
+
+      expect(config.componentUpdatePinnedKeys?.dev).toEqual([
+        { keyId: "mycellios-dev-old", spki },
+        { keyId: "mycellios-dev-new", spki },
+      ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects component-update data that is base64url but not Ed25519 SPKI", () => {
+    expect(() => loadCoordinatorConfig({
+      GPU_MESH_DB: ":memory:",
+      MYCELLIOS_COMPONENT_UPDATE_DEV_KEY_ID: "mycellios-dev-invalid",
+      MYCELLIOS_COMPONENT_UPDATE_DEV_PUBLIC_KEY:
+        Buffer.from("not-an-spki").toString("base64url"),
+    })).toThrow("Invalid dev component update public key configuration.");
+  });
+
+  it("loads model-certification verification only from a complete Ed25519 pin", () => {
+    const spki = generateKeyPairSync("ed25519").publicKey.export({ format: "der", type: "spki" }).toString("base64url");
+    expect(loadCoordinatorConfig({ GPU_MESH_DB: ":memory:", MYCELLIOS_MODEL_CERTIFICATION_KEY_ID: "cert-1",
+      MYCELLIOS_MODEL_CERTIFICATION_PUBLIC_KEY: spki }).modelCertificationPinnedKeys).toEqual([{ keyId: "cert-1", spki }]);
+    expect(() => loadCoordinatorConfig({ GPU_MESH_DB: ":memory:", MYCELLIOS_MODEL_CERTIFICATION_KEY_ID: "cert-1" }))
+      .toThrow("must be configured together");
+    expect(() => loadCoordinatorConfig({ GPU_MESH_DB: ":memory:", MYCELLIOS_MODEL_CERTIFICATION_KEY_ID: "cert-1",
+      MYCELLIOS_MODEL_CERTIFICATION_PUBLIC_KEY: Buffer.from("not-spki").toString("base64url") }))
+      .toThrow("Invalid model certification public key configuration");
+  });
+
+  it("requires the economic receipt key id and private key together", () => {
+    expect(() => loadCoordinatorConfig({
+      GPU_MESH_DB: ":memory:",
+      MYCELLIOS_ECONOMIC_RECEIPT_SIGNING_KEY_ID: "economic-prod-1",
+    })).toThrow("must be configured together");
+    expect(() => loadCoordinatorConfig({
+      GPU_MESH_DB: ":memory:",
+      MYCELLIOS_ECONOMIC_RECEIPT_SIGNING_PRIVATE_KEY: "private-key-only",
+    })).toThrow("must be configured together");
+  });
+
+  it("loads the economic receipt signing key from a secret file", () => {
+    const root = mkdtempSync(join(tmpdir(), "mycellios-economic-key-"));
+    try {
+      const privateKey = generateKeyPairSync("ed25519").privateKey.export({
+        format: "pem",
+        type: "pkcs8",
+      }).toString();
+      const keyFile = join(root, "economic-signing-key.pem");
+      writeFileSync(keyFile, privateKey, { mode: 0o600 });
+
+      const config = loadCoordinatorConfig({
+        GPU_MESH_DB: ":memory:",
+        MYCELLIOS_ECONOMIC_RECEIPT_SIGNING_KEY_ID: "economic-prod-1",
+        MYCELLIOS_ECONOMIC_RECEIPT_SIGNING_PRIVATE_KEY_FILE: keyFile,
+      });
+
+      expect(config.economicReceiptSigningKeyId).toBe("economic-prod-1");
+      expect(config.economicReceiptSigningPrivateKey).toBe(privateKey.trim());
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

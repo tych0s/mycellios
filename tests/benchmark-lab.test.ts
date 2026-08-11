@@ -204,6 +204,7 @@ function singleStageTrace() {
     durationMs: 1_000,
     routeClass: "replica" as const,
     affinityHit: false,
+    routeDecision: null,
     selectedRoute: [{
       routeStageIndex: 0,
       workerId: "worker-local",

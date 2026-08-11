@@ -1,6 +1,6 @@
 # mycellios landing page
 
-Public website independent from the Electron client, ready to be published at
+Public website backed by the Control API and independent from the native node service, ready to be published at
 `https://www.mycellios.com`.
 
 ## Development
@@ -51,7 +51,7 @@ same public message.
 
 The install section detects the visitor's operating system and downloads the
 normalized assets from the latest public GitHub Release. Release filenames are
-defined in `.github/workflows/desktop-build.yml`; keep those stable because the
+defined in `.github/workflows/node-build.yml`; keep those stable because the
 landing uses `releases/latest/download` URLs.
 
 ## Visual assets

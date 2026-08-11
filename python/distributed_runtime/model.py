@@ -219,6 +219,20 @@ class StageRunnerContract(Protocol):
         token_mode: str = "last",
     ) -> tuple[torch.Tensor, int | tuple[int, ...] | None]: ...
 
+    def forward_ids(
+        self,
+        request_id: int,
+        input_ids: torch.Tensor,
+    ) -> torch.Tensor: ...
+
+    def forward_ids_with_tokens(
+        self,
+        request_id: int,
+        input_ids: torch.Tensor,
+        *,
+        token_mode: str = "last",
+    ) -> tuple[torch.Tensor, int | tuple[int, ...]]: ...
+
     def close(self) -> None: ...
 
 
@@ -757,6 +771,33 @@ class StageRunner:
         self.caches[request_id] = output.past_key_values
         self.tokens_seen[request_id] += int(input_ids.shape[1])
         return output.last_hidden_state
+
+    @torch.inference_mode()
+    def forward_ids_with_tokens(
+        self,
+        request_id: int,
+        input_ids: torch.Tensor,
+        *,
+        token_mode: str = "last",
+    ) -> tuple[torch.Tensor, int | tuple[int, ...]]:
+        """Execute a complete first+last stage without a synthetic wire hop.
+
+        This path is valid only when the runner owns the entire model. It keeps
+        the same stage cache lifecycle as distributed execution while applying
+        the final projection directly to the hidden states produced by IDs.
+        """
+
+        if not self.spec.first or not self.spec.last or self.head is None:
+            raise RuntimeError("token projection requires one complete local stage")
+        if token_mode not in ("last", "all"):
+            raise ValueError("token_mode must be last or all")
+        hidden = self.forward_ids(request_id, input_ids)
+        selected = hidden if token_mode == "all" else hidden[:, -1:, :]
+        logits = self.head(selected)
+        tokens = torch.argmax(logits, dim=-1).reshape(-1).tolist()
+        if token_mode == "all":
+            return hidden, tuple(int(token) for token in tokens)
+        return hidden, int(tokens[-1])
 
     @torch.inference_mode()
     def forward_ids_batch(

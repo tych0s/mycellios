@@ -1,0 +1,43 @@
+{
+  "schema": "mycellios-final-web-native-traceability/1",
+  "requirements": [
+    { "id": "FR-00", "tasks": ["P1-F", "P1-G"], "gates": ["G1_ELECTRON_ZERO"] },
+    { "id": "FR-01", "tasks": ["P1-B", "P1-C", "P1-D", "P1-E"], "gates": ["G1_ELECTRON_ZERO"] },
+    { "id": "FR-02", "tasks": ["P1-B", "P1-D", "P1-E"], "gates": ["G1_ELECTRON_ZERO"] },
+    { "id": "FR-03", "tasks": ["P1-C", "P1-D"], "gates": ["G1_ELECTRON_ZERO"] },
+    { "id": "FR-04", "tasks": ["P1-B", "P1-C", "P1-D", "P5-D"], "gates": ["G1_ELECTRON_ZERO", "G5_RESILIENCE_SECURITY"] },
+    { "id": "FR-05", "tasks": ["P2-A", "P2-B"], "gates": ["G2_CERTIFIED_ARTIFACTS"] },
+    { "id": "FR-06", "tasks": ["P2-A", "P7-A"], "gates": ["G2_CERTIFIED_ARTIFACTS", "G7_FINAL_RELEASE"] },
+    { "id": "FR-07", "tasks": ["P2-A", "P2-B", "P2-C"], "gates": ["G2_CERTIFIED_ARTIFACTS"] },
+    { "id": "FR-08", "tasks": ["P3-A", "P3-B"], "gates": ["G3_AUTOMATIC_EXECUTION"] },
+    { "id": "FR-09", "tasks": ["P3-C", "P3-D"], "gates": ["G3_AUTOMATIC_EXECUTION"] },
+    { "id": "FR-10", "tasks": ["P4-A", "P4-B", "P4-C"], "gates": ["G4_WAN_CONVEYOR"] },
+    { "id": "FR-11", "tasks": ["P5-A", "P5-B"], "gates": ["G5_RESILIENCE_SECURITY"] },
+    { "id": "FR-12", "tasks": ["P5-C", "P5-D"], "gates": ["G5_RESILIENCE_SECURITY"] },
+    { "id": "FR-13", "tasks": ["P5-E", "P6-B", "P7-A"], "gates": ["G5_RESILIENCE_SECURITY", "G6_PRODUCT", "G7_FINAL_RELEASE"] },
+    { "id": "FR-14", "tasks": ["P6-A", "P6-B", "P6-C", "P6-D"], "gates": ["G6_PRODUCT"] },
+    { "id": "FR-15", "tasks": ["P7-B", "P7-C", "P7-D"], "gates": ["G7_FINAL_RELEASE"] }
+  ],
+  "acceptanceCriteria": [
+    { "id": "AC-01", "checks": ["G0_BASELINE/electron_inventory", "G1_ELECTRON_ZERO/electron_zero"], "evidenceClasses": ["automatic"] },
+    { "id": "AC-02", "checks": ["G1_ELECTRON_ZERO/native_lifecycle_matrix"], "evidenceClasses": ["physical"] },
+    { "id": "AC-03", "checks": ["G1_ELECTRON_ZERO/web_node_enrollment", "G1_ELECTRON_ZERO/native_lifecycle_matrix"], "evidenceClasses": ["automatic", "physical"] },
+    { "id": "AC-04", "checks": ["G1_ELECTRON_ZERO/node_control_plane", "G5_RESILIENCE_SECURITY/security_p0_control_matrix", "G5_RESILIENCE_SECURITY/security_review"], "evidenceClasses": ["automatic", "external"] },
+    { "id": "AC-05", "checks": ["G1_ELECTRON_ZERO/node_control_plane", "G1_ELECTRON_ZERO/web_node_enrollment", "G1_ELECTRON_ZERO/native_lifecycle_matrix", "G5_RESILIENCE_SECURITY/bounded_recovery"], "evidenceClasses": ["automatic", "physical"] },
+    { "id": "AC-06", "checks": ["G2_CERTIFIED_ARTIFACTS/component_and_model_contracts", "G2_CERTIFIED_ARTIFACTS/qwen3_physical_certification", "G7_FINAL_RELEASE/release_physical_matrix"], "evidenceClasses": ["automatic", "physical"] },
+    { "id": "AC-07", "checks": ["G2_CERTIFIED_ARTIFACTS/minimal_artifact_download"], "evidenceClasses": ["automatic"] },
+    { "id": "AC-08", "checks": ["G2_CERTIFIED_ARTIFACTS/component_and_model_contracts", "G2_CERTIFIED_ARTIFACTS/certification_harness"], "evidenceClasses": ["automatic"] },
+    { "id": "AC-09", "checks": ["G3_AUTOMATIC_EXECUTION/execution_route_policy"], "evidenceClasses": ["automatic"] },
+    { "id": "AC-10", "checks": ["G3_AUTOMATIC_EXECUTION/single_device_execution"], "evidenceClasses": ["automatic"] },
+    { "id": "AC-11", "checks": ["G3_AUTOMATIC_EXECUTION/atomic_activation_lifecycle", "G3_AUTOMATIC_EXECUTION/two_host_exact_execution"], "evidenceClasses": ["automatic", "physical"] },
+    { "id": "AC-12", "checks": ["G4_WAN_CONVEYOR/conveyor_correctness", "G4_WAN_CONVEYOR/physical_conveyor_ab"], "evidenceClasses": ["automatic", "physical"] },
+    { "id": "AC-13", "checks": ["G5_RESILIENCE_SECURITY/bounded_recovery", "G5_RESILIENCE_SECURITY/physical_fault_campaign"], "evidenceClasses": ["automatic", "physical"] },
+    { "id": "AC-14", "checks": ["G2_CERTIFIED_ARTIFACTS/component_and_model_contracts", "G1_ELECTRON_ZERO/external_rollback", "G7_FINAL_RELEASE/pre_environment_and_rollback"], "evidenceClasses": ["automatic", "external"] },
+    { "id": "AC-15", "checks": ["G5_RESILIENCE_SECURITY/protocol_and_artifact_fuzz", "G5_RESILIENCE_SECURITY/security_p0_control_matrix", "G5_RESILIENCE_SECURITY/security_review"], "evidenceClasses": ["automatic", "external"] },
+    { "id": "AC-16", "checks": ["G5_RESILIENCE_SECURITY/privacy_and_trust_policy"], "evidenceClasses": ["automatic"] },
+    { "id": "AC-17", "checks": ["G3_AUTOMATIC_EXECUTION/two_host_exact_execution", "G4_WAN_CONVEYOR/physical_conveyor_ab", "G5_RESILIENCE_SECURITY/physical_fault_campaign", "G7_FINAL_RELEASE/release_physical_matrix"], "evidenceClasses": ["physical"] },
+    { "id": "AC-18", "checks": ["G7_FINAL_RELEASE/release_supply_chain", "G7_FINAL_RELEASE/release_physical_matrix"], "evidenceClasses": ["automatic", "physical"] },
+    { "id": "AC-19", "checks": ["G6_PRODUCT/product_journeys", "G6_PRODUCT/accessibility", "G6_PRODUCT/visual_qa"], "evidenceClasses": ["automatic", "external"] },
+    { "id": "AC-20", "checks": ["G7_FINAL_RELEASE/release_supply_chain", "G7_FINAL_RELEASE/pre_environment_and_rollback", "G7_FINAL_RELEASE/release_authorization"], "evidenceClasses": ["automatic", "external"] }
+  ]
+}

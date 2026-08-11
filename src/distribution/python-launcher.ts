@@ -526,7 +526,8 @@ export interface PythonRootEngineLaunch extends PythonLaunchBase {
   /** Null selects the standard root model loader. */
   nativeGguf: PythonNativeGgufStageConfiguration | null;
   boundaries: number[];
-  firstRemoteStage: PythonDownstreamStage;
+  /** Null means the root owns the complete model and uses no activation wire. */
+  firstRemoteStage: PythonDownstreamStage | null;
   apiEndpoint: RuntimeEndpoint;
   returnBindHost: string;
   returnEndpoint: RuntimeEndpoint;
@@ -639,6 +640,15 @@ function buildDescription(
     prefillSettings(prefill),
     decodeSettings(decode),
   ];
+  if (stages.length === 1) {
+    const localSpeculation = pythonSpeculation(phaseSettings[1].speculation);
+    if (localSpeculation.provider !== "off" || configuration.draftModel) {
+      throw new Error("python_single_stage_speculation_is_not_certified");
+    }
+    if (configuration.recovery) {
+      throw new Error("python_single_stage_remote_recovery_is_invalid");
+    }
+  }
   const frameLimits = executableFrameLimits(prefill, decode);
   const codec = prefill.activationCodec;
   const routeId = routeIdentity(
@@ -768,7 +778,7 @@ function buildDescription(
   const rootStage = stages[0]!;
   const rootNativeGguf =
     configuration.nativeGgufStages[rootStage.stageId] ?? null;
-  const firstRemoteStage = downstreamStage(stages[1]!);
+  const firstRemoteStage = stages[1] ? downstreamStage(stages[1]) : null;
   const rootProcessId = rootProcessIdentity(
     routeId,
     rootStage,
@@ -867,8 +877,8 @@ function assertSharedExecutableRoute(
   if (manifest.kvTransition.mode !== "in-place") {
     throw new Error("python_server_requires_in_place_kv");
   }
-  if (prefill.stages.length < 2) {
-    throw new Error("python_distributed_runtime_requires_two_stages");
+  if (prefill.stages.length < 1) {
+    throw new Error("python_runtime_requires_at_least_one_stage");
   }
   assertExecutableMacroWaveContract(prefill, decode);
   for (const [phase, plan] of [
@@ -1255,15 +1265,11 @@ function renderRootEngineArguments(
     "--max-output-tokens",
     String(configuration.maxOutputTokens),
     "--max-retained-sessions",
-    String(configuration.maxRetainedSessions),
+    String(launch.firstRemoteStage ? configuration.maxRetainedSessions : 0),
     "--max-retained-session-tokens",
-    String(configuration.maxRetainedSessionTokens),
+    String(launch.firstRemoteStage ? configuration.maxRetainedSessionTokens : 0),
     "--retained-session-ttl-seconds",
     finiteNumber(configuration.retainedSessionTtlSeconds),
-    "--first-stage-host",
-    launch.firstRemoteStage.endpoint.host,
-    "--first-stage-port",
-    String(launch.firstRemoteStage.endpoint.port),
     "--return-bind-host",
     configuration.returnBindHost,
     "--return-advertise-host",
@@ -1275,6 +1281,14 @@ function renderRootEngineArguments(
     "--socket-timeout-seconds",
     finiteNumber(configuration.connectTimeoutSeconds),
   );
+  if (launch.firstRemoteStage) {
+    args.push(
+      "--first-stage-host",
+      launch.firstRemoteStage.endpoint.host,
+      "--first-stage-port",
+      String(launch.firstRemoteStage.endpoint.port),
+    );
+  }
   if (configuration.speculativeInflightWaves !== undefined) {
     args.push(
       "--speculative-inflight-waves",

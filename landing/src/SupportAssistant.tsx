@@ -16,11 +16,9 @@ import {
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import type {
   ChatStreamUpdate,
-  DesktopBridge,
-  DesktopSettings,
   SupportAssistantPublicConfig,
-} from "../../src/desktop/contracts";
-import { consumeChatCompletionStreamWithRecovery } from "../../src/desktop/chat-stream";
+} from "../../src/contracts/dashboard";
+import { consumeChatCompletionStreamWithRecovery } from "../../src/core/chat-stream";
 import "./support-assistant.css";
 
 interface AssistantMessage {
@@ -30,19 +28,12 @@ interface AssistantMessage {
   streaming?: boolean;
 }
 
-type AssistantDestination = "models" | "contribute" | "inference" | "machine";
-
-interface AssistantDeviceControl {
-  currentMode: DesktopSettings["computeMode"];
-  onChange: (mode: DesktopSettings["computeMode"]) => Promise<void>;
-}
+type AssistantDestination = "models" | "contribute" | "inference";
 
 interface SupportAssistantProps {
   apiOrigin?: string;
   surface?: "landing" | "panel";
   onNavigate?: (destination: AssistantDestination) => void;
-  deviceControl?: AssistantDeviceControl;
-  desktopBridge?: DesktopBridge;
 }
 
 interface AssistantAction {
@@ -89,8 +80,6 @@ export function SupportAssistant({
   apiOrigin = "",
   surface = "landing",
   onNavigate,
-  deviceControl,
-  desktopBridge,
 }: SupportAssistantProps) {
   const [open, setOpen] = useState(false);
   const [config, setConfig] = useState<SupportAssistantPublicConfig | null>(null);
@@ -107,12 +96,10 @@ export function SupportAssistant({
 
   async function loadConfig() {
     try {
-      const nextConfig = desktopBridge
-        ? await desktopBridge.getSupportAssistantConfig()
-        : await fetch(`${apiOrigin}/public/v1/assistant/config`, { cache: "no-store" }).then(async (response) => {
-            if (!response.ok) throw await responseError(response);
-            return response.json() as Promise<SupportAssistantPublicConfig>;
-          });
+      const nextConfig = await fetch(`${apiOrigin}/public/v1/assistant/config`, { cache: "no-store" }).then(async (response) => {
+        if (!response.ok) throw await responseError(response);
+        return response.json() as Promise<SupportAssistantPublicConfig>;
+      });
       setConfig(nextConfig);
       setConfigError(null);
     } catch (caught) {
@@ -122,7 +109,7 @@ export function SupportAssistant({
 
   useEffect(() => {
     void loadConfig();
-  }, [apiOrigin, desktopBridge]);
+  }, [apiOrigin]);
 
   useEffect(() => {
     if (!open) return;
@@ -135,44 +122,21 @@ export function SupportAssistant({
       setOpen(false);
       return;
     }
-    const view = destination === "machine" ? "contribute" : destination;
-    window.location.assign(`/network?view=${view}`);
+    window.location.assign(`/network?view=${destination}`);
   }
 
   const pendingAction = useMemo<AssistantAction | null>(() => {
     if (!latestIntent || !config) return null;
     const intent = normalizeIntent(latestIntent);
-    const requestsChange = /\b(change|switch|set|use|enable|activate|want|adjust|configure|cambia|cambiar|pon|poner|usa|usar|activa|activar|quiero|ajusta|ajustar|configura|configurar)\b/.test(intent);
-    const computeMode = intent.includes("cpu")
-      ? "cpu-only"
-      : /\b(gpu|maxima potencia|rendimiento maximo)\b/.test(intent)
-        ? "gpu-only"
-        : /\b(automatico|automatic|equilibrado|balanceado)\b/.test(intent)
-          ? "automatic"
-          : null;
-
-    if (requestsChange && computeMode && config.allowDeviceControl) {
-      const modeLabel = computeMode === "gpu-only"
-        ? "GPU only"
-        : computeMode === "cpu-only"
-          ? "CPU only"
-          : "Automatic";
-      if (deviceControl) {
-        if (deviceControl.currentMode === computeMode) return null;
-        return {
-          key: `compute-${computeMode}`,
-          title: `Switch this device to ${modeLabel}`,
-          detail: "This action only changes the local compute mode. It does not affect other nodes.",
-          label: `Confirm ${modeLabel}`,
-          execute: () => deviceControl.onChange(computeMode),
-        };
-      }
+    const requestsComputeChange = /\b(change|switch|set|use|enable|activate|adjust|configure|cambia|cambiar|pon|poner|usa|usar|activa|activar|ajusta|ajustar|configura|configurar)\b/.test(intent)
+      && /\b(cpu|gpu|automatico|automatic|equilibrado|balanceado)\b/.test(intent);
+    if (requestsComputeChange && config.allowDeviceControl) {
       return {
-        key: `open-compute-${computeMode}`,
-        title: `Configure ${modeLabel}`,
-        detail: "Open this device’s controls to confirm the change there.",
+        key: "open-compute-controls",
+        title: "Configure this device",
+        detail: "Open the native node controls to review and confirm the resource policy.",
         label: "Open this device",
-        execute: () => navigate("machine"),
+        execute: () => navigate("contribute"),
       };
     }
 
@@ -191,11 +155,11 @@ export function SupportAssistant({
         title: "Connect this device",
         detail: "Open the local controls to review which resources will be offered before connecting.",
         label: "Open contribution settings",
-        execute: () => navigate(deviceControl ? "machine" : "contribute"),
+        execute: () => navigate("contribute"),
       };
     }
     return null;
-  }, [config, deviceControl, latestIntent, onNavigate]);
+  }, [config, latestIntent, onNavigate]);
 
   async function submitPrompt(event?: FormEvent, suggestion?: string) {
     event?.preventDefault();
@@ -223,14 +187,7 @@ export function SupportAssistant({
               : message
           ));
         };
-      const response = desktopBridge
-        ? await desktopBridge.streamSupportAssistant({
-            sessionId,
-            messages: requestMessages,
-            page,
-            platform,
-          }, onUpdate)
-        : await consumeChatCompletionStreamWithRecovery(
+      const response = await consumeChatCompletionStreamWithRecovery(
             (_attempt, signal) => fetch(`${apiOrigin}/public/v1/assistant/chat`, {
               method: "POST",
               headers: { accept: "text/event-stream", "content-type": "application/json" },

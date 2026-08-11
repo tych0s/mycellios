@@ -138,6 +138,72 @@ export async function signOut(config: PublicAuthConfig, session: AuthSession): P
   }).catch(() => undefined);
 }
 
+export function sessionHasRecentAal2(session: Pick<AuthSession, "accessToken">, now = Date.now()): boolean {
+  const [, payload] = session.accessToken.split(".");
+  if (!payload) return false;
+  try {
+    const claims = JSON.parse(atob(payload.replaceAll("-", "+").replaceAll("_", "/"))) as {
+      aal?: unknown; auth_time?: unknown; amr?: unknown;
+    };
+    const amrTimes = Array.isArray(claims.amr) ? claims.amr.flatMap((entry) => {
+      if (!entry || typeof entry !== "object") return [];
+      const record = entry as Record<string, unknown>;
+      return typeof record.timestamp === "number" && record.method !== "token_refresh" ? [record.timestamp] : [];
+    }) : [];
+    const authenticationTimes = [...(typeof claims.auth_time === "number" ? [claims.auth_time] : []), ...amrTimes];
+    const authenticationTime = authenticationTimes.length > 0 ? Math.max(...authenticationTimes) : null;
+    return claims.aal === "aal2" && typeof authenticationTime === "number"
+      && authenticationTime * 1_000 <= now + 30_000 && authenticationTime * 1_000 >= now - 5 * 60_000;
+  } catch { return false; }
+}
+
+export async function verifyTotpStepUp(
+  config: PublicAuthConfig,
+  session: AuthSession,
+  code: string,
+): Promise<AuthSession> {
+  assertAuthConfig(config);
+  const headers = { apikey: config.anonKey, authorization: `Bearer ${session.accessToken}`, "content-type": "application/json" };
+  const factorsResponse = await fetch(new URL("/auth/v1/factors", config.url), { headers, cache: "no-store" });
+  const factorsPayload = await factorsResponse.json().catch(() => null) as {
+    totp?: Array<{ id?: unknown; status?: unknown }>;
+    all?: Array<{ id?: unknown; factor_type?: unknown; status?: unknown }>;
+    message?: unknown;
+  } | null;
+  if (!factorsResponse.ok) throw new Error(authPayloadMessage(factorsPayload, "Could not load MFA factors."));
+  const factor = factorsPayload?.totp?.find((candidate) => candidate.status === "verified")
+    ?? factorsPayload?.all?.find((candidate) => candidate.factor_type === "totp" && candidate.status === "verified");
+  if (typeof factor?.id !== "string") throw new Error("No verified TOTP factor is enrolled for this account.");
+  const challengeResponse = await fetch(new URL(`/auth/v1/factors/${encodeURIComponent(factor.id)}/challenge`, config.url), {
+    method: "POST", headers, body: "{}",
+  });
+  const challenge = await challengeResponse.json().catch(() => null) as { id?: unknown; message?: unknown } | null;
+  if (!challengeResponse.ok || typeof challenge?.id !== "string") {
+    throw new Error(authPayloadMessage(challenge, "Could not start MFA verification."));
+  }
+  const verifyResponse = await fetch(new URL(`/auth/v1/factors/${encodeURIComponent(factor.id)}/verify`, config.url), {
+    method: "POST", headers, body: JSON.stringify({ challenge_id: challenge.id, code: code.trim() }),
+  });
+  const verified = await verifyResponse.json().catch(() => null) as {
+    access_token?: unknown; refresh_token?: unknown; expires_in?: unknown; message?: unknown;
+  } | null;
+  if (!verifyResponse.ok || typeof verified?.access_token !== "string") {
+    throw new Error(authPayloadMessage(verified, "MFA verification failed."));
+  }
+  const elevated: AuthSession = {
+    ...session,
+    accessToken: verified.access_token,
+    refreshToken: typeof verified.refresh_token === "string" ? verified.refresh_token : session.refreshToken,
+    expiresAt: Date.now() + (typeof verified.expires_in === "number" ? verified.expires_in : 3600) * 1_000,
+  };
+  window.localStorage.setItem(SESSION_KEY, JSON.stringify(elevated));
+  return elevated;
+}
+
+function authPayloadMessage(payload: { message?: unknown } | null, fallback: string): string {
+  return typeof payload?.message === "string" ? payload.message : fallback;
+}
+
 function clearAuthSession(): void {
   window.localStorage.removeItem(SESSION_KEY);
 }

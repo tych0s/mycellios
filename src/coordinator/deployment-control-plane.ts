@@ -61,6 +61,8 @@ export interface RouteStageReservation {
   layerEnd: number;
   memoryMiB: number;
   capacityMiB: number;
+  /** Planned content-addressed model bytes assigned to this node and range. */
+  artifactBytes?: number;
 }
 
 export interface RouteReservation {
@@ -537,6 +539,7 @@ export class DeploymentControlPlane {
           ...stage,
           memoryMiB: Math.max(0, Math.ceil(stage.memoryMiB)),
           capacityMiB: Math.max(0, Math.floor(stage.capacityMiB)),
+          artifactBytes: Math.max(0, Math.ceil(stage.artifactBytes ?? 0)),
         }))
         .sort((left, right) => left.stageIndex - right.stageIndex || left.nodeId.localeCompare(right.nodeId));
       const requestedByNode = new Map<string, { requested: number; capacity: number }>();

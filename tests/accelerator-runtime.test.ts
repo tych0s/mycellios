@@ -24,7 +24,7 @@ import {
   selectAcceleratorPack,
   verifyPortableRuntimeInstallation,
   type RuntimeCommandRunner,
-} from "../src/desktop/accelerator-runtime.js";
+} from "../src/node/accelerator-runtime.js";
 import {
   ARTIFACT_SWARM_SCHEMA,
   ArtifactSwarmRegistry,
@@ -541,7 +541,7 @@ describe("desktop accelerator runtime", () => {
     writeFileSync(join(abandonedShortStaging, "incomplete.txt"), "interrupted", "utf8");
     const artifactBytes = Buffer.from("verified-test-cuda-wheel");
     replaceCudaArtifact(artifactBytes);
-    const events: import("../src/desktop/accelerator-runtime.js").AcceleratorProgressEvent[] = [];
+    const events: import("../src/node/accelerator-runtime.js").AcceleratorProgressEvent[] = [];
     const downloadedPaths: string[] = [];
     const artifactDownloader = vi.fn(async (artifact, cacheRoot, onProgress) => {
       onProgress({
@@ -636,18 +636,20 @@ describe("desktop accelerator runtime", () => {
     const userData = join(root, "user-data");
     const artifactBytes = Buffer.from("verified-test-cuda-wheel");
     const artifact = replaceCudaArtifact(artifactBytes);
-    const registry = new ArtifactSwarmRegistry();
     const keys = generateKeyPairSync("ed25519");
+    const registry = new ArtifactSwarmRegistry({ trustedPublisherKeys: [keys.publicKey] });
     const packageId = createHash("sha256").update("accelerator-package").digest("hex");
     const manifestBytes = Buffer.from("accelerator-package-manifest");
     const manifestDigest = createHash("sha256").update(manifestBytes).digest("hex");
     const signed = registry.publish(signArtifactSwarmManifest({
       schema: ARTIFACT_SWARM_SCHEMA,
       modelIdentity: `sha256:${createHash("sha256").update("accelerator-runtime").digest("hex")}`,
+      distributionManifestId: `sha256:${createHash("sha256").update("accelerator-distribution").digest("hex")}`,
       sourceRevision: "mycellios-desktop-native",
       tensorAbi: "mycellios-accelerator-artifact/1",
       packages: [{
         packageId,
+        artifactIds: ["cuda-wheel"],
         layerStart: 0,
         layerEnd: 1,
         manifest: {
@@ -736,7 +738,7 @@ describe("desktop accelerator runtime", () => {
     replaceCudaArtifact(artifactBytes);
     const externalPath = join(root, "external.whl");
     writeFileSync(externalPath, artifactBytes);
-    const events: import("../src/desktop/accelerator-runtime.js").AcceleratorProgressEvent[] = [];
+    const events: import("../src/node/accelerator-runtime.js").AcceleratorProgressEvent[] = [];
     const runner = vi.fn<RuntimeCommandRunner>();
 
     const result = await prepareAcceleratorRuntime({
@@ -813,7 +815,7 @@ describe("desktop accelerator runtime", () => {
   it("reports an actionable installation requirement while CPU remains available", async () => {
     const root = temporaryRoot();
     const base = createBaseRuntime(root);
-    const events: import("../src/desktop/accelerator-runtime.js").AcceleratorProgressEvent[] = [];
+    const events: import("../src/node/accelerator-runtime.js").AcceleratorProgressEvent[] = [];
     const result = await prepareAcceleratorRuntime({
       baseRuntimeRoot: base,
       userDataPath: join(root, "user-data"),
@@ -841,7 +843,7 @@ describe("desktop accelerator runtime", () => {
   it("does not download the Windows ROCm pack on Windows 10", async () => {
     const root = temporaryRoot();
     const base = createBaseRuntime(root);
-    const events: import("../src/desktop/accelerator-runtime.js").AcceleratorProgressEvent[] = [];
+    const events: import("../src/node/accelerator-runtime.js").AcceleratorProgressEvent[] = [];
     const downloader = vi.fn();
 
     const result = await prepareAcceleratorRuntime({
@@ -893,7 +895,7 @@ describe("desktop accelerator runtime", () => {
       });
     });
     vi.stubGlobal("fetch", fetchMock);
-    const transfers: import("../src/desktop/accelerator-runtime.js").AcceleratorArtifactTransfer[] = [];
+    const transfers: import("../src/node/accelerator-runtime.js").AcceleratorArtifactTransfer[] = [];
 
     const target = await downloadPinnedArtifact(artifact, cacheRoot, (transfer) => transfers.push(transfer));
 
@@ -927,7 +929,7 @@ describe("desktop accelerator runtime", () => {
       now += 50;
       return now;
     });
-    const transfers: import("../src/desktop/accelerator-runtime.js").AcceleratorArtifactTransfer[] = [];
+    const transfers: import("../src/node/accelerator-runtime.js").AcceleratorArtifactTransfer[] = [];
 
     await downloadPinnedArtifact({
       label: "Chunked wheel",

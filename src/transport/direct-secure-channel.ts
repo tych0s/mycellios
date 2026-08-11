@@ -330,7 +330,9 @@ export class DirectSecureChannel extends EventEmitter {
     header.writeBigUInt64BE(this.writeSequence, 0);
     header.writeUInt32BE(data.byteLength, 8);
     const nonce = frameNonce(this.writeSequence);
-    const cipher = createCipheriv("aes-256-gcm", this.writeKey, nonce);
+    const cipher = createCipheriv("aes-256-gcm", this.writeKey, nonce, {
+      authTagLength: AUTH_TAG_BYTES,
+    });
     cipher.setAAD(frameAad(this.connectionId, header));
     const encrypted = Buffer.concat([cipher.update(data), cipher.final()]);
     const frame = Buffer.concat([header, encrypted, cipher.getAuthTag()]);
@@ -377,6 +379,7 @@ export class DirectSecureChannel extends EventEmitter {
         "aes-256-gcm",
         this.readKey,
         frameNonce(sequence),
+        { authTagLength: AUTH_TAG_BYTES },
       );
       decipher.setAAD(frameAad(this.connectionId, header));
       decipher.setAuthTag(tag);

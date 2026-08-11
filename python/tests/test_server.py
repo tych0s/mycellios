@@ -502,11 +502,13 @@ class EngineConfigurationTests(unittest.TestCase):
                     build_server(parse_server_args(arguments))
 
     def test_balanced_and_explicit_boundaries(self) -> None:
+        self.assertEqual(balanced_boundaries(30, 1), (0, 30))
         self.assertEqual(balanced_boundaries(30, 4), (0, 8, 15, 22, 30))
+        self.assertEqual(parse_boundaries("0,30", 30), (0, 30))
         self.assertEqual(parse_boundaries("0,9,30", 30), (0, 9, 30))
         with self.assertRaisesRegex(ValueError, "strictly increasing"):
             parse_boundaries("0,10,10,30", 30)
-        with self.assertRaisesRegex(ValueError, "between 2"):
+        with self.assertRaisesRegex(ValueError, "between 1"):
             balanced_boundaries(4, 5)
 
     def test_remote_pipeline_requires_routable_ports(self) -> None:

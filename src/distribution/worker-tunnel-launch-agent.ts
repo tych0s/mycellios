@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { WorkerEnvelope } from "../contracts/types.js";
-import type { RuntimeProxyHandle, WorkerHub } from "../coordinator/worker-hub.js";
+import type { RuntimeProxyHandle } from "../contracts/runtime-transport.js";
 import type {
   LaunchAgent,
   LaunchAgentStartRequest,
@@ -21,6 +21,16 @@ interface PendingStart {
   ready: Deferred<void>;
   exited: Deferred<LaunchProcessExit>;
   output: LaunchCapturedOutput;
+}
+
+/** Minimal authenticated transport port required by the Engine launcher. */
+export interface WorkerRuntimeTransport {
+  on(event: "envelope", listener: (envelope: WorkerEnvelope) => void): unknown;
+  on(event: "disconnect", listener: (workerId: string) => void): unknown;
+  off(event: "envelope", listener: (envelope: WorkerEnvelope) => void): unknown;
+  off(event: "disconnect", listener: (workerId: string) => void): unknown;
+  send(workerId: string, type: string, payload: unknown): boolean;
+  createRuntimeProxy(workerId: string, targetPort: number): Promise<RuntimeProxyHandle>;
 }
 
 /** Runs compiler-sealed Python stages through the already authenticated worker socket. */
@@ -48,7 +58,7 @@ export class WorkerTunnelLaunchAgent implements LaunchAgent {
   };
 
   constructor(
-    private readonly hub: WorkerHub,
+    private readonly hub: WorkerRuntimeTransport,
     private readonly workerId: string,
     private readonly nodeId: string,
     private readonly description: PythonPipelineLaunchDescription,

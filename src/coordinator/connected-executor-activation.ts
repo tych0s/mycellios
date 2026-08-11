@@ -22,7 +22,6 @@ interface ProfiledConnectedExecutor extends ConnectedExecutor {
   performance: PlannerPerformanceScales;
 }
 
-const RUNTIME_LINK_EVIDENCE_TTL_MS = 5 * 60_000;
 
 /**
  * Decode throughput this worker actually measured **for this model**, or null.
@@ -176,7 +175,7 @@ export function buildConnectedExecutorActivationSnapshot(
         from: from.executor.nodeId,
         to: to.executor.nodeId,
         oneWayLatencyMs: Math.max(0.05, observation.rttP50Ms / 2),
-        jitterP95Ms: Math.max(0, (observation.rttP95Ms - observation.rttP50Ms) / 2),
+        jitterP95Ms: observation.jitterP95Ms / 2,
         bandwidthMbps: observation.goodputMbpsP50,
         // Probe failures are modeled as reachability below. Treating them as
         // both loss and unavailability would charge the same failure twice.
@@ -185,7 +184,7 @@ export function buildConnectedExecutorActivationSnapshot(
         evidence: {
           source: "runtime-probe" as const,
           measuredAt: observation.measuredAt,
-          validUntil: observation.measuredAt + RUNTIME_LINK_EVIDENCE_TTL_MS,
+          validUntil: observation.validUntil,
           successfulSamples: observation.successfulSamples,
           failedSamples: observation.failedSamples,
         },

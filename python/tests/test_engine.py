@@ -16,6 +16,7 @@ import torch
 from distributed_runtime.engine import (
     DistributedPipelineEngine,
     GenerationInput,
+    LocalPipelineEngine,
     PipelineEngineConfig,
     PipelineShutdownError,
     _GenerationJob,
@@ -57,6 +58,95 @@ from distributed_runtime.speculation import (
 
 
 class EngineUnitTests(unittest.TestCase):
+    def test_local_engine_executes_one_complete_stage_without_a_wire_hop(self) -> None:
+        config = PipelineEngineConfig(
+            model_name="fake",
+            boundaries=(0, 4),
+            max_active_sequences=1,
+            max_pending_requests=4,
+        )
+        artifact = SimpleNamespace(
+            identity="sha256:" + "1" * 64,
+            canonical_source="content-addressed://fake",
+            canonical_revision=None,
+            snapshot_identity=7,
+        )
+        model_config = SimpleNamespace(
+            num_hidden_layers=4,
+            hidden_size=8,
+            max_position_embeddings=128,
+        )
+
+        class FakeCompleteRunner:
+            parameter_bytes = 123
+            model_forward_calls = 0
+
+            def __init__(self) -> None:
+                self.steps: dict[int, int] = {}
+                self.closed = False
+
+            def begin(self, request_id: int) -> None:
+                self.steps[request_id] = 0
+
+            def end(self, request_id: int) -> None:
+                self.steps.pop(request_id)
+
+            def forward_ids_with_tokens(
+                self,
+                request_id: int,
+                input_ids: torch.Tensor,
+                *,
+                token_mode: str,
+            ) -> tuple[torch.Tensor, int]:
+                self.assertions = (tuple(input_ids.shape), token_mode)
+                self.model_forward_calls += 1
+                step = self.steps[request_id]
+                self.steps[request_id] = step + 1
+                return torch.zeros((1, input_ids.shape[1], 8)), (7, 9)[step]
+
+            def execution_snapshot(self) -> dict[str, str]:
+                return {"device": "cpu"}
+
+            def close(self) -> None:
+                self.closed = True
+
+        runner = FakeCompleteRunner()
+        callbacks: list[tuple[int, int, int]] = []
+        with (
+            mock.patch(
+                "distributed_runtime.engine.AutoConfig.from_pretrained",
+                return_value=model_config,
+            ),
+            mock.patch(
+                "distributed_runtime.engine.resolve_model_snapshot",
+                return_value="fake-snapshot",
+            ),
+            mock.patch(
+                "distributed_runtime.engine.model_artifact_reference",
+                return_value=artifact,
+            ),
+            mock.patch(
+                "distributed_runtime.engine.StageRunner",
+                return_value=runner,
+            ),
+        ):
+            engine = LocalPipelineEngine(config)
+            output = engine.generate(
+                [GenerationInput(41, torch.tensor([[1, 2, 3]]), 4, frozenset({9}))],
+                lambda client, token, step, _arrived: callbacks.append(
+                    (client, token, step)
+                ),
+            )[0]
+
+        self.assertEqual(output.token_ids, (7, 9))
+        self.assertEqual(output.finish_reason, "stop")
+        self.assertEqual(callbacks, [(41, 7, 0), (41, 9, 1)])
+        self.assertEqual(engine.stages, 1)
+        self.assertTrue(engine.healthy)
+        self.assertEqual(engine.execution_topology["observed_stage_count"], 1)
+        engine.close()
+        self.assertTrue(runner.closed)
+
     def test_exact_speculative_resolution_accepts_prefix_and_returns_correction(self) -> None:
         self.assertEqual(
             _resolve_verified_tokens((10, 20), (10, 20, 30)),

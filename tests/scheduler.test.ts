@@ -46,6 +46,32 @@ describe("multi-objective scheduler", () => {
     expect(route?.stages[0]?.workerId).toBe(eligible.id);
   });
 
+  it("classifies a proven request-origin worker as local-complete", () => {
+    const local = addWorker(store, { id: "origin-worker", tokensPerSecond: 30 });
+    const remote = addWorker(store, { id: "remote-worker", tokensPerSecond: 10 });
+    const decision = scheduler.selectExecutionRouteDecision(request, "local-session", {
+      connectedWorkerIds: new Set([local.id, remote.id]),
+      originWorkerId: local.id,
+    });
+
+    expect(decision.selected).toMatchObject({
+      kind: "local-complete",
+      route: { stages: [{ workerId: local.id }] },
+    });
+    expect(decision.fallbacks[0]).toMatchObject({ kind: "remote-replica" });
+  });
+
+  it("classifies a deployed one-stage native cell as local-complete without caller hints", () => {
+    const local = addWorker(store, {
+      id: "native-one-stage",
+      internalPipeline: { stageCount: 1, boundaries: [0, 28] },
+    });
+    const decision = scheduler.selectExecutionRouteDecision(request, "native-local", {
+      connectedWorkerIds: new Set([local.id]),
+    });
+    expect(decision.selected?.kind).toBe("local-complete");
+  });
+
   it("reuses a healthy session route", () => {
     const first = addWorker(store, { id: "first", tokensPerSecond: 10 });
     const second = addWorker(store, { id: "second", tokensPerSecond: 30 });
@@ -168,6 +194,26 @@ describe("multi-objective scheduler", () => {
     expect(plan?.standbys.every(
       (route) => route.stages[0]?.modelDigest === plan.primary.stages[0]?.modelDigest,
     )).toBe(true);
+    expect(plan?.decision).toMatchObject({
+      recommendation: { kind: "remote-replica" },
+      selected: { kind: "remote-replica", reason: "selected_best_service" },
+      selectedKind: "remote-replica",
+      reasons: ["selected_best_service"],
+    });
+    expect(plan?.decision.fallbacks.length).toBeGreaterThanOrEqual(2);
+    expect(plan?.decision.standbys).toEqual([
+      expect.objectContaining({
+        candidateId: expect.stringContaining(standbyOne.id),
+        kind: "remote-replica",
+        compatibility: "exact-model-revision-and-stage-contract",
+        stageCount: 1,
+        modelDigests: ["sha256:revision-a"],
+      }),
+      expect.objectContaining({
+        candidateId: expect.stringContaining(standbyTwo.id),
+        compatibility: "exact-model-revision-and-stage-contract",
+      }),
+    ]);
     const plannedWorkers = [plan!.primary, ...plan!.standbys]
       .flatMap((route) => route.stages.map((stage) => stage.workerId));
     expect(new Set(plannedWorkers).size).toBe(plannedWorkers.length);
@@ -192,6 +238,81 @@ describe("multi-objective scheduler", () => {
     expect(route?.routeClass).toBe("pipeline");
     expect(route?.stages).toHaveLength(3);
     expect(new Set(route?.stages.map((stage) => stage.workerId)).size).toBe(3);
+  });
+
+  it("keeps the smallest SLO-valid pipeline and excludes a slower extra node", () => {
+    const twoStage = [0, 1].map((index) => addWorker(store, {
+      id: `small-cell-${index}`,
+      model: "cell-choice-model",
+      modelDigest: "sha256:cell-choice",
+      mode: "pipeline",
+      tokensPerSecond: 20,
+      ttftMs: 100,
+      stage: { index, total: 2, layerStart: index * 15, layerEnd: (index + 1) * 15 },
+    }));
+    const threeStage = [0, 1, 2].map((index) => addWorker(store, {
+      id: `slow-large-cell-${index}`,
+      model: "cell-choice-model",
+      modelDigest: "sha256:cell-choice",
+      mode: "pipeline",
+      tokensPerSecond: 100,
+      ttftMs: index === 2 ? 70_000 : 100,
+      stage: { index, total: 3, layerStart: index * 10, layerEnd: (index + 1) * 10 },
+    }));
+    const workers = [...twoStage, ...threeStage];
+    const decision = scheduler.selectExecutionRouteDecision(
+      { ...request, model: "cell-choice-model" },
+      "minimum-cell",
+      {
+        connectedWorkerIds: new Set(workers.map((worker) => worker.id)),
+        allowPipeline: true,
+      },
+    );
+
+    expect(decision.selected?.kind).toBe("distributed-pipeline");
+    expect(decision.selected?.route.stages).toHaveLength(2);
+    expect(decision.evaluations.find((candidate) => candidate.nodeCount === 3)).toMatchObject({
+      eligible: false,
+      reasons: ["candidate_slo_exceeded"],
+    });
+  });
+
+  it("keeps an interactive pipeline co-located instead of taking a faster WAN stage", () => {
+    const root = addWorker(store, {
+      id: "colocated-root",
+      model: "locality-model",
+      modelDigest: "sha256:locality",
+      mode: "pipeline",
+      region: "es-mad",
+      stage: { index: 0, total: 2, layerStart: 0, layerEnd: 15 },
+    });
+    const localTail = addWorker(store, {
+      id: "colocated-tail",
+      model: "locality-model",
+      modelDigest: "sha256:locality",
+      mode: "pipeline",
+      region: "es-mad",
+      tokensPerSecond: 10,
+      stage: { index: 1, total: 2, layerStart: 15, layerEnd: 30 },
+    });
+    const wanTail = addWorker(store, {
+      id: "wan-tail",
+      model: "locality-model",
+      modelDigest: "sha256:locality",
+      mode: "pipeline",
+      region: "us-east",
+      tokensPerSecond: 100,
+      stage: { index: 1, total: 2, layerStart: 15, layerEnd: 30 },
+    });
+    const route = scheduler.selectRoute(
+      { ...request, model: "locality-model", workload_class: "interactive" },
+      "co-located-route",
+      {
+        connectedWorkerIds: new Set([root.id, localTail.id, wanTail.id]),
+        allowPipeline: true,
+      },
+    );
+    expect(route?.stages.map((stage) => stage.workerId)).toEqual([root.id, localTail.id]);
   });
 
   it("fails closed for a physical pipeline until every forward and return link is measured", () => {
@@ -229,6 +350,12 @@ describe("multi-objective scheduler", () => {
     expect(scheduler.selectRoute(routeInput, "missing-return", options)).toBeNull();
     observations.push(measuredLink("node-2", "node-0", 16, 750));
     expect(scheduler.selectRoute(routeInput, "complete-cycle", options)?.stages).toHaveLength(3);
+    observations[0]!.validUntil = Date.now() - 1;
+    expect(scheduler.selectRoute(routeInput, "expired-forward", options)).toBeNull();
+    observations[0]!.validUntil = Date.now() + 60_000;
+    observations[0]!.successfulSamples = 2;
+    observations[0]!.confidence = 0.5;
+    expect(scheduler.selectRoute(routeInput, "low-confidence-forward", options)).toBeNull();
   });
 
   it("routes interactive and batch traffic with different latency objectives", () => {
@@ -254,6 +381,101 @@ describe("multi-objective scheduler", () => {
       "throughput-objective",
       { connectedWorkerIds },
     )?.stages[0]?.workerId).toBe(highThroughput.id);
+  });
+
+  it("applies trust, residency and failure-domain constraints with stable reasons", () => {
+    const untrusted = addWorker(store, { id: "untrusted", tokensPerSecond: 100, trusted: false });
+    const wrongRegion = addWorker(store, {
+      id: "wrong-region",
+      region: "us-east",
+      tokensPerSecond: 80,
+      identity: { kind: "device", id: "domain-wrong-region" },
+    });
+    const excluded = addWorker(store, {
+      id: "excluded-domain",
+      tokensPerSecond: 60,
+      identity: { kind: "device", id: "domain-excluded" },
+    });
+    const eligible = addWorker(store, {
+      id: "eligible-policy",
+      tokensPerSecond: 20,
+      identity: { kind: "device", id: "domain-eligible" },
+    });
+    const decision = scheduler.selectExecutionRouteDecision(request, "policy-session", {
+      connectedWorkerIds: new Set([untrusted.id, wrongRegion.id, excluded.id, eligible.id]),
+      routePolicy: {
+        requireTrustedIdentity: true,
+        residencyRegion: "es-mad",
+        excludedFailureDomainIds: new Set(["domain-excluded"]),
+      },
+    });
+
+    expect(decision.selected?.route.stages[0]?.workerId).toBe(eligible.id);
+    const reasonsFor = (workerId: string) => decision.evaluations.find(
+      (evaluation) => evaluation.candidateId.includes(workerId),
+    )?.reasons;
+    expect(reasonsFor(untrusted.id)).toContain("candidate_trust_rejected");
+    expect(reasonsFor(wrongRegion.id)).toContain("candidate_residency_rejected");
+    expect(reasonsFor(excluded.id)).toContain("candidate_failure_domain_rejected");
+  });
+
+  it("pins sensitive edges by default while trusted-only also rejects an anonymous middle stage", () => {
+    const stages = [
+      addWorker(store, { id: "edge-first", model: "private-model", mode: "pipeline",
+        stage: { index: 0, total: 3, layerStart: 0, layerEnd: 10 } }),
+      addWorker(store, { id: "middle-anonymous", model: "private-model", mode: "pipeline", trusted: false,
+        stage: { index: 1, total: 3, layerStart: 10, layerEnd: 20 } }),
+      addWorker(store, { id: "edge-last", model: "private-model", mode: "pipeline",
+        stage: { index: 2, total: 3, layerStart: 20, layerEnd: 30 } }),
+    ];
+    const connectedWorkerIds = new Set(stages.map(({ id }) => id));
+    const boundaryOnly = scheduler.selectExecutionRouteDecision(
+      { ...request, model: "private-model" }, "boundary-only",
+      { connectedWorkerIds, allowPipeline: true, routePolicy: { requireTrustedBoundaryIdentity: true } },
+    );
+    expect(boundaryOnly.selected?.route.stages).toHaveLength(3);
+
+    const trustedOnly = scheduler.selectExecutionRouteDecision(
+      { ...request, model: "private-model" }, "trusted-only",
+      { connectedWorkerIds, allowPipeline: true, routePolicy: {
+        requireTrustedBoundaryIdentity: true,
+        requireTrustedIdentity: true,
+      } },
+    );
+    expect(trustedOnly.selected).toBeNull();
+    expect(trustedOnly.reasons).toContain("candidate_trust_rejected");
+
+    const wrongPins = scheduler.selectExecutionRouteDecision(
+      { ...request, model: "private-model" }, "wrong-pins",
+      { connectedWorkerIds, allowPipeline: true, routePolicy: {
+        requireTrustedBoundaryIdentity: true,
+        pinnedBoundaryIdentityIds: new Set(["test-edge-first"]),
+      } },
+    );
+    expect(wrongPins.selected).toBeNull();
+    expect(wrongPins.reasons).toContain("candidate_boundary_pin_rejected");
+  });
+
+  it("rejects routes outside the request SLO or normalized cost ceiling", () => {
+    const slow = addWorker(store, {
+      id: "slow-slo",
+      ttftMs: 70_000,
+      tokensPerSecond: 1,
+    });
+    const connectedWorkerIds = new Set([slow.id]);
+    const slo = scheduler.selectExecutionRouteDecision(request, "slo-session", {
+      connectedWorkerIds,
+    });
+    expect(slo.selectedKind).toBe("unavailable");
+    expect(slo.reasons).toContain("candidate_slo_exceeded");
+
+    const cost = scheduler.selectExecutionRouteDecision(
+      { ...request, deadline_ms: 600_000 },
+      "cost-session",
+      { connectedWorkerIds, routePolicy: { maxNormalizedCost: 0 } },
+    );
+    expect(cost.selectedKind).toBe("unavailable");
+    expect(cost.reasons).toContain("candidate_cost_exceeded");
   });
 
   it("drops KV affinity when its route is saturated and a free route exists", () => {
@@ -307,6 +529,33 @@ describe("multi-objective scheduler", () => {
       { connectedWorkerIds: new Set([worker.id]) },
     );
     expect(route).toBeNull();
+    const decision = scheduler.selectExecutionRouteDecision(
+      { ...request, max_tokens: 120, messages: [{ role: "user", content: "x".repeat(100) }] },
+      "context-decision",
+      { connectedWorkerIds: new Set([worker.id]) },
+    );
+    expect(decision.reasons).toContain("candidate_context_exceeded");
+  });
+
+  it("reports queue exhaustion instead of collapsing it into no capacity detail", () => {
+    const worker = addWorker(store, { id: "queue-full", maxConcurrency: 1 });
+    const initial = scheduler.selectRoute(request, "queue-initial", {
+      connectedWorkerIds: new Set([worker.id]),
+    })!;
+    const job = store.createJob({
+      id: "queue-blocker",
+      sessionId: "queue-blocker-session",
+      model: request.model,
+      workloadClass: "interactive",
+      deadlineAt: Date.now() + 60_000,
+    });
+    store.setJobRoute(job.id, initial, "queue-blocker-lease");
+
+    const decision = scheduler.selectExecutionRouteDecision(request, "queue-rejected", {
+      connectedWorkerIds: new Set([worker.id]),
+    });
+    expect(decision.selectedKind).toBe("unavailable");
+    expect(decision.reasons).toContain("candidate_capacity_exhausted");
   });
 });
 
@@ -316,15 +565,19 @@ function measuredLink(
   rttP95Ms: number,
   goodputMbpsP50: number,
 ) {
+  const measuredAt = Date.now();
   return {
     fromNodeId,
     toNodeId,
-    measuredAt: Date.now(),
+    measuredAt,
+    validUntil: measuredAt + 60_000,
     rttP50Ms: rttP95Ms * 0.75,
     rttP95Ms,
+    jitterP95Ms: rttP95Ms * 0.1,
     goodputMbpsP50,
     successfulSamples: 7,
     failedSamples: 0,
     availability: 1,
+    confidence: 1,
   };
 }

@@ -5,7 +5,7 @@ import {
   canInstallAutomaticUpdate,
   summarizeAutomaticUpdateError,
   trackActiveStage,
-} from "../src/desktop/update-recovery.js";
+} from "../src/update/update-recovery.js";
 
 describe("automatic desktop update recovery", () => {
   it("checks for unattended repairs at least every fifteen minutes", () => {
@@ -18,6 +18,7 @@ describe("automatic desktop update recovery", () => {
       quitting: false,
       activeJobs: 0,
       activeStages: 0,
+      componentUpdateBusy: false,
     })).toBe(true);
   });
 
@@ -27,12 +28,21 @@ describe("automatic desktop update recovery", () => {
       quitting: false,
       activeJobs: 1,
       activeStages: 0,
+      componentUpdateBusy: false,
     })).toBe(false);
     expect(canInstallAutomaticUpdate({
       updateReady: true,
       quitting: false,
       activeJobs: 0,
       activeStages: 1,
+      componentUpdateBusy: false,
+    })).toBe(false);
+    expect(canInstallAutomaticUpdate({
+      updateReady: true,
+      quitting: false,
+      activeJobs: 0,
+      activeStages: 0,
+      componentUpdateBusy: true,
     })).toBe(false);
   });
 
@@ -42,12 +52,14 @@ describe("automatic desktop update recovery", () => {
       quitting: false,
       activeJobs: 0,
       activeStages: 0,
+      componentUpdateBusy: false,
     })).toBe(false);
     expect(canInstallAutomaticUpdate({
       updateReady: true,
       quitting: true,
       activeJobs: 0,
       activeStages: 0,
+      componentUpdateBusy: false,
     })).toBe(false);
   });
 

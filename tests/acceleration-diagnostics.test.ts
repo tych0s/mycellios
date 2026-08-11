@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   buildWorkerAccelerationDiagnostics,
   sanitizeAcceleratorDiagnosticText,
-} from "../src/desktop/acceleration-diagnostics.js";
-import { createInitialAccelerationStatus } from "../src/desktop/acceleration-progress.js";
+} from "../src/node/acceleration-diagnostics.js";
+import { createInitialAccelerationStatus } from "../src/node/acceleration-progress.js";
 
 describe("remote accelerator diagnostics", () => {
   it("removes local paths, bearer credentials and multiline stack formatting", () => {

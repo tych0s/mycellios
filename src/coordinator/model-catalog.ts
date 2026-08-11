@@ -5,7 +5,7 @@ import {
   MODEL_ADAPTER_REGISTRY_ID,
   resolveModelAdapterContract,
 } from "../contracts/model-adapter-registry.js";
-import type { ActivationIncident } from "./activation-incident.js";
+import type { ActivationIncident } from "../contracts/activation-incident.js";
 
 const MIB = 1024 * 1024;
 const MAX_SAFETENSORS_HEADER_BYTES = 64 * MIB;

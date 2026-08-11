@@ -76,6 +76,8 @@ const runtime = await createCoordinator(config, {
             if (!operation) throw new Error(`deployment_operation_missing:${modelId}`);
             return deploymentController.prepareRoute(operation.id, stages).id;
           },
+          onPlanHeartbeat: (_modelId, reservationId) =>
+            deploymentController.renewRoute(reservationId),
           onActivated: (modelId, reservationId, result) => {
             const canary = {
               passed: true,

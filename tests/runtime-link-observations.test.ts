@@ -13,12 +13,15 @@ describe("runtime link observations", () => {
       fromNodeId: "node-a",
       toNodeId: "node-b",
       measuredAt: 4_000,
+      validUntil: 64_000,
       rttP50Ms: 30,
       rttP95Ms: 50,
+      jitterP95Ms: 20,
       goodputMbpsP50: 60,
       successfulSamples: 3,
       failedSamples: 1,
       availability: 0.75,
+      confidence: 0.75,
     }]);
   });
 

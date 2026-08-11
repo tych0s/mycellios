@@ -4,9 +4,9 @@ import {
   gpuPreparationAutomaticRetryLimit,
   gpuPreparationRetryDelayMs,
   readVerifiedAccelerationUsage,
-} from "../src/desktop/acceleration-evidence.js";
-import { createInitialAccelerationStatus } from "../src/desktop/acceleration-progress.js";
-import type { DashboardWorker } from "../src/desktop/contracts.js";
+} from "../src/node/acceleration-evidence.js";
+import { createInitialAccelerationStatus } from "../src/node/acceleration-progress.js";
+import type { DashboardWorker } from "../src/contracts/control-api.js";
 
 function worker(input: {
   id: string;
@@ -15,7 +15,7 @@ function worker(input: {
 }): DashboardWorker {
   return {
     id: input.id,
-    kind: "desktop",
+    kind: "node",
     status: "online",
     connected: true,
     region: "test",

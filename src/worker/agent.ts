@@ -31,6 +31,7 @@ import {
   LaunchProcessExitedError,
   type LaunchAgent,
   type LaunchAgentStartRequest,
+  type LaunchCapturedOutput,
   type LaunchProcessHandle,
 } from "../distribution/launch-supervisor.js";
 import {
@@ -83,6 +84,15 @@ export interface WorkerAgentOptions {
    * leaves the worker; only one-time challenge signatures are transmitted.
    */
   admissionSigner?: WorkerAdmissionSigner | undefined;
+  /** One-shot enrollment hook invoked after exact capabilities are known but before admission. */
+  beforeSignedAdmission?: (input: {
+    identity: { kind: "device" | "cell"; id: string };
+    capabilities: WorkerCapabilities;
+    protocol: { min: typeof WORKER_PROTOCOL_MIN; max: typeof WORKER_PROTOCOL_MAX };
+    signer: WorkerAdmissionSigner;
+    registrationDigest: string;
+    signal: AbortSignal;
+  }) => Promise<void>;
   /** Register the physical node without claiming that a model runtime exists. */
   advertiseDeployment?: boolean;
   /** Deterministic hardware source for embedded agents and tests. */
@@ -117,6 +127,8 @@ export interface WorkerAgentOptions {
     initialEnabled: boolean;
     onRemoteChange?: (enabled: boolean) => Promise<void> | void;
   };
+  /** Local fail-closed admission policy for schedule and exact model allowlists. */
+  workAdmissionPolicy?: (model: string | null, at: Date) => string | null;
   distributedExecutor?: {
     nodeId: string;
     stageHost: string;
@@ -425,6 +437,7 @@ const registrationResponseSchema = z
     protocolVersion: z.literal(1),
     credentialFingerprint: z.string().regex(/^sha256:[a-f0-9]{64}$/).optional(),
     workerSessionToken: z.string().min(1).max(4_096).optional(),
+    nodeGeneration: z.number().int().positive().optional(),
     enrollment: z.enum(["enrolled", "accepted", "local-legacy"]).optional(),
   })
   .strict();
@@ -446,26 +459,36 @@ export class WorkerAgent {
   private readonly coordinatorBaseUrl: URL;
   private registeredWorkerId: string | undefined;
   private workerSessionToken: string | undefined;
+  private registeredNodeGeneration: number | undefined;
   private capabilities: WorkerCapabilities | null = null;
   private socket: WebSocket | null = null;
   private rttProbeTimer: NodeJS.Timeout | null = null;
   private pendingRttProbe: bigint | null = null;
   private lastRttSampleMs: number | null = null;
   private stopped = false;
+  private readonly startupAbortController = new AbortController();
+  private directTransportStartPromise: Promise<DirectTransportAdvertisement | null> | null = null;
+  private stopPromise: Promise<void> | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private readonly activeJobs = new Map<string, AbortController>();
   private readonly recentJobs = new Map<string, number>();
   private readonly authorizedRuntimeProcesses = new Map<string, string>();
   private readonly preparedRuntimeProcesses = new Map<string, import("../distribution/python-launcher.js").PythonLaunchProcess>();
+  private readonly preparedRuntimeModels = new Map<string, string>();
   private readonly runtimeProcesses = new Map<string, LaunchProcessHandle>();
+  private readonly runtimeStartRequests = new Map<string, string>();
+  private readonly readyRuntimeOutputs = new Map<string, LaunchCapturedOutput>();
   private readonly runtimeLinkProbes = new Map<string, PendingRuntimeLinkProbe>();
   private readonly activeEvidenceChallenges = new Set<string>();
+  private activeRuntimeOperations = 0;
   private readonly runtimeTunnel: RuntimeStreamTunnel | null;
   private directTransportAdvertisement: DirectTransportAdvertisement | null = null;
   private readonly logger: Pick<Console, "info" | "warn" | "error">;
   private runtimeCapacityGeneration = 0;
   private runtimeDisconnectTimer: NodeJS.Timeout | null = null;
   private contributionEnabled: boolean;
+  private updateDraining = false;
+  private coordinatorReady = false;
 
   constructor(
     private readonly config: WorkerConfig,
@@ -500,42 +523,131 @@ export class WorkerAgent {
   }
 
   async start(): Promise<void> {
-    this.directTransportAdvertisement = await this.runtimeTunnel?.startDirectTransport() ?? null;
-    this.capabilities = await this.buildCapabilities();
-    this.updateFreeSlots();
-    await this.register();
-    let delayMs = 500;
-    do {
-      try {
-        await this.connectOnce();
-        delayMs = 500;
-      } catch (error) {
-        if (!this.stopped) this.logger.warn(`Worker connection failed: ${errorText(error)}`);
-      }
-      if (this.stopped || this.options.reconnect === false) break;
-      await delay(delayMs);
-      delayMs = Math.min(15_000, delayMs * 2);
-    } while (!this.stopped);
+    const signal = this.startupAbortController.signal;
+    try {
+      this.assertStartupActive(signal);
+      this.directTransportStartPromise = this.runtimeTunnel?.startDirectTransport()
+        ?? Promise.resolve(null);
+      const directTransportAdvertisement = await withAbort(
+        this.directTransportStartPromise,
+        signal,
+      );
+      this.assertStartupActive(signal);
+      this.directTransportAdvertisement = directTransportAdvertisement;
+      const capabilities = await withAbort(this.buildCapabilities(), signal);
+      this.assertStartupActive(signal);
+      this.capabilities = capabilities;
+      this.updateFreeSlots();
+      await this.register(signal);
+      this.assertStartupActive(signal);
+      let delayMs = 500;
+      do {
+        try {
+          await this.connectOnce(signal);
+          delayMs = 500;
+        } catch (error) {
+          if (!this.stopped) this.logger.warn(`Worker connection failed: ${errorText(error)}`);
+        }
+        if (this.stopped || this.options.reconnect === false) break;
+        await delay(delayMs, signal);
+        delayMs = Math.min(15_000, delayMs * 2);
+      } while (!this.stopped);
+    } catch (error) {
+      if (this.stopped || signal.aborted) return;
+      throw error;
+    }
   }
 
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
     this.stopped = true;
+    this.startupAbortController.abort(new Error("worker_start_cancelled"));
+    this.stopPromise ??= this.stopOnce();
+    return this.stopPromise;
+  }
+
+  private async stopOnce(): Promise<void> {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = null;
+    this.coordinatorReady = false;
     this.clearRuntimeDisconnectTimer();
     this.clearRuntimeLinkProbes();
-    await this.abortActiveJobs("Worker shutting down");
-    await this.resetDistributedRuntime("worker_shutting_down");
-    await this.runtimeTunnel?.close();
     await this.sendGoodbye("user_requested");
     await this.closeSocket();
+    await this.abortActiveJobs("Worker shutting down");
+    await this.resetDistributedRuntime("worker_shutting_down");
+    // A direct listener may still be inside asynchronous port discovery while
+    // stop() runs. Close once immediately, then wait for that start attempt and
+    // close again so it cannot publish a listener after shutdown completed.
+    await this.runtimeTunnel?.close();
+    await this.directTransportStartPromise?.catch(() => undefined);
+    await this.runtimeTunnel?.close();
+    this.directTransportAdvertisement = null;
+    this.registeredWorkerId = undefined;
+    this.workerSessionToken = undefined;
+    this.registeredNodeGeneration = undefined;
+  }
+
+  private assertStartupActive(signal: AbortSignal): void {
+    if (this.stopped || signal.aborted) throw new Error("worker_start_cancelled");
   }
 
   get workerId(): string | undefined {
     return this.registeredWorkerId;
   }
 
+  /** Narrow control-plane credential; callers must never log or persist it. */
+  get nodeControlSession(): { token: string; generation: number } | null {
+    return this.workerSessionToken && this.registeredNodeGeneration
+      ? { token: this.workerSessionToken, generation: this.registeredNodeGeneration }
+      : null;
+  }
+
   get isContributionEnabled(): boolean {
     return this.contributionEnabled;
+  }
+
+  get isConnected(): boolean {
+    return this.socket?.readyState === WebSocket.OPEN;
+  }
+
+  /** True only after the coordinator has accepted the hello and sent server.ready. */
+  get isReady(): boolean {
+    return this.isConnected && this.coordinatorReady;
+  }
+
+  /**
+   * Stop admitting new leases without aborting current jobs or persistent
+   * stages. The returned release is idempotent and preserves any independent
+   * contribution preference change made while the update was prepared.
+   */
+  async beginRuntimeUpdateDrain(): Promise<() => Promise<void>> {
+    if (this.stopped) throw new Error("worker_is_stopped");
+    if (this.updateDraining) throw new Error("worker_update_drain_already_active");
+    this.updateDraining = true;
+    this.updateFreeSlots();
+    try {
+      await this.sendHeartbeat();
+    } catch (error) {
+      this.updateDraining = false;
+      this.updateFreeSlots();
+      throw error;
+    }
+    let released = false;
+    return async () => {
+      if (released) return;
+      released = true;
+      this.updateDraining = false;
+      this.updateFreeSlots();
+      await this.sendHeartbeat();
+    };
+  }
+
+  async waitForIdle(timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + Math.max(0, timeoutMs);
+    while (this.activeJobs.size > 0 || this.activeRuntimeOperations > 0) {
+      if (Date.now() >= deadline) throw new Error("worker_drain_timeout");
+      await delay(Math.min(100, Math.max(1, deadline - Date.now())));
+    }
   }
 
   async setContributionEnabled(enabled: boolean): Promise<boolean> {
@@ -626,7 +738,7 @@ export class WorkerAgent {
           }
         : {}),
     };
-    if (this.registeredWorkerId) await this.register();
+    if (this.registeredWorkerId) await this.register(this.startupAbortController.signal);
     await this.sendHeartbeat();
   }
 
@@ -642,13 +754,23 @@ export class WorkerAgent {
       },
     };
     if (this.registeredWorkerId) {
-      await this.register();
+      await this.register(this.startupAbortController.signal);
       await this.sendHeartbeat();
     }
   }
 
   get activeJobCount(): number {
     return this.activeJobs.size;
+  }
+
+  /**
+   * All transient work that must finish before the runtime can be replaced.
+   * Persistent distributed stages are tracked by the desktop launch service.
+   */
+  get activeWorkCount(): number {
+    return this.activeJobs.size
+      + this.activeEvidenceChallenges.size
+      + this.activeRuntimeOperations;
   }
 
   private applyDirectTransportAdvertisement(
@@ -708,7 +830,8 @@ export class WorkerAgent {
       timer.unref();
       socket.once("close", finish);
       try {
-        socket.close(1000, "worker shutting down");
+        if (socket.readyState === WebSocket.CONNECTING) socket.terminate();
+        else socket.close(1000, "worker shutting down");
       } catch {
         finish();
       }
@@ -897,10 +1020,11 @@ export class WorkerAgent {
     }
   }
 
-  private async register(): Promise<void> {
+  private async register(signal: AbortSignal): Promise<void> {
+    this.assertStartupActive(signal);
     const identity = this.options.identity ?? this.defaultIdentity();
     if (!this.capabilities) throw new Error("Worker capabilities are not initialized");
-    const protocol = { min: WORKER_PROTOCOL_MIN, max: WORKER_PROTOCOL_MAX };
+    const protocol = { min: WORKER_PROTOCOL_MIN, max: WORKER_PROTOCOL_MAX } as const;
     const registration = {
       ...(identity ? { identity } : {}),
       capabilities: this.capabilities,
@@ -924,6 +1048,15 @@ export class WorkerAgent {
         capabilities: this.capabilities,
         protocol,
       });
+      await this.options.beforeSignedAdmission?.({
+        identity,
+        capabilities: this.capabilities,
+        protocol,
+        signer: this.options.admissionSigner,
+        registrationDigest,
+        signal,
+      });
+      this.assertStartupActive(signal);
       const challengeResponse = await fetch(
         coordinatorHttpUrl(
           this.coordinatorBaseUrl,
@@ -938,7 +1071,7 @@ export class WorkerAgent {
             protocol,
             registrationDigest,
           }),
-          signal: AbortSignal.timeout(10_000),
+          signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]),
           redirect: "manual",
         },
       );
@@ -955,6 +1088,7 @@ export class WorkerAgent {
         throw new Error("Worker admission challenge returned invalid JSON");
       }
       const challenge = workerAdmissionChallengeResponseSchema.parse(challengeJson);
+      this.assertStartupActive(signal);
       admission = {
         challengeId: challenge.challengeId,
         publicKey: this.options.admissionSigner.publicKey,
@@ -972,7 +1106,7 @@ export class WorkerAgent {
           ...registration,
           ...(admission ? { admission } : {}),
         }),
-        signal: AbortSignal.timeout(10_000),
+        signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]),
         redirect: "manual",
       },
     );
@@ -987,8 +1121,10 @@ export class WorkerAgent {
       throw new Error("Worker registration returned invalid JSON");
     }
     const body = registrationResponseSchema.parse(decoded);
+    this.assertStartupActive(signal);
     this.registeredWorkerId = body.workerId;
     this.workerSessionToken = body.workerSessionToken;
+    this.registeredNodeGeneration = body.nodeGeneration;
   }
 
   private defaultIdentity(): WorkerAgentOptions["identity"] {
@@ -1004,8 +1140,10 @@ export class WorkerAgent {
     return undefined;
   }
 
-  private connectOnce(): Promise<void> {
+  private connectOnce(signal: AbortSignal): Promise<void> {
+    this.assertStartupActive(signal);
     if (!this.registeredWorkerId) throw new Error("Worker has not been registered");
+    this.coordinatorReady = false;
     const url = coordinatorWebSocketUrl(
       this.coordinatorBaseUrl,
       "internal/v1/workers/connect",
@@ -1020,7 +1158,15 @@ export class WorkerAgent {
           : {}),
       });
       this.socket = socket;
+      const abortStartup = () => {
+        if (socket.readyState === WebSocket.CONNECTING) socket.terminate();
+      };
+      signal.addEventListener("abort", abortStartup, { once: true });
       socket.on("open", () => {
+        if (this.stopped || signal.aborted) {
+          socket.close(1000, "worker startup cancelled");
+          return;
+        }
         opened = true;
         this.sendMessage("worker.hello", {});
         this.startRttProbe(socket);
@@ -1029,6 +1175,7 @@ export class WorkerAgent {
         this.recordRttSample(payload);
       });
       socket.on("message", (raw) => {
+        if (this.stopped || signal.aborted) return;
         let decoded: unknown;
         try {
           const serialized = raw.toString();
@@ -1048,10 +1195,12 @@ export class WorkerAgent {
         if (!opened) reject(error);
       });
       socket.on("close", () => {
+        signal.removeEventListener("abort", abortStartup);
+        this.coordinatorReady = false;
         if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
         this.heartbeatTimer = null;
         this.stopRttProbe();
-        this.socket = null;
+        if (this.socket === socket) this.socket = null;
         this.clearRuntimeLinkProbes();
         this.runtimeTunnel?.transportDisconnected();
         void this.abortActiveJobs("Coordinator disconnected");
@@ -1142,6 +1291,7 @@ export class WorkerAgent {
   }
 
   private async handleServerMessage(input: unknown): Promise<void> {
+    if (this.stopped) return;
     const message = parseServerMessage(input);
     switch (message.type) {
       case "server.ready": {
@@ -1152,7 +1302,9 @@ export class WorkerAgent {
         if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
         this.clearRuntimeDisconnectTimer();
         await this.sendHeartbeat();
+        if (this.stopped) return;
         this.runtimeTunnel?.transportConnected();
+        this.coordinatorReady = true;
         this.heartbeatTimer = setInterval(
           () => void this.sendHeartbeat(),
           this.options.heartbeatIntervalMs ?? 5_000,
@@ -1206,7 +1358,7 @@ export class WorkerAgent {
         void this.handleEvidenceChallenge(message.payload);
         break;
       case "runtime.prepare":
-        if (!this.contributionEnabled) {
+        if (!this.baseAcceptsNewWork()) {
           this.sendMessage("runtime.prepared", {
             requestId: message.payload.requestId,
             ok: false,
@@ -1214,10 +1366,15 @@ export class WorkerAgent {
           });
           break;
         }
-        await this.prepareDistributedRuntime(message.payload.requestId, message.payload.description);
+        await this.runRuntimeOperation(() =>
+          this.prepareDistributedRuntime(
+            message.payload.requestId,
+            message.payload.description,
+          ),
+        );
         break;
       case "runtime.start":
-        if (!this.contributionEnabled) {
+        if (!this.baseAcceptsNewWork()) {
           this.sendMessage("runtime.exited", {
             requestId: message.payload.requestId,
             exit: { code: null, signal: null, error: "contribution_paused" },
@@ -1230,7 +1387,12 @@ export class WorkerAgent {
           });
           break;
         }
-        await this.startDistributedRuntime(message.payload.requestId, message.payload.request);
+        await this.runRuntimeOperation(() =>
+          this.startDistributedRuntime(
+            message.payload.requestId,
+            message.payload.request,
+          ),
+        );
         break;
       case "runtime.stop":
         await this.stopDistributedRuntime(message.payload.requestId, message.payload.reason);
@@ -1345,6 +1507,15 @@ export class WorkerAgent {
     ) {
       return;
     }
+    if (!this.baseAcceptsNewWork()) {
+      this.sendMessage("evidence.challenge.failed", {
+        challengeId: challenge.challengeId,
+        nonce: challenge.nonce,
+        sessionId: challenge.sessionId,
+        reason: "contribution_paused",
+      });
+      return;
+    }
     this.activeEvidenceChallenges.add(challenge.challengeId);
     try {
       if (challenge.kind === "deployment-canary") {
@@ -1368,6 +1539,17 @@ export class WorkerAgent {
       });
     } finally {
       this.activeEvidenceChallenges.delete(challenge.challengeId);
+    }
+  }
+
+  private async runRuntimeOperation<T>(
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    this.activeRuntimeOperations += 1;
+    try {
+      return await operation();
+    } finally {
+      this.activeRuntimeOperations -= 1;
     }
   }
 
@@ -1480,6 +1662,8 @@ export class WorkerAgent {
       if (!executor) throw new Error("distributed_executor_is_not_enabled");
       validatePythonLaunchDescription(input);
       const description = input as PythonPipelineLaunchDescription;
+      const policyRejection = this.workPolicyRejection(description.modelIdentity.id);
+      if (policyRejection) throw new Error(policyRejection);
       const local = description.launchOrder.filter((process) => process.anchor.memberId === executor.nodeId);
       if (local.length === 0) throw new Error("distributed_plan_has_no_process_for_this_node");
       const prepared = executor.launchAgent.prepareRuntime
@@ -1502,9 +1686,11 @@ export class WorkerAgent {
       await this.runtimeTunnel?.prepare(description);
       this.authorizedRuntimeProcesses.clear();
       this.preparedRuntimeProcesses.clear();
+      this.preparedRuntimeModels.clear();
       for (const process of local) {
         this.authorizedRuntimeProcesses.set(process.processId, JSON.stringify(process));
         this.preparedRuntimeProcesses.set(process.processId, preparedById.get(process.processId)!);
+        this.preparedRuntimeModels.set(process.processId, description.modelIdentity.id);
       }
       this.sendMessage("runtime.prepared", { requestId, ok: true });
     } catch (error) {
@@ -1523,7 +1709,19 @@ export class WorkerAgent {
       }
       const preparedProcess = this.preparedRuntimeProcesses.get(input.process.processId);
       if (!preparedProcess) throw new Error("distributed_launch_artifact_was_not_prepared");
-      if (this.runtimeProcesses.has(requestId)) throw new Error("distributed_launch_request_is_duplicate");
+      const policyRejection = this.workPolicyRejection(this.preparedRuntimeModels.get(input.process.processId) ?? null);
+      if (policyRejection) throw new Error(policyRejection);
+      const requestIdentity = JSON.stringify(input);
+      const existing = this.runtimeProcesses.get(requestId);
+      if (existing) {
+        if (this.runtimeStartRequests.get(requestId) !== requestIdentity) {
+          this.socket?.close(4400, "runtime start identity conflict");
+          return;
+        }
+        const output = this.readyRuntimeOutputs.get(requestId);
+        if (output) this.sendMessage("runtime.ready", { requestId, output });
+        return;
+      }
       const controller = new AbortController();
       const tunneledProcess = this.runtimeTunnel?.rewriteProcess(preparedProcess) ?? preparedProcess;
       const localRequest: LaunchAgentStartRequest = executor.pythonExecutable
@@ -1537,16 +1735,18 @@ export class WorkerAgent {
         : { ...input, process: tunneledProcess };
       const handle = await executor.launchAgent.start(localRequest, controller.signal);
       this.runtimeProcesses.set(requestId, handle);
+      this.runtimeStartRequests.set(requestId, requestIdentity);
       void handle.ready.then(
-        () => this.sendMessage("runtime.ready", {
-          requestId,
-          output: handle.output?.() ?? {
+        () => {
+          const output = handle.output?.() ?? {
             stdout: "",
             stderr: "",
             stdoutTruncated: false,
             stderrTruncated: false,
-          },
-        }),
+          };
+          this.readyRuntimeOutputs.set(requestId, output);
+          this.sendMessage("runtime.ready", { requestId, output });
+        },
         (error: unknown) => {
           // The exited promise carries the original spawn/runtime error and
           // captured output. Avoid racing it with a lossy wrapper error.
@@ -1573,8 +1773,11 @@ export class WorkerAgent {
     this.clearRuntimeDisconnectTimer();
     const handles = [...this.runtimeProcesses.values()];
     this.runtimeProcesses.clear();
+    this.runtimeStartRequests.clear();
+    this.readyRuntimeOutputs.clear();
     this.authorizedRuntimeProcesses.clear();
     this.preparedRuntimeProcesses.clear();
+    this.preparedRuntimeModels.clear();
     await Promise.all(handles.map((handle) => handle.stop(reason).catch(() => undefined)));
     await this.runtimeTunnel?.reset();
   }
@@ -1603,17 +1806,24 @@ export class WorkerAgent {
   ): void {
     if (!this.runtimeProcesses.has(requestId) && handle) return;
     this.runtimeProcesses.delete(requestId);
+    this.runtimeStartRequests.delete(requestId);
+    this.readyRuntimeOutputs.delete(requestId);
     const output = handle?.output?.() ?? { stdout: "", stderr: "", stdoutTruncated: false, stderrTruncated: false };
     this.sendMessage("runtime.exited", { requestId, exit, output });
   }
 
   private async execute(payload: JobPayload): Promise<void> {
-    if (!this.contributionEnabled) {
+    if (!this.baseAcceptsNewWork()) {
       this.sendMessage("lease.reject", {
         jobId: payload.jobId,
         leaseId: payload.leaseId,
         reason: "contribution_paused",
       });
+      return;
+    }
+    const policyRejection = this.workPolicyRejection(payload.request.model);
+    if (policyRejection) {
+      this.sendMessage("lease.reject", { jobId: payload.jobId, leaseId: payload.leaseId, reason: policyRejection });
       return;
     }
     const deploymentMatches = this.capabilities?.deployments.some(
@@ -1830,8 +2040,12 @@ export class WorkerAgent {
       };
     }
     const heartbeat: WorkerHeartbeat = {
-      draining: !this.contributionEnabled,
-      pausedReason: this.contributionEnabled ? null : "Contribution paused",
+      draining: !this.acceptsNewWork(),
+      pausedReason: !this.contributionEnabled
+        ? "Contribution paused"
+        : this.updateDraining
+          ? "Runtime update in progress"
+          : null,
       activeLeases: [...this.activeJobs.keys()],
       gpus: this.capabilities.gpus.map((gpu) => ({
         id: gpu.id,
@@ -1854,14 +2068,14 @@ export class WorkerAgent {
       capabilities: this.capabilities,
       metrics: {
         ...metrics,
-        ready: this.contributionEnabled && metrics.ready,
+        ready: this.acceptsNewWork() && metrics.ready,
       },
     });
   }
 
   private updateFreeSlots(): void {
     if (!this.capabilities) return;
-    const freeSlots = this.contributionEnabled
+    const freeSlots = this.acceptsNewWork()
       ? Math.max(0, this.config.limits.maxConcurrency - this.activeJobs.size)
       : 0;
     this.capabilities = {
@@ -1871,6 +2085,18 @@ export class WorkerAgent {
         freeSlots,
       })),
     };
+  }
+
+  private acceptsNewWork(): boolean {
+    return this.baseAcceptsNewWork() && this.workPolicyRejection(null) === null;
+  }
+
+  private baseAcceptsNewWork(): boolean {
+    return this.contributionEnabled && !this.updateDraining;
+  }
+
+  private workPolicyRejection(model: string | null): string | null {
+    return this.options.workAdmissionPolicy?.(model, new Date()) ?? null;
   }
 
   private sendMessage(type: string, payload: unknown): boolean {
@@ -1969,8 +2195,36 @@ async function readResponseTextLimited(response: Response, limitBytes: number): 
   }
 }
 
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(abortReason(signal));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }, milliseconds);
+    const abort = () => {
+      clearTimeout(timer);
+      reject(abortReason(signal!));
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+}
+
+function withAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(abortReason(signal));
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(abortReason(signal));
+    signal.addEventListener("abort", abort, { once: true });
+    void operation.then(resolve, reject).finally(() => {
+      signal.removeEventListener("abort", abort);
+    });
+  });
+}
+
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new Error(String(signal.reason ?? "worker_start_cancelled"));
 }
 
 function errorText(error: unknown): string {

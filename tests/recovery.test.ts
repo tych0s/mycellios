@@ -39,6 +39,9 @@ describe("coordinator crash recovery", () => {
 
     expect(store.getJob("job-orphan")?.status).toBe("failed");
     expect(store.getJob("job-orphan")?.failureCode).toBe("coordinator_restarted");
+    expect((database.raw.prepare(
+      "SELECT COUNT(*) AS count FROM execution_receipts WHERE job_id = 'job-orphan'",
+    ).get() as { count: number }).count).toBe(0);
     hub.close();
     database.close();
   });
@@ -74,7 +77,7 @@ describe("coordinator crash recovery", () => {
     const row = migrated.raw
       .prepare("SELECT id, deregistered FROM workers WHERE id = 'wrk-existing'")
       .get() as { id: string; deregistered: number };
-    expect(version.version).toBe(15);
+    expect(version.version).toBe(26);
     expect(row).toEqual({ id: "wrk-existing", deregistered: 1 });
     migrated.close();
   });
@@ -111,7 +114,7 @@ describe("coordinator crash recovery", () => {
     const row = migrated.raw
       .prepare("SELECT id, deregistered FROM workers WHERE id = 'wrk-partially-migrated'")
       .get() as { id: string; deregistered: number };
-    expect(version.version).toBe(15);
+    expect(version.version).toBe(26);
     expect(row).toEqual({ id: "wrk-partially-migrated", deregistered: 1 });
     migrated.close();
 
@@ -119,7 +122,7 @@ describe("coordinator crash recovery", () => {
     expect(
       (reopened.raw.prepare("SELECT version FROM schema_meta").get() as { version: number })
         .version,
-    ).toBe(15);
+    ).toBe(26);
     reopened.close();
   });
 
@@ -155,7 +158,32 @@ describe("coordinator crash recovery", () => {
     expect(columns.some((column) => column.name === "activation_error")).toBe(true);
     expect(
       (migrated.raw.prepare("SELECT version FROM schema_meta").get() as { version: number }).version,
-    ).toBe(15);
+    ).toBe(26);
+    migrated.close();
+  });
+
+  it("adds physical contribution binding when migrating the version 18 economic ledger", () => {
+    const directory = mkdtempSync(join(tmpdir(), "mycellios-v18-economy-migration-"));
+    directories.push(directory);
+    const path = join(directory, "mesh.db");
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`
+      CREATE TABLE schema_meta (version INTEGER NOT NULL);
+      INSERT INTO schema_meta(version) VALUES (18);
+      CREATE TABLE economic_settlements (
+        id TEXT PRIMARY KEY, job_id TEXT NOT NULL UNIQUE, execution_receipt_id TEXT NOT NULL UNIQUE,
+        pricing_policy_id TEXT NOT NULL, payer_account_id TEXT NOT NULL,
+        input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
+        gross_microunits INTEGER NOT NULL, provider_microunits INTEGER NOT NULL,
+        platform_microunits INTEGER NOT NULL, request_digest TEXT NOT NULL, created_at INTEGER NOT NULL
+      );
+    `);
+    legacy.close();
+
+    const migrated = new MeshDatabase(path);
+    const columns = migrated.raw.prepare("PRAGMA table_info(economic_settlements)").all() as Array<{ name: string }>;
+    expect(columns.some(({ name }) => name === "contribution_evidence_id")).toBe(true);
+    expect((migrated.raw.prepare("SELECT version FROM schema_meta").get() as { version: number }).version).toBe(26);
     migrated.close();
   });
 

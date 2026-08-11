@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   AutomaticModelActivationManager,
   DynamicModelActivationManager,
+  plannedStageArtifactBytes,
+  runWithReservationHeartbeat,
   type AutomaticModelRunner,
 } from "../src/coordinator/model-activation-manager.js";
 import { parseAutoDistributionConfig } from "../src/distribution/auto-distribute.js";
@@ -9,6 +11,50 @@ import type { AutoDistributionConfig } from "../src/distribution/auto-distribute
 import type { StoredRequestedModel } from "../src/storage/store.js";
 
 describe("automatic model activation manager", () => {
+  it("keeps a prepared route alive and fails closed when renewal is rejected", async () => {
+    let renewals = 0;
+    const completed = await runWithReservationHeartbeat(
+      new Promise<string>((resolve) => setTimeout(() => resolve("ready"), 230)),
+      () => { renewals += 1; return true; },
+      100,
+    );
+    expect(completed).toBe("ready");
+    expect(renewals).toBeGreaterThanOrEqual(2);
+
+    let aborted: Error | null = null;
+    await expect(runWithReservationHeartbeat(
+      new Promise<never>(() => undefined),
+      () => false,
+      100,
+      (error) => { aborted = error; },
+    )).rejects.toThrow("route_reservation_heartbeat_rejected");
+    expect(aborted).toMatchObject({ message: "route_reservation_heartbeat_rejected" });
+  });
+  it("accounts exact planned artifact bytes without double-counting tied endpoints", () => {
+    const model = {
+      id: "tiny",
+      layers: [0, 1, 2, 3].map((index) => ({
+        index,
+        weightBytes: 100 + index,
+        activationElements: 8,
+        kvBytesPerToken: 4,
+        decodeMsAtUnit: 1,
+        prefillMsPerTokenAtUnit: 1,
+      })),
+      embeddingBytes: 50,
+      lmHeadBytes: 50,
+      tiedEmbeddingAndHead: true,
+      runtimeOverheadBytesPerStage: 10,
+      embeddingDecodeMsAtUnit: 1,
+      lmHeadDecodeMsAtUnit: 1,
+      embeddingPrefillMsPerTokenAtUnit: 1,
+      lmHeadPrefillMsPerTokenAtUnit: 1,
+    };
+    expect(plannedStageArtifactBytes(model, 0, 2)).toBe(50 + 100 + 101);
+    expect(plannedStageArtifactBytes(model, 2, 4)).toBe(102 + 103 + 50);
+    expect(plannedStageArtifactBytes(model, 0, 4)).toBe(50 + 100 + 101 + 102 + 103);
+  });
+
   it("replaces stale progress when the verified executor topology is not ready", async () => {
     const persisted = [{
       phase: "active",

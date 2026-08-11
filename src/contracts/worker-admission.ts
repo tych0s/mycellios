@@ -64,6 +64,17 @@ export const workerCredentialRotationProofSchema = z.object({
   nextSignature: z.string().min(64).max(256).regex(BASE64URL),
 }).strict();
 
+export const workerCredentialRecoveryChallengeRequestSchema = z.object({
+  identity: workerAdmissionIdentitySchema.refine(({ kind }) => kind === "device", "Only native nodes support account recovery"),
+  nextPublicKey: workerAdmissionPublicKeySchema,
+  protocol: workerProtocolRangeSchema,
+}).strict();
+
+export const workerCredentialRecoveryProofSchema = z.object({
+  challengeId: z.string().uuid(),
+  nextSignature: z.string().min(64).max(256).regex(BASE64URL),
+}).strict();
+
 export const workerCredentialRotationChallengeResponseSchema =
   workerAdmissionChallengeResponseSchema;
 
@@ -79,3 +90,6 @@ export type WorkerCredentialRotationChallengeRequest =
   z.infer<typeof workerCredentialRotationChallengeRequestSchema>;
 export type WorkerCredentialRotationProof =
   z.infer<typeof workerCredentialRotationProofSchema>;
+export type WorkerCredentialRecoveryChallengeRequest =
+  z.infer<typeof workerCredentialRecoveryChallengeRequestSchema>;
+export type WorkerCredentialRecoveryProof = z.infer<typeof workerCredentialRecoveryProofSchema>;

@@ -7,7 +7,7 @@ const RELEASE_REF = "refs/heads/main";
 const RELEASE_WORKFLOW_POLICIES = [
   {
     workflowRef:
-      `${RELEASE_REPOSITORY}/.github/workflows/desktop-build.yml@${RELEASE_REF}`,
+      `${RELEASE_REPOSITORY}/.github/workflows/node-build.yml@${RELEASE_REF}`,
     eventName: "push",
   },
   {

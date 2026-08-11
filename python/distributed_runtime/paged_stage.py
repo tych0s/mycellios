@@ -2487,6 +2487,26 @@ class HFPagedStageRunner:
         return result.output.last_hidden_state
 
     @torch.inference_mode()
+    def forward_ids_with_tokens(
+        self,
+        request_id: int,
+        input_ids: torch.Tensor,
+        *,
+        token_mode: str = "last",
+    ) -> tuple[torch.Tensor, int | tuple[int, ...]]:
+        if not self.spec.first or not self.spec.last or self.head is None:
+            raise RuntimeError("token projection requires one complete local stage")
+        if token_mode not in ("last", "all"):
+            raise ValueError("token_mode must be last or all")
+        hidden = self.forward_ids(request_id, input_ids)
+        selected = hidden if token_mode == "all" else hidden[:, -1:, :]
+        predicted = torch.argmax(self.head(selected), dim=-1).reshape(-1)
+        tokens = predicted.detach().cpu().tolist()
+        if token_mode == "all":
+            return hidden, tuple(int(token) for token in tokens)
+        return hidden, int(tokens[-1])
+
+    @torch.inference_mode()
     def forward_hidden(
         self,
         request_id: int,

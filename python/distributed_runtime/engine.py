@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from concurrent.futures import CancelledError as FutureCancelledError, Future
+from concurrent.futures import (
+    CancelledError as FutureCancelledError,
+    Future,
+    ThreadPoolExecutor,
+)
 from collections import deque
 from collections.abc import Sequence
 import copy
@@ -330,8 +334,8 @@ class PipelineEngineConfig:
             or not 0 <= self.pipeline_snapshot_identity <= (1 << 64) - 1
         ):
             raise ValueError("pipeline_snapshot_identity must fit uint64")
-        if len(self.boundaries) < 3:
-            raise ValueError("a distributed pipeline requires at least two stages")
+        if len(self.boundaries) < 2:
+            raise ValueError("an execution route requires at least one stage")
         if self.boundaries[0] != 0:
             raise ValueError("boundaries must start at zero")
         if any(right <= left for left, right in zip(self.boundaries, self.boundaries[1:])):
@@ -761,6 +765,8 @@ class PipelineEngineConfig:
             raise ValueError("remote stages require a non-zero first_stage_port")
         if not self.spawn_local_stages and self.return_port == 0:
             raise ValueError("remote stages require a fixed, advertised return_port")
+        if len(self.boundaries) == 2 and not self.spawn_local_stages:
+            raise ValueError("a one-stage route must execute locally")
 
     @property
     def sealed_wave_token_limit(self) -> int:
@@ -1083,6 +1089,8 @@ class DistributedPipelineEngine:
         speculation_controller: AdaptiveSpeculationController | None = None,
         tree_draft_provider: NgramTreeDraftProvider | TreeDraftProvider | None = None,
     ) -> None:
+        if len(config.boundaries) < 3:
+            raise ValueError("distributed pipeline engine requires at least two stages")
         self.config = config
         # One sender owns the root-to-stage TCP stream for its entire
         # lifecycle. Reusing it across startup probes, data and shutdown keeps
@@ -6695,11 +6703,333 @@ def _speculation_load_profile(active_sequences: int) -> str:
     return "load-5-plus"
 
 
+class LocalPipelineEngine:
+    """Single-device execution using the same selective stage and KV lifecycle.
+
+    A complete local model is not represented as two fake network stages. One
+    worker thread owns the full first+last runner, preserving deterministic KV
+    mutation and request cancellation while exposing the server engine contract.
+    """
+
+    def __init__(self, config: PipelineEngineConfig) -> None:
+        if len(config.boundaries) != 2:
+            raise ValueError("local pipeline engine requires exactly one stage")
+        if not config.spawn_local_stages:
+            raise ValueError("local pipeline engine cannot use a remote first stage")
+        if config.speculative_max_draft_tokens > 0:
+            raise ValueError("single-stage speculation is not yet certified")
+        if config.max_retained_sessions > 0:
+            raise ValueError(
+                "single-stage session retention is not yet certified; "
+                "set max_retained_sessions to 0"
+            )
+        self.config = config
+        self._state_lock = threading.Lock()
+        self._closed = False
+        self._fatal_error: str | None = None
+        self._cancel: dict[int, threading.Event] = {}
+        self._executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="mycellios-local-engine",
+        )
+
+        ram_config = (config.ram_backed_moe_stages or (None,))[0]
+        paged_config = (config.paged_kv_stages or (None,))[0]
+        native_config = (config.native_gguf_stages or (None,))[0]
+        native_package: NativeGgufStagePackage | None = None
+        if native_config is not None:
+            native_package = verify_native_gguf_stage(
+                native_config.package,
+                expected_package_id=native_config.package_id,
+                expected_layer_start=config.boundaries[0],
+                expected_layer_end=config.boundaries[1],
+                expected_total_layers=config.boundaries[-1],
+            )
+            self.model_snapshot = config.model_name
+            model_config = AutoConfig.from_pretrained(
+                native_package.root,
+                local_files_only=True,
+                trust_remote_code=False,
+            )
+            self.model_artifact = model_artifact_reference(
+                str(native_package.root),
+                artifact_identity=native_package.artifact_identity,
+                canonical_source=native_package.model_source,
+                canonical_revision=native_package.model_revision,
+            )
+        elif ram_config is not None:
+            snapshot = validate_ram_backed_moe_binding(
+                ram_config,
+                model_name=config.model_name,
+                revision=config.revision,
+                pipeline_snapshot_identity=config.pipeline_snapshot_identity,
+            )
+            self.model_snapshot = str(snapshot)
+            model_config = AutoConfig.from_pretrained(
+                self.model_snapshot,
+                local_files_only=True,
+                trust_remote_code=False,
+            )
+            self.model_artifact = model_artifact_reference(
+                self.model_snapshot,
+                artifact_identity=ram_config.artifact_identity,
+                canonical_source=f"content-addressed://{ram_config.artifact_identity}",
+                canonical_revision=None,
+            )
+        else:
+            model_config = AutoConfig.from_pretrained(
+                config.model_name,
+                revision=config.revision,
+            )
+            self.model_snapshot = resolve_model_snapshot(
+                config.model_name,
+                config.revision,
+            )
+            self.model_artifact = model_artifact_reference(
+                self.model_snapshot,
+                artifact_identity=config.artifact_identity,
+                canonical_source=config.canonical_model_source,
+                canonical_revision=config.canonical_model_revision,
+            )
+        self.total_layers = int(model_config.num_hidden_layers)
+        if config.boundaries != (0, self.total_layers):
+            raise ValueError(
+                "single-stage boundaries must cover the complete model"
+            )
+        self.maximum_context = int(
+            getattr(model_config, "max_position_embeddings", 0) or 0
+        )
+        self.pipeline_id = (
+            config.pipeline_snapshot_identity
+            if config.pipeline_snapshot_identity is not None
+            else self.model_artifact.snapshot_identity
+        )
+        spec = StageModelSpec(
+            self.model_snapshot,
+            0,
+            self.total_layers,
+            self.total_layers,
+            config.threads_per_stage,
+            artifact_identity=self.model_artifact.identity,
+            canonical_model_source=self.model_artifact.canonical_source,
+            canonical_model_revision=self.model_artifact.canonical_revision,
+            stage_package_identity=(
+                native_package.package_identity
+                if native_package is not None
+                else config.stage_package_identity
+            ),
+        )
+        if native_config is not None:
+            self._runner = build_native_gguf_stage_runner(
+                spec,
+                native_config,
+                device=config.device,
+                dense_tiering=config.dense_tiering,
+            )
+        elif ram_config is not None:
+            self._runner = build_ram_backed_moe_stage_runner(
+                spec,
+                ram_config,
+                pipeline_snapshot_identity=self.pipeline_id,
+            )
+        elif paged_config is not None:
+            self._runner = HFPagedStageRunner.from_runtime_config(spec, paged_config)
+        else:
+            self._runner = StageRunner(
+                spec,
+                device=config.device,
+                dense_tiering=config.dense_tiering,
+            )
+
+    @property
+    def stages(self) -> int:
+        return 1
+
+    @property
+    def healthy(self) -> bool:
+        with self._state_lock:
+            return not self._closed and self._fatal_error is None
+
+    @property
+    def fatal_error(self) -> str | None:
+        with self._state_lock:
+            return self._fatal_error
+
+    @property
+    def root_parameter_bytes(self) -> int:
+        return int(self._runner.parameter_bytes)
+
+    @property
+    def execution_topology(self) -> dict[str, Any]:
+        snapshot = getattr(self._runner, "execution_snapshot", None)
+        execution = snapshot() if callable(snapshot) else {}
+        return {
+            "requested_device": self.config.device,
+            "observed_stage_count": 1,
+            "total_stage_count": 1,
+            "stages": [{"stage": 0, "layer_end": self.total_layers, "execution": execution}],
+        }
+
+    @property
+    def speculation_stats(self) -> dict[str, Any]:
+        return {"configured": False, "provider": "off"}
+
+    @property
+    def session_stats(self) -> dict[str, Any]:
+        return {"configured": False, "retained_sessions": 0}
+
+    @property
+    def prefill_window_stats(self) -> dict[str, Any]:
+        return {"configured": False, "current_chunks": 0, "current_bytes": 0}
+
+    @property
+    def speculative_window_stats(self) -> dict[str, Any]:
+        return {
+            "configured": False,
+            "configured_waves_per_request": 1,
+            "configured_bytes_per_request": 0,
+        }
+
+    @property
+    def root_batch_stats(self) -> dict[str, Any]:
+        return {
+            "ready_items": 0,
+            "model_forward_calls": int(getattr(self._runner, "model_forward_calls", 0)),
+            "physical_batch_calls": 0,
+            "physical_batch_items": 0,
+            "sequential_items": 0,
+            "max_physical_batch_size": 1,
+        }
+
+    def submit(
+        self,
+        requests: list[GenerationInput],
+        on_token: TokenCallback | None = None,
+    ) -> list[Future[GenerationOutput]]:
+        if not requests:
+            return []
+        if len({request.client_id for request in requests}) != len(requests):
+            raise ValueError("client_id values must be unique within a batch")
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("local engine is closed")
+            duplicates = [request.client_id for request in requests if request.client_id in self._cancel]
+            if duplicates:
+                raise ValueError(f"client_id already active: {duplicates[0]}")
+            if len(self._cancel) + len(requests) > self.config.max_pending_requests:
+                raise QueueFullError(
+                    "local request queue is full",
+                    pending=len(self._cancel),
+                    capacity=self.config.max_pending_requests,
+                )
+            for request in requests:
+                if self.maximum_context and request.input_ids.shape[1] + request.max_new_tokens > self.maximum_context:
+                    raise ValueError(
+                        f"request {request.client_id} exceeds model context {self.maximum_context}"
+                    )
+                self._cancel[request.client_id] = threading.Event()
+        futures: list[Future[GenerationOutput]] = []
+        for request in requests:
+            future = self._executor.submit(self._generate_one, request, on_token)
+            future.add_done_callback(
+                lambda _future, client_id=request.client_id: self._forget(client_id)
+            )
+            futures.append(future)
+        return futures
+
+    def generate(
+        self,
+        requests: list[GenerationInput],
+        on_token: TokenCallback | None = None,
+    ) -> list[GenerationOutput]:
+        return [future.result() for future in self.submit(requests, on_token)]
+
+    def cancel(self, client_id: int) -> bool:
+        with self._state_lock:
+            signal = self._cancel.get(client_id)
+            if signal is None:
+                return False
+            signal.set()
+            return True
+
+    def close(self) -> None:
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+            for signal in self._cancel.values():
+                signal.set()
+        self._executor.shutdown(wait=True, cancel_futures=False)
+        self._runner.close()
+
+    def _forget(self, client_id: int) -> None:
+        with self._state_lock:
+            self._cancel.pop(client_id, None)
+
+    def _generate_one(
+        self,
+        request: GenerationInput,
+        callback: TokenCallback | None,
+    ) -> GenerationOutput:
+        with self._state_lock:
+            cancelled = self._cancel[request.client_id]
+        started = time.perf_counter()
+        arrivals: list[float] = []
+        tokens: list[int] = []
+        began = False
+        try:
+            self._runner.begin(request.client_id)
+            began = True
+            current = request.input_ids
+            finish_reason = "length"
+            for step in range(request.max_new_tokens):
+                if cancelled.is_set():
+                    raise GenerationCancelledError(
+                        f"generation {request.client_id} was cancelled"
+                    )
+                project = getattr(self._runner, "forward_ids_with_tokens", None)
+                if not callable(project):
+                    raise RuntimeError(
+                        "single-stage runner does not implement direct token projection"
+                    )
+                _, token_value = project(request.client_id, current, token_mode="last")
+                if not isinstance(token_value, int):
+                    raise RuntimeError("single-stage runner returned an invalid token")
+                token = int(token_value)
+                arrived = time.perf_counter()
+                tokens.append(token)
+                arrivals.append(arrived)
+                if callback is not None:
+                    callback(request.client_id, token, step, arrived)
+                if token in request.eos_token_ids:
+                    finish_reason = "stop"
+                    break
+                current = torch.tensor(
+                    [[token]],
+                    dtype=request.input_ids.dtype,
+                )
+            intervals = [
+                (right - left) * 1_000
+                for left, right in zip(arrivals, arrivals[1:])
+            ]
+            return GenerationOutput(
+                client_id=request.client_id,
+                token_ids=tuple(tokens),
+                finish_reason=finish_reason,
+                ttft_ms=(arrivals[0] - started) * 1_000,
+                tpot_ms=sum(intervals) / len(intervals) if intervals else 0.0,
+                total_ms=(arrivals[-1] - started) * 1_000,
+            )
+        finally:
+            if began:
+                self._runner.end(request.client_id)
+
+
 def balanced_boundaries(total_layers: int, stages: int) -> tuple[int, ...]:
-    if total_layers < 2:
-        raise ValueError("model must have at least two layers")
-    if not 2 <= stages <= total_layers:
-        raise ValueError("stages must be between 2 and the number of model layers")
+    if total_layers < 1:
+        raise ValueError("model must have at least one layer")
+    if not 1 <= stages <= total_layers:
+        raise ValueError("stages must be between 1 and the number of model layers")
     return tuple(round(index * total_layers / stages) for index in range(stages + 1))
 
 
@@ -6708,8 +7038,8 @@ def parse_boundaries(raw: str, total_layers: int) -> tuple[int, ...]:
         boundaries = tuple(int(item.strip()) for item in raw.split(","))
     except ValueError as error:
         raise ValueError("boundaries must be comma-separated integers") from error
-    if len(boundaries) < 3 or boundaries[0] != 0 or boundaries[-1] != total_layers:
-        raise ValueError(f"boundaries must describe at least two stages from 0 to {total_layers}")
+    if len(boundaries) < 2 or boundaries[0] != 0 or boundaries[-1] != total_layers:
+        raise ValueError(f"boundaries must describe at least one stage from 0 to {total_layers}")
     if any(right <= left for left, right in zip(boundaries, boundaries[1:])):
         raise ValueError("boundaries must be strictly increasing")
     return boundaries

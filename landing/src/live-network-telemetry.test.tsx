@@ -28,6 +28,8 @@ describe("LiveNetworkTelemetry", () => {
           freeOfferedVramMb: 32_768,
         }],
         deployments: [],
+        quarantined: false,
+        quarantineExpiresAt: null,
       }, {
         id: "offline-peer",
         kind: "cell",
@@ -40,6 +42,8 @@ describe("LiveNetworkTelemetry", () => {
         lastSeenAt: new Date(0).toISOString(),
         gpus: [],
         deployments: [],
+        quarantined: false,
+        quarantineExpiresAt: null,
       }],
       models: [
         { id: "model-a", replicas: 2, pipelines: 1 },
@@ -58,13 +62,13 @@ describe("LiveNetworkTelemetry", () => {
     const html = renderToStaticMarkup(<LiveNetworkTelemetry snapshot={snapshot} />);
 
     expect(html).toContain('aria-label="Current live network data"');
+    expect(html).toContain('data-period="current"');
+    expect(html).toContain('data-evidence="coordinator-snapshot"');
     expect(html).toContain("LIVE");
-    expect(html).toContain("Public API · v0.73.1");
     expect(html).toContain("3 replicas · 1 pipelines");
-    expect(html).toContain("64 GB");
-    expect(html).toContain("32 GB free · 1 peers");
     expect(html).toContain("<strong>3</strong>");
     expect(html).toContain("2 running · 1 queued");
-    expect(html).toContain('aria-label="50% free"');
+    expect(html.match(/data-kpi=/g)).toHaveLength(4);
+    expect(html).not.toContain("Mesh VRAM");
   });
 });

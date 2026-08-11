@@ -23,6 +23,8 @@ describe("MeshNodePopover", () => {
         offeredVramMb: 131_072,
         freeOfferedVramMb: 89_000,
       }],
+      quarantined: false,
+      quarantineExpiresAt: null,
       deployments: [{
         deploymentId: "deployment-1",
         model: "singulared/Ornith-1.0-35B-MTP-GGUF:Q8_0",

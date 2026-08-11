@@ -4,6 +4,7 @@ import {
   ARTIFACT_SWARM_SCHEMA,
   ArtifactSwarmRegistry,
   artifactChunkId,
+  selectArtifactSwarmPackages,
   signArtifactSwarmManifest,
   verifyArtifactSwarmManifest,
   type ArtifactBlobDescriptor,
@@ -23,9 +24,18 @@ describe("native artifact swarm", () => {
     );
   });
 
+  it("rejects a valid self-signed manifest from an unpinned publisher", () => {
+    const trusted = generateKeyPairSync("ed25519");
+    const attacker = generateKeyPairSync("ed25519");
+    const registry = new ArtifactSwarmRegistry({ trustedPublisherKeys: [trusted.publicKey] });
+    expect(() => registry.publish(
+      signArtifactSwarmManifest(manifest(), attacker.privateKey, attacker.publicKey),
+    )).toThrow("artifact_swarm_publisher_is_not_trusted");
+  });
+
   it("prioritizes the requested stage path, then rare chunks and measured peers", () => {
     const keys = generateKeyPairSync("ed25519");
-    const registry = new ArtifactSwarmRegistry();
+    const registry = new ArtifactSwarmRegistry({ trustedPublisherKeys: [keys.publicKey] });
     const signed = registry.publish(
       signArtifactSwarmManifest(manifest(), keys.privateKey, keys.publicKey),
     );
@@ -65,7 +75,7 @@ describe("native artifact swarm", () => {
 
   it("quarantines corrupt peers and expires stale inventories", () => {
     const keys = generateKeyPairSync("ed25519");
-    const registry = new ArtifactSwarmRegistry();
+    const registry = new ArtifactSwarmRegistry({ trustedPublisherKeys: [keys.publicKey] });
     const signed = registry.publish(
       signArtifactSwarmManifest(manifest(), keys.privateKey, keys.publicKey),
     );
@@ -95,7 +105,7 @@ describe("native artifact swarm", () => {
 
   it("omits chunks already verified by the requester", () => {
     const keys = generateKeyPairSync("ed25519");
-    const registry = new ArtifactSwarmRegistry();
+    const registry = new ArtifactSwarmRegistry({ trustedPublisherKeys: [keys.publicKey] });
     const signed = registry.publish(
       signArtifactSwarmManifest(manifest(), keys.privateKey, keys.publicKey),
     );
@@ -110,17 +120,34 @@ describe("native artifact swarm", () => {
     });
     expect(plan.some((request) => request.chunkId === alreadyPresent)).toBe(false);
   });
+
+  it("maps only the selected distribution artifacts without widening package bytes", () => {
+    const keys = generateKeyPairSync("ed25519");
+    const signed = signArtifactSwarmManifest(manifest(), keys.privateKey, keys.publicKey);
+    expect(selectArtifactSwarmPackages(
+      signed,
+      signed.distributionManifestId,
+      ["layer-2-4", "output"],
+    )).toEqual([signed.packages[1]!.packageId]);
+    expect(() => selectArtifactSwarmPackages(
+      signed,
+      signed.distributionManifestId,
+      ["layer-0-2"],
+    )).toThrow("artifact_swarm_package_contains_unassigned_artifact");
+  });
 });
 
 function manifest(): UnsignedArtifactSwarmManifest {
   return {
     schema: ARTIFACT_SWARM_SCHEMA,
     modelIdentity: identity(1, true),
+    distributionManifestId: identity(2, true),
     sourceRevision: "commit-abc",
     tensorAbi: "mycellios-transformers-global-stage-tensors/1",
     packages: [
       {
         packageId: identity(10),
+        artifactIds: ["input", "layer-0-2", "shared"],
         layerStart: 0,
         layerEnd: 2,
         manifest: blob(20, [200]),
@@ -128,6 +155,7 @@ function manifest(): UnsignedArtifactSwarmManifest {
       },
       {
         packageId: identity(11),
+        artifactIds: ["layer-2-4", "output"],
         layerStart: 2,
         layerEnd: 4,
         manifest: blob(22, [200]),

@@ -7,7 +7,7 @@ import {
   gpuPreparationIsContinuing,
   selectImmediateRuntime,
   updateActiveAccelerationStages,
-} from "../src/desktop/acceleration-progress.js";
+} from "../src/node/acceleration-progress.js";
 
 describe("desktop acceleration progress", () => {
   it("reports setup only for active work or a retryable terminal failure", () => {
