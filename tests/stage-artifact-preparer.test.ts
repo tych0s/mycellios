@@ -72,18 +72,27 @@ describe("worker-local stage artifact preparation", () => {
         objects: [],
       });
     });
+    const progress: Array<Record<string, unknown>> = [];
     const prepared = await prepareNodeStageArtifacts(description, {
       nodeId: "node-a",
       pythonExecutable: "python",
       cacheDirectory: temporaryDirectory(),
       compilerRunner: runner,
       artifactCacheRunner: cacheRunner,
+      onProgress: (event) => progress.push(event),
     });
 
     expect(runner).toHaveBeenCalledTimes(new Set(
       local.map((process) => `${process.layerStart}:${process.layerEnd}:${process.totalLayers}`),
     ).size);
     expect(cacheRunner).toHaveBeenCalledTimes(runner.mock.calls.length);
+    expect(progress.filter((event) => event.state === "ready")).toEqual(
+      expect.arrayContaining([expect.objectContaining({
+        downloadedBytes: 2_048,
+        resumedBytes: 0,
+        materialized: true,
+      })]),
+    );
     expect(prepared.map((process) => process.processId)).toEqual(
       local.map((process) => process.processId),
     );

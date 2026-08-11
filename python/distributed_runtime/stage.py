@@ -15,9 +15,14 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from .checkpoint_control import (
+    StageCheckpointControl,
+    checkpoint_control_from_environment,
+)
 from .compute_timing import ComputeTimer
 from .device import normalize_torch_device_request
 from .dense_tiering import DenseTieringConfig
+from .failure_evidence import StageFailureEvidence
 from .model import (
     MAX_PHYSICAL_STAGE_BATCH_SIZE,
     StageModelSpec,
@@ -34,6 +39,7 @@ from .protocol import (
     TreePrepareQuote,
     TreePrepareRejection,
     TreePrepareStatus,
+    bind_socket_deployment_generation,
     configure_socket,
     decode_branch_request_id,
     decode_tree_prepare,
@@ -42,6 +48,9 @@ from .protocol import (
     encode_tree_prepare_quote,
     encode_tensor_payload,
     recv_frame,
+    route_identity_digest,
+    sampling_logits_payload,
+    wave_identity_digest,
     send_frame,
     token_payload,
     verify_result_payload,
@@ -190,6 +199,13 @@ class StageProcessConfig:
     codec: TensorCodec
     one_way_delay_ms: float
     bandwidth_mbps: float
+    deployment_generation: int = 0
+    route_id: str = "static"
+    wave_strategy_id: str = "autoregressive"
+    wave_artifact_identity: str = "static-model"
+    stage_index: int | None = None
+    stage_role: str | None = None
+    stage_executor_id: str | None = None
     device: str = "auto"
     dense_tiering: DenseTieringConfig = DenseTieringConfig()
     sealed_wave_tokens: int | None = None
@@ -228,6 +244,7 @@ _REQUEST_SCOPED_FRAMES = frozenset(
         FrameType.ACTIVATION,
         FrameType.PREFILL,
         FrameType.VERIFY,
+        FrameType.SAMPLING_VERIFY,
         FrameType.TRUNCATE,
         FrameType.END,
         FrameType.CANCEL,
@@ -335,6 +352,7 @@ def run_stage_process(
     downstream_errors: list[BaseException] = []
     upstream_send_lock = threading.Lock()
     control_thread: threading.Thread | None = None
+    checkpoint_control: StageCheckpointControl | None = None
     pending_frames: deque[Frame] = deque()
     reservation_deferred_frames: deque[Frame] = deque()
     request_admission: SingleRequestAdmission | None = None
@@ -350,6 +368,7 @@ def run_stage_process(
         validate_stage_config(config)
         runner = build_stage_runner(config)
         validate_speculative_runner(config, runner)
+        checkpoint_control = checkpoint_control_from_environment(runner)
         request_admission = request_admission_for_runner(runner)
         put_startup_metric_best_effort(
             metrics_queue,
@@ -373,12 +392,27 @@ def run_stage_process(
         listener = None
         hello = recv_frame(upstream)
         validate_hello(hello, config, runner.hidden_size)
+        bind_socket_deployment_generation(
+            upstream,
+            config.deployment_generation,
+            config.route_id,
+            wave_strategy_id=config.wave_strategy_id,
+            wave_artifact_identity=config.wave_artifact_identity,
+            next_receive_sequence=hello.sequence + 1,
+        )
 
         if config.next_host is not None and config.next_port is not None:
             downstream = connect_with_retry(
                 config.next_host,
                 config.next_port,
                 config.connect_timeout_seconds,
+            )
+            bind_socket_deployment_generation(
+                downstream,
+                config.deployment_generation,
+                config.route_id,
+                wave_strategy_id=config.wave_strategy_id,
+                wave_artifact_identity=config.wave_artifact_identity,
             )
             send_frame(
                 downstream,
@@ -418,6 +452,13 @@ def run_stage_process(
                 config.return_port,
                 config.connect_timeout_seconds,
             )
+            bind_socket_deployment_generation(
+                return_socket,
+                config.deployment_generation,
+                config.route_id,
+                wave_strategy_id=config.wave_strategy_id,
+                wave_artifact_identity=config.wave_artifact_identity,
+            )
 
         # The downstream monitor is already active and may need to relay an
         # immediate ERROR. Serialize both writes so their headers/payloads can
@@ -437,6 +478,14 @@ def run_stage_process(
             if frame is None and request_admission is not None:
                 frame = request_admission.next_deferred()
             if frame is None:
+                if checkpoint_control is not None:
+                    readable, _, _ = select.select(
+                        [upstream, checkpoint_control.wake_socket], [], []
+                    )
+                    if checkpoint_control.wake_socket in readable:
+                        checkpoint_control.service_pending()
+                        if upstream not in readable:
+                            continue
                 frame = recv_frame(upstream)
             if tree_reservation_defers_frame(
                 frame, tree_reservations, branch_parents
@@ -510,6 +559,7 @@ def run_stage_process(
                 FrameType.ACTIVATION,
                 FrameType.PREFILL,
                 FrameType.VERIFY,
+                FrameType.SAMPLING_VERIFY,
             ):
                 validate_activation(
                     frame,
@@ -625,7 +675,7 @@ def run_stage_process(
         # less useful local EOF. Other failures are reported on every route the
         # root may currently be reading.
         if not downstream_failed.is_set():
-            payload = str(error).encode("utf-8")[:4_096]
+            payload = stage_failure_payload(config, error)
             send_error_best_effort(
                 upstream,
                 config.pipeline_id,
@@ -647,6 +697,8 @@ def run_stage_process(
         raise
     finally:
         stopping.set()
+        if checkpoint_control is not None:
+            checkpoint_control.close()
         emulator_close_error: BaseException | None = None
         if emulator is not None:
             try:
@@ -766,6 +818,7 @@ def tree_reservation_defers_frame(
         FrameType.ACTIVATION,
         FrameType.PREFILL,
         FrameType.VERIFY,
+        FrameType.SAMPLING_VERIFY,
         FrameType.TRUNCATE,
         FrameType.PROMOTE,
         FrameType.END,
@@ -1854,6 +1907,7 @@ def collect_compatible_activation_frames(
             FrameType.ACTIVATION,
             FrameType.PREFILL,
             FrameType.VERIFY,
+            FrameType.SAMPLING_VERIFY,
         ):
             pending_frames.appendleft(candidate)
             break
@@ -1995,6 +2049,7 @@ def process_activation_frames(
             frame,
             output,
             token,
+            runner=runner,
             config=config,
             metrics=metrics,
             downstream=downstream,
@@ -2008,6 +2063,7 @@ def route_stage_result(
     output: torch.Tensor,
     token: int | tuple[int, ...] | None,
     *,
+    runner: StageRunnerContract,
     config: StageProcessConfig,
     metrics: dict[str, Any],
     downstream: socket.socket | None,
@@ -2023,6 +2079,33 @@ def route_stage_result(
                 FrameType.PREFILL_ACK,
                 frame.request_id,
                 step=frame.step,
+                emulator=emulator,
+            )
+        elif frame.frame_type == FrameType.SAMPLING_VERIFY:
+            projector = getattr(runner, "project_sampling_logits", None)
+            if not callable(projector):
+                raise RuntimeError(
+                    "last-stage backend does not expose certified sampling logits"
+                )
+            logits = projector(output)
+            if (
+                not isinstance(logits, torch.Tensor)
+                or logits.ndim != 3
+                or logits.shape[0] != 1
+                or logits.shape[1] != frame.token_count
+            ):
+                raise RuntimeError("last stage returned an invalid sampling distribution")
+            payload, token_count, vocabulary_size = sampling_logits_payload(
+                logits[0].tolist()
+            )
+            metrics["bytes_out"] += send_frame(
+                return_socket,
+                FrameType.SAMPLING_VERIFY_RESULT,
+                frame.request_id,
+                step=frame.step,
+                token_count=token_count,
+                hidden_size=vocabulary_size,
+                payload=payload,
                 emulator=emulator,
             )
         elif frame.frame_type == FrameType.VERIFY:
@@ -2070,7 +2153,7 @@ def route_stage_result(
 def activation_token_mode(frame_type: FrameType) -> str:
     if frame_type == FrameType.PREFILL:
         return "none"
-    if frame_type == FrameType.VERIFY:
+    if frame_type in (FrameType.VERIFY, FrameType.SAMPLING_VERIFY):
         return "all"
     if frame_type == FrameType.ACTIVATION:
         return "last"
@@ -2184,6 +2267,23 @@ def validate_hello(frame: Frame, config: StageProcessConfig, hidden_size: int) -
             f"pipeline identity mismatch: got {frame.request_id}, "
             f"expected {config.pipeline_id}"
         )
+    if frame.deployment_generation != config.deployment_generation:
+        raise ValueError(
+            "deployment generation mismatch: got "
+            f"{frame.deployment_generation}, expected {config.deployment_generation}"
+        )
+    if frame.route_digest != route_identity_digest(config.route_id):
+        raise ValueError("route identity mismatch")
+    if frame.wave_strategy_digest != wave_identity_digest(
+        "strategy", config.wave_strategy_id
+    ):
+        raise ValueError("wave strategy identity mismatch")
+    if frame.wave_artifact_digest != wave_identity_digest(
+        "artifact", config.wave_artifact_identity
+    ):
+        raise ValueError("wave artifact identity mismatch")
+    if frame.sequence != 0:
+        raise ValueError("HELLO sequence must be zero")
     if frame.step != config.spec.layer_start or frame.token_count != config.spec.layer_end:
         raise ValueError(
             f"layer range mismatch: got [{frame.step},{frame.token_count}), "
@@ -2205,6 +2305,36 @@ def validate_stage_config(config: StageProcessConfig) -> None:
         or not 0 <= config.pipeline_id <= (1 << 64) - 1
     ):
         raise ValueError("pipeline_id must be an unsigned 64-bit integer")
+    if (
+        not isinstance(config.deployment_generation, int)
+        or isinstance(config.deployment_generation, bool)
+        or not 0 <= config.deployment_generation <= (1 << 64) - 1
+    ):
+        raise ValueError("deployment_generation must be an unsigned 64-bit integer")
+    route_identity_digest(config.route_id)
+    wave_identity_digest("strategy", config.wave_strategy_id)
+    wave_identity_digest("artifact", config.wave_artifact_identity)
+    attribution = (config.stage_index, config.stage_role, config.stage_executor_id)
+    if any(value is not None for value in attribution):
+        if any(value is None for value in attribution):
+            raise ValueError("stage failure attribution must be configured completely")
+        if (
+            not isinstance(config.stage_index, int)
+            or isinstance(config.stage_index, bool)
+            or config.stage_index < 1
+        ):
+            raise ValueError("stage_index must be a positive integer")
+        expected_role = (
+            "tail" if config.spec.last else "head" if config.stage_index == 1 else "middle"
+        )
+        if config.stage_role != expected_role:
+            raise ValueError("stage_role does not match the physical stage position")
+        if (
+            not isinstance(config.stage_executor_id, str)
+            or len(config.stage_executor_id) != 32
+            or any(character not in "0123456789abcdef" for character in config.stage_executor_id)
+        ):
+            raise ValueError("stage_executor_id must be 32 lowercase hex characters")
     if not config.listen_host.strip() or not config.return_host.strip():
         raise ValueError("listen_host and return_host cannot be empty")
     for name, port in (("listen_port", config.listen_port), ("return_port", config.return_port)):
@@ -2552,7 +2682,7 @@ def validate_activation(
             "PREFILL token_count exceeds max_prefill_chunk_tokens: "
             f"{frame.token_count} > {config.max_prefill_chunk_tokens}"
         )
-    if frame.frame_type == FrameType.ACTIVATION:
+    if frame.frame_type in (FrameType.ACTIVATION, FrameType.SAMPLING_VERIFY):
         activation_limit = max(
             config.sealed_wave_tokens or 1,
             config.max_prefill_chunk_tokens or 1,
@@ -2562,7 +2692,7 @@ def validate_activation(
             or config.max_prefill_chunk_tokens is not None
         ) and frame.token_count > activation_limit:
             raise ValueError(
-                "ACTIVATION token_count exceeds sealed activation capacity: "
+                f"{frame.frame_type.name} token_count exceeds sealed activation capacity: "
                 f"{frame.token_count} > {activation_limit}"
             )
     expected_step = int(request_metrics[frame.request_id]["frames"])
@@ -2721,6 +2851,30 @@ def send_error_best_effort(
                 send_frame(sock, FrameType.ERROR, request_id, payload=payload)
     except BaseException:
         pass
+
+
+def stage_failure_payload(config: StageProcessConfig, error: BaseException) -> bytes:
+    """Return route-bound component evidence when launch identity is available."""
+
+    if (
+        config.stage_index is None
+        or config.stage_role is None
+        or config.stage_executor_id is None
+    ):
+        return str(error).encode("utf-8")[:4_096]
+    message = str(error)[:1_024] or type(error).__name__
+    return StageFailureEvidence(
+        generation=config.deployment_generation,
+        route_id=config.route_id,
+        stage_role=config.stage_role,  # validated before the process becomes ready
+        stage_index=config.stage_index,
+        executor_id=config.stage_executor_id,
+        layer_start=config.spec.layer_start,
+        layer_end=config.spec.layer_end,
+        failure_class="health-failed",
+        error_type=type(error).__name__,
+        message=message,
+    ).to_payload()
 
 
 def put_metric_best_effort(metrics_sink: Any, value: dict[str, Any]) -> None:

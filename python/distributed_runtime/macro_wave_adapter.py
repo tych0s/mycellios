@@ -31,9 +31,16 @@ from .macro_wave import (
     GreedyAcceptance,
     KVVersion,
     MacroWaveCommit,
+    MacroWavePrefixCommit,
     MacroWaveTree,
     WaveIdentity,
     verify_greedy_exact,
+)
+from .lossless_sampling import (
+    CounterSamplingRng,
+    SamplingRngCheckpoint,
+    lossless_speculative_sample,
+    probabilities_from_logits,
 )
 from .speculation import (
     AdaptiveSpeculationController,
@@ -177,6 +184,21 @@ class MacroWaveResolution:
     @property
     def accepted_draft_tokens(self) -> int:
         return len(self.commit_tokens)
+
+
+@dataclass(frozen=True)
+class SamplingMacroWaveResolution:
+    resolution: MacroWaveResolution | None
+    prefix_commit: MacroWavePrefixCommit | None
+    rng_before: SamplingRngCheckpoint
+    rng_after: SamplingRngCheckpoint
+    deferred_bridge_logits: tuple[float, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if (self.resolution is None) == (self.prefix_commit is None):
+            raise ValueError("sampling outcome requires resolution xor prefix_commit")
+        if self.deferred_bridge_logits is not None and self.prefix_commit is None:
+            raise ValueError("only a prefix commit may defer bridge logits")
 
 
 @dataclass(frozen=True)
@@ -532,6 +554,103 @@ def resolve_linear_macro_wave(
     return resolve_macro_wave(proposal, target_by_prefix)
 
 
+def resolve_linear_sampling_macro_wave(
+    proposal: MacroWaveProposal,
+    target_logits: Sequence[Sequence[float]],
+    *,
+    temperature: float,
+    top_p: float,
+    rng: CounterSamplingRng,
+    defer_bonus: bool = False,
+) -> SamplingMacroWaveResolution:
+    """Resolve one deterministic-draft wave without changing target sampling.
+
+    N-gram candidates are delta distributions. Each accepted candidate uses
+    ``min(1,p/q)`` and a rejection samples from ``max(p-q,0)``. Work happens on
+    an RNG clone; the caller publishes ``rng_after`` only after KV commit.
+    """
+
+    if not isinstance(proposal, MacroWaveProposal) or not proposal.is_linear:
+        raise ValueError("proposal must be a linear MacroWaveProposal")
+    if not isinstance(rng, CounterSamplingRng):
+        raise ValueError("rng must be a CounterSamplingRng")
+    draft = proposal.linear_tokens
+    rows = tuple(tuple(float(value) for value in row) for row in target_logits)
+    if len(rows) != len(draft) + 1:
+        raise ValueError(
+            "sampling target logits must contain one row per draft plus bonus"
+        )
+    before = rng.checkpoint()
+    working = CounterSamplingRng.from_checkpoint(before)
+    accepted: list[int] = []
+    continuation: int | None = None
+    for index, candidate in enumerate(draft):
+        target = probabilities_from_logits(
+            rows[index], temperature=temperature, top_p=top_p
+        )
+        if candidate >= len(target):
+            raise ValueError("draft token is outside the target vocabulary")
+        delta = tuple(1.0 if token == candidate else 0.0 for token in range(len(target)))
+        decision = lossless_speculative_sample(target, delta, candidate, working)
+        if decision.accepted_draft:
+            accepted.append(candidate)
+            continue
+        continuation = decision.token_id
+        break
+    exhausted = continuation is None
+    if exhausted:
+        if defer_bonus:
+            accepted_tokens = tuple(accepted)
+            branches = tuple(
+                proposal.branch_for_prefix(draft[:depth])
+                for depth in range(1, len(accepted_tokens) + 1)
+            )
+            prefix_commit = proposal.tree.commit_prefix(branches, accepted_tokens)
+            return SamplingMacroWaveResolution(
+                resolution=None,
+                prefix_commit=prefix_commit,
+                rng_before=before,
+                rng_after=working.checkpoint(),
+                deferred_bridge_logits=rows[-1],
+            )
+        bonus = probabilities_from_logits(
+            rows[-1], temperature=temperature, top_p=top_p
+        )
+        continuation = working.categorical(bonus)
+    accepted_tokens = tuple(accepted)
+    accepted_branches = tuple(
+        proposal.branch_for_prefix(draft[:depth])
+        for depth in range(1, len(accepted_tokens) + 1)
+    )
+    terminal = proposal.branch_for_prefix(accepted_tokens)
+    acceptance = GreedyAcceptance(
+        wave_identity=proposal.wave_identity,
+        accepted_branches=accepted_branches,
+        accepted_tokens=accepted_tokens,
+        continuation_token=continuation,
+        emitted_tokens=(*accepted_tokens, continuation),
+        terminal_prefix_branch=terminal,
+        stop_reason="candidate_exhausted" if exhausted else "sampling_rejection",
+    )
+    commit = proposal.tree.commit_greedy(acceptance)
+    resolution = MacroWaveResolution(
+        acceptance=acceptance,
+        commit=commit,
+        commit_tokens=accepted_tokens,
+        truncate_draft_to=len(accepted_tokens),
+        truncate_required=not exhausted,
+        continuation_kind=(
+            ContinuationKind.BONUS if exhausted else ContinuationKind.CORRECTION
+        ),
+        correction_token=None if exhausted else continuation,
+        bonus_token=continuation if exhausted else None,
+        emitted_tokens=acceptance.emitted_tokens,
+    )
+    return SamplingMacroWaveResolution(
+        resolution, None, before, working.checkpoint()
+    )
+
+
 def record_linear_resolution(
     controller: AdaptiveSpeculationController,
     proposal: MacroWaveProposal,
@@ -563,11 +682,13 @@ __all__ = [
     "MacroWavePreparation",
     "MacroWaveProposal",
     "MacroWaveResolution",
+    "SamplingMacroWaveResolution",
     "branched_candidates_to_macro_wave",
     "linear_draft_to_macro_wave",
     "prepare_tree_macro_wave",
     "prepare_linear_macro_wave",
     "record_linear_resolution",
     "resolve_linear_macro_wave",
+    "resolve_linear_sampling_macro_wave",
     "resolve_macro_wave",
 ]

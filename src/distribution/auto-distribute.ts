@@ -73,6 +73,10 @@ const nodeSchema = z
     decodeScale: z.number().positive().finite().default(1),
     prefillScale: z.number().positive().finite().default(1),
     codecScale: z.number().positive().finite().default(1),
+    maxStageLayers: z.number().int().positive().optional(),
+    stageRoles: z.array(z.enum(["head", "middle", "tail"])).min(1).max(3)
+      .refine((roles) => new Set(roles).size === roles.length, "stageRoles must be unique")
+      .optional(),
     powerWatts: z.number().positive().finite().default(65),
     availability: z.number().positive().max(1).default(0.999),
     agent: agentSchema,
@@ -99,11 +103,29 @@ const linkSchema = z
         validUntil: z.number().int().positive(),
         successfulSamples: z.number().int().nonnegative(),
         failedSamples: z.number().int().nonnegative(),
+        transportMode: z.enum(["direct", "relay"]).default("relay"),
+        fromEngineProfileId: z.string().regex(/^sha256:[0-9a-f]{64}$/).optional(),
+        toEngineProfileId: z.string().regex(/^sha256:[0-9a-f]{64}$/).optional(),
+        fromHardwareFingerprintSha256: z.string().regex(/^sha256:[0-9a-f]{64}$/).optional(),
+        toHardwareFingerprintSha256: z.string().regex(/^sha256:[0-9a-f]{64}$/).optional(),
       })
       .strict()
       .refine((value) => value.validUntil > value.measuredAt, {
         message: "link evidence must expire after it was measured",
         path: ["validUntil"],
+      })
+      .refine((value) => {
+        const binding = [
+          value.fromEngineProfileId,
+          value.toEngineProfileId,
+          value.fromHardwareFingerprintSha256,
+          value.toHardwareFingerprintSha256,
+        ];
+        return binding.every((entry) => entry === undefined)
+          || binding.every((entry) => entry !== undefined);
+      }, {
+        message: "certified link evidence binding must be complete",
+        path: ["fromEngineProfileId"],
       })
       .optional(),
   })
@@ -734,6 +756,8 @@ function runtimeTopology(config: AutoDistributionConfig): RuntimeTopology {
     decodeScale: node.decodeScale,
     prefillScale: node.prefillScale,
     codecScale: node.codecScale,
+    ...(node.maxStageLayers !== undefined ? { maxStageLayers: node.maxStageLayers } : {}),
+    ...(node.stageRoles !== undefined ? { stageRoles: [...node.stageRoles] } : {}),
     batchGain: 0.1,
     maxBatchSpeedup: 1.5,
     powerWatts: node.powerWatts,

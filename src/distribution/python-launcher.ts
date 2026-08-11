@@ -20,8 +20,20 @@ import {
   type ExecutorIsolationPolicyOptions,
   type ExecutorIsolationPolicyV4,
 } from "./process-environment.js";
+import {
+  draftStrategyCertificationIdentity,
+  draftStrategyCertificationSchema,
+  draftStrategyDescriptorIdentity,
+  draftStrategyDescriptorSchema,
+  type DraftStrategyCertification,
+  type DraftStrategyDescriptor,
+} from "../contracts/engine-family.js";
+import {
+  assertVerifiedDraftStrategyResolution,
+  type ResolvedDraftStrategy,
+} from "./draft-strategy-registry.js";
 
-const GDLP_FRAME_HEADER_BYTES = 32n;
+const GDLP_FRAME_HEADER_BYTES = 112n;
 const DEFAULT_PREFILL_INFLIGHT_BYTES = 64 * 1024 * 1024;
 const MAX_PREFILL_INFLIGHT_BYTES = 1024 * 1024 * 1024;
 const MAX_SPECULATIVE_BRANCHES = 64;
@@ -171,6 +183,8 @@ export interface PythonLaunchCompilerOptions {
   runtimeModel?: PythonRuntimeModelInput;
   /** Sealed local sibling model used only to propose target-verified tokens. */
   draftModel?: PythonDraftModelInput | null;
+  /** Registry-verified native speculative component and its signed grant. */
+  draftStrategyAuthority?: PythonDraftStrategyAuthority;
   publicModelName?: string;
   pythonExecutable?: string;
   /** Fixed native entrypoint; exposed only for normalized-description validation. */
@@ -387,12 +401,19 @@ export interface PythonDraftModelConfiguration extends PythonRuntimeModelSource 
   memoryReservationBytes: number;
 }
 
+export interface PythonDraftStrategyAuthority {
+  descriptor: DraftStrategyDescriptor;
+  certification: DraftStrategyCertification;
+}
+
 export interface PythonLaunchConfiguration {
   apiEndpoint: RuntimeEndpoint;
   returnEndpoint: RuntimeEndpoint;
   returnBindHost: string;
   runtimeModel: PythonRuntimeModelSource;
   draftModel: PythonDraftModelConfiguration | null;
+  /** Present only when a certified draft registry resolved this launch. */
+  draftStrategyAuthority?: PythonDraftStrategyAuthority;
   publicModelName: string;
   pythonExecutable: string;
   stageModule: typeof MYCELLIOS_STAGE_MODULE;
@@ -557,6 +578,7 @@ export interface PythonPipelineLaunchRoute {
 export interface PythonPipelineLaunchDescription {
   schema: "gdlp-python-launch/2";
   launchId: string;
+  deploymentGeneration: number;
   sourceProtocol: "gdlp/2";
   sourceManifest: RuntimePipelineManifestV2;
   pipelineId: string;
@@ -573,6 +595,7 @@ export interface PythonPipelineLaunchDescription {
 }
 
 interface PythonSpeculationArguments {
+  strategyId: string;
   provider: "off" | "ngram" | "draft-tree" | "draft-model";
   maxDraftTokens: number;
   maxBranches: number;
@@ -597,7 +620,7 @@ export function compilePythonLaunchDescription(
     throw new Error("python_launcher_requires_gdlp_2");
   }
   const configuration = normalizeConfiguration(manifestValue, optionsValue);
-  const description = buildDescription(manifestValue, configuration);
+  const description = buildDescription(manifestValue, configuration, 0);
   validatePythonLaunchDescription(description);
   return description;
 }
@@ -622,15 +645,87 @@ export function validatePythonLaunchDescription(
     value.configuration as unknown as PythonLaunchCompilerOptions,
     true,
   );
-  const expected = buildDescription(value.sourceManifest, configuration);
+  const generation = boundedInteger(
+    value.deploymentGeneration,
+    0,
+    Number.MAX_SAFE_INTEGER,
+    "python_deployment_generation_is_invalid",
+  );
+  const expected = buildDescription(value.sourceManifest, configuration, generation);
   if (canonicalJson(value) !== canonicalJson(expected)) {
     throw new Error("python_launch_description_mismatch");
+  }
+}
+
+/** Re-seals the complete launch identity against a durable deployment generation. */
+export function bindPythonLaunchDeploymentGeneration(
+  value: unknown,
+  generation: number,
+): PythonPipelineLaunchDescription {
+  validatePythonLaunchDescription(value);
+  const normalized = boundedInteger(
+    generation,
+    1,
+    Number.MAX_SAFE_INTEGER,
+    "python_deployment_generation_is_invalid",
+  );
+  return buildDescription(value.sourceManifest, value.configuration, normalized);
+}
+
+/** Seal a registry-verified draft component into launch, process and wire ids. */
+export function bindPythonLaunchDraftStrategyAuthority(
+  value: unknown,
+  authority: ResolvedDraftStrategy,
+  now = new Date(),
+): PythonPipelineLaunchDescription {
+  validatePythonLaunchDescription(value);
+  assertVerifiedDraftStrategyResolution(authority);
+  const normalizedAuthority = normalizeDraftStrategyAuthority(
+    value.sourceManifest,
+    value.configuration.draftModel,
+    authority,
+    now,
+  );
+  const description = buildDescription(
+    value.sourceManifest,
+    { ...value.configuration, draftStrategyAuthority: normalizedAuthority },
+    value.deploymentGeneration,
+  );
+  validatePythonLaunchDescription(description);
+  return description;
+}
+
+export function pythonLaunchRequiresDraftStrategyAuthority(
+  value: unknown,
+): boolean {
+  validatePythonLaunchDescription(value);
+  return pythonSpeculation(value.sourceManifest.plans.decode.speculation).provider !== "off";
+}
+
+export function assertPythonLaunchDraftStrategyCurrent(
+  value: unknown,
+  now: number,
+): void {
+  validatePythonLaunchDescription(value);
+  if (!Number.isFinite(now)) {
+    throw new Error("launch_draft_strategy_time_is_invalid");
+  }
+  const authority = value.configuration.draftStrategyAuthority;
+  if (
+    authority
+    && (
+      Date.parse(authority.certification.validFrom) > now
+      || Date.parse(authority.certification.expiresAt) <= now
+    )
+  ) {
+    throw new Error("launch_draft_strategy_certification_is_not_current");
   }
 }
 
 function buildDescription(
   manifest: RuntimePipelineManifestV2,
   configuration: PythonLaunchConfiguration,
+  deploymentGeneration: number,
 ): PythonPipelineLaunchDescription {
   const prefill = manifest.plans.prefill;
   const decode = manifest.plans.decode;
@@ -650,6 +745,16 @@ function buildDescription(
     }
   }
   const frameLimits = executableFrameLimits(prefill, decode);
+  const waveStrategy = pythonSpeculation(decode.speculation);
+  const waveStrategyId = configuration.draftStrategyAuthority
+    ? draftStrategyDescriptorIdentity(configuration.draftStrategyAuthority.descriptor)
+    : waveStrategy.strategyId;
+  const waveArtifactIdentity = configuration.runtimeModel.artifactIdentity
+    ?? `sha256:${createHash("sha256").update(canonicalJson({
+      source: configuration.runtimeModel.source,
+      revision: configuration.runtimeModel.revision,
+      snapshotIdentity: configuration.runtimeModel.snapshotIdentity ?? null,
+    })).digest("hex")}`;
   const codec = prefill.activationCodec;
   const routeId = routeIdentity(
     manifest.pipelineId,
@@ -770,7 +875,14 @@ function buildDescription(
       launchIndex: launchOrder.length,
       command: {
         executable: configuration.pythonExecutable,
-        args: renderRemoteStageArguments(partial, configuration),
+        args: renderRemoteStageArguments(
+          partial,
+          configuration,
+          deploymentGeneration,
+          routeId,
+          waveStrategyId,
+          waveArtifactIdentity,
+        ),
       },
     });
   }
@@ -817,7 +929,14 @@ function buildDescription(
     launchIndex: launchOrder.length,
     command: {
       executable: configuration.pythonExecutable,
-      args: renderRootEngineArguments(rootPartial, configuration),
+      args: renderRootEngineArguments(
+        rootPartial,
+        configuration,
+        deploymentGeneration,
+        routeId,
+        waveStrategyId,
+        waveArtifactIdentity,
+      ),
     },
   });
 
@@ -840,6 +959,7 @@ function buildDescription(
   };
   const withoutIdentity: Omit<PythonPipelineLaunchDescription, "launchId"> = {
     schema: "gdlp-python-launch/2",
+    deploymentGeneration,
     sourceProtocol: "gdlp/2",
     sourceManifest: structuredClone(manifest),
     pipelineId: manifest.pipelineId,
@@ -1012,6 +1132,10 @@ function hasDifferingPhaseCellProfiles(
 function renderRemoteStageArguments(
   launch: Omit<PythonRemoteStageLaunch, "launchIndex" | "command">,
   configuration: PythonLaunchConfiguration,
+  deploymentGeneration: number,
+  routeId: string,
+  waveStrategyId: string,
+  waveArtifactIdentity: string,
 ): string[] {
   const args = pythonModulePrefix(configuration.stageModule);
   const ramBackedMoe = configuration.ramBackedMoeStages[launch.stageId];
@@ -1036,6 +1160,14 @@ function renderRemoteStageArguments(
   }
   if (pagedKv) appendPagedKvArguments(args, pagedKv);
   args.push(
+    "--deployment-generation",
+    String(deploymentGeneration),
+    "--route-id",
+    routeId,
+    "--wave-strategy-id",
+    waveStrategyId,
+    "--wave-artifact-identity",
+    waveArtifactIdentity,
     "--layer-start",
     String(launch.layerStart),
     "--layer-end",
@@ -1049,6 +1181,20 @@ function renderRemoteStageArguments(
     "--listen-port",
     String(launch.anchor.endpoint.port),
   );
+  if (configuration.recovery) {
+    const executorId = configuration.recovery.stageExecutorIds[launch.stageIndex];
+    if (!executorId) throw new Error("python_recovery_stage_executor_is_missing");
+    const stageRole = launch.layerEnd === launch.totalLayers
+      ? "tail" : launch.stageIndex === 1 ? "head" : "middle";
+    args.push(
+      "--stage-index",
+      String(launch.stageIndex),
+      "--stage-role",
+      stageRole,
+      "--stage-executor-id",
+      executorId,
+    );
+  }
   if (!ramBackedMoe && !launch.cell) {
     args.push("--device", "auto");
     appendDenseTieringArguments(args, launch.macroWave);
@@ -1183,6 +1329,10 @@ function renderCellMemberArguments(
 function renderRootEngineArguments(
   launch: Omit<PythonRootEngineLaunch, "launchIndex" | "command">,
   configuration: PythonLaunchConfiguration,
+  deploymentGeneration: number,
+  routeId: string,
+  waveStrategyId: string,
+  waveArtifactIdentity: string,
 ): string[] {
   const speculation = pythonSpeculation(launch.decode.speculation);
   const maxActiveSequences = Math.max(
@@ -1220,6 +1370,14 @@ function renderRootEngineArguments(
   }
   if (pagedKv) appendPagedKvArguments(args, pagedKv);
   args.push(
+    "--deployment-generation",
+    String(deploymentGeneration),
+    "--route-id",
+    routeId,
+    "--wave-strategy-id",
+    waveStrategyId,
+    "--wave-artifact-identity",
+    waveArtifactIdentity,
     "--public-model-name",
     configuration.publicModelName,
     "--host",
@@ -1368,6 +1526,7 @@ function pythonSpeculation(policy: RuntimeSpeculationPolicy): PythonSpeculationA
   if (!selected) throw new Error("python_speculation_default_is_missing");
   if (policy.mode === "disabled" || selected.kind === "autoregressive") {
     return {
+      strategyId: selected.id,
       provider: "off",
       maxDraftTokens: 1,
       maxBranches: 0,
@@ -1391,6 +1550,7 @@ function pythonSpeculation(policy: RuntimeSpeculationPolicy): PythonSpeculationA
   }
   if (selected.kind === "ngram") {
     return {
+      strategyId: selected.id,
       provider: "ngram",
       maxDraftTokens: selected.maxDraftTokens,
       maxBranches: 0,
@@ -1407,6 +1567,7 @@ function pythonSpeculation(policy: RuntimeSpeculationPolicy): PythonSpeculationA
       throw new Error("python_draft_model_artifact_is_missing");
     }
     return {
+      strategyId: selected.id,
       provider: "draft-model",
       maxDraftTokens: selected.maxDraftTokens,
       maxBranches: 0,
@@ -1440,6 +1601,7 @@ function pythonSpeculation(policy: RuntimeSpeculationPolicy): PythonSpeculationA
     throw new Error("python_draft_tree_wave_does_not_match_draft_depth");
   }
   return {
+    strategyId: selected.id,
     provider: "draft-tree",
     maxDraftTokens: selected.maxDraftTokens,
     maxBranches: selected.maxBranches,
@@ -1449,6 +1611,82 @@ function pythonSpeculation(policy: RuntimeSpeculationPolicy): PythonSpeculationA
     artifactId: null,
     parameterBytes: 0,
     memoryReservationBytes: 0,
+  };
+}
+
+function normalizeDraftStrategyAuthority(
+  manifest: RuntimePipelineManifestV2,
+  draftModel: PythonDraftModelConfiguration | null,
+  value: unknown,
+  now?: Date,
+): PythonDraftStrategyAuthority {
+  if (!isRecord(value)) {
+    throw new Error("python_draft_strategy_authority_is_invalid");
+  }
+  assertExactKeys(
+    value,
+    ["descriptor", "certification"],
+    [],
+    "python_draft_strategy_authority_keys_are_invalid",
+  );
+  const descriptor = draftStrategyDescriptorSchema.parse(value.descriptor);
+  const certification = draftStrategyCertificationSchema.parse(value.certification);
+  const descriptorDigest = draftStrategyDescriptorIdentity(descriptor);
+  if (certification.descriptorDigest !== descriptorDigest) {
+    throw new Error("python_draft_strategy_certification_descriptor_mismatch");
+  }
+  if (certification.certificationId !== draftStrategyCertificationIdentity(certification)) {
+    throw new Error("python_draft_strategy_certification_identity_mismatch");
+  }
+  if (certification.status !== "certified") {
+    throw new Error("python_draft_strategy_is_not_certified");
+  }
+  if (now !== undefined) {
+    const instant = now.getTime();
+    if (
+      Number.isNaN(instant)
+      || Date.parse(certification.validFrom) > instant
+      || Date.parse(certification.expiresAt) <= instant
+    ) {
+      throw new Error("python_draft_strategy_certification_is_not_current");
+    }
+  }
+
+  const selected = pythonSpeculation(manifest.plans.decode.speculation);
+  if (selected.provider === "off") {
+    throw new Error("python_draft_strategy_authority_requires_speculation");
+  }
+  if (descriptor.strategyId !== selected.strategyId) {
+    throw new Error("python_draft_strategy_id_mismatch");
+  }
+  if (selected.maxDraftTokens < descriptor.limits.minDraftTokens
+    || selected.maxDraftTokens > descriptor.limits.maxDraftTokens) {
+    throw new Error("python_draft_strategy_token_limit_mismatch");
+  }
+  if (selected.provider === "ngram" || selected.provider === "draft-tree") {
+    if (descriptor.kind !== "ngram" || draftModel !== null) {
+      throw new Error("python_draft_strategy_kind_mismatch");
+    }
+  } else {
+    if (descriptor.kind === "ngram" || !draftModel) {
+      throw new Error("python_draft_strategy_kind_mismatch");
+    }
+    if (
+      selected.artifactId !== descriptor.componentDigest
+      || draftModel.artifactIdentity !== descriptor.componentDigest
+    ) {
+      throw new Error("python_draft_strategy_component_mismatch");
+    }
+    if (draftModel.memoryReservationBytes < Math.max(
+      descriptor.resource.minimumRamBytes,
+      descriptor.resource.minimumVramBytes,
+    )) {
+      throw new Error("python_draft_strategy_resource_mismatch");
+    }
+  }
+  return {
+    descriptor: structuredClone(descriptor),
+    certification: structuredClone(certification),
   };
 }
 
@@ -1464,6 +1702,7 @@ function normalizeConfiguration(
     [
       "runtimeModel",
       "draftModel",
+      "draftStrategyAuthority",
       "publicModelName",
       "pythonExecutable",
       "stageModule",
@@ -1613,6 +1852,13 @@ function normalizeConfiguration(
     speculation,
     requireNormalized,
   );
+  const draftStrategyAuthority = value.draftStrategyAuthority === undefined
+    ? undefined
+    : normalizeDraftStrategyAuthority(
+        manifest,
+        draftModel,
+        value.draftStrategyAuthority,
+      );
   assertDraftModelCapacity(manifest, draftModel);
   const requestedMaxSpeculativeBranches = boundedInteger(
     value.maxSpeculativeBranches ?? speculation.maxBranches,
@@ -1759,6 +2005,7 @@ function normalizeConfiguration(
     returnBindHost,
     runtimeModel,
     draftModel,
+    ...(draftStrategyAuthority ? { draftStrategyAuthority } : {}),
     publicModelName: safeString(
       value.publicModelName ?? manifest.modelId,
       "python_public_model_name_is_invalid",

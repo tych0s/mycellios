@@ -28,6 +28,10 @@ from .engine import (
     QueueFullError,
     TokenCallback,
 )
+from .recovery_outcome import (
+    RecoveryFailureObservation,
+    classify_recovery_failure,
+)
 
 
 EngineFactory = Callable[[], DistributedPipelineEngine]
@@ -178,17 +182,22 @@ class _ReplayJob:
     active_attempt: int = 0
     active_attempt_base: int = 0
     callback_error: BaseException | None = None
+    sampling_counter: int = 0
+
+    def __post_init__(self) -> None:
+        self.sampling_counter = self.request.sampling_counter
 
 
 class RecoveringPipelineEngine:
-    """Token-exact greedy recovery around ``DistributedPipelineEngine``.
+    """Token-exact greedy and target-sampling recovery around the Engine.
 
     Recovery never transfers a potentially partial KV cache.  It recreates an
     immutable-compatible route and prefills ``prompt + visible output tokens``;
     the next target-model argmax is therefore the exact continuation and is not
-    emitted twice.  This contract is intentionally limited to deterministic
-    greedy generation.  A future stochastic sampler must additionally capture
-    and restore its complete RNG/sampler state before using this wrapper.
+    emitted twice. Direct target sampling consumes exactly one counter-RNG draw
+    per visible token, so replay resumes at ``initial counter + emitted``. More
+    complex speculative samplers must provide an explicit committed checkpoint
+    rather than infer consumption from token count.
     """
 
     def __init__(
@@ -327,6 +336,7 @@ class RecoveringPipelineEngine:
         self._duplicate_tokens_suppressed = 0
         self._last_visible_prefix_sha256: str | None = None
         self._last_visible_prefix_tokens = 0
+        self._recovery_events: list[dict[str, object]] = []
 
     @property
     def stages(self) -> int:
@@ -419,6 +429,7 @@ class RecoveringPipelineEngine:
                 "duplicate_tokens_suppressed": self._duplicate_tokens_suppressed,
                 "last_visible_prefix_sha256": self._last_visible_prefix_sha256,
                 "last_visible_prefix_tokens": self._last_visible_prefix_tokens,
+                "events": copy.deepcopy(self._recovery_events),
                 "active_requests": len(self._jobs_by_client),
                 "last_recovery_error": self._last_recovery_error,
                 "last_recovery_duration_ms": self._last_recovery_duration_ms,
@@ -476,6 +487,11 @@ class RecoveringPipelineEngine:
                     input_ids=request.input_ids.detach().to(device="cpu").clone(),
                     max_new_tokens=request.max_new_tokens,
                     eos_token_ids=request.eos_token_ids,
+                    session_key=request.session_key,
+                    temperature=request.temperature,
+                    top_p=request.top_p,
+                    sampling_seed=request.sampling_seed,
+                    sampling_counter=request.sampling_counter,
                 ),
                 callback=on_token,
             )
@@ -606,6 +622,20 @@ class RecoveringPipelineEngine:
                         absolute_step = len(job.emitted)
                         job.emitted.append(int(token_id))
                         job.arrivals.append(observed_at)
+                        if job.request.sampling:
+                            checkpoint_reader = getattr(engine, "sampling_checkpoint", None)
+                            checkpoint = (
+                                checkpoint_reader(client_id)
+                                if callable(checkpoint_reader)
+                                else None
+                            )
+                            # Legacy/fake engines implement direct target
+                            # sampling only, which consumes one draw per token.
+                            job.sampling_counter = (
+                                checkpoint.counter
+                                if checkpoint is not None
+                                else job.sampling_counter + 1
+                            )
                         callback = job.callback
                     if callback is not None:
                         try:
@@ -703,7 +733,7 @@ class RecoveringPipelineEngine:
         if not retryable:
             return
         try:
-            self._recover_route(engine, epoch, error)
+            self._recover_route(engine, epoch, error, retryable)
         except BaseException as recovery_error:
             for job in retryable:
                 self._fail_job(job, recovery_error)
@@ -713,7 +743,23 @@ class RecoveringPipelineEngine:
         failed_engine: DistributedPipelineEngine,
         failed_epoch: int,
         cause: BaseException,
+        jobs: list[_ReplayJob],
     ) -> None:
+        visible_tokens = 0
+        for job in jobs:
+            with job.lock:
+                visible_tokens += len(job.emitted)
+        failure_evidence = getattr(failed_engine, "recovery_failure_evidence", None)
+        observed_role = "root"
+        observed_failure_class = "health-failed"
+        observed_generation = int(getattr(self.config, "deployment_generation", 0))
+        if isinstance(failure_evidence, dict):
+            if failure_evidence.get("stageRole") in {"head", "middle", "tail"}:
+                observed_role = failure_evidence["stageRole"]
+            if failure_evidence.get("failureClass") == "health-failed":
+                observed_failure_class = "health-failed"
+            if isinstance(failure_evidence.get("generation"), int):
+                observed_generation = failure_evidence["generation"]
         with self._condition:
             while self._recovering and self._epoch == failed_epoch and not self._closed:
                 self._condition.wait()
@@ -726,6 +772,7 @@ class RecoveringPipelineEngine:
             self._last_recovery_error = str(cause)
 
         started = time.perf_counter()
+        promoted = False
         try:
             try:
                 failed_engine.close()
@@ -793,6 +840,7 @@ class RecoveringPipelineEngine:
                 self._active_route_id = candidate_route.route_id
                 self._last_promoted_route_id = candidate_route.route_id
                 self._last_promotion_at_unix_ms = int(time.time() * 1_000)
+                promoted = True
         except BaseException as error:
             with self._condition:
                 self._route_recovery_failures += 1
@@ -800,9 +848,24 @@ class RecoveringPipelineEngine:
             raise
         finally:
             with self._condition:
-                self._last_recovery_duration_ms = (
+                duration_ms = (
                     time.perf_counter() - started
                 ) * 1_000
+                self._last_recovery_duration_ms = duration_ms
+                event = classify_recovery_failure(RecoveryFailureObservation(
+                    generation=observed_generation,
+                    active_generation=int(getattr(self.config, "deployment_generation", 0)),
+                    role=observed_role,
+                    failure_class=observed_failure_class,
+                    checkpoint_kind=(
+                        "visible-token-prefix" if visible_tokens > 0 else "none"
+                    ),
+                    checkpoint_compatible=True,
+                    compatible_standby_available=promoted,
+                    visible_tokens=visible_tokens,
+                    downtime_ms=duration_ms,
+                ))
+                self._recovery_events.append(event.to_document())
                 self._recovering = False
                 self._condition.notify_all()
 
@@ -866,6 +929,15 @@ class RecoveringPipelineEngine:
             input_ids=input_ids,
             max_new_tokens=job.request.max_new_tokens - len(job.emitted),
             eos_token_ids=job.request.eos_token_ids,
+            session_key=job.request.session_key,
+            temperature=job.request.temperature,
+            top_p=job.request.top_p,
+            sampling_seed=job.request.sampling_seed,
+            sampling_counter=(
+                job.sampling_counter
+                if job.request.sampling
+                else 0
+            ),
         )
 
     def _finish_attempt(self, job: _ReplayJob, result: GenerationOutput) -> None:

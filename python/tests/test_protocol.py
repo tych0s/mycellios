@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from collections import deque
+import json
 import math
 import socket
 import struct
 import queue
+import random
 import threading
 from pathlib import Path
 import tempfile
@@ -20,12 +22,20 @@ from distributed_runtime.protocol import (
     HEADER_BYTES,
     MAGIC,
     MAX_PAYLOAD_BYTES,
+    STATIC_WAVE_ARTIFACT_DIGEST,
+    STATIC_WAVE_STRATEGY_DIGEST,
     VERSION,
     Frame,
     FrameType,
+    LinkEmulator,
     TensorCodec,
+    bind_socket_deployment_generation,
     branch_request_payload,
     decode_branch_request_id,
+    decode_receipt_ack,
+    decode_receipt_envelope,
+    decode_sampling_logits,
+    decode_sampling_rng_checkpoint,
     decode_tensor,
     decode_token,
     decode_verify_result,
@@ -33,8 +43,14 @@ from distributed_runtime.protocol import (
     encode_tensor_payload,
     recv_exact,
     recv_frame,
+    receipt_ack_payload,
+    receipt_envelope_payload,
+    route_identity_digest,
     send_frame,
+    sampling_logits_payload,
+    sampling_rng_checkpoint_payload,
     token_payload,
+    wave_identity_digest,
     verify_result_payload,
 )
 from distributed_runtime.model import StageModelSpec
@@ -46,6 +62,7 @@ from distributed_runtime.stage import (
     forward_shutdown_and_wait,
     monitor_downstream_control,
     promote_stage_request,
+    route_stage_result,
     run_stage_process,
     validate_activation,
     validate_hello,
@@ -63,8 +80,8 @@ class ProtocolFramingTests(unittest.TestCase):
         self.sender.close()
         self.receiver.close()
 
-    def test_header_is_fixed_32_bytes(self) -> None:
-        self.assertEqual(HEADER_BYTES, 32)
+    def test_header_is_fixed_112_bytes(self) -> None:
+        self.assertEqual(HEADER_BYTES, 112)
 
     def test_control_frame_round_trip(self) -> None:
         sent = send_frame(
@@ -84,7 +101,349 @@ class ProtocolFramingTests(unittest.TestCase):
         self.assertEqual(frame.token_count, 20)
         self.assertEqual(frame.hidden_size, 576)
         self.assertEqual(frame.flags, int(TensorCodec.FP16))
+        self.assertEqual(frame.deployment_generation, 0)
         self.assertEqual(frame.payload, b"")
+
+    def test_signed_receipt_envelope_and_ack_round_trip(self) -> None:
+        envelope = json.dumps(
+            {
+                "deploymentGeneration": 7,
+                "keyId": "receipt-key-1",
+                "receipt": {"receiptId": "sha256:" + "a" * 64},
+                "routeDigest": "1" * 32,
+                "schema": "mycellios-execution-receipt-envelope/1",
+                "signature": "signed-upstream",
+                "waveArtifactDigest": "3" * 32,
+                "waveStrategyDigest": "2" * 32,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        send_frame(
+            self.sender,
+            FrameType.RECEIPT_ENVELOPE,
+            51,
+            payload=receipt_envelope_payload(envelope),
+        )
+        received = recv_frame(self.receiver)
+        self.assertEqual(decode_receipt_envelope(received), envelope)
+
+        acknowledgement = receipt_ack_payload(envelope)
+        send_frame(
+            self.receiver,
+            FrameType.RECEIPT_ACK,
+            51,
+            payload=acknowledgement,
+        )
+        self.assertEqual(
+            decode_receipt_ack(recv_frame(self.sender)), acknowledgement
+        )
+
+    def test_sampling_logits_and_rng_checkpoint_round_trip(self) -> None:
+        payload, token_count, vocabulary_size = sampling_logits_payload(
+            ((1.25, -0.5, 3.0), (0.0, 2.0, -4.0))
+        )
+        send_frame(
+            self.sender,
+            FrameType.SAMPLING_VERIFY_RESULT,
+            61,
+            step=7,
+            token_count=token_count,
+            hidden_size=vocabulary_size,
+            payload=payload,
+        )
+        frame = recv_frame(self.receiver)
+        self.assertEqual(
+            decode_sampling_logits(frame),
+            ((1.25, -0.5, 3.0), (0.0, 2.0, -4.0)),
+        )
+
+        checkpoint = sampling_rng_checkpoint_payload(bytes(range(32)), 2**63 + 9)
+        send_frame(
+            self.receiver,
+            FrameType.SAMPLING_RNG_CHECKPOINT,
+            61,
+            payload=checkpoint,
+        )
+        self.assertEqual(
+            decode_sampling_rng_checkpoint(recv_frame(self.sender)),
+            (bytes(range(32)), 2**63 + 9),
+        )
+
+    def test_sampling_frames_reject_malformed_or_nonfinite_payloads(self) -> None:
+        with self.assertRaisesRegex(ValueError, "finite"):
+            sampling_logits_payload(((0.0, math.nan),))
+        with self.assertRaisesRegex(ValueError, "different vocabulary"):
+            sampling_logits_payload(((0.0, 1.0), (2.0,)))
+        with self.assertRaisesRegex(ValueError, "one float32"):
+            send_frame(
+                self.sender,
+                FrameType.SAMPLING_VERIFY_RESULT,
+                62,
+                token_count=2,
+                hidden_size=3,
+                payload=b"\0" * 4,
+            )
+        with self.assertRaisesRegex(ValueError, "exactly 32"):
+            sampling_rng_checkpoint_payload(b"short", 0)
+
+    def test_receipt_envelope_rejects_noncanonical_and_oversized_payloads(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not canonical"):
+            receipt_envelope_payload(
+                '{"schema": "mycellios-execution-receipt-envelope/1"}'
+            )
+        with self.assertRaisesRegex(ValueError, "duplicate key"):
+            receipt_envelope_payload(
+                '{"schema":"mycellios-execution-receipt-envelope/1",'
+                '"schema":"mycellios-execution-receipt-envelope/1"}'
+            )
+        with self.assertRaisesRegex(ValueError, "between 1 and"):
+            send_frame(
+                self.sender,
+                FrameType.RECEIPT_ENVELOPE,
+                51,
+                payload=b"x" * (1024 * 1024 + 1),
+            )
+
+    def test_stateful_mixed_wave_control_tail_and_receipt_fuzz(self) -> None:
+        bind_args = {
+            "wave_strategy_id": "ngram-certified-v1",
+            "wave_artifact_identity": "sha256:" + "a" * 64,
+        }
+        bind_socket_deployment_generation(
+            self.sender, 31, "route-fuzz", **bind_args
+        )
+        bind_socket_deployment_generation(
+            self.receiver, 31, "route-fuzz", **bind_args
+        )
+        envelope = receipt_envelope_payload(
+            json.dumps(
+                {
+                    "deploymentGeneration": 31,
+                    "keyId": "receipt-key-1",
+                    "receipt": {"receiptId": "sha256:" + "b" * 64},
+                    "routeDigest": "1" * 32,
+                    "schema": "mycellios-execution-receipt-envelope/1",
+                    "signature": "signed-upstream",
+                    "waveArtifactDigest": "3" * 32,
+                    "waveStrategyDigest": "2" * 32,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        activation = encode_tensor(torch.tensor([[0.25, -0.5]]), TensorCodec.FP32)
+        sampling_result, sampling_rows, sampling_vocab = sampling_logits_payload(
+            ((0.25, -0.5),)
+        )
+        rng = random.Random(0x6D7963656C6C696F73)
+        observed: set[FrameType] = set()
+        transitions = (
+            FrameType.BEGIN,
+            FrameType.ACTIVATION,
+            FrameType.VERIFY,
+            FrameType.SAMPLING_VERIFY,
+            FrameType.TRUNCATE,
+            FrameType.CANCEL,
+            FrameType.TOKEN,
+            FrameType.SAMPLING_VERIFY_RESULT,
+            FrameType.SAMPLING_RNG_CHECKPOINT,
+            FrameType.RECEIPT_ENVELOPE,
+            FrameType.RECEIPT_ACK,
+        )
+        for ordinal in range(512):
+            frame_type = transitions[rng.randrange(len(transitions))]
+            observed.add(frame_type)
+            kwargs: dict[str, object] = {}
+            reverse = frame_type in (
+                FrameType.TOKEN,
+                FrameType.SAMPLING_VERIFY_RESULT,
+                FrameType.RECEIPT_ACK,
+            )
+            if frame_type in (
+                FrameType.ACTIVATION,
+                FrameType.VERIFY,
+                FrameType.SAMPLING_VERIFY,
+            ):
+                kwargs.update(
+                    flags=int(TensorCodec.FP32),
+                    token_count=1,
+                    hidden_size=2,
+                    payload=activation,
+                )
+            elif frame_type == FrameType.TRUNCATE:
+                kwargs["token_count"] = rng.randrange(4096)
+            elif frame_type == FrameType.TOKEN:
+                kwargs["payload"] = token_payload(rng.randrange(2**32))
+            elif frame_type == FrameType.SAMPLING_VERIFY_RESULT:
+                kwargs.update(
+                    token_count=sampling_rows,
+                    hidden_size=sampling_vocab,
+                    payload=sampling_result,
+                )
+            elif frame_type == FrameType.SAMPLING_RNG_CHECKPOINT:
+                kwargs["payload"] = sampling_rng_checkpoint_payload(
+                    bytes(rng.randrange(256) for _ in range(32)),
+                    rng.randrange(2**64),
+                )
+            elif frame_type == FrameType.RECEIPT_ENVELOPE:
+                kwargs["payload"] = envelope
+            elif frame_type == FrameType.RECEIPT_ACK:
+                kwargs["payload"] = receipt_ack_payload(envelope)
+            outbound, inbound = (
+                (self.receiver, self.sender) if reverse else (self.sender, self.receiver)
+            )
+            send_frame(outbound, frame_type, ordinal + 1, **kwargs)
+            frame = recv_frame(inbound)
+            self.assertEqual(frame.frame_type, frame_type)
+            if frame_type == FrameType.RECEIPT_ENVELOPE:
+                self.assertEqual(decode_receipt_envelope(frame), envelope)
+            elif frame_type == FrameType.RECEIPT_ACK:
+                self.assertEqual(decode_receipt_ack(frame), receipt_ack_payload(envelope))
+            elif frame_type == FrameType.SAMPLING_VERIFY_RESULT:
+                self.assertEqual(
+                    decode_sampling_logits(frame), ((0.25, -0.5),)
+                )
+            elif frame_type == FrameType.SAMPLING_RNG_CHECKPOINT:
+                seed, counter = decode_sampling_rng_checkpoint(frame)
+                self.assertEqual(len(seed), 32)
+                self.assertGreaterEqual(counter, 0)
+
+        self.assertEqual(observed, set(transitions))
+        for frame_type in (
+            FrameType.BEGIN,
+            FrameType.END,
+            FrameType.CANCEL,
+            FrameType.SHUTDOWN,
+            FrameType.TRUNCATE,
+        ):
+            with self.subTest(frame_type=frame_type.name):
+                with self.assertRaisesRegex(ValueError, "require"):
+                    send_frame(self.sender, frame_type, 999, flags=1)
+
+    def test_bound_socket_seals_every_frame_to_one_deployment_generation(self) -> None:
+        bind_socket_deployment_generation(self.sender, 17)
+        bind_socket_deployment_generation(self.receiver, 17)
+        send_frame(self.sender, FrameType.BEGIN, 41)
+        self.assertEqual(recv_frame(self.receiver).deployment_generation, 17)
+        with self.assertRaisesRegex(ValueError, "differs from socket binding"):
+            send_frame(
+                self.sender,
+                FrameType.END,
+                41,
+                deployment_generation=18,
+            )
+
+    def test_bound_receiver_rejects_a_superseded_generation(self) -> None:
+        bind_socket_deployment_generation(self.receiver, 18)
+        send_frame(
+            self.sender,
+            FrameType.BEGIN,
+            41,
+            deployment_generation=17,
+        )
+        with self.assertRaisesRegex(ValueError, "another deployment generation"):
+            recv_frame(self.receiver)
+
+    def test_bound_receiver_rejects_cross_route_and_replayed_frames(self) -> None:
+        bind_socket_deployment_generation(self.receiver, 17, "route-current")
+        current = route_identity_digest("route-current")
+        send_frame(
+            self.sender,
+            FrameType.BEGIN,
+            41,
+            deployment_generation=17,
+            route_digest=current,
+            sequence=0,
+        )
+        self.assertEqual(recv_frame(self.receiver).sequence, 0)
+        send_frame(
+            self.sender,
+            FrameType.END,
+            41,
+            deployment_generation=17,
+            route_digest=current,
+            sequence=0,
+        )
+        with self.assertRaisesRegex(ValueError, "replayed or out of order"):
+            recv_frame(self.receiver)
+
+        other_sender, other_receiver = socket.socketpair()
+        try:
+            bind_socket_deployment_generation(other_receiver, 17, "route-current")
+            send_frame(
+                other_sender,
+                FrameType.BEGIN,
+                42,
+                deployment_generation=17,
+                route_digest=route_identity_digest("route-old"),
+            )
+            with self.assertRaisesRegex(ValueError, "another route"):
+                recv_frame(other_receiver)
+        finally:
+            other_sender.close()
+            other_receiver.close()
+
+    def test_bound_receiver_rejects_cross_strategy_and_artifact_frames(self) -> None:
+        cases = (
+            (
+                "wave strategy",
+                wave_identity_digest("strategy", "strategy-old"),
+                wave_identity_digest("artifact", "sha256:current"),
+            ),
+            (
+                "wave artifact",
+                wave_identity_digest("strategy", "strategy-current"),
+                wave_identity_digest("artifact", "sha256:old"),
+            ),
+        )
+        for message, strategy_digest, artifact_digest in cases:
+            with self.subTest(message=message):
+                sender, receiver = socket.socketpair()
+                try:
+                    bind_socket_deployment_generation(
+                        receiver,
+                        17,
+                        "route-current",
+                        wave_strategy_id="strategy-current",
+                        wave_artifact_identity="sha256:current",
+                    )
+                    send_frame(
+                        sender,
+                        FrameType.BEGIN,
+                        42,
+                        deployment_generation=17,
+                        route_digest=route_identity_digest("route-current"),
+                        wave_strategy_digest=strategy_digest,
+                        wave_artifact_digest=artifact_digest,
+                    )
+                    with self.assertRaisesRegex(ValueError, message):
+                        recv_frame(receiver)
+                finally:
+                    sender.close()
+                    receiver.close()
+
+    def test_bound_route_sequences_mixed_frames_monotonically(self) -> None:
+        bind_socket_deployment_generation(self.sender, 23, "route-stateful")
+        bind_socket_deployment_generation(self.receiver, 23, "route-stateful")
+        frame_types = (
+            FrameType.BEGIN,
+            FrameType.END,
+            FrameType.CANCEL,
+            FrameType.PING,
+        )
+        for sequence in range(256):
+            frame_type = frame_types[sequence % len(frame_types)]
+            send_frame(
+                self.sender,
+                frame_type,
+                sequence + 1,
+                step=sequence if frame_type == FrameType.PING else 0,
+            )
+            frame = recv_frame(self.receiver)
+            self.assertEqual(frame.sequence, sequence)
+            self.assertEqual(frame.deployment_generation, 23)
+            self.assertEqual(frame.route_digest, route_identity_digest("route-stateful"))
 
     def test_route_probe_frames_are_payload_free_control_frames(self) -> None:
         self.assertEqual(
@@ -185,10 +544,16 @@ class ProtocolFramingTests(unittest.TestCase):
                                 int(frame_type),
                                 flags,
                                 1234,
+                                0,
+                                route_identity_digest("static"),
+                                STATIC_WAVE_STRATEGY_DIGEST,
+                                STATIC_WAVE_ARTIFACT_DIGEST,
+                                0,
                                 41,
                                 token_count,
                                 hidden_size,
                                 payload_size,
+                                b"\0" * 16,
                             )
                             + (b"x" if payload_size else b"")
                         )
@@ -203,17 +568,22 @@ class ProtocolFramingTests(unittest.TestCase):
     def test_activation_frame_survives_fragmented_transport(self) -> None:
         tensor = torch.arange(21, dtype=torch.float32).reshape(1, 3, 7) / 5
         payload = encode_tensor(tensor, TensorCodec.FP32)
-        raw = HEADER.pack(
-            MAGIC,
-            VERSION,
-            int(FrameType.ACTIVATION),
-            int(TensorCodec.FP32),
-            99,
-            4,
-            3,
-            7,
-            len(payload),
-        ) + payload
+        raw_sender, raw_receiver = socket.socketpair()
+        try:
+            send_frame(
+                raw_sender,
+                FrameType.ACTIVATION,
+                99,
+                step=4,
+                token_count=3,
+                hidden_size=7,
+                flags=int(TensorCodec.FP32),
+                payload=payload,
+            )
+            raw = bytes(recv_exact(raw_receiver, HEADER_BYTES + len(payload)))
+        finally:
+            raw_sender.close()
+            raw_receiver.close()
         for offset in range(0, len(raw), 3):
             self.sender.sendall(raw[offset : offset + 3])
 
@@ -222,6 +592,19 @@ class ProtocolFramingTests(unittest.TestCase):
         self.assertEqual(frame.request_id, 99)
         self.assertEqual(frame.step, 4)
         self.assertTrue(torch.equal(decoded, tensor))
+
+    def test_wave_digest_rejects_payload_tampering_before_decode(self) -> None:
+        raw_sender, raw_receiver = socket.socketpair()
+        try:
+            send_frame(raw_sender, FrameType.ERROR, 9, payload=b"original")
+            raw = bytearray(recv_exact(raw_receiver, HEADER_BYTES + len(b"original")))
+        finally:
+            raw_sender.close()
+            raw_receiver.close()
+        raw[-1] ^= 0x01
+        self.sender.sendall(raw)
+        with self.assertRaisesRegex(ValueError, "wave digest is invalid"):
+            recv_frame(self.receiver)
 
     def test_error_frame_can_carry_a_message(self) -> None:
         send_frame(self.sender, FrameType.ERROR, 8, payload=b"stage failed")
@@ -253,9 +636,15 @@ class ProtocolFramingTests(unittest.TestCase):
             0,
             0,
             0,
+            route_identity_digest("static"),
+            STATIC_WAVE_STRATEGY_DIGEST,
+            STATIC_WAVE_ARTIFACT_DIGEST,
+            0,
+            0,
             0,
             0,
             MAX_PAYLOAD_BYTES + 1,
+            b"\0" * 16,
         )
         self.sender.sendall(raw)
         with self.assertRaisesRegex(ValueError, "payload exceeds"):
@@ -727,9 +1116,15 @@ class DeflateCodecTests(unittest.TestCase):
                 int(TensorCodec.INT8_GROUPED_DEFLATE),
                 1,
                 0,
+                route_identity_digest("static"),
+                STATIC_WAVE_STRATEGY_DIGEST,
+                STATIC_WAVE_ARTIFACT_DIGEST,
+                0,
+                0,
                 MAX_PAYLOAD_BYTES // 4096 + 1,
                 4096,
                 len(payload),
+                b"\0" * 16,
             ) + payload
             sender.sendall(raw)
             with self.assertRaisesRegex(ValueError, "would inflate"):
@@ -767,6 +1162,57 @@ class DeflateCodecTests(unittest.TestCase):
 
 
 class PersistentStageDataPlaneTests(unittest.TestCase):
+    def test_last_stage_returns_full_sampling_distribution(self) -> None:
+        config = StageProcessConfig(
+            spec=StageModelSpec("fake", 0, 1, 1, 1),
+            pipeline_id=778,
+            listen_host="127.0.0.1",
+            listen_port=20_099,
+            next_host=None,
+            next_port=None,
+            next_layer_end=None,
+            return_host="127.0.0.1",
+            return_port=20_100,
+            codec=TensorCodec.FP32,
+            one_way_delay_ms=0,
+            bandwidth_mbps=0,
+        )
+        runner = _FakeLastStageRunner(config.spec)
+        frame = Frame(
+            FrameType.SAMPLING_VERIFY,
+            int(TensorCodec.FP32),
+            91,
+            3,
+            2,
+            runner.hidden_size,
+            encode_tensor(torch.ones(1, 2, runner.hidden_size), TensorCodec.FP32),
+        )
+        metrics: dict[str, object] = {"bytes_out": 0}
+        stage_return, root_return = socket.socketpair()
+        try:
+            route_stage_result(
+                frame,
+                torch.ones(1, 2, runner.hidden_size),
+                (42, 42),
+                runner=runner,
+                config=config,
+                metrics=metrics,
+                downstream=None,
+                return_socket=stage_return,
+                emulator=LinkEmulator(),
+            )
+            returned = recv_frame(root_return)
+            self.assertEqual(returned.frame_type, FrameType.SAMPLING_VERIFY_RESULT)
+            self.assertEqual(returned.token_count, 2)
+            self.assertEqual(returned.hidden_size, 3)
+            self.assertEqual(
+                decode_sampling_logits(returned),
+                ((1.0, 2.0, 3.0), (1.0, 2.0, 3.0)),
+            )
+        finally:
+            stage_return.close()
+            root_return.close()
+
     def test_stage_fork_and_promote_enforce_sealed_exact_leaf_lifecycle(self) -> None:
         config = StageProcessConfig(
             spec=StageModelSpec("fake", 15, 30, 30, 1),
@@ -1220,6 +1666,7 @@ class PersistentStageDataPlaneTests(unittest.TestCase):
             self.assertTrue(ready.wait(2))
             upstream = socket.create_connection(("127.0.0.1", stage_port), timeout=2)
             upstream.settimeout(2)
+            bind_socket_deployment_generation(upstream, 0)
             send_frame(
                 upstream,
                 FrameType.HELLO,
@@ -1324,6 +1771,7 @@ class PersistentStageDataPlaneTests(unittest.TestCase):
 
             upstream = socket.create_connection(("127.0.0.1", stage_port), timeout=2)
             upstream.settimeout(2)
+            bind_socket_deployment_generation(upstream, 0)
             send_frame(
                 upstream,
                 FrameType.HELLO,
@@ -1533,6 +1981,46 @@ class PersistentStageDataPlaneTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "pipeline identity mismatch"):
             validate_hello(wrong_pipeline, config, 4)
 
+        wrong_generation = Frame(
+            FrameType.HELLO,
+            int(TensorCodec.FP32),
+            123,
+            10,
+            20,
+            4,
+            b"",
+            deployment_generation=1,
+        )
+        with self.assertRaisesRegex(ValueError, "deployment generation mismatch"):
+            validate_hello(wrong_generation, config, 4)
+
+        wrong_route = Frame(
+            FrameType.HELLO,
+            int(TensorCodec.FP32),
+            123,
+            10,
+            20,
+            4,
+            b"",
+            route_digest=route_identity_digest("other-route"),
+        )
+        with self.assertRaisesRegex(ValueError, "route identity mismatch"):
+            validate_hello(wrong_route, config, 4)
+
+        replayed_hello = Frame(
+            FrameType.HELLO,
+            int(TensorCodec.FP32),
+            123,
+            10,
+            20,
+            4,
+            b"",
+            route_digest=route_identity_digest("static"),
+            sequence=1,
+        )
+        with self.assertRaisesRegex(ValueError, "HELLO sequence must be zero"):
+            validate_hello(replayed_hello, config, 4)
+
         invalid = StageProcessConfig(
             **{
                 **config.__dict__,
@@ -1734,6 +2222,7 @@ class PersistentStageDataPlaneTests(unittest.TestCase):
             self.assertTrue(ready.wait(2))
             upstream = socket.create_connection(("127.0.0.1", stage_port), timeout=2)
             upstream.settimeout(2)
+            bind_socket_deployment_generation(upstream, 0)
             send_frame(
                 upstream,
                 FrameType.HELLO,
@@ -1855,6 +2344,10 @@ class _FakeLastStageRunner:
         if token_mode == "all":
             return hidden, tuple(42 for _ in range(int(hidden.shape[1])))
         return hidden, 42
+
+    def project_sampling_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        rows = int(hidden.shape[1])
+        return torch.tensor([[[1.0, 2.0, 3.0]] * rows], dtype=torch.float32)
 
 
 class _FakeCellWorkLastStageRunner(_FakeLastStageRunner):

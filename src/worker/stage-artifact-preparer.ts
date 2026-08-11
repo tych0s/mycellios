@@ -65,6 +65,9 @@ export interface StageArtifactPreparationOptions {
     state: "preparing" | "ready";
     packageId?: string;
     weightsSizeBytes?: number;
+    downloadedBytes?: number;
+    resumedBytes?: number;
+    materialized?: boolean;
   }) => void;
 }
 
@@ -227,6 +230,9 @@ export async function prepareNodeStageArtifacts(
         state: "ready",
         packageId: prepared.package_id,
         weightsSizeBytes: prepared.weights_size_bytes,
+        downloadedBytes: cacheResult.downloaded_bytes,
+        resumedBytes: cacheResult.resumed_bytes,
+        materialized: cacheResult.materialized,
       });
     }
     result.push(rewriteProcessForStageArtifact(process, prepared));

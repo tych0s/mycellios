@@ -194,7 +194,9 @@ export class TopologyBeamPlanner implements DistributionPlanner {
             layerEnd <= model.layers.length;
             layerEnd += 1
           ) {
+            if (exceedsStageLayerLimit(node, state.nextLayer, layerEnd)) break;
             const last = layerEnd === model.layers.length;
+            if (!nodeSupportsStagePosition(node, first, last)) continue;
             const stage: StagePlacement = {
               nodeId: node.id,
               layerStart: state.nextLayer,
@@ -475,7 +477,13 @@ export class ExhaustiveTopologyPlanner implements DistributionPlanner {
       for (const node of topology.nodes) {
         if (used.has(node.id)) continue;
         for (let end = nextLayer + 1; end <= model.layers.length; end += 1) {
+          if (exceedsStageLayerLimit(node, nextLayer, end)) break;
           const stage = { nodeId: node.id, layerStart: nextLayer, layerEnd: end };
+          if (!nodeSupportsStagePosition(
+            node,
+            stages.length === 0,
+            end === model.layers.length,
+          )) continue;
           if (
             stageMemoryBytes(
               model,
@@ -831,6 +839,7 @@ function furthestLayerThatFits(
 ): number {
   let best = start;
   for (let end = start + 1; end <= model.layers.length; end += 1) {
+    if (exceedsStageLayerLimit(node, start, end)) break;
     const stage = { nodeId: node.id, layerStart: start, layerEnd: end };
     const memory = stageMemoryBytes(model, stage, workload, first, end === model.layers.length);
     if (memory > usableMemory(node)) break;
@@ -848,6 +857,7 @@ function maximumLayerCount(
 ): number {
   let count = 0;
   for (let end = 1; end <= model.layers.length; end += 1) {
+    if (exceedsStageLayerLimit(node, 0, end)) break;
     const stage = { nodeId: node.id, layerStart: 0, layerEnd: end };
     if (stageMemoryBytes(model, stage, workload, first, last) > usableMemory(node)) break;
     count = end;
@@ -1066,6 +1076,26 @@ function canStillCoverRemainingLayers(
 
 function usableMemory(node: ComputeNodeProfile): number {
   return Math.max(0, node.memoryBytes - node.reserveBytes);
+}
+
+function exceedsStageLayerLimit(
+  node: ComputeNodeProfile,
+  layerStart: number,
+  layerEnd: number,
+): boolean {
+  return node.maxStageLayers !== undefined
+    && layerEnd - layerStart > node.maxStageLayers;
+}
+
+function nodeSupportsStagePosition(
+  node: ComputeNodeProfile,
+  first: boolean,
+  last: boolean,
+): boolean {
+  if (!node.stageRoles) return true;
+  if (first && !node.stageRoles.includes("head")) return false;
+  if (last && !node.stageRoles.includes("tail")) return false;
+  return first || last || node.stageRoles.includes("middle");
 }
 
 function sum(values: number[]): number {

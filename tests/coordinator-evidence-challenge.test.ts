@@ -9,7 +9,7 @@ import type {
 import {
   mergeCurrentSessionEvidence,
 } from "../src/coordinator/evidence-authority.js";
-import { WorkerHub } from "../src/coordinator/worker-hub.js";
+import { WorkerHub, type EngineRuntimeChallengeRequest } from "../src/coordinator/worker-hub.js";
 import type { MeshStore, StoredWorker } from "../src/storage/store.js";
 import {
   sealRuntimePerformanceProfile,
@@ -185,6 +185,131 @@ describe("coordinator evidence authority", () => {
     });
     expect(merged.deployments[0]?.canaryEvidence).toBeUndefined();
   });
+
+  it("challenges the loaded engine and publishes a bound runtime profile", () => {
+    const capabilities = executorCapabilities();
+    capabilities.buildIdentity = buildIdentity("d");
+    capabilities.distributedExecutor!.physicalIdentity = {
+      schema: "gdlp-worker-physical-identity/1",
+      provider: "generic",
+      providerMachineFingerprintSha256: `sha256:${"8".repeat(64)}`,
+      hostFingerprintSha256: `sha256:${"e".repeat(64)}`,
+      gpuFingerprintsSha256: [`sha256:${"9".repeat(64)}`],
+      attestedAt: new Date().toISOString(),
+    };
+    capabilities.deployments = [{
+      ...pipelineCapabilities().deployments[0]!,
+      mode: "pipeline",
+      throughputSource: "measured",
+      verificationState: "verified",
+      tokensPerSecond: 20,
+      ttftMs: 100,
+      canaryEvidence: deploymentEvidence(),
+      stage: { index: 0, total: 1, layerStart: 0, layerEnd: 16 },
+      contextLimit: 8_192,
+    }];
+    const worker = storedWorker(capabilities);
+    const { hub, socket, state, current } = harness(worker);
+    issueChallenges(hub, state, capabilities);
+    const runtimeChallenge = socket.sent.find(
+      (message) => message.type === "evidence.challenge"
+        && (message.payload as { kind?: string }).kind === "runtime-performance",
+    )!.payload as Record<string, unknown>;
+    const profile = sealRuntimePerformanceProfile({
+      measuredAt: new Date().toISOString(),
+      backend: "cuda",
+      deviceName: "NVIDIA Test GPU",
+      precision: "float16",
+      source: "physical-microbenchmark",
+      activationCodecId: "fp16",
+      decodeMemory: series("GB/s", 400),
+      prefillCompute: series("TFLOP/s", 20),
+      activationCodec: series("GB/s", 2),
+    });
+    deliver(hub, state, "evidence.runtime.complete", {
+      ...binding(runtimeChallenge),
+      profile,
+    });
+
+    const engineRequest = {
+      descriptorDigest: `sha256:${"a".repeat(64)}`,
+      probeKind: "qwen3-dense-v1",
+      certificationId: `sha256:${"b".repeat(64)}`,
+      artifactManifestDigest: `sha256:${"a".repeat(64)}`,
+      modelId: "qwen-test",
+      modelRevision: "1".repeat(40),
+      backend: "cuda",
+      runtimeAbi: "cuda-12",
+      quantization: "bf16",
+      contextTokens: 8_192,
+      expectedLayerStart: 0,
+      expectedLayerEnd: 16,
+      expectedKvBytesPerToken: 32_768,
+      expectedLayerWeightBytes: 256 * 1024 * 1024,
+      referenceDecodeMsPerToken: 8,
+      referencePrefillMsPerToken: 0.4,
+      hiddenSize: 4_096,
+      attentionHeads: 32,
+      kvHeads: 4,
+      headDim: 128,
+      requiredRoles: ["head", "tail"],
+      minimumSamples: 7,
+    } satisfies EngineRuntimeChallengeRequest;
+    current.plans = [{
+      workerId: worker.id,
+      modelId: "qwen-test",
+      request: engineRequest,
+      evidence: {
+        canaryEvidenceId: current.worker.capabilities.deployments[0]!.canaryEvidence!.evidenceId,
+      },
+    }];
+    const challengeId = hub.startEngineRuntimeProfileChallenge(worker.id, engineRequest);
+    expect(challengeId).toMatch(/^challenge-/);
+    const engineChallenge = socket.sent.find(
+      (message) => message.type === "evidence.challenge"
+        && (message.payload as { kind?: string }).kind === "engine-runtime",
+    )!.payload as Record<string, unknown>;
+    deliver(hub, state, "evidence.engine-runtime.complete", {
+      ...binding(engineChallenge),
+      measurement: {
+        measuredAt: new Date().toISOString(),
+        samples: 21,
+        confidenceHalfWidthPct: 8,
+        capacity: {
+          contextTokens: 8_192,
+          maxLayerCount: 16,
+          kvBytesPerToken: 32_768,
+          maxKvTokens: 16_384,
+          usableMemoryBytes: 16 * 1024 * 1024 * 1024,
+        },
+        costs: {
+          decodeMsPerTokenP50: 4,
+          decodeMsPerTokenP95: 5,
+          prefillMsPerTokenP50: 0.2,
+          prefillMsPerTokenP95: 0.3,
+          verifyMsPerTokenP50: 3,
+          verifyMsPerTokenP95: 4,
+          decodeScale: 0.5,
+          prefillScale: 0.5,
+        },
+        features: {
+          fastKernel: true,
+          graphMode: "available",
+          roles: ["head", "middle", "tail"],
+        },
+      },
+    });
+
+    expect(current.worker.capabilities.distributedExecutor?.engineProfiles)
+      .toEqual([expect.objectContaining({
+        descriptorDigest: `sha256:${"a".repeat(64)}`,
+        certificationId: `sha256:${"b".repeat(64)}`,
+        artifactManifestDigest: `sha256:${"a".repeat(64)}`,
+        workerId: worker.id,
+        sessionId: "session-test",
+      })]);
+    hub.close();
+  });
 });
 
 function buildIdentity(seed: string): NonNullable<WorkerCapabilities["buildIdentity"]> {
@@ -310,7 +435,7 @@ function storedWorker(capabilities: WorkerCapabilities): StoredWorker {
 }
 
 function harness(initial: StoredWorker) {
-  const current = { worker: initial };
+  const current = { worker: initial, plans: [] as Array<Record<string, unknown>> };
   const store = {
     getWorker: (workerId: string) => workerId === current.worker.id ? current.worker : null,
     updateWorkerHeartbeat: (
@@ -322,6 +447,7 @@ function harness(initial: StoredWorker) {
       current.worker = { ...current.worker, capabilities, status, lastSeenAt: Date.now() };
     },
     listWorkers: () => [current.worker],
+    listEngineRuntimeActivationPlans: () => current.plans,
     setWorkerStatus: () => undefined,
   } as unknown as MeshStore;
   const hub = new WorkerHub(store);

@@ -1036,6 +1036,8 @@ export function launchAgentRpcHandleId(request: LaunchAgentStartRequest): string
     .update("gdlp-launch-agent-handle/1\0")
     .update(request.launchId)
     .update("\0")
+    .update(String(request.deploymentGeneration))
+    .update("\0")
     .update(request.process.processId)
     .digest("hex")
     .slice(0, 48);
@@ -1048,12 +1050,15 @@ export function validateLaunchAgentRpcStartRequest(
   assertRecord(value, "launch_agent_start_request");
   assertExactKeys(
     value,
-    ["launchId", "pipelineId", "nodeId", "process"],
+    ["launchId", "pipelineId", "deploymentGeneration", "nodeId", "process"],
     [],
     "launch_agent_start_request",
   );
   assertIdentifier(value.launchId, "launchId");
   assertIdentifier(value.pipelineId, "pipelineId");
+  if (!Number.isSafeInteger(value.deploymentGeneration) || Number(value.deploymentGeneration) < 0) {
+    throw new Error("launch_agent_deployment_generation_is_invalid");
+  }
   assertIdentifier(value.nodeId, "nodeId");
   validatePythonLaunchProcess(value.process, value.nodeId);
 }
@@ -2569,6 +2574,7 @@ function normalizeAllowedStartFingerprints(
       const expected: LaunchAgentStartRequest = {
         launchId: description.launchId,
         pipelineId: description.pipelineId,
+        deploymentGeneration: description.deploymentGeneration,
         nodeId,
         process: structuredClone(process),
       };

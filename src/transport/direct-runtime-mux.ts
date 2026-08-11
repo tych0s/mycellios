@@ -8,6 +8,7 @@ const HEADER_BYTES = 24;
 const DEFAULT_RECEIVE_WINDOW_BYTES = 4 * 1024 * 1024;
 const DEFAULT_MAX_CHUNK_BYTES = 48 * 1024;
 const DEFAULT_MAX_STREAMS = 256;
+const DEFAULT_MAX_PENDING_WRITE_BYTES = 64 * 1024 * 1024;
 const MAX_STREAM_ID_BYTES = 256;
 const MAX_METADATA_BYTES = 8 * 1024;
 const MAX_RESET_REASON_BYTES = 1_024;
@@ -52,6 +53,7 @@ interface StreamState {
   receiveOffset: number;
   sendCreditBytes: number;
   receiveBufferedBytes: number;
+  pendingWriteBytes: number;
   pendingWrites: PendingWrite[];
   incoming: IncomingChunk[];
   drainingIncoming: boolean;
@@ -62,6 +64,7 @@ export interface DirectRuntimeMuxOptions {
   receiveWindowBytes?: number;
   maximumChunkBytes?: number;
   maximumStreams?: number;
+  maximumPendingWriteBytes?: number;
 }
 
 export type DirectRuntimeDataHandler = (
@@ -113,6 +116,7 @@ export class DirectRuntimeStream extends EventEmitter<StreamEvents> {
     receiveOffset: number;
     sendCreditBytes: number;
     receiveBufferedBytes: number;
+    pendingWriteBytes: number;
   } {
     return this.mux.streamSnapshot(this.id);
   }
@@ -130,6 +134,7 @@ export class DirectRuntimeMux extends EventEmitter<MuxEvents> {
   private readonly receiveWindowBytes: number;
   private readonly maximumChunkBytes: number;
   private readonly maximumStreams: number;
+  private readonly maximumPendingWriteBytes: number;
   private readonly controlFrames: Buffer[] = [];
   private readonly dataFrames = new Map<string, Buffer[]>();
   private readonly dataRoundRobin: string[] = [];
@@ -158,6 +163,12 @@ export class DirectRuntimeMux extends EventEmitter<MuxEvents> {
       1,
       4_096,
       "direct_mux_stream_limit_is_invalid",
+    );
+    this.maximumPendingWriteBytes = boundedInteger(
+      options.maximumPendingWriteBytes ?? DEFAULT_MAX_PENDING_WRITE_BYTES,
+      1_024,
+      64 * 1024 * 1024,
+      "direct_mux_pending_write_limit_is_invalid",
     );
     this.on("error", () => undefined);
     channel.on("data", (value: Buffer) => this.receiveFrame(value));
@@ -196,8 +207,15 @@ export class DirectRuntimeMux extends EventEmitter<MuxEvents> {
     this.ensureOpen();
     const state = this.requiredStream(streamId);
     if (state.localClosed) throw new Error("direct_mux_stream_is_closed");
+    if (value.byteLength < 1) throw new Error("direct_mux_write_is_empty");
+    const projectedPendingBytes = Math.max(
+      0,
+      state.pendingWriteBytes + value.byteLength - state.sendCreditBytes,
+    );
+    if (projectedPendingBytes > this.maximumPendingWriteBytes) {
+      throw new Error("direct_mux_pending_write_capacity_exceeded");
+    }
     const data = Buffer.from(value);
-    if (data.byteLength < 1) throw new Error("direct_mux_write_is_empty");
     const promises: Promise<void>[] = [];
     for (let offset = 0; offset < data.byteLength; offset += this.maximumChunkBytes) {
       const piece = Buffer.from(data.subarray(
@@ -211,6 +229,7 @@ export class DirectRuntimeMux extends EventEmitter<MuxEvents> {
           resolve,
           reject,
         });
+        state.pendingWriteBytes += piece.byteLength;
         state.sendOffset += piece.byteLength;
       }));
     }
@@ -260,6 +279,7 @@ export class DirectRuntimeMux extends EventEmitter<MuxEvents> {
     receiveOffset: number;
     sendCreditBytes: number;
     receiveBufferedBytes: number;
+    pendingWriteBytes: number;
   } {
     const state = this.requiredStream(streamId);
     return {
@@ -268,6 +288,7 @@ export class DirectRuntimeMux extends EventEmitter<MuxEvents> {
       receiveOffset: state.receiveOffset,
       sendCreditBytes: state.sendCreditBytes,
       receiveBufferedBytes: state.receiveBufferedBytes,
+      pendingWriteBytes: state.pendingWriteBytes,
     };
   }
 
@@ -454,6 +475,7 @@ export class DirectRuntimeMux extends EventEmitter<MuxEvents> {
       const next = state.pendingWrites[0]!;
       if (next.data.byteLength > state.sendCreditBytes) return;
       state.pendingWrites.shift();
+      state.pendingWriteBytes -= next.data.byteLength;
       state.sendCreditBytes -= next.data.byteLength;
       void this.queueFrame({
         type: FrameType.Data,
@@ -543,6 +565,7 @@ export class DirectRuntimeMux extends EventEmitter<MuxEvents> {
       receiveOffset: 0,
       sendCreditBytes: 0,
       receiveBufferedBytes: 0,
+      pendingWriteBytes: 0,
       pendingWrites: [],
       incoming: [],
       drainingIncoming: false,
@@ -575,6 +598,7 @@ export class DirectRuntimeMux extends EventEmitter<MuxEvents> {
     state.localClosed = true;
     state.remoteClosed = true;
     for (const write of state.pendingWrites.splice(0)) write.reject(error);
+    state.pendingWriteBytes = 0;
     state.incoming.length = 0;
     state.receiveBufferedBytes = 0;
     this.dataFrames.delete(state.id);

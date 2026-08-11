@@ -549,8 +549,14 @@ describe("worker boundary hardening", () => {
     const request = {
       launchId: "launch-a",
       pipelineId: "pipeline-a",
+      deploymentGeneration: 1,
       nodeId: "node-a",
       process,
+    };
+    harness.preparedRuntimeFormation = {
+      launchId: request.launchId,
+      pipelineId: request.pipelineId,
+      deploymentGeneration: request.deploymentGeneration,
     };
     harness.authorizedRuntimeProcesses.set(process.processId, JSON.stringify(process));
     harness.preparedRuntimeProcesses.set(process.processId, process);
@@ -594,6 +600,11 @@ interface AgentHarness {
   handleEvidenceChallenge(challenge: unknown): Promise<void>;
   authorizedRuntimeProcesses: Map<string, string>;
   preparedRuntimeProcesses: Map<string, PythonLaunchProcess>;
+  preparedRuntimeFormation: {
+    launchId: string;
+    pipelineId: string;
+    deploymentGeneration: number;
+  } | null;
   runtimeProcesses: Map<string, LaunchProcessHandle>;
   runtimeStartRequests: Map<string, string>;
   readyRuntimeOutputs: Map<string, unknown>;

@@ -416,6 +416,18 @@ class MacroWaveCommit:
 
 
 @dataclass(frozen=True)
+class MacroWavePrefixCommit:
+    """Commit an accepted draft prefix while its continuation stays deferred."""
+
+    wave_identity: WaveIdentity
+    committed_kv_version: KVVersion
+    committed_branch_ids: tuple[BranchIdentity, ...]
+    rolled_back_branch_ids: tuple[BranchIdentity, ...]
+    rolled_back_kv_versions: tuple[KVVersion, ...]
+    kv_prefix_tokens: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class MacroWaveRollback:
     wave_identity: WaveIdentity
     restored_kv_version: KVVersion
@@ -611,6 +623,54 @@ class MacroWaveTree:
             kv_prefix_tokens=kv_prefix,
             visible_prefix_tokens=visible_prefix,
             pending_token=acceptance.continuation_token,
+        )
+
+    def commit_prefix(
+        self,
+        accepted_branches: Sequence[BranchIdentity],
+        accepted_tokens: Sequence[int],
+    ) -> MacroWavePrefixCommit:
+        """Commit one contiguous candidate prefix without a visible continuation."""
+
+        self._require_open()
+        branches = tuple(accepted_branches)
+        tokens = _token_tuple(accepted_tokens, "accepted_tokens")
+        if len(branches) != len(tokens):
+            raise ValueError("accepted branch and token counts must match")
+        parent = self.root_identity
+        accepted_versions: list[KVVersion] = []
+        for index, identity in enumerate(branches):
+            record = self._record(identity)
+            if record.parent_identity != parent:
+                raise ValueError("accepted branches must form one contiguous prefix")
+            if record.token_id != tokens[index]:
+                raise ValueError("accepted branch token does not match prefix")
+            accepted_versions.append(record.kv_version)
+            parent = identity
+        committed_head = (
+            accepted_versions[-1] if accepted_versions else self.ledger.base_version
+        )
+        finalized = self.ledger.finalize(committed_head)
+        accepted_set = set(branches)
+        rolled_back: list[BranchIdentity] = []
+        for identity, record in self._records.items():
+            if identity == self.root_identity:
+                continue
+            if identity in accepted_set:
+                record.state = MacroBranchState.COMMITTED
+            else:
+                record.state = MacroBranchState.ROLLED_BACK
+                rolled_back.append(identity)
+        self.state = MacroWaveState.COMMITTED
+        return MacroWavePrefixCommit(
+            wave_identity=self.identity,
+            committed_kv_version=committed_head,
+            committed_branch_ids=branches,
+            rolled_back_branch_ids=tuple(
+                sorted(rolled_back, key=lambda item: item.path)
+            ),
+            rolled_back_kv_versions=finalized.rolled_back,
+            kv_prefix_tokens=self.ledger.resolve_tokens(committed_head),
         )
 
     def rollback(self) -> MacroWaveRollback:

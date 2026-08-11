@@ -1,5 +1,10 @@
 import { createHash } from "node:crypto";
 import {
+  requireEligibleEngineRuntimeProfile,
+  type EngineRuntimeProfile,
+  type EngineRuntimeProfilePolicy,
+} from "../contracts/engine-runtime-profile.js";
+import {
   distributionObjective,
   evaluateDistributionPlan,
 } from "./cost-model.js";
@@ -32,12 +37,48 @@ export interface NativeFleetNodeState {
   freeSlots: number;
   observedP95ServiceMs: number | null;
   kvSessionIds: readonly string[];
+  engineCapability?: NativeEngineNodeCapability | undefined;
+}
+
+export interface NativeEngineNodeCapability {
+  profileId: `sha256:${string}`;
+  descriptorDigest: `sha256:${string}`;
+  certificationId: `sha256:${string}`;
+  artifactManifestDigest: `sha256:${string}`;
+  backend: string;
+  runtimeAbi: string;
+  quantizations: readonly string[];
+  maxContextTokens: number;
+  maxLayerCount: number;
+  kvBytesPerToken: number;
+  maxKvTokens: number;
+  decodeScale: number;
+  prefillScale: number;
+  fastKernel: boolean;
+  graphMode: "available" | "unavailable";
+  roles: readonly ("head" | "middle" | "tail" | "draft" | "auxiliary")[];
+  validUntilMs: number;
+}
+
+export interface NativeEngineRouteRequirement {
+  descriptorDigest: `sha256:${string}`;
+  certificationId: `sha256:${string}`;
+  artifactManifestDigest: `sha256:${string}`;
+  backend: string;
+  runtimeAbi: string;
+  quantization: string;
+  contextTokens: number;
+  requiredRoles: readonly NativeEngineNodeCapability["roles"][number][];
+  requireFastKernel: boolean;
+  requireGraph: boolean;
+  nowMs: number;
 }
 
 export interface NativeRouteRequest {
   workloadClass: NativeRouteWorkloadClass;
   sessionId: string | null;
   kvMissPenaltyMs: number;
+  engine?: NativeEngineRouteRequirement | undefined;
 }
 
 export interface NativeRouteScore {
@@ -114,6 +155,7 @@ export function planNativeReplicaChains(
       const state = stateByNode.get(node.id)!;
       return (
         state.freeSlots > 0
+        && engineNodeIsEligible(state, request.engine)
         && !excludedNodes.has(node.id)
         && !excludedFailureDomains.has(state.failureDomainId)
       );
@@ -121,24 +163,23 @@ export function planNativeReplicaChains(
     if (nodes.length === 0) break;
     const ids = new Set(nodes.map((node) => node.id));
     const candidateTopology: DistributionTopology = {
-      nodes: nodes.map((node) => congestionAdjustedNode(node, stateByNode.get(node.id)!)),
+      nodes: nodes.map((node) => congestionAdjustedNode(
+        node,
+        stateByNode.get(node.id)!,
+        request.engine,
+      )),
       links: topology.links.filter((link) => ids.has(link.from) && ids.has(link.to)),
     };
-    const planner = candidateTopology.nodes.length > 64
-      ? new FleetTopologyPlanner(searchOptions)
-      : new TopologyBeamPlanner(searchOptions);
-    const plan = planner.plan(model, candidateTopology, workload);
-    if (!plan) break;
-    const metrics = evaluateDistributionPlan(model, candidateTopology, workload, plan);
-    if (!metrics.feasible) break;
-    const score = scoreNativeRoute(
-      plan,
-      metrics,
+    const selected = nativePlacementCandidates(
+      model,
       candidateTopology,
+      workload,
       stateByNode,
       request,
-    );
-    if (!Number.isFinite(score.total)) break;
+      searchOptions,
+    )[0];
+    if (!selected) break;
+    const { plan, metrics, score } = selected;
     const nodeIds = plan.stages.map((stage) => stage.nodeId);
     const failureDomainIds = [
       ...new Set(nodeIds.map((nodeId) => stateByNode.get(nodeId)!.failureDomainId)),
@@ -165,6 +206,73 @@ export function planNativeReplicaChains(
         ? null
         : `independent_complete_chains_unavailable:${chains.length}:${options.desiredReplicas}`,
   };
+}
+
+interface NativePlacementCandidate {
+  plan: DistributionPlan;
+  metrics: DistributionMetrics;
+  score: NativeRouteScore;
+}
+
+/**
+ * The generic beam minimizes model/network cost, while native placement also
+ * knows physical hosts, live queues, KV affinity and failure boundaries. Run a
+ * bounded set of complete searches whose scopes can actually remove a WAN
+ * boundary, then choose only after evaluating the full native loop. This keeps
+ * the search scalable and prevents a post-hoc boundary metric from pretending
+ * it influenced placement when it did not.
+ */
+function nativePlacementCandidates(
+  model: DistributedModelProfile,
+  topology: DistributionTopology,
+  workload: DistributionWorkload,
+  stateByNode: ReadonlyMap<string, NativeFleetNodeState>,
+  request: NativeRouteRequest,
+  searchOptions: SearchOptions,
+): NativePlacementCandidate[] {
+  const nodeSets: string[][] = [topology.nodes.map((node) => node.id)];
+  const byHost = new Map<string, string[]>();
+  for (const node of topology.nodes) {
+    const host = stateByNode.get(node.id)!.physicalHostId;
+    byHost.set(host, [...(byHost.get(host) ?? []), node.id]);
+    nodeSets.push([node.id]);
+  }
+  nodeSets.push(...byHost.values());
+
+  const candidates = new Map<string, NativePlacementCandidate>();
+  for (const nodeIds of nodeSets) {
+    const ids = new Set(nodeIds);
+    const scoped: DistributionTopology = {
+      nodes: topology.nodes.filter((node) => ids.has(node.id)),
+      links: topology.links.filter((link) => ids.has(link.from) && ids.has(link.to)),
+    };
+    if (scoped.nodes.length === 0) continue;
+    const planner = scoped.nodes.length > 64
+      ? new FleetTopologyPlanner(searchOptions)
+      : new TopologyBeamPlanner(searchOptions);
+    const plan = planner.plan(model, scoped, workload);
+    if (!plan) continue;
+    const key = plan.stages.map((stage) =>
+      `${stage.nodeId}:${stage.layerStart}-${stage.layerEnd}`
+    ).join("|");
+    if (candidates.has(key)) continue;
+    const metrics = evaluateDistributionPlan(model, topology, workload, plan);
+    const score = scoreNativeRoute(plan, metrics, topology, stateByNode, request);
+    if (metrics.feasible && Number.isFinite(score.total)) {
+      candidates.set(key, { plan, metrics, score });
+    }
+  }
+  return [...candidates.values()].sort((left, right) =>
+    left.score.total - right.score.total
+    || left.plan.stages.length - right.plan.stages.length
+    || nativePlanIdentity(left.plan).localeCompare(nativePlanIdentity(right.plan))
+  );
+}
+
+function nativePlanIdentity(plan: DistributionPlan): string {
+  return plan.stages.map((stage) =>
+    `${stage.nodeId}:${stage.layerStart}-${stage.layerEnd}`
+  ).join("|");
 }
 
 /**
@@ -325,6 +433,7 @@ function validateNodeStates(
       || !Number.isInteger(state.freeSlots)
       || state.freeSlots < 0
       || state.freeSlots > state.capacity
+      || !engineCapabilityIsValid(state.engineCapability)
     ) {
       throw new Error(`native_node_state_is_invalid:${state.nodeId}`);
     }
@@ -344,18 +453,123 @@ function validateNodeStates(
   return result;
 }
 
+export function engineNodeIsEligible(
+  state: NativeFleetNodeState,
+  requirement: NativeEngineRouteRequirement | undefined,
+): boolean {
+  if (!requirement) return true;
+  const capability = state.engineCapability;
+  if (!capability) return false;
+  const requiredPipelineRoles = requirement.requiredRoles.filter(isPipelineRole);
+  return (
+    capability.validUntilMs > requirement.nowMs
+    && capability.descriptorDigest === requirement.descriptorDigest
+    && capability.certificationId === requirement.certificationId
+    && capability.artifactManifestDigest === requirement.artifactManifestDigest
+    && capability.backend === requirement.backend
+    && capability.runtimeAbi === requirement.runtimeAbi
+    && capability.quantizations.includes(requirement.quantization)
+    && capability.maxContextTokens >= requirement.contextTokens
+    && capability.maxKvTokens >= requirement.contextTokens
+    && capability.maxLayerCount > 0
+    && (!requirement.requireFastKernel || capability.fastKernel)
+    && (!requirement.requireGraph || capability.graphMode === "available")
+    && requiredPipelineRoles.length > 0
+    && requiredPipelineRoles.some((role) => capability.roles.includes(role))
+    && requirement.requiredRoles
+      .filter((role) => !isPipelineRole(role))
+      .every((role) => capability.roles.includes(role))
+  );
+}
+
+function engineCapabilityIsValid(
+  capability: NativeEngineNodeCapability | undefined,
+): boolean {
+  if (!capability) return true;
+  return (
+    /^sha256:[0-9a-f]{64}$/.test(capability.profileId)
+    && /^sha256:[0-9a-f]{64}$/.test(capability.descriptorDigest)
+    && /^sha256:[0-9a-f]{64}$/.test(capability.certificationId)
+    && /^sha256:[0-9a-f]{64}$/.test(capability.artifactManifestDigest)
+    && capability.backend.length > 0
+    && capability.runtimeAbi.length > 0
+    && capability.quantizations.length > 0
+    && new Set(capability.quantizations).size === capability.quantizations.length
+    && Number.isSafeInteger(capability.maxContextTokens)
+    && capability.maxContextTokens > 0
+    && Number.isSafeInteger(capability.maxLayerCount)
+    && capability.maxLayerCount > 0
+    && Number.isSafeInteger(capability.kvBytesPerToken)
+    && capability.kvBytesPerToken > 0
+    && Number.isSafeInteger(capability.maxKvTokens)
+    && capability.maxKvTokens >= capability.maxContextTokens
+    && Number.isFinite(capability.decodeScale)
+    && capability.decodeScale > 0
+    && Number.isFinite(capability.prefillScale)
+    && capability.prefillScale > 0
+    && Number.isSafeInteger(capability.validUntilMs)
+    && capability.validUntilMs > 0
+    && new Set(capability.roles).size === capability.roles.length
+  );
+}
+
 function congestionAdjustedNode(
   node: DistributionTopology["nodes"][number],
   state: NativeFleetNodeState,
+  engineRequirement: NativeEngineRouteRequirement | undefined,
 ): DistributionTopology["nodes"][number] {
   const occupied = state.activeRequests / Math.max(1, state.capacity);
   const queued = state.queuedRequests / Math.max(1, state.capacity);
   const congestion = 1 + occupied + queued * 2;
   return {
     ...node,
-    decodeScale: node.decodeScale * congestion,
-    prefillScale: node.prefillScale * congestion,
+    ...(engineRequirement
+      ? {
+          maxStageLayers: state.engineCapability!.maxLayerCount,
+          stageRoles: state.engineCapability!.roles.filter(isPipelineRole),
+          decodeScale: state.engineCapability!.decodeScale * congestion,
+          prefillScale: state.engineCapability!.prefillScale * congestion,
+        }
+      : {}),
+    ...(engineRequirement
+      ? {}
+      : {
+          decodeScale: node.decodeScale * congestion,
+          prefillScale: node.prefillScale * congestion,
+        }),
   };
+}
+
+export function nativeEngineNodeCapabilityFromProfile(
+  value: EngineRuntimeProfile,
+  policy: EngineRuntimeProfilePolicy = {},
+): NativeEngineNodeCapability {
+  const profile = requireEligibleEngineRuntimeProfile(value, policy);
+  return {
+    profileId: profile.profileId as `sha256:${string}`,
+    descriptorDigest: profile.descriptorDigest as `sha256:${string}`,
+    certificationId: profile.certificationId as `sha256:${string}`,
+    artifactManifestDigest: profile.artifactManifestDigest as `sha256:${string}`,
+    backend: profile.backend,
+    runtimeAbi: profile.runtimeAbi,
+    quantizations: [profile.quantization],
+    maxContextTokens: profile.capacity.contextTokens,
+    maxLayerCount: profile.capacity.maxLayerCount,
+    kvBytesPerToken: profile.capacity.kvBytesPerToken,
+    maxKvTokens: profile.capacity.maxKvTokens,
+    decodeScale: profile.costs.decodeScale,
+    prefillScale: profile.costs.prefillScale,
+    fastKernel: profile.features.fastKernel,
+    graphMode: profile.features.graphMode,
+    roles: [...profile.features.roles],
+    validUntilMs: Date.parse(profile.expiresAt),
+  };
+}
+
+function isPipelineRole(
+  role: NativeEngineNodeCapability["roles"][number],
+): role is "head" | "middle" | "tail" {
+  return role === "head" || role === "middle" || role === "tail";
 }
 
 function physicalBoundaryCost(

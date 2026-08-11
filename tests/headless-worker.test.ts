@@ -215,6 +215,7 @@ describe("headless GpuCloud worker", () => {
     await agent.start({
       launchId: "launch-1",
       pipelineId: "pipeline-1",
+      deploymentGeneration: 0,
       nodeId: "node-a",
       process: prepared[0]!,
     }, new AbortController().signal);

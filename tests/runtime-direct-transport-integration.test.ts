@@ -39,6 +39,65 @@ describe("coordinator-negotiated native direct runtime transport", () => {
     expect(snapshot.bytesSourceToDestination).toBeGreaterThan(0);
     expect(JSON.stringify(snapshot)).not.toMatch(/secret|grant/i);
     expect(fixture.sent.some((message) => message.type === "runtime.stream.data")).toBe(false);
+    client.end();
+    await waitUntil(() => fixture.hub.runtimeLinkObservations().some((item) =>
+      item.fromNodeId === "root-node"
+      && item.toNodeId === "stage-node"
+      && item.transportMode === "direct"
+    ));
+    expect(fixture.samples).toContainEqual(expect.objectContaining({
+      fromNodeId: "root-node",
+      toNodeId: "stage-node",
+      transportMode: "direct",
+    }));
+  });
+
+  it("attributes an authenticated abnormal direct close without exposing the grant", async () => {
+    const fixture = await createFixture();
+    const client = await fixture.openClient();
+    const offer = fixture.sent.find((message) => message.type === "runtime.direct.offer")!;
+    const grant = offer.payload.grant as { connectionId: string };
+    fixture.deliverWorker("worker-root", "runtime.direct.closed", {
+      streamId: offer.payload.streamId,
+      connectionId: grant.connectionId,
+      bytesTx: 7,
+      bytesRx: 3,
+      reason: "authenticated_direct_channel_reset",
+    });
+    await waitUntil(() => fixture.hub.runtimeLinkFailureEvidence().some((item) =>
+      item.reason === "authenticated_direct_channel_reset"
+    ));
+    const evidence = fixture.hub.runtimeLinkFailureEvidence().find((item) =>
+      item.reason === "authenticated_direct_channel_reset"
+    )!;
+    expect(evidence).toMatchObject({
+      role: "direct",
+      failureClass: "direct-link-lost",
+      sourceNodeId: "root-node",
+      destinationNodeId: "stage-node",
+      sourceOffset: 7,
+      destinationOffset: 3,
+    });
+    expect(evidence).not.toHaveProperty("connectionId");
+    expect(evidence).not.toHaveProperty("recoveryToken");
+    client.destroy();
+  });
+
+  it("records coordinator loss only for relay-bound sessions", async () => {
+    const fixture = await createFixture({ advertiseUnreachableCandidate: true });
+    const client = await fixture.openClient();
+    fixture.left.transportDisconnected();
+    const evidence = fixture.left.runtimeLinkFailureEvidence()[0]!;
+    expect(evidence).toMatchObject({
+      role: "coordinator",
+      failureClass: "coordinator-lost",
+      transportMode: "relay",
+      checkpointKind: "stream-offset",
+      sourceNodeId: "root-node",
+      destinationNodeId: "stage-node",
+    });
+    expect(fixture.right.runtimeLinkFailureEvidence()).toEqual([]);
+    client.destroy();
   });
 
   it("waits for the destination commit acknowledgement before releasing the source", async () => {
@@ -72,6 +131,56 @@ describe("coordinator-negotiated native direct runtime transport", () => {
       fixture.hub.runtimeTransportSnapshot().some((item) =>
         item.mode === "relay" && item.state === "active"
       )
+    );
+    expect(fixture.sent.some((message) => message.type === "runtime.direct.fallback")).toBe(true);
+    expect(fixture.sent.some((message) => message.type === "runtime.stream.data")).toBe(true);
+    expect(fixture.samples).toContainEqual(expect.objectContaining({
+      fromNodeId: "root-node",
+      toNodeId: "stage-node",
+      transportMode: "direct",
+      rttMs: null,
+      goodputMbps: null,
+    }));
+  });
+
+  it("carries the rewritten tail-to-root return stream directly exactly once", async () => {
+    const fixture = await createFixture();
+    const tail = await fixture.openTailReturn();
+    const responses: string[] = [];
+    tail.on("data", (data: Buffer) => responses.push(data.toString()));
+    tail.write(Buffer.from("tail-token-once"));
+    await waitUntil(() => responses.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(responses).toEqual(["tail-token-once"]);
+    expect(fixture.returnInputs).toEqual(["tail-token-once"]);
+    expect(fixture.hub.runtimeTransportSnapshot()).toContainEqual(
+      expect.objectContaining({
+        sourceNodeId: "stage-node",
+        destinationNodeId: "root-node",
+        mode: "direct",
+        state: "active",
+      }),
+    );
+    expect(fixture.sent.some((message) => message.type === "runtime.stream.data")).toBe(false);
+  });
+
+  it("falls the tail return back to relay before bytes and still delivers once", async () => {
+    const fixture = await createFixture({ advertiseUnreachableRootCandidate: true });
+    const tail = await fixture.openTailReturn();
+    const responses: string[] = [];
+    tail.on("data", (data: Buffer) => responses.push(data.toString()));
+    tail.write(Buffer.from("tail-relay-once"));
+    await waitUntil(() => responses.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(responses).toEqual(["tail-relay-once"]);
+    expect(fixture.returnInputs).toEqual(["tail-relay-once"]);
+    expect(fixture.hub.runtimeTransportSnapshot()).toContainEqual(
+      expect.objectContaining({
+        sourceNodeId: "stage-node",
+        destinationNodeId: "root-node",
+        mode: "relay",
+        state: "active",
+      }),
     );
     expect(fixture.sent.some((message) => message.type === "runtime.direct.fallback")).toBe(true);
     expect(fixture.sent.some((message) => message.type === "runtime.stream.data")).toBe(true);
@@ -144,13 +253,22 @@ async function createFixture(
     prependUnreachableCandidate?: boolean;
     delayDestinationCommitMs?: number;
     legacyDestinationCommit?: boolean;
+    advertiseUnreachableRootCandidate?: boolean;
   } = {},
 ) {
   const echo = createServer((socket) => socket.pipe(socket));
   await listen(echo);
   cleanup.push(() => closeServer(echo));
   const targetPort = (echo.address() as AddressInfo).port;
-  const description = launchDescription(targetPort);
+  const returnInputs: string[] = [];
+  const returnEcho = createServer((socket) => {
+    socket.on("data", (data: Buffer) => returnInputs.push(data.toString()));
+    socket.pipe(socket);
+  });
+  await listen(returnEcho);
+  cleanup.push(() => closeServer(returnEcho));
+  const returnPort = (returnEcho.address() as AddressInfo).port;
+  const description = launchDescription(targetPort, returnPort);
   const sent: Array<{ workerId: string; type: string; payload: Record<string, unknown> }> = [];
   let hub!: WorkerHub;
   let left!: RuntimeStreamTunnel;
@@ -227,13 +345,21 @@ async function createFixture(
     : options.prependUnreachableCandidate
       ? { ...rightDirect, candidates: [deadCandidate, ...rightDirect.candidates] }
       : rightDirect;
+  const advertisedLeft = options.advertiseUnreachableRootCandidate
+    ? { ...leftDirect, candidates: [deadCandidate] }
+    : leftDirect;
   const workers = [
-    worker("worker-root", "root-node", leftDirect),
+    worker("worker-root", "root-node", advertisedLeft),
     worker("worker-stage", "stage-node", advertisedRight),
   ];
+  const samples: Array<import("../src/storage/store.js").StoredRuntimeLinkSample> = [];
   const store = {
     getWorker: (workerId: string) => workers.find((worker) => worker.id === workerId),
     listWorkers: () => workers,
+    listRuntimeLinkSamples: () => [],
+    saveRuntimeLinkSample: (sample: import("../src/storage/store.js").StoredRuntimeLinkSample) => {
+      samples.push(structuredClone(sample));
+    },
   } as unknown as MeshStore;
   hub = new WorkerHub(store);
   vi.spyOn(hub, "isConnected").mockReturnValue(true);
@@ -257,12 +383,17 @@ async function createFixture(
   const root = description.launchOrder.find((process) => process.kind === "root-engine")!;
   const rewritten = left.rewriteProcess(root);
   const proxyPort = Number(flag(rewritten.command.args, "--first-stage-port"));
+  const stage = description.launchOrder.find((process) => process.kind === "remote-stage")!;
+  const rewrittenStage = right.rewriteProcess(stage);
+  const returnProxyPort = Number(flag(rewrittenStage.command.args, "--return-port"));
   const sockets: Socket[] = [];
   return {
     hub,
     left,
     right,
     sent,
+    samples,
+    returnInputs,
     deliverWorker,
     async openClient() {
       const socket = connect({ host: "127.0.0.1", port: proxyPort });
@@ -272,6 +403,21 @@ async function createFixture(
       await connected(socket);
       await waitUntil(() =>
         hub.runtimeTransportSnapshot().some((item) => item.state === "active")
+      );
+      return socket;
+    },
+    async openTailReturn() {
+      const socket = connect({ host: "127.0.0.1", port: returnProxyPort });
+      socket.on("error", () => undefined);
+      sockets.push(socket);
+      cleanup.push(() => closeSocket(socket));
+      await connected(socket);
+      await waitUntil(() =>
+        hub.runtimeTransportSnapshot().some((item) =>
+          item.sourceNodeId === "stage-node"
+          && item.destinationNodeId === "root-node"
+          && item.state === "active"
+        )
       );
       return socket;
     },
@@ -298,7 +444,10 @@ function worker(
   };
 }
 
-function launchDescription(stagePort: number): PythonPipelineLaunchDescription {
+function launchDescription(
+  stagePort: number,
+  returnPort: number,
+): PythonPipelineLaunchDescription {
   return {
     launchOrder: [
       {
@@ -306,7 +455,7 @@ function launchDescription(stagePort: number): PythonPipelineLaunchDescription {
         processId: "stage-process",
         anchor: { memberId: "stage-node", endpoint: { host: "10.0.0.20", port: stagePort } },
         downstream: null,
-        returnEndpoint: { host: "10.0.0.10", port: 30_092 },
+        returnEndpoint: { host: "10.0.0.10", port: returnPort },
         command: {
           executable: "python",
           args: [
@@ -314,7 +463,7 @@ function launchDescription(stagePort: number): PythonPipelineLaunchDescription {
             "--listen-host", "10.0.0.20",
             "--listen-port", String(stagePort),
             "--return-host", "10.0.0.10",
-            "--return-port", "30092",
+            "--return-port", String(returnPort),
           ],
         },
       },
@@ -330,7 +479,7 @@ function launchDescription(stagePort: number): PythonPipelineLaunchDescription {
           endpoint: { host: "10.0.0.20", port: stagePort },
         },
         apiEndpoint: { host: "0.0.0.0", port: 9_860 },
-        returnEndpoint: { host: "10.0.0.10", port: 30_092 },
+        returnEndpoint: { host: "10.0.0.10", port: returnPort },
         command: {
           executable: "python",
           args: [
@@ -340,7 +489,7 @@ function launchDescription(stagePort: number): PythonPipelineLaunchDescription {
             "--first-stage-port", String(stagePort),
             "--return-bind-host", "0.0.0.0",
             "--return-advertise-host", "10.0.0.10",
-            "--return-port", "30092",
+            "--return-port", String(returnPort),
           ],
         },
       },

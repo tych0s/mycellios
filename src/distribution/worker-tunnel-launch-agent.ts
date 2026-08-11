@@ -200,6 +200,15 @@ export class WorkerTunnelLaunchAgent implements LaunchAgent {
         ...(typeof payload.weightsSizeBytes === "number"
           ? { weightsSizeBytes: payload.weightsSizeBytes }
           : {}),
+        ...(typeof payload.downloadedBytes === "number"
+          ? { downloadedBytes: payload.downloadedBytes }
+          : {}),
+        ...(typeof payload.resumedBytes === "number"
+          ? { resumedBytes: payload.resumedBytes }
+          : {}),
+        ...(typeof payload.materialized === "boolean"
+          ? { materialized: payload.materialized }
+          : {}),
       };
       if (
         typeof event.stageIndex === "number"

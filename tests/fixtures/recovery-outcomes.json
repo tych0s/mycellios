@@ -1,0 +1,22 @@
+[
+  {
+    "name": "middle-visible-prefix",
+    "observation": {"generation":7,"activeGeneration":7,"role":"middle","failureClass":"process-exit","checkpointKind":"visible-token-prefix","checkpointCompatible":true,"compatibleStandbyAvailable":true,"visibleTokens":13,"downtimeMs":42.5,"discardedWaves":2,"discardedBytes":4096},
+    "event": {"schema":"mycellios-recovery-event/1","generation":7,"role":"middle","failureClass":"process-exit","outcome":"exact-replay","checkpointKind":"visible-token-prefix","replayScope":"visible-token-prefix","downtimeMs":42.5,"replayedTokens":13,"discardedWaves":2,"discardedBytes":4096}
+  },
+  {
+    "name": "root-safe-retry",
+    "observation": {"generation":8,"activeGeneration":8,"role":"root","failureClass":"health-failed","checkpointKind":"none","checkpointCompatible":true,"compatibleStandbyAvailable":true,"visibleTokens":0,"downtimeMs":9,"discardedWaves":0,"discardedBytes":0},
+    "event": {"schema":"mycellios-recovery-event/1","generation":8,"role":"root","failureClass":"health-failed","outcome":"safe-retry","checkpointKind":"none","replayScope":"full-request","downtimeMs":9,"replayedTokens":0,"discardedWaves":0,"discardedBytes":0}
+  },
+  {
+    "name": "relay-offset-resume",
+    "observation": {"generation":9,"activeGeneration":9,"role":"relay","failureClass":"relay-link-lost","checkpointKind":"stream-offset","checkpointCompatible":true,"compatibleStandbyAvailable":false,"visibleTokens":21,"downtimeMs":3.25,"discardedWaves":1,"discardedBytes":512},
+    "event": {"schema":"mycellios-recovery-event/1","generation":9,"role":"relay","failureClass":"relay-link-lost","outcome":"resume","checkpointKind":"stream-offset","replayScope":"stream-offset","downtimeMs":3.25,"replayedTokens":0,"discardedWaves":1,"discardedBytes":512}
+  },
+  {
+    "name": "superseded-tail",
+    "observation": {"generation":9,"activeGeneration":10,"role":"tail","failureClass":"health-failed","checkpointKind":"visible-token-prefix","checkpointCompatible":true,"compatibleStandbyAvailable":true,"visibleTokens":5,"downtimeMs":1,"discardedWaves":3,"discardedBytes":1024},
+    "event": {"schema":"mycellios-recovery-event/1","generation":9,"role":"tail","failureClass":"generation-superseded","outcome":"terminal","checkpointKind":"visible-token-prefix","replayScope":"none","downtimeMs":1,"replayedTokens":0,"discardedWaves":3,"discardedBytes":1024}
+  }
+]

@@ -1,8 +1,11 @@
 import { spawn, type ChildProcessByStdio } from "node:child_process";
+import { createConnection } from "node:net";
 import { resolve } from "node:path";
+import { join } from "node:path";
 import type { Readable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import {
+  assertPythonLaunchDraftStrategyCurrent,
   validatePythonLaunchDescription,
   type PythonLaunchProcess,
   type PythonPipelineLaunchDescription,
@@ -59,11 +62,22 @@ export interface LaunchProcessHandle {
   exited: Promise<LaunchProcessExit>;
   stop(reason: string): Promise<void>;
   output?(): LaunchCapturedOutput;
+  captureActivationCheckpoint?(requestId: number, maxBytes: number): Promise<{
+    payload: Buffer;
+    committedPosition: number;
+  }>;
+  restoreActivationCheckpoint?(
+    requestId: number,
+    payload: Uint8Array,
+    committedPosition: number,
+    maxBytes: number,
+  ): Promise<void>;
 }
 
 export interface LaunchAgentStartRequest {
   launchId: string;
   pipelineId: string;
+  deploymentGeneration: number;
   nodeId: string;
   process: PythonLaunchProcess;
 }
@@ -75,6 +89,9 @@ export interface RuntimePreparationProgressEvent {
   state: "preparing" | "ready";
   packageId?: string;
   weightsSizeBytes?: number;
+  downloadedBytes?: number;
+  resumedBytes?: number;
+  materialized?: boolean;
 }
 
 /** Implement this interface with an RPC client to launch on a remote node. */
@@ -217,6 +234,8 @@ export class PythonLaunchSupervisor {
     if (!options || typeof options.resolveAgent !== "function") {
       throw new Error("launch_agent_resolver_is_required");
     }
+    const clock = options.now ?? Date.now;
+    assertPythonLaunchDraftStrategyCurrent(descriptionValue, clock());
     this.description = structuredClone(descriptionValue);
     this.resolveAgent = options.resolveAgent;
     this.readinessTimeoutMs = boundedInteger(
@@ -231,7 +250,7 @@ export class PythonLaunchSupervisor {
       1_000_000,
       "launch_telemetry_limit_is_invalid",
     );
-    this.now = options.now ?? Date.now;
+    this.now = clock;
     this.processes = this.description.launchOrder.map((launch) => ({
       processId: launch.processId,
       nodeId: launch.anchor.memberId,
@@ -306,6 +325,7 @@ export class PythonLaunchSupervisor {
             {
               launchId: this.description.launchId,
               pipelineId: this.description.pipelineId,
+              deploymentGeneration: this.description.deploymentGeneration,
               nodeId: record.nodeId,
               process: structuredClone(record.launch),
             },
@@ -682,7 +702,7 @@ class WorkspaceBoundProcessHandle implements LaunchProcessHandle {
 
   constructor(
     private readonly inner: LocalProcessHandle,
-    workspace: ExecutorWorkspaceLease,
+    private readonly workspace: ExecutorWorkspaceLease,
     policy: ExecutorIsolationPolicyV4,
   ) {
     this.ready = inner.ready;
@@ -739,6 +759,132 @@ class WorkspaceBoundProcessHandle implements LaunchProcessHandle {
   output(): LaunchCapturedOutput {
     return this.inner.output();
   }
+
+  captureActivationCheckpoint(requestId: number, maxBytes: number): Promise<{
+    payload: Buffer;
+    committedPosition: number;
+  }> {
+    return activationCheckpointControlRequest(
+      join(this.workspace.path, "activation-checkpoint.sock"),
+      { operation: "capture", requestId, maxBytes },
+      undefined,
+      maxBytes,
+    ).then(({ payload, committedPosition }) => {
+      if (!Number.isSafeInteger(committedPosition) || committedPosition! < 1) {
+        throw new Error("activation_checkpoint_control_position_is_invalid");
+      }
+      return { payload, committedPosition: committedPosition! };
+    });
+  }
+
+  async restoreActivationCheckpoint(
+    requestId: number,
+    payload: Uint8Array,
+    committedPosition: number,
+    maxBytes: number,
+  ): Promise<void> {
+    const result = await activationCheckpointControlRequest(
+      join(this.workspace.path, "activation-checkpoint.sock"),
+      {
+        operation: "restore",
+        requestId,
+        maxBytes,
+        payloadBytes: payload.byteLength,
+        committedPosition,
+      },
+      Buffer.from(payload),
+      0,
+    );
+    if (result.payload.byteLength !== 0) throw new Error("activation_checkpoint_restore_response_is_invalid");
+  }
+}
+
+function activationCheckpointControlRequest(
+  socketPath: string,
+  header: Record<string, unknown>,
+  payload: Buffer | undefined,
+  maximumResponseBytes: number,
+): Promise<{ payload: Buffer; committedPosition?: number }> {
+  if (!Number.isSafeInteger(maximumResponseBytes) || maximumResponseBytes < 0) {
+    return Promise.reject(new Error("activation_checkpoint_response_limit_is_invalid"));
+  }
+  return new Promise((resolveRequest, rejectRequest) => {
+    const socket = createConnection(socketPath);
+    const chunks: Buffer[] = [];
+    let received = 0;
+    let settled = false;
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      rejectRequest(error);
+    };
+    const timeout = setTimeout(() => fail(new Error("activation_checkpoint_control_timed_out")), 35_000);
+    timeout.unref();
+    socket.once("connect", () => {
+      socket.write(`${JSON.stringify(header)}\n`);
+      if (payload) socket.write(payload);
+    });
+    socket.on("data", (chunk: Buffer) => {
+      received += chunk.byteLength;
+      if (received > maximumResponseBytes + 4_096) {
+        fail(new Error("activation_checkpoint_control_response_is_too_large"));
+        return;
+      }
+      chunks.push(Buffer.from(chunk));
+      const complete = Buffer.concat(chunks, received);
+      const newline = complete.indexOf(0x0a);
+      if (newline < 0) return;
+      if (newline > 4_096) {
+        fail(new Error("activation_checkpoint_control_header_is_too_large"));
+        return;
+      }
+      let response: unknown;
+      try {
+        response = JSON.parse(complete.subarray(0, newline).toString("utf8"));
+      } catch {
+        fail(new Error("activation_checkpoint_control_header_is_invalid"));
+        return;
+      }
+      if (!response || typeof response !== "object" || !("ok" in response)) {
+        fail(new Error("activation_checkpoint_control_response_is_invalid"));
+        return;
+      }
+      const record = response as {
+        ok: unknown; error?: unknown; payloadBytes?: unknown; committedPosition?: unknown;
+      };
+      if (record.ok !== true) {
+        fail(new Error(typeof record.error === "string"
+          ? `activation_checkpoint_control_failed:${record.error}`
+          : "activation_checkpoint_control_failed"));
+        return;
+      }
+      if (!Number.isSafeInteger(record.payloadBytes) || (record.payloadBytes as number) < 0
+        || (record.payloadBytes as number) > maximumResponseBytes) {
+        fail(new Error("activation_checkpoint_control_payload_size_is_invalid"));
+        return;
+      }
+      const body = complete.subarray(newline + 1);
+      if (body.byteLength < (record.payloadBytes as number)) return;
+      if (body.byteLength !== record.payloadBytes) {
+        fail(new Error("activation_checkpoint_control_payload_has_trailing_bytes"));
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      socket.end();
+      resolveRequest({
+        payload: Buffer.from(body),
+        ...(record.committedPosition === undefined
+          ? {}
+          : { committedPosition: record.committedPosition as number }),
+      });
+    });
+    socket.once("error", (error) => fail(error));
+    socket.once("end", () => {
+      if (!settled) fail(new Error("activation_checkpoint_control_ended_early"));
+    });
+  });
 }
 
 function cleanupWorkspace(

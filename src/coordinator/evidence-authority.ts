@@ -25,6 +25,7 @@ export function stripWorkerDeclaredEvidence(
   if (capabilities.distributedExecutor) {
     const {
       performanceEvidence: _performanceEvidence,
+      engineProfiles: _engineProfiles,
       ...executor
     } = capabilities.distributedExecutor;
     capabilities.distributedExecutor = executor;
@@ -90,6 +91,20 @@ export function mergeCurrentSessionEvidence(
   ) {
     incomingExecutor.performanceEvidence = structuredClone(evidence);
   }
+  if (incomingExecutor && currentExecutor?.engineProfiles) {
+    const profiles = currentExecutor.engineProfiles.filter(
+      (profile) =>
+        profile.workerId === workerId
+        && profile.sessionId === sessionId
+        && profile.nodeId === incomingExecutor.nodeId
+        && profile.evidence.runtimePerformanceEvidenceId
+          === incomingExecutor.performanceEvidence?.evidenceId
+        && profile.hardwareFingerprintSha256
+          === incomingExecutor.physicalIdentity?.hostFingerprintSha256
+        && engineRuntimeIdentityMatches(incomingExecutor, profile.backend),
+    );
+    if (profiles.length > 0) incomingExecutor.engineProfiles = structuredClone(profiles);
+  }
   return sanitized;
 }
 
@@ -118,6 +133,20 @@ function runtimeIdentityMatches(
     && executor.acceleration?.state === "gpu-ready"
     && executor.acceleration.backend === profile.backend
     && normalize(executor.acceleration.deviceName ?? "") === normalize(profile.deviceName);
+}
+
+function engineRuntimeIdentityMatches(
+  executor: NonNullable<WorkerCapabilities["distributedExecutor"]>,
+  backend: NonNullable<
+    NonNullable<WorkerCapabilities["distributedExecutor"]>["engineProfiles"]
+  >[number]["backend"],
+): boolean {
+  if (backend === "cpu") {
+    return executor.cpuEligible === true && executor.computeMode !== "gpu-only";
+  }
+  return executor.computeMode !== "cpu-only"
+    && executor.acceleration?.state === "gpu-ready"
+    && executor.acceleration.backend === backend;
 }
 
 function normalize(value: string): string {

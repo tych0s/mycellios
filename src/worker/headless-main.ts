@@ -8,6 +8,8 @@ import {
   createHeadlessRuntime,
   loadHeadlessWorkerEnvironment,
 } from "./headless-runtime.js";
+import { probeRuntimePerformanceProfile } from "../performance/runtime-profile-probe.js";
+import { probeQwen3EngineRuntimeProfile } from "../performance/engine-runtime-profile-probe.js";
 
 const environment = loadHeadlessWorkerEnvironment();
 const runtime = await createHeadlessRuntime(environment);
@@ -42,6 +44,27 @@ const agent = new WorkerAgent(workerConfig, {
     physicalVramMb: detectedVramMb,
   },
   distributedExecutor: runtime.executor,
+  runtimePerformanceProfileProbe: () => probeRuntimePerformanceProfile({
+    pythonExecutable: environment.pythonExecutable,
+    pythonPath: [environment.pythonPath],
+    backend: runtime.verifiedGpuRuntime.backend,
+    device: "cuda:0",
+    precision: "float16",
+    expectedDeviceName: runtime.verifiedGpuRuntime.deviceName,
+    cwd: process.cwd(),
+    env: { HF_HOME: environment.cachePath },
+  }),
+  engineRuntimeProfileProbe: (challenge) => probeQwen3EngineRuntimeProfile(
+    challenge,
+    {
+      pythonExecutable: environment.pythonExecutable,
+      pythonPath: [environment.pythonPath],
+      device: "cuda:0",
+      precision: "float16",
+      cwd: process.cwd(),
+      env: { HF_HOME: environment.cachePath },
+    },
+  ),
 });
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {

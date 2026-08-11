@@ -46,12 +46,16 @@ describe("native Python product package", () => {
       "distributed_runtime.native_gguf_disk_tiering",
       "distributed_runtime.dense_tiering",
       "distributed_runtime.draft_model",
+      "distributed_runtime.lossless_sampling",
     ]));
     expect(NATIVE_PYTHON_PRODUCT_FILES).toEqual(expect.arrayContaining([
       "distributed_runtime/native_gguf_runtime.py",
       "distributed_runtime/native_gguf_disk_tiering.py",
       "distributed_runtime/dense_tiering.py",
       "distributed_runtime/draft_model.py",
+      "distributed_runtime/lossless_sampling.py",
+      "distributed_runtime/failure_evidence.py",
+      "distributed_runtime/recovery_outcome.py",
     ]));
     for (const forbidden of [
       "distributed_runtime/external_gguf_runtime.py",

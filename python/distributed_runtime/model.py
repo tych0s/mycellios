@@ -13,6 +13,8 @@ from typing import Any, Mapping, Protocol
 
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
+from safetensors.torch import load as load_safetensors_bytes
+from safetensors.torch import save as save_safetensors_bytes
 import torch
 from torch import nn
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, DynamicCache
@@ -33,6 +35,7 @@ from .model_adapters import (
 )
 
 MAX_PHYSICAL_STAGE_BATCH_SIZE = 8
+MAX_ACTIVATION_CHECKPOINT_PAYLOAD_BYTES = 512 * 1024 * 1024
 
 RAGGED_GROUPING_ENV = "GDLP_RAGGED_GROUPING"
 
@@ -210,6 +213,19 @@ class StageRunnerContract(Protocol):
     ) -> int: ...
 
     def promote_request(self, parent_request_id: int, child_request_id: int) -> None: ...
+
+    def activation_checkpoint_payload(
+        self, request_id: int, *, max_bytes: int = MAX_ACTIVATION_CHECKPOINT_PAYLOAD_BYTES
+    ) -> bytes: ...
+
+    def restore_activation_checkpoint_payload(
+        self,
+        request_id: int,
+        payload: bytes,
+        committed_position: int,
+        *,
+        max_bytes: int = MAX_ACTIVATION_CHECKPOINT_PAYLOAD_BYTES,
+    ) -> None: ...
 
     def forward_hidden(
         self,
@@ -529,6 +545,127 @@ class StageRunner:
 
         self._require_active(request_id)
         return _cache_storage_bytes(self.caches.get(request_id))
+
+    def activation_checkpoint_payload(
+        self,
+        request_id: int,
+        *,
+        max_bytes: int = MAX_ACTIVATION_CHECKPOINT_PAYLOAD_BYTES,
+    ) -> bytes:
+        """Serialize the live local KV prefix without model code or pickle.
+
+        Identity, signature and compatibility metadata live in the coordinator's
+        signed activation-checkpoint envelope. This payload is deliberately only
+        a bounded Safetensors tensor map, so restoring untrusted executable
+        objects is impossible.
+        """
+
+        self._require_active(request_id)
+        _validate_activation_checkpoint_limit(max_bytes)
+        committed_position = self.tokens_seen[request_id]
+        if committed_position < 1:
+            raise ValueError("activation checkpoint requires a committed KV prefix")
+        cache = self.caches.get(request_id)
+        if not isinstance(cache, DynamicCache):
+            raise TypeError("activation checkpoint requires a DynamicCache-compatible KV")
+        tensors: dict[str, torch.Tensor] = {}
+        initialized = 0
+        saw_uninitialized = False
+        for layer_index, layer in enumerate(cache.layers):
+            if not layer.is_initialized:
+                saw_uninitialized = True
+                continue
+            if saw_uninitialized:
+                raise TypeError("activation checkpoint cache layers are not contiguous")
+            if (
+                not _is_batchable_layer(layer)
+                or layer.keys is None
+                or layer.values is None
+                or layer.keys.shape != layer.values.shape
+                or layer.keys.ndim != 4
+                or int(layer.keys.shape[0]) != 1
+                or int(layer.keys.shape[-2]) != committed_position
+            ):
+                raise TypeError("activation checkpoint cache layout is unsupported")
+            tensors[f"layer.{layer_index:04d}.key"] = layer.keys.detach().to("cpu").contiguous()
+            tensors[f"layer.{layer_index:04d}.value"] = layer.values.detach().to("cpu").contiguous()
+            initialized += 1
+        if initialized == 0:
+            raise ValueError("activation checkpoint has no initialized KV layers")
+        payload = save_safetensors_bytes(
+            tensors,
+            metadata={
+                "format": "mycellios-activation-kv/1",
+                "committed_position": str(committed_position),
+                "layer_count": str(initialized),
+            },
+        )
+        if len(payload) > max_bytes:
+            raise ValueError(
+                f"activation checkpoint payload exceeds limit: {len(payload)} > {max_bytes}"
+            )
+        return payload
+
+    def restore_activation_checkpoint_payload(
+        self,
+        request_id: int,
+        payload: bytes,
+        committed_position: int,
+        *,
+        max_bytes: int = MAX_ACTIVATION_CHECKPOINT_PAYLOAD_BYTES,
+    ) -> None:
+        """Validate a complete checkpoint off to the side, then publish atomically."""
+
+        _validate_activation_checkpoint_limit(max_bytes)
+        if not isinstance(payload, bytes):
+            raise TypeError("activation checkpoint payload must be bytes")
+        if not 0 < len(payload) <= max_bytes:
+            raise ValueError("activation checkpoint payload size is invalid")
+        if not isinstance(committed_position, int) or isinstance(committed_position, bool):
+            raise TypeError("activation checkpoint committed_position must be an integer")
+        if committed_position < 1:
+            raise ValueError("activation checkpoint committed_position must be positive")
+        if request_id in self.active_requests:
+            raise ValueError(f"request {request_id} is already active")
+        try:
+            tensors = load_safetensors_bytes(payload)
+        except Exception as error:
+            raise ValueError("activation checkpoint payload is not valid Safetensors") from error
+        if not tensors or len(tensors) % 2:
+            raise ValueError("activation checkpoint tensor inventory is invalid")
+        layer_count = len(tensors) // 2
+        expected_names = {
+            f"layer.{index:04d}.{kind}"
+            for index in range(layer_count)
+            for kind in ("key", "value")
+        }
+        if set(tensors) != expected_names:
+            raise ValueError("activation checkpoint tensor inventory is non-canonical")
+        restored = _new_request_cache(self.base.config, self.spec.kv_cache)
+        if len(restored.layers) < layer_count:
+            raise ValueError("activation checkpoint has more layers than this stage")
+        for layer_index in range(layer_count):
+            keys = tensors[f"layer.{layer_index:04d}.key"]
+            values = tensors[f"layer.{layer_index:04d}.value"]
+            target = restored.layers[layer_index]
+            if (
+                keys.shape != values.shape
+                or keys.ndim != 4
+                or int(keys.shape[0]) != 1
+                or int(keys.shape[-2]) != committed_position
+                or keys.dtype != values.dtype
+                or not _is_batchable_layer(target)
+            ):
+                raise ValueError("activation checkpoint tensor geometry is incompatible")
+            target.update(
+                keys.to(device=self.compute_device).contiguous(),
+                values.to(device=self.compute_device).contiguous(),
+            )
+        if _cache_storage_bytes(restored) > max_bytes:
+            raise ValueError("activation checkpoint restored KV exceeds limit")
+        self.caches[request_id] = restored
+        self.tokens_seen[request_id] = committed_position
+        self.active_requests.add(request_id)
 
     def project_request_cache_bytes(
         self,
@@ -904,6 +1041,34 @@ class StageRunner:
         if token_mode == "all":
             return output.last_hidden_state, tuple(int(token) for token in tokens)
         return output.last_hidden_state, int(tokens[-1])
+
+    @torch.inference_mode()
+    def project_sampling_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Project target logits for lossless sampling without mutating KV.
+
+        This deliberately remains a separate, optional runner capability. A
+        backend that cannot expose the target distribution must fail closed
+        instead of silently degrading a sampling request to greedy argmax.
+        """
+
+        if self.head is None:
+            raise RuntimeError("sampling logits are only available on the last stage")
+        if (
+            hidden.ndim != 3
+            or hidden.shape[0] != 1
+            or hidden.shape[1] < 1
+            or hidden.shape[2] != self.hidden_size
+        ):
+            raise ValueError(
+                f"hidden state must have shape [1, tokens, {self.hidden_size}]"
+            )
+        logits = self.head(
+            hidden.to(
+                device=self._effective_compute_device(),
+                dtype=self._effective_compute_dtype(),
+            )
+        )
+        return logits.detach().to(device="cpu", dtype=torch.float32).contiguous()
 
     def physical_batch_key(
         self,
@@ -1400,6 +1565,16 @@ class StageRunner:
         self.max_observed_physical_batch_size = max(
             self.max_observed_physical_batch_size,
             len(request_ids),
+        )
+
+
+def _validate_activation_checkpoint_limit(max_bytes: int) -> None:
+    if not isinstance(max_bytes, int) or isinstance(max_bytes, bool):
+        raise TypeError("activation checkpoint max_bytes must be an integer")
+    if not 1 <= max_bytes <= MAX_ACTIVATION_CHECKPOINT_PAYLOAD_BYTES:
+        raise ValueError(
+            "activation checkpoint max_bytes must be between 1 and "
+            f"{MAX_ACTIVATION_CHECKPOINT_PAYLOAD_BYTES}"
         )
 
 

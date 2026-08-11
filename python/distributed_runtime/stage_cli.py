@@ -79,6 +79,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model-canonical-source")
     parser.add_argument("--model-canonical-revision")
     parser.add_argument("--pipeline-snapshot-identity", type=_uint64_argument)
+    parser.add_argument("--deployment-generation", type=_uint64_argument, default=0)
+    parser.add_argument("--route-id", default="static")
+    parser.add_argument("--wave-strategy-id", default="autoregressive")
+    parser.add_argument("--wave-artifact-identity", default="static-model")
+    parser.add_argument("--stage-index", type=int)
+    parser.add_argument("--stage-role", choices=("head", "middle", "tail"))
+    parser.add_argument("--stage-executor-id")
     add_ram_backed_moe_arguments(parser)
     add_paged_kv_arguments(parser)
     add_native_gguf_arguments(parser)
@@ -335,6 +342,13 @@ def build_config(args: argparse.Namespace) -> StageProcessConfig:
     return StageProcessConfig(
         spec=spec,
         pipeline_id=pipeline_id,
+        deployment_generation=args.deployment_generation,
+        route_id=args.route_id,
+        wave_strategy_id=args.wave_strategy_id,
+        wave_artifact_identity=args.wave_artifact_identity,
+        stage_index=args.stage_index,
+        stage_role=args.stage_role,
+        stage_executor_id=args.stage_executor_id,
         listen_host=args.listen_host,
         listen_port=args.listen_port,
         next_host=args.next_host,

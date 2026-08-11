@@ -151,6 +151,33 @@ describe("physical runtime performance probe", () => {
         cpuEligible: false,
       },
       runtimePerformanceProfileProbe: async () => profile,
+      engineRuntimeProfileProbe: async () => ({
+        measuredAt: new Date(now).toISOString(),
+        samples: 21,
+        confidenceHalfWidthPct: 8,
+        capacity: {
+          contextTokens: 8_192,
+          maxLayerCount: 16,
+          kvBytesPerToken: 32_768,
+          maxKvTokens: 16_384,
+          usableMemoryBytes: 6 * 1024 * 1024 * 1024,
+        },
+        costs: {
+          decodeMsPerTokenP50: 4,
+          decodeMsPerTokenP95: 5,
+          prefillMsPerTokenP50: 0.2,
+          prefillMsPerTokenP95: 0.3,
+          verifyMsPerTokenP50: 3,
+          verifyMsPerTokenP95: 4,
+          decodeScale: 0.5,
+          prefillScale: 0.5,
+        },
+        features: {
+          fastKernel: true,
+          graphMode: "available",
+          roles: ["head", "tail"],
+        },
+      }),
       logger: { info() {}, warn() {}, error() {} },
     });
 
@@ -184,6 +211,7 @@ describe("physical runtime performance probe", () => {
       issuedAt: new Date(now - 1_000).toISOString(),
       expiresAt: new Date(now + 60_000).toISOString(),
       nodeId: "profile-node",
+      probeKind: "qwen3-dense-v1",
       backend: "cuda",
       deviceName: "NVIDIA RTX 2060",
       precision: "float16",
@@ -195,6 +223,48 @@ describe("physical runtime performance probe", () => {
     expect(sent).toContainEqual(expect.objectContaining({
       type: "evidence.runtime.complete",
       payload: expect.objectContaining({ profile }),
+    }));
+
+    await harness.handleEvidenceChallenge({
+      schema: "mycellios-evidence-challenge/1",
+      kind: "engine-runtime",
+      challengeId: "challenge-engine-profile",
+      nonce: Buffer.alloc(32, 5).toString("base64url"),
+      sessionId: "session-profile",
+      workerId: "worker-profile",
+      issuedAt: new Date(now - 1_000).toISOString(),
+      expiresAt: new Date(now + 60_000).toISOString(),
+      nodeId: "profile-node",
+      descriptorDigest: `sha256:${"a".repeat(64)}`,
+      certificationId: `sha256:${"b".repeat(64)}`,
+      artifactManifestDigest: `sha256:${"c".repeat(64)}`,
+      modelId: "Qwen/Qwen3-8B",
+      modelRevision: "1".repeat(40),
+      backend: "cuda",
+      runtimeAbi: "cuda-12",
+      quantization: "bf16",
+      contextTokens: 8_192,
+      expectedLayerStart: 0,
+      expectedLayerEnd: 16,
+      expectedKvBytesPerToken: 32_768,
+      expectedLayerWeightBytes: 256 * 1024 * 1024,
+      referenceDecodeMsPerToken: 8,
+      referencePrefillMsPerToken: 0.4,
+      hiddenSize: 4_096,
+      attentionHeads: 32,
+      kvHeads: 4,
+      headDim: 128,
+      requiredRoles: ["head", "tail"],
+      minimumSamples: 7,
+    });
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: "evidence.engine-runtime.complete",
+      payload: expect.objectContaining({
+        measurement: expect.objectContaining({
+          samples: 21,
+          capacity: expect.objectContaining({ maxLayerCount: 16 }),
+        }),
+      }),
     }));
   });
 

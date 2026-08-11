@@ -5,6 +5,7 @@ import {
   planNativeReplicaChains,
   requirePlannerWithinOracleTolerance,
   selectNativeChain,
+  engineNodeIsEligible,
   type NativeCompleteChain,
   type NativeFleetNodeState,
 } from "../src/distribution/fleet-placement.js";
@@ -110,6 +111,54 @@ describe("native two-phase fleet placement", () => {
     expect(selected?.score.physicalBoundaryCount).toBe(2);
   });
 
+  it("removes a WAN loop boundary by preferring a feasible local full-model node", () => {
+    const topology = completeTopology(3);
+    topology.nodes = topology.nodes.map((node, index) => ({
+      ...node,
+      maxStageLayers: index === 0 ? 4 : 2,
+      decodeScale: index === 0 ? 1 : 0.1,
+      prefillScale: index === 0 ? 1 : 0.1,
+    }));
+    topology.links = topology.links.map((link) => ({
+      ...link,
+      oneWayLatencyMs: 100,
+      jitterP95Ms: 10,
+    }));
+    const placement = planNativeReplicaChains(
+      model(4), topology, workload(3), states(topology),
+      { workloadClass: "interactive", sessionId: null, kvMissPenaltyMs: 0 },
+      { desiredReplicas: 1, searchOptions: narrowSearch() },
+    );
+
+    expect(placement.complete).toBe(true);
+    expect(placement.chains[0]!.nodeIds).toEqual(["node-0"]);
+    expect(placement.chains[0]!.score.physicalBoundaryCount).toBe(0);
+  });
+
+  it("uses a fat node only when its saved hops outweigh measured compute cost", () => {
+    const topology = completeTopology(3);
+    topology.nodes = topology.nodes.map((node, index) => ({
+      ...node,
+      maxStageLayers: index === 0 ? 4 : 2,
+      decodeScale: index === 0 ? 20 : 0.1,
+      prefillScale: index === 0 ? 20 : 0.1,
+    }));
+    topology.links = topology.links.map((link) => ({
+      ...link,
+      oneWayLatencyMs: 0.1,
+      jitterP95Ms: 0,
+    }));
+    const placement = planNativeReplicaChains(
+      model(4), topology, workload(3), states(topology),
+      { workloadClass: "interactive", sessionId: null, kvMissPenaltyMs: 0 },
+      { desiredReplicas: 1, searchOptions: narrowSearch() },
+    );
+
+    expect(placement.complete).toBe(true);
+    expect(placement.chains[0]!.nodeIds).toEqual(["node-1", "node-2"]);
+    expect(placement.chains[0]!.score.physicalBoundaryCount).toBe(2);
+  });
+
   it("uses path sums for interactive routing and the bottleneck for throughput", () => {
     const topology = completeTopology(4);
     const baseStates = states(topology);
@@ -161,6 +210,211 @@ describe("native two-phase fleet placement", () => {
       withinTolerance: false,
       relativeGap: 0.25,
     })).toThrow("native_planner_oracle_regression:0.250000");
+  });
+
+  it("fails closed on stale or incompatible engine capability evidence", () => {
+    const state = states(completeTopology(1))[0]!;
+    const descriptorDigest = `sha256:${"a".repeat(64)}` as const;
+    const certificationId = `sha256:${"d".repeat(64)}` as const;
+    const artifactManifestDigest = `sha256:${"e".repeat(64)}` as const;
+    const capability = {
+      profileId: `sha256:${"f".repeat(64)}` as const,
+      descriptorDigest,
+      certificationId,
+      artifactManifestDigest,
+      backend: "cuda",
+      runtimeAbi: "cuda-12",
+      quantizations: ["bf16"],
+      maxContextTokens: 32_768,
+      maxLayerCount: 16,
+      kvBytesPerToken: 2_048,
+      maxKvTokens: 32_768,
+      decodeScale: 0.5,
+      prefillScale: 0.75,
+      fastKernel: true,
+      graphMode: "available" as const,
+      roles: ["head", "middle", "tail"] as const,
+      validUntilMs: 2_000,
+    };
+    const requirement = {
+      descriptorDigest,
+      certificationId,
+      artifactManifestDigest,
+      backend: "cuda",
+      runtimeAbi: "cuda-12",
+      quantization: "bf16",
+      contextTokens: 8_192,
+      requiredRoles: ["head", "tail"] as const,
+      requireFastKernel: true,
+      requireGraph: true,
+      nowMs: 1_000,
+    };
+
+    expect(engineNodeIsEligible({ ...state, engineCapability: capability }, requirement))
+      .toBe(true);
+    expect(engineNodeIsEligible({ ...state, engineCapability: capability }, {
+      ...requirement,
+      nowMs: 2_000,
+    })).toBe(false);
+    expect(engineNodeIsEligible({ ...state, engineCapability: capability }, {
+      ...requirement,
+      quantization: "q4_k_m",
+    })).toBe(false);
+    expect(engineNodeIsEligible({ ...state, engineCapability: capability }, {
+      ...requirement,
+      requiredRoles: ["draft"],
+    })).toBe(false);
+    expect(engineNodeIsEligible(state, requirement)).toBe(false);
+  });
+
+  it("never assigns more layers than the certified engine capacity", () => {
+    const topology = completeTopology(4);
+    const descriptorDigest = `sha256:${"b".repeat(64)}` as const;
+    const certificationId = `sha256:${"d".repeat(64)}` as const;
+    const artifactManifestDigest = `sha256:${"e".repeat(64)}` as const;
+    const nodeStates = states(topology).map((state) => ({
+      ...state,
+      engineCapability: {
+        profileId: `sha256:${"f".repeat(64)}` as const,
+        descriptorDigest,
+        certificationId,
+        artifactManifestDigest,
+        backend: "cuda",
+        runtimeAbi: "cuda-12",
+        quantizations: ["bf16"],
+        maxContextTokens: 32_768,
+        maxLayerCount: 2,
+        kvBytesPerToken: 2_048,
+        maxKvTokens: 32_768,
+        decodeScale: 0.5,
+        prefillScale: 0.75,
+        fastKernel: true,
+        graphMode: "available" as const,
+        roles: ["head", "middle", "tail"] as const,
+        validUntilMs: 2_000,
+      },
+    }));
+    const placement = planNativeReplicaChains(
+      model(6),
+      topology,
+      workload(4),
+      nodeStates,
+      {
+        workloadClass: "interactive",
+        sessionId: null,
+        kvMissPenaltyMs: 0,
+        engine: {
+          descriptorDigest,
+          certificationId,
+          artifactManifestDigest,
+          backend: "cuda",
+          runtimeAbi: "cuda-12",
+          quantization: "bf16",
+          contextTokens: 128,
+          requiredRoles: ["head", "middle", "tail"],
+          requireFastKernel: true,
+          requireGraph: true,
+          nowMs: 1_000,
+        },
+      },
+      { desiredReplicas: 1, searchOptions: narrowSearch() },
+    );
+
+    expect(placement.complete).toBe(true);
+    expect(placement.chains[0]!.plan.stages).toHaveLength(3);
+    expect(placement.chains[0]!.plan.stages.every(
+      (stage) => stage.layerEnd - stage.layerStart <= 2,
+    )).toBe(true);
+  });
+
+  it("rejects a manually supplied route beyond the engine layer ceiling", () => {
+    const topology = completeTopology(1);
+    topology.nodes[0] = { ...topology.nodes[0]!, maxStageLayers: 2 };
+    const profile = model(3);
+    const activeWorkload = workload(1);
+    const metrics = evaluateDistributionPlan(profile, topology, activeWorkload, {
+      algorithm: "external",
+      codec: "fp16",
+      microBatchSize: 1,
+      prefillChunkTokens: 16,
+      stages: [{ nodeId: "node-0", layerStart: 0, layerEnd: 3 }],
+    });
+
+    expect(metrics.feasible).toBe(false);
+    expect(metrics.infeasibleReason).toBe("engine_layer_capacity_exceeded:node-0");
+  });
+
+  it("forms a chain from specialized head, middle and tail capabilities", () => {
+    const topology = completeTopology(3);
+    const descriptorDigest = `sha256:${"c".repeat(64)}` as const;
+    const certificationId = `sha256:${"d".repeat(64)}` as const;
+    const artifactManifestDigest = `sha256:${"e".repeat(64)}` as const;
+    const roleByNode = ["head", "middle", "tail"] as const;
+    const nodeStates = states(topology).map((state, index) => ({
+      ...state,
+      engineCapability: {
+        profileId: `sha256:${"f".repeat(64)}` as const,
+        descriptorDigest,
+        certificationId,
+        artifactManifestDigest,
+        backend: "cuda",
+        runtimeAbi: "cuda-12",
+        quantizations: ["bf16"],
+        maxContextTokens: 8_192,
+        maxLayerCount: 1,
+        kvBytesPerToken: 2_048,
+        maxKvTokens: 8_192,
+        decodeScale: 0.5,
+        prefillScale: 0.75,
+        fastKernel: true,
+        graphMode: "available" as const,
+        roles: [roleByNode[index]!],
+        validUntilMs: 2_000,
+      },
+    }));
+    const placement = planNativeReplicaChains(
+      model(3),
+      topology,
+      workload(3),
+      nodeStates,
+      {
+        workloadClass: "interactive",
+        sessionId: null,
+        kvMissPenaltyMs: 0,
+        engine: {
+          descriptorDigest,
+          certificationId,
+          artifactManifestDigest,
+          backend: "cuda",
+          runtimeAbi: "cuda-12",
+          quantization: "bf16",
+          contextTokens: 128,
+          requiredRoles: ["head", "middle", "tail"],
+          requireFastKernel: true,
+          requireGraph: true,
+          nowMs: 1_000,
+        },
+      },
+      { desiredReplicas: 1, searchOptions: narrowSearch() },
+    );
+
+    expect(placement.complete).toBe(true);
+    expect(placement.chains[0]!.nodeIds).toEqual(["node-0", "node-1", "node-2"]);
+  });
+
+  it("rejects a route whose node cannot own its pipeline position", () => {
+    const topology = completeTopology(1);
+    topology.nodes[0] = { ...topology.nodes[0]!, stageRoles: ["middle"] };
+    const metrics = evaluateDistributionPlan(model(1), topology, workload(1), {
+      algorithm: "external",
+      codec: "fp16",
+      microBatchSize: 1,
+      prefillChunkTokens: 16,
+      stages: [{ nodeId: "node-0", layerStart: 0, layerEnd: 1 }],
+    });
+
+    expect(metrics.feasible).toBe(false);
+    expect(metrics.infeasibleReason).toBe("engine_stage_role_unsupported:node-0");
   });
 });
 

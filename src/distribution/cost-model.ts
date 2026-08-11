@@ -61,6 +61,15 @@ export function evaluateDistributionPlan(
     const node = nodes[index]!;
     const first = index === 0;
     const last = index === plan.stages.length - 1;
+    if (!nodeSupportsStagePosition(node, first, last)) {
+      return { ...empty, infeasibleReason: `engine_stage_role_unsupported:${node.id}` };
+    }
+    if (
+      node.maxStageLayers !== undefined
+      && stage.layerEnd - stage.layerStart > node.maxStageLayers
+    ) {
+      return { ...empty, infeasibleReason: `engine_layer_capacity_exceeded:${node.id}` };
+    }
     const memoryBytes = stageMemoryBytes(model, stage, workload, first, last);
     const memoryLimitBytes = Math.max(0, node.memoryBytes - node.reserveBytes);
     if (memoryBytes > memoryLimitBytes) {
@@ -252,6 +261,17 @@ export function stageMemoryBytes(
     endpointWeights +
     kvPerToken * workload.contextTokens * workload.concurrentSequences
   );
+}
+
+function nodeSupportsStagePosition(
+  node: ComputeNodeProfile,
+  first: boolean,
+  last: boolean,
+): boolean {
+  if (!node.stageRoles) return true;
+  if (first && !node.stageRoles.includes("head")) return false;
+  if (last && !node.stageRoles.includes("tail")) return false;
+  return first || last || node.stageRoles.includes("middle");
 }
 
 export function directedLink(

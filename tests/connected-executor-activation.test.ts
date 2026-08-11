@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { buildConnectedExecutorActivationSnapshot } from "../src/coordinator/connected-executor-activation.js";
+import {
+  buildConnectedExecutorActivationSnapshot,
+  eligiblePlanningEngineProfile,
+} from "../src/coordinator/connected-executor-activation.js";
 import { parseAutoDistributionConfig } from "../src/distribution/auto-distribute.js";
 import type { StoredWorker } from "../src/storage/store.js";
 import {
@@ -7,6 +10,8 @@ import {
   sealRuntimePerformanceProfile,
   type RuntimePerformanceProfile,
 } from "../src/performance/runtime-profile.js";
+import { sealEngineRuntimeProfile } from "../src/contracts/engine-runtime-profile.js";
+import { sha256CanonicalEvidence } from "../src/core/json.js";
 
 describe("connected executor activation", () => {
   it("uses only connected unique desktop executors as model capacity", () => {
@@ -61,6 +66,42 @@ describe("connected executor activation", () => {
       prefillScale: 0.5,
       codecScale: 0.5,
     });
+  });
+
+  it("prefers SLO-qualified direct evidence but falls back to measured relay", () => {
+    const workers = [
+      worker("worker-a", "node-a", "node-a.relay", 9_850, 4_096, 3_500, 10),
+      worker("worker-b", "node-b", "node-b.relay", 9_851, 4_096, 3_500, 10),
+    ];
+    const relay = measuredLinks("node-a", "node-b");
+    const direct = relay.map((observation) => ({
+      ...observation,
+      transportMode: "direct" as const,
+      rttP50Ms: 8,
+      rttP95Ms: 10,
+      goodputMbpsP50: 900,
+    }));
+    const preferred = buildConnectedExecutorActivationSnapshot(
+      baseConfig(), workers, new Set(workers.map((worker) => worker.id)),
+      [...relay, ...direct],
+    );
+    expect(preferred.config?.links.every((link) =>
+      link.evidence?.transportMode === "direct"
+    )).toBe(true);
+
+    const unreliableDirect = direct.map((observation) => ({
+      ...observation,
+      successfulSamples: 1,
+      failedSamples: 3,
+      availability: 0.25,
+    }));
+    const fallback = buildConnectedExecutorActivationSnapshot(
+      baseConfig(), workers, new Set(workers.map((worker) => worker.id)),
+      [...relay, ...unreliableDirect],
+    );
+    expect(fallback.config?.links.every((link) =>
+      link.evidence?.transportMode === "relay"
+    )).toBe(true);
   });
 
   it("reports capacity but withholds a launch topology until two executors connect", () => {
@@ -301,6 +342,87 @@ describe("connected executor activation", () => {
     // Cae al perfil de rendimiento, que es el mismo 0,5 del primer test.
     expect(snapshot.config?.nodes.every((node) => node.decodeScale === 0.5)).toBe(true);
   });
+
+  it("selects only a fresh engine profile matching the current authority", () => {
+    const candidate = worker("worker-a", "node-a", "node-a.relay", 9_850, 4_096, 3_500, 10);
+    const descriptor = {
+      model: { modelId: "source-model", revision: "1".repeat(40) },
+      targets: [{ backend: "cuda", runtimeAbi: "cuda-12", quantizations: ["bf16"] }],
+    };
+    const certificationId = `sha256:${"b".repeat(64)}`;
+    const artifactManifestDigest = `sha256:${"c".repeat(64)}`;
+    const runtimeProfile = sealEngineRuntimeProfile({
+      descriptorDigest: sha256CanonicalEvidence(descriptor), certificationId,
+      artifactManifestDigest, sourceId: `sha256:${"d".repeat(64)}`,
+      hardwareFingerprintSha256: `sha256:${"e".repeat(64)}`,
+      workerId: candidate.id, sessionId: "session-a", nodeId: "node-a",
+      modelId: "base", modelRevision: "1".repeat(40), backend: "cuda",
+      runtimeAbi: "cuda-12", quantization: "bf16",
+      measuredAt: new Date(Date.now() - 1_000).toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(), samples: 21,
+      confidenceHalfWidthPct: 5,
+      capacity: { contextTokens: 4_096, maxLayerCount: 7,
+        kvBytesPerToken: 1_024, maxKvTokens: 8_192, usableMemoryBytes: 1_000_000 },
+      costs: { decodeMsPerTokenP50: 2, decodeMsPerTokenP95: 3,
+        prefillMsPerTokenP50: 1, prefillMsPerTokenP95: 2,
+        verifyMsPerTokenP50: 2, verifyMsPerTokenP95: 3,
+        decodeScale: 0.25, prefillScale: 0.5 },
+      features: { fastKernel: true, graphMode: "available", roles: ["head", "tail"] },
+      evidence: { deploymentCanaryEvidenceId: `sha256:${"f".repeat(64)}`,
+        runtimePerformanceEvidenceId: `sha256:${"0".repeat(64)}` },
+    });
+    candidate.capabilities.distributedExecutor!.engineProfiles = [runtimeProfile];
+    const authority = { descriptor, certification: {
+      certificationId, artifactManifestDigest,
+    } } as never;
+    expect(eligiblePlanningEngineProfile(candidate, authority, "base", 4_096))
+      .toMatchObject({ profileId: runtimeProfile.profileId, capacity: { maxLayerCount: 7 } });
+    expect(eligiblePlanningEngineProfile(candidate, authority, "another-model", 4_096))
+      .toBeNull();
+  });
+
+  it("binds certified path evidence to both current engine profiles", () => {
+    const first = worker("worker-a", "node-a", "node-a.relay", 9_850, 4_096, 3_500, 10);
+    const second = worker("worker-b", "node-b", "node-b.relay", 9_850, 4_096, 3_500, 10);
+    const descriptor = {
+      model: { modelId: "source-model", revision: "1".repeat(40) },
+      targets: [{ backend: "cuda", runtimeAbi: "cuda-12", quantizations: ["bf16"] }],
+    };
+    const authority = { descriptor, certification: {
+      certificationId: `sha256:${"b".repeat(64)}`,
+      artifactManifestDigest: `sha256:${"c".repeat(64)}`,
+    } } as never;
+    const measuredAt = Date.now() - 1_000;
+    const firstProfile = certifiedEngineProfile(first, authority, measuredAt, "d");
+    const secondProfile = certifiedEngineProfile(second, authority, measuredAt, "e");
+    first.capabilities.distributedExecutor!.engineProfiles = [firstProfile];
+    second.capabilities.distributedExecutor!.engineProfiles = [secondProfile];
+
+    const oldPath = buildConnectedExecutorActivationSnapshot(
+      baseConfig(), [first, second], new Set([first.id, second.id]),
+      measuredLinks("node-a", "node-b", measuredAt - 1), authority,
+    );
+    expect(oldPath.config).toBeNull();
+
+    const freshPath = buildConnectedExecutorActivationSnapshot(
+      baseConfig(), [first, second], new Set([first.id, second.id]),
+      measuredLinks("node-a", "node-b", measuredAt + 1), authority,
+    );
+    expect(freshPath.config?.links).toHaveLength(2);
+    expect(freshPath.config?.links[0]?.evidence).toMatchObject({
+      validUntil: measuredAt + 60_000,
+      fromEngineProfileId: firstProfile.profileId,
+      toEngineProfileId: secondProfile.profileId,
+      fromHardwareFingerprintSha256: firstProfile.hardwareFingerprintSha256,
+      toHardwareFingerprintSha256: secondProfile.hardwareFingerprintSha256,
+    });
+
+    const futurePath = buildConnectedExecutorActivationSnapshot(
+      baseConfig(), [first, second], new Set([first.id, second.id]),
+      measuredLinks("node-a", "node-b", Date.now() + 60_000), authority,
+    );
+    expect(futurePath.config).toBeNull();
+  });
 });
 
 function deployment(deploymentId: string, model: string, tokensPerSecond: number) {
@@ -477,8 +599,7 @@ function series(
   };
 }
 
-function measuredLinks(fromNodeId: string, toNodeId: string) {
-  const measuredAt = Date.now();
+function measuredLinks(fromNodeId: string, toNodeId: string, measuredAt = Date.now()) {
   return [
     {
       fromNodeId,
@@ -509,4 +630,42 @@ function measuredLinks(fromNodeId: string, toNodeId: string) {
       confidence: 1,
     },
   ];
+}
+
+function certifiedEngineProfile(
+  candidate: StoredWorker,
+  authority: { descriptor: { model: { revision: string } }; certification: {
+    certificationId: string; artifactManifestDigest: string;
+  } },
+  measuredAt: number,
+  fingerprintSeed: string,
+) {
+  return sealEngineRuntimeProfile({
+    descriptorDigest: sha256CanonicalEvidence(authority.descriptor),
+    certificationId: authority.certification.certificationId as `sha256:${string}`,
+    artifactManifestDigest: authority.certification.artifactManifestDigest as `sha256:${string}`,
+    sourceId: `sha256:${"d".repeat(64)}`,
+    hardwareFingerprintSha256: `sha256:${fingerprintSeed.repeat(64)}`,
+    workerId: candidate.id,
+    sessionId: `session-${candidate.id}`,
+    nodeId: candidate.capabilities.distributedExecutor!.nodeId,
+    modelId: "base",
+    modelRevision: authority.descriptor.model.revision,
+    backend: "cuda",
+    runtimeAbi: "cuda-12",
+    quantization: "bf16",
+    measuredAt: new Date(measuredAt).toISOString(),
+    expiresAt: new Date(measuredAt + 60_000).toISOString(),
+    samples: 21,
+    confidenceHalfWidthPct: 5,
+    capacity: { contextTokens: 4_096, maxLayerCount: 32, kvBytesPerToken: 1_024,
+      maxKvTokens: 8_192, usableMemoryBytes: 1_000_000 },
+    costs: { decodeMsPerTokenP50: 2, decodeMsPerTokenP95: 3,
+      prefillMsPerTokenP50: 1, prefillMsPerTokenP95: 2,
+      verifyMsPerTokenP50: 2, verifyMsPerTokenP95: 3,
+      decodeScale: 0.25, prefillScale: 0.5 },
+    features: { fastKernel: true, graphMode: "available", roles: ["head", "middle", "tail"] },
+    evidence: { deploymentCanaryEvidenceId: `sha256:${"f".repeat(64)}`,
+      runtimePerformanceEvidenceId: `sha256:${"0".repeat(64)}` },
+  });
 }

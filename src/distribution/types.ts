@@ -97,6 +97,14 @@ export interface ComputeNodeProfile {
   powerWatts: number;
   availability: number;
   /**
+   * Optional certified ceiling for the contiguous layer range assigned to one
+   * stage. Fleet admission projects fresh engine evidence into this field so
+   * generic planners cannot exceed the runtime's measured capacity.
+   */
+  maxStageLayers?: number;
+  /** Pipeline positions this measured runtime may own for the active engine. */
+  stageRoles?: readonly ("head" | "middle" | "tail")[];
+  /**
    * Explicit host-memory hierarchy used only by the MacroWave planner.
    * Existing planners continue to interpret memoryBytes/reserveBytes exactly
    * as before, so adding this profile is backwards compatible.
@@ -140,7 +148,14 @@ export interface DirectedLinkProfile {
     measuredAt: number;
     validUntil: number;
     successfulSamples: number;
-    failedSamples: number;
+      failedSamples: number;
+      /** Missing legacy evidence is conservatively interpreted as relay. */
+      transportMode?: "direct" | "relay";
+      /** Exact certified physical profiles whose live path was measured. */
+      fromEngineProfileId?: string | undefined;
+      toEngineProfileId?: string | undefined;
+      fromHardwareFingerprintSha256?: string | undefined;
+      toHardwareFingerprintSha256?: string | undefined;
   };
 }
 

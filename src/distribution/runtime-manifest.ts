@@ -3285,6 +3285,16 @@ function validatePlanRequest(request: RuntimePlanRequest): void {
       assertProbability(link.availability, "runtime_link_availability_is_invalid");
     }
     if (link.evidence !== undefined) {
+      const bindingValues = [
+        link.evidence.fromEngineProfileId,
+        link.evidence.toEngineProfileId,
+        link.evidence.fromHardwareFingerprintSha256,
+        link.evidence.toHardwareFingerprintSha256,
+      ];
+      const hasAnyBinding = bindingValues.some((value) => value !== undefined);
+      const hasCompleteBinding = bindingValues.every(
+        (value) => typeof value === "string" && /^sha256:[0-9a-f]{64}$/.test(value),
+      );
       if (
         link.evidence.source !== "runtime-probe"
         || !Number.isInteger(link.evidence.measuredAt)
@@ -3295,6 +3305,7 @@ function validatePlanRequest(request: RuntimePlanRequest): void {
         || link.evidence.successfulSamples < 0
         || !Number.isInteger(link.evidence.failedSamples)
         || link.evidence.failedSamples < 0
+        || (hasAnyBinding && !hasCompleteBinding)
       ) {
         throw new Error("runtime_link_evidence_is_invalid");
       }

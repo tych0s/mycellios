@@ -1,7 +1,7 @@
 import websocket from "@fastify/websocket";
 import staticFiles from "@fastify/static";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
-import { createHash, generateKeyPairSync, timingSafeEqual } from "node:crypto";
+import { createHash, createPublicKey, generateKeyPairSync, timingSafeEqual } from "node:crypto";
 import {
   createReadStream,
   existsSync,
@@ -116,6 +116,8 @@ import {
   DevelopmentLabStoreError,
 } from "./development-lab-store.js";
 import { WorkerHub } from "./worker-hub.js";
+import { ActivationCheckpointTransferAuthority } from "./activation-checkpoint-transfer.js";
+import { ActivationCheckpointStore } from "../distribution/activation-checkpoint-store.js";
 import { ExecutionReceiptStore } from "./execution-receipt-store.js";
 import { ModelCertificationRegistry } from "./model-certification-registry.js";
 import {
@@ -132,6 +134,7 @@ import {
   type DeploymentOperation,
 } from "./deployment-control-plane.js";
 import { stripWorkerDeclaredEvidence } from "./evidence-authority.js";
+import { activeEngineRuntimeActivationPlans } from "./engine-runtime-profile-scheduler.js";
 import {
   activationFailureIsTransient,
   activationFailureMessageAfterRuntimeChange,
@@ -348,6 +351,7 @@ export async function createCoordinator(
     sporePayoutGateway?: PayoutGateway;
     payoutSettlementVerifier?: PayoutSettlementVerifier;
     modelCapacityInspector?: typeof inspectHubModelCapacity;
+    engineRuntimeProfileReconciliation?: boolean;
   } = {},
 ): Promise<CoordinatorRuntime> {
   assertCoordinatorNetworkSecurity(config);
@@ -1362,7 +1366,31 @@ export async function createCoordinator(
     reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
     return reply.redirect(`/downloads/mycellios-node-windows-x64.zip?v=${publicAssetVersion}`);
   });
-  const hub = new WorkerHub(store);
+  const activationCheckpoints = new ActivationCheckpointStore((keyId) => {
+    const credential = database.listWorkerAdmissionCredentials(10_000)
+      .find((candidate) => candidate.fingerprint === keyId);
+    if (!credential || credential.status !== "active" || credential.algorithm !== "ed25519") {
+      return undefined;
+    }
+    try {
+      return createPublicKey({
+        key: Buffer.from(credential.publicKey, "base64url"),
+        format: "der",
+        type: "spki",
+      });
+    } catch {
+      return undefined;
+    }
+  }, {
+    maxEntries: 8,
+    maxEntryBytes: 512 * 1024 * 1024,
+    maxTotalBytes: 1024 * 1024 * 1024,
+  });
+  const hub = new WorkerHub(store, {
+    activationCheckpointTransfers: new ActivationCheckpointTransferAuthority(
+      activationCheckpoints,
+    ),
+  });
   const fleetContribution = new FleetContributionController(store, hub);
   hub.attach(app, {
     authorizedWorkerId: (request) => workerSessionPrincipals.get(request) ?? null,
@@ -2110,6 +2138,16 @@ export async function createCoordinator(
     hub.closeStaleConnections();
     mobileHub.expireDisconnectedWorkers();
     void activationManager?.refresh();
+    if (options.engineRuntimeProfileReconciliation === true) {
+      const activePlans = activeEngineRuntimeActivationPlans(
+        store.listEngineRuntimeActivationPlans(),
+        deploymentController,
+      );
+      hub.reconcileEngineRuntimeProfileChallenges(activePlans.map((plan) => ({
+        workerId: plan.workerId,
+        request: plan.request,
+      })));
+    }
     reconcileRequestedModels();
   }, 5_000);
   staleTimer.unref();

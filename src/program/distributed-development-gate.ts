@@ -411,11 +411,12 @@ export async function executeDistributedDevelopmentGate(
           onPlanPrepared: (modelId, stages) => {
             const operation = deploymentController.activeOperationForModel(modelId);
             if (!operation) throw new Error(`deployment_operation_missing:${modelId}`);
-            return deploymentController.prepareRoute(
+            const reservation = deploymentController.prepareRoute(
               operation.id,
               stages,
               Math.max(90_000, cli.timeoutMs + 60_000),
-            ).id;
+            );
+            return { id: reservation.id, generation: reservation.generation };
           },
           onPlanHeartbeat: (_modelId, reservationId) =>
             deploymentController.renewRoute(

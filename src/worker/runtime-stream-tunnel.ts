@@ -6,6 +6,10 @@ import type {
   PythonPipelineLaunchDescription,
   PythonRootEngineLaunch,
 } from "../distribution/python-launcher.js";
+import {
+  runtimeLinkFailureEvidenceSchema,
+  type RuntimeLinkFailureEvidence,
+} from "../contracts/runtime-link-failure.js";
 import type { DirectSessionGrant } from "../transport/direct-secure-channel.js";
 import {
   RuntimeDirectTransport,
@@ -204,6 +208,7 @@ export class RuntimeStreamTunnel {
   private readonly directTransport: RuntimeDirectTransport;
   private readonly completedTransportSnapshots: RuntimeStreamTransportSnapshot[] = [];
   private transportAvailable: boolean;
+  private readonly runtimeLinkFailures: RuntimeLinkFailureEvidence[] = [];
 
   constructor(
     private readonly nodeId: string,
@@ -432,6 +437,7 @@ export class RuntimeStreamTunnel {
     this.transportAvailable = false;
     for (const session of [...this.sessions.values()]) {
       if (session.transportMode === "direct") continue;
+      this.recordCoordinatorFailure(session);
       if (!session.recovery) {
         this.closeSession(
           session.streamId,
@@ -443,6 +449,10 @@ export class RuntimeStreamTunnel {
       session.recovery.suspended = true;
       session.socket.pause();
     }
+  }
+
+  runtimeLinkFailureEvidence(): RuntimeLinkFailureEvidence[] {
+    return this.runtimeLinkFailures.map((evidence) => ({ ...evidence }));
   }
 
   /** Re-advertises exact offsets; forwarding resumes only after coordinator validation. */
@@ -1145,6 +1155,27 @@ export class RuntimeStreamTunnel {
         : {}),
       ...payload,
     });
+  }
+
+  private recordCoordinatorFailure(session: StreamSession): void {
+    const recovery = session.recovery;
+    const evidence = runtimeLinkFailureEvidenceSchema.parse({
+      schema: "mycellios-runtime-link-failure/1",
+      streamId: session.streamId,
+      sourceNodeId: this.nodeId,
+      destinationNodeId: session.destinationNodeId,
+      generation: recovery?.generation ?? 0,
+      role: "coordinator",
+      failureClass: "coordinator-lost",
+      transportMode: "relay",
+      checkpointKind: recovery ? "stream-offset" : "none",
+      sourceOffset: recovery?.sendOffset ?? session.bytesTx,
+      destinationOffset: recovery?.receiveOffset ?? session.bytesRx,
+      observedAt: Date.now(),
+      reason: "authenticated_coordinator_transport_disconnected",
+    });
+    this.runtimeLinkFailures.unshift(evidence);
+    if (this.runtimeLinkFailures.length > 256) this.runtimeLinkFailures.length = 256;
   }
 
   private sendEnvelope(type: string, payload: unknown): boolean {

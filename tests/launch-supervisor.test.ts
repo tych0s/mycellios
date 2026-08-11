@@ -399,6 +399,7 @@ describe("Python launch supervisor", () => {
       {
         launchId: description.launchId,
         pipelineId: description.pipelineId,
+        deploymentGeneration: description.deploymentGeneration,
         nodeId: launchProcess.anchor.memberId,
         process: launchProcess,
       },
@@ -429,6 +430,7 @@ describe("Python launch supervisor", () => {
         {
           launchId: description.launchId,
           pipelineId: description.pipelineId,
+          deploymentGeneration: description.deploymentGeneration,
           nodeId: process.anchor.memberId,
           process,
         },
@@ -460,6 +462,62 @@ describe("Python launch supervisor", () => {
     await expect(
       local.start(request, new AbortController().signal),
     ).rejects.toThrow("local_process_executable_is_not_authorized");
+  });
+
+  it("captures and restores bounded KV through the private executor workspace socket", async () => {
+    const marker = "CHECKPOINT_CONTROL_READY";
+    const local = new LocalProcessAgent({
+      id: "checkpoint-control-local",
+      allowedExecutables: [process.execPath],
+      stopGraceMs: 1_000,
+      readyWhen: ({ recentStdout }) => recentStdout.includes(marker),
+    });
+    const childScript = String.raw`
+      const net = require("node:net");
+      const path = require("node:path").join(process.env.MYCELLIOS_EXECUTOR_WORKSPACE, "activation-checkpoint.sock");
+      const server = net.createServer((socket) => {
+        let bytes = Buffer.alloc(0);
+        socket.on("data", (chunk) => {
+          bytes = Buffer.concat([bytes, chunk]);
+          const newline = bytes.indexOf(10);
+          if (newline < 0) return;
+          const header = JSON.parse(bytes.subarray(0, newline).toString("utf8"));
+          if (header.operation === "capture") {
+            const payload = Buffer.from("live-kv");
+            socket.end(JSON.stringify({ok:true,payloadBytes:payload.length,committedPosition:37}) + "\n" + payload);
+          } else if (bytes.length >= newline + 1 + header.payloadBytes) {
+            const payload = bytes.subarray(newline + 1);
+            if (payload.toString() !== "restored-kv" || header.committedPosition !== 37) process.exit(91);
+            socket.end(JSON.stringify({ok:true,payloadBytes:0}) + "\n");
+          }
+        });
+      });
+      server.listen(path, () => console.log("${marker}"));
+      process.on("SIGTERM", () => server.close(() => process.exit(0)));
+    `;
+    const request = {
+      launchId: "checkpoint-control-launch",
+      pipelineId: "checkpoint-control-pipeline",
+      deploymentGeneration: 1,
+      nodeId: "local-node",
+      process: {
+        processId: "checkpoint-control-process",
+        stageId: "stage-a",
+        kind: "remote-stage",
+        isolation: normalizeExecutorIsolationPolicy({ stopGraceMs: 1_000 }),
+        command: { executable: process.execPath, args: ["-e", childScript] },
+      },
+    } as unknown as LaunchAgentStartRequest;
+    const handle = await local.start(request, new AbortController().signal);
+    await handle.ready;
+    await expect(handle.captureActivationCheckpoint?.(17, 64)).resolves.toEqual({
+      payload: Buffer.from("live-kv"),
+      committedPosition: 37,
+    });
+    await expect(handle.restoreActivationCheckpoint?.(
+      17, Buffer.from("restored-kv"), 37, 64,
+    )).resolves.toBeUndefined();
+    await handle.stop("test_complete");
   });
 
   it("retains a final readiness marker when bounded process output is truncated", async () => {

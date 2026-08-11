@@ -384,6 +384,7 @@ describe("HTTP LaunchAgent RPC", () => {
     const request: LaunchAgentStartRequest = {
       launchId: description.launchId,
       pipelineId: description.pipelineId,
+      deploymentGeneration: description.deploymentGeneration,
       nodeId: root.anchor.memberId,
       process: structuredClone(root),
     };
@@ -424,6 +425,7 @@ describe("HTTP LaunchAgent RPC", () => {
     const request: LaunchAgentStartRequest = {
       launchId: description.launchId,
       pipelineId: description.pipelineId,
+      deploymentGeneration: description.deploymentGeneration,
       nodeId: root.anchor.memberId,
       process: structuredClone(root),
     };
@@ -482,6 +484,7 @@ describe("HTTP LaunchAgent RPC", () => {
     const requestFor = (process: (typeof processes)[number]): LaunchAgentStartRequest => ({
       launchId: description.launchId,
       pipelineId: description.pipelineId,
+      deploymentGeneration: description.deploymentGeneration,
       nodeId: process.anchor.memberId,
       process: structuredClone(process),
     });
@@ -527,6 +530,7 @@ describe("HTTP LaunchAgent RPC", () => {
       validateLaunchAgentRpcStartRequest({
         launchId: historical.launchId,
         pipelineId: historical.pipelineId,
+        deploymentGeneration: historical.deploymentGeneration,
         nodeId: historicalRoot.anchor.memberId,
         process: structuredClone(historicalRoot),
       }),
@@ -542,6 +546,7 @@ describe("HTTP LaunchAgent RPC", () => {
     const request: LaunchAgentStartRequest = {
       launchId: description.launchId,
       pipelineId: description.pipelineId,
+      deploymentGeneration: description.deploymentGeneration,
       nodeId: root.anchor.memberId,
       process: structuredClone(root),
     };
@@ -1284,6 +1289,7 @@ function fixtureRequest(
   return {
     launchId: description.launchId,
     pipelineId: description.pipelineId,
+    deploymentGeneration: description.deploymentGeneration,
     nodeId: process.anchor.memberId,
     process: structuredClone(process),
   };

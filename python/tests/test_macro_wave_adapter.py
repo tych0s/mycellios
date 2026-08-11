@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import unittest
 
 from distributed_runtime.engine import _resolve_verified_tokens
+from distributed_runtime.lossless_sampling import CounterSamplingRng
 from distributed_runtime.macro_wave import KVVersion, MacroBranchState
 from distributed_runtime.macro_wave_adapter import (
     ContinuationKind,
@@ -13,6 +14,7 @@ from distributed_runtime.macro_wave_adapter import (
     prepare_tree_macro_wave,
     record_linear_resolution,
     resolve_linear_macro_wave,
+    resolve_linear_sampling_macro_wave,
     resolve_macro_wave,
 )
 from distributed_runtime.speculation import (
@@ -36,6 +38,71 @@ class _FixedDraftProvider:
         del token_history
         limit = self.max_draft_tokens if max_tokens is None else max_tokens
         return self.tokens[:limit]
+
+
+class SamplingMacroWaveTests(unittest.TestCase):
+    def test_full_acceptance_can_commit_prefix_and_defer_bonus_distribution(self) -> None:
+        proposal = linear_draft_to_macro_wave(
+            (1, 2), request_id=3, ordinal=1, base_prefix_tokens=(9,),
+            parent_kv_version=KVVersion(1), strategy="ngram"
+        )
+        outcome = resolve_linear_sampling_macro_wave(
+            proposal,
+            ((-100.0, 100.0, -100.0), (-100.0, -100.0, 100.0), (1.0, 2.0, 3.0)),
+            temperature=1.0,
+            top_p=1.0,
+            rng=CounterSamplingRng(b"c" * 32),
+            defer_bonus=True,
+        )
+        self.assertIsNone(outcome.resolution)
+        self.assertIsNotNone(outcome.prefix_commit)
+        self.assertEqual(outcome.prefix_commit.kv_prefix_tokens, (9, 1, 2))
+        self.assertEqual(outcome.deferred_bridge_logits, (1.0, 2.0, 3.0))
+        self.assertEqual(outcome.rng_after.counter, 2)
+
+    def test_delta_draft_full_acceptance_commits_and_samples_bonus(self) -> None:
+        proposal = linear_draft_to_macro_wave(
+            (1, 2),
+            request_id=4,
+            ordinal=1,
+            base_prefix_tokens=(9,),
+            parent_kv_version=KVVersion(1),
+            strategy="ngram",
+        )
+        rng = CounterSamplingRng(b"a" * 32)
+        outcome = resolve_linear_sampling_macro_wave(
+            proposal,
+            ((-100.0, 100.0, -100.0), (-100.0, -100.0, 100.0), (100.0, -100.0, -100.0)),
+            temperature=1.0,
+            top_p=1.0,
+            rng=rng,
+        )
+        self.assertEqual(outcome.resolution.emitted_tokens, (1, 2, 0))
+        self.assertFalse(outcome.resolution.truncate_required)
+        self.assertEqual(outcome.rng_before.counter, 0)
+        self.assertEqual(outcome.rng_after.counter, 3)
+        self.assertEqual(rng.checkpoint().counter, 0)
+
+    def test_delta_draft_rejection_rolls_back_suffix_and_uses_residual(self) -> None:
+        proposal = linear_draft_to_macro_wave(
+            (1, 2),
+            request_id=5,
+            ordinal=1,
+            base_prefix_tokens=(9,),
+            parent_kv_version=KVVersion(1),
+            strategy="ngram",
+        )
+        outcome = resolve_linear_sampling_macro_wave(
+            proposal,
+            ((100.0, -100.0, -100.0), (-100.0, -100.0, 100.0), (100.0, -100.0, -100.0)),
+            temperature=1.0,
+            top_p=1.0,
+            rng=CounterSamplingRng(b"b" * 32),
+        )
+        self.assertEqual(outcome.resolution.emitted_tokens, (0,))
+        self.assertTrue(outcome.resolution.truncate_required)
+        self.assertEqual(outcome.resolution.accepted_draft_tokens, 0)
+        self.assertEqual(outcome.rng_after.counter, 2)
 
 
 @dataclass

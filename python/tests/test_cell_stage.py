@@ -32,6 +32,7 @@ from distributed_runtime.protocol import (
     Frame,
     FrameType,
     TensorCodec,
+    bind_socket_deployment_generation,
     decode_tensor,
     encode_tensor,
     recv_frame,
@@ -786,6 +787,7 @@ class TensorParallelCellStageTests(unittest.TestCase):
             self.assertTrue(stage_ready.wait(30), "cell stage did not bind its GDLP listener")
             upstream = socket.create_connection(("127.0.0.1", stage_port), timeout=30)
             upstream.settimeout(30)
+            bind_socket_deployment_generation(upstream, 0)
             try:
                 send_frame(
                     upstream,

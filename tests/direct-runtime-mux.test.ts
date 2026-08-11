@@ -111,10 +111,91 @@ describe("direct runtime stream multiplexer", () => {
     expect(values).toEqual(["still-running"]);
     await pair.close();
   });
+
+  it("bounds queued sender memory without blocking control or sibling streams", async () => {
+    const pair = await muxPair({
+      receiveWindowBytes: 1_024,
+      maximumChunkBytes: 512,
+      maximumPendingWriteBytes: 1_024,
+    });
+    const incoming: DirectRuntimeStream[] = [];
+    pair.serverMux.on("stream", (stream) => incoming.push(stream));
+    const bulk = await pair.clientMux.openStream("bulk");
+    const control = await pair.clientMux.openStream("control");
+    await waitUntil(() => incoming.length === 2);
+    await bulk.write(Buffer.alloc(1_024));
+    expect(bulk.snapshot()).toMatchObject({ sendOffset: 1_024, pendingWriteBytes: 0 });
+    await expect(bulk.write(Buffer.alloc(1_025))).rejects.toThrow(
+      "direct_mux_pending_write_capacity_exceeded",
+    );
+    expect(bulk.snapshot()).toMatchObject({ sendOffset: 1_024, pendingWriteBytes: 0 });
+
+    const controlValues: string[] = [];
+    incoming.find((stream) => stream.id === "control")!.setDataHandler((data) => {
+      controlValues.push(data.toString());
+    });
+    await control.write(Buffer.from("cancel-reset-health"));
+    await waitUntil(() => controlValues.length === 1);
+    expect(controlValues).toEqual(["cancel-reset-health"]);
+    await pair.close();
+  });
+
+  it("preserves control latency and an RSS ceiling under sustained bulk pressure", async () => {
+    const pair = await muxPair({
+      receiveWindowBytes: 4 * 1_024,
+      maximumChunkBytes: 1_024,
+      maximumPendingWriteBytes: 64 * 1_024,
+    });
+    const incoming: DirectRuntimeStream[] = [];
+    pair.serverMux.on("stream", (stream) => incoming.push(stream));
+    const bulk = await Promise.all(
+      ["bulk-a", "bulk-b", "bulk-c"].map((id) => pair.clientMux.openStream(id)),
+    );
+    const control = await pair.clientMux.openStream("health-control");
+    await waitUntil(() => incoming.length === 4);
+    for (const stream of incoming.filter((candidate) => candidate.id.startsWith("bulk-"))) {
+      stream.setDataHandler(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      });
+    }
+    let observedControls = 0;
+    incoming.find((stream) => stream.id === "health-control")!.setDataHandler(() => {
+      observedControls += 1;
+    });
+
+    const rssBefore = process.memoryUsage.rss();
+    const bulkRuns = bulk.map(async (stream, streamIndex) => {
+      for (let batch = 0; batch < 8; batch += 1) {
+        await Promise.all(Array.from({ length: 64 }, (_, chunkIndex) =>
+          stream.write(Buffer.alloc(1_024, streamIndex + chunkIndex + batch))
+        ));
+      }
+    });
+    const controlLatenciesMs: number[] = [];
+    for (let index = 0; index < 24; index += 1) {
+      const started = performance.now();
+      await control.write(Buffer.from(`health-${index}`));
+      await waitUntil(() => observedControls === index + 1);
+      controlLatenciesMs.push(performance.now() - started);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    await Promise.all(bulkRuns);
+    const rssDelta = Math.max(0, process.memoryUsage.rss() - rssBefore);
+    const sortedLatency = [...controlLatenciesMs].sort((left, right) => left - right);
+    const p95 = sortedLatency[Math.ceil(sortedLatency.length * 0.95) - 1]!;
+    expect(p95).toBeLessThan(100);
+    expect(rssDelta).toBeLessThan(64 * 1_024 * 1_024);
+    for (const stream of bulk) expect(stream.snapshot().pendingWriteBytes).toBe(0);
+    await pair.close();
+  });
 });
 
 async function muxPair(
-  options: { receiveWindowBytes?: number; maximumChunkBytes?: number } = {},
+  options: {
+    receiveWindowBytes?: number;
+    maximumChunkBytes?: number;
+    maximumPendingWriteBytes?: number;
+  } = {},
 ) {
   const grant = createDirectSessionGrant({
     connectionId: `mux-${Math.random().toString(16).slice(2)}`,

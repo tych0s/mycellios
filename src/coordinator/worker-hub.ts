@@ -35,15 +35,24 @@ import {
   DEPLOYMENT_CANARY_CHALLENGE_WARMUPS,
   EVIDENCE_CHALLENGE_SCHEMA,
   EVIDENCE_CHALLENGE_TTL_MS,
+  engineRuntimeChallengeSchema,
   type DeploymentCanaryChallenge,
+  type EngineRuntimeChallenge,
   type RuntimePerformanceChallenge,
 } from "../contracts/evidence-challenge.js";
-import { sha256Text } from "../core/json.js";
+import {
+  ENGINE_RUNTIME_PROFILE_DEFAULT_MAXIMUM_AGE_MS,
+  engineRuntimeMeasurementSchema,
+  sealEngineRuntimeProfile,
+} from "../contracts/engine-runtime-profile.js";
+import { canonicalEvidenceJson, sha256Text } from "../core/json.js";
 import {
   createCoordinatorRuntimePerformanceEvidence,
   runtimePerformanceProfileSchema,
 } from "../performance/runtime-profile.js";
 import {
+  DEFAULT_RUNTIME_LINK_SAMPLE_AGE_MS,
+  DEFAULT_RUNTIME_LINK_SAMPLES_PER_LINK,
   RuntimeLinkObservationStore,
   type RuntimeLinkObservation,
 } from "./runtime-link-observations.js";
@@ -54,10 +63,29 @@ import {
 import {
   mergeCurrentSessionEvidence,
 } from "./evidence-authority.js";
+import { publishCoordinatorEngineRuntimeProfile } from "./engine-profile-authority.js";
+import {
+  engineRuntimeProfileNeedsChallenge,
+  engineRuntimeActivationPlansReady,
+  type CertifiedEngineRuntimeChallengePlan,
+} from "./engine-runtime-profile-scheduler.js";
+import type { EngineRuntimeActivationPlan } from "../contracts/engine-runtime-activation.js";
+import type { ActivationCheckpointCompatibility } from "../contracts/activation-checkpoint.js";
+import { ActivationCheckpointTransferAuthority } from "./activation-checkpoint-transfer.js";
+import {
+  activationCheckpointChunks,
+  activationCheckpointRestoreBeginSchema,
+} from "../contracts/activation-checkpoint-transfer.js";
+import {
+  runtimeLinkFailureEvidenceSchema,
+  type RuntimeLinkFailureEvidence,
+} from "../contracts/runtime-link-failure.js";
 
 interface HubEvents {
   envelope: [WorkerEnvelope];
   disconnect: [string];
+  activationCheckpointRestored: [string, string, string];
+  activationCheckpointRestoreFailed: [string, string, string, string];
 }
 
 export interface AuthorizedWorkerSession {
@@ -90,6 +118,15 @@ interface PendingCanarySample {
   outputTokens: number | null;
 }
 
+interface PendingActivationCheckpointRestoreCompletion {
+  workerId: string;
+  workerSessionId: string;
+  checkpointId: string;
+  timeout: NodeJS.Timeout;
+  resolve: (value: { transferId: string; checkpointId: string }) => void;
+  reject: (error: Error) => void;
+}
+
 interface PendingDeploymentCanary {
   kind: "deployment-canary";
   challenge: DeploymentCanaryChallenge;
@@ -103,7 +140,22 @@ interface PendingRuntimePerformance {
   timeout: NodeJS.Timeout;
 }
 
-type PendingEvidenceChallenge = PendingDeploymentCanary | PendingRuntimePerformance;
+interface PendingEngineRuntime {
+  kind: "engine-runtime";
+  challenge: EngineRuntimeChallenge;
+  timeout: NodeJS.Timeout;
+}
+
+type PendingEvidenceChallenge =
+  | PendingDeploymentCanary
+  | PendingRuntimePerformance
+  | PendingEngineRuntime;
+
+export type EngineRuntimeChallengeRequest = Omit<
+  EngineRuntimeChallenge,
+  "schema" | "kind" | "challengeId" | "nonce" | "sessionId" | "workerId"
+  | "issuedAt" | "expiresAt" | "nodeId"
+>;
 
 interface RuntimeStreamSession {
   streamId: string;
@@ -208,18 +260,33 @@ export class WorkerHub extends EventEmitter<HubEvents> {
   private pendingConnections = 0;
   private readonly runtimeStreams = new Map<string, RuntimeStreamSession>();
   private readonly completedRuntimeTransports: RuntimeTransportSnapshot[] = [];
+  private readonly runtimeLinkFailures: RuntimeLinkFailureEvidence[] = [];
   private readonly runtimeProxyServers = new Set<Server>();
   private readonly runtimeLinkProbes = new Map<string, RuntimeLinkProbeSession>();
-  private readonly runtimeLinkObservationsStore = new RuntimeLinkObservationStore();
+  private readonly runtimeLinkObservationsStore: RuntimeLinkObservationStore;
   private readonly runtimeLinkLastStartedAt = new Map<string, number>();
   private runtimeLinkProbeTimer: NodeJS.Timeout | null = null;
   private runtimeLinkProbeCursor = 0;
   private readonly evidenceChallenges = new Map<string, PendingEvidenceChallenge>();
   private readonly evidenceRetryAfter = new Map<string, number>();
+  private readonly activationCheckpointTransfers: ActivationCheckpointTransferAuthority | null;
+  private readonly pendingActivationCheckpointRestoreCompletions = new Map<
+    string,
+    PendingActivationCheckpointRestoreCompletion
+  >();
   private sessionIsCurrent: ((session: AuthorizedWorkerSession) => boolean) | undefined;
 
-  constructor(private readonly store: MeshStore) {
+  constructor(
+    private readonly store: MeshStore,
+    options: { activationCheckpointTransfers?: ActivationCheckpointTransferAuthority } = {},
+  ) {
     super();
+    this.activationCheckpointTransfers = options.activationCheckpointTransfers ?? null;
+    this.runtimeLinkObservationsStore = new RuntimeLinkObservationStore(
+      DEFAULT_RUNTIME_LINK_SAMPLE_AGE_MS,
+      DEFAULT_RUNTIME_LINK_SAMPLES_PER_LINK,
+      this.store.listRuntimeLinkSamples?.() ?? [],
+    );
   }
 
   attach(
@@ -302,6 +369,258 @@ export class WorkerHub extends EventEmitter<HubEvents> {
 
   runtimeLinkObservations(now = Date.now()): RuntimeLinkObservation[] {
     return this.runtimeLinkObservationsStore.observations(now);
+  }
+
+  runtimeLinkFailureEvidence(): RuntimeLinkFailureEvidence[] {
+    return this.runtimeLinkFailures.map((evidence) => ({ ...evidence }));
+  }
+
+  requestActivationCheckpoint(
+    workerId: string,
+    stageRequestId: number,
+    expected: ActivationCheckpointCompatibility,
+    maximumBytes: number,
+    expiresAt: number,
+    now = Date.now(),
+  ): string {
+    const state = this.connections.get(workerId);
+    if (!state?.ready || !this.activationCheckpointTransfers) {
+      throw new Error("activation_checkpoint_transfer_worker_is_unavailable");
+    }
+    const transferId = this.activationCheckpointTransfers.expect({
+      workerId,
+      workerSessionId: state.sessionId,
+      expected,
+      maximumBytes,
+      expiresAt,
+    }, now);
+    if (!this.send(workerId, "runtime.checkpoint.request", {
+      transferId,
+      stageRequestId,
+      expected,
+      maximumBytes,
+      expiresAt,
+    })) {
+      this.activationCheckpointTransfers.abort(transferId);
+      throw new Error("activation_checkpoint_transfer_request_delivery_failed");
+    }
+    return transferId;
+  }
+
+  async restoreActivationCheckpoint(
+    workerId: string,
+    targetLaunchRequestId: string,
+    targetStageRequestId: number,
+    checkpointId: string,
+    expected: ActivationCheckpointCompatibility,
+    maximumBytes: number,
+    expiresAt: number,
+    now = Date.now(),
+  ): Promise<{ transferId: string; checkpointId: string }> {
+    const state = this.connections.get(workerId);
+    if (!state?.ready || !this.activationCheckpointTransfers) {
+      throw new Error("activation_checkpoint_restore_worker_is_unavailable");
+    }
+    const prepared = this.activationCheckpointTransfers.prepareRestore({
+      workerId,
+      workerSessionId: state.sessionId,
+      checkpointId,
+      expected,
+      expiresAt,
+    }, now);
+    if (prepared.payload.byteLength > maximumBytes) {
+      prepared.payload.fill(0);
+      this.activationCheckpointTransfers.abortRestore(prepared.transferId);
+      throw new Error("activation_checkpoint_restore_limit_exceeded");
+    }
+    const chunks = activationCheckpointChunks(
+      prepared.transferId, prepared.checkpoint, prepared.payload,
+    );
+    const completion = new Promise<{ transferId: string; checkpointId: string }>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.activationCheckpointTransfers?.abortRestore(prepared.transferId);
+        this.rejectActivationCheckpointRestoreCompletion(
+          prepared.transferId,
+          new Error("activation_checkpoint_restore_acknowledgement_expired"),
+        );
+      }, Math.max(1, expiresAt - Date.now()));
+      timeout.unref();
+      this.pendingActivationCheckpointRestoreCompletions.set(prepared.transferId, {
+        workerId,
+        workerSessionId: state.sessionId,
+        checkpointId: prepared.checkpoint.checkpointId,
+        timeout,
+        resolve,
+        reject,
+      });
+    });
+    void completion.catch(() => undefined);
+    try {
+      const begin = activationCheckpointRestoreBeginSchema.parse({
+        transferId: prepared.transferId,
+        targetLaunchRequestId,
+        targetStageRequestId,
+        expected,
+        checkpoint: prepared.checkpoint,
+        chunkCount: chunks.length,
+        maximumBytes,
+        expiresAt,
+      });
+      if (!this.send(workerId, "runtime.checkpoint.restore.begin", begin)) {
+        throw new Error("activation_checkpoint_restore_delivery_failed");
+      }
+      for (const chunk of chunks) {
+        await this.waitForActivationCheckpointBackpressure(state, expiresAt);
+        if (!this.send(workerId, "runtime.checkpoint.restore.chunk", chunk)) {
+          throw new Error("activation_checkpoint_restore_delivery_failed");
+        }
+      }
+      if (!this.send(workerId, "runtime.checkpoint.restore.commit", {
+        transferId: prepared.transferId,
+        checkpointId: prepared.checkpoint.checkpointId,
+      })) throw new Error("activation_checkpoint_restore_delivery_failed");
+      return await completion;
+    } catch (error) {
+      this.activationCheckpointTransfers.abortRestore(prepared.transferId);
+      this.rejectActivationCheckpointRestoreCompletion(
+        prepared.transferId,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+      throw error;
+    } finally {
+      prepared.payload.fill(0);
+    }
+  }
+
+  private resolveActivationCheckpointRestoreCompletion(
+    transferId: string,
+    checkpointId: string,
+  ): void {
+    const pending = this.pendingActivationCheckpointRestoreCompletions.get(transferId);
+    if (!pending || pending.checkpointId !== checkpointId) {
+      throw new Error("activation_checkpoint_restore_completion_is_unexpected");
+    }
+    this.pendingActivationCheckpointRestoreCompletions.delete(transferId);
+    clearTimeout(pending.timeout);
+    pending.resolve({ transferId, checkpointId });
+  }
+
+  private rejectActivationCheckpointRestoreCompletion(transferId: string, error: Error): void {
+    const pending = this.pendingActivationCheckpointRestoreCompletions.get(transferId);
+    if (!pending) return;
+    this.pendingActivationCheckpointRestoreCompletions.delete(transferId);
+    clearTimeout(pending.timeout);
+    pending.reject(error);
+  }
+
+  private rejectActivationCheckpointRestoreSession(
+    workerId: string,
+    workerSessionId: string,
+    reason: string,
+  ): void {
+    for (const [transferId, pending] of this.pendingActivationCheckpointRestoreCompletions) {
+      if (pending.workerId === workerId && pending.workerSessionId === workerSessionId) {
+        this.rejectActivationCheckpointRestoreCompletion(transferId, new Error(reason));
+      }
+    }
+  }
+
+  startEngineRuntimeProfileChallenge(
+    workerId: string,
+    request: EngineRuntimeChallengeRequest,
+    now = Date.now(),
+  ): string | null {
+    const state = this.connections.get(workerId);
+    const worker = this.store.getWorker(workerId);
+    const executor = worker?.capabilities.distributedExecutor;
+    if (!state?.ready || !worker || !executor || this.connections.get(workerId) !== state) {
+      return null;
+    }
+    const key = evidenceChallengeKey(workerId, "engine-runtime", executor.nodeId);
+    if (!this.challengeMayStart(key, now)) return null;
+    const challenge = engineRuntimeChallengeSchema.parse({
+      ...this.challengeBinding(state, now),
+      kind: "engine-runtime" as const,
+      nodeId: executor.nodeId,
+      ...request,
+    });
+    const pending: PendingEngineRuntime = {
+      kind: "engine-runtime",
+      challenge,
+      timeout: this.evidenceChallengeTimeout(challenge),
+    };
+    this.evidenceChallenges.set(challenge.challengeId, pending);
+    if (!this.sendSocket(state.socket, "evidence.challenge", challenge)) {
+      this.finishEvidenceChallenge(pending, false);
+      return null;
+    }
+    return challenge.challengeId;
+  }
+
+  /**
+   * Reconciles coordinator-certified activation plans with current physical
+   * profiles. Invalid or disconnected targets fail closed in the existing
+   * challenge path; retry cooldowns also prevent duplicate in-flight probes.
+   */
+  reconcileEngineRuntimeProfileChallenges(
+    plans: readonly CertifiedEngineRuntimeChallengePlan[],
+    now = Date.now(),
+  ): string[] {
+    const started: string[] = [];
+    const seenWorkers = new Set<string>();
+    for (const plan of plans) {
+      if (seenWorkers.has(plan.workerId)) continue;
+      seenWorkers.add(plan.workerId);
+      const profiles = this.store.getWorker(plan.workerId)
+        ?.capabilities.distributedExecutor?.engineProfiles ?? [];
+      if (!engineRuntimeProfileNeedsChallenge(profiles, plan.request, now)) continue;
+      const challengeId = this.startEngineRuntimeProfileChallenge(
+        plan.workerId,
+        plan.request,
+        now,
+      );
+      if (challengeId) started.push(challengeId);
+    }
+    return started;
+  }
+
+  reconcileStoredEngineRuntimeProfileChallenges(now = Date.now()): string[] {
+    return this.reconcileEngineRuntimeProfileChallenges(
+      this.store.listEngineRuntimeActivationPlans().map((plan) => ({
+        workerId: plan.workerId,
+        request: plan.request,
+      })),
+      now,
+    );
+  }
+
+  /**
+   * Keeps a canaried bootstrap route private until every assigned stage has an
+   * exact, coordinator-sealed runtime profile. A timeout fails activation and
+   * lets the caller tear the unpublished route down.
+   */
+  async waitForEngineRuntimeProfiles(
+    plans: readonly EngineRuntimeActivationPlan[],
+    timeoutMs = EVIDENCE_CHALLENGE_TTL_MS,
+    pollIntervalMs = 250,
+    onPoll?: () => void | Promise<void>,
+  ): Promise<void> {
+    if (
+      plans.length === 0
+      || !Number.isFinite(timeoutMs) || timeoutMs <= 0
+      || !Number.isFinite(pollIntervalMs) || pollIntervalMs <= 0
+    ) throw new Error("engine_runtime_profile_gate_policy_is_invalid");
+    const deadline = Date.now() + timeoutMs;
+    while (!engineRuntimeActivationPlansReady(plans, this.store.listWorkers())) {
+      await onPoll?.();
+      this.reconcileEngineRuntimeProfileChallenges(plans);
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error("engine_runtime_profile_gate_timed_out");
+      await new Promise<void>((resolve) => setTimeout(
+        resolve,
+        Math.min(pollIntervalMs, remaining),
+      ));
+    }
   }
 
   /**
@@ -453,6 +772,12 @@ export class WorkerHub extends EventEmitter<HubEvents> {
     for (const pending of this.evidenceChallenges.values()) clearTimeout(pending.timeout);
     this.evidenceChallenges.clear();
     this.evidenceRetryAfter.clear();
+    for (const transferId of this.pendingActivationCheckpointRestoreCompletions.keys()) {
+      this.rejectActivationCheckpointRestoreCompletion(
+        transferId,
+        new Error("activation_checkpoint_restore_coordinator_closed"),
+      );
+    }
     for (const server of this.runtimeProxyServers) server.close();
     this.runtimeProxyServers.clear();
   }
@@ -598,6 +923,67 @@ export class WorkerHub extends EventEmitter<HubEvents> {
         this.handleRuntimeDirectEnvelope(envelope);
         return;
       }
+      if (envelope.type.startsWith("runtime.checkpoint.")) {
+        if (!this.activationCheckpointTransfers) {
+          this.closeInvalid(state, "activation checkpoint transfer is not enabled", 4403);
+          return;
+        }
+        if (envelope.type === "runtime.checkpoint.begin") {
+          this.activationCheckpointTransfers.begin(
+            envelope.workerId, state.sessionId, envelope.payload,
+          );
+        } else if (envelope.type === "runtime.checkpoint.chunk") {
+          this.activationCheckpointTransfers.chunk(
+            envelope.workerId, state.sessionId, envelope.payload,
+          );
+        } else if (envelope.type === "runtime.checkpoint.commit") {
+          const checkpoint = this.activationCheckpointTransfers.commit(
+            envelope.workerId, state.sessionId, envelope.payload,
+          );
+          this.send(envelope.workerId, "runtime.checkpoint.committed", {
+            transferId: envelope.payload.transferId,
+            checkpointId: checkpoint.checkpointId,
+          });
+        } else if (envelope.type === "runtime.checkpoint.failed") {
+          this.activationCheckpointTransfers.abort(envelope.payload.transferId);
+        } else if (envelope.type === "runtime.checkpoint.restored") {
+          this.activationCheckpointTransfers.completeRestore(
+            envelope.workerId,
+            state.sessionId,
+            envelope.payload.transferId,
+            envelope.payload.checkpointId,
+          );
+          this.emit(
+            "activationCheckpointRestored",
+            envelope.workerId,
+            envelope.payload.transferId,
+            envelope.payload.checkpointId,
+          );
+          this.resolveActivationCheckpointRestoreCompletion(
+            envelope.payload.transferId,
+            envelope.payload.checkpointId,
+          );
+        } else if (envelope.type === "runtime.checkpoint.restore.failed") {
+          this.activationCheckpointTransfers.failRestore(
+            envelope.workerId,
+            state.sessionId,
+            envelope.payload.transferId,
+            envelope.payload.checkpointId,
+          );
+          this.emit(
+            "activationCheckpointRestoreFailed",
+            envelope.workerId,
+            envelope.payload.transferId,
+            envelope.payload.checkpointId,
+            envelope.payload.code,
+          );
+          this.rejectActivationCheckpointRestoreCompletion(
+            envelope.payload.transferId,
+            new Error(envelope.payload.code),
+          );
+        }
+        return;
+      }
       if (envelope.type.startsWith("runtime.link.probe.")) {
         if (this.store.getWorker(envelope.workerId)?.capabilities.distributedExecutor?.protocol
           !== "gdlp-worker-tunnel/2") {
@@ -649,6 +1035,12 @@ export class WorkerHub extends EventEmitter<HubEvents> {
     }
     if (state.workerId && this.connections.get(state.workerId) === state) {
       const disconnectedWorkerId = state.workerId;
+      this.activationCheckpointTransfers?.abortSession(disconnectedWorkerId, state.sessionId);
+      this.rejectActivationCheckpointRestoreSession(
+        disconnectedWorkerId,
+        state.sessionId,
+        "activation_checkpoint_restore_worker_disconnected",
+      );
       this.clearEvidenceChallengesForSession(disconnectedWorkerId, state.sessionId);
       this.connections.delete(state.workerId);
       this.store.setWorkerStatus(state.workerId, "offline");
@@ -663,7 +1055,10 @@ export class WorkerHub extends EventEmitter<HubEvents> {
             continue;
           }
           if (stream.recovery && stream.transportMode === "relay") {
-            this.suspendRuntimeStream(stream);
+            this.suspendRuntimeStream(
+              stream,
+              `distributed_worker_disconnected:${disconnectedWorkerId}`,
+            );
           } else {
             this.terminateRuntimeStream(
               stream,
@@ -829,7 +1224,10 @@ export class WorkerHub extends EventEmitter<HubEvents> {
   }
 
   private evidenceChallengeTimeout(
-    challenge: DeploymentCanaryChallenge | RuntimePerformanceChallenge,
+    challenge:
+      | DeploymentCanaryChallenge
+      | RuntimePerformanceChallenge
+      | EngineRuntimeChallenge,
   ): NodeJS.Timeout {
     const timeout = setTimeout(() => {
       const pending = this.evidenceChallenges.get(challenge.challengeId);
@@ -867,6 +1265,19 @@ export class WorkerHub extends EventEmitter<HubEvents> {
         return;
       }
       this.completeRuntimePerformanceChallenge(state, pending, payload.profile, now);
+      return;
+    }
+    if (pending.kind === "engine-runtime") {
+      if (envelope.type !== "evidence.engine-runtime.complete") {
+        this.closeInvalid(state, "evidence response kind mismatch", 4403);
+        return;
+      }
+      this.completeEngineRuntimeChallenge(
+        state,
+        pending,
+        payload.measurement,
+        now,
+      );
       return;
     }
     this.handleDeploymentCanaryEnvelope(state, pending, envelope.type, payload, now);
@@ -1090,6 +1501,121 @@ export class WorkerHub extends EventEmitter<HubEvents> {
     }
   }
 
+  private completeEngineRuntimeChallenge(
+    state: ConnectionState,
+    pending: PendingEngineRuntime,
+    input: unknown,
+    now: number,
+  ): void {
+    try {
+      const measurement = engineRuntimeMeasurementSchema.parse(input);
+      const challenge = pending.challenge;
+      const worker = this.store.getWorker(challenge.workerId);
+      const executor = worker?.capabilities.distributedExecutor;
+      const performance = executor?.performanceEvidence;
+      const physical = executor?.physicalIdentity;
+      const build = worker?.capabilities.buildIdentity;
+      const activationPlan = this.store.listEngineRuntimeActivationPlans().find(
+        (candidate) => candidate.workerId === challenge.workerId
+          && candidate.modelId === challenge.modelId
+          && canonicalEvidenceJson(candidate.request) === canonicalEvidenceJson({
+            probeKind: challenge.probeKind,
+            descriptorDigest: challenge.descriptorDigest,
+            certificationId: challenge.certificationId,
+            artifactManifestDigest: challenge.artifactManifestDigest,
+            modelId: challenge.modelId,
+            modelRevision: challenge.modelRevision,
+            backend: challenge.backend,
+            runtimeAbi: challenge.runtimeAbi,
+            quantization: challenge.quantization,
+            contextTokens: challenge.contextTokens,
+            expectedLayerStart: challenge.expectedLayerStart,
+            expectedLayerEnd: challenge.expectedLayerEnd,
+            expectedKvBytesPerToken: challenge.expectedKvBytesPerToken,
+            expectedLayerWeightBytes: challenge.expectedLayerWeightBytes,
+            referenceDecodeMsPerToken: challenge.referenceDecodeMsPerToken,
+            referencePrefillMsPerToken: challenge.referencePrefillMsPerToken,
+            hiddenSize: challenge.hiddenSize,
+            attentionHeads: challenge.attentionHeads,
+            kvHeads: challenge.kvHeads,
+            headDim: challenge.headDim,
+            requiredRoles: challenge.requiredRoles,
+            minimumSamples: challenge.minimumSamples,
+          }),
+      );
+      if (
+        !worker
+        || !executor
+        || !performance
+        || !physical
+        || !build
+        || !activationPlan
+        || executor.nodeId !== challenge.nodeId
+        || performance.sessionId !== challenge.sessionId
+        || this.connections.get(worker.id) !== state
+        || measurement.samples < challenge.minimumSamples
+        || measurement.capacity.contextTokens < challenge.contextTokens
+        || measurement.capacity.maxKvTokens < challenge.contextTokens
+        || measurement.capacity.kvBytesPerToken !== challenge.expectedKvBytesPerToken
+        || measurement.capacity.maxLayerCount
+          < challenge.expectedLayerEnd - challenge.expectedLayerStart
+        || !scaleMatches(
+          measurement.costs.decodeScale,
+          measurement.costs.decodeMsPerTokenP50 / challenge.referenceDecodeMsPerToken,
+        )
+        || !scaleMatches(
+          measurement.costs.prefillScale,
+          measurement.costs.prefillMsPerTokenP50 / challenge.referencePrefillMsPerToken,
+        )
+        || challenge.requiredRoles.some(
+          (role) => !measurement.features.roles.includes(role),
+        )
+        || Date.parse(measurement.measuredAt) < Date.parse(challenge.issuedAt) - 5_000
+        || Date.parse(measurement.measuredAt) > now + 5_000
+      ) {
+        throw new Error("engine_runtime_measurement_does_not_match_challenge");
+      }
+      const measuredAtMs = Date.parse(measurement.measuredAt);
+      const profile = sealEngineRuntimeProfile({
+        descriptorDigest: challenge.descriptorDigest,
+        certificationId: challenge.certificationId,
+        artifactManifestDigest: challenge.artifactManifestDigest,
+        sourceId: build.sourceId,
+        hardwareFingerprintSha256: physical.hostFingerprintSha256,
+        workerId: challenge.workerId,
+        sessionId: challenge.sessionId,
+        nodeId: challenge.nodeId,
+        modelId: challenge.modelId,
+        modelRevision: challenge.modelRevision,
+        backend: challenge.backend,
+        runtimeAbi: challenge.runtimeAbi,
+        quantization: challenge.quantization,
+        measuredAt: measurement.measuredAt,
+        expiresAt: new Date(
+          measuredAtMs + ENGINE_RUNTIME_PROFILE_DEFAULT_MAXIMUM_AGE_MS,
+        ).toISOString(),
+        samples: measurement.samples,
+        confidenceHalfWidthPct: measurement.confidenceHalfWidthPct,
+        capacity: measurement.capacity,
+        costs: measurement.costs,
+        features: measurement.features,
+        evidence: {
+          deploymentCanaryEvidenceId: activationPlan.evidence.canaryEvidenceId,
+          runtimePerformanceEvidenceId: performance.evidenceId,
+        },
+      });
+      publishCoordinatorEngineRuntimeProfile(this.store, worker.id, profile);
+      this.finishEvidenceChallenge(pending, true);
+    } catch (error) {
+      this.logger?.warn({
+        workerId: state.workerId,
+        challengeId: pending.challenge.challengeId,
+        error: error instanceof Error ? error.message : String(error),
+      }, "engine runtime evidence rejected");
+      this.finishEvidenceChallenge(pending, false);
+    }
+  }
+
   private finishEvidenceChallenge(
     pending: PendingEvidenceChallenge,
     succeeded: boolean,
@@ -1124,6 +1650,21 @@ export class WorkerHub extends EventEmitter<HubEvents> {
     const envelope: ServerEnvelope = { v: 1, type, payload };
     socket.send(JSON.stringify(envelope));
     return true;
+  }
+
+  private async waitForActivationCheckpointBackpressure(
+    state: ConnectionState,
+    expiresAt: number,
+  ): Promise<void> {
+    while (state.socket.bufferedAmount > MAX_WEBSOCKET_BUFFERED_BYTES / 2) {
+      if (
+        Date.now() >= expiresAt
+        || !state.ready
+        || this.connections.get(state.workerId ?? "") !== state
+        || state.socket.readyState !== state.socket.OPEN
+      ) throw new Error("activation_checkpoint_restore_delivery_expired");
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
   }
 
   private startRuntimeLinkProbe(
@@ -1221,10 +1762,13 @@ export class WorkerHub extends EventEmitter<HubEvents> {
   ): void {
     if (!this.runtimeLinkProbes.delete(probe.probeId)) return;
     clearTimeout(probe.timeout);
+    const measuredAt = Date.now();
     if (rttMs === null || goodputMbps === null) {
       this.runtimeLinkObservationsStore.recordFailure(
         probe.sourceNodeId,
         probe.destinationNodeId,
+        measuredAt,
+        "relay",
       );
     } else {
       this.runtimeLinkObservationsStore.recordSuccess(
@@ -1232,8 +1776,18 @@ export class WorkerHub extends EventEmitter<HubEvents> {
         probe.destinationNodeId,
         rttMs,
         goodputMbps,
+        measuredAt,
+        "relay",
       );
     }
+    this.store.saveRuntimeLinkSample?.({
+      fromNodeId: probe.sourceNodeId,
+      toNodeId: probe.destinationNodeId,
+      measuredAt,
+      rttMs,
+      goodputMbps,
+      transportMode: "relay",
+    });
   }
 
   private handleRuntimeStreamEnvelope(envelope: WorkerEnvelope): void {
@@ -1609,6 +2163,9 @@ export class WorkerHub extends EventEmitter<HubEvents> {
         session.bytesDestinationToSource = Math.max(session.bytesDestinationToSource, bytesTx);
         session.bytesSourceToDestination = Math.max(session.bytesSourceToDestination, bytesRx);
       }
+      if (typeof payload.reason === "string") {
+        this.recordRuntimeLinkFailure(session, "direct", payload.reason);
+      }
       this.terminateRuntimeStream(session);
     }
   }
@@ -1641,6 +2198,23 @@ export class WorkerHub extends EventEmitter<HubEvents> {
       return;
     }
     clearTimeout(direct.timeout);
+    if (session.sourceNodeId) {
+      const measuredAt = Date.now();
+      this.runtimeLinkObservationsStore.recordFailure(
+        session.sourceNodeId,
+        session.destinationNodeId,
+        measuredAt,
+        "direct",
+      );
+      this.store.saveRuntimeLinkSample?.({
+        fromNodeId: session.sourceNodeId,
+        toNodeId: session.destinationNodeId,
+        measuredAt,
+        rttMs: null,
+        goodputMbps: null,
+        transportMode: "direct",
+      });
+    }
     const cancel = {
       streamId: session.streamId,
       connectionId: direct.grant.connectionId,
@@ -1690,7 +2264,7 @@ export class WorkerHub extends EventEmitter<HubEvents> {
       ? session.destinationWorkerId
       : session.sourceWorkerId;
     if (!targetWorkerId || !this.send(targetWorkerId, "runtime.stream.data", payload)) {
-      this.suspendRuntimeStream(session);
+      this.suspendRuntimeStream(session, "runtime_stream_relay_delivery_failed");
     }
   }
 
@@ -1721,7 +2295,7 @@ export class WorkerHub extends EventEmitter<HubEvents> {
       ? session.destinationWorkerId
       : session.sourceWorkerId;
     if (!targetWorkerId || !this.send(targetWorkerId, "runtime.stream.ack", payload)) {
-      this.suspendRuntimeStream(session);
+      this.suspendRuntimeStream(session, "runtime_stream_relay_ack_delivery_failed");
     }
   }
 
@@ -1821,9 +2395,13 @@ export class WorkerHub extends EventEmitter<HubEvents> {
     }
   }
 
-  private suspendRuntimeStream(session: RuntimeStreamSession): void {
+  private suspendRuntimeStream(
+    session: RuntimeStreamSession,
+    reason = "runtime_stream_relay_unavailable",
+  ): void {
     const recovery = session.recovery;
     if (!recovery || recovery.suspended) return;
+    this.recordRuntimeLinkFailure(session, "relay", reason);
     recovery.suspended = true;
     recovery.reports.clear();
     const deadlineAt = Date.now() + RUNTIME_STREAM_RECOVERY_GRACE_MS;
@@ -1845,6 +2423,35 @@ export class WorkerHub extends EventEmitter<HubEvents> {
     if (this.isConnected(session.destinationWorkerId)) {
       this.send(session.destinationWorkerId, "runtime.stream.suspend", suspension);
     }
+  }
+
+  private recordRuntimeLinkFailure(
+    session: RuntimeStreamSession,
+    role: "direct" | "relay",
+    reason: string,
+  ): void {
+    const recovery = session.recovery;
+    const evidence = runtimeLinkFailureEvidenceSchema.parse({
+      schema: "mycellios-runtime-link-failure/1",
+      streamId: session.streamId,
+      sourceNodeId: session.sourceNodeId,
+      destinationNodeId: session.destinationNodeId,
+      generation: recovery?.generation ?? 0,
+      role,
+      failureClass: role === "direct" ? "direct-link-lost" : "relay-link-lost",
+      transportMode: role,
+      checkpointKind: role === "relay" && recovery ? "stream-offset" : "none",
+      sourceOffset: role === "relay" && recovery
+        ? recovery.sourceForwardOffset
+        : session.bytesSourceToDestination,
+      destinationOffset: role === "relay" && recovery
+        ? recovery.destinationForwardOffset
+        : session.bytesDestinationToSource,
+      observedAt: Date.now(),
+      reason: reason.slice(0, 256),
+    });
+    this.runtimeLinkFailures.unshift(evidence);
+    if (this.runtimeLinkFailures.length > 512) this.runtimeLinkFailures.length = 512;
   }
 
   private runtimeStreamIdentityMatches(
@@ -1950,6 +2557,7 @@ export class WorkerHub extends EventEmitter<HubEvents> {
       this.send(session.destinationWorkerId, "runtime.direct.cancel", cancel);
     }
     session.endedAt = Date.now();
+    this.recordCompletedDirectTransport(session);
     this.completedRuntimeTransports.unshift(this.runtimeTransportSnapshotForSession(session));
     if (this.completedRuntimeTransports.length > 512) {
       this.completedRuntimeTransports.length = 512;
@@ -1975,6 +2583,40 @@ export class WorkerHub extends EventEmitter<HubEvents> {
       });
     }
     session.localSocket?.destroy();
+  }
+
+  private recordCompletedDirectTransport(session: RuntimeStreamSession): void {
+    if (
+      session.transportMode !== "direct"
+      || !session.sourceNodeId
+      || !session.direct?.connectRttMs
+      || session.connectedAt === null
+      || session.endedAt === null
+    ) return;
+    const durationMs = Math.max(1, session.endedAt - session.connectedAt);
+    for (const [fromNodeId, toNodeId, bytes] of [
+      [session.sourceNodeId, session.destinationNodeId, session.bytesSourceToDestination],
+      [session.destinationNodeId, session.sourceNodeId, session.bytesDestinationToSource],
+    ] as const) {
+      if (bytes <= 0) continue;
+      const goodputMbps = bytes * 8 / durationMs / 1_000;
+      this.runtimeLinkObservationsStore.recordSuccess(
+        fromNodeId,
+        toNodeId,
+        session.direct.connectRttMs,
+        goodputMbps,
+        session.endedAt,
+        "direct",
+      );
+      this.store.saveRuntimeLinkSample?.({
+        fromNodeId,
+        toNodeId,
+        measuredAt: session.endedAt,
+        rttMs: session.direct.connectRttMs,
+        goodputMbps,
+        transportMode: "direct",
+      });
+    }
   }
 
   private runtimeTransportSnapshotForSession(
@@ -2007,6 +2649,12 @@ function messageType(input: unknown): string | null {
   if (!input || typeof input !== "object" || Array.isArray(input)) return null;
   const type = (input as Record<string, unknown>).type;
   return typeof type === "string" ? type : null;
+}
+
+function scaleMatches(observed: number, rawExpected: number): boolean {
+  const expected = Math.max(0.01, Math.min(100, rawExpected));
+  return Number.isFinite(observed)
+    && Math.abs(observed - expected) <= Math.max(1e-9, expected * 1e-6);
 }
 
 function runtimeLinkKey(fromNodeId: string, toNodeId: string): string {

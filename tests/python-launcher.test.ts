@@ -1,7 +1,11 @@
-import { createHash } from "node:crypto";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   compilePythonLaunchDescription,
+  bindPythonLaunchDraftStrategyAuthority,
+  assertPythonLaunchDraftStrategyCurrent,
+  pythonLaunchRequiresDraftStrategyAuthority,
+  bindPythonLaunchDeploymentGeneration,
   pythonPrefillFrameByteReservation,
   validatePythonLaunchDescription,
   type PythonLaunchCompilerOptions,
@@ -12,6 +16,13 @@ import {
   type PythonRemoteStageLaunch,
   type PythonRootEngineLaunch,
 } from "../src/distribution/python-launcher.js";
+import {
+  DRAFT_STRATEGY_CERTIFICATION_SCHEMA,
+  DRAFT_STRATEGY_DESCRIPTOR_SCHEMA,
+  draftStrategyDescriptorIdentity,
+  signDraftStrategyCertification,
+} from "../src/contracts/engine-family.js";
+import { NativeDraftStrategyRegistry } from "../src/distribution/draft-strategy-registry.js";
 import {
   buildRuntimePipelineManifest,
   certifyRuntimeTensorParallelCollectives,
@@ -696,8 +707,44 @@ describe("GDLP/2 Python launch compiler", () => {
     expect(second).toEqual(first);
     expect(JSON.stringify(second)).toBe(JSON.stringify(first));
     expect(first.schema).toBe("gdlp-python-launch/2");
+    expect(first.deploymentGeneration).toBe(0);
     expect(first.launchId).toMatch(/^[a-f0-9]{24}$/);
     expect(() => validatePythonLaunchDescription(first)).not.toThrow();
+  });
+
+  it("re-seals launch identity against the durable deployment generation", () => {
+    const unbound = compile();
+    const first = bindPythonLaunchDeploymentGeneration(unbound, 7);
+    const successor = bindPythonLaunchDeploymentGeneration(unbound, 8);
+    expect(first.deploymentGeneration).toBe(7);
+    let sealedWaveArtifact: string | undefined;
+    for (const process of first.launchOrder) {
+      if (process.kind === "cell-member") continue;
+      const generationIndex = process.command.args.indexOf("--deployment-generation");
+      expect(generationIndex).toBeGreaterThanOrEqual(0);
+      expect(process.command.args[generationIndex + 1]).toBe("7");
+      const routeIndex = process.command.args.indexOf("--route-id");
+      expect(routeIndex).toBeGreaterThanOrEqual(0);
+      expect(process.command.args[routeIndex + 1]).toBe(first.route.routeId);
+      expect(argumentValue(process.command.args, "--wave-strategy-id"))
+        .toBe("autoregressive");
+      const artifact = argumentValue(
+        process.command.args,
+        "--wave-artifact-identity",
+      );
+      expect(artifact).toMatch(/^sha256:[a-f0-9]{64}$/);
+      sealedWaveArtifact ??= artifact;
+      expect(artifact).toBe(sealedWaveArtifact);
+    }
+    expect(first.launchId).not.toBe(unbound.launchId);
+    expect(successor.launchId).not.toBe(first.launchId);
+    expect(() => validatePythonLaunchDescription(first)).not.toThrow();
+    const replay = structuredClone(first);
+    replay.deploymentGeneration = 8;
+    expect(() => validatePythonLaunchDescription(replay))
+      .toThrow("python_launch_description_mismatch");
+    expect(() => bindPythonLaunchDeploymentGeneration(unbound, 0))
+      .toThrow("python_deployment_generation_is_invalid");
   });
 
   it("seals the executor isolation policy into every process and launch identity", () => {
@@ -1001,6 +1048,18 @@ describe("GDLP/2 Python launch compiler", () => {
         JSON.parse(value),
       ),
     ).toEqual(recovery.standbyRoutes);
+    for (const remote of remotes(description)) {
+      expect(argumentValue(remote.command.args, "--stage-index")).toBe(
+        String(remote.stageIndex),
+      );
+      expect(argumentValue(remote.command.args, "--stage-executor-id")).toBe(
+        stageExecutorIds[remote.stageIndex],
+      );
+      expect(argumentValue(remote.command.args, "--stage-role")).toBe(
+        remote.layerEnd === remote.totalLayers
+          ? "tail" : remote.stageIndex === 1 ? "head" : "middle",
+      );
+    }
     expect(() => validatePythonLaunchDescription(description)).not.toThrow();
 
     const withoutRecovery = compile(current);
@@ -1008,6 +1067,9 @@ describe("GDLP/2 Python launch compiler", () => {
     expect(root(withoutRecovery).command.args).not.toContain(
       "--recovery-max-retries",
     );
+    for (const remote of remotes(withoutRecovery)) {
+      expect(remote.command.args).not.toContain("--stage-executor-id");
+    }
     expect(withoutRecovery.route.routeId).not.toBe(description.route.routeId);
   });
 
@@ -1155,6 +1217,88 @@ describe("GDLP/2 Python launch compiler", () => {
     expect(() => validatePythonLaunchDescription(description)).not.toThrow();
   });
 
+  it("seals a resolved signed draft strategy into every process wire identity", () => {
+    const unbound = compile(speculativeConveyorManifest(), {
+      speculativeInflightWaves: 2,
+      speculativeInflightBytes: 4096,
+    });
+    const descriptor = {
+      schema: DRAFT_STRATEGY_DESCRIPTOR_SCHEMA,
+      strategyId: "ngram",
+      version: "1.0.0",
+      kind: "ngram" as const,
+      componentDigest: `sha256:${"1".repeat(64)}` as const,
+      targetDescriptorDigest: `sha256:${"2".repeat(64)}` as const,
+      tokenizerDigest: `sha256:${"3".repeat(64)}` as const,
+      vocabularyDigest: `sha256:${"4".repeat(64)}` as const,
+      resource: {
+        minimumRamBytes: 0,
+        minimumVramBytes: 0,
+        allowedBackends: ["cpu" as const, "cuda" as const],
+      },
+      limits: { minDraftTokens: 1, maxDraftTokens: 8, maxInflightWaves: 4 },
+      evidenceDigest: `sha256:${"5".repeat(64)}` as const,
+    };
+    const descriptorDigest = draftStrategyDescriptorIdentity(descriptor);
+    const key = generateKeyPairSync("ed25519");
+    const certification = signDraftStrategyCertification({
+      schema: DRAFT_STRATEGY_CERTIFICATION_SCHEMA,
+      descriptorDigest,
+      sourceId: `sha256:${"6".repeat(64)}`,
+      status: "certified",
+      validFrom: "2026-08-01T00:00:00.000Z",
+      expiresAt: "2026-09-01T00:00:00.000Z",
+      publisherKeyId: "release-2026",
+    }, key.privateKey);
+    const registry = new NativeDraftStrategyRegistry(
+      new Map([["release-2026", key.publicKey]]),
+    );
+    registry.registerDescriptor(descriptor);
+    registry.registerCertification(certification);
+    const resolution = registry.resolve({
+      descriptorDigest,
+      targetDescriptorDigest: descriptor.targetDescriptorDigest,
+      tokenizerDigest: descriptor.tokenizerDigest,
+      vocabularyDigest: descriptor.vocabularyDigest,
+      backend: "cuda",
+      availableRamBytes: 0,
+      availableVramBytes: 0,
+      requestedDraftTokens: 2,
+      requestedInflightWaves: 2,
+      now: new Date("2026-08-10T00:00:00.000Z"),
+    });
+    const bound = bindPythonLaunchDraftStrategyAuthority(
+      unbound,
+      resolution,
+      new Date("2026-08-10T00:00:00.000Z"),
+    );
+
+    expect(bound.launchId).not.toBe(unbound.launchId);
+    expect(pythonLaunchRequiresDraftStrategyAuthority(unbound)).toBe(true);
+    expect(pythonLaunchRequiresDraftStrategyAuthority(compile())).toBe(false);
+    expect(bound.configuration.draftStrategyAuthority?.certification.certificationId)
+      .toBe(certification.certificationId);
+    for (const process of [root(bound), ...remotes(bound)]) {
+      expect(argumentValue(process.command.args, "--wave-strategy-id"))
+        .toBe(descriptorDigest);
+    }
+    expect(() => validatePythonLaunchDescription(bound)).not.toThrow();
+    expect(() => assertPythonLaunchDraftStrategyCurrent(
+      bound,
+      Date.parse("2026-10-01T00:00:00.000Z"),
+    )).toThrow("launch_draft_strategy_certification_is_not_current");
+    expect(() => bindPythonLaunchDraftStrategyAuthority(
+      unbound,
+      { descriptor, certification } as never,
+      new Date("2026-08-10T00:00:00.000Z"),
+    )).toThrow("draft_strategy_resolution_was_not_issued_by_registry");
+    expect(() => bindPythonLaunchDraftStrategyAuthority(
+      unbound,
+      resolution,
+      new Date("2026-10-01T00:00:00.000Z"),
+    )).toThrow("python_draft_strategy_certification_is_not_current");
+  });
+
   it("rejects incomplete, unsafe or incompatible VERIFY conveyor credits", () => {
     const current = speculativeConveyorManifest();
     expect(() =>
@@ -1280,7 +1424,7 @@ describe("GDLP/2 Python launch compiler", () => {
   });
 
   it("fails closed unless one maximum prefill frame fits the byte credit", () => {
-    const required = 32 + 8 * 512 * 2;
+    const required = 112 + 8 * 512 * 2;
     expect(
       compile(manifest(), {
         prefillInflightChunks: 4,
@@ -1334,7 +1478,7 @@ describe("GDLP/2 Python launch compiler", () => {
   it("matches the Python reservation formula for every runtime tensor codec", () => {
     const tokens = 8;
     const hidden = 511;
-    const header = 32n;
+    const header = 112n;
     const elements = BigInt(tokens * hidden);
     const groupedBlocks = 8n;
     const hadamardBlocks = 13n;
@@ -2018,10 +2162,13 @@ describe("GDLP/2 Python launch compiler", () => {
     const current = buildRuntimePipelineManifest(input);
     const args = root(compile(current)).command.args;
     expect(argumentValue(args, "--speculation")).toBe("ngram");
+    expect(argumentValue(args, "--wave-strategy-id")).toBe("ngram");
     expect(argumentValue(args, "--speculative-max-draft-tokens")).toBe("5");
     expect(argumentValue(args, "--sealed-wave-tokens")).toBe("6");
     expect(argumentValue(args, "--max-prefill-chunk-tokens")).toBe("8");
     for (const stage of remotes(compile(current))) {
+      expect(argumentValue(stage.command.args, "--wave-strategy-id"))
+        .toBe("ngram");
       expect(argumentValue(stage.command.args, "--sealed-wave-tokens")).toBe("6");
       expect(argumentValue(stage.command.args, "--max-prefill-chunk-tokens")).toBe("8");
     }

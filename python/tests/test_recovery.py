@@ -27,6 +27,65 @@ from distributed_runtime.recovery import (
 
 
 class RecoveringPipelineEngineTests(unittest.TestCase):
+    def test_sampling_recovery_restores_counter_after_visible_prefix(self) -> None:
+        identity = _identity()
+        expected = {6: (10, 11, 12)}
+        first = _ScriptedEngine(identity, expected, {6: 1}, emit_before_failure=2)
+        replacements: list[_ScriptedEngine] = []
+
+        def factory() -> _ScriptedEngine:
+            replacement = _ScriptedEngine(identity, expected, {6: 1})
+            replacements.append(replacement)
+            return replacement
+
+        engine = RecoveringPipelineEngine(factory, initial_engine=first, max_retries=1)
+        try:
+            output = engine.generate(
+                [
+                    GenerationInput(
+                        6,
+                        torch.tensor([[1]]),
+                        3,
+                        temperature=0.7,
+                        top_p=0.9,
+                        sampling_seed=b"r" * 32,
+                        sampling_counter=5,
+                    )
+                ]
+            )[0]
+        finally:
+            engine.close()
+        self.assertEqual(output.token_ids, expected[6])
+        self.assertEqual(first.observed_sampling, [(0.7, 0.9, b"r" * 32, 5)])
+        self.assertEqual(replacements[0].observed_sampling, [(0.7, 0.9, b"r" * 32, 7)])
+
+    def test_sampling_recovery_uses_explicit_variable_cost_checkpoint(self) -> None:
+        identity = _identity()
+        expected = {5: (10, 11, 12)}
+        first = _ScriptedEngine(
+            identity,
+            expected,
+            {5: 1},
+            emit_before_failure=2,
+            rng_costs=(2, 1),
+        )
+        replacements: list[_ScriptedEngine] = []
+
+        def factory() -> _ScriptedEngine:
+            replacement = _ScriptedEngine(identity, expected, {5: 1})
+            replacements.append(replacement)
+            return replacement
+
+        engine = RecoveringPipelineEngine(factory, initial_engine=first, max_retries=1)
+        try:
+            engine.generate(
+                [GenerationInput(5, torch.tensor([[1]]), 3, temperature=1.0,
+                    sampling_seed=b"q" * 32, sampling_counter=5)]
+            )
+        finally:
+            engine.close()
+        self.assertEqual(replacements[0].observed_sampling[0][3], 8)
+
     def test_remote_standby_contract_round_trips_and_is_content_sealed(self) -> None:
         route = RemoteRecoveryStandbyRoute(
             route_id="standby-eu-1",
@@ -142,6 +201,12 @@ class RecoveringPipelineEngineTests(unittest.TestCase):
         self.assertEqual(stats["duplicate_tokens_suppressed"], 2)
         self.assertEqual(stats["visible_prefix_checkpoints"], 1)
         self.assertEqual(stats["checkpoint_kind"], "visible-token-prefix-not-kv")
+        self.assertEqual(len(stats["events"]), 1)
+        self.assertEqual(stats["events"][0]["schema"], "mycellios-recovery-event/1")
+        self.assertEqual(stats["events"][0]["role"], "root")
+        self.assertEqual(stats["events"][0]["outcome"], "exact-replay")
+        self.assertEqual(stats["events"][0]["replayScope"], "visible-token-prefix")
+        self.assertEqual(stats["events"][0]["replayedTokens"], 2)
         self.assertRegex(
             stats["last_visible_prefix_sha256"],
             r"^sha256:[0-9a-f]{64}$",
@@ -200,6 +265,40 @@ class RecoveringPipelineEngineTests(unittest.TestCase):
         self.assertEqual(stats["route_promotions"], 1)
         self.assertEqual(stats["standby_routes"][0]["promotions"], 1)
         self.assertTrue(stats["standby_routes"][0]["statically_prevalidated"])
+        self.assertEqual(stats["events"][0]["outcome"], "exact-replay")
+
+    def test_authenticated_stage_evidence_attributes_recovery_to_tail(self) -> None:
+        identity = _identity()
+        expected = {19: (90, 91)}
+        first = _ScriptedEngine(identity, expected, {19: 1}, emit_before_failure=1)
+        first.recovery_failure_evidence = {
+            "schema": "gdlp-stage-failure-evidence/1",
+            "generation": 0,
+            "routeId": "static",
+            "stageRole": "tail",
+            "stageIndex": 1,
+            "executorId": identity.stage_executor_ids[1],
+            "layerStart": 2,
+            "layerEnd": 4,
+            "failureClass": "health-failed",
+            "errorType": "RuntimeError",
+            "message": "synthetic tail failure",
+        }
+        engine = RecoveringPipelineEngine(
+            lambda: _ScriptedEngine(identity, expected, {19: 1}),
+            initial_engine=first,
+            max_retries=1,
+        )
+        try:
+            self.assertEqual(
+                engine.generate([GenerationInput(19, torch.tensor([[4]]), 2)])[0].token_ids,
+                expected[19],
+            )
+            event = engine.recovery_stats["events"][0]
+        finally:
+            engine.close()
+        self.assertEqual(event["role"], "tail")
+        self.assertEqual(event["outcome"], "exact-replay")
 
     def test_dirty_shutdown_of_failed_route_is_evidence_not_a_promotion_blocker(
         self,
@@ -327,7 +426,10 @@ class RecoveringPipelineEngineTests(unittest.TestCase):
                 future.result(timeout=2)
             self.assertFalse(engine.healthy)
             self.assertIn("recovery identity differs", engine.fatal_error or "")
-            self.assertGreaterEqual(engine.recovery_stats["compatibility_rejections"], 1)
+            stats = engine.recovery_stats
+            self.assertGreaterEqual(stats["compatibility_rejections"], 1)
+            self.assertEqual(stats["events"][0]["outcome"], "terminal")
+            self.assertEqual(stats["events"][0]["replayScope"], "none")
         finally:
             engine.close()
 
@@ -486,11 +588,13 @@ class _ScriptedEngine:
         prompt_lengths: dict[int, int],
         *,
         emit_before_failure: int | None = None,
+        rng_costs: tuple[int, ...] = (),
     ) -> None:
         self.recovery_identity = identity
         self.expected = expected
         self.prompt_lengths = prompt_lengths
         self.emit_before_failure = emit_before_failure
+        self.rng_costs = rng_costs
         self.config = SimpleNamespace(
             boundaries=identity.boundaries,
             codec=TensorCodec(identity.codec),
@@ -514,6 +618,8 @@ class _ScriptedEngine:
         self.observed_inputs: list[torch.Tensor] = []
         self.observed_max_new_tokens: list[int] = []
         self.observed_batches: list[tuple[int, ...]] = []
+        self.observed_sampling: list[tuple[float, float, bytes | None, int]] = []
+        self._sampling_counters: dict[int, int] = {}
 
     def submit(self, requests, callback):
         self.observed_batches.append(tuple(request.client_id for request in requests))
@@ -522,6 +628,15 @@ class _ScriptedEngine:
         for request in requests:
             self.observed_inputs.append(request.input_ids.clone())
             self.observed_max_new_tokens.append(request.max_new_tokens)
+            self.observed_sampling.append(
+                (
+                    float(request.temperature),
+                    float(request.top_p),
+                    request.sampling_seed,
+                    request.sampling_counter,
+                )
+            )
+            self._sampling_counters[request.client_id] = request.sampling_counter
             prompt_length = self.prompt_lengths[request.client_id]
             replayed = tuple(int(value) for value in request.input_ids[0, prompt_length:])
             expected = self.expected[request.client_id]
@@ -534,6 +649,9 @@ class _ScriptedEngine:
 
         for request, suffix in zip(requests, suffixes):
             for step, token in enumerate(suffix):
+                if request.sampling:
+                    cost = self.rng_costs[step] if step < len(self.rng_costs) else 1
+                    self._sampling_counters[request.client_id] += cost
                 callback(request.client_id, token, step, 0.0)
 
         if self.emit_before_failure is not None:
@@ -559,6 +677,10 @@ class _ScriptedEngine:
                     )
                 )
         return futures
+
+    def sampling_checkpoint(self, client_id: int):
+        counter = self._sampling_counters.get(client_id)
+        return None if counter is None else SimpleNamespace(counter=counter)
 
     def cancel(self, _client_id: int) -> bool:
         return False

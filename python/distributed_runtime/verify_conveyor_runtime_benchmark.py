@@ -486,6 +486,130 @@ def summarize_paired_runs(
     }
 
 
+def decide_conveyor_promotion(
+    campaign: Mapping[str, Any],
+    *,
+    minimum_pairs: int = 4,
+    minimum_speedup: float = 1.05,
+    maximum_relative_spread: float = 0.25,
+) -> dict[str, Any]:
+    """Promote only exact, matched, stable physical-WAN conveyor evidence."""
+
+    if minimum_pairs < 2:
+        raise ValueError("minimum_pairs must be at least two")
+    if not math.isfinite(minimum_speedup) or minimum_speedup <= 1:
+        raise ValueError("minimum_speedup must be finite and greater than one")
+    if (
+        not math.isfinite(maximum_relative_spread)
+        or not 0 <= maximum_relative_spread <= 1
+    ):
+        raise ValueError("maximum_relative_spread must be between zero and one")
+
+    reasons: list[str] = []
+    if campaign.get("evidence_class") not in (
+        "physical-wan-direct",
+        "physical-wan-relay",
+    ):
+        reasons.append("physical_wan_evidence_class_is_invalid")
+    boundary_value = campaign.get("claim_boundary")
+    boundary = boundary_value if isinstance(boundary_value, Mapping) else {}
+    if not all(
+        boundary.get(name) is True
+        for name in ("physical_multi_pc", "physical_gpu", "wan_measured")
+    ):
+        reasons.append("physical_wan_evidence_is_missing")
+    scenarios_value = campaign.get("scenarios")
+    scenarios = (
+        list(scenarios_value)
+        if isinstance(scenarios_value, Sequence)
+        and not isinstance(scenarios_value, (str, bytes, bytearray))
+        else []
+    )
+    if not scenarios:
+        reasons.append("scenario_matrix_is_empty")
+
+    evaluated = 0
+    for scenario_index, scenario_value in enumerate(scenarios):
+        if not isinstance(scenario_value, Mapping):
+            reasons.append(f"scenario_is_invalid:{scenario_index}")
+            continue
+        if scenario_value.get("success") is not True:
+            reasons.append(f"scenario_is_inexact:{scenario_index}")
+        arms_value = scenario_value.get("arms")
+        arms = (
+            list(arms_value)
+            if isinstance(arms_value, Sequence)
+            and not isinstance(arms_value, (str, bytes, bytearray))
+            else []
+        )
+        if not arms or any(
+            not isinstance(arm, Mapping)
+            or not isinstance(arm.get("evidence"), Mapping)
+            or arm["evidence"].get("exact") is not True
+            for arm in arms
+        ):
+            reasons.append(f"scenario_arm_evidence_is_incomplete:{scenario_index}")
+        comparisons_value = scenario_value.get("comparisons")
+        comparisons = (
+            list(comparisons_value)
+            if isinstance(comparisons_value, Sequence)
+            and not isinstance(comparisons_value, (str, bytes, bytearray))
+            else []
+        )
+        if not comparisons:
+            reasons.append(f"scenario_comparison_is_missing:{scenario_index}")
+            continue
+        for comparison_index, comparison_value in enumerate(comparisons):
+            evaluated += 1
+            label = f"{scenario_index}:{comparison_index}"
+            if not isinstance(comparison_value, Mapping):
+                reasons.append(f"comparison_is_invalid:{label}")
+                continue
+            pair_count = comparison_value.get("pair_count")
+            speedup_value = comparison_value.get("speedup")
+            speedup = speedup_value if isinstance(speedup_value, Mapping) else {}
+            samples_value = speedup.get("samples")
+            try:
+                samples = (
+                    [float(value) for value in samples_value]
+                    if isinstance(samples_value, Sequence)
+                    and not isinstance(samples_value, (str, bytes, bytearray))
+                    else []
+                )
+            except (TypeError, ValueError):
+                samples = []
+            if (
+                isinstance(pair_count, bool)
+                or not isinstance(pair_count, int)
+                or pair_count < minimum_pairs
+                or len(samples) != pair_count
+            ):
+                reasons.append(f"comparison_pairs_are_incomplete:{label}")
+                continue
+            if any(not math.isfinite(value) or value <= 0 for value in samples):
+                reasons.append(f"comparison_speedup_is_invalid:{label}")
+                continue
+            geometric = math.exp(statistics.fmean(math.log(value) for value in samples))
+            relative_spread = (max(samples) - min(samples)) / geometric
+            if min(samples) < minimum_speedup:
+                reasons.append(f"comparison_speedup_gate_failed:{label}")
+            if relative_spread > maximum_relative_spread:
+                reasons.append(f"comparison_is_too_noisy:{label}")
+
+    if evaluated == 0:
+        reasons.append("no_contender_was_evaluated")
+    unique_reasons = list(dict.fromkeys(reasons))
+    return {
+        "schema": "mycellios-verify-conveyor-promotion/1",
+        "decision": "promote" if not unique_reasons else "disable",
+        "minimum_pairs": minimum_pairs,
+        "minimum_speedup": minimum_speedup,
+        "maximum_relative_spread": maximum_relative_spread,
+        "evaluated_comparisons": evaluated,
+        "reasons": unique_reasons,
+    }
+
+
 def publish_json_no_overwrite(path: Path | str, payload: Mapping[str, Any]) -> Path:
     """Publish one JSON artifact atomically without replacing prior evidence."""
 
@@ -961,7 +1085,7 @@ def run_runtime_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                         ),
                     }
                 )
-    return {
+    result = {
         "evidence_class": EVIDENCE_CLASS,
         "claim_boundary": {
             "physical_multi_pc": False,
@@ -1023,6 +1147,8 @@ def run_runtime_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "Physical throughput claims require the separate two-host GPU gate.",
         ],
     }
+    result["promotion"] = decide_conveyor_promotion(result)
+    return result
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

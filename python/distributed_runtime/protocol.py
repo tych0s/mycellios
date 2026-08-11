@@ -3,12 +3,16 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from enum import IntEnum
+import hashlib
+import hmac
+import json
 import math
 import socket
 import struct
 import threading
 import time
-from typing import Callable
+from typing import Callable, Sequence
+from weakref import WeakKeyDictionary
 import zlib
 
 import torch
@@ -19,10 +23,30 @@ MAGIC = b"GDLP"
 # stage proves that every preceding stage consumed and revalidated COMMIT.
 # Mixed deployments therefore fail during HELLO instead of silently weakening
 # the all-stage mutation barrier.
-VERSION = 6
-HEADER = struct.Struct("<4sBBHQIIII")
+# v9 additionally seals the complete header and payload with a wave digest.
+# v10 names the certified wave strategy and target artifact independently of
+# the route, so a valid frame cannot be replayed under another execution
+# contract even when a caller accidentally reuses a route identifier.
+# Generation alone cannot distinguish two certified routes in one deployment,
+# while sequence fencing rejects replay and reordering before mutation.
+# v11 separates stochastic VERIFY activations, target logits and RNG
+# checkpoints from greedy token results. Mixed semantics fail at HELLO.
+VERSION = 11
+ROUTE_DIGEST_BYTES = 16
+WAVE_IDENTITY_DIGEST_BYTES = 16
+WAVE_DIGEST_BYTES = 16
+STATIC_ROUTE_DIGEST = hashlib.sha256(b"GDLP/ROUTE/v1\0static").digest()[:ROUTE_DIGEST_BYTES]
+STATIC_WAVE_STRATEGY_DIGEST = hashlib.sha256(
+    b"GDLP/WAVE-STRATEGY/v1\0autoregressive"
+).digest()[:WAVE_IDENTITY_DIGEST_BYTES]
+STATIC_WAVE_ARTIFACT_DIGEST = hashlib.sha256(
+    b"GDLP/WAVE-ARTIFACT/v1\0static-model"
+).digest()[:WAVE_IDENTITY_DIGEST_BYTES]
+HEADER = struct.Struct("<4sBBHQQ16s16s16sQIIII16s")
 HEADER_BYTES = HEADER.size
 MAX_PAYLOAD_BYTES = 64 * 1024 * 1024
+MAX_RECEIPT_ENVELOPE_BYTES = 1024 * 1024
+RECEIPT_ID_BYTES = 32
 QUANT_GROUP_SIZE = 64
 UINT16_MAX = (1 << 16) - 1
 UINT32_MAX = (1 << 32) - 1
@@ -73,6 +97,11 @@ class FrameType(IntEnum):
     TREE_RESERVATION_COMMIT = 21
     TREE_RESERVATION_CANCEL = 22
     TREE_RESERVATION_COMMIT_RESULT = 23
+    RECEIPT_ENVELOPE = 24
+    RECEIPT_ACK = 25
+    SAMPLING_VERIFY = 26
+    SAMPLING_VERIFY_RESULT = 27
+    SAMPLING_RNG_CHECKPOINT = 28
 
 
 class TreePrepareStatus(IntEnum):
@@ -108,7 +137,12 @@ _DEFLATE_BASE = {
 }
 
 TENSOR_FRAME_TYPES = frozenset(
-    (FrameType.ACTIVATION, FrameType.PREFILL, FrameType.VERIFY)
+    (
+        FrameType.ACTIVATION,
+        FrameType.PREFILL,
+        FrameType.VERIFY,
+        FrameType.SAMPLING_VERIFY,
+    )
 )
 ROUTE_PROBE_FRAME_TYPES = frozenset((FrameType.PING, FrameType.PONG))
 BRANCH_CONTROL_FRAME_TYPES = frozenset((FrameType.FORK, FrameType.PROMOTE))
@@ -135,6 +169,14 @@ TREE_RESERVATION_FRAME_TYPES = (
 TREE_PREPARE_PREFIX = struct.Struct("<QBBHIQQQ")
 TREE_PATH_LENGTH = struct.Struct("<I")
 TREE_RESERVATION_NONCE = struct.Struct("<Q")
+RECEIPT_FRAME_TYPES = frozenset((FrameType.RECEIPT_ENVELOPE,))
+RECEIPT_ACK_FRAME_TYPES = frozenset((FrameType.RECEIPT_ACK,))
+SAMPLING_RESULT_FRAME_TYPES = frozenset((FrameType.SAMPLING_VERIFY_RESULT,))
+SAMPLING_RNG_FRAME_TYPES = frozenset((FrameType.SAMPLING_RNG_CHECKPOINT,))
+SAMPLING_RNG_PAYLOAD = struct.Struct("<32sQ")
+ZERO_METADATA_CONTROL_FRAME_TYPES = frozenset(
+    (FrameType.BEGIN, FrameType.END, FrameType.CANCEL, FrameType.SHUTDOWN)
+)
 
 
 @dataclass(frozen=True)
@@ -146,6 +188,12 @@ class Frame:
     token_count: int
     hidden_size: int
     payload: bytes | bytearray
+    deployment_generation: int = 0
+    route_digest: bytes = STATIC_ROUTE_DIGEST
+    wave_strategy_digest: bytes = STATIC_WAVE_STRATEGY_DIGEST
+    wave_artifact_digest: bytes = STATIC_WAVE_ARTIFACT_DIGEST
+    sequence: int = 0
+    wave_digest: bytes = b"\0" * WAVE_DIGEST_BYTES
 
 
 @dataclass(frozen=True)
@@ -613,6 +661,87 @@ def configure_socket(sock: socket.socket) -> None:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
 
 
+@dataclass
+class _SocketFrameBinding:
+    deployment_generation: int
+    route_digest: bytes
+    wave_strategy_digest: bytes
+    wave_artifact_digest: bytes
+    next_send_sequence: int = 0
+    next_receive_sequence: int = 0
+
+
+_SOCKET_FRAME_BINDINGS: WeakKeyDictionary[socket.socket, _SocketFrameBinding] = (
+    WeakKeyDictionary()
+)
+_SOCKET_GENERATION_LOCK = threading.Lock()
+
+
+def route_identity_digest(route_id: str) -> bytes:
+    if not isinstance(route_id, str) or not route_id or len(route_id) > 256:
+        raise ValueError("route_id must contain between 1 and 256 characters")
+    try:
+        encoded = route_id.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise ValueError("route_id must be ASCII") from error
+    return hashlib.sha256(b"GDLP/ROUTE/v1\0" + encoded).digest()[:ROUTE_DIGEST_BYTES]
+
+
+def wave_identity_digest(kind: str, identity: str) -> bytes:
+    if kind not in ("strategy", "artifact"):
+        raise ValueError("wave identity kind must be strategy or artifact")
+    if not isinstance(identity, str) or not identity or len(identity) > 512:
+        raise ValueError(f"wave {kind} identity must contain between 1 and 512 characters")
+    try:
+        encoded = identity.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise ValueError(f"wave {kind} identity must be ASCII") from error
+    domain = f"GDLP/WAVE-{kind.upper()}/v1\0".encode("ascii")
+    return hashlib.sha256(domain + encoded).digest()[:WAVE_IDENTITY_DIGEST_BYTES]
+
+
+def bind_socket_deployment_generation(
+    sock: socket.socket,
+    deployment_generation: int,
+    route_id: str = "static",
+    *,
+    wave_strategy_id: str = "autoregressive",
+    wave_artifact_identity: str = "static-model",
+    next_receive_sequence: int = 0,
+) -> None:
+    """Fence every subsequent frame to one deployment and certified route."""
+
+    _require_unsigned("deployment_generation", deployment_generation, UINT64_MAX)
+    _require_unsigned("next_receive_sequence", next_receive_sequence, UINT64_MAX)
+    route_digest = route_identity_digest(route_id)
+    strategy_digest = wave_identity_digest("strategy", wave_strategy_id)
+    artifact_digest = wave_identity_digest("artifact", wave_artifact_identity)
+    with _SOCKET_GENERATION_LOCK:
+        existing = _SOCKET_FRAME_BINDINGS.get(sock)
+        if existing is not None:
+            if (
+                existing.deployment_generation != deployment_generation
+                or existing.route_digest != route_digest
+                or existing.wave_strategy_digest != strategy_digest
+                or existing.wave_artifact_digest != artifact_digest
+                or existing.next_receive_sequence != next_receive_sequence
+            ):
+                raise ValueError("socket frame identity cannot be rebound")
+            return
+        _SOCKET_FRAME_BINDINGS[sock] = _SocketFrameBinding(
+            deployment_generation=deployment_generation,
+            route_digest=route_digest,
+            wave_strategy_digest=strategy_digest,
+            wave_artifact_digest=artifact_digest,
+            next_receive_sequence=next_receive_sequence,
+        )
+
+
+def _socket_frame_binding(sock: socket.socket) -> _SocketFrameBinding | None:
+    with _SOCKET_GENERATION_LOCK:
+        return _SOCKET_FRAME_BINDINGS.get(sock)
+
+
 def send_frame(
     sock: socket.socket,
     frame_type: FrameType,
@@ -624,6 +753,11 @@ def send_frame(
     flags: int = 0,
     payload: bytes | bytearray | memoryview = b"",
     emulator: LinkEmulator | None = None,
+    deployment_generation: int | None = None,
+    route_digest: bytes | None = None,
+    wave_strategy_digest: bytes | None = None,
+    wave_artifact_digest: bytes | None = None,
+    sequence: int | None = None,
 ) -> int:
     try:
         normalized_type = FrameType(frame_type)
@@ -631,6 +765,61 @@ def send_frame(
         raise ValueError(f"unknown frame type {frame_type}") from error
     _require_unsigned("flags", flags, UINT16_MAX)
     _require_unsigned("request_id", request_id, UINT64_MAX)
+    binding = _socket_frame_binding(sock)
+    bound_generation = None if binding is None else binding.deployment_generation
+    selected_generation = (
+        bound_generation if deployment_generation is None else deployment_generation
+    )
+    if selected_generation is None:
+        selected_generation = 0
+    _require_unsigned("deployment_generation", selected_generation, UINT64_MAX)
+    if bound_generation is not None and selected_generation != bound_generation:
+        raise ValueError("frame deployment generation differs from socket binding")
+    selected_route = (
+        binding.route_digest
+        if route_digest is None and binding is not None
+        else route_digest
+    )
+    if selected_route is None:
+        selected_route = route_identity_digest("static")
+    if not isinstance(selected_route, bytes) or len(selected_route) != ROUTE_DIGEST_BYTES:
+        raise ValueError(f"route_digest must contain exactly {ROUTE_DIGEST_BYTES} bytes")
+    if binding is not None and selected_route != binding.route_digest:
+        raise ValueError("frame route differs from socket binding")
+    selected_strategy = (
+        binding.wave_strategy_digest
+        if wave_strategy_digest is None and binding is not None
+        else wave_strategy_digest
+    )
+    if selected_strategy is None:
+        selected_strategy = STATIC_WAVE_STRATEGY_DIGEST
+    selected_artifact = (
+        binding.wave_artifact_digest
+        if wave_artifact_digest is None and binding is not None
+        else wave_artifact_digest
+    )
+    if selected_artifact is None:
+        selected_artifact = STATIC_WAVE_ARTIFACT_DIGEST
+    for name, value in (
+        ("wave_strategy_digest", selected_strategy),
+        ("wave_artifact_digest", selected_artifact),
+    ):
+        if not isinstance(value, bytes) or len(value) != WAVE_IDENTITY_DIGEST_BYTES:
+            raise ValueError(
+                f"{name} must contain exactly {WAVE_IDENTITY_DIGEST_BYTES} bytes"
+            )
+    if binding is not None and selected_strategy != binding.wave_strategy_digest:
+        raise ValueError("frame wave strategy differs from socket binding")
+    if binding is not None and selected_artifact != binding.wave_artifact_digest:
+        raise ValueError("frame wave artifact differs from socket binding")
+    selected_sequence = (
+        binding.next_send_sequence
+        if sequence is None and binding is not None
+        else (0 if sequence is None else sequence)
+    )
+    _require_unsigned("sequence", selected_sequence, UINT64_MAX)
+    if binding is not None and selected_sequence != binding.next_send_sequence:
+        raise ValueError("frame sequence differs from socket binding")
     _require_unsigned("step", step, UINT32_MAX)
     _require_unsigned("token_count", token_count, UINT32_MAX)
     _require_unsigned("hidden_size", hidden_size, UINT32_MAX)
@@ -652,16 +841,51 @@ def send_frame(
         hidden_size=hidden_size,
         payload_size=payload_size,
     )
+    if binding is not None:
+        with _SOCKET_GENERATION_LOCK:
+            current = _SOCKET_FRAME_BINDINGS.get(sock)
+            if current is not binding or current.next_send_sequence != selected_sequence:
+                raise ValueError("frame sequence was concurrently superseded")
+            if current.next_send_sequence == UINT64_MAX:
+                raise ValueError("frame sequence is exhausted")
+            current.next_send_sequence += 1
+    unsigned_header = HEADER.pack(
+        MAGIC,
+        VERSION,
+        int(normalized_type),
+        flags,
+        request_id,
+        selected_generation,
+        selected_route,
+        selected_strategy,
+        selected_artifact,
+        selected_sequence,
+        step,
+        token_count,
+        hidden_size,
+        payload_size,
+        b"\0" * WAVE_DIGEST_BYTES,
+    )
+    digest = hashlib.sha256(b"GDLP/WAVE/v1\0")
+    digest.update(unsigned_header)
+    digest.update(payload)
+    wave_digest = digest.digest()[:WAVE_DIGEST_BYTES]
     header = HEADER.pack(
         MAGIC,
         VERSION,
         int(normalized_type),
         flags,
         request_id,
+        selected_generation,
+        selected_route,
+        selected_strategy,
+        selected_artifact,
+        selected_sequence,
         step,
         token_count,
         hidden_size,
         payload_size,
+        wave_digest,
     )
     selected_emulator = (
         emulator
@@ -679,15 +903,48 @@ def send_frame(
 
 def recv_frame(sock: socket.socket) -> Frame:
     raw_header = recv_exact(sock, HEADER_BYTES)
-    magic, version, type_value, flags, request_id, step, token_count, hidden_size, size = (
-        HEADER.unpack(raw_header)
-    )
+    (
+        magic,
+        version,
+        type_value,
+        flags,
+        request_id,
+        deployment_generation,
+        route_digest,
+        wave_strategy_digest,
+        wave_artifact_digest,
+        sequence,
+        step,
+        token_count,
+        hidden_size,
+        size,
+        wave_digest,
+    ) = HEADER.unpack(raw_header)
     if magic != MAGIC:
         raise ValueError("invalid frame magic")
     if version != VERSION:
         raise ValueError(f"unsupported protocol version {version}")
     if size > MAX_PAYLOAD_BYTES:
         raise ValueError(f"payload exceeds {MAX_PAYLOAD_BYTES} bytes")
+    binding = _socket_frame_binding(sock)
+    if binding is not None:
+        with _SOCKET_GENERATION_LOCK:
+            current = _SOCKET_FRAME_BINDINGS.get(sock)
+            if current is not binding:
+                raise ValueError("socket frame identity changed during receive")
+            if deployment_generation != current.deployment_generation:
+                raise ValueError("frame belongs to another deployment generation")
+            if route_digest != current.route_digest:
+                raise ValueError("frame belongs to another route")
+            if wave_strategy_digest != current.wave_strategy_digest:
+                raise ValueError("frame belongs to another wave strategy")
+            if wave_artifact_digest != current.wave_artifact_digest:
+                raise ValueError("frame belongs to another wave artifact")
+            if sequence != current.next_receive_sequence:
+                raise ValueError("frame sequence is replayed or out of order")
+            if current.next_receive_sequence == UINT64_MAX:
+                raise ValueError("frame receive sequence is exhausted")
+            current.next_receive_sequence += 1
     try:
         frame_type = FrameType(type_value)
     except ValueError as error:
@@ -701,6 +958,28 @@ def recv_frame(sock: socket.socket) -> Frame:
         payload_size=size,
     )
     payload = recv_exact(sock, size) if size else b""
+    unsigned_header = HEADER.pack(
+        magic,
+        version,
+        type_value,
+        flags,
+        request_id,
+        deployment_generation,
+        route_digest,
+        wave_strategy_digest,
+        wave_artifact_digest,
+        sequence,
+        step,
+        token_count,
+        hidden_size,
+        size,
+        b"\0" * WAVE_DIGEST_BYTES,
+    )
+    expected_digest = hashlib.sha256(
+        b"GDLP/WAVE/v1\0" + unsigned_header + payload
+    ).digest()[:WAVE_DIGEST_BYTES]
+    if not hmac.compare_digest(wave_digest, expected_digest):
+        raise ValueError("frame wave digest is invalid")
     return Frame(
         frame_type=frame_type,
         flags=flags,
@@ -709,6 +988,12 @@ def recv_frame(sock: socket.socket) -> Frame:
         token_count=token_count,
         hidden_size=hidden_size,
         payload=payload,
+        deployment_generation=deployment_generation,
+        route_digest=route_digest,
+        wave_strategy_digest=wave_strategy_digest,
+        wave_artifact_digest=wave_artifact_digest,
+        sequence=sequence,
+        wave_digest=wave_digest,
     )
 
 
@@ -724,6 +1009,64 @@ def recv_exact(sock: socket.socket, size: int) -> bytearray:
             raise EOFError("socket closed while receiving a frame")
         received += count
     return data
+
+
+def receipt_envelope_payload(value: bytes | bytearray | memoryview | str) -> bytes:
+    """Validate and retain the signed canonical JSON receipt envelope bytes."""
+
+    encoded = value.encode("utf-8") if isinstance(value, str) else bytes(value)
+    if not 1 <= len(encoded) <= MAX_RECEIPT_ENVELOPE_BYTES:
+        raise ValueError(
+            "receipt envelope must contain between 1 and "
+            f"{MAX_RECEIPT_ENVELOPE_BYTES} bytes"
+        )
+    try:
+        text = encoded.decode("utf-8")
+        parsed = json.loads(text, object_pairs_hook=_unique_json_object)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("receipt envelope must be valid UTF-8 JSON") from error
+    if not isinstance(parsed, dict):
+        raise ValueError("receipt envelope must be a JSON object")
+    if parsed.get("schema") != "mycellios-execution-receipt-envelope/1":
+        raise ValueError("receipt envelope schema is invalid")
+    canonical = json.dumps(
+        parsed,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if not hmac.compare_digest(encoded, canonical):
+        raise ValueError("receipt envelope JSON is not canonical")
+    return encoded
+
+
+def receipt_ack_payload(envelope_payload: bytes | bytearray | memoryview) -> bytes:
+    normalized = receipt_envelope_payload(envelope_payload)
+    return hashlib.sha256(normalized).digest()
+
+
+def decode_receipt_envelope(frame: Frame) -> bytes:
+    if frame.frame_type != FrameType.RECEIPT_ENVELOPE:
+        raise ValueError("frame does not carry a receipt envelope")
+    return receipt_envelope_payload(frame.payload)
+
+
+def decode_receipt_ack(frame: Frame) -> bytes:
+    if frame.frame_type != FrameType.RECEIPT_ACK:
+        raise ValueError("frame does not carry a receipt acknowledgement")
+    if len(frame.payload) != RECEIPT_ID_BYTES:
+        raise ValueError("receipt acknowledgement must contain one SHA-256 digest")
+    return bytes(frame.payload)
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("receipt envelope JSON contains a duplicate key")
+        result[key] = value
+    return result
 
 
 def encode_tensor_payload(
@@ -1120,6 +1463,70 @@ def decode_verify_result(frame: Frame) -> tuple[int, ...]:
     return struct.unpack(f"<{frame.token_count}I", frame.payload)
 
 
+def sampling_logits_payload(
+    rows: Sequence[Sequence[float]],
+) -> tuple[bytes, int, int]:
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)) or not rows:
+        raise ValueError("sampling logits must contain at least one row")
+    token_count = len(rows)
+    hidden_size = len(rows[0])
+    if hidden_size < 1:
+        raise ValueError("sampling logits vocabulary cannot be empty")
+    values: list[float] = []
+    for row in rows:
+        if not isinstance(row, Sequence) or isinstance(row, (str, bytes)):
+            raise ValueError("sampling logits row must be a sequence")
+        if len(row) != hidden_size:
+            raise ValueError("sampling logits rows have different vocabulary sizes")
+        for value in row:
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(float(value))
+            ):
+                raise ValueError("sampling logits must contain finite numbers")
+            values.append(float(value))
+    if token_count * hidden_size * 4 > MAX_PAYLOAD_BYTES:
+        raise ValueError("sampling logits exceed the frame payload limit")
+    return struct.pack(f"<{len(values)}f", *values), token_count, hidden_size
+
+
+def decode_sampling_logits(frame: Frame) -> tuple[tuple[float, ...], ...]:
+    if (
+        frame.frame_type != FrameType.SAMPLING_VERIFY_RESULT
+        or frame.token_count < 1
+        or frame.hidden_size < 1
+    ):
+        raise ValueError("invalid sampling verification result frame")
+    expected = frame.token_count * frame.hidden_size * 4
+    if len(frame.payload) != expected:
+        raise ValueError(
+            f"sampling logits have {len(frame.payload)} bytes, expected {expected}"
+        )
+    values = struct.unpack(f"<{frame.token_count * frame.hidden_size}f", frame.payload)
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("sampling logits must contain finite numbers")
+    return tuple(
+        tuple(values[start : start + frame.hidden_size])
+        for start in range(0, len(values), frame.hidden_size)
+    )
+
+
+def sampling_rng_checkpoint_payload(seed: bytes, counter: int) -> bytes:
+    if not isinstance(seed, bytes) or len(seed) != 32:
+        raise ValueError("sampling RNG seed must contain exactly 32 bytes")
+    _require_unsigned("sampling RNG counter", counter, UINT64_MAX)
+    return SAMPLING_RNG_PAYLOAD.pack(seed, counter)
+
+
+def decode_sampling_rng_checkpoint(frame: Frame) -> tuple[bytes, int]:
+    if frame.frame_type != FrameType.SAMPLING_RNG_CHECKPOINT:
+        raise ValueError("frame is not a sampling RNG checkpoint")
+    if len(frame.payload) != SAMPLING_RNG_PAYLOAD.size:
+        raise ValueError("sampling RNG checkpoint payload must contain seed and counter")
+    return SAMPLING_RNG_PAYLOAD.unpack(frame.payload)
+
+
 def _require_unsigned(name: str, value: int, maximum: int) -> None:
     if not isinstance(value, int) or isinstance(value, bool):
         raise TypeError(f"{name} must be an integer")
@@ -1176,6 +1583,26 @@ def _validate_frame_metadata(
             raise ValueError(
                 f"{frame_type.name} frames require "
                 "flags=token_count=hidden_size=0 and cannot carry a payload"
+            )
+        return
+    if frame_type in ZERO_METADATA_CONTROL_FRAME_TYPES:
+        if (
+            flags != 0
+            or step != 0
+            or token_count != 0
+            or hidden_size != 0
+            or payload_size != 0
+        ):
+            raise ValueError(
+                f"{frame_type.name} frames require "
+                "flags=step=token_count=hidden_size=0 and cannot carry a payload"
+            )
+        return
+    if frame_type == FrameType.TRUNCATE:
+        if flags != 0 or step != 0 or hidden_size != 0 or payload_size != 0:
+            raise ValueError(
+                "TRUNCATE frames require flags=step=hidden_size=0 "
+                "and cannot carry a payload"
             )
         return
     if frame_type in BRANCH_CONTROL_FRAME_TYPES:
@@ -1244,6 +1671,46 @@ def _validate_frame_metadata(
         if payload_size != TREE_RESERVATION_NONCE.size:
             raise ValueError(
                 f"{frame_type.name} payload must contain exactly one uint64"
+            )
+        return
+    if frame_type in RECEIPT_FRAME_TYPES:
+        if flags != 0 or step != 0 or token_count != 0 or hidden_size != 0:
+            raise ValueError(
+                "RECEIPT_ENVELOPE frames require "
+                "flags=step=token_count=hidden_size=0"
+            )
+        if not 1 <= payload_size <= MAX_RECEIPT_ENVELOPE_BYTES:
+            raise ValueError(
+                "RECEIPT_ENVELOPE payload must contain between 1 and "
+                f"{MAX_RECEIPT_ENVELOPE_BYTES} bytes"
+            )
+        return
+    if frame_type in RECEIPT_ACK_FRAME_TYPES:
+        if flags != 0 or step != 0 or token_count != 0 or hidden_size != 0:
+            raise ValueError(
+                "RECEIPT_ACK frames require flags=step=token_count=hidden_size=0"
+            )
+        if payload_size != RECEIPT_ID_BYTES:
+            raise ValueError("RECEIPT_ACK payload must contain one SHA-256 digest")
+        return
+    if frame_type in SAMPLING_RESULT_FRAME_TYPES:
+        if flags != 0 or token_count < 1 or hidden_size < 1:
+            raise ValueError(
+                "SAMPLING_VERIFY_RESULT requires flags=0 and a positive matrix shape"
+            )
+        if payload_size != token_count * hidden_size * 4:
+            raise ValueError(
+                "sampling result payload must contain one float32 per logit"
+            )
+        return
+    if frame_type in SAMPLING_RNG_FRAME_TYPES:
+        if flags != 0 or step != 0 or token_count != 0 or hidden_size != 0:
+            raise ValueError(
+                "SAMPLING_RNG_CHECKPOINT requires zero frame metadata"
+            )
+        if payload_size != SAMPLING_RNG_PAYLOAD.size:
+            raise ValueError(
+                "sampling RNG checkpoint payload must contain seed and counter"
             )
         return
     if frame_type in TENSOR_FRAME_TYPES:

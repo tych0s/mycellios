@@ -44,6 +44,7 @@ from distributed_runtime.protocol import (
     decode_tensor,
     recv_frame,
     encode_tree_prepare_quote,
+    sampling_logits_payload,
     tree_reservation_payload,
     token_payload,
     verify_result_payload,
@@ -3763,6 +3764,59 @@ def _conveyor_test_case() -> tuple[
         LinkEmulator(),
     ) != 1:
         raise AssertionError("third VERIFY conveyor credit was not dispatched")
+    frames = (recv_frame(child), recv_frame(child), recv_frame(child))
+    return engine, runner, job, active, root, child, frames
+
+
+def _sampling_conveyor_test_case() -> tuple[
+    DistributedPipelineEngine,
+    "_FakeRootBatchRunner",
+    _GenerationJob,
+    dict[int, _GenerationJob],
+    socket.socket,
+    socket.socket,
+    tuple[Frame, Frame, Frame],
+]:
+    engine = _root_batch_test_engine(
+        prefill_chunk_tokens=0,
+        speculative_max_draft_tokens=2,
+        speculative_inflight_waves=3,
+        speculative_inflight_bytes=1 << 20,
+    )
+    engine.draft_provider = _MappedDraftProvider()
+    engine.speculation_controller = _AlwaysSpeculationController()
+    engine._speculation_controllers = {}
+    runner = _FakeRootBatchRunner()
+    runner.active = {1: 3}
+    job = _GenerationJob(
+        GenerationInput(
+            951,
+            torch.tensor([[1, 2, 3]]),
+            16,
+            temperature=1.0,
+            sampling_seed=b"w" * 32,
+        ),
+        None,
+        wire_id=1,
+        step=1,
+        started_at=time.perf_counter() - 1,
+        token_ids=[10],
+        arrivals=[time.perf_counter() - 0.5],
+        prefill_offset=3,
+        prefill_acked_offset=3,
+        kv_valid=3,
+    )
+    engine._jobs_by_client = {job.request.client_id: job}
+    active = {1: job}
+    root, child = socket.socketpair()
+    first = engine._prepare_linear_or_classic_decode_wave(
+        job, runner, active_sequences=1
+    )
+    engine._dispatch_root_waves([first], runner, root, LinkEmulator())
+    if engine._dispatch_speculative_credit_round(active, runner, root, LinkEmulator()) != 1:
+        raise AssertionError("second sampling conveyor credit was not dispatched")
+    if engine._dispatch_speculative_credit_round(active, runner, root, LinkEmulator()) != 1:
+        raise AssertionError("third sampling conveyor credit was not dispatched")
     frames = (recv_frame(child), recv_frame(child), recv_frame(child))
     return engine, runner, job, active, root, child, frames
 

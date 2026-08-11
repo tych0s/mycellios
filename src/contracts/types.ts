@@ -3,6 +3,7 @@ import type {
 } from "../performance/runtime-profile.js";
 import type { DeploymentCanaryEvidence } from "./deployment-canary.js";
 import type { NativeBuildIdentity } from "./build-identity.js";
+import type { EngineRuntimeProfile } from "./engine-runtime-profile.js";
 
 export type WorkloadClass = "interactive" | "batch" | "benchmark";
 export type AdapterKind =
@@ -299,6 +300,8 @@ export interface WorkerCapabilities {
     acceleration?: WorkerAcceleratorDiagnostics | undefined;
     /** Coordinator-observed physical calibration consumed by placement. */
     performanceEvidence?: CoordinatorRuntimePerformanceEvidence | undefined;
+    /** Coordinator-owned, engine/artifact-specific physical capacity evidence. */
+    engineProfiles?: EngineRuntimeProfile[] | undefined;
     /** Honest host-side process isolation controls; absent on legacy workers. */
     isolation?: WorkerExecutorIsolationCapability | undefined;
     /**

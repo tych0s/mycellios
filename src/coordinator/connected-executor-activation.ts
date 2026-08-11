@@ -7,11 +7,17 @@ import type { StoredRequestedModel, StoredWorker } from "../storage/store.js";
 import { deriveDecodeScales } from "../distribution/node-scale.js";
 import type { WorkerHub } from "./worker-hub.js";
 import type { DynamicActivationSnapshot } from "./model-activation-manager.js";
-import type { RuntimeLinkObservation } from "./runtime-link-observations.js";
+import {
+  selectPreferredRuntimeLinkObservation,
+  type RuntimeLinkObservation,
+} from "./runtime-link-observations.js";
 import {
   plannerScalesFromCoordinatorEvidence,
   type PlannerPerformanceScales,
 } from "../performance/runtime-profile.js";
+import type { EngineActivationAuthority } from "./engine-activation-authority.js";
+import { sha256CanonicalEvidence } from "../core/json.js";
+import { requireEligibleEngineRuntimeProfile } from "../contracts/engine-runtime-profile.js";
 
 interface ConnectedExecutor {
   worker: StoredWorker;
@@ -90,7 +96,9 @@ export function buildConnectedExecutorActivationSnapshot(
   workers: readonly StoredWorker[],
   connectedWorkerIds: ReadonlySet<string>,
   runtimeLinkObservations: readonly RuntimeLinkObservation[] = [],
+  engineAuthority?: EngineActivationAuthority,
 ): DynamicActivationSnapshot {
+  const activationNow = Date.now();
   const executors = connectedExecutors(workers, connectedWorkerIds);
   const capacityNodes = executors.map(({ worker, executor }) => ({
     id: executor.nodeId,
@@ -127,7 +135,32 @@ export function buildConnectedExecutorActivationSnapshot(
   //
   // Un nodo sin medida conserva 1 y se declara NO medido, en vez de pasar por
   // informado en silencio — el mismo criterio que `estimateLinkLatencyMs`.
-  const decodeScales = deriveDecodeScales(profiledExecutors.map(({ executor, worker }) => ({
+  const engineProfilesByNode = new Map(profiledExecutors.flatMap(({ worker, executor }) => {
+    if (!engineAuthority) return [];
+    const profile = eligiblePlanningEngineProfile(
+      worker,
+      engineAuthority,
+      baseConfig.model.publicName,
+      baseConfig.workload.contextTokens,
+    );
+    return profile ? [[executor.nodeId, profile] as const] : [];
+  }));
+  const planningExecutors = engineAuthority
+    ? profiledExecutors.filter(({ executor }) => engineProfilesByNode.has(executor.nodeId))
+    : profiledExecutors;
+  if (planningExecutors.length < 2) {
+    return {
+      capacityNodes,
+      config: null,
+      readinessDetails: executors.map(({ executor }) =>
+        engineProfilesByNode.has(executor.nodeId)
+          ? `${executor.nodeId}: certified engine profile verified.`
+          : `${executor.nodeId}: waiting for a certified engine profile matching this activation.`
+      ),
+    };
+  }
+
+  const decodeScales = deriveDecodeScales(planningExecutors.map(({ executor, worker }) => ({
     nodeId: executor.nodeId,
     measuredTokensPerSecond: measuredDecodeThroughput(worker, baseConfig.model.publicName),
   })));
@@ -135,7 +168,8 @@ export function buildConnectedExecutorActivationSnapshot(
     decodeScales.scales.map((scale) => [scale.nodeId, scale]),
   );
 
-  const nodes = profiledExecutors.map(({ worker, executor, performance }) => {
+  const nodes = planningExecutors.map(({ worker, executor, performance }) => {
+    const engineProfile = engineProfilesByNode.get(executor.nodeId) ?? null;
     const memoryMiB = worker.capabilities.gpus.reduce(
       (sum, gpu) => sum + gpu.offeredVramMb,
       0,
@@ -155,22 +189,48 @@ export function buildConnectedExecutorActivationSnapshot(
         : performance.decodeScale,
       prefillScale: performance.prefillScale,
       codecScale: performance.codecScale,
+      ...(engineProfile
+        ? {
+            decodeScale: engineProfile.costs.decodeScale,
+            prefillScale: engineProfile.costs.prefillScale,
+            maxStageLayers: engineProfile.capacity.maxLayerCount,
+            stageRoles: engineProfile.features.roles.filter((role): role is "head" | "middle" | "tail" =>
+              role === "head" || role === "middle" || role === "tail"
+            ),
+          }
+        : {}),
       powerWatts: measuredPower > 0 ? measuredPower : 1,
       availability: Math.max(0.01, Math.min(1, worker.reliability)),
       agent: { kind: "managed" as const },
     };
   });
-  const observationByLink = new Map(runtimeLinkObservations.map((observation) => [
-    linkKey(observation.fromNodeId, observation.toNodeId),
-    observation,
-  ]));
-  const measuredLinks = profiledExecutors.flatMap((from) => profiledExecutors
+  const observationsByLink = new Map<string, RuntimeLinkObservation[]>();
+  for (const observation of runtimeLinkObservations) {
+    const key = linkKey(observation.fromNodeId, observation.toNodeId);
+    observationsByLink.set(key, [...(observationsByLink.get(key) ?? []), observation]);
+  }
+  const measuredLinks = planningExecutors.flatMap((from) => planningExecutors
     .filter((to) => to.executor.nodeId !== from.executor.nodeId)
     .flatMap((to) => {
-      const observation = observationByLink.get(
-        linkKey(from.executor.nodeId, to.executor.nodeId),
+      const observation = selectPreferredRuntimeLinkObservation(
+        (observationsByLink.get(linkKey(from.executor.nodeId, to.executor.nodeId)) ?? [])
+          .filter((candidate) => {
+            if (!engineAuthority) return true;
+            const fromProfile = engineProfilesByNode.get(from.executor.nodeId);
+            const toProfile = engineProfilesByNode.get(to.executor.nodeId);
+            return fromProfile !== undefined
+              && toProfile !== undefined
+              && candidate.measuredAt <= activationNow
+              && candidate.measuredAt >= Math.max(
+                Date.parse(fromProfile.measuredAt),
+                Date.parse(toProfile.measuredAt),
+              );
+          }),
+        baseConfig.workload.minRouteAvailability,
       );
       if (!observation) return [];
+      const fromProfile = engineProfilesByNode.get(from.executor.nodeId);
+      const toProfile = engineProfilesByNode.get(to.executor.nodeId);
       return [{
         from: from.executor.nodeId,
         to: to.executor.nodeId,
@@ -184,9 +244,22 @@ export function buildConnectedExecutorActivationSnapshot(
         evidence: {
           source: "runtime-probe" as const,
           measuredAt: observation.measuredAt,
-          validUntil: observation.validUntil,
+          validUntil: Math.min(
+            observation.validUntil,
+            fromProfile ? Date.parse(fromProfile.expiresAt) : Number.POSITIVE_INFINITY,
+            toProfile ? Date.parse(toProfile.expiresAt) : Number.POSITIVE_INFINITY,
+          ),
           successfulSamples: observation.successfulSamples,
           failedSamples: observation.failedSamples,
+          transportMode: observation.transportMode,
+          ...(fromProfile && toProfile
+            ? {
+                fromEngineProfileId: fromProfile.profileId,
+                toEngineProfileId: toProfile.profileId,
+                fromHardwareFingerprintSha256: fromProfile.hardwareFingerprintSha256,
+                toHardwareFingerprintSha256: toProfile.hardwareFingerprintSha256,
+              }
+            : {}),
         },
       }];
     }));
@@ -232,6 +305,40 @@ export function buildConnectedExecutorActivationSnapshot(
     },
   });
   return { capacityNodes, config };
+}
+
+export function eligiblePlanningEngineProfile(
+  worker: StoredWorker,
+  authority: EngineActivationAuthority,
+  modelId: string,
+  contextTokens: number,
+) {
+  const executor = worker.capabilities.distributedExecutor;
+  const descriptorDigest = sha256CanonicalEvidence(authority.descriptor);
+  return (executor?.engineProfiles ?? [])
+    .filter((profile) =>
+      profile.workerId === worker.id
+      && profile.modelId === modelId
+      && profile.modelRevision === authority.descriptor.model.revision
+      && authority.descriptor.targets.some((target) =>
+        target.backend === profile.backend
+        && target.runtimeAbi === profile.runtimeAbi
+        && target.quantizations.includes(profile.quantization)
+      )
+    )
+    .flatMap((profile) => {
+      try {
+        return [requireEligibleEngineRuntimeProfile(profile, {
+          descriptorDigest,
+          certificationId: authority.certification.certificationId,
+          artifactManifestDigest: authority.certification.artifactManifestDigest,
+          contextTokens,
+        })];
+      } catch {
+        return [];
+      }
+    })
+    .sort((left, right) => Date.parse(right.measuredAt) - Date.parse(left.measuredAt))[0] ?? null;
 }
 
 /** True only for a currently published model route that runtime telemetry marks as degraded. */

@@ -7,6 +7,7 @@ import {
   deploymentMetricsFromCanaryEvidence,
 } from "./deployment-canary.js";
 import { nativeBuildIdentitySchema } from "./build-identity.js";
+import { engineRuntimeProfileSchema } from "./engine-runtime-profile.js";
 import {
   workerAdmissionProofSchema,
   workerProtocolRangeSchema,
@@ -360,6 +361,7 @@ export const workerCapabilitiesSchema = z.object({
        * challenge on the current authenticated worker session.
        */
       performanceEvidence: coordinatorRuntimePerformanceEvidenceSchema.optional(),
+      engineProfiles: z.array(engineRuntimeProfileSchema).max(128).optional(),
       isolation: z
         .object({
           schema: z.literal("mycellios-executor-isolation-capability/1"),

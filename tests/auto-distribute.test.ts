@@ -57,6 +57,60 @@ describe("automatic compatible-model distribution", () => {
     expect(() => parseAutoDistributionConfig(value)).toThrow();
   });
 
+  it("projects certified layer ceilings and stage roles into production planning", () => {
+    const value = configFixture();
+    value.nodes[0] = { ...value.nodes[0]!, maxStageLayers: 4, stageRoles: ["head"] };
+    value.nodes[1] = { ...value.nodes[1]!, maxStageLayers: 4, stageRoles: ["tail"] };
+    const compiled = compileAutoDistribution(parseAutoDistributionConfig(value), profileFixture());
+    expect(compiled.manifest.plans.decode.stages.map((stage) => ({
+      nodeId: stage.anchor.memberId,
+      layers: stage.layerEnd - stage.layerStart,
+    }))).toEqual([
+      { nodeId: "node-a", layers: 4 },
+      { nodeId: "node-b", layers: 4 },
+    ]);
+
+    value.nodes[0] = { ...value.nodes[0]!, stageRoles: ["middle"] };
+    expect(() => compileAutoDistribution(parseAutoDistributionConfig(value), profileFixture()))
+      .toThrow(/no_feasible_runtime_pipeline/);
+  });
+
+  it("rejects duplicate certified stage roles at config load", () => {
+    const value = configFixture();
+    value.nodes[0] = { ...value.nodes[0]!, stageRoles: ["head", "head"] };
+    expect(() => parseAutoDistributionConfig(value)).toThrow("stageRoles must be unique");
+  });
+
+  it("accepts only complete certified bindings on runtime path evidence", () => {
+    const value = configFixture();
+    const digest = (seed: string) => `sha256:${seed.repeat(64)}`;
+    const evidence = {
+      source: "runtime-probe" as const,
+      measuredAt: 1_000,
+      validUntil: 2_000,
+      successfulSamples: 7,
+      failedSamples: 0,
+      transportMode: "direct" as const,
+      fromEngineProfileId: digest("a"),
+      toEngineProfileId: digest("b"),
+      fromHardwareFingerprintSha256: digest("c"),
+      toHardwareFingerprintSha256: digest("d"),
+    };
+    value.links = [{
+      from: "node-a", to: "node-b", oneWayLatencyMs: 5, jitterP95Ms: 1,
+      bandwidthMbps: 1_000, lossRate: 0, availability: 1, evidence,
+    }];
+    expect(parseAutoDistributionConfig(value).links[0]?.evidence)
+      .toMatchObject(evidence);
+
+    const partial = structuredClone(value) as unknown as {
+      links: Array<{ evidence: Record<string, unknown> }>;
+    };
+    delete partial.links[0]!.evidence.toHardwareFingerprintSha256;
+    expect(() => parseAutoDistributionConfig(partial))
+      .toThrow("certified link evidence binding must be complete");
+  });
+
   it("preserves the cost-model reason when recent route evidence is insufficient", () => {
     const value = configFixture();
     value.nodes[0]!.availability = 0.95;

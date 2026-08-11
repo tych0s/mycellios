@@ -15,6 +15,10 @@ import {
   type SupportAssistantSettings,
 } from "../support/assistant.js";
 import { MeshDatabase } from "./database.js";
+import {
+  engineRuntimeActivationPlanSchema,
+  type EngineRuntimeActivationPlan,
+} from "../contracts/engine-runtime-activation.js";
 
 export interface StoredWorker {
   id: string;
@@ -25,6 +29,10 @@ export interface StoredWorker {
   lastSeenAt: number;
   identityKind: "device" | "cell" | null;
   identityId: string | null;
+}
+
+interface EngineRuntimeActivationPlanRow {
+  plan_json: string;
 }
 
 export interface StoredJob {
@@ -131,6 +139,15 @@ export interface StoredNetworkTelemetrySample {
   completedJobs: number;
 }
 
+export interface StoredRuntimeLinkSample {
+  fromNodeId: string;
+  toNodeId: string;
+  measuredAt: number;
+  rttMs: number | null;
+  goodputMbps: number | null;
+  transportMode: "direct" | "relay";
+}
+
 export interface StoredDiagnosticEvent extends RemoteDiagnosticEvent {
   receivedAt: string;
 }
@@ -159,6 +176,95 @@ interface RequestedModelRow {
 
 export class MeshStore {
   constructor(readonly database: MeshDatabase) {}
+
+  saveRuntimeLinkSample(
+    sample: StoredRuntimeLinkSample,
+    maximumAgeMs = 5 * 60_000,
+    maximumSamplesPerLink = 32,
+  ): void {
+    if (
+      !sample.fromNodeId
+      || !sample.toNodeId
+      || sample.fromNodeId === sample.toNodeId
+      || !Number.isSafeInteger(sample.measuredAt)
+      || sample.measuredAt <= 0
+      || !Number.isFinite(maximumAgeMs)
+      || maximumAgeMs <= 0
+      || !Number.isInteger(maximumSamplesPerLink)
+      || maximumSamplesPerLink < 1
+      || (sample.transportMode !== "direct" && sample.transportMode !== "relay")
+      || ((sample.rttMs === null) !== (sample.goodputMbps === null))
+      || (sample.rttMs !== null && (!Number.isFinite(sample.rttMs) || sample.rttMs <= 0))
+      || (sample.goodputMbps !== null
+        && (!Number.isFinite(sample.goodputMbps) || sample.goodputMbps <= 0))
+    ) {
+      throw new Error("runtime_link_sample_is_invalid");
+    }
+    this.database.transaction(() => {
+      this.database.raw.prepare(
+        `INSERT INTO runtime_link_samples(
+           from_node_id, to_node_id, measured_at, rtt_ms, goodput_mbps, transport_mode
+         ) VALUES (?, ?, ?, ?, ?, ?)`,
+      ).run(
+        sample.fromNodeId,
+        sample.toNodeId,
+        sample.measuredAt,
+        sample.rttMs,
+        sample.goodputMbps,
+        sample.transportMode,
+      );
+      this.database.raw.prepare(
+        "DELETE FROM runtime_link_samples WHERE measured_at < ?",
+      ).run(sample.measuredAt - maximumAgeMs);
+      this.database.raw.prepare(
+        `DELETE FROM runtime_link_samples
+         WHERE from_node_id = ? AND to_node_id = ? AND transport_mode = ? AND id NOT IN (
+           SELECT id FROM runtime_link_samples
+           WHERE from_node_id = ? AND to_node_id = ? AND transport_mode = ?
+           ORDER BY measured_at DESC, id DESC
+           LIMIT ?
+         )`,
+      ).run(
+        sample.fromNodeId,
+        sample.toNodeId,
+        sample.transportMode,
+        sample.fromNodeId,
+        sample.toNodeId,
+        sample.transportMode,
+        maximumSamplesPerLink,
+      );
+    });
+  }
+
+  listRuntimeLinkSamples(
+    now = Date.now(),
+    maximumAgeMs = 5 * 60_000,
+  ): StoredRuntimeLinkSample[] {
+    if (!Number.isFinite(now) || !Number.isFinite(maximumAgeMs) || maximumAgeMs <= 0) {
+      throw new Error("runtime_link_sample_query_is_invalid");
+    }
+    const rows = this.database.raw.prepare(
+      `SELECT from_node_id, to_node_id, measured_at, rtt_ms, goodput_mbps, transport_mode
+       FROM runtime_link_samples
+       WHERE measured_at >= ?
+       ORDER BY from_node_id, to_node_id, transport_mode, measured_at, id`,
+    ).all(now - maximumAgeMs) as unknown as Array<{
+      from_node_id: string;
+      to_node_id: string;
+      measured_at: number;
+      rtt_ms: number | null;
+      goodput_mbps: number | null;
+      transport_mode: "direct" | "relay";
+    }>;
+    return rows.map((row) => ({
+      fromNodeId: row.from_node_id,
+      toNodeId: row.to_node_id,
+      measuredAt: Number(row.measured_at),
+      rttMs: row.rtt_ms === null ? null : Number(row.rtt_ms),
+      goodputMbps: row.goodput_mbps === null ? null : Number(row.goodput_mbps),
+      transportMode: row.transport_mode,
+    }));
+  }
 
   getSupportAssistantSettings(): SupportAssistantSettings {
     const row = this.database.raw.prepare(
@@ -412,6 +518,57 @@ export class MeshStore {
       .prepare("SELECT * FROM requested_models ORDER BY created_at DESC")
       .all() as unknown as RequestedModelRow[];
     return rows.map((row) => this.mapRequestedModel(row));
+  }
+
+  replaceEngineRuntimeActivationPlans(
+    modelId: string,
+    activationId: string,
+    values: readonly unknown[],
+  ): EngineRuntimeActivationPlan[] {
+    const plans = values.map((value) => engineRuntimeActivationPlanSchema.parse(value));
+    if (
+      plans.some((plan) => plan.modelId !== modelId || plan.activationId !== activationId)
+      || new Set(plans.map((plan) => plan.routeReservationId)).size > 1
+      || new Set(plans.map((plan) => plan.workerId)).size !== plans.length
+    ) {
+      throw new Error("engine_runtime_activation_plan_set_is_invalid");
+    }
+    return this.database.transaction(() => {
+      const now = Date.now();
+      this.database.raw.prepare(
+        "DELETE FROM engine_runtime_activation_plans WHERE model_id = ?",
+      ).run(modelId);
+      const insert = this.database.raw.prepare(
+        `INSERT INTO engine_runtime_activation_plans(
+           model_id, activation_id, worker_id, plan_json, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?)`,
+      );
+      for (const plan of plans) {
+        insert.run(
+          modelId,
+          activationId,
+          plan.workerId,
+          JSON.stringify(plan),
+          Date.parse(plan.createdAt),
+          now,
+        );
+      }
+      return plans.map((plan) => structuredClone(plan));
+    });
+  }
+
+  listEngineRuntimeActivationPlans(): EngineRuntimeActivationPlan[] {
+    const rows = this.database.raw.prepare(
+      `SELECT plan_json FROM engine_runtime_activation_plans
+       ORDER BY model_id, worker_id`,
+    ).all() as unknown as EngineRuntimeActivationPlanRow[];
+    return rows.map((row) => engineRuntimeActivationPlanSchema.parse(JSON.parse(row.plan_json)));
+  }
+
+  removeEngineRuntimeActivationPlans(modelId: string): number {
+    return Number(this.database.raw.prepare(
+      "DELETE FROM engine_runtime_activation_plans WHERE model_id = ?",
+    ).run(modelId).changes);
   }
 
   setRequestedModelProfile(

@@ -9,7 +9,10 @@ import type {
 import { estimateInputTokens } from "../core/request.js";
 import { safeVramBudget } from "../core/tiers.js";
 import type { MeshStore, StoredWorker } from "../storage/store.js";
-import type { RuntimeLinkObservation } from "../distribution/runtime-link-observations.js";
+import {
+  selectPreferredRuntimeLinkObservation,
+  type RuntimeLinkObservation,
+} from "../coordinator/runtime-link-observations.js";
 import { deploymentMetricsFromCanaryEvidence } from "../contracts/deployment-canary.js";
 import {
   decideExecutionRoute,
@@ -530,10 +533,11 @@ export class Scheduler {
       const leftNodeId = left.capabilities.distributedExecutor?.nodeId;
       const rightNodeId = right.capabilities.distributedExecutor?.nodeId;
       if (leftNodeId && rightNodeId) {
-        const observation = observations.find(
-          (candidate) =>
+        const observation = selectPreferredRuntimeLinkObservation(
+          observations.filter((candidate) =>
             candidate.fromNodeId === leftNodeId
-            && candidate.toNodeId === rightNodeId,
+            && candidate.toNodeId === rightNodeId
+          ),
         );
         if (
           observation

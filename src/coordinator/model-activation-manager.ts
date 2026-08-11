@@ -13,6 +13,13 @@ import {
   type AutoDistributionRunResult,
 } from "../distribution/auto-distribute.js";
 import { HttpLaunchAgent } from "../distribution/launch-agent-rpc.js";
+import {
+  bindPythonLaunchDeploymentGeneration,
+  bindPythonLaunchDraftStrategyAuthority,
+  pythonLaunchRequiresDraftStrategyAuthority,
+  type PythonPipelineLaunchDescription,
+} from "../distribution/python-launcher.js";
+import type { ResolvedDraftStrategy } from "../distribution/draft-strategy-registry.js";
 import type { ModelActivationProgressEvent, ModelExecutionCapacityNode } from "./model-catalog.js";
 
 export type AutomaticModelRunner = (
@@ -48,12 +55,21 @@ export interface DynamicActivationRouteStage {
   artifactBytes: number;
 }
 
+export interface DynamicActivationPreparedRoute {
+  id: string;
+  generation: number;
+}
+
 export interface DynamicModelActivationManagerOptions {
   snapshot(): DynamicActivationSnapshot;
   resolveManagedAgent(
     nodeId: string,
     launch: import("../distribution/python-launcher.js").PythonPipelineLaunchDescription,
   ): import("../distribution/launch-supervisor.js").LaunchAgent | undefined;
+  /** Resolve only pinned, verified strategy grants; raw catalog data is forbidden. */
+  resolveDraftStrategyAuthority?(
+    launch: PythonPipelineLaunchDescription,
+  ): ResolvedDraftStrategy | null | Promise<ResolvedDraftStrategy | null>;
   cwd?: string;
   environment?: NodeJS.ProcessEnv;
   workerBuildIdentity?: NativeBuildIdentity;
@@ -63,7 +79,7 @@ export interface DynamicModelActivationManagerOptions {
   onPlanPrepared?(
     modelId: string,
     stages: readonly DynamicActivationRouteStage[],
-  ): string | Promise<string>;
+  ): DynamicActivationPreparedRoute | Promise<DynamicActivationPreparedRoute>;
   onPlanHeartbeat?(modelId: string, reservationId: string): boolean | Promise<boolean>;
   reservationHeartbeatMs?: number;
   onActivated?(
@@ -71,6 +87,7 @@ export interface DynamicModelActivationManagerOptions {
     reservationId: string | null,
     result: AutoDistributionRunResult,
   ): void | Promise<void>;
+  onStopped?(modelId: string): void | Promise<void>;
 }
 
 export class AutomaticModelActivationManager implements ModelActivationManager {
@@ -327,12 +344,38 @@ export class DynamicModelActivationManager implements ModelActivationManager {
       }
       await writeAutoDistributionArtifacts(config, compilation, cwd);
       const reservationStages = routeStagesForReservation(config, compilation);
-      const routeReservationId = this.options.onPlanPrepared
+      const preparedRoute = this.options.onPlanPrepared
         ? await this.options.onPlanPrepared(
             model.id,
             reservationStages,
           )
         : null;
+      const routeReservationId = preparedRoute?.id ?? null;
+      if (preparedRoute !== null) {
+        compilation = {
+          ...compilation,
+          launch: bindPythonLaunchDeploymentGeneration(
+            compilation.launch,
+            preparedRoute.generation,
+          ),
+        };
+      }
+      if (pythonLaunchRequiresDraftStrategyAuthority(compilation.launch)) {
+        const authority = await this.options.resolveDraftStrategyAuthority?.(
+          compilation.launch,
+        );
+        if (!authority) {
+          throw new Error("distributed_activation_draft_strategy_authority_is_required");
+        }
+        compilation = {
+          ...compilation,
+          launch: bindPythonLaunchDraftStrategyAuthority(
+            compilation.launch,
+            authority,
+          ),
+        };
+      }
+      await writeAutoDistributionArtifacts(config, compilation, cwd);
       this.appendProgress(
         model.id,
         "plan_ready",
@@ -378,7 +421,8 @@ export class DynamicModelActivationManager implements ModelActivationManager {
       this.failProgress(model.id, error instanceof Error ? error.message : String(error));
       throw error;
     });
-    this.activePromise = running.finally(() => {
+    this.activePromise = running.finally(async () => {
+      await this.options.onStopped?.(model.id);
       this.activePromise = null;
       this.activeModelId = null;
       this.activeAbort = null;

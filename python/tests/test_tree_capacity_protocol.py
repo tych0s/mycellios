@@ -14,6 +14,8 @@ from distributed_runtime.model import StageModelSpec
 from distributed_runtime.protocol import (
     HEADER,
     MAGIC,
+    STATIC_WAVE_ARTIFACT_DIGEST,
+    STATIC_WAVE_STRATEGY_DIGEST,
     VERSION,
     Frame,
     FrameType,
@@ -21,12 +23,14 @@ from distributed_runtime.protocol import (
     TreePrepareQuote,
     TreePrepareRejection,
     TreePrepareStatus,
+    bind_socket_deployment_generation,
     branch_request_payload,
     decode_tree_reservation_nonce,
     decode_tree_prepare,
     encode_tensor,
     encode_tree_prepare_quote,
     recv_frame,
+    route_identity_digest,
     send_frame,
     tree_prepare_payload,
     tree_reservation_payload,
@@ -304,10 +308,16 @@ class TreeCapacityPayloadTests(unittest.TestCase):
                             int(frame_type),
                             flags,
                             41,
+                            0,
+                            route_identity_digest("static"),
+                            STATIC_WAVE_STRATEGY_DIGEST,
+                            STATIC_WAVE_ARTIFACT_DIGEST,
+                            0,
                             5,
                             token_count,
                             hidden_size,
                             size,
+                            b"\0" * 16,
                         )
                         + payload[:size]
                     )
@@ -1091,6 +1101,7 @@ class TreeCapacityStageTests(unittest.TestCase):
                 self.assertTrue(all(event.wait(2) for event in ready))
                 upstream = socket.create_connection(("127.0.0.1", ports[0]), timeout=5)
                 upstream.settimeout(5)
+                bind_socket_deployment_generation(upstream, 0)
                 send_frame(
                     upstream,
                     FrameType.HELLO,
@@ -1313,6 +1324,7 @@ class TreeCapacityStageTests(unittest.TestCase):
                     ("127.0.0.1", stage_port), timeout=5
                 )
                 upstream.settimeout(5)
+                bind_socket_deployment_generation(upstream, 0)
                 send_frame(
                     upstream,
                     FrameType.HELLO,

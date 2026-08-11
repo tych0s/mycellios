@@ -938,6 +938,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model-canonical-source")
     parser.add_argument("--model-canonical-revision")
     parser.add_argument("--pipeline-snapshot-identity", type=int)
+    parser.add_argument("--deployment-generation", type=int, default=0)
+    parser.add_argument("--route-id", default="static")
+    parser.add_argument("--wave-strategy-id", default="autoregressive")
+    parser.add_argument("--wave-artifact-identity", default="static-model")
     add_ram_backed_moe_arguments(parser)
     add_paged_kv_arguments(parser)
     add_native_gguf_arguments(parser)
@@ -1523,6 +1527,10 @@ def build_server(args: argparse.Namespace) -> DistributedMycelliosServer:
             canonical_model_source=args.model_canonical_source,
             canonical_model_revision=args.model_canonical_revision,
             pipeline_snapshot_identity=args.pipeline_snapshot_identity,
+            deployment_generation=args.deployment_generation,
+            route_id=args.route_id,
+            wave_strategy_id=args.wave_strategy_id,
+            wave_artifact_identity=args.wave_artifact_identity,
             ram_backed_moe_stages=(
                 None
                 if ram_backed_moe is None
@@ -1619,6 +1627,7 @@ def build_server(args: argparse.Namespace) -> DistributedMycelliosServer:
                 )
             standby_config = replace(
                 engine_config,
+                route_id=route.route_id,
                 first_stage_host=route.first_stage_host,
                 first_stage_port=route.first_stage_port,
                 stage_executor_ids=route.stage_executor_ids,

@@ -1,7 +1,16 @@
 import { z } from "zod";
+import {
+  activationCheckpointBeginSchema,
+  activationCheckpointChunkSchema,
+  activationCheckpointCommitSchema,
+  activationCheckpointFailedSchema,
+  activationCheckpointRestoredSchema,
+  activationCheckpointRestoreFailedSchema,
+} from "./activation-checkpoint-transfer.js";
 import { deploymentSchema, gpuSchema, workerCapabilitiesSchema } from "./schemas.js";
 import { evidenceResponseBindingSchema } from "./evidence-challenge.js";
 import { runtimePerformanceProfileSchema } from "../performance/runtime-profile.js";
+import { engineRuntimeMeasurementSchema } from "./engine-runtime-profile.js";
 
 const MAX_IDENTIFIER_LENGTH = 256;
 const MAX_TOKEN_CHUNK_BYTES = 64 * 1024;
@@ -299,6 +308,13 @@ export const evidenceRuntimeCompleteEnvelopeSchema = envelopeSchema(
   }).strict(),
 );
 
+export const evidenceEngineRuntimeCompleteEnvelopeSchema = envelopeSchema(
+  "evidence.engine-runtime.complete",
+  evidenceResponseBindingSchema.extend({
+    measurement: engineRuntimeMeasurementSchema,
+  }).strict(),
+);
+
 export const evidenceChallengeFailedEnvelopeSchema = envelopeSchema(
   "evidence.challenge.failed",
   evidenceResponseBindingSchema.extend({
@@ -315,6 +331,9 @@ export const runtimePrepareProgressEnvelopeSchema = envelopeSchema(
     state: z.enum(["preparing", "ready"]),
     packageId: z.string().length(64).regex(/^[0-9a-f]+$/).optional(),
     weightsSizeBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    downloadedBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    resumedBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    materialized: z.boolean().optional(),
   }).strict(),
 );
 export const runtimeStreamOpenedEnvelopeSchema = envelopeSchema(
@@ -494,6 +513,31 @@ export const runtimeLinkProbeResultEnvelopeSchema = envelopeSchema(
   }).strict(),
 );
 
+export const runtimeCheckpointBeginEnvelopeSchema = envelopeSchema(
+  "runtime.checkpoint.begin",
+  activationCheckpointBeginSchema,
+);
+export const runtimeCheckpointChunkEnvelopeSchema = envelopeSchema(
+  "runtime.checkpoint.chunk",
+  activationCheckpointChunkSchema,
+);
+export const runtimeCheckpointCommitEnvelopeSchema = envelopeSchema(
+  "runtime.checkpoint.commit",
+  activationCheckpointCommitSchema,
+);
+export const runtimeCheckpointFailedEnvelopeSchema = envelopeSchema(
+  "runtime.checkpoint.failed",
+  activationCheckpointFailedSchema,
+);
+export const runtimeCheckpointRestoredEnvelopeSchema = envelopeSchema(
+  "runtime.checkpoint.restored",
+  activationCheckpointRestoredSchema,
+);
+export const runtimeCheckpointRestoreFailedEnvelopeSchema = envelopeSchema(
+  "runtime.checkpoint.restore.failed",
+  activationCheckpointRestoreFailedSchema,
+);
+
 export const workerEnvelopeSchema = z.discriminatedUnion("type", [
   workerHelloEnvelopeSchema,
   workerHeartbeatEnvelopeSchema,
@@ -508,6 +552,7 @@ export const workerEnvelopeSchema = z.discriminatedUnion("type", [
   evidenceCanaryTokenEnvelopeSchema,
   evidenceCanaryCompleteEnvelopeSchema,
   evidenceRuntimeCompleteEnvelopeSchema,
+  evidenceEngineRuntimeCompleteEnvelopeSchema,
   evidenceChallengeFailedEnvelopeSchema,
   runtimePrepareProgressEnvelopeSchema,
   runtimePreparedEnvelopeSchema,
@@ -526,6 +571,12 @@ export const workerEnvelopeSchema = z.discriminatedUnion("type", [
   runtimeDirectCommittedEnvelopeSchema,
   runtimeDirectClosedEnvelopeSchema,
   runtimeDirectTelemetryEnvelopeSchema,
+  runtimeCheckpointBeginEnvelopeSchema,
+  runtimeCheckpointChunkEnvelopeSchema,
+  runtimeCheckpointCommitEnvelopeSchema,
+  runtimeCheckpointFailedEnvelopeSchema,
+  runtimeCheckpointRestoredEnvelopeSchema,
+  runtimeCheckpointRestoreFailedEnvelopeSchema,
   runtimeLinkProbePingEnvelopeSchema,
   runtimeLinkProbePongEnvelopeSchema,
   runtimeLinkProbeResultEnvelopeSchema,

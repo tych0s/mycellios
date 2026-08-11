@@ -497,6 +497,57 @@ class AdaptiveSpeculationControllerTests(unittest.TestCase):
             margin.decide(history_tokens=50, available_draft_tokens=2).enabled
         )
 
+    def test_transient_regression_falls_back_then_rearms_for_future_jobs(self) -> None:
+        controller = AdaptiveSpeculationController(
+            AdaptiveSpeculationConfig(
+                max_draft_tokens=2,
+                candidate_sizes=(2,),
+                min_token_history=1,
+                min_classic_observations=4,
+                min_verify_observations=4,
+                minimum_speedup=1.05,
+                confidence_level=0.95,
+            )
+        )
+        for _ in range(32):
+            controller.record_classic(
+                latency_seconds=1.0,
+                transferred_bytes=0,
+            )
+        for _ in range(4):
+            controller.record_verification(
+                proposed_tokens=2,
+                accepted_tokens=0,
+                latency_seconds=4.0,
+                transferred_bytes=0,
+            )
+        degraded = controller.decide(
+            history_tokens=32,
+            available_draft_tokens=2,
+        )
+        self.assertFalse(degraded.enabled)
+        self.assertEqual(degraded.reason, "not_beneficial")
+        self.assertEqual(degraded.candidate_size, 0)
+
+        # The fallback is a decision from fresh aggregate evidence, not a
+        # process-lifetime fuse. Later jobs can re-arm the same certified
+        # strategy after enough successful measurements clear the bound.
+        for _ in range(128):
+            controller.record_verification(
+                proposed_tokens=2,
+                accepted_tokens=2,
+                latency_seconds=0.5,
+                transferred_bytes=0,
+            )
+        recovered = controller.decide(
+            history_tokens=32,
+            available_draft_tokens=2,
+        )
+        self.assertTrue(recovered.enabled)
+        self.assertEqual(recovered.reason, "beneficial")
+        self.assertEqual(recovered.candidate_size, 2)
+        self.assertGreater(recovered.predicted_speedup_lower_bound or 0, 1.05)
+
     def test_byte_cost_can_reverse_a_latency_only_win(self) -> None:
         controller = self._controller(candidates=(2,), byte_cost=0.01)
         self._record_classic(controller, latency=1.0, transferred_bytes=100)

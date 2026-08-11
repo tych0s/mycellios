@@ -23,6 +23,7 @@ from transformers import AutoConfig
 
 from .device import normalize_torch_device_request
 from .dense_tiering import DenseTieringConfig
+from .failure_evidence import StageFailureEvidence
 from .macro_wave import KVVersion, MacroWaveState
 from .macro_wave_adapter import (
     MacroWaveProposal,
@@ -30,7 +31,9 @@ from .macro_wave_adapter import (
     prepare_tree_macro_wave,
     record_linear_resolution,
     resolve_linear_macro_wave,
+    resolve_linear_sampling_macro_wave,
 )
+from .lossless_sampling import CounterSamplingRng, probabilities_from_logits
 from .model import (
     StageModelSpec,
     StageRunner,
@@ -52,13 +55,17 @@ from .protocol import (
     TensorCodec,
     TreePrepareStatus,
     branch_request_payload,
+    bind_socket_deployment_generation,
     configure_socket,
     decode_tree_prepare,
     decode_tree_reservation_nonce,
     decode_token,
+    decode_sampling_logits,
     decode_verify_result,
     encode_tensor_payload,
     recv_frame,
+    route_identity_digest,
+    wave_identity_digest,
     send_frame,
     tree_prepare_payload,
     tree_reservation_payload,
@@ -241,6 +248,10 @@ class PipelineEngineConfig:
     canonical_model_source: str | None = None
     canonical_model_revision: str | None = None
     pipeline_snapshot_identity: int | None = None
+    deployment_generation: int = 0
+    route_id: str = "static"
+    wave_strategy_id: str = "autoregressive"
+    wave_artifact_identity: str = "static-model"
     # Root + every child stage for local physical tests. In remote mode only
     # the root slot may be configured here; each child process receives its own
     # independently sealed host-local binding from stage_cli.
@@ -787,6 +798,10 @@ class GenerationInput:
     # must contain the COMPLETE tokenized conversation; the engine reuses the
     # live KV prefix it already served for this key and prefills only the rest.
     session_key: str | None = None
+    temperature: float = 0.0
+    top_p: float = 1.0
+    sampling_seed: bytes | None = None
+    sampling_counter: int = 0
 
     def __post_init__(self) -> None:
         if self.client_id < 0:
@@ -808,6 +823,37 @@ class GenerationInput:
             raise ValueError(
                 "session_key must be a non-empty string of at most 256 characters"
             )
+        if (
+            not isinstance(self.temperature, (int, float))
+            or isinstance(self.temperature, bool)
+            or not math.isfinite(float(self.temperature))
+            or float(self.temperature) < 0.0
+        ):
+            raise ValueError("temperature must be finite and non-negative")
+        if (
+            not isinstance(self.top_p, (int, float))
+            or isinstance(self.top_p, bool)
+            or not math.isfinite(float(self.top_p))
+            or not 0.0 < float(self.top_p) <= 1.0
+        ):
+            raise ValueError("top_p must be in (0, 1]")
+        if float(self.temperature) > 0.0:
+            if not isinstance(self.sampling_seed, bytes) or len(self.sampling_seed) != 32:
+                raise ValueError("sampling requires an explicit 32-byte seed")
+        elif self.sampling_seed is not None:
+            raise ValueError("sampling_seed requires temperature > 0")
+        if (
+            not isinstance(self.sampling_counter, int)
+            or isinstance(self.sampling_counter, bool)
+            or not 0 <= self.sampling_counter < 2**64
+        ):
+            raise ValueError("sampling_counter must be uint64")
+        if not self.sampling and self.sampling_counter != 0:
+            raise ValueError("sampling_counter requires temperature > 0")
+
+    @property
+    def sampling(self) -> bool:
+        return float(self.temperature) > 0.0
 
 
 @dataclass(frozen=True)
@@ -925,7 +971,14 @@ class _InflightWave:
 
     @property
     def is_verify(self) -> bool:
-        return self.frame_type == FrameType.VERIFY
+        return self.frame_type == FrameType.VERIFY or (
+            self.frame_type == FrameType.SAMPLING_VERIFY
+            and self.verify_proposal is not None
+        )
+
+    @property
+    def is_sampling(self) -> bool:
+        return self.frame_type == FrameType.SAMPLING_VERIFY
 
 
 @dataclass
@@ -959,6 +1012,7 @@ class _GenerationJob:
     verify_base_tokens: int = 0
     verify_generation: int = 0
     verify_bridge_targets: dict[int, int] = field(default_factory=dict)
+    sampling_bridge_logits: dict[int, tuple[float, ...]] = field(default_factory=dict)
     verify_inflight_bytes: int = 0
     verify_reserved_bytes: int = 0
     verify_collapse_pending: bool = False
@@ -988,10 +1042,17 @@ class _GenerationJob:
     # Earliest instant this request could start preparing its next decode
     # continuation. It includes batch-window and sibling-drafter queueing.
     next_decode_ready_at: float = 0.0
+    sampling_rng: CounterSamplingRng | None = None
 
     def __post_init__(self) -> None:
         if self.next_step is None:
             self.next_step = self.step
+        if self.request.sampling:
+            assert self.request.sampling_seed is not None
+            self.sampling_rng = CounterSamplingRng(
+                self.request.sampling_seed,
+                self.request.sampling_counter,
+            )
 
 
 @dataclass
@@ -1104,6 +1165,7 @@ class DistributedPipelineEngine:
         self._close_error: PipelineShutdownError | None = None
         self._shutdown_report: dict[str, Any] | None = None
         self._fatal_error: str | None = None
+        self._recovery_failure_evidence: dict[str, object] | None = None
         self._request_counter = 0
         self._processes: list[Any] = []
         self._metrics_queue: Any | None = None
@@ -1475,6 +1537,11 @@ class DistributedPipelineEngine:
     def fatal_error(self) -> str | None:
         with self._state_lock:
             return self._fatal_error
+
+    @property
+    def recovery_failure_evidence(self) -> dict[str, object] | None:
+        with self._state_lock:
+            return copy.deepcopy(self._recovery_failure_evidence)
 
     @property
     def session_stats(self) -> dict[str, Any]:
@@ -2046,6 +2113,15 @@ class DistributedPipelineEngine:
             job.cancel_requested.set()
         return True
 
+    def sampling_checkpoint(self, client_id: int):
+        """Return the last scheduler-committed RNG checkpoint for recovery."""
+
+        with self._state_lock:
+            job = self._jobs_by_client.get(client_id)
+            if job is None or job.sampling_rng is None:
+                return None
+            return job.sampling_rng.checkpoint()
+
     def close(self) -> None:
         with self._state_lock:
             if self._closed:
@@ -2357,6 +2433,23 @@ class DistributedPipelineEngine:
                             ),
                         ),
                         pipeline_id=self.pipeline_id,
+                        deployment_generation=config.deployment_generation,
+                        route_id=config.route_id,
+                        wave_strategy_id=config.wave_strategy_id,
+                        wave_artifact_identity=config.wave_artifact_identity,
+                        stage_index=(
+                            stage_index
+                            if config.stage_executor_ids is not None
+                            else None
+                        ),
+                        stage_role=(
+                            "tail" if stage_index == self.stages - 1
+                            else "head" if stage_index == 1 else "middle"
+                        ) if config.stage_executor_ids is not None else None,
+                        stage_executor_id=(
+                            config.stage_executor_ids[stage_index]
+                            if config.stage_executor_ids is not None else None
+                        ),
                         listen_host="127.0.0.1",
                         listen_port=listen_ports[child_index],
                         next_host="127.0.0.1" if has_next else None,
@@ -2459,6 +2552,13 @@ class DistributedPipelineEngine:
         )
         downstream.settimeout(config.socket_timeout_seconds)
         self._downstream = downstream
+        bind_socket_deployment_generation(
+            downstream,
+            config.deployment_generation,
+            config.route_id,
+            wave_strategy_id=config.wave_strategy_id,
+            wave_artifact_identity=config.wave_artifact_identity,
+        )
         send_frame(
             downstream,
             FrameType.HELLO,
@@ -2478,6 +2578,13 @@ class DistributedPipelineEngine:
         downstream.settimeout(None)
         return_socket, _ = listener.accept()
         configure_socket(return_socket)
+        bind_socket_deployment_generation(
+            return_socket,
+            config.deployment_generation,
+            config.route_id,
+            wave_strategy_id=config.wave_strategy_id,
+            wave_artifact_identity=config.wave_artifact_identity,
+        )
         # A model server may sit idle indefinitely. A dedicated reader keeps the
         # direct-return path drained and exposes first tokens while the root stage
         # is still preparing later requests in the same microbatch.
@@ -3251,6 +3358,7 @@ class DistributedPipelineEngine:
             FrameType.PREFILL: FrameType.PREFILL_ACK,
             FrameType.ACTIVATION: FrameType.TOKEN,
             FrameType.VERIFY: FrameType.VERIFY_RESULT,
+            FrameType.SAMPLING_VERIFY: FrameType.SAMPLING_VERIFY_RESULT,
         }.get(flight.frame_type)
         if frame.frame_type != expected_type:
             expected_name = expected_type.name if expected_type is not None else "none"
@@ -3373,6 +3481,7 @@ class DistributedPipelineEngine:
                 proposal.tree.rollback()
         job.verify_generation += 1
         job.verify_bridge_targets.clear()
+        job.sampling_bridge_logits.clear()
         job.verify_collapse_pending = bool(condemned)
         job.verify_proposal = None
         job.verify_base_tokens = 0
@@ -3434,11 +3543,22 @@ class DistributedPipelineEngine:
             raise RuntimeError(f"pipeline connection failed: {value}") from value
         frame, arrived = value
         if frame.frame_type == FrameType.ERROR:
-            raise RuntimeError(frame.payload.decode("utf-8", errors="replace"))
+            try:
+                evidence = StageFailureEvidence.parse_payload(frame.payload)
+                self._validate_stage_failure_evidence(evidence, frame)
+            except ValueError as error:
+                raise RuntimeError("pipeline stage failure evidence is invalid") from error
+            with self._state_lock:
+                self._recovery_failure_evidence = evidence.to_document()
+            raise RuntimeError(
+                f"{evidence.stage_role} stage {evidence.stage_index} failed: "
+                f"{evidence.error_type}: {evidence.message}"
+            )
         if frame.frame_type not in (
             FrameType.PREFILL_ACK,
             FrameType.TOKEN,
             FrameType.VERIFY_RESULT,
+            FrameType.SAMPLING_VERIFY_RESULT,
             FrameType.TREE_PREPARE_RESULT,
             FrameType.TREE_RESERVATION_COMMIT_RESULT,
         ):
@@ -3475,7 +3595,11 @@ class DistributedPipelineEngine:
         if job is None:
             raise RuntimeError(f"token for unknown request {frame.request_id}")
         flight = self._consume_inflight_return(job, frame)
-        if frame.frame_type in (FrameType.TOKEN, FrameType.VERIFY_RESULT):
+        if frame.frame_type in (
+            FrameType.TOKEN,
+            FrameType.VERIFY_RESULT,
+            FrameType.SAMPLING_VERIFY_RESULT,
+        ):
             job.next_decode_ready_at = arrived
         if job.cancel_requested.is_set():
             if flight.is_verify:
@@ -3686,6 +3810,139 @@ class DistributedPipelineEngine:
                 active_sequences=len(active),
             )
 
+        sampled_token: int | None = None
+        if frame.frame_type == FrameType.SAMPLING_VERIFY_RESULT:
+            if not job.request.sampling or job.sampling_rng is None:
+                raise RuntimeError("sampling result returned for a greedy request")
+            rows = decode_sampling_logits(frame)
+            proposal = flight.verify_proposal or job.verify_proposal
+            if proposal is not None:
+                if flight.verify_seed_tokens == 0:
+                    bridge = job.sampling_bridge_logits.pop(flight.step, None)
+                    if bridge is None:
+                        raise RuntimeError(
+                            f"request {frame.request_id} sampling step {flight.step} "
+                            "returned before its predecessor bridge committed"
+                        )
+                    rows = (bridge, *rows)
+                elif flight.verify_seed_tokens != 1:
+                    raise RuntimeError("sampling VERIFY seed count must be zero or one")
+                successor = (
+                    job.inflight_waves[0]
+                    if job.inflight_waves
+                    and job.inflight_waves[0].is_verify
+                    and job.inflight_waves[0].verify_generation
+                    == job.verify_generation
+                    else None
+                )
+                if job.inflight_waves and successor is None:
+                    raise RuntimeError(
+                        "sampling conveyor mixed incompatible in-flight work"
+                    )
+                outcome = resolve_linear_sampling_macro_wave(
+                    proposal,
+                    rows,
+                    temperature=float(job.request.temperature),
+                    top_p=float(job.request.top_p),
+                    rng=job.sampling_rng,
+                    defer_bonus=successor is not None,
+                )
+                resolution = outcome.resolution
+                with self._speculation_lock:
+                    controller = self._speculation_controller_for_profile_locked(
+                        job.speculation_profile
+                    )
+                    if resolution is None:
+                        controller.record_verification(
+                            proposed_tokens=len(proposal.linear_tokens),
+                            accepted_tokens=len(proposal.linear_tokens),
+                            latency_seconds=max(1e-9, arrived - flight.started_at),
+                            transferred_bytes=(
+                                flight.outbound_bytes + HEADER_BYTES + len(frame.payload)
+                            ),
+                        )
+                    else:
+                        record_linear_resolution(
+                            controller,
+                            proposal,
+                            resolution,
+                            latency_seconds=max(1e-9, arrived - flight.started_at),
+                            transferred_bytes=(
+                                flight.outbound_bytes + HEADER_BYTES + len(frame.payload)
+                            ),
+                        )
+                job.sampling_rng = CounterSamplingRng.from_checkpoint(outcome.rng_after)
+                if resolution is None:
+                    if successor is None or outcome.deferred_bridge_logits is None:
+                        raise RuntimeError("sampling prefix commit lost its successor bridge")
+                    appended_before = len(job.token_ids)
+                    reason = self._append_verified_tokens(
+                        job, proposal.linear_tokens, arrived
+                    )
+                    appended = len(job.token_ids) - appended_before
+                    job.kv_valid += flight.verify_seed_tokens + appended
+                    job.sampling_bridge_logits[successor.step] = (
+                        outcome.deferred_bridge_logits
+                    )
+                    self._sync_legacy_verify_head(job)
+                    if reason is not None:
+                        self._condemn_verify_descendants(job, rejection=False)
+                        job.verify_deferred_finish_reason = reason
+                        if job.inflight_waves:
+                            return None
+                        return self._resume_after_verify_drain(
+                            job, active, runner, downstream
+                        )
+                    return None
+                assert resolution is not None
+                if resolution.truncate_required:
+                    keep_tokens = (
+                        flight.verify_base_tokens
+                        + flight.verify_seed_tokens
+                        + resolution.accepted_draft_tokens
+                    )
+                    runner.truncate(frame.request_id, keep_tokens)
+                    send_frame(
+                        downstream,
+                        FrameType.TRUNCATE,
+                        frame.request_id,
+                        token_count=keep_tokens,
+                    )
+                appended_before = len(job.token_ids)
+                reason = self._append_verified_tokens(
+                    job, resolution.emitted_tokens, arrived
+                )
+                appended = len(job.token_ids) - appended_before
+                job.kv_valid += (
+                    flight.verify_seed_tokens
+                    + min(resolution.accepted_draft_tokens, appended)
+                )
+                job.verify_proposal = None
+                job.verify_base_tokens = 0
+                if successor is not None:
+                    self._condemn_verify_descendants(job, rejection=True)
+                    if reason is not None:
+                        job.verify_deferred_finish_reason = reason
+                    if job.inflight_waves:
+                        return None
+                    return self._resume_after_verify_drain(
+                        job, active, runner, downstream
+                    )
+                if reason is not None:
+                    self._finish_turn(job, active, runner, downstream, reason)
+                    return None
+                return self._prepare_decode_wave(
+                    job,
+                    runner,
+                    active_sequences=len(active),
+                )
+            probabilities = probabilities_from_logits(
+                rows[-1],
+                temperature=float(job.request.temperature),
+                top_p=float(job.request.top_p),
+            )
+            sampled_token = job.sampling_rng.categorical(probabilities)
+
         if job.verify_proposal is not None:
             raise RuntimeError(
                 f"request {frame.request_id} returned TOKEN for a verification wave"
@@ -3695,7 +3952,7 @@ class DistributedPipelineEngine:
         # still outside KV until a later wave succeeds.
         job.kv_valid += 1
         prior_output_tokens = len(job.token_ids)
-        token = decode_token(frame)
+        token = sampled_token if sampled_token is not None else decode_token(frame)
         job.token_ids.append(token)
         job.arrivals.append(arrived)
         if job.callback is not None:
@@ -4568,11 +4825,19 @@ class DistributedPipelineEngine:
         if proposal is not None:
             job.verify_base_tokens = verify_base_tokens
             input_tokens = (job.token_ids[-1], *proposal.linear_tokens)
-            frame_type = FrameType.VERIFY
+            frame_type = (
+                FrameType.SAMPLING_VERIFY
+                if job.request.sampling
+                else FrameType.VERIFY
+            )
         else:
             job.verify_base_tokens = 0
             input_tokens = (job.token_ids[-1],)
-            frame_type = FrameType.ACTIVATION
+            frame_type = (
+                FrameType.SAMPLING_VERIFY
+                if job.request.sampling
+                else FrameType.ACTIVATION
+            )
         sealed_wave_token_limit = _sealed_wave_token_limit(self.config)
         if len(input_tokens) > sealed_wave_token_limit:
             raise RuntimeError(
@@ -4761,7 +5026,11 @@ class DistributedPipelineEngine:
         return _PreparedRootWave(
             job=job,
             input_ids=torch.tensor([input_tokens], dtype=torch.long),
-            frame_type=FrameType.VERIFY,
+            frame_type=(
+                FrameType.SAMPLING_VERIFY
+                if job.request.sampling
+                else FrameType.VERIFY
+            ),
             step=next_step,
             reserved_bytes=reserved_bytes,
             draft_latency_seconds=preparation.draft_latency_seconds,
@@ -5245,6 +5514,33 @@ class DistributedPipelineEngine:
             if self._fatal_error is None:
                 self._fatal_error = f"{type(error).__name__}: {error}"
 
+    def _validate_stage_failure_evidence(
+        self,
+        evidence: StageFailureEvidence,
+        frame: Any,
+    ) -> None:
+        if evidence.generation != frame.deployment_generation:
+            raise ValueError("stage failure evidence generation differs from its frame")
+        if evidence.route_id != self.config.route_id:
+            raise ValueError("stage failure evidence route differs from the active route")
+        boundaries = self.config.boundaries
+        if evidence.stage_index >= len(boundaries) - 1:
+            raise ValueError("stage failure evidence index is outside the route")
+        if (
+            evidence.layer_start != boundaries[evidence.stage_index]
+            or evidence.layer_end != boundaries[evidence.stage_index + 1]
+        ):
+            raise ValueError("stage failure evidence layer range differs from the route")
+        expected_role = (
+            "tail" if evidence.stage_index == len(boundaries) - 2
+            else "head" if evidence.stage_index == 1 else "middle"
+        )
+        if evidence.stage_role != expected_role:
+            raise ValueError("stage failure evidence role differs from the route")
+        executor_ids = self.config.stage_executor_ids
+        if executor_ids is None or evidence.executor_id != executor_ids[evidence.stage_index]:
+            raise ValueError("stage failure evidence executor differs from the route")
+
     def _fail_pending_submissions(self, error: BaseException) -> None:
         while self._deferred_batches:
             for job in self._deferred_batches.popleft():
@@ -5546,7 +5842,10 @@ class DistributedPipelineEngine:
                         self.hidden_size,
                     )
                     if (
-                        wave.frame_type == FrameType.VERIFY
+                        wave.frame_type in (
+                            FrameType.VERIFY,
+                            FrameType.SAMPLING_VERIFY,
+                        )
                         and (wave.verify_proposal or job.verify_proposal) is not None
                         and hasattr(self, "config")
                         and hasattr(self, "hidden_size")
@@ -5556,13 +5855,23 @@ class DistributedPipelineEngine:
             ),
             verify_proposal=(
                 wave.verify_proposal
-                or (job.verify_proposal if wave.frame_type == FrameType.VERIFY else None)
+                or (
+                    job.verify_proposal
+                    if wave.frame_type in (
+                        FrameType.VERIFY,
+                        FrameType.SAMPLING_VERIFY,
+                    )
+                    else None
+                )
             ),
             verify_base_tokens=(
                 wave.verify_base_tokens
                 or (
                     job.verify_base_tokens
-                    if wave.frame_type == FrameType.VERIFY
+                    if wave.frame_type in (
+                        FrameType.VERIFY,
+                        FrameType.SAMPLING_VERIFY,
+                    )
                     else 0
                 )
             ),
@@ -5571,7 +5880,10 @@ class DistributedPipelineEngine:
                 wave.verify_input_tokens
                 or (
                     tuple(int(token) for token in wave.input_ids.reshape(-1).tolist())
-                    if wave.frame_type == FrameType.VERIFY
+                    if wave.frame_type in (
+                        FrameType.VERIFY,
+                        FrameType.SAMPLING_VERIFY,
+                    )
                     else ()
                 )
             ),
@@ -6373,7 +6685,10 @@ class DistributedPipelineEngine:
                     next_step = wave.job.next_step
                     if next_step is None or wave.step != next_step:
                         raise RuntimeError("prepared root wave has a stale outbound step")
-                    if wave.frame_type == FrameType.VERIFY:
+                    if wave.frame_type in (
+                        FrameType.VERIFY,
+                        FrameType.SAMPLING_VERIFY,
+                    ) and (wave.verify_proposal or wave.job.verify_proposal) is not None:
                         proposal = wave.verify_proposal or wave.job.verify_proposal
                         if proposal is None:
                             raise RuntimeError(
@@ -6492,7 +6807,13 @@ class DistributedPipelineEngine:
             job=job,
             input_ids=input_chunk,
             frame_type=(
-                FrameType.ACTIVATION if end == total else FrameType.PREFILL
+                (
+                    FrameType.SAMPLING_VERIFY
+                    if job.request.sampling
+                    else FrameType.ACTIVATION
+                )
+                if end == total
+                else FrameType.PREFILL
             ),
             step=next_step,
             prefill_end=end,
@@ -6677,7 +6998,7 @@ def _longest_common_prefix(left: Sequence[int], right: Sequence[int]) -> int:
 def _root_token_mode(frame_type: FrameType) -> str:
     if frame_type == FrameType.PREFILL:
         return "none"
-    if frame_type == FrameType.VERIFY:
+    if frame_type in (FrameType.VERIFY, FrameType.SAMPLING_VERIFY):
         return "all"
     if frame_type == FrameType.ACTIVATION:
         return "last"

@@ -319,6 +319,33 @@ export class MeshDatabase {
       CREATE INDEX IF NOT EXISTS route_reservations_model_status
       ON route_reservations(model_id, status, expires_at);
 
+      CREATE TABLE IF NOT EXISTS activation_checkpoint_recoveries (
+        id TEXT PRIMARY KEY,
+        operation_key TEXT NOT NULL UNIQUE,
+        model_id TEXT NOT NULL REFERENCES requested_models(id) ON DELETE CASCADE,
+        reservation_id TEXT REFERENCES route_reservations(id) ON DELETE SET NULL,
+        recovery_generation INTEGER NOT NULL,
+        source_checkpoint_id TEXT NOT NULL,
+        target_worker_id TEXT NOT NULL,
+        target_launch_request_id TEXT NOT NULL,
+        target_stage_request_id INTEGER NOT NULL,
+        compatibility_json TEXT NOT NULL,
+        maximum_bytes INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK(status IN (
+          'prepared', 'restoring', 'restored', 'promoting', 'promoted', 'failed'
+        )),
+        transfer_id TEXT,
+        error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        restored_at INTEGER,
+        promoted_at INTEGER
+      );
+
+      CREATE INDEX IF NOT EXISTS activation_checkpoint_recoveries_model_generation
+      ON activation_checkpoint_recoveries(model_id, recovery_generation, created_at);
+
       CREATE TABLE IF NOT EXISTS deployment_stage_leases (
         id TEXT PRIMARY KEY,
         reservation_id TEXT NOT NULL REFERENCES route_reservations(id) ON DELETE CASCADE,
@@ -827,6 +854,36 @@ export class MeshDatabase {
 
       CREATE INDEX IF NOT EXISTS worker_admission_credentials_status
       ON worker_admission_credentials(status, last_seen_at);
+
+      CREATE TABLE IF NOT EXISTS runtime_link_samples (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        from_node_id TEXT NOT NULL,
+        to_node_id TEXT NOT NULL,
+        measured_at INTEGER NOT NULL,
+        rtt_ms REAL,
+        goodput_mbps REAL,
+        transport_mode TEXT NOT NULL DEFAULT 'relay'
+          CHECK(transport_mode IN ('direct', 'relay')),
+        CHECK(from_node_id <> to_node_id),
+        CHECK((rtt_ms IS NULL AND goodput_mbps IS NULL)
+          OR (rtt_ms > 0 AND goodput_mbps > 0))
+      );
+
+      CREATE INDEX IF NOT EXISTS runtime_link_samples_pair_time
+      ON runtime_link_samples(from_node_id, to_node_id, measured_at DESC, id DESC);
+
+      CREATE TABLE IF NOT EXISTS engine_runtime_activation_plans (
+        model_id TEXT NOT NULL,
+        activation_id TEXT NOT NULL,
+        worker_id TEXT NOT NULL,
+        plan_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(model_id, worker_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS engine_runtime_activation_plans_activation
+      ON engine_runtime_activation_plans(activation_id, model_id);
 
       CREATE TABLE IF NOT EXISTS node_enrollments (
         id TEXT PRIMARY KEY,

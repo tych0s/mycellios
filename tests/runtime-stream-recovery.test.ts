@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { WorkerEnvelope } from "../src/contracts/types.js";
 import { WorkerHub } from "../src/coordinator/worker-hub.js";
 import type { MeshStore } from "../src/storage/store.js";
+import { classifyRuntimeLinkFailure } from "../src/contracts/runtime-link-failure.js";
 
 const RECOVERY_TOKEN = "recovery_token_0123456789";
 
@@ -26,6 +27,22 @@ describe("WorkerHub recoverable runtime streams", () => {
       workerId: "worker-a",
       type: "runtime.stream.suspend",
     }));
+    const failure = hub.runtimeLinkFailureEvidence()[0]!;
+    expect(failure).toMatchObject({
+      role: "relay",
+      failureClass: "relay-link-lost",
+      transportMode: "relay",
+      checkpointKind: "stream-offset",
+      sourceNodeId: "node-a",
+      destinationNodeId: "node-b",
+      generation: 0,
+      sourceOffset: 4,
+      destinationOffset: 0,
+    });
+    expect(classifyRuntimeLinkFailure(failure, 0, failure.observedAt)).toMatchObject({
+      outcome: "resume",
+      replayScope: "stream-offset",
+    });
 
     // Source retained four bytes; destination proves it delivered none.
     deliver(hub, "worker-a", "runtime.stream.resume", {

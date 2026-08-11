@@ -11,6 +11,7 @@ from typing import Any
 from distributed_runtime.verify_conveyor_runtime_benchmark import (
     ControlledReferenceDraftProvider,
     build_interleaved_order,
+    decide_conveyor_promotion,
     parse_acceptances,
     parse_delays,
     parse_stage_counts,
@@ -336,6 +337,72 @@ class VerifyConveyorRuntimeBenchmarkTests(unittest.TestCase):
                 [path for path in destination.parent.iterdir() if path != destination],
                 [],
             )
+
+    def test_promotion_requires_exact_stable_matched_physical_wan_pairs(self) -> None:
+        campaign = {
+            "evidence_class": "physical-wan-direct",
+            "claim_boundary": {
+                "physical_multi_pc": True,
+                "physical_gpu": True,
+                "wan_measured": True,
+            },
+            "scenarios": [
+                {
+                    "success": True,
+                    "arms": [{"evidence": {"exact": True}}],
+                    "comparisons": [
+                        {
+                            "pair_count": 4,
+                            "speedup": {"samples": [1.10, 1.11, 1.12, 1.13]},
+                        }
+                    ],
+                }
+            ],
+        }
+        promoted = decide_conveyor_promotion(campaign)
+        self.assertEqual(promoted["decision"], "promote")
+        self.assertEqual(promoted["reasons"], [])
+
+        loopback = deepcopy(campaign)
+        loopback["claim_boundary"]["wan_measured"] = False
+        self.assertIn(
+            "physical_wan_evidence_is_missing",
+            decide_conveyor_promotion(loopback)["reasons"],
+        )
+
+        incomplete = deepcopy(campaign)
+        incomplete["scenarios"][0]["comparisons"][0] = {
+            "pair_count": 2,
+            "speedup": {"samples": [1.10, 1.11]},
+        }
+        self.assertIn(
+            "comparison_pairs_are_incomplete:0:0",
+            decide_conveyor_promotion(incomplete)["reasons"],
+        )
+
+        noisy = deepcopy(campaign)
+        noisy["scenarios"][0]["comparisons"][0]["speedup"]["samples"] = [
+            1.06,
+            1.50,
+            1.07,
+            1.48,
+        ]
+        self.assertIn(
+            "comparison_is_too_noisy:0:0",
+            decide_conveyor_promotion(noisy)["reasons"],
+        )
+
+        regressing = deepcopy(campaign)
+        regressing["scenarios"][0]["comparisons"][0]["speedup"]["samples"] = [
+            1.01,
+            1.10,
+            1.11,
+            1.12,
+        ]
+        self.assertIn(
+            "comparison_speedup_gate_failed:0:0",
+            decide_conveyor_promotion(regressing)["reasons"],
+        )
 
 
 if __name__ == "__main__":
