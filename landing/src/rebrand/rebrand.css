@@ -41,10 +41,11 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
 .rb-social:hover,.rb-social:focus-visible { opacity:1; background:rgba(238,233,226,.1); }
 .rb-pill-ghost { margin-left:8px; padding:0 24px; min-height:44px; color:inherit; border-color:currentColor; background:transparent; }
 .rb-pill-ghost:hover,.rb-pill-ghost:focus-visible { color:var(--rb-forest)!important; border-color:transparent; background:#eee9e2; }
-/* The burger panel is ivory, so the same marks need a dark-on-light hover wash. */
-.rb-mobile-social { display:flex; gap:4px; margin-left:-11px; }
-.rb-mobile-social .rb-social:hover,.rb-mobile-social .rb-social:focus-visible { background:rgba(30,42,34,.08); }
-.rb-menu,.rb-mobile-nav { display:none; }
+/* The social row inside the mobile sheet: bordered chips on the dark panel. */
+.rb-mobile-social { display:flex; gap:8px; margin:12px 4px 2px; }
+.rb-mobile-social .rb-social { border:1px solid rgba(238,233,226,.16); opacity:.85; }
+.rb-mobile-social .rb-social:hover,.rb-mobile-social .rb-social:focus-visible { background:rgba(238,233,226,.08); }
+.rb-menu,.rb-mobile-nav,.rb-mobile-backdrop { display:none; }
 /* Hero: a dark stage where the world is drawn as land dots and the mycelium
    grows across it. The copy and the prompt input sit on the left, the globe
    bleeds off the right edge. Colours are pinned rather than tokenised because
@@ -66,6 +67,11 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
    same element, so it waits too — a shadow with nothing casting it was the
    other half of what looked wrong. */
 .rb-hero-mushroom { position:absolute; z-index:4; left:50%; bottom:-8px; width:min(700px,56vw); height:min(600px,68vh,48vw); opacity:1; transform:translateX(-50%); pointer-events:none; }
+/* The phone-only mycelium anchor: sits on the hero's floor so the colony can
+   start there even though the organism itself stands behind the globe. Kept
+   out of the desktop layout — zero-size would fail the renderer's 20px
+   sanity check, so it has a real box but paints nothing. */
+#rb-hero-base { position:absolute; left:0; bottom:0; width:100%; height:24px; pointer-events:none; }
 .rb-hero-mushroom mushroom-stage { opacity:0; transform:translateY(6px) scale(.996); transition:opacity .22s ease-out,transform .28s cubic-bezier(.22,.8,.2,1); }
 .rb-hero-mushroom.is-grown mushroom-stage { opacity:1; transform:none; }
 .rb-ground-colony { position:absolute; z-index:4; inset:0; overflow:hidden; pointer-events:none; }
@@ -345,6 +351,7 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
 .rb-story-track li.is-on i { width:74px; background:var(--rb-bronze); }
 .rb-story-track li.is-on span { color:var(--rb-ink); }
 @keyframes rbFade { from { opacity:0; transform:translateY(7px); } to { opacity:1; transform:none; } }
+@keyframes rbMobileNavIn { from { opacity:0; transform:translateY(-8px) scale(.985); } to { opacity:1; transform:none; } }
 .rb-story-fallback { display:none; }
 
 /* ── Models ───────────────────────────────────────────────────────────── */
@@ -591,7 +598,7 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
    whole viewport is 700px, so putting a 61px body to its left would leave the
    two nearly touching in the corner. The left edge is empty at this width and is
    the only place a body this size fits without crowding anything. */
-@media(max-width:700px){ .rb-gutter-fruiting.rb-reveal { height:76px; right:auto; left:4px; opacity:.96; } .rb-gutter-fruiting .rb-gutter-body { opacity:.9; } .rb-gutter-fruiting .rb-gutter-rim { stroke-width:1.15; opacity:.68; } }
+@media(max-width:700px){ .rb-gutter-fruiting.rb-reveal { height:76px; right:auto; left:4px; opacity:.96; } .rb-gutter-stage { right:auto; left:4px; height:88px; } .rb-gutter-fruiting .rb-gutter-body { opacity:.9; } .rb-gutter-fruiting .rb-gutter-rim { stroke-width:1.15; opacity:.68; } }
 .rb-pay-head { max-width:840px; }
 .rb-pay-head h2 { margin-top:16px; }
 .rb-pay-head>p:not(.rb-kicker) { max-width:620px; margin:18px 0 0; color:#5b635c; font-size:15px; line-height:1.7; }
@@ -920,8 +927,25 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
   .rb-header nav,.rb-desktop-cta { display:none; }
   .rb-menu { position:relative; z-index:41; display:grid; place-items:center; width:44px; height:44px; border:1px solid var(--rb-line); border-radius:50%; background:rgba(248,245,240,.94); color:var(--rb-ink); }
   .rb-menu svg { width:19px; }
-  .rb-mobile-nav { position:absolute; z-index:40; display:flex; flex-direction:column; gap:20px; top:78px; left:var(--rb-gutter); right:var(--rb-gutter); padding:24px; border:1px solid var(--rb-line); border-top:2px solid var(--rb-bronze); color:var(--rb-ink); background:#f8f5f0; box-shadow:0 20px 60px rgba(30,42,34,.12); animation:rbFade .2s ease-out both; }
-  .rb-mobile-nav a { display:flex; align-items:center; min-height:44px; }
+  /* The mobile sheet: a dark panel in the hero's own register — the ivory
+     box it replaced sat on the dark page like an error. Grouped rows with
+     hairline separators, a mono kicker for the $SPORE cluster, the login as
+     a bronze CTA, and a backdrop that dims the page behind it. */
+  .rb-mobile-backdrop { position:fixed; z-index:39; inset:0; display:block; background:rgba(8,11,9,.55); backdrop-filter:blur(3px); animation:rbFade .18s ease-out both; }
+  .rb-mobile-nav { position:absolute; z-index:40; top:78px; left:var(--rb-gutter); right:var(--rb-gutter); display:flex; flex-direction:column; padding:12px 14px 16px; border:1px solid rgba(238,233,226,.14); border-radius:20px; background:radial-gradient(120% 90% at 85% 0%,rgba(173,122,72,.18),transparent 55%),#0e1511; color:#eee9e2; box-shadow:0 30px 70px rgba(0,0,0,.45); animation:rbMobileNavIn .24s cubic-bezier(.22,.8,.2,1) both; }
+  .rb-mobile-group { display:flex; flex-direction:column; padding-block:7px; }
+  .rb-mobile-group + .rb-mobile-group { border-top:1px solid rgba(238,233,226,.08); }
+  .rb-mobile-nav a { display:flex; align-items:center; justify-content:space-between; min-height:48px; padding:0 10px; border-radius:12px; font-size:16.5px; font-weight:550; letter-spacing:-.01em; color:#e9e3d7; }
+  /* The arrow is the affordance: hidden at rest, bronze on hover/focus. */
+  .rb-mobile-nav a::after { content:"→"; color:var(--rb-bronze); font-family:var(--rb-font-mono); font-size:13px; opacity:0; transform:translateX(-4px); transition:opacity .16s ease,transform .16s ease; }
+  .rb-mobile-nav a:hover,.rb-mobile-nav a:focus-visible { background:rgba(238,233,226,.06); }
+  .rb-mobile-nav a:hover::after,.rb-mobile-nav a:focus-visible::after { opacity:1; transform:none; }
+  .rb-mobile-kicker { padding:6px 10px 0; color:#c9976a; font:500 10px var(--rb-font-mono); letter-spacing:.22em; text-transform:uppercase; }
+  .rb-mobile-sub { display:flex; flex-direction:column; margin:4px 0 2px 10px; padding-left:12px; border-left:1px solid rgba(173,122,72,.4); }
+  .rb-mobile-sub a { min-height:42px; font-size:14.5px; font-weight:500; color:#b9c2b4; }
+  .rb-mobile-cta { margin-top:10px; min-height:50px; justify-content:center; border:1px solid rgba(201,151,106,.55); border-radius:14px; background:rgba(173,122,72,.14); color:#f2e7d8; font:600 12px var(--rb-font-mono); letter-spacing:.14em; text-transform:uppercase; }
+  .rb-mobile-cta::after { content:none; }
+  .rb-mobile-cta:hover,.rb-mobile-cta:focus-visible { background:rgba(173,122,72,.26); }
   .rb-hero-copy { width:min(560px,58vw); transform:translateY(-150px); }
   .rb-hero-mushroom { left:50%; width:min(580px,68vw); height:min(500px,60vh,60vw); }
   .rb-globe { right:4%; width:min(86vw,94vh); }
@@ -971,23 +995,78 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
      inheriting it added a full extra viewport of empty scroll. */
   .rb-hero-inner { display:block; min-height:0; }
   .rb-hero-copy { width:auto; padding-top:0; transform:none; }
-  /* Exactly the desktop organism, reframed and rendered at a bounded mobile
-     quality budget. The cap stays below the lede and the stem plants left of
-     the centred scroll cue. */
-  .rb-hero-mushroom { display:block; left:43%; bottom:-42px; width:280px; height:240px; opacity:1; transform:translateX(-50%); }
-  .rb-ground-colony { display:none; }
+  /* Phones do not draw the organism. Behind the globe it read as a
+     transparent ghost, and every earlier framing either overlapped the copy
+     or pushed it under the fold — so the mobile hero is the planet and the
+     text. `wantsMushroom()` keeps the renderer off the phone entirely; this
+     only hides the empty host. */
+  .rb-hero-mushroom { display:none; }
+  /* The organism is absent from the phone's first screen without this, which
+     is the one thing the hero cannot afford: the page is named after a fungus
+     and opens on a planet. The standing body is still out — it is 190KB of
+     three.js and every framing of it fought the copy — but the ground colony
+     is five SVG paths that were already in the markup, so the phone gets the
+     species at the scale a phone can carry: small bodies along the hero's
+     floor, under everything, costing nothing.
+
+     The arrangement has a subject. Five bodies of similar size spread evenly
+     along an edge read as a border print, not as a colony — so `c` stands in
+     the centre at nearly twice its neighbours and the other four fall in
+     around it, largest nearest and smallest furthest. That is the same
+     composition the desktop hero uses, where the standing organism holds the
+     middle; this is the phone's version of it at a scale the phone can carry.
+
+     The centre column is the SCROLL cue's, which is why it was empty before.
+     Tucking the cue above the cap only worked while the body stayed small; a
+     body tall enough to be the subject leaves no band up there. So the phone
+     copies what the desktop hero already does — the cue crosses the *stem*,
+     under the cap, on the same axis. Same reading order, and the cue's 52px
+     of text sits mostly over dark ground because the stem is ~13px wide.
+
+     That is why the centre is `-d` and not `-c`. `-d` is the parasol: cap at
+     13% of its box with the stem running the rest, so it reaches high while
+     leaving a long stem for the cue. `-c` is the flat specimen, whose cap
+     hangs at 27% and would put the gills exactly where the cue has to go —
+     it takes the parasol's old place out at 76% instead. The two only
+     swapped positions; no geometry changed.
+
+     The bottom right is the support assistant's fixed launcher (56px at
+     right:12px), so nothing grows into that corner. */
+  /* `--rb-mini-lean:0` matters here: `-d` carries a 4deg desktop lean, which
+     at this size walks the cap ~9px off the axis the cue is centred on. The
+     sway keyframes still breathe it ±1.2deg, so it is alive, just upright. */
+  .rb-ground-mushroom-d { left:50%; --rb-mini-size:92px; --rb-mini-opacity:.88; --rb-mini-lean:0deg; }
+  .rb-ground-mushroom-a { left:22%; --rb-mini-size:34px; --rb-mini-opacity:.72; }
+  .rb-ground-mushroom-c { left:76%; --rb-mini-size:31px; --rb-mini-opacity:.74; }
+  .rb-ground-mushroom-b { left:7%; --rb-mini-size:21px; --rb-mini-opacity:.6; }
+  .rb-ground-mushroom-e { left:66%; --rb-mini-size:23px; --rb-mini-opacity:.62; }
   .rb-hero h1 { font-size:clamp(40px,12.5vw,54px); }
   .rb-hero-prompt { max-width:none; }
-  /* The organism sits behind the control plane, but never behind its content:
-     the mobile field is an opaque dark plate so the placeholder and entered
-     prompt keep full contrast as the cap passes beneath its left edge. */
-  .rb-hero-prompt input,.rb-hero-prompt button { background:rgba(11,15,12,.92); }
   .rb-hero::after { background:radial-gradient(90% 46% at 50% 16%,transparent 0%,rgba(11,15,12,.55) 55%,rgba(11,15,12,.95) 78%); }
   /* Clipped to an arc rather than a full circle: a 1:1 globe at this width
-     would push the prompt input below the fold on a phone. */
-  .rb-globe { position:relative; top:auto; right:auto; width:124%; max-width:none; height:min(310px,34vh); margin:0 0 22px -12%; overflow:hidden; transform:none; }
+     would push the prompt input below the fold on a phone.
+
+     The arc gave back ~46px so the floor could hold a real organism. Only
+     ~93px separated the prompt from the hero's bottom edge, which is not
+     enough for a 58px body *and* the scroll cue above it — and the cue cannot
+     move off the centre axis without losing the composition. The globe is the
+     one element here with slack: it is already a crop, so a shallower crop
+     costs a band of empty dots rather than anything the eye was reading. */
+  .rb-globe { position:relative; top:auto; right:auto; width:124%; max-width:none; height:min(272px,30vh); margin:0 0 8px -12%; overflow:hidden; transform:none; }
   .rb-globe canvas { height:auto; aspect-ratio:1; }
-  .rb-scroll-cue { bottom:26px; }
+  /* On the stem, under the cap — the desktop hero's own arrangement.
+
+     Lifting the cue above the crown was the earlier answer and it does not
+     survive a subject-sized body: at 92px the cap bottom is already ~74px off
+     the floor, so there is no band left up there that is not the prompt's.
+     Below the cap there is, and it is the same picture the desktop draws.
+     The parasol's cap bottom sits at ~61% of its box (viewBox y54 of 140),
+     i.e. 92 × 1.4 × .61 − 5 ≈ 74px above the floor; the cue occupies 26–63px,
+     clearing the gills by ~15px and leaving the arrow its breathing loop.
+     22px rather than 26px because the short-phone tier shortens the same cap
+     to 78px, and one offset has to satisfy both — at 26px it cleared the tall
+     cap but grazed the short one. */
+  .rb-scroll-cue { bottom:22px; }
   .rb-page h2 { font-size:clamp(34px,10vw,44px); }
   /* The three-column diagram cannot survive a phone, so the story stacks:
      request on top, devices in a row, answer underneath. */
@@ -1055,6 +1134,19 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
   .rb-footer nav { margin-top:44px; }
   .rb-footer-brand>p { max-width:310px; }
   .rb-footer-bottom { margin-top:44px; gap:20px; }
+}
+
+/* Short phones (a 740pt iPhone SE/mini class screen) run ~100px poorer than a
+   844pt one, and the hero spends that difference in exactly the band where the
+   centre specimen and the prompt both want to live.
+
+   So the shortest screens take a second, smaller cut: a little more off the
+   globe crop and a slightly shorter centre body, so the cap still stops clear
+   of the prompt input. The composition is identical — biggest organism dead
+   centre, cue on its stem — only the scale changes. */
+@media(max-width:700px) and (max-height:800px){
+  .rb-globe { height:min(216px,25vh); margin-bottom:4px; }
+  .rb-ground-mushroom-d { --rb-mini-size:78px; }
 }
 
 /* Reduced motion: no scrubbing, no travelling dashes. The story collapses to

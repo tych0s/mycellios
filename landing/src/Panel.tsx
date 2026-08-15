@@ -15,6 +15,8 @@ import {
   Copy,
   Cpu,
   Download,
+  Eye,
+  EyeOff,
   ExternalLink,
   FileText,
   Gauge,
@@ -54,7 +56,6 @@ import {
   Timer,
   Trash2,
   UserRound,
-  WalletCards,
   Wifi,
   X,
   Zap,
@@ -129,6 +130,19 @@ import "./panel.css";
 
 import "./panel-downloads.css";
 import "./panel-desktop.css";
+
+function MetaMaskProviderIcon() {
+  return <svg viewBox="0 0 35 34" aria-hidden="true">
+    <path d="M32.7077 32.7522L25.1688 30.5174L19.4833 33.9008L15.5167 33.8991L9.82793 30.5174L2.29225 32.7522L0 25.0489L2.29225 16.4993L0 9.27094L2.29225 0.312256L14.0674 7.31554H20.9326L32.7077 0.312256L35 9.27094L32.7077 16.4993L35 25.0489L32.7077 32.7522Z" fill="#FF5C16" />
+    <path d="M2.29395 0.312256L14.0691 7.32047L13.6008 12.1301L2.29395 0.312256ZM9.82959 25.0522L15.0106 28.9811L9.82959 30.5175V25.0522ZM14.5966 18.5565L13.6009 12.1333L7.22692 16.5009L7.24335 20.9983L9.82809 18.5565H14.5966ZM32.7077 0.312256L20.9326 7.32047L21.3993 12.1301L32.7077 0.312256ZM25.1722 25.0522L19.9912 28.9811L25.1722 30.5175V25.0522ZM27.7766 16.5025L21.401 12.1333L20.4053 18.5565H25.1722L27.7586 20.9983L27.7766 16.5025Z" fill="#FF5C16" />
+    <path d="M9.82793 30.5175L2.29225 32.7522L0 25.0522H9.82793V30.5175ZM14.5947 18.5549L16.0341 27.8406L14.0393 22.6777L7.23975 20.9984L9.82613 18.5549H14.5947ZM25.1721 30.5175L32.7078 32.7522L35.0001 25.0522H25.1721V30.5175ZM20.4053 18.5549L18.9658 27.8406L20.9607 22.6777L27.7602 20.9984L25.1722 18.5549H20.4053Z" fill="#E34807" />
+    <path d="M0 25.0488L2.29225 16.4993H7.22183L7.23991 20.9967L14.0394 22.676L16.0343 27.8389L15.0089 28.976L9.82793 25.0472H0ZM35.0001 25.0488L32.7078 16.4993H27.7783L27.7602 20.9967L20.9607 22.676L18.9658 27.8389L19.9912 28.976L25.1722 25.0472H35.0001Z" fill="#FF8D5D" />
+    <path d="M20.9325 7.31543H14.0673L13.6006 12.1251L16.0342 27.834H18.9656L21.4008 12.1251L20.9325 7.31543Z" fill="#FF8D5D" />
+    <path d="M2.29225 0.312256L0 9.27094L2.29225 16.4993H7.22183L13.5991 12.1301L2.29225 0.312256ZM13.17 20.4199H10.9369L9.72095 21.6062L14.0409 22.6727L13.17 20.4199ZM32.7077 0.312256L34.9999 9.27094L32.7077 16.4993H27.7781L21.4009 12.1301L32.7077 0.312256ZM21.833 20.4199H24.0694L25.2853 21.6079L20.9604 22.676L21.833 20.4199ZM19.4817 30.8362L19.9911 28.9794L18.9658 27.8423H16.0327L15.0073 28.9794L15.5167 30.8362" fill="#661800" />
+    <path d="M19.4816 30.8359V33.9021H15.5166V30.8359H19.4816Z" fill="#C0C4CD" />
+    <path d="M9.82959 30.5142L15.52 33.9008V30.8346L15.0106 28.9778L9.82959 30.5142ZM25.1721 30.5142L19.4817 33.9008V30.8346L19.9911 28.9778L25.1721 30.5142Z" fill="#E7EBF6" />
+  </svg>;
+}
 
 type PanelView = "overview" | "history" | "nodes" | "models" | "jobs" | "tests" | "logs" | "inference" | "contribute" | "join" | "downloads" | "admin";
 type PanelMode = "simple" | "developer";
@@ -869,6 +883,7 @@ function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
       </div>
       {authOpen && <AccountModal
         config={authConfig}
+        onConfigLoaded={setAuthConfig}
         session={authSession}
         identity={networkIdentity}
         account={apiAccount}
@@ -1006,6 +1021,7 @@ function JoinQuickMenu({
 
 function AccountModal({
   config,
+  onConfigLoaded,
   session,
   identity,
   account,
@@ -1015,6 +1031,7 @@ function AccountModal({
   onClose,
 }: {
   config: PublicAuthConfig;
+  onConfigLoaded: (config: PublicAuthConfig) => void;
   session: AuthSession | null;
   identity: NetworkIdentity | null;
   account: ApiAccount | null;
@@ -1026,6 +1043,7 @@ function AccountModal({
   const [mode, setMode] = useState<"signin" | "signup">("signin");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [passwordVisible, setPasswordVisible] = useState(false);
   const [busy, setBusy] = useState(false);
   const [providerBusy, setProviderBusy] = useState<"x" | "metamask" | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1086,9 +1104,14 @@ function AccountModal({
     setBusy(true);
     setError(null);
     try {
+      let activeConfig = config;
+      if (!activeConfig.enabled || !activeConfig.url || !activeConfig.anonKey) {
+        activeConfig = await loadAuthConfig();
+        onConfigLoaded(activeConfig);
+      }
       const nextSession = mode === "signin"
-        ? await signIn(config, email.trim(), password)
-        : await signUp(config, email.trim(), password);
+        ? await signIn(activeConfig, email.trim(), password)
+        : await signUp(activeConfig, email.trim(), password);
       const nextIdentity = await loadNetworkIdentity(nextSession.accessToken);
       onAuthenticated(nextSession, nextIdentity);
     } catch (caught) {
@@ -1140,14 +1163,14 @@ function AccountModal({
           </button>
           <div className="account-provider-divider"><i />or<i /></div>
           <button type="button" className="account-provider-wallet" disabled={providerBusy !== null || busy} onClick={() => void continueWithMetaMask()}>
-            {providerBusy === "metamask" ? <LoaderCircle className="spin" /> : <WalletCards />}
+            {providerBusy === "metamask" ? <LoaderCircle className="spin" /> : <MetaMaskProviderIcon />}
             MetaMask
           </button>
         </div>
         <div className="account-mode-tabs"><button className={mode === "signin" ? "active" : ""} onClick={() => setMode("signin")}>Sign in</button><button className={mode === "signup" ? "active" : ""} onClick={() => setMode("signup")}>Create account</button></div>
         <form onSubmit={(event) => void submit(event)}>
           <label>Email<input type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} required /></label>
-          <label>Password<input type="password" autoComplete={mode === "signin" ? "current-password" : "new-password"} minLength={8} value={password} onChange={(event) => setPassword(event.target.value)} required /></label>
+          <label>Password<span className="account-password-field"><input type={passwordVisible ? "text" : "password"} autoComplete={mode === "signin" ? "current-password" : "new-password"} minLength={8} value={password} onChange={(event) => setPassword(event.target.value)} required /><button type="button" aria-label={passwordVisible ? "Hide password" : "Show password"} aria-pressed={passwordVisible} title={passwordVisible ? "Hide password" : "Show password"} onClick={() => setPasswordVisible((visible) => !visible)}>{passwordVisible ? <EyeOff aria-hidden="true" /> : <Eye aria-hidden="true" />}</button></span></label>
           {error && <div className="account-auth-error" role="alert"><CircleAlert size={16} />{error}</div>}
           <button className="account-submit" disabled={busy}>{busy ? <LoaderCircle className="spin" /> : <ShieldCheck />}{busy ? "Connecting…" : mode === "signin" ? "Sign in securely" : "Create account"}</button>
         </form>

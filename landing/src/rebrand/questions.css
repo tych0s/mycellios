@@ -270,6 +270,12 @@
 
 @media (max-width: 1000px) {
   .rb-quest-inner { grid-template-columns: 1fr; gap: 44px; }
+  /* The desktop list is pinned to grid line 2. If that placement survives the
+     one-column template, CSS creates an implicit second column and squeezes
+     the questions into the right half of a phone. Both reading blocks belong
+     to the one explicit track after the layout collapses. */
+  .rb-quest-head,
+  .rb-quest-list { grid-column: 1; width: 100%; min-width: 0; }
   /* Stuck to the top of a single column, the heading would sit over its own
      answers. Below the breakpoint it simply scrolls away. */
   .rb-quest-head { position: static; }

@@ -12090,6 +12090,7 @@ body {
 .account-provider-actions > button:hover:not(:disabled) { transform: translateY(-1px); }
 .account-provider-actions > button:disabled { opacity: .58; cursor: wait; }
 .account-provider-actions svg { width: 17px; height: 17px; }
+.account-provider-wallet svg:not(.spin) { width: 25px; height: 24px; flex: 0 0 auto; }
 .account-provider-x { border: 1px solid rgba(255,255,255,.78); color: #151515; background: #fff; }
 .account-provider-x span { font-size: 16px; line-height: 1; }
 .account-provider-wallet { border: 1px solid rgba(213,163,109,.28); color: #efcfac; background: rgba(13,25,19,.62); }
@@ -12103,6 +12104,12 @@ body {
 .account-modal form label { display: grid; gap: 7px; color: #b0a99e; font: 650 9px var(--panel-font-mono); letter-spacing: .09em; text-transform: uppercase; }
 .account-modal form input { width: 100%; min-height: 46px; padding: 0 14px; border: 1px solid rgba(205, 169, 131, .22); border-radius: 11px; outline: none; color: #fff; background: rgba(20, 37, 29, .72); font: 500 14px var(--panel-font); }
 .account-modal form input:focus { border-color: #daaf81; box-shadow: 0 0 0 3px rgba(215, 167, 115, .12); }
+.account-password-field { position: relative; display: block; }
+.account-password-field input { padding-right: 52px !important; }
+.account-password-field > button { position: absolute; top: 1px; right: 1px; width: 44px; height: 44px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 10px; color: #9e988f; background: transparent; cursor: pointer; transition: color 150ms ease-out, background 150ms ease-out; }
+.account-password-field > button:hover { color: #f1d2b1; background: rgba(210,158,102,.09); }
+.account-password-field > button:focus-visible { outline: 2px solid rgba(210,158,102,.48); outline-offset: -4px; color: #f1d2b1; }
+.account-password-field > button svg { width: 18px; height: 18px; }
 .account-submit, .account-signout { display: inline-flex; align-items: center; justify-content: center; gap: 9px; min-height: 46px; border: 0; border-radius: 12px; color: #fff; background: linear-gradient(135deg, #d5a36d, #d3a069); font-weight: 700; }
 .account-submit svg, .account-signout svg { width: 17px; }
 .account-submit:disabled { opacity: .6; }

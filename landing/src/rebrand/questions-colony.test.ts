@@ -432,6 +432,17 @@ describe("the colony fits the space the column has spare", () => {
     expect(collapsed).toMatch(/\.rb-quest-colony \{ display: none; \}/);
   });
 
+  it("uses the full explicit column after the responsive grid collapses", async () => {
+    /* `grid-column: 2` does not become harmless when the template changes to
+       one column: it creates an implicit second track and compresses the FAQ
+       into the right half of a phone. The breakpoint must reset placement. */
+    const css = await read("./questions.css");
+    const collapsed = css.slice(css.indexOf("@media (max-width: 1000px)"));
+    expect(collapsed).toMatch(/\.rb-quest-head,\s*\.rb-quest-list \{[^}]*grid-column: 1/);
+    expect(collapsed).toMatch(/\.rb-quest-head,\s*\.rb-quest-list \{[^}]*width: 100%/);
+    expect(collapsed).toMatch(/\.rb-quest-head,\s*\.rb-quest-list \{[^}]*min-width: 0/);
+  });
+
   it("stays planted under the heading column instead of sliding with scroll", async () => {
     /* The colony used to travel left as the sticky heading released. The travel
        is gone: it was motion the reader never asked for, in the margin of a

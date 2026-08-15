@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { growFruitingBody, type Point } from "./fruiting-body";
-import { loadMushroomStage, wantsMushroom } from "./HeroMushroom";
+import { loadMushroomStage } from "./HeroMushroom";
 
 /*
  * A young fruiting body coming up out of the exchange section's bottom edge.
@@ -31,13 +31,11 @@ import { loadMushroomStage, wantsMushroom } from "./HeroMushroom";
  * renderer, and the hero's entry is the reference's own numbers verbatim,
  * pinned by a test so tuning this one cannot drift that one.
  *
- * The SVG below is not dead code and not a lesser copy: it is what the visitors
- * who never get WebGL actually see. `wantsMushroom()` excludes phones under
- * 700px (where three.js would be 133KB for a decoration behind the text) and
- * anyone with `prefers-reduced-motion` (where a breathing, rotating organism is
- * exactly what the setting exists to prevent). For them the flat silhouette is
- * the right answer rather than the fallback answer, so it keeps its own
- * reasoning:
+ * The SVG below records the earlier fallback geometry and keeps its geometric
+ * tests useful, but it is no longer a production render path. Mobile now uses
+ * the same real material as desktop; its cost is controlled through the
+ * renderer's mobile quality profile, and reduced motion freezes that same body
+ * instead of replacing it with an illustration.
  *
  * Drawn as outlines — cap arc, underside arc, a fan of gills, a hairline stalk
  * — it renders unmistakably as a *parasol*: an arc over a line with ribs
@@ -178,7 +176,7 @@ function stipeOutline(centre: Point[], baseWidth: number, topWidth: number): str
 }
 
 /*
- * The flat specimen, for the visitors who never load the renderer.
+ * The retired flat specimen, retained as a tested geometric reference.
  *
  * Everything above about mass, the closed silhouette and group alpha applies to
  * this and only this — the WebGL body has real geometry and none of those
@@ -285,6 +283,8 @@ function GutterFruitingStage() {
     let cancelled = false;
     let element: HTMLElement | null = null;
     let failsafe = 0;
+    const mobile = window.matchMedia("(max-width: 700px)").matches;
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
     const mount = () => {
       void loadMushroomStage().then(({ defineMushroomStage }) => {
@@ -298,13 +298,14 @@ function GutterFruitingStage() {
            set before the element is connected. */
         element.setAttribute("variant", "gutter");
         element.setAttribute("accent", "#c9976a");
+        if (mobile) element.setAttribute("quality", "mobile");
         /* No spores. They are the hero's signature and they drift upward across
            whatever is above them — here that is the pricing table. */
         element.setAttribute("spores", "off");
         /* Half amplitude. The hero is the thing you look at, so it may sway;
            this is in the corner of the eye, where full motion is a distraction
            rather than life. */
-        element.setAttribute("motion", "calm");
+        element.setAttribute("motion", reduceMotion ? "off" : "calm");
         element.setAttribute("scale", "1");
         element.style.cssText = "width:100%;height:100%;display:block;";
         element.addEventListener("mushroom-ready", () => {
@@ -344,16 +345,9 @@ function GutterFruitingStage() {
 }
 
 /*
- * Which body this visitor gets.
- *
- * Decided once on mount rather than at module scope: `wantsMushroom()` reads
- * media queries, and evaluating it during render would make the component
- * depend on window in an environment that may not have one. The initial state
- * is the flat body, so the very first paint is always the one that needs
- * nothing, and desktop swaps to the renderer on the same tick the effect runs.
+ * Every viewport gets the same rendered organism. Mobile only changes the GPU
+ * budget and motion, never the geometry or material identity.
  */
 export function GutterFruiting() {
-  const [webgl, setWebgl] = useState(false);
-  useEffect(() => setWebgl(wantsMushroom()), []);
-  return webgl ? <GutterFruitingStage /> : <GutterFruitingSvg />;
+  return <GutterFruitingStage />;
 }

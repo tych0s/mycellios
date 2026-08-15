@@ -278,11 +278,33 @@ describe("Landing", () => {
     expect(closing.indexOf("rb-fruit-mark")).toBeLessThan(closing.indexOf('href="/join"'));
   });
 
-  it("renders the network-only support assistant entry point", () => {
+  it("keeps the support assistant off the landing", () => {
+    // The launcher floated over every section at every scroll position; the
+    // assistant lives in the panel now, not on the public page.
     const html = renderToStaticMarkup(<RebrandLanding />);
 
-    expect(html).toContain('aria-label="Open mycellios assistant"');
-    expect(html).toContain("Need help?");
-    expect(html).toContain("Assistant offline");
+    expect(html).not.toContain("support-assistant");
+    expect(html).not.toContain("Need help?");
+  });
+
+  it("ships the mobile menu as a dark grouped sheet, not the ivory link stack", async () => {
+    const read = (path: string) => import("node:fs/promises").then(({ readFile }) =>
+      readFile(new URL(path, import.meta.url), "utf8"),
+    );
+    const page = await read("./rebrand/RebrandLanding.tsx");
+    const css = await read("./rebrand/rebrand.css");
+
+    // Structure: groups with a mono kicker for the $SPORE cluster, the login
+    // as a CTA, and a backdrop that dims the page and closes on tap.
+    expect(page).toContain("rb-mobile-group");
+    expect(page).toContain("rb-mobile-kicker");
+    expect(page).toContain("rb-mobile-cta");
+    expect(page).toContain("rb-mobile-backdrop");
+    // Skin: dark forest panel on the hero's register, bronze accents, and a
+    // per-row arrow affordance. The ivory box must not come back.
+    expect(css).toContain("#0e1511");
+    expect(css).toContain("rbMobileNavIn");
+    expect(css).toMatch(/\.rb-mobile-nav a::after \{ content:"→"/);
+    expect(css).not.toMatch(/\.rb-mobile-nav \{[^}]*background:#f8f5f0/);
   });
 });

@@ -20,7 +20,6 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState, type CSSProperties, type FormEvent } from "react";
 import { applySeoMetadata } from "../seo";
-import { SupportAssistant } from "../SupportAssistant";
 import { FruitingMark } from "./FruitingMark";
 import { HeroGlobe } from "./HeroGlobe";
 import { HeroGroundColony } from "./HeroGroundColony";
@@ -33,7 +32,7 @@ import { QuestionsSection } from "./QuestionsSection";
 import { ScrollStory } from "./ScrollStory";
 import { SponsorFooter } from "./SponsorFooter";
 import { SporeDrift } from "./SporeDrift";
-import { SporeMenu, SporeMobileLinks } from "./SporeMenu";
+import { SporeMenu } from "./SporeMenu";
 import { useCountUp, useInView, useRevealOnScroll } from "./use-motion";
 import "./rebrand.css";
 
@@ -261,17 +260,46 @@ export function RebrandLanding() {
             <a className="rb-pill rb-pill-ghost" href="/network?view=overview">Login</a>
           </div>
           <button className="rb-menu" type="button" aria-label={mobileOpen ? "Close menu" : "Open menu"} aria-expanded={mobileOpen} onClick={() => setMobileOpen(!mobileOpen)}>{mobileOpen ? <X /> : <Menu />}</button>
-          {mobileOpen && <div className="rb-mobile-nav"><a href="/network?view=inference">Chat</a><a href="/create">Create</a><a href="/earn">Earn</a><SporeMobileLinks /><a href="/network" onClick={() => setMobileOpen(false)}>Network</a><a href="/blog">Blog</a><a href="/network?view=overview">Login</a><div className="rb-mobile-social"><a className="rb-social" href={GITHUB_URL} target="_blank" rel="noreferrer" aria-label="mycellios on GitHub"><GithubMark /></a><a className="rb-social" href={X_URL} target="_blank" rel="noreferrer" aria-label="mycellios on X"><XMark /></a><a className="rb-social" href={TELEGRAM_URL} target="_blank" rel="noreferrer" aria-label="mycellios on Telegram"><TelegramMark /></a></div></div>}
+          {mobileOpen && <>
+            {/* Dims the page so the sheet reads as a layer, and taps outside
+                close it. */}
+            <div className="rb-mobile-backdrop" aria-hidden="true" onClick={() => setMobileOpen(false)} />
+            {/* A tap anywhere on the sheet navigates or dismisses — rows are
+                links, everything else is dead space that should close. */}
+            <nav className="rb-mobile-nav" aria-label="Mobile navigation" onClick={() => setMobileOpen(false)}>
+              <div className="rb-mobile-group">
+                <a href="/network?view=inference">Chat</a>
+                <a href="/create">Create</a>
+                <a href="/earn">Earn</a>
+              </div>
+              <div className="rb-mobile-group">
+                <span className="rb-mobile-kicker">$ SPORE</span>
+                <div className="rb-mobile-sub">
+                  <a href="/spore">Staking</a>
+                  <a href="/spore/treasury">Treasury</a>
+                  <a href="/spore/data">Data</a>
+                </div>
+              </div>
+              <div className="rb-mobile-group">
+                <a href="/network">Network</a>
+                <a href="/blog">Blog</a>
+              </div>
+              <a className="rb-mobile-cta" href="/network?view=overview">Login</a>
+              <div className="rb-mobile-social"><a className="rb-social" href={GITHUB_URL} target="_blank" rel="noreferrer" aria-label="mycellios on GitHub"><GithubMark /></a><a className="rb-social" href={X_URL} target="_blank" rel="noreferrer" aria-label="mycellios on X"><XMark /></a><a className="rb-social" href={TELEGRAM_URL} target="_blank" rel="noreferrer" aria-label="mycellios on Telegram"><TelegramMark /></a></div>
+            </nav>
+          </>}
         </div>
       </header>
 
       <section className="rb-hero" aria-labelledby="rb-hero-title">
         <HeroGlobe />
+        <HeroGroundColony />
         {/* A grounded fruiting body beside the scroll cue. Its foot meets the
             viewport edge, so the page-wide mycelium can grow from a believable
-            origin instead of from artwork floating behind the headline. */}
+            origin instead of from artwork floating behind the headline.
+            Desktop only: `wantsMushroom()` keeps the renderer and the host off
+            phones, where every framing of the organism fought the copy. */}
         <HeroMushroom />
-        <HeroGroundColony />
         <div className="rb-hero-inner rb-shell">
           <div className="rb-hero-copy">
             {/* Name the category immediately, then state the product's defining
@@ -296,6 +324,11 @@ export function RebrandLanding() {
           <span>Scroll</span>
           <ArrowDown />
         </a>
+        {/* Mycelium origin on phones. There the organism stands behind the
+            globe — its base is mid-hero, which would start the colony in the
+            middle of the copy — so the network anchors to the hero's floor
+            instead and still begins right after the hero, like the desktop. */}
+        <div id="rb-hero-base" aria-hidden="true" />
       </section>
 
       <ScrollStory />
@@ -423,7 +456,6 @@ export function RebrandLanding() {
           <div className="rb-footer-bottom"><span>© 2026 mycellios</span><a href="#rb-top">Back to top <ArrowDown /></a></div>
         </div>
       </footer>
-      <SupportAssistant surface="landing" />
     </main>
   );
 }

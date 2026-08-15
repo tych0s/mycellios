@@ -542,23 +542,31 @@ describe("the rendered specimen", () => {
        pricing table, and they are the hero's signature besides. Motion is
        halved because this sits in the corner of the eye. */
     expect(component).toContain('setAttribute("spores", "off")');
-    expect(component).toContain('setAttribute("motion", "calm")');
+    expect(component).toContain('reduceMotion ? "off" : "calm"');
   });
 
-  it("does not build a WebGL context for visitors who will never see one", async () => {
+  it("uses the same rendered organism on phones with a bounded quality profile", async () => {
     /*
-     * Phones under 700px and anyone asking for reduced motion get the flat
-     * body instead — the same gate the hero uses, imported rather than
-     * re-stated, because a second copy of the rule is a second thing to drift.
-     * For them the silhouette is the right answer rather than a fallback, so
-     * every test above it still applies.
+     * Visual identity stays invariant: phones and reduced-motion visitors keep
+     * the real gutter geometry. Only renderer cost and motion change.
      */
     const component = await read("./GutterFruiting.tsx");
-    expect(component).toContain("wantsMushroom()");
-    expect(component).toMatch(/webgl \?\s*<GutterFruitingStage \/>\s*:\s*<GutterFruitingSvg \/>/);
+    expect(component).toContain('matchMedia("(max-width: 700px)")');
+    expect(component).toContain('setAttribute("quality", "mobile")');
+    expect(component).toContain('matchMedia("(prefers-reduced-motion: reduce)")');
+    expect(component).toMatch(/return <GutterFruitingStage \/>/);
+    expect(code(component)).not.toContain("wantsMushroom()");
     // And the module is the hero's, so the chunk is fetched once for the page.
     expect(component).toContain('from "./HeroMushroom"');
     expect(component).toContain("loadMushroomStage()");
+  });
+
+  it("positions the rendered organism in the empty left corner on phones", async () => {
+    const css = await read("./rebrand.css");
+    const phone = css.match(/@media\(max-width:700px\)\{[^\n]*\.rb-gutter-stage \{[^}]*\}/)?.[0] ?? "";
+    expect(phone).toContain("right:auto");
+    expect(phone).toContain("left:4px");
+    expect(phone).toContain("height:88px");
   });
 
   it("waits until the section is near before paying for a context", async () => {

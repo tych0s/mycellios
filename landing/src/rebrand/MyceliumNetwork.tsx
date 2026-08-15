@@ -46,8 +46,14 @@ export function MyceliumNetwork() {
      * Anchor to the stable host rather than the dynamically imported custom
      * element. The root geometry is therefore correct on the first layout,
      * even while the WebGL fruiting body is still compiling its first frame.
+     *
+     * On a phone the organism stands behind the globe — its base is mid-hero,
+     * which would start the colony in the middle of the copy — so the network
+     * anchors to the hero's floor (`#rb-hero-base`) and still begins right
+     * after the hero, like the desktop.
      */
-    field.setAttribute("origin-from", "#rb-hero-mushroom");
+    const mobile = window.matchMedia("(max-width: 700px)").matches;
+    field.setAttribute("origin-from", mobile ? "#rb-hero-base" : "#rb-hero-mushroom");
     field.setAttribute(
       "motion",
       window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "off" : "full",

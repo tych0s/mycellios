@@ -28,13 +28,17 @@ import { useEffect, useRef, useState } from "react";
  * An organism that materialises out of the dark reads as intended; the same
  * organism appearing between two frames reads as a bug.
  *
- * Every viewport draws the same organism. Mobile changes only its rendering
- * budget and motion, never its geometry or material identity.
+ * Phones do not draw the organism at all. Behind the globe it read as a
+ * transparent ghost, and every earlier framing either overlapped the copy or
+ * pushed it under the fold — so the mobile hero is the planet and the text,
+ * and `wantsMushroom()` keeps the 190KB renderer off the phone entirely: no
+ * prefetch, no WebGL context, no empty host.
  */
 
 /** True when this visitor will actually draw the organism. */
 export function wantsMushroom(): boolean {
-  return true;
+  if (typeof window === "undefined" || !window.matchMedia) return true;
+  return !window.matchMedia("(max-width: 700px)").matches;
 }
 
 let stagePromise: Promise<typeof import("./vendor/mushroom-stage.js")> | null = null;
@@ -57,7 +61,6 @@ export function HeroMushroom() {
     const host = hostRef.current;
     if (!host || !wantsMushroom()) return;
 
-    const mobile = window.matchMedia("(max-width: 700px)").matches;
     const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
     let cancelled = false;
@@ -71,10 +74,9 @@ export function HeroMushroom() {
       defineMushroomStage();
       element = document.createElement("mushroom-stage");
       element.setAttribute("variant", "hero");
-      if (mobile) element.setAttribute("quality", "mobile");
       element.setAttribute("accent", "#c9976a");
-      element.setAttribute("spores", mobile || reduceMotion ? "off" : "on");
-      element.setAttribute("motion", reduceMotion ? "off" : mobile ? "calm" : "full");
+      element.setAttribute("spores", reduceMotion ? "off" : "on");
+      element.setAttribute("motion", reduceMotion ? "off" : "full");
       element.setAttribute("scale", "1");
       element.style.cssText = "width:100%;height:100%;display:block;";
       element.addEventListener("mushroom-ready", () => setShown(true), { once: true });

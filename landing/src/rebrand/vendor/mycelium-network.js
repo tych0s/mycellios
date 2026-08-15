@@ -319,11 +319,18 @@ export function defineMyceliumField() {
         const half = Math.max(1, mid - railInset);
         const lateral = 1 - Math.abs((x0 + x1) * 0.5 - mid) / half;
         if (lateral <= 0) return 0;
-        return Math.min(1, enter) * Math.min(1, lateral);
+        /* sqrt pushes the veil outward: a segment only has to be *somewhat*
+           inside the column to lose most of its ink, so the reading column
+           stays clean instead of fading gradually from the rail inward. */
+        return Math.min(1, enter) * Math.min(1, Math.sqrt(lateral));
       };
 
+      /* Narrow pages carry extra trunks (see trunkDefs below), so they get a
+         larger budget — otherwise the cap would truncate the colony long
+         before it reaches the footer on a tall stacked document. */
+      const segCap = W < 700 ? 13500 : 9000;
       const grow = (x, y, ang, len, depth, spread) => {
-        if (segs.length > 9000) return;
+        if (segs.length > segCap) return;
         /* Once a root has cleared the fruiting body, commit it to the nearest
            outward direction. Branch noise still makes the paths organic, but
            this persistent steering prevents long trunks from wandering back
@@ -375,6 +382,21 @@ export function defineMyceliumField() {
         [ox, oy, Math.PI * 0.22, H * 0.9],
         [ox, oy, Math.PI * 0.12, H * 0.72]
       ];
+      /* On a narrow page five trunks are not enough: branches accumulate per
+         pixel travelled, so the first viewport and a half below the origin
+         reads as empty and the colony only becomes visible mid-page. Extra
+         trunks on small widths put the network on screen right after the
+         hero, the way the desktop already does. They grow interleaved rather
+         than appended: growth is depth-first and capped, so latecomers would
+         starve before drawing a single segment. */
+      if (W < 700) {
+        trunkDefs.splice(
+          1, 0,
+          [ox, oy, Math.PI * 0.35, H * 0.6],
+          [ox, oy, Math.PI * 0.65, H * 0.6],
+          [ox, oy, Math.PI * 0.5, H * 0.55]
+        );
+      }
       trunkDefs.forEach((t) => grow(t[0], t[1], t[2], t[3], 0, 1));
 
       segs.sort((a, b) => a.o - b.o);
@@ -404,10 +426,12 @@ export function defineMyceliumField() {
         const fade = 1 / (1 + s.d * 0.55);
         /* `s.c` is how deep this segment sits in the reading column, 0..1.
            Interpolating rather than switching is what keeps the line reading as
-           one filament: at full depth a trunk still carries a third of its ink
-           so the colony is legibly one organism, fine branch noise drops to a
-           sixth, and everything in between is a gradient no edge can form in. */
-        const floor = s.d === 0 ? 0.34 : 0.16;
+           one filament. The floors are deliberately near zero: the colony lives
+           in the page margins, and a trunk crossing the copy at a third of its
+           ink read as lines drawn across the whole page. What remains at full
+           depth is a ghost that keeps the path technically unbroken without
+           registering as a line. */
+        const floor = s.d === 0 ? 0.08 : 0.03;
         const veil = 1 - s.c * (1 - floor);
         ctx.strokeStyle = this.rgba((0.055 + 0.075 * fade) * ink * veil);
         ctx.lineWidth = Math.max(0.35, (1.45 - s.d * 0.28) * (1 - s.c * 0.45));
