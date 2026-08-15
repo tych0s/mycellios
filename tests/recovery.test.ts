@@ -76,7 +76,7 @@ describe("coordinator crash recovery", () => {
 
     const migrated = new MeshDatabase(path);
     expect((migrated.raw.prepare("SELECT version FROM schema_meta").get() as { version: number }).version)
-      .toBe(31);
+      .toBe(33);
     expect(migrated.raw.prepare(
       `SELECT spore_quote_id, spore_quote_attestation_digest
        FROM payout_dispatch_operations WHERE id = 'dispatch-legacy'`,
@@ -115,11 +115,11 @@ describe("coordinator crash recovery", () => {
     const row = migrated.raw
       .prepare("SELECT id, deregistered FROM workers WHERE id = 'wrk-existing'")
       .get() as { id: string; deregistered: number };
-    expect(version.version).toBe(31);
+    expect(version.version).toBe(33);
     expect(migrated.raw.prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'payout_settlement_evidence'",
     ).get()).toEqual({ name: "payout_settlement_evidence" });
-    expect(version.version).toBe(31);
+    expect(version.version).toBe(33);
     expect(row).toEqual({ id: "wrk-existing", deregistered: 1 });
     migrated.close();
   });
@@ -156,7 +156,7 @@ describe("coordinator crash recovery", () => {
     const row = migrated.raw
       .prepare("SELECT id, deregistered FROM workers WHERE id = 'wrk-partially-migrated'")
       .get() as { id: string; deregistered: number };
-    expect(version.version).toBe(31);
+    expect(version.version).toBe(33);
     expect(row).toEqual({ id: "wrk-partially-migrated", deregistered: 1 });
     migrated.close();
 
@@ -164,7 +164,7 @@ describe("coordinator crash recovery", () => {
     expect(
       (reopened.raw.prepare("SELECT version FROM schema_meta").get() as { version: number })
         .version,
-    ).toBe(31);
+    ).toBe(33);
     reopened.close();
   });
 
@@ -200,7 +200,7 @@ describe("coordinator crash recovery", () => {
     expect(columns.some((column) => column.name === "activation_error")).toBe(true);
     expect(
       (migrated.raw.prepare("SELECT version FROM schema_meta").get() as { version: number }).version,
-    ).toBe(31);
+    ).toBe(33);
     migrated.close();
   });
 
@@ -225,7 +225,7 @@ describe("coordinator crash recovery", () => {
     const migrated = new MeshDatabase(path);
     const columns = migrated.raw.prepare("PRAGMA table_info(economic_settlements)").all() as Array<{ name: string }>;
     expect(columns.some(({ name }) => name === "contribution_evidence_id")).toBe(true);
-    expect((migrated.raw.prepare("SELECT version FROM schema_meta").get() as { version: number }).version).toBe(31);
+    expect((migrated.raw.prepare("SELECT version FROM schema_meta").get() as { version: number }).version).toBe(33);
     migrated.close();
   });
 

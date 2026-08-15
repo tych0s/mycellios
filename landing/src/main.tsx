@@ -20,7 +20,9 @@ const isRebrandRoute = window.location.pathname === "/rebrand" || window.locatio
 if (isRebrandRoute) window.history.replaceState({}, "", "/");
 applySeoMetadata();
 
-const path = window.location.pathname;
+const path = window.location.pathname.length > 1
+  ? window.location.pathname.replace(/\/+$/, "")
+  : window.location.pathname;
 const surface = resolveLandingSurface(path, window.location.search);
 
 const page = path === "/create" ? <CreateStudio />

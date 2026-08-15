@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-const SCHEMA_VERSION = 31;
+const SCHEMA_VERSION = 33;
 
 export interface PersistenceOutboxRow {
   id: number;
@@ -1148,6 +1148,212 @@ export class MeshDatabase {
 
       CREATE INDEX IF NOT EXISTS node_snapshot_history_node_sequence
       ON node_snapshot_history(node_id, sequence);
+
+      CREATE TABLE IF NOT EXISTS studio_agents (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        create_idempotency_key TEXT NOT NULL,
+        template_id TEXT CHECK(template_id IS NULL OR template_id IN ('concierge', 'researcher', 'developer')),
+        status TEXT NOT NULL CHECK(status IN ('draft', 'published', 'archived')),
+        operational_state TEXT NOT NULL CHECK(operational_state IN (
+          'draft', 'validating', 'waiting_for_capacity', 'activating_model',
+          'ready', 'serving', 'degraded', 'unavailable', 'revoked'
+        )),
+        draft_version INTEGER NOT NULL CHECK(draft_version > 0),
+        configuration_json TEXT NOT NULL,
+        published_revision_id TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        archived_at INTEGER,
+        UNIQUE(owner_id, create_idempotency_key),
+        UNIQUE(id, owner_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS studio_agents_owner_updated
+      ON studio_agents(owner_id, status, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS studio_agent_revisions (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK(revision > 0),
+        configuration_json TEXT NOT NULL,
+        configuration_digest TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY(agent_id, owner_id) REFERENCES studio_agents(id, owner_id) ON DELETE CASCADE,
+        UNIQUE(agent_id, revision),
+        UNIQUE(agent_id, configuration_digest),
+        UNIQUE(id, agent_id, owner_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS studio_channel_deployments (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        revision_id TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        channel TEXT NOT NULL CHECK(channel IN ('web', 'telegram', 'api')),
+        state TEXT NOT NULL CHECK(state IN ('waiting_for_capacity', 'ready', 'degraded', 'revoked')),
+        public_id TEXT NOT NULL UNIQUE,
+        publish_idempotency_key TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        revoked_at INTEGER,
+        FOREIGN KEY(revision_id, agent_id, owner_id) REFERENCES studio_agent_revisions(id, agent_id, owner_id),
+        UNIQUE(owner_id, publish_idempotency_key, channel)
+      );
+
+      CREATE INDEX IF NOT EXISTS studio_deployments_owner_state
+      ON studio_channel_deployments(owner_id, state, updated_at DESC);
+
+      CREATE UNIQUE INDEX IF NOT EXISTS studio_deployments_active_channel
+      ON studio_channel_deployments(agent_id, channel)
+      WHERE revoked_at IS NULL;
+
+      CREATE TABLE IF NOT EXISTS studio_agent_events (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        details_json TEXT NOT NULL,
+        previous_event_digest TEXT,
+        event_digest TEXT NOT NULL UNIQUE,
+        occurred_at INTEGER NOT NULL,
+        FOREIGN KEY(agent_id, owner_id) REFERENCES studio_agents(id, owner_id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS studio_agent_events_agent_sequence
+      ON studio_agent_events(agent_id, sequence);
+
+      CREATE TRIGGER IF NOT EXISTS studio_revision_update_guard
+      BEFORE UPDATE ON studio_agent_revisions
+      BEGIN
+        SELECT RAISE(ABORT, 'immutable_studio_agent_revision');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS studio_revision_delete_guard
+      BEFORE DELETE ON studio_agent_revisions
+      BEGIN
+        SELECT RAISE(ABORT, 'immutable_studio_agent_revision');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS studio_deployment_revision_guard
+      BEFORE UPDATE OF agent_id, revision_id, owner_id, channel, public_id, publish_idempotency_key, created_at
+      ON studio_channel_deployments
+      BEGIN
+        SELECT RAISE(ABORT, 'immutable_studio_deployment_identity');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS studio_agent_owner_guard
+      BEFORE UPDATE OF owner_id, created_at ON studio_agents
+      BEGIN
+        SELECT RAISE(ABORT, 'immutable_studio_agent_owner');
+      END;
+
+      CREATE TABLE IF NOT EXISTS studio_knowledge_sources (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        media_type TEXT NOT NULL,
+        content_sha256 TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0 AND size_bytes <= 8388608),
+        state TEXT NOT NULL CHECK(state IN ('ready', 'failed', 'deleted')),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        deleted_at INTEGER,
+        FOREIGN KEY(agent_id, owner_id) REFERENCES studio_agents(id, owner_id) ON DELETE CASCADE,
+        UNIQUE(agent_id, content_sha256)
+      );
+
+      CREATE TABLE IF NOT EXISTS studio_knowledge_chunks (
+        id TEXT PRIMARY KEY,
+        source_id TEXT NOT NULL REFERENCES studio_knowledge_sources(id) ON DELETE CASCADE,
+        agent_id TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+        content TEXT NOT NULL,
+        content_sha256 TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE(source_id, ordinal)
+      );
+
+      CREATE INDEX IF NOT EXISTS studio_knowledge_chunks_agent
+      ON studio_knowledge_chunks(owner_id, agent_id, source_id, ordinal);
+
+      CREATE VIRTUAL TABLE IF NOT EXISTS studio_knowledge_fts USING fts5(
+        chunk_id UNINDEXED, owner_id UNINDEXED, agent_id UNINDEXED, source_id UNINDEXED,
+        content, tokenize = 'unicode61 remove_diacritics 2'
+      );
+
+      CREATE TABLE IF NOT EXISTS studio_memory_facts (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        fact TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('proposed', 'approved', 'rejected', 'expired', 'deleted')),
+        origin TEXT NOT NULL,
+        confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+        expires_at INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        deleted_at INTEGER,
+        FOREIGN KEY(agent_id, owner_id) REFERENCES studio_agents(id, owner_id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS studio_memory_agent_subject
+      ON studio_memory_facts(owner_id, agent_id, subject_id, status, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS studio_tool_audit (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        tool_id TEXT NOT NULL CHECK(tool_id IN ('documents', 'calculator', 'web', 'api')),
+        input_digest TEXT NOT NULL,
+        outcome TEXT NOT NULL CHECK(outcome IN ('completed', 'rejected', 'failed')),
+        output_json TEXT,
+        error_code TEXT,
+        duration_ms INTEGER NOT NULL CHECK(duration_ms >= 0),
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY(agent_id, owner_id) REFERENCES studio_agents(id, owner_id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS studio_invocations (
+        id TEXT PRIMARY KEY,
+        deployment_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        request_digest TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('pending', 'completed', 'failed')),
+        response_json TEXT,
+        error_code TEXT,
+        usage_json TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY(deployment_id) REFERENCES studio_channel_deployments(id),
+        FOREIGN KEY(agent_id, owner_id) REFERENCES studio_agents(id, owner_id) ON DELETE CASCADE,
+        UNIQUE(deployment_id, idempotency_key)
+      );
+
+      CREATE TABLE IF NOT EXISTS studio_telegram_updates (
+        deployment_id TEXT NOT NULL REFERENCES studio_channel_deployments(id),
+        update_id TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        request_json TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('received', 'completed', 'rejected', 'failed')),
+        response_json TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(deployment_id, update_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS studio_telegram_policies (
+        deployment_id TEXT PRIMARY KEY REFERENCES studio_channel_deployments(id),
+        secret_digest TEXT NOT NULL,
+        allowed_chats_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
 
     `);
 

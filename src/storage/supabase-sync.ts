@@ -19,6 +19,17 @@ const TABLE_PRIMARY_KEYS = Object.freeze({
   deployment_operations: "id",
   route_reservations: "id",
   deployment_stage_leases: "id",
+  studio_agents: "id",
+  studio_agent_revisions: "id",
+  studio_channel_deployments: "id",
+  studio_agent_events: "event_digest",
+  studio_knowledge_sources: "id",
+  studio_knowledge_chunks: "id",
+  studio_memory_facts: "id",
+  studio_tool_audit: "id",
+  studio_invocations: "id",
+  studio_telegram_policies: "deployment_id",
+  studio_telegram_updates: "id",
 } as const);
 
 type SyncedTable = keyof typeof TABLE_PRIMARY_KEYS;
@@ -165,6 +176,17 @@ export class SupabasePersistence {
       deploymentOperations,
       routeReservations,
       deploymentStageLeases,
+      studioAgents,
+      studioRevisions,
+      studioDeployments,
+      studioEvents,
+      studioSources,
+      studioChunks,
+      studioFacts,
+      studioToolAudit,
+      studioInvocations,
+      studioTelegramPolicies,
+      studioTelegramUpdates,
     ] = await Promise.all([
       this.readTable("workers"),
       this.readTable("requested_models"),
@@ -179,6 +201,17 @@ export class SupabasePersistence {
       this.readTable("deployment_operations"),
       this.readTable("route_reservations"),
       this.readTable("deployment_stage_leases"),
+      this.readTable("studio_agents"),
+      this.readTable("studio_agent_revisions"),
+      this.readTable("studio_channel_deployments"),
+      this.readTable("studio_agent_events"),
+      this.readTable("studio_knowledge_sources"),
+      this.readTable("studio_knowledge_chunks"),
+      this.readTable("studio_memory_facts"),
+      this.readTable("studio_tool_audit"),
+      this.readTable("studio_invocations"),
+      this.readTable("studio_telegram_policies"),
+      this.readTable("studio_telegram_updates"),
     ]);
     this.store.database.transaction(() => {
       for (const row of workers) this.restoreWorker(row);
@@ -194,6 +227,18 @@ export class SupabasePersistence {
       for (const row of routeReservations) this.restoreRouteReservation(row);
       for (const row of deploymentStageLeases) this.restoreDeploymentStageLease(row);
       for (const row of deploymentStates) this.restoreDeploymentState(row);
+      for (const row of studioAgents) this.restoreStudioAgent(row);
+      for (const row of studioRevisions) this.restoreStudioRevision(row);
+      for (const row of studioAgents) this.restoreStudioPublishedRevision(row);
+      for (const row of studioDeployments) this.restoreStudioDeployment(row);
+      for (const row of studioEvents) this.restoreStudioEvent(row);
+      for (const row of studioSources) this.restoreStudioSource(row);
+      for (const row of studioChunks) this.restoreStudioChunk(row);
+      for (const row of studioFacts) this.restoreStudioFact(row);
+      for (const row of studioToolAudit) this.restoreStudioToolAudit(row);
+      for (const row of studioInvocations) this.restoreStudioInvocation(row);
+      for (const row of studioTelegramPolicies) this.restoreStudioTelegramPolicy(row);
+      for (const row of studioTelegramUpdates) this.restoreStudioTelegramUpdate(row);
     });
   }
 
@@ -731,6 +776,103 @@ export class SupabasePersistence {
       row.updated_at,
     );
   }
+
+  private restoreStudioAgent(row: Record<string, unknown>): void {
+    if (typeof row.id !== "string" || typeof row.owner_id !== "string") return;
+    const updatedAt = timestampValue(row.updated_at, 0);
+    const existing = this.store.database.raw.prepare("SELECT updated_at FROM studio_agents WHERE id = ?").get(row.id) as { updated_at: number } | undefined;
+    if (existing && Number(existing.updated_at) >= updatedAt) return;
+    this.store.database.raw.prepare(
+      `INSERT INTO studio_agents(id, owner_id, create_idempotency_key, template_id, status,
+         operational_state, draft_version, configuration_json, published_revision_id,
+         created_at, updated_at, archived_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         template_id=excluded.template_id, status=excluded.status,
+         operational_state=excluded.operational_state, draft_version=excluded.draft_version,
+         configuration_json=excluded.configuration_json, updated_at=excluded.updated_at,
+         archived_at=excluded.archived_at`,
+    ).run(row.id, row.owner_id, stringValue(row.create_idempotency_key, row.id), nullableString(row.template_id),
+      stringValue(row.status, "draft"), stringValue(row.operational_state, "draft"), numberValue(row.draft_version, 1),
+      JSON.stringify(row.configuration ?? {}), timestampValue(row.created_at, updatedAt), updatedAt, nullableTimestamp(row.archived_at));
+  }
+
+  private restoreStudioRevision(row: Record<string, unknown>): void {
+    if (typeof row.id !== "string" || typeof row.agent_id !== "string" || typeof row.owner_id !== "string") return;
+    this.store.database.raw.prepare(
+      `INSERT OR IGNORE INTO studio_agent_revisions(id, agent_id, owner_id, revision,
+         configuration_json, configuration_digest, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(row.id, row.agent_id, row.owner_id, numberValue(row.revision, 1), JSON.stringify(row.configuration ?? {}),
+      stringValue(row.configuration_digest, row.id), timestampValue(row.created_at, Date.now()));
+  }
+
+  private restoreStudioPublishedRevision(row: Record<string, unknown>): void {
+    if (typeof row.id !== "string" || typeof row.published_revision_id !== "string") return;
+    const exists = this.store.database.raw.prepare(
+      "SELECT 1 AS found FROM studio_agent_revisions WHERE id = ? AND agent_id = ?",
+    ).get(row.published_revision_id, row.id);
+    if (exists) this.store.database.raw.prepare(
+      "UPDATE studio_agents SET published_revision_id = ? WHERE id = ?",
+    ).run(row.published_revision_id, row.id);
+  }
+
+  private restoreStudioDeployment(row: Record<string, unknown>): void {
+    if (typeof row.id !== "string" || typeof row.agent_id !== "string" || typeof row.revision_id !== "string" || typeof row.owner_id !== "string") return;
+    this.store.database.raw.prepare(
+      `INSERT OR IGNORE INTO studio_channel_deployments(id, agent_id, revision_id, owner_id,
+         channel, state, public_id, publish_idempotency_key, created_at, updated_at, revoked_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(row.id, row.agent_id, row.revision_id, row.owner_id, stringValue(row.channel, "web"),
+      stringValue(row.state, "waiting_for_capacity"), stringValue(row.public_id, row.id),
+      stringValue(row.publish_idempotency_key, row.id), timestampValue(row.created_at, Date.now()),
+      timestampValue(row.updated_at, Date.now()), nullableTimestamp(row.revoked_at));
+  }
+
+  private restoreStudioEvent(row: Record<string, unknown>): void {
+    if (typeof row.event_digest !== "string" || typeof row.agent_id !== "string" || typeof row.owner_id !== "string") return;
+    this.store.database.raw.prepare(
+      `INSERT OR IGNORE INTO studio_agent_events(agent_id, owner_id, event_type, details_json,
+         previous_event_digest, event_digest, occurred_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(row.agent_id, row.owner_id, stringValue(row.event_type, "restored"), JSON.stringify(row.details ?? {}),
+      nullableString(row.previous_event_digest), row.event_digest, timestampValue(row.occurred_at, Date.now()));
+  }
+
+  private restoreStudioSource(row: Record<string, unknown>): void {
+    if (typeof row.id !== "string" || typeof row.agent_id !== "string" || typeof row.owner_id !== "string") return;
+    this.store.database.raw.prepare(`INSERT OR REPLACE INTO studio_knowledge_sources(id,agent_id,owner_id,name,media_type,content_sha256,size_bytes,state,created_at,updated_at,deleted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(row.id,row.agent_id,row.owner_id,stringValue(row.name,"Restored source"),stringValue(row.media_type,"text/plain"),stringValue(row.content_sha256,row.id),numberValue(row.size_bytes,0),stringValue(row.state,"ready"),timestampValue(row.created_at,Date.now()),timestampValue(row.updated_at,Date.now()),nullableTimestamp(row.deleted_at));
+  }
+
+  private restoreStudioChunk(row: Record<string, unknown>): void {
+    if (typeof row.id !== "string" || typeof row.source_id !== "string" || typeof row.agent_id !== "string" || typeof row.owner_id !== "string" || typeof row.content !== "string") return;
+    this.store.database.raw.prepare(`INSERT OR IGNORE INTO studio_knowledge_chunks(id,source_id,agent_id,owner_id,ordinal,content,content_sha256,created_at) VALUES(?,?,?,?,?,?,?,?)`).run(row.id,row.source_id,row.agent_id,row.owner_id,numberValue(row.ordinal,0),row.content,stringValue(row.content_sha256,row.id),timestampValue(row.created_at,Date.now()));
+    this.store.database.raw.prepare("DELETE FROM studio_knowledge_fts WHERE chunk_id = ?").run(row.id);
+    this.store.database.raw.prepare("INSERT INTO studio_knowledge_fts(chunk_id,owner_id,agent_id,source_id,content) VALUES(?,?,?,?,?)").run(row.id,row.owner_id,row.agent_id,row.source_id,row.content);
+  }
+
+  private restoreStudioFact(row: Record<string, unknown>): void {
+    if (typeof row.id !== "string" || typeof row.agent_id !== "string" || typeof row.owner_id !== "string") return;
+    this.store.database.raw.prepare(`INSERT OR REPLACE INTO studio_memory_facts(id,agent_id,owner_id,subject_id,fact,status,origin,confidence,expires_at,created_at,updated_at,deleted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(row.id,row.agent_id,row.owner_id,stringValue(row.subject_id,"restored"),stringValue(row.fact,"[deleted]"),stringValue(row.status,"deleted"),stringValue(row.origin,"restore"),numberValue(row.confidence,0),nullableTimestamp(row.expires_at),timestampValue(row.created_at,Date.now()),timestampValue(row.updated_at,Date.now()),nullableTimestamp(row.deleted_at));
+  }
+
+  private restoreStudioToolAudit(row: Record<string, unknown>): void {
+    if (typeof row.id !== "string" || typeof row.agent_id !== "string" || typeof row.owner_id !== "string") return;
+    this.store.database.raw.prepare(`INSERT OR IGNORE INTO studio_tool_audit(id,agent_id,owner_id,tool_id,input_digest,outcome,output_json,error_code,duration_ms,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(row.id,row.agent_id,row.owner_id,stringValue(row.tool_id,"documents"),stringValue(row.input_digest,row.id),stringValue(row.outcome,"failed"),row.output === null || row.output === undefined ? null : JSON.stringify(row.output),nullableString(row.error_code),numberValue(row.duration_ms,0),timestampValue(row.created_at,Date.now()));
+  }
+
+  private restoreStudioInvocation(row: Record<string, unknown>): void {
+    if (typeof row.id !== "string" || typeof row.deployment_id !== "string" || typeof row.agent_id !== "string" || typeof row.owner_id !== "string") return;
+    this.store.database.raw.prepare(`INSERT OR IGNORE INTO studio_invocations(id,deployment_id,agent_id,owner_id,idempotency_key,request_digest,status,response_json,error_code,usage_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(row.id,row.deployment_id,row.agent_id,row.owner_id,stringValue(row.idempotency_key,row.id),stringValue(row.request_digest,row.id),stringValue(row.status,"failed"),row.response == null ? null : JSON.stringify(row.response),nullableString(row.error_code),row.usage == null ? null : JSON.stringify(row.usage),timestampValue(row.created_at,Date.now()),timestampValue(row.updated_at,Date.now()));
+  }
+
+  private restoreStudioTelegramPolicy(row: Record<string, unknown>): void {
+    if (typeof row.deployment_id !== "string" || typeof row.secret_digest !== "string" || !Array.isArray(row.allowed_chats)) return;
+    this.store.database.raw.prepare("INSERT OR REPLACE INTO studio_telegram_policies(deployment_id,secret_digest,allowed_chats_json,updated_at) VALUES(?,?,?,?)").run(row.deployment_id,row.secret_digest,JSON.stringify(row.allowed_chats),timestampValue(row.updated_at,Date.now()));
+  }
+
+  private restoreStudioTelegramUpdate(row: Record<string, unknown>): void {
+    if (typeof row.deployment_id !== "string" || typeof row.update_id !== "string" || typeof row.chat_id !== "string") return;
+    this.store.database.raw.prepare("INSERT OR IGNORE INTO studio_telegram_updates(deployment_id,update_id,chat_id,request_json,state,response_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)").run(row.deployment_id,row.update_id,row.chat_id,JSON.stringify(row.request ?? {}),stringValue(row.state,"failed"),row.response == null ? null : JSON.stringify(row.response),timestampValue(row.created_at,Date.now()),timestampValue(row.updated_at,Date.now()));
+  }
 }
 
 function isSyncedTable(value: string): value is SyncedTable {
@@ -755,6 +897,10 @@ function numberValue(value: unknown, fallback: number): number {
 
 function nullableNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function nullableTimestamp(value: unknown): number | null {
+  return value === null || value === undefined ? null : timestampValue(value, Date.now());
 }
 
 function timestampValue(value: unknown, fallback: number): number {

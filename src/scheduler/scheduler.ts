@@ -12,7 +12,7 @@ import type { MeshStore, StoredWorker } from "../storage/store.js";
 import {
   selectPreferredRuntimeLinkObservation,
   type RuntimeLinkObservation,
-} from "../coordinator/runtime-link-observations.js";
+} from "../contracts/runtime-link-observations.js";
 import { deploymentMetricsFromCanaryEvidence } from "../contracts/deployment-canary.js";
 import {
   decideExecutionRoute,

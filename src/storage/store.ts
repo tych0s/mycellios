@@ -1062,6 +1062,26 @@ export class MeshStore {
         this.database.enqueueRemoteChange("deployment_stage_leases", row.id, "upsert", row);
         queued += 1;
       }
+      const studioAgents = this.database.raw.prepare("SELECT * FROM studio_agents").all() as unknown as Array<Record<string, unknown> & { id: string; configuration_json: string; created_at: number; updated_at: number; archived_at: number | null }>;
+      for (const { configuration_json: configurationJson, created_at: createdAt, updated_at: updatedAt, archived_at: archivedAt, ...row } of studioAgents) {
+        this.database.enqueueRemoteChange("studio_agents", row.id, "upsert", { ...row, configuration: JSON.parse(configurationJson), created_at: new Date(createdAt).toISOString(), updated_at: new Date(updatedAt).toISOString(), archived_at: archivedAt === null ? null : new Date(archivedAt).toISOString() });
+        queued += 1;
+      }
+      const studioRevisions = this.database.raw.prepare("SELECT * FROM studio_agent_revisions").all() as unknown as Array<Record<string, unknown> & { id: string; configuration_json: string; created_at: number }>;
+      for (const { configuration_json: configurationJson, created_at: createdAt, ...row } of studioRevisions) {
+        this.database.enqueueRemoteChange("studio_agent_revisions", row.id, "upsert", { ...row, configuration: JSON.parse(configurationJson), created_at: new Date(createdAt).toISOString() });
+        queued += 1;
+      }
+      const studioDeployments = this.database.raw.prepare("SELECT * FROM studio_channel_deployments").all() as unknown as Array<Record<string, unknown> & { id: string; created_at: number; updated_at: number; revoked_at: number | null }>;
+      for (const { created_at: createdAt, updated_at: updatedAt, revoked_at: revokedAt, ...row } of studioDeployments) {
+        this.database.enqueueRemoteChange("studio_channel_deployments", row.id, "upsert", { ...row, created_at: new Date(createdAt).toISOString(), updated_at: new Date(updatedAt).toISOString(), revoked_at: revokedAt === null ? null : new Date(revokedAt).toISOString() });
+        queued += 1;
+      }
+      const studioEvents = this.database.raw.prepare("SELECT * FROM studio_agent_events").all() as unknown as Array<Record<string, unknown> & { event_digest: string; details_json: string; occurred_at: number }>;
+      for (const { details_json: detailsJson, occurred_at: occurredAt, ...row } of studioEvents) {
+        this.database.enqueueRemoteChange("studio_agent_events", row.event_digest, "upsert", { ...row, details: JSON.parse(detailsJson), occurred_at: new Date(occurredAt).toISOString() });
+        queued += 1;
+      }
       return queued;
     });
   }

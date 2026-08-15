@@ -1,7 +1,7 @@
 import websocket from "@fastify/websocket";
 import staticFiles from "@fastify/static";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
-import { createHash, createPublicKey, generateKeyPairSync, timingSafeEqual } from "node:crypto";
+import { createHash, createPublicKey, generateKeyPairSync, randomUUID, timingSafeEqual } from "node:crypto";
 import {
   createReadStream,
   existsSync,
@@ -152,6 +152,18 @@ import {
   apiUsageJson,
   type ApiKeyPrincipal,
 } from "./api-access.js";
+import { StudioAgentError, StudioAgentStore } from "./studio-agent-store.js";
+import { StudioContextStore } from "./studio-context-store.js";
+import { StudioAgentRuntime, type StudioInference } from "./studio-agent-runtime.js";
+import {
+  studioAgentCreateSchema,
+  studioInvocationSchema,
+  studioKnowledgeIngestSchema,
+  studioMemoryFactCreateSchema,
+  studioRollbackRequestSchema,
+  studioAgentUpdateSchema,
+  studioPublishRequestSchema,
+} from "../contracts/studio.js";
 import {
   WorkerAdmissionAuthority,
   WorkerAdmissionError,
@@ -298,6 +310,9 @@ export interface CoordinatorRuntime {
   mobileHub: MobileComputeHub;
   service: MeshService;
   apiAccess: ApiAccessManager;
+  studioAgents: StudioAgentStore;
+  studioContext: StudioContextStore;
+  studioRuntime: StudioAgentRuntime;
   billing: BillingManager;
   billingCheckout: BillingCheckoutService | null;
   stablecoinCheckout: StablecoinCheckoutService | null;
@@ -352,6 +367,7 @@ export async function createCoordinator(
     payoutSettlementVerifier?: PayoutSettlementVerifier;
     modelCapacityInspector?: typeof inspectHubModelCapacity;
     engineRuntimeProfileReconciliation?: boolean;
+    studioInference?: StudioInference;
   } = {},
 ): Promise<CoordinatorRuntime> {
   assertCoordinatorNetworkSecurity(config);
@@ -383,7 +399,7 @@ export async function createCoordinator(
     const path = request.url.split("?", 1)[0] ?? request.url;
     if (path.startsWith("/v1/")) {
       reply.header("Access-Control-Allow-Origin", "*");
-      reply.header("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
+      reply.header("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
       reply.header(
         "Access-Control-Allow-Headers",
         "Authorization,Content-Type,Idempotency-Key",
@@ -613,6 +629,8 @@ export async function createCoordinator(
     maxConcurrent: config.apiMaxConcurrent ?? 2,
     maxActiveKeys: config.apiMaxActiveKeys ?? 10,
   });
+  const studioAgents = new StudioAgentStore(database);
+  const studioContext = new StudioContextStore(database);
   const billing = new BillingManager(database, apiAccess);
   const sellerEarnings = new SellerEarningsManager(database, new Map());
   const sellerDestinationVerifierKeys = options.sellerDestinationVerifierKeys
@@ -1455,8 +1473,80 @@ export async function createCoordinator(
     });
     return { ...event, result: { ...event.result, executionReceiptId: receipt.receiptId } };
   };
+  const studioInference: StudioInference = options.studioInference ?? (async (request) => {
+    const chat: ChatCompletionRequest = {
+      model: request.model,
+      messages: request.messages,
+      max_tokens: request.maxOutputTokens,
+      deadline_ms: request.deadlineMs,
+      privacy: { trust: "trusted-only", boundary: "trusted-edges" },
+    };
+    if (!service.hasCapacity(chat)) throw new StudioAgentError("studio_waiting_for_capacity", "No compatible Mycellios route is available.", 503);
+    const usage = apiAccessEnabled ? apiAccess.beginUsage(request.ownerId, null, chat) : null;
+    let handle: ReturnType<MeshService["submit"]>;
+    try {
+      handle = service.submit(chat, request.sessionId, `studio-${randomUUID()}`);
+    } catch (error) {
+      if (usage) apiAccess.failUsage(usage.id, "submission_failed");
+      throw error;
+    }
+    if (usage) apiAccess.attachJob(usage.id, handle.jobId, handle.sessionId);
+    const conversationId = store.startInferenceConversation(handle.sessionId, request.model, request.messages);
+    let completed: Extract<JobStreamEvent, { type: "completed" }> | null = null;
+    let routeClass: "replica" | "pipeline" = "replica";
+    try {
+      for await (const event of handle.events) {
+        if (event.type === "accepted") routeClass = event.route.routeClass;
+        if (event.type === "token") request.onToken?.(event.token.text);
+        if (event.type === "failed") throw new StudioAgentError(event.code, event.message, 502);
+        if (event.type === "completed") completed = attachExecutionReceipt(event, request.model, routeClass);
+      }
+      if (!completed) throw new StudioAgentError("studio_inference_missing_result", "Inference ended without a result.", 502);
+    } catch (error) {
+      if (usage) apiAccess.failUsage(usage.id, error instanceof StudioAgentError ? error.code : "studio_inference_failed");
+      store.appendInferenceMessage({
+        conversationId,
+        jobId: handle.jobId,
+        role: "assistant",
+        content: "",
+        status: "failed",
+        metadata: { failure_code: error instanceof StudioAgentError ? error.code : "studio_inference_failed" },
+      });
+      throw error;
+    }
+    if (usage) {
+      apiAccess.completeUsage(usage.id, completed.result.metrics.inputTokens, completed.result.metrics.outputTokens);
+      if (completed.result.networkTrace) settleCompletedInference({
+        userId: request.ownerId,
+        jobId: handle.jobId,
+        modelId: request.model,
+        routeClass,
+        inputTokens: completed.result.metrics.inputTokens,
+        outputTokens: completed.result.metrics.outputTokens,
+        networkTrace: completed.result.networkTrace,
+        recovery: completed.result.recovery ?? { mode: "none", attempts: 1, replayedTokenEvents: 0 },
+        executionReceiptId: completed.result.executionReceiptId!,
+      });
+    }
+    store.appendInferenceMessage({
+      conversationId,
+      jobId: handle.jobId,
+      role: "assistant",
+      content: completed.result.text,
+      status: "completed",
+      inputTokens: completed.result.metrics.inputTokens,
+      outputTokens: completed.result.metrics.outputTokens,
+      routeClass,
+      latencyMs: completed.result.metrics.activeMs,
+      metadata: { execution_receipt_id: completed.result.executionReceiptId ?? null },
+    });
+    void persistence?.flush();
+    return { text: completed.result.text, inputTokens: completed.result.metrics.inputTokens, outputTokens: completed.result.metrics.outputTokens, receiptId: completed.result.executionReceiptId ?? null };
+  });
+  const studioRuntime = new StudioAgentRuntime(database, studioAgents, studioContext, studioInference);
   const supportAssistantRateLimits = new Map<string, SupportAssistantRateState>();
   const publicCatalogRateLimits = new Map<string, PublicCatalogRateState>();
+  const studioPublicRateLimits = new Map<string, PublicCatalogRateState>();
   let activeSupportAssistantRequests = 0;
   let activePublicCatalogRequests = 0;
   const activationManager = options.activationManager ?? options.activationManagerFactory?.({
@@ -2113,6 +2203,7 @@ export async function createCoordinator(
   });
   service.on("healthy", ({ model }) => {
     inferenceRouteFailures.delete(model);
+    studioAgents.activateCompatibleWaiting(model);
   });
   service.on("degraded", ({ model, code, jobId, workerId }) => {
     const now = Date.now();
@@ -2249,6 +2340,211 @@ export async function createCoordinator(
       apiAccess.getOrCreateAccount(principal.userId),
       apiAccess.limits,
     ) };
+  });
+
+  const studioOwner = (request: FastifyRequest, reply: FastifyReply): string | null => {
+    const principal = principalFor(request);
+    if (principal.kind !== "user") {
+      void reply.code(403).send({ error: {
+        code: "account_session_required",
+        message: "Studio agents can only be managed from a signed-in account session.",
+      } });
+      return null;
+    }
+    return principal.userId;
+  };
+  const studioError = (reply: FastifyReply, error: unknown) => {
+    if (error instanceof StudioAgentError) {
+      return reply.code(error.statusCode).send({ error: { code: error.code, message: error.message } });
+    }
+    throw error;
+  };
+
+  app.get("/v1/studio/agents", async (request, reply) => {
+    const ownerId = studioOwner(request, reply);
+    if (!ownerId) return;
+    return { object: "list", data: studioAgents.list(ownerId) };
+  });
+
+  app.post("/v1/studio/agents", async (request, reply) => {
+    const ownerId = studioOwner(request, reply);
+    if (!ownerId) return;
+    const input = studioAgentCreateSchema.parse(request.body);
+    try {
+      return reply.code(201).send(studioAgents.create({ ownerId, ...input }));
+    } catch (error) { return studioError(reply, error); }
+  });
+
+  app.get("/v1/studio/agents/:agentId", async (request, reply) => {
+    const ownerId = studioOwner(request, reply);
+    if (!ownerId) return;
+    const { agentId } = request.params as { agentId: string };
+    const agent = studioAgents.get(agentId, ownerId);
+    if (!agent) return reply.code(404).send({ error: { code: "studio_agent_not_found" } });
+    return { agent, revisions: studioAgents.revisions(agentId, ownerId), deployments: studioAgents.deployments(agentId, ownerId) };
+  });
+
+  app.patch("/v1/studio/agents/:agentId/draft", async (request, reply) => {
+    const ownerId = studioOwner(request, reply);
+    if (!ownerId) return;
+    const { agentId } = request.params as { agentId: string };
+    const input = studioAgentUpdateSchema.parse(request.body);
+    try { return studioAgents.update(agentId, ownerId, input.expectedVersion, input.configuration); }
+    catch (error) { return studioError(reply, error); }
+  });
+
+  app.post("/v1/studio/agents/:agentId/publish", async (request, reply) => {
+    const ownerId = studioOwner(request, reply);
+    if (!ownerId) return;
+    const { agentId } = request.params as { agentId: string };
+    const input = studioPublishRequestSchema.parse(request.body);
+    const agent = studioAgents.get(agentId, ownerId);
+    const hasCapacity = Boolean(agent && service.hasCapacity({ model: agent.configuration.modelPolicy.preferredModel, messages: [{ role: "user", content: "capacity" }], max_tokens: 1 }));
+    try { return studioAgents.publish({ agentId, ownerId, hasCapacity, ...input }); }
+    catch (error) { return studioError(reply, error); }
+  });
+
+  app.post("/v1/studio/agents/:agentId/rollback", async (request, reply) => {
+    const ownerId = studioOwner(request, reply); if (!ownerId) return;
+    const { agentId } = request.params as { agentId: string };
+    const input = studioRollbackRequestSchema.parse(request.body);
+    const revision = studioAgents.revision(input.revisionId, agentId, ownerId);
+    const hasCapacity = service.hasCapacity({ model: revision.configuration.modelPolicy.preferredModel, messages: [{ role: "user", content: "capacity" }], max_tokens: 1 });
+    try { return studioAgents.rollback({ agentId, ownerId, hasCapacity, ...input }); } catch (error) { return studioError(reply, error); }
+  });
+
+  app.delete("/v1/studio/agents/:agentId", async (request, reply) => {
+    const ownerId = studioOwner(request, reply);
+    if (!ownerId) return;
+    const { agentId } = request.params as { agentId: string };
+    try { return studioAgents.archive(agentId, ownerId); }
+    catch (error) { return studioError(reply, error); }
+  });
+
+  app.post("/v1/studio/agents/:agentId/knowledge", async (request, reply) => {
+    const ownerId = studioOwner(request, reply); if (!ownerId) return;
+    const { agentId } = request.params as { agentId: string };
+    try { return reply.code(201).send(studioContext.ingestText({ ownerId, agentId, ...studioKnowledgeIngestSchema.parse(request.body) })); }
+    catch (error) { return studioError(reply, error); }
+  });
+
+  app.delete("/v1/studio/agents/:agentId/knowledge/:sourceId", async (request, reply) => {
+    const ownerId = studioOwner(request, reply); if (!ownerId) return;
+    const { agentId, sourceId } = request.params as { agentId: string; sourceId: string };
+    try { studioContext.deleteSource(ownerId, agentId, sourceId); return reply.code(204).send(); }
+    catch (error) { return studioError(reply, error); }
+  });
+
+  app.get("/v1/studio/agents/:agentId/memory", async (request, reply) => {
+    const ownerId = studioOwner(request, reply); if (!ownerId) return;
+    const { agentId } = request.params as { agentId: string };
+    const { subjectId = "owner" } = request.query as { subjectId?: string };
+    try { return { object: "list", data: studioContext.listFacts(ownerId, agentId, subjectId) }; }
+    catch (error) { return studioError(reply, error); }
+  });
+
+  app.post("/v1/studio/agents/:agentId/memory", async (request, reply) => {
+    const ownerId = studioOwner(request, reply); if (!ownerId) return;
+    const { agentId } = request.params as { agentId: string };
+    try { return reply.code(201).send(studioContext.addFact({ ownerId, agentId, ...studioMemoryFactCreateSchema.parse(request.body) })); }
+    catch (error) { return studioError(reply, error); }
+  });
+
+  app.post("/v1/studio/agents/:agentId/memory/:factId/approve", async (request, reply) => {
+    const ownerId = studioOwner(request, reply); if (!ownerId) return;
+    const { agentId, factId } = request.params as { agentId: string; factId: string };
+    try { return studioContext.approveFact(ownerId, agentId, factId); } catch (error) { return studioError(reply, error); }
+  });
+
+  app.delete("/v1/studio/agents/:agentId/memory/:factId", async (request, reply) => {
+    const ownerId = studioOwner(request, reply); if (!ownerId) return;
+    const { agentId, factId } = request.params as { agentId: string; factId: string };
+    try { studioContext.deleteFact(ownerId, agentId, factId); return reply.code(204).send(); } catch (error) { return studioError(reply, error); }
+  });
+
+  app.delete("/v1/studio/deployments/:deploymentId", async (request, reply) => {
+    const ownerId = studioOwner(request, reply); if (!ownerId) return;
+    const { deploymentId } = request.params as { deploymentId: string };
+    try { return studioAgents.revokeDeployment(deploymentId, ownerId); } catch (error) { return studioError(reply, error); }
+  });
+
+  app.post("/v1/studio/deployments/:deploymentId/telegram", async (request, reply) => {
+    const ownerId = studioOwner(request, reply); if (!ownerId) return;
+    const { deploymentId } = request.params as { deploymentId: string };
+    const body = request.body as { secret?: unknown; allowedChats?: unknown };
+    try {
+      if (typeof body?.secret !== "string" || !Array.isArray(body.allowedChats) || body.allowedChats.some((item) => typeof item !== "string")) throw new StudioAgentError("studio_telegram_policy_invalid", "Telegram policy is invalid.");
+      studioRuntime.configureTelegram({ deploymentId, ownerId, secret: body.secret, allowedChats: body.allowedChats as string[] });
+      return reply.code(204).send();
+    } catch (error) { return studioError(reply, error); }
+  });
+
+  const invokeStudio = async (
+    reply: FastifyReply,
+    input: z.infer<typeof studioInvocationSchema> & { publicId: string; channel: "web" | "api" },
+  ) => {
+    const { stream, ...invocation } = input;
+    if (!stream) return studioRuntime.invoke(invocation);
+    reply.hijack();
+    reply.raw.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+      "x-accel-buffering": "no",
+    });
+    const heartbeat = setInterval(() => {
+      if (!reply.raw.destroyed && !reply.raw.writableEnded) reply.raw.write(`: mycellios-studio-heartbeat ${Date.now()}\n\n`);
+    }, 10_000);
+    heartbeat.unref();
+    try {
+      const result = await studioRuntime.invoke(invocation, (text) => {
+        if (!reply.raw.destroyed && !reply.raw.writableEnded) reply.raw.write(`data: ${JSON.stringify({ type: "token", delta: text })}\n\n`);
+      });
+      if (!reply.raw.destroyed && !reply.raw.writableEnded) reply.raw.write(`data: ${JSON.stringify({ type: "completed", result })}\n\n`);
+    } catch (error) {
+      const code = error instanceof StudioAgentError ? error.code : "studio_inference_failed";
+      const message = error instanceof Error ? error.message : "Studio inference failed.";
+      if (!reply.raw.destroyed && !reply.raw.writableEnded) reply.raw.write(`data: ${JSON.stringify({ type: "error", error: { code, message } })}\n\n`);
+    } finally {
+      clearInterval(heartbeat);
+      if (!reply.raw.destroyed && !reply.raw.writableEnded) {
+        reply.raw.write("data: [DONE]\n\n");
+        reply.raw.end();
+      }
+    }
+  };
+
+  app.post("/public/v1/studio/web/:publicId/invoke", async (request, reply) => {
+    const { publicId } = request.params as { publicId: string };
+    const rateKey = createHash("sha256").update(`${request.ip}\n${request.headers["user-agent"] ?? "unknown"}\n${publicId}`).digest("hex").slice(0, 24);
+    const release = claimPublicCatalogRequest(studioPublicRateLimits, rateKey);
+    if (!release) return reply.code(429).send({ error: { code: "studio_rate_limit_exceeded", message: "Too many Studio requests." } });
+    try { return await invokeStudio(reply, { publicId, channel: "web", ...studioInvocationSchema.parse(request.body) }); }
+    catch (error) { return studioError(reply, error); }
+    finally { release(); }
+  });
+
+  app.post("/v1/studio/api/:publicId/invoke", async (request, reply) => {
+    const principal = principalFor(request);
+    if (principal.kind === "system") return reply.code(403).send({ error: { code: "account_identity_required" } });
+    const { publicId } = request.params as { publicId: string };
+    const deployment = studioAgents.deploymentByPublicId(publicId, "api");
+    if (!deployment || deployment.ownerId !== principal.userId) return reply.code(404).send({ error: { code: "studio_deployment_not_found" } });
+    try { return await invokeStudio(reply, { publicId, channel: "api", ...studioInvocationSchema.parse(request.body) }); }
+    catch (error) { return studioError(reply, error); }
+  });
+
+  app.post("/public/v1/studio/telegram/:publicId", async (request, reply) => {
+    const { publicId } = request.params as { publicId: string };
+    const secret = typeof request.headers["x-telegram-bot-api-secret-token"] === "string" ? request.headers["x-telegram-bot-api-secret-token"] : "";
+    const body = request.body as { update_id?: unknown; message?: { chat?: { id?: unknown }; text?: unknown } };
+    try {
+      if ((typeof body.update_id !== "string" && typeof body.update_id !== "number") || typeof body.message?.chat?.id !== "number" || typeof body.message.text !== "string") throw new StudioAgentError("studio_telegram_update_invalid", "Telegram update is invalid.");
+      const result = await studioRuntime.handleTelegram({ publicId, secret, updateId: String(body.update_id), chatId: String(body.message.chat.id), text: body.message.text });
+      return result.replayed
+        ? { ok: true, replayed: true }
+        : { method: "sendMessage", chat_id: body.message.chat.id, text: result.text };
+    } catch (error) { return studioError(reply, error); }
   });
 
   const billingSessionPrincipal = (request: FastifyRequest) => {
@@ -4860,6 +5156,9 @@ export async function createCoordinator(
     mobileHub,
     service,
     apiAccess,
+    studioAgents,
+    studioContext,
+    studioRuntime,
     billing,
     billingCheckout,
     stablecoinCheckout,

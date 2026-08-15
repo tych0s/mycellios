@@ -22,7 +22,10 @@ describe("native installation bootstrap", () => {
     expect(`${JSON.stringify(node)}${JSON.stringify(worker)}`).not.toContain(bundle().enrollmentToken);
     expect(await readFile(result.enrollmentPath, "utf8")).toContain(bundle().enrollmentToken);
     expect(JSON.parse(await readFile(result.installationManifestPath, "utf8"))).toEqual(manifest);
-    if (process.platform !== "win32") expect((await import("node:fs/promises")).stat(result.enrollmentPath).then((value) => value.mode & 0o777)).resolves.toBe(0o600);
+    if (process.platform !== "win32") {
+      await expect((await import("node:fs/promises")).stat(result.enrollmentPath).then((value) => value.mode & 0o777))
+        .resolves.toBe(0o600);
+    }
   });
 
   it("is fail-closed on reinstall and rolls back partial output", async () => {

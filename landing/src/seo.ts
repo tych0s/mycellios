@@ -99,14 +99,14 @@ export const SEO_PAGES = {
     ),
   },
   "/create": {
-    title: "Create images with mycellios",
+    title: "Build persistent AI identities | Mycellios Studio",
     description:
-      "Describe an image, choose a visual style and aspect ratio, and prepare an image generation request in the mycellios creative studio.",
+      "Create, configure, and test a persistent AI identity with personality, memory, trusted knowledge, tools, and launch channels in Mycellios Studio.",
     canonicalPath: "/create",
     robots: "index, follow, max-image-preview:large",
     structuredData: webPage(
-      "Create images with mycellios",
-      "The mycellios creative studio for preparing image generation requests.",
+      "Build persistent AI identities | Mycellios Studio",
+      "A visual builder for creating, testing, and preparing persistent AI identities for web, Telegram, and API channels.",
       "/create",
     ),
   },
