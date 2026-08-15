@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { STORY_SECONDS, beatFor, nextPlayed, scrollTravel } from "./use-motion";
+import { STORY_SECONDS, beatFor, nextPlayed, scrollTravel, storyProgress } from "./use-motion";
 
 /*
  * These guard the one thing a reader complained about: how much work the story
@@ -48,6 +48,16 @@ describe("the story plays itself instead of charging the reader for it", () => {
 });
 
 describe("scrolling scrubs ahead rather than being the only transport", () => {
+  it("rewinds immediately while the reader scrolls back up", () => {
+    expect(storyProgress(0.25, 0.9, true)).toBe(0.25);
+    expect(storyProgress(0.9, 0.25, true)).toBe(0.9);
+  });
+
+  it("lets autoplay resume from the settled scroll position", () => {
+    expect(storyProgress(0.25, 0.4, false)).toBe(0.4);
+    expect(storyProgress(0.4, 0.25, false)).toBe(0.4);
+  });
+
   it("lets a reader reach the end before the last pixel of the section", () => {
     // 200vh section, 100vh viewport: one viewport of travel. The payoff has to
     // land with room left, or it is gone the instant it arrives.

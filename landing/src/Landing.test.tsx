@@ -10,6 +10,17 @@ import { RebrandLanding } from "./rebrand/RebrandLanding.js";
  * as real text for anyone who never triggers the animation.
  */
 describe("Landing", () => {
+  it("uses the approved editorial, interface, and technical font roles", async () => {
+    const css = await import("node:fs/promises").then(({ readFile }) =>
+      readFile(new URL("./rebrand/rebrand.css", import.meta.url), "utf8"),
+    );
+
+    expect(css).toContain('--rb-font-display:"Fraunces",serif');
+    expect(css).toContain('--rb-font-body:"Geist",sans-serif');
+    expect(css).toContain('--rb-font-mono:"IBM Plex Mono",monospace');
+    expect(css).not.toContain("family=Manrope");
+  });
+
   it("opens the hero on the headline and ends it at the prompt", () => {
     const html = renderToStaticMarkup(<RebrandLanding />);
 
@@ -101,11 +112,11 @@ describe("Landing", () => {
     // holds — both are what make the split concrete rather than decorative.
     expect(html).toContain("Split model");
     expect(html).toContain("Stream result");
-    expect(html).toContain("layers A–F");
-    expect(html).toContain("layers O–Z");
+    expect(html).toContain("layers 0–6");
+    expect(html).toContain("layers 14–20");
   });
 
-  it("states both sides of the exchange and the proof that gates the payout", () => {
+  it("leads with subscriptions, keeps token access secondary and gates earnings on proof", () => {
     const html = renderToStaticMarkup(<RebrandLanding />);
 
     expect(html).toContain('id="payments"');
@@ -119,15 +130,16 @@ describe("Landing", () => {
     expect(html).toContain("Sell your idle machine");
     // The split is the same memory split the diagram above shows, so the three
     // layer ranges reappear here as shares of one payment.
-    expect(html).toContain("layers A–F");
+    expect(html).toContain("layers 0–6");
     expect(html).toContain("52%");
     expect(html).toContain("13%");
     expect(html).toContain("35%");
     expect(html).toContain("receipt signed");
-    expect(html).toContain("accepted stages · signed receipts");
-    // Nothing here may read as a promise: the split is illustrative and no
-    // payout is live.
+    expect(html).toContain("signed receipts");
+    // Usage credits must not be confused with the future public asset, and the
+    // route attribution must not read as a guaranteed payout.
     expect(html).toContain("not subscription pricing or a guaranteed payout");
+    expect(html).toContain("Usage tokens are access credits, not $SPORE");
     expect(html).toContain("contributor payouts and $SPORE are not live yet");
   });
 
@@ -154,7 +166,7 @@ describe("Landing", () => {
     expect(html.match(/rb-get-shelf[\s\S]*?--i:3/)).not.toBeNull();
   });
 
-  it("shows open models of every size and how many machines each one needs", () => {
+  it("shows the verified August 2026 open-model shortlist without claiming native support", () => {
     const html = renderToStaticMarkup(<RebrandLanding />);
 
     expect(html).toContain('id="models"');
@@ -163,16 +175,17 @@ describe("Landing", () => {
     expect(html).not.toContain('id="economics"');
     expect(html).not.toContain("≈13,000×");
     expect(html).not.toContain("ARC-AGI-1");
-    // Real Hugging Face references, not invented names — the catalogue is a live
-    // query against the hub, so the rows have to point at checkpoints that exist.
-    expect(html).toContain("Qwen/Qwen3-0.6B");
-    expect(html).toContain("zai-org/GLM-4.5-Air");
-    expect(html).toContain("Qwen/Qwen3-235B-A22B");
-    // The run mode is the claim: a model too big for one box still runs.
-    expect(html).toContain("One machine");
-    expect(html).toContain("8+ machines");
-    // Support is architecture-based, so the adapter families are named rather
-    // than a fixed model list being implied.
+    // Canonical references verified against official model cards.
+    expect(html).toContain("openai/gpt-oss-20b");
+    expect(html).toContain("google/gemma-4-12B");
+    expect(html).toContain("Qwen/Qwen3.5-27B");
+    expect(html).toContain("mistralai/Mistral-Small-4-119B-2603");
+    expect(html).toContain("deepseek-ai/DeepSeek-V4-Flash");
+    expect(html).toContain("zai-org/GLM-5.2");
+    expect(html).toContain("moonshotai/Kimi-K3");
+    expect(html).toContain("August 2026 shortlist");
+    expect(html).toContain("Shortlist ≠ installed support");
+    // Runtime support remains a separate, registry-backed fact.
     expect(html).toContain("Native adapters today");
     expect(html).toContain("Qwen3-MoE");
   });
@@ -188,6 +201,8 @@ describe("Landing", () => {
     // The contribution switch ships off, so the page may not imply otherwise.
     expect(html).toContain("Share your hardware");
     expect(html).toContain("Off until you turn it on.");
+    expect(html).toContain('role="switch"');
+    expect(html).toContain('aria-checked="false"');
     // And the storage line stays honest: the conversation is written to a local
     // database file, so "we store nothing" is never claimed.
     expect(html).toContain("nothing is uploaded unless you point the app at a hosted coordinator");
@@ -223,11 +238,11 @@ describe("Landing", () => {
   it("preserves the honesty disclaimers around models and downloads", () => {
     const html = renderToStaticMarkup(<RebrandLanding />);
 
-    // Sizes are arithmetic on parameter counts, and the split is still in
-    // physical testing — neither may read as a measured, shipped capability.
-    expect(html).toContain("BF16 weight estimates, not measured runtimes");
-    expect(html).toContain("the multi-machine split is in physical testing");
-    expect(html).toContain("Model support is architecture-based");
+    // Published scale is not runtime evidence, and shortlist presence is not a
+    // support promise — neither may read as a measured, shipped capability.
+    expect(html).toContain("not a memory or speed promise");
+    expect(html).toContain("Shortlist ≠ installed support");
+    expect(html).toContain("only after an adapter and physical evidence ship");
     expect(html).toContain("VISION · NOT LIVE YET · no active token, no financial promise");
     // Unsigned early builds are still disclosed at the download itself.
     expect(html).toContain("Code signing is rolling out");
@@ -252,6 +267,8 @@ describe("Landing", () => {
     expect(closing).toContain("rb-fruit-mark");
     expect(closing).toContain("rb-fruit-cap");
     expect(closing).toContain("rb-fruit-stipe");
+    expect(closing).toContain("rb-fruit-under");
+    expect(closing).toContain("rb-fruit-cap-paint");
     expect(closing).toContain('d="M');
     // Decorative only — the panel already says "Many machines. One model.",
     // and announcing the same thing twice is noise on a screen reader.

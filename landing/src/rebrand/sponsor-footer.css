@@ -13,7 +13,7 @@
 
 .rb-sponsors-heading span {
   color: #765f49;
-  font: 600 10px "IBM Plex Mono", monospace;
+  font: 600 10px var(--rb-font-mono);
   letter-spacing: .12em;
   text-transform: uppercase;
 }
@@ -79,7 +79,7 @@
 .rb-sponsor-mark i:nth-child(2) { transform: rotate(70deg) scale(.48); }
 .rb-sponsor-mark i:last-child { width: 4px; height: 4px; border: 0; border-radius: 50%; background: #dfb98c; }
 .rb-sponsor-cta > span:nth-child(2) { min-width: 0; display: grid; gap: 4px; }
-.rb-sponsor-cta strong { font: 500 16px "Fraunces", serif; }
+.rb-sponsor-cta strong { font: 500 16px var(--rb-font-display); }
 .rb-sponsor-cta small { overflow: hidden; color: #6f766f; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .rb-sponsor-cta > svg { width: 17px; height: 17px; color: var(--rb-bronze); transition: transform .16s ease; }
 .rb-sponsor-cta:hover > svg,

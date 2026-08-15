@@ -28,29 +28,13 @@ import { useEffect, useRef, useState } from "react";
  * An organism that materialises out of the dark reads as intended; the same
  * organism appearing between two frames reads as a bug.
  *
- * Two cases skip the download entirely rather than paying for it and then
- * doing nothing with it:
- *   - `prefers-reduced-motion`, where a rotating, breathing, spore-shedding
- *     organism is exactly what the setting exists to prevent;
- *   - viewports at or below 700px, where the copy occupies the full width and
- *     the mushroom would sit behind the text rather than beside it, so a mobile
- *     visitor would be charged three quarters of the page weight for a
- *     decoration they cannot see.
- *
- * That 700 is the same number as the `max-width:700px` block in rebrand.css
- * that hides `.rb-hero-mushroom`, and the same number `wantsMushroom()` uses to
- * decide whether to prefetch at all. All three must agree: a gap between them
- * is either a band of widths where the host paints its shade plate across the
- * headline with no organism inside it, or a phone paying for a chunk it will
- * never render.
+ * Every viewport draws the same organism. Mobile changes only its rendering
+ * budget and motion, never its geometry or material identity.
  */
 
 /** True when this visitor will actually draw the organism. */
 export function wantsMushroom(): boolean {
-  return (
-    !window.matchMedia("(prefers-reduced-motion: reduce)").matches &&
-    !window.matchMedia("(max-width: 700px)").matches
-  );
+  return true;
 }
 
 let stagePromise: Promise<typeof import("./vendor/mushroom-stage.js")> | null = null;
@@ -73,6 +57,9 @@ export function HeroMushroom() {
     const host = hostRef.current;
     if (!host || !wantsMushroom()) return;
 
+    const mobile = window.matchMedia("(max-width: 700px)").matches;
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
     let cancelled = false;
     let element: HTMLElement | null = null;
 
@@ -83,9 +70,11 @@ export function HeroMushroom() {
       if (cancelled) return;
       defineMushroomStage();
       element = document.createElement("mushroom-stage");
+      element.setAttribute("variant", "hero");
+      if (mobile) element.setAttribute("quality", "mobile");
       element.setAttribute("accent", "#c9976a");
-      element.setAttribute("spores", "on");
-      element.setAttribute("motion", "full");
+      element.setAttribute("spores", mobile || reduceMotion ? "off" : "on");
+      element.setAttribute("motion", reduceMotion ? "off" : mobile ? "calm" : "full");
       element.setAttribute("scale", "1");
       element.style.cssText = "width:100%;height:100%;display:block;";
       element.addEventListener("mushroom-ready", () => setShown(true), { once: true });
@@ -103,5 +92,5 @@ export function HeroMushroom() {
     };
   }, []);
 
-  return <div className={`rb-hero-mushroom${shown ? " is-grown" : ""}`} ref={hostRef} aria-hidden="true" />;
+  return <div id="rb-hero-mushroom" className={`rb-hero-mushroom${shown ? " is-grown" : ""}`} ref={hostRef} aria-hidden="true" />;
 }

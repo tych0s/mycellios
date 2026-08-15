@@ -1,4 +1,5 @@
 import { ArrowUpRight } from "lucide-react";
+import { QuestionsColony } from "./QuestionsColony";
 import "./questions.css";
 
 /*
@@ -68,6 +69,11 @@ export function QuestionsSection() {
           <h2 id="rb-quest-title">The awkward<br /><em>questions.</em></h2>
           <p>The ones worth asking before installing anything. If the honest answer is “not yet”, that is the answer printed here.</p>
         </div>
+
+        {/* Its horizontal origin is measured from the heading column, while
+            its vertical origin belongs to the section's ground. This lets it
+            peel left without following the sticky box below the crop. */}
+        <QuestionsColony />
 
         <div className="rb-quest-list rb-reveal">
           {QUESTIONS.map((item) => (

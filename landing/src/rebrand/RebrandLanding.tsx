@@ -18,7 +18,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { useEffect, useRef, useState, type CSSProperties, type FormEvent, type PointerEvent } from "react";
+import { useEffect, useRef, useState, type CSSProperties, type FormEvent } from "react";
 import { applySeoMetadata } from "../seo";
 import { SupportAssistant } from "../SupportAssistant";
 import { FruitingMark } from "./FruitingMark";
@@ -32,6 +32,7 @@ import { PaymentsSection } from "./PaymentsSection";
 import { QuestionsSection } from "./QuestionsSection";
 import { ScrollStory } from "./ScrollStory";
 import { SponsorFooter } from "./SponsorFooter";
+import { SporeDrift } from "./SporeDrift";
 import { SporeMenu, SporeMobileLinks } from "./SporeMenu";
 import { useCountUp, useInView, useRevealOnScroll } from "./use-motion";
 import "./rebrand.css";
@@ -51,6 +52,13 @@ import "./rebrand.css";
  * by the reader's own scroll. There are no still renders standing in for the
  * system: a diagram that moves when you move explains a distributed runtime
  * better than a photograph of mycelium ever did.
+ *
+ * There is deliberately no per-section illustration. Two passes tried one — lit
+ * 3-D bodies floating in the gutters, then flat line plates sitting in the
+ * grid — and both failed for the same underlying reason: an extra drawing beside
+ * copy that already has a working diagram (the rail, the table, the board) is a
+ * second thing to look at, and it makes the section busier without making the
+ * claim clearer. The sections illustrate themselves.
  */
 
 const brandLogo = "/assets/logos/logo.png";
@@ -136,21 +144,6 @@ function downloadUrl(key: DownloadKey): string {
 
 function Brand() {
   return <a className="rb-brand" href="#rb-top" aria-label="mycellios, home"><img src={brandLogo} alt="" /><span>mycellios</span></a>;
-}
-
-/*
- * Pointer-tracked highlight for the card grids.
- *
- * The position is written straight to the element as two custom properties and
- * the light itself is a CSS radial gradient, so the card follows the cursor
- * without a single React re-render. Nothing depends on this: with no pointer
- * (touch, keyboard) the properties keep their fallbacks and the card is simply
- * a card.
- */
-function trackGlow(event: PointerEvent<HTMLElement>): void {
-  const box = event.currentTarget.getBoundingClientRect();
-  event.currentTarget.style.setProperty("--mx", `${((event.clientX - box.left) / box.width) * 100}%`);
-  event.currentTarget.style.setProperty("--my", `${((event.clientY - box.top) / box.height) * 100}%`);
 }
 
 /* Downloads. The visitor's platform is detected so the primary action is a
@@ -311,35 +304,64 @@ export function RebrandLanding() {
 
       <ModelsSection />
 
-      {/* Half a section, on purpose: "you do not have to join anything" is one
-          line of reassurance between the catalogue and the three doors, and a
-          full chapter would give it more weight than it needs. */}
-      <LocalStrip />
+      {/* Two sections under one drift.
 
-      <section className="rb-doors" id="doors" aria-labelledby="rb-doors-title">
-        <div className="rb-shell">
-          <div className="rb-doors-head rb-reveal">
-            <p className="rb-kicker"><i /><span>Where you fit</span></p>
-            <h2 id="rb-doors-title">Three doors.<br /><em>One network.</em></h2>
+          The local strip and the doors are separate arguments — "you do not
+          have to join anything", then "here is where you fit" — and they stay
+          separate sections with their own backgrounds and their own rule
+          between them. What they share is air: this is the one stretch of the
+          page with no diagram, no plate and no body in it, and the spores are
+          what fills it. A field mounted on either section alone stops dead at
+          that rule, which is what the layer looked like and is the opposite of
+          weather.
+
+          So the wrapper, and only the wrapper: it establishes the containing
+          block the layer sizes itself to and does nothing else. No background,
+          no padding, no z-index of its own — every one of those would take
+          something away from the two sections, which still paint their own. The
+          one decoration on both, and the only place on the page where the
+          organism appears without a body: a fourth fruiting body here would be
+          the page repeating itself, and what drifts above a colony is what the
+          colony released. See SporeDrift.tsx. */}
+      <div className="rb-drift-band">
+        {/* Half a section, on purpose: "you do not have to join anything" is one
+            line of reassurance between the catalogue and the three doors, and a
+            full chapter would give it more weight than it needs. */}
+        <LocalStrip />
+
+        <section className="rb-doors" id="doors" aria-labelledby="rb-doors-title">
+          <div className="rb-shell">
+            <div className="rb-doors-head rb-reveal">
+              <p className="rb-kicker"><i /><span>Where you fit</span></p>
+              <h2 id="rb-doors-title">Three doors.<br /><em>One network.</em></h2>
+            </div>
+            <div className="rb-doors-grid">
+              {doors.map((door, index) => {
+                const Icon = door.icon;
+                const external = "external" in door.action && door.action.external;
+                return (
+                  <article className="rb-door rb-reveal" key={door.label} style={{ "--i": index } as CSSProperties}>
+                    <div className="rb-door-top"><Icon /><span>{door.label}</span></div>
+                    <h3>{door.title}</h3>
+                    <p>{door.copy}</p>
+                    <a href={door.action.href} {...(external ? { target: "_blank", rel: "noreferrer" } : {})}>
+                      {door.action.text} <ArrowUpRight />
+                    </a>
+                  </article>
+                );
+              })}
+            </div>
           </div>
-          <div className="rb-doors-grid">
-            {doors.map((door, index) => {
-              const Icon = door.icon;
-              const external = "external" in door.action && door.action.external;
-              return (
-                <article className="rb-door rb-glow rb-reveal" key={door.label} style={{ "--i": index } as CSSProperties} onPointerMove={trackGlow}>
-                  <div className="rb-door-top"><Icon /><span>{door.label}</span></div>
-                  <h3>{door.title}</h3>
-                  <p>{door.copy}</p>
-                  <a href={door.action.href} {...(external ? { target: "_blank", rel: "noreferrer" } : {})}>
-                    {door.action.text} <ArrowUpRight />
-                  </a>
-                </article>
-              );
-            })}
-          </div>
-        </div>
-      </section>
+        </section>
+
+        {/* Last child, and that is load-bearing rather than a formatting choice.
+            The layer and the two sections all paint in the same auto/0 stacking
+            level, where tree order decides — mounted first, the field would go
+            under both opaque section backgrounds and be invisible, which is the
+            same failure as the layer opacity that used to be on it. A z-index
+            here instead would put it above the content wrappers too. */}
+        <SporeDrift />
+      </div>
 
       <section className="rb-proof" id="evidence" aria-labelledby="rb-proof-title">
         <div className="rb-shell rb-proof-inner">

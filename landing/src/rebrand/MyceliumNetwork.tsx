@@ -12,8 +12,8 @@ import "./mycelium-network.css";
  *
  * The renderer is `vendor/mycelium-network.js` — no dependencies, plain
  * Canvas2D. What earns its keep is `origin-from`: the field looks up the
- * hero's `<mushroom-stage>`, takes its box, and anchors all eleven trunks at
- * the base of the stem. The mycelium is then literally growing out of the
+ * hero mushroom host, takes its box, and anchors the primary roots at the
+ * base of the stem. The mycelium is then literally growing out of the
  * mushroom rather than being drawn near it, which is the entire metaphor and
  * the thing you cannot get by placing two decorations on the same page.
  *
@@ -33,7 +33,7 @@ export function MyceliumNetwork() {
     defineMyceliumField();
     const field = document.createElement("mycelium-field");
     field.setAttribute("accent", "#ad7a48");
-    field.setAttribute("density", "1");
+    field.setAttribute("density", "0.58");
     /*
      * The renderer's own default is additive light on a black page. This
      * landing alternates dark and ivory bands, and adding light to paper is a
@@ -43,12 +43,11 @@ export function MyceliumNetwork() {
      */
     field.setAttribute("dim", "");
     /*
-     * Anchors the colony at the base of the hero's mushroom. The field retries
-     * this for a few frames on its own, which matters here: the mushroom
-     * arrives from a dynamic `import()` and simply does not exist in the DOM
-     * for the first frames of the page's life.
+     * Anchor to the stable host rather than the dynamically imported custom
+     * element. The root geometry is therefore correct on the first layout,
+     * even while the WebGL fruiting body is still compiling its first frame.
      */
-    field.setAttribute("origin-from", ".rb-hero-mushroom mushroom-stage");
+    field.setAttribute("origin-from", "#rb-hero-mushroom");
     field.setAttribute(
       "motion",
       window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "off" : "full",

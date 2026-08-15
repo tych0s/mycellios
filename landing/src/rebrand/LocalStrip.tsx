@@ -1,5 +1,5 @@
 import { ArrowUpRight, Terminal } from "lucide-react";
-import { useRef } from "react";
+import { useRef, useState } from "react";
 import { useInView } from "./use-motion";
 
 /*
@@ -23,6 +23,7 @@ const CHIPS = ["No account", "No API key", "OpenAI-style /v1"] as const;
 export function LocalStrip() {
   const bandRef = useRef<HTMLDivElement>(null);
   const live = useInView(bandRef, 0.35);
+  const [sharingPreview, setSharingPreview] = useState(false);
 
   return (
     <section className="rb-local" aria-labelledby="rb-local-title">
@@ -54,13 +55,25 @@ export function LocalStrip() {
             </ul>
           </article>
 
-          {/* The one control that decides whether your machine works for anyone
-              else. It is drawn in its shipped position: off. */}
-          <article className="rb-local-switch">
+          {/* This is an interactive preview, not the real desktop setting. The
+              explicit status copy prevents a landing-page click from implying
+              that hardware was enlisted without installation or consent. */}
+          <button
+            className={`rb-local-switch ${sharingPreview ? "is-on" : ""}`}
+            type="button"
+            role="switch"
+            aria-checked={sharingPreview}
+            aria-describedby="rb-sharing-preview-status"
+            onClick={() => setSharingPreview((enabled) => !enabled)}
+          >
             <span className="rb-local-knob" aria-hidden="true"><i /></span>
             <strong>Share your hardware</strong>
-            <small>Off until you turn it on. Running locally never enlists your machine.</small>
-          </article>
+            <small id="rb-sharing-preview-status">
+              {sharingPreview
+                ? "Preview on — no hardware is actually shared from this page."
+                : "Off until you turn it on. Running locally never enlists your machine."}
+            </small>
+          </button>
         </div>
 
         <p className="rb-local-foot">

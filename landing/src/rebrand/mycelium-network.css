@@ -50,8 +50,27 @@
 /* Section backgrounds stay below the colony, but every real content wrapper
    sits above it. This keeps the organism visible in the page gutters while
    guaranteeing that typography, diagrams, cards and controls are never
-   crossed by a filament. The hero has its own explicit layer system. */
-.rb-page > section:not(.rb-hero):not(.rb-story) > * {
+   crossed by a filament. The hero has its own explicit layer system.
+
+   The one exclusion is `.rb-decor`: a section child marked decorative is not a
+   content wrapper, it is scenery placed in the same margins the colony grows
+   through, and it positions itself. Without the exclusion this rule's
+   `position: relative` would silently pull such an element back into the
+   document flow — and because this selector is more specific than a single
+   class, it would win no matter what the element's own rules said. Marking the
+   exception here rather than out-specifying it there keeps this file the only
+   place the page's stacking order is decided.
+
+   A descendant combinator rather than the child one it started as. Two sections
+   — the local strip and the doors — are wrapped in `.rb-drift-band` so one
+   spore layer can span both of them (see SporeDrift.tsx), which took them out of
+   `.rb-page > section` and, with the child combinator, silently dropped their
+   headings and cards back to the auto level where the colony paints over them.
+   Nothing on this page nests a section inside another section, so the looser
+   combinator matches exactly the same set plus whatever a future wrapper holds —
+   which is the behaviour that was meant, since a wrapper is a layout device and
+   should not be able to change what paints above what. */
+.rb-page section:not(.rb-hero):not(.rb-story) > *:not(.rb-decor) {
   position: relative;
   z-index: 2;
 }

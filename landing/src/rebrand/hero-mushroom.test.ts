@@ -63,12 +63,12 @@ describe("the arrival is faded rather than popped", () => {
     expect(component).toMatch(/setTimeout\(\(\) => setShown\(true\)/);
   });
 
-  it("starts the host hidden and transitions it in", async () => {
+  it("shows only the real renderer and transitions it in quickly", async () => {
     const css = await read("./rebrand.css");
-    const base = css.match(/\n\.rb-hero-mushroom \{[^}]*\}/)?.[0] ?? "";
-    expect(base).toMatch(/opacity:0/);
-    expect(base).toMatch(/transition:[^;]*opacity/);
-    expect(css).toMatch(/\.rb-hero-mushroom\.is-grown \{[^}]*opacity:1/);
+    expect(css).toMatch(/\.rb-hero-mushroom mushroom-stage \{[^}]*opacity:0/);
+    expect(css).toMatch(/\.rb-hero-mushroom\.is-grown mushroom-stage \{[^}]*opacity:1/);
+    expect(css).not.toContain("rb-hero-mushroom-placeholder");
+    expect(css).toMatch(/\.rb-hero-mushroom mushroom-stage \{[^}]*transition:opacity \.22s/);
   });
 
   it("keeps the horizontal centring in both states", async () => {
@@ -76,9 +76,92 @@ describe("the arrival is faded rather than popped", () => {
     // The element is centred with translateX(-50%). A grown state that dropped
     // it would slide the organism half its own width across the hero.
     const base = css.match(/\n\.rb-hero-mushroom \{[^}]*\}/)?.[0] ?? "";
-    const grown = css.match(/\.rb-hero-mushroom\.is-grown \{[^}]*\}/)?.[0] ?? "";
+    const grown = css.match(/\.rb-hero-mushroom\.is-grown mushroom-stage \{[^}]*\}/)?.[0] ?? "";
     expect(base).toContain("translateX(-50%)");
-    expect(grown).toContain("translateX(-50%)");
+    expect(base).toContain("left:50%");
+    expect(grown).toContain("transform:none");
+  });
+
+  it("keeps the planted end of the stem solid at the viewport edge", async () => {
+    const css = await read("./rebrand.css");
+    const base = css.match(/\n\.rb-hero-mushroom \{[^}]*\}/)?.[0] ?? "";
+
+    // The hero already clips the organism at the viewport boundary. A mask on
+    // the host erased the last 12% of the stem before it reached that boundary,
+    // making its base look airbrushed away instead of planted below the fold.
+    expect(base).not.toContain("mask-image");
+    expect(base).toContain("bottom:-8px");
+  });
+
+  it("starts the mycelium below the mushroom instead of on its visible stem", async () => {
+    const renderer = await read("./vendor/mycelium-network.js");
+    const component = await read("./MyceliumNetwork.tsx");
+    const mushroom = await read("./HeroMushroom.tsx");
+
+    expect(renderer).toContain("b.bottom - r.top");
+    expect(renderer).not.toMatch(/b\.height \* 0\.9\d/);
+    expect(mushroom).toContain('id="rb-hero-mushroom"');
+    expect(component).toContain('origin-from", "#rb-hero-mushroom"');
+  });
+
+  it("keeps the grown colony out of the page reading column", async () => {
+    const renderer = await read("./vendor/mycelium-network.js");
+
+    // Stacking the canvas behind transparent wrappers is not an exclusion:
+    // filaments still show through copy. The renderer itself must reject
+    // centre segments, nodes and travelling pulses after leaving the hero.
+    expect(renderer).toContain("clearsReadingZone");
+    expect(renderer).toContain("x0 <= railInset && x1 <= railInset");
+    // Point marks and travelling glints are still excluded outright: unlike a
+    // filament, omitting one leaves nothing dangling.
+    expect(renderer).toContain("cx <= railInset || cx >= W - railInset");
+    expect(renderer).toContain("x > railInset && x < this.vw - railInset");
+  });
+
+  it("keeps the colony sparse and ambient after its visible root flare", async () => {
+    const renderer = await read("./vendor/mycelium-network.js");
+    const component = await read("./MyceliumNetwork.tsx");
+
+    expect(component).toContain('density", "0.58"');
+    expect(renderer).toContain("const ink = dim ? 1.08 : 0.88");
+    expect(renderer).toContain("Math.min(140, Math.max(96");
+    expect(renderer).toContain("slice(0, 4)");
+    expect(renderer).not.toContain("SURGE_SECONDS");
+    expect(renderer).not.toContain("armSurge");
+  });
+
+  it("lets organic runners cross the story section to stay connected", async () => {
+    const renderer = await read("./vendor/mycelium-network.js");
+
+    expect(renderer).toContain("const railInset = W * 0.32");
+    expect(renderer).not.toContain("const leftSpine = []");
+    expect(renderer).toContain("clearsReadingZone");
+  });
+
+  it("never severs a filament at the reading column", async () => {
+    const renderer = await read("./vendor/mycelium-network.js");
+
+    // Two separate ways to look severed, both fixed here. Discarding a segment
+    // mid-path leaves the rest floating with nothing attached; and stepping the
+    // ink abruptly between two adjacent segments reads as a cut even when the
+    // path is unbroken. So nothing is dropped, and the veil is a 0..1 ramp.
+    expect(renderer).toContain("c: centreVeil(x0, cx, cy)");
+    expect(renderer).not.toContain("if (clearsReadingZone(x0, cx, cy)) {");
+    expect(renderer).toContain("const veil = 1 - s.c * (1 - floor)");
+    expect(renderer).toContain("if (s.d === 0 && s.c < 1)");
+    // A boolean crossing flag is exactly the regression this guards against.
+    expect(renderer).not.toContain("s.c ? (s.d === 0 ? 0.34 : 0.16) : 1");
+  });
+
+  it("uses a lighter first-frame renderer budget", async () => {
+    const vendor = await read("./vendor/mushroom-stage.js");
+
+    expect(vendor).toContain("lowPower ? 1.15 : 1.4");
+    expect(vendor).toContain("lowPower ? 56 : 80");
+    expect(vendor).toContain("lowPower ? 44 : 64");
+    expect(vendor).toContain("samples: lowPower ? 0 : 2");
+    expect(vendor).toContain("if (!this._firstFramePainted)");
+    expect(vendor.indexOf("if (!this._firstFramePainted)")).toBeLessThan(vendor.indexOf("r.setRenderTarget(this.rtScene)"));
   });
 });
 
@@ -90,10 +173,11 @@ describe("the browser learns about the chunk while it is still parsing the HTML"
     // to the preload scanner instead, so both large fetches start together.
     expect(config).toContain("mycellios:preload-hero-renderer");
     expect(config).toContain('rel="modulepreload"');
+    expect(config).toContain('fetchPriority="high"');
     expect(config).toContain("mushroom-stage-");
   });
 
-  it("makes the preload conditional in script rather than trusting `media`", async () => {
+  it("makes the preload route-conditional in script rather than trusting `media`", async () => {
     const config = await read("../../../vite.landing.config.ts");
     // `media` on `modulepreload` is not reliably honoured across browsers, and
     // one that ignored it would hand every phone the entire renderer. An inline
@@ -102,8 +186,8 @@ describe("the browser learns about the chunk while it is still parsing the HTML"
     // plugin says the word `media` precisely to explain why it is not used.
     const link = config.slice(config.indexOf('l.rel="modulepreload"'));
     expect(link.slice(0, 200)).not.toMatch(/\bmedia\s*=/);
-    expect(config).toContain('matchMedia("(max-width: 700px)")');
-    expect(config).toContain('matchMedia("(prefers-reduced-motion: reduce)")');
+    expect(config).not.toContain('matchMedia("(max-width: 700px)")');
+    expect(config).not.toContain('matchMedia("(prefers-reduced-motion: reduce)")');
   });
 
   it("keeps three.js tree-shakeable", async () => {
@@ -117,18 +201,29 @@ describe("the browser learns about the chunk while it is still parsing the HTML"
   });
 });
 
-describe("visitors who will not see it do not pay for it", () => {
-  it("skips reduced-motion and phone widths at the same 700px the CSS hides it at", async () => {
+describe("every visitor sees the same organism", () => {
+  it("uses the hero WebGL geometry on phones with a bounded quality profile", async () => {
     const component = await read("./HeroMushroom.tsx");
     const css = await read("./rebrand.css");
     const config = await read("../../../vite.landing.config.ts");
+    const vendor = await read("./vendor/mushroom-stage.js");
     expect(component).toContain('matchMedia("(prefers-reduced-motion: reduce)")');
     expect(component).toContain('matchMedia("(max-width: 700px)")');
-    // The same breakpoint must hide `.rb-hero-mushroom`, or there is a band of
-    // widths painting a shade plate with no organism behind it — and it must
-    // gate the preload too, or the phone downloads what the CSS then hides.
     const phone = css.slice(css.indexOf("@media(max-width:700px)"));
-    expect(phone).toMatch(/\.rb-hero-mushroom \{ display:none/);
-    expect(config).toContain('matchMedia("(max-width: 700px)")');
+    expect(phone).toMatch(/\.rb-hero-mushroom \{ display:block/);
+    expect(component).toContain('setAttribute("variant", "hero")');
+    expect(component).toContain('setAttribute("quality", "mobile")');
+    expect(component).not.toContain("rb-hero-mushroom-mobile");
+    expect(vendor).toContain("mobileQuality ? 1");
+    expect(vendor).toContain("samples: lowPower ? 0 : 2");
+    expect(phone).toMatch(/\.rb-hero-prompt input,\.rb-hero-prompt button \{ background:rgba\(11,15,12,\.92\)/);
+    expect(css).not.toContain("rb-hero-mushroom-placeholder");
+    expect(config).not.toContain('matchMedia("(max-width: 700px)")');
+  });
+
+  it("keeps the same 3D geometry but disables motion for reduced motion", async () => {
+    const component = await read("./HeroMushroom.tsx");
+    expect(component).toContain('reduceMotion ? "off" : mobile ? "calm" : "full"');
+    expect(component).toContain('mobile || reduceMotion ? "off" : "on"');
   });
 });

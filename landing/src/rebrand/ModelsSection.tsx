@@ -5,27 +5,20 @@ import { useInView } from "./use-motion";
 /*
  * The models.
  *
- * The runtime has no house model and no fixed catalogue: `model-catalog.ts`
- * queries Hugging Face live and accepts any checkpoint whose architecture has a
- * native adapter (llama, qwen3, qwen3_moe, glm4_moe today). So this section is
- * not a price list — it is one claim, drawn: the bigger the open model, the more
- * ordinary machines it takes, and nothing here caps out at what one box can hold.
- *
- * The proof is the last column. Each square is one machine, and they light up in
- * sequence as the row lands, so a 470 GB model visibly needs a row of boxes where
- * a 1.2 GB model needs one. That is the whole product in a single glance.
- *
- * Sizes are BF16 weight estimates (parameters × 2 bytes) — the same arithmetic
- * the coordinator uses in `estimateCatalogMemoryMiB` — not measured runtimes.
+ * This is an editorial shortlist, not runtime inventory. The Panel queries the
+ * Hub and the adapter registry decides what can actually run. Keeping those two
+ * facts separate prevents a newly released checkpoint from looking supported
+ * merely because it appears here.
  */
 
 const MODELS = [
-  { name: "Qwen3 0.6B", ref: "Qwen/Qwen3-0.6B", family: "Qwen3", size: "1.2 GB", bar: 8, run: "One machine", boxes: 1 },
-  { name: "Hermes 3 · Llama 3.2 3B", ref: "NousResearch/Hermes-3-Llama-3.2-3B", family: "Llama", size: "6.4 GB", bar: 17, run: "One machine", boxes: 1 },
-  { name: "Qwen3 8B", ref: "Qwen/Qwen3-8B", family: "Qwen3", size: "16.4 GB", bar: 27, run: "One machine", boxes: 1 },
-  { name: "Qwen3 30B-A3B", ref: "Qwen/Qwen3-30B-A3B", family: "Qwen3-MoE", size: "61 GB", bar: 45, run: "2–3 machines", boxes: 3 },
-  { name: "GLM-4.5-Air", ref: "zai-org/GLM-4.5-Air", family: "GLM-4.5-MoE", size: "212 GB", bar: 72, run: "4–8 machines", boxes: 5 },
-  { name: "Qwen3 235B-A22B", ref: "Qwen/Qwen3-235B-A22B", family: "Qwen3-MoE", size: "470 GB", bar: 100, run: "8+ machines", boxes: 7 },
+  { name: "GPT-OSS", ref: "openai/gpt-oss-20b · 120b", href: "https://huggingface.co/openai/gpt-oss-20b", license: "Apache 2.0", scale: "20B / 120B", bar: 28, fit: "Local baseline", status: "local" },
+  { name: "Gemma 4", ref: "google/gemma-4-12B · 31B", href: "https://huggingface.co/google/gemma-4-12B", license: "Apache 2.0", scale: "12B / 31B", bar: 34, fit: "Edge + vision", status: "local" },
+  { name: "Qwen3.5 27B", ref: "Qwen/Qwen3.5-27B", href: "https://huggingface.co/Qwen/Qwen3.5-27B", license: "Apache 2.0", scale: "27B", bar: 31, fit: "Primary canary", status: "candidate" },
+  { name: "Mistral Small 4", ref: "mistralai/Mistral-Small-4-119B-2603", href: "https://huggingface.co/mistralai/Mistral-Small-4-119B-2603", license: "Apache 2.0", scale: "119B · 6.5B active", bar: 53, fit: "Distributed candidate", status: "candidate" },
+  { name: "DeepSeek V4", ref: "deepseek-ai/DeepSeek-V4-Flash · Pro", href: "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash", license: "MIT", scale: "284B / 1.6T", bar: 82, fit: "Long-context R&D", status: "research" },
+  { name: "GLM-5.2", ref: "zai-org/GLM-5.2", href: "https://huggingface.co/zai-org/GLM-5.2", license: "MIT", scale: "753B", bar: 72, fit: "Coding + agents R&D", status: "research" },
+  { name: "Kimi K3", ref: "moonshotai/Kimi-K3", href: "https://huggingface.co/moonshotai/Kimi-K3", license: "Kimi K3", scale: "2.8T · 104B active", bar: 100, fit: "Frontier benchmark", status: "benchmark" },
 ] as const;
 
 /* The adapter registry, named. These are the four families with a native
@@ -48,41 +41,36 @@ export function ModelsSection() {
               wraps, and a ragged three-line headline is not a headline. */}
           <h2 id="rb-models-title">Any open model.<br /><em>Even the biggest ones.</em></h2>
           <p>
-            No house model, no vendor lock. The network reads Hugging Face directly and runs any open checkpoint
-            whose architecture has a native adapter — the small ones on one box, the large ones split across several.
+            A current shortlist from local-scale reasoning to frontier MoE systems. Mycellios evaluates each architecture
+            independently: appearing here means it is worth integrating, not that the native adapter already ships.
           </p>
         </div>
 
         <div className={`rb-models-panel ${live ? "is-live" : ""}`} ref={panelRef}>
           <div className="rb-models-bar">
-            <span className="rb-models-live"><i />Read live from Hugging Face</span>
-            <span>Open weights · BF16 estimate</span>
+            <span className="rb-models-live"><i />August 2026 shortlist</span>
+            <span>Official model cards · integration candidates</span>
           </div>
 
           <div className="rb-models-cols" aria-hidden="true">
-            <span>Model</span><span>Family</span><span>Memory</span><span>Run mode</span>
+            <span>Model</span><span>License</span><span>Scale</span><span>Mycellios fit</span>
           </div>
 
-          <ol className="rb-models-list" aria-label="Open models and how many machines each one takes">
+          <ol className="rb-models-list" aria-label="August 2026 open-model integration shortlist">
             {MODELS.map((model, index) => (
               <li key={model.ref} style={{ "--i": index, "--w": model.bar } as CSSProperties}>
                 <div className="rb-model-id">
-                  <strong>{model.name}</strong>
+                  <strong><a href={model.href} target="_blank" rel="noreferrer">{model.name}<ArrowUpRight /></a></strong>
                   <small>{model.ref}</small>
                 </div>
-                <span className="rb-model-family">{model.family}</span>
+                <span className="rb-model-license">{model.license}</span>
                 <div className="rb-model-size">
-                  <b>{model.size}</b>
+                  <b>{model.scale}</b>
                   <span className="rb-model-track" aria-hidden="true"><i /></span>
                 </div>
-                <div className={`rb-model-run ${model.boxes > 1 ? "is-split" : ""}`}>
-                  <em>{model.run}</em>
-                  {/* One square per machine. The count is the argument. */}
-                  <span className="rb-model-boxes" aria-hidden="true">
-                    {Array.from({ length: model.boxes }, (_, box) => (
-                      <i key={box} style={{ "--b": box } as CSSProperties} />
-                    ))}
-                  </span>
+                <div className={`rb-model-fit is-${model.status}`}>
+                  <i aria-hidden="true" />
+                  <em>{model.fit}</em>
                 </div>
               </li>
             ))}
@@ -98,12 +86,11 @@ export function ModelsSection() {
         </div>
 
         <p className="rb-models-note rb-reveal">
-          Sizes are BF16 weight estimates, not measured runtimes, and the machine counts are indicative.
-          Single-machine models run today; the multi-machine split is in physical testing.
-          <a href="#evidence">See what is built <ArrowUpRight /></a>
+          Scale is the published parameter count, not a memory or speed promise. Hardware fit still depends on
+          precision, context, runtime support and the measured route selected by Mycellios.
         </p>
 
-        <p className="rb-econ-caveat rb-reveal">Model support is architecture-based · new families land as adapters ship</p>
+        <p className="rb-econ-caveat rb-reveal">Shortlist ≠ installed support · new families land only after an adapter and physical evidence ship</p>
       </div>
     </section>
   );

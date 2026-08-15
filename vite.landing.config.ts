@@ -67,14 +67,9 @@ const productionProxy = () => ({
  *
  * It is a script rather than a plain `<link rel="modulepreload" media="...">`
  * because the preload has to be *conditional* and `media` on `modulepreload` is
- * not reliably honoured across browsers. Phones and reduced-motion visitors
- * never draw the organism; preloading 137KB for them would be a regression on
- * exactly the connections least able to afford it, and a silently-ignored
- * `media` attribute would do just that. The inline check cannot be ignored.
- *
- * The 700px and the reduced-motion test are the same conditions HeroMushroom
- * and the CSS use — all three must agree, and `hero-mushroom.test.ts` pins them
- * together.
+ * not reliably honoured across browsers. Every landing viewport now draws the
+ * same organism, so the preload is route-conditional but no longer width- or
+ * motion-conditional; mobile quality is controlled inside the renderer.
  */
 function preloadHeroRenderer() {
   let file: string | null = null;
@@ -89,10 +84,8 @@ function preloadHeroRenderer() {
       const script =
         `<script>(function(){` +
         `if(location.pathname!=="/"&&location.pathname!=="/rebrand"&&location.pathname!=="/rebrand/")return;` +
-        `if(matchMedia("(prefers-reduced-motion: reduce)").matches)return;` +
-        `if(matchMedia("(max-width: 700px)").matches)return;` +
         `var l=document.createElement("link");` +
-        `l.rel="modulepreload";l.crossOrigin="";l.href="/${file}";` +
+        `l.rel="modulepreload";l.crossOrigin="";l.fetchPriority="high";l.href="/${file}";` +
         `document.head.appendChild(l);` +
         `})();</script>`;
       return html.replace("</head>", `  ${script}\n  </head>`);

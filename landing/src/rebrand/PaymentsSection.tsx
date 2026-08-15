@@ -1,20 +1,21 @@
 import { ArrowUpRight, BadgeCheck, HandCoins, ShieldCheck, Wallet } from "lucide-react";
 import { useRef, type CSSProperties } from "react";
+import { GutterFruiting } from "./GutterFruiting";
 import { useInView } from "./use-motion";
 
 /*
  * The exchange.
  *
  * A distributed runtime is only interesting if both sides of it are: the buyer
- * wants one price for one answer, the machine owner wants to be paid for the
- * part it actually ran. This section is that single sentence, drawn — money
- * enters on the left, is split across the same three machines the scroll story
- * just introduced, and leaves on the right only against signed receipts.
+ * wants predictable access, the machine owner wants to be paid for the part it
+ * actually ran. This section is that single sentence, drawn — a subscription
+ * (or usage tokens when flexibility matters) funds access on the left, work is
+ * attributed across the same three machines the scroll story just introduced,
+ * and value leaves on the right only against signed receipts.
  *
  * The split is not decorative: 24 / 6 / 16 GB of one model is 52 / 13 / 35 % of
- * the job, so the bars are the memory shares from the diagram above, restated
- * as payment. The figures illustrate the rule; they are not a live rate, and
- * the caveat under the rail says so.
+ * the job, so the bars are the memory shares from the diagram above. They show
+ * how one route is attributed, not a public price or a guaranteed payout.
  */
 
 const SHARES = [
@@ -38,6 +39,7 @@ export function PaymentsSection() {
 
   return (
     <section className="rb-pay" id="payments" aria-labelledby="rb-pay-title">
+      <GutterFruiting />
       <div className="rb-shell">
         <div className="rb-pay-head rb-reveal">
           <p className="rb-kicker"><i /><span>The exchange</span></p>
@@ -58,7 +60,7 @@ export function PaymentsSection() {
 
           {/* The three shares are a real list: on a phone the rail collapses and
               this is what carries the meaning of the section. */}
-          <ol className="rb-pay-machines" aria-label="How one payment is split">
+          <ol className="rb-pay-machines" aria-label="How one served route is attributed">
             {SHARES.map((machine, index) => (
               <li key={machine.name} style={{ "--i": index, "--share": machine.share } as CSSProperties}>
                 <div className="rb-pay-machine-top">

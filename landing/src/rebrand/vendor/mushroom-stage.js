@@ -1,5 +1,6 @@
 /* <mushroom-stage> — procedural translucent mushroom, three.js + custom bloom.
-   Attributes: accent (#hex) | spores ("on"/"off") | motion ("full"|"calm"|"off") | scale (number) */
+   Attributes: accent (#hex) | spores ("on"/"off") | motion ("full"|"calm"|"off") | scale (number)
+               | variant ("hero"|"gutter"|"colony", boot-time only) */
 /*
  * Vendored from the design reference. It is kept as a custom element rather
  * than rewritten as a React component on purpose: the value here is the *look*,
@@ -7,7 +8,7 @@
  * thresholds) that a rewrite would quietly drift away from. React owns the
  * mount point; this owns the pixels.
  *
- * Changed against the reference in exactly four places, all marked `mycellios:`
+ * Changed against the reference in exactly six places, all marked `mycellios:`
  *   1. three.js is resolved from the bundle instead of fetched from unpkg;
  *   2. the IIFE became an idempotent exported `defineMushroomStage()`, so
  *      React's StrictMode double-mount cannot race `customElements.define`;
@@ -16,14 +17,291 @@
  *   4. three.js is imported by name rather than as a namespace, so the bundler
  *      can drop what this file never touches — that alone is 190KB gzipped
  *      down to 137KB. `THREE_MODULE` is rebuilt from those bindings so the
- *      several hundred `THREE.Foo` call sites below stay exactly as written.
+ *      several hundred `THREE.Foo` call sites below stay exactly as written;
+ *   5. the tuned constants that describe *which* mushroom this is were lifted
+ *      into a `VARIANTS` table so the page can grow a second, younger specimen
+ *      from the same renderer. The hero's entry holds the reference's own
+ *      numbers verbatim and is pinned by a test;
+ *   6. one body per element became N: `buildBody()` is the reference's body
+ *      code lifted whole, and a variant may carry a `colony` of them. A
+ *      variant without one is a single body at the identity transform, which
+ *      is what the reference always built.
  *
- * Everything else — the profile tables, the scroll-driven `progress`, the
- * bloom chain — is untouched.
+ * Everything else — the scroll-driven `progress`, the bloom chain — is
+ * untouched.
  */
 import {AdditiveBlending, BufferGeometry, CanvasTexture, Clock, Color, DirectionalLight, DoubleSide, Float32BufferAttribute, FrontSide, Group, HalfFloatType, HemisphereLight, InstancedMesh, LatheGeometry, LinearFilter, Matrix4, Mesh, MeshBasicMaterial, MeshPhysicalMaterial, MeshStandardMaterial, OrthographicCamera, PerspectiveCamera, PlaneGeometry, PointLight, Points, SRGBColorSpace, Scene, ShaderMaterial, Vector2, Vector3, WebGLRenderTarget, WebGLRenderer} from "three";
 const THREE_MODULE = {AdditiveBlending, BufferGeometry, CanvasTexture, Clock, Color, DirectionalLight, DoubleSide, Float32BufferAttribute, FrontSide, Group, HalfFloatType, HemisphereLight, InstancedMesh, LatheGeometry, LinearFilter, Matrix4, Mesh, MeshBasicMaterial, MeshPhysicalMaterial, MeshStandardMaterial, OrthographicCamera, PerspectiveCamera, PlaneGeometry, PointLight, Points, SRGBColorSpace, Scene, ShaderMaterial, Vector2, Vector3, WebGLRenderTarget, WebGLRenderer};
 
+
+// cap silhouette: apex -> rim
+const CAP_TOP = [
+  [0.000, 0.955], [0.090, 0.951], [0.190, 0.938], [0.300, 0.914], [0.410, 0.878],
+  [0.520, 0.830], [0.630, 0.770], [0.730, 0.700], [0.820, 0.620], [0.895, 0.535],
+  [0.950, 0.452], [0.990, 0.378], [1.030, 0.318], [1.060, 0.292], [1.080, 0.302]
+];
+// cap underside: stem junction -> rim lip
+const CAP_UNDER = [
+  [0.095, 0.520], [0.220, 0.498], [0.360, 0.462], [0.500, 0.420], [0.650, 0.371],
+  [0.790, 0.325], [0.910, 0.295], [1.010, 0.284], [1.060, 0.290], [1.080, 0.302]
+];
+const STEM = [
+  [0.000, 0.560], [0.078, 0.548], [0.070, 0.400], [0.072, 0.200], [0.080, -0.040],
+  [0.093, -0.300], [0.112, -0.560], [0.140, -0.820], [0.170, -1.080], [0.000, -1.180]
+];
+
+/*
+ * mycellios: a fifth change against the reference — a second specimen.
+ *
+ * The page needs another fruiting body beside the pricing rail, and the only
+ * two honest options were a flat SVG or this. A drawn one loses: the hero has
+ * already shown the visitor what this organism looks like with volume on it,
+ * so a flat one further down does not read as a quieter version of the same
+ * thing, it reads as a worse one. And on desktop the renderer's cost is
+ * already paid — three.js is in the bundle by the time anyone scrolls this
+ * far, so a second instance costs a context and a few hundred triangles, not
+ * another 133KB.
+ *
+ * But it must not be the same mushroom twice. Two identical organisms on one
+ * page is wallpaper; what makes a colony read as alive is that its bodies are
+ * at different ages. So `hero` is a mature open cap and `gutter` is a young
+ * closed bell on a long thin stem — the stage before the cap opens, which is
+ * a genuinely different silhouette rather than the same one scaled down.
+ *
+ * EVERY NUMBER UNDER `hero` IS THE REFERENCE'S OWN VALUE, MOVED, NOT CHANGED.
+ * That is the whole safety property of this table: parameterising a look that
+ * lives in tuned constants is only safe if the original constants survive
+ * verbatim, so the hero is pinned against these literals by a test and cannot
+ * drift while the second specimen is tuned.
+ */
+export const VARIANTS = {
+  hero: {
+    capTop: CAP_TOP,
+    capUnder: CAP_UNDER,
+    stem: STEM,
+    capScale: [1.1, 0.86, 1.1],
+    stemBend: -0.075,
+    gillFactor: 1,
+    camera: { x: 0.30, y: -1.02, z: 5.15, fov: 26, target: [0, 0.36, 0] },
+    /* Multipliers on everything that emits light. The hero is the page's
+       light source; the gutter body is lit by it and gives nothing back. */
+    tune: { halo: 1, glow: 1, shell: 1, bloom: 0.68, threshold: 0.42 }
+  },
+  /*
+   * A young bell. The cap has not opened, so it is taller than it is wide —
+   * 1.29 of height against 0.65 of radius, where the hero's is the other way
+   * round — and it sits on a stem half the thickness. Read as a silhouette,
+   * which is how it will mostly be read at 110px in a margin, it is a
+   * different organism at a glance and unmistakably the same species.
+   */
+  gutter: {
+    capTop: [
+      [0.000, 1.215], [0.055, 1.208], [0.115, 1.190], [0.180, 1.158], [0.250, 1.110],
+      [0.320, 1.048], [0.390, 0.972], [0.452, 0.888], [0.508, 0.796], [0.555, 0.698],
+      [0.592, 0.598], [0.618, 0.500], [0.634, 0.412], [0.643, 0.348], [0.648, 0.318]
+    ],
+    capUnder: [
+      [0.058, 0.560], [0.140, 0.548], [0.230, 0.522], [0.320, 0.484], [0.410, 0.436],
+      [0.490, 0.392], [0.560, 0.352], [0.612, 0.328], [0.640, 0.319], [0.648, 0.318]
+    ],
+    stem: [
+      [0.000, 0.560], [0.046, 0.552], [0.041, 0.400], [0.040, 0.180], [0.043, -0.080],
+      [0.050, -0.340], [0.060, -0.620], [0.074, -0.900], [0.092, -1.160], [0.000, -1.240]
+    ],
+    /* Unsquashed: the hero's 0.86 flattens a dome that has already opened.
+       Doing the same to a bell would just make it a dome again. */
+    capScale: [1, 1, 1],
+    /* More lean than the hero's. A thin stem that stands plumb is a pin; the
+       bend is most of what says this grew rather than was placed. */
+    stemBend: -0.105,
+    /* A closed bell shows almost none of its gills, and the ones it does show
+       are a dark seam under the rim rather than a fan. Half the blades at a
+       sixth of the emission is what that looks like from outside. */
+    gillFactor: 0.5,
+    /*
+     * Solved against the geometry rather than eyeballed, because this framing
+     * carries a load-bearing claim: the body has to be *cut* by the section's
+     * bottom rule, not stood on it.
+     *
+     * Projecting the profile through this camera at the wrapper's 0.62 aspect
+     * puts the crown at 0.053 down the box and the foot of the stem at 1.061 —
+     * just past the bottom edge, which the wrapper clips. So the stem runs into
+     * the rule and disappears under it, which is what something growing out of
+     * a surface does; a stem that stopped at 0.99 would be an object resting on
+     * a line. Sideways it spans 0.07..0.93, so the cap has margin at the widest
+     * point of its sway. The check is in the tests, run against these numbers.
+     */
+    camera: { x: 0.16, y: -1.62, z: 5.10, fov: 25, target: [0, 0.06, 0] },
+    /* The subject of this section is the pricing rail. Killing the halo
+       outright and dropping the rest to a third is what keeps this texture in
+       a margin instead of a second thing to look at — low contrast, which is
+       what actually prevents competition, rather than no volume. */
+    tune: { halo: 0, glow: 0.34, shell: 0.42, bloom: 0.26, threshold: 0.6 }
+  },
+  /*
+   * Three bodies, one context, one patch of ground.
+   *
+   * The questions column is a tall empty space under a sticky heading, and one
+   * mushroom in it would be a spot of decoration. Three at different ages are a
+   * colony, which is the thing the company is actually named after — and a
+   * colony is the one arrangement that earns the space, because the reason to
+   * look at it is the relationship between the bodies rather than any one of
+   * them.
+   *
+   * The ages are the point. `flared` is past its prime, cap turned up at the
+   * brim and gone concave; `opening` is the bell in the middle of tearing open;
+   * `button` is a knob on a thick short stem that has barely cleared the
+   * ground. Together with the hero's mature plate and the gutter's young bell
+   * that is five distinct silhouettes of one species, and none of them is
+   * another one scaled.
+   *
+   * They are placed on a shallow arc rather than a line — different z, so the
+   * front one overlaps the back one and the group has depth from a single
+   * camera. `rotY` turns each one a different way so no two present the same
+   * profile.
+   */
+  colony: {
+    /* The colony's own frame is the whole group, so the top-level profile keys
+       are the middle specimen's: anything that reads `V.capTop` without knowing
+       about colonies (a probe, a future caller) gets a real body rather than
+       undefined. */
+    capTop: [
+      [0.000, 1.015], [0.241, 1.008], [0.363, 0.986], [0.460, 0.952], [0.540, 0.905],
+      [0.607, 0.847], [0.664, 0.781], [0.712, 0.710], [0.750, 0.635], [0.780, 0.561],
+      [0.801, 0.491], [0.814, 0.430], [0.818, 0.390], [0.850, 0.390], [0.870, 0.430]
+    ],
+    capUnder: [
+      [0.080, 0.645], [0.168, 0.609], [0.256, 0.576], [0.343, 0.545], [0.431, 0.516],
+      [0.519, 0.491], [0.607, 0.469], [0.694, 0.451], [0.782, 0.437], [0.870, 0.430]
+    ],
+    stem: [
+      [0.000, 0.645], [0.064, 0.645], [0.059, 0.401], [0.059, 0.083], [0.071, -0.292],
+      [0.080, -0.667], [0.087, -0.968], [0.092, -1.155], [0.094, -1.230], [0.000, -1.290]
+    ],
+    capScale: [1, 1, 1],
+    stemBend: -0.085,
+    gillFactor: 0.8,
+    colony: [
+      {
+        /* Old. The cap has gone past flat: the brim sits 0.105 above the low
+           point of the margin, so the underside is convex and catches light
+           from below instead of shading itself. That upturn is the whole
+           reason this one is legible as elderly at 200px. */
+        capTop: [
+          [0.000, 0.735], [0.425, 0.730], [0.558, 0.717], [0.653, 0.696], [0.727, 0.669],
+          [0.786, 0.637], [0.835, 0.603], [0.874, 0.568], [0.905, 0.536], [0.929, 0.509],
+          [0.946, 0.488], [0.956, 0.475], [0.959, 0.470], [0.997, 0.470], [1.020, 0.575]
+        ],
+        capUnder: [
+          [0.070, 0.452], [0.176, 0.473], [0.281, 0.492], [0.387, 0.509], [0.492, 0.526],
+          [0.598, 0.540], [0.703, 0.553], [0.809, 0.563], [0.914, 0.571], [1.020, 0.575]
+        ],
+        /* The last three rows carry the stem to the common ground depth. See the
+           note on GROUND below: the profile's own foot is not a design choice,
+           it is whatever puts this body's tip under the same plane as the other
+           two once `scale` and `at[1]` have been applied. */
+        stem: [
+          [0.000, 0.452], [0.052, 0.452], [0.048, 0.240], [0.048, -0.038], [0.060, -0.364],
+          [0.071, -0.690], [0.078, -0.952], [0.084, -1.115], [0.086, -1.180], [0.088, -1.318],
+          [0.090, -1.457], [0.000, -1.538]
+        ],
+        /* A cap this old has thinned as well as spread. */
+        capScale: [1, 0.94, 1],
+        stemBend: -0.055,
+        gillFactor: 1,
+        at: [-0.98, -0.02, -0.30], scale: 0.92, rotY: 0.42
+      },
+      {
+        /* Middle. Still a bell, but the veil has torn and the margin is on its
+           way down and out — the only one of the three showing the transition
+           rather than an end state. */
+        capTop: [
+          [0.000, 1.015], [0.241, 1.008], [0.363, 0.986], [0.460, 0.952], [0.540, 0.905],
+          [0.607, 0.847], [0.664, 0.781], [0.712, 0.710], [0.750, 0.635], [0.780, 0.561],
+          [0.801, 0.491], [0.814, 0.430], [0.818, 0.390], [0.850, 0.390], [0.870, 0.430]
+        ],
+        capUnder: [
+          [0.080, 0.645], [0.168, 0.609], [0.256, 0.576], [0.343, 0.545], [0.431, 0.516],
+          [0.519, 0.491], [0.607, 0.469], [0.694, 0.451], [0.782, 0.437], [0.870, 0.430]
+        ],
+        stem: [
+          [0.000, 0.645], [0.064, 0.645], [0.059, 0.401], [0.059, 0.083], [0.071, -0.292],
+          [0.080, -0.667], [0.087, -0.968], [0.092, -1.155], [0.094, -1.230], [0.095, -1.305],
+          [0.096, -1.380], [0.000, -1.455]
+        ],
+        capScale: [1, 1, 1],
+        stemBend: -0.085,
+        gillFactor: 0.8,
+        at: [0.66, 0.02, 0.08], scale: 1, rotY: -0.58
+      },
+      {
+        /* Youngest, and the one that makes the group a colony rather than a
+           row: it is small, in front, and leaning hard. Its stem is 0.118 at
+           the top against the old one's 0.052 — a button's stem is thick
+           relative to its cap, and getting that ratio right is what stops it
+           reading as the middle one shrunk. */
+        capTop: [
+          [0.000, 1.045], [0.081, 1.042], [0.141, 1.031], [0.195, 1.014], [0.242, 0.992],
+          [0.285, 0.964], [0.322, 0.933], [0.354, 0.898], [0.380, 0.862], [0.401, 0.826],
+          [0.416, 0.793], [0.425, 0.763], [0.428, 0.744], [0.445, 0.744], [0.455, 0.760]
+        ],
+        capUnder: [
+          [0.105, 0.885], [0.144, 0.864], [0.183, 0.845], [0.222, 0.827], [0.261, 0.810],
+          [0.299, 0.796], [0.338, 0.783], [0.377, 0.772], [0.416, 0.764], [0.455, 0.760]
+        ],
+        /* The deepest profile of the three, which is the opposite of what a
+           button's stem looks like — because this body is scaled 0.66 and sits
+           0.34 low, so it needs 0.65 more local stem than the middle one to
+           reach the same world ground. The visible stem is still the shortest of
+           the three; the surplus is below the edge where nobody sees it. */
+        stem: [
+          [0.000, 0.885], [0.118, 0.885], [0.111, 0.653], [0.111, 0.350], [0.125, -0.008],
+          [0.137, -0.365], [0.144, -0.650], [0.150, -0.829], [0.152, -0.900], [0.154, -1.029],
+          [0.156, -1.158], [0.157, -1.287], [0.159, -1.416], [0.161, -1.545], [0.000, -1.659]
+        ],
+        capScale: [1, 1, 1],
+        /* The most lean of the three. A button is the least anchored thing in
+           the patch. */
+        stemBend: -0.13,
+        /* A closed knob shows essentially no gills. */
+        gillFactor: 0.45,
+        at: [-0.12, -0.34, 0.62], scale: 0.66, rotY: 1.15
+      }
+    ],
+    /*
+     * Solved against all three bodies at once, the same way the gutter's was,
+     * and over the whole rotation the loop sways the group through — 0.01 to
+     * 0.57 radians — rather than at rest, so the framing holds at the extremes
+     * of the sway instead of only in the middle of it.
+     *
+     * At the wrapper's 1.62 aspect the colony spans 0.021..0.973 across the box
+     * with 0.006 of skew, so it is centred and fills the width; crowns sit
+     * 0.073 down from the top.
+     *
+     * GROUND. The three stems end on one world plane at y = -1.36, and every
+     * tip projects below 1.10 — past the bottom edge, which the wrapper clips.
+     * That plane is the fix for the first version, where each profile simply
+     * kept its own foot depth: after `scale` and `at[1]` the button's tip landed
+     * at 0.989 of the box at rest and 0.911 when scrolled, so its closing cone
+     * hung *above* the edge with shading on it, and the group read as three
+     * mushrooms floating rather than three growing out of something. The other
+     * two reached only 1.004 and 1.076 — resting on the line, which is the same
+     * mistake with less of it.
+     *
+     * So the depth of each profile's last rows is not a drawing decision. It is
+     * solved: whatever local y puts this body's tip under y = -1.36 in world
+     * space once its own scale and offset apply, plus enough margin that the
+     * scroll lift (0.14) and the breath (0.0125) cannot raise it back into view.
+     * Per-body, because a single worst-case over the group is exactly what let
+     * one floating specimen through the first time.
+     */
+    camera: { x: 0, y: -2.04, z: 5.10, fov: 24, target: [-0.2, 0.2, 0] },
+    /* Lower than the gutter's even. This sits beside six rows of text that a
+       visitor is reading, and the halo is the one part that would put light
+       across the words. */
+    tune: { halo: 0, glow: 0.3, shell: 0.36, bloom: 0.22, threshold: 0.62 }
+  }
+};
 
 export function defineMushroomStage() {
   if (window.customElements && customElements.get('mushroom-stage')) return;
@@ -78,21 +356,6 @@ export function defineMushroomStage() {
     return tbl[tbl.length - 1][1];
   };
 
-  // cap silhouette: apex -> rim
-  const CAP_TOP = [
-    [0.000, 0.955], [0.090, 0.951], [0.190, 0.938], [0.300, 0.914], [0.410, 0.878],
-    [0.520, 0.830], [0.630, 0.770], [0.730, 0.700], [0.820, 0.620], [0.895, 0.535],
-    [0.950, 0.452], [0.990, 0.378], [1.030, 0.318], [1.060, 0.292], [1.080, 0.302]
-  ];
-  // cap underside: stem junction -> rim lip
-  const CAP_UNDER = [
-    [0.095, 0.520], [0.220, 0.498], [0.360, 0.462], [0.500, 0.420], [0.650, 0.371],
-    [0.790, 0.325], [0.910, 0.295], [1.010, 0.284], [1.060, 0.290], [1.080, 0.302]
-  ];
-  const STEM = [
-    [0.000, 0.560], [0.078, 0.548], [0.070, 0.400], [0.072, 0.200], [0.080, -0.040],
-    [0.093, -0.300], [0.112, -0.560], [0.140, -0.820], [0.170, -1.080], [0.000, -1.180]
-  ];
 
   const radialTexture = (THREE, inner, mid) => {
     const c = document.createElement('canvas');
@@ -110,6 +373,10 @@ export function defineMushroomStage() {
   };
 
   class MushroomStage extends HTMLElement {
+    /* `variant` is deliberately absent: it chooses geometry, and geometry is
+       built once at boot. Making it live would mean rebuilding and disposing
+       every buffer on an attribute write, which is a lot of machinery for a
+       thing no caller does. Set it before the element is connected. */
     static get observedAttributes() { return ['accent', 'spores', 'motion', 'scale', 'progress']; }
 
     setProgress(p) { this._prog = Math.max(0, Math.min(1, p || 0)); }
@@ -149,11 +416,17 @@ export function defineMushroomStage() {
       const THREE = await loadThree();
       if (this._dead) return;
       this.THREE = THREE;
+      /* Unknown names fall back to the hero rather than throwing: a typo in an
+         attribute should cost the wrong specimen, not an empty canvas where the
+         organism was. */
+      const V = VARIANTS[this.getAttribute('variant')] || VARIANTS.hero;
+      this.V = V;
       this.motion = this.getAttribute('motion') || 'full';
       this.baseScale = parseFloat(this.getAttribute('scale')) || 1;
       const reduce = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
       this.reduce = reduce;
-      const lowPower = (navigator.hardwareConcurrency || 8) <= 4 || innerWidth < 700;
+      const mobileQuality = this.getAttribute('quality') === 'mobile';
+      const lowPower = mobileQuality || (navigator.hardwareConcurrency || 8) <= 4 || innerWidth < 700;
 
       const canvas = document.createElement('canvas');
       canvas.style.cssText = 'display:block;width:100%;height:100%;';
@@ -163,13 +436,13 @@ export function defineMushroomStage() {
       const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: !lowPower, powerPreference: 'high-performance' });
       renderer.setClearColor(0x000000, 0);
       this.renderer = renderer;
-      this.dprCap = lowPower ? 1.25 : 1.7;
+      this.dprCap = mobileQuality ? 1 : lowPower ? 1.15 : 1.4;
 
       const scene = new THREE.Scene();
-      const camera = new THREE.PerspectiveCamera(26, 1, 0.1, 60);
-      camera.position.set(0.30, -1.02, 5.15);
+      const camera = new THREE.PerspectiveCamera(V.camera.fov, 1, 0.1, 60);
+      camera.position.set(V.camera.x, V.camera.y, V.camera.z);
       this.scene = scene; this.camera = camera;
-      this.target = new THREE.Vector3(0, 0.36, 0);
+      this.target = new THREE.Vector3(...V.camera.target);
 
       const accent = new THREE.Color(this.getAttribute('accent') || '#C9976A');
       this.accent = accent;
@@ -199,23 +472,67 @@ export function defineMushroomStage() {
       scene.add(group);
       this.group = group;
 
+      /*
+       * One element, one context, however many bodies.
+       *
+       * The questions column wanted three specimens, and the obvious way to get
+       * them — three <mushroom-stage> elements — would have put five live WebGL
+       * contexts on one page next to the hero and the gutter. Browsers cap
+       * contexts somewhere around eight to sixteen and drop the oldest when you
+       * pass it, so the obvious way buys a page where scrolling far enough kills
+       * the hero. Three bodies in one scene cost three draw calls instead.
+       *
+       * It is also the better picture. Three separate canvases are three
+       * pictures of a mushroom; three bodies in one scene share a camera, a key
+       * light and a horizon, so they stand in the same place — which is what
+       * makes them read as a colony rather than as repeated decoration.
+       *
+       * A variant without a `colony` is its own single body, placed at the
+       * origin at unit scale: an identity transform, so the hero and the gutter
+       * come out of this loop exactly as they went in.
+       */
+      const seg = lowPower ? 56 : 80;
+      const members = V.colony || [V];
+      this.bodies = members.map((B) => this.buildBody(THREE, B, { group, seg, lowPower, skin, underSkin, gillMat, accent, tune: V.tune, scene }));
+
+      this.capGroup = this.bodies[0].capGroup;
+      this.shellMat = this.bodies[0].shellMat;
+      this.stem = this.bodies[0].stem;
+      return this.finishBoot(THREE, { scene, group, V, accent, lowPower, canvas });
+    }
+
+    /* Everything that is one fruiting body: cap, shell, gills, stem, and the
+       light inside it. Pulled out of boot() when the colony arrived — three
+       copies of a hundred lines inline is how the specimens would have drifted
+       apart. */
+    buildBody(THREE, B, ctx) {
+      const { group, seg, lowPower, skin, underSkin, gillMat, accent, tune, scene } = ctx;
+      const V = B;
+
+      const root = new THREE.Group();
+      root.name = 'body';
+      /* Placement is optional and defaults to the identity, so a lone specimen
+         is not paying for the colony's existence. */
+      root.position.set(...(B.at || [0, 0, 0]));
+      root.scale.setScalar(B.scale || 1);
+      root.rotation.y = B.rotY || 0;
+      group.add(root);
+
       // ── cap
-      const seg = lowPower ? 64 : 112;
-      const capTopGeo = new THREE.LatheGeometry(CAP_TOP.map(p => new THREE.Vector2(p[0], p[1])), seg);
+      const capTopGeo = new THREE.LatheGeometry(V.capTop.map(p => new THREE.Vector2(p[0], p[1])), seg);
       const cap = new THREE.Mesh(capTopGeo, skin);
       cap.name = 'cap';
-      const underGeo = new THREE.LatheGeometry(CAP_UNDER.map(p => new THREE.Vector2(p[0], p[1])), seg);
+      const underGeo = new THREE.LatheGeometry(V.capUnder.map(p => new THREE.Vector2(p[0], p[1])), seg);
       const under = new THREE.Mesh(underGeo, underSkin);
       under.name = 'capUnderside';
       const capGroup = new THREE.Group();
-      capGroup.scale.set(1.1, 0.86, 1.1);
+      capGroup.scale.set(...V.capScale);
       capGroup.add(cap, under);
-      group.add(capGroup);
-      this.capGroup = capGroup;
+      root.add(capGroup);
 
       // ── fresnel shell over the cap
       const shellMat = new THREE.ShaderMaterial({
-        uniforms: { uColor: { value: new THREE.Color(0xffeedc) }, uPower: { value: 2.4 }, uStrength: { value: 0.85 } },
+        uniforms: { uColor: { value: new THREE.Color(0xffeedc) }, uPower: { value: 2.4 }, uStrength: { value: 0.85 * tune.shell } },
         vertexShader: `varying vec3 vN; varying vec3 vV;
           void main(){ vec4 mv = modelViewMatrix * vec4(position,1.0); vN = normalize(normalMatrix * normal); vV = normalize(-mv.xyz); gl_Position = projectionMatrix * mv; }`,
         fragmentShader: `uniform vec3 uColor; uniform float uPower, uStrength; varying vec3 vN; varying vec3 vV;
@@ -227,7 +544,6 @@ export function defineMushroomStage() {
       shell.scale.setScalar(1.016);
       shell.name = 'capRim';
       capGroup.add(shell);
-      this.shellMat = shellMat;
 
       // ── gills
       const bladeGeo = (r0, r1) => {
@@ -235,7 +551,7 @@ export function defineMushroomStage() {
         for (let i = 0; i <= N; i++) {
           const t = i / N;
           const r = r0 + (r1 - r0) * t;
-          const yTop = lerpTable(CAP_UNDER, r) - 0.005;
+          const yTop = lerpTable(V.capUnder, r) - 0.005;
           const d = 0.072 * Math.pow(t, 0.45) * (1 - Math.pow(t, 5));
           pos.push(r, yTop, 0, r, yTop - d, 0);
           const c = 0.55 + 0.45 * (1 - t);
@@ -252,9 +568,21 @@ export function defineMushroomStage() {
         g.computeVertexNormals();
         return g;
       };
-      const count = lowPower ? 56 : 96;
-      const long = new THREE.InstancedMesh(bladeGeo(0.135, 1.052), gillMat, count);
-      const short = new THREE.InstancedMesh(bladeGeo(0.48, 1.048), gillMat, count);
+      /*
+       * Gill radii are expressed against the rim rather than as absolutes.
+       *
+       * The literals below are the reference's, which reach 1.052 of a rim that
+       * sits at 1.08 — so they end just inside it. Kept as absolutes they would
+       * have run a long way past a narrower cap's rim and hung in the air
+       * outside the body. `rim / 1.08` is exactly 1 for the hero, so its blades
+       * are unchanged to the bit, and the other specimen's are re-fitted to
+       * its own underside without a second table.
+       */
+      const rimK = V.capUnder[V.capUnder.length - 1][0] / 1.08;
+      /* A closed bell hides most of its gills; the hero shows all of them. */
+      const count = Math.round((lowPower ? 44 : 64) * V.gillFactor);
+      const long = new THREE.InstancedMesh(bladeGeo(0.135 * rimK, 1.052 * rimK), gillMat, count);
+      const short = new THREE.InstancedMesh(bladeGeo(0.48 * rimK, 1.048 * rimK), gillMat, count);
       long.name = 'gills'; short.name = 'gillsShort';
       const m = new THREE.Matrix4();
       const bladeCol = new THREE.Color();
@@ -276,13 +604,13 @@ export function defineMushroomStage() {
       capGroup.add(long, short);
 
       // ── stem, bent
-      const stemGeo = new THREE.LatheGeometry(STEM.map(p => new THREE.Vector2(p[0], p[1])), Math.max(40, seg / 2));
+      const stemGeo = new THREE.LatheGeometry(V.stem.map(p => new THREE.Vector2(p[0], p[1])), Math.max(40, seg / 2));
       {
         const p = stemGeo.attributes.position;
         for (let i = 0; i < p.count; i++) {
           const y = p.getY(i);
           const k = Math.max(0, 0.56 - y) / 1.74;
-          const off = -0.075 * Math.pow(k, 1.75);
+          const off = V.stemBend * Math.pow(k, 1.75);
           p.setX(i, p.getX(i) + off);
           p.setZ(i, p.getZ(i) + off * 0.35);
         }
@@ -291,8 +619,22 @@ export function defineMushroomStage() {
       }
       const stem = new THREE.Mesh(stemGeo, skin);
       stem.name = 'stem';
-      group.add(stem);
-      this.stem = stem;
+      root.add(stem);
+
+      /* The light that makes a body look lit from inside rather than painted.
+         It belongs to the body, not the scene, so a colony member carries its
+         own — three specimens sharing one point light at the origin would leave
+         the outer two flat. */
+      const inner = new THREE.PointLight(accent.clone(), 1.3 * tune.glow, 2.6, 2);
+      inner.position.set(0, 0.44, 0);
+      root.add(inner);
+
+      return { root, capGroup, stem, shellMat, inner, capScale: V.capScale };
+    }
+
+    finishBoot(THREE, ctx) {
+      const { scene, group, V, accent, lowPower, canvas } = ctx;
+      const gillMat = this.mats.gillMat;
 
       // ── halos
       const haloBig = new THREE.Mesh(
@@ -318,6 +660,11 @@ export function defineMushroomStage() {
       haloCore.scale.setScalar(1.7);
       haloCore.renderOrder = -1;
       group.add(haloBig, haloCore);
+      /* A specimen with no halo still builds them and hides them, rather than
+         omitting them: the tick loop drives `this.halos[0]` every frame, and a
+         variant that changes the *shape* of the object graph is a variant that
+         will eventually crash the loop for one caller and not the other. */
+      haloBig.visible = haloCore.visible = V.tune.halo > 0;
       this.halos = [haloBig, haloCore];
 
       // ── spores
@@ -361,19 +708,20 @@ export function defineMushroomStage() {
       const key = new THREE.DirectionalLight(0xfff6ec, 1.5); key.position.set(-2.3, 2.7, 1.9);
       const rim = new THREE.DirectionalLight(0xffdcb4, 1.35); rim.position.set(2.5, 0.7, -2.1);
       const fill = new THREE.DirectionalLight(0xb9a894, 0.5); fill.position.set(1.4, -1.4, 2.2);
-      const inner = new THREE.PointLight(accent.clone(), 1.3, 2.6, 2); inner.position.set(0, 0.44, 0);
-      scene.add(hemi, key, rim, fill, inner);
-      this.inner = inner;
+      scene.add(hemi, key, rim, fill);
+      /* Kept as an alias so applyAccent and the tick loop still have the single
+         name they were written against; the colony drives every body's light. */
+      this.inner = this.bodies[0].inner;
 
       // ── bloom plumbing
       const half = () => ({ minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, type: THREE.HalfFloatType, depthBuffer: false });
-      this.rtScene = new THREE.WebGLRenderTarget(2, 2, { type: THREE.HalfFloatType, samples: lowPower ? 0 : 4 });
+      this.rtScene = new THREE.WebGLRenderTarget(2, 2, { type: THREE.HalfFloatType, samples: lowPower ? 0 : 2 });
       this.rtA = new THREE.WebGLRenderTarget(2, 2, half());
       this.rtB = new THREE.WebGLRenderTarget(2, 2, half());
       const mk = (fs, uniforms) => new THREE.ShaderMaterial({ uniforms, vertexShader: QUAD_VS, fragmentShader: fs, depthTest: false, depthWrite: false });
-      this.pBright = mk(BRIGHT_FS, { tDiffuse: { value: null }, uThreshold: { value: 0.42 }, uKnee: { value: 0.35 } });
+      this.pBright = mk(BRIGHT_FS, { tDiffuse: { value: null }, uThreshold: { value: V.tune.threshold }, uKnee: { value: 0.35 } });
       this.pBlur = mk(BLUR_FS, { tDiffuse: { value: null }, uDir: { value: new THREE.Vector2() } });
-      this.pComp = mk(COMP_FS, { tScene: { value: null }, tBloom: { value: null }, uStrength: { value: 0.68 } });
+      this.pComp = mk(COMP_FS, { tScene: { value: null }, tBloom: { value: null }, uStrength: { value: V.tune.bloom } });
       this.pComp.transparent = true;
       this.quadScene = new THREE.Scene();
       this.quadCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
@@ -410,16 +758,6 @@ export function defineMushroomStage() {
       this._ready = true;
       this.resize();
       this.tick();
-      /* mycellios: the element used to appear the instant three.js compiled its
-         shaders, which is a hard pop one to two seconds after the rest of the
-         hero is already painted. Announcing the *first drawn frame* — not
-         merely `_ready`, which still precedes any pixels — lets the host fade
-         it in. Dispatched after a frame so the compositor has the canvas
-         content before the transition starts. */
-      requestAnimationFrame(() => {
-        if (this._dead) return;
-        this.dispatchEvent(new CustomEvent('mushroom-ready', { bubbles: true }));
-      });
     }
 
     applyAccent(hex) {
@@ -430,7 +768,7 @@ export function defineMushroomStage() {
       this.mats.gillMat.emissive.copy(c);
       this.mats.underSkin.emissive.copy(c);
       this.mats.underSkin.sheenColor.copy(c);
-      this.inner.color.copy(c);
+      this.bodies.forEach((b) => b.inner.color.copy(c));
       this.sporeMat.uniforms.uColor.value.copy(c).lerp(new THREE.Color(0xfff2e4), 0.5);
     }
 
@@ -477,6 +815,11 @@ export function defineMushroomStage() {
       this._flow += dt * (0.03 + g * 0.14);
       this.sporeMat.uniforms.uFlow.value = this._flow;
 
+      /* The loop rewrites cap scale, halo, glow and shell every frame, so the
+         boot-time values are only defaults — anything tuned per specimen has to
+         be re-applied here too or the first animated frame puts it straight
+         back to the hero's. */
+      const V = this.V;
       if (!still) {
         const p = this.pt;
         p.x += (p.tx - p.x) * 0.045;
@@ -487,29 +830,62 @@ export function defineMushroomStage() {
         this.group.position.y = g * 0.14 + breath * 0.025 * amp;
         this.group.rotation.x = 0.17 - p.y * 0.05 * amp + Math.sin(t * 0.22) * 0.015 * amp;
         this.group.scale.setScalar(this.baseScale * (1 + breath * 0.012 * amp));
-        this.capGroup.scale.set(1.1 * (1 + Math.sin(t * 0.62 + 0.5) * 0.016 * amp), 0.86 * (1 + breath * 0.026 * amp), 1.1 * (1 + Math.sin(t * 0.62 + 0.5) * 0.016 * amp));
-        this.stem.scale.y = 1 - breath * 0.012 * amp;
-        this.camera.position.x = 0.34 + p.x * 0.16 * amp;
-        this.camera.position.y = -1.02 - p.y * 0.1 * amp;
+        /* Each body breathes on its own clock. Three specimens swelling in
+           lockstep would beat like one object cut into three pieces; the phase
+           offset is what makes them separate organisms that happen to share a
+           patch of ground. A lone specimen gets offset 0 — the hero's own
+           timing, unchanged. */
+        this.bodies.forEach((b, i) => {
+          const ph = i * 2.1;
+          const bs = i ? Math.sin(t * 0.62 + ph) : breath;
+          const swell = 1 + Math.sin(t * 0.62 + 0.5 + ph) * 0.016 * amp;
+          const [csx, csy, csz] = b.capScale;
+          b.capGroup.scale.set(csx * swell, csy * (1 + bs * 0.026 * amp), csz * swell);
+          b.stem.scale.y = 1 - bs * 0.012 * amp;
+        });
+        /* The 0.34 here is the reference's own drift off the 0.30 it booted at
+           — the camera settles a little right of where it starts. Kept as an
+           offset so every specimen drifts by the same amount from its own
+           framing instead of all of them snapping to the hero's. */
+        this.camera.position.x = V.camera.x + 0.04 + p.x * 0.16 * amp;
+        this.camera.position.y = V.camera.y - p.y * 0.1 * amp;
         this.camera.lookAt(this.target);
         const pulse = 0.5 + Math.sin(t * 0.38) * 0.5;
-        this.halos[0].material.opacity = 0.36 + pulse * 0.2 + g * 0.26;
+        this.halos[0].material.opacity = (0.36 + pulse * 0.2 + g * 0.26) * V.tune.halo;
         this.halos[0].scale.setScalar(4.1 + pulse * 0.22 + g * 0.5);
-        this.halos[1].material.opacity = 0.3 + (0.5 + Math.sin(t * 0.55 + 1.1) * 0.5) * 0.22 + g * 0.3;
-        this.mats.gillMat.emissiveIntensity = 0.28 + pulse * 0.14 + g * 0.6;
-        this.inner.intensity = 1.15 + pulse * 0.45 + g * 1.4;
-        this.shellMat.uniforms.uStrength.value = 0.72 + pulse * 0.22 + g * 0.35;
+        this.halos[1].material.opacity = (0.3 + (0.5 + Math.sin(t * 0.55 + 1.1) * 0.5) * 0.22 + g * 0.3) * V.tune.halo;
+        this.mats.gillMat.emissiveIntensity = (0.28 + pulse * 0.14 + g * 0.6) * V.tune.glow;
+        this.bodies.forEach((b, i) => {
+          const p2 = i ? 0.5 + Math.sin(t * 0.38 + i * 2.1) * 0.5 : pulse;
+          b.inner.intensity = (1.15 + p2 * 0.45 + g * 1.4) * V.tune.glow;
+          b.shellMat.uniforms.uStrength.value = (0.72 + p2 * 0.22 + g * 0.35) * V.tune.shell;
+        });
         this.sporeMat.uniforms.uTime.value = t;
       } else {
         if (!this._needsRender) return;
         this.group.rotation.set(0.17, 0.18, -0.03);
         this.group.scale.setScalar(this.baseScale);
-        this.capGroup.scale.set(1.1, 0.86, 1.1);
+        this.bodies.forEach((b) => b.capGroup.scale.set(...b.capScale));
         this.camera.lookAt(this.target);
         this._needsRender = false;
       }
 
       const r = this.renderer;
+      /* Paint the actual mushroom before compiling the bloom pipeline. Shader
+         compilation for the four post-processing passes was the visible
+         two-to-three second gap on a cold load. The direct material shaders
+         are enough for the first real frame; bloom joins on the next frame,
+         after the host is already visible. */
+      if (!this._firstFramePainted) {
+        r.setRenderTarget(null);
+        r.clear();
+        r.render(this.scene, this.camera);
+        this._firstFramePainted = true;
+        requestAnimationFrame(() => {
+          if (!this._dead) this.dispatchEvent(new CustomEvent('mushroom-ready', { bubbles: true }));
+        });
+        return;
+      }
       r.setRenderTarget(this.rtScene);
       r.clear();
       r.render(this.scene, this.camera);

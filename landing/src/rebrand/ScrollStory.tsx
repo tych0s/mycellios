@@ -33,13 +33,13 @@ const BEATS = [
 ] as const;
 
 /* `layers` makes the split concrete: three cards reading 24/6/16 GB show three
-   machines, but A–F / G–N / O–Z show one model cut across them. The uneven
+   machines, but 0–6 / 7–13 / 14–20 show one model cut across them. The uneven
    capacities are deliberate — a 6 GB laptop next to a 24 GB GPU is the whole
    claim: ordinary machines, not matched hardware. */
 const DEVICES = [
-  { icon: Cpu, name: "GPU", detail: "24 GB", layers: "layers A–F" },
-  { icon: Laptop, name: "Laptop", detail: "6 GB", layers: "layers G–N" },
-  { icon: MemoryStick, name: "PC", detail: "16 GB", layers: "layers O–Z" },
+  { icon: Cpu, name: "GPU", detail: "24 GB", layers: "layers 0–6" },
+  { icon: Laptop, name: "Laptop", detail: "6 GB", layers: "layers 7–13" },
+  { icon: MemoryStick, name: "PC", detail: "16 GB", layers: "layers 14–20" },
 ] as const;
 
 export function ScrollStory() {

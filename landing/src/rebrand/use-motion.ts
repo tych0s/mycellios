@@ -4,8 +4,9 @@ import { useEffect, useState, type RefObject } from "react";
 /*
  * Motion primitives for the landing.
  *
- * The landing is a scroll story, so every effect here is driven by the reader's
- * own scrolling rather than by autoplaying timers. Three rules hold throughout:
+ * The landing is a scroll story. Its pinned chapters can fill in while the
+ * reader pauses, but direct scrolling remains the authority in both directions.
+ * Three rules hold throughout:
  *
  *  - work happens inside requestAnimationFrame, never inside the scroll event;
  *  - progress is published as a CSS custom property so the animation itself
@@ -53,16 +54,23 @@ export function scrollTravel(top: number, height: number, viewport: number): num
 }
 
 /**
+ * Chooses the visible story progress for one frame. While the reader is
+ * actively scrolling, the scroll position wins — including when it moves
+ * backwards. Once the gesture settles, autoplay may continue from that point.
+ */
+export function storyProgress(scrollProgress: number, played: number, scrolling: boolean): number {
+  return scrolling ? scrollProgress : Math.max(scrollProgress, played);
+}
+
+/**
  * Drives a pinned story section: writes 0→1 into `--p` on the element and
  * returns the current beat index. React only re-renders on beat changes, so the
  * per-frame cost stays in CSS.
  *
- * The section plays *itself*. As soon as it is pinned an autoplay clock starts,
- * and progress is the further of the clock and the reader's own scroll — so
- * standing still shows the whole story in {@link STORY_SECONDS}, while a reader
- * who wants to move on can scrub past it at their own speed. Neither one can
- * pull the story backwards, which is what made the section feel like a toll
- * gate when scroll was the only transport.
+ * The section can play *itself* while pinned, but a live scroll gesture always
+ * owns the progress. That makes the story a reversible scrub: scrolling back
+ * deactivates the cards and rewinds the beat instead of leaving the section
+ * permanently completed.
  */
 export function useStoryProgress(ref: RefObject<HTMLElement | null>, beats: number): number {
   const [beat, setBeat] = useState(0);
@@ -79,6 +87,7 @@ export function useStoryProgress(ref: RefObject<HTMLElement | null>, beats: numb
     let frame = 0;
     let played = 0;
     let last = 0;
+    let interactingUntil = 0;
 
     const update = (now: number) => {
       frame = 0;
@@ -88,10 +97,18 @@ export function useStoryProgress(ref: RefObject<HTMLElement | null>, beats: numb
       // window in which the reader is being held — and so the only window in
       // which playing at them is fair.
       const pinned = rect.top <= 0 && rect.bottom >= viewport;
-      played = nextPlayed(played, last ? (now - last) / 1000 : 0, pinned);
+      const scrolling = now < interactingUntil;
+      const scrollProgress = scrollTravel(rect.top, element.offsetHeight, viewport);
+      if (scrolling) {
+        // Do not let the autoplay clock fight a user gesture, especially on
+        // the way back up. It resumes from this exact point after the gesture.
+        played = scrollProgress;
+      } else {
+        played = nextPlayed(played, last ? (now - last) / 1000 : 0, pinned);
+      }
       last = now;
 
-      const progress = Math.max(scrollTravel(rect.top, element.offsetHeight, viewport), played);
+      const progress = storyProgress(scrollProgress, played, scrolling);
       element.style.setProperty("--p", progress.toFixed(4));
       setBeat(beatFor(progress, beats));
 
@@ -103,12 +120,18 @@ export function useStoryProgress(ref: RefObject<HTMLElement | null>, beats: numb
     const schedule = () => {
       if (!frame) frame = window.requestAnimationFrame(update);
     };
+    const onScroll = () => {
+      // Keep this window short: enough to cover a burst of wheel/touch events,
+      // while allowing the chapter to continue playing when the reader pauses.
+      interactingUntil = performance.now() + 180;
+      schedule();
+    };
 
     schedule();
-    window.addEventListener("scroll", schedule, { passive: true });
+    window.addEventListener("scroll", onScroll, { passive: true });
     window.addEventListener("resize", schedule);
     return () => {
-      window.removeEventListener("scroll", schedule);
+      window.removeEventListener("scroll", onScroll);
       window.removeEventListener("resize", schedule);
       if (frame) window.cancelAnimationFrame(frame);
     };

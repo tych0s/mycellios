@@ -44,7 +44,10 @@ function path(points: Point[]): string {
 export function FruitingMark() {
   // Fully open, leaning slightly, drawn once at module scale — nothing here
   // depends on the browser, which is what lets it server-render.
-  const body = growFruitingBody({ maturity: 1, lean: -0.22, gillCount: 9 });
+  const body = growFruitingBody({ maturity: 1, lean: 0.38, gillCount: 11 });
+  const capPath = `${path(body.cap)} ${path(body.underside).replace(/^M/, "L")} Z`;
+  const undersidePath = `${path(body.underside)} Z`;
+  const stipePath = path(body.stipe);
 
   return (
     <svg
@@ -54,6 +57,28 @@ export function FruitingMark() {
       aria-hidden="true"
       focusable="false"
     >
+      <defs>
+        <linearGradient id="rb-fruit-stipe-paint" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0" stopColor="#8f6845" />
+          <stop offset="0.34" stopColor="#eadfce" />
+          <stop offset="0.68" stopColor="#f6eee2" />
+          <stop offset="1" stopColor="#a97b50" />
+        </linearGradient>
+        <linearGradient id="rb-fruit-cap-paint" x1="0.16" y1="0" x2="0.86" y2="1">
+          <stop offset="0" stopColor="#f3eadc" />
+          <stop offset="0.38" stopColor="#d9bd99" />
+          <stop offset="0.76" stopColor="#b9824d" />
+          <stop offset="1" stopColor="#7d5535" />
+        </linearGradient>
+        <linearGradient id="rb-fruit-under-paint" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stopColor="#e7d3b7" />
+          <stop offset="0.58" stopColor="#b98455" />
+          <stop offset="1" stopColor="#6c452d" />
+        </linearGradient>
+        <filter id="rb-fruit-soft-glow" x="-35%" y="-35%" width="170%" height="180%">
+          <feGaussianBlur stdDeviation="2.4" />
+        </filter>
+      </defs>
       {/*
         Order is the order it grows in, and it is also the order that makes the
         shape legible: stalk first so the cap overprints the join, then the cap
@@ -65,16 +90,20 @@ export function FruitingMark() {
         the exact wrong reading. Closing the cap into a solid gives the stalk
         something to disappear behind, which is what a cap does.
       */}
-      <path className="rb-fruit-stipe" d={path(body.stipe)} />
+      <path className="rb-fruit-stipe-shadow" d={stipePath} />
+      <path className="rb-fruit-stipe" d={stipePath} />
+      <path className="rb-fruit-stipe-light" d={stipePath} />
       {/* Cap outline and underside are one path: closing over the crown and
           back along the hollow gives the rim an overhang, where closing on a
           straight chord would fill a lens. */}
-      <path className="rb-fruit-cap" d={`${path(body.cap)} ${path(body.underside).replace(/^M/, "L")} Z`} />
+      <path className="rb-fruit-cap" d={capPath} />
+      <path className="rb-fruit-under" d={undersidePath} />
       <g className="rb-fruit-gills">
         {body.gills.map(([from, to], index) => (
           <path key={index} d={path([from, to])} />
         ))}
       </g>
+      <path className="rb-fruit-cap-light" d={path(body.cap)} />
     </svg>
   );
 }

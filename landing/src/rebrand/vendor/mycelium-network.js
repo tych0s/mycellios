@@ -142,6 +142,27 @@ export function defineMyceliumField() {
       return y - range.travel;
     }
 
+    /*
+     * Viewport y of the growth canvas's own origin — the one number that maps
+     * a filament's canvas coordinate onto the screen.
+     *
+     * `placeGrowthCanvas` moves that canvas three different ways depending on
+     * where the story is, so reading the host's box is only correct in one of
+     * the three. This mirrors those three cases, and everything drawn on the
+     * fixed glint canvas goes through it: without that, marks meant to sit on
+     * a filament detach from it by the story's whole travel for the entire
+     * lower half of the page.
+     */
+    canvasTop() {
+      const hostTop = this.getBoundingClientRect().top;
+      const range = this.storyRange();
+      if (!range) return hostTop;
+      const y = window.scrollY || 0;
+      if (y >= range.end) return hostTop + range.travel;
+      if (y >= range.top) return -(range.top - (this._pageTop || 0));
+      return hostTop;
+    }
+
     lockOrigin() {
       const sel = this.getAttribute('origin-from') || 'mushroom-stage';
       const src = document.querySelector(sel);
@@ -149,7 +170,11 @@ export function defineMyceliumField() {
       const b = src.getBoundingClientRect();
       if (b.height < 20) return false;
       const r = this.getBoundingClientRect();
-      this.setOrigin(b.left - r.left + b.width * 0.5, b.top - r.top + b.height * 0.96);
+      /* Start below the rendered host, not four percent inside it. The hero
+         already places that host 8px below the viewport edge, so b.bottom is a
+         naturally hidden junction: the roots emerge on the next surface
+         without painting a bronze starter segment over the visible stem. */
+      this.setOrigin(b.left - r.left + b.width * 0.5, b.bottom - r.top);
       return true;
     }
 
@@ -256,12 +281,49 @@ export function defineMyceliumField() {
       const density = parseFloat(this.getAttribute('density')) || 1;
       const ox = this._ox != null ? this._ox : (parseFloat(this.getAttribute('origin-x')) || 0.34) * W;
       const oy = this._oy != null ? this._oy : (parseFloat(this.getAttribute('origin-y')) || 0.62) * H;
-      const corridorStart = oy + (this.vh || 900) * 0.2;
+      const corridorStart = oy + 18;
       const corridorLeft = W * 0.12;
       const corridorRight = W * 0.88;
+      /* Below the short root flare, the centre belongs to the message. Painting the
+         canvas behind transparent content does not stop a trunk showing
+         through type, so only the two edge rails are allowed to receive
+         visible segments after the physical connection beneath the stem has
+         become clear. */
+      const readingZoneStart = oy + Math.min(140, Math.max(96, (this.vh || 900) * 0.14));
+      /* Keep the central reading column clear, but give the organic left and
+         right runners enough room to arc through the story section and meet
+         the next generation. A narrow 14% rail made that union look cut off. */
+      const railInset = W * 0.32;
+      const clearsReadingZone = (x0, x1, y1) => (
+        y1 <= readingZoneStart ||
+        (x0 <= railInset && x1 <= railInset) ||
+        (x0 >= W - railInset && x1 >= W - railInset)
+      );
+      /* A filament is a path, not a scatter of marks: rejecting the segments
+         that happen to pass over the centre column does not hide the filament,
+         it saws it in half and leaves the far half floating with nothing
+         attached to it. So segments are never dropped — each one carries how
+         far into the reading column it sits, and pays for it at draw time.
+         Nodes, which are point marks rather than continuity, stay excluded.
+
+         This is a ramp, not a flag, and that distinction is the whole fix. A
+         boolean crossing test steps the ink by 6x between two adjacent
+         segments, and the eye reads an abrupt change in density as a cut just
+         as readily as it reads a gap — the line was continuous and still
+         looked severed. Fading in over the approach means no two neighbouring
+         segments ever differ enough to register as an edge. */
+      const centreVeil = (x0, x1, y1) => {
+        const enter = (y1 - readingZoneStart) / 150;
+        if (enter <= 0) return 0;
+        const mid = W * 0.5;
+        const half = Math.max(1, mid - railInset);
+        const lateral = 1 - Math.abs((x0 + x1) * 0.5 - mid) / half;
+        if (lateral <= 0) return 0;
+        return Math.min(1, enter) * Math.min(1, lateral);
+      };
 
       const grow = (x, y, ang, len, depth, spread) => {
-        if (segs.length > 14000) return;
+        if (segs.length > 9000) return;
         /* Once a root has cleared the fruiting body, commit it to the nearest
            outward direction. Branch noise still makes the paths organic, but
            this persistent steering prevents long trunks from wandering back
@@ -286,12 +348,20 @@ export function defineMyceliumField() {
           if (cy > H + 60 || cy < -60) break;
           pts.push([cx, cy]);
           const order = Math.min(0.995, 0.055 + 0.9 * (cy / H) + depth * 0.012 + rnd() * 0.008);
-          segs.push({ x0: pts[pts.length - 2][0], y0: pts[pts.length - 2][1], x1: cx, y1: cy, d: depth, o: order });
+          const x0 = pts[pts.length - 2][0];
+          const y0 = pts[pts.length - 2][1];
+          /* Dropping a segment does not hide a filament, it cuts one in half
+             and leaves the far side floating as a detached stub — which is the
+             break visible beside the story column. So nothing is discarded;
+             crossings are marked and veiled at draw time instead. */
+          segs.push({ x0, y0, x1: cx, y1: cy, d: depth, o: order, c: centreVeil(x0, cx, cy) });
           const branchChance = (depth < 2 ? 0.032 : 0.02) * density;
           if (i > 1 && i < n - 1 && rnd() < branchChance) {
             const side = rnd() < 0.5 ? -1 : 1;
             kids.push([cx, cy, a + side * (0.5 + rnd() * 0.75), len * (0.36 + rnd() * 0.24), depth + 1, spread * 1.15, order]);
-            nodes.push({ x: cx, y: cy, o: order, r: 1.6 + rnd() * 2.2, d: depth });
+            if (cy <= readingZoneStart || cx <= railInset || cx >= W - railInset) {
+              nodes.push({ x: cx, y: cy, o: order, r: 1.6 + rnd() * 2.2, d: depth });
+            }
           }
         }
         if (depth <= 1 && pts.length > 6) trunks.push(pts);
@@ -299,15 +369,11 @@ export function defineMyceliumField() {
       };
 
       const trunkDefs = [
-        [ox, oy, Math.PI * 0.52, H * 1.15],
-        [ox, oy, Math.PI * 0.72, H * 1.0],
-        [ox, oy, Math.PI * 0.3, H * 1.05],
-        [ox, oy, Math.PI * 0.88, H * 0.8],
-        [ox, oy, Math.PI * 0.14, H * 0.85],
-        [ox, oy, Math.PI * 0.6, H * 0.95],
-        [ox, oy, Math.PI * 0.42, H * 0.9],
-        [ox, oy, Math.PI * 0.98, H * 0.4],
-        [ox, oy, Math.PI * 0.04, H * 0.45]
+        [ox, oy, Math.PI * 0.5, 150],
+        [ox, oy, Math.PI * 0.78, H * 0.9],
+        [ox, oy, Math.PI * 0.88, H * 0.72],
+        [ox, oy, Math.PI * 0.22, H * 0.9],
+        [ox, oy, Math.PI * 0.12, H * 0.72]
       ];
       trunkDefs.forEach((t) => grow(t[0], t[1], t[2], t[3], 0, 1));
 
@@ -315,7 +381,7 @@ export function defineMyceliumField() {
       nodes.sort((a, b) => a.o - b.o);
       this.segs = segs; this.nodes = nodes; this.trunks = trunks;
       this._nodeCursor = 0;
-      this.pulses = trunks.slice(0, 14).map((p, i) => ({ pts: p, t: rnd(), sp: 0.055 + rnd() * 0.075, ph: i }));
+      this.pulses = trunks.filter((_, i) => i > 0).slice(0, 4).map((p, i) => ({ pts: p, t: rnd(), sp: 0.045 + rnd() * 0.05, ph: i }));
     }
 
     drawTo(p) {
@@ -331,19 +397,28 @@ export function defineMyceliumField() {
        */
       const dim = this.hasAttribute('dim');
       ctx.globalCompositeOperation = dim ? 'source-over' : 'lighter';
-      const ink = dim ? 2.4 : 1;
+      const ink = dim ? 1.08 : 0.88;
       let drawn = 0;
       while (this._cursor < this.segs.length && this.segs[this._cursor].o <= p && drawn < 900) {
         const s = this.segs[this._cursor++];
         const fade = 1 / (1 + s.d * 0.55);
-        ctx.strokeStyle = this.rgba((0.055 + 0.075 * fade) * ink);
-        ctx.lineWidth = Math.max(0.4, 1.45 - s.d * 0.28);
+        /* `s.c` is how deep this segment sits in the reading column, 0..1.
+           Interpolating rather than switching is what keeps the line reading as
+           one filament: at full depth a trunk still carries a third of its ink
+           so the colony is legibly one organism, fine branch noise drops to a
+           sixth, and everything in between is a gradient no edge can form in. */
+        const floor = s.d === 0 ? 0.34 : 0.16;
+        const veil = 1 - s.c * (1 - floor);
+        ctx.strokeStyle = this.rgba((0.055 + 0.075 * fade) * ink * veil);
+        ctx.lineWidth = Math.max(0.35, (1.45 - s.d * 0.28) * (1 - s.c * 0.45));
         ctx.beginPath();
         ctx.moveTo(s.x0, s.y0);
         ctx.lineTo(s.x1, s.y1);
         ctx.stroke();
-        if (s.d === 0) {
-          ctx.strokeStyle = this.rgba(0.022 * ink);
+        // The trunk's soft halo fades on the same ramp. Dropping it abruptly
+        // would reintroduce exactly the density edge the ramp above removes.
+        if (s.d === 0 && s.c < 1) {
+          ctx.strokeStyle = this.rgba(0.022 * ink * (1 - s.c));
           ctx.lineWidth = 4.5;
           ctx.stroke();
         }
@@ -354,7 +429,7 @@ export function defineMyceliumField() {
         const s = nd.r * 7;
         // The node sprite has a near-white core, which on paper would punch a
         // pale hole rather than mark a fork. Halved over light bands.
-        ctx.globalAlpha = (dim ? 0.12 : 0.24) / (1 + nd.d * 0.5);
+        ctx.globalAlpha = (dim ? 0.075 : 0.16) / (1 + nd.d * 0.5);
         ctx.drawImage(this.sprite, nd.x - s / 2, nd.y - s / 2, s, s);
         ctx.globalAlpha = 1;
       }
@@ -378,10 +453,17 @@ export function defineMyceliumField() {
       if (!lctx || this.motion === 'off' || this.reduce) return;
       if (this.storyIsPinned()) return;
       lctx.clearRect(0, 0, this.vw, this.vh);
-      const top = this.getBoundingClientRect().top;
-      const dt = 0.016;
+      /* Not the host's own box: the growth canvas is moved three different
+         ways across the page, and everything drawn here has to ride the
+         filaments rather than the element that contains them. */
+      const top = this.canvasTop();
+      /* Use wall time so spores and pulses keep the same restrained speed on
+         high-refresh displays and under transient frame pressure. */
+      const frameNow = performance.now();
+      const dt = Math.min(0.05, Math.max(0, (frameNow - (this._lastFrame || frameNow)) / 1000));
+      this._lastFrame = frameNow;
       lctx.globalCompositeOperation = 'source-over';
-      const now = performance.now() * 0.00012;
+      const now = frameNow * 0.00012;
       const hero = this._hero || (this._hero = document.querySelector('.rb-hero'));
       const heroRect = hero && hero.getBoundingClientRect();
       const sporeTop = heroRect ? Math.max(0, heroRect.top) : 0;
@@ -415,10 +497,14 @@ export function defineMyceliumField() {
           const x = a[0] + (b[0] - a[0]) * f;
           const y = a[1] + (b[1] - a[1]) * f + top;
           if (y < -40 || y > this.vh + 40) continue;
+          const documentY = y - top;
+          const railInset = this.vw * 0.32;
+          const readingZoneStart = (this._oy || 0) + Math.min(140, Math.max(96, this.vh * 0.14));
+          if (documentY > readingZoneStart && x > railInset && x < this.vw - railInset) continue;
           const orderHere = Math.min(0.995, 0.055 + 0.9 * ((y - top) / this._h));
           if (orderHere > this._shown) continue;
           const s = 22 + Math.sin(pu.t * 20 + pu.ph) * 4;
-          lctx.globalAlpha = 0.5 * Math.sin(Math.PI * Math.min(1, pu.t * 1.6));
+          lctx.globalAlpha = 0.28 * Math.sin(Math.PI * Math.min(1, pu.t * 1.6));
           lctx.drawImage(this.sprite, x - s / 2, y - s / 2, s, s);
         }
       }
