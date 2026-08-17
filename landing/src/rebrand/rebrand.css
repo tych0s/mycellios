@@ -924,7 +924,7 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
 @media(min-width:1001px) and (max-width:1400px){ .rb-globe { right:8%; } }
 @media(max-width:1000px){
   .rb-header-inner { grid-template-columns:1fr auto; }
-  .rb-header nav,.rb-desktop-cta { display:none; }
+  .rb-header-inner > nav:not(.rb-mobile-nav),.rb-desktop-cta { display:none; }
   .rb-menu { position:relative; z-index:41; display:grid; place-items:center; width:44px; height:44px; border:1px solid var(--rb-line); border-radius:50%; background:rgba(248,245,240,.94); color:var(--rb-ink); }
   .rb-menu svg { width:19px; }
   /* The mobile sheet: a dark panel in the hero's own register — the ivory
@@ -932,7 +932,7 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
      hairline separators, a mono kicker for the $SPORE cluster, the login as
      a bronze CTA, and a backdrop that dims the page behind it. */
   .rb-mobile-backdrop { position:fixed; z-index:39; inset:0; display:block; background:rgba(8,11,9,.55); backdrop-filter:blur(3px); animation:rbFade .18s ease-out both; }
-  .rb-mobile-nav { position:absolute; z-index:40; top:78px; left:var(--rb-gutter); right:var(--rb-gutter); display:flex; flex-direction:column; padding:12px 14px 16px; border:1px solid rgba(238,233,226,.14); border-radius:20px; background:radial-gradient(120% 90% at 85% 0%,rgba(173,122,72,.18),transparent 55%),#0e1511; color:#eee9e2; box-shadow:0 30px 70px rgba(0,0,0,.45); animation:rbMobileNavIn .24s cubic-bezier(.22,.8,.2,1) both; }
+  .rb-header-inner > .rb-mobile-nav { position:absolute; z-index:40; top:78px; left:var(--rb-gutter); right:var(--rb-gutter); display:flex; flex-direction:column; padding:12px 14px 16px; border:1px solid rgba(238,233,226,.14); border-radius:20px; background:radial-gradient(120% 90% at 85% 0%,rgba(173,122,72,.18),transparent 55%),#0e1511; color:#eee9e2; box-shadow:0 30px 70px rgba(0,0,0,.45); animation:rbMobileNavIn .24s cubic-bezier(.22,.8,.2,1) both; }
   .rb-mobile-group { display:flex; flex-direction:column; padding-block:7px; }
   .rb-mobile-group + .rb-mobile-group { border-top:1px solid rgba(238,233,226,.08); }
   .rb-mobile-nav a { display:flex; align-items:center; justify-content:space-between; min-height:48px; padding:0 10px; border-radius:12px; font-size:16.5px; font-weight:550; letter-spacing:-.01em; color:#e9e3d7; }

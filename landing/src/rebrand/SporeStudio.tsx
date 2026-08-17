@@ -1,6 +1,5 @@
-import { Activity, ArrowRight, Database, Leaf, LockKeyhole, Menu, Network, ShieldCheck, Sprout, X } from "lucide-react";
-import { useState } from "react";
-import { SporeMenu, SporeMobileLinks } from "./SporeMenu";
+import { Activity, Database, Leaf, LockKeyhole, Network, ShieldCheck, Sprout } from "lucide-react";
+import { LandingHeader } from "./RebrandLanding";
 import "./create-studio.css";
 import "./spore-studio.css";
 
@@ -10,17 +9,6 @@ const steps = [
   ["03", "Verify work", "Rewards must come from paid, verifiable compute—not raw usage or circular activity."],
   ["04", "Claim or compound", "Claiming and compounding remain disabled until custody, accounting and audits are complete."],
 ] as const;
-
-function Header() {
-  const [open, setOpen] = useState(false);
-  return <header className="create-header spore-header">
-    <a className="create-brand" href="/" aria-label="Mycellios home"><img src="/assets/logos/logo.png" alt="" />mycellios</a>
-    <nav aria-label="Main navigation"><a href="/network?view=inference">Chat</a><a href="/create">Create</a><a href="/earn">Earn</a><SporeMenu active /><a href="/#how-it-works">Network</a><a href="/blog">Blog</a></nav>
-    <a className="create-login" href="/network?view=overview">Login</a>
-    <button className="create-menu-button" type="button" aria-label={open ? "Close menu" : "Open menu"} aria-expanded={open} onClick={() => setOpen(!open)}>{open ? <X /> : <Menu />}</button>
-    {open && <div className="create-mobile-nav"><a href="/network?view=inference">Chat</a><a href="/create">Create</a><a href="/earn">Earn</a><SporeMobileLinks active /><a href="/#how-it-works">Network</a><a href="/blog">Blog</a><a href="/network?view=overview">Login</a></div>}
-  </header>;
-}
 
 function PreviewNotice() {
   return <aside className="spore-notice"><Sprout /><div><strong>SPORE is a product preview</strong><span>No token, staking contract, treasury, price feed or reward program is live.</span></div></aside>;
@@ -53,5 +41,5 @@ function Data() {
 
 export function SporeStudio() {
   const path = window.location.pathname;
-  return <main className="spore-page"><Header /><div className="spore-shell">{path.endsWith("/treasury") ? <Treasury /> : path.endsWith("/data") ? <Data /> : <Staking />}</div></main>;
+  return <main className="rb-page spore-page"><LandingHeader /><div className="spore-shell">{path.endsWith("/treasury") ? <Treasury /> : path.endsWith("/data") ? <Data /> : <Staking />}</div></main>;
 }

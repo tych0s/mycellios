@@ -304,6 +304,8 @@ describe("Landing", () => {
     // per-row arrow affordance. The ivory box must not come back.
     expect(css).toContain("#0e1511");
     expect(css).toContain("rbMobileNavIn");
+    expect(css).toContain(".rb-header-inner > nav:not(.rb-mobile-nav),.rb-desktop-cta { display:none; }");
+    expect(css).toContain(".rb-header-inner > .rb-mobile-nav { position:absolute;");
     expect(css).toMatch(/\.rb-mobile-nav a::after \{ content:"→"/);
     expect(css).not.toMatch(/\.rb-mobile-nav \{[^}]*background:#f8f5f0/);
   });
