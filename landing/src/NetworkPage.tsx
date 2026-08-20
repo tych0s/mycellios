@@ -590,7 +590,7 @@ export function NetworkPage({
           {error ? "REFRESH FAILED" : loading ? "CONNECTING" : stale ? "STALE" : "LIVE"}
         </span>
         <span>{hasData ? `${relativeTime(snapshot.capturedAt)} · v${snapshot.version}` : "—"}</span>
-        <a href="/join">connect a device →</a>
+        <a href="/earn">connect a device →</a>
       </div>
 
       {selectedNode && <NodePanel
@@ -602,7 +602,7 @@ export function NetworkPage({
       {!loading && nodes.length === 0 && <div className="net-empty">
         <strong>No nodes announced</strong>
         <span>The coordinator is reachable, but no worker is currently visible.</span>
-        <a href="/join">Connect a device →</a>
+        <a href="/earn">Connect a device →</a>
       </div>}
 
       {error && <div className="net-error" role="alert">

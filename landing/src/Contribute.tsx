@@ -1,17 +1,16 @@
 import {
   Activity,
   AlertTriangle,
-  CheckCircle2,
   ChevronDown,
   Cpu,
   Download,
-  Gauge,
   MonitorSmartphone,
   Power,
   Radio,
   RefreshCw,
   Server,
   ShieldCheck,
+  Zap,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { NodeCommand } from "../../src/contracts/node-control";
@@ -40,6 +39,7 @@ interface ContributeProps {
   accessToken: string | null;
   authConfig: PublicAuthConfig;
   authSession: AuthSession | null;
+  getValidSession(forceRefresh?: boolean): Promise<AuthSession | null>;
   onSessionElevated(session: AuthSession): void;
   onSignIn(): void;
   onOpenAccount(): void;
@@ -59,7 +59,11 @@ export function Contribute(props: ContributeProps) {
   const [loadingNodes, setLoadingNodes] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const failedNodeLoadToken = useRef<string | null>(null);
+  const nodeLoadInFlight = useRef(false);
+  const nodeLoadBlocked = useRef(false);
   const startButtonRef = useRef<HTMLButtonElement>(null);
+  const errorPresentation = error ? contributionErrorPresentation(error) : null;
 
   useEffect(() => {
     initializeMobileWorker();
@@ -77,21 +81,51 @@ export function Contribute(props: ContributeProps) {
     return unsubscribe;
   }, []);
 
-  const refreshNodes = useCallback(async () => {
-    if (!props.accessToken) {
+  const refreshNodes = useCallback(async (manual = false) => {
+    if (nodeLoadInFlight.current) return;
+    if (manual) {
+      nodeLoadBlocked.current = false;
+      failedNodeLoadToken.current = null;
+    } else if (nodeLoadBlocked.current) {
+      return;
+    }
+    if (!props.authSession) {
       setNodes([]);
       return;
     }
+    if (failedNodeLoadToken.current === props.authSession.accessToken) return;
+    nodeLoadInFlight.current = true;
     setLoadingNodes(true);
+    let attemptedToken: string | null = props.authSession.accessToken;
     try {
-      setNodes(await loadOwnedNodes(props.accessToken));
+      let session = await props.getValidSession(false);
+      if (!session) {
+        setNodes([]);
+        return;
+      }
+      try {
+        setNodes(await loadOwnedNodes(session.accessToken));
+      } catch (cause) {
+        if (!isInvalidSessionError(cause)) throw cause;
+        session = await props.getValidSession(true);
+        if (!session) {
+          setNodes([]);
+          return;
+        }
+        attemptedToken = session.accessToken;
+        setNodes(await loadOwnedNodes(session.accessToken));
+      }
+      failedNodeLoadToken.current = null;
       setError(null);
     } catch (cause) {
+      failedNodeLoadToken.current = attemptedToken;
+      nodeLoadBlocked.current = true;
       setError(errorText(cause));
     } finally {
+      nodeLoadInFlight.current = false;
       setLoadingNodes(false);
     }
-  }, [props.accessToken]);
+  }, [props.authSession, props.getValidSession]);
 
   useEffect(() => {
     void refreshNodes();
@@ -103,16 +137,26 @@ export function Contribute(props: ContributeProps) {
     >
       <div className="panel-page-title">
         <div>
-          <span>CONTRIBUTE</span>
           <h1>Your devices</h1>
-          <p>
-            Run a temporary browser worker or pair a persistent native node.
-          </p>
         </div>
       </div>
-      {error && (
-        <div className="inline-error" role="alert">
-          {error}
+      {errorPresentation && (
+        <div className="contribute-error" role="alert">
+          <AlertTriangle aria-hidden="true" />
+          <span>
+            <strong>{errorPresentation.title}</strong>
+            <small>{errorPresentation.detail}</small>
+          </span>
+          <button
+            type="button"
+            onClick={() => {
+              setError(null);
+              if (errorPresentation.requiresAuth) props.onSignIn();
+              else void refreshNodes(true);
+            }}
+          >
+            {errorPresentation.action}
+          </button>
         </div>
       )}
       {notice && (
@@ -125,7 +169,7 @@ export function Contribute(props: ContributeProps) {
         {...props}
         nodes={nodes}
         loading={loadingNodes}
-        onRefresh={refreshNodes}
+        onRefresh={() => void refreshNodes(true)}
         onNotice={setNotice}
         onError={setError}
       />
@@ -142,31 +186,22 @@ function BrowserContribution({
 }) {
   const connected = worker.running && worker.connection === "online";
   return (
-    <>
-      <div className="hardware-hero browser-hardware-hero">
-        <div className="device-orb">
-          <MonitorSmartphone size={36} />
-        </div>
+    <article className="contribute-browser-card">
+      <header>
+        <div className="contribute-browser-icon"><MonitorSmartphone /></div>
         <div>
-          <span className="eyebrow">BROWSER</span>
-          <h2>Browser worker</h2>
-          <p>
-            {worker.backend === "webgpu" ? "WebGPU" : "CPU"} · {worker.gpuLabel}
-          </p>
+          <h2>This browser</h2>
+          <p>{worker.statusText}</p>
         </div>
         <span className={`state-badge ${connected ? "online" : "paused"}`}>
-          {connected ? "Connected" : worker.connectionLabel}
+          {connected ? "Connected" : "Paused"}
         </span>
-      </div>
-      <div className="browser-contribution-status">
-        <Activity size={16} />
-        <div>
-          <strong>
-            {connected
-              ? "Browser contribution active"
-              : "Browser contribution paused"}
-          </strong>
-          <span>{worker.statusText}</span>
+      </header>
+
+      <div className="contribute-browser-action">
+        <div className="contribute-browser-facts" aria-label="Browser worker details">
+          <span><Cpu /><small>Engine</small><strong>{worker.backend === "webgpu" ? "WebGPU" : "CPU"}</strong></span>
+          <span><Activity /><small>Work</small><strong>{worker.verifiedTasks > 0 ? `${worker.verifiedTasks} verified` : "No tasks yet"}</strong></span>
         </div>
         <button
           ref={startButtonRef}
@@ -174,57 +209,30 @@ function BrowserContribution({
           onClick={() => void toggleMobileWorker()}
         >
           {worker.starting ? <Radio className="spin" /> : <Power />}
-          {worker.running ? "Pause" : "Start contributing"}
+          {worker.running ? "Pause contribution" : "Start contributing"}
         </button>
       </div>
-      <div
-        className="contribute-metrics"
-        aria-label="Browser contribution metrics"
-      >
-        <WorkerMetric
-          icon={Cpu}
-          label="Engine"
-          value={worker.backend === "webgpu" ? "WebGPU" : "CPU"}
-          detail={worker.gpuLabel}
-        />
-        <WorkerMetric
-          icon={Gauge}
-          label="Performance"
-          value={formatGflops(worker.estimatedGflops)}
-          detail="estimated GFLOPS"
-        />
-        <WorkerMetric
-          icon={CheckCircle2}
-          label="Checked"
-          value={String(worker.verifiedTasks)}
-          detail="verified tasks"
-        />
-        <WorkerMetric
-          icon={MonitorSmartphone}
-          label="Display"
-          value={worker.wakeLockActive ? "Awake" : "Normal"}
-          detail="Wake Lock"
-        />
-      </div>
-      <div
-        className="contribute-levels"
-        role="group"
-        aria-label="Browser power level"
-      >
-        {(["low", "balanced", "maximum"] as MobileWorkerLevel[]).map(
-          (level) => (
+
+      <div className="contribute-power-row">
+        <span>Power</span>
+        <div className="contribute-levels" role="group" aria-label="Browser power level">
+          {(["low", "balanced", "maximum"] as MobileWorkerLevel[]).map((level, index) => (
             <button
               key={level}
               className={worker.level === level ? "active" : ""}
               disabled={worker.running || worker.starting}
               onClick={() => setMobileWorkerLevel(level)}
+              aria-label={`${level} browser power`}
             >
-              {level}
+              <span className="contribute-level-icon" aria-hidden="true">
+                {Array.from({ length: index + 1 }, (_, ray) => <Zap key={ray} />)}
+              </span>
+              <span>{level}</span>
             </button>
-          ),
-        )}
+          ))}
+        </div>
       </div>
-    </>
+    </article>
   );
 }
 
@@ -297,7 +305,14 @@ function NativeNodeSetup(
     }
   };
   return (
-    <div className="contribute-detail-grid">
+    <details className="contribute-native-disclosure">
+      <summary>
+        <span className="contribute-native-summary-icon"><Server /></span>
+        <span><strong>Use a dedicated computer</strong><small>Install a persistent node for contribution beyond this browser.</small></span>
+        <b className={props.nodes.length > 0 ? "" : "empty"} aria-label={`${props.nodes.length} paired nodes`}>{props.nodes.length || ""}</b>
+        <ChevronDown />
+      </summary>
+      <div className="contribute-detail-grid">
       <article className="contribute-settings-card">
         <div className="contribute-card-head">
           <div>
@@ -311,22 +326,23 @@ function NativeNodeSetup(
           browser never scans localhost.
         </p>
         <div className="page-actions">
-          <a href={installer.path}>
+          <a href={installer.path} download>
             <Download />
             Download {installer.label}
           </a>
-          <button disabled={busy !== null} onClick={() => void createBundle()}>
-            <ShieldCheck />
-            {busy === "pair" ? "Creating…" : "Create pairing bundle"}
-          </button>
-          <button disabled={busy !== null} onClick={() => void acceptTransfer()}>
-            <ShieldCheck />
-            Accept ownership transfer
-          </button>
+          {props.accessToken ? <>
+            <button type="button" disabled={busy !== null} onClick={() => void createBundle()}>
+              <ShieldCheck />
+              {busy === "pair" ? "Creating…" : "Create pairing bundle"}
+            </button>
+            <button type="button" disabled={busy !== null} onClick={() => void acceptTransfer()}>
+              <ShieldCheck />
+              Accept ownership transfer
+            </button>
+          </> : (
+            <button type="button" onClick={props.onSignIn}><ShieldCheck />Sign in to pair a node</button>
+          )}
         </div>
-        {!props.accessToken && (
-          <button onClick={props.onSignIn}>Sign in to pair a node</button>
-        )}
       </article>
       <article className="contribute-activity-card">
         <div className="contribute-card-head">
@@ -360,7 +376,8 @@ function NativeNodeSetup(
           ))
         )}
       </article>
-    </div>
+      </div>
+    </details>
   );
 }
 
@@ -899,37 +916,44 @@ export function nodePresentation(
   };
 }
 
-function WorkerMetric({
-  icon: Icon,
-  label,
-  value,
-  detail,
-}: {
-  icon: typeof Cpu;
-  label: string;
-  value: string;
-  detail: string;
-}) {
-  return (
-    <article>
-      <div>
-        <Icon size={19} />
-      </div>
-      <span>{label}</span>
-      <strong>{value}</strong>
-      <small>{detail}</small>
-    </article>
-  );
-}
-function formatGflops(value: number) {
-  if (!Number.isFinite(value) || value <= 0) return "—";
-  return value < 100
-    ? value.toFixed(value < 1 ? 2 : 1)
-    : Math.round(value).toLocaleString();
-}
 function errorText(cause: unknown) {
   return cause instanceof Error ? cause.message : String(cause);
 }
+
+export interface ContributionErrorPresentation {
+  title: string;
+  detail: string;
+  action: string;
+  requiresAuth: boolean;
+}
+
+export function contributionErrorPresentation(message: string): ContributionErrorPresentation {
+  const normalized = message.toLowerCase();
+  if (isInvalidSessionError(message)) {
+    return {
+      title: "La sesión de contribución ha caducado",
+      detail: "La credencial de red de este navegador ya no es válida. Vuelve a iniciar sesión para reconectar tu contribución.",
+      action: "Iniciar sesión",
+      requiresAuth: true,
+    };
+  }
+  return {
+    title: "No se pudo actualizar la contribución",
+    detail: message || "El coordinador no ha podido confirmar el estado de este navegador.",
+    action: "Reintentar",
+    requiresAuth: false,
+  };
+}
+
+function isInvalidSessionError(error: unknown): boolean {
+  const normalized = errorText(error).toLowerCase();
+  return normalized.includes("invalid_network_token")
+    || normalized.includes("invalid network token")
+    || normalized.includes("invalid_access_token")
+    || normalized.includes("account session is invalid")
+    || normalized.includes("session is invalid or expired");
+}
+
 const DAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
 function timeToMinute(value: string) {
   const [hours = "0", minutes = "0"] = value.split(":");

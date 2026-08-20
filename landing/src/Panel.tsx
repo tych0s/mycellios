@@ -24,7 +24,6 @@ import {
   Globe2,
   HardDrive,
   History,
-  House,
   Laptop,
   LayoutDashboard,
   LoaderCircle,
@@ -87,7 +86,48 @@ import type { NativeBuildIdentity } from "../../src/contracts/build-identity";
 import type { BenchmarkMeasurement, BenchmarkRun } from "../../src/benchlab/types";
 import { Contribute } from "./Contribute";
 import { SupportAssistant } from "./SupportAssistant";
+import { TABLE_PAGE_SIZE, TablePagination } from "./TablePagination";
 const brandIcon = "/assets/logos/logo.png";
+
+function GoogleProviderIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true">
+    <path fill="#4285f4" d="M21.6 12.23c0-.72-.06-1.42-.19-2.09H12v3.97h5.38a4.6 4.6 0 0 1-1.99 3.02v2.58h3.23c1.89-1.74 2.98-4.31 2.98-7.48Z" />
+    <path fill="#34a853" d="M12 22c2.7 0 4.96-.9 6.62-2.43l-3.23-2.58c-.9.6-2.04.96-3.39.96-2.6 0-4.81-1.76-5.6-4.13H3.06v2.66A10 10 0 0 0 12 22Z" />
+    <path fill="#fbbc05" d="M6.4 13.82A6 6 0 0 1 6.08 12c0-.63.11-1.25.32-1.82V7.52H3.06A10 10 0 0 0 2 12c0 1.61.39 3.14 1.06 4.48l3.34-2.66Z" />
+    <path fill="#ea4335" d="M12 6.05c1.47 0 2.79.5 3.83 1.5l2.87-2.87A9.63 9.63 0 0 0 12 2a10 10 0 0 0-8.94 5.52l3.34 2.66c.79-2.37 3-4.13 5.6-4.13Z" />
+  </svg>;
+}
+
+function XProviderIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M18.9 2H22l-6.77 7.74L23.2 22h-6.24l-4.89-6.39L6.49 22H3.37l7.24-8.28L2.96 2h6.4l4.42 5.84L18.9 2Zm-1.1 17.84h1.73L8.42 4.05H6.57L17.8 19.84Z" /></svg>;
+}
+
+function MetaMaskProviderIcon() {
+  return <svg viewBox="0 0 35 34" aria-hidden="true">
+    <path d="M32.7077 32.7522L25.1688 30.5174L19.4833 33.9008L15.5167 33.8991L9.82793 30.5174L2.29225 32.7522L0 25.0489L2.29225 16.4993L0 9.27094L2.29225 0.312256L14.0674 7.31554H20.9326L32.7077 0.312256L35 9.27094L32.7077 16.4993L35 25.0489L32.7077 32.7522Z" fill="#FF5C16" />
+    <path d="M2.29395 0.312256L14.0691 7.32047L13.6008 12.1301L2.29395 0.312256Z" fill="#FF5C16" />
+    <path d="M9.82959 25.0522L15.0106 28.9811L9.82959 30.5175V25.0522Z" fill="#FF5C16" />
+    <path d="M14.5966 18.5565L13.6009 12.1333L7.22692 16.5009L7.22363 16.4993V16.5025L7.24335 20.9983L9.82809 18.5565H9.82974H14.5966Z" fill="#FF5C16" />
+    <path d="M32.7077 0.312256L20.9326 7.32047L21.3993 12.1301L32.7077 0.312256Z" fill="#FF5C16" />
+    <path d="M25.1722 25.0522L19.9912 28.9811L25.1722 30.5175V25.0522Z" fill="#FF5C16" />
+    <path d="M27.7766 16.5025H27.7783H27.7766V16.4993L27.775 16.5009L21.401 12.1333L20.4053 18.5565H25.1722L27.7586 20.9983L27.7766 16.5025Z" fill="#FF5C16" />
+    <path d="M9.82793 30.5175L2.29225 32.7522L0 25.0522H9.82793V30.5175Z" fill="#E34807" />
+    <path d="M14.5947 18.5549L16.0341 27.8406L14.0393 22.6777L7.23975 20.9984L9.82613 18.5549H14.593H14.5947Z" fill="#E34807" />
+    <path d="M25.1721 30.5175L32.7078 32.7522L35.0001 25.0522H25.1721V30.5175Z" fill="#E34807" />
+    <path d="M20.4053 18.5549L18.9658 27.8406L20.9607 22.6777L27.7602 20.9984L25.1722 18.5549H20.4053Z" fill="#E34807" />
+    <path d="M0 25.0488L2.29225 16.4993H7.22183L7.23991 20.9967L14.0394 22.676L16.0343 27.8389L15.0089 28.976L9.82793 25.0472H0V25.0488Z" fill="#FF8D5D" />
+    <path d="M35.0001 25.0488L32.7078 16.4993H27.7783L27.7602 20.9967L20.9607 22.676L18.9658 27.8389L19.9912 28.976L25.1722 25.0472H35.0001V25.0488Z" fill="#FF8D5D" />
+    <path d="M20.9325 7.31543H17.4999H14.0673L13.6006 12.1251L16.0342 27.834H18.9656L21.4008 12.1251L20.9325 7.31543Z" fill="#FF8D5D" />
+    <path d="M2.29225 0.312256L0 9.27094L2.29225 16.4993H7.22183L13.5991 12.1301L2.29225 0.312256Z" fill="#661800" />
+    <path d="M13.17 20.4199H10.9369L9.72095 21.6062L14.0409 22.6727L13.17 20.4182V20.4199Z" fill="#661800" />
+    <path d="M32.7077 0.312256L34.9999 9.27094L32.7077 16.4993H27.7781L21.4009 12.1301L32.7077 0.312256Z" fill="#661800" />
+    <path d="M21.833 20.4199H24.0694L25.2853 21.6079L20.9604 22.676L21.833 20.4182V20.4199Z" fill="#661800" />
+    <path d="M19.4817 30.8362L19.9911 28.9794L18.9658 27.8423H16.0327L15.0073 28.9794L15.5167 30.8362" fill="#661800" />
+    <path d="M19.4816 30.8359V33.9021H15.5166V30.8359H19.4816Z" fill="#C0C4CD" />
+    <path d="M9.82959 30.5142L15.52 33.9008V30.8346L15.0106 28.9778L9.82959 30.5142Z" fill="#E7EBF6" />
+    <path d="M25.1721 30.5142L19.4817 33.9008V30.8346L19.9911 28.9778L25.1721 30.5142Z" fill="#E7EBF6" />
+  </svg>;
+}
 import {
   benchmarkRunSnapshot,
   benchmarkFilterValues,
@@ -106,22 +146,29 @@ import { applySeoMetadata } from "./seo";
 import {
   loadAuthConfig,
   loadNetworkIdentity,
+  linkOAuthIdentity,
   restoreAuthSession,
+  subscribeAuthSession,
+  validAuthSession,
   signIn,
+  signInWithGoogle,
   signInWithMetaMask,
   signInWithX,
   signOut,
   signUp,
   type AuthSession,
   type NetworkIdentity,
+  type OAuthProvider,
   type PublicAuthConfig,
 } from "./auth";
 import { ApiAccessPanel } from "./ApiAccessPanel";
 import { BillingAccountPanel } from "./BillingAccountPanel";
 import {
   loadApiAccount,
+  apiRequestUrl,
   loadApiUsage,
   loadOperatorEvidence,
+  configuredApiUrl,
   type ApiAccount,
   type ApiUsage,
   type OperatorEvidenceSnapshot,
@@ -130,19 +177,6 @@ import "./panel.css";
 
 import "./panel-downloads.css";
 import "./panel-desktop.css";
-
-function MetaMaskProviderIcon() {
-  return <svg viewBox="0 0 35 34" aria-hidden="true">
-    <path d="M32.7077 32.7522L25.1688 30.5174L19.4833 33.9008L15.5167 33.8991L9.82793 30.5174L2.29225 32.7522L0 25.0489L2.29225 16.4993L0 9.27094L2.29225 0.312256L14.0674 7.31554H20.9326L32.7077 0.312256L35 9.27094L32.7077 16.4993L35 25.0489L32.7077 32.7522Z" fill="#FF5C16" />
-    <path d="M2.29395 0.312256L14.0691 7.32047L13.6008 12.1301L2.29395 0.312256ZM9.82959 25.0522L15.0106 28.9811L9.82959 30.5175V25.0522ZM14.5966 18.5565L13.6009 12.1333L7.22692 16.5009L7.24335 20.9983L9.82809 18.5565H14.5966ZM32.7077 0.312256L20.9326 7.32047L21.3993 12.1301L32.7077 0.312256ZM25.1722 25.0522L19.9912 28.9811L25.1722 30.5175V25.0522ZM27.7766 16.5025L21.401 12.1333L20.4053 18.5565H25.1722L27.7586 20.9983L27.7766 16.5025Z" fill="#FF5C16" />
-    <path d="M9.82793 30.5175L2.29225 32.7522L0 25.0522H9.82793V30.5175ZM14.5947 18.5549L16.0341 27.8406L14.0393 22.6777L7.23975 20.9984L9.82613 18.5549H14.5947ZM25.1721 30.5175L32.7078 32.7522L35.0001 25.0522H25.1721V30.5175ZM20.4053 18.5549L18.9658 27.8406L20.9607 22.6777L27.7602 20.9984L25.1722 18.5549H20.4053Z" fill="#E34807" />
-    <path d="M0 25.0488L2.29225 16.4993H7.22183L7.23991 20.9967L14.0394 22.676L16.0343 27.8389L15.0089 28.976L9.82793 25.0472H0ZM35.0001 25.0488L32.7078 16.4993H27.7783L27.7602 20.9967L20.9607 22.676L18.9658 27.8389L19.9912 28.976L25.1722 25.0472H35.0001Z" fill="#FF8D5D" />
-    <path d="M20.9325 7.31543H14.0673L13.6006 12.1251L16.0342 27.834H18.9656L21.4008 12.1251L20.9325 7.31543Z" fill="#FF8D5D" />
-    <path d="M2.29225 0.312256L0 9.27094L2.29225 16.4993H7.22183L13.5991 12.1301L2.29225 0.312256ZM13.17 20.4199H10.9369L9.72095 21.6062L14.0409 22.6727L13.17 20.4199ZM32.7077 0.312256L34.9999 9.27094L32.7077 16.4993H27.7781L21.4009 12.1301L32.7077 0.312256ZM21.833 20.4199H24.0694L25.2853 21.6079L20.9604 22.676L21.833 20.4199ZM19.4817 30.8362L19.9911 28.9794L18.9658 27.8423H16.0327L15.0073 28.9794L15.5167 30.8362" fill="#661800" />
-    <path d="M19.4816 30.8359V33.9021H15.5166V30.8359H19.4816Z" fill="#C0C4CD" />
-    <path d="M9.82959 30.5142L15.52 33.9008V30.8346L15.0106 28.9778L9.82959 30.5142ZM25.1721 30.5142L19.4817 33.9008V30.8346L19.9911 28.9778L25.1721 30.5142Z" fill="#E7EBF6" />
-  </svg>;
-}
 
 type PanelView = "overview" | "history" | "nodes" | "models" | "jobs" | "tests" | "logs" | "inference" | "contribute" | "join" | "downloads" | "admin";
 type PanelMode = "simple" | "developer";
@@ -291,7 +325,7 @@ const sharedNavItems: Array<{ id: PanelView; label: string; icon: typeof Network
   { id: "logs", label: "Logs", icon: ScrollText },
   { id: "models", label: "Models", icon: Boxes },
   { id: "inference", label: "Chat", icon: MessageSquareText },
-  { id: "contribute", label: "This device", icon: Zap },
+  { id: "contribute", label: "Run", icon: Zap },
   { id: "downloads", label: "Downloads", icon: Download },
   { id: "admin", label: "Admin", icon: ShieldCheck },
 ];
@@ -311,9 +345,10 @@ function initialView(mobileEntry: boolean): PanelView {
 
 export function panelViewFromLocation(pathname: string, search: string, mobileEntry = false): PanelView {
   const requested = new URLSearchParams(search).get("view");
+  if (requested === "join") return "contribute";
   if (sharedNavItems.some((item) => item.id === requested)) return requested as PanelView;
   if (mobileEntry || pathname.startsWith("/mobile")) return "contribute";
-  if (pathname === "/join") return "join";
+  if (pathname === "/join") return "contribute";
   if (pathname === "/downloads") return "downloads";
   if (pathname === "/admin") return "admin";
   return "overview";
@@ -349,6 +384,7 @@ export function ApiQuotaBadge({ account }: { account: ApiAccount | null }) {
 function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
   const localBrowser = ["localhost", "127.0.0.1", "::1", "[::1]"].includes(window.location.hostname);
   const localProductionProxy = localBrowser && window.location.port === "4174";
+  const dashboardEntry = !mobileEntry && window.location.pathname === "/dashboard";
   const [panelMode, setPanelMode] = useState<PanelMode>(initialPanelMode);
   const [view, setView] = useState<PanelView>(() => initialView(mobileEntry));
   const [snapshot, setSnapshot] = useState<PublicSnapshot>(EMPTY);
@@ -360,15 +396,13 @@ function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
   const menuButtonRef = useRef<HTMLButtonElement>(null);
   const sidebarCloseButtonRef = useRef<HTMLButtonElement>(null);
   const mainContentRef = useRef<HTMLElement>(null);
-  const [contentScale, setContentScale] = useState(() => {
-    const saved = Number(window.localStorage.getItem("mycellios.content-scale"));
-    return Number.isFinite(saved) && saved >= 0.9 && saved <= 1.3 ? saved : 1;
-  });
   const [modelAdminToken, setModelAdminToken] = useState(() =>
     window.sessionStorage.getItem("mycellios-model-admin-token") ?? "",
   );
   const [authConfig, setAuthConfig] = useState<PublicAuthConfig>({ enabled: false });
+  const apiRequestBaseUrl = authConfig.publicApiBaseUrl;
   const [authSession, setAuthSession] = useState<AuthSession | null>(null);
+  const authSessionRef = useRef<AuthSession | null>(null);
   const [networkIdentity, setNetworkIdentity] = useState<NetworkIdentity | null>(null);
   const [authReady, setAuthReady] = useState(false);
   const [apiAccount, setApiAccount] = useState<ApiAccount | null>(null);
@@ -379,16 +413,44 @@ function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
     return window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark";
   });
 
-  function changeContentScale(delta: number) {
-    setContentScale((current) => {
-      const next = Math.min(1.3, Math.max(0.9, Math.round((current + delta) * 10) / 10));
-      window.localStorage.setItem("mycellios.content-scale", String(next));
-      return next;
-    });
-  }
   const canManageModels = networkIdentity?.role === "owner"
     || networkIdentity?.role === "admin"
     || networkIdentity?.role === "operator";
+
+  useEffect(() => { authSessionRef.current = authSession; }, [authSession]);
+
+  useEffect(() => subscribeAuthSession((session) => {
+    authSessionRef.current = session;
+    setAuthSession(session);
+    if (!session) {
+      setNetworkIdentity(null);
+      setApiAccount(null);
+      return;
+    }
+    void loadNetworkIdentity(session.accessToken).then(setNetworkIdentity).catch(() => undefined);
+    if (authConfig.apiAccessEnabled) {
+      void loadApiAccount(session.accessToken, apiRequestBaseUrl).then(setApiAccount).catch(() => undefined);
+    }
+  }), [apiRequestBaseUrl, authConfig.apiAccessEnabled]);
+
+  const getValidSession = useCallback(async (forceRefresh = false): Promise<AuthSession | null> => {
+    const current = authSessionRef.current;
+    if (!current) return null;
+    try {
+      const next = await validAuthSession(authConfig, current, forceRefresh);
+      if (next !== current) {
+        authSessionRef.current = next;
+        setAuthSession(next);
+      }
+      return next;
+    } catch {
+      authSessionRef.current = null;
+      setAuthSession(null);
+      setNetworkIdentity(null);
+      setApiAccount(null);
+      return null;
+    }
+  }, [authConfig]);
   const advancedAccess = (localBrowser && !localProductionProxy) || canManageModels;
   const navItems = useMemo(() => {
     return sharedNavItems.filter((item) =>
@@ -472,7 +534,7 @@ function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
         if (!cancelled) {
           setNetworkIdentity(identity);
           if (config.apiAccessEnabled) {
-            setApiAccount(await loadApiAccount(session.accessToken).catch(() => null));
+            setApiAccount(await loadApiAccount(session.accessToken, config.publicApiBaseUrl).catch(() => null));
           }
         }
       } catch {
@@ -489,6 +551,20 @@ function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
   }, []);
 
   useEffect(() => {
+    if (!authSession || !authConfig.enabled) return;
+    const delay = Math.max(1_000, authSession.expiresAt - Date.now() - 90_000);
+    const timer = window.setTimeout(() => void getValidSession(), delay);
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") void getValidSession();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [authConfig.enabled, authSession, getValidSession]);
+
+  useEffect(() => {
     if (!authReady || advancedAccess) return;
     if (panelMode === "developer") {
       setPanelMode("simple");
@@ -496,7 +572,7 @@ function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
     }
     if (!panelViewAllowed(view, false)) {
       setView("overview");
-      window.history.replaceState({}, "", "/network");
+      window.history.replaceState({}, "", dashboardEntry ? "/dashboard" : "/network");
     }
   }, [advancedAccess, authReady, panelMode, view]);
 
@@ -510,7 +586,7 @@ function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
       const next = panelViewAllowed(requested, advancedAccess) ? requested : "overview";
       setView(next);
       setMenuOpen(false);
-      if (next !== requested) window.history.replaceState({}, "", "/network");
+      if (next !== requested) window.history.replaceState({}, "", dashboardEntry ? "/dashboard" : "/network");
       window.requestAnimationFrame(() => mainContentRef.current?.focus());
     };
     window.addEventListener("popstate", onPopState);
@@ -535,10 +611,12 @@ function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
     if (!panelViewAllowed(next, advancedAccess)) next = "overview";
     setView(next);
     setMenuOpen(false);
-    const path = mobileEntry ? "/mobile/" : next === "join" ? "/join" : next === "downloads" ? "/downloads" : next === "admin" ? "/admin" : "/network";
+    const path = mobileEntry ? "/browser/" : dashboardEntry ? "/dashboard" : next === "downloads" ? "/downloads" : next === "admin" ? "/admin" : "/network";
     const query = mobileEntry
       ? next === "contribute" ? "" : `?view=${next}`
-      : next === "overview" || next === "join" || next === "downloads" || next === "admin" ? "" : `?view=${next}`;
+      : dashboardEntry
+        ? next === "overview" ? "" : `?view=${next}`
+      : next === "overview" || next === "downloads" || next === "admin" ? "" : `?view=${next}`;
     const target = `${path}${query}`;
     if (`${window.location.pathname}${window.location.search}` !== target) {
       window.history.pushState({}, "", target);
@@ -708,7 +786,7 @@ function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
       throw new Error("Sign in to use your account's inference balance.");
     }
     const result = await consumeChatCompletionStreamWithRecovery(
-      (_attempt, signal) => fetch("/v1/chat/completions", {
+      (_attempt, signal) => fetch(apiRequestUrl("/v1/chat/completions", authConfig.publicApiBaseUrl), {
         method: "POST",
         headers: {
           accept: "text/event-stream",
@@ -723,7 +801,7 @@ function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
       { sessionId },
     );
     if (authSession && authConfig.apiAccessEnabled) {
-      setApiAccount(await loadApiAccount(authSession.accessToken).catch(() => apiAccount));
+      setApiAccount(await loadApiAccount(authSession.accessToken, apiRequestBaseUrl).catch(() => apiAccount));
     }
     return result;
   }
@@ -745,20 +823,13 @@ function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
     <div className="public-panel-viewport">
       <div
         className={`public-panel theme-${theme} panel-mode-${panelMode}`}
-        style={{
-          width: `${100 / contentScale}%`,
-          height: `${100 / contentScale}vh`,
-          minHeight: `${100 / contentScale}vh`,
-          transform: `scale(${contentScale})`,
-          transformOrigin: "top left",
-        } as CSSProperties}
       >
       <a className="panel-skip-link" href="#panel-main-content">Skip to main content</a>
       <aside id="panel-navigation" className={menuOpen ? "panel-sidebar open" : "panel-sidebar"} aria-label="Primary navigation">
         <button ref={sidebarCloseButtonRef} className="panel-sidebar-close" aria-label="Close navigation" onClick={closeNavigation}><X size={18} /></button>
-        <a className="panel-brand" href={publicLink("/")}><img src={brandIcon} alt="" /><div><strong>mycellios</strong><span>network control</span></div></a>
+        <a className="panel-brand" href={publicLink("/")}><img src={brandIcon} alt="" /><div><strong>mycellios</strong><span>Mycellios Network</span></div></a>
         <nav>
-          <span className="panel-nav-label">{panelMode === "developer" ? "DEVELOPER TOOLS" : "MYCELLIOS"}</span>
+          {panelMode === "developer" && <span className="panel-nav-label">DEVELOPER TOOLS</span>}
           {navItems.map(({ id, label, icon: Icon }) => (
             <button key={id} className={view === id ? "active" : ""} title={label} aria-label={label} aria-current={view === id ? "page" : undefined} onClick={() => navigate(id)}>
               <Icon size={18} /><span>{label}</span>{id === "nodes" && <b>{snapshot.summary.connected}</b>}
@@ -776,69 +847,64 @@ function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
           <span><strong>Developer mode</strong><small>{panelMode === "developer" ? "Advanced tools visible" : "Simple panel active"}</small></span>
           <i aria-hidden="true" />
         </button>}
-        <div className="panel-sidebar-links">
-          <a href={publicLink("/mobile/")}><Smartphone size={17} /><span>Mobile app</span><ExternalLink size={13} /></a>
-          <a href={publicLink("/")}><House size={17} /><span>Landing</span><ExternalLink size={13} /></a>
-        </div>
-        <div className={`panel-sidebar-status ${coordinatorError ? "degraded" : "healthy"}`}>
-          <i />
-          <div>
-            <span>Network Status</span>
-            <strong>{coordinatorError ? "Degraded" : "Healthy"}</strong>
-            <small>{coordinatorError ? "Coordinator unavailable" : "Coordinator operational"}</small>
+        <div className="panel-sidebar-footer">
+          <div className="panel-top-actions panel-sidebar-actions">
+            <button className="panel-theme-indicator" type="button" onClick={toggleTheme} aria-label={`Cambiar a modo ${theme === "dark" ? "claro" : "oscuro"}`} title={`Cambiar a modo ${theme === "dark" ? "claro" : "oscuro"}`}><SunMoon size={16} /></button>
+            <EarnQuickMenu
+              earnUrl={`${window.location.origin}/earn`}
+              browserUrl={publicLink("/browser/?autostart=1")}
+              downloadsUrl={publicLink("/downloads")}
+              external={false}
+              onOpenEarn={() => window.location.assign("/earn")}
+            />
           </div>
-        </div>
-        {networkIdentity && <button className="panel-sidebar-account" onClick={() => setAuthOpen(true)}><UserRound /><span><strong>@{networkIdentity.email?.split("@")[0] ?? "mycellios"}</strong><small>{apiAccount ? `${formatCompactTokens(apiAccount.token_balance)} API tokens` : "Account"}</small></span><ChevronRight /></button>}
-        <div className="panel-sidebar-version" aria-label="Versiones">
-          <span><small>API</small><strong>{snapshot.version}</strong></span>
+          <button
+            type="button"
+            className="panel-sidebar-account"
+            onClick={() => setAuthOpen(true)}
+            aria-label={networkIdentity ? `Open account for ${networkIdentity.email ?? "Mycellios user"}` : "Sign in to Mycellios"}
+            title={networkIdentity ? networkIdentity.email ?? "Mycellios account" : "Sign in to Mycellios"}
+          >
+            <UserRound size={16} />
+            <span>
+              <strong>{networkIdentity?.email?.split("@")[0] ?? "Sign in"}</strong>
+              <small>{networkIdentity ? "Mycellios account" : "Access your account"}</small>
+            </span>
+            <ChevronRight size={14} aria-hidden="true" />
+          </button>
+          <div className="panel-sidebar-meta">
+            <div
+              className={`panel-sidebar-status ${coordinatorError ? "degraded" : "healthy"}`}
+              role="status"
+              aria-label={`Network status: ${coordinatorError ? "Degraded" : "Healthy"}`}
+            >
+              <i />
+              <strong>{coordinatorError ? "Degraded" : "Healthy"}</strong>
+            </div>
+            <div className="panel-sidebar-version" aria-label="Versión v0.77">
+              <span><strong>v0.77</strong></span>
+            </div>
+          </div>
         </div>
       </aside>
       {menuOpen && <button className="panel-menu-backdrop" aria-label="Close navigation overlay" onClick={closeNavigation} />}
 
       <div className="panel-main">
-        <header className="panel-topbar">
-          <button
-            ref={menuButtonRef}
-            className="panel-menu-button"
-            aria-label={menuOpen ? "Close navigation" : "Show navigation labels"}
-            aria-controls="panel-navigation"
-            aria-expanded={menuOpen}
-            onClick={() => setMenuOpen((current) => !current)}
-          ><Menu /></button>
-          <div className="panel-topbar-status"><span className={`panel-live-dot ${coordinatorError ? "degraded" : ""}`} /><div><strong>{coordinatorError ? "Network degraded" : "Network healthy"}</strong><small>{snapshot.capturedAt === EMPTY.capturedAt ? "Waiting for snapshot" : `Updated ${relativeTime(snapshot.capturedAt)}`}</small></div></div>
-          <div className="panel-top-actions">
-            <ApiQuotaBadge account={apiAccount} />
-            <button className="panel-theme-indicator" type="button" onClick={toggleTheme} aria-label={`Cambiar a modo ${theme === "dark" ? "claro" : "oscuro"}`} title={`Cambiar a modo ${theme === "dark" ? "claro" : "oscuro"}`}><SunMoon size={16} /></button>
-            {localProductionProxy && <span className="panel-environment-badge"><Globe2 size={13} /> Production via local</span>}
-            <div className="panel-zoom-controls" role="group" aria-label="Interface zoom">
-              <button type="button" aria-label="Reduce interface size" disabled={contentScale <= 0.9} onClick={() => changeContentScale(-0.1)}><Minus size={14} /></button>
-              <output aria-live="polite">{Math.round(contentScale * 100)}%</output>
-              <button type="button" aria-label="Increase interface size" disabled={contentScale >= 1.3} onClick={() => changeContentScale(0.1)}><Plus size={14} /></button>
-            </div>
-            <span title={buildIdentityTitle(snapshot.buildIdentity)}>API {shortBuildIdentity(snapshot.buildIdentity)}</span>
-            {authConfig.enabled && (
-              networkIdentity
-                ? <button className="panel-account-button signed-in" onClick={() => setAuthOpen(true)} title={networkIdentity.email ?? "Mycellios account"}><UserRound size={16} /><span>{networkIdentity.role ?? "member"}</span></button>
-                : <button className="panel-account-button" onClick={() => setAuthOpen(true)}><UserRound size={16} /><span>Sign in</span></button>
-            )}
-            <JoinQuickMenu
-              inviteUrl={`${window.location.origin}/join`}
-              browserUrl={publicLink("/mobile/?autostart=1")}
-              downloadsUrl={publicLink("/downloads")}
-              external={false}
-              onOpenJoin={() => navigate("join")}
-            />
-            <button onClick={() => void refresh()} aria-label="Refresh"><RefreshCw className={loading ? "spin" : ""} size={17} /></button>
-            <a href={mobileEntry ? "/mobile/" : "/network?view=contribute"}>This device <Zap size={15} /></a>
-          </div>
-        </header>
+        <button
+          ref={menuButtonRef}
+          className="panel-menu-button"
+          aria-label={menuOpen ? "Close navigation" : "Show navigation labels"}
+          aria-controls="panel-navigation"
+          aria-expanded={menuOpen}
+          onClick={() => setMenuOpen((current) => !current)}
+        ><Menu /></button>
 
         {issue && <div className="panel-error" role="alert" aria-live="assertive" title={issue.message}><CircleAlert size={17} /> {issue.source === "coordinator" ? "Coordinator unavailable." : "This node could not join the network."} Retrying automatically.</div>}
         <main id="panel-main-content" ref={mainContentRef} className="panel-content" tabIndex={-1}>
           <div className="panel-content-scale">
             {loading && snapshot.capturedAt === EMPTY.capturedAt ? <PanelLoading /> : (
               <>
-              {view === "overview" && <Overview snapshot={snapshot} connectionError={coordinatorError} onNavigate={navigate} publicLink={publicLink} external={false} apiBaseUrl={apiBaseUrl} joinUrl={`${window.location.origin}/join`} developerMode={panelMode === "developer"} />}
+              {view === "overview" && <Overview snapshot={snapshot} connectionError={coordinatorError} onNavigate={navigate} publicLink={publicLink} external={false} apiBaseUrl={apiBaseUrl} earnUrl={`${window.location.origin}/earn`} developerMode={panelMode === "developer"} theme={theme} />}
               {view === "history" && <NetworkHistory endpoint="/public/v1/history" />}
               {view === "nodes" && advancedAccess && <Nodes snapshot={snapshot} onRemove={removeWorker} onClearOffline={clearOfflineWorkers} onListCredentials={listWorkerCredentials} onRevokeCredential={revokeWorkerCredential} />}
               {view === "models" && advancedAccess && <Models snapshot={snapshot} onSearch={searchHubModels} onRequest={requestModel} onRemove={removeRequestedModel} adminToken={modelAdminToken} requiresAdminToken={requiresModelAdminToken} secureTokenStorage={false} />}
@@ -846,14 +912,17 @@ function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
                 snapshot={snapshot}
                 operatorAccess={canManageModels}
                 accessToken={authSession?.accessToken ?? null}
+                getValidSession={getValidSession}
+                apiBaseUrl={configuredApiUrl(authConfig.publicApiBaseUrl)}
               />}
               {view === "tests" && advancedAccess && <Tests />}
               {view === "logs" && advancedAccess && <SystemLogs snapshot={snapshot} connectionError={coordinatorError} />}
-              {view === "inference" && <Inference snapshot={snapshot} onSend={sendPrompt} onNavigate={navigate} developerMode={panelMode === "developer"} accountAuthenticated={!authConfig.apiAccessEnabled || authSession !== null} onSignIn={() => setAuthOpen(true)} apiAccessEnabled={authConfig.apiAccessEnabled ?? false} apiBaseUrl={apiBaseUrl} accessToken={authSession?.accessToken ?? null} apiAccount={apiAccount} />}
+              {view === "inference" && <Inference snapshot={snapshot} onSend={sendPrompt} onNavigate={navigate} developerMode={panelMode === "developer"} accountAuthenticated={!authConfig.apiAccessEnabled || authSession !== null} onSignIn={() => setAuthOpen(true)} apiAccessEnabled={authConfig.apiAccessEnabled ?? false} apiBaseUrl={apiBaseUrl} accessToken={authSession?.accessToken ?? null} getValidSession={getValidSession} apiAccount={apiAccount} />}
               {view === "contribute" && <Contribute
                 accessToken={authSession?.accessToken ?? null}
                 authConfig={authConfig}
                 authSession={authSession}
+                getValidSession={getValidSession}
                 onSessionElevated={setAuthSession}
                 onSignIn={() => setAuthOpen(true)}
                 onOpenAccount={() => setAuthOpen(true)}
@@ -864,7 +933,6 @@ function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
                   traceCount: snapshot.recentNetworkTraces?.length ?? 0,
                 }}
               />}
-              {view === "join" && <JoinNetwork publicLink={publicLink} external={false} />}
               {view === "downloads" && <Downloads publicLink={publicLink} external={false} />}
               {view === "admin" && advancedAccess && <AssistantAdmin
                 apiOrigin=""
@@ -891,7 +959,7 @@ function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
           setAuthSession(session);
           setNetworkIdentity(identity);
           if (authConfig.apiAccessEnabled) {
-            void loadApiAccount(session.accessToken).then(setApiAccount);
+            void loadApiAccount(session.accessToken, authConfig.publicApiBaseUrl).then(setApiAccount);
           }
           setAuthOpen(false);
         }}
@@ -909,18 +977,18 @@ function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
   );
 }
 
-function JoinQuickMenu({
-  inviteUrl,
+function EarnQuickMenu({
+  earnUrl,
   browserUrl,
   downloadsUrl,
   external,
-  onOpenJoin,
+  onOpenEarn,
 }: {
-  inviteUrl: string;
+  earnUrl: string;
   browserUrl: string;
   downloadsUrl: string;
   external: boolean;
-  onOpenJoin: () => void;
+  onOpenEarn: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const [copyState, setCopyState] = useState<"idle" | "copied" | "error">("idle");
@@ -949,9 +1017,9 @@ function JoinQuickMenu({
     if (copyResetRef.current) clearTimeout(copyResetRef.current);
   }, []);
 
-  async function copyInvite() {
+  async function copyEarnLink() {
     try {
-      await navigator.clipboard.writeText(inviteUrl);
+      await navigator.clipboard.writeText(earnUrl);
       setCopyState("copied");
     } catch {
       setCopyState("error");
@@ -965,38 +1033,38 @@ function JoinQuickMenu({
       <button
         type="button"
         className="panel-join-trigger"
-        aria-label="Join"
+        aria-label="Earn"
         aria-haspopup="dialog"
         aria-controls={menuId}
         aria-expanded={open}
         onClick={() => setOpen((current) => !current)}
       >
         <Share2 size={15} />
-        <span>Join</span>
+        <span>Earn</span>
         <ChevronDown className="panel-join-chevron" size={13} />
       </button>
       {open && (
-        <section className="panel-join-popover" id={menuId} role="dialog" aria-label="Join or invite">
+        <section className="panel-join-popover" id={menuId} role="dialog" aria-label="Earn by contributing">
           <div className="panel-join-popover-intro">
-            <span>MESH ACCESS</span>
-            <strong>Join or invite</strong>
-            <p>Connect a node in seconds or share this public access with someone who wants to contribute compute.</p>
+            <span>CONTRIBUTE CAPACITY</span>
+            <strong>Earn</strong>
+            <p>Choose how to contribute compute. Rewards remain unavailable until verified work and payouts are activated.</p>
           </div>
           <div className="panel-join-invite">
             <div className="panel-join-invite-head">
-              <span>PUBLIC JOIN LINK</span>
-              <button type="button" className={copyState} onClick={() => void copyInvite()} aria-live="polite">
+              <span>PUBLIC CONTRIBUTION LINK</span>
+              <button type="button" className={copyState} onClick={() => void copyEarnLink()} aria-live="polite">
                 {copyState === "copied" ? <Check size={14} /> : <Copy size={14} />}
                 {copyState === "copied" ? "Copied" : copyState === "error" ? "Try again" : "Copy"}
               </button>
             </div>
-            <code><span>$</span>{inviteUrl}</code>
+            <code><span>$</span>{earnUrl}</code>
             <small>Anyone with this link can choose a browser node or install mycellios-node.</small>
           </div>
           <div className="panel-join-quick-actions">
-            <button type="button" onClick={() => { setOpen(false); onOpenJoin(); }}>
+            <button type="button" onClick={() => { setOpen(false); onOpenEarn(); }}>
               <Network size={16} />
-              <span><strong>Open Join</strong><small>See every connection option</small></span>
+              <span><strong>Open Earn</strong><small>See every contribution option</small></span>
               <ChevronRight size={15} />
             </button>
             <a href={browserUrl} {...externalProps}>
@@ -1045,7 +1113,8 @@ function AccountModal({
   const [password, setPassword] = useState("");
   const [passwordVisible, setPasswordVisible] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [providerBusy, setProviderBusy] = useState<"x" | "metamask" | null>(null);
+  const [providerBusy, setProviderBusy] = useState<"google" | "x" | "metamask" | null>(null);
+  const [linkBusy, setLinkBusy] = useState<OAuthProvider | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [accountTab, setAccountTab] = useState<"account" | "billing" | "usage">(initialTab);
   const [usage, setUsage] = useState<ApiUsage[]>([]);
@@ -1096,8 +1165,8 @@ function AccountModal({
   useEffect(() => {
     if (!session || accountTab !== "usage") return;
     setUsageBusy(true);
-    void loadApiUsage(session.accessToken).then(setUsage).catch((caught) => setError(errorText(caught))).finally(() => setUsageBusy(false));
-  }, [accountTab, session]);
+    void loadApiUsage(session.accessToken, 50, config.publicApiBaseUrl).then(setUsage).catch((caught) => setError(errorText(caught))).finally(() => setUsageBusy(false));
+  }, [accountTab, config.publicApiBaseUrl, session]);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -1132,6 +1201,29 @@ function AccountModal({
     }
   }
 
+  function continueWithGoogle() {
+    setProviderBusy("google");
+    setError(null);
+    try {
+      signInWithGoogle(config);
+    } catch (caught) {
+      setProviderBusy(null);
+      setError(errorText(caught));
+    }
+  }
+
+  async function linkProvider(provider: OAuthProvider) {
+    if (!session) return;
+    setLinkBusy(provider);
+    setError(null);
+    try {
+      await linkOAuthIdentity(config, session, provider);
+    } catch (caught) {
+      setLinkBusy(null);
+      setError(errorText(caught));
+    }
+  }
+
   async function continueWithMetaMask() {
     setProviderBusy("metamask");
     setError(null);
@@ -1148,38 +1240,39 @@ function AccountModal({
 
   return <div className="modal-backdrop account-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) onClose(); }}>
     <section ref={dialogRef} className="account-modal" role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1}>
-      <button className="account-modal-close" aria-label="Close" onClick={onClose}><X size={18} /></button>
-      <div className="account-modal-brand"><img src={brandIcon} alt="" /><span>MYCELLIOS ID</span></div>
+      <button type="button" className="account-modal-close" aria-label="Close" onClick={onClose}><X size={18} /></button>
+      <div className="account-modal-brand"><img src={brandIcon} alt="" /></div>
       {session && identity ? <>
         <div className="account-detail-tabs"><button className={accountTab === "account" ? "active" : ""} onClick={() => setAccountTab("account")}>Account</button><button className={accountTab === "billing" ? "active" : ""} onClick={() => setAccountTab("billing")}>Plan</button><button className={accountTab === "usage" ? "active" : ""} onClick={() => setAccountTab("usage")}>Usage</button></div>
-        <AccountDetails tab={accountTab} titleId={titleId} session={session} identity={identity} account={account} usage={usage} usageBusy={usageBusy} onSignOut={onSignOut} />
+        <AccountDetails tab={accountTab} titleId={titleId} session={session} identity={identity} account={account} usage={usage} usageBusy={usageBusy} linkBusy={linkBusy} metaMaskBusy={providerBusy === "metamask"} error={error} onLinkProvider={(provider) => void linkProvider(provider)} onMetaMask={() => void continueWithMetaMask()} onSignOut={onSignOut} />
       </> : <>
         <h2 id={titleId}>{mode === "signin" ? "Welcome back" : "Create your account"}</h2>
         <p>Use one identity for network access, history and administration.</p>
-        <div className="account-provider-actions">
-          <button type="button" className="account-provider-x" disabled={providerBusy !== null || busy} onClick={continueWithX}>
-            {providerBusy === "x" ? <LoaderCircle className="spin" /> : <span aria-hidden="true">𝕏</span>}
-            Continue with X
-          </button>
-          <div className="account-provider-divider"><i />or<i /></div>
-          <button type="button" className="account-provider-wallet" disabled={providerBusy !== null || busy} onClick={() => void continueWithMetaMask()}>
-            {providerBusy === "metamask" ? <LoaderCircle className="spin" /> : <MetaMaskProviderIcon />}
-            MetaMask
-          </button>
-        </div>
         <div className="account-mode-tabs"><button className={mode === "signin" ? "active" : ""} onClick={() => setMode("signin")}>Sign in</button><button className={mode === "signup" ? "active" : ""} onClick={() => setMode("signup")}>Create account</button></div>
         <form onSubmit={(event) => void submit(event)}>
           <label>Email<input type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} required /></label>
           <label>Password<span className="account-password-field"><input type={passwordVisible ? "text" : "password"} autoComplete={mode === "signin" ? "current-password" : "new-password"} minLength={8} value={password} onChange={(event) => setPassword(event.target.value)} required /><button type="button" aria-label={passwordVisible ? "Hide password" : "Show password"} aria-pressed={passwordVisible} title={passwordVisible ? "Hide password" : "Show password"} onClick={() => setPasswordVisible((visible) => !visible)}>{passwordVisible ? <EyeOff aria-hidden="true" /> : <Eye aria-hidden="true" />}</button></span></label>
           {error && <div className="account-auth-error" role="alert"><CircleAlert size={16} />{error}</div>}
-          <button className="account-submit" disabled={busy}>{busy ? <LoaderCircle className="spin" /> : <ShieldCheck />}{busy ? "Connecting…" : mode === "signin" ? "Sign in securely" : "Create account"}</button>
+          <button className="account-submit" disabled={busy}>{busy ? <LoaderCircle className="spin" /> : null}<span>{busy ? "Connecting…" : mode === "signin" ? "Sign in securely" : "Create account"}</span>{!busy && <ArrowRight aria-hidden="true" />}</button>
         </form>
+        <div className="account-provider-divider"><i />or continue with<i /></div>
+        <div className="account-provider-orbs" aria-label="Other sign-in options">
+          <button type="button" className="account-provider-google" aria-label="Continue with Google" title="Continue with Google" disabled={providerBusy !== null || busy} onClick={continueWithGoogle}>
+            {providerBusy === "google" ? <LoaderCircle className="spin" /> : <GoogleProviderIcon />}
+          </button>
+          <button type="button" className="account-provider-x" aria-label="Continue with X" title="Continue with X" disabled={providerBusy !== null || busy} onClick={continueWithX}>
+            {providerBusy === "x" ? <LoaderCircle className="spin" /> : <XProviderIcon />}
+          </button>
+          <button type="button" className="account-provider-wallet" aria-label="Continue with MetaMask" title="Continue with MetaMask" disabled={providerBusy !== null || busy} onClick={() => void continueWithMetaMask()}>
+            {providerBusy === "metamask" ? <LoaderCircle className="spin" /> : <MetaMaskProviderIcon />}
+          </button>
+        </div>
       </>}
     </section>
   </div>;
 }
 
-export function AccountDetails({ tab, titleId, session, identity, account, usage, usageBusy, onSignOut }: {
+export function AccountDetails({ tab, titleId, session, identity, account, usage, usageBusy, linkBusy, metaMaskBusy, error, onLinkProvider, onMetaMask, onSignOut }: {
   tab: "account" | "billing" | "usage";
   titleId: string;
   session: AuthSession;
@@ -1187,6 +1280,11 @@ export function AccountDetails({ tab, titleId, session, identity, account, usage
   account: ApiAccount | null;
   usage: ApiUsage[];
   usageBusy: boolean;
+  linkBusy: OAuthProvider | null;
+  metaMaskBusy: boolean;
+  error: string | null;
+  onLinkProvider: (provider: OAuthProvider) => void;
+  onMetaMask: () => void;
   onSignOut: () => void;
 }) {
   const totals = new Map<string, { requests: number; tokens: number }>();
@@ -1195,11 +1293,26 @@ export function AccountDetails({ tab, titleId, session, identity, account, usage
     totals.set(entry.model, { requests: current.requests + 1, tokens: current.tokens + entry.total_tokens });
   }
   const usageByModel = [...totals.entries()].sort((left, right) => right[1].tokens - left[1].tokens);
+  const usagePageSize = TABLE_PAGE_SIZE;
+  const [usagePage, setUsagePage] = useState(0);
+  const usagePageCount = Math.max(1, Math.ceil(usageByModel.length / usagePageSize));
+  const visibleUsagePage = Math.min(usagePage, usagePageCount - 1);
+  const visibleUsageByModel = usageByModel.slice(visibleUsagePage * usagePageSize, visibleUsagePage * usagePageSize + usagePageSize);
+  useEffect(() => setUsagePage(0), [usage.length]);
 
   if (tab === "account") return <>
     <h2 id={titleId}>Your network identity</h2>
     <p>History and permissions follow this account across devices.</p>
     <div className="account-identity-card"><UserRound /><span><strong>{identity.email ?? session.user.email ?? identity.id}</strong><small>{identity.role ?? "member"} · hosted network</small></span></div>
+    <section className="account-link-identities">
+      <div><strong>One account, any sign-in</strong><small>Google, X and email with the same verified address are unified automatically. You can also continue with your MetaMask wallet.</small></div>
+      <span>
+        <button type="button" disabled={linkBusy !== null || metaMaskBusy} onClick={() => onLinkProvider("google")}>{linkBusy === "google" ? <LoaderCircle className="spin" /> : <b aria-hidden="true">G</b>}Google</button>
+        <button type="button" disabled={linkBusy !== null || metaMaskBusy} onClick={() => onLinkProvider("twitter")}>{linkBusy === "twitter" ? <LoaderCircle className="spin" /> : <b aria-hidden="true">𝕏</b>}X</button>
+        <button type="button" disabled={linkBusy !== null || metaMaskBusy} onClick={onMetaMask}>{metaMaskBusy ? <LoaderCircle className="spin" /> : <MetaMaskProviderIcon />}MetaMask</button>
+      </span>
+      {error && <div className="account-auth-error" role="alert"><CircleAlert size={16} />{error}</div>}
+    </section>
     <div className="account-facts"><span><small>MEMBER SINCE</small><strong>{account ? new Date(account.created_at).toLocaleDateString() : "—"}</strong></span><span><small>PROMPTS SENT</small><strong>{account?.request_count ?? 0}</strong></span><span><small>API TOKEN BALANCE</small><strong>{formatCompactTokens(account?.token_balance ?? 0)} tokens</strong></span></div>
     <button className="account-signout" onClick={onSignOut}><LogOut size={16} />Sign out</button>
   </>;
@@ -1210,7 +1323,8 @@ export function AccountDetails({ tab, titleId, session, identity, account, usage
     <h2 id={titleId}>Usage</h2>
     <p>Real requests and tokens across chat and the API.</p>
     <div className="account-usage-summary"><span><small>REQUESTS</small><strong>{account?.request_count ?? 0}</strong></span><span><small>INPUT TOKENS</small><strong>{formatCompactTokens(account?.lifetime_input_tokens ?? 0)}</strong></span><span><small>OUTPUT TOKENS</small><strong>{formatCompactTokens(account?.lifetime_output_tokens ?? 0)}</strong></span></div>
-    <div className="account-usage-models"><span>BY MODEL</span>{usageBusy ? <div className="account-usage-empty" role="status"><LoaderCircle className="spin" />Loading usage…</div> : usageByModel.length === 0 ? <div className="account-usage-empty">No usage recorded yet.</div> : usageByModel.map(([model, total]) => <div key={model}><strong>{model}</strong><span>{total.requests} request{total.requests === 1 ? "" : "s"}</span><b>{formatCompactTokens(total.tokens)} tokens</b></div>)}</div>
+    <div className="account-usage-models"><span>BY MODEL</span>{usageBusy ? <div className="account-usage-empty" role="status"><LoaderCircle className="spin" />Loading usage…</div> : usageByModel.length === 0 ? <div className="account-usage-empty">No usage recorded yet.</div> : visibleUsageByModel.map(([model, total]) => <div key={model}><strong>{model}</strong><span>{total.requests} request{total.requests === 1 ? "" : "s"}</span><b>{formatCompactTokens(total.tokens)} tokens</b></div>)}</div>
+    {usageByModel.length > usagePageSize && <TablePagination label="usage models" page={visibleUsagePage} pageCount={usagePageCount} total={usageByModel.length} onPageChange={setUsagePage} />}
   </>;
 }
 
@@ -1268,6 +1382,8 @@ function AssistantAdmin({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  const loadInFlight = useRef(false);
+  const automaticLoadBlocked = useRef(false);
 
   function authorizationHeaders(token = draftToken): Record<string, string> {
     const trimmed = token.trim();
@@ -1299,7 +1415,11 @@ function AssistantAdmin({
     });
   }
 
-  async function load(token = draftToken) {
+  async function load(token = draftToken, manual = false) {
+    if (loadInFlight.current) return;
+    if (manual) automaticLoadBlocked.current = false;
+    if (automaticLoadBlocked.current) return;
+    loadInFlight.current = true;
     setLoading(true);
     setError(null);
     setSaved(false);
@@ -1326,14 +1446,20 @@ function AssistantAdmin({
       setSettings(null);
       setRuntime(null);
       setFleet(null);
+      automaticLoadBlocked.current = true;
       setError(errorText(caught));
     } finally {
+      loadInFlight.current = false;
       setLoading(false);
     }
   }
 
   useEffect(() => {
-    void load(adminToken);
+    // A signed-in user can still lack the network-admin role. Keep the admin
+    // endpoints completely opt-in so opening this view never creates an
+    // unauthorized probe or a noisy 503 when the provider is unavailable.
+    automaticLoadBlocked.current = true;
+    setLoading(false);
   }, [apiOrigin, authSession?.accessToken]);
 
   useEffect(() => {
@@ -1462,7 +1588,7 @@ function AssistantAdmin({
             placeholder="Administrator token"
             aria-label="Assistant administrator token"
           />
-          <button type="button" disabled={loading || (!draftToken.trim() && !authSession)} onClick={() => void load()}>
+          <button type="button" disabled={loading || (!draftToken.trim() && !authSession)} onClick={() => void load(draftToken, true)}>
             {loading ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}Unlock
           </button>
         </div>
@@ -1646,19 +1772,19 @@ function AssistantAdmin({
   );
 }
 
-export function LiveNetworkTelemetry({ snapshot, evidence = overviewSnapshotEvidence(snapshot.capturedAt, null) }: { snapshot: PublicSnapshot; evidence?: OverviewSnapshotEvidence }) {
+export function LiveNetworkTelemetry({ snapshot, evidence = overviewSnapshotEvidence(snapshot.capturedAt, null), showSnapshot = true }: { snapshot: PublicSnapshot; evidence?: OverviewSnapshotEvidence; showSnapshot?: boolean }) {
   const replicas = snapshot.models.reduce((total, model) => total + model.replicas, 0);
   const pipelines = snapshot.models.reduce((total, model) => total + model.pipelines, 0);
   const inflightJobs = snapshot.jobs.filter((job) => ["queued", "leasing", "running", "streaming"].includes(job.status));
   const runningJobs = inflightJobs.filter((job) => job.status === "running" || job.status === "streaming").length;
   const queuedJobs = inflightJobs.length - runningJobs;
   return (
-    <section className="live-network-telemetry" aria-label="Current live network data" aria-live="polite" data-period="current" data-evidence="coordinator-snapshot">
-      <div className="snapshot" data-kpi="snapshot">
+    <section className={`live-network-telemetry${showSnapshot ? "" : " without-snapshot"}`} aria-label="Current live network data" aria-live="polite" data-period="current" data-evidence="coordinator-snapshot">
+      {showSnapshot && <div className="snapshot" data-kpi="snapshot">
         <span><Radio size={12} />Snapshot</span>
         <strong className={evidence.state}><i />{evidence.label}</strong>
         <small>{evidence.detail}</small>
-      </div>
+      </div>}
       <div data-kpi="connected-peers">
         <span><GitFork size={12} />Connected peers</span>
         <strong>{snapshot.summary.connected}</strong>
@@ -1714,12 +1840,7 @@ export function NetworkHistory({ endpoint, compact = false }: { endpoint: string
   }, [load]);
 
   return <section className="network-history-page">
-    <PageTitle
-      eyebrow="PERSISTENT TELEMETRY"
-      title="Network history"
-      copy="Real evolution of shared capacity, nodes, models and tasks. The coordinator stores one sample every ten minutes."
-      actions={<button type="button" disabled={loading} onClick={() => void load()}>{loading ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}Refresh</button>}
-    />
+    <PageTitle title="Network history" />
     <div className="network-history-toolbar">
       <div className="network-history-ranges" role="group" aria-label="History range">
         {(Object.keys(historyRangeLabels) as NetworkHistoryRange[]).map((value) => (
@@ -1940,9 +2061,15 @@ function HistorySummaryCard({
 }
 
 function NetworkHistoryTable({ samples }: { samples: NetworkTelemetrySample[] }) {
-  const visible = samples.slice(-24).reverse();
+  const [page, setPage] = useState(0);
+  const allRows = samples.slice(-24).reverse();
+  const pageSize = TABLE_PAGE_SIZE;
+  const pageCount = Math.max(1, Math.ceil(allRows.length / pageSize));
+  const visiblePage = Math.min(page, pageCount - 1);
+  const visible = allRows.slice(visiblePage * pageSize, visiblePage * pageSize + pageSize);
+  useEffect(() => setPage(0), [samples]);
   return <article className="network-history-table-card">
-    <header><div><span>EXACT SAMPLES</span><h2>Latest saved readings</h2></div><small>Showing the 24 most recent</small></header>
+    <header><div><span>EXACT SAMPLES</span><h2>Latest saved readings</h2></div><small>Showing {allRows.length} most recent</small></header>
     <div className="network-history-table-scroll">
       <table>
         <thead><tr><th>Timestamp</th><th>Active VRAM</th><th>Free VRAM</th><th>Nodes</th><th>Online</th><th>Models</th><th>Inflight</th><th>Completed</th></tr></thead>
@@ -1958,6 +2085,7 @@ function NetworkHistoryTable({ samples }: { samples: NetworkTelemetrySample[] })
         </tr>)}</tbody>
       </table>
     </div>
+    {allRows.length > pageSize && <TablePagination label="history samples" page={visiblePage} pageCount={pageCount} total={allRows.length} onPageChange={setPage} />}
   </article>;
 }
 
@@ -1998,22 +2126,22 @@ function formatHistoryChartTime(value: string): string {
 
 export function DashboardConnect({
   apiBaseUrl,
-  joinUrl,
+  earnUrl,
   downloadsUrl,
   browserUrl,
   external,
-  onOpenJoin,
+  onOpenEarn,
 }: {
   apiBaseUrl: string;
-  joinUrl: string;
+  earnUrl: string;
   downloadsUrl: string;
   browserUrl: string;
   external: boolean;
-  onOpenJoin: () => void;
+  onOpenEarn: () => void;
 }) {
   const titleId = useId();
-  const [copied, setCopied] = useState<"api" | "join" | null>(null);
-  const [copyError, setCopyError] = useState<"api" | "join" | null>(null);
+  const [copied, setCopied] = useState<"api" | "link" | null>(null);
+  const [copyError, setCopyError] = useState<"api" | "link" | null>(null);
   const resetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const externalProps = external ? { target: "_blank", rel: "noreferrer" } as const : {};
 
@@ -2021,7 +2149,7 @@ export function DashboardConnect({
     if (resetRef.current) clearTimeout(resetRef.current);
   }, []);
 
-  async function copyValue(kind: "api" | "join", value: string) {
+  async function copyValue(kind: "api" | "link", value: string) {
     try {
       await navigator.clipboard.writeText(value);
       setCopied(kind);
@@ -2037,12 +2165,12 @@ export function DashboardConnect({
     }, 2200);
   }
 
-  const copyLabel = (kind: "api" | "join") => copied === kind ? "Copied" : copyError === kind ? "Try again" : "Copy";
+  const copyLabel = (kind: "api" | "link") => copied === kind ? "Copied" : copyError === kind ? "Try again" : "Copy";
 
   return (
     <article className="dashboard-connect" aria-labelledby={titleId}>
       <header>
-        <div><strong id={titleId}>Connect</strong><span>· join the configured mycellios network</span></div>
+        <div><strong id={titleId}>Connect</strong><span>· use the configured mycellios network</span></div>
         <a href="https://github.com/tych0s/mycellios#readme" target="_blank" rel="noreferrer">Full docs <ArrowRight size={13} /></a>
       </header>
       <div className="dashboard-connect-grid">
@@ -2066,12 +2194,12 @@ export function DashboardConnect({
           </div>
         </section>
         <section className="dashboard-connect-join">
-          <span>2 · JOIN</span>
+          <span>2 · SHARE</span>
           <div className="dashboard-connect-command">
-            <code>{joinUrl}</code>
-            <button type="button" className={copyError === "join" ? "error" : copied === "join" ? "copied" : ""} onClick={() => void copyValue("join", joinUrl)}>
-              {copied === "join" ? <Check size={14} /> : <Copy size={14} />}
-              {copyLabel("join")}
+            <code>{earnUrl}</code>
+            <button type="button" className={copyError === "link" ? "error" : copied === "link" ? "copied" : ""} onClick={() => void copyValue("link", earnUrl)}>
+              {copied === "link" ? <Check size={14} /> : <Copy size={14} />}
+              {copyLabel("link")}
             </button>
           </div>
           <p>Share the public link, connect in a browser, or install mycellios-node. The configured API uses the OpenAI-compatible <code>/v1</code> interface.</p>
@@ -2079,7 +2207,7 @@ export function DashboardConnect({
       </div>
       <footer>
         <a href={browserUrl} {...externalProps}><Smartphone size={14} />Start a browser node <ExternalLink size={12} /></a>
-        <button type="button" onClick={onOpenJoin}>View every option <ChevronRight size={13} /></button>
+        <button type="button" onClick={onOpenEarn}>View every option <ChevronRight size={13} /></button>
       </footer>
     </article>
   );
@@ -2117,7 +2245,7 @@ export function overviewSnapshotEvidence(
   return { state: "stale", label: "STALE SNAPSHOT", detail: `Captured ${relativeTime(capturedAt, now)}`, capturedAt, ageMs };
 }
 
-function Overview({ snapshot, connectionError, onNavigate, publicLink, external, apiBaseUrl, joinUrl, developerMode }: { snapshot: PublicSnapshot; connectionError: string | null; onNavigate: (view: PanelView) => void; publicLink: (path: string) => string; external: boolean; apiBaseUrl: string; joinUrl: string; developerMode: boolean }) {
+function Overview({ snapshot, connectionError, onNavigate, publicLink, external, apiBaseUrl, earnUrl, developerMode, theme }: { snapshot: PublicSnapshot; connectionError: string | null; onNavigate: (view: PanelView) => void; publicLink: (path: string) => string; external: boolean; apiBaseUrl: string; earnUrl: string; developerMode: boolean; theme: "dark" | "light" }) {
   const evidence = overviewSnapshotEvidence(snapshot.capturedAt, connectionError);
   const active = snapshot.workers.filter((worker) => worker.connected);
   const operational = active.filter((worker) => worker.status === "online");
@@ -2140,12 +2268,12 @@ function Overview({ snapshot, connectionError, onNavigate, publicLink, external,
   const browserNodes = operational.filter((worker) => worker.kind === "browser").length;
   const cellNodes = operational.filter((worker) => worker.kind === "cell").length;
   const connectPanel = <DashboardConnect
-    apiBaseUrl={apiBaseUrl}
-    joinUrl={joinUrl}
+                apiBaseUrl={configuredApiUrl(apiBaseUrl)}
+    earnUrl={earnUrl}
     downloadsUrl={publicLink("/downloads")}
-    browserUrl={publicLink("/mobile/?autostart=1")}
+    browserUrl={publicLink("/browser/?autostart=1")}
     external={external}
-    onOpenJoin={() => onNavigate("join")}
+    onOpenEarn={() => window.location.assign("/earn")}
   />;
   const recentActivity = <article className="activity-card">
     <div className="card-heading"><div><span>RECENT ACTIVITY</span><h2>Network tasks</h2></div>{developerMode && <button onClick={() => onNavigate("jobs")}>View all</button>}</div>
@@ -2156,7 +2284,7 @@ function Overview({ snapshot, connectionError, onNavigate, publicLink, external,
   </article>;
   return (
     <section className="overview-page">
-      <PageTitle eyebrow="NETWORK CONTROL" title="Distributed AI network" copy="A live view of the capacity, models and tasks connected to your mycellios network." actions={developerMode ? <button onClick={() => onNavigate("nodes")}>Manage nodes</button> : undefined} />
+      <PageTitle title="Overview" />
       <aside className="overview-announcement" aria-label="Contribute to the configured mycellios network">
         <div className="announcement-icon"><Network size={21} /></div>
         <div><strong>Welcome to the founding mesh</strong><span>Run open models with approved shared capacity. Contribute from this browser or install a local node; you choose the resources and can pause at any time.</span></div>
@@ -2165,20 +2293,20 @@ function Overview({ snapshot, connectionError, onNavigate, publicLink, external,
           <a href="https://github.com/tych0s/mycellios" target="_blank" rel="noreferrer"><GitFork size={15} />GitHub</a>
         </div>
       </aside>
-      <div className={`overview-evidence ${evidence.state}`} role="status"><span><Radio />{evidence.label}</span><strong>Point-in-time coordinator snapshot</strong><small>{evidence.detail}</small></div>
+      <div className={`overview-evidence ${evidence.state}`} role="status"><span><Radio />{evidence.label}</span><strong>Coordinator snapshot</strong><small>{evidence.detail}</small></div>
       {evidence.state === "waiting" ? <article className="overview-no-evidence"><CircleAlert /><div><span>NO VERIFIED NETWORK DATA</span><h2>Overview is waiting for the coordinator</h2><p>Capacity, models, tasks and performance remain hidden until a real snapshot arrives. Retrying automatically.</p></div></article> : <>
-      <LiveNetworkTelemetry snapshot={snapshot} evidence={evidence} />
+      <LiveNetworkTelemetry snapshot={snapshot} evidence={evidence} showSnapshot={false} />
       <DashboardConnect
         apiBaseUrl={apiBaseUrl}
-        joinUrl={joinUrl}
+        earnUrl={earnUrl}
         downloadsUrl={publicLink("/downloads")}
-        browserUrl={publicLink("/mobile/?autostart=1")}
+        browserUrl={publicLink("/browser/?autostart=1")}
         external={external}
-        onOpenJoin={() => onNavigate("join")}
+        onOpenEarn={() => window.location.assign("/earn")}
       />
       <article className="global-capacity-card">
         <div className="global-capacity-main">
-          <div className="global-capacity-heading"><span>GLOBAL NODE CAPACITY</span><b className={evidence.state}><i /> {evidence.label}</b></div>
+          <div className="global-capacity-heading"><span>GLOBAL NODE CAPACITY</span></div>
           <div className="execution-overview"><ExecutionBadge execution={execution} workers={snapshot.workers} large /><span><strong>Effective inference device</strong><small>Reported by the runtime after loading the model, never inferred from detected hardware.</small></span></div>
           <div className="global-capacity-total"><strong>{formatMemory(activeOfferedVramMb)}</strong><div><b>Active usable memory</b><small>Offered by {operational.length} operational node{operational.length === 1 ? "" : "s"}</small></div></div>
           <div className="global-capacity-bar" aria-label={`${Math.round(freeRatio * 100)}% of offered memory is free`}><i style={{ width: `${freeRatio * 100}%` }} /></div>
@@ -2209,7 +2337,7 @@ function Overview({ snapshot, connectionError, onNavigate, publicLink, external,
           developerMode={developerMode}
           onNavigate={onNavigate}
         />
-        <NetworkModelCatalog snapshot={snapshot} developerMode={developerMode} onNavigate={onNavigate} />
+        <NetworkModelCatalog snapshot={snapshot} developerMode={developerMode} theme={theme} onNavigate={onNavigate} />
         <article className="activity-card">
           <div className="card-heading"><div><span>RECENT ACTIVITY</span><h2>Network tasks</h2></div>{developerMode && <button onClick={() => onNavigate("jobs")}>View all</button>}</div>
           <div className="activity-list">
@@ -2249,7 +2377,7 @@ function workerPeerRole(worker: PublicWorker): ConnectedPeerRow["role"] {
 }
 
 function ConnectedPeersTable({ workers }: { workers: PublicWorker[] }) {
-  const pageSize = 10;
+  const pageSize = TABLE_PAGE_SIZE;
   const [filter, setFilter] = useState<PeerFilter>("all");
   const [sortKey, setSortKey] = useState<PeerSortKey>("status");
   const [sortDirection, setSortDirection] = useState<"asc" | "desc">("asc");
@@ -2314,12 +2442,7 @@ function ConnectedPeersTable({ workers }: { workers: PublicWorker[] }) {
       <header>
         <strong id="connected-peers-title">Connected peers</strong>
         <div className="connected-peers-controls">
-          <span>{rangeStart}–{rangeEnd}</span>
-          <div className="connected-peers-pagination" aria-label="Peer pages">
-            <button type="button" aria-label="Previous peer page" disabled={visiblePage === 0} onClick={() => setPage((current) => Math.max(0, current - 1))}><ChevronLeft size={13} /></button>
-            <button type="button" aria-label="Next peer page" disabled={visiblePage >= pageCount - 1} onClick={() => setPage((current) => Math.min(pageCount - 1, current + 1))}><ChevronRight size={13} /></button>
-          </div>
-          <span>· {filteredRows.length} total</span>
+          <span>{filteredRows.length} total</span>
           <label><SlidersHorizontal size={12} /><span>Filter</span><select aria-label="Filter peers" value={filter} onChange={(event) => { setFilter(event.target.value as PeerFilter); setPage(0); }}><option value="all">All peers</option><option value="serving">Serving</option><option value="connected">Connected</option><option value="offline">Needs attention</option></select></label>
         </div>
       </header>
@@ -2352,6 +2475,7 @@ function ConnectedPeersTable({ workers }: { workers: PublicWorker[] }) {
           </tbody>
         </table>
       </div>
+      {filteredRows.length > pageSize && <TablePagination label="peers" page={visiblePage} pageCount={pageCount} total={filteredRows.length} onPageChange={setPage} />}
     </article>
   );
 }
@@ -2384,12 +2508,14 @@ interface NetworkCatalogEntry {
   request: RequestedModelCapacity | null;
 }
 
-function NetworkModelCatalog({ snapshot, developerMode, onNavigate }: {
+function NetworkModelCatalog({ snapshot, developerMode, theme, onNavigate }: {
   snapshot: PublicSnapshot;
   developerMode: boolean;
+  theme: "light" | "dark";
   onNavigate: (view: PanelView) => void;
 }) {
   const [selectedModelId, setSelectedModelId] = useState("");
+  const [page, setPage] = useState(0);
   const closeSelectedModel = useCallback(() => setSelectedModelId(""), []);
   const drawerTitleId = useId();
   const entries = useMemo<NetworkCatalogEntry[]>(() => {
@@ -2413,6 +2539,11 @@ function NetworkModelCatalog({ snapshot, developerMode, onNavigate }: {
     return [...active, ...queued];
   }, [snapshot.models, snapshot.requestedModels]);
   const selectedEntry = entries.find((entry) => entry.id === selectedModelId) ?? null;
+  const pageSize = TABLE_PAGE_SIZE;
+  const pageCount = Math.max(1, Math.ceil(entries.length / pageSize));
+  const visiblePage = Math.min(page, pageCount - 1);
+  const visibleEntries = entries.slice(visiblePage * pageSize, visiblePage * pageSize + pageSize);
+  useEffect(() => setPage(0), [entries]);
 
   return <>
     <article className="network-model-catalog">
@@ -2423,7 +2554,7 @@ function NetworkModelCatalog({ snapshot, developerMode, onNavigate }: {
       <div className="network-model-table-wrap">
         <table className="network-model-table">
           <thead><tr><th>Model</th><th>Status</th><th>Availability</th><th>Peer memory</th><th>Measured speed</th><th>Processed tokens</th><th><span className="sr-only">Details</span></th></tr></thead>
-          <tbody>{entries.map((entry) => {
+          <tbody>{visibleEntries.map((entry) => {
             const telemetry = networkModelTelemetry(snapshot, entry.id);
             return <tr key={entry.id} className={selectedModelId === entry.id ? "selected" : ""}>
               <td><button type="button" className="network-model-name" onClick={() => setSelectedModelId(entry.id)}><i><Boxes /></i><span><strong>{entry.id}</strong><small>{networkModelRuntimeLabel(telemetry.deployments)}</small></span></button></td>
@@ -2438,17 +2569,19 @@ function NetworkModelCatalog({ snapshot, developerMode, onNavigate }: {
         </table>
         {entries.length === 0 && <div className="network-model-empty"><Boxes /><strong>No models are active yet</strong><span>Models and their token activity will appear here as soon as a node publishes one.</span>{developerMode && <button type="button" onClick={() => onNavigate("models")}>Open model catalog</button>}</div>}
       </div>
+      {entries.length > pageSize && <TablePagination label="models" page={visiblePage} pageCount={pageCount} total={entries.length} onPageChange={setPage} />}
     </article>
     {selectedEntry && createPortal(
-      <NetworkModelDrawer entry={selectedEntry} snapshot={snapshot} titleId={drawerTitleId} onClose={closeSelectedModel} />,
+      <NetworkModelDrawer entry={selectedEntry} snapshot={snapshot} theme={theme} titleId={drawerTitleId} onClose={closeSelectedModel} />,
       document.body,
     )}
   </>;
 }
 
-function NetworkModelDrawer({ entry, snapshot, titleId, onClose }: {
+function NetworkModelDrawer({ entry, snapshot, theme, titleId, onClose }: {
   entry: NetworkCatalogEntry;
   snapshot: PublicSnapshot;
+  theme: "light" | "dark";
   titleId: string;
   onClose: () => void;
 }) {
@@ -2458,6 +2591,12 @@ function NetworkModelDrawer({ entry, snapshot, titleId, onClose }: {
   const inputTokens = telemetry.jobs.reduce((total, job) => total + job.inputTokens, 0);
   const outputTokens = telemetry.jobs.reduce((total, job) => total + job.outputTokens, 0);
   const completedRequests = telemetry.jobs.filter((job) => job.status === "completed").length;
+  const [peerPage, setPeerPage] = useState(0);
+  const peerPageSize = TABLE_PAGE_SIZE;
+  const peerPageCount = Math.max(1, Math.ceil(telemetry.peers.length / peerPageSize));
+  const visiblePeerPage = Math.min(peerPage, peerPageCount - 1);
+  const visiblePeers = telemetry.peers.slice(visiblePeerPage * peerPageSize, visiblePeerPage * peerPageSize + peerPageSize);
+  useEffect(() => setPeerPage(0), [entry.id, telemetry.peers.length]);
   useEffect(() => {
     const dialog = dialogRef.current;
     if (!dialog) return;
@@ -2476,7 +2615,7 @@ function NetworkModelDrawer({ entry, snapshot, titleId, onClose }: {
       previous?.focus();
     };
   }, [onClose]);
-  return <div className="model-detail-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) onClose(); }}>
+  return <div className={`model-detail-backdrop ${theme === "light" ? "theme-light" : "theme-dark"}`} role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) onClose(); }}>
     <aside ref={dialogRef} className="model-detail-drawer" role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1}>
       <header className="model-detail-head">
         <div className="model-detail-icon"><Boxes /></div>
@@ -2507,13 +2646,14 @@ function NetworkModelDrawer({ entry, snapshot, titleId, onClose }: {
         <div className="model-peer-table-wrap">
           <table className="model-peer-table">
             <thead><tr><th>Node</th><th>Region</th><th>Device</th><th>Memory</th><th>Speed</th></tr></thead>
-            <tbody>{telemetry.peers.map(({ worker, deployments }) => {
+            <tbody>{visiblePeers.map(({ worker, deployments }) => {
               const measured = deployments.filter(isMeasuredDeployment).reduce((total, deployment) => total + deployment.tokensPerSecond, 0);
               return <tr key={worker.id}><td><strong><i />{shortId(worker.id)}</strong></td><td>{worker.region}</td><td>{worker.gpus[0]?.model ?? worker.kind}</td><td>{formatMemory(worker.offeredVramMb)}</td><td>{measured > 0 ? `${formatCompactNumber(measured)} tok/s` : "Not measured"}</td></tr>;
             })}</tbody>
           </table>
           {telemetry.peers.length === 0 && <div className="model-peer-empty"><Server /><span>No active peer is advertising this model right now.</span></div>}
         </div>
+        {telemetry.peers.length > peerPageSize && <TablePagination label="model peers" page={visiblePeerPage} pageCount={peerPageCount} total={telemetry.peers.length} onPageChange={setPeerPage} />}
       </section>
     </aside>
   </div>;
@@ -2587,7 +2727,6 @@ function InteractiveMesh({ workers, traces, registeredWorkers, sharedVramMb, pub
   const [selectedWorkerId, setSelectedWorkerId] = useState("");
   const [fullscreen, setFullscreen] = useState(false);
   const cardRef = useRef<HTMLElement>(null);
-  const stageRef = useRef<HTMLDivElement>(null);
   const visibleWorkers = workers.slice(0, MESH_OVERVIEW_POSITIONS.length);
   const selectedWorker = visibleWorkers.find((worker) => worker.id === selectedWorkerId) ?? null;
   const selectedWorkerIndex = selectedWorker ? visibleWorkers.findIndex((worker) => worker.id === selectedWorker.id) : -1;
@@ -2625,13 +2764,6 @@ function InteractiveMesh({ workers, traces, registeredWorkers, sharedVramMb, pub
     else await cardRef.current.requestFullscreen();
   }
 
-  function resetView() {
-    setZoom(1);
-    setSelectedWorkerId("");
-    stageRef.current?.style.setProperty("--mesh-pointer-x", "50%");
-    stageRef.current?.style.setProperty("--mesh-pointer-y", "45%");
-  }
-
   return (
     <article className={`network-canvas interactive-mesh${fullscreen ? " fullscreen" : ""}`} ref={cardRef}>
       <div className="canvas-head mesh-canvas-head">
@@ -2643,13 +2775,11 @@ function InteractiveMesh({ workers, traces, registeredWorkers, sharedVramMb, pub
         </div>
         <div className="mesh-head-actions">
           {developerMode && <button className="canvas-link" onClick={() => onNavigate("nodes")}>Node details</button>}
-          <button className="mesh-icon-button" onClick={resetView} title="Reset network view" aria-label="Reset network view"><RefreshCw /></button>
           <button className="mesh-fullscreen-button" onClick={() => void toggleFullscreen()}><Maximize2 />{fullscreen ? "Exit fullscreen" : "Fullscreen"}</button>
         </div>
       </div>
       <div
         className="interactive-mesh-stage"
-        ref={stageRef}
         onPointerMove={updatePointerGlow}
         onPointerLeave={(event) => {
           event.currentTarget.style.setProperty("--mesh-pointer-x", "50%");
@@ -2682,12 +2812,12 @@ function InteractiveMesh({ workers, traces, registeredWorkers, sharedVramMb, pub
               </g>;
             })}
           </svg>
-          <button className="mesh-core" onClick={resetView} aria-label="Focus mycellios coordinator">
+          <div className="mesh-core" role="img" aria-label="mycellios coordinator">
             <span><img src={brandIcon} alt="" /></span>
             <strong>mycellios</strong>
             <small>coordinator</small>
             <i />
-          </button>
+          </div>
           {visibleWorkers.map((worker, index) => {
             const position = MESH_OVERVIEW_POSITIONS[index] ?? { x: 50, y: 50 };
             const selected = selectedWorkerId === worker.id;
@@ -2707,7 +2837,7 @@ function InteractiveMesh({ workers, traces, registeredWorkers, sharedVramMb, pub
             );
           })}
         </div>
-        {visibleWorkers.length === 0 && <div className="network-empty interactive-empty"><Wifi size={28} /><strong>The mesh is ready for its first node</strong><span>Every connected device becomes part of the live topology.</span><a href={publicLink("/mobile/")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}>Connect this device <ArrowRight size={13} /></a></div>}
+        {visibleWorkers.length === 0 && <div className="network-empty interactive-empty"><Wifi size={28} /><strong>The mesh is ready for its first node</strong><span>Every connected device becomes part of the live topology.</span><a href={publicLink("/browser/")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}>Connect this device <ArrowRight size={13} /></a></div>}
         <div className="mesh-stage-legend"><b><i /> OBSERVED</b><span>{physicalLinks} physical</span><span>{links.length - physicalLinks} declared/simulated</span>{links.length === 0 && <span>No route observed yet</span>}</div>
         {selectedWorker && selectedWorkerPosition && <MeshNodePopover worker={selectedWorker} position={selectedWorkerPosition} sharePercent={selectedSharePercent} onClose={() => setSelectedWorkerId("")} />}
         {visibleWorkers.length > 0 && <div className="mesh-zoom-controls" aria-label="Network zoom controls">
@@ -2809,6 +2939,7 @@ function Nodes({
   const [actionError, setActionError] = useState<string | null>(null);
   const [selectedWorkerId, setSelectedWorkerId] = useState("");
   const [credentials, setCredentials] = useState<WorkerCredentialSummary[] | null>(null);
+  const [credentialsPage, setCredentialsPage] = useState(0);
   const [credentialError, setCredentialError] = useState<string | null>(null);
   const connectedWorkers = snapshot.workers.filter((worker) => worker.connected);
   const activeWorkers = snapshot.workers.filter((worker) => worker.connected && worker.status === "online");
@@ -2830,6 +2961,10 @@ function Nodes({
   const measuredThroughput = measuredDeployments.reduce((total, deployment) => total + deployment.tokensPerSecond, 0);
   const sortedWorkers = [...snapshot.workers].sort((left, right) => nodeStateOrder(left) - nodeStateOrder(right));
   const selectedWorker = snapshot.workers.find((worker) => worker.id === selectedWorkerId) ?? null;
+  const credentialsPageSize = TABLE_PAGE_SIZE;
+  const credentialsPageCount = Math.max(1, Math.ceil((credentials?.length ?? 0) / credentialsPageSize));
+  const visibleCredentialsPage = Math.min(credentialsPage, credentialsPageCount - 1);
+  const visibleCredentials = credentials?.slice(visibleCredentialsPage * credentialsPageSize, visibleCredentialsPage * credentialsPageSize + credentialsPageSize) ?? [];
   async function remove(workerId: string) {
     setBusy(workerId);
     setActionError(null);
@@ -2857,6 +2992,7 @@ function Nodes({
     setCredentialError(null);
     try {
       setCredentials(await onListCredentials());
+      setCredentialsPage(0);
     } catch (error) {
       setCredentialError(friendlyModelMutationError(error));
     } finally {
@@ -2962,7 +3098,7 @@ function Nodes({
         )}
         {credentials !== null && credentials.length > 0 && (
           <div className="device-trust-list">
-            {credentials.map((credential) => (
+            {visibleCredentials.map((credential) => (
               <article key={`${credential.identityKind}:${credential.identityId}`}>
                 <div className="device-trust-identity">
                   <div><LockKeyhole /></div>
@@ -2999,13 +3135,14 @@ function Nodes({
             ))}
           </div>
         )}
+        {(credentials?.length ?? 0) > credentialsPageSize && <TablePagination label="device identities" page={visibleCredentialsPage} pageCount={credentialsPageCount} total={credentials?.length ?? 0} onPageChange={setCredentialsPage} />}
       </section>
       </PanelDisclosure>
 
       <NodeInventorySection eyebrow="INSTALLED DEVICES" title="Physical devices" workers={installedWorkers} snapshot={snapshot} busy={busy} onRemove={remove} onSelect={setSelectedWorkerId} />
       {browserWorkers.length > 0 && <NodeInventorySection eyebrow="TEMPORARY CAPACITY" title="Active browsers" workers={browserWorkers} snapshot={snapshot} busy={busy} onRemove={remove} onSelect={setSelectedWorkerId} />}
       {cellWorkers.length > 0 && <NodeInventorySection eyebrow="DISTRIBUTED EXECUTORS" title="Compute cells" workers={cellWorkers} snapshot={snapshot} busy={busy} onRemove={remove} onSelect={setSelectedWorkerId} />}
-      {snapshot.workers.length === 0 && <div className="node-card-grid"><div className="wide-empty"><Empty icon={Server} title="No registered nodes" copy="Open the mobile worker or install mycellios to add the first machine." /><a href="/mobile/">Connect a device <ArrowRight size={15} /></a></div></div>}
+      {snapshot.workers.length === 0 && <div className="node-card-grid"><div className="wide-empty"><Empty icon={Server} title="No registered nodes" copy="Open the browser worker or install mycellios to add the first machine." /><a href="/browser/">Connect a device <ArrowRight size={15} /></a></div></div>}
       {selectedWorker && <NodeDetailsDrawer worker={selectedWorker} snapshot={snapshot} onClose={() => setSelectedWorkerId("")} />}
     </section>
   );
@@ -3218,6 +3355,7 @@ function Models({ snapshot, onSearch, onRequest, onRemove, adminToken: initialAd
   requiresAdminToken: boolean;
   secureTokenStorage: boolean;
 }) {
+  const [activePage, setActivePage] = useState(0);
   const [source, setSource] = useState("");
   const [modelId, setModelId] = useState("");
   const [revision, setRevision] = useState("");
@@ -3258,6 +3396,11 @@ function Models({ snapshot, onSearch, onRequest, onRemove, adminToken: initialAd
     if (catalogSort === "memory") return filtered.slice().sort((left, right) => (estimatedHubMemoryMiB(left) ?? Number.MAX_SAFE_INTEGER) - (estimatedHubMemoryMiB(right) ?? Number.MAX_SAFE_INTEGER));
     return filtered;
   }, [availableCatalogMemoryMiB, catalogFit, catalogModels, catalogSort, catalogStatus]);
+  const activePageSize = TABLE_PAGE_SIZE;
+  const activePageCount = Math.max(1, Math.ceil(snapshot.models.length / activePageSize));
+  const visibleActivePage = Math.min(activePage, activePageCount - 1);
+  const visibleActiveModels = snapshot.models.slice(visibleActivePage * activePageSize, visibleActivePage * activePageSize + activePageSize);
+  useEffect(() => setActivePage(0), [snapshot.models]);
 
   useEffect(() => {
     const query = catalogQuery.trim();
@@ -3399,16 +3542,18 @@ function Models({ snapshot, onSearch, onRequest, onRemove, adminToken: initialAd
     </form>
 
     <div className="model-request-list">
+      <div className="model-request-list-heading"><div><span>NETWORK QUEUE</span><strong>Requested models</strong></div><small>{snapshot.requestedModels.length} {snapshot.requestedModels.length === 1 ? "model" : "models"}</small></div>
       {snapshot.requestedModels.map((model) => <RequestedModelCard key={model.id} model={model} onRemove={(modelId) => onRemove(modelId, adminToken)} />)}
     </div>
 
     <div className="panel-table model-active-table"><div className="panel-table-head"><span>Active model</span><span>Replicas</span><span>Pipelines</span><span>Effective device</span></div>
-      {snapshot.models.map((model) => {
+      {visibleActiveModels.map((model) => {
         const execution = modelExecutionSummary(snapshot, model.id);
         return <div className="panel-table-row model-execution-row" key={model.id}><strong><Boxes size={17} />{model.id}</strong><span>{model.replicas}</span><span>{model.pipelines}</span><ExecutionBadge execution={execution} workers={snapshot.workers} /></div>;
       })}
       {snapshot.models.length === 0 && <Empty icon={Boxes} title="No active models" copy="Choose a model above. It will remain queued with an exact capacity shortfall until the network can run it." />}
     </div>
+    {snapshot.models.length > activePageSize && <TablePagination label="active models" page={visibleActivePage} pageCount={activePageCount} total={snapshot.models.length} onPageChange={setActivePage} />}
   </section>;
 }
 
@@ -3490,11 +3635,19 @@ function ActivationIncidentPanel({
   </aside>;
 }
 
-export function Jobs({ snapshot, operatorAccess = false, accessToken = null }: {
+export function Jobs({ snapshot, operatorAccess = false, accessToken = null, getValidSession, apiBaseUrl }: {
   snapshot: PublicSnapshot;
   operatorAccess?: boolean;
   accessToken?: string | null;
+  getValidSession?: (forceRefresh?: boolean) => Promise<AuthSession | null>;
+  apiBaseUrl?: string;
 }) {
+  const pageSize = TABLE_PAGE_SIZE;
+  const [page, setPage] = useState(0);
+  const pageCount = Math.max(1, Math.ceil(snapshot.jobs.length / pageSize));
+  const visiblePage = Math.min(page, pageCount - 1);
+  const visibleJobs = snapshot.jobs.slice(visiblePage * pageSize, visiblePage * pageSize + pageSize);
+  useEffect(() => setPage(0), [snapshot.jobs]);
   const [evidence, setEvidence] = useState<OperatorEvidenceSnapshot | null>(null);
   const [evidenceError, setEvidenceError] = useState<string | null>(null);
   const [evidenceBusy, setEvidenceBusy] = useState(false);
@@ -3502,22 +3655,40 @@ export function Jobs({ snapshot, operatorAccess = false, accessToken = null }: {
     if (!operatorAccess || !accessToken) return;
     setEvidenceBusy(true);
     try {
-      setEvidence(await loadOperatorEvidence(accessToken));
+      setEvidence(await loadOperatorEvidence(accessToken, apiBaseUrl));
       setEvidenceError(null);
     } catch (caught) {
-      setEvidenceError(errorText(caught));
+      // Supabase sessions can expire or rotate between the identity lookup and
+      // this request. Refresh once, then retry with the current access token.
+      const message = errorText(caught);
+      const shouldRefresh = getValidSession && /invalid_network_token|invalid.*token|session.*valid|unauthorized|401/i.test(message);
+      if (shouldRefresh) {
+        const refreshed = await getValidSession(true);
+        if (refreshed) {
+          try {
+            setEvidence(await loadOperatorEvidence(refreshed.accessToken, apiBaseUrl));
+            setEvidenceError(null);
+            return;
+          } catch (retryError) {
+            setEvidenceError(errorText(retryError));
+            return;
+          }
+        }
+      }
+      setEvidenceError(message);
     } finally {
       setEvidenceBusy(false);
     }
-  }, [accessToken, operatorAccess]);
+  }, [accessToken, apiBaseUrl, getValidSession, operatorAccess]);
 
   useEffect(() => { void loadEvidence(); }, [loadEvidence]);
   const receiptJobs = new Set(evidence?.receipts.map((receipt) => receipt.jobId) ?? []);
   return <section><PageTitle eyebrow="EXECUTION LOG" title="Network jobs" copy="Recent inference requests and their execution state." />
     <div className="panel-table jobs-table"><div className="panel-table-head"><span>Request</span><span>Model</span><span>Tokens</span><span>Status</span></div>
-      {snapshot.jobs.map((job) => <div className="panel-table-row" key={job.id}><strong><Activity size={16} />{shortId(job.id)}<small>{relativeTime(job.createdAt)}{receiptJobs.has(job.id) ? " · receipt verified" : ""}</small></strong><span>{job.model}</span><span>{job.inputTokens + job.outputTokens}</span><b className={job.status}><i />{job.status}</b></div>)}
+      {visibleJobs.map((job) => <div className="panel-table-row" key={job.id}><strong><Activity size={16} />{shortId(job.id)}<small>{relativeTime(job.createdAt)}{receiptJobs.has(job.id) ? " · receipt verified" : ""}</small></strong><span>{job.model}</span><span>{job.inputTokens + job.outputTokens}</span><b className={job.status}><i />{job.status}</b></div>)}
       {snapshot.jobs.length === 0 && <Empty icon={Activity} title="No jobs yet" copy="Use the inference console when a model becomes available." />}
     </div>
+    {snapshot.jobs.length > pageSize && <TablePagination label="jobs" page={visiblePage} pageCount={pageCount} total={snapshot.jobs.length} onPageChange={setPage} />}
     {operatorAccess && accessToken && <OperatorEvidence evidence={evidence} busy={evidenceBusy} error={evidenceError} onRefresh={loadEvidence} />}
   </section>;
 }
@@ -3531,7 +3702,7 @@ function OperatorEvidence({ evidence, busy, error, onRefresh }: {
   return <section className="operator-evidence-console" aria-labelledby="operator-evidence-title" aria-busy={busy}>
     <header><div><small>READ-ONLY · ROLE RESTRICTED</small><h2 id="operator-evidence-title">Operator evidence</h2><span>Incidents, signed releases, certifications and receipts from canonical stores.</span></div>
       <button type="button" disabled={busy} onClick={() => void onRefresh()}>{busy ? <LoaderCircle className="spin" /> : <RefreshCw />}Refresh</button></header>
-    {error && <div className="operator-evidence-error" role="alert"><CircleAlert />Evidence unavailable: {error}</div>}
+    {error && <div className="operator-evidence-error" role="alert"><CircleAlert /><span><strong>Evidence unavailable</strong><small>{error}</small></span></div>}
     {!evidence && busy && <div className="operator-evidence-loading" role="status" aria-live="polite"><LoaderCircle className="spin" />Verifying operational evidence…</div>}
     {evidence && <div className="operator-evidence-grid" aria-live="polite">
       <EvidenceLane title="Incidents" count={evidence.incidents.length} state={evidence.incidents.length ? "attention" : "clear"}>
@@ -3563,7 +3734,7 @@ type SystemLogFilter = "important" | "errors" | "all";
 function SystemLogs({ snapshot, connectionError }: { snapshot: PublicSnapshot; connectionError: string | null }) {
   const [filter, setFilter] = useState<SystemLogFilter>("important");
   const [query, setQuery] = useState("");
-  const [visibleCount, setVisibleCount] = useState(30);
+  const [page, setPage] = useState(0);
 
   const networkLogs = useMemo(
     () => networkSnapshotLogs(snapshot, connectionError),
@@ -3579,9 +3750,12 @@ function SystemLogs({ snapshot, connectionError }: { snapshot: PublicSnapshot; c
   });
   const warningCount = logSnapshot.entries.filter((entry) => entry.level === "warning").length;
   const errorCount = logSnapshot.entries.filter((entry) => entry.level === "error").length;
-  const renderedEntries = visibleEntries.slice(0, visibleCount);
+  const pageSize = TABLE_PAGE_SIZE;
+  const pageCount = Math.max(1, Math.ceil(visibleEntries.length / pageSize));
+  const visiblePage = Math.min(page, pageCount - 1);
+  const renderedEntries = visibleEntries.slice(visiblePage * pageSize, visiblePage * pageSize + pageSize);
 
-  useEffect(() => setVisibleCount(30), [filter, query]);
+  useEffect(() => setPage(0), [filter, query]);
 
   return <section className="system-logs-page">
     <PageTitle
@@ -3604,10 +3778,10 @@ function SystemLogs({ snapshot, connectionError }: { snapshot: PublicSnapshot; c
     </div>
     {logSnapshot.truncated && <div className="system-log-notice"><CircleAlert />Se muestran únicamente las entradas más recientes para mantener el panel rápido y seguro.</div>}
     <div className="system-log-list" aria-live="polite">
-      {visibleEntries.map((entry) => <SystemLogRow entry={entry} key={entry.id} />)}
+      {renderedEntries.map((entry) => <SystemLogRow entry={entry} key={entry.id} />)}
       {visibleEntries.length === 0 && <Empty icon={ScrollText} title="No hay logs para este filtro" copy={normalizedQuery ? "Prueba otra búsqueda o muestra todos los niveles." : "No se han registrado eventos de este nivel."} />}
     </div>
-    {visibleCount < visibleEntries.length && <div className="panel-load-more"><span>Showing {renderedEntries.length} of {visibleEntries.length} matching events</span><button type="button" onClick={() => setVisibleCount((count) => count + 30)}><Plus size={15} />Load 30 more</button></div>}
+    {visibleEntries.length > pageSize && <TablePagination label="logs" page={visiblePage} pageCount={pageCount} total={visibleEntries.length} onPageChange={setPage} />}
     <footer className="system-log-safety"><ShieldCheck /><span><strong>Safe, limited read</strong><small>Credentials, tokens, passwords and secrets are redacted before reaching this screen.</small></span></footer>
   </section>;
 }
@@ -3845,11 +4019,14 @@ function Tests() {
     <PageTitle eyebrow="PRUEBAS REALES AUTOMÁTICAS" title="¿Mycellios mejora de verdad?" copy="Compara velocidad, latencia y eficiencia sin mezclar modelos, capacidad, rutas o hardware diferentes." actions={<button disabled={running} onClick={() => void runNow()}>{running ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}{running ? "Midiendo…" : "Repetir prueba ahora"}</button>} />
     <div className="benchmark-auto-notice"><Activity size={19} /><span><strong>Medición automática con evidencia real</strong>El banco calienta el modelo, repite peticiones y guarda su variación. Una lectura ausente aparece como “Sin lectura”; nunca se estima para rellenar la pantalla.</span></div>
     {error && <div className="benchmark-error" role="alert"><CircleAlert size={17} /><span><strong>No se pudo ejecutar la prueba</strong>{error}</span></div>}
-    <div className="panel-stat-grid benchmark-stats">
-      <Stat icon={Activity} label="Pruebas visibles" value={String(filteredRuns.length)} detail={`${runs.length} guardadas en total`} />
-      <Stat icon={Boxes} label="Selected model" value={selectedMeasurement?.model.label ?? "No reading"} detail={selected ? `v${selected.version} · ${formatBenchmarkDate(selected.finishedAt)}` : "No measurements"} />
-      <Stat icon={Server} label="Nodes used" value={selectedInventory ? String(selectedNodes) : "No reading"} detail={selectedInventory ? `${selectedInventory.connectedDevices}/${selectedInventory.totalDevices} connected` : "No inventory"} />
-      <Stat icon={Gauge} label="Best comparable P50" value={formatBenchmark(bestThroughput, " tok/s")} detail={selectedMeasurement ? `${trendRuns.length} test${trendRuns.length === 1 ? "" : "s"} with the same fingerprint` : "No scenario selected"} tone="purple" />
+    <div className="benchmark-overview-row">
+      <div className="panel-stat-grid benchmark-stats">
+        <Stat icon={Activity} label="Pruebas visibles" value={String(filteredRuns.length)} detail={`${runs.length} guardadas en total`} />
+        <Stat icon={Boxes} label="Modelo seleccionado" value={selectedMeasurement?.model.label ?? "Sin lectura"} detail={selected ? `v${selected.version} · ${formatBenchmarkDate(selected.finishedAt)}` : "Sin mediciones"} />
+        <Stat icon={Server} label="Nodos usados" value={selectedInventory ? String(selectedNodes) : "Sin lectura"} detail={selectedInventory ? `${selectedInventory.connectedDevices}/${selectedInventory.totalDevices} conectados` : "Sin inventario"} />
+        <Stat icon={Gauge} label="Mejor P50 comparable" value={formatBenchmark(bestThroughput, " tok/s")} detail={selectedMeasurement ? `${trendRuns.length} prueba${trendRuns.length === 1 ? "" : "s"} con la misma huella` : "Sin escenario seleccionado"} tone="purple" />
+      </div>
+      <div className="benchmark-overview-context"><span><i /> Estado del banco</span><strong>{loading ? "Sincronizando historial" : runs.length > 0 ? "Historial listo para comparar" : "Esperando la primera medición"}</strong><small>Solo se muestran lecturas observadas. La capacidad y la ruta se comparan por separado.</small></div>
     </div>
     {selectedMeasurement && <div className="benchmark-capacity-strip">
       <BenchmarkMetric icon={MemoryStick} label="Offered memory" value={formatBenchmark(selectedOfferedGb, " GB")} detail={formatBenchmark(selectedInventory?.physicalMemoryGb ?? null, " physical GB")} />
@@ -4068,11 +4245,17 @@ function BenchmarkComparisonMetric({ label, baseline, current, baselineDetail, c
 }
 
 function BenchmarkHistory({ runs, selectedRunId, onSelect }: { runs: BenchmarkRun[]; selectedRunId: string; onSelect: (runId: string) => void }) {
+  const [page, setPage] = useState(0);
+  const pageSize = TABLE_PAGE_SIZE;
+  const pageCount = Math.max(1, Math.ceil(runs.length / pageSize));
+  const visiblePage = Math.min(page, pageCount - 1);
+  const visibleRuns = runs.slice(visiblePage * pageSize, visiblePage * pageSize + pageSize);
+  useEffect(() => setPage(0), [runs]);
   return <article className="benchmark-history">
-    <div className="card-heading"><div><span>EVOLUTION HISTORY</span><h2>All real tests</h2></div><small>Select a row to analyze it</small></div>
+    <div className="card-heading"><div><span>EVOLUTION HISTORY</span><h2>All real tests</h2></div><small>{runs.length} tests · select a row</small></div>
     <div className="benchmark-history-table">
       <div className="benchmark-history-head"><span>Version / build</span><span>Model / evidence</span><span>Nodes / topology</span><span>Capacity</span><span>P50 speed</span><span>Confidence</span><span>Status</span></div>
-      {runs.map((run) => {
+      {visibleRuns.map((run) => {
         const snapshot = benchmarkRunSnapshot(run);
         if (!snapshot) return null;
         return <button className={`benchmark-history-row ${run.runId === selectedRunId ? "selected" : ""}`} aria-pressed={run.runId === selectedRunId} key={run.runId} onClick={() => onSelect(run.runId)}>
@@ -4086,6 +4269,7 @@ function BenchmarkHistory({ runs, selectedRunId, onSelect }: { runs: BenchmarkRu
         </button>;
       })}
     </div>
+    {runs.length > pageSize && <TablePagination label="benchmark tests" page={visiblePage} pageCount={pageCount} total={runs.length} onPageChange={setPage} />}
   </article>;
 }
 
@@ -4254,7 +4438,7 @@ const INFERENCE_FILE_ACCEPT = [
   ".sql", ".log", ".ini", ".env",
 ].join(",");
 
-function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthenticated, onSignIn, apiAccessEnabled, apiBaseUrl, accessToken, apiAccount }: {
+function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthenticated, onSignIn, apiAccessEnabled, apiBaseUrl, accessToken, getValidSession, apiAccount }: {
   snapshot: PublicSnapshot;
   onSend: (model: string, messages: ChatMessage[], sessionId: string, onUpdate?: (update: ChatStreamUpdate) => void) => Promise<ChatResponse>;
   onNavigate: (view: PanelView) => void;
@@ -4264,6 +4448,7 @@ function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthent
   apiAccessEnabled: boolean;
   apiBaseUrl: string;
   accessToken: string | null;
+  getValidSession: (forceRefresh?: boolean) => Promise<AuthSession | null>;
   apiAccount: ApiAccount | null;
 }) {
   const options = useMemo(() => snapshot.models.map((item) => inferenceModelOption(snapshot, item)), [snapshot]);
@@ -4402,10 +4587,10 @@ function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthent
     setSessionId(newInferenceSessionId());
   }
 
-  const apiAccessPanel = <ApiAccessPanel enabled={apiAccessEnabled} apiBaseUrl={apiBaseUrl} accessToken={accessToken} account={apiAccount} availableModels={realModels.length} onSignIn={onSignIn} />;
+  const apiAccessPanel = <ApiAccessPanel enabled={apiAccessEnabled} apiBaseUrl={apiBaseUrl} accessToken={accessToken} getValidSession={getValidSession} account={apiAccount} availableModels={realModels.length} onSignIn={onSignIn} />;
 
   if (!modelAvailable) return <section className="inference-page inference-empty-page">
-    <PageTitle eyebrow="REAL INFERENCE" title="Test a model" copy="Chat with a connected model when the network confirms a real runtime." />
+    <PageTitle title="Test a model" />
     {developerMode ? apiAccessPanel : <PanelDisclosure icon={Code2} eyebrow="OPTIONAL" title="API access" summary="Keys, usage, and the OpenAI-compatible endpoint.">{apiAccessPanel}</PanelDisclosure>}
     <div className="inference-unavailable focused-empty">
       <div className="inference-unavailable-icon"><MessageSquareText /></div>
@@ -4417,7 +4602,7 @@ function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthent
   </section>;
 
   return <section className="inference-page">
-    <PageTitle eyebrow="REAL INFERENCE" title="Test a model" copy="Chat with a connected model and inspect the route, latency and tokens for every response." />
+    <PageTitle title="Test a model" />
     {developerMode ? apiAccessPanel : <PanelDisclosure icon={Code2} eyebrow="OPTIONAL" title="API access" summary="Keys, usage, and the OpenAI-compatible endpoint.">{apiAccessPanel}</PanelDisclosure>}
     {modelAvailable && !accountAuthenticated && <div className="inference-unavailable account-required">
       <div className="inference-unavailable-icon"><LockKeyhole /></div>
@@ -4596,16 +4781,9 @@ function formatFileSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function JoinNetwork({ publicLink, external }: { publicLink: (path: string) => string; external: boolean }) {
-  return <section><PageTitle eyebrow="ZERO-CONFIG JOIN" title="Join the network" copy="No terminal required. Open an approved enrollment handoff, review the detected hardware and confirm participation." />
-    <div className="join-grid"><a className="join-card featured" href={publicLink("/mobile/?autostart=1")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><div><Smartphone /><span>INSTANT</span></div><h2>Use this browser</h2><p>Works on modern Android, iPhone, tablet and desktop browsers. Keep the page visible while contributing.</p><ul><li><CheckCircle2 />WebGPU when available</li><li><CheckCircle2 />Automatic CPU fallback</li><li><CheckCircle2 />One explicit confirmation</li></ul><strong>Open and confirm <ArrowRight /></strong></a>
-      <a className="join-card" href={publicLink("/downloads")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><div><Laptop /><span>WINDOWS · MACOS · LINUX</span></div><h2>Install mycellios-node</h2><p>Runs as a native service, detects the hardware, prepares certified runtimes automatically and contributes on CPU while GPU setup finishes.</p><ul><li><CheckCircle2 />Windows CUDA/ROCm and Apple Silicon MPS when certified</li><li><CheckCircle2 />Automatic verified downloads</li><li><CheckCircle2 />Safe CPU fallback</li></ul><strong>Choose your computer <Download /></strong></a></div>
-  </section>;
-}
-
 function Downloads({ publicLink, external }: { publicLink: (path: string) => string; external: boolean }) {
-  return <section><PageTitle eyebrow="CLIENTS" title="Downloads" copy="Install the native client or enter immediately through the universal browser worker." />
-    <div className="download-grid"><a className="download-card ready" href={publicLink("/downloads/windows")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Laptop />WINDOWS · ZIP</span><h2>Windows 10/11</h2><p>Versioned x64 bootstrapper · extract the verified package and run MycelliosNodeSetup.exe</p><strong>Download ZIP <Download /></strong></a><a className="download-card ready" href={publicLink("/downloads/macos-arm64")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Cpu />MACOS · PKG</span><h2>Mac M1 or newer</h2><p>Versioned arm64 native-node package · signature and package receipt required before release</p><strong>Download PKG <Download /></strong></a><a className="download-card ready" href={publicLink("/downloads/linux-deb")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Cpu />LINUX · DEB</span><h2>Ubuntu / Debian</h2><p>Versioned amd64 native-node package · served only from the certified download root</p><strong>Download DEB <Download /></strong></a><a className="download-card ready" href={publicLink("/mobile/?autostart=1")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Globe2 />UNIVERSAL</span><h2>Browser worker</h2><p>Android, iOS and desktops · real WebGPU probe with automatic CPU fallback after confirmation</p><strong>Open and confirm <ExternalLink /></strong></a></div>
+  return <section><PageTitle eyebrow="CLIENTS" title="Downloads" copy="Install a certified native client for persistent contribution from your computer." />
+    <div className="download-grid"><a className="download-card ready" href={publicLink("/downloads/windows")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Laptop />WINDOWS · ZIP</span><h2>Windows 10/11</h2><p>Versioned x64 bootstrapper · extract the verified package and run MycelliosNodeSetup.exe</p><strong>Download ZIP <Download /></strong></a><a className="download-card ready" href={publicLink("/downloads/macos-arm64")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Cpu />MACOS · PKG</span><h2>Mac M1 or newer</h2><p>Versioned arm64 native-node package · signature and package receipt required before release</p><strong>Download PKG <Download /></strong></a><a className="download-card ready" href={publicLink("/downloads/linux-deb")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Cpu />LINUX · DEB</span><h2>Ubuntu / Debian</h2><p>Versioned amd64 native-node package · served only from the certified download root</p><strong>Download DEB <Download /></strong></a></div>
   </section>;
 }
 
@@ -4932,8 +5110,10 @@ function friendlyModelMutationError(error: unknown): string {
   return message.replace(/^Error invoking remote method ['"]?models:[^:]+['"]?:\s*Error:\s*/i, "");
 }
 
-function PageTitle({ eyebrow, title, copy, actions }: { eyebrow: string; title: string; copy: string; actions?: React.ReactNode }) {
-  return <div className="panel-page-title"><div><span>{eyebrow}</span><h1>{title}</h1><p>{copy}</p></div>{actions && <div className="page-actions">{actions}</div>}</div>;
+function PageTitle({ eyebrow, title, copy, actions }: { eyebrow?: string; title: string; copy?: string; actions?: React.ReactNode }) {
+  void eyebrow;
+  void copy;
+  return <div className="panel-page-title"><div><h1>{title}</h1></div>{actions && <div className="page-actions">{actions}</div>}</div>;
 }
 
 function PanelDisclosure({ icon: Icon, eyebrow, title, summary, children, defaultOpen = false }: { icon: typeof Activity; eyebrow: string; title: string; summary: string; children: React.ReactNode; defaultOpen?: boolean }) {

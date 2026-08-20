@@ -64,40 +64,54 @@ export interface OperatorEvidenceSnapshot {
   receipts: Array<{ receiptId: string; jobId: string; routeClass: string; recoveryMode: string; traceDigest: string; completedAt: number }>;
 }
 
-export async function loadApiAccount(accessToken: string): Promise<ApiAccount> {
-  return apiRequest<ApiAccount>("/v1/account", accessToken);
+export const configuredApiUrl = (apiBaseUrl?: string): string => apiBaseUrl ?? "/v1";
+
+export async function loadApiAccount(accessToken: string, apiBaseUrl?: string): Promise<ApiAccount> {
+  return apiRequest<ApiAccount>("/v1/account", accessToken, {}, apiBaseUrl);
 }
 
-export async function loadApiUsage(accessToken: string, limit = 50): Promise<ApiUsage[]> {
-  const response = await apiRequest<{ data: ApiUsage[] }>(`/v1/account/usage?limit=${limit}`, accessToken);
+export function apiRequestUrl(path: string, apiBaseUrl?: string): string {
+  if (!apiBaseUrl) return path;
+  const base = apiBaseUrl.replace(/\/+$/, "");
+  // Public dashboard reads stay same-origin in the browser. The dev server
+  // proxies /public to the coordinator, avoiding a cross-origin preflight;
+  // production serves the same route from its own origin.
+  if (path.startsWith("/public/v1/")) return path;
+  if (!base.endsWith("/v1")) return `${base}${path}`;
+
+  return `${base}${path.startsWith("/v1/") ? path.slice("/v1".length) : path}`;
+}
+
+export async function loadApiUsage(accessToken: string, limit = 50, apiBaseUrl?: string): Promise<ApiUsage[]> {
+  const response = await apiRequest<{ data: ApiUsage[] }>(`/v1/account/usage?limit=${limit}`, accessToken, {}, apiBaseUrl);
   return response.data;
 }
 
-export function loadOperatorEvidence(accessToken: string): Promise<OperatorEvidenceSnapshot> {
-  return apiRequest<OperatorEvidenceSnapshot>("/public/v1/admin/operations", accessToken);
+export function loadOperatorEvidence(accessToken: string, apiBaseUrl?: string): Promise<OperatorEvidenceSnapshot> {
+  return apiRequest<OperatorEvidenceSnapshot>("/public/v1/admin/operations", accessToken, {}, apiBaseUrl);
 }
 
-export async function loadApiKeys(accessToken: string): Promise<ApiKeySummary[]> {
-  const response = await apiRequest<{ data: ApiKeySummary[] }>("/v1/api-keys", accessToken);
+export async function loadApiKeys(accessToken: string, apiBaseUrl?: string): Promise<ApiKeySummary[]> {
+  const response = await apiRequest<{ data: ApiKeySummary[] }>("/v1/api-keys", accessToken, {}, apiBaseUrl);
   return response.data;
 }
 
-export function createApiKey(accessToken: string, name: string): Promise<CreatedApiKey> {
+export function createApiKey(accessToken: string, name: string, apiBaseUrl?: string): Promise<CreatedApiKey> {
   return apiRequest<CreatedApiKey>("/v1/api-keys", accessToken, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ name }),
-  });
+  }, apiBaseUrl);
 }
 
-export async function revokeApiKey(accessToken: string, keyId: string): Promise<void> {
+export async function revokeApiKey(accessToken: string, keyId: string, apiBaseUrl?: string): Promise<void> {
   await apiRequest<void>(`/v1/api-keys/${encodeURIComponent(keyId)}`, accessToken, {
     method: "DELETE",
-  });
+  }, apiBaseUrl);
 }
 
-export async function loadOwnedNodes(accessToken: string): Promise<OwnedNode[]> {
-  return (await apiRequest<{ data: OwnedNode[] }>("/v1/nodes", accessToken)).data;
+export async function loadOwnedNodes(accessToken: string, apiBaseUrl?: string): Promise<OwnedNode[]> {
+  return (await apiRequest<{ data: OwnedNode[] }>("/v1/nodes", accessToken, {}, apiBaseUrl)).data;
 }
 
 export function enqueueOwnedNodeCommand(
@@ -189,8 +203,9 @@ async function apiRequest<T>(
   path: string,
   accessToken: string,
   init: RequestInit = {},
+  apiBaseUrl?: string,
 ): Promise<T> {
-  const response = await fetch(path, {
+  const response = await fetch(apiRequestUrl(path, apiBaseUrl), {
     ...init,
     cache: "no-store",
     headers: {

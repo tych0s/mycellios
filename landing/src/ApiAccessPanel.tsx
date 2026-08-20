@@ -20,11 +20,14 @@ import {
   type ApiKeySummary,
   type CreatedApiKey,
 } from "./api-access";
+import type { AuthSession } from "./auth";
+import { TABLE_PAGE_SIZE, TablePagination } from "./TablePagination";
 
 interface ApiAccessPanelProps {
   enabled: boolean;
   apiBaseUrl: string;
   accessToken: string | null;
+  getValidSession?: (forceRefresh?: boolean) => Promise<AuthSession | null>;
   account: ApiAccount | null;
   availableModels: number;
   onSignIn: () => void;
@@ -34,6 +37,7 @@ export function ApiAccessPanel({
   enabled,
   apiBaseUrl,
   accessToken,
+  getValidSession,
   account,
   availableModels,
   onSignIn,
@@ -45,6 +49,11 @@ export function ApiAccessPanel({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [connection, setConnection] = useState<"idle" | "testing" | "ready" | "empty" | "failed">("idle");
+  const [keysPage, setKeysPage] = useState(0);
+  const keysPageSize = TABLE_PAGE_SIZE;
+  const keysPageCount = Math.max(1, Math.ceil(keys.length / keysPageSize));
+  const visibleKeysPage = Math.min(keysPage, keysPageCount - 1);
+  const visibleKeys = keys.slice(visibleKeysPage * keysPageSize, visibleKeysPage * keysPageSize + keysPageSize);
   const normalizedBase = apiBaseUrl.replace(/\/+$/, "");
   const origin = normalizedBase.replace(/\/v1$/, "");
   const commands = useMemo(() => [
@@ -65,17 +74,33 @@ export function ApiAccessPanel({
     },
   ], [normalizedBase]);
 
+  async function withCurrentSession<T>(operation: (accessToken: string) => Promise<T>): Promise<T> {
+    const session = getValidSession ? await getValidSession(false) : null;
+    const token = getValidSession ? session?.accessToken : accessToken;
+    if (!token) throw new Error("Sign in to continue.");
+    try {
+      return await operation(token);
+    } catch (caught) {
+      if (!getValidSession || !apiAccessSessionNeedsRefresh(caught)) throw caught;
+      const renewed = await getValidSession(true);
+      if (!renewed) throw caught;
+      return operation(renewed.accessToken);
+    }
+  }
+
   useEffect(() => {
     if (!open || !accessToken) return;
     let cancelled = false;
     setBusy(true);
     setError(null);
-    void loadApiKeys(accessToken)
+    void withCurrentSession((token) => loadApiKeys(token, apiBaseUrl))
       .then((next) => { if (!cancelled) setKeys(next); })
       .catch((caught) => { if (!cancelled) setError(errorText(caught)); })
       .finally(() => { if (!cancelled) setBusy(false); });
     return () => { cancelled = true; };
   }, [accessToken, open]);
+
+  useEffect(() => setKeysPage(0), [keys.length]);
 
   async function testConnection() {
     if (!accessToken) {
@@ -85,15 +110,18 @@ export function ApiAccessPanel({
     setConnection("testing");
     setError(null);
     try {
-      const response = await fetch(`${normalizedBase}/models`, {
-        cache: "no-store",
-        headers: { authorization: `Bearer ${accessToken}` },
+      const payload = await withCurrentSession(async (token) => {
+        const response = await fetch(`${normalizedBase}/models`, {
+          cache: "no-store",
+          headers: { authorization: `Bearer ${token}` },
+        });
+        const body = await response.json().catch(() => null) as {
+          data?: unknown[];
+          error?: { code?: string; message?: string };
+        } | null;
+        if (!response.ok) throw new Error(body?.error?.code ?? body?.error?.message ?? `HTTP ${response.status}`);
+        return body;
       });
-      const payload = await response.json().catch(() => null) as {
-        data?: unknown[];
-        error?: { message?: string };
-      } | null;
-      if (!response.ok) throw new Error(payload?.error?.message ?? `HTTP ${response.status}`);
       setConnection((payload?.data?.length ?? 0) > 0 ? "ready" : "empty");
     } catch (caught) {
       setConnection("failed");
@@ -107,7 +135,7 @@ export function ApiAccessPanel({
     setBusy(true);
     setError(null);
     try {
-      const next = await createApiKey(accessToken, name.trim());
+      const next = await withCurrentSession((token) => createApiKey(token, name.trim(), apiBaseUrl));
       setCreated(next);
       setKeys((current) => [next, ...current]);
       setName("My application");
@@ -123,7 +151,7 @@ export function ApiAccessPanel({
     setBusy(true);
     setError(null);
     try {
-      await revokeApiKey(accessToken, keyId);
+      await withCurrentSession((token) => revokeApiKey(token, keyId, apiBaseUrl));
       setKeys((current) => current.map((key) =>
         key.id === keyId ? { ...key, revoked_at: new Date().toISOString() } : key
       ));
@@ -136,6 +164,7 @@ export function ApiAccessPanel({
 
   const live = availableModels > 0;
   const targetLabel = live ? "API TARGET READY" : "API TARGET WAITING";
+  const errorPresentation = error ? apiAccessErrorPresentation(error) : null;
   return <section className={`api-access-panel${open ? " open" : ""}`}>
     <button className="api-access-summary" type="button" onClick={() => setOpen((current) => !current)} aria-expanded={open}>
       <span className={`api-target-state${live ? " ready" : ""}`}><i />{targetLabel}</span>
@@ -189,15 +218,22 @@ export function ApiAccessPanel({
         <div className="api-key-list">
           {busy && keys.length === 0 && <div className="api-key-empty"><LoaderCircle className="spin" />Loading keys…</div>}
           {!busy && keys.length === 0 && <div className="api-key-empty"><KeyRound />You do not have any keys yet.</div>}
-          {keys.map((key) => <div className={`api-key-row${key.revoked_at ? " revoked" : ""}`} key={key.id}>
+          {visibleKeys.map((key) => <div className={`api-key-row${key.revoked_at ? " revoked" : ""}`} key={key.id}>
             <KeyRound />
             <span><strong>{key.name}</strong><code>{key.prefix}••••••••</code></span>
             <small>{key.revoked_at ? "Revoked" : key.last_used_at ? `Used ${relativeDate(key.last_used_at)}` : "Never used"}</small>
             {!key.revoked_at && <button aria-label={`Revoke ${key.name}`} disabled={busy} onClick={() => void removeKey(key.id)}><Trash2 /></button>}
           </div>)}
         </div>
+        {keys.length > keysPageSize && <TablePagination label="API keys" page={visibleKeysPage} pageCount={keysPageCount} total={keys.length} onPageChange={setKeysPage} />}
       </section>}
-      {error && <div className="api-access-error"><CircleAlert />{error}</div>}
+      {errorPresentation && <div className="api-access-error" role="alert">
+        <CircleAlert />
+        <span><strong>{errorPresentation.title}</strong><small>{errorPresentation.detail}</small></span>
+        <button type="button" onClick={() => { setError(null); if (errorPresentation.requiresAuth) onSignIn(); else void testConnection(); }}>
+          {errorPresentation.action}
+        </button>
+      </div>}
     </div>}
   </section>;
 }
@@ -226,4 +262,38 @@ function relativeDate(value: string): string {
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+export function apiAccessSessionNeedsRefresh(error: unknown): boolean {
+  const message = errorText(error).toLowerCase();
+  return message.includes("invalid_network_token")
+    || message.includes("invalid network token")
+    || message.includes("invalid_access_token")
+    || message.includes("account session is invalid")
+    || message.includes("session is invalid or expired");
+}
+
+export interface ApiAccessErrorPresentation {
+  title: string;
+  detail: string;
+  action: string;
+  requiresAuth: boolean;
+}
+
+export function apiAccessErrorPresentation(message: string): ApiAccessErrorPresentation {
+  const normalized = message.toLowerCase();
+  if (normalized.includes("invalid_network_token") || normalized.includes("invalid network token")) {
+    return {
+      title: "La sesión de API ha caducado",
+      detail: "La credencial de esta sesión ya no es válida. Inicia sesión de nuevo para comprobar la conexión y administrar tus claves.",
+      action: "Iniciar sesión",
+      requiresAuth: true,
+    };
+  }
+  return {
+    title: "No se pudo comprobar la API",
+    detail: message || "El endpoint no ha podido confirmar su estado.",
+    action: "Reintentar",
+    requiresAuth: false,
+  };
 }

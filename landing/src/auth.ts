@@ -1,9 +1,16 @@
 const SESSION_KEY = "mycellios.auth.session";
+const SESSION_REFRESH_MARGIN_MS = 90_000;
+let refreshInFlight: Promise<AuthSession> | null = null;
 
 export interface PublicAuthConfig {
   enabled: boolean;
   url?: string;
   anonKey?: string;
+  providers?: {
+    email: boolean;
+    google: boolean;
+    twitter: boolean;
+  };
   apiAccessEnabled?: boolean;
   publicApiBaseUrl?: string;
   starterTokens?: number;
@@ -27,10 +34,37 @@ export interface NetworkIdentity {
   role: "owner" | "admin" | "operator" | "viewer" | null;
 }
 
+export type OAuthProvider = "google" | "twitter";
+
 export async function loadAuthConfig(): Promise<PublicAuthConfig> {
   const response = await fetch("/public/v1/auth-config", { cache: "no-store" });
   if (!response.ok) return { enabled: false };
-  return response.json() as Promise<PublicAuthConfig>;
+  const config = await response.json() as PublicAuthConfig;
+  if (!config.enabled || !config.url || !config.anonKey) return config;
+  try {
+    const settingsUrl = new URL("/auth/v1/settings", config.url);
+    const settingsResponse = await fetch(settingsUrl, {
+      cache: "no-store",
+      headers: {
+        apikey: config.anonKey,
+        authorization: `Bearer ${config.anonKey}`,
+      },
+    });
+    if (!settingsResponse.ok) return config;
+    const settings = await settingsResponse.json() as {
+      external?: Partial<Record<"email" | OAuthProvider, boolean>>;
+    };
+    return {
+      ...config,
+      providers: {
+        email: settings.external?.email !== false,
+        google: settings.external?.google === true,
+        twitter: settings.external?.twitter === true,
+      },
+    };
+  } catch {
+    return config;
+  }
 }
 
 export function storedAuthSession(): AuthSession | null {
@@ -47,15 +81,57 @@ export async function restoreAuthSession(config: PublicAuthConfig): Promise<Auth
   if (redirected) return redirected;
   const current = storedAuthSession();
   if (!current || !config.enabled || !config.url || !config.anonKey) return null;
-  if (current.expiresAt > Date.now() + 60_000) return current;
+  if (current.expiresAt > Date.now() + SESSION_REFRESH_MARGIN_MS) return current;
   try {
-    return await authRequest(config, "/auth/v1/token?grant_type=refresh_token", {
-      refresh_token: current.refreshToken,
-    });
+    return await refreshAuthSession(config, current);
   } catch {
     clearAuthSession();
     return null;
   }
+}
+
+export function authSessionNeedsRefresh(session: AuthSession, now = Date.now()): boolean {
+  return session.expiresAt <= now + SESSION_REFRESH_MARGIN_MS;
+}
+
+export async function refreshAuthSession(
+  config: PublicAuthConfig,
+  session: AuthSession,
+  force = false,
+): Promise<AuthSession> {
+  const stored = storedAuthSession();
+  const freshest = stored?.user.id === session.user.id && stored.expiresAt > session.expiresAt
+    ? stored
+    : session;
+  if (!force && !authSessionNeedsRefresh(freshest)) return freshest;
+  if (!refreshInFlight) {
+    refreshInFlight = authRequest(config, "/auth/v1/token?grant_type=refresh_token", {
+      refresh_token: freshest.refreshToken,
+    }).finally(() => { refreshInFlight = null; });
+  }
+  return refreshInFlight;
+}
+
+export async function validAuthSession(
+  config: PublicAuthConfig,
+  session: AuthSession,
+  forceRefresh = false,
+): Promise<AuthSession> {
+  const stored = storedAuthSession();
+  const freshest = stored?.user.id === session.user.id && stored.expiresAt > session.expiresAt
+    ? stored
+    : session;
+  return forceRefresh || authSessionNeedsRefresh(freshest)
+    ? refreshAuthSession(config, freshest, forceRefresh)
+    : freshest;
+}
+
+export function subscribeAuthSession(listener: (session: AuthSession | null) => void): () => void {
+  const onStorage = (event: StorageEvent) => {
+    if (event.key === SESSION_KEY) listener(storedAuthSession());
+  };
+  window.addEventListener("storage", onStorage);
+  return () => window.removeEventListener("storage", onStorage);
 }
 
 export function signIn(
@@ -74,12 +150,47 @@ export function signUp(
   return authRequest(config, "/auth/v1/signup", { email, password });
 }
 
-export function signInWithX(config: PublicAuthConfig): void {
+export function signInWithOAuth(config: PublicAuthConfig, provider: OAuthProvider): void {
   assertAuthConfig(config);
+  assertOAuthProviderEnabled(config, provider);
   const authorizeUrl = new URL("/auth/v1/authorize", config.url);
-  authorizeUrl.searchParams.set("provider", "x");
+  authorizeUrl.searchParams.set("provider", provider);
   authorizeUrl.searchParams.set("redirect_to", `${window.location.origin}${window.location.pathname}${window.location.search}`);
   window.location.assign(authorizeUrl);
+}
+
+export function signInWithGoogle(config: PublicAuthConfig): void {
+  signInWithOAuth(config, "google");
+}
+
+export function signInWithX(config: PublicAuthConfig): void {
+  signInWithOAuth(config, "twitter");
+}
+
+export async function linkOAuthIdentity(
+  config: PublicAuthConfig,
+  session: Pick<AuthSession, "accessToken">,
+  provider: OAuthProvider,
+): Promise<void> {
+  assertAuthConfig(config);
+  assertOAuthProviderEnabled(config, provider);
+  const authorizeUrl = new URL("/auth/v1/user/identities/authorize", config.url);
+  authorizeUrl.searchParams.set("provider", provider);
+  authorizeUrl.searchParams.set("redirect_to", `${window.location.origin}${window.location.pathname}${window.location.search}`);
+  authorizeUrl.searchParams.set("skip_http_redirect", "true");
+  const response = await fetch(authorizeUrl, {
+    cache: "no-store",
+    headers: {
+      apikey: config.anonKey,
+      authorization: `Bearer ${session.accessToken}`,
+    },
+  });
+  const payload = await response.json().catch(() => null) as { url?: unknown; message?: unknown; error_description?: unknown } | null;
+  if (!response.ok || typeof payload?.url !== "string") {
+    const message = payload?.message ?? payload?.error_description;
+    throw new Error(typeof message === "string" ? message : `Could not link ${provider} (HTTP ${response.status}).`);
+  }
+  window.location.assign(payload.url);
 }
 
 export async function signInWithMetaMask(config: PublicAuthConfig): Promise<AuthSession> {
@@ -214,6 +325,12 @@ function assertAuthConfig(config: PublicAuthConfig): asserts config is PublicAut
   }
 }
 
+function assertOAuthProviderEnabled(config: PublicAuthConfig, provider: OAuthProvider): void {
+  if (config.providers && !config.providers[provider]) {
+    throw new Error(`${provider === "twitter" ? "X" : "Google"} sign-in is not configured yet.`);
+  }
+}
+
 async function consumeOAuthRedirect(config: PublicAuthConfig): Promise<AuthSession | null> {
   if (!window.location.hash.includes("access_token=") && !window.location.hash.includes("error=")) return null;
   const params = new URLSearchParams(window.location.hash.slice(1));
@@ -223,12 +340,12 @@ async function consumeOAuthRedirect(config: PublicAuthConfig): Promise<AuthSessi
   assertAuthConfig(config);
   const accessToken = params.get("access_token");
   const refreshToken = params.get("refresh_token");
-  if (!accessToken || !refreshToken) throw new Error("X did not return a valid Mycellios session.");
+  if (!accessToken || !refreshToken) throw new Error("The identity provider did not return a valid Mycellios session.");
   const response = await fetch(new URL("/auth/v1/user", config.url), {
     headers: { apikey: config.anonKey, authorization: `Bearer ${accessToken}` },
   });
   const user = await response.json().catch(() => null) as { id?: unknown; email?: unknown } | null;
-  if (!response.ok || typeof user?.id !== "string") throw new Error("X returned an invalid Mycellios identity.");
+  if (!response.ok || typeof user?.id !== "string") throw new Error("The identity provider returned an invalid Mycellios identity.");
   const session: AuthSession = {
     accessToken,
     refreshToken,
