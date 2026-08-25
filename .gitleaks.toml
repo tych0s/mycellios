@@ -1,0 +1,11 @@
+title = "Mycellios secret scanning policy"
+
+[[allowlists]]
+description = "Known non-secret fixtures used by security and provider tests"
+regexTarget = "match"
+regexes = [
+  '''sk_test_1234567890abcdef''',
+  '''execution_receipt_envelope_key_is_unknown:coordinator-receipt-key-1''',
+  '''model\.embed_tokens\.weight.*weights-00001\.safetensors''',
+]
+paths = ['''tests/.*''', '''python/tests/.*''']

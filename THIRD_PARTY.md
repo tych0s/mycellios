@@ -9,9 +9,8 @@ Those files are source-only: the desktop and coordinator releases are assembled
 from a closed allowlist, carry SHA-256 manifests and reject research or
 simulation modules during verification.
 
-The Mycellios kernel licence is pending a decision by the owner. Until a
-`LICENSE` file exists, no open-source licence should be assumed for Mycellios
-code.
+Unless a file states otherwise, Mycellios source code is licensed under the
+GNU General Public License, version 3 only (`GPL-3.0-only`).
 
 ## Libraries used by the native runtime
 

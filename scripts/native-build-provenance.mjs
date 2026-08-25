@@ -15,7 +15,6 @@ export const NATIVE_BUILD_PROVENANCE_FILE =
 const SOURCE_INPUTS = Object.freeze([
   ".gitattributes",
   ".github/actionlint.yaml",
-  ".github/workflows",
   "package.json",
   "package-lock.json",
   "python/requirements-distribution.txt",
