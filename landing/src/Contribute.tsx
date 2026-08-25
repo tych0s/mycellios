@@ -169,7 +169,7 @@ export function Contribute(props: ContributeProps) {
         {...props}
         nodes={nodes}
         loading={loadingNodes}
-        onRefresh={() => void refreshNodes(true)}
+        onRefresh={() => refreshNodes(true)}
         onNotice={setNotice}
         onError={setError}
       />
