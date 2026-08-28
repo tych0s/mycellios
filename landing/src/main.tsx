@@ -18,9 +18,6 @@ if (!root) throw new Error("Missing landing root element");
 // the canonical tags describe the merged page.
 const isRebrandRoute = window.location.pathname === "/rebrand" || window.location.pathname === "/rebrand/";
 if (isRebrandRoute) window.history.replaceState({}, "", "/");
-if (window.location.pathname === "/join" || window.location.pathname === "/join/") {
-  window.history.replaceState({}, "", "/earn");
-}
 applySeoMetadata();
 
 const path = window.location.pathname.length > 1
@@ -32,7 +29,7 @@ const page = path === "/create" ? <CreateStudio />
   : path === "/earn" ? <EarnStudio />
   : path.startsWith("/spore") ? <SporeStudio />
   : surface === "network" ? <NetworkPage />
-  : surface === "panel" ? <Panel accountEntry={path === "/account"} mobileEntry={path === "/browser" || path === "/mobile"} />
+  : surface === "panel" ? <Panel accountEntry={path === "/account"} />
   : <RebrandLanding />;
 
 /*

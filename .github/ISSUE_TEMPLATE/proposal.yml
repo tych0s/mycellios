@@ -1,0 +1,44 @@
+name: Proposal
+description: Propose a product, protocol, research or infrastructure change.
+title: "proposal: "
+labels: [proposal]
+body:
+  - type: dropdown
+    id: boundary
+    attributes:
+      label: Area
+      options:
+        - Production runtime or control plane
+        - Research, simulator or planner
+        - Native packaging or release
+        - User experience or documentation
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What concrete limitation or user need does this address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Explain the behavior, boundaries and alternatives considered.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Validation plan
+      description: State which claims need tests, simulations or physical hardware evidence.
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security and privacy impact
+      description: Address trust, activations, artifacts, identities, networking and resource isolation as applicable.
+    validations:
+      required: true

@@ -31,7 +31,7 @@ describe("Landing", () => {
     expect(html).toContain("The open compute<br/>layer<br/>");
     expect(html).toContain("<em>for distributed AI.</em>");
     expect(html.match(/<h1/g)).toHaveLength(1);
-    expect(html).toContain('href="/earn"');
+    expect(html).toContain('href="/join"');
     // Nothing frames the headline and nothing follows the prompt: the status
     // pill, the public-testing footnote and "See how it works" are all gone.
     expect(html).not.toContain("rb-status-pill");
@@ -76,7 +76,7 @@ describe("Landing", () => {
     expect(header).toContain('aria-label="mycellios on GitHub"');
     expect(header).toContain('href="https://x.com/mycellios"');
     expect(header).toContain('href="https://t.me/mycellios"');
-    expect(header).toContain('href="/dashboard">Login</a>');
+    expect(header).toContain('href="/network?view=overview">Login</a>');
     expect(header).toContain(">Login</a>");
     // The old "Find your worker" pill is gone from every header surface, mobile
     // burger menu included.
@@ -275,7 +275,7 @@ describe("Landing", () => {
     expect(closing).toContain('aria-hidden="true"');
     expect(closing).toContain("Many machines.");
     // It stands above the wordmark and the final ask, not after them.
-    expect(closing.indexOf("rb-fruit-mark")).toBeLessThan(closing.indexOf('href="/earn"'));
+    expect(closing.indexOf("rb-fruit-mark")).toBeLessThan(closing.indexOf('href="/join"'));
   });
 
   it("keeps the support assistant off the landing", () => {

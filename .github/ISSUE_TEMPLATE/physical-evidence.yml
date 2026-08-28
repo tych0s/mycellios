@@ -1,0 +1,42 @@
+name: Physical validation evidence
+description: Submit reproducible evidence from real hardware or multiple machines.
+title: "evidence: "
+labels: [evidence, hardware]
+body:
+  - type: textarea
+    id: claim
+    attributes:
+      label: Claim being validated
+      description: Distinguish measured behavior from expected or simulated behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: topology
+    attributes:
+      label: Hardware and topology
+      description: Hosts, CPU/GPU/RAM, links, OS, drivers and physical placement.
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: Source revision
+      placeholder: Full Git commit SHA
+    validations:
+      required: true
+  - type: textarea
+    id: procedure
+    attributes:
+      label: Exact procedure and artifacts
+      description: Commands, configuration, raw evidence location, checksums and pass/fail gate.
+    validations:
+      required: true
+  - type: checkboxes
+    id: attestation
+    attributes:
+      label: Attestation
+      options:
+        - label: The run used real stated hardware and no mock or simulator substituted the measured path.
+          required: true
+        - label: Artifacts contain no credentials, private addresses, personal data or proprietary model data.
+          required: true

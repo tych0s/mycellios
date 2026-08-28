@@ -110,16 +110,16 @@ export const SEO_PAGES = {
       "/create",
     ),
   },
-  "/earn": {
-    title: "Earn | Contribute compute to mycellios",
+  "/join": {
+    title: "Join a distributed AI network | mycellios",
     description:
       "Connect a computer to an existing mycellios network or create a private network that pools memory and compute across your own machines.",
-    canonicalPath: "/earn",
+    canonicalPath: "/join",
     robots: "index, follow, max-image-preview:large",
     structuredData: webPage(
-      "Earn | Contribute compute to mycellios",
+      "Join a distributed AI network | mycellios",
       "Connect a machine to mycellios or create a private distributed AI network.",
-      "/earn",
+      "/join",
     ),
   },
   "/downloads": {
@@ -134,21 +134,21 @@ export const SEO_PAGES = {
       url: `${SITE_ORIGIN}/downloads`,
     },
   },
-  "/browser/": {
-    title: "Browser worker for desktop, tablet, and phone | mycellios",
+  "/mobile/": {
+    title: "Contribute mobile compute | mycellios",
     description:
-      "Connect a desktop, tablet, or phone browser to mycellios and contribute voluntary, measurable compute that you can pause anytime.",
-    canonicalPath: "/browser/",
+      "Connect a compatible mobile browser to the mycellios public test network and contribute voluntary, measurable compute that you can pause anytime.",
+    canonicalPath: "/mobile/",
     robots: "index, follow, max-image-preview:large",
     structuredData: {
       "@context": "https://schema.org",
       "@type": "WebApplication",
-      name: "mycellios browser worker",
+      name: "mycellios mobile compute cell",
       applicationCategory: "DeveloperApplication",
-      operatingSystem: "Any compatible desktop, tablet, or phone browser",
+      operatingSystem: "Any compatible mobile browser",
       description:
-        "A universal browser worker for voluntarily contributing compatible compute to the mycellios network.",
-      url: `${SITE_ORIGIN}/browser/`,
+        "A browser-based compute cell for voluntarily contributing compatible mobile hardware to the mycellios network.",
+      url: `${SITE_ORIGIN}/mobile/`,
       publisher: { "@id": ORGANIZATION_ID },
       offers: {
         "@type": "Offer",
@@ -173,15 +173,15 @@ export const SEO_PAGES = {
 
 export type SeoPath = keyof typeof SEO_PAGES;
 
-export const INDEXABLE_SEO_PATHS = ["/", "/network", "/create", "/earn", "/downloads", "/browser/"] as const;
-export const LANDING_SEO_PATHS = ["/", "/network", "/create", "/earn", "/downloads", "/admin"] as const;
+export const INDEXABLE_SEO_PATHS = ["/", "/network", "/create", "/join", "/downloads", "/mobile/"] as const;
+export const LANDING_SEO_PATHS = ["/", "/network", "/create", "/join", "/downloads", "/admin"] as const;
 
 export function canonicalUrl(page: SeoPage): string {
   return `${SITE_ORIGIN}${page.canonicalPath}`;
 }
 
 export function seoPageForPath(pathname: string): SeoPage {
-  if (pathname === "/browser" || pathname.startsWith("/browser/") || pathname === "/mobile" || pathname.startsWith("/mobile/")) return SEO_PAGES["/browser/"];
+  if (pathname === "/mobile" || pathname.startsWith("/mobile/")) return SEO_PAGES["/mobile/"];
   if (pathname in SEO_PAGES) return SEO_PAGES[pathname as SeoPath];
   return SEO_PAGES["/"];
 }

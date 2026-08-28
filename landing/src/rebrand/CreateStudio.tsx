@@ -169,7 +169,7 @@ export function CreateStudio() {
         </div>
         <div className="studio-top-actions">
           <button type="button" className="studio-reset" onClick={resetDraft}><RefreshCw />Reset</button>
-          <a className="studio-login" href="/dashboard">Continue to workspace <ArrowRight /></a>
+          <a className="studio-login" href="/network?view=overview">Continue to workspace <ArrowRight /></a>
         </div>
         <button className="studio-mobile-menu" type="button" aria-label={mobileNavOpen ? "Close studio navigation" : "Open studio navigation"} aria-expanded={mobileNavOpen} onClick={() => setMobileNavOpen((open) => !open)}>
           {mobileNavOpen ? <X /> : <Menu />}

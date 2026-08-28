@@ -29,6 +29,7 @@ export async function stageNodeInstaller(input) {
   if (runtimeManifest.platform !== platform || runtimeManifest.arch !== arch) {
     throw new Error("node_installer_runtime_target_mismatch");
   }
+  await assertSymlinksStayInside(runtime);
   await rm(output, { recursive: true, force: true });
   await mkdir(join(output, "bin"), { recursive: true });
   await Promise.all([
@@ -122,7 +123,6 @@ export async function inventoryNodeInstaller(root, excluded = new Set()) {
 }
 
 async function copyTree(source, destination, options = {}) {
-  if (options.materializeInternalSymlinks) await assertSymlinksStayInside(source);
   await cp(source, destination, {
     recursive: true,
     dereference: options.materializeInternalSymlinks === true,

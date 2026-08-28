@@ -154,6 +154,9 @@ function diagnosticEvent() {
     source: "runtime",
     event: "runtime-start-failed",
     message: "CUDA runtime could not start.",
-    occurredAt: "2026-07-29T12:00:00.000Z",
+    // Keep the fixture inside the retention window. A fixed historical date
+    // eventually gets pruned after the first insert and makes the retry look
+    // like a new event instead of exercising idempotency.
+    occurredAt: new Date().toISOString(),
   };
 }

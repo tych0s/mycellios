@@ -1,0 +1,52 @@
+name: Bug report
+description: Report a reproducible defect in Mycellios.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: For vulnerabilities, stop and use the private Security Advisory link instead.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Coordinator or API
+        - Native worker or stage runtime
+        - Planner, simulator or benchmark lab
+        - Installer, updater or release
+        - Web or mobile interface
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Include expected behavior and the smallest reproducible sequence.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Commit/version, OS, Node/Python versions and relevant hardware.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Logs or evidence
+      description: Redact credentials, personal data, private addresses and model data.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checks
+      options:
+        - label: I searched for an existing report.
+          required: true
+        - label: This report contains no secrets or private user data.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true

@@ -115,7 +115,7 @@ export function LandingHeader({ active }: { active?: "network" }) {
         <a className="rb-social" href={GITHUB_URL} target="_blank" rel="noreferrer" aria-label="mycellios on GitHub"><GithubMark /></a>
         <a className="rb-social" href={X_URL} target="_blank" rel="noreferrer" aria-label="mycellios on X"><XMark /></a>
         <a className="rb-social" href={TELEGRAM_URL} target="_blank" rel="noreferrer" aria-label="mycellios on Telegram"><TelegramMark /></a>
-        <a className="rb-pill rb-pill-ghost" href="/dashboard">Login</a>
+        <a className="rb-pill rb-pill-ghost" href="/network?view=overview">Login</a>
       </div>
       <button className="rb-menu" type="button" aria-label={mobileOpen ? "Close menu" : "Open menu"} aria-expanded={mobileOpen} onClick={() => setMobileOpen(!mobileOpen)}>{mobileOpen ? <X /> : <Menu />}</button>
       {mobileOpen && <>
@@ -124,7 +124,7 @@ export function LandingHeader({ active }: { active?: "network" }) {
           <div className="rb-mobile-group"><a href="/network?view=inference">Chat</a><a href="/create">Create</a><a href="/earn">Earn</a></div>
           <div className="rb-mobile-group"><span className="rb-mobile-kicker">$ SPORE</span><div className="rb-mobile-sub"><a href="/spore">Staking</a><a href="/spore/treasury">Treasury</a><a href="/spore/data">Data</a></div></div>
           <div className="rb-mobile-group"><a className={active === "network" ? "active" : undefined} href="/network" aria-current={active === "network" ? "page" : undefined}>Live network</a><a href="/blog">Blog</a></div>
-          <a className="rb-mobile-cta" href="/dashboard">Login</a>
+          <a className="rb-mobile-cta" href="/network?view=overview">Login</a>
           <div className="rb-mobile-social"><a className="rb-social" href={GITHUB_URL} target="_blank" rel="noreferrer" aria-label="mycellios on GitHub"><GithubMark /></a><a className="rb-social" href={X_URL} target="_blank" rel="noreferrer" aria-label="mycellios on X"><XMark /></a><a className="rb-social" href={TELEGRAM_URL} target="_blank" rel="noreferrer" aria-label="mycellios on Telegram"><TelegramMark /></a></div>
         </nav>
       </>}

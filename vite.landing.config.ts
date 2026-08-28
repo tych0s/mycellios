@@ -1,8 +1,7 @@
 import react from "@vitejs/plugin-react";
 import { createRequire } from "node:module";
 import { resolve, sep } from "node:path";
-import { defineConfig, loadEnv } from "vite";
-import { buildNativeSourceProvenance } from "./scripts/native-build-provenance.mjs";
+import { defineConfig } from "vite";
 
 /*
  * Where `node_modules` actually lives.
@@ -41,32 +40,15 @@ const servableRoots = [
   resolve(import.meta.dirname),
   ...(installedModulesDir ? [installedModulesDir] : []),
 ];
-const landingBuildProvenance = buildNativeSourceProvenance(import.meta.dirname);
-const landingBuildIdentity = {
-  schema: landingBuildProvenance.schema,
-  version: landingBuildProvenance.version,
-  sourceId: landingBuildProvenance.sourceId,
-};
 
 const LOCAL_UI_PORT = Number(process.env.PORT || 4_174);
 const LOCAL_UI_HOST = process.env.HOST || "127.0.0.1";
-const landingEnv = loadEnv(process.env.NODE_ENV || "development", resolve(import.meta.dirname, "landing"), "");
 const apiTarget = process.env.MYCELLIOS_UI_API_TARGET?.trim()
-  || landingEnv.MYCELLIOS_UI_API_TARGET?.trim()
   || "https://www.mycellios.com";
-const identityTarget = process.env.MYCELLIOS_UI_IDENTITY_TARGET?.trim()
-  || landingEnv.MYCELLIOS_UI_IDENTITY_TARGET?.trim()
-  || "https://www.mycellios.com";
-const productionProxy = (websocket = false) => ({
+const productionProxy = () => ({
   target: apiTarget,
   changeOrigin: true,
   secure: apiTarget.startsWith("https://"),
-  ...(websocket ? { ws: true } : {}),
-});
-const identityProxy = () => ({
-  target: identityTarget,
-  changeOrigin: true,
-  secure: identityTarget.startsWith("https://"),
 });
 
 /*
@@ -113,9 +95,6 @@ function preloadHeroRenderer() {
 
 export default defineConfig({
   root: "landing",
-  define: {
-    __MYCELLIOS_BUILD_IDENTITY__: JSON.stringify(landingBuildIdentity),
-  },
   plugins: [react(), preloadHeroRenderer()],
   publicDir: "public",
   server: {
@@ -125,10 +104,6 @@ export default defineConfig({
     allowedHosts: ["www.mycellios.com"],
     fs: { allow: servableRoots },
     proxy: {
-      "/public/v1/auth-config": identityProxy(),
-      "/v1/auth": identityProxy(),
-      "/mobile/v1": productionProxy(true),
-      "/local": productionProxy(),
       "/public": productionProxy(),
       "/v1": productionProxy(),
     },
@@ -139,10 +114,6 @@ export default defineConfig({
     strictPort: true,
     allowedHosts: ["www.mycellios.com"],
     proxy: {
-      "/public/v1/auth-config": identityProxy(),
-      "/v1/auth": identityProxy(),
-      "/mobile/v1": productionProxy(true),
-      "/local": productionProxy(),
       "/public": productionProxy(),
       "/v1": productionProxy(),
     },

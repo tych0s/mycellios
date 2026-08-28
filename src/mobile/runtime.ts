@@ -548,7 +548,7 @@ async function handleServerMessage(raw: string): Promise<void> {
       emit();
     } else {
       setStatus("Connected. Running the one-time network admission check…");
-      addLog("Browser worker connected · requesting its one-time admission check.");
+      addLog("Mobile worker connected · requesting its one-time admission check.");
       requestWork();
     }
     return;
@@ -1259,7 +1259,7 @@ function cancelActiveExecutions(reason: string): void {
 function assertExecutionAllowed(signal: AbortSignal): void {
   throwIfMobileExecutionCancelled(signal);
   if ((!state.running && !state.starting) || document.visibilityState !== "visible") {
-    throw new MobileExecutionCancelledError("Browser contribution is paused");
+    throw new MobileExecutionCancelledError("Mobile compute is paused");
   }
 }
 

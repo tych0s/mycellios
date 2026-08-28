@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -50,6 +50,7 @@ describe("native node installer layout", () => {
     const escaping = await createFixture();
     await symlink(join(escaping.dist, "node", "main.js"), join(escaping.runtime, "escape"));
     await expect(stageNodeInstaller(escaping)).rejects.toThrow("node_installer_runtime_symlink_escapes_root");
+    await expect(access(escaping.output)).rejects.toThrow();
   });
 });
 

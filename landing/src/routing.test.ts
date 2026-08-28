@@ -42,31 +42,14 @@ describe("panel information architecture", () => {
     expect(panelViewFromLocation("/network", "?view=network")).toBe("network");
     expect(panelViewFromLocation("/network", "?view=history")).toBe("network");
     expect(panelViewFromLocation("/network", "?view=tasks")).toBe("jobs");
-    expect(panelViewFromLocation("/dashboard", "?view=join")).toBe("contribute");
-    expect(panelViewFromLocation("/join", "")).toBe("contribute");
-    expect(normalizePanelView("join")).toBe("contribute");
     expect(normalizePanelView("unknown")).toBeNull();
     expect(panelLocation("overview")).toBe("/network?view=overview");
-    expect(panelLocation("overview", false, true)).toBe("/dashboard");
-    expect(panelLocation("inference", false, true)).toBe("/dashboard?view=inference");
     expect(normalizePanelView("settings")).toBeNull();
   });
 
   it("routes Stripe returns to the account surface", () => {
     expect(resolveLandingSurface("/account", "?checkout=success")).toBe("panel");
     expect(panelViewFromLocation("/account", "?checkout=success")).toBe("overview");
-  });
-
-  it("routes the dashboard login destination to the Panel overview", () => {
-    expect(resolveLandingSurface("/dashboard", "")).toBe("panel");
-    expect(panelViewFromLocation("/dashboard", "")).toBe("overview");
-  });
-
-  it("routes browser worker entries to the contribution panel", () => {
-    expect(resolveLandingSurface("/browser", "")).toBe("panel");
-    expect(resolveLandingSurface("/mobile", "")).toBe("panel");
-    expect(panelViewFromLocation("/browser", "")).toBe("contribute");
-    expect(panelViewFromLocation("/mobile", "")).toBe("contribute");
   });
 
   it("keeps the web contribution route and exposes no retired desktop views", () => {

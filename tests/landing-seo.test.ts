@@ -49,9 +49,9 @@ describe("landing SEO contract", () => {
     expect(robots).not.toContain("Disallow: /admin");
   });
 
-  it("ships universal browser-worker metadata before JavaScript runs", () => {
+  it("ships mobile metadata before JavaScript runs", () => {
     const mobileHtml = read("src/mobile/index.html");
-    const mobile = SEO_PAGES["/browser/"];
+    const mobile = SEO_PAGES["/mobile/"];
 
     expect(mobileHtml).toContain(`<title>${mobile.title}</title>`);
     expect(mobileHtml).toContain(`content="${mobile.description}"`);

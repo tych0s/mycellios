@@ -6,7 +6,7 @@ import "./styles.css";
 const root = document.getElementById("root");
 if (!root) throw new Error("Missing mobile root element");
 
-applySeoMetadata("/browser/");
+applySeoMetadata("/mobile/");
 createRoot(root).render(<Panel mobileEntry />);
 
 if ("serviceWorker" in navigator && window.isSecureContext) {
