@@ -388,6 +388,10 @@ export async function createCoordinator(
   const runtimeRevision = runtimeMetadata.revision;
   const app = Fastify({ logger: options.logger ?? false, bodyLimit: 2 * 1024 * 1024 });
   const apiAccessEnabled = config.apiAccessEnabled ?? false;
+  const isAccountNodeRoute = (path: string): boolean =>
+    path === "/v1/nodes"
+    || path.startsWith("/v1/nodes/")
+    || path.startsWith("/v1/node-ownership-transfers/");
   app.addHook("onRequest", async (request, reply) => {
     // The public UI and mobile worker must never be embeddable as drive-by
     // compute. Apply the policy to static and dynamic responses so it remains
@@ -397,7 +401,7 @@ export async function createCoordinator(
     reply.header("X-Content-Type-Options", "nosniff");
     reply.header("Referrer-Policy", "strict-origin-when-cross-origin");
     const path = request.url.split("?", 1)[0] ?? request.url;
-    if (path.startsWith("/v1/")) {
+    if (path.startsWith("/v1/") || path.startsWith("/public/v1/")) {
       reply.header("Access-Control-Allow-Origin", "*");
       reply.header("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
       reply.header(
@@ -440,6 +444,10 @@ export async function createCoordinator(
       ) return;
       if (path.startsWith("/internal/v1/releases/")) return;
       if (path === "/v1/auth/me") return;
+      // Account-owned node operations use the user's renewable Supabase
+      // session. They must reach the account authenticator below instead of
+      // being mistaken for requests that require the static network secret.
+      if (isAccountNodeRoute(path)) return;
       const received = parseBearerToken(request.headers.authorization);
       // Remote public workers prove possession of a stable device key on these
       // routes. Registration returns a narrowly scoped session token for the
@@ -776,9 +784,10 @@ export async function createCoordinator(
     return principal;
   };
   app.addHook("preHandler", async (request, reply) => {
-    if (!apiAccessEnabled || request.method === "OPTIONS") return;
+    if (request.method === "OPTIONS") return;
     const path = request.url.split("?", 1)[0] ?? request.url;
     if (!path.startsWith("/v1/") || path === "/v1/auth/me") return;
+    if (!apiAccessEnabled && !isAccountNodeRoute(path)) return;
     const token = parseBearerToken(request.headers.authorization);
     if (!token) {
       return reply.code(401).send({
@@ -856,12 +865,21 @@ export async function createCoordinator(
   if (mobileAssetsPath) {
     await app.register(staticFiles, {
       root: mobileAssetsPath,
+      prefix: "/browser/",
+      decorateReply: false,
+      index: "index.html",
+      cacheControl: false,
+      setHeaders: setPublicAssetCacheHeaders,
+    });
+    await app.register(staticFiles, {
+      root: mobileAssetsPath,
       prefix: "/mobile/",
       decorateReply: false,
       index: "index.html",
       cacheControl: false,
       setHeaders: setPublicAssetCacheHeaders,
     });
+    app.get("/browser", async (_request, reply) => reply.redirect("/browser/"));
     app.get("/mobile", async (_request, reply) => reply.redirect("/mobile/"));
   }
   const nodeUpdatesPath = resolveNodeUpdatesPath(
@@ -2280,7 +2298,7 @@ export async function createCoordinator(
           mobileHub.onlineCount(),
         mobile: mobileWorkers.length,
       },
-      mobilePwa: mobileAssetsPath ? "/mobile/" : null,
+      mobilePwa: mobileAssetsPath ? "/browser/" : null,
       landing: config.landingAssetsPath ? "/" : null,
       nodeUpdates: nodeUpdatesPath ? "/updates/node/" : null,
       downloads: releaseDownloadsPath ? "/downloads/" : null,
@@ -5073,6 +5091,7 @@ export async function createCoordinator(
     });
     const landingRouteDocuments = {
       "/network": "network/index.html",
+      "/dashboard": "index.html",
       "/create": "create/index.html",
       "/admin": "admin/index.html",
       "/join": "join/index.html",

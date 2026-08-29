@@ -3,12 +3,9 @@ import {
   Bot,
   Check,
   CircleAlert,
-  Cpu,
   LoaderCircle,
   MessageCircle,
-  RotateCcw,
   Send,
-  ShieldCheck,
   Sparkles,
   X,
   Zap,
@@ -122,7 +119,8 @@ export function SupportAssistant({
       setOpen(false);
       return;
     }
-    window.location.assign(`/network?view=${destination}`);
+    const base = window.location.pathname === "/dashboard" ? "/dashboard" : "/network";
+    window.location.assign(`${base}?view=${destination}`);
   }
 
   const pendingAction = useMemo<AssistantAction | null>(() => {
@@ -236,14 +234,6 @@ export function SupportAssistant({
     }
   }
 
-  function resetConversation() {
-    setMessages([]);
-    setDraft("");
-    setError(null);
-    setLatestIntent("");
-    setActionDone(null);
-  }
-
   const online = config?.enabled && config.available;
   const welcome = config?.welcomeMessage ?? DEFAULT_WELCOME;
 
@@ -253,19 +243,17 @@ export function SupportAssistant({
         <section className="support-assistant-window" role="dialog" aria-label="mycellios assistant">
           <header>
             <div className="support-assistant-avatar"><Bot size={20} /></div>
-            <div>
+            <div className="support-assistant-title">
               <strong>mycellios assistant</strong>
-              <span className={online ? "online" : "offline"}><i />{online ? "Network model connected" : "No network model"}</span>
+              <i
+                className={`support-assistant-connection${online ? " online" : " offline"}`}
+                role="status"
+                aria-label={online ? "Assistant connected" : "Assistant disconnected"}
+                title={online ? "Connected" : "Disconnected"}
+              />
             </div>
-            <button type="button" title="New conversation" aria-label="New conversation" onClick={resetConversation}><RotateCcw size={16} /></button>
             <button type="button" title="Close" aria-label="Close assistant" onClick={() => setOpen(false)}><X size={18} /></button>
           </header>
-
-          <div className="support-assistant-trust">
-            <ShieldCheck size={14} />
-            <span>Network AI only</span>
-            <b>{config?.selectedModel ?? "no model"}</b>
-          </div>
 
           <div className="support-assistant-conversation" ref={conversationRef}>
             <div className="support-assistant-message assistant">
@@ -310,9 +298,6 @@ export function SupportAssistant({
             {config && !config.enabled && (
               <div className="support-assistant-unavailable"><CircleAlert size={16} /><span><strong>Assistant disabled</strong><small>The network administrator has temporarily disabled it.</small></span></div>
             )}
-            {config?.enabled && !config.available && (
-              <div className="support-assistant-unavailable"><Cpu size={16} /><span><strong>No live model connected</strong><small>The chat does not substitute an external AI. It will become available when the network announces a model.</small></span></div>
-            )}
           </div>
 
           <form className="support-assistant-composer" onSubmit={(event) => void submitPrompt(event)}>
@@ -334,7 +319,6 @@ export function SupportAssistant({
               {busy ? <LoaderCircle className="spin" size={18} /> : <Send size={18} />}
             </button>
           </form>
-          <footer>Actions that change the system always require confirmation.</footer>
         </section>
       )}
 
@@ -347,7 +331,12 @@ export function SupportAssistant({
       >
         {open ? <X size={22} /> : <MessageCircle size={23} />}
         {!open && <span><strong>Need help?</strong><small>{online ? "Ask the network" : "Assistant offline"}</small></span>}
-        {!open && <i className={online ? "online" : ""} />}
+        {!open && <i
+          className={online ? "online" : "offline"}
+          role="status"
+          aria-label={online ? "Assistant connected" : "Assistant disconnected"}
+          title={online ? "Connected" : "Disconnected"}
+        />}
       </button>
     </div>
   );

@@ -366,9 +366,13 @@ describe("mobile compute hub", () => {
     const page = await runtime.app.inject({ method: "GET", url: "/mobile/" });
     expect(page.statusCode).toBe(200);
     expect(page.body).toContain("Contribute power to the network");
+    const browserPage = await runtime.app.inject({ method: "GET", url: "/browser/" });
+    expect(browserPage.statusCode).toBe(200);
     const manifest = await runtime.app.inject({ method: "GET", url: "/mobile/manifest.webmanifest" });
     expect(manifest.statusCode).toBe(200);
     expect(manifest.json<{ short_name: string }>().short_name).toBe("mycellios");
+    const browserManifest = await runtime.app.inject({ method: "GET", url: "/browser/manifest.webmanifest" });
+    expect(browserManifest.statusCode).toBe(200);
   });
 });
 

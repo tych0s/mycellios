@@ -27,7 +27,8 @@ describe("node enrollment API", () => {
       port: 0,
       databasePath: ":memory:",
       requestTimeoutMs: 1_000,
-      apiAccessEnabled: true,
+      apiAccessEnabled: false,
+      networkToken: "network-secret",
     }, { logger: false, supabaseAuthService: auth });
     runtimes.push(runtime);
 

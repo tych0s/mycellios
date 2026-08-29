@@ -38,6 +38,9 @@ describe("operator evidence API", () => {
     const published = await runtime.app.inject({ method: "PUT", url: "/public/v1/admin/model-certifications",
       headers: { authorization: "Bearer admin-session" }, payload: certification });
     expect(published.statusCode).toBe(201);
+    const preflight = await runtime.app.inject({ method: "OPTIONS", url: "/public/v1/admin/operations" });
+    expect(preflight.statusCode).toBe(204);
+    expect(preflight.headers["access-control-allow-origin"]).toBe("*");
     const read = await runtime.app.inject({ method: "GET", url: "/public/v1/admin/operations",
       headers: { authorization: "Bearer operator-session" } });
     expect(read.statusCode).toBe(200);

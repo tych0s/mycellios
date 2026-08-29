@@ -25,9 +25,9 @@ function mobileAssets(): Plugin {
         fileName: "manifest.webmanifest",
         source: JSON.stringify(
           {
-            name: "mycellios mobile worker",
+            name: "mycellios browser worker",
             short_name: "mycellios",
-            description: "Contribute verified compute power to the mycellios network from this device.",
+            description: "Contribute verified compute power from a desktop, tablet, or phone browser.",
             start_url: "./",
             scope: "./",
             display: "standalone",

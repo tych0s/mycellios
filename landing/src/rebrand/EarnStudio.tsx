@@ -12,7 +12,7 @@ const contributionOptions = [
     copy: "Use WebGPU when available, with a CPU fallback. This tab stays open while your device contributes.",
     detail: "No installation · Pause at any time",
     action: "Open browser worker",
-    href: "/mobile/?autostart=1",
+    href: "/browser/?autostart=1",
     icon: AppWindow,
   },
   {
@@ -37,9 +37,9 @@ export function EarnStudio() {
         <nav aria-label="Main navigation">
           <a href="/network?view=inference">Chat</a><a href="/create">Create</a><a className="active" href="/earn" aria-current="page">Earn</a><SporeMenu /><a href="/#how-it-works">Network</a><a href="/blog">Blog</a>
         </nav>
-        <a className="create-login" href="/network?view=overview">Login</a>
+        <a className="create-login" href="/dashboard">Login</a>
         <button className="create-menu-button" type="button" aria-label={menuOpen ? "Close menu" : "Open menu"} aria-expanded={menuOpen} onClick={() => setMenuOpen((open) => !open)}>{menuOpen ? <X /> : <Menu />}</button>
-        {menuOpen && <div className="create-mobile-nav"><a href="/network?view=inference">Chat</a><a href="/create">Create</a><a className="active" href="/earn">Earn</a><SporeMobileLinks /><a href="/#how-it-works">Network</a><a href="/blog">Blog</a><a href="/network?view=overview">Login</a></div>}
+        {menuOpen && <div className="create-mobile-nav"><a href="/network?view=inference">Chat</a><a href="/create">Create</a><a className="active" href="/earn">Earn</a><SporeMobileLinks /><a href="/#how-it-works">Network</a><a href="/blog">Blog</a><a href="/dashboard">Login</a></div>}
       </header>
 
       <section className="earn-intro">

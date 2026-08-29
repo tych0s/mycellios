@@ -16,7 +16,7 @@ describe("web chat boundary", () => {
     expect(assistant).not.toContain("DesktopSettings");
     expect(assistant).not.toContain('navigate("machine")');
     expect(`${panel}\n${assistant}`).not.toContain("window.desktopAPI");
-    expect(panel).toContain('fetch("/v1/chat/completions"');
+    expect(panel).toContain('fetch(apiRequestUrl("/v1/chat/completions", authConfig.publicApiBaseUrl)');
     expect(assistant).toContain("/public/v1/assistant/chat");
   });
 });
