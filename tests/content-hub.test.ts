@@ -91,11 +91,16 @@ describe("Content Hub blog integration", () => {
     const listing = await app.inject({ method: "GET", url: "/blog" });
     expect(listing.statusCode).toBe(200);
     expect(listing.headers["content-type"]).toContain("text/html");
-    expect(listing.body).toContain(`href="/blog.css?v=20260723"`);
+    expect(listing.body).toContain(`href="/blog.css?v=20260816"`);
     expect(listing.body).toContain(`class="blog-feed"`);
-    expect(listing.body).toContain(
-      `<a href="/blog" aria-current="page">Blog</a>`,
-    );
+    expect(listing.body).toContain(`blog-header`);
+    expect(listing.body).toContain(`class="rb-header-inner rb-shell"`);
+    expect(listing.body).toContain(`href="/network?view=inference">Chat</a>`);
+    expect(listing.body).toContain(`href="/blog" aria-current="page">Blog</a>`);
+    expect(listing.body).toContain(`src="/assets/logos/logo.png"`);
+    expect(listing.body).toContain(`href="/assets/brand/favicon.png"`);
+    expect(listing.body).toContain(`href="/assets/brand/app-icon.png"`);
+    expect(listing.body).not.toContain(`src="/mycellios-favicon-v2.png"`);
     expect(listing.body).toContain("&lt;strong&gt;markup&lt;/strong&gt;");
     expect(listing.body).not.toContain("<strong>markup</strong>");
 

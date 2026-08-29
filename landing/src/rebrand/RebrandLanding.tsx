@@ -181,7 +181,7 @@ function downloadUrl(key: DownloadKey): string {
 }
 
 function Brand() {
-  return <a className="rb-brand" href="#rb-top" aria-label="mycellios, home"><img src={brandLogo} alt="" /><span>mycellios</span></a>;
+  return <a className="rb-brand" href="/" aria-label="mycellios, home"><img src={brandLogo} alt="" /><span>mycellios</span></a>;
 }
 
 /* Downloads. The visitor's platform is detected so the primary action is a

@@ -7,7 +7,7 @@ const SITE_SLUG = "mycellios";
 const SITE_ORIGIN = "https://www.mycellios.com";
 const BLOG_PATH = "/blog";
 const BLOG_LOCALE = "en";
-const BLOG_ASSET_VERSION = "20260723";
+const BLOG_ASSET_VERSION = "20260816";
 const DEFAULT_CACHE_TTL_MS = 60_000;
 const DEFAULT_STALE_IF_ERROR_MS = 24 * 60 * 60 * 1_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
@@ -625,8 +625,9 @@ function renderDocument(options: DocumentOptions): string {
     ${options.noIndex ? `<meta name="robots" content="noindex, nofollow" />` : ""}
     <link rel="canonical" href="${escapeHtml(options.canonical)}" />
     <link rel="stylesheet" href="/blog.css?v=${BLOG_ASSET_VERSION}" />
-    <link rel="icon" href="/mycellios-favicon-v2.png" type="image/png" sizes="64x64" />
-    <link rel="apple-touch-icon" href="/mycellios-app-icon-v2.png" />
+    <link rel="icon" href="/assets/brand/favicon.png" type="image/png" sizes="32x32" />
+    <link rel="shortcut icon" href="/assets/brand/favicon.png" type="image/png" />
+    <link rel="apple-touch-icon" href="/assets/brand/app-icon.png" />
     <meta property="og:type" content="${options.ogType ?? "website"}" />
     <meta property="og:site_name" content="mycellios" />
     <meta property="og:url" content="${escapeHtml(options.canonical)}" />
@@ -643,22 +644,23 @@ function renderDocument(options: DocumentOptions): string {
 
 function renderNavigation(): string {
   return `
-    <nav class="blog-nav" aria-label="Main navigation">
-      <a class="blog-nav__brand" href="/" aria-label="mycellios home"><img src="/mycellios-favicon-v2.png" alt="" width="31" height="31" />mycellios</a>
-      <div class="blog-nav__links">
-        <a href="/">Home</a>
-        <a href="/blog" aria-current="page">Blog</a>
-        <a href="/join">Join now</a>
+    <header class="rb-header blog-header">
+      <div class="rb-header-inner rb-shell">
+        <a class="rb-brand" href="/" aria-label="mycellios, home"><img src="/assets/logos/logo.png" alt="" width="38" height="38" /><span>mycellios</span></a>
+        <nav aria-label="Main navigation">
+          <a href="/network?view=inference">Chat</a><a href="/create">Create</a><a href="/earn">Earn</a><a href="/spore">$ SPORE</a><a href="/network">Live network</a><a class="active" href="/blog" aria-current="page">Blog</a>
+        </nav>
+        <div class="rb-header-actions rb-desktop-cta"><a class="rb-social" href="https://github.com/tych0s/mycellios" target="_blank" rel="noreferrer" aria-label="mycellios on GitHub">GH</a><a class="rb-social" href="https://x.com/mycellios" target="_blank" rel="noreferrer" aria-label="mycellios on X">X</a><a class="rb-pill rb-pill-ghost" href="/network?view=overview">Login</a></div>
       </div>
-    </nav>
+    </header>
   `;
 }
 
 function renderFooter(): string {
   return `
     <footer class="blog-footer">
-      <a class="blog-nav__brand" href="/"><img src="/mycellios-favicon-v2.png" alt="" width="31" height="31" />mycellios</a>
       <p>Many machines. One model.</p>
+      <a href="/">mycellios home</a>
     </footer>
   `;
 }

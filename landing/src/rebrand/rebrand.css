@@ -21,7 +21,7 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
 .rb-header nav { display:flex; gap:clamp(20px,2.4vw,34px); font-size:12px; white-space:nowrap; }
 .rb-header nav a { position:relative; display:inline-flex; align-items:center; min-height:44px; }
 .rb-header nav a::after { content:""; position:absolute; left:0; right:100%; bottom:-6px; height:1px; background:currentColor; transition:right .18s ease; }
-.rb-header nav a:hover::after,.rb-header nav a:focus-visible::after { right:0; }
+.rb-header nav a:hover::after,.rb-header nav a:focus-visible::after,.rb-header nav a.active::after { right:0; }
 .rb-desktop-cta { justify-self:end; }
 /* Square, and the page's one deliberate exception is the round social mark.
    The 999px pill is the default shape of every developer landing page — it is

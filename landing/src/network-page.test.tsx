@@ -1,6 +1,7 @@
+import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { NetworkPage, deriveNetworkMetrics, nodeState, type NetworkSnapshot } from "./NetworkPage";
+import { NetworkPage, deriveDailyJobs, deriveNetworkMetrics, nodeState, type NetworkSnapshot, type NetworkTelemetryHistory } from "./NetworkPage";
 import {
   BORDER_LINES,
   LAND_POINTS,
@@ -59,6 +60,21 @@ const snapshot: NetworkSnapshot = {
   ],
   models: [{ id: "real-model", replicas: 1, pipelines: 0 }],
   jobs: [{ id: "job-1", model: "real-model", status: "completed", workerId: "worker-madrid-1", inputTokens: 12, outputTokens: 25, updatedAt: new Date().toISOString() }],
+};
+
+/** Multi-day history with a counter reset, shared by the chart-wall tests. */
+const wallHistory: NetworkTelemetryHistory = {
+  capturedAt: "2026-08-14T00:20:00Z",
+  intervalMinutes: 10,
+  retentionDays: 90,
+  range: "30d",
+  samples: [
+    { capturedAt: "2026-08-13T00:00:00Z", registeredNodes: 3, connectedNodes: 2, onlineNodes: 2, browserNodes: 0, activeModels: 1, modelReplicas: 1, modelPipelines: 0, offeredVramMb: 57_344, freeVramMb: 24_576, inflightJobs: 1, runningJobs: 1, completedJobs: 100 },
+    { capturedAt: "2026-08-13T00:10:00Z", registeredNodes: 3, connectedNodes: 2, onlineNodes: 2, browserNodes: 0, activeModels: 1, modelReplicas: 1, modelPipelines: 0, offeredVramMb: 57_344, freeVramMb: 24_576, inflightJobs: 0, runningJobs: 0, completedJobs: 104 },
+    { capturedAt: "2026-08-14T00:00:00Z", registeredNodes: 3, connectedNodes: 3, onlineNodes: 3, browserNodes: 0, activeModels: 1, modelReplicas: 1, modelPipelines: 0, offeredVramMb: 57_344, freeVramMb: 20_480, inflightJobs: 2, runningJobs: 2, completedJobs: 111 },
+    // Counter reset: the negative delta must be ignored, not synthesised.
+    { capturedAt: "2026-08-14T00:10:00Z", registeredNodes: 3, connectedNodes: 3, onlineNodes: 3, browserNodes: 0, activeModels: 1, modelReplicas: 1, modelPipelines: 0, offeredVramMb: 57_344, freeVramMb: 20_480, inflightJobs: 1, runningJobs: 1, completedJobs: 50 },
+  ],
 };
 
 /** Rotates a lon/lat pair the way the renderer does, for assertion convenience. */
@@ -184,6 +200,153 @@ describe("network observatory", () => {
     expect(html).not.toContain("1,248");
     expect(html).not.toContain("4,230,781");
     expect(html).not.toContain("tok/s");
+  });
+
+  it("renders persisted evidence beneath the live globe", () => {
+    const history: NetworkTelemetryHistory = {
+      capturedAt: new Date().toISOString(), intervalMinutes: 10, retentionDays: 90, range: "30d",
+      samples: [{ capturedAt: new Date().toISOString(), registeredNodes: 3, connectedNodes: 2, onlineNodes: 2, browserNodes: 0, activeModels: 1, modelReplicas: 1, modelPipelines: 0, offeredVramMb: 57_344, freeVramMb: 24_576, inflightJobs: 1, runningJobs: 1, completedJobs: 7 }],
+    };
+    const html = renderToStaticMarkup(<NetworkPage initialSnapshot={snapshot} initialHistory={history} animate={false} />);
+    expect(html).toContain("A network you can inspect");
+    expect(html).toContain("1 persisted observations");
+    expect(html).toContain("Nodes behind the snapshot");
+    expect(html).toContain("Deliberately absent");
+  });
+
+  it("derives daily jobs from positive deltas of the cumulative counter", () => {
+    expect(deriveDailyJobs(wallHistory.samples)).toEqual([
+      { day: "2026-08-13", count: 4 },
+      { day: "2026-08-14", count: 7 },
+    ]);
+    // No samples means no fabricated baseline buckets.
+    expect(deriveDailyJobs([])).toEqual([]);
+  });
+
+  it("renders the reference-grade chart wall from persisted samples only", () => {
+    const html = renderToStaticMarkup(<NetworkPage initialSnapshot={snapshot} initialHistory={wallHistory} animate={false} />);
+    expect(html).toContain('id="net-wall-network-title"');
+    expect(html).toContain("jobs completed per day");
+    expect(html).toContain("derived from the persisted cumulative counter");
+    expect(html).toContain("capacity offered (GB)");
+    expect(html).toContain("nodes online");
+    expect(html).toContain("workers online");
+    expect(html).toContain("sampled every 10 min");
+    // Striped bars render as stacks of thin rects inside a bronze group.
+    expect(html).toContain('class="net-wall-bars"');
+    const stripedBars = html.match(/<g class="net-wall-bars">([\s\S]*?)<\/g><text class="axis"/)?.[1] ?? "";
+    expect(stripedBars).toContain("<rect");
+    expect((stripedBars.match(/<rect/g) ?? []).length).toBeGreaterThan(2);
+    // The step-area chart fills with a dot-grid pattern, the step line with none.
+    expect(html).toContain("net-wall-dots");
+    expect(html).toMatch(/<path class="net-wall-area bronze"[^>]*fill="url\(#/);
+    expect(html).toMatch(/<path class="net-wall-line ivory"[^>]*><\/path>/);
+    // Axis ticks and date labels come with every frame.
+    expect(html).toContain("08-13");
+    expect(html).toContain("08-14");
+  });
+
+  it("renders the snapshot stat grid from the live snapshot", () => {
+    const html = renderToStaticMarkup(<NetworkPage initialSnapshot={snapshot} initialHistory={wallHistory} animate={false} />);
+    expect(html).toContain('id="net-wall-snapshot-title"');
+    expect(html).toContain("net-wall-stat");
+    expect(html).toContain("registered nodes");
+    expect(html).toContain("completed jobs");
+    expect(html).toContain("GPUs online");
+  });
+
+  it("keeps the $SPORE wall explicitly inactive without any economic number", () => {
+    const html = renderToStaticMarkup(<NetworkPage initialSnapshot={snapshot} initialHistory={wallHistory} animate={false} />);
+    expect(html).toContain('id="net-wall-spore-title"');
+    expect(html).toContain("Not active");
+    expect(html).toContain("Not published");
+    expect(html).toContain("economic feed not published yet");
+  });
+
+  it("lists the 8 most recent snapshot jobs as mono rows", () => {
+    const manyJobs = {
+      ...snapshot,
+      jobs: Array.from({ length: 9 }, (_, index) => ({
+        id: `job-${index}`,
+        model: "real-model",
+        status: "completed",
+        workerId: "worker-madrid-1",
+        inputTokens: index,
+        outputTokens: 0,
+        updatedAt: new Date(Date.now() - (9 - index) * 60_000).toISOString(),
+      })),
+    };
+    const html = renderToStaticMarkup(<NetworkPage initialSnapshot={manyJobs} initialHistory={wallHistory} animate={false} />);
+    expect(html).toContain('id="net-wall-activity-title"');
+    expect(html).toContain("net-wall-activity-table");
+    // job-0 is the oldest of nine and must be cut by the top-8 rule.
+    expect(html).toContain("job-8");
+    expect(html).not.toContain("job-0");
+  });
+
+  it("states honestly when the snapshot carries no jobs", () => {
+    const html = renderToStaticMarkup(<NetworkPage initialSnapshot={{ ...snapshot, jobs: [] }} initialHistory={wallHistory} animate={false} />);
+    expect(html).toContain("No jobs observed in the current snapshot");
+  });
+
+  it("styles the chart wall with dedicated forest-panel rules", () => {
+    const css = readFileSync(new URL("./network-page.css", import.meta.url), "utf8");
+    for (const selector of [".net-wall-grid", ".net-wall-panel", ".net-wall-stats", ".net-wall-stat", ".net-wall-bars", ".net-wall-dots", ".net-wall-tip", ".net-wall-activity-row"]) {
+      expect(css).toContain(selector);
+    }
+    // The evidence base stays deep forest; pure black is a non-goal.
+    expect(css).not.toMatch(/background:\s*#000/);
+  });
+
+  it("keeps the Overview console centered instead of stretching edge-to-edge", () => {
+    const css = readFileSync(new URL("./network-page.css", import.meta.url), "utf8");
+    const dashboardRule = css.match(/\.net-dashboard\s*\{([\s\S]*?)\}/)?.[1] ?? "";
+    expect(dashboardRule).toContain("left: 50%");
+    expect(dashboardRule).toContain("width: min(1200px");
+    expect(dashboardRule).toContain("transform: translateX(-50%)");
+  });
+
+  it("uses three visual rows and keeps the globe to one grid cell", () => {
+    const css = readFileSync(new URL("./network-page.css", import.meta.url), "utf8");
+    const visualsRule = css.match(/\.net-dashboard-visuals\s*\{([\s\S]*?)\}/)?.[1] ?? "";
+    const globeRule = css.match(/\.net-globe-card\s*\{([\s\S]*?)\}/)?.[1] ?? "";
+    expect(visualsRule).toContain("grid-template-columns: repeat(2");
+    expect(visualsRule).toContain("grid-template-rows: repeat(3");
+    expect(globeRule).toContain("grid-row: auto");
+  });
+
+  it("offers one overview and one immersive globe mode without duplicating routes", () => {
+    const overview = renderToStaticMarkup(<NetworkPage initialSnapshot={snapshot} initialViewMode="overview" animate={false} />);
+    const globe = renderToStaticMarkup(<NetworkPage initialSnapshot={snapshot} initialViewMode="globe" animate={false} />);
+    expect(overview).toContain("completed jobs");
+    expect(overview).not.toContain("Waiting for verified data");
+    expect(overview).toContain("Offered capacity");
+    expect(overview).toContain("Node availability");
+    expect(overview).toContain("Model fabric");
+    expect(overview).toContain("Inference load");
+    expect(overview).toContain("Completed work");
+    expect(overview).toContain("LIVE TOPOLOGY");
+    expect(overview).toContain("The network, in signals.");
+    expect(overview).toContain("Not published");
+    expect(overview).toContain("$SPORE");
+    expect(globe).not.toContain("net-hero-overview");
+    expect(globe).toContain("TOKENS IN SNAPSHOT");
+  });
+
+  it("uses the canonical landing header on the public observatory", () => {
+    const html = renderToStaticMarkup(<NetworkPage initialSnapshot={snapshot} animate={false} />);
+    expect(html).toContain("Live network");
+    expect(html).toContain("$ SPORE");
+    expect(html).toContain("mycellios on GitHub");
+    expect(html).toContain("aria-current=\"page\"");
+    expect(html).toContain("class=\"rb-brand\" href=\"/\"");
+  });
+
+  it("does not animate canvas geometry between overview and globe", () => {
+    const css = readFileSync(new URL("./network-page.css", import.meta.url), "utf8");
+    const globeRule = css.match(/\.net-globe\s*\{([^}]*)\}/)?.[1] ?? "";
+    expect(globeRule).toContain("transition: opacity");
+    expect(globeRule).not.toMatch(/transition:[^;]*(?:left|width|height|top)/);
   });
 
   it("renders a truthful empty state", () => {

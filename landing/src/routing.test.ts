@@ -50,6 +50,8 @@ describe("panel information architecture", () => {
     expect(panelLocation("overview", false, true)).toBe("/dashboard");
     expect(panelLocation("inference", false, true)).toBe("/dashboard?view=inference");
     expect(normalizePanelView("settings")).toBeNull();
+    expect(resolveLandingSurface("/network", "?view=globe")).toBe("network");
+    expect(resolveLandingSurface("/network", "?view=overview")).toBe("panel");
   });
 
   it("routes Stripe returns to the account surface", () => {

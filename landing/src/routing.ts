@@ -88,7 +88,8 @@ export function panelLocation(view: PanelView, mobile = false, dashboard = false
 const PANEL_PATHS = new Set(["/network", "/dashboard", "/admin", "/downloads", "/account", "/browser", "/mobile"]);
 
 export function resolveLandingSurface(pathname: string, search: string): LandingSurface {
-  if (pathname === "/network" && !new URLSearchParams(search).has("view")) return "network";
+  const view = new URLSearchParams(search).get("view");
+  if (pathname === "/network" && (view === null || view === "globe")) return "network";
   if (PANEL_PATHS.has(pathname)) return "panel";
   return "landing";
 }

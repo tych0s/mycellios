@@ -3,3 +3,15 @@
 @keyframes sporePulse{to{opacity:.85;transform:translateY(-8px)}}
 @media(max-width:760px){.spore-page{padding:8px 8px 55px}.spore-shell{width:calc(100% - 16px)}.spore-hero,.spore-data-hero{min-height:0;display:block;padding:68px 0 44px}.spore-hero h1,.spore-title h1,.spore-data-hero h1{font-size:48px}.spore-mark{width:230px;margin:42px auto 0}.spore-data-hero .spore-pulse{height:160px;margin-top:28px}.spore-how>div,.spore-split>div,.spore-metrics,.spore-chart-grid,.spore-signal-grid{grid-template-columns:1fr}.spore-gate{padding:30px 20px}.spore-title{padding:70px 0 35px}.spore-metrics article{min-height:115px}.spore-chart-grid>article{min-height:240px}.spore-split article{margin-bottom:10px}}
 @media(prefers-reduced-motion:reduce){.spore-page *{animation:none!important;transition-duration:.01ms!important}.spore-how article:hover{transform:none}}
+
+/* SPORE uses the canonical landing header so navigation, logo and mobile
+   behavior remain identical across every public surface. */
+.spore-page { padding-top: 0; }
+.spore-page .rb-header { position: relative; height: 96px; color: #f4f1ea; }
+.spore-page .rb-header-inner { max-width: calc(1160px + 48px); }
+.spore-page .rb-header nav,
+.spore-page .rb-pill-ghost { font-family: var(--rb-font-body); }
+@media (max-width: 760px) {
+  .spore-page { padding-top: 0; }
+  .spore-page .rb-header { height: 76px; }
+}

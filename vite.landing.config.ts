@@ -129,6 +129,10 @@ export default defineConfig({
       "/v1/auth": identityProxy(),
       "/mobile/v1": productionProxy(true),
       "/local": productionProxy(),
+      // `/blog` is server-rendered by the coordinator. Without this explicit
+      // proxy the Vite SPA fallback returns the landing document for the blog
+      // route, which looks like an empty/broken page in the Dev Runner.
+      "/blog": productionProxy(),
       "/public": productionProxy(),
       "/v1": productionProxy(),
     },
@@ -143,6 +147,7 @@ export default defineConfig({
       "/v1/auth": identityProxy(),
       "/mobile/v1": productionProxy(true),
       "/local": productionProxy(),
+      "/blog": productionProxy(),
       "/public": productionProxy(),
       "/v1": productionProxy(),
     },

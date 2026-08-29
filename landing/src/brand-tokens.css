@@ -17,7 +17,7 @@
   --rb-gutter: clamp(20px, 3.5vw, 48px);
 
   --rb-font-display: "Fraunces", Georgia, serif;
-  --rb-font-ui: "Manrope", system-ui, -apple-system, sans-serif;
+  --rb-font-ui: "Geist", system-ui, -apple-system, sans-serif;
   --rb-font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace;
 }
 
