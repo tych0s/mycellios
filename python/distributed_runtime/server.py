@@ -536,10 +536,7 @@ class DistributedMycelliosServer:
             # balancer in front) that this node is broken and should be taken
             # out; a 429 with Retry-After tells it to slow down and come back,
             # which is what a saturated but healthy pipeline actually wants.
-            # Measured under overload with a flat queue, every admitted request
-            # timed out and goodput fell to ZERO
-            # (docs/benchmarks/gpu_cloud-exp10-salida-larga-2026-07-24): refusing
-            # work we cannot serve is what keeps the served work served.
+            # Refusing work we cannot serve protects the work already admitted.
             return overloaded_response(error)
         except RuntimeError as error:
             return error_response(str(error), "service_unavailable", 503)

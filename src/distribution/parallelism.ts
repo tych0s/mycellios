@@ -37,10 +37,9 @@ export interface ParallelismEstimate {
 }
 
 /**
- * external runtime B/RDMA-vs-TCP evidence (docs/INVESTIGACION_EXTERNA_OPTIMIZACION_2026-07-19.md
- * section 5.2): tensor parallelism scales on links of tens of microseconds and
- * stops scaling around ~300 us per message, so 0.3 ms one-way is the viability
- * ceiling for a TP cell interconnect.
+ * Tensor parallelism requires a very low-latency interconnect. The 0.3 ms
+ * one-way ceiling is deliberately conservative and must be revalidated against
+ * Mycellios physical evidence before it is relaxed.
  */
 export const TP_CELL_MAX_ONE_WAY_LATENCY_MS = 0.3;
 export const TP_CELL_MIN_SUCCESSFUL_LINK_SAMPLES = 3;

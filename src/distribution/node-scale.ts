@@ -99,14 +99,8 @@ export function deriveDecodeScales(
 }
 
 /**
- * ⚠️ Reminder carried from the audit of `external-runtime-c` (25-07-2026):
- * they measured the SAME 13-layer block at 11.5 ms behind an idle desktop CPU
- * and 35-50 ms behind an old or co-tenanted server CPU, while all five of their
- * GPUs benchmarked identically (1523-1527 GB/s). The GPU is not the variable —
- * a block forward is hundreds of small kernel launches and launch cost tracks
- * single-thread CPU speed. Throughput measured on the node captures that
- * automatically; a spec-sheet estimate from GPU model never would. This is the
- * reason `measured` is the only source accepted above.
+ * Decode scale is accepted only from measured node throughput. GPU model names
+ * alone miss host CPU, launch overhead, contention and runtime configuration.
  */
 export const DECODE_SCALE_SOURCE_NOTE =
   "decodeScale is derived only from measured decode throughput; GPU specs alone "

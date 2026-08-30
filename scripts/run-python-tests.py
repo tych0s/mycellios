@@ -4,7 +4,7 @@
 Por qué existe. El workflow reusable de CI detecta el stack del repositorio y
 elige Node, así que el job `Test (Python)` sale **skipped**: los ~850 tests de
 Python —todo el camino caliente del runtime— no se ejecutan nunca en CI. Se
-diagnosticó varias veces y quedó anotado en `docs/REGISTRO_VERIFICACIONES.md`
+diagnosticó varias veces durante el desarrollo del runtime
 §9, pero el diagnóstico no ejecuta tests.
 
 Por qué un trinquete y no "todo verde o rojo". Hay fallos preexistentes reales.

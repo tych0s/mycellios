@@ -33,10 +33,8 @@ export type {
 export const DEFAULT_SEARCH_OPTIONS: SearchOptions = {
   beamWidth: 512,
   candidateCodecs: ["fp16", "int8", "q4"],
-  // Measured on separate GPUs over WAN (docs/benchmarks/gpu_cloud-exp1-maxactive-2026-07-24):
-  // capping admission at 8 halves aggregate throughput under load (52,7 vs 102,6 tok/s)
-  // and collapses under overload (18,8 tok/s, 177 errors); 32 fixes both, and 64 measured
-  // no better. The search still picks by the cost model — this only lets it reach the knee.
+  // Keep the search wide enough to discover the concurrency knee. The cost
+  // model still decides which candidate is usable for the current route.
   candidateMicroBatchSizes: [1, 2, 4, 8, 16, 32],
   candidatePrefillChunks: [16, 32, 64, 128, 256],
   objectiveWeights: {
@@ -285,17 +283,15 @@ const DEFAULT_FLEET_OPTIONS: FleetPlannerOptions = {
 /**
  * Drop nodes whose network position is catastrophically worse than the fleet's.
  *
- * Measured on the real fleet (Exp15, `docs/benchmarks/gpu_cloud-exp15-mapa-latencia-2026-07-25/`):
- * the best node sat at 54 ms and the worst at 437 ms, and a single far node is
- * enough to drag a four-hop chain from ~3.1 tok/s down to ~0.55. Since the cost
- * model sums latency along the route, one outlier taxes every token that crosses
- * it — so the cheapest possible win is simply not routing through it.
+ * Since the cost model sums latency along the route, one network outlier taxes
+ * every token that crosses it. Excluding a catastrophic outlier can therefore
+ * be safer than forcing it into a route.
  *
  * The rule is relative, not absolute: a threshold in milliseconds would be wrong
  * for a LAN cell and wrong again for an intercontinental swarm. A node is evicted
  * when its median link is `multiple` times worse than the fleet median.
  *
- * Two guards, both learned from peer runtime doing this in production:
+ * Two guards prevent over-pruning:
  *  - Never evict below `minimumNodes`. A planner with nothing left to place is
  *    worse than a slow route.
  *  - If the rule wants to drop (nearly) everyone, the outlier is the measurement,

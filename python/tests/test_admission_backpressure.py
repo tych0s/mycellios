@@ -9,7 +9,7 @@ servidor lo traducía —junto con cualquier otro `RuntimeError`— a un 503
   - Un fallo interno de verdad quedaba disfrazado de carga.
 
 Contexto medido: bajo sobrecarga con cola plana, TODA petición admitida expiró y
-el goodput cayó a CERO (`docs/benchmarks/gpu_cloud-exp10-salida-larga-2026-07-24`).
+el goodput puede caer a cero cuando una cola saturada sigue admitiendo trabajo.
 Rechazar lo que no se puede servir es lo que mantiene servido lo que sí.
 """
 import unittest

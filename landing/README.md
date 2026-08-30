@@ -19,19 +19,8 @@ npm run landing:preview
 
 Static output is generated in `landing-dist/`. This is the directory the hosting
 provider should make available to the coordinator. Public routes include
-`robots.txt`, `sitemap.xml`, the brand favicon, and the Docusaurus manual under
-`/docs/`.
-
-The public documentation has an isolated source tree so internal research is
-never published by accident:
-
-```powershell
-npm run docs:dev
-npm run docs:build
-```
-
-`npm run landing:build` also runs the documentation build and writes its output
-to `landing-dist/docs/`.
+`robots.txt`, `sitemap.xml` and the brand favicon. Repository documentation is
+maintained in the root `docs/` directory and is not bundled into the landing.
 
 The coordinator owns the server-rendered `/blog` and `/blog/:slug` routes. Set
 `CONTENT_HUB_API_URL` to the Content Hub API and configure the same

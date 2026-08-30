@@ -1,0 +1,95 @@
+{
+  "schema": "gdlp-auto-distribute/1",
+  "model": {
+    "source": "Qwen/Qwen3-0.6B",
+    "revision": null,
+    "publicName": "two-host-smoke"
+  },
+  "nodes": [
+    {
+      "id": "host-a",
+      "region": "private-lan",
+      "endpoint": { "host": "192.0.2.10", "port": 18101 },
+      "memoryMiB": 8192,
+      "reserveMiB": 1024,
+      "decodeScale": 1,
+      "prefillScale": 1,
+      "codecScale": 1,
+      "powerWatts": 65,
+      "availability": 0.99,
+      "agent": { "kind": "local" }
+    },
+    {
+      "id": "host-b",
+      "region": "private-lan",
+      "endpoint": { "host": "192.0.2.11", "port": 18101 },
+      "memoryMiB": 8192,
+      "reserveMiB": 1024,
+      "decodeScale": 1,
+      "prefillScale": 1,
+      "codecScale": 1,
+      "powerWatts": 65,
+      "availability": 0.99,
+      "agent": {
+        "kind": "http",
+        "endpoint": "http://192.0.2.11:9750",
+        "authTokenEnv": "MYCELLIOS_HOST_B_TOKEN",
+        "requestTimeoutMs": 30000
+      }
+    }
+  ],
+  "links": [
+    {
+      "from": "host-a",
+      "to": "host-b",
+      "oneWayLatencyMs": 1,
+      "jitterP95Ms": 0.5,
+      "bandwidthMbps": 1000,
+      "lossRate": 0,
+      "availability": 0.99
+    },
+    {
+      "from": "host-b",
+      "to": "host-a",
+      "oneWayLatencyMs": 1,
+      "jitterP95Ms": 0.5,
+      "bandwidthMbps": 1000,
+      "lossRate": 0,
+      "availability": 0.99
+    }
+  ],
+  "distribution": {
+    "minimumStages": 2,
+    "maximumStages": 2,
+    "allowLossyActivation": false
+  },
+  "workload": {
+    "promptTokens": 64,
+    "outputTokens": 16,
+    "contextTokens": 2048,
+    "concurrentSequences": 1,
+    "minRouteAvailability": 0.9,
+    "batchWindowMs": 0,
+    "p95": true
+  },
+  "runtime": {
+    "pythonExecutable": "python",
+    "stagePythonExecutable": "python",
+    "pythonPath": "python",
+    "hfHome": "runtime/hf-cache",
+    "apiEndpoint": { "host": "127.0.0.1", "port": 8081 },
+    "apiAdvertiseHost": "192.0.2.10",
+    "returnEndpoint": { "host": "192.0.2.10", "port": 18100 },
+    "returnBindHost": "0.0.0.0",
+    "threadsPerStage": 1,
+    "connectTimeoutSeconds": 300,
+    "readinessTimeoutMs": 600000,
+    "maxOutputTokens": 256
+  },
+  "canary": {
+    "prompt": "Reply with only OK. /no_think",
+    "maxTokens": 16,
+    "timeoutMs": 300000
+  },
+  "artifactsDirectory": "runtime/auto-distribute/two-host-smoke"
+}

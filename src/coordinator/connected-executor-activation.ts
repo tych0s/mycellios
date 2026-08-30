@@ -62,10 +62,8 @@ function measuredDecodeThroughput(worker: StoredWorker, modelName: string): numb
  * number that made every placement look free and hid the single largest term
  * in the cost model.
  *
- * The measured fleet median is 65 ms per hop (Exp15, `docs/benchmarks/
- * gpu_cloud-exp15-mapa-latencia-2026-07-25/`), with a worst observed node at
- * 437 ms. Assuming the median when blind is not accurate, but it is the right
- * kind of wrong: an unmeasured link no longer outranks a measured good one.
+ * The conservative 65 ms default prevents an unknown link from outranking a
+ * measured good one. It is a planning guard, not a performance claim.
  */
 const UNMEASURED_LINK_LATENCY_MS = 65;
 /** Floor for a genuinely measured link, so a 0 never divides downstream. */
@@ -74,9 +72,7 @@ const MIN_LINK_LATENCY_MS = 0.1;
 /**
  * One-way latency between two executors, estimated from each one's round trip
  * to the coordinator: one way a→coordinator is `rttA/2`, coordinator→b is
- * `rttB/2`, so a→b via the coordinator is `(rttA + rttB) / 2`. Exp16 measured
- * that a direct node→node hop costs 0.96-1.24x a node→relay hop, so this also
- * approximates the direct path.
+ * `rttB/2`, so a→b via the coordinator is `(rttA + rttB) / 2`.
  */
 export function estimateLinkLatencyMs(fromRttMs: number, toRttMs: number): number {
   const measured = [fromRttMs, toRttMs].filter((rtt) => Number.isFinite(rtt) && rtt > 0);
