@@ -9,7 +9,7 @@ export const PORTABLE_PYTHON_PROVENANCE_FILE = "python-artifact.json";
 
 export const DISTRIBUTION_PACKAGE_VERSIONS = Object.freeze({
   numpy: "1.26.4",
-  aiohttp: "3.14.1",
+  aiohttp: "3.14.3",
   accelerate: "1.14.0",
   transformers: "5.14.1",
   safetensors: "0.8.0",
@@ -50,15 +50,15 @@ const MACOS_ARM64_PYTHON = pythonArtifact(
 
 const WINDOWS_X64_WHEEL_LOCK = wheelLock(
   "win32-x64-cp312.txt",
-  "2a5de3d3f2e3ba4ebac91e1efe068159e81263d3ccd6a3d93333078e753c6c65",
+  "de504739e05a89229e437ec5d09a45dc00f2080db042d11519204926e1a90040",
 );
 const LINUX_X64_WHEEL_LOCK = wheelLock(
   "linux-x64-cp312.txt",
-  "090355535c96e7202ae761a18dadc5d66c9e98493a148eba16ae3c3e7c95c59d",
+  "f3d9a819ebcc82c33da8ccad858eecf2d9ac4c35d5e8ad4b1da6702bfeb9748a",
 );
 const MACOS_ARM64_WHEEL_LOCK = wheelLock(
   "darwin-arm64-cp312.txt",
-  "75c84302540edc1b7f6c1620c3474b7ccbf431dd6df881717f74ebf419c56348",
+  "1adf58ca36108ca3c7e26c303a8c6c802bf25825e87e7d1d9f6ab2d86de3371a",
 );
 
 /**

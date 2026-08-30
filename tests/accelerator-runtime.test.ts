@@ -357,7 +357,7 @@ describe("desktop accelerator runtime", () => {
         transformersVersion: "5.14.1",
         accelerateVersion: "1.14.0",
         safetensorsVersion: "0.8.0",
-        aiohttpVersion: "3.14.1",
+        aiohttpVersion: "3.14.3",
         sentencepieceVersion: "0.2.2",
         numpyVersion: "1.26.4",
       })}\n`,
@@ -1004,7 +1004,7 @@ function createBaseRuntime(root: string): string {
     transformersVersion: "5.14.1",
     accelerateVersion: "1.14.0",
     safetensorsVersion: "0.8.0",
-    aiohttpVersion: "3.14.1",
+    aiohttpVersion: "3.14.3",
     sentencepieceVersion: "0.2.2",
     numpyVersion: "1.26.4",
     backend: "cpu",
@@ -1031,7 +1031,7 @@ function createMpsBaseRuntime(root: string): string {
     transformersVersion: "5.14.1",
     accelerateVersion: "1.14.0",
     safetensorsVersion: "0.8.0",
-    aiohttpVersion: "3.14.1",
+    aiohttpVersion: "3.14.3",
     sentencepieceVersion: "0.2.2",
     numpyVersion: "1.26.4",
     backend: "cpu",
@@ -1058,7 +1058,7 @@ function createMacIntelBaseRuntime(root: string): string {
     transformersVersion: "4.57.3",
     accelerateVersion: "1.14.0",
     safetensorsVersion: "0.8.0",
-    aiohttpVersion: "3.14.1",
+    aiohttpVersion: "3.14.3",
     sentencepieceVersion: "0.2.2",
     numpyVersion: "1.26.4",
     backend: "cpu",
@@ -1101,13 +1101,13 @@ function portableWheelLock(platform: "win32/x64" | "darwin/arm64" | "darwin/x64"
   if (platform === "win32/x64") {
     return {
       path: "scripts/wheel-locks/win32-x64-cp312.txt",
-      sha256: "2a5de3d3f2e3ba4ebac91e1efe068159e81263d3ccd6a3d93333078e753c6c65",
+      sha256: "de504739e05a89229e437ec5d09a45dc00f2080db042d11519204926e1a90040",
     };
   }
   if (platform === "darwin/arm64") {
     return {
       path: "scripts/wheel-locks/darwin-arm64-cp312.txt",
-      sha256: "75c84302540edc1b7f6c1620c3474b7ccbf431dd6df881717f74ebf419c56348",
+      sha256: "1adf58ca36108ca3c7e26c303a8c6c802bf25825e87e7d1d9f6ab2d86de3371a",
     };
   }
   return {
