@@ -4999,8 +4999,7 @@ export function formatActivationTime(value: string): string {
 }
 
 function newInferenceSessionId(): string {
-  const id = globalThis.crypto?.randomUUID?.();
-  return id ? `chat-${id}` : `chat-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return `chat-${globalThis.crypto.randomUUID()}`;
 }
 
 export function ProductStateBanner({ presentation, subject }: {

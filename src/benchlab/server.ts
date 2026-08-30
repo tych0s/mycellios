@@ -53,8 +53,8 @@ export async function startBenchmarkServer(options: BenchmarkServerOptions): Pro
         return;
       }
       serveFile(response, join(dashboardDirectory, fileName));
-    } catch (error) {
-      sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) });
+    } catch {
+      sendJson(response, 500, { error: "Benchmark request failed." });
     }
   });
 

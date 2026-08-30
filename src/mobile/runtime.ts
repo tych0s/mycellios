@@ -646,8 +646,9 @@ async function loadExpert(offer: {
   const signal = state.executionController.signal;
   try {
     setStatus("Downloading and verifying a real model expert…");
+    const manifestUrl = trustedExpertManifestUrl(offer.artifactId, offer.manifestUrl);
     const manifestResponse = await abortable(fetch(
-      new URL(offer.manifestUrl, window.location.origin),
+      manifestUrl,
       { signal },
     ), signal);
     if (!manifestResponse.ok) throw new Error(`expert manifest HTTP ${manifestResponse.status}`);
@@ -710,6 +711,24 @@ async function loadExpert(offer: {
     });
     addLog(`Expert load failed: ${errorText(error)}`);
   }
+}
+
+export function trustedExpertManifestUrl(
+  artifactId: string,
+  candidate: string,
+  origin = window.location.origin,
+): URL {
+  const expectedPath = `/mobile/v1/experts/${artifactId}/manifest`;
+  const url = new URL(candidate, origin);
+  if (
+    url.origin !== origin
+    || url.pathname !== expectedPath
+    || url.search !== ""
+    || url.hash !== ""
+  ) {
+    throw new Error("untrusted expert manifest URL");
+  }
+  return url;
 }
 
 async function executeExpert(offer: {

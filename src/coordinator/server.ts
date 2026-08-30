@@ -1,5 +1,6 @@
 import websocket from "@fastify/websocket";
 import staticFiles from "@fastify/static";
+import rateLimit from "@fastify/rate-limit";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { createHash, createPublicKey, generateKeyPairSync, randomUUID, timingSafeEqual } from "node:crypto";
 import {
@@ -368,6 +369,7 @@ export async function createCoordinator(
     modelCapacityInspector?: typeof inspectHubModelCapacity;
     engineRuntimeProfileReconciliation?: boolean;
     studioInference?: StudioInference;
+    globalRateLimitMax?: number;
   } = {},
 ): Promise<CoordinatorRuntime> {
   assertCoordinatorNetworkSecurity(config);
@@ -387,6 +389,12 @@ export async function createCoordinator(
   const runtimeVersion = runtimeMetadata.version;
   const runtimeRevision = runtimeMetadata.revision;
   const app = Fastify({ logger: options.logger ?? false, bodyLimit: 2 * 1024 * 1024 });
+  await app.register(rateLimit, {
+    global: true,
+    max: options.globalRateLimitMax ?? 600,
+    timeWindow: "1 minute",
+    hook: "onRequest",
+  });
   const apiAccessEnabled = config.apiAccessEnabled ?? false;
   const isAccountNodeRoute = (path: string): boolean =>
     path === "/v1/nodes"

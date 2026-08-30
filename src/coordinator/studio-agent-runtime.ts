@@ -50,7 +50,7 @@ export class StudioAgentRuntime {
       .filter((match) => revision.configuration.knowledgeSourceIds.includes(match.sourceId));
     const memory = revision.configuration.memoryMode === "session" ? [] : this.context.listFacts(deployment.ownerId, deployment.agentId, input.subjectId, true).slice(0, 20);
     const calculatorExpression = revision.configuration.tools.includes("calculator")
-      ? /^(?:\/calculate|calculate:)\s+(.+)$/i.exec(input.message.trim())?.[1]
+      ? parseCalculatorExpression(input.message)
       : undefined;
     const calculator = calculatorExpression
       ? this.context.executeTool({
@@ -130,6 +130,17 @@ export class StudioAgentRuntime {
     const id = sha(`${deploymentId}\0${updateId}`);
     this.database.enqueueRemoteChange("studio_telegram_updates", id, "upsert", { id, deployment_id: deploymentId, update_id: updateId, chat_id: row.chat_id, request: JSON.parse(String(row.request_json)), state: row.state, response: row.response_json === null ? null : JSON.parse(String(row.response_json)), created_at: new Date(Number(row.created_at)).toISOString(), updated_at: new Date(Number(row.updated_at)).toISOString() });
   }
+}
+
+function parseCalculatorExpression(message: string): string | undefined {
+  const trimmed = message.trim();
+  const lower = trimmed.toLowerCase();
+  for (const prefix of ["/calculate", "calculate:"] as const) {
+    if (!lower.startsWith(prefix)) continue;
+    const expression = trimmed.slice(prefix.length).trim();
+    return expression || undefined;
+  }
+  return undefined;
 }
 
 function sha(value: string): string { return createHash("sha256").update(value).digest("hex"); }

@@ -48,15 +48,13 @@ function assistantSessionId(): string {
   const key = "mycellios.support-session";
   const saved = window.sessionStorage.getItem(key);
   if (saved) return saved;
-  const created = typeof crypto !== "undefined" && "randomUUID" in crypto
-    ? crypto.randomUUID()
-    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const created = crypto.randomUUID();
   window.sessionStorage.setItem(key, created);
   return created;
 }
 
 function messageId(prefix: string): string {
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  return `${prefix}-${crypto.randomUUID()}`;
 }
 
 function normalizeIntent(value: string): string {

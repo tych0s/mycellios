@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
 import type { ChatCompletionRequest } from "../src/contracts/types.js";
 import {
   API_KEY_PREFIX,
@@ -38,9 +39,9 @@ describe("API access accounting", () => {
       expect.objectContaining({ id: created.id, name: "Production" }),
     ]);
     expect(JSON.stringify(access.listKeys("user-1"))).not.toContain(created.secret);
-    expect(
-      database.raw.prepare("SELECT secret_hash FROM api_keys WHERE id = ?").get(created.id),
-    ).not.toEqual(expect.objectContaining({ secret_hash: created.secret }));
+    const stored = database.raw.prepare("SELECT secret_hash FROM api_keys WHERE id = ?")
+      .get(created.id) as { secret_hash: string };
+    expect(stored.secret_hash).toMatch(/^scrypt\$[a-f0-9]{32}\$[a-f0-9]{64}$/);
     expect(access.authenticateKey(created.secret)).toEqual({
       kind: "api_key",
       userId: "user-1",
@@ -49,6 +50,19 @@ describe("API access accounting", () => {
     expect(access.revokeKey("user-1", created.id)).toBe(true);
     expect(access.authenticateKey(created.secret)).toBeNull();
     expect(created.secret.startsWith(API_KEY_PREFIX)).toBe(true);
+  });
+
+  it("upgrades a valid legacy API-key hash after authentication", () => {
+    const created = access.createKey("user-1", "Legacy");
+    const legacyHash = createHash("sha256").update(created.secret, "utf8").digest("hex");
+    database.raw.prepare("UPDATE api_keys SET secret_hash = ? WHERE id = ?")
+      .run(legacyHash, created.id);
+
+    expect(access.authenticateKey(created.secret)).toMatchObject({ apiKeyId: created.id });
+    const migrated = database.raw.prepare("SELECT secret_hash FROM api_keys WHERE id = ?")
+      .get(created.id) as { secret_hash: string };
+    expect(migrated.secret_hash).toMatch(/^scrypt\$/);
+    expect(migrated.secret_hash).not.toBe(legacyHash);
   });
 
   it("reserves the maximum cost before dispatch and reconciles the real token count", () => {

@@ -1,4 +1,4 @@
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import type { ChatCompletionRequest } from "../contracts/types.js";
 import { newId } from "../core/ids.js";
 import { estimateInputTokens } from "../core/request.js";
@@ -207,7 +207,11 @@ export class ApiAccessManager {
        WHERE prefix = ? AND revoked_at IS NULL
        LIMIT 1`,
     ).get(match[1]!) as ApiKeyRow | undefined;
-    if (!row || !constantTimeHashEqual(row.secret_hash, hashApiKey(token))) return null;
+    if (!row || !verifyApiKeyHash(token, row.secret_hash)) return null;
+    if (!row.secret_hash.startsWith("scrypt$")) {
+      this.database.raw.prepare("UPDATE api_keys SET secret_hash = ? WHERE id = ? AND secret_hash = ?")
+        .run(hashApiKey(token), row.id, row.secret_hash);
+    }
     this.getOrCreateAccount(row.user_id);
     return { kind: "api_key", userId: row.user_id, apiKeyId: row.id };
   }
@@ -449,7 +453,21 @@ export function apiUsageJson(usage: ApiUsageRecord): Record<string, unknown> {
 }
 
 function hashApiKey(token: string): string {
-  return createHash("sha256").update(token, "utf8").digest("hex");
+  const salt = randomBytes(16);
+  const digest = scryptSync(token, salt, 32);
+  return `scrypt$${salt.toString("hex")}$${digest.toString("hex")}`;
+}
+
+function verifyApiKeyHash(token: string, stored: string): boolean {
+  const encoded = /^scrypt\$([a-f0-9]{32})\$([a-f0-9]{64})$/.exec(stored);
+  if (encoded) {
+    const actual = scryptSync(token, Buffer.from(encoded[1]!, "hex"), 32);
+    return timingSafeEqual(Buffer.from(encoded[2]!, "hex"), actual);
+  }
+  return constantTimeHashEqual(
+    stored,
+    createHash("sha256").update(token, "utf8").digest("hex"),
+  );
 }
 
 function constantTimeHashEqual(left: string, right: string): boolean {

@@ -459,6 +459,23 @@ describe("public coordinator security boundaries", () => {
     expect(response.headers["x-content-type-options"]).toBe("nosniff");
   });
 
+  it("rate limits every HTTP route at the coordinator boundary", async () => {
+    const runtime = await createCoordinator({
+      host: "127.0.0.1",
+      port: 0,
+      databasePath: ":memory:",
+      requestTimeoutMs: 1_000,
+    }, { logger: false, globalRateLimitMax: 2 });
+    runtimes.push(runtime);
+
+    expect((await runtime.app.inject({ method: "GET", url: "/health" })).statusCode).toBe(200);
+    expect((await runtime.app.inject({ method: "GET", url: "/health" })).statusCode).toBe(200);
+    const limited = await runtime.app.inject({ method: "GET", url: "/health" });
+    expect(limited.statusCode).toBe(429);
+    expect(limited.json()).toMatchObject({ statusCode: 429, error: "Too Many Requests" });
+    expect(Number(limited.headers["retry-after"])).toBeGreaterThan(0);
+  });
+
   it("publishes one exact coordinator build identity on health and public snapshot", async () => {
     const buildIdentity = {
       schema: "mycellios-native-build-provenance/1" as const,

@@ -524,12 +524,16 @@ function decodeXmlText(value: string): string {
   if (/&(?!(?:amp|lt|gt|quot|apos);)/i.test(value)) {
     throw new Error("upnp_xml_entity_is_invalid");
   }
-  return value
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&quot;/gi, "\"")
-    .replace(/&apos;/gi, "'");
+  const entities: Record<string, string> = {
+    amp: "&",
+    lt: "<",
+    gt: ">",
+    quot: "\"",
+    apos: "'",
+  };
+  return value.replace(/&(amp|lt|gt|quot|apos);/gi, (_entity, name: string) => (
+    entities[name.toLowerCase()]!
+  ));
 }
 
 function soapFields(fields: Record<string, string>): string {
