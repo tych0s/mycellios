@@ -29,6 +29,7 @@ physical runtime.
 
 ```bash
 npm ci
+npm run verify:structure
 npm run typecheck
 npm run landing:typecheck
 npm run mobile:typecheck
@@ -69,5 +70,4 @@ depend on equipment that GitHub-hosted runners cannot reproduce.
 - Use conventional, imperative commit messages where practical.
 
 By contributing, you agree that your contribution is licensed under the
-repository's `GPL-3.0-only` license. The project name and logo remain subject to
-the trademark notice in the README.
+repository's `GPL-3.0-only` license.
