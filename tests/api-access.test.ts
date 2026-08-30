@@ -1,5 +1,4 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { createHash } from "node:crypto";
 import type { ChatCompletionRequest } from "../src/contracts/types.js";
 import {
   API_KEY_PREFIX,
@@ -53,14 +52,17 @@ describe("API access accounting", () => {
   });
 
   it("upgrades a valid legacy API-key hash after authentication", () => {
-    const created = access.createKey("user-1", "Legacy");
-    const legacyHash = createHash("sha256").update(created.secret, "utf8").digest("hex");
-    database.raw.prepare("UPDATE api_keys SET secret_hash = ? WHERE id = ?")
-      .run(legacyHash, created.id);
+    const token = "myc_live_ABCDEFGHIJ_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const legacyHash = "d3b25274d98f95b96e11a283738dd14f6c7e16de4debbfac4c0dfc432e706272";
+    const now = Date.now();
+    access.getOrCreateAccount("user-1");
+    database.raw.prepare(
+      "INSERT INTO api_keys(id, user_id, name, prefix, secret_hash, created_at, last_used_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)",
+    ).run("key-legacy", "user-1", "Legacy", "ABCDEFGHIJ", legacyHash, now);
 
-    expect(access.authenticateKey(created.secret)).toMatchObject({ apiKeyId: created.id });
+    expect(access.authenticateKey(token)).toMatchObject({ apiKeyId: "key-legacy" });
     const migrated = database.raw.prepare("SELECT secret_hash FROM api_keys WHERE id = ?")
-      .get(created.id) as { secret_hash: string };
+      .get("key-legacy") as { secret_hash: string };
     expect(migrated.secret_hash).toMatch(/^scrypt\$/);
     expect(migrated.secret_hash).not.toBe(legacyHash);
   });
