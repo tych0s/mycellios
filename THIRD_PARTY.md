@@ -1,5 +1,8 @@
 # Third-party software
 
+Unless a file states otherwise, Mycellios source code is licensed under the
+GNU General Public License, version 3 only (`GPL-3.0-only`).
+
 Mycellios uses open-source libraries for model loading, tensor execution,
 transport and its user interfaces. These dependencies do not replace the
 Mycellios planner, scheduler or distributed runtime.
