@@ -641,7 +641,7 @@ describe("GDLP/2 runtime manifest", () => {
         expect(stage.members).toHaveLength(1);
         const member = stage.members[0]!;
         expect(stage.anchor).toEqual({ memberId: member.nodeId, endpoint: member.endpoint });
-        expect(member.backend.engine).toMatch(/llama\.cpp|mlx/);
+        expect(member.backend.engine).toMatch(/external GGUF runtime|mlx/);
         expect(member.backend.modelFormats).toEqual(["gguf"]);
         expect(member.capabilities.activationCodecs).toContain(phase.activationCodec);
         expect(member.assignedMemoryBytes).toBe(stage.memoryBytes);

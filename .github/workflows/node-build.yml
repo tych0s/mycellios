@@ -1,0 +1,139 @@
+name: Native node build
+
+on:
+  pull_request:
+    paths:
+      - "src/node/**"
+      - "src/worker/**"
+      - "src/contracts/**"
+      - "scripts/**"
+      - "package*.json"
+      - ".github/workflows/node-build.yml"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  node:
+    name: mycellios-node · ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: windows-x64
+          - os: ubuntu-latest
+            target: linux-x64
+          - os: macos-14
+            target: macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm run node:runtime:check
+      - name: Install pinned WiX toolset
+        if: matrix.target == 'windows-x64'
+        shell: powershell
+        # Hosted images can carry a newer 3.14.1 package revision. Force the
+        # audited version instead of failing before the MSI build starts.
+        run: choco install wixtoolset --version=3.14.1 --allow-downgrade --no-progress -y
+      - run: npx vitest run tests/node-*.test.ts tests/headless-worker.test.ts tests/worker-hardening.test.ts
+      - name: Compile production node payload
+        run: npm run clean --silent && npx tsc -p tsconfig.build.json
+      - name: Build certified portable Python runtime
+        run: npm run node:runtime
+      - name: Stage native node payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/stage-node-installer.mjs \
+            --dist=dist \
+            --runtime=build/distribution-runtime \
+            --node-executable="$(node -p 'process.execPath')" \
+            --node-modules=node_modules \
+            --source-root=. \
+            --target="${{ matrix.target }}" \
+            --source-revision="$GITHUB_SHA" \
+            --output="build/node-package/${{ matrix.target }}"
+          node scripts/verify-node-installer.mjs --root="build/node-package/${{ matrix.target }}"
+      - name: Build and verify native Debian installer
+        if: matrix.target == 'linux-x64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p 'require("./package.json").version')"
+          node scripts/build-node-deb.mjs \
+            --staged-root="build/node-package/${{ matrix.target }}" \
+            --output="build/mycellios-node-${version}-linux-x64.deb" \
+            --version="$version" \
+            --source-revision="$GITHUB_SHA" \
+            --source-date-epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          node scripts/verify-node-deb.mjs \
+            --deb="build/mycellios-node-${version}-linux-x64.deb" \
+            --staged-root="build/node-package/${{ matrix.target }}" \
+            --version="$version"
+          artifact="build/mycellios-node-${version}-linux-x64.deb"
+          evidence="build/evidence/${{ matrix.target }}"
+          epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          node scripts/node-release-evidence.mjs --artifact="$artifact" --staged-root="build/node-package/${{ matrix.target }}" --output-directory="$evidence" --source-date-epoch="$epoch" --builder-os="${{ runner.os }}" --builder-arch="${{ runner.arch }}" --workflow="$GITHUB_WORKFLOW" --run-id="$GITHUB_RUN_ID" --run-attempt="$GITHUB_RUN_ATTEMPT"
+          node scripts/verify-node-release-evidence.mjs --artifact="$artifact" --staged-root="build/node-package/${{ matrix.target }}" --evidence="$evidence/$(basename "$artifact").provenance.json" --sbom="$evidence/$(basename "$artifact").cdx.json" --checksum="$evidence/$(basename "$artifact").sha256"
+      - name: Build and verify native macOS installer
+        if: matrix.target == 'macos-arm64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p 'require("./package.json").version')"
+          pkg="build/mycellios-node-${version}-macos-arm64.pkg"
+          node scripts/build-node-pkg.mjs \
+            --staged-root="build/node-package/${{ matrix.target }}" \
+            --output="$pkg" \
+            --version="$version" \
+            --source-date-epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          node scripts/verify-node-pkg.mjs \
+            --pkg="$pkg" \
+            --staged-root="build/node-package/${{ matrix.target }}" \
+            --version="$version"
+          evidence="build/evidence/${{ matrix.target }}"
+          epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          node scripts/node-release-evidence.mjs --artifact="$pkg" --staged-root="build/node-package/${{ matrix.target }}" --output-directory="$evidence" --source-date-epoch="$epoch" --builder-os="${{ runner.os }}" --builder-arch="${{ runner.arch }}" --workflow="$GITHUB_WORKFLOW" --run-id="$GITHUB_RUN_ID" --run-attempt="$GITHUB_RUN_ATTEMPT"
+          node scripts/verify-node-release-evidence.mjs --artifact="$pkg" --staged-root="build/node-package/${{ matrix.target }}" --evidence="$evidence/$(basename "$pkg").provenance.json" --sbom="$evidence/$(basename "$pkg").cdx.json" --checksum="$evidence/$(basename "$pkg").sha256"
+      - name: Build and verify native Windows installer
+        if: matrix.target == 'windows-x64'
+        shell: powershell
+        run: |
+          $version = node -p "require('./package.json').version"
+          $msi = "build/mycellios-node-$version-windows-x64.msi"
+          node scripts/build-node-msi.mjs `
+            --staged-root="build/node-package/${{ matrix.target }}" `
+            --output="$msi" `
+            --version="$version" `
+            --source-revision="$env:GITHUB_SHA"
+          node scripts/verify-node-msi.mjs `
+            --msi="$msi" `
+            --staged-root="build/node-package/${{ matrix.target }}" `
+            --version="$version" `
+            --source-revision="$env:GITHUB_SHA"
+          $evidence = "build/evidence/${{ matrix.target }}"
+          $epoch = git show -s --format=%ct "$env:GITHUB_SHA"
+          node scripts/node-release-evidence.mjs --artifact="$msi" --staged-root="build/node-package/${{ matrix.target }}" --output-directory="$evidence" --source-date-epoch="$epoch" --builder-os="${{ runner.os }}" --builder-arch="${{ runner.arch }}" --workflow="$env:GITHUB_WORKFLOW" --run-id="$env:GITHUB_RUN_ID" --run-attempt="$env:GITHUB_RUN_ATTEMPT"
+          $name = Split-Path $msi -Leaf
+          node scripts/verify-node-release-evidence.mjs --artifact="$msi" --staged-root="build/node-package/${{ matrix.target }}" --evidence="$evidence/$name.provenance.json" --sbom="$evidence/$name.cdx.json" --checksum="$evidence/$name.sha256"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mycellios-node-${{ matrix.target }}
+          path: |
+            build/node-package/${{ matrix.target }}
+            build/*.deb
+            build/*.pkg
+            build/*.msi
+            build/evidence/${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 14

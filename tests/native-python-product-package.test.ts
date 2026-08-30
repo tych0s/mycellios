@@ -118,9 +118,9 @@ assigned_builtin("distributed_runtime.dynamic_nine")
       "distributed_runtime.dynamic_three",
       "distributed_runtime.dynamic_two",
       "distributed_runtime.external_gguf_runtime",
+      "distributed_runtime.gpu_cloud_probe",
       "distributed_runtime.native_stage",
       "distributed_runtime.resident_expert_mesh_cli",
-      "distributed_runtime.gpu_cloud_probe",
     ]);
   });
 
