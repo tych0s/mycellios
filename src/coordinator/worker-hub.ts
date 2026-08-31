@@ -38,6 +38,7 @@ import {
   engineRuntimeChallengeSchema,
   type DeploymentCanaryChallenge,
   type EngineRuntimeChallenge,
+  type EngineRuntimeChallengeRequest,
   type RuntimePerformanceChallenge,
 } from "../contracts/evidence-challenge.js";
 import {
@@ -71,6 +72,7 @@ import {
 } from "./engine-runtime-profile-scheduler.js";
 import type { EngineRuntimeActivationPlan } from "../contracts/engine-runtime-activation.js";
 import type { ActivationCheckpointCompatibility } from "../contracts/activation-checkpoint.js";
+export type { EngineRuntimeChallengeRequest } from "../contracts/evidence-challenge.js";
 import { ActivationCheckpointTransferAuthority } from "./activation-checkpoint-transfer.js";
 import {
   activationCheckpointChunks,
@@ -150,12 +152,6 @@ type PendingEvidenceChallenge =
   | PendingDeploymentCanary
   | PendingRuntimePerformance
   | PendingEngineRuntime;
-
-export type EngineRuntimeChallengeRequest = Omit<
-  EngineRuntimeChallenge,
-  "schema" | "kind" | "challengeId" | "nonce" | "sessionId" | "workerId"
-  | "issuedAt" | "expiresAt" | "nodeId"
->;
 
 interface RuntimeStreamSession {
   streamId: string;

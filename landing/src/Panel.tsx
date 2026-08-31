@@ -87,6 +87,17 @@ import type { BenchmarkMeasurement, BenchmarkRun } from "../../src/benchlab/type
 import { Contribute } from "./Contribute";
 import { SupportAssistant } from "./SupportAssistant";
 import { TABLE_PAGE_SIZE, TablePagination } from "./TablePagination";
+import {
+  formatFileSize,
+  inferenceMessageWithAttachments,
+  INFERENCE_FILE_ACCEPT,
+  MAX_INFERENCE_FILES,
+  MAX_INFERENCE_TOTAL_CHARS,
+  readInferenceAttachment,
+  type InferenceAttachment,
+  type InferenceAttachmentSummary,
+} from "./inference-attachments";
+import { firstFocusable, trapDialogTab, formatCompactNumber, formatCompactTokens, formatPower, shortId, shortFingerprint, formatMemory, relativeTime, relativeTimeEs } from "./panel-ui-utilities";
 const brandIcon = "/assets/logos/logo.png";
 
 function GoogleProviderIcon() {
@@ -4416,28 +4427,6 @@ interface InferencePendingTurn extends ChatStreamUpdate {
   attachments: InferenceAttachmentSummary[];
 }
 
-interface InferenceAttachmentSummary {
-  id: string;
-  name: string;
-  size: number;
-  kind: "pdf" | "docx" | "text";
-  truncated: boolean;
-}
-
-interface InferenceAttachment extends InferenceAttachmentSummary {
-  text: string;
-}
-
-const MAX_INFERENCE_FILES = 5;
-const MAX_INFERENCE_FILE_BYTES = 10 * 1024 * 1024;
-const MAX_INFERENCE_FILE_CHARS = 18_000;
-const MAX_INFERENCE_TOTAL_CHARS = 36_000;
-const INFERENCE_FILE_ACCEPT = [
-  ".pdf", ".docx", ".txt", ".md", ".csv", ".json", ".xml", ".yaml", ".yml", ".toml",
-  ".html", ".css", ".js", ".jsx", ".ts", ".tsx", ".py", ".java", ".c", ".cpp", ".h",
-  ".sql", ".log", ".ini", ".env",
-].join(",");
-
 function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthenticated, onSignIn, apiAccessEnabled, apiBaseUrl, accessToken, getValidSession, apiAccount }: {
   snapshot: PublicSnapshot;
   onSend: (model: string, messages: ChatMessage[], sessionId: string, onUpdate?: (update: ChatStreamUpdate) => void) => Promise<ChatResponse>;
@@ -4716,69 +4705,6 @@ function InferenceModelPicker({ options, value, onChange }: { options: Inference
       </button>)}
     </div>}
   </div>;
-}
-
-export async function readInferenceAttachment(file: File, remainingChars: number): Promise<InferenceAttachment> {
-  if (file.size === 0) throw new Error(`${file.name} is empty.`);
-  if (file.size > MAX_INFERENCE_FILE_BYTES) throw new Error(`${file.name} exceeds the ${formatFileSize(MAX_INFERENCE_FILE_BYTES)} limit.`);
-  const extension = file.name.split(".").at(-1)?.toLowerCase() ?? "";
-  let text = "";
-  let kind: InferenceAttachment["kind"] = "text";
-  if (extension === "pdf" || file.type === "application/pdf") {
-    kind = "pdf";
-    const pdfjs = await import("pdfjs-dist");
-    pdfjs.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).toString();
-    const document = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
-    const pages: string[] = [];
-    for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
-      const page = await document.getPage(pageNumber);
-      const content = await page.getTextContent();
-      pages.push(`[Page ${pageNumber}]\n${content.items.map((item) => "str" in item ? item.str : "").join(" ")}`);
-      if (pages.join("\n\n").length >= Math.min(MAX_INFERENCE_FILE_CHARS, remainingChars)) break;
-    }
-    text = pages.join("\n\n");
-  } else if (extension === "docx" || file.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
-    kind = "docx";
-    const mammoth = await import("mammoth");
-    const result = await mammoth.extractRawText({ arrayBuffer: await file.arrayBuffer() });
-    text = result.value;
-  } else if (file.type.startsWith("text/") || inferenceTextExtension(extension)) {
-    text = await file.text();
-  } else {
-    throw new Error(`${file.name} is not supported. Use PDF, DOCX, text, Markdown, CSV, JSON or source files.`);
-  }
-  const normalized = text.replace(/\u0000/g, "").replace(/\r\n/g, "\n").trim();
-  if (!normalized) throw new Error(`Could not extract text from ${file.name}. Scanned PDFs need OCR before attaching.`);
-  const limit = Math.max(1, Math.min(MAX_INFERENCE_FILE_CHARS, remainingChars));
-  const truncated = normalized.length > limit;
-  return {
-    id: crypto.randomUUID(),
-    name: file.name.replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 180) || "documento",
-    size: file.size,
-    kind,
-    truncated,
-    text: normalized.slice(0, limit),
-  };
-}
-
-function inferenceTextExtension(extension: string): boolean {
-  return new Set(["txt", "md", "csv", "json", "xml", "yaml", "yml", "toml", "html", "css", "js", "jsx", "ts", "tsx", "py", "java", "c", "cpp", "h", "sql", "log", "ini", "env"]).has(extension);
-}
-
-export function inferenceMessageWithAttachments(prompt: string, attachments: InferenceAttachment[]): string {
-  if (attachments.length === 0) return prompt;
-  const documents = attachments.map((attachment, index) => [
-    `--- ARCHIVO ${index + 1}: ${attachment.name} (${formatFileSize(attachment.size)})${attachment.truncated ? " · CONTENIDO RECORTADO" : ""} ---`,
-    attachment.text,
-    `--- FIN DE ${attachment.name} ---`,
-  ].join("\n")).join("\n\n");
-  return `${prompt}\n\nEl usuario ha adjuntado los siguientes documentos como material de referencia. Analiza su contenido y distingue claramente lo que procede de los archivos.\n\n${documents}`;
-}
-
-function formatFileSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function Downloads({ publicLink, external }: { publicLink: (path: string) => string; external: boolean }) {
@@ -5130,30 +5056,6 @@ function Stat({ icon: Icon, label, value, detail, tone = "blue" }: { icon: typeo
 function CapacityMetric({ icon: Icon, label, value, detail }: { icon: typeof Cpu; label: string; value: string; detail: string }) { return <div className="global-capacity-metric"><i><Icon /></i><span><small>{label}</small><strong>{value}</strong><em>{detail}</em></span></div>; }
 function Metric({ label, value }: { label: string; value: string }) { return <div><span>{label}</span><strong>{value}</strong></div>; }
 function Empty({ icon: Icon, title, copy }: { icon: typeof Activity; title: string; copy: string }) { return <div className="panel-empty"><Icon /><strong>{title}</strong><p>{copy}</p></div>; }
-const DIALOG_FOCUS_SELECTOR = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
-
-function dialogFocusables(dialog: HTMLElement): HTMLElement[] {
-  return [...dialog.querySelectorAll<HTMLElement>(DIALOG_FOCUS_SELECTOR)]
-    .filter((element) => !element.hasAttribute("hidden") && element.getAttribute("aria-hidden") !== "true");
-}
-
-function firstFocusable(dialog: HTMLElement): HTMLElement | null {
-  return dialogFocusables(dialog)[0] ?? null;
-}
-
-function trapDialogTab(event: KeyboardEvent, dialog: HTMLElement): void {
-  if (event.key !== "Tab") return;
-  const controls = dialogFocusables(dialog);
-  const first = controls[0];
-  const last = controls.at(-1);
-  if (!first || !last) { event.preventDefault(); dialog.focus(); return; }
-  if (event.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) {
-    event.preventDefault(); last.focus();
-  } else if (!event.shiftKey && (document.activeElement === last || !dialog.contains(document.activeElement))) {
-    event.preventDefault(); first.focus();
-  }
-}
-
 function PanelLoading() { return <div className="panel-loading" role="status" aria-live="polite" aria-atomic="true"><LoaderCircle className="spin" /><strong>Connecting to mycellios</strong><span>Loading the configured network snapshot…</span></div>; }
 function WorkerKindIcon({ worker }: { worker: PublicWorker }) {
   if (worker.kind === "browser") return <Smartphone />;
@@ -5196,18 +5098,6 @@ function topologyPosition(index: number, total: number): { x: number; y: number 
   const angle = -Math.PI / 2 + (slot / count) * Math.PI * 2;
   return { x: 50 + Math.cos(angle) * (inner ? 28 : 43), y: 52 + Math.sin(angle) * (inner ? 25 : 38) };
 }
-function formatCompactNumber(value: number): string { return new Intl.NumberFormat("en-US", { maximumFractionDigits: value < 10 ? 1 : 0 }).format(value); }
-function formatCompactTokens(value: number): string {
-  if (value >= 1_000_000) return `${new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 }).format(value / 1_000_000)}M`;
-  if (value >= 1_000) return `${new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 }).format(value / 1_000)}K`;
-  return new Intl.NumberFormat("en-US").format(value);
-}
-function formatPower(watts: number): string { return watts >= 1_000 ? `${(watts / 1_000).toFixed(1)} kW` : `${Math.round(watts)} W`; }
-function shortId(value: string) { return value.length <= 10 ? value : `${value.slice(0, 6)}…${value.slice(-4)}`; }
-function shortFingerprint(value: string) {
-  const digest = value.replace(/^sha256:/, "");
-  return digest.length <= 20 ? digest : `${digest.slice(0, 10)}…${digest.slice(-8)}`;
-}
 function credentialKindLabel(kind: WorkerCredentialSummary["identityKind"]) {
   return kind === "browser"
     ? "NAVEGADOR PWA"
@@ -5215,9 +5105,6 @@ function credentialKindLabel(kind: WorkerCredentialSummary["identityKind"]) {
       ? "CELDA DISTRIBUIDA"
       : "DISPOSITIVO INSTALADO";
 }
-function formatMemory(value: number) { return value >= 1_024 ? `${(value / 1_024).toFixed(value >= 10_240 ? 0 : 1)} GB` : `${Math.round(value)} MB`; }
-function relativeTime(value: string, now = Date.now()) { const seconds = Math.max(0, Math.floor((now - new Date(value).getTime()) / 1_000)); if (seconds < 5) return "now"; if (seconds < 60) return `${seconds}s ago`; const minutes = Math.floor(seconds / 60); if (minutes < 60) return `${minutes}m ago`; return `${Math.floor(minutes / 60)}h ago`; }
-function relativeTimeEs(value: string) { const seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1_000)); if (seconds < 5) return "ahora"; if (seconds < 60) return `hace ${seconds} s`; const minutes = Math.floor(seconds / 60); if (minutes < 60) return `hace ${minutes} min`; return `hace ${Math.floor(minutes / 60)} h`; }
 
 type ExecutionTelemetry = NonNullable<DashboardDeployment["execution"]>;
 type ExecutionStageTelemetry = NonNullable<ExecutionTelemetry["stages"]>[number];

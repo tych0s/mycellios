@@ -30,6 +30,7 @@ export const NATIVE_PYTHON_ENTRY_MODULES = Object.freeze([
   "distributed_runtime.physical_probe",
   "distributed_runtime.runtime_profile",
   "distributed_runtime.engine_runtime_profile",
+  "distributed_runtime.activation_integrity",
   "distributed_runtime.stage_artifact_cache",
   "distributed_runtime.installed_stage_canary",
 ]);
@@ -41,6 +42,7 @@ export const NATIVE_PYTHON_ENTRY_MODULES = Object.freeze([
  */
 export const NATIVE_PYTHON_PRODUCT_FILES = Object.freeze([
   "distributed_runtime/__init__.py",
+  "distributed_runtime/activation_integrity.py",
   "distributed_runtime/batching.py",
   "distributed_runtime/cell_backend.py",
   "distributed_runtime/cell_member_cli.py",
@@ -108,6 +110,7 @@ const allowedModules = new Set(
     .filter((path) => path.endsWith(".py"))
     .map(pathToModule),
 );
+let cachedUvPython;
 export const NATIVE_PYTHON_PRODUCT_POLICY_ID = `sha256:${sha256(Buffer.from(JSON.stringify({
   schema: NATIVE_PYTHON_PRODUCT_SCHEMA,
   entryModules: NATIVE_PYTHON_ENTRY_MODULES,
@@ -336,15 +339,9 @@ function analyzeNativePythonImportSources(sources) {
 }
 
 function runNativePythonImportAnalyzer(request) {
-  const commands = process.platform === "win32"
-    ? [
-        { executable: "python", prefix: [] },
-        { executable: "py", prefix: ["-3.12"] },
-      ]
-    : [
-        { executable: "python", prefix: [] },
-        { executable: "python3", prefix: [] },
-      ];
+  const commands = nativePythonAnalyzerCommands();
+  const uvPython = resolveUvManagedPython();
+  if (uvPython) commands.push({ executable: uvPython, prefix: [] });
   const missing = [];
   for (const command of commands) {
     const result = spawnSync(
@@ -400,6 +397,50 @@ function runNativePythonImportAnalyzer(request) {
   throw new Error(
     `Python 3.12 is required for native Python AST analysis; commands not found: ${missing.join(", ")}.`,
   );
+}
+
+export function nativePythonAnalyzerCommands(
+  platform = process.platform,
+  configuredPython = process.env.MYCELLIOS_PYTHON,
+) {
+  const commands = [];
+  if (typeof configuredPython === "string" && configuredPython.trim()) {
+    commands.push({ executable: configuredPython.trim(), prefix: [] });
+  }
+  commands.push(...(platform === "win32"
+    ? [
+        { executable: "py", prefix: ["-3.12"] },
+        { executable: "python", prefix: [] },
+      ]
+    : [
+        { executable: "python3.12", prefix: [] },
+        { executable: "python3", prefix: [] },
+        { executable: "python", prefix: [] },
+      ]));
+  return commands;
+}
+
+function resolveUvManagedPython() {
+  if (cachedUvPython !== undefined) return cachedUvPython;
+  const result = spawnSync("uv", ["python", "find", "3.12"], {
+    encoding: "utf8",
+    shell: false,
+    timeout: 10_000,
+    windowsHide: true,
+  });
+  if (result.error?.code === "ENOENT" || result.status !== 0) {
+    cachedUvPython = null;
+    return cachedUvPython;
+  }
+  if (result.error || result.signal !== null || typeof result.stdout !== "string") {
+    cachedUvPython = null;
+    return cachedUvPython;
+  }
+  const executable = result.stdout.trim();
+  cachedUvPython = executable && resolve(executable) === executable
+    ? executable
+    : null;
+  return cachedUvPython;
 }
 
 function isPlainObject(value) {

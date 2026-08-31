@@ -6,6 +6,11 @@ describe("Control and Engine component boundaries", () => {
     expect(componentFor("landing/src/Panel.tsx")).toBe("control");
     expect(componentFor("src/worker/agent.ts")).toBe("engine");
     expect(componentFor("src/contracts/worker-protocol.ts")).toBe("shared");
+    expect(componentFor("src/adapters/mycellios-pipeline.ts")).toBe("engine");
+    expect(componentFor("src/benchlab/run.ts")).toBe("tooling");
+    expect(componentFor("src/economy/economic-ledger.ts")).toBe("engine");
+    expect(componentFor("src/simulator/model.ts")).toBe("tooling");
+    expect(componentFor("src/support/assistant.ts")).toBe("shared");
   });
 
   it("prevents browser code from importing Engine internals", () => {

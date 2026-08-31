@@ -1,0 +1,39 @@
+{
+  "schema": "mycellios.web-bundle-budget.v2",
+  "surfaces": {
+    "landing": {
+      "outputDirectory": "landing-dist",
+      "sourceMapsAllowed": false,
+      "defaultMaximumBytes": 25000,
+      "budgets": {
+        "application-shell": { "match": "index-", "maximumBytes": 225000 },
+        "panel-route": { "match": "Panel-", "maximumBytes": 350000 },
+        "network-route": { "match": "NetworkPage-", "maximumBytes": 85000 },
+        "landing-route": { "match": "RebrandLanding-", "maximumBytes": 125000 },
+        "mushroom-renderer": { "match": "mushroom-stage-", "maximumBytes": 575000 },
+        "document-library": { "match": "lib-", "maximumBytes": 525000 },
+        "pdf-reader": { "match": "pdf-", "maximumBytes": 450000 },
+        "pdf-worker": { "match": "pdf.worker.min-", "maximumBytes": 1300000 }
+      },
+      "criticalPaths": {
+        "home": { "entry": "index.html", "highPriorityMatches": ["mushroom-stage-"], "maximumBytes": 800000 },
+        "panel": { "entry": "src/Panel.tsx", "highPriorityMatches": [], "maximumBytes": 550000 },
+        "network": { "entry": "src/NetworkPage.tsx", "highPriorityMatches": [], "maximumBytes": 425000 }
+      }
+    },
+    "mobile": {
+      "outputDirectory": "mobile-dist",
+      "sourceMapsAllowed": false,
+      "defaultMaximumBytes": 25000,
+      "budgets": {
+        "application-shell": { "match": "index-", "maximumBytes": 550000 },
+        "document-library": { "match": "lib-", "maximumBytes": 525000 },
+        "pdf-reader": { "match": "pdf-", "maximumBytes": 450000 },
+        "pdf-worker": { "match": "pdf.worker.min-", "maximumBytes": 1300000 }
+      },
+      "criticalPaths": {
+        "application": { "entry": "index.html", "highPriorityMatches": [], "maximumBytes": 550000 }
+      }
+    }
+  }
+}

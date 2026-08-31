@@ -4,13 +4,17 @@ export type Component = "control" | "engine" | "shared" | "legacy" | "tooling" |
 
 const roots: ReadonlyArray<readonly [string, Component]> = [
   ["landing/", "control"], ["src/mobile/", "control"], ["src/coordinator/", "control"],
+  ["src/support/", "shared"],
   ["src/node/", "engine"], ["src/worker/", "engine"], ["src/distribution/", "engine"], ["src/transport/", "engine"],
+  ["src/adapters/", "engine"],
   ["src/model-fabric/", "engine"], ["src/scheduler/", "engine"], ["src/telemetry/", "engine"],
   ["python/distributed_runtime/", "engine"],
   ["src/contracts/", "shared"], ["src/core/", "shared"], ["src/performance/", "shared"],
   ["src/storage/", "shared"], ["src/update/", "shared"],
+  ["src/economy/", "engine"],
   ["src/desktop/", "legacy"], ["src/renderer/", "legacy"],
-  ["src/program/", "tooling"], ["scripts/", "tooling"], ["tests/", "tooling"],
+  ["src/program/", "tooling"], ["src/benchlab/", "tooling"], ["src/simulator/", "tooling"],
+  ["src/demo.ts", "tooling"], ["scripts/", "tooling"], ["tests/", "tooling"],
 ];
 
 export function componentFor(portablePath: string): Component {

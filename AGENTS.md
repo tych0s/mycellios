@@ -37,6 +37,8 @@ These rules apply to the complete repository.
 - Use a spec for medium or large cross-area changes; fold durable outcomes into
   canonical docs when complete.
 - Run `npm run verify:structure`, relevant focused tests and `npm run typecheck`.
+- Run `npm run verify:architecture` when changing imports, source areas or a
+  module tracked by the size ratchet.
 - Physical tests that cannot run must be reported as skipped or unavailable,
   never as passing.
 - Do not commit or push unless the user explicitly requests it.

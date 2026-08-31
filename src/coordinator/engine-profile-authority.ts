@@ -2,6 +2,7 @@ import {
   engineRuntimeProfileSchema,
   type EngineRuntimeProfile,
 } from "../contracts/engine-runtime-profile.js";
+import type { EngineRuntimeChallengeRequest } from "../contracts/evidence-challenge.js";
 import type { MeshStore } from "../storage/store.js";
 
 /**
@@ -56,7 +57,7 @@ export function publishCoordinatorEngineRuntimeProfile(
 }
 
 function requestMatchesProfile(
-  request: import("./worker-hub.js").EngineRuntimeChallengeRequest,
+  request: EngineRuntimeChallengeRequest,
   profile: EngineRuntimeProfile,
 ): boolean {
   return request.descriptorDigest === profile.descriptorDigest

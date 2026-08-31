@@ -1,6 +1,6 @@
 # Status and evidence
 
-Updated: 2026-08-30.
+Updated: 2026-08-31.
 
 ## Implemented and connected
 
@@ -11,6 +11,8 @@ Updated: 2026-08-30.
 - streaming API and persistent runtime transport;
 - direct-channel selection with bounded relay fallback;
 - recovery orchestration and execution traces;
+- commit-first activation-integrity sketches with a Torch-free control-plane
+  verifier and optional binding inside signed physical receipts;
 - physical campaign, evidence import and gate-report tooling.
 
 ## Verified in automated or single-host runs
@@ -33,6 +35,8 @@ skipped when their required model, GPU or host environment is unavailable.
 - remote recovery after physically losing a stage;
 - P50/P95 latency and sustained throughput on residential LAN/WAN;
 - a reproducible comparison showing that Mycellios outperforms another system.
+- activation-integrity enforcement using a distinct trusted recompute stage on
+  a physical route (the contract exists, but no such receipt is committed).
 
 ## Evidence policy
 
@@ -48,6 +52,16 @@ A physical claim is accepted only when the artifact records at least:
 
 Existing files in `benchmarks/` are retained local/loopback evidence. They are
 useful regression baselines, but none proves a two-computer route.
+
+## Benchmark taxonomy
+
+Physical reports separate control overhead, process startup, model loading,
+activation transfer, TTFT, TPOT, sustained tokens/s, peak memory, cleanup and
+recovery. Every result is bound to an exact source/build, operating systems,
+hardware and drivers, model revision, assigned ranges, topology and transport.
+An optimization comparison uses the same model and topology on both sides and
+must retain output parity; loopback measurements cannot establish a multi-host
+performance claim.
 
 ## Next gate
 

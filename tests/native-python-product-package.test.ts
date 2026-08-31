@@ -18,6 +18,7 @@ import {
   assertNativePythonProductMatchesSource,
   assertNativePythonSourceClosure,
   prepareNativePythonProductSource,
+  nativePythonAnalyzerCommands,
   verifyNativePythonProductSource,
 } from "../scripts/native-python-product-policy.mjs";
 
@@ -30,6 +31,16 @@ afterEach(() => {
 });
 
 describe("native Python product package", () => {
+  it("prefers an explicit Python 3.12 command and supports an override", () => {
+    expect(nativePythonAnalyzerCommands("linux", undefined)).toEqual([
+      { executable: "python3.12", prefix: [] },
+      { executable: "python3", prefix: [] },
+      { executable: "python", prefix: [] },
+    ]);
+    expect(nativePythonAnalyzerCommands("win32", "C:\\runtime\\python.exe")[0])
+      .toEqual({ executable: "C:\\runtime\\python.exe", prefix: [] });
+  });
+
   it("is a closed allowlist covering every native product entrypoint", () => {
     expect(() =>
       assertNativePythonSourceClosure(resolve("python")),
@@ -38,6 +49,7 @@ describe("native Python product package", () => {
       "distributed_runtime.server",
       "distributed_runtime.stage_cli",
       "distributed_runtime.cell_member_cli",
+      "distributed_runtime.activation_integrity",
       "distributed_runtime.native_gguf_cli",
       "distributed_runtime.installed_stage_canary",
     ]));
@@ -50,6 +62,7 @@ describe("native Python product package", () => {
     ]));
     expect(NATIVE_PYTHON_PRODUCT_FILES).toEqual(expect.arrayContaining([
       "distributed_runtime/native_gguf_runtime.py",
+      "distributed_runtime/activation_integrity.py",
       "distributed_runtime/native_gguf_disk_tiering.py",
       "distributed_runtime/dense_tiering.py",
       "distributed_runtime/draft_model.py",

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { inferenceMessageWithAttachments, readInferenceAttachment } from "./Panel";
+import { inferenceMessageWithAttachments, readInferenceAttachment } from "./inference-attachments";
 
 describe("inference attachments", () => {
   it("extracts text files and includes their content in the model message", async () => {

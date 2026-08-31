@@ -20,6 +20,8 @@ multi-host validation. -->
 - [ ] No credentials, personal data, private endpoints, model weights or caches are included.
 - [ ] Security, trust and native product boundaries were considered.
 - [ ] Canonical documentation was updated when claims or supported behavior changed.
+- [ ] `npm run verify:bundle` passes for web changes and no public sourcemaps were added.
+- [ ] Physical checks are reported as passed, failed, skipped or unavailable truthfully.
 
 ## Security and compatibility
 

@@ -36,3 +36,7 @@ export function buildNativePythonProductManifest(
   sourceRoot: string,
 ): NativePythonProductManifest;
 export function analyzeNativePythonImports(source: string): string[];
+export function nativePythonAnalyzerCommands(
+  platform?: NodeJS.Platform,
+  configuredPython?: string,
+): Array<{ executable: string; prefix: string[] }>;

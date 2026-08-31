@@ -9,7 +9,29 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: public-quality-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  static:
+    name: Static repository policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm install --global npm@10.9.8
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run verify:structure
+      - run: npm run verify:docs
+      - run: npm run verify:format
+      - run: npm run verify:architecture
+      - run: npm run verify:component-boundaries
+
   typescript:
     name: TypeScript, tests and build
     runs-on: ubuntu-latest
@@ -23,8 +45,9 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
+      - run: npm install --global npm@10.9.8
       - run: npm ci --no-audit --no-fund
-      - run: npm run verify:structure
+      - run: npm run doctor -- --json
       - run: npm run typecheck
       - run: npm run landing:typecheck
       - run: npm run mobile:typecheck
@@ -62,6 +85,7 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
+      - run: npm install --global npm@10.9.8
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: npm run verify:component-boundaries
 

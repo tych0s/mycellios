@@ -166,6 +166,47 @@ describe("execution receipt chain", () => {
     ).toThrow("execution_receipt_stage_chain_is_invalid");
   });
 
+  it("rejects failed and zero-work stages before settlement", () => {
+    const first = signedStage(
+      0,
+      requestRoot,
+      middleRoot,
+      "stage-key-0",
+      firstKeys.privateKey,
+    );
+    const second = signedStage(
+      1,
+      middleRoot,
+      resultRoot,
+      "stage-key-1",
+      secondKeys.privateKey,
+    );
+    expect(() => receipt([{ ...first, outcome: "failed" }, second])).toThrow(
+      "execution_receipt_contains_failed_stage",
+    );
+    expect(() => receipt([
+      {
+        ...first,
+        counters: { ...first.counters, frames: 0 },
+      },
+      second,
+    ])).toThrow("execution_receipt_stage_attests_zero_work");
+    expect(() => receipt([
+      {
+        ...first,
+        counters: { ...first.counters, inputBytes: 0 },
+      },
+      second,
+    ])).toThrow("execution_receipt_stage_attests_zero_work");
+    expect(() => receipt([
+      {
+        ...first,
+        counters: { ...first.counters, outputBytes: 0 },
+      },
+      second,
+    ])).toThrow("execution_receipt_stage_attests_zero_work");
+  });
+
   it("rejects tampering even when the envelope digest is recomputed", () => {
     const value = receipt();
     const tamperedStage = {

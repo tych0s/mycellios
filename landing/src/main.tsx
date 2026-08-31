@@ -1,14 +1,28 @@
-import { StrictMode } from "react";
+import { lazy, StrictMode, Suspense, useEffect, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
-import { Panel } from "./Panel";
-import { NetworkPage } from "./NetworkPage";
-import { RebrandLanding } from "./rebrand/RebrandLanding";
-import { CreateStudio } from "./rebrand/CreateStudio";
-import { EarnStudio } from "./rebrand/EarnStudio";
-import { SporeStudio } from "./rebrand/SporeStudio";
 import { loadMushroomStage, wantsMushroom } from "./rebrand/HeroMushroom";
 import { applySeoMetadata } from "./seo";
 import { resolveLandingSurface } from "./routing";
+
+const Panel = lazy(() => import("./Panel").then((module) => ({ default: module.Panel })));
+const NetworkPage = lazy(() => import("./NetworkPage").then((module) => ({ default: module.NetworkPage })));
+const RebrandLanding = lazy(() => import("./rebrand/RebrandLanding").then((module) => ({ default: module.RebrandLanding })));
+const CreateStudio = lazy(() => import("./rebrand/CreateStudio").then((module) => ({ default: module.CreateStudio })));
+const EarnStudio = lazy(() => import("./rebrand/EarnStudio").then((module) => ({ default: module.EarnStudio })));
+const SporeStudio = lazy(() => import("./rebrand/SporeStudio").then((module) => ({ default: module.SporeStudio })));
+
+function LoadedRoute({ children }: { children: ReactNode }) {
+  useEffect(() => {
+    const loader = document.getElementById("mycellios-loader");
+    if (!loader) return;
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      loader.dataset.state = "leaving";
+      loader.addEventListener("transitionend", () => loader.remove(), { once: true });
+      window.setTimeout(() => loader.remove(), 400);
+    }));
+  }, []);
+  return children;
+}
 
 const root = document.getElementById("root");
 if (!root) throw new Error("Missing landing root element");
@@ -28,11 +42,18 @@ const path = window.location.pathname.length > 1
   : window.location.pathname;
 const surface = resolveLandingSurface(path, window.location.search);
 
-const page = path === "/create" ? <CreateStudio />
-  : path === "/earn" ? <EarnStudio />
-  : path.startsWith("/spore") ? <SporeStudio />
-  : surface === "network" ? <NetworkPage />
-  : surface === "panel" ? <Panel accountEntry={path === "/account"} mobileEntry={path === "/browser" || path === "/mobile"} />
+const isCreate = path === "/create";
+const isEarn = path === "/earn";
+const isSpore = path.startsWith("/spore");
+const isNetwork = surface === "network";
+const isPanel = surface === "panel";
+const isLanding = !isCreate && !isEarn && !isSpore && !isNetwork && !isPanel;
+
+const page = isCreate ? <CreateStudio />
+  : isEarn ? <EarnStudio />
+  : isSpore ? <SporeStudio />
+  : isNetwork ? <NetworkPage />
+  : isPanel ? <Panel accountEntry={path === "/account"} mobileEntry={path === "/browser" || path === "/mobile"} />
   : <RebrandLanding />;
 
 /*
@@ -46,25 +67,19 @@ const page = path === "/create" ? <CreateStudio />
  * now overlaps them: same chunk, same lazy boundary, no bytes added to this
  * bundle, but the network is busy with it while React is still mounting.
  *
- * The condition is derived from the element actually being rendered, not from a
- * second copy of the routing rules — a prefetch guarded by its own paraphrase of
- * the router is a phone downloading 190KB it will never draw, one refactor from
- * now. `wantsMushroom()` then applies the same reduced-motion and width tests
- * the component uses.
+ * The condition is derived from the same mutually exclusive flags that select
+ * the lazy route. A separate paraphrase of the router would eventually make a
+ * phone or studio route download 190KB it never draws. `wantsMushroom()` then
+ * applies the same reduced-motion and width tests the component uses.
  */
-if (page.type === RebrandLanding && wantsMushroom()) {
+if (isLanding && wantsMushroom()) {
   void loadMushroomStage().catch(() => {
     /* The component awaits the same shared promise and reports there. */
   });
 }
 
-createRoot(root).render(<StrictMode>{page}</StrictMode>);
-
-const loader = document.getElementById("mycellios-loader");
-if (loader) {
-  requestAnimationFrame(() => requestAnimationFrame(() => {
-    loader.dataset.state = "leaving";
-    loader.addEventListener("transitionend", () => loader.remove(), { once: true });
-    window.setTimeout(() => loader.remove(), 400);
-  }));
-}
+createRoot(root).render(
+  <StrictMode>
+    <Suspense fallback={null}><LoadedRoute>{page}</LoadedRoute></Suspense>
+  </StrictMode>,
+);

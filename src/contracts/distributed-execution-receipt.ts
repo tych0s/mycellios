@@ -350,6 +350,20 @@ function validateExecutionReceiptChain(
   let expectedRoot = receipt.requestRoot;
   const stageIds = new Set<string>();
   for (const observation of receipt.stages) {
+    // Settlement is fail-closed: a terminal receipt proves completed work, not
+    // merely a valid signature over an assigned range. This invariant is
+    // adapted from external-runtime-c's Apache-2.0 receipt coverage verifier; see
+    // THIRD_PARTY.md for the pinned source revision.
+    if (observation.outcome === "failed") {
+      throw new Error("execution_receipt_contains_failed_stage");
+    }
+    if (
+      observation.counters.frames < 1
+      || observation.counters.inputBytes < 1
+      || observation.counters.outputBytes < 1
+    ) {
+      throw new Error("execution_receipt_stage_attests_zero_work");
+    }
     if (stageIds.has(observation.stageId)) {
       throw new Error("execution_receipt_stage_is_duplicated");
     }

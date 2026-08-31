@@ -68,3 +68,22 @@ future extraction proceeds by dependency direction:
 Each extraction must preserve import boundaries, build provenance, a single
 lockfile and the native release gates. Moving folders without those boundaries
 would create the appearance of a monorepo without its benefits.
+
+## Large-module reduction
+
+The architecture gate records current oversized modules as finite debt. Their
+line ceilings may stay equal or decrease, but cannot grow. New modules must
+remain below the default ceiling.
+
+Reduction follows risk and dependency direction:
+
+1. extract pure parsing, validation and formatting functions;
+2. extract protocol handlers behind existing contracts;
+3. split stateful services only after characterization tests cover lifecycle
+   and failure behavior;
+4. move directories only when the extracted boundary has an independent owner
+   or release reason.
+
+The first targets are coordinator route groups, landing panel sections and
+Python engine family adapters. Changes should reduce a recorded ceiling rather
+than replace one large module with another.

@@ -40,6 +40,9 @@ model computation and moves activations between assigned ranges.
   command runner.
 - Artifact, build and route identities are checked across control and data
   planes.
+- Activation-integrity evidence is accepted only when its committed seed,
+  suspect/trusted sketches and recomputed verdict agree; an absent challenge is
+  never inferred to have passed.
 - A direct channel cannot silently downgrade after application bytes move.
 - Model registration happens only after readiness and canary success.
 - Simulations and loopback measurements never count as multi-host evidence.

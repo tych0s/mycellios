@@ -1,0 +1,6 @@
+{
+  "schema": "mycellios-python-import-boundaries/1",
+  "forbiddenAbsoluteRoots": ["benchmarks", "research", "scripts", "sidecars", "tests"],
+  "allowedDebt": [],
+  "maximumAllowedDebt": 0
+}

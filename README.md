@@ -49,13 +49,23 @@ connections.
 
 Read [Architecture](docs/ARCHITECTURE.md) for the component boundaries.
 
-## Quick validation
+## Choose your path
+
+| Goal | First command | Guide |
+| --- | --- | --- |
+| Evaluate the software locally | `npm run doctor` | [Status and evidence](docs/STATUS_AND_EVIDENCE.md) |
+| Make a first contribution | `npm ci && npm run check` | [Contributing](CONTRIBUTING.md) |
+| Prepare two physical hosts | `npm run preflight:two-host -- --config <file>` | [Two-host quickstart](docs/TWO_HOST_QUICKSTART.md) |
+| Review architecture or releases | `npm run verify:architecture` | [Repository structure](docs/REPOSITORY_STRUCTURE.md) |
+
+## Evaluator quick validation
 
 Requirements: Node.js 24+, npm and Python 3 with the dependencies appropriate
 for the runtime being tested.
 
 ```bash
 npm ci
+npm run doctor
 npm run typecheck
 npm test
 npm run build
@@ -98,6 +108,7 @@ two machines. Continue with [Two-host quickstart](docs/TWO_HOST_QUICKSTART.md).
 - [Architecture](docs/ARCHITECTURE.md)
 - [Two-host quickstart](docs/TWO_HOST_QUICKSTART.md)
 - [Status and evidence](docs/STATUS_AND_EVIDENCE.md)
+- [Roadmap](docs/ROADMAP.md)
 - [Development](docs/DEVELOPMENT.md)
 - [Repository structure](docs/REPOSITORY_STRUCTURE.md)
 - [Security](docs/SECURITY.md)
@@ -116,9 +127,15 @@ The immediate priority is reliability, not feature count:
 New claims require committed evidence. New architecture work requires a clear
 failure or measured limitation in the native path.
 
+The ordered evidence gates and engineering-health track are maintained in the
+[roadmap](docs/ROADMAP.md).
+
 ## Contributing
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) and [Development](docs/DEVELOPMENT.md).
+The shortest first contribution is a focused test, documentation correction or
+reproducible bug fix; `npm run doctor` checks your local prerequisites before
+you install or build anything.
 Project decisions follow [GOVERNANCE.md](GOVERNANCE.md), notable changes are in
 [CHANGELOG.md](CHANGELOG.md), and security reports follow
 [SECURITY.md](SECURITY.md).

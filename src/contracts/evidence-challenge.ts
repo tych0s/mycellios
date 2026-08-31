@@ -129,6 +129,7 @@ export const evidenceChallengeSchema = z.discriminatedUnion("kind", [
 
 export type DeploymentCanaryChallenge = z.infer<typeof deploymentCanaryChallengeSchema>;
 export type RuntimePerformanceChallenge = z.infer<typeof runtimePerformanceChallengeSchema>;
+export type EngineRuntimeChallengeRequest = z.infer<typeof engineRuntimeChallengeRequestSchema>;
 export type EngineRuntimeChallenge = z.infer<typeof engineRuntimeChallengeSchema>;
 export type EvidenceChallenge = z.infer<typeof evidenceChallengeSchema>;
 

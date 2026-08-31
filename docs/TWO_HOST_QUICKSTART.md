@@ -30,6 +30,20 @@ set:
 - the Python executable used on each host;
 - a unique authentication environment variable for the remote agent.
 
+Run the non-mutating preflight before profiling or launching anything:
+
+```bash
+npm run preflight:two-host -- \
+  --config config/auto-distribute.two-host.local.json \
+  --json
+```
+
+The checked-in example must return `dryRun: true` because its addresses are
+documentation placeholders. A physical candidate must use two distinct,
+non-loopback machine identities and authenticated endpoints. Warnings about an
+unpinned model revision, unprepared ranges or unmeasured transport do not turn
+planning inputs into evidence.
+
 Generate and inspect the route without starting anything:
 
 ```bash
@@ -77,6 +91,9 @@ run and record whether recovery succeeds and all processes are cleaned up.
 
 Do not call the gate complete if the route used loopback, both stages ran on
 one machine, a fallback produced synthetic output or cleanup is unverified.
+An accepted signed receipt also requires TTFT, TPOT, tokens/s, peak memory and
+passing assertions for exact output, non-empty ranges, build/model identity and
+complete cleanup.
 
 ## Known boundary
 

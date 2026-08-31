@@ -2,7 +2,7 @@ import {
   requireEligibleEngineRuntimeProfile,
   type EngineRuntimeProfile,
 } from "../contracts/engine-runtime-profile.js";
-import type { EngineRuntimeChallengeRequest } from "./worker-hub.js";
+import type { EngineRuntimeChallengeRequest } from "../contracts/evidence-challenge.js";
 import type { EngineRuntimeActivationPlan } from "../contracts/engine-runtime-activation.js";
 import type { DeploymentControlPlane } from "./deployment-control-plane.js";
 import type { StoredWorker } from "../storage/store.js";

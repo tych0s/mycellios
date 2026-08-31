@@ -75,7 +75,8 @@ export default defineConfig({
   build: {
     outDir: resolve(workspaceRoot, "mobile-dist"),
     emptyOutDir: true,
-    sourcemap: true,
+    manifest: true,
+    sourcemap: false,
     target: "es2022",
   },
 });

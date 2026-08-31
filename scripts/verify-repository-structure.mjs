@@ -7,6 +7,7 @@ export const CANONICAL_DOCS = Object.freeze([
   "DEVELOPMENT.md",
   "README.md",
   "REPOSITORY_STRUCTURE.md",
+  "ROADMAP.md",
   "SECURITY.md",
   "STATUS_AND_EVIDENCE.md",
   "TWO_HOST_QUICKSTART.md",

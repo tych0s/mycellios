@@ -28,6 +28,7 @@ The baseline is Node.js 24, npm's committed lockfile and Python 3.12 for the
 physical runtime.
 
 ```bash
+npm run doctor
 npm ci
 npm run verify:structure
 npm run typecheck
@@ -36,6 +37,18 @@ npm run mobile:typecheck
 npm test
 npm run build
 ```
+
+## A good first contribution
+
+Start with one observable outcome: reproduce a bug, add a missing focused test,
+clarify an existing canonical document or reduce a module without changing its
+contract. Run the narrowest relevant test while iterating, then `npm run check`
+before opening the pull request. Issues labelled `good first issue` are intended
+to be solvable without physical GPUs or access to private infrastructure.
+
+Avoid broad rewrites, new product surfaces and benchmark claims in a first pull
+request. If the change needs a new protocol, dependency or top-level area, open
+a proposal first so maintainers can confirm the boundary.
 
 Run the offline Python suite with:
 

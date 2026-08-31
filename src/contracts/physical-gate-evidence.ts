@@ -1,6 +1,7 @@
 import { createHash, createPublicKey, sign, verify, type KeyObject } from "node:crypto";
 import { z } from "zod";
 import { canonicalEvidenceJson } from "../core/json.js";
+import { activationIntegrityEvidenceSchema } from "./activation-integrity.js";
 
 export const PHYSICAL_GATE_EVIDENCE_SCHEMA = "mycellios-physical-gate-evidence/1" as const;
 const sha256 = z.string().regex(/^sha256:[a-f0-9]{64}$/);
@@ -22,6 +23,7 @@ const physicalGateEvidenceUnsignedBase = z.object({
     aggregation: z.enum(["sample", "min", "max", "mean", "median", "p50", "p95", "p99"]), evidenceClass: z.literal("hardware-physical") }).strict()).max(512),
   assertions: z.array(z.object({ id: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,127}$/), status: z.enum(["pass", "fail"]),
     detail: z.string().min(1).max(2_048), evidence: z.array(z.string().min(1).max(2_048)).min(1).max(32) }).strict()).min(1).max(128),
+  activationIntegrity: z.array(activationIntegrityEvidenceSchema).min(1).max(64).optional(),
 }).strict();
 
 function refineReceipt(receipt: z.infer<typeof physicalGateEvidenceUnsignedBase>, context: z.RefinementCtx): void {
@@ -32,6 +34,22 @@ function refineReceipt(receipt: z.infer<typeof physicalGateEvidenceUnsignedBase>
   const expectedStatus = receipt.assertions.some((assertion) => assertion.status === "fail") ? "fail" : "pass";
   if (receipt.status !== expectedStatus) context.addIssue({ code: "custom", path: ["status"], message: `Expected ${expectedStatus} from assertions` });
   if (Date.parse(receipt.completedAt) < Date.parse(receipt.startedAt)) context.addIssue({ code: "custom", path: ["completedAt"], message: "Completion cannot precede start" });
+  if (receipt.check === "two_host_exact_execution" && receipt.status === "pass") {
+    const fingerprints = new Set(receipt.hardware.map((entry) => entry.fingerprint));
+    const identities = new Set(receipt.hardware.map((entry) => entry.id));
+    if (fingerprints.size < 2 || identities.size < 2) context.addIssue({ code: "custom", path: ["hardware"], message: "Two-host evidence requires two distinct machine identities and fingerprints" });
+    if (receipt.coverage.networkScopes.includes("same-host") || !receipt.coverage.networkScopes.some((scope) => scope === "lan" || scope === "multi-site" || scope === "public-relay")) {
+      context.addIssue({ code: "custom", path: ["coverage", "networkScopes"], message: "Two-host evidence cannot use same-host or loopback scope" });
+    }
+    const measurements = new Set(receipt.measurements.map((measurement) => measurement.name));
+    for (const required of ["ttft-ms", "tpot-ms", "tokens-per-second", "peak-memory-mib"]) {
+      if (!measurements.has(required)) context.addIssue({ code: "custom", path: ["measurements"], message: `Two-host evidence requires ${required}` });
+    }
+    const assertions = new Map(receipt.assertions.map((assertion) => [assertion.id, assertion.status]));
+    for (const required of ["exact-output", "non-empty-ranges", "build-model-match", "cleanup-complete"]) {
+      if (assertions.get(required) !== "pass") context.addIssue({ code: "custom", path: ["assertions"], message: `Two-host evidence requires passing ${required}` });
+    }
+  }
 }
 
 const PHYSICAL_CHECK_CAMPAIGNS: Record<string, { gate: string; campaign: string }> = {

@@ -31,3 +31,24 @@ their packages and reported by the release SBOM.
 Hardware SDKs and drivers may have separate vendor terms and are not
 relicensed by Mycellios. Review the generated SBOM and applicable vendor terms
 before redistributing a release artifact.
+
+## Adapted receipt invariant
+
+The fail-closed zero-work invariant in
+`src/contracts/distributed-execution-receipt.ts` is adapted from the receipt
+coverage verifier in `external-runtime-c` at revision
+`fcf728096948c7686bcf0897e9acb75d1abda1d5` (`shard/receipt.py`). Shard is
+licensed under Apache License 2.0, Copyright 2026 leyten. Mycellios uses its own
+typed receipt schema, canonical encoding, trust pins and verification code; no
+Shard runtime is included or required.
+
+## Adapted activation-integrity challenge
+
+The commit-first activation sketch in
+`python/distributed_runtime/activation_integrity.py` is adapted from
+`external-runtime-c` at revision
+`fcf728096948c7686bcf0897e9acb75d1abda1d5` (`shard/challenge.py`). Shard is
+licensed under Apache License 2.0, Copyright 2026 leyten. The Mycellios version
+is modified to use a domain-separated hash stream, sampling without
+replacement, strict bounded wire validation and explicit fail-closed error
+codes. It includes no external-compute-runtime code and does not require either external runtime.
