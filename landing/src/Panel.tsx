@@ -1089,7 +1089,7 @@ function EarnQuickMenu({
               <ChevronRight size={15} />
             </a>
           </div>
-          <a className="panel-join-guide" href="https://github.com/tych0s/mycellios" target="_blank" rel="noreferrer">
+          <a className="panel-join-guide" href="https://github.com/nodecodex-org/mycellios" target="_blank" rel="noreferrer">
             <GitFork size={14} /> Setup &amp; contribute on GitHub <ExternalLink size={12} />
           </a>
         </section>
@@ -2182,7 +2182,7 @@ export function DashboardConnect({
     <article className="dashboard-connect" aria-labelledby={titleId}>
       <header>
         <div><strong id={titleId}>Connect</strong><span>· use the configured mycellios network</span></div>
-        <a href="https://github.com/tych0s/mycellios#readme" target="_blank" rel="noreferrer">Full docs <ArrowRight size={13} /></a>
+        <a href="https://github.com/nodecodex-org/mycellios#readme" target="_blank" rel="noreferrer">Full docs <ArrowRight size={13} /></a>
       </header>
       <div className="dashboard-connect-grid">
         <section>
@@ -2301,7 +2301,7 @@ function Overview({ snapshot, connectionError, onNavigate, publicLink, external,
         <div><strong>Welcome to the founding mesh</strong><span>Run open models with approved shared capacity. Contribute from this browser or install a local node; you choose the resources and can pause at any time.</span></div>
         <div className="overview-announcement-actions">
           <button onClick={() => onNavigate("contribute")}>Contribute now <ArrowRight size={15} /></button>
-          <a href="https://github.com/tych0s/mycellios" target="_blank" rel="noreferrer"><GitFork size={15} />GitHub</a>
+          <a href="https://github.com/nodecodex-org/mycellios" target="_blank" rel="noreferrer"><GitFork size={15} />GitHub</a>
         </div>
       </aside>
       <div className={`overview-evidence ${evidence.state}`} role="status"><span><Radio />{evidence.label}</span><strong>Coordinator snapshot</strong><small>{evidence.detail}</small></div>

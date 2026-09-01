@@ -71,9 +71,9 @@ describe("native Python product package", () => {
       "distributed_runtime/recovery_outcome.py",
     ]));
     for (const forbidden of [
-      "distributed_runtime/external_gguf_runtime.py",
-      "distributed_runtime/native_stage.py",
-      "distributed_runtime/gpu_cloud_probe.py",
+      "distributed_runtime/llama_cpp.py",
+      "distributed_runtime/nakshatra.py",
+      "distributed_runtime/salad_probe.py",
       "distributed_runtime/benchmark.py",
       "distributed_runtime/resident_expert_mesh_cli.py",
     ]) {
@@ -91,11 +91,11 @@ import distributed_runtime.string_decoy
 
 from . import (
     benchmark as relative_alias,
-    gpu_cloud_probe,
+    salad_probe,
 )
-from .native_stage import run as run_native_stage
+from .nakshatra import run as run_nakshatra
 from distributed_runtime import (
-    external_gguf_runtime as llama,
+    llama_cpp as llama,
     resident_expert_mesh_cli,
 )
 import distributed_runtime.cell_fixture_compiler as compiler, distributed_runtime.benchmark as benchmark_module
@@ -130,10 +130,10 @@ assigned_builtin("distributed_runtime.dynamic_nine")
       "distributed_runtime.dynamic_six",
       "distributed_runtime.dynamic_three",
       "distributed_runtime.dynamic_two",
-      "distributed_runtime.external_gguf_runtime",
-      "distributed_runtime.gpu_cloud_probe",
-      "distributed_runtime.native_stage",
+      "distributed_runtime.llama_cpp",
+      "distributed_runtime.nakshatra",
       "distributed_runtime.resident_expert_mesh_cli",
+      "distributed_runtime.salad_probe",
     ]);
   });
 
@@ -162,7 +162,7 @@ importlib.import_module(module_name)
       server,
       `${readFileSync(server, "utf8")}
 if False:
-    from distributed_runtime import benchmark as hidden_benchmark, gpu_cloud_probe
+    from distributed_runtime import benchmark as hidden_benchmark, salad_probe
 `,
       "utf8",
     );

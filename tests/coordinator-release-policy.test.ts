@@ -69,13 +69,13 @@ describe("native coordinator release staging", () => {
     );
     expect(manifest.files.some((entry) =>
       entry.path.includes("simulator")
-      || entry.path.includes("gpu_cloud")
+      || entry.path.includes("salad")
       || entry.path.endsWith("benchmark.py"),
     )).toBe(false);
     expect(() => verifyCoordinatorReleaseDirectory(destination)).not.toThrow();
 
-    mkdirSync(join(destination, "deploy", "gpu_cloud"));
-    writeFileSync(join(destination, "deploy", "gpu_cloud", "entrypoint.py"), "pass\n");
+    mkdirSync(join(destination, "deploy", "salad"));
+    writeFileSync(join(destination, "deploy", "salad", "entrypoint.py"), "pass\n");
     expect(() => verifyCoordinatorReleaseDirectory(destination)).toThrow(
       "non-production deploy material",
     );

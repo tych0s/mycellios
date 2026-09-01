@@ -47,7 +47,7 @@ const token = process.env.MYCELLIOS_MODEL_ADMIN_TOKEN
   ?? process.env.MYCELLIOS_ADMIN_ACCESS_TOKEN;
 if (!token?.trim()) {
   throw new Error(
-    "Set MYCELLIOS_MODEL_ADMIN_TOKEN or MYCELLIOS_ADMIN_ACCESS_TOKEN through the configured secret store.",
+    "Set MYCELLIOS_MODEL_ADMIN_TOKEN or MYCELLIOS_ADMIN_ACCESS_TOKEN through Infisical.",
   );
 }
 

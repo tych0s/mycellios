@@ -774,7 +774,7 @@ describe("HTTP LaunchAgent RPC", () => {
     if (request.process.kind !== "remote-stage") {
       throw new Error("fixture_first_process_is_not_remote_stage");
     }
-    (request.process as unknown as Record<string, unknown>).native_stage = {
+    (request.process as unknown as Record<string, unknown>).nakshatra = {
       packagePath: "D:/packages/stage-4-6",
       packageId: "a".repeat(64),
       manifestSha256: "b".repeat(64),
@@ -784,7 +784,7 @@ describe("HTTP LaunchAgent RPC", () => {
       layerStart: request.process.layerStart,
       layerEnd: request.process.layerEnd,
       totalLayers: request.process.totalLayers,
-      daemonExecutable: "D:/bin/llama-native_stage-worker.exe",
+      daemonExecutable: "D:/bin/llama-nakshatra-worker.exe",
       pipelineId: "18446744073709551615",
       contextTokens: 4_096,
       gpuLayers: 0,
@@ -793,7 +793,7 @@ describe("HTTP LaunchAgent RPC", () => {
       callTimeoutSeconds: 30,
       closeTimeoutSeconds: 5,
     };
-    const fake = new FakeAgent("fake:native_stage");
+    const fake = new FakeAgent("fake:nakshatra");
     const { address } = await serve(fake, request.nodeId);
 
     await expect(
@@ -807,13 +807,13 @@ describe("HTTP LaunchAgent RPC", () => {
     if (request.process.kind !== "remote-stage") {
       throw new Error("fixture_first_process_is_not_remote_stage");
     }
-    request.process.command.args.push("--local-model-runtime-url", "http://127.0.0.1:11434");
+    request.process.command.args.push("--ollama-url", "http://127.0.0.1:11434");
     const fake = new FakeAgent("fake:external-argv");
     const { address } = await serve(fake, request.nodeId);
 
     await expect(
       rpcClient(address).start(request, new AbortController().signal),
-    ).rejects.toThrow("external_backend_command_is_not_allowed:local-model-runtime");
+    ).rejects.toThrow("external_backend_command_is_not_allowed:ollama");
     expect(fake.starts).toHaveLength(0);
   });
 

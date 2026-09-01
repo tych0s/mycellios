@@ -1,0 +1,139 @@
+name: Publish existing native node release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without the v prefix
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: read
+
+concurrency:
+  group: mycellios-public-release
+  cancel-in-progress: false
+
+jobs:
+  publish-release:
+    name: Publish existing native node release
+    runs-on: [self-hosted, nodecodex-ci]
+    environment: production
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Download the exact four-file node release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == "refs/heads/main" ]]
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          mkdir -p release-assets
+          gh release download "v${VERSION}" --repo "$GITHUB_REPOSITORY" --dir release-assets \
+            --pattern mycellios-node-windows-x64.zip \
+            --pattern mycellios-node-linux-x64.tar.gz \
+            --pattern mycellios-node-macos-arm64.tar.gz \
+            --pattern mycellios-node-latest.json
+          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 4
+      - name: Verify source provenance for every package
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          metadata="$(gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,targetCommitish)"
+          source_sha="$(node -e 'const v=JSON.parse(process.argv[1]);if(v.isDraft||v.isPrerelease||!/^[0-9a-f]{40}$/.test(v.targetCommitish))process.exit(1);process.stdout.write(v.targetCommitish)' "$metadata")"
+          [[ "$source_sha" == "$GITHUB_SHA" ]]
+          for package in release-assets/mycellios-node-*.*; do
+            gh attestation verify "$package" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/node-build.yml" \
+              --source-digest "$source_sha" \
+              --source-ref refs/heads/main \
+              --deny-self-hosted-runners
+          done
+      - name: Publish one atomic coordinator transaction
+        shell: bash
+        env:
+          RELEASE_UPLOAD_URL: https://www.mycellios.com/internal/v1/releases
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          transaction_id="node-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA:0:12}"
+          manifest="$RUNNER_TEMP/mycellios-node-release.json"
+          source_id="$(node --input-type=module -e 'import {buildNativeSourceProvenance} from "./scripts/native-build-provenance.mjs";process.stdout.write(buildNativeSourceProvenance(process.cwd()).sourceId)')"
+          npx tsx src/coordinator/public-release-transaction-cli.ts \
+            --assets=release-assets \
+            --output="$manifest" \
+            --revision="$GITHUB_SHA" \
+            --source-id="$source_id" \
+            --transaction-id="$transaction_id" \
+            --version="$VERSION"
+
+          oidc_token() {
+            curl --fail --silent --show-error \
+              -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=mycellios-release-upload" |
+              jq -er '.value | select(type == "string" and length > 0)'
+          }
+          upload_file() {
+            local channel="$1" file="$2" name size digest chunks index chunk token chunk_digest
+            name="$(basename "$file")"
+            size="$(stat -c '%s' "$file")"
+            digest="$(sha256sum "$file" | cut -d ' ' -f 1)"
+            mkdir -p "$RUNNER_TEMP/chunks-$digest"
+            split -b 32m -d -a 6 "$file" "$RUNNER_TEMP/chunks-$digest/chunk-"
+            chunks="$(find "$RUNNER_TEMP/chunks-$digest" -type f -name 'chunk-*' | wc -l | tr -d ' ')"
+            index=0
+            for chunk in "$RUNNER_TEMP/chunks-$digest"/chunk-*; do
+              token="$(oidc_token)"
+              chunk_digest="$(sha256sum "$chunk" | cut -d ' ' -f 1)"
+              curl --fail-with-body --silent --show-error --retry 10 --retry-all-errors \
+                -X PUT "$RELEASE_UPLOAD_URL/$channel/$name" \
+                -H "Authorization: Bearer $token" \
+                -H "Content-Type: application/octet-stream" \
+                -H "X-Release-Transaction-Id: $transaction_id" \
+                -H "X-Release-Source-Id: $source_id" \
+                -H "X-Release-Revision: $GITHUB_SHA" \
+                -H "X-Release-Version: $VERSION" \
+                -H "X-Chunk-Index: $index" -H "X-Chunk-Count: $chunks" \
+                -H "X-Chunk-Sha256: $chunk_digest" \
+                -H "X-File-Sha256: $digest" -H "X-File-Size: $size" \
+                --data-binary "@$chunk"
+              index=$((index + 1))
+            done
+          }
+          abort_transaction() {
+            local token
+            token="$(oidc_token)" || return 1
+            curl --fail-with-body --silent --show-error --retry 5 --retry-all-errors \
+              -X POST "$RELEASE_UPLOAD_URL/transactions/$transaction_id/abort" \
+              -H "Authorization: Bearer $token" >/dev/null
+          }
+          trap 'abort_transaction || true' ERR INT TERM
+          upload_file downloads release-assets/mycellios-node-linux-x64.tar.gz
+          upload_file downloads release-assets/mycellios-node-macos-arm64.tar.gz
+          upload_file downloads release-assets/mycellios-node-windows-x64.zip
+          upload_file updates release-assets/mycellios-node-latest.json
+          token="$(oidc_token)"
+          curl --fail-with-body --silent --show-error --retry 10 --retry-all-errors \
+            -X POST "$RELEASE_UPLOAD_URL/transactions/$transaction_id/commit" \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/json" \
+            --data-binary "@$manifest" >/dev/null
+          trap - ERR INT TERM
+          curl --fail --silent --show-error --retry 10 --retry-all-errors \
+            "https://www.mycellios.com/updates/node/mycellios-node-latest.json?transaction=$transaction_id" \
+            -o "$RUNNER_TEMP/public-node-latest.json"
+          cmp -s release-assets/mycellios-node-latest.json "$RUNNER_TEMP/public-node-latest.json"

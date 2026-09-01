@@ -1,0 +1,66 @@
+{
+  "schema": "mycellios-security-p0-controls/1",
+  "publicNetworkAllowed": false,
+  "reviewedAt": "2026-08-10",
+  "controls": [
+    {
+      "id": "os_isolation",
+      "status": "implemented",
+      "owner": "runtime-security",
+      "evidence": ["src/node/os-isolation.ts", "src/node/service-definition.ts", "tests/node-os-isolation.test.ts", "tests/process-tree.test.ts"],
+      "residual": "Host compromise remains outside the node sandbox boundary.",
+      "nextReviewAt": "2026-11-10"
+    },
+    {
+      "id": "account_rate_limits",
+      "status": "implemented",
+      "owner": "coordinator-security",
+      "evidence": ["src/coordinator/api-access.ts", "tests/api-access.test.ts", "tests/coordinator-security.test.ts"],
+      "residual": "Provider-level distributed denial of service remains a perimeter responsibility.",
+      "nextReviewAt": "2026-11-10"
+    },
+    {
+      "id": "append_only_audit",
+      "status": "implemented",
+      "owner": "identity-security",
+      "evidence": ["src/storage/database.ts", "src/coordinator/node-command-store.ts", "tests/node-enrollment-store.test.ts", "tests/node-command-store.test.ts"],
+      "residual": "Database administrators can still replace the local database; external log anchoring is not deployed.",
+      "nextReviewAt": "2026-11-10"
+    },
+    {
+      "id": "owner_key_recovery",
+      "status": "implemented",
+      "owner": "identity-security",
+      "evidence": ["src/coordinator/worker-admission.ts", "src/contracts/worker-admission.ts", "tests/worker-admission.test.ts"],
+      "residual": "Account takeover can authorize recovery and therefore depends on upstream AAL2 controls.",
+      "nextReviewAt": "2026-11-10"
+    },
+    {
+      "id": "production_tls_perimeter",
+      "status": "external-blocked",
+      "owner": "platform-operations",
+      "evidence": ["src/core/config.ts", "tests/coordinator-config-security.test.ts", "docs/SECURITY.md"],
+      "residual": "The local checkout cannot prove the deployed proxy certificate, TLS policy, firewall or secret rotation.",
+      "prerequisite": "Import deployment evidence for TLS 1.3, valid certificate chain, restricted origin, firewall and secret rotation.",
+      "nextReviewAt": "2026-09-10"
+    },
+    {
+      "id": "sybil_abuse_resistance",
+      "status": "residual-blocked",
+      "owner": "network-security",
+      "evidence": ["src/coordinator/worker-admission.ts", "src/scheduler/scheduler.ts", "src/economy/economic-ledger.ts", "tests/worker-admission.test.ts", "tests/scheduler.test.ts", "tests/economic-ledger.test.ts"],
+      "residual": "Stable signed identities, reputation and verified-work settlement do not impose a scarce identity cost against a coordinated public Sybil population.",
+      "prerequisite": "Approve and test an admission quota, quarantine and verified-work cost policy before permissionless enrollment.",
+      "nextReviewAt": "2026-09-10"
+    },
+    {
+      "id": "independent_crypto_review",
+      "status": "external-blocked",
+      "owner": "security-assurance",
+      "evidence": ["src/contracts/execution-receipt.ts", "src/contracts/worker-admission.ts", "src/transport/direct-secure-channel.ts", "tests/execution-receipt.test.ts", "tests/worker-admission.test.ts"],
+      "residual": "Internal tests cannot substitute for an independent review of protocol composition, key lifecycle and implementation misuse resistance.",
+      "prerequisite": "Import an independent review report with all critical and high findings closed or explicitly accepted by the owner.",
+      "nextReviewAt": "2026-09-10"
+    }
+  ]
+}

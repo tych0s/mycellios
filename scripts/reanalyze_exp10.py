@@ -4,7 +4,7 @@
 QUÉ HACE
 --------
 Recalcula, a partir de los datos ya publicados en
-`docs/benchmarks/gpu_cloud-exp10-salida-larga-2026-07-24/result.json`, el tiempo de
+`docs/benchmarks/salad-exp10-salida-larga-2026-07-24/result.json`, el tiempo de
 servicio que cada brazo NECESITABA y lo compara con la ventana en que se midió.
 No re-corre nada: audita la corrida existente.
 
@@ -45,7 +45,7 @@ DEFAULT_RESULT = (
     pathlib.Path(__file__).resolve().parents[1]
     / "docs"
     / "benchmarks"
-    / "gpu_cloud-exp10-salida-larga-2026-07-24"
+    / "salad-exp10-salida-larga-2026-07-24"
     / "result.json"
 )
 

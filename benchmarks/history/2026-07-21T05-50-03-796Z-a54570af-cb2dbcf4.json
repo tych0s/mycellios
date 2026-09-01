@@ -1,0 +1,143 @@
+{
+  "schema": "mycellios-benchmark-run/1",
+  "runId": "2026-07-21T05-50-03-796Z-a54570af-cb2dbcf4",
+  "version": "0.2.2",
+  "label": "v0.2.2 · a54570af",
+  "gitCommit": "a54570afb8909aac5ac555c146c888df707a491e",
+  "gitBranch": "main",
+  "gitDirty": true,
+  "startedAt": "2026-07-21T05:50:04.245Z",
+  "finishedAt": "2026-07-21T05:50:49.809Z",
+  "suite": "real-runtime",
+  "status": "regression",
+  "measurements": [
+    {
+      "id": "runtime-sha256:7f9ddbfd649-c1",
+      "title": "qwen3-0.6b-gdlp2-pilot real · concurrencia 1",
+      "description": "Peticiones reales por la API OpenAI-compatible y el pipeline GDLP/2 activo.",
+      "evidence": "loopback",
+      "environment": "local-loopback",
+      "model": {
+        "id": "hf://Qwen/Qwen3-0.6B",
+        "label": "qwen3-0.6b-gdlp2-pilot",
+        "revision": "c1899de289a04d12100db370d81485cdf75e47ca",
+        "precision": "fp16"
+      },
+      "inventory": {
+        "totalDevices": 1,
+        "connectedDevices": 1,
+        "selectedDevices": 1,
+        "profiles": [
+          {
+            "label": "CPU host activo · PC-Dani",
+            "kind": "cpu",
+            "count": 1,
+            "memoryGb": 31.1
+          },
+          {
+            "label": "GPU detectada, no usada · AMD Radeon(TM) 890M Graphics",
+            "kind": "gpu",
+            "count": 1,
+            "memoryGb": 0.5
+          }
+        ]
+      },
+      "workload": {
+        "promptTokens": 28,
+        "outputTokens": 36,
+        "concurrentSequences": 1
+      },
+      "metrics": {
+        "tokensPerSecond": 3.24,
+        "tokensPerSecondP95": 3.74,
+        "aggregateTokensPerSecond": 3.192,
+        "ttftMsP50": 1029.6,
+        "ttftMsP95": 1249.5,
+        "tpotMsP50": 257.08,
+        "tpotMsP95": 269.33,
+        "acceptanceRate": 1,
+        "energyWhPerToken": null
+      },
+      "status": "regression",
+      "comparison": {
+        "baselineRunId": "2026-07-21T05-47-59-389Z-a54570af-fb5701d7",
+        "tokensPerSecondPct": -1.01,
+        "ttftP95Pct": 18.27,
+        "acceptancePoints": 0,
+        "reasons": [
+          "TTFT P95 subió 18.3%"
+        ]
+      },
+      "notes": [
+        "MEDICIÓN REAL LOCAL: no es una simulación ni una proyección.",
+        "Endpoint http://127.0.0.1:8082; 3 peticiones medidas y 36 tokens reales.",
+        "2 etapas sobre el host PC-Dani; ejecución PyTorch CPU; GPU detectada pero no usada por este runtime.",
+        "Coordinador: 0 workers remotos conectados de 0 registrados.",
+        "Artefacto sha256:7f9ddbfd649bdf32c5bd5af94cc938b509245146b412af3e5c77ef3953dbb793; snapshot 9195747895521566514."
+      ]
+    },
+    {
+      "id": "runtime-sha256:7f9ddbfd649-c2",
+      "title": "qwen3-0.6b-gdlp2-pilot real · concurrencia 2",
+      "description": "Peticiones reales por la API OpenAI-compatible y el pipeline GDLP/2 activo.",
+      "evidence": "loopback",
+      "environment": "local-loopback",
+      "model": {
+        "id": "hf://Qwen/Qwen3-0.6B",
+        "label": "qwen3-0.6b-gdlp2-pilot",
+        "revision": "c1899de289a04d12100db370d81485cdf75e47ca",
+        "precision": "fp16"
+      },
+      "inventory": {
+        "totalDevices": 1,
+        "connectedDevices": 1,
+        "selectedDevices": 1,
+        "profiles": [
+          {
+            "label": "CPU host activo · PC-Dani",
+            "kind": "cpu",
+            "count": 1,
+            "memoryGb": 31.1
+          },
+          {
+            "label": "GPU detectada, no usada · AMD Radeon(TM) 890M Graphics",
+            "kind": "gpu",
+            "count": 1,
+            "memoryGb": 0.5
+          }
+        ]
+      },
+      "workload": {
+        "promptTokens": 28,
+        "outputTokens": 72,
+        "concurrentSequences": 2
+      },
+      "metrics": {
+        "tokensPerSecond": 2.558,
+        "tokensPerSecondP95": 3.548,
+        "aggregateTokensPerSecond": 3.375,
+        "ttftMsP50": 1040.28,
+        "ttftMsP95": 1210.8,
+        "tpotMsP50": 228.94,
+        "tpotMsP95": 235.22,
+        "acceptanceRate": 1,
+        "energyWhPerToken": null
+      },
+      "status": "passed",
+      "comparison": {
+        "baselineRunId": "2026-07-21T05-47-59-389Z-a54570af-fb5701d7",
+        "tokensPerSecondPct": 21.81,
+        "ttftP95Pct": -16.72,
+        "acceptancePoints": 0,
+        "reasons": []
+      },
+      "notes": [
+        "MEDICIÓN REAL LOCAL: no es una simulación ni una proyección.",
+        "Endpoint http://127.0.0.1:8082; 6 peticiones medidas y 72 tokens reales.",
+        "2 etapas sobre el host PC-Dani; ejecución PyTorch CPU; GPU detectada pero no usada por este runtime.",
+        "Coordinador: 0 workers remotos conectados de 0 registrados.",
+        "Artefacto sha256:7f9ddbfd649bdf32c5bd5af94cc938b509245146b412af3e5c77ef3953dbb793; snapshot 9195747895521566514."
+      ]
+    }
+  ]
+}

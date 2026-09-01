@@ -1,0 +1,22 @@
+{
+  "region": "salad-wan",
+  "capacityScope": "host",
+  "offeredVramMb": 512,
+  "limits": {
+    "maxConcurrency": 1,
+    "pauseWhenForeground": false
+  },
+  "adapter": {
+    "kind": "mock",
+    "model": "headless-shard-only",
+    "tokensPerSecond": 1,
+    "ttftMs": 1,
+    "failureRate": 0
+  },
+  "deployment": {
+    "contextLimit": 8192
+  },
+  "llmfit": {
+    "enabled": false
+  }
+}

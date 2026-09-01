@@ -718,10 +718,10 @@ describe("release uploads", () => {
 
   it("restricts OIDC claims to this repository, workflow and release refs", () => {
     expect(validateGitHubReleaseClaims({
-      repository: "tych0s/mycellios",
+      repository: "nodecodex-org/mycellios",
       ref: "refs/heads/main",
       sha: "a".repeat(40),
-      workflow_ref: "tych0s/mycellios/.github/workflows/node-build.yml@refs/heads/main",
+      workflow_ref: "nodecodex-org/mycellios/.github/workflows/node-build.yml@refs/heads/main",
       event_name: "push",
       environment: "production",
     })).toMatchObject({
@@ -740,11 +740,11 @@ describe("release uploads", () => {
     })).toThrow("release_repository_not_allowed");
 
     expect(validateGitHubReleaseClaims({
-      repository: "tych0s/mycellios",
+      repository: "nodecodex-org/mycellios",
       ref: "refs/heads/main",
       sha: "b".repeat(40),
       workflow_ref:
-        "tych0s/mycellios/.github/workflows/publish-existing-release.yml@refs/heads/main",
+        "nodecodex-org/mycellios/.github/workflows/publish-existing-release.yml@refs/heads/main",
       event_name: "workflow_dispatch",
       environment: "production",
     })).toMatchObject({
@@ -754,48 +754,48 @@ describe("release uploads", () => {
     });
 
     expect(() => validateGitHubReleaseClaims({
-      repository: "tych0s/mycellios",
+      repository: "nodecodex-org/mycellios",
       ref: "refs/tags/v0.2.19",
       sha: "b".repeat(40),
-      workflow_ref: "tych0s/mycellios/.github/workflows/node-build.yml@refs/heads/main",
+      workflow_ref: "nodecodex-org/mycellios/.github/workflows/node-build.yml@refs/heads/main",
       event_name: "push",
       environment: "production",
     })).toThrow("release_ref_not_allowed");
 
     expect(() => validateGitHubReleaseClaims({
-      repository: "tych0s/mycellios",
+      repository: "nodecodex-org/mycellios",
       ref: "refs/heads/main",
       sha: "b".repeat(40),
       workflow_ref:
-        "tych0s/mycellios/.github/workflows/node-build.yml@refs/heads/main-evil",
+        "nodecodex-org/mycellios/.github/workflows/node-build.yml@refs/heads/main-evil",
       event_name: "push",
       environment: "production",
     })).toThrow("release_workflow_not_allowed");
 
     expect(() => validateGitHubReleaseClaims({
-      repository: "tych0s/mycellios",
+      repository: "nodecodex-org/mycellios",
       ref: "refs/heads/main",
       sha: "b".repeat(40),
-      workflow_ref: "tych0s/mycellios/.github/workflows/node-build.yml@refs/heads/main",
+      workflow_ref: "nodecodex-org/mycellios/.github/workflows/node-build.yml@refs/heads/main",
       event_name: "workflow_dispatch",
       environment: "production",
     })).toThrow("release_event_not_allowed");
 
     expect(() => validateGitHubReleaseClaims({
-      repository: "tych0s/mycellios",
+      repository: "nodecodex-org/mycellios",
       ref: "refs/heads/main",
       sha: "b".repeat(40),
       workflow_ref:
-        "tych0s/mycellios/.github/workflows/publish-existing-release.yml@refs/heads/main",
+        "nodecodex-org/mycellios/.github/workflows/publish-existing-release.yml@refs/heads/main",
       event_name: "push",
       environment: "production",
     })).toThrow("release_event_not_allowed");
 
     expect(() => validateGitHubReleaseClaims({
-      repository: "tych0s/mycellios",
+      repository: "nodecodex-org/mycellios",
       ref: "refs/heads/main",
       sha: "c".repeat(40),
-      workflow_ref: "tych0s/mycellios/.github/workflows/node-build.yml@refs/heads/main",
+      workflow_ref: "nodecodex-org/mycellios/.github/workflows/node-build.yml@refs/heads/main",
       event_name: "push",
       environment: "attestation",
     })).toThrow("release_environment_not_allowed");
@@ -951,11 +951,11 @@ function releaseRuntimeMetadata(
 
 function releaseClaims(sha: string): GitHubReleaseClaims {
   return {
-    repository: "tych0s/mycellios",
+    repository: "nodecodex-org/mycellios",
     ref: "refs/heads/main",
     sha,
     workflowRef:
-      "tych0s/mycellios/.github/workflows/node-build.yml@refs/heads/main",
+      "nodecodex-org/mycellios/.github/workflows/node-build.yml@refs/heads/main",
     eventName: "push",
     environment: "production",
   };

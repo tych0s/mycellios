@@ -1,5 +1,5 @@
 .git
-.agent-state
+.jarvis
 .claude
 .codex-runtime
 node_modules

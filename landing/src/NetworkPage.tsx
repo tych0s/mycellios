@@ -956,7 +956,7 @@ export function NetworkPage({
             <p><Database /> <span><strong>Derived</strong>Regions and totals are calculated only from that snapshot; the formula stays visible in the open source client.</span></p>
             <p><CheckCircle2 /> <span><strong>Deliberately absent</strong>Revenue, rewards and throughput stay unpublished until they have an auditable public source.</span></p>
           </div>
-          <div className="net-method-links"><a href="/docs">Read the protocol <ExternalLink /></a><a href="https://github.com/tych0s/mycellios" target="_blank" rel="noreferrer">Inspect the source <ExternalLink /></a></div>
+          <div className="net-method-links"><a href="/docs">Read the protocol <ExternalLink /></a><a href="https://github.com/nodecodex-org/mycellios" target="_blank" rel="noreferrer">Inspect the source <ExternalLink /></a></div>
         </section>
       </div>
     </section>

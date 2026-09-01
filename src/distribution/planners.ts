@@ -295,7 +295,7 @@ const DEFAULT_FLEET_OPTIONS: FleetPlannerOptions = {
  *  - Never evict below `minimumNodes`. A planner with nothing left to place is
  *    worse than a slow route.
  *  - If the rule wants to drop (nearly) everyone, the outlier is the measurement,
- *    not the fleet. peer runtime words it as "if I banned them all, the problem is me".
+ *    not the fleet. Petals words it as "if I banned them all, the problem is me".
  */
 export function evictFarNodes(
   topology: DistributionTopology,

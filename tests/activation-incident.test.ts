@@ -118,7 +118,7 @@ describe("activation incident classification", () => {
   it("stops a native access-violation loop and keeps only safe identifiers", () => {
     const incident = classifyActivationIncident({
       message:
-        "launch_process_exited:stage-abc:C:\\Users\\ExampleUser\\secret.py:Bearer token:code=3221225477",
+        "launch_process_exited:stage-abc:C:\\Users\\Daniel\\secret.py:Bearer token:code=3221225477",
       maximumAttempts: 5,
     });
 
@@ -132,7 +132,7 @@ describe("activation incident classification", () => {
       stageId: "stage-abc",
       processExitCode: 3_221_225_477,
     });
-    expect(JSON.stringify(incident)).not.toContain("ExampleUser");
+    expect(JSON.stringify(incident)).not.toContain("Daniel");
     expect(JSON.stringify(incident)).not.toContain("Bearer");
     expect(activationFailureIsTransient(
       "launch_process_exited:stage-abc:code=3221225477",

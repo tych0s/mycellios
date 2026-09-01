@@ -20,7 +20,7 @@ LOS CUATRO BRAZOS
     A  4 tramos, nodo actual                     -> base
     B  4 tramos, mejor nodo por RTT MEDIDO       -> aísla geografía
     C  2 tramos (relé fuera del plano de datos)  -> aísla topología
-    D  C + etapa native_stage/GGUF                  -> aísla motor nativo
+    D  C + etapa nakshatra/GGUF                  -> aísla motor nativo
 
 A/B se corre en el MISMO nodo e intercalado, no en bloques: el ruido del banco
 es ±20-25 % y dos bloques consecutivos confunden deriva temporal con efecto.

@@ -420,7 +420,7 @@ class DistributedMycelliosServer:
         # `degraded` significa que el motor tiene un error fatal y NO va a servir
         # ni una petición más. Devolver 200 con esa palabra dentro convierte una
         # caída en un outage silencioso: todo supervisor, balanceador y sonda
-        # mira el código, no el cuerpo. Y en el despliegue real (GpuCloud) la
+        # mira el código, no el cuerpo. Y en el despliegue real (Salad) la
         # recuperación automática está prohibida, así que nadie se entera nunca.
         # `recovering` sí es 200: el motor está trabajando en volver.
         return web.json_response(

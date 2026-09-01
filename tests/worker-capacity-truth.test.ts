@@ -93,7 +93,7 @@ describe("worker capacity truth", () => {
         acceleration,
         physicalIdentity: {
           schema: "gdlp-worker-physical-identity/1",
-          provider: "gpu_cloud",
+          provider: "salad",
           providerMachineFingerprintSha256: `sha256:${"1".repeat(64)}`,
           hostFingerprintSha256: `sha256:${"2".repeat(64)}`,
           gpuFingerprintsSha256: [`sha256:${"3".repeat(64)}`],
@@ -120,7 +120,7 @@ describe("worker capacity truth", () => {
     expect(capabilities.distributedExecutor?.acceleration).toEqual(acceleration);
     expect(capabilities.distributedExecutor).toHaveProperty("physicalIdentity", {
       schema: "gdlp-worker-physical-identity/1",
-      provider: "gpu_cloud",
+      provider: "salad",
       providerMachineFingerprintSha256: `sha256:${"1".repeat(64)}`,
       hostFingerprintSha256: `sha256:${"2".repeat(64)}`,
       gpuFingerprintsSha256: [`sha256:${"3".repeat(64)}`],

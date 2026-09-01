@@ -62,7 +62,7 @@ class StageExecutorAbiTests(unittest.TestCase):
 
     def test_manifest_round_trip_seals_every_execution_field(self) -> None:
         manifest = _manifest(
-            engine="external GGUF runtime",
+            engine="llama.cpp",
             adapter="gdlp-llama-stage",
             layer_start=0,
             layer_end=8,
@@ -88,7 +88,7 @@ class StageExecutorAbiTests(unittest.TestCase):
         chain = validate_executor_chain(
             (
                 _manifest(
-                    engine="external GGUF runtime",
+                    engine="llama.cpp",
                     adapter="gdlp-llama-stage",
                     layer_start=0,
                     layer_end=8,
@@ -113,7 +113,7 @@ class StageExecutorAbiTests(unittest.TestCase):
                 ),
             )
         )
-        self.assertEqual([item.engine for item in chain], ["external GGUF runtime", "mlx", "onnxruntime"])
+        self.assertEqual([item.engine for item in chain], ["llama.cpp", "mlx", "onnxruntime"])
         self.assertTrue(chain[-1].last)
 
     def test_chain_rejects_gaps_model_mismatch_and_tensor_mismatch(self) -> None:

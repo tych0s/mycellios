@@ -7,9 +7,9 @@ import { buildNativeSourceProvenance } from "./scripts/native-build-provenance.m
 /*
  * Where `node_modules` actually lives.
  *
- * A git worktree shares one install with the repo it was cut from, so it may
- * not have a local `node_modules` and every import can resolve to an ancestor
- * directory — outside Vite's root. Vite serves those
+ * A git worktree shares one install with the repo it was cut from, so inside
+ * `.state/worktrees/<branch>` there is no local `node_modules` and every import
+ * resolves to an ancestor directory — outside Vite's root. Vite serves those
  * through `/@fs/`, and its default allow list only covers the project root, so
  * anything reached as a plain asset rather than as a module gets a 403. That is
  * how `@fontsource-variable/manrope` fails: its `index.css` is in the module
@@ -122,7 +122,7 @@ export default defineConfig({
     host: LOCAL_UI_HOST,
     port: LOCAL_UI_PORT,
     strictPort: true,
-    allowedHosts: ["www.mycellios.com", "www.mycellios.com"],
+    allowedHosts: ["www.mycellios.com", "dev-mycellios.nodecodex.io"],
     fs: { allow: servableRoots },
     proxy: {
       "/public/v1/auth-config": identityProxy(),
@@ -141,7 +141,7 @@ export default defineConfig({
     host: LOCAL_UI_HOST,
     port: LOCAL_UI_PORT,
     strictPort: true,
-    allowedHosts: ["www.mycellios.com", "www.mycellios.com"],
+    allowedHosts: ["www.mycellios.com", "dev-mycellios.nodecodex.io"],
     proxy: {
       "/public/v1/auth-config": identityProxy(),
       "/v1/auth": identityProxy(),

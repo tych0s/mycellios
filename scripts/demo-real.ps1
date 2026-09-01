@@ -115,7 +115,7 @@ function Wait-Http {
 }
 
 if (-not (Test-Path -LiteralPath $server) -or -not (Test-Path -LiteralPath $model)) {
-    & (Join-Path $PSScriptRoot 'setup-local-externalggufruntime.ps1')
+    & (Join-Path $PSScriptRoot 'setup-local-llamacpp.ps1')
 }
 
 $started = @()

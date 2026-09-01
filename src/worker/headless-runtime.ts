@@ -39,7 +39,7 @@ export interface HeadlessWorkerEnvironment {
   networkToken?: string;
   workerCredentialPath?: string;
   nodeId: string;
-  provider: "gpu_cloud" | "generic";
+  provider: "salad" | "generic";
   providerMachineId: string;
   stagePort: number;
   pythonExecutable: string;
@@ -141,15 +141,15 @@ export function loadHeadlessWorkerEnvironment(
   environment: NodeJS.ProcessEnv = process.env,
   cwd = process.cwd(),
 ): HeadlessWorkerEnvironment {
-  const rawProviderMachineId = environment.GPU_CLOUD_MACHINE_ID?.trim();
+  const rawProviderMachineId = environment.SALAD_MACHINE_ID?.trim();
   const explicitNodeId = environment.MYCELLIOS_NODE_ID?.trim();
   if (!explicitNodeId && !rawProviderMachineId) {
-    throw new Error("headless_worker_requires_mycellios_node_id_or_gpu_cloud_machine_id");
+    throw new Error("headless_worker_requires_mycellios_node_id_or_salad_machine_id");
   }
-  const provider = rawProviderMachineId ? "gpu_cloud" as const : "generic" as const;
+  const provider = rawProviderMachineId ? "salad" as const : "generic" as const;
   const providerMachineId = rawProviderMachineId ?? explicitNodeId!;
   const nodeId = explicitNodeId
-    ?? `gpu_cloud-${sha256Text(`gdlp-gpu_cloud-node-id-v1\0${providerMachineId}`).slice(-32)}`;
+    ?? `salad-${sha256Text(`gdlp-salad-node-id-v1\0${providerMachineId}`).slice(-32)}`;
   if (!NODE_ID.test(nodeId)) throw new Error("headless_worker_node_id_is_invalid");
 
   const coordinatorUrl = requiredText(
@@ -183,7 +183,7 @@ export function loadHeadlessWorkerEnvironment(
     configPath: resolve(
       cwd,
       environment.GPU_MESH_WORKER_CONFIG?.trim()
-        || "./config/worker.gpu_cloud.example.json",
+        || "./config/worker.salad.example.json",
     ),
     coordinatorUrl: coordinator.href.replace(/\/$/, ""),
     ...(networkToken ? { networkToken } : {}),

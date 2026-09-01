@@ -1,0 +1,56 @@
+diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -21,5 +21,5 @@
+   "scripts": {
+     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+-    "build": "npm run clean --silent && npm run verify:structure && tsc -p tsconfig.build.json && npm run verify:native-boundary && npm run mobile:build && npm run landing:build && node scripts/write-coordinator-output-receipt.mjs",
++    "build": "npm run clean --silent && npm run verify:structure && tsc -p tsconfig.build.json && npm run mobile:build && npm run landing:build && node scripts/write-coordinator-output-receipt.mjs",
+     "check": "npm run verify:structure && npm run typecheck && npm run landing:typecheck && npm run mobile:typecheck && npm test",
+     "typecheck": "tsc -p tsconfig.json --noEmit",
+@@ -75,16 +75,9 @@
+     "campaign:physical-gpu-conveyor-ab": "tsx src/distribution/physical-gpu-conveyor-ab-cli.ts",
+     "verify:physical-gpu-gate": "tsx src/distribution/physical-gpu-gate-cli.ts",
+     "verify:wan-pilot": "tsx src/distribution/wan-pilot-gate-cli.ts",
+-    "verify:gpu_cloud-container": "node scripts/verify-gpu_cloud-container.mjs",
+     "test": "vitest run",
+-    "gate:program": "tsx scripts/gate-program.ts",
+-    "gate:physical:import": "tsx scripts/import-physical-gate-evidence.ts",
+-    "program:run": "tsx scripts/gate-program.ts",
+     "verify:component-boundaries": "tsx scripts/verify-component-boundaries.ts",
+     "verify:structure": "node scripts/verify-repository-structure.mjs",
+-    "verify:native-runtime-boundary": "tsx scripts/verify-native-runtime-boundary.ts",
+-    "verify:traceability": "tsx scripts/verify-final-web-native-traceability.ts",
+-    "verify:native-boundary": "tsx scripts/verify-native-product-boundary.ts && node scripts/verify-native-python-product-source.mjs",
+     "version:check": "node scripts/node-release-version.mjs --check",
+     "version:bump": "node scripts/node-release-version.mjs --bump",
+     "coordinator:release:prepare": "node scripts/prepare-coordinator-release.mjs",
+@@ -92,7 +86,6 @@
+     "test:watch": "vitest",
+     "smoke:public": "node scripts/smoke-public-network.mjs",
+     "verify:stripe-sandbox": "node scripts/verify-stripe-sandbox.mjs",
+-    "provision:stripe-sandbox": "node scripts/provision-stripe-sandbox.mjs",
+     "smoke:runtime-profile:local": "tsx scripts/smoke-runtime-performance-profile.ts",
+     "smoke:model-profile:local": "tsx scripts/smoke-model-profile-local.ts",
+     "dev:e2e:distributed": "tsx scripts/dev-distributed-e2e.ts",
+diff --git a/tests/runtime-manifest-v2.test.ts b/tests/runtime-manifest-v2.test.ts
+--- a/tests/runtime-manifest-v2.test.ts
++++ b/tests/runtime-manifest-v2.test.ts
+@@ -641,4 +641,4 @@ describe("GDLP/2 runtime manifest", () => {
+         const member = stage.members[0]!;
+         expect(stage.anchor).toEqual({ memberId: member.nodeId, endpoint: member.endpoint });
+-        expect(member.backend.engine).toMatch(/llama\.cpp|mlx/);
++        expect(member.backend.engine).toMatch(/external GGUF runtime|mlx/);
+         expect(member.backend.modelFormats).toEqual(["gguf"]);
+diff --git a/tests/native-python-product-package.test.ts b/tests/native-python-product-package.test.ts
+--- a/tests/native-python-product-package.test.ts
++++ b/tests/native-python-product-package.test.ts
+@@ -117,7 +117,7 @@ describe("native Python product package", () => {
+       "distributed_runtime.dynamic_three",
+       "distributed_runtime.dynamic_two",
+       "distributed_runtime.external_gguf_runtime",
++      "distributed_runtime.gpu_cloud_probe",
+       "distributed_runtime.native_stage",
+       "distributed_runtime.resident_expert_mesh_cli",
+-      "distributed_runtime.gpu_cloud_probe",
+     ]);

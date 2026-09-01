@@ -84,10 +84,10 @@ class EngineConfigurationTests(unittest.TestCase):
 
     def test_server_cli_rejects_known_external_backends(self) -> None:
         for argument, backend in (
-            ("--native_stage-package", "native_stage"),
-            ("--external-gguf-runtime-server", "external GGUF runtime"),
-            ("--local-model-runtime-url", "local-model-runtime"),
-            ("--model-serving-runtime-endpoint", "model-serving-runtime"),
+            ("--nakshatra-package", "nakshatra"),
+            ("--llama-cpp-server", "llama.cpp"),
+            ("--ollama-url", "ollama"),
+            ("--vllm-endpoint", "vllm"),
         ):
             with self.subTest(argument=argument):
                 with self.assertRaisesRegex(
@@ -583,7 +583,7 @@ class HealthStatusCodeTests(unittest.IsolatedAsyncioTestCase):
     Antes, `/health` devolvía siempre 200 y metía la palabra `degraded` dentro
     del JSON. Todo supervisor, balanceador y sonda mira el código de estado, así
     que un motor con error fatal —que no va a servir ni una petición más— pasaba
-    por sano. Y en el despliegue real (GpuCloud) la recuperación automática está
+    por sano. Y en el despliegue real (Salad) la recuperación automática está
     prohibida, así que nadie se enteraba nunca: outage silencioso.
     """
 

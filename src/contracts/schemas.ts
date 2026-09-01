@@ -405,7 +405,7 @@ export const workerCapabilitiesSchema = z.object({
       physicalIdentity: z
         .object({
           schema: z.literal("gdlp-worker-physical-identity/1"),
-          provider: z.enum(["gpu_cloud", "generic"]),
+          provider: z.enum(["salad", "generic"]),
           providerMachineFingerprintSha256: sha256Digest,
           hostFingerprintSha256: sha256Digest,
           gpuFingerprintsSha256: z.array(sha256Digest).min(1).max(64),

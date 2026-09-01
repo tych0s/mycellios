@@ -1,0 +1,62 @@
+name: Verify public coordinator deployment
+
+on:
+  workflow_call:
+
+concurrency:
+  group: mycellios-public-coordinator
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify exact coordinator identity
+    runs-on: [self-hosted, nodecodex-ci]
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Wait for the Dokploy deployment of these exact bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          source_id="$(
+            node --input-type=module -e '
+              import { buildNativeSourceProvenance } from "./scripts/native-build-provenance.mjs";
+              process.stdout.write(buildNativeSourceProvenance(process.cwd()).sourceId);
+            '
+          )"
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$source_id" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+          for _ in $(seq 1 120); do
+            if payload="$(
+              curl --fail --silent --show-error \
+                --max-time 5 \
+                -H "Cache-Control: no-cache" \
+                "https://www.mycellios.com/health?revision=${GITHUB_SHA}" \
+                2>/dev/null
+            )"; then
+              if node -e '
+                const health = JSON.parse(process.argv[1]);
+                if (
+                  health.status !== "ok"
+                  || health.version !== process.argv[2]
+                  || health.revision !== process.argv[3]
+                  || health.buildIdentity?.version !== process.argv[2]
+                  || health.buildIdentity?.sourceId !== process.argv[4]
+                ) process.exit(1);
+              ' "$payload" "$version" "$GITHUB_SHA" "$source_id"; then
+                echo "Dokploy activated ${version} / ${GITHUB_SHA} / ${source_id}."
+                exit 0
+              fi
+            fi
+            sleep 10
+          done
+
+          echo "Dokploy did not activate the exact coordinator identity within 20 minutes." >&2
+          exit 1

@@ -1,0 +1,59 @@
+{
+  "schema": "mycellios-gate-program/1",
+  "gates": [
+    { "id": "G0_BASELINE", "phase": 0, "inputs": ["package.json", "package-lock.json", "src", "scripts", ".github/workflows", "config/final-web-native-program.json", "config/gate-program-evidence.json"], "checks": [
+      { "id": "isolated_worktree", "kind": "automatic" },
+      { "id": "clean_worktree", "kind": "automatic" },
+      { "id": "runtime_channel_integrated", "kind": "automatic" },
+      { "id": "electron_inventory", "kind": "automatic" },
+      { "id": "native_builders", "kind": "external" },
+      { "id": "physical_hardware", "kind": "physical" }
+    ]},
+    { "id": "G1_ELECTRON_ZERO", "phase": 1, "inputs": ["package.json", "package-lock.json", "src", "scripts", ".github/workflows", "docs"], "checks": [
+      { "id": "electron_zero", "kind": "automatic" },
+      { "id": "node_control_plane", "kind": "automatic" },
+      { "id": "web_node_enrollment", "kind": "automatic" },
+      { "id": "native_lifecycle_matrix", "kind": "physical" },
+      { "id": "external_rollback", "kind": "external" }
+    ]},
+    { "id": "G2_CERTIFIED_ARTIFACTS", "phase": 2, "inputs": ["src/contracts", "src/model-fabric", "src/update", "src/benchlab", "python", "config"], "checks": [
+      { "id": "component_and_model_contracts", "kind": "automatic" },
+      { "id": "minimal_artifact_download", "kind": "automatic" },
+      { "id": "certification_harness", "kind": "automatic" },
+      { "id": "qwen3_physical_certification", "kind": "physical" }
+    ]},
+    { "id": "G3_AUTOMATIC_EXECUTION", "phase": 3, "inputs": ["src/distribution", "src/scheduler", "src/coordinator", "src/worker", "src/telemetry", "python/distributed_runtime", "tests"], "checks": [
+      { "id": "execution_route_policy", "kind": "automatic" },
+      { "id": "single_device_execution", "kind": "automatic" },
+      { "id": "atomic_activation_lifecycle", "kind": "automatic" },
+      { "id": "two_host_exact_execution", "kind": "physical" }
+    ]},
+    { "id": "G4_WAN_CONVEYOR", "phase": 4, "inputs": ["src/distribution", "python/distributed_runtime", "src/benchlab", "config"], "checks": [
+      { "id": "bounded_authenticated_data_plane", "kind": "automatic" },
+      { "id": "conveyor_correctness", "kind": "automatic" },
+      { "id": "physical_conveyor_ab", "kind": "physical" }
+    ]},
+    { "id": "G5_RESILIENCE_SECURITY", "phase": 5, "inputs": ["src", "python", "tests", "docs", "config"], "checks": [
+      { "id": "bounded_recovery", "kind": "automatic" },
+      { "id": "privacy_and_trust_policy", "kind": "automatic" },
+      { "id": "protocol_and_artifact_fuzz", "kind": "automatic" },
+      { "id": "automatic_fault_campaign", "kind": "automatic" },
+      { "id": "security_p0_control_matrix", "kind": "automatic" },
+      { "id": "economic_publication_policy", "kind": "automatic" },
+      { "id": "physical_fault_campaign", "kind": "physical" },
+      { "id": "security_review", "kind": "external" }
+    ]},
+    { "id": "G6_PRODUCT", "phase": 6, "inputs": ["landing", "src/coordinator", "src/contracts", "tests", "docs"], "checks": [
+      { "id": "product_journeys", "kind": "automatic" },
+      { "id": "accessibility", "kind": "automatic" },
+      { "id": "visual_qa", "kind": "external" }
+    ]},
+    { "id": "G7_FINAL_RELEASE", "phase": 7, "inputs": ["package.json", "package-lock.json", "src", "python", "scripts", ".github/workflows", "docs", "config"], "checks": [
+      { "id": "final_traceability", "kind": "automatic" },
+      { "id": "release_supply_chain", "kind": "automatic" },
+      { "id": "release_physical_matrix", "kind": "physical" },
+      { "id": "pre_environment_and_rollback", "kind": "external" },
+      { "id": "release_authorization", "kind": "external" }
+    ]}
+  ]
+}

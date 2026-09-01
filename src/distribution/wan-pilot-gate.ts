@@ -3,7 +3,7 @@ import { z } from "zod";
 const digest = z.string().regex(/^sha256:[0-9a-f]{64}$/);
 const physicalIdentitySchema = z.object({
   schema: z.literal("gdlp-worker-physical-identity/1"),
-  provider: z.enum(["gpu_cloud", "generic"]),
+  provider: z.enum(["salad", "generic"]),
   providerMachineFingerprintSha256: digest,
   hostFingerprintSha256: digest,
   gpuFingerprintsSha256: z.array(digest).min(1).max(64),
@@ -51,7 +51,7 @@ const snapshotSchema = z.object({
 export interface WanPilotGateOptions {
   model: string;
   minimumPhysicalNodes?: number;
-  minimumGpuCloudNodes?: number;
+  minimumSaladNodes?: number;
 }
 
 export interface WanPilotGateReport {
@@ -62,11 +62,11 @@ export interface WanPilotGateReport {
   model: string;
   stageCount: number;
   physicalNodeCount: number;
-  gpu_cloudNodeCount: number;
+  saladNodeCount: number;
   gpuFingerprintCount: number;
   nodes: Array<{
     nodeId: string;
-    provider: "gpu_cloud" | "generic";
+    provider: "salad" | "generic";
     stageIndexes: number[];
   }>;
   limitations: string[];
@@ -82,9 +82,9 @@ export function verifyWanPilotSnapshot(
     options.minimumPhysicalNodes ?? 2,
     "wan_pilot_minimum_physical_nodes_is_invalid",
   );
-  const minimumGpuCloudNodes = boundedMinimum(
-    options.minimumGpuCloudNodes ?? 2,
-    "wan_pilot_minimum_gpu_cloud_nodes_is_invalid",
+  const minimumSaladNodes = boundedMinimum(
+    options.minimumSaladNodes ?? 2,
+    "wan_pilot_minimum_salad_nodes_is_invalid",
   );
   if (!snapshot.models.some((entry) => entry.id === model)) {
     throw new Error("wan_pilot_model_is_not_active");
@@ -135,7 +135,7 @@ export function verifyWanPilotSnapshot(
   );
   const nodes = new Map<string, {
     nodeId: string;
-    provider: "gpu_cloud" | "generic";
+    provider: "salad" | "generic";
     providerFingerprint: string;
     hostFingerprint: string;
     gpuFingerprints: string[];
@@ -176,9 +176,9 @@ export function verifyWanPilotSnapshot(
   ) {
     throw new Error("wan_pilot_physical_machine_fingerprints_are_not_unique");
   }
-  const gpu_cloudNodeCount = physicalNodes.filter((node) => node.provider === "gpu_cloud").length;
-  if (gpu_cloudNodeCount < minimumGpuCloudNodes) {
-    throw new Error("wan_pilot_has_too_few_gpu_cloud_nodes");
+  const saladNodeCount = physicalNodes.filter((node) => node.provider === "salad").length;
+  if (saladNodeCount < minimumSaladNodes) {
+    throw new Error("wan_pilot_has_too_few_salad_nodes");
   }
 
   return {
@@ -189,7 +189,7 @@ export function verifyWanPilotSnapshot(
     model,
     stageCount: stages.length,
     physicalNodeCount: physicalNodes.length,
-    gpu_cloudNodeCount,
+    saladNodeCount,
     gpuFingerprintCount: gpuFingerprints.size,
     nodes: physicalNodes.map(({ nodeId, provider, stageIndexes }) => ({
       nodeId,

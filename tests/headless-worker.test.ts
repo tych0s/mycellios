@@ -50,28 +50,28 @@ const probe: PhysicalProbeV1 = {
   }],
 };
 
-describe("headless GpuCloud worker", () => {
+describe("headless Salad worker", () => {
   it("derives a private stable node id and requires authenticated HTTPS externally", () => {
     expect(() => loadHeadlessWorkerEnvironment({
-      GPU_CLOUD_MACHINE_ID: machineId,
+      SALAD_MACHINE_ID: machineId,
       GPU_MESH_COORDINATOR: "https://www.mycellios.com",
     }, "/opt/mycellios")).toThrow(
       "headless_worker_external_coordinator_requires_scoped_credential_or_32_character_network_token",
     );
 
     const environment = loadHeadlessWorkerEnvironment({
-      GPU_CLOUD_MACHINE_ID: machineId,
+      SALAD_MACHINE_ID: machineId,
       GPU_MESH_COORDINATOR: "https://www.mycellios.com",
       MYCELLIOS_NETWORK_TOKEN: "n".repeat(32),
     }, "/opt/mycellios");
-    expect(environment.nodeId).toMatch(/^gpu_cloud-[0-9a-f]{32}$/);
+    expect(environment.nodeId).toMatch(/^salad-[0-9a-f]{32}$/);
     expect(environment.nodeId).not.toContain(machineId);
-    expect(environment.provider).toBe("gpu_cloud");
+    expect(environment.provider).toBe("salad");
     expect(environment.configPath).toBe(
-      resolve("/opt/mycellios", "./config/worker.gpu_cloud.example.json"),
+      resolve("/opt/mycellios", "./config/worker.salad.example.json"),
     );
     const scoped = loadHeadlessWorkerEnvironment({
-      GPU_CLOUD_MACHINE_ID: machineId,
+      SALAD_MACHINE_ID: machineId,
       GPU_MESH_COORDINATOR: "https://www.mycellios.com",
       MYCELLIOS_WORKER_CREDENTIAL_PATH: "/var/lib/mycellios/worker-credential.json",
     }, "/opt/mycellios");
@@ -99,7 +99,7 @@ describe("headless GpuCloud worker", () => {
 
   it("publishes only hashed provider and GPU identity", () => {
     const identity = buildPhysicalIdentity(
-      { provider: "gpu_cloud", providerMachineId: machineId },
+      { provider: "salad", providerMachineId: machineId },
       probe,
       "2026-07-24T00:00:00.000Z",
     );
@@ -117,7 +117,7 @@ describe("headless GpuCloud worker", () => {
 
   it("creates a gpu-only relay executor after the physical CUDA probe", async () => {
     const environment = loadHeadlessWorkerEnvironment({
-      GPU_CLOUD_MACHINE_ID: machineId,
+      SALAD_MACHINE_ID: machineId,
       GPU_MESH_COORDINATOR: "https://www.mycellios.com",
       MYCELLIOS_NETWORK_TOKEN: "n".repeat(32),
       MYCELLIOS_VERSION: "0.2.99",
@@ -229,7 +229,7 @@ describe("headless GpuCloud worker", () => {
 
   it("fails closed when the container cannot prove a CUDA device", async () => {
     const environment = loadHeadlessWorkerEnvironment({
-      GPU_CLOUD_MACHINE_ID: machineId,
+      SALAD_MACHINE_ID: machineId,
       GPU_MESH_COORDINATOR: "https://www.mycellios.com",
       MYCELLIOS_NETWORK_TOKEN: "n".repeat(32),
     }, "/opt/mycellios");
