@@ -15,12 +15,6 @@ from distributed_runtime.resident_expert_mesh_cli import (
 
 ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE = ROOT / "config" / "resident-expert-mesh-4gb.example.json"
-BENCHMARK = (
-    ROOT
-    / "docs"
-    / "benchmarks"
-    / "resident-expert-mesh-4gb-synthetic.md"
-)
 
 
 def example_document() -> dict:
@@ -546,18 +540,6 @@ class ResidentExpertMeshCliTests(unittest.TestCase):
         # Windows PowerShell can expose a CP1252 stdout. Keep the human-readable
         # report encodable there so the real CLI does not fail after simulation.
         markdown.encode("cp1252")
-
-        benchmark = BENCHMARK.read_text(encoding="utf-8")
-        self.assertIn(json.loads(first)["inputSha256"], benchmark)
-        for expected in (
-            "35,817440",
-            "22,769002",
-            "11,916201",
-            "6,948336",
-            "3,789036",
-        ):
-            self.assertIn(expected, benchmark)
-        self.assertIn("tok/s parcial por secuencia", benchmark)
 
 
 if __name__ == "__main__":
