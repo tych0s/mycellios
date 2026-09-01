@@ -99,4 +99,3 @@ function option(name: string): string | undefined {
   }
   return value;
 }
-
