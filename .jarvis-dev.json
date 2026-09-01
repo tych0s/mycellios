@@ -1,0 +1,3 @@
+{
+  "command": "UI_PORT=${PORT:-4174}; MYCELLIOS_DEV_API_PORT=${MYCELLIOS_DEV_API_PORT:-$((UI_PORT + 1))}; if [ \"$MYCELLIOS_DEV_API_PORT\" = \"$UI_PORT\" ]; then MYCELLIOS_DEV_API_PORT=$((UI_PORT + 1)); fi; GPU_MESH_HOST=127.0.0.1 GPU_MESH_PORT=$MYCELLIOS_DEV_API_PORT GPU_MESH_DB=:memory: CONTENT_HUB_API_URL=https://content-api.example.io npm run dev:coordinator & COORDINATOR_PID=$!; trap 'kill \"$COORDINATOR_PID\" 2>/dev/null || true' EXIT INT TERM; MYCELLIOS_UI_API_TARGET=http://127.0.0.1:$MYCELLIOS_DEV_API_PORT npm run landing:dev"
+}

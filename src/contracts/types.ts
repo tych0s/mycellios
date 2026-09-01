@@ -256,7 +256,7 @@ export interface WorkerAcceleratorDiagnostics {
  */
 export interface WorkerPhysicalIdentity {
   schema: "gdlp-worker-physical-identity/1";
-  provider: "gpu_cloud" | "generic";
+  provider: "salad" | "generic";
   providerMachineFingerprintSha256: string;
   hostFingerprintSha256: string;
   gpuFingerprintsSha256: string[];

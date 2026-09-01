@@ -1,0 +1,7 @@
+# Generated automatically by the example/ci-templates reconciler.
+# Edit this file to force specific values. The reconciler preserves explicit
+# values and only overwrites entries set to "auto".
+
+type: other            # api | web | platform | worker | other
+language: auto    # node | python | rust | go | auto
+runtime: auto      # nixpacks | railpack | dockerfile | auto

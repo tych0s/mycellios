@@ -70,7 +70,7 @@ function runtimeRequest(nodeCount = 2): RuntimePlanRequest {
     availability: 0.999,
     endpoint: { host: `10.0.0.${index + 1}`, port: 21_000 + index },
     backend: {
-      engine: index === 0 ? "external GGUF runtime" : "mlx",
+      engine: index === 0 ? "llama.cpp" : "mlx",
       version: "1.0",
       modelFormats: ["gguf"],
       executionModes: ["layer-range", "expert-range"],
@@ -641,7 +641,7 @@ describe("GDLP/2 runtime manifest", () => {
         expect(stage.members).toHaveLength(1);
         const member = stage.members[0]!;
         expect(stage.anchor).toEqual({ memberId: member.nodeId, endpoint: member.endpoint });
-        expect(member.backend.engine).toMatch(/external GGUF runtime|mlx/);
+        expect(member.backend.engine).toMatch(/llama\.cpp|mlx/);
         expect(member.backend.modelFormats).toEqual(["gguf"]);
         expect(member.capabilities.activationCodecs).toContain(phase.activationCodec);
         expect(member.assignedMemoryBytes).toBe(stage.memoryBytes);

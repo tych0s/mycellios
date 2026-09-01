@@ -4,10 +4,10 @@ from collections.abc import Sequence
 
 
 _EXTERNAL_BACKEND_ARGUMENT_PREFIXES = (
-    ("--native_stage", "native_stage"),
-    ("--external-gguf-runtime", "external GGUF runtime"),
-    ("--local-model-runtime", "local-model-runtime"),
-    ("--model-serving-runtime", "model-serving-runtime"),
+    ("--nakshatra", "nakshatra"),
+    ("--llama-cpp", "llama.cpp"),
+    ("--ollama", "ollama"),
+    ("--vllm", "vllm"),
 )
 
 

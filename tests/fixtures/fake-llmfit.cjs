@@ -32,7 +32,7 @@ if (command === "system") {
           name: "fixture/distributed-small",
           fit_level: "Perfect",
           run_mode: "GPU",
-          runtime: "external GGUF runtime",
+          runtime: "llama.cpp",
           best_quant: "Q8_0",
           estimated_tps: 42,
           measured_tps: 36,

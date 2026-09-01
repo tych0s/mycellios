@@ -227,24 +227,24 @@ function remotes(description: PythonPipelineLaunchDescription): PythonRemoteStag
   );
 }
 
-function legacyNativeStageBindings(
+function legacyNakshatraBindings(
   description: PythonPipelineLaunchDescription,
-): Record<string, LegacyNativeStageStageInput> {
+): Record<string, LegacyNakshatraStageInput> {
   return (
     description.configuration as unknown as {
-      native_stageStages: Record<string, LegacyNativeStageStageInput>;
+      nakshatraStages: Record<string, LegacyNakshatraStageInput>;
     }
-  ).native_stageStages;
+  ).nakshatraStages;
 }
 
-function legacyNativeStageLaunch(
+function legacyNakshatraLaunch(
   launch: PythonRemoteStageLaunch,
-): LegacyNativeStageStageInput | null {
+): LegacyNakshatraStageInput | null {
   return (
     launch as unknown as {
-      native_stage: LegacyNativeStageStageInput | null;
+      nakshatra: LegacyNakshatraStageInput | null;
     }
-  ).native_stage;
+  ).nakshatra;
 }
 
 function cellMembers(description: PythonPipelineLaunchDescription): PythonCellMemberLaunch[] {
@@ -268,14 +268,14 @@ function moduleName(args: string[]): string | undefined {
   return argumentValue(args, "-m");
 }
 
-const NATIVE_STAGE_TEST_COMMIT = "12fd25f77366fa6b3b4b768ec3050bf629380bac";
+const NAKSHATRA_TEST_COMMIT = "12fd25f77366fa6b3b4b768ec3050bf629380bac";
 const NATIVE_GGUF_SNAPSHOT_ID = "12345";
 const NATIVE_GGUF_MODEL_IDENTITY = strongArtifactIdentity(NATIVE_GGUF_SNAPSHOT_ID);
 const NATIVE_GGUF_MODEL_SOURCE = "mycellios://models/launcher-native-gguf";
 const NATIVE_GGUF_MODEL_REVISION = "native-gguf-r1";
 
 /** Archived research shape; it is deliberately absent from product exports. */
-interface LegacyNativeStageStageInput {
+interface LegacyNakshatraStageInput {
   packagePath: string;
   packageId: string;
   manifestSha256: string;
@@ -295,11 +295,11 @@ interface LegacyNativeStageStageInput {
   modelIdentity?: string;
 }
 
-type LegacyNativeStageOptions = Partial<PythonLaunchCompilerOptions> & {
-  native_stageStages: Record<string, LegacyNativeStageStageInput>;
+type LegacyNakshatraOptions = Partial<PythonLaunchCompilerOptions> & {
+  nakshatraStages: Record<string, LegacyNakshatraStageInput>;
 };
 
-function native_stagePipelineId(commit = NATIVE_STAGE_TEST_COMMIT): string {
+function nakshatraPipelineId(commit = NAKSHATRA_TEST_COMMIT): string {
   const bytes = createHash("sha256")
     .update("gdlp-hub-snapshot-v1\0")
     .update(commit, "ascii")
@@ -310,23 +310,23 @@ function native_stagePipelineId(commit = NATIVE_STAGE_TEST_COMMIT): string {
   return result.toString();
 }
 
-function native_stageStage(
+function nakshatraStage(
   current: RuntimePipelineManifestV2,
   stageIndex: number,
-  overrides: Partial<LegacyNativeStageStageInput> = {},
-): LegacyNativeStageStageInput {
+  overrides: Partial<LegacyNakshatraStageInput> = {},
+): LegacyNakshatraStageInput {
   const stage = current.plans.prefill.stages[stageIndex]!;
   return {
     packagePath: `D:\\packages\\${stage.stageId}`,
     packageId: "a".repeat(64),
     manifestSha256: "b".repeat(64),
     modelSource: "hf://HuggingFaceTB/SmolLM2-135M-Instruct",
-    modelRevision: NATIVE_STAGE_TEST_COMMIT,
+    modelRevision: NAKSHATRA_TEST_COMMIT,
     layerStart: stage.layerStart,
     layerEnd: stage.layerEnd,
     totalLayers: current.totalLayers,
-    daemonExecutable: "D:\\bin\\llama-native_stage-worker.exe",
-    pipelineId: native_stagePipelineId(),
+    daemonExecutable: "D:\\bin\\llama-nakshatra-worker.exe",
+    pipelineId: nakshatraPipelineId(),
     contextTokens: 4_096,
     gpuLayers: 99,
     computeApi: "cuda",
@@ -337,17 +337,17 @@ function native_stageStage(
   };
 }
 
-function native_stageOptions(
+function nakshatraOptions(
   current: RuntimePipelineManifestV2,
   stageIndexes: number[] = [2],
-): LegacyNativeStageOptions {
-  const snapshot = `C:\\cache\\models--HuggingFaceTB--SmolLM2-135M-Instruct\\snapshots\\${NATIVE_STAGE_TEST_COMMIT}`;
+): LegacyNakshatraOptions {
+  const snapshot = `C:\\cache\\models--HuggingFaceTB--SmolLM2-135M-Instruct\\snapshots\\${NAKSHATRA_TEST_COMMIT}`;
   return {
     runtimeModel: { source: snapshot, revision: null },
-    native_stageStages: Object.fromEntries(
+    nakshatraStages: Object.fromEntries(
       stageIndexes.map((index) => {
         const stage = current.plans.prefill.stages[index]!;
-        return [stage.stageId, native_stageStage(current, index)];
+        return [stage.stageId, nakshatraStage(current, index)];
       }),
     ),
   };
@@ -1744,7 +1744,7 @@ describe("GDLP/2 Python launch compiler", () => {
     const binding = description.configuration.nativeGgufStages[target.stageId]!;
 
     expect(launch.nativeGguf).toEqual(binding);
-    expect(Object.hasOwn(launch, "native_stage")).toBe(false);
+    expect(Object.hasOwn(launch, "nakshatra")).toBe(false);
     expect(launch.cell).toBeNull();
     expect(binding).toEqual(nativeGgufStage(current, 2));
     expect(argumentValue(launch.command.args, "--model")).toBe(
@@ -1772,8 +1772,8 @@ describe("GDLP/2 Python launch compiler", () => {
       binding.packageId,
     );
     expect(launch.command.args).toContain("--device");
-    expect(launch.command.args.some((argument) => argument.includes("native_stage"))).toBe(false);
-    expect(launch.command.args.some((argument) => argument.includes("local-model-runtime"))).toBe(false);
+    expect(launch.command.args.some((argument) => argument.includes("nakshatra"))).toBe(false);
+    expect(launch.command.args.some((argument) => argument.includes("ollama"))).toBe(false);
     expect(() =>
       validatePythonLaunchDescription(JSON.parse(JSON.stringify(description))),
     ).not.toThrow();
@@ -1816,7 +1816,7 @@ describe("GDLP/2 Python launch compiler", () => {
     expect(argumentValue(rootLaunch.command.args, "--native-gguf-package-id")).toBe(
       rootBinding.packageId,
     );
-    expect(rootLaunch.command.args.some((argument) => argument.includes("native_stage"))).toBe(
+    expect(rootLaunch.command.args.some((argument) => argument.includes("nakshatra"))).toBe(
       false,
     );
     expect(() =>
@@ -1898,10 +1898,10 @@ describe("GDLP/2 Python launch compiler", () => {
       `python_native_gguf_stage_range_mismatch:${target.stageId}`,
     );
 
-    const conflicting: LegacyNativeStageOptions = {
+    const conflicting: LegacyNakshatraOptions = {
       ...nativeGgufOptions(current),
-      native_stageStages: {
-        [target.stageId]: native_stageStage(current, 2, {
+      nakshatraStages: {
+        [target.stageId]: nakshatraStage(current, 2, {
           modelSource: nativeGgufOptions(current).runtimeModel!.source,
           modelRevision: null,
           pipelineId: NATIVE_GGUF_SNAPSHOT_ID,
@@ -1924,54 +1924,54 @@ describe("GDLP/2 Python launch compiler", () => {
     );
   });
 
-  it("rejects NativeStage before a production launch description can be built", () => {
+  it("rejects Nakshatra before a production launch description can be built", () => {
     const current = manifest();
-    expect(() => compile(current, native_stageOptions(current))).toThrow(
+    expect(() => compile(current, nakshatraOptions(current))).toThrow(
       "python_launch_options_have_unknown_or_missing_fields",
     );
   });
 
-  it.skip("research fixture: binds one sealed NativeStage package to an exact non-root stage", () => {
+  it.skip("research fixture: binds one sealed Nakshatra package to an exact non-root stage", () => {
     const current = manifest();
     const target = current.plans.prefill.stages[2]!;
-    const description = compile(current, native_stageOptions(current));
+    const description = compile(current, nakshatraOptions(current));
     const launch = remotes(description).find((stage) => stage.stageId === target.stageId)!;
-    const normalized = legacyNativeStageBindings(description)[target.stageId]!;
+    const normalized = legacyNakshatraBindings(description)[target.stageId]!;
 
-    expect(legacyNativeStageLaunch(launch)).toEqual(normalized);
+    expect(legacyNakshatraLaunch(launch)).toEqual(normalized);
     expect(launch.cell).toBeNull();
     expect(normalized.modelIdentity).toBe(description.runtimeModel.artifactIdentity);
     expect(argumentValue(launch.command.args, "--model")).toBe(
       "hf://HuggingFaceTB/SmolLM2-135M-Instruct",
     );
-    expect(argumentValue(launch.command.args, "--revision")).toBe(NATIVE_STAGE_TEST_COMMIT);
+    expect(argumentValue(launch.command.args, "--revision")).toBe(NAKSHATRA_TEST_COMMIT);
     expect(launch.command.args).not.toContain("--model-artifact-identity");
     expect(launch.command.args).not.toContain("--pipeline-snapshot-identity");
-    expect(argumentValue(launch.command.args, "--native_stage-package")).toBe(
+    expect(argumentValue(launch.command.args, "--nakshatra-package")).toBe(
       normalized.packagePath,
     );
-    expect(argumentValue(launch.command.args, "--native_stage-package-id")).toBe(
+    expect(argumentValue(launch.command.args, "--nakshatra-package-id")).toBe(
       normalized.packageId,
     );
-    expect(argumentValue(launch.command.args, "--native_stage-manifest-sha256")).toBe(
+    expect(argumentValue(launch.command.args, "--nakshatra-manifest-sha256")).toBe(
       normalized.manifestSha256,
     );
-    expect(argumentValue(launch.command.args, "--native_stage-daemon-bin")).toBe(
+    expect(argumentValue(launch.command.args, "--nakshatra-daemon-bin")).toBe(
       normalized.daemonExecutable,
     );
-    expect(argumentValue(launch.command.args, "--native_stage-pipeline-id")).toBe(
+    expect(argumentValue(launch.command.args, "--nakshatra-pipeline-id")).toBe(
       normalized.pipelineId,
     );
-    expect(argumentValue(launch.command.args, "--native_stage-context-tokens")).toBe("4096");
-    expect(argumentValue(launch.command.args, "--native_stage-gpu-layers")).toBe("99");
-    expect(argumentValue(launch.command.args, "--native_stage-compute-api")).toBe("cuda");
-    expect(argumentValue(launch.command.args, "--native_stage-startup-timeout-seconds")).toBe(
+    expect(argumentValue(launch.command.args, "--nakshatra-context-tokens")).toBe("4096");
+    expect(argumentValue(launch.command.args, "--nakshatra-gpu-layers")).toBe("99");
+    expect(argumentValue(launch.command.args, "--nakshatra-compute-api")).toBe("cuda");
+    expect(argumentValue(launch.command.args, "--nakshatra-startup-timeout-seconds")).toBe(
       "90",
     );
-    expect(argumentValue(launch.command.args, "--native_stage-call-timeout-seconds")).toBe(
+    expect(argumentValue(launch.command.args, "--nakshatra-call-timeout-seconds")).toBe(
       "30.5",
     );
-    expect(argumentValue(launch.command.args, "--native_stage-close-timeout-seconds")).toBe(
+    expect(argumentValue(launch.command.args, "--nakshatra-close-timeout-seconds")).toBe(
       "5",
     );
     expect(argumentValue(root(description).command.args, "--model")).toContain(
@@ -1982,25 +1982,25 @@ describe("GDLP/2 Python launch compiler", () => {
     ).not.toThrow();
   });
 
-  it.skip("research fixture: binds a local non-Hub NativeStage snapshot", () => {
+  it.skip("research fixture: binds a local non-Hub Nakshatra snapshot", () => {
     const current = manifest();
     const target = current.plans.prefill.stages[2]!;
     const localSource = "D:\\models\\SmolLM2-local-snapshot";
     const snapshotIdentity = "12345";
-    const options = native_stageOptions(current);
+    const options = nakshatraOptions(current);
     options.runtimeModel = {
       source: localSource,
       revision: null,
       snapshotIdentity,
     };
-    options.native_stageStages![target.stageId] = native_stageStage(current, 2, {
+    options.nakshatraStages![target.stageId] = nakshatraStage(current, 2, {
       modelSource: localSource,
       modelRevision: null,
       pipelineId: snapshotIdentity,
     });
 
     const description = compile(current, options);
-    const normalized = legacyNativeStageBindings(description)[target.stageId]!;
+    const normalized = legacyNakshatraBindings(description)[target.stageId]!;
     const launch = remotes(description).find((stage) => stage.stageId === target.stageId)!;
 
     expect(description.runtimeModel.artifactIdentity).toBe(
@@ -2028,95 +2028,95 @@ describe("GDLP/2 Python launch compiler", () => {
     expect(() => validatePythonLaunchDescription(strongDescription)).not.toThrow();
 
     const wrongContent = structuredClone(options);
-    wrongContent.native_stageStages![target.stageId]!.pipelineId = "12346";
+    wrongContent.nakshatraStages![target.stageId]!.pipelineId = "12346";
     expect(() => compile(current, wrongContent)).toThrow(
-      `python_native_stage_pipeline_identity_mismatch:${target.stageId}`,
+      `python_nakshatra_pipeline_identity_mismatch:${target.stageId}`,
     );
 
     const wrongCoordinates = structuredClone(options);
-    wrongCoordinates.native_stageStages![target.stageId]!.modelIdentity =
+    wrongCoordinates.nakshatraStages![target.stageId]!.modelIdentity =
       `sha256:${"f".repeat(64)}`;
     expect(() => compile(current, wrongCoordinates)).toThrow(
-      `python_native_stage_model_identity_mismatch:${target.stageId}`,
+      `python_nakshatra_model_identity_mismatch:${target.stageId}`,
     );
   });
 
-  it.skip("research fixture: sorts multiple NativeStage stage bindings", () => {
+  it.skip("research fixture: sorts multiple Nakshatra stage bindings", () => {
     const current = manifest();
-    const forward = native_stageOptions(current, [1, 2]);
-    const reversedEntries = Object.entries(forward.native_stageStages!).reverse();
+    const forward = nakshatraOptions(current, [1, 2]);
+    const reversedEntries = Object.entries(forward.nakshatraStages!).reverse();
     const reversed = {
       ...forward,
-      native_stageStages: Object.fromEntries(reversedEntries),
+      nakshatraStages: Object.fromEntries(reversedEntries),
     };
     expect(compile(current, reversed)).toEqual(compile(current, forward));
   });
 
-  it.skip("research fixture: detects NativeStage metadata tampering", () => {
+  it.skip("research fixture: detects Nakshatra metadata tampering", () => {
     const current = manifest();
     const stageId = current.plans.prefill.stages[2]!.stageId;
 
-    const configuration = compile(current, native_stageOptions(current));
-    legacyNativeStageBindings(configuration)[stageId]!.packagePath += "-tampered";
+    const configuration = compile(current, nakshatraOptions(current));
+    legacyNakshatraBindings(configuration)[stageId]!.packagePath += "-tampered";
     expect(() => validatePythonLaunchDescription(configuration)).toThrow(
       "python_launch_description_mismatch",
     );
 
-    const process = compile(current, native_stageOptions(current));
-    legacyNativeStageLaunch(
+    const process = compile(current, nakshatraOptions(current));
+    legacyNakshatraLaunch(
       remotes(process).find((stage) => stage.stageId === stageId)!,
     )!.packageId = "c".repeat(64);
     expect(() => validatePythonLaunchDescription(process)).toThrow(
       "python_launch_description_mismatch",
     );
 
-    const argv = compile(current, native_stageOptions(current));
+    const argv = compile(current, nakshatraOptions(current));
     const args = remotes(argv).find((stage) => stage.stageId === stageId)!.command.args;
-    args[args.indexOf("--native_stage-context-tokens") + 1] = "8192";
+    args[args.indexOf("--nakshatra-context-tokens") + 1] = "8192";
     expect(() => validatePythonLaunchDescription(argv)).toThrow(
       "python_launch_description_mismatch",
     );
   });
 
-  it.skip("research fixture: validates legacy NativeStage bindings", () => {
+  it.skip("research fixture: validates legacy Nakshatra bindings", () => {
     const current = manifest();
     const rootId = current.plans.prefill.stages[0]!.stageId;
-    expect(() => compile(current, native_stageOptions(current, [0]))).toThrow(
-      `python_native_stage_stage_cannot_be_root:${rootId}`,
+    expect(() => compile(current, nakshatraOptions(current, [0]))).toThrow(
+      `python_nakshatra_stage_cannot_be_root:${rootId}`,
     );
 
-    const unknown = native_stageOptions(current);
-    unknown.native_stageStages = {
-      "stage-does-not-exist": native_stageStage(current, 2),
+    const unknown = nakshatraOptions(current);
+    unknown.nakshatraStages = {
+      "stage-does-not-exist": nakshatraStage(current, 2),
     };
     expect(() => compile(current, unknown)).toThrow(
-      "python_native_stage_stage_is_not_in_both_phases:stage-does-not-exist",
+      "python_nakshatra_stage_is_not_in_both_phases:stage-does-not-exist",
     );
 
     const stageId = current.plans.prefill.stages[2]!.stageId;
-    const range = native_stageOptions(current);
-    range.native_stageStages![stageId]!.layerStart -= 1;
+    const range = nakshatraOptions(current);
+    range.nakshatraStages![stageId]!.layerStart -= 1;
     expect(() => compile(current, range)).toThrow(
-      `python_native_stage_stage_range_mismatch:${stageId}`,
+      `python_nakshatra_stage_range_mismatch:${stageId}`,
     );
 
-    const pipeline = native_stageOptions(current);
-    pipeline.native_stageStages![stageId]!.pipelineId = "1";
+    const pipeline = nakshatraOptions(current);
+    pipeline.nakshatraStages![stageId]!.pipelineId = "1";
     expect(() => compile(current, pipeline)).toThrow(
-      `python_native_stage_pipeline_identity_mismatch:${stageId}`,
+      `python_nakshatra_pipeline_identity_mismatch:${stageId}`,
     );
 
-    const compute = native_stageOptions(current);
-    compute.native_stageStages![stageId]!.computeApi = "cpu";
+    const compute = nakshatraOptions(current);
+    compute.nakshatraStages![stageId]!.computeApi = "cpu";
     expect(() => compile(current, compute)).toThrow(
-      `python_native_stage_compute_api_gpu_layers_mismatch:${stageId}`,
+      `python_nakshatra_compute_api_gpu_layers_mismatch:${stageId}`,
     );
 
-    const missingIdentity = native_stageOptions(current);
-    delete (missingIdentity.native_stageStages![stageId] as Partial<LegacyNativeStageStageInput>)
+    const missingIdentity = nakshatraOptions(current);
+    delete (missingIdentity.nakshatraStages![stageId] as Partial<LegacyNakshatraStageInput>)
       .packageId;
     expect(() => compile(current, missingIdentity)).toThrow(
-      `python_native_stage_stage_configuration_keys_are_invalid:${stageId}`,
+      `python_nakshatra_stage_configuration_keys_are_invalid:${stageId}`,
     );
 
     const cell = certifyTensorParallelCell(
@@ -2125,9 +2125,9 @@ describe("GDLP/2 Python launch compiler", () => {
     const cellStageId = cell.plans.prefill.stages[1]!.stageId;
     expect(() =>
       compile(cell, {
-        ...native_stageOptions(cell, [1]),
+        ...nakshatraOptions(cell, [1]),
       })).toThrow(
-      `python_native_stage_stage_cannot_use_cell_execution:${cellStageId}`,
+      `python_nakshatra_stage_cannot_use_cell_execution:${cellStageId}`,
     );
   });
 

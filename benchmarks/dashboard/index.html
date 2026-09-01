@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>mycellios · Banco de pruebas</title>
+    <link rel="stylesheet" href="/dashboard.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+          <div><strong>mycellios</strong><span>Banco de pruebas</span></div>
+        </div>
+        <div class="top-actions">
+          <span id="last-update" class="muted">Cargando historial…</span>
+          <button id="run-button" class="primary">● Medir runtime real</button>
+        </div>
+      </header>
+
+      <main>
+        <section class="hero">
+          <div>
+            <p class="eyebrow">EVOLUCIÓN MEDIBLE</p>
+            <h1>¿Estamos mejorando de verdad?</h1>
+            <p>Peticiones reales, hardware detectado y rendimiento medido en una sola vista.</p>
+          </div>
+          <div class="evidence-legend" aria-label="Tipos de evidencia">
+            <span><i class="dot physical"></i>Físico multi-equipo</span>
+            <span><i class="dot loopback"></i>Real local</span>
+          </div>
+        </section>
+
+        <section id="summary" class="summary-grid" aria-label="Resumen"></section>
+
+        <section class="panel chart-panel">
+          <div class="panel-heading">
+            <div><p class="eyebrow">TENDENCIA</p><h2>Tokens por segundo</h2></div>
+            <select id="scenario-filter" aria-label="Escenario mostrado"></select>
+          </div>
+          <div id="trend-chart" class="chart" role="img" aria-label="Evolución medida de tokens por segundo"></div>
+        </section>
+
+        <section class="panel results-panel">
+          <div class="panel-heading filters-heading">
+            <div><p class="eyebrow">HISTORIAL COMPLETO</p><h2>Resultados por versión</h2></div>
+            <div class="filters">
+              <select id="version-filter" aria-label="Filtrar por versión"><option value="">Todas las versiones</option></select>
+              <select id="evidence-filter" aria-label="Filtrar por evidencia"><option value="">Toda evidencia</option></select>
+              <input id="search-filter" type="search" placeholder="Buscar modelo o test…" aria-label="Buscar" />
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Versión</th><th>Prueba / modelo</th><th>Dispositivos</th><th>Tokens/s</th><th>TTFT P95</th><th>Cambio</th><th>Estado</th></tr></thead>
+              <tbody id="results-body"></tbody>
+            </table>
+          </div>
+          <p id="empty-results" class="empty" hidden>No hay resultados para estos filtros.</p>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="detail-dialog">
+      <button id="close-detail" class="close" aria-label="Cerrar">×</button>
+      <div id="detail-content"></div>
+    </dialog>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="/dashboard.js" defer></script>
+  </body>
+</html>

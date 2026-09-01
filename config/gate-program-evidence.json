@@ -1,0 +1,21 @@
+{
+  "schema": "mycellios-gate-imported-evidence/1",
+  "evidence": [
+    {
+      "gate": "G0_BASELINE",
+      "check": "native_builders",
+      "kind": "external",
+      "status": "blocked",
+      "detail": "Historical native-builder evidence predates the current source and installer layouts; rerun required for the exact candidate SHA",
+      "observedAt": "2026-08-09T17:15:41.000Z",
+      "sourceSha": null,
+      "sourceIdentity": null,
+      "artifactDigests": [],
+      "evidence": [
+        "https://github.com/example/mycellios/actions/runs/31324862613/job/93274446043",
+        "https://github.com/example/mycellios/actions/runs/31324862613/job/93274446054",
+        "https://github.com/example/mycellios/actions/runs/31324862613/job/93274446020"
+      ]
+    }
+  ]
+}

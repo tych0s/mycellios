@@ -661,7 +661,7 @@ export function makeSporeField(count: number, seed: number = SPORE_SEED): Spore[
        * mote travels the same 7–19px a second it did before and takes between one
        * and three minutes to cross the whole thing, which is what a spore in
        * still air looks like. Tied to depth so the near stratum runs faster than
-       * the far one — the parallel-runtime that gives the layer its volume.
+       * the far one — the parallax that gives the layer its volume.
        */
       rise: 0.006 + depth * 0.011,
       sway: 0.004 + depth * 0.009,

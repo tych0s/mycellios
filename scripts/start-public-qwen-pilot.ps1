@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string] $CoordinatorUrl = 'https://www.mycellios.com'
+    [string] $CoordinatorUrl = 'https://mycellios.example.io'
 )
 
 $ErrorActionPreference = 'Stop'

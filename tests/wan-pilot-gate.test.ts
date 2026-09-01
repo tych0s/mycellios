@@ -4,7 +4,7 @@ import { verifyWanPilotSnapshot } from "../src/distribution/wan-pilot-gate.js";
 const digest = (character: string) => `sha256:${character.repeat(64)}`;
 
 function identity(
-  provider: "gpu_cloud" | "generic",
+  provider: "salad" | "generic",
   providerFingerprint: string,
   hostFingerprint: string,
   gpuFingerprint: string,
@@ -30,19 +30,19 @@ function snapshot() {
     }],
     workers: [
       {
-        id: "gpu_cloud-worker-a",
+        id: "salad-worker-a",
         status: "online",
         connected: true,
-        executionNodeId: "gpu_cloud-a",
-        physicalIdentity: identity("gpu_cloud", digest("1"), digest("2"), digest("3")),
+        executionNodeId: "salad-a",
+        physicalIdentity: identity("salad", digest("1"), digest("2"), digest("3")),
         deployments: [],
       },
       {
-        id: "gpu_cloud-worker-b",
+        id: "salad-worker-b",
         status: "online",
         connected: true,
-        executionNodeId: "gpu_cloud-b",
-        physicalIdentity: identity("gpu_cloud", digest("4"), digest("5"), digest("6")),
+        executionNodeId: "salad-b",
+        physicalIdentity: identity("salad", digest("4"), digest("5"), digest("6")),
         deployments: [],
       },
       {
@@ -59,7 +59,7 @@ function snapshot() {
             fallback: false,
             stages: [
               {
-                nodeId: "gpu_cloud-a",
+                nodeId: "salad-a",
                 stageIndex: 0,
                 layerStart: 0,
                 layerEnd: 14,
@@ -68,7 +68,7 @@ function snapshot() {
                 fallback: false,
               },
               {
-                nodeId: "gpu_cloud-b",
+                nodeId: "salad-b",
                 stageIndex: 1,
                 layerStart: 14,
                 layerEnd: 28,
@@ -85,7 +85,7 @@ function snapshot() {
 }
 
 describe("WAN physical pipeline gate", () => {
-  it("accepts a completed model crossing two unique attested GpuCloud GPUs", () => {
+  it("accepts a completed model crossing two unique attested Salad GPUs", () => {
     const report = verifyWanPilotSnapshot(snapshot(), {
       model: "Qwen/Qwen3-0.6B",
     });
@@ -93,10 +93,10 @@ describe("WAN physical pipeline gate", () => {
       passed: true,
       stageCount: 2,
       physicalNodeCount: 2,
-      gpu_cloudNodeCount: 2,
+      saladNodeCount: 2,
       gpuFingerprintCount: 2,
     });
-    expect(report.nodes.map((node) => node.nodeId)).toEqual(["gpu_cloud-a", "gpu_cloud-b"]);
+    expect(report.nodes.map((node) => node.nodeId)).toEqual(["salad-a", "salad-b"]);
   });
 
   it("rejects duplicate physical machines hidden behind different worker ids", () => {
@@ -119,7 +119,7 @@ describe("WAN physical pipeline gate", () => {
     delete unattested.workers[1]!.physicalIdentity;
     expect(() => verifyWanPilotSnapshot(unattested, {
       model: "Qwen/Qwen3-0.6B",
-    })).toThrow("wan_pilot_stage_worker_is_not_physically_attested:gpu_cloud-b");
+    })).toThrow("wan_pilot_stage_worker_is_not_physically_attested:salad-b");
   });
 
   it("rejects a model with no completed inference or non-contiguous layers", () => {
@@ -130,7 +130,7 @@ describe("WAN physical pipeline gate", () => {
     })).toThrow("wan_pilot_pipeline_has_no_completed_job");
 
     const wrongWorker = snapshot();
-    wrongWorker.jobs[0]!.workerId = "gpu_cloud-worker-a";
+    wrongWorker.jobs[0]!.workerId = "salad-worker-a";
     expect(() => verifyWanPilotSnapshot(wrongWorker, {
       model: "Qwen/Qwen3-0.6B",
     })).toThrow("wan_pilot_pipeline_has_no_completed_job");

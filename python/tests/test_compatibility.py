@@ -97,7 +97,7 @@ class ExecutorCompatibilityRegistryTests(unittest.TestCase):
 
     def test_complete_heterogeneous_chain_requires_every_stage_certified(self) -> None:
         manifests = (
-            _manifest(0, 8, engine="external GGUF runtime", adapter="gdlp-llama-stage"),
+            _manifest(0, 8, engine="llama.cpp", adapter="gdlp-llama-stage"),
             _manifest(8, 16, engine="python-torch", adapter="llama-tp-safetensors"),
         )
         keys = tuple(_key(manifest) for manifest in manifests)

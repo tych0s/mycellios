@@ -12,7 +12,7 @@ describe("stageStartupDiagnostic", () => {
       stderr: [
         "Fetching model files",
         "Traceback (most recent call last):",
-        '  File "C:\\Users\\ExampleUser\\runtime\\server.py", line 12, in main',
+        '  File "C:\\Users\\User\\runtime\\server.py", line 12, in main',
         "RuntimeError: CUDA kernel image is unavailable",
       ].join("\n"),
       stdoutTruncated: false,
@@ -29,7 +29,7 @@ describe("stageStartupDiagnostic", () => {
     const handle = fixtureHandle({
       stdout: "",
       stderr:
-        "Bearer abc.def secret=visible exampleuser@example.com /home/exampleuser/models/model.py",
+        "Bearer abc.def secret=visible user@example.invalid /home/User/models/model.py",
       stdoutTruncated: false,
       stderrTruncated: false,
     });

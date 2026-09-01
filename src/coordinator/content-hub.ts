@@ -650,7 +650,7 @@ function renderNavigation(): string {
         <nav aria-label="Main navigation">
           <a href="/network?view=inference">Chat</a><a href="/create">Create</a><a href="/earn">Earn</a><a href="/spore">$ SPORE</a><a href="/network">Live network</a><a class="active" href="/blog" aria-current="page">Blog</a>
         </nav>
-        <div class="rb-header-actions rb-desktop-cta"><a class="rb-social" href="https://github.com/tych0s/mycellios" target="_blank" rel="noreferrer" aria-label="mycellios on GitHub">GH</a><a class="rb-social" href="https://x.com/mycellios" target="_blank" rel="noreferrer" aria-label="mycellios on X">X</a><a class="rb-pill rb-pill-ghost" href="/network?view=overview">Login</a></div>
+        <div class="rb-header-actions rb-desktop-cta"><a class="rb-social" href="https://github.com/example/mycellios" target="_blank" rel="noreferrer" aria-label="mycellios on GitHub">GH</a><a class="rb-social" href="https://x.com/mycellios" target="_blank" rel="noreferrer" aria-label="mycellios on X">X</a><a class="rb-pill rb-pill-ghost" href="/network?view=overview">Login</a></div>
       </div>
     </header>
   `;

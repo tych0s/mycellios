@@ -7,12 +7,12 @@ try {
   const source = required(argumentsMap, "--snapshot");
   const model = required(argumentsMap, "--model");
   const minimumPhysicalNodes = optionalInteger(argumentsMap, "--min-physical-nodes", 2);
-  const minimumGpuCloudNodes = optionalInteger(argumentsMap, "--min-gpu_cloud-nodes", 2);
+  const minimumSaladNodes = optionalInteger(argumentsMap, "--min-salad-nodes", 2);
   const snapshot = await loadSnapshot(source);
   const report = verifyWanPilotSnapshot(snapshot, {
     model,
     minimumPhysicalNodes,
-    minimumGpuCloudNodes,
+    minimumSaladNodes,
   });
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
 } catch (error) {

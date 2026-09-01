@@ -1,0 +1,51 @@
+literal:https://dev-mycellios.example.io/dashboard==>/dashboard
+literal:https://dev-mycellios.example.io/==>https://www.mycellios.com/
+literal:dev-mycellios.example.io==>www.mycellios.com
+literal:supabase-mycellios.example.io==>supabase.example.invalid
+literal:MESHLLM==>EXTERNAL_RUNTIME_A
+literal:MeshLLM==>ExternalRuntimeA
+literal:MeshLlm==>ExternalRuntimeA
+literal:meshLlm==>externalRuntimeA
+literal:meshllm==>external-runtime-a
+literal:mesh-llm==>external-runtime-a
+regex:\bMesh[-_ ]?LLM\b==>external runtime A
+regex:\bEXO\b==>external runtime B
+regex:\bexo\b==>external runtime B
+literal:leyten/shard==>external-runtime-c
+literal:external/shard-runtime==>external-runtime-c
+literal:Daniel==>ExampleUser
+literal:daniel==>exampleuser
+literal:c0mpute==>external-compute-runtime
+literal:electron-zero==>native-runtime-boundary
+literal:example-ci==>self-hosted
+literal:https://github.com/example/mycellios/releases/latest==>https://github.com/tych0s/mycellios
+literal:example/mycellios==>tych0s/mycellios
+literal:example==>tych0s
+literal:https://mycellios.example.io==>https://www.mycellios.com
+literal:mycellios.example.io==>www.mycellios.com
+literal:DOKPLOY_DEPLOY_SHA==>DEPLOY_REVISION
+literal:.jarvis==>.agent-state
+literal:sidecars/==>native-helpers/
+literal:INFISICAL==>SECRET_STORE
+regex:\bInfisical\b==>the configured secret store
+regex:\binfisical\b==>secret-store
+literal:SALAD==>GPU_CLOUD
+literal:Salad==>GpuCloud
+literal:salad==>gpu_cloud
+literal:NAKSHATRA==>NATIVE_STAGE
+literal:Nakshatra==>NativeStage
+literal:nakshatra==>native_stage
+literal:llama.cpp==>external GGUF runtime
+literal:llama_cpp==>external_gguf_runtime
+literal:llama-cpp==>external-gguf-runtime
+literal:llamacpp==>externalggufruntime
+literal:Ollama==>local model runtime
+literal:ollama==>local-model-runtime
+literal:vLLM==>model serving runtime
+literal:vllm==>model-serving-runtime
+literal:Petals==>peer runtime
+literal:petals==>peer-runtime
+literal:AntSeed==>distributed runtime
+literal:antseed==>distributed-runtime
+literal:Parallax==>parallel runtime
+literal:parallax==>parallel-runtime

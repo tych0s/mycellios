@@ -8,9 +8,9 @@ import { createInitialAccelerationStatus } from "../src/node/acceleration-progre
 describe("remote accelerator diagnostics", () => {
   it("removes local paths, bearer credentials and multiline stack formatting", () => {
     const sanitized = sanitizeAcceleratorDiagnosticText(
-      "Traceback C:\\Users\\ExampleUser\\AppData\\runtime\\python.exe\nBearer super-secret-token /home/user/runtime/file.py",
+      "Traceback C:\\Users\\User\\AppData\\runtime\\python.exe\nBearer super-secret-token /home/user/runtime/file.py",
     );
-    expect(sanitized).not.toContain("ExampleUser");
+    expect(sanitized).not.toContain("Daniel");
     expect(sanitized).not.toContain("super-secret-token");
     expect(sanitized).not.toContain("/home/user");
     expect(sanitized).not.toContain("\n");

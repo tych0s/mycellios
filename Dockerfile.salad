@@ -1,0 +1,76 @@
+# syntax=docker/dockerfile:1.7
+
+ARG NODE_IMAGE=node:24-bookworm-slim
+ARG PYTORCH_IMAGE=pytorch/pytorch:2.13.0-cuda12.6-cudnn9-runtime
+
+FROM ${NODE_IMAGE} AS node-build
+WORKDIR /build
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
+COPY tsconfig.json tsconfig.build.json ./
+COPY src ./src
+RUN npx tsc -p tsconfig.build.json
+
+FROM ${NODE_IMAGE} AS production-dependencies
+WORKDIR /build
+COPY container/salad/package.json container/salad/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev --ignore-scripts
+
+FROM ${PYTORCH_IMAGE} AS runtime
+
+ARG TRANSFORMERS_VERSION=5.14.1
+ARG ACCELERATE_VERSION=1.14.0
+ARG SAFETENSORS_VERSION=0.8.0
+ARG AIOHTTP_VERSION=3.14.1
+ARG SENTENCEPIECE_VERSION=0.2.2
+ARG NUMPY_VERSION=1.26.4
+
+LABEL org.opencontainers.image.title="mycellios Salad GPU worker"
+LABEL org.opencontainers.image.description="Fail-closed headless GDLP shard executor for external SaladCloud GPUs"
+
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libgcc-s1 \
+    libgomp1 \
+    libstdc++6 \
+    openssl \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+  python -m pip uninstall --break-system-packages --yes spin \
+  && python -m pip install --break-system-packages --no-cache-dir \
+    "transformers==${TRANSFORMERS_VERSION}" \
+    "accelerate==${ACCELERATE_VERSION}" \
+    "safetensors==${SAFETENSORS_VERSION}" \
+    "aiohttp==${AIOHTTP_VERSION}" \
+    "sentencepiece==${SENTENCEPIECE_VERSION}" \
+    "numpy==${NUMPY_VERSION}" \
+  && python -m pip check \
+  && python -c "import torch; import transformers; assert torch.__version__.startswith('2.13.0'); assert torch.version.cuda == '12.6'"
+
+COPY --from=node-build /usr/local/bin/node /usr/local/bin/node
+
+WORKDIR /opt/mycellios
+COPY --from=node-build /build/dist ./dist
+COPY --from=production-dependencies /build/node_modules ./node_modules
+COPY package.json ./
+COPY python ./python
+COPY config/worker.salad.example.json ./config/worker.salad.example.json
+
+RUN groupadd --gid 10001 mycellios \
+  && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin mycellios \
+  && mkdir -p /var/cache/mycellios/huggingface /var/lib/mycellios \
+  && chown -R 10001:10001 /var/cache/mycellios /var/lib/mycellios /opt/mycellios
+
+ENV NODE_ENV=production \
+  GPU_MESH_WORKER_CONFIG=/opt/mycellios/config/worker.salad.example.json \
+  MYCELLIOS_PYTHON_EXECUTABLE=python \
+  MYCELLIOS_PYTHONPATH=/opt/mycellios/python \
+  MYCELLIOS_WORKER_CREDENTIAL_PATH=/var/lib/mycellios/worker-credential.json \
+  HF_HOME=/var/cache/mycellios/huggingface \
+  PYTHONUNBUFFERED=1
+
+USER 10001:10001
+
+CMD ["node", "dist/worker/headless-main.js"]

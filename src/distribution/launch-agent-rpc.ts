@@ -1309,7 +1309,7 @@ function validateNativeGgufCommand(
     "native_gguf_pipeline_identity",
   );
   for (const incompatible of [
-    "--native_stage-package",
+    "--nakshatra-package",
     "--ram-moe-artifact-schema",
     "--cell-fixture",
   ]) {
@@ -1402,18 +1402,18 @@ function validateCommand(
     assertArgument(argument);
     const lowered = argument.toLowerCase();
     for (const [prefix, backend] of [
-      ["--native_stage", "native_stage"],
-      ["--external-gguf-runtime", "external GGUF runtime"],
-      ["--local-model-runtime", "local-model-runtime"],
-      ["--model-serving-runtime", "model-serving-runtime"],
+      ["--nakshatra", "nakshatra"],
+      ["--llama-cpp", "llama.cpp"],
+      ["--ollama", "ollama"],
+      ["--vllm", "vllm"],
     ] as const) {
       if (lowered.startsWith(prefix)) {
         throw new Error(`external_backend_command_is_not_allowed:${backend}`);
       }
     }
     for (const [moduleName, backend] of [
-      ["distributed_runtime.native_stage", "native_stage"],
-      ["distributed_runtime.external_gguf_runtime", "external GGUF runtime"],
+      ["distributed_runtime.nakshatra", "nakshatra"],
+      ["distributed_runtime.llama_cpp", "llama.cpp"],
     ] as const) {
       if (lowered === moduleName || lowered.startsWith(`${moduleName}_`)) {
         throw new Error(`external_backend_command_is_not_allowed:${backend}`);

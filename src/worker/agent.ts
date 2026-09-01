@@ -198,7 +198,7 @@ const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 /** Tags our own RTT probes so unsolicited pongs cannot corrupt the estimate. */
 const RTT_PROBE_PAYLOAD = Buffer.from("gdlp-rtt");
 /**
- * peer runtime uses 0.2 for the same job (`overhead_delay` / EMA over peer pings) and
+ * Petals uses 0.2 for the same job (`overhead_delay` / EMA over peer pings) and
  * it is a reasonable default: fast enough to follow a route change, slow enough
  * that one scheduling hiccup does not move placement.
  */

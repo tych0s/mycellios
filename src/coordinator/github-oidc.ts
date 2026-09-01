@@ -2,7 +2,7 @@ import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
 
 const GITHUB_ACTIONS_ISSUER = "https://token.actions.githubusercontent.com";
 const RELEASE_UPLOAD_AUDIENCE = "mycellios-release-upload";
-const RELEASE_REPOSITORY = "tych0s/mycellios";
+const RELEASE_REPOSITORY = "example/mycellios";
 const RELEASE_REF = "refs/heads/main";
 const RELEASE_WORKFLOW_POLICIES = [
   {

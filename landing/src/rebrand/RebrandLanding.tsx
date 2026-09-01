@@ -62,8 +62,8 @@ import "./rebrand.css";
 
 const brandLogo = "/assets/logos/logo.png";
 const EMAIL = "hello@mycellios.com";
-const RELEASES_URL = "https://github.com/tych0s/mycellios";
-const GITHUB_URL = "https://github.com/tych0s/mycellios";
+const RELEASES_URL = "https://github.com/example/mycellios/releases/latest";
+const GITHUB_URL = "https://github.com/example/mycellios";
 const X_URL = "https://x.com/mycellios";
 const TELEGRAM_URL = "https://t.me/mycellios";
 

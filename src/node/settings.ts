@@ -25,7 +25,7 @@ export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = Object.freeze({
 });
 
 const LEGACY_PUBLIC_COORDINATOR_URLS = new Set([
-  "https://www.mycellios.com",
+  "https://mycellios.example.io",
   "https://mycellios.com",
   "https://network.mycellios.app",
 ]);
@@ -35,7 +35,7 @@ const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
  * Normalizes both current settings and pre-native desktop settings.
  *
  * Legacy adapter fields are deliberately not copied to the result. Old
- * local model runtime/connectivity-test selections therefore migrate to a hardware-only
+ * Ollama/connectivity-test selections therefore migrate to a hardware-only
  * Mycellios node, without ever activating the old inference path.
  */
 export function sanitizeDesktopSettings(input: unknown): DesktopSettings {
