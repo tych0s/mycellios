@@ -22,7 +22,46 @@ jobs:
           node-version: "24"
           cache: npm
       - run: npm ci --ignore-scripts --no-audit --no-fund
-      - run: npm audit --omit=dev --audit-level=high
+      - name: Audit production dependencies
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          for attempt in 1 2 3; do
+            output_file="$(mktemp)"
+            status=0
+            timeout 75s npm audit --omit=dev --audit-level=high --fetch-timeout=60000 >"$output_file" 2>&1 || status=$?
+            cat "$output_file"
+
+            if [ "$status" -eq 0 ]; then
+              rm -f "$output_file"
+              exit 0
+            fi
+
+            if [ "$status" -ne 124 ] && ! grep -Eiq \
+              'network timeout|audit endpoint returned an error|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENETUNREACH|ECONNREFUSED|socket hang up|429 Too Many Requests|502 Bad Gateway|503 Service Unavailable|504 Gateway Timeout' \
+              "$output_file"; then
+              rm -f "$output_file"
+              exit "$status"
+            fi
+
+            rm -f "$output_file"
+            if [ "$attempt" -eq 3 ]; then
+              case "${GITHUB_EVENT_NAME:-pull_request}" in
+                schedule|workflow_dispatch)
+                  echo "::error::npm audit could not reach the registry after 3 attempts."
+                  exit 1
+                  ;;
+                *)
+                  echo "::warning::npm audit could not reach the registry after 3 attempts; the enforced scheduled audit will retry independently."
+                  exit 0
+                  ;;
+              esac
+            fi
+
+            echo "::warning::npm audit registry request failed on attempt $attempt/3; retrying."
+            sleep "$((attempt * 10))"
+          done
 
   secrets:
     name: Gitleaks
