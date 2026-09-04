@@ -50,4 +50,3 @@ uncontrolled growth of known oversized modules.
 - Moving the repository to `apps/` and `packages/` before runtime evidence.
 - Redesigning the landing, mobile UI or coordinator product behavior.
 - Claiming multi-host performance without committed physical evidence.
-
