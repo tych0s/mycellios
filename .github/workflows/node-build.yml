@@ -2,13 +2,6 @@ name: Native node build
 
 on:
   pull_request:
-    paths:
-      - "src/node/**"
-      - "src/worker/**"
-      - "src/contracts/**"
-      - "scripts/**"
-      - "package*.json"
-      - ".github/workflows/node-build.yml"
   push:
     branches: [main]
   workflow_dispatch:
@@ -17,8 +10,45 @@ permissions:
   contents: read
 
 jobs:
+  native_scope:
+    name: Native build scope
+    runs-on: ubuntu-latest
+    outputs:
+      required: ${{ steps.scope.outputs.required }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - id: scope
+        name: Detect native changes
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "required=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- \
+            src/node \
+            src/worker \
+            src/contracts \
+            scripts \
+            'package*.json' \
+            .github/workflows/node-build.yml; then
+            echo "required=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "required=true" >> "$GITHUB_OUTPUT"
+          fi
+
   node:
     name: mycellios-node · ${{ matrix.target }}
+    needs: native_scope
     strategy:
       fail-fast: false
       matrix:
@@ -31,26 +61,38 @@ jobs:
             target: macos-arm64
     runs-on: ${{ matrix.os }}
     steps:
+      - name: Native build not required
+        if: needs.native_scope.outputs.required != 'true'
+        run: echo "No native inputs changed; reporting the required check without rebuilding installers."
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        if: needs.native_scope.outputs.required == 'true'
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        if: needs.native_scope.outputs.required == 'true'
         with:
           node-version: "24"
           cache: npm
-      - run: npm ci --ignore-scripts --no-audit --no-fund
-      - run: npm run typecheck
-      - run: npm run node:runtime:check
+      - if: needs.native_scope.outputs.required == 'true'
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - if: needs.native_scope.outputs.required == 'true'
+        run: npm run typecheck
+      - if: needs.native_scope.outputs.required == 'true'
+        run: npm run node:runtime:check
       - name: Install pinned WiX toolset
-        if: matrix.target == 'windows-x64'
+        if: needs.native_scope.outputs.required == 'true' && matrix.target == 'windows-x64'
         shell: powershell
         # Hosted images can carry a newer 3.14.1 package revision. Force the
         # audited version instead of failing before the MSI build starts.
         run: choco install wixtoolset --version=3.14.1 --allow-downgrade --no-progress -y
-      - run: npx vitest run tests/node-*.test.ts tests/headless-worker.test.ts tests/worker-hardening.test.ts
+      - if: needs.native_scope.outputs.required == 'true'
+        run: npx vitest run tests/node-*.test.ts tests/headless-worker.test.ts tests/worker-hardening.test.ts
       - name: Compile production node payload
+        if: needs.native_scope.outputs.required == 'true'
         run: npm run clean --silent && npx tsc -p tsconfig.build.json
       - name: Build certified portable Python runtime
+        if: needs.native_scope.outputs.required == 'true'
         run: npm run node:runtime
       - name: Stage native node payload
+        if: needs.native_scope.outputs.required == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -65,7 +107,7 @@ jobs:
             --output="build/node-package/${{ matrix.target }}"
           node scripts/verify-node-installer.mjs --root="build/node-package/${{ matrix.target }}"
       - name: Build and verify native Debian installer
-        if: matrix.target == 'linux-x64'
+        if: needs.native_scope.outputs.required == 'true' && matrix.target == 'linux-x64'
         shell: bash
         run: |
           set -euo pipefail
@@ -86,7 +128,7 @@ jobs:
           node scripts/node-release-evidence.mjs --artifact="$artifact" --staged-root="build/node-package/${{ matrix.target }}" --output-directory="$evidence" --source-date-epoch="$epoch" --builder-os="${{ runner.os }}" --builder-arch="${{ runner.arch }}" --workflow="$GITHUB_WORKFLOW" --run-id="$GITHUB_RUN_ID" --run-attempt="$GITHUB_RUN_ATTEMPT"
           node scripts/verify-node-release-evidence.mjs --artifact="$artifact" --staged-root="build/node-package/${{ matrix.target }}" --evidence="$evidence/$(basename "$artifact").provenance.json" --sbom="$evidence/$(basename "$artifact").cdx.json" --checksum="$evidence/$(basename "$artifact").sha256"
       - name: Build and verify native macOS installer
-        if: matrix.target == 'macos-arm64'
+        if: needs.native_scope.outputs.required == 'true' && matrix.target == 'macos-arm64'
         shell: bash
         run: |
           set -euo pipefail
@@ -106,7 +148,7 @@ jobs:
           node scripts/node-release-evidence.mjs --artifact="$pkg" --staged-root="build/node-package/${{ matrix.target }}" --output-directory="$evidence" --source-date-epoch="$epoch" --builder-os="${{ runner.os }}" --builder-arch="${{ runner.arch }}" --workflow="$GITHUB_WORKFLOW" --run-id="$GITHUB_RUN_ID" --run-attempt="$GITHUB_RUN_ATTEMPT"
           node scripts/verify-node-release-evidence.mjs --artifact="$pkg" --staged-root="build/node-package/${{ matrix.target }}" --evidence="$evidence/$(basename "$pkg").provenance.json" --sbom="$evidence/$(basename "$pkg").cdx.json" --checksum="$evidence/$(basename "$pkg").sha256"
       - name: Build and verify native Windows installer
-        if: matrix.target == 'windows-x64'
+        if: needs.native_scope.outputs.required == 'true' && matrix.target == 'windows-x64'
         shell: powershell
         run: |
           $version = node -p "require('./package.json').version"
@@ -127,6 +169,7 @@ jobs:
           $name = Split-Path $msi -Leaf
           node scripts/verify-node-release-evidence.mjs --artifact="$msi" --staged-root="build/node-package/${{ matrix.target }}" --evidence="$evidence/$name.provenance.json" --sbom="$evidence/$name.cdx.json" --checksum="$evidence/$name.sha256"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: needs.native_scope.outputs.required == 'true'
         with:
           name: mycellios-node-${{ matrix.target }}
           path: |
