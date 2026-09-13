@@ -12,7 +12,7 @@ export async function runTwoHostPreflight(argv: readonly string[], environment: 
   const json = argv.includes("--json");
   const config = parseAutoDistributionConfig(JSON.parse(await readFile(resolve(configPath), "utf8")));
   const environmentNames = new Set(Object.entries(environment).filter(([, value]) => typeof value === "string" && value.length > 0).map(([name]) => name));
-  const report = evaluateTwoHostPreflight(config, { python312: hasPython312(), configuredEnvironmentNames: environmentNames });
+  const report = evaluateTwoHostPreflight(config, { python312: hasPython312(config.runtime.pythonExecutable), configuredEnvironmentNames: environmentNames });
   if (json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   else {
     process.stdout.write(`Two-host preflight: ${report.ready ? "READY" : report.dryRun ? "DRY RUN ONLY" : "NOT READY"}\n`);
@@ -21,13 +21,12 @@ export async function runTwoHostPreflight(argv: readonly string[], environment: 
   return report.ready ? 0 : 2;
 }
 
-function hasPython312(): boolean {
-  for (const [command, args] of process.platform === "win32" ? [["py", ["-3.12", "--version"]] as const, ["python", ["--version"]] as const]
-    : [["python3.12", ["--version"]] as const, ["python3", ["--version"]] as const, ["python", ["--version"]] as const]) {
-    try { if (/^Python 3\.12(?:\.|$)/.test(execFileSync(command, args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim())) return true; }
-    catch { /* keep probing */ }
-  }
-  return false;
+function hasPython312(executable: string): boolean {
+  try {
+    return /^Python 3\.12(?:\.|$)/.test(execFileSync(executable, ["--version"], {
+      encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5_000, windowsHide: true,
+    }).trim());
+  } catch { return false; }
 }
 
 const invokedDirectly = process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url;

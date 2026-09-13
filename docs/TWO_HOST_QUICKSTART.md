@@ -56,6 +56,10 @@ The artifacts appear under `runtime/auto-distribute/two-host-smoke/`. Inspect
 `profile.json`, `runtime-manifest.json` and `python-launch.json`. Confirm that
 there are two non-empty, non-overlapping ranges assigned to different hosts.
 
+Preflight probes the configured local `runtime.pythonExecutable` with a bounded
+version check. It does not contact host B or certify its Python environment.
+Verify the remote interpreter and connectivity on that machine separately.
+
 ## 3. Start the remote launch agent
 
 Set a high-entropy token on both the coordinator shell and host B without
