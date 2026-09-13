@@ -11,6 +11,8 @@ import unittest
 from safetensors import safe_open
 from safetensors.torch import load_file
 import torch
+
+from tests.cell_parity import assert_fp32_cell_close, scale_cell_fixture_layer
 from transformers import AutoConfig
 
 from distributed_runtime.cell_parallel import (
@@ -387,10 +389,10 @@ class TensorParallelCellStageTests(unittest.TestCase):
         attention_heads = 4
         kv_heads = 2
         head_dim = 4
-        dense_layers = (
+        dense_layers = tuple(scale_cell_fixture_layer(layer) for layer in (
             _dense_layer(generator, hidden_size, kv_heads, head_dim, 9),
             _dense_layer(generator, hidden_size, kv_heads, head_dim, 11),
-        )
+        ))
         prompt = torch.randn((1, 2, hidden_size), generator=generator)
         parent_next = torch.randn((1, 1, hidden_size), generator=generator)
         child_next = torch.randn((1, 1, hidden_size), generator=generator)
@@ -479,9 +481,7 @@ class TensorParallelCellStageTests(unittest.TestCase):
                     prompt,
                     token_mode="none",
                 )
-                torch.testing.assert_close(
-                    actual_prompt, expected_prompt, rtol=1e-5, atol=1e-5
-                )
+                assert_fp32_cell_close(actual_prompt, expected_prompt)
                 parent_bytes = runner.request_cache_bytes(parent_request_id)
                 self.assertEqual(parent_bytes, 256)
                 self.assertEqual(
@@ -518,33 +518,18 @@ class TensorParallelCellStageTests(unittest.TestCase):
                 actual_parent_next, _ = runner.forward_hidden(
                     parent_request_id, parent_next
                 )
-                torch.testing.assert_close(
-                    actual_parent_next,
-                    expected_parent_next,
-                    rtol=1e-5,
-                    atol=1e-5,
-                )
+                assert_fp32_cell_close(actual_parent_next, expected_parent_next)
                 self.assertEqual(runner.sequence_length(child_request_id), 2)
                 self.assertEqual(runner.request_cache_bytes(child_request_id), 256)
 
                 actual_child_next, _ = runner.forward_hidden(
                     child_request_id, child_next
                 )
-                torch.testing.assert_close(
-                    actual_child_next,
-                    expected_child_next,
-                    rtol=1e-5,
-                    atol=1e-5,
-                )
+                assert_fp32_cell_close(actual_child_next, expected_child_next)
                 actual_child_second, _ = runner.forward_hidden(
                     child_request_id, child_second
                 )
-                torch.testing.assert_close(
-                    actual_child_second,
-                    expected_child_second,
-                    rtol=1e-5,
-                    atol=1e-5,
-                )
+                assert_fp32_cell_close(actual_child_second, expected_child_second)
                 self.assertEqual(runner.sequence_length(parent_request_id), 3)
                 self.assertEqual(runner.sequence_length(child_request_id), 4)
                 self.assertEqual(runner.request_cache_bytes(parent_request_id), 384)
@@ -572,12 +557,7 @@ class TensorParallelCellStageTests(unittest.TestCase):
                 actual_promoted_next, _ = runner.forward_hidden(
                     parent_request_id, promoted_next
                 )
-                torch.testing.assert_close(
-                    actual_promoted_next,
-                    expected_promoted_next,
-                    rtol=1e-5,
-                    atol=1e-5,
-                )
+                assert_fp32_cell_close(actual_promoted_next, expected_promoted_next)
             finally:
                 runner.end(parent_request_id)
                 runner.close()
@@ -820,11 +800,7 @@ class TensorParallelCellStageTests(unittest.TestCase):
                 )
                 prefill = downstream_frames.get(timeout=30)
                 self.assertEqual(prefill.frame_type, FrameType.PREFILL)
-                self.assertTrue(
-                    torch.allclose(
-                        decode_tensor(prefill), expected_prompt, rtol=1e-5, atol=1e-5
-                    )
-                )
+                assert_fp32_cell_close(decode_tensor(prefill), expected_prompt)
 
                 send_frame(
                     upstream,
@@ -838,11 +814,7 @@ class TensorParallelCellStageTests(unittest.TestCase):
                 )
                 decode = downstream_frames.get(timeout=30)
                 self.assertEqual(decode.frame_type, FrameType.ACTIVATION)
-                self.assertTrue(
-                    torch.allclose(
-                        decode_tensor(decode), expected_next, rtol=1e-5, atol=1e-5
-                    )
-                )
+                assert_fp32_cell_close(decode_tensor(decode), expected_next)
 
                 send_frame(
                     upstream,
@@ -865,14 +837,7 @@ class TensorParallelCellStageTests(unittest.TestCase):
                 )
                 corrected = downstream_frames.get(timeout=30)
                 self.assertEqual(corrected.frame_type, FrameType.ACTIVATION)
-                self.assertTrue(
-                    torch.allclose(
-                        decode_tensor(corrected),
-                        expected_correction,
-                        rtol=1e-5,
-                        atol=1e-5,
-                    )
-                )
+                assert_fp32_cell_close(decode_tensor(corrected), expected_correction)
 
                 send_frame(upstream, FrameType.END, request_id)
                 self.assertEqual(

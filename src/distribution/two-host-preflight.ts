@@ -33,7 +33,7 @@ export function evaluateTwoHostPreflight(config: AutoDistributionConfig, capabil
       error("remote_auth_missing", node.id, `Configure the environment variable named by authTokenEnv for ${node.id}.`);
     }
   }
-  if (!capabilities.python312) error("python_runtime_unavailable", "runtime", "Python 3.12 is required on both hosts.");
+  if (!capabilities.python312) error("python_runtime_unavailable", "runtime", "The configured local runtime.pythonExecutable must run Python 3.12. Verify the remote interpreter separately on host B.");
   if (config.model.revision === null) warning("model_revision_unpinned", "model", "Pin an immutable model revision before accepting physical evidence.");
 
   const ranges = capabilities.preparedStageRanges ?? [];

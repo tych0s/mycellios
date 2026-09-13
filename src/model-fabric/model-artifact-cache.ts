@@ -1,5 +1,5 @@
 import { lstat, readdir, rm, stat } from "node:fs/promises";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 
 export interface ModelArtifactCacheProtection {
   active: readonly string[];
@@ -33,7 +33,7 @@ export async function collectModelArtifactCache(
     if (!/^[0-9a-f]{64}$/.test(entry.name)) continue;
     if (entry.isSymbolicLink() || !entry.isDirectory()) throw new Error("model_artifact_cache_entry_is_unsafe");
     const path = resolve(root, entry.name);
-    if (!path.startsWith(`${root}/`)) throw new Error("model_artifact_cache_path_escaped");
+    if (dirname(path) !== root) throw new Error("model_artifact_cache_path_escaped");
     const metadata = await stat(path);
     entries.push({ digest: entry.name, path, bytes: await directoryBytes(path), mtimeMs: metadata.mtimeMs });
   }
@@ -56,7 +56,7 @@ async function directoryBytes(root: string): Promise<number> {
   let total = 0;
   for (const entry of await readdir(root, { withFileTypes: true })) {
     const path = resolve(root, entry.name);
-    if (!path.startsWith(`${root}/`) || entry.isSymbolicLink()) throw new Error("model_artifact_cache_entry_is_unsafe");
+    if (dirname(path) !== root || entry.isSymbolicLink()) throw new Error("model_artifact_cache_entry_is_unsafe");
     if (entry.isDirectory()) total += await directoryBytes(path);
     else if (entry.isFile()) total += (await lstat(path)).size;
     else throw new Error("model_artifact_cache_entry_is_unsafe");

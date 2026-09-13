@@ -464,7 +464,7 @@ describe("Python launch supervisor", () => {
     ).rejects.toThrow("local_process_executable_is_not_authorized");
   });
 
-  it("captures and restores bounded KV through the private executor workspace socket", async () => {
+  it("captures and restores bounded KV on POSIX and rejects unsupported Windows control", async () => {
     const marker = "CHECKPOINT_CONTROL_READY";
     const local = new LocalProcessAgent({
       id: "checkpoint-control-local",
@@ -492,7 +492,12 @@ describe("Python launch supervisor", () => {
           }
         });
       });
-      server.listen(path, () => console.log("${marker}"));
+      if (process.platform === "win32") {
+        console.log("${marker}");
+        setInterval(() => {}, 1000);
+      } else {
+        server.listen(path, () => console.log("${marker}"));
+      }
       process.on("SIGTERM", () => server.close(() => process.exit(0)));
     `;
     const request = {
@@ -510,6 +515,17 @@ describe("Python launch supervisor", () => {
     } as unknown as LaunchAgentStartRequest;
     const handle = await local.start(request, new AbortController().signal);
     await handle.ready;
+    if (process.platform === "win32") {
+      try {
+        await expect(handle.captureActivationCheckpoint?.(17, 64))
+          .rejects.toThrow("activation_checkpoint_control_unsupported:win32");
+        await expect(handle.restoreActivationCheckpoint?.(17, Buffer.from("restored-kv"), 37, 64))
+          .rejects.toThrow("activation_checkpoint_control_unsupported:win32");
+      } finally {
+        await handle.stop("test_complete");
+      }
+      return;
+    }
     await expect(handle.captureActivationCheckpoint?.(17, 64)).resolves.toEqual({
       payload: Buffer.from("live-kv"),
       committedPosition: 37,

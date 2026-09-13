@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
 import { access, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { posix } from "node:path";
 import type { NodeConfiguration } from "../contracts/node-configuration.js";
 
 export interface NodeIsolationProbe {
@@ -44,11 +44,11 @@ async function assertLinuxCgroup(
     .map((line) => line.match(/^0::(.+)$/)?.[1])
     .find((value): value is string => Boolean(value));
   if (!relative || relative === "/") throw new Error("node_linux_dedicated_cgroup_is_missing");
-  const root = join("/sys/fs/cgroup", relative);
+  const root = posix.join("/sys/fs/cgroup", relative);
   const [memoryText, cpuText, pidsText] = await Promise.all([
-    probe.readText(join(root, "memory.max")),
-    probe.readText(join(root, "cpu.max")),
-    probe.readText(join(root, "pids.max")),
+    probe.readText(posix.join(root, "memory.max")),
+    probe.readText(posix.join(root, "cpu.max")),
+    probe.readText(posix.join(root, "pids.max")),
   ]);
   const memoryMax = boundedNumber(memoryText, "node_linux_memory_limit_is_unbounded");
   if (memoryMax > config.limits.maxRamMiB * 1024 * 1024) {

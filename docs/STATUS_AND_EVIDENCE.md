@@ -1,6 +1,6 @@
 # Status and evidence
 
-Updated: 2026-08-31.
+Updated: 2026-09-13.
 
 ## Implemented and connected
 
@@ -26,6 +26,16 @@ Updated: 2026-08-31.
 
 The normal test suite validates software behavior. Opt-in physical tests are
 skipped when their required model, GPU or host environment is unavailable.
+
+The local development gate enrolls signed workers in its temporary coordinator
+database. Its two workers are logical processes on one computer. Cleanup
+deadlines remain active until completion and cleanup failures return nonzero.
+
+Activation checkpoint capture/restore currently uses a Unix socket. The native
+Windows launcher explicitly rejects this operation with
+`activation_checkpoint_control_unsupported:win32`; this path does not establish
+Windows checkpoint recovery support. Windows configuration writes flush the
+payload before atomic rename; directory fsync is available only on POSIX.
 
 ## Not yet demonstrated by committed evidence
 

@@ -32,7 +32,7 @@ afterEach(() => {
 
 describe("native Python product package", () => {
   it("prefers an explicit Python 3.12 command and supports an override", () => {
-    expect(nativePythonAnalyzerCommands("linux", undefined)).toEqual([
+    expect(nativePythonAnalyzerCommands("linux", "")).toEqual([
       { executable: "python3.12", prefix: [] },
       { executable: "python3", prefix: [] },
       { executable: "python", prefix: [] },

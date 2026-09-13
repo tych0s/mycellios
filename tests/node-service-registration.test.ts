@@ -15,7 +15,7 @@ describe("native service registration", () => {
     const manifest = installation(root, "linux");
     await registerNativeNodeService({ manifest, config: configuration(manifest, { mode: "linux-cgroup-v2" }), run: runner(calls) });
     const unit = await readFile(manifest.serviceDefinitionPath, "utf8");
-    expect(unit).toContain("User=mycellios"); expect(unit).toContain(`ReadWritePaths=\"${join(root, "config")}\"`);
+    expect(unit).toContain("User=mycellios"); expect(unit).toContain(`ReadWritePaths=${JSON.stringify(join(root, "config"))}`);
     expect(calls).toContainEqual(["/bin/systemctl", "enable", "--now", manifest.serviceName]);
   });
 

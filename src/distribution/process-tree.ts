@@ -66,29 +66,28 @@ async function terminateWindowsTree(
     stdio: "ignore",
     env: buildIsolatedProcessEnvironment(),
   });
-  await waitForHelper(helper, timeoutMs);
-  return true;
+  return waitForHelper(helper, timeoutMs);
 }
 
 async function waitForHelper(
   helper: ChildProcess,
   timeoutMs: number,
-): Promise<void> {
-  await new Promise<void>((resolve) => {
+): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
     let settled = false;
-    const finish = () => {
+    const finish = (succeeded: boolean) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve();
+      resolve(succeeded);
     };
     const timer = setTimeout(() => {
       bestEffortDirectKill(helper, "SIGKILL");
-      finish();
+      finish(false);
     }, Math.max(100, timeoutMs));
     timer.unref?.();
-    helper.once("error", finish);
-    helper.once("close", finish);
+    helper.once("error", () => finish(false));
+    helper.once("close", (code) => finish(code === 0));
   });
 }
 

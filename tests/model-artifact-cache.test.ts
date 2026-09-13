@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -14,6 +14,27 @@ async function artifact(root: string, character: string, bytes: number): Promise
 }
 
 describe("model artifact cache", () => {
+  it.each([false, true])("rejects directory links without touching their target (nested=%s)", async (nested) => {
+    const root = await mkdtemp(join(tmpdir(), "mycellios-model-cache-link-"));
+    try {
+      const cache = join(root, "cache");
+      const outside = join(root, "outside");
+      await mkdir(cache);
+      await mkdir(outside);
+      await writeFile(join(outside, "keep.bin"), "preserve");
+      const digestPath = join(cache, "a".repeat(64));
+      if (nested) await mkdir(digestPath);
+      await symlink(outside, nested ? join(digestPath, "linked") : digestPath,
+        process.platform === "win32" ? "junction" : "dir");
+      await expect(collectModelArtifactCache(cache, 0, {
+        active: [], previous: [], inUse: [], resumable: [],
+      })).rejects.toThrow("model_artifact_cache_entry_is_unsafe");
+      await expect(readFile(join(outside, "keep.bin"), "utf8")).resolves.toBe("preserve");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("collects oldest unprotected content while preserving active, previous, in-use and resumable roots", async () => {
     const root = await mkdtemp(join(tmpdir(), "mycellios-model-cache-"));
     const active = await artifact(root, "a", 10);
