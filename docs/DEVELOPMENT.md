@@ -39,6 +39,31 @@ npm run test:physical-recovery
 npm run test:physical-gpu-cell
 ```
 
+The Python runner fails on every failure or import error, including without
+`--strict`; that flag remains accepted for existing callers. Skips are reported
+separately. The small FP32 CPU cell fixtures compare each coordinate against its
+token's activation scale with a fixed `32 * float32.eps` budget. Independent
+FP64 reference measurements showed reduction-order roundoff in both dense and
+sharded paths. This fixture budget is not a GPU accuracy claim; exact cache,
+fork, promotion and alias checks remain in place, with separate corruption
+rejection tests for the numerical helper.
+
+On Windows, point tools at the prepared runtime when Python is not installed
+system-wide:
+
+```powershell
+$env:MYCELLIOS_PYTHON = (Resolve-Path runtime/distribution-venv/python.exe).Path
+npm test -- --maxWorkers=1
+& $env:MYCELLIOS_PYTHON scripts/run-python-tests.py --strict
+npm run dev:e2e:distributed -- --runtime runtime/distribution-venv --timeout 120
+```
+
+The development gate needs its selected model in the Hugging Face cache. A
+local validation used `hmellor/tiny-random-LlamaForCausalLM` at revision
+`9408c553e5c189a7dcdc5a5dbd2feb476b061759`. Prepare the snapshot in the gate's
+cache before an offline run. Random tiny-model output validates routing and
+cleanup, not answer quality or physical multi-host performance.
+
 ## Development rules
 
 - Preserve fail-closed schemas and identity checks.

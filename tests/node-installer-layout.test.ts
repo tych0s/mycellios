@@ -17,7 +17,7 @@ describe("native node installer layout", () => {
       source: { revision: "a".repeat(40), sourceId: expect.stringMatching(/^sha256:/) },
       entrypoints: { service: "app/node/main.js", install: "app/node/install-main.js", uninstall: "app/node/uninstall-main.js", launcher: process.platform === "win32" ? "install.ps1" : "install" } });
     const paths = manifest.files.map((file) => file.path);
-    expect(paths).toEqual(expect.arrayContaining(["app/node/main.js", "app/contracts/node-control.js", "bin/node",
+    expect(paths).toEqual(expect.arrayContaining(["app/node/main.js", "app/contracts/node-control.js", process.platform === "win32" ? "bin/node.exe" : "bin/node",
       "node_modules/ws/package.json", "node_modules/zod/package.json", "runtime/runtime-manifest.json"]));
     expect(paths).toContain(process.platform === "win32" ? "install.ps1" : "install");
     expect(paths.some((path) => path.includes("vitest"))).toBe(false);

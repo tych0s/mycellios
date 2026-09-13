@@ -805,6 +805,11 @@ function activationCheckpointControlRequest(
   payload: Buffer | undefined,
   maximumResponseBytes: number,
 ): Promise<{ payload: Buffer; committedPosition?: number }> {
+  // Python's checkpoint endpoint uses AF_UNIX, unavailable in the Windows
+  // runtime. A Windows named pipe cannot speak to that endpoint.
+  if (process.platform === "win32") {
+    return Promise.reject(new Error("activation_checkpoint_control_unsupported:win32"));
+  }
   if (!Number.isSafeInteger(maximumResponseBytes) || maximumResponseBytes < 0) {
     return Promise.reject(new Error("activation_checkpoint_response_limit_is_invalid"));
   }

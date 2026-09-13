@@ -116,11 +116,15 @@ async function writeDurableJson(path: string, value: unknown): Promise<void> {
 }
 
 async function syncFile(path: string): Promise<void> {
-  const file = await open(path, "r");
+  // Windows FlushFileBuffers requires a handle opened for writing.
+  const file = await open(path, "r+");
   try { await file.sync(); } finally { await file.close(); }
 }
 
 async function syncDirectory(path: string): Promise<void> {
+  // Node cannot fsync a directory on Windows. File contents have already been
+  // flushed before the atomic rename; retain directory fsync on POSIX.
+  if (process.platform === "win32") return;
   const directory = await open(path, "r");
   try { await directory.sync(); } finally { await directory.close(); }
 }

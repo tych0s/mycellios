@@ -71,7 +71,7 @@ jobs:
         env:
           HF_HUB_OFFLINE: "1"
           TRANSFORMERS_OFFLINE: "1"
-        run: python scripts/run-python-tests.py
+        run: python scripts/run-python-tests.py --strict
 
   product-boundary:
     name: Native product boundary

@@ -10,6 +10,8 @@ import unittest
 
 import torch
 
+from tests.cell_parity import assert_fp32_cell_close
+
 from distributed_runtime.cell_parallel import (
     llama_attention_shard_plan,
     llama_decoder_layer_tensor_parallel,
@@ -243,9 +245,7 @@ class ExternalTensorParallelCellTests(unittest.TestCase):
                 actual_prompt, _ = runner.forward_hidden(
                     request_id, prompt, token_mode="none"
                 )
-                self.assertTrue(
-                    torch.allclose(actual_prompt, expected_prompt, rtol=1e-5, atol=1e-5)
-                )
+                assert_fp32_cell_close(actual_prompt, expected_prompt)
                 self.assertEqual(
                     runner.member_work_reports,
                     _expected_cpu_rank_work(1, 5, 3),
@@ -263,9 +263,7 @@ class ExternalTensorParallelCellTests(unittest.TestCase):
                 )
 
                 actual_next, _ = runner.forward_hidden(request_id, next_hidden)
-                self.assertTrue(
-                    torch.allclose(actual_next, expected_next, rtol=1e-5, atol=1e-5)
-                )
+                assert_fp32_cell_close(actual_next, expected_next)
                 self.assertEqual(
                     runner.member_work_reports,
                     _expected_cpu_rank_work(2, 10, 4),
@@ -287,14 +285,7 @@ class ExternalTensorParallelCellTests(unittest.TestCase):
                     ),
                 )
                 actual_correction, _ = runner.forward_hidden(request_id, correction)
-                self.assertTrue(
-                    torch.allclose(
-                        actual_correction,
-                        expected_correction,
-                        rtol=1e-5,
-                        atol=1e-5,
-                    )
-                )
+                assert_fp32_cell_close(actual_correction, expected_correction)
                 self.assertEqual(
                     runner.member_work_reports,
                     _expected_cpu_rank_work(3, 15, 5),
@@ -335,18 +326,8 @@ class ExternalTensorParallelCellTests(unittest.TestCase):
                     (batch_prompt_a, batch_prompt_b),
                     token_mode="none",
                 )
-                torch.testing.assert_close(
-                    batch_prompt_results[0][0],
-                    expected_batch_prompt_a,
-                    rtol=1e-4,
-                    atol=5e-5,
-                )
-                torch.testing.assert_close(
-                    batch_prompt_results[1][0],
-                    expected_batch_prompt_b,
-                    rtol=1e-4,
-                    atol=5e-5,
-                )
+                assert_fp32_cell_close(batch_prompt_results[0][0], expected_batch_prompt_a)
+                assert_fp32_cell_close(batch_prompt_results[1][0], expected_batch_prompt_b)
                 self.assertEqual(
                     tuple(result[1] for result in batch_prompt_results),
                     (None, None),
@@ -373,18 +354,8 @@ class ExternalTensorParallelCellTests(unittest.TestCase):
                     request_ids,
                     (batch_next_a, batch_next_b),
                 )
-                torch.testing.assert_close(
-                    batch_next_results[0][0],
-                    expected_batch_next_a,
-                    rtol=1e-4,
-                    atol=5e-5,
-                )
-                torch.testing.assert_close(
-                    batch_next_results[1][0],
-                    expected_batch_next_b,
-                    rtol=1e-4,
-                    atol=5e-5,
-                )
+                assert_fp32_cell_close(batch_next_results[0][0], expected_batch_next_a)
+                assert_fp32_cell_close(batch_next_results[1][0], expected_batch_next_b)
                 self.assertEqual(
                     runner.member_work_reports,
                     _expected_cpu_rank_work(5, 25, 11),
@@ -412,12 +383,7 @@ class ExternalTensorParallelCellTests(unittest.TestCase):
                     fork_prompt,
                     token_mode="none",
                 )
-                torch.testing.assert_close(
-                    actual_fork_prompt,
-                    expected_fork_prompt,
-                    rtol=1e-5,
-                    atol=1e-5,
-                )
+                assert_fp32_cell_close(actual_fork_prompt, expected_fork_prompt)
                 parent_cache_bytes = runner.request_cache_bytes(parent_request_id)
                 self.assertEqual(parent_cache_bytes, 256)
                 self.assertEqual(
@@ -474,12 +440,7 @@ class ExternalTensorParallelCellTests(unittest.TestCase):
                     parent_request_id,
                     fork_parent_next,
                 )
-                torch.testing.assert_close(
-                    actual_fork_parent_next,
-                    expected_fork_parent_next,
-                    rtol=1e-5,
-                    atol=1e-5,
-                )
+                assert_fp32_cell_close(actual_fork_parent_next, expected_fork_parent_next)
                 self.assertEqual(runner.sequence_length(child_request_id), 2)
                 self.assertEqual(runner.request_cache_bytes(child_request_id), 256)
 
@@ -487,22 +448,12 @@ class ExternalTensorParallelCellTests(unittest.TestCase):
                     child_request_id,
                     fork_child_next,
                 )
-                torch.testing.assert_close(
-                    actual_fork_child_next,
-                    expected_fork_child_next,
-                    rtol=1e-5,
-                    atol=1e-5,
-                )
+                assert_fp32_cell_close(actual_fork_child_next, expected_fork_child_next)
                 actual_fork_child_second, _ = runner.forward_hidden(
                     child_request_id,
                     fork_child_second,
                 )
-                torch.testing.assert_close(
-                    actual_fork_child_second,
-                    expected_fork_child_second,
-                    rtol=1e-5,
-                    atol=1e-5,
-                )
+                assert_fp32_cell_close(actual_fork_child_second, expected_fork_child_second)
                 self.assertEqual(runner.sequence_length(parent_request_id), 3)
                 self.assertEqual(runner.sequence_length(child_request_id), 4)
                 self.assertEqual(runner.request_cache_bytes(parent_request_id), 384)
@@ -543,12 +494,7 @@ class ExternalTensorParallelCellTests(unittest.TestCase):
                     parent_request_id,
                     promoted_next,
                 )
-                torch.testing.assert_close(
-                    actual_promoted_next,
-                    expected_promoted_next,
-                    rtol=1e-4,
-                    atol=3e-4,
-                )
+                assert_fp32_cell_close(actual_promoted_next, expected_promoted_next)
                 self.assertEqual(runner.sequence_length(parent_request_id), 5)
                 self.assertEqual(
                     runner.member_work_reports,

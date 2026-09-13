@@ -1,8 +1,11 @@
 import { EventEmitter } from "node:events";
+import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { promisify } from "node:util";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   createIdempotentDevelopmentCleanup,
@@ -10,6 +13,28 @@ import {
 } from "../scripts/dev-distributed-e2e.js";
 
 describe("distributed development gate cleanup", () => {
+  it("reports a stalled cleanup before the CLI exits and still drains later steps", async () => {
+    const moduleUrl = pathToFileURL(resolve("scripts/dev-distributed-e2e.ts")).href;
+    const script = `
+      import { createIdempotentDevelopmentCleanup } from ${JSON.stringify(moduleUrl)};
+      const cleanup = createIdempotentDevelopmentCleanup([
+        { name: 'stalled', run: () => new Promise(() => {}) },
+        { name: 'last', run: () => process.stdout.write('drained\\n') },
+      ], 25);
+      cleanup().catch(error => {
+        process.stderr.write(error.errors[0].message);
+        process.exitCode = 2;
+      });
+    `;
+    await expect(promisify(execFile)(process.execPath, [
+      "--import", "tsx", "--input-type=module", "--eval", script,
+    ], { timeout: 10_000, windowsHide: true })).rejects.toMatchObject({
+      code: 2,
+      stdout: "drained\n",
+      stderr: expect.stringContaining("development_cleanup_timeout:stalled"),
+    });
+  });
+
   it("drains every resource and removes its temporary root exactly once", async () => {
     const temporaryRoot = await mkdtemp(join(tmpdir(), "mycellios-dev-e2e-cleanup-test-"));
     await writeFile(join(temporaryRoot, "state.json"), "{}");

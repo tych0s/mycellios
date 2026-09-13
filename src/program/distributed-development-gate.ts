@@ -29,6 +29,8 @@ import {
 import { DynamicModelActivationManager } from "../coordinator/model-activation-manager.js";
 import type { HubModelCapacityProfile } from "../coordinator/model-catalog.js";
 import { createCoordinator, type CoordinatorRuntime } from "../coordinator/server.js";
+import { NodeEnrollmentStore } from "../coordinator/node-enrollment-store.js";
+import { workerAdmissionPublicKeyFingerprint } from "../coordinator/worker-admission.js";
 import {
   MODEL_ADAPTER_EVIDENCE_SCOPE,
   MODEL_ADAPTER_REGISTRY_ID,
@@ -99,7 +101,11 @@ export interface DevelopmentGateExecutionOptions {
  */
 export function createIdempotentDevelopmentCleanup(
   steps: readonly DevelopmentGateCleanupStep[],
+  stepTimeoutMs = CLEANUP_STEP_TIMEOUT_MS,
 ): () => Promise<void> {
+  if (!Number.isSafeInteger(stepTimeoutMs) || stepTimeoutMs < 1) {
+    throw new Error("development_cleanup_timeout_invalid");
+  }
   let running: Promise<void> | null = null;
   return () => {
     running ??= (async () => {
@@ -108,7 +114,7 @@ export function createIdempotentDevelopmentCleanup(
         try {
           await withTimeout(
             Promise.resolve().then(() => step.run()),
-            CLEANUP_STEP_TIMEOUT_MS,
+            stepTimeoutMs,
             `development_cleanup_timeout:${step.name}`,
           );
         } catch (error) {
@@ -449,7 +455,28 @@ export async function executeDistributedDevelopmentGate(
     await coordinator.app.listen({ host: "127.0.0.1", port: coordinatorPort });
     emitPhase("coordinator", `private coordinator ready on ${coordinatorUrl}`);
 
+    const enrollments = new NodeEnrollmentStore(coordinator.database);
     for (const [index, nodeId] of ["dev-node-a", "dev-node-b"].entries()) {
+      // The private gate must satisfy the same ownership/key binding as a
+      // real node. These enrollments exist only in its temporary database.
+      const signer = workerAdmissionSigner(generateWorkerAdmissionCredential());
+      const accountId = "development-gate";
+      const enrollment = enrollments.issue({
+        accountId,
+        actor: { kind: "account", id: accountId, scopes: ["node:identity"] },
+        expiresInSeconds: 60,
+      });
+      enrollments.confirm({ enrollmentId: enrollment.enrollmentId, accountId, actorId: accountId });
+      const consumed = enrollments.consume({
+        enrollmentToken: enrollment.enrollmentToken,
+        nonce: enrollment.nonce,
+        identityKind: "device",
+        identityId: nodeId,
+        publicKeyFingerprint: workerAdmissionPublicKeyFingerprint(signer.publicKey) as `sha256:${string}`,
+      });
+      if (consumed.state !== "consumed") {
+        throw new Error(`development_worker_enrollment_failed:${nodeId}:${consumed.state}`);
+      }
       const nodeCache = join(cacheRoot, index === 0 ? "node-a" : "node-b");
       const launchAgent = new DevelopmentStageLaunchAgent({
         nodeId,
@@ -470,7 +497,7 @@ export async function executeDistributedDevelopmentGate(
       const worker = new WorkerAgent(developmentWorkerConfig(index), {
         coordinatorUrl,
         identity: { kind: "device", id: nodeId },
-        admissionSigner: workerAdmissionSigner(generateWorkerAdmissionCredential()),
+        admissionSigner: signer,
         reconnect: false,
         heartbeatIntervalMs: 1_000,
         advertiseDeployment: false,
@@ -1161,7 +1188,8 @@ function withTimeout<T>(
   let timer: NodeJS.Timeout | null = null;
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => reject(new Error(message)), timeoutMs);
-    timer.unref();
+    // A pending Promise does not keep Node alive. Keep this deadline referenced
+    // so a stalled cleanup cannot make the CLI exit successfully before drain.
   });
   return Promise.race([operation, timeout]).finally(() => {
     if (timer) clearTimeout(timer);

@@ -42,7 +42,7 @@ describe.skipIf(process.platform !== "win32")(
 
       expect(result.status).not.toBe(0);
       expect(result.stderr).toContain(
-        "Distribution runtime is missing. Run npm run desktop:runtime first.",
+        "Distribution runtime is missing. Run npm run node:runtime first.",
       );
     });
   },

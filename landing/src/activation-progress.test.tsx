@@ -71,7 +71,9 @@ describe("activation progress presentation", () => {
   it("shows the event date as well as its time", () => {
     const [date, time] = formatActivationTime("2026-07-24T08:18:45.682Z").split("\n");
     expect(date).toBeTruthy();
-    expect(time).toMatch(/08:18:45/);
+    expect(time).toBe(new Date("2026-07-24T08:18:45.682Z").toLocaleTimeString([], {
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+    }));
   });
 
   it("does not promise another retry after the bounded attempts are exhausted", () => {
