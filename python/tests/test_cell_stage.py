@@ -12,7 +12,7 @@ from safetensors import safe_open
 from safetensors.torch import load_file
 import torch
 
-from tests.cell_parity import assert_fp32_cell_close
+from tests.cell_parity import assert_fp32_cell_close, scale_cell_fixture_layer
 from transformers import AutoConfig
 
 from distributed_runtime.cell_parallel import (
@@ -389,10 +389,10 @@ class TensorParallelCellStageTests(unittest.TestCase):
         attention_heads = 4
         kv_heads = 2
         head_dim = 4
-        dense_layers = (
+        dense_layers = tuple(scale_cell_fixture_layer(layer) for layer in (
             _dense_layer(generator, hidden_size, kv_heads, head_dim, 9),
             _dense_layer(generator, hidden_size, kv_heads, head_dim, 11),
-        )
+        ))
         prompt = torch.randn((1, 2, hidden_size), generator=generator)
         parent_next = torch.randn((1, 1, hidden_size), generator=generator)
         child_next = torch.randn((1, 1, hidden_size), generator=generator)

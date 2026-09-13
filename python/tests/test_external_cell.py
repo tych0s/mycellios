@@ -10,7 +10,7 @@ import unittest
 
 import torch
 
-from tests.cell_parity import assert_fp32_cell_close
+from tests.cell_parity import assert_fp32_cell_close, scale_cell_fixture_layer
 
 from distributed_runtime.cell_parallel import (
     llama_attention_shard_plan,
@@ -49,10 +49,10 @@ class ExternalTensorParallelCellTests(unittest.TestCase):
         kv_heads = 4
         head_dim = 2
         rank_weights = (3.0, 1.0)
-        layers = (
+        layers = tuple(scale_cell_fixture_layer(layer) for layer in (
             _dense_layer(generator, hidden_size, kv_heads, head_dim, 9),
             _dense_layer(generator, hidden_size, kv_heads, head_dim, 11),
-        )
+        ))
         prompt = torch.randn((1, 3, hidden_size), generator=generator)
         next_hidden = torch.randn((1, 1, hidden_size), generator=generator)
         correction = torch.randn((1, 1, hidden_size), generator=generator)

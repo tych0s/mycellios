@@ -48,6 +48,12 @@ sharded paths. This fixture budget is not a GPU accuracy claim; exact cache,
 fork, promotion and alias checks remain in place, with separate corruption
 rejection tests for the numerical helper.
 
+The two cache/fork regression fixtures use fan-in-scaled projection matrices.
+Unit-variance random matrices amplified rounding across repeated decode steps
+enough to exceed the budget on a hosted CI CPU. Scaling the fixture inputs keeps
+the same seeds, dimensions, state transitions and fixed acceptance budget; it
+does not change runtime arithmetic or certify arbitrary ill-conditioned weights.
+
 On Windows, point tools at the prepared runtime when Python is not installed
 system-wide:
 
