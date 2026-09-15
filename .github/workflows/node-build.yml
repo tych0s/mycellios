@@ -12,7 +12,7 @@ permissions:
 jobs:
   native_scope:
     name: Native build scope
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nodecodex-ci, mycellios-isolated, Linux, X64]
     outputs:
       required: ${{ steps.scope.outputs.required }}
     steps:
@@ -53,13 +53,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
+          - runner: [self-hosted, nodecodex-ci, mycellios-isolated, Windows, X64]
             target: windows-x64
-          - os: ubuntu-latest
+          - runner: [self-hosted, nodecodex-ci, mycellios-isolated, Linux, X64]
             target: linux-x64
-          - os: macos-14
+          - runner: [self-hosted, nodecodex-ci, mycellios-isolated, macOS, ARM64]
             target: macos-arm64
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Native build not required
         if: needs.native_scope.outputs.required != 'true'
@@ -80,8 +80,7 @@ jobs:
       - name: Install pinned WiX toolset
         if: needs.native_scope.outputs.required == 'true' && matrix.target == 'windows-x64'
         shell: powershell
-        # Hosted images can carry a newer 3.14.1 package revision. Force the
-        # audited version instead of failing before the MSI build starts.
+        # Keep the audited toolchain on the isolated Windows runner.
         run: choco install wixtoolset --version=3.14.1 --allow-downgrade --no-progress -y
       - if: needs.native_scope.outputs.required == 'true'
         run: npx vitest run tests/node-*.test.ts tests/headless-worker.test.ts tests/worker-hardening.test.ts

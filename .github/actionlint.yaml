@@ -1,4 +1,5 @@
 self-hosted-runner:
   labels:
     - self-hosted
-    - self-hosted
+    - nodecodex-ci
+    - mycellios-isolated
