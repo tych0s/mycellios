@@ -16,7 +16,7 @@ concurrency:
 jobs:
   static:
     name: Static repository policy
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nodecodex-ci, mycellios-isolated, Linux, X64]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -34,7 +34,7 @@ jobs:
 
   typescript:
     name: TypeScript, tests and build
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nodecodex-ci, mycellios-isolated, Linux, X64]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -56,7 +56,7 @@ jobs:
 
   python:
     name: Python 3.12 runtime
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nodecodex-ci, mycellios-isolated, Linux, X64]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -75,7 +75,7 @@ jobs:
 
   product-boundary:
     name: Native product boundary
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nodecodex-ci, mycellios-isolated, Linux, X64]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -91,7 +91,7 @@ jobs:
 
   actions:
     name: GitHub Actions syntax
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nodecodex-ci, mycellios-isolated, Linux, X64]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Run actionlint
