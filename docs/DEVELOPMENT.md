@@ -3,8 +3,8 @@
 ## Prerequisites
 
 - Node.js 24 or newer
-- npm
-- Python 3 and the runtime dependencies needed by the selected executor
+- npm 10 (the exact version is pinned in `package.json`)
+- Python 3.12 and the runtime dependencies needed by the selected executor
 
 ## Install and verify
 
@@ -15,20 +15,27 @@ npm run check
 npm run build
 ```
 
+If another npm major is installed, `npx --yes npm@10.9.8 run doctor` runs the
+pinned tool without changing the global installation. Use the same prefix for
+the other npm commands.
+
 Use focused commands while iterating:
 
 ```bash
 npm test -- --run tests/<area>.test.ts
-python scripts/run-python-tests.py
+python -u scripts/run-python-tests.py
 npm run verify:architecture
-npm run verify:native-boundary
+npm run verify:component-boundaries
 npm run verify:bundle
 ```
 
 `npm run doctor -- --json` provides machine-readable diagnostics for setup
 scripts and support requests. Python 3.12 is required for full runtime work; a
 missing Python interpreter is reported as a partial control-plane setup rather
-than a successful full-runtime setup.
+than a successful full-runtime setup. Discovery checks `MYCELLIOS_PYTHON`, the
+prepared runtime (including Windows `Scripts/python.exe`), and system/managed
+interpreters. An incompatible Python earlier on PATH does not hide a prepared
+Python 3.12 runtime.
 
 Physical tests are opt-in and must not be presented as passed when skipped:
 
@@ -60,7 +67,7 @@ system-wide:
 ```powershell
 $env:MYCELLIOS_PYTHON = (Resolve-Path runtime/distribution-venv/python.exe).Path
 npm test -- --maxWorkers=1
-& $env:MYCELLIOS_PYTHON scripts/run-python-tests.py --strict
+& $env:MYCELLIOS_PYTHON -u scripts/run-python-tests.py --strict
 npm run dev:e2e:distributed -- --runtime runtime/distribution-venv --timeout 120
 ```
 
@@ -69,6 +76,15 @@ local validation used `hmellor/tiny-random-LlamaForCausalLM` at revision
 `9408c553e5c189a7dcdc5a5dbd2feb476b061759`. Prepare the snapshot in the gate's
 cache before an offline run. Random tiny-model output validates routing and
 cleanup, not answer quality or physical multi-host performance.
+
+Set `MYCELLIOS_DEV_E2E_HF_HOME` to an explicitly prepared Hugging Face cache when
+validating an isolated checkout. Relative paths resolve from that checkout.
+Copied snapshot symlinks must still resolve to blobs inside the same model
+repository, or be materialized as regular files. Cross-repository links are
+rejected by the checkpoint containment guard. `MYCELLIOS_DEV_E2E_DEBUG=1` enables
+coordinator diagnostics for investigating preparation and worker disconnects.
+Keep native runs, builds and the full test suite sequential on memory-constrained
+machines; the example's `--maxWorkers=1` limits test concurrency.
 
 ## Development rules
 

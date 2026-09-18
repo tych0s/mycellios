@@ -418,3 +418,18 @@
   .support-assistant-window { animation: none; transition: none; }
   .support-assistant-caret { animation: none; }
 }
+
+/* Keep help available below chat without covering the composer or Stop. */
+.public-panel-viewport:has(.inference-page) .support-assistant-panel {
+  position: relative;
+  right: auto;
+  bottom: auto;
+  display: flex;
+  justify-content: flex-end;
+  padding: 0 24px 22px;
+}
+
+.public-panel-viewport:has(.inference-page) .support-assistant-panel .support-assistant-window {
+  right: 24px;
+  bottom: 92px;
+}

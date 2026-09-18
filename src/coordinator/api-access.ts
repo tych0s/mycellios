@@ -371,9 +371,27 @@ export class ApiAccessManager {
 
   userOwnsSession(userId: string, sessionId: string): boolean {
     const row = this.database.raw.prepare(
-      "SELECT 1 AS found FROM api_usage WHERE user_id = ? AND session_id = ? LIMIT 1",
-    ).get(userId, sessionId) as { found: number } | undefined;
+      `SELECT 1 AS found FROM api_usage WHERE user_id = ? AND session_id = ?
+       AND NOT EXISTS (SELECT 1 FROM api_usage WHERE session_id = ? AND user_id <> ?)
+       LIMIT 1`,
+    ).get(userId, sessionId, sessionId, userId) as { found: number } | undefined;
     return row?.found === 1;
+  }
+
+  /** Recheck immediately before dispatch because capacity waits can admit other callers. */
+  assertSessionAccess(userId: string | null, sessionId?: string): void {
+    if (!sessionId) return;
+    const foreignUsage = this.database.raw.prepare(
+      `SELECT 1 FROM api_usage WHERE session_id = ?
+       AND (? IS NULL OR user_id <> ?) LIMIT 1`,
+    ).get(sessionId, userId, userId);
+    const unownedConversation = userId !== null && !this.userOwnsSession(userId, sessionId)
+      && this.database.raw.prepare(
+        "SELECT 1 FROM inference_conversations WHERE session_id = ? LIMIT 1",
+      ).get(sessionId);
+    if (foreignUsage || unownedConversation) {
+      throw new ApiAccessError("session_not_found", "The requested session was not found", 404);
+    }
   }
 
   grantTokens(userId: string, amount: number): ApiAccount {

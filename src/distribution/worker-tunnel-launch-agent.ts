@@ -39,6 +39,8 @@ export class WorkerTunnelLaunchAgent implements LaunchAgent {
   private readonly pending = new Map<string, PendingStart>();
   private readonly preparations = new Map<string, Deferred<void>>();
   private prepared = false;
+  private closed = false;
+  private connectionGeneration = 0;
   private readonly preparationListeners = new Set<
     (event: RuntimePreparationProgressEvent) => void
   >();
@@ -46,6 +48,7 @@ export class WorkerTunnelLaunchAgent implements LaunchAgent {
   private readonly onEnvelope = (envelope: WorkerEnvelope) => this.handleEnvelope(envelope);
   private readonly onDisconnect = (workerId: string) => {
     if (workerId !== this.workerId) return;
+    this.connectionGeneration += 1;
     const error = new Error(`distributed_worker_disconnected:${workerId}`);
     for (const preparation of this.preparations.values()) preparation.reject(error);
     for (const start of this.pending.values()) {
@@ -71,8 +74,13 @@ export class WorkerTunnelLaunchAgent implements LaunchAgent {
 
   async start(request: LaunchAgentStartRequest, signal: AbortSignal): Promise<LaunchProcessHandle> {
     if (signal.aborted) throw abortError(signal);
+    if (this.closed) throw new Error(`worker_tunnel_closed:${this.workerId}`);
     if (request.nodeId !== this.nodeId) throw new Error("worker_tunnel_launch_node_mismatch");
+    const generation = this.connectionGeneration;
     await this.prepare(signal);
+    if (signal.aborted) throw abortError(signal);
+    if (this.closed) throw new Error(`worker_tunnel_closed:${this.workerId}`);
+    if (generation !== this.connectionGeneration) throw new Error(`distributed_worker_disconnected:${this.workerId}`);
     const requestId = requestIdentity(request);
     if (this.pending.has(requestId)) throw new Error("worker_tunnel_duplicate_launch");
     const start: PendingStart = {
@@ -123,6 +131,7 @@ export class WorkerTunnelLaunchAgent implements LaunchAgent {
   }
 
   async close(): Promise<void> {
+    this.closed = true;
     this.hub.off("envelope", this.onEnvelope);
     this.hub.off("disconnect", this.onDisconnect);
     const error = new Error(`worker_tunnel_closed:${this.workerId}`);
@@ -142,6 +151,7 @@ export class WorkerTunnelLaunchAgent implements LaunchAgent {
 
   private async prepare(signal: AbortSignal): Promise<void> {
     if (this.prepared) return;
+    const generation = this.connectionGeneration;
     const requestId = `prepare-${shortHash(JSON.stringify(this.description))}`;
     let preparation = this.preparations.get(requestId);
     if (!preparation) {
@@ -153,6 +163,7 @@ export class WorkerTunnelLaunchAgent implements LaunchAgent {
       }
     }
     await withTimeoutAndSignal(preparation.promise, this.timeoutMs, signal, "worker_tunnel_prepare_timeout");
+    if (this.closed || generation !== this.connectionGeneration) return;
     this.prepared = true;
   }
 
@@ -267,15 +278,19 @@ function deferred<T>(): Deferred<T> {
 
 async function withTimeoutAndSignal<T>(promise: Promise<T>, timeoutMs: number, signal: AbortSignal, message: string): Promise<T> {
   if (signal.aborted) throw abortError(signal);
-  return await new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
-    const abort = () => reject(abortError(signal));
-    signal.addEventListener("abort", abort, { once: true });
-    void promise.then(resolve, reject).finally(() => {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", abort);
+  let timer: NodeJS.Timeout | undefined;
+  let abort: (() => void) | undefined;
+  try {
+    return await new Promise<T>((resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+      abort = () => reject(abortError(signal));
+      signal.addEventListener("abort", abort, { once: true });
+      void promise.then(resolve, reject);
     });
-  });
+  } finally {
+    clearTimeout(timer);
+    if (abort) signal.removeEventListener("abort", abort);
+  }
 }
 
 function abortError(signal: AbortSignal): Error {

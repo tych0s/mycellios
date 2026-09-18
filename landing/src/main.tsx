@@ -1,5 +1,5 @@
 import { lazy, StrictMode, Suspense, useEffect, type ReactNode } from "react";
-import { createRoot } from "react-dom/client";
+import { createRoot, type Root } from "react-dom/client";
 import { loadMushroomStage, wantsMushroom } from "./rebrand/HeroMushroom";
 import { applySeoMetadata } from "./seo";
 import { resolveLandingSurface } from "./routing";
@@ -15,11 +15,18 @@ function LoadedRoute({ children }: { children: ReactNode }) {
   useEffect(() => {
     const loader = document.getElementById("mycellios-loader");
     if (!loader) return;
-    requestAnimationFrame(() => requestAnimationFrame(() => {
+    let timer: number | undefined;
+    const removeLoader = () => loader.remove();
+    let frame = requestAnimationFrame(() => { frame = requestAnimationFrame(() => {
       loader.dataset.state = "leaving";
-      loader.addEventListener("transitionend", () => loader.remove(), { once: true });
-      window.setTimeout(() => loader.remove(), 400);
-    }));
+      loader.addEventListener("transitionend", removeLoader, { once: true });
+      timer = window.setTimeout(removeLoader, 400);
+    }); });
+    return () => {
+      cancelAnimationFrame(frame);
+      if (timer !== undefined) window.clearTimeout(timer);
+      loader.removeEventListener("transitionend", removeLoader);
+    };
   }, []);
   return children;
 }
@@ -78,7 +85,11 @@ if (isLanding && wantsMushroom()) {
   });
 }
 
-createRoot(root).render(
+// Vite can evaluate this entry again after an imported module changes. Reuse
+// its React root so the previous mounted tree is updated, never duplicated.
+const applicationRoot: Root = import.meta.hot?.data.reactRoot ?? createRoot(root);
+if (import.meta.hot) import.meta.hot.data.reactRoot = applicationRoot;
+applicationRoot.render(
   <StrictMode>
     <Suspense fallback={null}><LoadedRoute>{page}</LoadedRoute></Suspense>
   </StrictMode>,

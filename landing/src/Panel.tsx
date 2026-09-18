@@ -79,6 +79,8 @@ import type {
 } from "../../src/contracts/dashboard";
 import type { ChatResponse, ChatStreamUpdate } from "../../src/contracts/chat";
 import { consumeChatCompletionStreamWithRecovery } from "../../src/core/chat-stream";
+import { isAvailableInferenceWorker, selectInferenceModel } from "./inference-selection";
+import { friendlyInferenceError, inferenceWaitingStatus } from "./inference-status";
 import type { ChatMessage, NetworkExecutionTrace } from "../../src/contracts/types";
 import { projectObservedTopology } from "./network-topology";
 import { type ProductStatePresentation } from "./product-state";
@@ -402,6 +404,7 @@ function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
   const [loading, setLoading] = useState(true);
   const [issue, setIssue] = useState<PanelIssue | null>(null);
   const coordinatorError = issue?.source === "coordinator" ? issue.message : null;
+  const coordinatorStatus = coordinatorError ? "Unavailable" : loading ? "Connecting" : "Connected";
   const error = issue?.message ?? null;
   const [menuOpen, setMenuOpen] = useState(false);
   const menuButtonRef = useRef<HTMLButtonElement>(null);
@@ -469,9 +472,12 @@ function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
       && (panelMode === "developer" || simplePanelViews.has(item.id)));
   }, [advancedAccess, panelMode]);
   const requiresModelAdminToken = (!localBrowser || localProductionProxy) && !canManageModels;
+  const snapshotRequestPending = useRef(false);
   const refresh = useCallback(async () => {
+    if (snapshotRequestPending.current) return;
+    snapshotRequestPending.current = true;
     try {
-      const response = await fetch("/public/v1/snapshot", { cache: "no-store" });
+      const response = await fetch("/public/v1/snapshot", { cache: "no-store", signal: AbortSignal.timeout(12_000) });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       setSnapshot(await response.json() as PublicSnapshot);
       setIssue(null);
@@ -481,6 +487,7 @@ function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
         message: caught instanceof Error ? caught.message : String(caught),
       });
     } finally {
+      snapshotRequestPending.current = false;
       setLoading(false);
     }
   }, []);
@@ -792,8 +799,9 @@ function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
     await refresh();
   }
 
-  async function sendPrompt(model: string, messages: ChatMessage[], sessionId: string, onUpdate?: (update: ChatStreamUpdate) => void): Promise<ChatResponse> {
-    if (authConfig.apiAccessEnabled && !authSession) {
+  async function sendPrompt(model: string, messages: ChatMessage[], sessionId: string, onUpdate?: (update: ChatStreamUpdate) => void, signal?: AbortSignal): Promise<ChatResponse> {
+    const session = await getValidSession();
+    if (authConfig.apiAccessEnabled && !session) {
       throw new Error("Sign in to use your account's inference balance.");
     }
     const result = await consumeChatCompletionStreamWithRecovery(
@@ -802,17 +810,19 @@ function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
         headers: {
           accept: "text/event-stream",
           "content-type": "application/json",
-          ...(authSession ? { authorization: `Bearer ${authSession.accessToken}` } : {}),
+          ...(session ? { authorization: `Bearer ${session.accessToken}` } : {}),
         },
         body: JSON.stringify({ model, messages, session_id: sessionId, stream: true, max_tokens: 128, temperature: 0, top_p: 1 }),
         signal,
       }),
       model,
       onUpdate ?? (() => undefined),
-      { sessionId },
+      { sessionId, ...(signal ? { signal } : {}) },
     );
-    if (authSession && authConfig.apiAccessEnabled) {
-      setApiAccount(await loadApiAccount(authSession.accessToken, apiRequestBaseUrl).catch(() => apiAccount));
+    if (session && authConfig.apiAccessEnabled) {
+      void loadApiAccount(session.accessToken, apiRequestBaseUrl).then((account) => {
+        if (authSessionRef.current?.accessToken === session.accessToken) setApiAccount(account);
+      }).catch(() => undefined);
     }
     return result;
   }
@@ -885,15 +895,16 @@ function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
           </button>
           <div className="panel-sidebar-meta">
             <div
-              className={`panel-sidebar-status ${coordinatorError ? "degraded" : "healthy"}`}
+              className={`panel-sidebar-status ${coordinatorError || loading ? "degraded" : "healthy"}`}
               role="status"
-              aria-label={`Network status: ${coordinatorError ? "Degraded" : "Healthy"}`}
+              aria-label={`Coordinator connection: ${coordinatorStatus}`}
+              title={coordinatorError ? "Cannot refresh the coordinator snapshot" : loading ? "Loading the coordinator snapshot" : `Coordinator connected · ${snapshot.summary.connected} connected nodes`}
             >
               <i />
-              <strong>{coordinatorError ? "Degraded" : "Healthy"}</strong>
+              <strong>{coordinatorStatus}</strong>
             </div>
-            <div className="panel-sidebar-version" aria-label="Versión v0.77">
-              <span><strong>v0.77</strong></span>
+            <div className="panel-sidebar-version" aria-label={`Coordinator version ${snapshot.version}`}>
+              <span><strong>{snapshot.version === "—" ? "—" : `v${snapshot.version}`}</strong></span>
             </div>
           </div>
         </div>
@@ -928,7 +939,7 @@ function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
               />}
               {view === "tests" && advancedAccess && <Tests />}
               {view === "logs" && advancedAccess && <SystemLogs snapshot={snapshot} connectionError={coordinatorError} />}
-              {view === "inference" && <Inference snapshot={snapshot} onSend={sendPrompt} onNavigate={navigate} developerMode={panelMode === "developer"} accountAuthenticated={!authConfig.apiAccessEnabled || authSession !== null} onSignIn={() => setAuthOpen(true)} apiAccessEnabled={authConfig.apiAccessEnabled ?? false} apiBaseUrl={apiBaseUrl} accessToken={authSession?.accessToken ?? null} getValidSession={getValidSession} apiAccount={apiAccount} />}
+              {view === "inference" && <Inference snapshot={snapshot} coordinatorConnected={!coordinatorError} onSend={sendPrompt} onNavigate={navigate} developerMode={panelMode === "developer"} accountAuthenticated={!authConfig.apiAccessEnabled || authSession !== null} onSignIn={() => setAuthOpen(true)} apiAccessEnabled={authConfig.apiAccessEnabled ?? false} apiBaseUrl={apiBaseUrl} accessToken={authSession?.accessToken ?? null} getValidSession={getValidSession} apiAccount={apiAccount} />}
               {view === "contribute" && <Contribute
                 accessToken={authSession?.accessToken ?? null}
                 authConfig={authConfig}
@@ -4427,9 +4438,10 @@ interface InferencePendingTurn extends ChatStreamUpdate {
   attachments: InferenceAttachmentSummary[];
 }
 
-function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthenticated, onSignIn, apiAccessEnabled, apiBaseUrl, accessToken, getValidSession, apiAccount }: {
+function Inference({ snapshot, coordinatorConnected, onSend, onNavigate, developerMode, accountAuthenticated, onSignIn, apiAccessEnabled, apiBaseUrl, accessToken, getValidSession, apiAccount }: {
   snapshot: PublicSnapshot;
-  onSend: (model: string, messages: ChatMessage[], sessionId: string, onUpdate?: (update: ChatStreamUpdate) => void) => Promise<ChatResponse>;
+  coordinatorConnected: boolean;
+  onSend: (model: string, messages: ChatMessage[], sessionId: string, onUpdate?: (update: ChatStreamUpdate) => void, signal?: AbortSignal) => Promise<ChatResponse>;
   onNavigate: (view: PanelView) => void;
   developerMode: boolean;
   accountAuthenticated: boolean;
@@ -4441,7 +4453,7 @@ function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthent
   apiAccount: ApiAccount | null;
 }) {
   const options = useMemo(() => snapshot.models.map((item) => inferenceModelOption(snapshot, item)), [snapshot]);
-  const realModels = options.filter((item) => !item.legacyExternalRuntime);
+  const realModels = options.filter((item) => item.nativeRuntime);
   const [model, setModel] = useState("");
   // The landing hero hands off its prompt through sessionStorage so the visitor
   // lands in the chat with what they already typed, instead of an empty box.
@@ -4455,16 +4467,20 @@ function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthent
   const [filesBusy, setFilesBusy] = useState(false);
   const [turns, setTurns] = useState<InferenceTurn[]>([]);
   const [sessionId, setSessionId] = useState(() => newInferenceSessionId());
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<{ message: string; stopped: boolean } | null>(null);
   const [pendingTurn, setPendingTurn] = useState<InferencePendingTurn | null>(null);
+  const [interruptedTurn, setInterruptedTurn] = useState<InferencePendingTurn | null>(null);
+  const activeRequest = useRef<AbortController | null>(null);
   const [instructionsOpen, setInstructionsOpen] = useState(false);
   const [instructions, setInstructions] = useState(() => window.localStorage.getItem("mycellios.chat.instructions") ?? "");
   const outputRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const modelAvailable = realModels.length > 0;
-  const inferenceAvailable = modelAvailable && accountAuthenticated;
-  const selectedModel = realModels.some((item) => item.id === model) ? model : realModels[0]?.id ?? "";
-  const selectedOption = realModels.find((item) => item.id === selectedModel) ?? null;
+  const selectedOption = selectInferenceModel(realModels, model);
+  const modelAvailable = selectedOption !== null;
+  const inferenceAvailable = coordinatorConnected && modelAvailable && accountAuthenticated;
+  const selectedModel = selectedOption?.id ?? "";
+
+  useEffect(() => () => { activeRequest.current?.abort(); activeRequest.current = null; }, []);
 
   function saveInstructions(next: string) {
     setInstructions(next);
@@ -4519,7 +4535,10 @@ function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthent
   async function send() {
     const cleanPrompt = prompt.trim();
     const attachedFiles = attachments;
-    if (!selectedModel || (!cleanPrompt && attachedFiles.length === 0) || pendingTurn || filesBusy) return;
+    if (!inferenceAvailable || (!cleanPrompt && attachedFiles.length === 0) || activeRequest.current || filesBusy) return;
+    const request = new AbortController();
+    activeRequest.current = request;
+    let latestUpdate: ChatStreamUpdate | null = null;
     const displayPrompt = cleanPrompt || "Analiza los archivos adjuntos.";
     const messageContent = inferenceMessageWithAttachments(displayPrompt, attachedFiles);
     const attachmentSummaries = attachedFiles.map(({ id, name, size, kind, truncated }) => ({ id, name, size, kind, truncated }));
@@ -4542,6 +4561,7 @@ function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthent
     setAttachments([]);
     setAttachmentError(null);
     setError(null);
+    setInterruptedTurn(null);
     try {
       const messages: ChatMessage[] = [
         ...(instructions.trim() ? [{ role: "developer" as const, content: instructions.trim() }] : []),
@@ -4552,54 +4572,61 @@ function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthent
         { role: "user", content: messageContent },
       ];
       const response = await onSend(selectedModel, messages, sessionId, (update) => {
+        if (activeRequest.current !== request || request.signal.aborted) return;
+        latestUpdate = update;
         setPendingTurn((current) => current ? { ...current, ...update } : current);
-      });
+      }, request.signal);
+      if (activeRequest.current !== request) return;
+      request.signal.throwIfAborted();
       if (!response.text.trim()) throw new Error("The model finished without returning text.");
       setTurns((current) => [...current, { id: response.requestId, prompt: displayPrompt, messageContent, attachments: attachmentSummaries, response }]);
     } catch (caught) {
+      if (activeRequest.current !== request) return;
       setPrompt(cleanPrompt);
       setAttachments(attachedFiles);
-      setError(errorText(caught));
+      const partial = latestUpdate as ChatStreamUpdate | null;
+      if (partial?.text) setInterruptedTurn({ ...partial, prompt: displayPrompt, attachments: attachmentSummaries });
+      setError({ message: errorText(caught), stopped: request.signal.aborted });
     } finally {
-      setPendingTurn(null);
+      if (activeRequest.current === request) { activeRequest.current = null; setPendingTurn(null); }
     }
   }
 
   function resetConversation(nextModel?: string) {
+    activeRequest.current?.abort();
+    activeRequest.current = null;
     if (nextModel !== undefined) setModel(nextModel);
     setTurns([]);
-    setPrompt("");
-    setAttachments([]);
+    if (nextModel === undefined) { setPrompt(""); setAttachments([]); }
     setAttachmentError(null);
     setError(null);
     setPendingTurn(null);
+    setInterruptedTurn(null);
     setSessionId(newInferenceSessionId());
   }
 
   const apiAccessPanel = <ApiAccessPanel enabled={apiAccessEnabled} apiBaseUrl={apiBaseUrl} accessToken={accessToken} getValidSession={getValidSession} account={apiAccount} availableModels={realModels.length} onSignIn={onSignIn} />;
 
-  if (!modelAvailable) return <section className="inference-page inference-empty-page">
-    <PageTitle title="Test a model" />
-    {developerMode ? apiAccessPanel : <PanelDisclosure icon={Code2} eyebrow="OPTIONAL" title="API access" summary="Keys, usage, and the OpenAI-compatible endpoint.">{apiAccessPanel}</PanelDisclosure>}
-    <div className="inference-unavailable focused-empty">
+  const unavailableNotice = <div className="inference-unavailable focused-empty" role="status">
       <div className="inference-unavailable-icon"><MessageSquareText /></div>
-      <div className="inference-unavailable-copy"><span>NO AI MODELS AVAILABLE</span><h2>Connect a model to start chatting</h2><p>The network is healthy, but no verified inference runtime is available yet.</p>
-        {developerMode && snapshot.requestedModels[0] && <div className="inference-request-state"><LoaderCircle className={snapshot.requestedModels[0].status === "active" ? "" : "spin"} /><span><strong>{snapshot.requestedModels[0].id}</strong>{snapshot.requestedModels[0].message}</span></div>}
+      <div className="inference-unavailable-copy"><span>{!coordinatorConnected ? "CONNECTION INTERRUPTED" : model ? "SELECTED MODEL UNAVAILABLE" : "WAITING FOR A MODEL"}</span><h2>{!coordinatorConnected ? "Reconnecting to the network" : model ? "Your selected model is offline" : "Connect a model to start chatting"}</h2><p>{!coordinatorConnected ? "The last model snapshot may be out of date. Your conversation and draft stay here while Mycellios reconnects." : model ? `${model} has no available native route in the latest network snapshot. Choose another model or wait for it to reconnect.` : "No connected native inference route is available in the latest network snapshot. Connect a node and activate a model to begin."}</p>
+        {developerMode && snapshot.requestedModels[0] && <div className="inference-request-state"><LoaderCircle className={["profiling", "activating"].includes(snapshot.requestedModels[0].status) ? "spin" : ""} /><span><strong>{snapshot.requestedModels[0].id}</strong>{snapshot.requestedModels[0].message}</span></div>}
         <div className="inference-unavailable-actions"><button className="primary-button" onClick={() => onNavigate("models")}><Boxes size={16} />View and activate models</button></div>
       </div>
     </div>
-  </section>;
+  ;
 
   return <section className="inference-page">
     <PageTitle title="Test a model" />
     {developerMode ? apiAccessPanel : <PanelDisclosure icon={Code2} eyebrow="OPTIONAL" title="API access" summary="Keys, usage, and the OpenAI-compatible endpoint.">{apiAccessPanel}</PanelDisclosure>}
-    {modelAvailable && !accountAuthenticated && <div className="inference-unavailable account-required">
+    {(!coordinatorConnected || !modelAvailable) && unavailableNotice}
+    {coordinatorConnected && modelAvailable && !accountAuthenticated && <div className="inference-unavailable account-required">
       <div className="inference-unavailable-icon"><LockKeyhole /></div>
       <div className="inference-unavailable-copy"><span>ACCOUNT REQUIRED</span><h2>The model is connected; sign in to use it</h2><p>Sending uses your account balance and limits. Chat remains visible so you can see how it works.</p><div className="inference-unavailable-actions"><button className="primary-button" onClick={onSignIn}><UserRound size={16} />Sign in</button></div></div>
     </div>}
-    <div className={`inference-console${inferenceAvailable ? "" : " is-unavailable"}`} aria-disabled={!inferenceAvailable}>
+    <div className={`inference-console${inferenceAvailable ? "" : " is-unavailable"}`} aria-busy={pendingTurn !== null}>
       <div className="inference-toolbar">
-        <div className="inference-toolbar-title"><MessageSquareText /><span><strong>Chat</strong><small>Inferencia distribuida en tiempo real</small></span></div>
+        <div className="inference-toolbar-title"><MessageSquareText /><span><strong>Chat</strong><small>{selectedModel || model || "Waiting for a native model"}</small></span></div>
         <div className="inference-toolbar-controls">
           <span className="inference-toolbar-stat"><Network /><b>{selectedOption?.nodeCount ?? 0}</b> nodo{selectedOption?.nodeCount === 1 ? "" : "s"}</span>
           <span className="inference-toolbar-stat"><MemoryStick /><b>{selectedOption && selectedOption.peerMemoryMb > 0 ? formatMemory(selectedOption.peerMemoryMb) : "—"}</b> memoria</span>
@@ -4608,15 +4635,16 @@ function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthent
       {developerMode && <div className="inference-route-strip">
         {inferenceAvailable
           ? <div className="inference-model-summary"><ExecutionBadge execution={selectedOption?.execution ?? unknownExecutionSummary()} workers={snapshot.workers} large /><span className="inference-live"><i />AVAILABLE</span><span>{selectedOption?.routeLabel}</span><span>{selectedOption?.freeSlots ?? 0} free slot{selectedOption?.freeSlots === 1 ? "" : "s"}</span></div>
-          : <div className="inference-model-summary inference-offline"><LockKeyhole size={14} /><span>{modelAvailable ? "SIGN IN" : "NO REAL CONNECTION"}</span></div>}
+          : <div className="inference-model-summary inference-offline"><LockKeyhole size={14} /><span>{!coordinatorConnected ? "RECONNECTING" : modelAvailable ? "SIGN IN" : "NO REAL CONNECTION"}</span></div>}
       </div>}
       <div className="inference-output" aria-live="polite" ref={outputRef}>
         {turns.length === 0 && !pendingTurn && !error && (inferenceAvailable
           ? <div className="inference-welcome"><Sparkles /><h2>Escribe una pregunta</h2><p>La respuesta vendrá exclusivamente del despliegue nativo seleccionado de Mycellios.</p><div className="inference-suggestions">{["Resume cómo funciona esta red", "Explica una idea en tres frases", "Responde con una prueba corta"].map((suggestion) => <button key={suggestion} onClick={() => setPrompt(suggestion)}>{suggestion}</button>)}</div></div>
-          : <div className="inference-welcome inference-welcome-locked"><LockKeyhole /><h2>{modelAvailable ? "El chat está esperando tu cuenta" : "El chat está esperando un modelo"}</h2><p>{modelAvailable ? "Inicia sesión para activar el envío con tu saldo de tokens." : "Podrás escribir y enviar mensajes en cuanto la red confirme una conexión de inferencia real."}</p></div>)}
+          : <div className="inference-welcome inference-welcome-locked"><LockKeyhole /><h2>{!coordinatorConnected ? "Restableciendo la conexión" : modelAvailable ? "El chat está esperando tu cuenta" : "El chat está esperando un modelo"}</h2><p>{coordinatorConnected && modelAvailable ? "Puedes preparar tu mensaje. Inicia sesión para enviarlo con tu saldo de tokens." : "Puedes preparar tu mensaje ahora. El envío estará disponible cuando haya una ruta de inferencia nativa conectada."}</p></div>)}
         {turns.map((turn) => <InferenceCompletedTurn turn={turn} key={turn.id} />)}
         {pendingTurn && <InferenceStreamingTurn turn={pendingTurn} />}
-        {error && <div className="inference-error" role="alert"><CircleAlert /><div><strong>No se pudo completar la inferencia</strong><span>{friendlyInferenceError(error)}</span></div></div>}
+        {interruptedTurn && <div className="inference-turn"><InferenceUserMessage prompt={interruptedTurn.prompt} attachments={interruptedTurn.attachments} /><div className="inference-message"><img src={brandIcon} alt="" /><div><div className="inference-stream-head"><span>{interruptedTurn.model}</span><b>INCOMPLETE RESPONSE</b></div><p>{interruptedTurn.text}</p></div></div></div>}
+        {error && <div className={`inference-error${error.stopped ? " is-stopped" : ""}`} role={error.stopped ? "status" : "alert"}>{error.stopped ? <Pause /> : <CircleAlert />}<div><strong>{error.stopped ? "Generation stopped" : "The response could not be completed"}</strong><span>{error.stopped ? "Your message is ready to edit or send again." : friendlyInferenceError(error.message)}</span></div></div>}
       </div>
       <div className="inference-input">
         {attachments.length > 0 && <div className="inference-attachments" aria-label="Archivos adjuntos">{attachments.map((attachment) => <div key={attachment.id}><FileText /><span><strong>{attachment.name}</strong><small>{formatFileSize(attachment.size)} · {attachment.kind.toUpperCase()}{attachment.truncated ? " · contenido recortado" : ""}</small></span><button type="button" onClick={() => setAttachments((current) => current.filter((item) => item.id !== attachment.id))} aria-label={`Quitar ${attachment.name}`}><X /></button></div>)}</div>}
@@ -4624,16 +4652,16 @@ function Inference({ snapshot, onSend, onNavigate, developerMode, accountAuthent
         <div className="inference-composer-row">
           <input ref={fileInputRef} hidden type="file" multiple accept={INFERENCE_FILE_ACCEPT} onChange={(event) => void addFiles(event.target.files)} />
           <button type="button" className="inference-attach" disabled={!inferenceAvailable || pendingTurn !== null || filesBusy || attachments.length >= MAX_INFERENCE_FILES} onClick={() => fileInputRef.current?.click()} aria-label="Attach documents" title="PDF, DOCX, text, code, CSV or JSON">{filesBusy ? <LoaderCircle className="spin" /> : <Paperclip />}</button>
-          <textarea aria-label="Message" value={prompt} disabled={!inferenceAvailable || pendingTurn !== null} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder={inferenceAvailable ? `Write to ${model ? selectedModel : "automatic mesh"}…` : modelAvailable ? "Sign in to start writing…" : "Connect a real model to start writing…"} />
+          <textarea aria-label="Message" value={prompt} disabled={pendingTurn !== null} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void send(); } }} placeholder={inferenceAvailable ? `Write to ${selectedModel}…` : "Draft a message while waiting…"} />
         </div>
         <div className="inference-input-foot"><div className="inference-composer-tools">
-          <InferenceModelPicker options={realModels} value={model} onChange={(nextModel) => resetConversation(nextModel)} />
+          <InferenceModelPicker options={realModels} value={model} onChange={(nextModel) => { if (nextModel !== model) resetConversation(nextModel); }} disabled={pendingTurn !== null} />
           <div className={`inference-instructions${instructionsOpen ? " open" : ""}`}>
             <button type="button" aria-label="Instrucciones de esta conversación" aria-expanded={instructionsOpen} onClick={() => setInstructionsOpen((current) => !current)}><SlidersHorizontal />{instructions.trim() && <i />}</button>
             {instructionsOpen && <div className="inference-instructions-popover"><header><strong>Instrucciones para esta conversación</strong><span>Se enviarán antes de cada mensaje.</span></header><textarea value={instructions} onChange={(event) => saveInstructions(event.target.value)} placeholder="Por ejemplo: responde en español claro y avisa cuando no estés seguro." maxLength={2_000} /><div className="inference-instruction-presets">{["Respuestas directas", "Paso a paso", "Código primero", "Resumen breve"].map((preset) => <button type="button" key={preset} onClick={() => saveInstructions(instructions.trim() ? `${instructions.trim()}\n${preset}.` : `${preset}.`)}>{preset}</button>)}</div><footer><button type="button" onClick={() => saveInstructions("")}>Limpiar</button><button type="button" onClick={() => setInstructionsOpen(false)}>Listo</button></footer></div>}
           </div>
-          <span>{inferenceAvailable ? <><Paperclip size={12} />Archivos · <kbd>Enter</kbd> enviar</> : <><LockKeyhole size={12} />{modelAvailable ? "Inicia sesión para enviar" : "Conecta un modelo real"}</>}</span>
-        </div><div>{turns.length > 0 && <button className="inference-clear" onClick={() => resetConversation()}><Trash2 size={14} />Nueva conversación</button>}<button className="inference-send" disabled={!inferenceAvailable || (!prompt.trim() && attachments.length === 0) || pendingTurn !== null || filesBusy} onClick={() => void send()}>{pendingTurn ? <LoaderCircle className="spin" /> : <Send />}<span>Enviar</span></button></div></div>
+          <span>{inferenceAvailable ? <><Paperclip size={12} />Archivos · <kbd>Enter</kbd> enviar</> : <><LockKeyhole size={12} />{!coordinatorConnected ? "Reconectando" : modelAvailable ? "Inicia sesión para enviar" : "Conecta un modelo real"}</>}</span>
+        </div><div>{(turns.length > 0 || interruptedTurn) && <button className="inference-clear" disabled={pendingTurn !== null} onClick={() => resetConversation()}><Trash2 size={14} />Nueva conversación</button>}{pendingTurn ? <button className="inference-send" onClick={() => activeRequest.current?.abort()}><Pause /><span>Stop</span></button> : <button className="inference-send" disabled={!inferenceAvailable || (!prompt.trim() && attachments.length === 0) || filesBusy} onClick={() => void send()}><Send /><span>Enviar</span></button>}</div></div>
       </div>
     </div>
   </section>;
@@ -4687,13 +4715,13 @@ function InferenceUserMessage({ prompt, attachments }: { prompt: string; attachm
 
 type InferenceModelOption = ReturnType<typeof inferenceModelOption>;
 
-function InferenceModelPicker({ options, value, onChange }: { options: InferenceModelOption[]; value: string; onChange: (value: string) => void }) {
+function InferenceModelPicker({ options, value, onChange, disabled }: { options: InferenceModelOption[]; value: string; onChange: (value: string) => void; disabled: boolean }) {
   const [open, setOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const selected = options.find((option) => option.id === value) ?? null;
-  const label = selected?.id ?? "Mesh — automatic";
+  const label = selected?.id ?? (value ? `${value} · offline` : "Mesh — automatic");
   return <div className={`inference-model-picker${open ? " open" : ""}`} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false); }}>
-    <button ref={triggerRef} type="button" aria-label="Select chat model" aria-haspopup="listbox" aria-expanded={open} disabled={options.length === 0} onClick={() => setOpen((current) => !current)}>
+    <button ref={triggerRef} type="button" aria-label="Select chat model" aria-haspopup="listbox" aria-expanded={open} disabled={disabled || options.length === 0} onClick={() => setOpen((current) => !current)} onKeyDown={(event) => { if (event.key === "Escape") setOpen(false); }}>
       <Cpu /><span><small>MODEL</small><strong>{label}</strong></span><ChevronDown />
     </button>
     {open && <div className="inference-model-menu" role="listbox" aria-label="Available models">
@@ -4701,7 +4729,7 @@ function InferenceModelPicker({ options, value, onChange }: { options: Inference
         <span><strong>Mesh — automatic</strong><small>The network chooses the best available route</small></span><b className="auto"><i />AUTO</b>{value === "" && <Check />}
       </button>
       {options.map((option) => <button type="button" role="option" aria-selected={option.id === value} className={option.id === value ? "selected" : ""} key={option.id} onMouseDown={(event) => event.preventDefault()} onClick={() => { onChange(option.id); setOpen(false); triggerRef.current?.focus(); }}>
-        <span><strong>{option.id}</strong><small>{option.nodeCount} node{option.nodeCount === 1 ? "" : "s"} · {option.peerMemoryMb > 0 ? formatMemory(option.peerMemoryMb) : "memory not reported"}</small></span><b className={option.freeSlots > 0 ? "warm" : "ready"}><i />{option.freeSlots > 0 ? "WARM" : "READY"}</b>{option.id === value && <Check />}
+        <span><strong>{option.id}</strong><small>{option.nodeCount} connected node{option.nodeCount === 1 ? "" : "s"} · {option.peerMemoryMb > 0 ? formatMemory(option.peerMemoryMb) : "memory not reported"}</small></span><b className={option.freeSlots > 0 ? "warm" : "ready"}><i />{option.freeSlots > 0 ? "AVAILABLE" : "BUSY"}</b>{option.id === value && <Check />}
       </button>)}
     </div>}
   </div>;
@@ -5317,20 +5345,17 @@ function computeModeLabel(mode: NonNullable<PublicWorker["computeMode"]>): strin
   return "Automatic";
 }
 
-function inferenceModelOption(snapshot: PublicSnapshot, model: PublicSnapshot["models"][number]) {
-  const deployments = snapshot.workers.flatMap((worker) => worker.deployments).filter((deployment) => deployment.model === model.id);
-  const peers = snapshot.workers.filter((worker) => worker.connected && worker.deployments.some((deployment) => deployment.model === model.id));
-  const adapters = deployments.map((deployment) => deployment.adapter).filter((adapter): adapter is NonNullable<PublicDeployment["adapter"]> => adapter !== undefined);
-  const legacyExternalRuntime = adapters.some(
-    (adapter) => adapter !== "mycellios-pipeline",
-  );
+export function inferenceModelOption(snapshot: PublicSnapshot, model: PublicSnapshot["models"][number]) {
+  const isNativeModel = (deployment: PublicDeployment) => deployment.model === model.id && deployment.adapter === "mycellios-pipeline";
+  const peers = snapshot.workers.filter((worker) => isAvailableInferenceWorker(worker) && worker.deployments.some(isNativeModel));
+  const deployments = peers.flatMap((worker) => worker.deployments).filter(isNativeModel);
   const freeSlots = deployments.reduce((total, deployment) => total + deployment.freeSlots, 0);
   const routeLabel = model.pipelines > 0
     ? `${model.pipelines} pipeline${model.pipelines === 1 ? "" : "s"}`
     : `${model.replicas} replica${model.replicas === 1 ? "" : "s"}`;
   return {
     ...model,
-    legacyExternalRuntime,
+    nativeRuntime: deployments.length > 0 && (model.pipelines > 0 || model.replicas > 0),
     freeSlots,
     routeLabel,
     nodeCount: peers.length,
@@ -5398,34 +5423,6 @@ function splitThinkingContent(text: string): { reasoning: string | null; answer:
   const reasoning = match[1]?.trim() || null;
   const answer = text.slice(match[0].length).trim();
   return { reasoning, answer: answer || "The model returned no final content." };
-}
-
-function friendlyInferenceError(message: string): string {
-  const normalized = message.toLowerCase();
-  if (normalized.includes("first token")) return "The route produced no token after retrying. The coordinator marked it degraded and will activate auto-repair.";
-  if (normalized.includes("disconnected from the distributed pipeline")) return "A device in the distributed route disconnected. The request was safely cancelled while the network rebuilds the route.";
-  if (normalized.includes("no_candidates") || normalized.includes("no candidate") || normalized.includes("unavailable")) return "The model is no longer available. Check its nodes and try again.";
-  if (normalized.includes("timeout") || normalized.includes("deadline")) return "The network took too long to respond. The request was cancelled without inventing a response.";
-  if (
-    normalized.includes("401") ||
-    normalized.includes("invalid_network_token") ||
-    normalized.includes("invalid network token") ||
-    normalized.includes("administrator token") ||
-    normalized.includes("credential")
-  ) return "The network requires a valid credential to use this model.";
-  return message;
-}
-
-function inferenceWaitingStatus(update: ChatStreamUpdate): string {
-  if (update.phase === "recovering") {
-    if (update.statusMessage) return update.statusMessage;
-    return update.affectedNodeId
-      ? `Node ${shortId(update.affectedNodeId)} disconnected. Reconnecting the route and retrying…`
-      : "A stage lost its connection. Reconnecting the route and retrying…";
-  }
-  if (update.phase === "connecting") return "Looking for an available route…";
-  if (update.phase === "waiting_first_token") return "Route ready. Waiting for the first token…";
-  return "Waiting for the model's first token…";
 }
 
 async function fetchBenchmarkRuns(): Promise<BenchmarkRun[]> {

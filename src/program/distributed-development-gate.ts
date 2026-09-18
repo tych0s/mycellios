@@ -211,7 +211,7 @@ export async function executeDistributedDevelopmentGate(
   const runtimeEnvironment: NodeJS.ProcessEnv = {
     ...environment,
     PYTHONPATH: pythonSource,
-    HF_HOME: join(cacheRoot, "huggingface"),
+    HF_HOME: resolve(workspace, environment.MYCELLIOS_DEV_E2E_HF_HOME?.trim() || join(cacheRoot, "huggingface")),
     ...(cli.modelSource === DEFAULT_MODEL ? { HF_HUB_OFFLINE: "1" } : {}),
     TOKENIZERS_PARALLELISM: "false",
     PATH: [runtimeRoot, dirname(pythonExecutable), environment.PATH ?? ""]
@@ -233,6 +233,7 @@ export async function executeDistributedDevelopmentGate(
   let signalBinding: DevelopmentSignalBinding | null = null;
   let interruptedSignal: "SIGINT" | "SIGTERM" | null = null;
   let eventSequence = 0;
+  let diagnosticTimer: NodeJS.Timeout | undefined;
   const emitPhase = (phase: string, message: string): void => {
     const event: DevelopmentGateEvent = {
       sequence: ++eventSequence,
@@ -251,6 +252,7 @@ export async function executeDistributedDevelopmentGate(
       name: "stop-timeout-and-signals",
       run: () => {
         clearTimeout(gateTimeout);
+        clearInterval(diagnosticTimer);
         signalBinding?.dispose();
         options.signal?.removeEventListener("abort", forwardExternalAbort);
         controller.abort(new Error("development_gate_cleanup"));
@@ -372,7 +374,7 @@ export async function executeDistributedDevelopmentGate(
       apiAccessEnabled: false,
       networkToken,
     }, {
-      logger: false,
+      logger: environment.MYCELLIOS_DEV_E2E_DEBUG === "1",
       runtimeMetadata,
       ...(cli.modelSource === DEFAULT_MODEL
         ? { modelCapacityInspector: async (input) => developmentTinyModelProfile(input) }
@@ -569,6 +571,17 @@ export async function executeDistributedDevelopmentGate(
       throw new Error("development_worker_signed_admission_is_invalid");
     }
     emitPhase("workers", "two signed source workers connected");
+    if (environment.MYCELLIOS_DEV_E2E_DEBUG === "1") {
+      let lastTick = Date.now();
+      diagnosticTimer = setInterval(() => {
+        const now = Date.now();
+        const lagMs = Math.max(0, now - lastTick - 5_000);
+        lastTick = now;
+        const states = coordinator!.store.listWorkers().map((worker) =>
+          `${worker.identityId ?? worker.id}:${worker.status}, heartbeat age ${now - worker.lastSeenAt}ms`);
+        emitPhase("control-health", `event-loop lag ${lagMs}ms; ${states.join("; ")}`);
+      }, 5_000);
+    }
 
     const requestedResponse = await fetch(`${coordinatorUrl}/public/v1/requested-models`, {
       method: "POST",
@@ -1050,6 +1063,8 @@ Options:
   --model <id>       Hugging Face model (${DEFAULT_MODEL} by default)
   --runtime <path>   Installed Mycellios Python runtime
   --timeout <sec>    Whole-gate timeout in seconds (default: ${DEFAULT_TIMEOUT_SECONDS})
+
+Set MYCELLIOS_DEV_E2E_HF_HOME to use a prewarmed model cache (relative to this checkout or absolute).
 
 The gate starts a private coordinator, two independently signed source workers,
 verified native model stages, the real tunnel/direct transport and a real

@@ -11,7 +11,7 @@ import socket
 import struct
 import threading
 import time
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import torch
 import torch.distributed as distributed
@@ -32,8 +32,8 @@ from .cell_stage import (
     _tensor_key,
     _validate_local_weights,
 )
-from .model import StageModelSpec
-
+if TYPE_CHECKING:
+    from .model import StageModelSpec
 
 _CONTROL_SCHEMA = "gdlp-cell-control/2"
 _CONTROL_HEADER = struct.Struct("!IQ")

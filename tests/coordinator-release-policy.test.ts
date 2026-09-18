@@ -3,12 +3,14 @@ import {
   cpSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { loadCoordinatorConfig } from "../src/core/config.js";
 import {
   prepareCoordinatorRelease,
   verifyCoordinatorOutputReceiptDocument,
@@ -72,6 +74,15 @@ describe("native coordinator release staging", () => {
       || entry.path.includes("gpu_cloud")
       || entry.path.endsWith("benchmark.py"),
     )).toBe(false);
+    expect(manifest.files.map((entry) => entry.path).filter((path) => path.startsWith("deploy/")))
+      .toEqual([
+        "deploy/systemd/mycellios-dynamic-workers.conf",
+        "deploy/systemd/mycellios-release-storage.conf",
+      ]);
+    for (const file of ["mycellios-dynamic-workers.conf", "mycellios-release-storage.conf"]) {
+      expect(readFileSync(join(destination, "deploy", "systemd", file), "utf8"))
+        .toBe(readFileSync(resolve("deploy", "systemd", file), "utf8"));
+    }
     expect(() => verifyCoordinatorReleaseDirectory(destination)).not.toThrow();
 
     mkdirSync(join(destination, "deploy", "gpu_cloud"));
@@ -79,6 +90,35 @@ describe("native coordinator release staging", () => {
     expect(() => verifyCoordinatorReleaseDirectory(destination)).toThrow(
       "non-production deploy material",
     );
+  });
+
+  it("requires the native storage policy instead of silently omitting missing deployment inputs", () => {
+    const fixture = createFixture();
+    const destination = join(fixture, "release");
+    mkdirSync(destination);
+    rmSync(join(fixture, "deploy", "systemd", "mycellios-release-storage.conf"));
+    writeCoordinatorOutputReceipt(fixture);
+
+    expect(() => prepareCoordinatorRelease(fixture, destination, {
+      revision: "f".repeat(40),
+      populateProductionDependencies: writeProductionDependencies,
+    })).toThrow("Coordinator release input is missing: deploy/systemd/mycellios-release-storage.conf");
+  });
+
+  it("loads the shipped storage policy into the native coordinator configuration", () => {
+    const source = readFileSync(resolve("deploy/systemd/mycellios-release-storage.conf"), "utf8");
+    const environment = Object.fromEntries(source.split(/\r?\n/)
+      .filter((line) => line.startsWith("Environment="))
+      .map((line) => {
+        const assignment = line.slice("Environment=".length);
+        const separator = assignment.indexOf("=");
+        return [assignment.slice(0, separator), assignment.slice(separator + 1)];
+      }));
+    const config = loadCoordinatorConfig(environment);
+    expect(config.databasePath).toBe(resolve("/var/lib/mycellios/mycellios.db"));
+    expect(config.nodeUpdatesPath).toBe(resolve("/var/lib/mycellios/node-updates"));
+    expect(config.releaseDownloadsPath).toBe(resolve("/var/lib/mycellios/downloads"));
+    expect(environment.MYCELLIOS_BENCHMARK_ROOT).toBe("/var/lib/mycellios/benchmarks");
   });
 
   it("rejects an output receipt generated before the native source changed", () => {
@@ -196,14 +236,6 @@ function createFixture(): string {
   write(root, "mobile-dist/index.html", "<main>mobile</main>\n");
   write(root, "package.json", '{"name":"fixture","version":"1.0.0"}\n');
   write(root, "package-lock.json", '{"name":"fixture","lockfileVersion":3}\n');
-  for (const file of [
-    "mycellios-content-hub.conf",
-    "mycellios-dynamic-workers.conf",
-    "mycellios-release-storage.conf",
-    "mycellios-supabase-persistence.conf",
-  ]) {
-    write(root, `deploy/systemd/${file}`, "[Service]\n");
-  }
   return root;
 }
 

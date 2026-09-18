@@ -89,8 +89,8 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
 .rb-scroll-cue svg { width:15px; height:15px; animation:rbScrollCue 2.6s ease-in-out infinite; }
 .rb-scroll-cue:hover,.rb-scroll-cue:focus-visible { color:#f4f1ea; }
 @keyframes rbScrollCue { 0%,100% { transform:translateY(-3px); opacity:.55; } 50% { transform:translateY(3px); opacity:1; } }
-.rb-hero-inner { position:relative; z-index:5; min-height:inherit; display:flex; align-items:center; }
-.rb-hero-copy { position:relative; z-index:5; width:min(620px,50vw); padding-top:40px; transform:translateY(-160px); }
+.rb-hero-inner { position:relative; z-index:5; min-height:inherit; display:flex; align-items:center; padding-block:128px 144px; }
+.rb-hero-copy { position:relative; z-index:5; width:min(620px,50vw); }
 .rb-hero-copy > h1,.rb-hero-copy > .rb-lede,.rb-hero-copy > .rb-hero-prompt { position:relative; z-index:1; }
 /* The kicker is the plate label, not a status pill. A short bronze rule, the
    name, then a hairline that runs out to the end of the header measure — the
@@ -114,11 +114,11 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
 /* Prompt entry: the primary hero action. Submitting hands the text to the
    panel chat, so this is styled as an input, not a decorative search bar. */
 .rb-hero-prompt { display:flex; align-items:center; gap:10px; margin-top:20px; max-width:520px; }
-.rb-hero-prompt input { flex:1; min-width:0; height:56px; padding:0 20px; border:1px solid rgba(238,233,226,.22); background:rgba(238,233,226,.05); color:#f4f1ea; font:400 15px var(--rb-font-body); transition:border-color .18s ease,background .18s ease; }
-.rb-hero-prompt input::placeholder { color:rgba(238,233,226,.45); }
+.rb-hero-prompt input { flex:1; min-width:0; height:56px; padding:0 20px; border:1px solid rgba(238,233,226,.22); background:rgba(12,19,15,.94); color:#f4f1ea; font:400 15px var(--rb-font-body); transition:border-color .18s ease,background .18s ease; }
+.rb-hero-prompt input::placeholder { color:rgba(238,233,226,.68); }
 .rb-hero-prompt input:hover { border-color:rgba(238,233,226,.34); }
-.rb-hero-prompt input:focus { outline:none; border-color:var(--rb-bronze); background:rgba(238,233,226,.08); }
-.rb-hero-prompt button { display:grid; place-items:center; width:56px; height:56px; flex:none; border:1px solid rgba(238,233,226,.22); background:rgba(238,233,226,.05); color:#f4f1ea; transition:background .18s ease,border-color .18s ease,transform .18s ease; }
+.rb-hero-prompt input:focus { outline:none; border-color:var(--rb-bronze); background:rgba(12,19,15,.98); }
+.rb-hero-prompt button { display:grid; place-items:center; width:56px; height:56px; flex:none; border:1px solid rgba(238,233,226,.22); background:rgba(12,19,15,.94); color:#f4f1ea; transition:background .18s ease,border-color .18s ease,transform .18s ease; }
 .rb-hero-prompt button svg { width:18px; height:18px; }
 .rb-hero-prompt button:hover { border-color:var(--rb-bronze); background:var(--rb-bronze); transform:translateY(-2px); }
 .rb-hero-prompt button:active { transform:translateY(0) scale(.97); }
@@ -946,7 +946,7 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
   .rb-mobile-cta { margin-top:10px; min-height:50px; justify-content:center; border:1px solid rgba(201,151,106,.55); border-radius:14px; background:rgba(173,122,72,.14); color:#f2e7d8; font:600 12px var(--rb-font-mono); letter-spacing:.14em; text-transform:uppercase; }
   .rb-mobile-cta::after { content:none; }
   .rb-mobile-cta:hover,.rb-mobile-cta:focus-visible { background:rgba(173,122,72,.26); }
-  .rb-hero-copy { width:min(560px,58vw); transform:translateY(-150px); }
+  .rb-hero-copy { width:min(560px,58vw); }
   .rb-hero-mushroom { left:50%; width:min(580px,68vw); height:min(500px,60vh,60vw); }
   .rb-globe { right:4%; width:min(86vw,94vh); }
   .rb-story { height:190vh; }
@@ -993,7 +993,7 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
   /* min-height:inherit is a desktop device for vertically centring the copy
      against the globe. On a phone the globe stacks above the copy instead, so
      inheriting it added a full extra viewport of empty scroll. */
-  .rb-hero-inner { display:block; min-height:0; }
+  .rb-hero-inner { display:block; min-height:0; padding-block:0; }
   .rb-hero-copy { width:auto; padding-top:0; transform:none; }
   /* Phones do not draw the organism. Behind the globe it read as a
      transparent ghost, and every earlier framing either overlapped the copy

@@ -26,4 +26,10 @@ export interface DeveloperEnvironmentResult {
 }
 
 export function evaluateDeveloperEnvironment(input: DeveloperEnvironmentInput): DeveloperEnvironmentResult;
-export function inspectDeveloperEnvironment(root?: string): DeveloperEnvironmentResult;
+export interface DeveloperInspectionOptions {
+  commandVersion?: (command: string, args: string[]) => string | null;
+  platform?: NodeJS.Platform;
+  environment?: NodeJS.ProcessEnv;
+  nodeExecutable?: string;
+}
+export function inspectDeveloperEnvironment(root?: string, options?: DeveloperInspectionOptions): DeveloperEnvironmentResult;

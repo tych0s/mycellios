@@ -24,6 +24,16 @@ export interface StudioTemplate {
 
 export const STUDIO_STORAGE_KEY = "mycellios.studio.draft.v1";
 
+export function loadLocalStudioDraft(): StudioDraft {
+  try { return restoreStudioDraft(window.localStorage.getItem(STUDIO_STORAGE_KEY)); }
+  catch { return draftFromTemplate("concierge"); }
+}
+
+export function persistLocalStudioDraft(draft: StudioDraft): boolean {
+  try { window.localStorage.setItem(STUDIO_STORAGE_KEY, JSON.stringify(draft)); return true; }
+  catch { return false; }
+}
+
 export const STUDIO_TEMPLATES: readonly StudioTemplate[] = [
   {
     id: "concierge",

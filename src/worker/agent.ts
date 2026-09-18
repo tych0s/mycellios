@@ -39,7 +39,7 @@ import {
   validatePythonLaunchDescription,
   type PythonPipelineLaunchDescription,
 } from "../distribution/python-launcher.js";
-import { validateExecutorIsolationPolicy } from "../distribution/process-environment.js";
+import { isLaunchAgentStartRequest, runtimeFailureSummary } from "./runtime-start-validation.js";
 import { MAX_RUNTIME_STREAM_CHUNK_BYTES } from "../contracts/worker-protocol.js";
 import {
   RuntimeStreamTunnel,
@@ -555,6 +555,7 @@ export class WorkerAgent {
   } | null = null;
   private readonly runtimeProcesses = new Map<string, LaunchProcessHandle>();
   private readonly runtimeStartRequests = new Map<string, string>();
+  private readonly runtimeStartControllers = new Map<string, AbortController>();
   private readonly readyRuntimeOutputs = new Map<string, LaunchCapturedOutput>();
   private readonly runtimeProcessStages = new Map<string, string>();
   private readonly pendingActivationCheckpointRestores = new Map<string, PendingActivationCheckpointRestore>();
@@ -1278,7 +1279,9 @@ export class WorkerAgent {
       socket.on("error", (error) => {
         if (!opened) reject(error);
       });
-      socket.on("close", () => {
+      socket.on("close", (code, reason) => {
+        const closeReason = reason.toString("utf8").replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 123);
+        if (!this.stopped) this.logger.warn(`Coordinator connection closed (code ${code}, ready ${this.coordinatorReady}): ${closeReason || "no reason received"}`);
         signal.removeEventListener("abort", abortStartup);
         this.coordinatorReady = false;
         if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
@@ -2144,19 +2147,20 @@ export class WorkerAgent {
       };
       this.sendMessage("runtime.prepared", { requestId, ok: true });
     } catch (error) {
-      this.sendMessage("runtime.prepared", { requestId, ok: false, error: errorText(error) });
+      this.sendMessage("runtime.prepared", { requestId, ok: false, error: runtimeFailureSummary(error) });
     }
   }
 
   private async startDistributedRuntime(requestId: string, input: unknown): Promise<void> {
     const executor = this.options.distributedExecutor;
+    let controller: AbortController | undefined;
     try {
       if (!executor) throw new Error("distributed_executor_is_not_enabled");
       if (!isLaunchAgentStartRequest(input)) throw new Error("distributed_launch_request_is_invalid");
       if (input.nodeId !== executor.nodeId) throw new Error("distributed_launch_node_mismatch");
       const requestIdentity = JSON.stringify(input);
       const existing = this.runtimeProcesses.get(requestId);
-      if (existing) {
+      if (existing || this.runtimeStartControllers.has(requestId)) {
         if (this.runtimeStartRequests.get(requestId) !== requestIdentity) {
           this.socket?.close(4400, "runtime start identity conflict");
           return;
@@ -2179,7 +2183,7 @@ export class WorkerAgent {
       if (!preparedProcess) throw new Error("distributed_launch_artifact_was_not_prepared");
       const policyRejection = this.workPolicyRejection(this.preparedRuntimeModels.get(input.process.processId) ?? null);
       if (policyRejection) throw new Error(policyRejection);
-      const controller = new AbortController();
+      controller = new AbortController();
       const tunneledProcess = this.runtimeTunnel?.rewriteProcess(preparedProcess) ?? preparedProcess;
       const localRequest: LaunchAgentStartRequest = executor.pythonExecutable
         ? {
@@ -2190,11 +2194,19 @@ export class WorkerAgent {
             },
           }
         : { ...input, process: tunneledProcess };
-      const handle = await executor.launchAgent.start(localRequest, controller.signal);
-      this.runtimeProcesses.set(requestId, handle);
+      this.runtimeStartControllers.set(requestId, controller);
       this.runtimeStartRequests.set(requestId, requestIdentity);
+      const handle = await executor.launchAgent.start(localRequest, controller.signal);
+      if (controller.signal.aborted) {
+        void handle.ready.catch(() => undefined);
+        void handle.exited.catch(() => undefined);
+        await handle.stop("runtime_start_cancelled");
+        throw new Error("runtime_start_cancelled");
+      }
+      this.runtimeProcesses.set(requestId, handle);
       void handle.ready.then(
         () => {
+          if (this.runtimeProcesses.get(requestId) !== handle) return;
           const output = handle.output?.() ?? {
             stdout: "",
             stderr: "",
@@ -2217,11 +2229,15 @@ export class WorkerAgent {
         (error: unknown) => this.sendRuntimeExit(requestId, handle, { code: null, signal: null, error: errorText(error) }),
       );
     } catch (error) {
+      if (controller && this.runtimeStartControllers.get(requestId) !== controller) return;
       this.sendRuntimeExit(requestId, undefined, { code: null, signal: null, error: errorText(error) });
+    } finally {
+      if (controller && this.runtimeStartControllers.get(requestId) === controller) this.runtimeStartControllers.delete(requestId);
     }
   }
 
   private async stopDistributedRuntime(requestId: string, reason: string): Promise<void> {
+    this.runtimeStartControllers.get(requestId)?.abort(new Error(reason));
     const handle = this.runtimeProcesses.get(requestId);
     if (handle) await handle.stop(reason).catch(() => undefined);
   }
@@ -2229,6 +2245,8 @@ export class WorkerAgent {
   private async resetDistributedRuntime(reason: string): Promise<void> {
     this.clearRuntimeDisconnectTimer();
     this.runtimePreparationGeneration += 1;
+    for (const controller of this.runtimeStartControllers.values()) controller.abort(new Error(reason));
+    this.runtimeStartControllers.clear();
     const handles = [...this.runtimeProcesses.values()];
     this.runtimeProcesses.clear();
     this.runtimeStartRequests.clear();
@@ -2268,12 +2286,13 @@ export class WorkerAgent {
     handle: LaunchProcessHandle | undefined,
     exit: { code: number | null; signal: NodeJS.Signals | null; error?: string },
   ): void {
-    if (!this.runtimeProcesses.has(requestId) && handle) return;
+    if (handle && this.runtimeProcesses.get(requestId) !== handle) return;
     this.runtimeProcesses.delete(requestId);
     this.runtimeStartRequests.delete(requestId);
     this.readyRuntimeOutputs.delete(requestId);
     const output = handle?.output?.() ?? { stdout: "", stderr: "", stdoutTruncated: false, stderrTruncated: false };
-    this.sendMessage("runtime.exited", { requestId, exit, output });
+    this.sendMessage("runtime.exited", { requestId,
+      exit: { ...exit, ...(exit.error === undefined ? {} : { error: runtimeFailureSummary(exit.error) }) }, output });
   }
 
   private async execute(payload: JobPayload): Promise<void> {
@@ -2712,36 +2731,4 @@ function deploymentAdapterKind(
     throw new Error("mycellios_native_control_cannot_be_a_model_deployment");
   }
   return adapter;
-}
-
-function isLaunchAgentStartRequest(value: unknown): value is LaunchAgentStartRequest {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const request = value as Record<string, unknown>;
-  if (
-    typeof request.launchId !== "string" ||
-    typeof request.pipelineId !== "string" ||
-    !Number.isSafeInteger(request.deploymentGeneration) ||
-    Number(request.deploymentGeneration) < 0 ||
-    typeof request.nodeId !== "string" ||
-    !request.process ||
-    typeof request.process !== "object" ||
-    Array.isArray(request.process)
-  ) return false;
-  const process = request.process as Record<string, unknown>;
-  const anchor = process.anchor;
-  if (
-    typeof process.processId !== "string"
-    || !anchor
-    || typeof anchor !== "object"
-    || Array.isArray(anchor)
-    || (anchor as Record<string, unknown>).memberId !== request.nodeId
-  ) {
-    return false;
-  }
-  try {
-    validateExecutorIsolationPolicy(process.isolation);
-    return true;
-  } catch {
-    return false;
-  }
 }

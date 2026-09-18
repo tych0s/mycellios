@@ -1,7 +1,8 @@
 import { spawn, type ChildProcessByStdio } from "node:child_process";
-import { createConnection } from "node:net";
+import { randomBytes } from "node:crypto";
 import { resolve } from "node:path";
-import { join } from "node:path";
+import { activationCheckpointControlRequest } from "./activation-checkpoint-control.js";
+import { CHECKPOINT_CONTROL_TOKEN_ENV } from "../contracts/activation-checkpoint-control.js";
 import type { Readable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import {
@@ -636,6 +637,7 @@ export class LocalProcessAgent implements LaunchAgent {
         ? {}
         : { root: this.workspaceRoot }),
     });
+    const checkpointToken = randomBytes(32).toString("hex");
     const spawnOptions = {
       shell: false,
       windowsHide: true,
@@ -650,6 +652,7 @@ export class LocalProcessAgent implements LaunchAgent {
             TEMP: workspace.path,
             TMP: workspace.path,
             MYCELLIOS_EXECUTOR_WORKSPACE: workspace.path,
+            [CHECKPOINT_CONTROL_TOKEN_ENV]: checkpointToken,
           },
         },
       ),
@@ -684,6 +687,7 @@ export class LocalProcessAgent implements LaunchAgent {
       localHandle,
       workspace,
       request.process.isolation,
+      checkpointToken,
     );
     const abort = () => {
       void handle.stop("launch_aborted");
@@ -699,11 +703,13 @@ class WorkspaceBoundProcessHandle implements LaunchProcessHandle {
   readonly exited: Promise<LaunchProcessExit>;
   private readonly watchdog: NodeJS.Timeout;
   private violation: string | null = null;
+  private readonly checkpointController = new AbortController();
 
   constructor(
     private readonly inner: LocalProcessHandle,
     private readonly workspace: ExecutorWorkspaceLease,
     policy: ExecutorIsolationPolicyV4,
+    private readonly checkpointToken: string,
   ) {
     this.ready = inner.ready;
     this.watchdog = setInterval(() => {
@@ -728,6 +734,7 @@ class WorkspaceBoundProcessHandle implements LaunchProcessHandle {
     this.watchdog.unref?.();
     this.exited = inner.exited.then(
       (exit) => {
+        this.checkpointController.abort();
         clearInterval(this.watchdog);
         return cleanupWorkspace(
           workspace,
@@ -737,6 +744,7 @@ class WorkspaceBoundProcessHandle implements LaunchProcessHandle {
         );
       },
       (error) => {
+        this.checkpointController.abort();
         clearInterval(this.watchdog);
         try {
           workspace.cleanup();
@@ -752,6 +760,7 @@ class WorkspaceBoundProcessHandle implements LaunchProcessHandle {
   }
 
   async stop(reason: string): Promise<void> {
+    this.checkpointController.abort();
     await this.inner.stop(reason);
     await this.exited.then(() => undefined);
   }
@@ -765,7 +774,7 @@ class WorkspaceBoundProcessHandle implements LaunchProcessHandle {
     committedPosition: number;
   }> {
     return activationCheckpointControlRequest(
-      join(this.workspace.path, "activation-checkpoint.sock"),
+      { workspacePath: this.workspace.path, token: this.checkpointToken, signal: this.checkpointController.signal },
       { operation: "capture", requestId, maxBytes },
       undefined,
       maxBytes,
@@ -784,7 +793,7 @@ class WorkspaceBoundProcessHandle implements LaunchProcessHandle {
     maxBytes: number,
   ): Promise<void> {
     const result = await activationCheckpointControlRequest(
-      join(this.workspace.path, "activation-checkpoint.sock"),
+      { workspacePath: this.workspace.path, token: this.checkpointToken, signal: this.checkpointController.signal },
       {
         operation: "restore",
         requestId,
@@ -797,99 +806,6 @@ class WorkspaceBoundProcessHandle implements LaunchProcessHandle {
     );
     if (result.payload.byteLength !== 0) throw new Error("activation_checkpoint_restore_response_is_invalid");
   }
-}
-
-function activationCheckpointControlRequest(
-  socketPath: string,
-  header: Record<string, unknown>,
-  payload: Buffer | undefined,
-  maximumResponseBytes: number,
-): Promise<{ payload: Buffer; committedPosition?: number }> {
-  // Python's checkpoint endpoint uses AF_UNIX, unavailable in the Windows
-  // runtime. A Windows named pipe cannot speak to that endpoint.
-  if (process.platform === "win32") {
-    return Promise.reject(new Error("activation_checkpoint_control_unsupported:win32"));
-  }
-  if (!Number.isSafeInteger(maximumResponseBytes) || maximumResponseBytes < 0) {
-    return Promise.reject(new Error("activation_checkpoint_response_limit_is_invalid"));
-  }
-  return new Promise((resolveRequest, rejectRequest) => {
-    const socket = createConnection(socketPath);
-    const chunks: Buffer[] = [];
-    let received = 0;
-    let settled = false;
-    const fail = (error: Error) => {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      rejectRequest(error);
-    };
-    const timeout = setTimeout(() => fail(new Error("activation_checkpoint_control_timed_out")), 35_000);
-    timeout.unref();
-    socket.once("connect", () => {
-      socket.write(`${JSON.stringify(header)}\n`);
-      if (payload) socket.write(payload);
-    });
-    socket.on("data", (chunk: Buffer) => {
-      received += chunk.byteLength;
-      if (received > maximumResponseBytes + 4_096) {
-        fail(new Error("activation_checkpoint_control_response_is_too_large"));
-        return;
-      }
-      chunks.push(Buffer.from(chunk));
-      const complete = Buffer.concat(chunks, received);
-      const newline = complete.indexOf(0x0a);
-      if (newline < 0) return;
-      if (newline > 4_096) {
-        fail(new Error("activation_checkpoint_control_header_is_too_large"));
-        return;
-      }
-      let response: unknown;
-      try {
-        response = JSON.parse(complete.subarray(0, newline).toString("utf8"));
-      } catch {
-        fail(new Error("activation_checkpoint_control_header_is_invalid"));
-        return;
-      }
-      if (!response || typeof response !== "object" || !("ok" in response)) {
-        fail(new Error("activation_checkpoint_control_response_is_invalid"));
-        return;
-      }
-      const record = response as {
-        ok: unknown; error?: unknown; payloadBytes?: unknown; committedPosition?: unknown;
-      };
-      if (record.ok !== true) {
-        fail(new Error(typeof record.error === "string"
-          ? `activation_checkpoint_control_failed:${record.error}`
-          : "activation_checkpoint_control_failed"));
-        return;
-      }
-      if (!Number.isSafeInteger(record.payloadBytes) || (record.payloadBytes as number) < 0
-        || (record.payloadBytes as number) > maximumResponseBytes) {
-        fail(new Error("activation_checkpoint_control_payload_size_is_invalid"));
-        return;
-      }
-      const body = complete.subarray(newline + 1);
-      if (body.byteLength < (record.payloadBytes as number)) return;
-      if (body.byteLength !== record.payloadBytes) {
-        fail(new Error("activation_checkpoint_control_payload_has_trailing_bytes"));
-        return;
-      }
-      settled = true;
-      clearTimeout(timeout);
-      socket.end();
-      resolveRequest({
-        payload: Buffer.from(body),
-        ...(record.committedPosition === undefined
-          ? {}
-          : { committedPosition: record.committedPosition as number }),
-      });
-    });
-    socket.once("error", (error) => fail(error));
-    socket.once("end", () => {
-      if (!settled) fail(new Error("activation_checkpoint_control_ended_early"));
-    });
-  });
 }
 
 function cleanupWorkspace(

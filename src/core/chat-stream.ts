@@ -59,6 +59,7 @@ export class ChatStreamError extends Error {
 
 export interface RecoveringChatStreamOptions {
   sessionId: string;
+  signal?: AbortSignal;
   maximumAttempts?: number;
   retryDelayMs?: number;
   connectionTimeoutMs?: number;
@@ -71,6 +72,7 @@ export async function consumeChatCompletionStreamWithRecovery(
   onUpdate: (update: ChatStreamUpdate) => void,
   options: RecoveringChatStreamOptions,
 ): Promise<ChatResponse> {
+  options.signal?.throwIfAborted();
   const maximumAttempts = Math.max(1, Math.min(12, options.maximumAttempts ?? 8));
   const retryDelayMs = Math.max(0, options.retryDelayMs ?? 1_000);
   const connectionTimeoutMs = Math.max(1, options.connectionTimeoutMs ?? 15_000);
@@ -95,8 +97,11 @@ export async function consumeChatCompletionStreamWithRecovery(
   let replayPrefix = "";
   onUpdate(latest);
   for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
+    options.signal?.throwIfAborted();
     const startedAt = Date.now();
     const attemptController = new AbortController();
+    const cancelAttempt = () => attemptController.abort(options.signal?.reason);
+    options.signal?.addEventListener("abort", cancelAttempt, { once: true });
     let connectionTimedOut = false;
     const connectionTimer = setTimeout(() => {
       connectionTimedOut = true;
@@ -134,8 +139,10 @@ export async function consumeChatCompletionStreamWithRecovery(
         startedAt,
         streamIdleTimeoutMs,
         () => attemptController.abort(),
+        options.signal,
       );
     } catch (caught) {
+      options.signal?.throwIfAborted();
       const error = connectionTimedOut
         ? new ChatStreamError(
             "connection_timeout",
@@ -161,9 +168,10 @@ export async function consumeChatCompletionStreamWithRecovery(
         elapsedMs: Math.max(latest.elapsedMs, Date.now() - startedAt),
       };
       onUpdate(latest);
-      await waitForReconnect(Math.min(8_000, retryDelayMs * (2 ** (attempt - 1))));
+      await waitForReconnect(Math.min(8_000, retryDelayMs * (2 ** (attempt - 1))), options.signal);
     } finally {
       clearTimeout(connectionTimer);
+      options.signal?.removeEventListener("abort", cancelAttempt);
     }
   }
   throw new ChatStreamError("retry_exhausted", "The inference retry was exhausted.");
@@ -176,7 +184,9 @@ export async function consumeChatCompletionStream(
   startedAt = Date.now(),
   streamIdleTimeoutMs = 25_000,
   abortAttempt?: () => void,
+  signal?: AbortSignal,
 ): Promise<ChatResponse> {
+  signal?.throwIfAborted();
   if (!response.ok) throw await responseError(response);
   if (!response.headers.get("content-type")?.includes("text/event-stream")) {
     throw new Error("El coordinador no devolvió un flujo de tokens válido.");
@@ -321,17 +331,26 @@ export async function consumeChatCompletionStream(
     }
   };
 
-  while (!doneMarker) {
-    const { done, value } = await readStreamChunk(reader, streamIdleTimeoutMs, abortAttempt);
-    buffer += decoder.decode(value, { stream: !done }).replaceAll("\r\n", "\n");
-    let boundary = buffer.indexOf("\n\n");
-    while (boundary >= 0) {
-      const event = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      consumeEvent(event);
-      boundary = buffer.indexOf("\n\n");
+  try {
+    while (!doneMarker) {
+      signal?.throwIfAborted();
+      const { done, value } = await readStreamChunk(reader, streamIdleTimeoutMs, abortAttempt, signal);
+      buffer = (buffer + decoder.decode(value, { stream: !done })).replaceAll("\r\n", "\n");
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        signal?.throwIfAborted();
+        const event = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        consumeEvent(event);
+        boundary = buffer.indexOf("\n\n");
+      }
+      if (done) break;
     }
-    if (done) break;
+    signal?.throwIfAborted();
+  } finally {
+    // Stop the transport on completion, malformed SSE, or cancellation, too.
+    void reader.cancel().catch(() => undefined);
+    reader.releaseLock();
   }
 
   if (!completed) throw new Error("El flujo terminó antes de recibir el resultado completo.");
@@ -369,11 +388,18 @@ async function readStreamChunk(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   timeoutMs: number,
   abortAttempt?: () => void,
+  signal?: AbortSignal,
 ) {
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let cancel: (() => void) | undefined;
   try {
     return await Promise.race([
       reader.read(),
+      new Promise<never>((_resolve, reject) => {
+        cancel = () => { reject(signal?.reason); void reader.cancel().catch(() => undefined); };
+        signal?.addEventListener("abort", cancel, { once: true });
+        if (signal?.aborted) cancel();
+      }),
       new Promise<never>((_resolve, reject) => {
         timer = setTimeout(() => {
           abortAttempt?.();
@@ -387,12 +413,14 @@ async function readStreamChunk(
     ]);
   } finally {
     if (timer !== undefined) clearTimeout(timer);
+    if (cancel) signal?.removeEventListener("abort", cancel);
   }
 }
 
-function waitForReconnect(milliseconds: number): Promise<void> {
+function waitForReconnect(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
   if (milliseconds <= 0) return Promise.resolve();
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const onlineEvents = globalThis as unknown as {
       addEventListener?: (type: string, listener: () => void, options?: { once?: boolean }) => void;
       removeEventListener?: (type: string, listener: () => void) => void;
@@ -403,10 +431,13 @@ function waitForReconnect(milliseconds: number): Promise<void> {
       settled = true;
       clearTimeout(timer);
       onlineEvents.removeEventListener?.("online", finish);
-      resolve();
+      signal?.removeEventListener("abort", finish);
+      if (signal?.aborted) reject(signal.reason);
+      else resolve();
     };
     const timer = setTimeout(finish, milliseconds);
     onlineEvents.addEventListener?.("online", finish, { once: true });
+    signal?.addEventListener("abort", finish, { once: true });
   });
 }
 

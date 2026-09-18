@@ -464,7 +464,7 @@ describe("Python launch supervisor", () => {
     ).rejects.toThrow("local_process_executable_is_not_authorized");
   });
 
-  it("captures and restores bounded KV on POSIX and rejects unsupported Windows control", async () => {
+  it("captures and restores bounded KV through the local platform transport", async () => {
     const marker = "CHECKPOINT_CONTROL_READY";
     const local = new LocalProcessAgent({
       id: "checkpoint-control-local",
@@ -475,6 +475,7 @@ describe("Python launch supervisor", () => {
     const childScript = String.raw`
       const net = require("node:net");
       const path = require("node:path").join(process.env.MYCELLIOS_EXECUTOR_WORKSPACE, "activation-checkpoint.sock");
+      const token = process.env.MYCELLIOS_CHECKPOINT_CONTROL_TOKEN;
       const server = net.createServer((socket) => {
         let bytes = Buffer.alloc(0);
         socket.on("data", (chunk) => {
@@ -482,6 +483,8 @@ describe("Python launch supervisor", () => {
           const newline = bytes.indexOf(10);
           if (newline < 0) return;
           const header = JSON.parse(bytes.subarray(0, newline).toString("utf8"));
+          if (process.platform === "win32" && header.token !== token) process.exit(92);
+          if (header.requestId === 18) { console.log("CHECKPOINT_CONTROL_WAITING"); return; }
           if (header.operation === "capture") {
             const payload = Buffer.from("live-kv");
             socket.end(JSON.stringify({ok:true,payloadBytes:payload.length,committedPosition:37}) + "\n" + payload);
@@ -493,8 +496,15 @@ describe("Python launch supervisor", () => {
         });
       });
       if (process.platform === "win32") {
-        console.log("${marker}");
-        setInterval(() => {}, 1000);
+        server.listen(0, "127.0.0.1", () => {
+          const port = server.address().port;
+          const schema = "mycellios-checkpoint-control/1";
+          const signature = require("node:crypto").createHmac("sha256", Buffer.from(token, "hex"))
+            .update(schema + "\n127.0.0.1\n" + port).digest("hex");
+          require("node:fs").writeFileSync(require("node:path").join(process.env.MYCELLIOS_EXECUTOR_WORKSPACE,
+            "activation-checkpoint.endpoint.json"), JSON.stringify({ schema, host: "127.0.0.1", port, signature }));
+          console.log("${marker}");
+        });
       } else {
         server.listen(path, () => console.log("${marker}"));
       }
@@ -515,25 +525,25 @@ describe("Python launch supervisor", () => {
     } as unknown as LaunchAgentStartRequest;
     const handle = await local.start(request, new AbortController().signal);
     await handle.ready;
-    if (process.platform === "win32") {
-      try {
-        await expect(handle.captureActivationCheckpoint?.(17, 64))
-          .rejects.toThrow("activation_checkpoint_control_unsupported:win32");
-        await expect(handle.restoreActivationCheckpoint?.(17, Buffer.from("restored-kv"), 37, 64))
-          .rejects.toThrow("activation_checkpoint_control_unsupported:win32");
-      } finally {
-        await handle.stop("test_complete");
-      }
-      return;
+    try {
+      await expect(handle.captureActivationCheckpoint?.(17, 64)).resolves.toEqual({
+        payload: Buffer.from("live-kv"),
+        committedPosition: 37,
+      });
+      await expect(handle.restoreActivationCheckpoint?.(
+        17, Buffer.from("restored-kv"), 37, 64,
+      )).resolves.toBeUndefined();
+      const pending = expect(handle.captureActivationCheckpoint?.(18, 64))
+        .rejects.toThrow("activation_checkpoint_control_aborted");
+      await expect.poll(() => handle.output?.().stdout, { timeout: 5_000 })
+        .toContain("CHECKPOINT_CONTROL_WAITING");
+      await handle.stop("stop_during_checkpoint");
+      await pending;
+    } finally {
+      await handle.stop("test_complete");
     }
-    await expect(handle.captureActivationCheckpoint?.(17, 64)).resolves.toEqual({
-      payload: Buffer.from("live-kv"),
-      committedPosition: 37,
-    });
-    await expect(handle.restoreActivationCheckpoint?.(
-      17, Buffer.from("restored-kv"), 37, 64,
-    )).resolves.toBeUndefined();
-    await handle.stop("test_complete");
+    await expect(handle.captureActivationCheckpoint?.(17, 64))
+      .rejects.toThrow("activation_checkpoint_control_aborted");
   });
 
   it("retains a final readiness marker when bounded process output is truncated", async () => {

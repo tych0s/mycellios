@@ -9029,6 +9029,12 @@ body:has(.public-panel-viewport) {
   gap: 4px;
 }
 
+.public-panel-viewport .public-panel .inference-error.is-stopped {
+  color: var(--text-secondary);
+  border-color: var(--border-subtle);
+  background: transparent;
+}
+
 .public-panel .inference-error strong {
   color: var(--text-primary);
   font-size: 12px;
