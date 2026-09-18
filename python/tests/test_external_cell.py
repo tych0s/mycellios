@@ -506,6 +506,7 @@ class ExternalTensorParallelCellTests(unittest.TestCase):
                 )
                 runner.end(parent_request_id)
             finally:
+                failure = sys.exception()
                 if runner is not None:
                     runner.close()
                 if member.poll() is None:
@@ -517,6 +518,8 @@ class ExternalTensorParallelCellTests(unittest.TestCase):
                 stderr = member.stderr.read() if member.stderr is not None else ""
                 if member.stderr is not None:
                     member.stderr.close()
+                if failure is not None and stderr:
+                    failure.add_note(f"External cell member stderr:\n{stderr}")
             self.assertEqual(member.returncode, 0, stderr)
             self.assertIn('"event": "joining_external_cell"', stderr)
             self.assertIn('"event": "external_cell_stopped"', stderr)
@@ -585,6 +588,7 @@ class ExternalTensorParallelCellTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "shard digest"):
                     build_stage_runner(config)
             finally:
+                failure = sys.exception()
                 if member.poll() is None:
                     member.terminate()
                 try:
@@ -595,6 +599,8 @@ class ExternalTensorParallelCellTests(unittest.TestCase):
                 stderr = member.stderr.read() if member.stderr is not None else ""
                 if member.stderr is not None:
                     member.stderr.close()
+                if failure is not None and stderr:
+                    failure.add_note(f"External cell member stderr:\n{stderr}")
             self.assertNotEqual(member.returncode, 0)
             self.assertIn("external cell anchor rejected rank 1", stderr)
             self.assertIn("shard digest", stderr)

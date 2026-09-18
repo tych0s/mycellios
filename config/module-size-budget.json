@@ -2,7 +2,7 @@
   "schema": "mycellios-module-size-budget/2",
   "defaultMaximumLines": 2000,
   "trackedDebt": {
-    "landing/src/Panel.tsx": { "ceiling": 5558, "target": 5400, "owner": "web-control" },
+    "landing/src/Panel.tsx": { "ceiling": 5555, "target": 5400, "owner": "web-control" },
     "python/distributed_runtime/engine.py": { "ceiling": 7387, "target": 7200, "owner": "python-runtime" },
     "python/distributed_runtime/external_cell.py": { "ceiling": 2323, "target": 2200, "owner": "python-runtime" },
     "python/distributed_runtime/model.py": { "ceiling": 2501, "target": 2400, "owner": "python-runtime" },
@@ -12,12 +12,12 @@
     "python/distributed_runtime/resident_expert_rpc.py": { "ceiling": 2640, "target": 2500, "owner": "python-runtime" },
     "python/distributed_runtime/routing_aware_placement.py": { "ceiling": 2027, "target": 1950, "owner": "python-runtime" },
     "python/distributed_runtime/stage.py": { "ceiling": 3037, "target": 2900, "owner": "python-runtime" },
-    "src/coordinator/server.ts": { "ceiling": 6077, "target": 5900, "owner": "coordinator" },
+    "src/coordinator/server.ts": { "ceiling": 6063, "target": 5900, "owner": "coordinator" },
     "src/coordinator/worker-hub.ts": { "ceiling": 2723, "target": 2600, "owner": "coordinator" },
     "src/distribution/launch-agent-rpc.ts": { "ceiling": 2793, "target": 2650, "owner": "distribution" },
     "src/distribution/python-launcher.ts": { "ceiling": 3579, "target": 3400, "owner": "distribution" },
     "src/distribution/runtime-manifest.ts": { "ceiling": 3494, "target": 3300, "owner": "distribution" },
     "src/storage/database.ts": { "ceiling": 2878, "target": 2750, "owner": "storage" },
-    "src/worker/agent.ts": { "ceiling": 2747, "target": 2600, "owner": "worker" }
+    "src/worker/agent.ts": { "ceiling": 2734, "target": 2600, "owner": "worker" }
   }
 }

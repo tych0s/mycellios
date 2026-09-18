@@ -1,5 +1,5 @@
-import { EventEmitter } from "node:events";
-import { describe, expect, it } from "vitest";
+import { EventEmitter, getEventListeners } from "node:events";
+import { describe, expect, it, vi } from "vitest";
 import type { WorkerEnvelope } from "../src/contracts/types.js";
 import type { WorkerHub } from "../src/coordinator/worker-hub.js";
 import type {
@@ -48,6 +48,51 @@ class FakeWorkerHub extends EventEmitter {
 }
 
 describe("worker tunnel execution telemetry", () => {
+  it("does not launch after cancellation while returning from a cached preparation", async () => {
+    const hub = new FakeWorkerHub();
+    const agent = new WorkerTunnelLaunchAgent(hub as unknown as WorkerHub, "worker", "node", {} as PythonPipelineLaunchDescription);
+    const request = { launchId: "launch", nodeId: "node", process: { processId: "first" } } as LaunchAgentStartRequest;
+    const first = await agent.start(request, new AbortController().signal);
+    await first.ready;
+    const controller = new AbortController();
+    const starting = agent.start({ ...request, process: { ...request.process, processId: "second" } }, controller.signal);
+    controller.abort(new Error("route_cancelled"));
+    try {
+      await expect(starting).rejects.toThrow("route_cancelled");
+      expect(hub.sent.filter(({ type }) => type === "runtime.start")).toHaveLength(1);
+    } finally {
+      await agent.close();
+    }
+  });
+
+  it("releases the preparation deadline and listener as soon as it is aborted", async () => {
+    vi.useFakeTimers();
+    const hub = new FakeWorkerHub();
+    vi.spyOn(hub, "send").mockReturnValue(true);
+    const agent = new WorkerTunnelLaunchAgent(hub as unknown as WorkerHub, "worker", "node", {} as PythonPipelineLaunchDescription);
+    const controller = new AbortController();
+    const request = { nodeId: "node" } as LaunchAgentStartRequest;
+    const starting = agent.start(request, controller.signal);
+    controller.abort(new Error("route_cancelled"));
+    try {
+      await expect(starting).rejects.toThrow("route_cancelled");
+      expect(vi.getTimerCount()).toBe(0);
+      expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    } finally {
+      await agent.close();
+      vi.useRealTimers();
+    }
+  });
+
+  it("rejects launch after closing the worker tunnel without sending runtime commands", async () => {
+    const hub = new FakeWorkerHub();
+    const agent = new WorkerTunnelLaunchAgent(hub as unknown as WorkerHub, "worker", "node", {} as PythonPipelineLaunchDescription, 10);
+    await agent.close();
+    await expect(agent.start({ nodeId: "node" } as LaunchAgentStartRequest, new AbortController().signal))
+      .rejects.toThrow("worker_tunnel_closed:worker");
+    expect(hub.sent).toHaveLength(0);
+  });
+
   it("copies the runtime.ready output before resolving the launch handle", async () => {
     const hub = new FakeWorkerHub();
     const description = {

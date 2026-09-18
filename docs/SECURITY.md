@@ -16,6 +16,23 @@ node as an explicit trust decision, not as an anonymous shell target.
   protections; ambiguous mid-stream downgrade is rejected.
 - Cleanup is part of the result. A campaign is not successful while supervised
   processes remain active.
+- Account chat sessions are checked before cancellation, usage reservation and
+  dispatch, including after waiting for capacity. Idempotency keys are scoped to
+  the authenticated account; retrying an active request does not cancel it.
+- Retry protection for older, unscoped idempotency records is retained only
+  when the stored usage associates the original job with the same account.
+  Internal account keys cannot collide with accepted external keys.
+- A stored conversation with usage records from different accounts fails closed
+  for every account. Investigate historical ownership before repairing such
+  records; the request path must never guess an owner or reassign the session.
+- Windows checkpoint control binds only to loopback and requires a per-launch
+  secret. Endpoint metadata must be authenticated before the launcher connects;
+  the secret is passed to the child environment, never written to the descriptor
+  or included in diagnostic output. This local control port is not a remote
+  launch-agent API.
+- Checkpoint control uses one absolute deadline from connection acceptance
+  through header/payload framing and queued execution. Dribbling bytes cannot
+  reset that budget or hold the serial control server indefinitely.
 
 ## Operating a private test
 

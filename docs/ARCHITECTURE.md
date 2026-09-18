@@ -45,6 +45,13 @@ model computation and moves activations between assigned ranges.
   never inferred to have passed.
 - A direct channel cannot silently downgrade after application bytes move.
 - Model registration happens only after readiness and canary success.
+- Stage checkpoint control is local to the supervised launch. Unix uses a
+  workspace socket; Windows uses an authenticated loopback endpoint whose
+  descriptor is signed with a per-launch secret. Capture and restore execute
+  on the stage thread, and control requests retain bounded framing and timeout
+  limits. Queued mutations are cancelled when the caller disconnects, times out
+  or closes the launch. A mutation already executing remains stage-owned. The
+  launcher owns the secret and endpoint lifecycle.
 - Simulations and loopback measurements never count as multi-host evidence.
 
 ## Supported execution shapes

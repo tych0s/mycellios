@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import timedelta
 import multiprocessing as multiprocessing
 import queue
-import socket
+import sys
 import unittest
 
 import torch
@@ -213,7 +213,8 @@ class CellParallelPhysicalTests(unittest.TestCase):
         )
 
         world_size = 2
-        port = _reserve_port()
+        rendezvous = _rendezvous_store()
+        port = rendezvous.port
         context = multiprocessing.get_context("spawn")
         results = context.Queue()
         processes = []
@@ -295,16 +296,14 @@ class CellParallelPhysicalTests(unittest.TestCase):
 
         reports = []
         try:
-            for _ in processes:
-                reports.append(results.get(timeout=30))
-        except queue.Empty as error:
-            raise AssertionError("cell workers did not return before timeout") from error
+            reports = _collect_reports(results, processes)
         finally:
             for process in processes:
                 process.join(timeout=10)
                 if process.is_alive():
                     process.terminate()
                     process.join(timeout=5)
+            del rendezvous
 
         self.assertTrue(all(process.exitcode == 0 for process in processes))
         errors = [report[1] for report in reports if report[0] == "error"]
@@ -388,7 +387,8 @@ class CellParallelPhysicalTests(unittest.TestCase):
         )
 
         world_size = 2
-        port = _reserve_port()
+        rendezvous = _rendezvous_store()
+        port = rendezvous.port
         context = multiprocessing.get_context("spawn")
         results = context.Queue()
         processes = []
@@ -449,16 +449,14 @@ class CellParallelPhysicalTests(unittest.TestCase):
 
         reports = []
         try:
-            for _ in processes:
-                reports.append(results.get(timeout=30))
-        except queue.Empty as error:
-            raise AssertionError("MQA cell workers did not return before timeout") from error
+            reports = _collect_reports(results, processes)
         finally:
             for process in processes:
                 process.join(timeout=10)
                 if process.is_alive():
                     process.terminate()
                     process.join(timeout=5)
+            del rendezvous
 
         self.assertTrue(all(process.exitcode == 0 for process in processes))
         errors = [report[1] for report in reports if report[0] == "error"]
@@ -513,7 +511,7 @@ def _cell_worker(
     try:
         distributed.init_process_group(
             backend="gloo",
-            init_method=f"tcp://127.0.0.1:{port}",
+            store=_rendezvous_store(port),
             rank=rank,
             world_size=world_size,
             timeout=timedelta(seconds=20),
@@ -580,7 +578,7 @@ def _cell_worker(
             )
         )
     except BaseException as error:
-        results.put(("error", f"{type(error).__name__}: {error}"))
+        results.put(("error", f"rank {rank}: {type(error).__name__}: {error}"))
         raise
     finally:
         if distributed.is_initialized():
@@ -609,7 +607,7 @@ def _mqa_cell_worker(
     try:
         distributed.init_process_group(
             backend="gloo",
-            init_method=f"tcp://127.0.0.1:{port}",
+            store=_rendezvous_store(port),
             rank=rank,
             world_size=world_size,
             timeout=timedelta(seconds=20),
@@ -654,20 +652,42 @@ def _mqa_cell_worker(
             )
         )
     except BaseException as error:
-        results.put(("error", f"{type(error).__name__}: {error}"))
+        results.put(("error", f"rank {rank}: {type(error).__name__}: {error}"))
         raise
     finally:
         if distributed.is_initialized():
             distributed.destroy_process_group()
 
 
-def _reserve_port() -> int:
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        listener.bind(("127.0.0.1", 0))
-        return int(listener.getsockname()[1])
-    finally:
-        listener.close()
+def _rendezvous_store(port: int = 0) -> distributed.TCPStore:
+    # Keep the OS-selected port bound throughout spawn instead of releasing a
+    # "free" port that another process can claim before rank zero starts.
+    # The parent owns only rendezvous; both real Gloo ranks run in child processes.
+    return distributed.TCPStore(
+        "127.0.0.1",
+        port,
+        world_size=None,
+        is_master=port == 0,
+        timeout=timedelta(seconds=20),
+        wait_for_workers=False,
+        use_libuv=sys.platform != "win32",
+    )
+
+
+def _collect_reports(results: object, processes: list[multiprocessing.Process]) -> list:
+    reports = []
+    for _ in processes:
+        try:
+            report = results.get(timeout=30)
+        except queue.Empty as error:
+            exits = [(process.pid, process.exitcode) for process in processes]
+            raise AssertionError(
+                f"cell workers did not return before timeout; process exits={exits}"
+            ) from error
+        if report[0] == "error":
+            raise AssertionError(f"cell worker failed: {report[1]}")
+        reports.append(report)
+    return reports
 
 
 if __name__ == "__main__":

@@ -46,11 +46,11 @@ const coordinatorOutputs = Object.freeze([
     selection: "complete-tree",
   }),
 ]);
+// Optional Content Hub and Supabase settings belong to the operator's service
+// configuration; a public checkout ships only these repository-owned policies.
 const systemdFiles = Object.freeze([
-  "mycellios-content-hub.conf",
   "mycellios-dynamic-workers.conf",
   "mycellios-release-storage.conf",
-  "mycellios-supabase-persistence.conf",
 ]);
 const requiredTopLevel = new Set([
   "REVISION",

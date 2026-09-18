@@ -10,7 +10,7 @@ from pathlib import Path
 import queue
 import socket
 import time
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from safetensors.torch import save_file
 import torch
@@ -25,7 +25,9 @@ from .cell_parallel import (
     shard_sizes,
 )
 from .cell_backend import rank_backend
-from .model import StageModelSpec
+
+if TYPE_CHECKING:
+    from .model import StageModelSpec
 
 
 _SCHEMA_V1 = "gdlp-llama-cell-layer/1"

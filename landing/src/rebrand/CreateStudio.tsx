@@ -21,15 +21,15 @@ import {
   Wrench,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useState, type CSSProperties, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent } from "react";
 import { loadAuthConfig, restoreAuthSession, type AuthSession } from "../auth";
-import { importStudioDraft, publishStudioAgent, type SavedStudioAgent } from "./studio-api";
+import { saveStudioDraft, publishStudioAgent, type SavedStudioAgent } from "./studio-api";
 import {
-  STUDIO_STORAGE_KEY,
   STUDIO_TEMPLATES,
   draftFromTemplate,
   previewReply,
-  restoreStudioDraft,
+  loadLocalStudioDraft,
+  persistLocalStudioDraft,
   studioCompletion,
   type MemoryMode,
   type StudioChannelId,
@@ -71,7 +71,7 @@ const lastStep = steps[steps.length - 1]!;
 type PreviewMessage = { role: "agent" | "user"; text: string };
 
 export function CreateStudio() {
-  const [draft, setDraft] = useState<StudioDraft>(() => restoreStudioDraft(window.localStorage.getItem(STUDIO_STORAGE_KEY)));
+  const [draft, setDraft] = useState<StudioDraft>(loadLocalStudioDraft);
   const [activeStep, setActiveStep] = useState<StudioStep>("identity");
   const [templateOpen, setTemplateOpen] = useState(true);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
@@ -81,17 +81,22 @@ export function CreateStudio() {
     { role: "agent" as const, text: "I am ready to test. Change the draft and ask me something — this preview stays in your browser." },
   ]);
   const [saved, setSaved] = useState(true);
+  const [storageFailed, setStorageFailed] = useState(false);
   const [session, setSession] = useState<AuthSession | null>(null);
   const [remoteAgent, setRemoteAgent] = useState<SavedStudioAgent | null>(null);
   const [remoteStatus, setRemoteStatus] = useState<string | null>(null);
   const [remoteBusy, setRemoteBusy] = useState(false);
+  const publishing = useRef(false);
+  const currentDraft = useRef(draft);
+  currentDraft.current = draft;
   const completion = useMemo(() => studioCompletion(draft), [draft]);
 
   useEffect(() => {
     setSaved(false);
     const timeout = window.setTimeout(() => {
-      window.localStorage.setItem(STUDIO_STORAGE_KEY, JSON.stringify(draft));
-      setSaved(true);
+      const persisted = persistLocalStudioDraft(draft);
+      setSaved(persisted);
+      setStorageFailed(!persisted);
     }, 180);
     return () => window.clearTimeout(timeout);
   }, [draft]);
@@ -104,10 +109,12 @@ export function CreateStudio() {
 
   function update(patch: Partial<StudioDraft>) {
     setDraft((current) => ({ ...current, ...patch }));
+    setRemoteStatus(remoteAgent ? "Draft changed · publish to apply updates" : null);
   }
 
   function chooseTemplate(id: StudioTemplateId) {
     setDraft(draftFromTemplate(id));
+    setRemoteStatus(remoteAgent ? "Draft changed · publish to apply updates" : null);
     setConversation([{ role: "agent", text: `Template loaded. I am ready to become ${draftFromTemplate(id).name}.` }]);
     setTemplateOpen(false);
   }
@@ -137,23 +144,27 @@ export function CreateStudio() {
   }
 
   function resetDraft() {
+    if (publishing.current) return;
     const fresh = draftFromTemplate("concierge");
     setDraft(fresh);
     setConversation([{ role: "agent", text: "Draft reset. Choose a template or shape this identity from scratch." }]);
     setTemplateOpen(true);
+    setRemoteAgent(null);
+    setRemoteStatus(null);
   }
 
   async function saveAndPublish() {
-    if (!session || remoteBusy) return;
+    if (!session || publishing.current) return;
+    publishing.current = true;
     setRemoteBusy(true); setRemoteStatus(null);
     try {
-      const agent = remoteAgent ?? await importStudioDraft(session, draft, `import-${crypto.randomUUID()}`);
+      const agent = await saveStudioDraft(session, draft, remoteAgent, `import-${crypto.randomUUID()}`);
       setRemoteAgent(agent);
       const result = await publishStudioAgent(session, agent, draft.channel, `publish-${crypto.randomUUID()}`);
       setRemoteAgent(result.agent);
-      setRemoteStatus(result.agent.operationalState === "waiting_for_capacity" ? "Published · waiting for compatible capacity" : `Published · ${result.agent.operationalState}`);
+      setRemoteStatus(currentDraft.current !== draft ? "Earlier draft published. Your newer changes still need publication." : result.agent.operationalState === "waiting_for_capacity" ? "Published · waiting for compatible capacity" : `Published · ${result.agent.operationalState}`);
     } catch (error) { setRemoteStatus(error instanceof Error ? error.message : "Studio could not save this agent."); }
-    finally { setRemoteBusy(false); }
+    finally { publishing.current = false; setRemoteBusy(false); }
   }
 
   return (
@@ -165,10 +176,10 @@ export function CreateStudio() {
         </a>
         <div className="studio-draft-status" aria-live="polite">
           <CircleDot />
-          <span>{saved ? "Draft saved locally" : "Saving draft…"}</span>
+          <span>{storageFailed ? "Browser storage unavailable · keep this tab open" : saved ? "Draft saved locally" : "Saving draft…"}</span>
         </div>
         <div className="studio-top-actions">
-          <button type="button" className="studio-reset" onClick={resetDraft}><RefreshCw />Reset</button>
+          <button type="button" className="studio-reset" disabled={remoteBusy} onClick={resetDraft}><RefreshCw />Reset</button>
           <a className="studio-login" href="/dashboard">Continue to workspace <ArrowRight /></a>
         </div>
         <button className="studio-mobile-menu" type="button" aria-label={mobileNavOpen ? "Close studio navigation" : "Open studio navigation"} aria-expanded={mobileNavOpen} onClick={() => setMobileNavOpen((open) => !open)}>

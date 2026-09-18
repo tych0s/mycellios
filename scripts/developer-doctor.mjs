@@ -30,33 +30,56 @@ export function evaluateDeveloperEnvironment(input) {
 
 function commandVersion(command, args) {
   try {
-    return execFileSync(command, args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    return execFileSync(command, args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000, windowsHide: true }).trim();
   } catch {
     return null;
   }
 }
 
-export function inspectDeveloperEnvironment(root = process.cwd()) {
-  const candidates = process.platform === "win32" ? ["py", "python"] : ["python3.12", "python3", "python"];
+export function inspectDeveloperEnvironment(root = process.cwd(), options = {}) {
+  const probe = options.commandVersion ?? commandVersion;
+  const platform = options.platform ?? process.platform;
+  const environment = options.environment ?? process.env;
+  const nodeExecutable = options.nodeExecutable ?? process.execPath;
+  // npm.cmd cannot be executed directly by execFileSync on Windows. Prefer
+  // the actual CLI supplied by npm, preserving paths with spaces as arguments.
+  const npmVersion = environment.npm_execpath
+    ? probe(nodeExecutable, [environment.npm_execpath, "--version"])
+    : platform === "win32"
+      ? probe("cmd.exe", ["/d", "/s", "/c", "npm --version"])
+      : probe("npm", ["--version"]);
+  const runtimeRoot = environment.MYCELLIOS_DESKTOP_RUNTIME_ROOT
+    || resolve(root, "runtime", "distribution-venv");
+  const candidates = [
+    ...(environment.MYCELLIOS_PYTHON ? [environment.MYCELLIOS_PYTHON] : []),
+    resolve(runtimeRoot, platform === "win32" ? "python.exe" : "bin/python"),
+    ...(platform === "win32" ? [resolve(runtimeRoot, "Scripts", "python.exe")] : []),
+    ...(platform === "win32" ? ["py", "python"] : ["python3.12", "python3", "python"]),
+  ];
   let pythonVersion = null;
   for (const candidate of candidates) {
     const args = candidate === "py" ? ["-3.12", "--version"] : ["--version"];
-    pythonVersion = commandVersion(candidate, args);
-    if (pythonVersion) break;
+    const found = probe(candidate, args);
+    pythonVersion ??= found;
+    if (/^Python 3\.12(?:\.|$)/.test(found ?? "")) {
+      pythonVersion = found;
+      break;
+    }
   }
-  if (!pythonVersion) {
-    const managedPython = commandVersion("uv", ["python", "find", "3.12"]);
+  if (!/^Python 3\.12(?:\.|$)/.test(pythonVersion ?? "")) {
+    const managedPython = probe("uv", ["python", "find", "3.12"]);
     if (managedPython && isAbsolute(managedPython)) {
-      pythonVersion = commandVersion(managedPython, ["--version"]);
+      const found = probe(managedPython, ["--version"]);
+      if (/^Python 3\.12(?:\.|$)/.test(found ?? "")) pythonVersion = found;
     }
   }
   return evaluateDeveloperEnvironment({
     nodeVersion: process.version,
-    npmVersion: commandVersion(process.platform === "win32" ? "npm.cmd" : "npm", ["--version"]),
+    npmVersion,
     pythonVersion,
-    gitVersion: commandVersion("git", ["--version"]),
-    powershellVersion: commandVersion(process.platform === "win32" ? "powershell.exe" : "pwsh", ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"]),
-    platform: process.platform,
+    gitVersion: probe("git", ["--version"]),
+    powershellVersion: probe(platform === "win32" ? "powershell.exe" : "pwsh", ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"]),
+    platform,
     hasLockfile: existsSync(resolve(root, "package-lock.json")),
     hasAlternativeLock: ["pnpm-lock.yaml", "pnpm-workspace.yaml", "yarn.lock"].some((name) => existsSync(resolve(root, name))),
   });

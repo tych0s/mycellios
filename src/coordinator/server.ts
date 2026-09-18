@@ -1,6 +1,7 @@
 import websocket from "@fastify/websocket";
 import staticFiles from "@fastify/static";
 import rateLimit from "@fastify/rate-limit";
+import { resolveChatIdempotencyKey, parseIdempotencyKey, waitForChatCapacity } from "./chat-admission.js";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { createHash, createPublicKey, generateKeyPairSync, randomUUID, timingSafeEqual } from "node:crypto";
 import {
@@ -389,6 +390,71 @@ export async function createCoordinator(
   const runtimeVersion = runtimeMetadata.version;
   const runtimeRevision = runtimeMetadata.revision;
   const app = Fastify({ logger: options.logger ?? false, bodyLimit: 2 * 1024 * 1024 });
+  app.setErrorHandler((error, request, reply) => {
+    if (error instanceof ZodError) {
+      return reply.code(400).send({
+        error: { code: "invalid_request", message: "Request validation failed", details: error.issues },
+      });
+    }
+    if (error instanceof ComponentReleaseStoreError) {
+      const path = request.url.split("?", 1)[0] ?? request.url;
+      return sendComponentReleaseError(
+        reply,
+        error,
+        request.method === "GET" && path.startsWith("/updates/v1/")
+          ? "public"
+          : "admin",
+      );
+    }
+    if (error instanceof MeshServiceError) {
+      return reply.code(error.statusCode).send({ error: { code: error.code, message: error.message } });
+    }
+    if (error instanceof ApiAccessError) {
+      if (error.retryAfterSeconds !== undefined) {
+        reply.header("retry-after", error.retryAfterSeconds);
+      }
+      return reply.code(error.statusCode).send({
+        error: { code: error.code, message: error.message },
+      });
+    }
+    if (error instanceof BillingCheckoutError) {
+      return reply.code(error.statusCode).send({
+        error: { code: error.code, message: error.message },
+      });
+    }
+    if (
+      error instanceof PayoutError
+      || (error instanceof Error
+        && error.name === "PayoutError"
+        && typeof (error as Error & { code?: unknown }).code === "string")
+    ) {
+      const payoutError = error as PayoutError;
+      const statusCode = payoutError.code === "payout_not_found" ? 404
+        : payoutError.code === "payout_gateway_unavailable" ? 503
+          : payoutError.code.startsWith("invalid_") ? 400
+            : 409;
+      return reply.code(statusCode).send({
+        error: { code: payoutError.code, message: payoutError.message },
+      });
+    }
+    if (error instanceof SellerEarningsError) {
+      return reply.code(400).send({ error: { code: error.code, message: error.message } });
+    }
+    if (error instanceof WorkerAdmissionError) {
+      return reply.code(error.statusCode).send({
+        error: { code: error.code, message: error.message },
+      });
+    }
+    const statusCode = (error as { statusCode?: number }).statusCode;
+    if (typeof statusCode === "number" && statusCode >= 400 && statusCode < 500) {
+      return reply.send(error);
+    }
+    app.log.error(error);
+    return reply.code(500).send({
+      error: { code: "internal_error", message: "The coordinator could not process the request" },
+    });
+  });
+
   await app.register(rateLimit, {
     global: true,
     max: options.globalRateLimitMax ?? 600,
@@ -3820,13 +3886,16 @@ export async function createCoordinator(
         deadline_ms: Math.min(config.requestTimeoutMs, 180_000),
       };
 
+      apiAccess.assertSessionAccess(null, parsed.session_id);
       const supersededJobId = service.cancelMatchingActiveSession(parsed, parsed.session_id);
       if (supersededJobId) {
         await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 1_000));
       }
       if (!service.hasCapacity(parsed, parsed.session_id)) {
-        await waitForChatCapacity(service, parsed, parsed.session_id, 30_000);
+        await waitForChatCapacity(service, parsed, parsed.session_id, 30_000, reply.raw);
       }
+      if (reply.raw.destroyed) return;
+      apiAccess.assertSessionAccess(null, parsed.session_id);
       const handle = service.submit(parsed, parsed.session_id);
       const conversationId = store.startInferenceConversation(
         handle.sessionId,
@@ -4576,8 +4645,9 @@ export async function createCoordinator(
     const principal: ApiRequestPrincipal = apiAccessEnabled
       ? principalFor(request)
       : { kind: "system" };
-    const idempotencyKey = parseIdempotencyKey(request.headers["idempotency-key"]);
-    const supersededJobId = service.cancelMatchingActiveSession(parsed, parsed.session_id);
+    if (principal.kind !== "system") apiAccess.assertSessionAccess(principal.userId, parsed.session_id);
+    const idempotencyKey = resolveChatIdempotencyKey(service, parsed, request.headers["idempotency-key"], principal);
+    const supersededJobId = idempotencyKey ? null : service.cancelMatchingActiveSession(parsed, parsed.session_id);
     if (supersededJobId) {
       app.log.warn({
         supersededJobId,
@@ -4592,8 +4662,10 @@ export async function createCoordinator(
       // A reconnect can race both route rebuilding and the automatic startup
       // benchmark. Keep the fetch pending while capacity returns instead of
       // making the installed web surface a transient 503.
-      await waitForChatCapacity(service, parsed, parsed.session_id, 45_000);
+      await waitForChatCapacity(service, parsed, parsed.session_id, 45_000, reply.raw);
     }
+    if (reply.raw.destroyed) return;
+    if (principal.kind !== "system") apiAccess.assertSessionAccess(principal.userId, parsed.session_id);
     const usage = principal.kind === "system"
       ? null
       : apiAccess.beginUsage(
@@ -5112,67 +5184,6 @@ export async function createCoordinator(
       app.get(path, async (_request, reply) => reply.sendFile(document));
     }
   }
-
-  app.setErrorHandler((error, request, reply) => {
-    if (error instanceof ZodError) {
-      return reply.code(400).send({
-        error: { code: "invalid_request", message: "Request validation failed", details: error.issues },
-      });
-    }
-    if (error instanceof ComponentReleaseStoreError) {
-      const path = request.url.split("?", 1)[0] ?? request.url;
-      return sendComponentReleaseError(
-        reply,
-        error,
-        request.method === "GET" && path.startsWith("/updates/v1/")
-          ? "public"
-          : "admin",
-      );
-    }
-    if (error instanceof MeshServiceError) {
-      return reply.code(error.statusCode).send({ error: { code: error.code, message: error.message } });
-    }
-    if (error instanceof ApiAccessError) {
-      if (error.retryAfterSeconds !== undefined) {
-        reply.header("retry-after", error.retryAfterSeconds);
-      }
-      return reply.code(error.statusCode).send({
-        error: { code: error.code, message: error.message },
-      });
-    }
-    if (error instanceof BillingCheckoutError) {
-      return reply.code(error.statusCode).send({
-        error: { code: error.code, message: error.message },
-      });
-    }
-    if (
-      error instanceof PayoutError
-      || (error instanceof Error
-        && error.name === "PayoutError"
-        && typeof (error as Error & { code?: unknown }).code === "string")
-    ) {
-      const payoutError = error as PayoutError;
-      const statusCode = payoutError.code === "payout_not_found" ? 404
-        : payoutError.code === "payout_gateway_unavailable" ? 503
-          : payoutError.code.startsWith("invalid_") ? 400
-            : 409;
-      return reply.code(statusCode).send({
-        error: { code: payoutError.code, message: payoutError.message },
-      });
-    }
-    if (error instanceof SellerEarningsError) {
-      return reply.code(400).send({ error: { code: error.code, message: error.message } });
-    }
-    if (error instanceof WorkerAdmissionError) {
-      return reply.code(error.statusCode).send({
-        error: { code: error.code, message: error.message },
-      });
-    }
-    app.log.error(error);
-    return reply.code(500).send({
-      error: { code: "internal_error", message: "The coordinator could not process the request" },
-    });
-  });
 
   return {
     app,
@@ -5814,31 +5825,6 @@ function mobileDashboardWorker(worker: MobileWorkerSnapshot) {
       residentExperts: worker.residentExperts,
     },
   };
-}
-
-async function waitForChatCapacity(
-  service: MeshService,
-  request: ChatCompletionRequest,
-  sessionId: string | undefined,
-  timeoutMs: number,
-): Promise<void> {
-  const deadline = Date.now() + Math.max(0, timeoutMs);
-  while (!service.hasCapacity(request, sessionId) && Date.now() < deadline) {
-    await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 250));
-  }
-}
-
-function parseIdempotencyKey(received: string | string[] | undefined): string | undefined {
-  const value = Array.isArray(received) ? received[0] : received;
-  if (value === undefined) return undefined;
-  if (!/^[\x21-\x7E]{1,128}$/.test(value)) {
-    throw new MeshServiceError(
-      "invalid_idempotency_key",
-      "Idempotency-Key must contain 1-128 printable ASCII characters",
-      400,
-    );
-  }
-  return value;
 }
 
 interface SupportAssistantRateState {

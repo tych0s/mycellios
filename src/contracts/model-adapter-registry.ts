@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { resolve } from "node:path";
 import {
   canonicalEvidenceJson,
   sha256CanonicalEvidence,
@@ -129,22 +129,13 @@ function loadStoredRegistry(): {
   document: StoredModelAdapterRegistry;
 } {
   const resourcesPath = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
-  const entrypoint = process.argv[1];
   const candidates = [
     ...(resourcesPath
       ? [resolve(resourcesPath, "python", "distributed_runtime", "model_adapter_registry.json")]
       : []),
-    resolve(process.cwd(), "python", "distributed_runtime", "model_adapter_registry.json"),
-    ...(entrypoint
-      ? [resolve(
-          dirname(entrypoint),
-          "..",
-          "..",
-          "python",
-          "distributed_runtime",
-          "model_adapter_registry.json",
-        )]
-      : []),
+    // Both src/contracts and dist/contracts belong to this installation. A
+    // library importer or service working directory cannot select another copy.
+    resolve(import.meta.dirname, "../..", "python", "distributed_runtime", "model_adapter_registry.json"),
   ];
   const path = candidates.find((candidate) => existsSync(candidate));
   if (!path) {

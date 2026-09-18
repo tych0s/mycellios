@@ -21,6 +21,9 @@ mobile-dist/
 coverage/
 runtime/
 .env
+.env.*
+!.env.example
+!.env.*.example
 *.log
 
 # Estado local y secretos de workers
@@ -43,6 +46,7 @@ __pycache__/
 
 # Estado local de Codex y artefactos de publicación generados
 .codex-runtime/
+.codex-tmp/
 .cache/
 updates/
 /src/graphify-out/

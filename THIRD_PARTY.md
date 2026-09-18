@@ -52,3 +52,20 @@ licensed under Apache License 2.0, Copyright 2026 leyten. The Mycellios version
 is modified to use a domain-separated hash stream, sampling without
 replacement, strict bounded wire validation and explicit fail-closed error
 codes. It includes no c0mpute code and does not require either external runtime.
+
+## Design references for the public-quality candidate
+
+The comparison refreshed on 2026-09-18 used the following source snapshots:
+
+| Reference | Revision and license record | Design input |
+| --- | --- | --- |
+| c0mpute | [`fcd4690fb6b19af51e801069ce6d35ae93b6db7a`](https://github.com/leyten/c0mpute/tree/fcd4690fb6b19af51e801069ce6d35ae93b6db7a); [README license: TBD](https://github.com/leyten/c0mpute/blob/fcd4690fb6b19af51e801069ce6d35ae93b6db7a/README.md#license) | Model-specific availability and worker preparation states. |
+| shard | [`fcf728096948c7686bcf0897e9acb75d1abda1d5`](https://github.com/leyten/shard/tree/fcf728096948c7686bcf0897e9acb75d1abda1d5); [Apache-2.0 and third-party NOTICE](https://github.com/leyten/shard/blob/fcf728096948c7686bcf0897e9acb75d1abda1d5/NOTICE) | Bounded transport and run-specific validation. |
+| AntSeed | [`aef3462a52d45b4d6734e230f86c0ecd01cb1be5`](https://github.com/AntSeed/antseed/tree/aef3462a52d45b4d6734e230f86c0ecd01cb1be5); [GPLv3 license](https://github.com/AntSeed/antseed/blob/aef3462a52d45b4d6734e230f86c0ecd01cb1be5/LICENSE) | Evidence freshness, retry lifecycle and installed-runtime validation. |
+
+The public-quality candidate implements its UI and reliability patterns
+independently in Mycellios. This comparison adds no copied source, visual
+assets or bundled dependencies from these repositories; it does not replace
+the existing adapted-code notices above. In particular, c0mpute's unspecified
+license is not treated as permission to copy its implementation or assets.
+The resulting work plan is maintained in [`docs/ROADMAP.md`](docs/ROADMAP.md).

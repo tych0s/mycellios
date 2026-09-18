@@ -11,6 +11,50 @@ import type { AutoDistributionConfig } from "../src/distribution/auto-distribute
 import type { StoredRequestedModel } from "../src/storage/store.js";
 
 describe("automatic model activation manager", () => {
+  it("rejects activation while shutdown drains and after it has completed", async () => {
+    let launches = 0;
+    let finishDrain!: () => void;
+    const runner: AutomaticModelRunner = async (_config, signal) => {
+      launches += 1;
+      if (launches > 1) throw new Error("unexpected_second_launch");
+      await new Promise<void>((resolve) => {
+        signal.addEventListener("abort", () => { finishDrain = resolve; }, { once: true });
+      });
+    };
+    const manager = new AutomaticModelActivationManager(baseConfig(), process.cwd(), process.env, runner);
+    await manager.initialize();
+    const running = manager.activate(requestedModel());
+    const closing = manager.close();
+    try {
+      await expect(manager.activate({ ...requestedModel(), id: "another-model" })).rejects.toThrow("automatic_activation_manager_closed");
+      expect(manager.capacityNodesForModel(requestedModel().id)).toEqual([]);
+    } finally {
+      finishDrain();
+      await closing;
+      await running;
+    }
+    await expect(manager.activate(requestedModel())).rejects.toThrow("automatic_activation_manager_closed");
+    expect(launches).toBe(1);
+    expect(manager.isBusy()).toBe(false);
+  });
+
+  it("does not restart a closed dynamic manager from a later reconciliation tick", async () => {
+    const phases: string[] = [];
+    const manager = new DynamicModelActivationManager({
+      snapshot: () => ({ capacityNodes: [{ id: "node-a", availableVramMiB: 4096 }], config: null }),
+      resolveManagedAgent: () => undefined,
+      onProgress: (_modelId, event) => phases.push(event.phase),
+    });
+    await manager.initialize();
+    await manager.close();
+    await manager.refresh();
+    await expect(manager.activate(requestedModel())).rejects.toThrow("automatic_activation_manager_closed");
+    expect(phases).toEqual([]);
+    expect(manager.capacityNodesForModel(requestedModel().id)).toEqual([]);
+    expect(manager.isBusy()).toBe(false);
+    await manager.close();
+  });
+
   it("keeps a prepared route alive and fails closed when renewal is rejected", async () => {
     let renewals = 0;
     const completed = await runWithReservationHeartbeat(

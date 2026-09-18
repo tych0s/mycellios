@@ -91,6 +91,7 @@ export interface DynamicModelActivationManagerOptions {
 }
 
 export class AutomaticModelActivationManager implements ModelActivationManager {
+  private closed = false;
   private readonly healthyNodeIds = new Set<string>();
   private activeModelId: string | null = null;
   private activeAbort: AbortController | null = null;
@@ -133,6 +134,7 @@ export class AutomaticModelActivationManager implements ModelActivationManager {
   }
 
   capacityNodesForModel(modelId: string): readonly ModelExecutionCapacityNode[] {
+    if (this.closed) return [];
     if (this.activeModelId !== null && this.activeModelId !== modelId) return [];
     return this.baseConfig.nodes
       .filter((node) => this.healthyNodeIds.has(node.id))
@@ -151,6 +153,7 @@ export class AutomaticModelActivationManager implements ModelActivationManager {
   }
 
   activate(model: StoredRequestedModel): Promise<void> {
+    if (this.closed) return Promise.reject(new Error("automatic_activation_manager_closed"));
     if (this.isManaging(model.id)) return this.activePromise!;
     if (this.activePromise) {
       return Promise.reject(new Error(`automatic_activation_busy:${this.activeModelId}`));
@@ -179,6 +182,7 @@ export class AutomaticModelActivationManager implements ModelActivationManager {
   }
 
   async close(): Promise<void> {
+    this.closed = true;
     if (this.activeModelId) await this.deactivate(this.activeModelId);
   }
 
@@ -237,6 +241,7 @@ export class AutomaticModelActivationManager implements ModelActivationManager {
 
 /** Activation manager backed by the shard executors currently connected to the coordinator. */
 export class DynamicModelActivationManager implements ModelActivationManager {
+  private closed = false;
   private current: DynamicActivationSnapshot = { capacityNodes: [], config: null };
   private activeModelId: string | null = null;
   private activeAbort: AbortController | null = null;
@@ -252,6 +257,7 @@ export class DynamicModelActivationManager implements ModelActivationManager {
   }
 
   capacityNodesForModel(modelId: string): readonly ModelExecutionCapacityNode[] {
+    if (this.closed) return [];
     if (this.activeModelId !== null && this.activeModelId !== modelId) return [];
     return this.current.capacityNodes.map((node) => ({ ...node }));
   }
@@ -271,6 +277,7 @@ export class DynamicModelActivationManager implements ModelActivationManager {
   }
 
   activate(model: StoredRequestedModel): Promise<void> {
+    if (this.closed) return Promise.reject(new Error("automatic_activation_manager_closed"));
     if (this.isManaging(model.id)) return this.activePromise!;
     if (this.activePromise) return Promise.reject(new Error(`automatic_activation_busy:${this.activeModelId}`));
     this.progress.set(model.id, []);
@@ -487,6 +494,7 @@ export class DynamicModelActivationManager implements ModelActivationManager {
   }
 
   async close(): Promise<void> {
+    this.closed = true;
     if (this.activeModelId) await this.deactivate(this.activeModelId);
   }
 }

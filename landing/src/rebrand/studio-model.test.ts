@@ -1,5 +1,7 @@
-import { describe, expect, it } from "vitest";
-import { draftFromTemplate, previewReply, restoreStudioDraft, studioCompletion } from "./studio-model";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { draftFromTemplate, loadLocalStudioDraft, persistLocalStudioDraft, previewReply, restoreStudioDraft, studioCompletion } from "./studio-model";
+
+afterEach(() => vi.unstubAllGlobals());
 
 describe("Mycellios Studio draft model", () => {
   it("creates isolated template drafts", () => {
@@ -29,6 +31,14 @@ describe("Mycellios Studio draft model", () => {
 
   it("falls back safely when storage is malformed", () => {
     expect(restoreStudioDraft("not-json").templateId).toBe("concierge");
+  });
+
+  it("keeps Studio usable when browser storage is denied or full", () => {
+    vi.stubGlobal("window", { get localStorage() { throw new DOMException("Blocked", "SecurityError"); } });
+    expect(loadLocalStudioDraft()).toEqual(draftFromTemplate("concierge"));
+    expect(persistLocalStudioDraft(draftFromTemplate("concierge"))).toBe(false);
+    vi.stubGlobal("window", { localStorage: { getItem: () => null, setItem: () => { throw new DOMException("Full", "QuotaExceededError"); } } });
+    expect(persistLocalStudioDraft(draftFromTemplate("researcher"))).toBe(false);
   });
 
   it("tracks readiness and produces draft-aware preview copy", () => {
