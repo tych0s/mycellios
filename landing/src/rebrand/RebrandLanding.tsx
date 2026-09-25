@@ -34,6 +34,7 @@ import { SponsorFooter } from "./SponsorFooter";
 import { SporeDrift } from "./SporeDrift";
 import { SporeMenu } from "./SporeMenu";
 import { useCountUp, useInView, useRevealOnScroll } from "./use-motion";
+import { fetchPublicDownloadAvailability, PUBLIC_DOWNLOAD_OPTIONS } from "../public-downloads";
 import "./rebrand.css";
 
 /*
@@ -62,7 +63,7 @@ import "./rebrand.css";
 
 const brandLogo = "/assets/logos/logo.png";
 const EMAIL = "hello@mycellios.com";
-const RELEASES_URL = "https://github.com/tych0s/mycellios";
+const RELEASES_URL = "https://github.com/tych0s/mycellios/releases";
 const GITHUB_URL = "https://github.com/tych0s/mycellios";
 const X_URL = "https://x.com/mycellios";
 const TELEGRAM_URL = "https://t.me/mycellios";
@@ -163,22 +164,7 @@ const evidenceRows = [
   { title: "Model larger than every node", detail: "2–4 physical machines", status: "TESTING", done: false },
 ] as const;
 
-const downloads = {
-  windows: { label: "Windows", detail: "Windows 10/11 · x64" },
-  "mac-arm64": { label: "macOS", detail: "Apple Silicon" },
-  "linux-deb": { label: "Linux", detail: "Ubuntu / Debian · x64" },
-  "linux-rpm": { label: "Linux", detail: "Fedora / RHEL · x64" },
-} as const;
-
-type DownloadKey = keyof typeof downloads;
-
-function downloadUrl(key: DownloadKey): string {
-  if (key === "windows") return "/downloads/windows";
-  if (key === "mac-arm64") return "/downloads/macos-arm64";
-  if (key === "linux-deb") return "/downloads/linux-deb";
-  if (key === "linux-rpm") return "/downloads/linux-rpm";
-  throw new Error(`Unsupported download target: ${String(key)}`);
-}
+type DownloadKey = typeof PUBLIC_DOWNLOAD_OPTIONS[number]["id"];
 
 function Brand() {
   return <a className="rb-brand" href="/" aria-label="mycellios, home"><img src={brandLogo} alt="" /><span>mycellios</span></a>;
@@ -187,31 +173,36 @@ function Brand() {
 /* Downloads. The visitor's platform is detected so the primary action is a
    single button; every other build stays one click away rather than on screen. */
 function GetStartedSection() {
-  const [recommended, setRecommended] = useState<DownloadKey>("windows");
-  const [macVisitor, setMacVisitor] = useState(false);
+  const [recommended, setRecommended] = useState<DownloadKey>("windows-x64");
+  const [availability, setAvailability] = useState<Awaited<ReturnType<typeof fetchPublicDownloadAvailability>> | null>(null);
 
   useEffect(() => {
     const agent = navigator.userAgent.toLowerCase();
     const isAppleMobile = /iphone|ipad|ipod/.test(agent) || (agent.includes("mac") && navigator.maxTouchPoints > 1);
     if (agent.includes("mac") && !isAppleMobile) {
-      setMacVisitor(true);
-      setRecommended("mac-arm64");
-    } else if (agent.includes("linux")) setRecommended("linux-deb");
-    else setRecommended("windows");
+      setRecommended("macos-arm64");
+    } else if (agent.includes("linux")) setRecommended("linux-x64");
+    else setRecommended("windows-x64");
+    void fetchPublicDownloadAvailability().then(setAvailability).catch(() => setAvailability(null));
   }, []);
 
-  const selected = downloads[recommended];
+  const selected = PUBLIC_DOWNLOAD_OPTIONS.find((option) => option.id === recommended)!;
+  const selectedPackage = availability?.packages.find((item) => item.id === recommended);
+  const selectedAvailable = selectedPackage?.available === true;
+  const selectedHref = selectedAvailable && selectedPackage
+    ? selectedPackage.path
+    : `/downloads?platform=${recommended}&availability=${availability ? "unavailable" : "unknown"}`;
 
   return (
     <section className="rb-get" id="install" aria-labelledby="rb-get-title">
       <div className="rb-shell rb-get-inner">
         <div className="rb-get-copy rb-reveal">
           <p className="rb-kicker rb-kicker-light"><i /><span>Join</span></p>
-          <h2 id="rb-get-title">One install.<br /><em>Your machine joins the network.</em></h2>
-          <p>Hardware is detected automatically. No terminal, no Docker, no configuration.</p>
-          <a className="rb-get-primary" href={downloadUrl(recommended)}>
+          <h2 id="rb-get-title">Your machine.<br /><em>Part of the network.</em></h2>
+          <p>Check which native packages are published, or try the browser worker without installing anything.</p>
+          <a className="rb-get-primary" href={selectedHref}>
             <span className="rb-get-icon"><Download /></span>
-            <span><small>Download for</small><strong>{selected.label}</strong></span>
+            <span><small>{selectedAvailable ? "Download for" : availability ? "Package status" : "Checking availability"}</small><strong>{selectedAvailable ? `${selected.label} ${selected.format}` : selected.label}</strong></span>
             <ArrowDownRight />
           </a>
           <p className="rb-get-meta"><ShieldCheck />You choose what to share · pause at any time</p>
@@ -219,28 +210,19 @@ function GetStartedSection() {
 
         <div className="rb-get-side rb-reveal">
           <div className="rb-get-shelf">
-            {(Object.keys(downloads) as DownloadKey[]).map((key, index) => (
-              <a className={key === recommended ? "recommended" : ""} href={downloadUrl(key)} key={key} style={{ "--i": index } as CSSProperties}>
+            {PUBLIC_DOWNLOAD_OPTIONS.map((option, index) => {
+              const pkg = availability?.packages.find((item) => item.id === option.id);
+              const available = pkg?.available === true;
+              return <a className={option.id === recommended ? "recommended" : ""} href={available && pkg ? pkg.path : `/downloads?platform=${option.id}&availability=${availability ? "unavailable" : "unknown"}`} key={option.id} style={{ "--i": index } as CSSProperties}>
                 <HardDriveDownload />
-                <span><strong>{downloads[key].label}</strong><small>{downloads[key].detail}</small></span>
-                {key === recommended ? <b>PICKED</b> : <ArrowDownRight />}
-              </a>
-            ))}
+                <span><strong>{option.label}</strong><small>{option.detail}</small></span>
+                <b>{available ? option.format : availability ? "UNAVAILABLE" : "CHECKING"}</b>
+              </a>;
+            })}
           </div>
-          {macVisitor && (
-            <details className="rb-mac-note">
-              <summary>Opening the macOS test build</summary>
-              <ol>
-                <li>Open the DMG and drag mycellios to Applications.</li>
-                <li>Open it once — macOS shows a warning. Close it.</li>
-                <li>System Settings → Privacy &amp; Security → <strong>Open Anyway</strong>.</li>
-              </ol>
-            </details>
-          )}
+          <p className="rb-get-safety">Native package availability is checked against published release files. Try the browser worker on compatible devices.<a href="/browser/">Try it in your browser <ArrowUpRight /></a></p>
           <p className="rb-get-safety">
-            Installers are built and package-verified in GitHub Actions. Code signing is rolling out; early
-            builds may still trigger a publisher warning.
-            <a href={RELEASES_URL} target="_blank" rel="noreferrer">Release notes <ArrowUpRight /></a>
+            <a href={RELEASES_URL} target="_blank" rel="noreferrer">View published releases <ArrowUpRight /></a>
           </p>
         </div>
       </div>
@@ -428,7 +410,7 @@ export function RebrandLanding() {
           <FruitingMark />
           <Brand />
           <h2 id="rb-closing-title">Many machines.<br /><em>One model.</em></h2>
-          <a className="rb-pill rb-pill-light" href="/join">Connect this device <Zap /></a>
+          <a className="rb-pill rb-pill-light" href="/earn">Connect this device <Zap /></a>
           <small>Public test network · no login required</small>
         </div>
       </section>

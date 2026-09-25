@@ -5,7 +5,7 @@ describe("native node contribution entry", () => {
   it.each([
     ["Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Win32", "/downloads/windows"],
     ["Mozilla/5.0 (Macintosh; Intel Mac OS X)", "MacIntel", "/downloads/macos-arm64"],
-    ["Mozilla/5.0 (X11; Linux x86_64)", "Linux x86_64", "/downloads/linux-deb"],
+    ["Mozilla/5.0 (X11; Linux x86_64)", "Linux x86_64", "/downloads/linux"],
   ])("selects a declared installer without probing localhost", (agent, platform, expected) => {
     expect(detectInstallerPlatform(agent, platform).path).toBe(expected);
   });

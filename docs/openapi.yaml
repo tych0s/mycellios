@@ -30,6 +30,19 @@ paths:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
 
+  /public/v1/downloads:
+    get:
+      operationId: getPublicDownloads
+      summary: Disponibilidad de paquetes nativos
+      description: Indica qué archivos de descarga están publicados en el coordinador actual.
+      responses:
+        "200":
+          description: Paquetes disponibles y sus rutas públicas
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicDownloadAvailability"
+
   /v1/models:
     get:
       operationId: listModels
@@ -565,6 +578,41 @@ components:
             online:
               type: integer
               minimum: 0
+
+    PublicDownloadAvailability:
+      type: object
+      additionalProperties: false
+      required: [schema, version, packages]
+      properties:
+        schema:
+          const: mycellios-public-downloads/1
+        version:
+          type: string
+          minLength: 1
+        packages:
+          type: array
+          minItems: 3
+          maxItems: 3
+          items:
+            type: object
+            additionalProperties: false
+            required: [id, label, format, fileName, path, available]
+            properties:
+              id:
+                type: string
+                enum: [windows-x64, macos-arm64, linux-x64]
+              label:
+                type: string
+              format:
+                type: string
+                enum: [ZIP, TAR.GZ]
+              fileName:
+                type: string
+              path:
+                type: string
+                pattern: "^/downloads/"
+              available:
+                type: boolean
 
     ChatMessage:
       type: object

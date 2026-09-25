@@ -979,7 +979,7 @@ export function detectInstallerPlatform(userAgent: string, platform: string) {
     return { label: "Windows", path: "/downloads/windows" };
   if (value.includes("mac"))
     return { label: "macOS", path: "/downloads/macos-arm64" };
-  return { label: "Linux DEB", path: "/downloads/linux-deb" };
+  return { label: "Linux", path: "/downloads/linux" };
 }
 function detectInstaller() {
   return detectInstallerPlatform(navigator.userAgent, navigator.platform);

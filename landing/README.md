@@ -38,10 +38,10 @@ API with `PORT=8788` to match `.env.example`.
 The interface and all SEO metadata are English-only so every visitor sees the
 same public message.
 
-The install section detects the visitor's operating system and downloads the
-normalized assets from the latest public GitHub Release. Release filenames are
-defined in `.github/workflows/node-build.yml`; keep those stable because the
-landing uses `releases/latest/download` URLs.
+The install section checks `GET /public/v1/downloads` before offering a native
+package. The coordinator reports only non-empty files present in its release
+store; unavailable or unsupported packages lead to an explanation page. Keep
+the platform paths and filenames aligned with `src/coordinator/release-upload.ts`.
 
 ## Visual assets
 

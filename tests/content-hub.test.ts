@@ -226,11 +226,12 @@ describe("Content Hub blog integration", () => {
     });
     expect(dynamicSitemap.statusCode).toBe(200);
     expect(dynamicSitemap.headers["content-type"]).toContain("application/xml");
-    for (const path of ["/", "/network", "/join", "/downloads", "/mobile/", "/blog"]) {
+    for (const path of ["/", "/network", "/create", "/earn", "/downloads", "/browser/", "/blog"]) {
       expect(dynamicSitemap.body).toContain(
         `<loc>https://www.mycellios.com${path}</loc>`,
       );
     }
+    expect(dynamicSitemap.body).not.toContain("https://www.mycellios.com/join</loc>");
     expect(dynamicSitemap.body).toContain(
       "<loc>https://www.mycellios.com/blog/research-note</loc>",
     );

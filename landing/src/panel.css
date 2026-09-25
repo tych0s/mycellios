@@ -9534,6 +9534,60 @@ body:has(.public-panel-viewport) {
   font-weight: 500;
 }
 
+.public-panel .download-card.unavailable {
+  border-color: var(--border-subtle);
+  background: var(--surface-muted);
+}
+
+.public-panel .download-card-action {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 25px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.public-panel a.download-card-action {
+  color: var(--blue-300);
+  text-decoration: none;
+}
+
+.public-panel .download-card-action svg {
+  width: 15px;
+  height: 15px;
+}
+
+.public-panel .download-availability-note {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 20px;
+  padding: 16px 18px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-muted);
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.public-panel .download-availability-note strong {
+  color: var(--text-primary);
+}
+
+.public-panel .download-availability-note p {
+  margin: 0;
+}
+
+.public-panel .download-availability-note a {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: fit-content;
+  color: var(--blue-300);
+  text-decoration: none;
+}
+
 .public-panel .contribute-page {
   width: 100%;
   max-width: 1240px;
