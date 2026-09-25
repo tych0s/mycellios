@@ -197,7 +197,7 @@ describe("inference-only coordinator and worker", () => {
     expect(await response.text()).toContain("mycellios test network");
   });
 
-  it("serves the earn route as a landing page", async () => {
+  it("serves public landing routes and repairs navigation aliases", async () => {
     const { runtime, address, agent, run } = await startNetwork();
     cleanup.push(async () => {
       await agent.stop();
@@ -209,15 +209,6 @@ describe("inference-only coordinator and worker", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toContain("text/html");
     expect(await response.text()).toContain("mycellios test landing");
-  });
-
-  it("serves account and SPORE pages and repairs their trailing-slash aliases", async () => {
-    const { runtime, address, agent, run } = await startNetwork();
-    cleanup.push(async () => {
-      await agent.stop();
-      await run;
-      await runtime.close();
-    });
 
     for (const path of ["account", "spore", "spore/treasury", "spore/data"]) {
       const response = await fetch(new URL(path, `${address}/`));
@@ -234,22 +225,6 @@ describe("inference-only coordinator and worker", () => {
       ["join", "/earn"],
       ["join/", "/earn"],
       ["downloads/linux-deb", "/downloads/linux"],
-    ] as const) {
-      const response = await fetch(new URL(path, `${address}/`), { redirect: "manual" });
-      expect(response.status).toBe(302);
-      expect(response.headers.get("location")).toBe(destination);
-    }
-  });
-
-  it("repairs the docs alias and the documentation navbar destinations", async () => {
-    const { runtime, address, agent, run } = await startNetwork();
-    cleanup.push(async () => {
-      await agent.stop();
-      await run;
-      await runtime.close();
-    });
-
-    for (const [path, destination] of [
       ["docs", "/docs/"],
       ["docs/downloads", "/downloads"],
       ["docs/network", "/network"],
@@ -261,35 +236,7 @@ describe("inference-only coordinator and worker", () => {
     }
   });
 
-  it("reports the actual published download files and routes missing packages to an explanation", async () => {
-    const { runtime, address, agent, run } = await startNetwork();
-    cleanup.push(async () => {
-      await agent.stop();
-      await run;
-      await runtime.close();
-    });
-
-    const response = await fetch(new URL("public/v1/downloads", `${address}/`));
-    expect(response.status).toBe(200);
-    const availability = await response.json();
-    expect(availability).toMatchObject({
-      schema: "mycellios-public-downloads/1",
-      packages: [
-        { id: "windows-x64", format: "ZIP", path: "/downloads/windows" },
-        { id: "macos-arm64", format: "TAR.GZ", path: "/downloads/macos-arm64" },
-        { id: "linux-x64", format: "TAR.GZ", path: "/downloads/linux" },
-      ],
-    });
-
-    const missing = await fetch(new URL("downloads/windows", `${address}/`), { redirect: "manual" });
-    expect(missing.status).toBe(302);
-    expect(missing.headers.get("location")).toBe("/downloads?availability=unavailable&platform=windows-x64");
-    const unsupported = await fetch(new URL("downloads/linux-rpm", `${address}/`), { redirect: "manual" });
-    expect(unsupported.status).toBe(302);
-    expect(unsupported.headers.get("location")).toBe("/downloads?availability=unsupported&platform=linux-rpm");
-  });
-
-  it("serves a file in the configured download store through its platform route", async () => {
+  it("reports published downloads and serves archive files when available", async () => {
     const downloadsRoot = mkdtempSync(join(tmpdir(), "mycellios-downloads-"));
     const archiveName = "mycellios-node-windows-x64.zip";
     writeFileSync(join(downloadsRoot, archiveName), "fixture archive");
@@ -301,18 +248,31 @@ describe("inference-only coordinator and worker", () => {
       rmSync(downloadsRoot, { recursive: true, force: true });
     });
 
-    const availability = await fetch(new URL("public/v1/downloads", `${address}/`)).then((response) => response.json());
-    expect(availability.packages).toContainEqual(expect.objectContaining({
-      id: "windows-x64",
-      available: true,
-      fileName: archiveName,
-    }));
-    const redirect = await fetch(new URL("downloads/windows", `${address}/`), { redirect: "manual" });
-    expect(redirect.status).toBe(302);
-    expect(redirect.headers.get("location")).toBe(`/downloads/${archiveName}?v=${availability.version}`);
-    const download = await fetch(new URL(redirect.headers.get("location")!, `${address}/`));
+    const response = await fetch(new URL("public/v1/downloads", `${address}/`));
+    expect(response.status).toBe(200);
+    const availability = await response.json();
+    expect(availability).toMatchObject({
+      schema: "mycellios-public-downloads/1",
+      packages: [
+        { id: "windows-x64", format: "ZIP", path: "/downloads/windows", available: true, fileName: archiveName },
+        { id: "macos-arm64", format: "TAR.GZ", path: "/downloads/macos-arm64" },
+        { id: "linux-x64", format: "TAR.GZ", path: "/downloads/linux" },
+      ],
+    });
+
+    const downloadRedirect = await fetch(new URL("downloads/windows", `${address}/`), { redirect: "manual" });
+    expect(downloadRedirect.status).toBe(302);
+    expect(downloadRedirect.headers.get("location")).toBe(`/downloads/${archiveName}?v=${availability.version}`);
+    const download = await fetch(new URL(downloadRedirect.headers.get("location")!, `${address}/`));
     expect(download.status).toBe(200);
     expect(await download.text()).toBe("fixture archive");
+
+    const missing = await fetch(new URL("downloads/macos-arm64", `${address}/`), { redirect: "manual" });
+    expect(missing.status).toBe(302);
+    expect(missing.headers.get("location")).toBe("/downloads?availability=unavailable&platform=macos-arm64");
+    const unsupported = await fetch(new URL("downloads/linux-rpm", `${address}/`), { redirect: "manual" });
+    expect(unsupported.status).toBe(302);
+    expect(unsupported.headers.get("location")).toBe("/downloads?availability=unsupported&platform=linux-rpm");
   });
 
   it("connects a signed public cell worker without exposing the global network token", async () => {
