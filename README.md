@@ -12,23 +12,23 @@
   <img alt="GPL-3.0-only license" src="https://img.shields.io/badge/license-GPL--3.0--only-blue.svg" />
 </p>
 
-Mycellios is an experimental, local-first runtime for serving a language model
-across heterogeneous computers. It profiles a model, plans contiguous layer
-ranges, supervises each stage and streams activations through a familiar
-inference API.
+Mycellios is a distributed inference runtime for running large language models
+across multiple heterogeneous computers. It splits a model into contiguous
+stages so smaller GPUs can work together as one inference route, while a
+coordinator supervises execution and exposes a familiar streaming API.
 
 ## What it does
 
-- **Plans model stages:** profiles supported models and assigns non-overlapping
-  ranges to workers.
-- **Runs a supervised route:** coordinates readiness, canaries, registration
-  and cleanup, with authenticated remote launch agents.
+- **Combines distributed compute:** partitions supported models into
+  non-overlapping layer ranges that can run on different workers and GPUs.
+- **Runs a supervised route:** coordinates remote launch, readiness, canaries,
+  registration, recovery and cleanup across the participating computers.
 - **Streams inference:** connects the stages over persistent runtime channels
   and exposes a streaming HTTP API.
 - **Captures evidence:** records execution details for debugging, recovery and
   performance evaluation.
 
-## Intended route
+## How the network works
 
 ```mermaid
 flowchart LR
@@ -42,27 +42,34 @@ flowchart LR
 Each stage loads its assigned model range. The coordinator manages admission,
 planning and route lifecycle; workers execute only authorized launches.
 
-## Current status
+## Evidence status
 
-The software path has been exercised on one computer, including CPU pipeline
-parity, local transport, recovery and cleanup. A route spanning two physical
-computers is the next evidence gate. Multi-host throughput, WAN latency, GPU
-parallelism across machines and remote recovery have not yet been demonstrated.
+The distributed execution path includes model partitioning, authenticated
+remote launch agents, persistent stage transport, streaming inference, recovery
+contracts and evidence capture. Its software behavior has been exercised on one
+computer, including CPU pipeline parity, local transport, recovery and cleanup.
+
+A versioned route spanning two physical computers is the next evidence gate.
+Multi-host throughput, WAN latency, GPU parallelism across machines and remote
+recovery have not yet been measured and published by the project.
 
 Simulation, loopback and multiple processes on one computer are useful for
 software checks; they do not count as multi-host evidence. See
 [Status and evidence](docs/STATUS_AND_EVIDENCE.md) for the full boundary.
 
-## Economy and token status
+## Compute economy, blockchain and token
 
-The codebase records usage and contribution evidence in an internal ledger,
-with signed settlement receipts. Its compute credits are bookkeeping units:
-non-monetary, non-transferable and non-withdrawable.
+Mycellios connects distributed inference with verifiable economic records. Each
+job can produce signed settlement receipts that bind usage, pricing and
+contributor allocations to execution evidence. This provides the accounting
+foundation for a decentralized compute network.
 
-There is no active public token, blockchain network or on-chain contributor
-settlement, and no token supply has been chosen. See the [economic and token
-status](docs/STATUS_AND_EVIDENCE.md#economic-and-token-status) for the current
-readiness gates.
+The architecture can extend these signed records to blockchain settlement and
+token-based rewards for computers that contribute compute. Today, credits remain
+internal, non-monetary and non-transferable: a public token, blockchain network
+and token supply have not yet been selected or launched. See the [economic and
+token status](docs/STATUS_AND_EVIDENCE.md#economic-and-token-status) for the
+current readiness gates.
 
 ## Try it locally
 
