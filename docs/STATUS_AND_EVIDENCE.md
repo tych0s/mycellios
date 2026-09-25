@@ -1,6 +1,6 @@
 # Status and evidence
 
-Updated: 2026-09-18 (public-quality validation).
+Updated: 2026-09-25 (economic and token status).
 
 ## Implemented and connected
 
@@ -26,6 +26,23 @@ Updated: 2026-09-18 (public-quality validation).
 
 The normal test suite validates software behavior. Opt-in physical tests are
 skipped when their required model, GPU or host environment is unavailable.
+
+## Economic and token status
+
+The source includes usage-based pricing and an internal ledger that allocates
+contributor credits from execution and contribution evidence. Each settlement
+is balanced and produces a signed receipt bound to its job, pricing policy and
+evidence. The readiness contract defines internal compute credits as
+non-monetary, non-transferable and non-withdrawable.
+
+The public-token readiness state is disabled and has no network selected. It
+allows only `no_go` or `eligible_for_spec`; no public Mycellios token or
+on-chain contributor settlement is active. Optional stablecoin billing
+adapters are a separate inbound-payment path and do not change this boundary.
+
+Any future token decision remains gated on demonstrated need and evidence for
+legal, accounting, security, governance, smart-contract and liquidity readiness.
+The repository does not commit to a chain, token supply or launch date.
 
 The local development gate enrolls signed workers in its temporary coordinator
 database. Its two workers are logical processes on one computer. Cleanup
