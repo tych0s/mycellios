@@ -4,7 +4,7 @@
   <img src="assets/mycellios-logo.png" alt="Mycellios logo" width="128" />
 </p>
 
-<p align="center"><strong>One model. Multiple computers. One inference route.</strong></p>
+<p align="center"><strong>Connect GPUs. Split the model. Run AI together.</strong></p>
 
 <p align="center">
   <a href="https://github.com/tych0s/mycellios/actions/workflows/public-quality.yml"><img alt="Public quality gates" src="https://github.com/tych0s/mycellios/actions/workflows/public-quality.yml/badge.svg?branch=main" /></a>
@@ -12,10 +12,11 @@
   <img alt="GPL-3.0-only license" src="https://img.shields.io/badge/license-GPL--3.0--only-blue.svg" />
 </p>
 
-Mycellios is a distributed inference runtime for running large language models
-across multiple heterogeneous computers. It splits a model into contiguous
-stages so smaller GPUs can work together as one inference route, while a
-coordinator supervises execution and exposes a familiar streaming API.
+Mycellios connects GPUs from different computers through a distributed network,
+similar to P2P, so they can run one AI model together. Instead of requiring one
+large GPU, it splits the model into smaller parts and assigns each part to a
+different worker. Mycellios coordinates the complete route and returns one
+streamed response through a familiar API.
 
 ## What it does
 
