@@ -130,6 +130,8 @@ import {
   ContentHubClient,
   registerContentHubRoutes,
 } from "./content-hub.js";
+import { registerPublicDownloadRoutes } from "./public-download-routes.js";
+import { registerLandingEntryRoutes } from "./landing-entry-routes.js";
 import { SupabaseAuthService } from "./supabase-auth.js";
 import {
   DeploymentControlPlane,
@@ -1472,9 +1474,10 @@ export async function createCoordinator(
       ),
     );
   });
-  app.get("/downloads/windows", async (_request, reply) => {
-    reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
-    return reply.redirect(`/downloads/mycellios-node-windows-x64.zip?v=${publicAssetVersion}`);
+  registerPublicDownloadRoutes(app, {
+    version: publicAssetVersion,
+    downloadsRoot: releaseDownloadsPath,
+    transactions: releaseTransactions,
   });
   const activationCheckpoints = new ActivationCheckpointStore((keyId) => {
     const credential = database.listWorkerAdmissionCredentials(10_000)
@@ -5142,14 +5145,6 @@ export async function createCoordinator(
       }
     },
   );
-  app.get("/downloads/macos-arm64", async (_request, reply) => {
-    reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
-    return reply.redirect(`/downloads/mycellios-node-macos-arm64.tar.gz?v=${publicAssetVersion}`);
-  });
-  app.get("/downloads/linux", async (_request, reply) => {
-    reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
-    return reply.redirect(`/downloads/mycellios-node-linux-x64.tar.gz?v=${publicAssetVersion}`);
-  });
   const contentHubClient = config.contentHubApiUrl
     ? new ContentHubClient({ baseUrl: config.contentHubApiUrl })
     : null;
@@ -5169,20 +5164,7 @@ export async function createCoordinator(
       cacheControl: false,
       setHeaders: setPublicAssetCacheHeaders,
     });
-    const landingRouteDocuments = {
-      "/network": "network/index.html",
-      "/dashboard": "index.html",
-      "/create": "create/index.html",
-      "/admin": "admin/index.html",
-      "/join": "join/index.html",
-      "/downloads": "downloads/index.html",
-    } as const;
-    for (const [path, routeDocument] of Object.entries(landingRouteDocuments)) {
-      const document = existsSync(resolve(landingAssetsPath, routeDocument))
-        ? routeDocument
-        : "index.html";
-      app.get(path, async (_request, reply) => reply.sendFile(document));
-    }
+    registerLandingEntryRoutes(app, landingAssetsPath);
   }
 
   return {

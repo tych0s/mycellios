@@ -17,9 +17,10 @@ const MAX_SITEMAP_PAGES = 200;
 const PUBLIC_PRODUCT_SITEMAP_ROUTES = [
   { path: "/", changeFrequency: "weekly", priority: "1.0" },
   { path: "/network", changeFrequency: "daily", priority: "0.9" },
-  { path: "/join", changeFrequency: "weekly", priority: "0.8" },
+  { path: "/create", changeFrequency: "weekly", priority: "0.8" },
+  { path: "/earn", changeFrequency: "weekly", priority: "0.8" },
   { path: "/downloads", changeFrequency: "weekly", priority: "0.9" },
-  { path: "/mobile/", changeFrequency: "weekly", priority: "0.7" },
+  { path: "/browser/", changeFrequency: "weekly", priority: "0.7" },
 ] as const;
 
 const localeSchema = z.string().regex(/^[a-z]{2}(?:-[A-Z]{2})?$/);

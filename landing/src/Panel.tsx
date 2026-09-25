@@ -87,6 +87,7 @@ import { type ProductStatePresentation } from "./product-state";
 import type { NativeBuildIdentity } from "../../src/contracts/build-identity";
 import type { BenchmarkMeasurement, BenchmarkRun } from "../../src/benchlab/types";
 import { Contribute } from "./Contribute";
+import { DownloadsPage } from "./Downloads";
 import { SupportAssistant } from "./SupportAssistant";
 import { TABLE_PAGE_SIZE, TablePagination } from "./TablePagination";
 import {
@@ -955,7 +956,7 @@ function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
                   traceCount: snapshot.recentNetworkTraces?.length ?? 0,
                 }}
               />}
-              {view === "downloads" && <Downloads publicLink={publicLink} external={false} />}
+              {view === "downloads" && <DownloadsPage title={<PageTitle eyebrow="CLIENTS" title="Downloads" copy="Native packages are listed here only when their release files are available." />} publicLink={publicLink} external={false} />}
               {view === "admin" && advancedAccess && <AssistantAdmin
                 apiOrigin=""
                 adminToken={modelAdminToken}
@@ -4733,12 +4734,6 @@ function InferenceModelPicker({ options, value, onChange, disabled }: { options:
       </button>)}
     </div>}
   </div>;
-}
-
-function Downloads({ publicLink, external }: { publicLink: (path: string) => string; external: boolean }) {
-  return <section><PageTitle eyebrow="CLIENTS" title="Downloads" copy="Install a certified native client for persistent contribution from your computer." />
-    <div className="download-grid"><a className="download-card ready" href={publicLink("/downloads/windows")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Laptop />WINDOWS · ZIP</span><h2>Windows 10/11</h2><p>Versioned x64 bootstrapper · extract the verified package and run MycelliosNodeSetup.exe</p><strong>Download ZIP <Download /></strong></a><a className="download-card ready" href={publicLink("/downloads/macos-arm64")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Cpu />MACOS · PKG</span><h2>Mac M1 or newer</h2><p>Versioned arm64 native-node package · signature and package receipt required before release</p><strong>Download PKG <Download /></strong></a><a className="download-card ready" href={publicLink("/downloads/linux-deb")} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}><span><Cpu />LINUX · DEB</span><h2>Ubuntu / Debian</h2><p>Versioned amd64 native-node package · served only from the certified download root</p><strong>Download DEB <Download /></strong></a></div>
-  </section>;
 }
 
 function ActivationProgressLog({ model }: { model: RequestedModelCapacity }) {
