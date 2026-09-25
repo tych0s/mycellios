@@ -152,7 +152,8 @@ describe("Landing", () => {
     expect(html).toContain("We are building");
     expect(html).toContain("Multi-node · GPU · LAN");
     expect(html).toContain('id="install"');
-    expect(html).toContain("Download for");
+    expect(html).toContain("Checking availability");
+    expect(html).toContain("Windows 10/11 · x64");
   });
 
   it("gives the staggered lists the index their entrance animation needs", () => {
@@ -163,7 +164,7 @@ describe("Landing", () => {
     // rendered, every row still animates — all at once, on top of each other —
     // so this guards the stagger, not the visibility.
     expect(html.match(/rb-board-row[^>]*--i:3/)).not.toBeNull();
-    expect(html.match(/rb-get-shelf[\s\S]*?--i:3/)).not.toBeNull();
+    expect(html.match(/rb-get-shelf[\s\S]*?--i:2/)).not.toBeNull();
   });
 
   it("shows the verified August 2026 open-model shortlist without claiming native support", () => {
@@ -244,8 +245,9 @@ describe("Landing", () => {
     expect(html).toContain("Shortlist ≠ installed support");
     expect(html).toContain("only after an adapter and physical evidence ship");
     expect(html).toContain("VISION · NOT LIVE YET · no active token, no financial promise");
-    // Unsigned early builds are still disclosed at the download itself.
-    expect(html).toContain("Code signing is rolling out");
+    // Native packages are only offered when the public release store has them.
+    expect(html).toContain("Native package availability is checked against published release files.");
+    expect(html).toContain("Try it in your browser");
   });
 
   it("drops every static illustration in favour of browser-drawn visuals", () => {
