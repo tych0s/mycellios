@@ -1149,6 +1149,9 @@ body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); 
   .rb-ground-mushroom-d { --rb-mini-size:78px; }
 }
 
+@media(max-width:360px){
+  .rb-hero h1 em { font-size:.92em; white-space:nowrap; }
+}
 /* Reduced motion: no scrubbing, no travelling dashes. The story collapses to
    its static list and every scroll-triggered entrance starts already finished. */
 @media(prefers-reduced-motion:reduce){
