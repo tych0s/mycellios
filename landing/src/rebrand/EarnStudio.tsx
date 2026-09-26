@@ -1,7 +1,6 @@
 import { AppWindow, ChevronRight, Download, Menu, MonitorUp, X } from "lucide-react";
 import { useState } from "react";
 import { SporeMenu, SporeMobileLinks } from "./SporeMenu";
-import "./create-studio.css";
 import "./earn-studio.css";
 
 const contributionOptions = [
@@ -33,13 +32,13 @@ export function EarnStudio() {
   return (
     <main className="earn-page">
       <header className="create-header earn-header">
-        <a className="create-brand" href="/" aria-label="Mycellios home"><img src="/assets/logos/logo.png" alt="" />mycellios</a>
+        <a className="create-brand" href="/" aria-label="Mycellios home"><img src="/assets/brand/favicon.png" alt="" width={34} height={34} />mycellios</a>
         <nav aria-label="Main navigation">
           <a href="/network?view=inference">Chat</a><a href="/create">Create</a><a className="active" href="/earn" aria-current="page">Earn</a><SporeMenu /><a href="/#how-it-works">Network</a><a href="/blog">Blog</a>
         </nav>
         <a className="create-login" href="/dashboard">Login</a>
         <button className="create-menu-button" type="button" aria-label={menuOpen ? "Close menu" : "Open menu"} aria-expanded={menuOpen} onClick={() => setMenuOpen((open) => !open)}>{menuOpen ? <X /> : <Menu />}</button>
-        {menuOpen && <div className="create-mobile-nav"><a href="/network?view=inference">Chat</a><a href="/create">Create</a><a className="active" href="/earn">Earn</a><SporeMobileLinks /><a href="/#how-it-works">Network</a><a href="/blog">Blog</a><a href="/dashboard">Login</a></div>}
+        {menuOpen && <div className="create-mobile-nav"><a href="/network?view=inference">Chat</a><a href="/create">Create</a><a className="active" href="/earn">Earn</a><SporeMobileLinks /><a href="/#how-it-works">Network</a><a href="/blog">Blog</a></div>}
       </header>
 
       <section className="earn-intro">

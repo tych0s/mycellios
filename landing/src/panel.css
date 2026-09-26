@@ -29,7 +29,7 @@ body:has(.public-panel-viewport) {
   max-width: 100%;
   min-height: 100vh;
   height: auto;
-  overflow: visible;
+  overflow-x: clip;
   background: #0e1712;
 }
 

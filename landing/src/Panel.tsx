@@ -101,7 +101,7 @@ import {
   type InferenceAttachmentSummary,
 } from "./inference-attachments";
 import { firstFocusable, trapDialogTab, formatCompactNumber, formatCompactTokens, formatPower, shortId, shortFingerprint, formatMemory, relativeTime, relativeTimeEs } from "./panel-ui-utilities";
-const brandIcon = "/assets/logos/logo.png";
+const brandIcon = "/assets/brand/favicon.png";
 
 function GoogleProviderIcon() {
   return <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -2463,7 +2463,7 @@ function ConnectedPeersTable({ workers }: { workers: PublicWorker[] }) {
   return (
     <article className="connected-peers-card" aria-labelledby="connected-peers-title">
       <header>
-        <strong id="connected-peers-title">Connected peers</strong>
+        <strong id="connected-peers-title">Registered peers</strong>
         <div className="connected-peers-controls">
           <span>{filteredRows.length} total</span>
           <label><SlidersHorizontal size={12} /><span>Filter</span><select aria-label="Filter peers" value={filter} onChange={(event) => { setFilter(event.target.value as PeerFilter); setPage(0); }}><option value="all">All peers</option><option value="serving">Serving</option><option value="connected">Connected</option><option value="offline">Needs attention</option></select></label>
@@ -4640,8 +4640,8 @@ function Inference({ snapshot, coordinatorConnected, onSend, onNavigate, develop
       </div>}
       <div className="inference-output" aria-live="polite" ref={outputRef}>
         {turns.length === 0 && !pendingTurn && !error && (inferenceAvailable
-          ? <div className="inference-welcome"><Sparkles /><h2>Escribe una pregunta</h2><p>La respuesta vendrá exclusivamente del despliegue nativo seleccionado de Mycellios.</p><div className="inference-suggestions">{["Resume cómo funciona esta red", "Explica una idea en tres frases", "Responde con una prueba corta"].map((suggestion) => <button key={suggestion} onClick={() => setPrompt(suggestion)}>{suggestion}</button>)}</div></div>
-          : <div className="inference-welcome inference-welcome-locked"><LockKeyhole /><h2>{!coordinatorConnected ? "Restableciendo la conexión" : modelAvailable ? "El chat está esperando tu cuenta" : "El chat está esperando un modelo"}</h2><p>{coordinatorConnected && modelAvailable ? "Puedes preparar tu mensaje. Inicia sesión para enviarlo con tu saldo de tokens." : "Puedes preparar tu mensaje ahora. El envío estará disponible cuando haya una ruta de inferencia nativa conectada."}</p></div>)}
+          ? <div className="inference-welcome"><Sparkles /><h2>Ask a question</h2><p>Responses come from the selected native Mycellios deployment.</p><div className="inference-suggestions">{["Summarize how this network works", "Explain an idea in three sentences", "Give me a short example"].map((suggestion) => <button key={suggestion} onClick={() => setPrompt(suggestion)}>{suggestion}</button>)}</div></div>
+          : <div className="inference-welcome inference-welcome-locked"><LockKeyhole /><h2>{!coordinatorConnected ? "Restoring connection" : modelAvailable ? "Chat is waiting for your account" : "Chat is waiting for a model"}</h2><p>{coordinatorConnected && modelAvailable ? "You can prepare your message. Sign in to send it using your token balance." : "You can prepare your message now. Sending will be available when a native inference route is connected."}</p></div>)}
         {turns.map((turn) => <InferenceCompletedTurn turn={turn} key={turn.id} />)}
         {pendingTurn && <InferenceStreamingTurn turn={pendingTurn} />}
         {interruptedTurn && <div className="inference-turn"><InferenceUserMessage prompt={interruptedTurn.prompt} attachments={interruptedTurn.attachments} /><div className="inference-message"><img src={brandIcon} alt="" /><div><div className="inference-stream-head"><span>{interruptedTurn.model}</span><b>INCOMPLETE RESPONSE</b></div><p>{interruptedTurn.text}</p></div></div></div>}

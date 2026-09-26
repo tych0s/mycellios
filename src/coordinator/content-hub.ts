@@ -2,12 +2,13 @@ import type { FastifyInstance, FastifyReply } from "fastify";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { z } from "zod";
+import sanitizeHtml from "sanitize-html";
 
 const SITE_SLUG = "mycellios";
 const SITE_ORIGIN = "https://www.mycellios.com";
 const BLOG_PATH = "/blog";
 const BLOG_LOCALE = "en";
-const BLOG_ASSET_VERSION = "20260816";
+const BLOG_ASSET_VERSION = "20260926";
 const DEFAULT_CACHE_TTL_MS = 60_000;
 const DEFAULT_STALE_IF_ERROR_MS = 24 * 60 * 60 * 1_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
@@ -61,7 +62,7 @@ const seoMetadataSchema = z.object({
 });
 
 const blogPostSchema = blogPostSummarySchema.extend({
-  contentHtml: z.string().min(1),
+  contentHtml: z.string().min(1).max(512_000),
   readingMinutes: z.number().int().positive(),
   seo: seoMetadataSchema,
   alternateUrls: z.record(localeSchema, z.string().url()).default({}),
@@ -159,7 +160,8 @@ export class ContentHubClient {
       if (!response.ok) {
         throw new ContentHubError("Could not load the published post", response.status);
       }
-      return blogPostSchema.parse(await response.json());
+      const post = blogPostSchema.parse(await response.json());
+      return { ...post, contentHtml: sanitizeBlogContent(post.contentHtml) };
     });
   }
 
@@ -647,14 +649,40 @@ function renderNavigation(): string {
   return `
     <header class="rb-header blog-header">
       <div class="rb-header-inner rb-shell">
-        <a class="rb-brand" href="/" aria-label="mycellios, home"><img src="/assets/logos/logo.png" alt="" width="38" height="38" /><span>mycellios</span></a>
+        <a class="rb-brand" href="/" aria-label="mycellios, home"><img src="/assets/brand/favicon.png" alt="" width="38" height="38" /><span>mycellios</span></a>
         <nav aria-label="Main navigation">
           <a href="/network?view=inference">Chat</a><a href="/create">Create</a><a href="/earn">Earn</a><a href="/spore">$ SPORE</a><a href="/network">Live network</a><a class="active" href="/blog" aria-current="page">Blog</a>
         </nav>
-        <div class="rb-header-actions rb-desktop-cta"><a class="rb-social" href="https://github.com/tych0s/mycellios" target="_blank" rel="noreferrer" aria-label="mycellios on GitHub">GH</a><a class="rb-social" href="https://x.com/mycellios" target="_blank" rel="noreferrer" aria-label="mycellios on X">X</a><a class="rb-pill rb-pill-ghost" href="/network?view=overview">Login</a></div>
+        <div class="rb-header-actions rb-desktop-cta"><a class="rb-social" href="https://github.com/tych0s/mycellios" target="_blank" rel="noreferrer" aria-label="mycellios on GitHub">GH</a><a class="rb-social" href="https://x.com/mycellios" target="_blank" rel="noreferrer" aria-label="mycellios on X">X</a><a class="rb-pill rb-pill-ghost" href="/dashboard">Login</a></div>
+        <details class="blog-mobile-menu">
+          <summary aria-label="Navigation menu"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16" /></svg><span class="blog-sr-only">Menu</span></summary>
+          <nav class="blog-mobile-nav" aria-label="Mobile navigation">
+            <a href="/network?view=inference">Chat</a><a href="/create">Create</a><a href="/earn">Earn</a><a href="/spore">$ SPORE</a><a href="/network">Live network</a><a href="/blog" aria-current="page">Blog</a><a href="/dashboard">Login</a>
+          </nav>
+        </details>
       </div>
     </header>
   `;
+}
+
+function sanitizeBlogContent(contentHtml: string): string {
+  return sanitizeHtml(contentHtml, {
+    allowedTags: [
+      "a", "blockquote", "br", "code", "del", "em", "h2", "h3", "h4", "hr",
+      "img", "li", "ol", "p", "pre", "s", "strong", "table", "tbody", "td",
+      "th", "thead", "tr", "ul",
+    ],
+    allowedAttributes: {
+      a: ["href", "title"],
+      img: ["src", "alt", "title", "width", "height", "loading"],
+      ol: ["start"],
+      td: ["colspan", "rowspan"],
+      th: ["colspan", "rowspan", "scope"],
+    },
+    allowedSchemes: ["http", "https", "mailto"],
+    allowedSchemesByTag: { img: ["https"] },
+    allowProtocolRelative: false,
+  });
 }
 
 function renderFooter(): string {
