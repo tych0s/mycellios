@@ -122,6 +122,27 @@ export const SEO_PAGES = {
       "/earn",
     ),
   },
+  "/spore": {
+    title: "$SPORE participation preview | mycellios",
+    description:
+      "Preview the proposed SPORE participation flow. No token, staking contract, treasury, price feed or reward program is live.",
+    canonicalPath: "/spore",
+    robots: "noindex, nofollow, noarchive",
+  },
+  "/spore/treasury": {
+    title: "SPORE treasury preview | mycellios",
+    description:
+      "Preview the proposed SPORE treasury model. No treasury contract or reward distributions are live.",
+    canonicalPath: "/spore/treasury",
+    robots: "noindex, nofollow, noarchive",
+  },
+  "/spore/data": {
+    title: "Network data preview | mycellios",
+    description:
+      "Preview the planned mycellios network telemetry. No live feed or token price data is available.",
+    canonicalPath: "/spore/data",
+    robots: "noindex, nofollow, noarchive",
+  },
   "/downloads": {
     title: "Download mycellios for Windows, macOS, and Linux",
     description:
@@ -174,7 +195,17 @@ export const SEO_PAGES = {
 export type SeoPath = keyof typeof SEO_PAGES;
 
 export const INDEXABLE_SEO_PATHS = ["/", "/network", "/create", "/earn", "/downloads", "/browser/"] as const;
-export const LANDING_SEO_PATHS = ["/", "/network", "/create", "/earn", "/downloads", "/admin"] as const;
+export const LANDING_SEO_PATHS = [
+  "/",
+  "/network",
+  "/create",
+  "/earn",
+  "/spore",
+  "/spore/treasury",
+  "/spore/data",
+  "/downloads",
+  "/admin",
+] as const;
 
 export function canonicalUrl(page: SeoPage): string {
   return `${SITE_ORIGIN}${page.canonicalPath}`;

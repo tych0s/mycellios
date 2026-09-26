@@ -171,7 +171,7 @@ export function CreateStudio() {
     <main className="studio-page">
       <header className="studio-topbar">
         <a className="studio-brand" href="/" aria-label="Mycellios home">
-          <img src="/assets/logos/logo.png" alt="" />
+          <img src="/assets/brand/favicon.png" alt="" width={34} height={34} />
           <span>mycellios</span><i>studio</i>
         </a>
         <div className="studio-draft-status" aria-live="polite">

@@ -2,3 +2,120 @@
 @media(max-width:1000px){.earn-intro{margin-top:92px}.earn-header nav{display:none}}
 @media(max-width:680px){.earn-page{padding:8px 8px 30px}.earn-intro{width:auto;margin:70px 14px 28px;text-align:left}.earn-intro h1{font-size:40px}.earn-intro p{font-size:12px}.earn-options{width:auto;margin:0 6px;grid-template-columns:1fr}.earn-option{min-height:0;padding:22px}.earn-option p{min-height:0}.earn-notice{width:auto;margin:12px 6px 0;padding:14px}.earn-notice>div{display:grid}.earn-option:hover{transform:none}}
 @media(prefers-reduced-motion:reduce){.earn-page *{transition-duration:.01ms!important}}
+
+body:has(.earn-page) { margin: 0; background: #090b09; }
+.earn-page, .earn-page * { box-sizing: border-box; }
+.earn-page { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+.earn-intro h1, .earn-option h2 { font-family: Georgia, "Times New Roman", serif; }
+.earn-header {
+  position: sticky;
+  z-index: 30;
+  top: 0;
+  min-height: 72px;
+  margin: -10px -20px 0;
+  padding: 0 20px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 20px;
+  border-bottom: 1px solid rgba(240,235,226,.13);
+  background: rgba(9,11,9,.94);
+  backdrop-filter: blur(16px);
+}
+.earn-header .create-brand {
+  width: max-content;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: #f1eee8;
+  text-decoration: none;
+  font: 600 22px/1 Georgia, "Times New Roman", serif;
+  letter-spacing: -.035em;
+  white-space: nowrap;
+}
+.earn-header .create-brand img {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  border-radius: 7px;
+  object-fit: contain;
+}
+.earn-header nav {
+  display: flex;
+  align-items: center;
+  gap: clamp(12px, 2vw, 24px);
+  color: #aaa69e;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.earn-header nav a { min-height: 42px; display: inline-flex; align-items: center; text-decoration: none; transition: color .16s ease; }
+.earn-header nav a:hover, .earn-header nav a:focus-visible, .earn-header nav a.active { color: #f1eee8; }
+.earn-header nav a.active { text-decoration: underline; text-decoration-color: #b88a5a; text-underline-offset: 7px; }
+.earn-header .create-login {
+  justify-self: end;
+  min-height: 40px;
+  padding: 0 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(240,235,226,.42);
+  color: #f1eee8;
+  text-decoration: none;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  transition: color .16s ease, background .16s ease;
+}
+.earn-header .create-login:hover, .earn-header .create-login:focus-visible { color: #151615; background: #f1eee8; }
+.earn-header .create-menu-button, .earn-header .create-mobile-nav { display: none; }
+.earn-header .create-menu-button {
+  width: 42px;
+  height: 42px;
+  place-items: center;
+  border: 1px solid rgba(240,235,226,.2);
+  border-radius: 50%;
+  color: #f1eee8;
+  background: #111411;
+  cursor: pointer;
+}
+.earn-header .create-menu-button svg { width: 19px; height: 19px; }
+.earn-header .create-mobile-nav a {
+  min-height: 42px;
+  padding: 0 12px;
+  display: flex;
+  align-items: center;
+  border-radius: 9px;
+  color: #c9c4bc;
+  font-size: 13px;
+  text-decoration: none;
+}
+.earn-header .create-mobile-nav a:hover, .earn-header .create-mobile-nav a:focus-visible, .earn-header .create-mobile-nav a.active { color: #f1eee8; background: rgba(240,235,226,.08); }
+.earn-header :focus-visible { outline: 2px solid #d78b5b; outline-offset: 3px; }
+.earn-option > a { text-decoration: none; }
+@media(max-width:1000px) {
+  .earn-header { grid-template-columns: minmax(0, 1fr) auto auto; gap: 10px; }
+  .earn-header nav { display: none; }
+  .earn-header .create-menu-button { display: grid; }
+  .earn-header .create-mobile-nav {
+    position: absolute;
+    z-index: 40;
+    top: calc(100% + 8px);
+    right: 14px;
+    width: min(290px, calc(100vw - 28px));
+    padding: 10px;
+    display: grid;
+    gap: 2px;
+    border: 1px solid rgba(240,235,226,.16);
+    border-radius: 16px;
+    background: #101310;
+    box-shadow: 0 24px 48px rgba(0,0,0,.42);
+  }
+}
+@media(max-width:680px) {
+  .earn-header { min-height: 64px; margin: -8px -8px 0; padding: 0 14px; }
+  .earn-header .create-brand { font-size: 20px; }
+  .earn-header .create-brand img { width: 32px; height: 32px; flex-basis: 32px; }
+  .earn-header .create-login { min-height: 38px; padding: 0 11px; font-size: 10px; }
+  .earn-header .create-menu-button { width: 38px; height: 38px; }
+}

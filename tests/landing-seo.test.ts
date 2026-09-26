@@ -3,7 +3,9 @@ import { describe, expect, it } from "vitest";
 import {
   canonicalUrl,
   INDEXABLE_SEO_PATHS,
+  LANDING_SEO_PATHS,
   SEO_PAGES,
+  seoPageForPath,
   type SeoPath,
 } from "../landing/src/seo.js";
 
@@ -19,6 +21,12 @@ describe("landing SEO contract", () => {
     expect(new Set(canonicals).size).toBe(canonicals.length);
     expect(SEO_PAGES["/admin"].robots).toContain("noindex");
     expect(SEO_PAGES["/account"].robots).toContain("noindex");
+    for (const path of ["/spore", "/spore/treasury", "/spore/data"] as const) {
+      expect(seoPageForPath(path)).toBe(SEO_PAGES[path]);
+      expect(SEO_PAGES[path].robots).toContain("noindex");
+      expect("structuredData" in SEO_PAGES[path]).toBe(false);
+      expect(LANDING_SEO_PATHS).toContain(path);
+    }
     for (const path of INDEXABLE_SEO_PATHS) {
       expect(SEO_PAGES[path].robots).toMatch(/^index,/);
       expect(SEO_PAGES[path].structuredData).toBeDefined();

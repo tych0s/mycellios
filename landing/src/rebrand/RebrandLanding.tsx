@@ -61,7 +61,7 @@ import "./rebrand.css";
  * claim clearer. The sections illustrate themselves.
  */
 
-const brandLogo = "/assets/logos/logo.png";
+const brandLogo = "/assets/brand/favicon.png";
 const EMAIL = "hello@mycellios.com";
 const RELEASES_URL = "https://github.com/tych0s/mycellios/releases";
 const GITHUB_URL = "https://github.com/tych0s/mycellios";
@@ -420,7 +420,7 @@ export function RebrandLanding() {
         <div className="rb-footer-inner rb-shell">
           <div className="rb-footer-brand"><Brand /><p>Distributed intelligence built from the capacity already around us.</p></div>
           <nav aria-label="Product"><span>Product</span><a href="/network?view=inference">Chat</a><a href="/create">Create</a><a href="/earn">Earn</a><a href="/spore">$ SPORE</a></nav>
-          <nav aria-label="Network"><span>Network</span><a href="#how-it-works">How it works</a><a href="/network">Network</a><a href="/downloads">Downloads</a><a href="/mobile/">Browser worker</a></nav>
+          <nav aria-label="Network"><span>Network</span><a href="#how-it-works">How it works</a><a href="/network">Network</a><a href="/downloads">Downloads</a><a href="/browser/">Browser worker</a></nav>
           <nav aria-label="Resources"><span>Resources</span><a href="/docs">Documentation</a><a href="/blog">Blog</a><a href={GITHUB_URL}><GitBranch /> GitHub</a><a href={`mailto:${EMAIL}`}>Contact</a></nav>
           <div className="rb-footer-bottom"><span>© 2026 mycellios</span><a href="#rb-top">Back to top <ArrowDown /></a></div>
         </div>

@@ -60,11 +60,24 @@ describe("Content Hub blog integration", () => {
     expect(request).toHaveBeenCalledTimes(3);
   });
 
+  it("rejects oversized article HTML before sanitizing it", async () => {
+    const request = vi.fn<typeof fetch>(async () =>
+      Response.json(postFixture({ contentHtml: "x".repeat(512_001) })),
+    );
+    const client = new ContentHubClient({
+      baseUrl: "https://content.example.com",
+      fetch: request,
+    });
+
+    await expect(client.getPost("research-note")).rejects.toThrow();
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
   it("server-renders list and article routes without trusting metadata as HTML", async () => {
     const post = postFixture({
       title: `Research </script><script>alert("metadata")</script>`,
       excerpt: "A validated excerpt with <strong>markup</strong> that must remain plain text.",
-      contentHtml: "<p><strong>Trusted article HTML</strong> from Content Hub.</p>",
+      contentHtml: "<p><strong>Trusted article HTML</strong> from Content Hub.</p><script>alert('xss')</script><a href=\"javascript:alert(1)\" onclick=\"alert(2)\">unsafe link</a><img src=\"https://cdn.example.com/safe.webp\" alt=\"Safe image\" onerror=\"alert(3)\" />",
       seo: {
         title: "Distributed intelligence research | mycellios",
         description:
@@ -91,13 +104,17 @@ describe("Content Hub blog integration", () => {
     const listing = await app.inject({ method: "GET", url: "/blog" });
     expect(listing.statusCode).toBe(200);
     expect(listing.headers["content-type"]).toContain("text/html");
-    expect(listing.body).toContain(`href="/blog.css?v=20260816"`);
+    expect(listing.body).toContain(`href="/blog.css?v=20260926"`);
     expect(listing.body).toContain(`class="blog-feed"`);
     expect(listing.body).toContain(`blog-header`);
     expect(listing.body).toContain(`class="rb-header-inner rb-shell"`);
+    expect(listing.body).toContain(`class="blog-mobile-menu"`);
+    expect(listing.body).toContain(`<nav class="blog-mobile-nav" aria-label="Mobile navigation">`);
     expect(listing.body).toContain(`href="/network?view=inference">Chat</a>`);
     expect(listing.body).toContain(`href="/blog" aria-current="page">Blog</a>`);
-    expect(listing.body).toContain(`src="/assets/logos/logo.png"`);
+    expect(listing.body).toContain(`href="/dashboard">Login</a>`);
+    expect(listing.body).not.toContain(`href="/network?view=overview">Login</a>`);
+    expect(listing.body).toContain(`src="/assets/brand/favicon.png"`);
     expect(listing.body).toContain(`href="/assets/brand/favicon.png"`);
     expect(listing.body).toContain(`href="/assets/brand/app-icon.png"`);
     expect(listing.body).not.toContain(`src="/mycellios-favicon-v2.png"`);
@@ -116,6 +133,11 @@ describe("Content Hub blog integration", () => {
     expect(article.body).toContain(`class="blog-article"`);
     expect(article.body).toContain(`class="blog-prose"`);
     expect(article.body).toContain("<p><strong>Trusted article HTML</strong> from Content Hub.</p>");
+    expect(article.body).toContain(`<img src="https://cdn.example.com/safe.webp" alt="Safe image" />`);
+    expect(article.body).not.toContain("<script>");
+    expect(article.body).not.toContain("javascript:");
+    expect(article.body).not.toContain("onclick=");
+    expect(article.body).not.toContain("onerror=");
     expect(article.body).toContain("Research &lt;/script&gt;&lt;script&gt;");
     expect(article.body).not.toContain(`</script><script>alert("metadata")</script>`);
     expect(article.body).toContain(`"@type":"BlogPosting"`);

@@ -2,6 +2,8 @@ import type { FastifyInstance } from "fastify";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 
+const REPOSITORY_DOCS = "https://github.com/tych0s/mycellios/blob/main/docs";
+
 export function registerLandingEntryRoutes(app: FastifyInstance, assetsRoot: string): void {
   const routeDocuments = {
     "/network": "network/index.html",
@@ -9,9 +11,9 @@ export function registerLandingEntryRoutes(app: FastifyInstance, assetsRoot: str
     "/create": "create/index.html",
     "/earn": "earn/index.html",
     "/account": "index.html",
-    "/spore": "index.html",
-    "/spore/treasury": "index.html",
-    "/spore/data": "index.html",
+    "/spore": "spore/index.html",
+    "/spore/treasury": "spore/treasury/index.html",
+    "/spore/data": "spore/data/index.html",
     "/admin": "admin/index.html",
     "/downloads": "downloads/index.html",
   } as const;
@@ -21,7 +23,9 @@ export function registerLandingEntryRoutes(app: FastifyInstance, assetsRoot: str
   }
 
   const redirects = [
-    ["/join", "/earn"], ["/join/", "/earn"], ["/docs", "/docs/"],
+    ["/join", "/earn"], ["/join/", "/earn"],
+    ["/docs", `${REPOSITORY_DOCS}/README.md`], ["/docs/", `${REPOSITORY_DOCS}/README.md`],
+    ["/docs/protocol", `${REPOSITORY_DOCS}/ARCHITECTURE.md`], ["/docs/protocol/", `${REPOSITORY_DOCS}/ARCHITECTURE.md`],
     ["/docs/downloads", "/downloads"], ["/docs/network", "/network"], ["/docs/blog", "/blog"],
     ["/docs/downloads/", "/downloads"], ["/docs/network/", "/network"], ["/docs/blog/", "/blog"],
   ] as const;

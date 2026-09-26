@@ -16,6 +16,9 @@ const routeOutputPaths: Record<(typeof LANDING_SEO_PATHS)[number], string> = {
   "/network": "network/index.html",
   "/create": "create/index.html",
   "/earn": "earn/index.html",
+  "/spore": "spore/index.html",
+  "/spore/treasury": "spore/treasury/index.html",
+  "/spore/data": "spore/data/index.html",
   "/downloads": "downloads/index.html",
   "/admin": "admin/index.html",
 };
