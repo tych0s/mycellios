@@ -67,11 +67,18 @@ export function newBillingIdempotencyKey(kind: "subscription" | "portal"): strin
 }
 
 async function billingRequest<T>(path: string, accessToken: string, init: RequestInit = {}): Promise<T> {
-  const response = await fetch(path, {
-    ...init,
-    cache: "no-store",
-    headers: { ...init.headers, authorization: `Bearer ${accessToken}` },
-  });
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      ...init,
+      cache: "no-store",
+      signal: init.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000),
+      headers: { ...init.headers, authorization: `Bearer ${accessToken}` },
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === "TimeoutError") throw new Error("The billing service did not respond. Try again.");
+    throw error;
+  }
   const body = await response.json().catch(() => null) as {
     error?: { code?: string; message?: string };
   } | null;

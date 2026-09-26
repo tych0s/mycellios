@@ -12,6 +12,9 @@ describe("panel UI utilities", () => {
   it("uses an injectable clock for stable relative labels", () => {
     const now = Date.parse("2026-08-30T13:00:00Z");
     expect(relativeTime("2026-08-30T12:58:30Z", now)).toBe("1m ago");
+    expect(relativeTime("2026-08-28T13:00:00Z", now)).toBe("2d ago");
+    expect(relativeTime("2026-07-16T13:00:00Z", now)).toBe("Jul 16, 2026");
+    expect(relativeTime("invalid", now)).toBe("Unknown");
     expect(relativeTimeEs("2026-08-30T12:58:30Z", now)).toBe("hace 1 min");
   });
 });

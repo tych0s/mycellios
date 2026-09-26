@@ -6,12 +6,9 @@ import { useInView } from "./use-motion";
 /*
  * The exchange.
  *
- * A distributed runtime is only interesting if both sides of it are: the buyer
- * wants predictable access, the machine owner wants to be paid for the part it
- * actually ran. This section is that single sentence, drawn — a subscription
- * (or usage tokens when flexibility matters) funds access on the left, work is
- * attributed across the same three machines the scroll story just introduced,
- * and value leaves on the right only against signed receipts.
+ * Users need clear access; machine owners need a record of the work they ran.
+ * This section shows plan access alongside signed stage attribution. Payouts
+ * are not live, so the diagram stops at verified contribution evidence.
  *
  * The split is not decorative: 24 / 6 / 16 GB of one model is 52 / 13 / 35 % of
  * the job, so the bars are the memory shares from the diagram above. They show
@@ -25,9 +22,9 @@ const SHARES = [
 ] as const;
 
 const RULES = [
-  { id: "01", icon: Wallet, title: "Choose your access", copy: "Subscribe for regular use. Your plan and allowance stay visible in one account." },
-  { id: "02", icon: BadgeCheck, title: "Meter real work", copy: "Each answer uses plan allowance while every machine signs the stage it ran." },
-  { id: "03", icon: ShieldCheck, title: "Settle on proof", copy: "Receipts are checked first. Work that fails verification is not paid." },
+  { id: "01", icon: Wallet, title: "Choose your access", copy: "Check current plan availability and usage allowance in your account." },
+  { id: "02", icon: BadgeCheck, title: "Meter real work", copy: "Each machine signs the stages it runs. Active plans show usage in your account." },
+  { id: "03", icon: ShieldCheck, title: "Verify the work", copy: "Receipts are checked before contribution credit is recorded." },
 ] as const;
 
 export function PaymentsSection() {
@@ -43,15 +40,15 @@ export function PaymentsSection() {
       <div className="rb-shell">
         <div className="rb-pay-head rb-reveal">
           <p className="rb-kicker"><i /><span>The exchange</span></p>
-          <h2 id="rb-pay-title">Subscribe for ongoing access.<br /><em>Machines earn from verified work.</em></h2>
-          <p>Mycellios Go is the simple way to use the network regularly. Contributor value follows accepted stages and signed receipts — never a promise or an unverified request.</p>
+          <h2 id="rb-pay-title">Access for users.<br /><em>Proof for machine owners.</em></h2>
+          <p>Mycellios Go is the network’s regular-access plan. Check its availability in your account. Accepted stages and signed receipts record each machine’s contribution.</p>
         </div>
 
         <div className={`rb-pay-rail ${live ? "is-live" : ""}`} ref={railRef}>
           <article className="rb-pay-card buyer">
             <span><Wallet />Your access</span>
             <strong>Mycellios Go</strong>
-            <small>€10 monthly · 1M usage tokens</small>
+            <small>Current plans and usage in Account</small>
           </article>
 
           <div className="rb-pay-wire" aria-hidden="true">
@@ -83,7 +80,7 @@ export function PaymentsSection() {
 
           <article className="rb-pay-card seller">
             <span><HandCoins />Machine owners</span>
-            <strong>Verified earnings</strong>
+            <strong>Verified contribution</strong>
             <small>accepted stages · signed receipts</small>
           </article>
         </div>
@@ -108,8 +105,8 @@ export function PaymentsSection() {
         </div>
 
         <div className="rb-pay-actions rb-reveal">
-          <a className="rb-pill rb-pill-dark" href="/account">Choose Mycellios Go <ArrowUpRight /></a>
-          <a className="rb-pill rb-pill-ghost" href="/earn">Sell your idle machine <ArrowUpRight /></a>
+          <a className="rb-pill rb-pill-dark" href="/account">Explore Mycellios Go <ArrowUpRight /></a>
+          <a className="rb-pill rb-pill-ghost" href="/earn">Connect your machine <ArrowUpRight /></a>
         </div>
 
         <p className="rb-econ-caveat rb-reveal">Usage tokens are access credits, not $SPORE · contributor payouts and $SPORE are not live yet</p>

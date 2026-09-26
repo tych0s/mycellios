@@ -71,6 +71,10 @@ jobs:
         with:
           node-version: "24"
           cache: npm
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        if: needs.native_scope.outputs.required == 'true'
+        with:
+          python-version: "3.12"
       - if: needs.native_scope.outputs.required == 'true'
         run: npm ci --ignore-scripts --no-audit --no-fund
       - if: needs.native_scope.outputs.required == 'true'

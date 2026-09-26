@@ -79,6 +79,7 @@ export function SupportAssistant({
   const [open, setOpen] = useState(false);
   const [config, setConfig] = useState<SupportAssistantPublicConfig | null>(null);
   const [configError, setConfigError] = useState<string | null>(null);
+  const [configRefresh, setConfigRefresh] = useState(0);
   const [messages, setMessages] = useState<AssistantMessage[]>([]);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
@@ -89,22 +90,30 @@ export function SupportAssistant({
   const conversationRef = useRef<HTMLDivElement>(null);
   const sessionId = useMemo(assistantSessionId, []);
 
-  async function loadConfig() {
-    try {
-      const nextConfig = await fetch(`${apiOrigin}/public/v1/assistant/config`, { cache: "no-store" }).then(async (response) => {
-        if (!response.ok) throw await responseError(response);
-        return response.json() as Promise<SupportAssistantPublicConfig>;
-      });
-      setConfig(nextConfig);
-      setConfigError(null);
-    } catch (caught) {
-      setConfigError(readError(caught));
-    }
-  }
-
   useEffect(() => {
+    const controller = new AbortController();
+    const loadConfig = async () => {
+      try {
+        const response = await fetch(`${apiOrigin}/public/v1/assistant/config`, {
+          cache: "no-store",
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]),
+        });
+        if (!response.ok) throw await responseError(response);
+        const nextConfig = await response.json() as SupportAssistantPublicConfig;
+        if (controller.signal.aborted) return;
+        setConfig(nextConfig);
+        setConfigError(null);
+      } catch (caught) {
+        if (controller.signal.aborted) return;
+        setConfig(null);
+        setConfigError(caught instanceof Error && caught.name === "TimeoutError"
+          ? "The assistant connection timed out."
+          : "The assistant status could not be retrieved.");
+      }
+    };
     void loadConfig();
-  }, [apiOrigin]);
+    return () => controller.abort();
+  }, [apiOrigin, configRefresh]);
 
   useEffect(() => {
     if (!open) return;
@@ -213,7 +222,7 @@ export function SupportAssistant({
     } catch (caught) {
       setMessages((current) => current.filter((message) => message.id !== assistantId));
       setError(readError(caught));
-      void loadConfig();
+      setConfigRefresh((current) => current + 1);
     } finally {
       setBusy(false);
     }
@@ -290,11 +299,14 @@ export function SupportAssistant({
             )}
 
             {(error || configError) && (
-              <div className="support-assistant-error"><CircleAlert size={15} /><span>{error ?? "The assistant status could not be retrieved."}</span></div>
+              <div className="support-assistant-error"><CircleAlert size={15} /><span>{error ?? configError}</span>{configError && <button type="button" onClick={() => setConfigRefresh((current) => current + 1)}>Retry</button>}</div>
             )}
 
             {config && !config.enabled && (
               <div className="support-assistant-unavailable"><CircleAlert size={16} /><span><strong>Assistant disabled</strong><small>The network administrator has temporarily disabled it.</small></span></div>
+            )}
+            {config?.enabled && !config.available && (
+              <div className="support-assistant-unavailable"><CircleAlert size={16} /><span><strong>No model available</strong><small>The assistant needs an active network model. Try again later.</small></span></div>
             )}
           </div>
 
@@ -309,7 +321,7 @@ export function SupportAssistant({
                   void submitPrompt();
                 }
               }}
-              placeholder={online ? "Ask about mycellios, your GPU, or the network…" : "Waiting for a network model…"}
+              placeholder={online ? "Ask about mycellios, your GPU, or the network…" : configError ? "Assistant connection unavailable" : "Waiting for a network model…"}
               disabled={!online || busy}
               aria-label="Message for the assistant"
             />
@@ -321,9 +333,10 @@ export function SupportAssistant({
       )}
 
       <button
-        className={`support-assistant-launcher ${open ? "open" : ""}`}
+        className={`support-assistant-launcher ${open ? "open" : online ? "online" : "offline"}`}
         type="button"
         aria-label={open ? "Close assistant" : "Open mycellios assistant"}
+        title={open ? "Close assistant" : online ? "Open mycellios assistant" : "Assistant offline"}
         aria-expanded={open}
         onClick={() => setOpen((current) => !current)}
       >

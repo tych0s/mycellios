@@ -369,12 +369,12 @@ describe("it stands clear of everything else in that corner", () => {
     const css = code(await read("./rebrand.css"));
     const support = code(await assistant());
 
-    /* Under 620px the launcher collapses to an icon — but the viewport collapses
+    /* Under 620px the launcher collapses to a 44px icon target, but the viewport collapses
        further, so there is no longer a gap to the left of it that fits a body.
        The left edge is empty at this width, and the desktop `right` has to be
        actively cancelled or the two rules would both apply. */
     const phone = support.slice(support.indexOf("@media (max-width: 620px)"));
-    expect(phone).toMatch(/\.support-assistant-launcher \{[^}]*width:\s*56px/);
+    expect(phone).toMatch(/\.support-assistant-launcher,\s*\.support-assistant-launcher\.open,\s*\.support-assistant-launcher\.offline \{[^}]*width:\s*44px/);
 
     const rule = css.match(/@media\(max-width:700px\)\{ \.rb-gutter-fruiting[^}]*\}/)![0];
     expect(rule).toContain("left:4px");

@@ -10,6 +10,14 @@ node as an explicit trust decision, not as an anonymous shell target.
   launch descriptions.
 - Tokens and private keys come from environment variables or platform secret
   storage; they are never stored in example configuration.
+- `MYCELLIOS_SUPABASE_URL` is the coordinator's server-side endpoint.
+  Set `MYCELLIOS_SUPABASE_PUBLIC_URL` to the HTTPS origin reachable by browsers
+  when the server uses an internal address. The public auth configuration must
+  expose only that browser origin and the public anon key, never the service
+  role key or an internal container hostname.
+- Browser OAuth returns require a one-use state stored in the initiating tab
+  and expire after ten minutes. Unsolicited token fragments are removed from
+  the address bar without creating a session.
 - Artifact, runtime, hardware and route identities are bound into health and
   evidence records where the relevant protocol supports them.
 - Direct transport has explicit fallback rules and anti-replay/session

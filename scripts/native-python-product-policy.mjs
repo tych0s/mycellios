@@ -341,7 +341,12 @@ function analyzeNativePythonImportSources(sources) {
 function runNativePythonImportAnalyzer(request) {
   const commands = nativePythonAnalyzerCommands();
   const uvPython = resolveUvManagedPython();
-  if (uvPython) commands.push({ executable: uvPython, prefix: [] });
+  // On Windows, `py -3.12` can exist while that interpreter is not registered.
+  // Use an already installed uv-managed runtime before trying the launcher.
+  if (uvPython) commands.splice(process.env.MYCELLIOS_PYTHON?.trim() ? 1 : 0, 0, {
+    executable: uvPython,
+    prefix: [],
+  });
   const missing = [];
   for (const command of commands) {
     const result = spawnSync(

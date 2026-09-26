@@ -7,10 +7,10 @@ const REPOSITORY_DOCS = "https://github.com/tych0s/mycellios/blob/main/docs";
 export function registerLandingEntryRoutes(app: FastifyInstance, assetsRoot: string): void {
   const routeDocuments = {
     "/network": "network/index.html",
-    "/dashboard": "index.html",
+    "/dashboard": "dashboard/index.html",
     "/create": "create/index.html",
     "/earn": "earn/index.html",
-    "/account": "index.html",
+    "/account": "account/index.html",
     "/spore": "spore/index.html",
     "/spore/treasury": "spore/treasury/index.html",
     "/spore/data": "spore/data/index.html",

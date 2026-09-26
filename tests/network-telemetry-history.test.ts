@@ -85,6 +85,32 @@ describe("network telemetry history", () => {
         .toISOString(),
     );
   });
+
+  it("counts completed work beyond the 100 jobs shown in a snapshot", async () => {
+    const runtime = await createCoordinator({
+      host: "127.0.0.1",
+      port: 0,
+      databasePath: ":memory:",
+      requestTimeoutMs: 1_000,
+    }, { logger: false });
+    runtimes.push(runtime);
+    for (let index = 0; index < 101; index += 1) {
+      const id = `completed-${index}`;
+      runtime.store.createJob({
+        id,
+        sessionId: "history-test",
+        model: "test-model",
+        workloadClass: "interactive",
+        deadlineAt: Date.now() + 60_000,
+      });
+      runtime.store.setJobStatus(id, "completed");
+    }
+
+    const response = await runtime.app.inject({ method: "GET", url: "/public/v1/snapshot" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ summary: { completedJobs: 101 } });
+    expect(runtime.store.listJobs(100)).toHaveLength(100);
+  });
 });
 
 function telemetrySample(

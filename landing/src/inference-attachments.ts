@@ -75,7 +75,7 @@ export async function readInferenceAttachment(
   const truncated = normalized.length > limit;
   return {
     id: crypto.randomUUID(),
-    name: file.name.replace(/[\u0000-\u001f\u007f]/gu, "").slice(0, 180) || "documento",
+    name: file.name.replace(/[\u0000-\u001f\u007f]/gu, "").slice(0, 180) || "document",
     size: file.size,
     kind,
     truncated,
@@ -96,11 +96,11 @@ export function inferenceMessageWithAttachments(
 ): string {
   if (attachments.length === 0) return prompt;
   const documents = attachments.map((attachment, index) => [
-    `--- ARCHIVO ${index + 1}: ${attachment.name} (${formatFileSize(attachment.size)})${attachment.truncated ? " · CONTENIDO RECORTADO" : ""} ---`,
+    `--- FILE ${index + 1}: ${attachment.name} (${formatFileSize(attachment.size)})${attachment.truncated ? " · CONTENT TRUNCATED" : ""} ---`,
     attachment.text,
-    `--- FIN DE ${attachment.name} ---`,
+    `--- END OF ${attachment.name} ---`,
   ].join("\n")).join("\n\n");
-  return `${prompt}\n\nEl usuario ha adjuntado los siguientes documentos como material de referencia. Analiza su contenido y distingue claramente lo que procede de los archivos.\n\n${documents}`;
+  return `${prompt}\n\nThe user attached the following documents as reference material. Analyze their contents and clearly distinguish information from the files.\n\n${documents}`;
 }
 
 export function formatFileSize(bytes: number): string {

@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createCoordinator, type CoordinatorRuntime } from "../src/coordinator/server.js";
 import {
+  claimSupportAssistantRequest,
+  type SupportAssistantRateState,
+} from "../src/coordinator/support-assistant-rate.js";
+import {
   buildSupportAssistantMessages,
   DEFAULT_SUPPORT_ASSISTANT_SETTINGS,
   resolveSupportAssistantModel,
@@ -150,6 +154,51 @@ describe("network support assistant", () => {
     expect(response.statusCode).toBe(503);
     expect(response.json().error.code).toBe("assistant_model_unavailable");
   });
+
+  it("limits one client even when it rotates the supplied session ID", async () => {
+    const coordinator = await start();
+    const headers = { "user-agent": "assistant-rate-limit-test" };
+    for (let index = 0; index < 120; index += 1) {
+      const response = await coordinator.app.inject({
+        method: "POST",
+        url: "/public/v1/assistant/chat",
+        headers,
+        payload: {
+          session_id: `browser-session-${index}`,
+          messages: [{ role: "user", content: "How does the network work?" }],
+        },
+      });
+      expect(response.statusCode).toBe(503);
+    }
+    const rejected = await coordinator.app.inject({
+      method: "POST",
+      url: "/public/v1/assistant/chat",
+      headers,
+      payload: {
+        session_id: "browser-session-rotated-again",
+        messages: [{ role: "user", content: "How does the network work?" }],
+      },
+    });
+    expect(rejected.statusCode).toBe(429);
+    expect(rejected.json().error.code).toBe("assistant_rate_limited");
+  });
+
+  it("does not spend the inference-wide allowance when no model is available", async () => {
+    const coordinator = await start();
+    for (let index = 0; index <= 240; index += 1) {
+      const response = await coordinator.app.inject({
+        method: "POST",
+        url: "/public/v1/assistant/chat",
+        headers: { "user-agent": `offline-client-${index}` },
+        payload: {
+          session_id: `offline-session-${index}`,
+          messages: [{ role: "user", content: "Is the assistant available?" }],
+        },
+      });
+      expect(response.statusCode).toBe(503);
+      expect(response.json().error.code).toBe("assistant_model_unavailable");
+    }
+  });
 });
 
 describe("support assistant context", () => {
@@ -180,5 +229,32 @@ describe("support assistant context", () => {
     expect(messages[0]?.content).toContain("Available inference models: qwen-network");
     expect(messages[0]?.content).toContain("cannot silently change");
     expect(messages.at(-1)).toEqual({ role: "user", content: "Cambia mi GPU a máxima potencia" });
+  });
+});
+
+describe("support assistant request accounting", () => {
+  it("caps successful-work claims across rotating clients", () => {
+    const states = new Map<string, SupportAssistantRateState>();
+    for (let index = 0; index < 240; index += 1) {
+      const release = claimSupportAssistantRequest(states, "assistant-global", 240, 8, 1_000);
+      expect(release).toBeTypeOf("function");
+      release?.();
+    }
+    expect(claimSupportAssistantRequest(states, "assistant-global", 240, 8, 1_001)).toBeNull();
+  });
+
+  it("bounds the number of tracked client keys and removes expired inactive keys", () => {
+    const states = new Map<string, SupportAssistantRateState>();
+    for (let index = 0; index < 2_000; index += 1) {
+      states.set(`client-${index}`, { windowStartedAt: 1_000, requests: 1, active: 0 });
+    }
+    expect(claimSupportAssistantRequest(states, "extra", 120, 8, 1_001)).toBeNull();
+    expect(states.size).toBe(2_000);
+
+    const release = claimSupportAssistantRequest(states, "fresh", 120, 8, 601_001);
+    expect(release).toBeTypeOf("function");
+    expect(states.size).toBe(1);
+    release?.();
+    expect(states.get("fresh")?.active).toBe(0);
   });
 });

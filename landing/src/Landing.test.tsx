@@ -69,6 +69,13 @@ describe("Landing", () => {
     expect(header).toContain(">Blog</a>");
   });
 
+  it("sends documentation links to the coordinator in dev and preview", async () => {
+    const config = await import("node:fs/promises").then(({ readFile }) =>
+      readFile(new URL("../../vite.landing.config.ts", import.meta.url), "utf8"),
+    );
+    expect(config.match(/"\/docs": productionProxy\(\)/g)).toHaveLength(2);
+  });
+
   it("closes the header with the social marks and Login instead of a worker CTA", () => {
     const html = renderToStaticMarkup(<RebrandLanding />);
     const header = html.slice(0, html.indexOf("</header>"));
@@ -116,18 +123,16 @@ describe("Landing", () => {
     expect(html).toContain("layers 14–20");
   });
 
-  it("leads with subscriptions, keeps token access secondary and gates earnings on proof", () => {
+  it("shows plan access and evidence without promising live payouts", () => {
     const html = renderToStaticMarkup(<RebrandLanding />);
 
     expect(html).toContain('id="payments"');
-    // Buyer and seller each have to be named: a payment section that only says
-    // "you get paid" is an earnings pitch, not an exchange.
-    expect(html).toContain("Subscribe for ongoing access.");
-    expect(html).toContain("Machines earn from verified work.");
-    expect(html).toContain("Choose Mycellios Go");
+    expect(html).toContain("Access for users.");
+    expect(html).toContain("Proof for machine owners.");
+    expect(html).toContain("Explore Mycellios Go");
     expect(html).toContain('href="/account"');
     expect(html).not.toContain("$0.0240");
-    expect(html).toContain("Sell your idle machine");
+    expect(html).toContain("Connect your machine");
     // The split is the same memory split the diagram above shows, so the three
     // layer ranges reappear here as shares of one payment.
     expect(html).toContain("layers 0–6");

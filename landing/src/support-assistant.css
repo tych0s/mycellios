@@ -53,6 +53,10 @@
   border-radius: 16px;
 }
 
+.support-assistant-launcher.offline { width: 56px; min-width: 56px; padding: 0; }
+.support-assistant-launcher.offline > span { display: none; }
+.support-assistant-launcher.offline > i { position: absolute; top: 7px; right: 7px; margin: 0; }
+
 .support-assistant-launcher > span { display: grid; gap: 1px; text-align: left; }
 .support-assistant-launcher strong { font-size: 13px; font-weight: 750; }
 .support-assistant-launcher small { color: rgba(255,255,255,.7); font-size: 10px; }
@@ -250,6 +254,17 @@
   font-size: 10px;
 }
 .support-assistant-error { color: #ff9daf; background: rgba(125,31,60,.16); }
+.support-assistant-error span { flex: 1; min-width: 0; }
+.support-assistant-error button {
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  border: 1px solid currentColor;
+  border-radius: 6px;
+  color: inherit;
+  background: transparent;
+  font-size: 11px;
+  cursor: pointer;
+}
 .support-assistant-unavailable {
   display: flex;
   gap: 9px;
@@ -401,7 +416,7 @@
 }
 
 @media (max-width: 620px) {
-  .support-assistant { right: 12px; bottom: 12px; }
+  .support-assistant { right: 8px; bottom: 8px; }
   .support-assistant-window {
     position: fixed;
     inset: 10px 10px 80px;
@@ -410,8 +425,10 @@
     border-radius: 20px;
   }
   .support-assistant-launcher > span { display: none; }
-  .support-assistant-launcher { width: 56px; min-width: 56px; padding: 0; border-radius: 17px; }
-  .support-assistant-launcher > i { position: absolute; top: 7px; right: 7px; margin: 0; }
+  .support-assistant-launcher,
+  .support-assistant-launcher.open,
+  .support-assistant-launcher.offline { width: 44px; min-width: 44px; min-height: 44px; height: 44px; padding: 0; border-radius: 14px; }
+  .support-assistant-launcher > i { position: absolute; top: 4px; right: 4px; margin: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {

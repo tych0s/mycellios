@@ -308,7 +308,7 @@ function NativeNodeSetup(
     <details className="contribute-native-disclosure">
       <summary>
         <span className="contribute-native-summary-icon"><Server /></span>
-        <span><strong>Use a dedicated computer</strong><small>Install a persistent node for contribution beyond this browser.</small></span>
+        <span><strong>Use a dedicated computer</strong><small>Check native package availability for persistent contribution.</small></span>
         <b className={props.nodes.length > 0 ? "" : "empty"} aria-label={`${props.nodes.length} paired nodes`}>{props.nodes.length || ""}</b>
         <ChevronDown />
       </summary>
@@ -322,13 +322,13 @@ function NativeNodeSetup(
           <Server />
         </div>
         <p>
-          Install the signed service, then use a one-time pairing bundle. The
-          browser never scans localhost.
+          When a native package is available, install the signed service and
+          use a one-time pairing bundle. The browser never scans localhost.
         </p>
         <div className="page-actions">
-          <a href={installer.path} download>
+          <a href="/downloads">
             <Download />
-            Download {installer.label}
+            Check {installer.label} package
           </a>
           {props.accessToken ? <>
             <button type="button" disabled={busy !== null} onClick={() => void createBundle()}>
@@ -931,16 +931,16 @@ export function contributionErrorPresentation(message: string): ContributionErro
   const normalized = message.toLowerCase();
   if (isInvalidSessionError(message)) {
     return {
-      title: "La sesión de contribución ha caducado",
-      detail: "La credencial de red de este navegador ya no es válida. Vuelve a iniciar sesión para reconectar tu contribución.",
-      action: "Iniciar sesión",
+      title: "Your contribution session has expired",
+      detail: "This browser's network credential is no longer valid. Sign in again to reconnect your contribution.",
+      action: "Sign in",
       requiresAuth: true,
     };
   }
   return {
-    title: "No se pudo actualizar la contribución",
-    detail: message || "El coordinador no ha podido confirmar el estado de este navegador.",
-    action: "Reintentar",
+    title: "Could not update contribution",
+    detail: message || "The coordinator could not confirm this browser's status.",
+    action: "Retry",
     requiresAuth: false,
   };
 }

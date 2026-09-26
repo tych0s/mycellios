@@ -73,6 +73,23 @@ describe("Content Hub blog integration", () => {
     expect(request).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps the empty blog message below the page heading", async () => {
+    const app = Fastify();
+    apps.push(app);
+    await registerContentHubRoutes(app, {
+      client: new ContentHubClient({
+        baseUrl: "https://content.example.com",
+        fetch: vi.fn<typeof fetch>().mockResolvedValue(Response.json(postsPage())),
+      }),
+    });
+
+    const listing = await app.inject({ method: "GET", url: "/blog" });
+    expect(listing.statusCode).toBe(200);
+    expect(listing.body.match(/<h1>/g)).toHaveLength(1);
+    expect(listing.body).toContain("<h1>Notes from the network.</h1>");
+    expect(listing.body).toContain("<h2>No articles yet</h2>");
+  });
+
   it("server-renders list and article routes without trusting metadata as HTML", async () => {
     const post = postFixture({
       title: `Research </script><script>alert("metadata")</script>`,
@@ -104,7 +121,7 @@ describe("Content Hub blog integration", () => {
     const listing = await app.inject({ method: "GET", url: "/blog" });
     expect(listing.statusCode).toBe(200);
     expect(listing.headers["content-type"]).toContain("text/html");
-    expect(listing.body).toContain(`href="/blog.css?v=20260926"`);
+    expect(listing.body).toContain(`href="/blog.css?v=20260926b"`);
     expect(listing.body).toContain(`class="blog-feed"`);
     expect(listing.body).toContain(`blog-header`);
     expect(listing.body).toContain(`class="rb-header-inner rb-shell"`);

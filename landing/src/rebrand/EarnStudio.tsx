@@ -1,6 +1,5 @@
-import { AppWindow, ChevronRight, Download, Menu, MonitorUp, X } from "lucide-react";
-import { useState } from "react";
-import { SporeMenu, SporeMobileLinks } from "./SporeMenu";
+import { AppWindow, ChevronRight, Download, MonitorUp } from "lucide-react";
+import { LandingHeader } from "./RebrandLanding";
 import "./earn-studio.css";
 
 const contributionOptions = [
@@ -17,29 +16,19 @@ const contributionOptions = [
   {
     id: "native",
     eyebrow: "ON MY MACHINE",
-    title: "Install the native worker",
-    copy: "Run verified workloads through the Mycellios desktop runtime, including compatible GPU acceleration.",
+    title: "Native worker packages",
+    copy: "Run verified workloads with compatible GPU acceleration when a native package is published for your system.",
     detail: "Windows · macOS · Linux",
-    action: "Choose an installer",
+    action: "Check package availability",
     href: "/downloads",
     icon: MonitorUp,
   },
 ] as const;
 
 export function EarnStudio() {
-  const [menuOpen, setMenuOpen] = useState(false);
-
   return (
-    <main className="earn-page">
-      <header className="create-header earn-header">
-        <a className="create-brand" href="/" aria-label="Mycellios home"><img src="/assets/brand/favicon.png" alt="" width={34} height={34} />mycellios</a>
-        <nav aria-label="Main navigation">
-          <a href="/network?view=inference">Chat</a><a href="/create">Create</a><a className="active" href="/earn" aria-current="page">Earn</a><SporeMenu /><a href="/#how-it-works">Network</a><a href="/blog">Blog</a>
-        </nav>
-        <a className="create-login" href="/dashboard">Login</a>
-        <button className="create-menu-button" type="button" aria-label={menuOpen ? "Close menu" : "Open menu"} aria-expanded={menuOpen} onClick={() => setMenuOpen((open) => !open)}>{menuOpen ? <X /> : <Menu />}</button>
-        {menuOpen && <div className="create-mobile-nav"><a href="/network?view=inference">Chat</a><a href="/create">Create</a><a className="active" href="/earn">Earn</a><SporeMobileLinks /><a href="/#how-it-works">Network</a><a href="/blog">Blog</a></div>}
-      </header>
+    <main className="rb-page earn-page">
+      <LandingHeader active="earn" />
 
       <section className="earn-intro">
         <span>CONTRIBUTE CAPACITY</span>

@@ -40,7 +40,16 @@ describe("account MFA step-up", () => {
       "https://auth.example/auth/v1/factors/factor-1/verify",
     ]);
     expect(JSON.parse(String(request.mock.calls[2]?.[1]?.body))).toEqual({ challenge_id: "challenge-1", code: "123456" });
+    for (const [, init] of request.mock.calls) expect(init?.signal).toBeInstanceOf(AbortSignal);
     expect(setItem).toHaveBeenCalledOnce();
+  });
+
+  it("reports a timed-out MFA step without storing a new session", async () => {
+    const setItem = vi.fn();
+    vi.stubGlobal("window", { localStorage: { setItem } });
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new DOMException("Timed out", "TimeoutError"); }));
+    await expect(verifyTotpStepUp(config, session, "123456")).rejects.toThrow("MFA factor lookup took too long");
+    expect(setItem).not.toHaveBeenCalled();
   });
 
   it("fails closed when no verified TOTP factor exists", async () => {

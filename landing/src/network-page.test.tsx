@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { NetworkPage, deriveDailyJobs, deriveNetworkMetrics, nodeState, type NetworkSnapshot, type NetworkTelemetryHistory } from "./NetworkPage";
+import { NetworkPage, deriveDailyJobs, deriveNetworkMetrics, historyForRange, nodeState, type NetworkSnapshot, type NetworkTelemetryHistory } from "./NetworkPage";
 import {
   BORDER_LINES,
   LAND_POINTS,
@@ -84,6 +84,27 @@ function project(lon: number, lat: number, yaw = 0, tilt = 0): Vec3 {
 }
 
 describe("network observatory", () => {
+  it("does not display an age for the placeholder snapshot", () => {
+    const html = renderToStaticMarkup(<NetworkPage animate={false} />);
+    expect(html).toContain("Latest snapshot <strong>connecting</strong>");
+    expect(html).not.toMatch(/\d+d ago/);
+  });
+
+  it("never shows samples from a different selected history range", () => {
+    expect(historyForRange(wallHistory, "30d")).toBe(wallHistory);
+    expect(historyForRange(wallHistory, "7d")).toBeNull();
+    expect(historyForRange(null, "7d")).toBeNull();
+    const html = renderToStaticMarkup(<NetworkPage initialSnapshot={snapshot} initialHistory={{ ...wallHistory, range: "7d" }} animate={false} />);
+    expect(html).toContain('aria-pressed="true">7 days</button>');
+    expect(html).toContain("4 persisted observations");
+  });
+
+  it("keeps intraday times on chart axes when the selected history covers about a day", () => {
+    const html = renderToStaticMarkup(<NetworkPage initialSnapshot={snapshot} initialHistory={{ ...wallHistory, range: "24h" }} animate={false} />);
+    expect(html).toContain('aria-pressed="true">24 hours</button>');
+    expect(html).toMatch(/class="axis"[^>]*>\d{1,2} \d{2}:\d{2}<\/text>/);
+  });
+
   it("derives displayed capacity only from the public snapshot", () => {
     expect(deriveNetworkMetrics(snapshot)).toMatchObject({
       regions: 2,
@@ -97,7 +118,7 @@ describe("network observatory", () => {
   it("classifies node state from real connection, status and deployments", () => {
     expect(nodeState(snapshot.workers[0]!)).toBe("serving");
     expect(nodeState(snapshot.workers[1]!)).toBe("standby");
-    expect(nodeState(snapshot.workers[2]!)).toBe("joining");
+    expect(nodeState(snapshot.workers[2]!)).toBe("offline");
   });
 
   it("ignores the placeholder 'auto' region when counting regions", () => {
@@ -228,7 +249,8 @@ describe("network observatory", () => {
     expect(html).toContain('id="net-wall-network-title"');
     expect(html).toContain("jobs completed per day");
     expect(html).toContain("derived from the persisted cumulative counter");
-    expect(html).toContain("capacity offered (GB)");
+    expect(html).toContain("online capacity (GB)");
+    expect(html).toContain("observed VRAM on connected online workers");
     expect(html).toContain("nodes online");
     expect(html).toContain("workers online");
     expect(html).toContain("sampled every 10 min");
@@ -320,7 +342,7 @@ describe("network observatory", () => {
     const globe = renderToStaticMarkup(<NetworkPage initialSnapshot={snapshot} initialViewMode="globe" animate={false} />);
     expect(overview).toContain("completed jobs");
     expect(overview).not.toContain("Waiting for verified data");
-    expect(overview).toContain("Offered capacity");
+    expect(overview).toContain("Online capacity");
     expect(overview).toContain("Node availability");
     expect(overview).toContain("Model fabric");
     expect(overview).toContain("Inference load");
@@ -330,7 +352,7 @@ describe("network observatory", () => {
     expect(overview).toContain("Not published");
     expect(overview).toContain("$SPORE");
     expect(globe).not.toContain("net-hero-overview");
-    expect(globe).toContain("TOKENS IN SNAPSHOT");
+    expect(globe).toContain("TOKENS IN RECENT JOBS");
   });
 
   it("uses the canonical landing header on the public observatory", () => {
@@ -357,6 +379,14 @@ describe("network observatory", () => {
     }} />);
     expect(html).toContain("No nodes announced");
     expect(html).toContain("Waiting for the first node");
+  });
+
+  it("does not present unknown metrics as zero before the first snapshot", () => {
+    const html = renderToStaticMarkup(<NetworkPage animate={false} />);
+    expect(html).toContain("Awaiting snapshot");
+    expect(html).toContain("Waiting for network snapshot");
+    expect(html).not.toContain("No nodes announced");
+    expect(html).toContain("<strong>—</strong>connected nodes");
   });
 
   it("routes bare Network separately while preserving every Panel view", () => {

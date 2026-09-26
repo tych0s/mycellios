@@ -49,11 +49,10 @@ const softwareApplication = {
   "@id": SOFTWARE_ID,
   name: "mycellios",
   applicationCategory: "DeveloperApplication",
-  operatingSystem: "Windows 10/11, macOS, Ubuntu, Debian, Fedora, RHEL",
+  operatingSystem: "Windows 10/11, macOS (Apple Silicon), Linux (x64)",
   description:
     "A distributed intelligence network that connects capacity across different machines to run AI models that cannot fit on a single device.",
   url: `${SITE_ORIGIN}/`,
-  downloadUrl: `${SITE_ORIGIN}/downloads`,
   publisher: { "@id": ORGANIZATION_ID },
   offers: {
     "@type": "Offer",
@@ -99,14 +98,14 @@ export const SEO_PAGES = {
     ),
   },
   "/create": {
-    title: "Build persistent AI identities | Mycellios Studio",
+    title: "Design an AI identity | Mycellios Studio",
     description:
-      "Create, configure, and test a persistent AI identity with personality, memory, trusted knowledge, tools, and launch channels in Mycellios Studio.",
+      "Design an AI identity with personality, memory, knowledge, tools, and launch channels. Preview a local draft and sign in to publish.",
     canonicalPath: "/create",
     robots: "index, follow, max-image-preview:large",
     structuredData: webPage(
-      "Build persistent AI identities | Mycellios Studio",
-      "A visual builder for creating, testing, and preparing persistent AI identities for web, Telegram, and API channels.",
+      "Design an AI identity | Mycellios Studio",
+      "A visual builder for drafting and previewing AI identities before publishing to web, Telegram, or API channels.",
       "/create",
     ),
   },
@@ -144,9 +143,9 @@ export const SEO_PAGES = {
     robots: "noindex, nofollow, noarchive",
   },
   "/downloads": {
-    title: "Download mycellios for Windows, macOS, and Linux",
+    title: "Native package availability | mycellios",
     description:
-      "Download the mycellios desktop app for Windows, macOS, Ubuntu, Debian, Fedora, or RHEL and connect your machine to a distributed AI network.",
+      "Check which mycellios native packages are published for Windows, macOS, and Linux, or contribute from your browser without installing software.",
     canonicalPath: "/downloads",
     robots: "index, follow, max-image-preview:large",
     structuredData: {
@@ -184,6 +183,12 @@ export const SEO_PAGES = {
     canonicalPath: "/admin",
     robots: "noindex, nofollow, noarchive",
   },
+  "/dashboard": {
+    title: "Dashboard | mycellios",
+    description: "Sign in to manage your Mycellios account and network workspace.",
+    canonicalPath: "/dashboard",
+    robots: "noindex, nofollow, noarchive",
+  },
   "/account": {
     title: "Account and subscription | mycellios",
     description: "Secure account, subscription, billing and usage management for mycellios.",
@@ -205,6 +210,8 @@ export const LANDING_SEO_PATHS = [
   "/spore/data",
   "/downloads",
   "/admin",
+  "/dashboard",
+  "/account",
 ] as const;
 
 export function canonicalUrl(page: SeoPage): string {

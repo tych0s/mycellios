@@ -210,11 +210,18 @@ describe("inference-only coordinator and worker", () => {
     expect(response.headers.get("content-type")).toContain("text/html");
     expect(await response.text()).toContain("mycellios test landing");
 
-    for (const path of ["account", "spore", "spore/treasury", "spore/data"]) {
+    for (const path of ["spore", "spore/treasury", "spore/data"]) {
       const response = await fetch(new URL(path, `${address}/`));
       expect(response.status).toBe(200);
       expect(response.headers.get("content-type")).toContain("text/html");
       expect(await response.text()).toContain("mycellios test landing");
+    }
+    for (const path of ["account", "dashboard"]) {
+      const response = await fetch(new URL(path, `${address}/`));
+      expect(response.status).toBe(200);
+      const html = await response.text();
+      expect(html).toContain(`mycellios test ${path}`);
+      expect(html).toContain('content="noindex, nofollow"');
     }
     for (const [path, destination] of [
       ["dashboard/", "/dashboard"],
