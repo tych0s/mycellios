@@ -21,6 +21,8 @@ const routeOutputPaths: Record<(typeof LANDING_SEO_PATHS)[number], string> = {
   "/spore/data": "spore/data/index.html",
   "/downloads": "downloads/index.html",
   "/admin": "admin/index.html",
+  "/dashboard": "dashboard/index.html",
+  "/account": "account/index.html",
 };
 
 function escapeAttribute(value: string): string {

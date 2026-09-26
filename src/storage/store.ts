@@ -900,6 +900,13 @@ export class MeshStore {
     return rows.map((row) => this.mapJob(row));
   }
 
+  countCompletedJobs(): number {
+    const row = this.database.raw
+      .prepare("SELECT COUNT(*) AS count FROM jobs WHERE status = 'completed'")
+      .get() as { count: number };
+    return Number(row.count);
+  }
+
   queueAllForRemotePersistence(): number {
     return this.database.transaction(() => {
       let queued = 0;

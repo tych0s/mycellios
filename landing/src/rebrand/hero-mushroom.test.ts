@@ -60,7 +60,7 @@ describe("the arrival is faded rather than popped", () => {
     const component = await read("./HeroMushroom.tsx");
     // No WebGL or a lost context would otherwise strand the hero at opacity 0,
     // taking the shade plate with it.
-    expect(component).toMatch(/setTimeout\(\(\) => setShown\(true\)/);
+    expect(component).toContain("setTimeout(show, 4000)");
   });
 
   it("shows only the real renderer and transitions it in quickly", async () => {
@@ -215,7 +215,7 @@ describe("the browser learns about the chunk while it is still parsing the HTML"
     expect(config).toContain("mushroom-stage-");
   });
 
-  it("makes the preload route-conditional in script rather than trusting `media`", async () => {
+  it("makes the preload route- and width-conditional in script rather than trusting `media`", async () => {
     const config = await read("../../../vite.landing.config.ts");
     // `media` on `modulepreload` is not reliably honoured across browsers, and
     // one that ignored it would hand every phone the entire renderer. An inline
@@ -224,7 +224,9 @@ describe("the browser learns about the chunk while it is still parsing the HTML"
     // plugin says the word `media` precisely to explain why it is not used.
     const link = config.slice(config.indexOf('l.rel="modulepreload"'));
     expect(link.slice(0, 200)).not.toMatch(/\bmedia\s*=/);
-    expect(config).not.toContain('matchMedia("(max-width: 700px)")');
+    const mobileGate = config.indexOf('window.matchMedia("(max-width: 700px)").matches)return;');
+    expect(mobileGate).toBeGreaterThan(0);
+    expect(mobileGate).toBeLessThan(config.indexOf('l.rel="modulepreload"'));
     expect(config).not.toContain('matchMedia("(prefers-reduced-motion: reduce)")');
   });
 
@@ -239,7 +241,7 @@ describe("the browser learns about the chunk while it is still parsing the HTML"
   });
 });
 
-describe("every visitor sees the same organism", () => {
+describe("the mobile hero stays free of the 3D renderer", () => {
   it("keeps the organism and its renderer off phones entirely", async () => {
     const component = await read("./HeroMushroom.tsx");
     const css = await read("./rebrand.css");
@@ -248,12 +250,13 @@ describe("every visitor sees the same organism", () => {
     /*
      * The phone experiment is settled: behind the globe the specimen read as
      * a transparent ghost, and every earlier framing fought the copy. So the
-     * mobile hero is planet + text, and `wantsMushroom()` is the single gate
-     * that keeps the 190KB chunk, the WebGL context and the host itself off
-     * the phone — the bootstrap prefetch is already guarded by the same call.
+     * mobile hero is planet + text, and the bootstrap and resize listener
+     * keep the large chunk and WebGL context off the phone.
      */
     expect(component).toMatch(/wantsMushroom\(\)[\s\S]*matchMedia\("\(max-width: 700px\)"\)/);
-    expect(component).toContain("if (!host || !wantsMushroom()) return;");
+    expect(component).toContain("if (wantsMushroom()) start();");
+    expect(component).toContain("else stop(true);");
+    expect(component).toContain('mobile.addEventListener("change", syncWidth)');
     const phone = css.slice(css.indexOf("@media(max-width:700px)"));
     expect(phone).toMatch(/\.rb-hero-mushroom \{ display:none/);
     // Nothing passes behind the input on a phone, so the field keeps the
@@ -261,7 +264,7 @@ describe("every visitor sees the same organism", () => {
     // legibility over the cap must stay gone.
     expect(phone).not.toContain("background:rgba(11,15,12,.92)");
     expect(css).not.toContain("rb-hero-mushroom-placeholder");
-    expect(config).not.toContain('matchMedia("(max-width: 700px)")');
+    expect(config).toContain('window.matchMedia("(max-width: 700px)").matches)return;');
   });
 
   it("keeps the same 3D geometry but disables motion for reduced motion", async () => {
@@ -448,7 +451,7 @@ describe("the phone hero still grows something", () => {
     // afford mushrooms at all is that these are paths, not a WebGL context.
     expect(colony).not.toContain("mushroom-stage");
     expect(colony).not.toContain("loadMushroomStage");
-    expect(component).toContain("if (!host || !wantsMushroom()) return;");
+    expect(component).toContain("if (wantsMushroom()) start();");
   });
 
   it("holds the specimens still under reduced motion", async () => {

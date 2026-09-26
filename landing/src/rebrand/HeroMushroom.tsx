@@ -59,38 +59,64 @@ export function HeroMushroom() {
 
   useEffect(() => {
     const host = hostRef.current;
-    if (!host || !wantsMushroom()) return;
+    if (!host) return;
 
+    const mobile = window.matchMedia("(max-width: 700px)");
     const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
     let cancelled = false;
     let element: HTMLElement | null = null;
+    let failsafe: number | undefined;
+    let generation = 0;
 
-    void loadMushroomStage().then(({ defineMushroomStage }) => {
-      // The import resolves a microtask after unmount in StrictMode's
-      // mount/unmount/remount, so the element must not be created if the
-      // effect has already been cleaned up.
-      if (cancelled) return;
-      defineMushroomStage();
-      element = document.createElement("mushroom-stage");
-      element.setAttribute("variant", "hero");
-      element.setAttribute("accent", "#c9976a");
-      element.setAttribute("spores", reduceMotion ? "off" : "on");
-      element.setAttribute("motion", reduceMotion ? "off" : "full");
-      element.setAttribute("scale", "1");
-      element.style.cssText = "width:100%;height:100%;display:block;";
-      element.addEventListener("mushroom-ready", () => setShown(true), { once: true });
-      // A boot that fails (no WebGL, a lost context) would otherwise leave the
-      // host at opacity 0 forever, so the fade is not allowed to depend solely
-      // on an event that may never arrive.
-      const failsafe = window.setTimeout(() => setShown(true), 4000);
-      element.addEventListener("mushroom-ready", () => window.clearTimeout(failsafe), { once: true });
-      host.appendChild(element);
-    });
+    const stop = (resetShown: boolean) => {
+      generation += 1;
+      if (failsafe !== undefined) window.clearTimeout(failsafe);
+      failsafe = undefined;
+      element?.remove();
+      element = null;
+      if (resetShown) setShown(false);
+    };
+    const start = () => {
+      if (element) return;
+      const currentGeneration = ++generation;
+      void loadMushroomStage().then(({ defineMushroomStage }) => {
+        // Width changes and StrictMode unmounts can happen while the large
+        // renderer is still downloading. Only the latest desktop request mounts.
+        if (cancelled || mobile.matches || currentGeneration !== generation) return;
+        defineMushroomStage();
+        element = document.createElement("mushroom-stage");
+        element.setAttribute("variant", "hero");
+        element.setAttribute("accent", "#c9976a");
+        element.setAttribute("spores", reduceMotion ? "off" : "on");
+        element.setAttribute("motion", reduceMotion ? "off" : "full");
+        element.setAttribute("scale", "1");
+        element.style.cssText = "width:100%;height:100%;display:block;";
+        const show = () => {
+          if (currentGeneration !== generation) return;
+          if (failsafe !== undefined) window.clearTimeout(failsafe);
+          failsafe = undefined;
+          setShown(true);
+        };
+        element.addEventListener("mushroom-ready", show, { once: true });
+        // A failed WebGL boot must not leave the host transparent forever.
+        failsafe = window.setTimeout(show, 4000);
+        host.appendChild(element);
+      }).catch(() => {
+        // Decorative rendering can fail independently of the readable hero.
+      });
+    };
+    const syncWidth = () => {
+      if (wantsMushroom()) start();
+      else stop(true);
+    };
+    mobile.addEventListener("change", syncWidth);
+    syncWidth();
 
     return () => {
       cancelled = true;
-      element?.remove();
+      mobile.removeEventListener("change", syncWidth);
+      stop(false);
     };
   }, []);
 

@@ -2,6 +2,12 @@ import websocket from "@fastify/websocket";
 import staticFiles from "@fastify/static";
 import rateLimit from "@fastify/rate-limit";
 import { resolveChatIdempotencyKey, parseIdempotencyKey, waitForChatCapacity } from "./chat-admission.js";
+import {
+  claimSupportAssistantRequest,
+  supportAssistantClientRateKey,
+  supportAssistantRateKey,
+  type SupportAssistantRateState,
+} from "./support-assistant-rate.js";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { createHash, createPublicKey, generateKeyPairSync, randomUUID, timingSafeEqual } from "node:crypto";
 import {
@@ -1640,6 +1646,8 @@ export async function createCoordinator(
   });
   const studioRuntime = new StudioAgentRuntime(database, studioAgents, studioContext, studioInference);
   const supportAssistantRateLimits = new Map<string, SupportAssistantRateState>();
+  const supportAssistantClientRateLimits = new Map<string, SupportAssistantRateState>();
+  const supportAssistantGlobalRateLimits = new Map<string, SupportAssistantRateState>();
   const publicCatalogRateLimits = new Map<string, PublicCatalogRateState>();
   const studioPublicRateLimits = new Map<string, PublicCatalogRateState>();
   let activeSupportAssistantRequests = 0;
@@ -2406,7 +2414,7 @@ export async function createCoordinator(
       maxActiveKeys: apiAccess.limits.maxActiveKeys,
     },
     ...(config.supabaseUrl && config.supabaseAnonKey
-      ? { url: config.supabaseUrl, anonKey: config.supabaseAnonKey }
+      ? { url: config.publicSupabaseUrl ?? config.supabaseUrl, anonKey: config.supabaseAnonKey }
       : {}),
   }));
 
@@ -3822,11 +3830,13 @@ export async function createCoordinator(
         },
       });
     }
-    const releaseRateLimit = claimSupportAssistantRequest(
-      supportAssistantRateLimits,
-      supportAssistantRateKey(request, body.session_id),
+    const releaseClientRateLimit = claimSupportAssistantRequest(
+      supportAssistantClientRateLimits,
+      supportAssistantClientRateKey(request),
+      120,
+      8,
     );
-    if (!releaseRateLimit) {
+    if (!releaseClientRateLimit) {
       return reply.code(429).send({
         error: {
           code: "assistant_rate_limited",
@@ -3834,6 +3844,20 @@ export async function createCoordinator(
         },
       });
     }
+    const releaseRateLimit = claimSupportAssistantRequest(
+      supportAssistantRateLimits,
+      supportAssistantRateKey(request, body.session_id),
+    );
+    if (!releaseRateLimit) {
+      releaseClientRateLimit();
+      return reply.code(429).send({
+        error: {
+          code: "assistant_rate_limited",
+          message: "The mycellios assistant is already handling too many requests. Try again shortly.",
+        },
+      });
+    }
+    let releaseGlobalRateLimit: (() => void) | null = null;
     activeSupportAssistantRequests += 1;
     try {
       const settings = store.getSupportAssistantSettings();
@@ -3854,6 +3878,21 @@ export async function createCoordinator(
             message: settings.modelId
               ? `The configured network model ${settings.modelId} is not connected right now.`
               : "No real mycellios network model is available for support right now.",
+          },
+        });
+      }
+
+      releaseGlobalRateLimit = claimSupportAssistantRequest(
+        supportAssistantGlobalRateLimits,
+        "assistant-global",
+        240,
+        8,
+      );
+      if (!releaseGlobalRateLimit) {
+        return reply.code(429).send({
+          error: {
+            code: "assistant_rate_limited",
+            message: "The mycellios assistant is already handling too many requests. Try again shortly.",
           },
         });
       }
@@ -3979,6 +4018,8 @@ export async function createCoordinator(
     } finally {
       activeSupportAssistantRequests = Math.max(0, activeSupportAssistantRequests - 1);
       releaseRateLimit();
+      releaseClientRateLimit();
+      releaseGlobalRateLimit?.();
     }
   });
 
@@ -5675,7 +5716,7 @@ function publicSnapshot(
       online: workers.filter((worker) => worker.status === "online").length,
       mobile: workers.filter((worker) => worker.kind === "browser").length,
       offeredVramMb: workers.reduce((sum, worker) => sum + worker.offeredVramMb, 0),
-      completedJobs: jobs.filter((job) => job.status === "completed").length,
+      completedJobs: store.countCompletedJobs(),
     },
     workers,
     models: models.map((model) => ({
@@ -5806,52 +5847,6 @@ function mobileDashboardWorker(worker: MobileWorkerSnapshot) {
       verifiedTasks: worker.verifiedTasks,
       residentExperts: worker.residentExperts,
     },
-  };
-}
-
-interface SupportAssistantRateState {
-  windowStartedAt: number;
-  requests: number;
-  active: number;
-}
-
-function supportAssistantRateKey(request: FastifyRequest, sessionId: string): string {
-  const userAgent = request.headers["user-agent"] ?? "unknown";
-  return createHash("sha256")
-    .update(`${request.ip}\n${userAgent}\n${sessionId}`)
-    .digest("hex")
-    .slice(0, 24);
-}
-
-function claimSupportAssistantRequest(
-  states: Map<string, SupportAssistantRateState>,
-  key: string,
-  now = Date.now(),
-): (() => void) | null {
-  const windowMs = 10 * 60_000;
-  const previous = states.get(key);
-  const state = !previous || now - previous.windowStartedAt >= windowMs
-    ? { windowStartedAt: now, requests: 0, active: 0 }
-    : previous;
-  // A reconnect can overlap briefly with the abandoned socket. Two active
-  // attempts let the new request supersede the stale job without opening an
-  // unlimited parallel-inference path for one browser session.
-  if (state.requests >= 24 || state.active >= 2) return null;
-  state.requests += 1;
-  state.active += 1;
-  states.set(key, state);
-  if (states.size > 2_000) {
-    for (const [candidateKey, candidate] of states) {
-      if (now - candidate.windowStartedAt >= windowMs && candidate.active === 0) {
-        states.delete(candidateKey);
-      }
-    }
-  }
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    state.active = Math.max(0, state.active - 1);
   };
 }
 

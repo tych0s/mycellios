@@ -205,14 +205,22 @@ async function apiRequest<T>(
   init: RequestInit = {},
   apiBaseUrl?: string,
 ): Promise<T> {
-  const response = await fetch(apiRequestUrl(path, apiBaseUrl), {
-    ...init,
-    cache: "no-store",
-    headers: {
-      ...init.headers,
-      authorization: `Bearer ${accessToken}`,
-    },
-  });
+  const timeout = AbortSignal.timeout(init.method && init.method !== "GET" ? 30_000 : 15_000);
+  let response: Response;
+  try {
+    response = await fetch(apiRequestUrl(path, apiBaseUrl), {
+      ...init,
+      signal: init.signal ? AbortSignal.any([init.signal, timeout]) : timeout,
+      cache: "no-store",
+      headers: {
+        ...init.headers,
+        authorization: `Bearer ${accessToken}`,
+      },
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === "TimeoutError") throw new Error("The API request timed out. Try again.");
+    throw error;
+  }
   if (response.status === 204) return undefined as T;
   const payload = await response.json().catch(() => null) as {
     error?: { code?: string; message?: string };

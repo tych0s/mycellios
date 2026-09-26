@@ -4,7 +4,7 @@
 .rb-page,.rb-page * { box-sizing:border-box; }
 html { scroll-behavior:smooth; }
 body:has(.rb-page) { margin:0; background:var(--rb-paper); color:var(--rb-ink); }
-.rb-page { --rb-font-display:"Fraunces",serif; --rb-font-body:"Geist",sans-serif; --rb-font-mono:"IBM Plex Mono",monospace; min-width:320px; overflow:clip; background:var(--rb-paper); color:var(--rb-ink); font-family:var(--rb-font-body); }
+.rb-page { --rb-font-display:"Fraunces",serif; --rb-font-body:"Geist",sans-serif; --rb-font-mono:"IBM Plex Mono",monospace; min-width:0; overflow:clip; background:var(--rb-paper); color:var(--rb-ink); font-family:var(--rb-font-body); }
 .rb-shell { width:100%; max-width:calc(var(--rb-content) + var(--rb-gutter) + var(--rb-gutter)); margin-inline:auto; padding-inline:var(--rb-gutter); }
 .rb-page a { color:inherit; text-decoration:none; }
 .rb-page button,.rb-page select { font:inherit; cursor:pointer; }

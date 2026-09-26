@@ -286,7 +286,7 @@ export function benchmarkComparisonNarrative(
   if (comparison.verdict === "within-variation") {
     return {
       eyebrow: "WITHIN VARIATION",
-      title: "No hay una mejora demostrada",
+      title: "No demonstrated improvement",
       description: "The scenario is identical and stable, but the P5–P95 bands overlap. The difference may be normal execution noise.",
     };
   }
@@ -299,7 +299,7 @@ export function benchmarkComparisonNarrative(
   }
   if (comparison.mode === "capacity-change") {
     return {
-      eyebrow: "CAMBIO DE CAPACIDAD",
+      eyebrow: "CAPACITY CHANGE",
       title: "Hardware or topology changed",
       description: "Total speed can still show scaling. Also inspect tok/s per node and GB; this is not a clean code improvement.",
     };
@@ -307,28 +307,28 @@ export function benchmarkComparisonNarrative(
   if (comparison.mode === "configuration-change") {
     return {
       eyebrow: "DIFFERENT CONFIGURATION",
-      title: "Ha cambiado el backend o la carga",
+      title: "Backend or workload changed",
       description: "The model and capacity may match, but the fingerprint does not. Values are shown without attributing the change to code.",
     };
   }
   if (comparison.mode === "different-evidence") {
     return {
-      eyebrow: "EVIDENCIA DISTINTA",
+      eyebrow: "DIFFERENT EVIDENCE",
       title: "Physical and loopback do not mix",
       description: "Real values from each run are shown, but no improvement is calculated between different environments.",
     };
   }
   if (comparison.mode === "different-model") {
     return {
-      eyebrow: "MODELOS DISTINTOS",
+      eyebrow: "DIFFERENT MODELS",
       title: "This selection is not comparable",
       description: "Select a reference from the same model to measure speed and efficiency over time.",
     };
   }
   return {
-    eyebrow: "SIN REFERENCIA",
-    title: "A second run is required",
-    description: "Once another real test exists, you can compare versions, nodes, VRAM, latency and efficiency.",
+    eyebrow: "NO REFERENCE RUN",
+    title: "No comparable reference yet",
+    description: "Repeat the same model and workload with matching physical evidence to compare speed, latency and efficiency.",
   };
 }
 

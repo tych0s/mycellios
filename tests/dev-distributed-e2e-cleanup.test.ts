@@ -28,7 +28,9 @@ describe("distributed development gate cleanup", () => {
     `;
     await expect(promisify(execFile)(process.execPath, [
       "--import", "tsx", "--input-type=module", "--eval", script,
-    ], { timeout: 10_000, windowsHide: true })).rejects.toMatchObject({
+    // The child starts tsx under the full parallel suite; its load time is not
+    // the cleanup deadline being asserted (25 ms inside the child).
+    ], { timeout: 30_000, windowsHide: true })).rejects.toMatchObject({
       code: 2,
       stdout: "drained\n",
       stderr: expect.stringContaining("development_cleanup_timeout:stalled"),

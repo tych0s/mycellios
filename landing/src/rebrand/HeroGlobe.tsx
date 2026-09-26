@@ -100,7 +100,7 @@ export function HeroGlobe() {
     };
     resize();
 
-    const observer = new ResizeObserver(resize);
+    const observer = new ResizeObserver(() => { resize(); render(); });
     observer.observe(canvas);
 
     let rotation = DRIFT_START;
@@ -467,7 +467,11 @@ export function HeroGlobe() {
 
     let frame = 0;
     let previous = performance.now();
+    let inViewport = typeof IntersectionObserver === "undefined";
+    const shouldAnimate = () => document.visibilityState === "visible" && inViewport;
     const loop = (now: number) => {
+      frame = 0;
+      if (!shouldAnimate()) return;
       // Clamped so a backgrounded tab does not resume with a growth jump.
       const delta = Math.min(0.05, Math.max(0, (now - previous) / 1000));
       previous = now;
@@ -477,10 +481,27 @@ export function HeroGlobe() {
       render();
       frame = window.requestAnimationFrame(loop);
     };
-    frame = window.requestAnimationFrame(loop);
+    const updateAnimation = () => {
+      if (!shouldAnimate()) {
+        window.cancelAnimationFrame(frame);
+        frame = 0;
+        return;
+      }
+      previous = performance.now();
+      if (!frame) frame = window.requestAnimationFrame(loop);
+    };
+    const visibilityObserver = typeof IntersectionObserver === "undefined" ? null : new IntersectionObserver((entries) => {
+      inViewport = entries[0]?.isIntersecting ?? false;
+      updateAnimation();
+    });
+    visibilityObserver?.observe(canvas);
+    document.addEventListener("visibilitychange", updateAnimation);
+    updateAnimation();
 
     return () => {
       window.cancelAnimationFrame(frame);
+      visibilityObserver?.disconnect();
+      document.removeEventListener("visibilitychange", updateAnimation);
       observer.disconnect();
     };
   }, []);

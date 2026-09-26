@@ -75,9 +75,8 @@ const identityProxy = () => ({
  *
  * The mushroom chunk is the biggest asset on the page and it is reached through
  * a dynamic `import()`, so the browser cannot know it exists until it has
- * downloaded and parsed the ~200KB entry bundle. Even with the import kicked
- * off at the top of the bootstrap, that is a serial hop the preload scanner
- * could have skipped entirely.
+ * downloaded and parsed the entry bundle. Desktop visitors can start fetching
+ * it while parsing HTML; phones skip it because the hero never mounts there.
  *
  * This injects the preload from a tiny inline script in `<head>`, which runs
  * during HTML parse — before the entry bundle has even finished downloading —
@@ -85,9 +84,8 @@ const identityProxy = () => ({
  *
  * It is a script rather than a plain `<link rel="modulepreload" media="...">`
  * because the preload has to be *conditional* and `media` on `modulepreload` is
- * not reliably honoured across browsers. Every landing viewport now draws the
- * same organism, so the preload is route-conditional but no longer width- or
- * motion-conditional; mobile quality is controlled inside the renderer.
+ * not reliably honoured across browsers. Keep the width gate aligned with
+ * wantsMushroom() so the 3D chunk stays off phones.
  */
 function preloadHeroRenderer() {
   let file: string | null = null;
@@ -102,6 +100,7 @@ function preloadHeroRenderer() {
       const script =
         `<script>(function(){` +
         `if(location.pathname!=="/"&&location.pathname!=="/rebrand"&&location.pathname!=="/rebrand/")return;` +
+        `if(window.matchMedia&&window.matchMedia("(max-width: 700px)").matches)return;` +
         `var l=document.createElement("link");` +
         `l.rel="modulepreload";l.crossOrigin="";l.fetchPriority="high";l.href="/${file}";` +
         `document.head.appendChild(l);` +
@@ -132,7 +131,10 @@ export default defineConfig({
       // `/blog` is server-rendered by the coordinator. Without this explicit
       // proxy the Vite SPA fallback returns the landing document for the blog
       // route, which looks like an empty/broken page in the Dev Runner.
-      "/blog": productionProxy(),
+      "^/blog(?:/|\\?|$)": productionProxy(),
+      // Documentation paths redirect from the coordinator to their canonical
+      // sources; the SPA fallback would silently render the homepage instead.
+      "/docs": productionProxy(),
       "/public": productionProxy(),
       "/v1": productionProxy(),
     },
@@ -147,7 +149,8 @@ export default defineConfig({
       "/v1/auth": identityProxy(),
       "/mobile/v1": productionProxy(true),
       "/local": productionProxy(),
-      "/blog": productionProxy(),
+      "^/blog(?:/|\\?|$)": productionProxy(),
+      "/docs": productionProxy(),
       "/public": productionProxy(),
       "/v1": productionProxy(),
     },

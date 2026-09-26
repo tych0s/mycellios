@@ -21,6 +21,9 @@ describe("landing SEO contract", () => {
     expect(new Set(canonicals).size).toBe(canonicals.length);
     expect(SEO_PAGES["/admin"].robots).toContain("noindex");
     expect(SEO_PAGES["/account"].robots).toContain("noindex");
+    expect(SEO_PAGES["/dashboard"].robots).toContain("noindex");
+    expect(LANDING_SEO_PATHS).toContain("/account");
+    expect(LANDING_SEO_PATHS).toContain("/dashboard");
     for (const path of ["/spore", "/spore/treasury", "/spore/data"] as const) {
       expect(seoPageForPath(path)).toBe(SEO_PAGES[path]);
       expect(SEO_PAGES[path].robots).toContain("noindex");

@@ -44,6 +44,30 @@ describe("coordinator network configuration security", () => {
     expect(config.networkToken).toBeUndefined();
   });
 
+  it("separates the browser Supabase origin from the internal server origin", () => {
+    const environment = {
+      GPU_MESH_DB: ":memory:",
+      MYCELLIOS_SUPABASE_URL: "http://supabase-internal:8443",
+      MYCELLIOS_SUPABASE_SERVICE_ROLE_KEY: "service-role",
+      MYCELLIOS_SUPABASE_ANON_KEY: "public-anon",
+    };
+    expect(loadCoordinatorConfig({
+      ...environment,
+      MYCELLIOS_SUPABASE_PUBLIC_URL: "https://auth.example/",
+    })).toMatchObject({
+      supabaseUrl: "http://supabase-internal:8443",
+      publicSupabaseUrl: "https://auth.example",
+    });
+    expect(() => loadCoordinatorConfig({
+      ...environment,
+      MYCELLIOS_SUPABASE_PUBLIC_URL: "http://auth.example",
+    })).toThrow("MYCELLIOS_SUPABASE_PUBLIC_URL must be an HTTPS origin");
+    expect(() => loadCoordinatorConfig({
+      ...environment,
+      MYCELLIOS_SUPABASE_PUBLIC_URL: "not-a-url",
+    })).toThrow("MYCELLIOS_SUPABASE_PUBLIC_URL must be an HTTPS origin");
+  });
+
   it("allows a public bind only when the network token is present", () => {
     const config = loadCoordinatorConfig({
       GPU_MESH_HOST: " 0.0.0.0 ",

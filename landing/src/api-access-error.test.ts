@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { apiAccessErrorPresentation, apiAccessSessionNeedsRefresh } from "./ApiAccessPanel";
+import { apiAccessErrorPresentation, apiAccessSessionNeedsRefresh, copyApiValue } from "./ApiAccessPanel";
 
 describe("apiAccessErrorPresentation", () => {
   it("explains invalid network tokens and offers re-authentication", () => {
     expect(apiAccessErrorPresentation("invalid_network_token")).toMatchObject({
-      title: "La sesión de API ha caducado",
-      action: "Iniciar sesión",
+      title: "Your API session has expired",
+      action: "Sign in",
       requiresAuth: true,
     });
   });
@@ -23,10 +23,33 @@ describe("apiAccessErrorPresentation", () => {
   });
   it("keeps ordinary API errors actionable", () => {
     expect(apiAccessErrorPresentation("HTTP 503")).toMatchObject({
-      title: "No se pudo comprobar la API",
+      title: "Could not check the API",
       detail: "HTTP 503",
-      action: "Reintentar",
+      action: "Retry",
       requiresAuth: false,
     });
+  });
+  it("offers the right action for key loading and mutations", () => {
+    expect(apiAccessErrorPresentation("HTTP 503", "keys")).toMatchObject({
+      title: "Could not load API keys", action: "Retry",
+    });
+    expect(apiAccessErrorPresentation("HTTP 503", "mutation")).toMatchObject({
+      title: "Could not change the API key", action: "Dismiss",
+    });
+    expect(apiAccessErrorPresentation("invalid_access_token", "keys")).toMatchObject({
+      action: "Sign in", requiresAuth: true,
+    });
+  });
+});
+
+describe("copyApiValue", () => {
+  it("reports successful copying without changing the API key", async () => {
+    let copied = "";
+    expect(await copyApiValue("secret-key", async (text) => { copied = text; })).toBe("copied");
+    expect(copied).toBe("secret-key");
+  });
+
+  it("reports clipboard denial so the user can copy the visible key manually", async () => {
+    expect(await copyApiValue("secret-key", async () => { throw new Error("denied"); })).toBe("failed");
   });
 });

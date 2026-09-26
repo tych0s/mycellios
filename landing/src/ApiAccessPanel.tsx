@@ -11,7 +11,7 @@ import {
   Trash2,
   Wifi,
 } from "lucide-react";
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
   createApiKey,
   loadApiKeys,
@@ -44,10 +44,13 @@ export function ApiAccessPanel({
 }: ApiAccessPanelProps) {
   const [open, setOpen] = useState(false);
   const [keys, setKeys] = useState<ApiKeySummary[]>([]);
+  const [keysLoaded, setKeysLoaded] = useState(false);
+  const keysRequestSeq = useRef(0);
   const [name, setName] = useState("My application");
   const [created, setCreated] = useState<CreatedApiKey | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [errorSource, setErrorSource] = useState<"connection" | "keys" | "mutation">("connection");
   const [connection, setConnection] = useState<"idle" | "testing" | "ready" | "empty" | "failed">("idle");
   const [keysPage, setKeysPage] = useState(0);
   const keysPageSize = TABLE_PAGE_SIZE;
@@ -60,7 +63,7 @@ export function ApiAccessPanel({
     {
       label: "API ENDPOINT",
       value: normalizedBase,
-      help: "OpenAI-compatible endpoint ready to configure in a client.",
+      help: "Use this base URL in an OpenAI-compatible client.",
     },
     {
       label: "EXPORT BASE URL",
@@ -88,17 +91,27 @@ export function ApiAccessPanel({
     }
   }
 
-  useEffect(() => {
-    if (!open || !accessToken) return;
-    let cancelled = false;
+  async function reloadKeys() {
+    if (!accessToken) return;
+    const requestSeq = ++keysRequestSeq.current;
     setBusy(true);
+    setKeys([]);
+    setKeysLoaded(false);
     setError(null);
-    void withCurrentSession((token) => loadApiKeys(token, apiBaseUrl))
-      .then((next) => { if (!cancelled) setKeys(next); })
-      .catch((caught) => { if (!cancelled) setError(errorText(caught)); })
-      .finally(() => { if (!cancelled) setBusy(false); });
-    return () => { cancelled = true; };
-  }, [accessToken, open]);
+    try {
+      const next = await withCurrentSession((token) => loadApiKeys(token, apiBaseUrl));
+      if (keysRequestSeq.current === requestSeq) { setKeys(next); setKeysLoaded(true); }
+    } catch (caught) {
+      if (keysRequestSeq.current === requestSeq) { setErrorSource("keys"); setError(errorText(caught)); }
+    } finally {
+      if (keysRequestSeq.current === requestSeq) setBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    if (open && accessToken) void reloadKeys();
+    return () => { keysRequestSeq.current += 1; };
+  }, [accessToken, apiBaseUrl, open]);
 
   useEffect(() => setKeysPage(0), [keys.length]);
 
@@ -113,6 +126,7 @@ export function ApiAccessPanel({
       const payload = await withCurrentSession(async (token) => {
         const response = await fetch(`${normalizedBase}/models`, {
           cache: "no-store",
+          signal: AbortSignal.timeout(12_000),
           headers: { authorization: `Bearer ${token}` },
         });
         const body = await response.json().catch(() => null) as {
@@ -125,6 +139,7 @@ export function ApiAccessPanel({
       setConnection((payload?.data?.length ?? 0) > 0 ? "ready" : "empty");
     } catch (caught) {
       setConnection("failed");
+      setErrorSource("connection");
       setError(errorText(caught));
     }
   }
@@ -140,6 +155,7 @@ export function ApiAccessPanel({
       setKeys((current) => [next, ...current]);
       setName("My application");
     } catch (caught) {
+      setErrorSource("mutation");
       setError(errorText(caught));
     } finally {
       setBusy(false);
@@ -156,6 +172,7 @@ export function ApiAccessPanel({
         key.id === keyId ? { ...key, revoked_at: new Date().toISOString() } : key
       ));
     } catch (caught) {
+      setErrorSource("mutation");
       setError(errorText(caught));
     } finally {
       setBusy(false);
@@ -163,8 +180,8 @@ export function ApiAccessPanel({
   }
 
   const live = availableModels > 0;
-  const targetLabel = live ? "API TARGET READY" : "API TARGET WAITING";
-  const errorPresentation = error ? apiAccessErrorPresentation(error) : null;
+  const targetLabel = live ? "MODEL AVAILABLE" : "NO MODEL ONLINE";
+  const errorPresentation = error ? apiAccessErrorPresentation(error, errorSource) : null;
   return <section className={`api-access-panel${open ? " open" : ""}`}>
     <button className="api-access-summary" type="button" onClick={() => setOpen((current) => !current)} aria-expanded={open}>
       <span className={`api-target-state${live ? " ready" : ""}`}><i />{targetLabel}</span>
@@ -175,7 +192,7 @@ export function ApiAccessPanel({
     {open && <div className="api-access-body">
       <header>
         <div className="api-access-icon"><PlugZap /></div>
-        <div><span>OPENAI-COMPATIBLE</span><h2>Connect mycellios to your applications</h2><p>Use the same client format while requests run on the mycellios network.</p></div>
+        <div><span>OPENAI-COMPATIBLE</span><h2>Connect mycellios to your applications</h2><p>Use an OpenAI-compatible client. Requests run through the network when a model is connected.</p></div>
       </header>
 
       {!enabled && <div className="api-access-notice"><CircleAlert /><span><strong>Account access is not configured</strong>The local coordinator keeps the API available, but public keys require the account service.</span></div>}
@@ -217,7 +234,7 @@ export function ApiAccessPanel({
         </form>
         <div className="api-key-list">
           {busy && keys.length === 0 && <div className="api-key-empty"><LoaderCircle className="spin" />Loading keys…</div>}
-          {!busy && keys.length === 0 && <div className="api-key-empty"><KeyRound />You do not have any keys yet.</div>}
+          {!busy && keys.length === 0 && <div className="api-key-empty"><KeyRound />{keysLoaded ? "You do not have any keys yet." : "API keys could not be loaded."}</div>}
           {visibleKeys.map((key) => <div className={`api-key-row${key.revoked_at ? " revoked" : ""}`} key={key.id}>
             <KeyRound />
             <span><strong>{key.name}</strong><code>{key.prefix}••••••••</code></span>
@@ -230,7 +247,7 @@ export function ApiAccessPanel({
       {errorPresentation && <div className="api-access-error" role="alert">
         <CircleAlert />
         <span><strong>{errorPresentation.title}</strong><small>{errorPresentation.detail}</small></span>
-        <button type="button" onClick={() => { setError(null); if (errorPresentation.requiresAuth) onSignIn(); else void testConnection(); }}>
+        <button type="button" onClick={() => { setError(null); if (errorPresentation.requiresAuth) onSignIn(); else if (errorSource === "keys") void reloadKeys(); else if (errorSource === "connection") void testConnection(); }}>
           {errorPresentation.action}
         </button>
       </div>}
@@ -239,13 +256,19 @@ export function ApiAccessPanel({
 }
 
 function CopyButton({ value, label = "Copy" }: { value: string; label?: string }) {
-  const [copied, setCopied] = useState(false);
+  const [status, setStatus] = useState<"idle" | "copied" | "failed">("idle");
+  const resetTimer = useRef<number | null>(null);
+  useEffect(() => () => { if (resetTimer.current !== null) window.clearTimeout(resetTimer.current); }, []);
   async function copy() {
-    await navigator.clipboard.writeText(value);
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1_500);
+    if (resetTimer.current !== null) window.clearTimeout(resetTimer.current);
+    setStatus(await copyApiValue(value));
+    resetTimer.current = window.setTimeout(() => setStatus("idle"), 2_500);
   }
-  return <button type="button" className="api-copy-button" onClick={() => void copy()}>{copied ? <Check /> : <Clipboard />}{copied ? "Copied" : label}</button>;
+  return <button type="button" className={`api-copy-button${status === "failed" ? " failed" : ""}`} aria-live="polite" title={status === "failed" ? "Select the text and copy it manually." : undefined} onClick={() => void copy()}>{status === "copied" ? <Check /> : status === "failed" ? <CircleAlert /> : <Clipboard />}{status === "copied" ? "Copied" : status === "failed" ? "Copy failed" : label}</button>;
+}
+
+export async function copyApiValue(value: string, writeText = (text: string) => navigator.clipboard.writeText(text)): Promise<"copied" | "failed"> {
+  try { await writeText(value); return "copied"; } catch { return "failed"; }
 }
 
 function formatTokens(value: number): string {
@@ -280,20 +303,19 @@ export interface ApiAccessErrorPresentation {
   requiresAuth: boolean;
 }
 
-export function apiAccessErrorPresentation(message: string): ApiAccessErrorPresentation {
-  const normalized = message.toLowerCase();
-  if (normalized.includes("invalid_network_token") || normalized.includes("invalid network token")) {
+export function apiAccessErrorPresentation(message: string, source: "connection" | "keys" | "mutation" = "connection"): ApiAccessErrorPresentation {
+  if (apiAccessSessionNeedsRefresh(new Error(message))) {
     return {
-      title: "La sesión de API ha caducado",
-      detail: "La credencial de esta sesión ya no es válida. Inicia sesión de nuevo para comprobar la conexión y administrar tus claves.",
-      action: "Iniciar sesión",
+      title: "Your API session has expired",
+      detail: "This session credential is no longer valid. Sign in again to check the connection and manage your keys.",
+      action: "Sign in",
       requiresAuth: true,
     };
   }
   return {
-    title: "No se pudo comprobar la API",
-    detail: message || "El endpoint no ha podido confirmar su estado.",
-    action: "Reintentar",
+    title: source === "keys" ? "Could not load API keys" : source === "mutation" ? "Could not change the API key" : "Could not check the API",
+    detail: message || "The endpoint could not confirm its status.",
+    action: source === "mutation" ? "Dismiss" : "Retry",
     requiresAuth: false,
   };
 }

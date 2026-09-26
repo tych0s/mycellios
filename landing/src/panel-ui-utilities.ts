@@ -37,9 +37,16 @@ export function shortFingerprint(value: string): string {
 }
 export function formatMemory(value: number): string { return value >= 1_024 ? `${(value / 1_024).toFixed(value >= 10_240 ? 0 : 1)} GB` : `${Math.round(value)} MB`; }
 export function relativeTime(value: string, now = Date.now()): string {
-  const seconds = Math.max(0, Math.floor((now - new Date(value).getTime()) / 1_000));
+  const timestamp = new Date(value).getTime();
+  if (!Number.isFinite(timestamp)) return "Unknown";
+  const seconds = Math.max(0, Math.floor((now - timestamp) / 1_000));
   if (seconds < 5) return "now"; if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60); return minutes < 60 ? `${minutes}m ago` : `${Math.floor(minutes / 60)}h ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return days < 30 ? `${days}d ago` : new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric" }).format(timestamp);
 }
 export function relativeTimeEs(value: string, now = Date.now()): string {
   const seconds = Math.max(0, Math.floor((now - new Date(value).getTime()) / 1_000));

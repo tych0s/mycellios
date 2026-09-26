@@ -1,6 +1,9 @@
 const SESSION_KEY = "mycellios.auth.session";
+const OAUTH_STATE_KEY = "mycellios.auth.oauth-state";
+const OAUTH_STATE_PARAM = "mycellios_oauth_state";
+const OAUTH_STATE_MAX_AGE_MS = 10 * 60_000;
 const SESSION_REFRESH_MARGIN_MS = 90_000;
-let refreshInFlight: Promise<AuthSession> | null = null;
+const refreshInFlight = new Map<string, Promise<AuthSession>>();
 
 export interface PublicAuthConfig {
   enabled: boolean;
@@ -10,6 +13,7 @@ export interface PublicAuthConfig {
     email: boolean;
     google: boolean;
     twitter: boolean;
+    web3?: boolean;
   };
   apiAccessEnabled?: boolean;
   publicApiBaseUrl?: string;
@@ -34,17 +38,46 @@ export interface NetworkIdentity {
   role: "owner" | "admin" | "operator" | "viewer" | null;
 }
 
+export class AuthServiceError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "AuthServiceError";
+  }
+}
+
+export class EmailConfirmationRequired extends Error {
+  constructor() {
+    super("Check your email to confirm the account, then sign in.");
+    this.name = "EmailConfirmationRequired";
+  }
+}
+
+export function isDefinitiveAuthFailure(error: unknown): boolean {
+  return error instanceof AuthServiceError
+    && error.status >= 400 && error.status < 500
+    && error.status !== 408 && error.status !== 429;
+}
+
+export function sessionSurvivesRefreshFailure(session: Pick<AuthSession, "expiresAt">, error: unknown, now = Date.now()): boolean {
+  return session.expiresAt > now && !isDefinitiveAuthFailure(error);
+}
+
 export type OAuthProvider = "google" | "twitter";
 
-export async function loadAuthConfig(): Promise<PublicAuthConfig> {
-  const response = await fetch("/public/v1/auth-config", { cache: "no-store" });
+export async function loadAuthConfig(resolveProviders = true): Promise<PublicAuthConfig> {
+  const response = await fetch("/public/v1/auth-config", { cache: "no-store", signal: AbortSignal.timeout(10_000) });
   if (!response.ok) return { enabled: false };
   const config = await response.json() as PublicAuthConfig;
+  return resolveProviders ? loadAuthProviders(config) : config;
+}
+
+export async function loadAuthProviders(config: PublicAuthConfig): Promise<PublicAuthConfig> {
   if (!config.enabled || !config.url || !config.anonKey) return config;
   try {
     const settingsUrl = new URL("/auth/v1/settings", config.url);
     const settingsResponse = await fetch(settingsUrl, {
       cache: "no-store",
+      signal: AbortSignal.timeout(6_000),
       headers: {
         apikey: config.anonKey,
         authorization: `Bearer ${config.anonKey}`,
@@ -60,6 +93,7 @@ export async function loadAuthConfig(): Promise<PublicAuthConfig> {
         email: settings.external?.email !== false,
         google: settings.external?.google === true,
         twitter: settings.external?.twitter === true,
+        web3: config.providers?.web3 === true,
       },
     };
   } catch {
@@ -83,10 +117,21 @@ export async function restoreAuthSession(config: PublicAuthConfig): Promise<Auth
   if (!current || !config.enabled || !config.url || !config.anonKey) return null;
   if (current.expiresAt > Date.now() + SESSION_REFRESH_MARGIN_MS) return current;
   try {
-    return await refreshAuthSession(config, current);
-  } catch {
-    clearAuthSession();
-    return null;
+    const refreshed = await refreshAuthSession(config, current);
+    const stored = storedAuthSession();
+    return stored?.refreshToken === refreshed.refreshToken
+      ? refreshed
+      : stored && stored.expiresAt > Date.now() ? stored : null;
+  } catch (error) {
+    const stored = storedAuthSession();
+    if (stored?.refreshToken !== current.refreshToken) {
+      return stored && stored.expiresAt > Date.now() ? stored : null;
+    }
+    if (isDefinitiveAuthFailure(error)) {
+      clearAuthSession();
+      return null;
+    }
+    return sessionSurvivesRefreshFailure(current, error) ? current : null;
   }
 }
 
@@ -104,12 +149,15 @@ export async function refreshAuthSession(
     ? stored
     : session;
   if (!force && !authSessionNeedsRefresh(freshest)) return freshest;
-  if (!refreshInFlight) {
-    refreshInFlight = authRequest(config, "/auth/v1/token?grant_type=refresh_token", {
-      refresh_token: freshest.refreshToken,
-    }).finally(() => { refreshInFlight = null; });
-  }
-  return refreshInFlight;
+  const pending = refreshInFlight.get(freshest.refreshToken);
+  if (pending) return pending;
+  const request = authRequest(config, "/auth/v1/token?grant_type=refresh_token", {
+    refresh_token: freshest.refreshToken,
+  }, freshest.refreshToken).finally(() => {
+    if (refreshInFlight.get(freshest.refreshToken) === request) refreshInFlight.delete(freshest.refreshToken);
+  });
+  refreshInFlight.set(freshest.refreshToken, request);
+  return request;
 }
 
 export async function validAuthSession(
@@ -155,7 +203,7 @@ export function signInWithOAuth(config: PublicAuthConfig, provider: OAuthProvide
   assertOAuthProviderEnabled(config, provider);
   const authorizeUrl = new URL("/auth/v1/authorize", config.url);
   authorizeUrl.searchParams.set("provider", provider);
-  authorizeUrl.searchParams.set("redirect_to", `${window.location.origin}${window.location.pathname}${window.location.search}`);
+  authorizeUrl.searchParams.set("redirect_to", oauthRedirectTarget());
   window.location.assign(authorizeUrl);
 }
 
@@ -176,21 +224,26 @@ export async function linkOAuthIdentity(
   assertOAuthProviderEnabled(config, provider);
   const authorizeUrl = new URL("/auth/v1/user/identities/authorize", config.url);
   authorizeUrl.searchParams.set("provider", provider);
-  authorizeUrl.searchParams.set("redirect_to", `${window.location.origin}${window.location.pathname}${window.location.search}`);
+  authorizeUrl.searchParams.set("redirect_to", oauthRedirectTarget());
   authorizeUrl.searchParams.set("skip_http_redirect", "true");
-  const response = await fetch(authorizeUrl, {
-    cache: "no-store",
-    headers: {
-      apikey: config.anonKey,
-      authorization: `Bearer ${session.accessToken}`,
-    },
-  });
-  const payload = await response.json().catch(() => null) as { url?: unknown; message?: unknown; error_description?: unknown } | null;
-  if (!response.ok || typeof payload?.url !== "string") {
-    const message = payload?.message ?? payload?.error_description;
-    throw new Error(typeof message === "string" ? message : `Could not link ${provider} (HTTP ${response.status}).`);
+  try {
+    const response = await authTimedFetch(authorizeUrl, {
+      cache: "no-store",
+      headers: {
+        apikey: config.anonKey,
+        authorization: `Bearer ${session.accessToken}`,
+      },
+    }, 15_000, "Account linking");
+    const payload = await response.json().catch(() => null) as { url?: unknown; message?: unknown; error_description?: unknown } | null;
+    if (!response.ok || typeof payload?.url !== "string") {
+      const message = payload?.message ?? payload?.error_description;
+      throw new Error(typeof message === "string" ? message : `Could not link ${provider} (HTTP ${response.status}).`);
+    }
+    window.location.assign(safeOAuthLink(payload.url, config.url));
+  } catch (error) {
+    window.sessionStorage.removeItem(OAUTH_STATE_KEY);
+    throw error;
   }
-  window.location.assign(payload.url);
 }
 
 export async function signInWithMetaMask(config: PublicAuthConfig): Promise<AuthSession> {
@@ -230,9 +283,12 @@ export async function signInWithMetaMask(config: PublicAuthConfig): Promise<Auth
 export async function loadNetworkIdentity(accessToken: string): Promise<NetworkIdentity> {
   const response = await fetch("/v1/auth/me", {
     cache: "no-store",
+    signal: AbortSignal.timeout(10_000),
     headers: { authorization: `Bearer ${accessToken}` },
   });
-  if (!response.ok) throw new Error("Your Mycellios session is no longer valid.");
+  if (!response.ok) throw new Error(response.status === 401 || response.status === 403
+    ? "Your Mycellios session is no longer valid."
+    : `Network permissions could not be verified (HTTP ${response.status}).`);
   const body = await response.json() as { user: NetworkIdentity };
   return body.user;
 }
@@ -242,6 +298,7 @@ export async function signOut(config: PublicAuthConfig, session: AuthSession): P
   if (!config.url || !config.anonKey) return;
   await fetch(new URL("/auth/v1/logout", config.url), {
     method: "POST",
+    signal: AbortSignal.timeout(8_000),
     headers: {
       apikey: config.anonKey,
       authorization: `Bearer ${session.accessToken}`,
@@ -275,7 +332,7 @@ export async function verifyTotpStepUp(
 ): Promise<AuthSession> {
   assertAuthConfig(config);
   const headers = { apikey: config.anonKey, authorization: `Bearer ${session.accessToken}`, "content-type": "application/json" };
-  const factorsResponse = await fetch(new URL("/auth/v1/factors", config.url), { headers, cache: "no-store" });
+  const factorsResponse = await authTimedFetch(new URL("/auth/v1/factors", config.url), { headers, cache: "no-store" }, 10_000, "MFA factor lookup");
   const factorsPayload = await factorsResponse.json().catch(() => null) as {
     totp?: Array<{ id?: unknown; status?: unknown }>;
     all?: Array<{ id?: unknown; factor_type?: unknown; status?: unknown }>;
@@ -285,16 +342,16 @@ export async function verifyTotpStepUp(
   const factor = factorsPayload?.totp?.find((candidate) => candidate.status === "verified")
     ?? factorsPayload?.all?.find((candidate) => candidate.factor_type === "totp" && candidate.status === "verified");
   if (typeof factor?.id !== "string") throw new Error("No verified TOTP factor is enrolled for this account.");
-  const challengeResponse = await fetch(new URL(`/auth/v1/factors/${encodeURIComponent(factor.id)}/challenge`, config.url), {
+  const challengeResponse = await authTimedFetch(new URL(`/auth/v1/factors/${encodeURIComponent(factor.id)}/challenge`, config.url), {
     method: "POST", headers, body: "{}",
-  });
+  }, 15_000, "MFA challenge");
   const challenge = await challengeResponse.json().catch(() => null) as { id?: unknown; message?: unknown } | null;
   if (!challengeResponse.ok || typeof challenge?.id !== "string") {
     throw new Error(authPayloadMessage(challenge, "Could not start MFA verification."));
   }
-  const verifyResponse = await fetch(new URL(`/auth/v1/factors/${encodeURIComponent(factor.id)}/verify`, config.url), {
+  const verifyResponse = await authTimedFetch(new URL(`/auth/v1/factors/${encodeURIComponent(factor.id)}/verify`, config.url), {
     method: "POST", headers, body: JSON.stringify({ challenge_id: challenge.id, code: code.trim() }),
-  });
+  }, 20_000, "MFA verification");
   const verified = await verifyResponse.json().catch(() => null) as {
     access_token?: unknown; refresh_token?: unknown; expires_in?: unknown; message?: unknown;
   } | null;
@@ -315,7 +372,27 @@ function authPayloadMessage(payload: { message?: unknown } | null, fallback: str
   return typeof payload?.message === "string" ? payload.message : fallback;
 }
 
-function clearAuthSession(): void {
+async function authTimedFetch(input: RequestInfo | URL, init: RequestInit, timeoutMs: number, label: string): Promise<Response> {
+  try { return await fetch(input, { ...init, signal: AbortSignal.timeout(timeoutMs) }); }
+  catch (error) {
+    if (error instanceof Error && error.name === "TimeoutError") throw new Error(`${label} took too long. Try again.`);
+    throw error;
+  }
+}
+
+function safeOAuthLink(value: string, authOrigin: string): string {
+  let destination: URL;
+  try { destination = new URL(value); }
+  catch { throw new Error("The identity provider returned an invalid link."); }
+  const auth = new URL(authOrigin);
+  const localAuth = destination.origin === auth.origin && ["localhost", "127.0.0.1", "[::1]"].includes(destination.hostname);
+  if ((destination.protocol !== "https:" && !(destination.protocol === "http:" && localAuth)) || destination.username || destination.password) {
+    throw new Error("The identity provider returned an unsafe link.");
+  }
+  return destination.toString();
+}
+
+export function clearAuthSession(): void {
   window.localStorage.removeItem(SESSION_KEY);
 }
 
@@ -331,19 +408,42 @@ function assertOAuthProviderEnabled(config: PublicAuthConfig, provider: OAuthPro
   }
 }
 
+function oauthRedirectTarget(): string {
+  const state = [...crypto.getRandomValues(new Uint8Array(16))]
+    .map((value) => value.toString(16).padStart(2, "0"))
+    .join("");
+  window.sessionStorage.setItem(OAUTH_STATE_KEY, JSON.stringify({ state, startedAt: Date.now() }));
+  const redirect = new URL(`${window.location.pathname}${window.location.search}`, window.location.origin);
+  redirect.searchParams.set(OAUTH_STATE_PARAM, state);
+  return redirect.toString();
+}
+
 async function consumeOAuthRedirect(config: PublicAuthConfig): Promise<AuthSession | null> {
   if (!window.location.hash.includes("access_token=") && !window.location.hash.includes("error=")) return null;
   const params = new URLSearchParams(window.location.hash.slice(1));
   const oauthError = params.get("error_description") ?? params.get("error");
-  window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+  const query = new URLSearchParams(window.location.search);
+  const returnedState = query.get(OAUTH_STATE_PARAM);
+  query.delete(OAUTH_STATE_PARAM);
+  window.history.replaceState(null, "", `${window.location.pathname}${query.size > 0 ? `?${query}` : ""}`);
+  const savedState = window.sessionStorage.getItem(OAUTH_STATE_KEY);
+  window.sessionStorage.removeItem(OAUTH_STATE_KEY);
+  let initiated = false;
+  try {
+    const pending = JSON.parse(savedState ?? "null") as { state?: unknown; startedAt?: unknown } | null;
+    initiated = typeof pending?.state === "string" && pending.state === returnedState
+      && typeof pending.startedAt === "number" && Date.now() - pending.startedAt >= 0
+      && Date.now() - pending.startedAt <= OAUTH_STATE_MAX_AGE_MS;
+  } catch { /* Ignore an invalid or stale browser state. */ }
+  if (!initiated) return null;
   if (oauthError) throw new Error(oauthError);
   assertAuthConfig(config);
   const accessToken = params.get("access_token");
   const refreshToken = params.get("refresh_token");
   if (!accessToken || !refreshToken) throw new Error("The identity provider did not return a valid Mycellios session.");
-  const response = await fetch(new URL("/auth/v1/user", config.url), {
+  const response = await authTimedFetch(new URL("/auth/v1/user", config.url), {
     headers: { apikey: config.anonKey, authorization: `Bearer ${accessToken}` },
-  });
+  }, 10_000, "Identity verification");
   const user = await response.json().catch(() => null) as { id?: unknown; email?: unknown } | null;
   if (!response.ok || typeof user?.id !== "string") throw new Error("The identity provider returned an invalid Mycellios identity.");
   const session: AuthSession = {
@@ -360,13 +460,23 @@ async function authRequest(
   config: PublicAuthConfig,
   path: string,
   body: Record<string, string>,
+  expectedRefreshToken?: string,
 ): Promise<AuthSession> {
   assertAuthConfig(config);
-  const response = await fetch(new URL(path, config.url), {
-    method: "POST",
-    headers: { apikey: config.anonKey, "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  let response: Response;
+  try {
+    response = await fetch(new URL(path, config.url), {
+      method: "POST",
+      headers: { apikey: config.anonKey, "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(20_000),
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === "TimeoutError") {
+      throw new Error("The account service did not respond. Try again.");
+    }
+    throw error;
+  }
   const payload = await response.json().catch(() => null) as {
     access_token?: unknown;
     refresh_token?: unknown;
@@ -378,14 +488,17 @@ async function authRequest(
   } | null;
   if (!response.ok) {
     const message = payload?.msg ?? payload?.message ?? payload?.error_description;
-    throw new Error(typeof message === "string" ? message : `Authentication failed (HTTP ${response.status}).`);
+    throw new AuthServiceError(typeof message === "string" ? message : `Authentication failed (HTTP ${response.status}).`, response.status);
   }
   if (
     typeof payload?.access_token !== "string"
     || typeof payload.refresh_token !== "string"
     || typeof payload.user?.id !== "string"
   ) {
-    throw new Error("Check your email to confirm the account, then sign in.");
+    if (path === "/auth/v1/signup" && typeof payload?.user?.id === "string") {
+      throw new EmailConfirmationRequired();
+    }
+    throw new Error("The account service returned an incomplete session. Try again.");
   }
   const session: AuthSession = {
     accessToken: payload.access_token,
@@ -398,7 +511,9 @@ async function authRequest(
       email: typeof payload.user.email === "string" ? payload.user.email : null,
     },
   };
-  window.localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+  if (!expectedRefreshToken || storedAuthSession()?.refreshToken === expectedRefreshToken) {
+    window.localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+  }
   return session;
 }
 

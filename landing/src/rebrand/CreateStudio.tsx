@@ -23,7 +23,8 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent } from "react";
 import { loadAuthConfig, restoreAuthSession, type AuthSession } from "../auth";
-import { saveStudioDraft, publishStudioAgent, type SavedStudioAgent } from "./studio-api";
+import type { SavedStudioAgent } from "./studio-api";
+import { loadStudioContinuity, saveStudioContinuity } from "./studio-continuity";
 import {
   STUDIO_TEMPLATES,
   draftFromTemplate,
@@ -85,11 +86,18 @@ export function CreateStudio() {
   const [session, setSession] = useState<AuthSession | null>(null);
   const [remoteAgent, setRemoteAgent] = useState<SavedStudioAgent | null>(null);
   const [remoteStatus, setRemoteStatus] = useState<string | null>(null);
+  const [remoteError, setRemoteError] = useState(false);
+  const [remoteMissing, setRemoteMissing] = useState(false);
   const [remoteBusy, setRemoteBusy] = useState(false);
   const publishing = useRef(false);
+  const nameField = useRef<HTMLInputElement>(null);
+  const roleField = useRef<HTMLInputElement>(null);
+  const instructionsField = useRef<HTMLTextAreaElement>(null);
   const currentDraft = useRef(draft);
   currentDraft.current = draft;
   const completion = useMemo(() => studioCompletion(draft), [draft]);
+  const continuity = session ? loadStudioContinuity(session.user.id) : null;
+  const identityReady = Boolean(draft.name.trim() && draft.role.trim() && draft.instructions.trim());
 
   useEffect(() => {
     setSaved(false);
@@ -102,19 +110,52 @@ export function CreateStudio() {
   }, [draft]);
 
   useEffect(() => {
+    const saveBeforeLeaving = () => { persistLocalStudioDraft(currentDraft.current); };
+    window.addEventListener("pagehide", saveBeforeLeaving);
+    return () => window.removeEventListener("pagehide", saveBeforeLeaving);
+  }, []);
+
+  useEffect(() => {
     let active = true;
-    void loadAuthConfig().then(restoreAuthSession).then((value) => { if (active) setSession(value); }).catch(() => undefined);
+    void loadAuthConfig(false).then(restoreAuthSession).then(async (value) => {
+      if (!active) return;
+      setSession(value);
+      if (!value) return;
+      const continuity = loadStudioContinuity(value.user.id);
+      if (continuity.agentId) {
+        try {
+          const { loadStudioAgent } = await import("./studio-api");
+          const agent = await loadStudioAgent(value, continuity.agentId);
+          if (active) {
+            setRemoteAgent(agent);
+            if (continuity.publish) setRemoteStatus("A previous publication needs confirmation. Confirm it before sending new changes.");
+          }
+        } catch (error) {
+          if (active) {
+            setRemoteMissing(isMissingStudioAgent(error));
+            setRemoteStatus(isMissingStudioAgent(error)
+              ? "Your saved agent was not found in this account. You can start a new one from this local draft."
+              : "Could not check your existing Studio agent. Retry to check before publishing.");
+            setRemoteError(true);
+          }
+        }
+      } else if (continuity.create && active) {
+        setRemoteStatus("An earlier import was not confirmed. Retry to check it before publishing.");
+      }
+    }).catch(() => undefined);
     return () => { active = false; };
   }, []);
 
   function update(patch: Partial<StudioDraft>) {
     setDraft((current) => ({ ...current, ...patch }));
     setRemoteStatus(remoteAgent ? "Draft changed · publish to apply updates" : null);
+    setRemoteError(false);
   }
 
   function chooseTemplate(id: StudioTemplateId) {
     setDraft(draftFromTemplate(id));
     setRemoteStatus(remoteAgent ? "Draft changed · publish to apply updates" : null);
+    setRemoteError(false);
     setConversation([{ role: "agent", text: `Template loaded. I am ready to become ${draftFromTemplate(id).name}.` }]);
     setTemplateOpen(false);
   }
@@ -149,21 +190,80 @@ export function CreateStudio() {
     setDraft(fresh);
     setConversation([{ role: "agent", text: "Draft reset. Choose a template or shape this identity from scratch." }]);
     setTemplateOpen(true);
+    setRemoteStatus(remoteAgent ? "Local draft reset. Your published agent is unchanged." : null);
+    setRemoteError(false);
+  }
+
+  function forgetMissingAgent() {
+    if (!session) return;
+    if (!saveStudioContinuity(session.user.id, {})) setStorageFailed(true);
     setRemoteAgent(null);
-    setRemoteStatus(null);
+    setRemoteMissing(false);
+    setRemoteError(false);
+    setRemoteStatus("Saved link cleared. Your local draft is ready to import as a new agent.");
+  }
+
+  function completeIdentity() {
+    setTemplateOpen(false);
+    setActiveStep("identity");
+    window.requestAnimationFrame(() => {
+      if (!draft.name.trim()) nameField.current?.focus();
+      else if (!draft.role.trim()) roleField.current?.focus();
+      else instructionsField.current?.focus();
+    });
   }
 
   async function saveAndPublish() {
     if (!session || publishing.current) return;
+    if (!identityReady && !continuity?.publish) { completeIdentity(); return; }
     publishing.current = true;
-    setRemoteBusy(true); setRemoteStatus(null);
+    setRemoteBusy(true); setRemoteStatus(null); setRemoteError(false);
     try {
-      const agent = await saveStudioDraft(session, draft, remoteAgent, `import-${crypto.randomUUID()}`);
-      setRemoteAgent(agent);
-      const result = await publishStudioAgent(session, agent, draft.channel, `publish-${crypto.randomUUID()}`);
+      const { importStudioDraft, loadStudioAgent, saveStudioDraft, publishStudioAgent, studioAgentMatchesDraft } = await import("./studio-api");
+      const ownerId = session.user.id;
+      let continuity = loadStudioContinuity(ownerId);
+      let agent = remoteAgent;
+      if (continuity.agentId && agent?.id !== continuity.agentId) {
+        agent = await loadStudioAgent(session, continuity.agentId);
+        setRemoteAgent(agent);
+      }
+      if (continuity.publish) {
+        const pending = continuity.publish;
+        if (!agent || agent.id !== pending.agentId) throw new Error("Could not verify the pending publication. Reload Studio and try again.");
+        const confirmed = await publishStudioAgent(session, { ...agent, draftVersion: pending.draftVersion }, pending.channel, pending.key);
+        continuity = { ...continuity, agentId: confirmed.agent.id, publish: undefined };
+        if (!saveStudioContinuity(ownerId, continuity)) setStorageFailed(true);
+        setRemoteAgent(confirmed.agent);
+        setRemoteStatus("Previous publication confirmed. Review your draft before publishing further changes.");
+        return;
+      }
+      if (!agent) {
+        const pending = continuity.create ?? { key: `import-${crypto.randomUUID()}`, draft };
+        continuity = { ...continuity, create: pending };
+        if (!saveStudioContinuity(ownerId, continuity)) setStorageFailed(true);
+        agent = await importStudioDraft(session, pending.draft, pending.key);
+        continuity = { ...continuity, agentId: agent.id, create: undefined };
+        if (!saveStudioContinuity(ownerId, continuity)) setStorageFailed(true);
+        setRemoteAgent(agent);
+      }
+      if (!studioAgentMatchesDraft(agent, draft)) {
+        agent = await saveStudioDraft(session, draft, agent, `import-${crypto.randomUUID()}`);
+        setRemoteAgent(agent);
+      }
+      const pending = { key: `publish-${crypto.randomUUID()}`, agentId: agent.id, draftVersion: agent.draftVersion, channel: draft.channel };
+      continuity = { ...continuity, publish: pending };
+      if (!saveStudioContinuity(ownerId, continuity)) setStorageFailed(true);
+      const result = await publishStudioAgent(session, agent, pending.channel, pending.key);
+      if (!saveStudioContinuity(ownerId, { ...continuity, agentId: result.agent.id, publish: undefined })) setStorageFailed(true);
       setRemoteAgent(result.agent);
       setRemoteStatus(currentDraft.current !== draft ? "Earlier draft published. Your newer changes still need publication." : result.agent.operationalState === "waiting_for_capacity" ? "Published · waiting for compatible capacity" : `Published · ${result.agent.operationalState}`);
-    } catch (error) { setRemoteStatus(error instanceof Error ? error.message : "Studio could not save this agent."); }
+    } catch (error) {
+      if (isMissingStudioAgent(error)) {
+        setRemoteMissing(true);
+        setRemoteStatus("Your saved agent was not found in this account. You can start a new one from this local draft.");
+      } else setRemoteStatus(error instanceof Error ? error.message : "Studio could not save this agent.");
+      setRemoteError(true);
+    }
     finally { publishing.current = false; setRemoteBusy(false); }
   }
 
@@ -180,7 +280,7 @@ export function CreateStudio() {
         </div>
         <div className="studio-top-actions">
           <button type="button" className="studio-reset" disabled={remoteBusy} onClick={resetDraft}><RefreshCw />Reset</button>
-          <a className="studio-login" href="/dashboard">Continue to workspace <ArrowRight /></a>
+          <a className="studio-login" href="/dashboard">Workspace <ArrowRight /></a>
         </div>
         <button className="studio-mobile-menu" type="button" aria-label={mobileNavOpen ? "Close studio navigation" : "Open studio navigation"} aria-expanded={mobileNavOpen} onClick={() => setMobileNavOpen((open) => !open)}>
           {mobileNavOpen ? <X /> : <Menu />}
@@ -190,10 +290,10 @@ export function CreateStudio() {
       <div className="studio-shell">
         <aside className={`studio-rail ${mobileNavOpen ? "open" : ""}`} aria-label="Studio builder steps">
           <div className="studio-rail-heading">
-            <span>Build an identity</span>
-            <strong>{completion}% ready</strong>
+            <span>Draft checklist</span>
+            <strong>{completion}% filled</strong>
           </div>
-          <div className="studio-progress" aria-label={`${completion}% ready`}><i style={{ width: `${completion}%` }} /></div>
+          <div className="studio-progress" aria-label={`${completion}% of draft checklist filled`}><i style={{ width: `${completion}%` }} /></div>
           <nav>
             {steps.map(({ id, label, icon: Icon }, index) => (
               <button className={activeStep === id ? "active" : ""} type="button" onClick={() => { setActiveStep(id); setMobileNavOpen(false); }} key={id}>
@@ -203,7 +303,7 @@ export function CreateStudio() {
           </nav>
           <div className="studio-rail-note">
             <Sparkles />
-            <p><strong>Local draft</strong>Your configuration stays in this browser until you sign in and publish.</p>
+            <p><strong>Local draft</strong>Your draft stays in this browser. Publishing sends supported settings to your account.</p>
           </div>
         </aside>
 
@@ -229,9 +329,9 @@ export function CreateStudio() {
                 </div>
               )}
               <div className="studio-fields">
-                <label><span>Name</span><input value={draft.name} maxLength={48} onChange={(event) => update({ name: event.target.value })} /></label>
-                <label><span>Role</span><input value={draft.role} maxLength={100} onChange={(event) => update({ role: event.target.value })} /></label>
-                <label className="studio-field-wide"><span>Personality and boundaries</span><textarea value={draft.instructions} maxLength={600} onChange={(event) => update({ instructions: event.target.value })} /><small>{draft.instructions.length}/600 · Tell it how to behave, and what it must never invent.</small></label>
+                <label><span>Name</span><input ref={nameField} value={draft.name} maxLength={48} onChange={(event) => update({ name: event.target.value })} /></label>
+                <label><span>Role</span><input ref={roleField} value={draft.role} maxLength={100} onChange={(event) => update({ role: event.target.value })} /></label>
+                <label className="studio-field-wide"><span>Personality and boundaries</span><textarea ref={instructionsField} value={draft.instructions} maxLength={600} onChange={(event) => update({ instructions: event.target.value })} /><small>{draft.instructions.length}/600 · Tell it how to behave, and what it must never invent.</small></label>
               </div>
             </div>
           )}
@@ -252,13 +352,13 @@ export function CreateStudio() {
               <form className="studio-source-form" onSubmit={addKnowledge}>
                 <label htmlFor="studio-source">Source label</label>
                 <div><input id="studio-source" value={knowledgeInput} maxLength={64} placeholder="e.g. Product handbook" onChange={(event) => setKnowledgeInput(event.target.value)} /><button type="submit" disabled={!knowledgeInput.trim() || draft.knowledge.length >= 6}><Plus />Add source</button></div>
-                <small>This MVP stores source names only. Files and URLs are connected after sign-in.</small>
+                <small>Labels stay in this browser. No source content is uploaded or included when you publish.</small>
               </form>
               <div className="studio-source-list">
                 {draft.knowledge.map((source, index) => (
-                  <div key={`${source}-${index}`}><span><BookOpen /><i>{String(index + 1).padStart(2, "0")}</i></span><p><strong>{source}</strong><small>Ready to connect · no content uploaded</small></p><button type="button" aria-label={`Remove ${source}`} onClick={() => update({ knowledge: draft.knowledge.filter((_, itemIndex) => itemIndex !== index) })}><Trash2 /></button></div>
+                  <div key={`${source}-${index}`}><span><BookOpen /><i>{String(index + 1).padStart(2, "0")}</i></span><p><strong>{source}</strong><small>Local label · no content connected</small></p><button type="button" aria-label={`Remove ${source}`} onClick={() => update({ knowledge: draft.knowledge.filter((_, itemIndex) => itemIndex !== index) })}><Trash2 /></button></div>
                 ))}
-                {draft.knowledge.length === 0 && <div className="studio-empty"><BookOpen /><p><strong>No trusted source yet</strong><small>Add one label so the identity knows what it should be grounded in.</small></p></div>}
+                {draft.knowledge.length === 0 && <div className="studio-empty"><BookOpen /><p><strong>No source labels yet</strong><small>Add a name here to plan a source. No content is connected in this draft.</small></p></div>}
               </div>
             </div>
           )}
@@ -281,13 +381,17 @@ export function CreateStudio() {
                 ))}
               </div>
               <div className="studio-launch-summary">
-                <span>Ready to continue</span>
+                <span>Review before publishing</span>
                 <h2>{draft.name || "Untitled identity"} for {channels.find((channel) => channel.id === draft.channel)?.label}</h2>
-                <ul><li><Check />Identity and behavior configured</li><li className={draft.knowledge.length ? "" : "waiting"}><Check />{draft.knowledge.length || "No"} knowledge source{draft.knowledge.length === 1 ? "" : "s"}</li><li className={draft.tools.length ? "" : "waiting"}><Check />{draft.tools.length || "No"} tool{draft.tools.length === 1 ? "" : "s"} enabled</li></ul>
-                {session
-                  ? <button type="button" onClick={() => void saveAndPublish()} disabled={remoteBusy}>{remoteBusy ? "Publishing…" : remoteAgent ? "Publish this revision" : "Import draft and publish"} <ExternalLink /></button>
-                  : <a href="/network?view=overview">Sign in to connect and publish <ExternalLink /></a>}
-                <small aria-live="polite">{remoteStatus ?? (session ? "Import is explicit; your local draft remains unchanged." : "No agent has been deployed yet.")}</small>
+                <ul><li className={identityReady ? "" : "waiting"}><Check />{identityReady ? "Identity and behavior configured" : "Add a name, role, and behavior"}</li><li className="waiting"><BookOpen />{draft.knowledge.length || "No"} local source label{draft.knowledge.length === 1 ? "" : "s"} · not published</li><li className={draft.tools.length ? "" : "waiting"}><Check />{draft.tools.length || "No"} tool{draft.tools.length === 1 ? "" : "s"} selected</li></ul>
+                {remoteMissing && session
+                  ? <button type="button" onClick={forgetMissingAgent}>Start a new agent from this draft <ArrowRight /></button>
+                  : !identityReady && !continuity?.publish
+                    ? <button type="button" onClick={completeIdentity}>Complete identity first <ArrowRight /></button>
+                    : session
+                  ? <button type="button" onClick={() => void saveAndPublish()} disabled={remoteBusy}>{remoteBusy ? "Checking and publishing…" : continuity?.publish ? "Confirm previous publication" : continuity?.create ? "Retry import and publish" : continuity?.agentId ? "Publish this revision" : "Import draft and publish"} <ExternalLink /></button>
+                  : <a href="/dashboard">Sign in, then return to publish <ExternalLink /></a>}
+                <small className={remoteError ? "error" : undefined} role={remoteError ? "alert" : undefined} aria-live="polite">{remoteStatus ?? (session ? "Import is explicit; your local draft remains unchanged." : "No agent has been deployed yet.")}</small>
               </div>
             </div>
           )}
@@ -299,16 +403,16 @@ export function CreateStudio() {
           </div>
         </section>
 
-        <aside className="studio-preview" aria-label="Live identity preview">
+        <aside className="studio-preview" aria-label="Local identity preview">
           <div className="studio-preview-heading">
             <div className="studio-avatar" aria-hidden="true"><span>{initials(draft.name)}</span><i style={{ "--signal": `${completion}%` } as CSSProperties} /></div>
-            <div><span>Live preview</span><strong>{draft.name || "Untitled identity"}</strong><small>{draft.role || "Add a role"}</small></div>
+            <div><span>Draft preview</span><strong>{draft.name || "Untitled identity"}</strong><small>{draft.role || "Add a role"}</small></div>
             <b><CircleDot />Draft</b>
           </div>
           <div className="studio-signals" aria-label="Configured identity signals">
             <span><Database />{memoryOptions.find((option) => option.id === draft.memoryMode)?.label}</span>
-            <span><BookOpen />{draft.knowledge.length} sources</span>
-            <span><Wrench />{draft.tools.length} tools</span>
+            <span><BookOpen />{draft.knowledge.length} local labels</span>
+            <span><Wrench />{draft.tools.length} selected tools</span>
           </div>
           <div className="studio-conversation" aria-live="polite">
             {conversation.slice(-5).map((message, index) => (
@@ -327,11 +431,11 @@ export function CreateStudio() {
 }
 
 function stepTitle(step: StudioStep): string {
-  return ({ identity: "Give it a point of view.", memory: "Choose what can persist.", knowledge: "Ground it in trusted context.", tools: "Define what it can do.", launch: "Choose where it should live." })[step];
+  return ({ identity: "Give it a point of view.", memory: "Choose what can persist.", knowledge: "Plan trusted sources.", tools: "Define what it can do.", launch: "Choose where it should live." })[step];
 }
 
 function stepDescription(step: StudioStep): string {
-  return ({ identity: "Start from a working pattern, then make the voice and boundaries yours.", memory: "A persistent identity needs an explicit memory policy, not unlimited retention.", knowledge: "Name the sources this identity should trust before connecting their contents.", tools: "Capabilities stay visible and controlled. Nothing runs until it is connected securely.", launch: "Select a first channel and inspect exactly what is ready before publishing." })[step];
+  return ({ identity: "Start from a working pattern, then make the voice and boundaries yours.", memory: "A persistent identity needs an explicit memory policy, not unlimited retention.", knowledge: "List sources to connect later. These labels remain local and provide no knowledge to the published agent.", tools: "Capabilities stay visible and controlled. Nothing runs until it is connected securely.", launch: "Choose a channel and review what will be published." })[step];
 }
 
 function previousStep(step: StudioStep): StudioStep {
@@ -345,4 +449,8 @@ function nextStep(step: StudioStep): StudioStep {
 function initials(name: string): string {
   const value = name.trim();
   return value ? value.slice(0, 2).toUpperCase() : "AI";
+}
+
+function isMissingStudioAgent(error: unknown): boolean {
+  return error instanceof Error && "status" in error && error.status === 404;
 }

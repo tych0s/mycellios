@@ -24,18 +24,22 @@ function FlowLine({ tone = "bronze" }: { tone?: "bronze" | "green" | "cream" }) 
   return <svg className={`spore-chart ${tone}`} viewBox="0 0 500 150" preserveAspectRatio="none" aria-hidden="true"><path d="M4 135 C54 128 63 105 102 110 S150 76 193 84 S252 48 300 61 S370 30 420 42 S463 18 496 24" /><path className="fill" d="M4 135 C54 128 63 105 102 110 S150 76 193 84 S252 48 300 61 S370 30 420 42 S463 18 496 24 L496 150 L4 150Z" /></svg>;
 }
 
+function EmptyChart() {
+  return <div className="spore-empty-chart" role="img" aria-label="No verified series available"><span>AWAITING VERIFIED DATA</span></div>;
+}
+
 function Treasury() {
-  return <><section className="spore-title"><span>VALUE ROUTING</span><h1>The <em>SPORE</em> treasury</h1><p>A transparent proposal for routing margin from completed compute. Nothing moves until real revenue, governance and audit trails exist.</p></section><PreviewNotice />
-    <section className="spore-split"><h2>Verified compute margin enters one ledger, then follows explicit rules.</h2><div><article><Sprout /><strong>Network resilience</strong><p>Funds future worker incentives, reliability and operating reserves.</p></article><article><ShieldCheck /><strong>Participant distribution</strong><p>Only paid, attributable work can become a distribution event.</p></article></div></section>
+  return <><section className="spore-title"><span>VALUE ROUTING</span><h1>The <em>SPORE</em>{" "}treasury</h1><p>A transparent proposal for routing margin from completed compute. Nothing moves until real revenue, governance and audit trails exist.</p></section><PreviewNotice />
+    <section className="spore-split"><h2>A proposed ledger routes verified compute margin through explicit rules.</h2><div><article><Sprout /><strong>Network resilience</strong><p>Funds future worker incentives, reliability and operating reserves.</p></article><article><ShieldCheck /><strong>Participant distribution</strong><p>Only paid, attributable work can become a distribution event.</p></article></div></section>
     <section className="spore-metrics"><article className="primary"><span>RESERVE STATUS</span><strong>Not funded</strong><small>No treasury contract deployed</small></article><article><span>DISTRIBUTIONS</span><strong>0</strong><small>No reward events recorded</small></article><article><span>BUYBACKS</span><strong>Disabled</strong><small>No market operation configured</small></article></section>
     <section className="spore-chart-grid"><article><header><span>Illustrative reserve path</span><strong>Requires real revenue</strong></header><FlowLine tone="green" /></article><article><header><span>Illustrative distributions</span><strong>Requires verified work</strong></header><FlowLine tone="cream" /></article></section></>;
 }
 
 function Data() {
-  const signals = [["Workers", "Connect to view"],["Native GPU", "No live feed"],["Browser", "No live feed"],["Image routes", "No live feed"],["Busy now", "—"],["SPORE price", "Not listed"]];
-  return <><section className="spore-data-hero"><div><span>MYCELLIOS / DATA</span><h1>Network signals,<br/><em>without invented numbers.</em></h1><p>This preview shows the telemetry model. Production values will appear only from an authenticated network feed.</p></div><div className="spore-pulse" aria-hidden="true">{Array.from({length:18},(_,i)=><i key={i}/>)}</div></section><PreviewNotice />
-    <section className="spore-live"><header><Activity /><h2>Live</h2><span>feed disconnected</span></header><div className="spore-signal-grid">{signals.map(([label,value])=><article key={label}><strong>{value}</strong><span><i />{label}</span></article>)}</div></section>
-    <section className="spore-telemetry"><h2><Network /> Network telemetry</h2><div className="spore-chart-grid"><article><header><span>Jobs completed per day</span><strong>Awaiting source</strong></header><div className="spore-bars" aria-hidden="true">{[42,68,28,82,55,34,72,48,88,63,37,76,51,67,31,58,79,45].map((h,i)=><i key={i} style={{height:`${h}%`}} />)}</div></article><article><header><span>Useful compute recorded</span><strong>Schema preview</strong></header><FlowLine /></article></div></section>
+  const signals = [["Credited workers", "No source"],["Credited GPU work", "No source"],["Credited browser work", "No source"],["Verified routes", "No source"],["Rewards today", "—"],["SPORE price", "Not listed"]];
+  return <><section className="spore-data-hero"><div><span>MYCELLIOS / DATA</span><h1>Network signals,<br/>{" "}<em>without invented numbers.</em></h1><p>This preview shows the planned telemetry layout. For current connected nodes, models and jobs, visit the <a href="/network">live network</a>.</p></div><div className="spore-pulse" aria-hidden="true">{Array.from({length:18},(_,i)=><i key={i}/>)}</div></section><PreviewNotice />
+    <section className="spore-live"><header><Activity /><h2>Planned feed</h2><span>source not connected</span></header><div className="spore-signal-grid">{signals.map(([label,value])=><article key={label}><strong>{value}</strong><span><i />{label}</span></article>)}</div></section>
+    <section className="spore-telemetry"><h2><Network /> Planned contribution feed</h2><div className="spore-chart-grid"><article><header><span>Verified work credited per day</span><strong>Awaiting source</strong></header><EmptyChart /></article><article><header><span>Useful compute recorded</span><strong>Awaiting source</strong></header><EmptyChart /></article></div></section>
     <section className="spore-provenance"><Database /><div><strong>Source before spectacle</strong><p>Every published metric will include its origin, sample window and last update. Price and market-cap panels stay absent until a real market exists.</p></div></section></>;
 }
 

@@ -8,9 +8,10 @@ export const PUBLIC_DOWNLOAD_OPTIONS = [
   { id: "linux-x64", label: "Linux", detail: "Linux · x64", format: "TAR.GZ" },
 ] as const;
 
-export async function fetchPublicDownloadAvailability(): Promise<PublicDownloadAvailability> {
+export async function fetchPublicDownloadAvailability(signal?: AbortSignal): Promise<PublicDownloadAvailability> {
   const response = await fetch("/public/v1/downloads", {
     headers: { accept: "application/json" },
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000),
   });
   if (!response.ok) throw new Error(`download_availability_http_${response.status}`);
   const value: unknown = await response.json();
@@ -22,6 +23,8 @@ function isPublicDownloadAvailability(value: unknown): value is PublicDownloadAv
   if (!value || typeof value !== "object") return false;
   const candidate = value as Record<string, unknown>;
   if (candidate.schema !== DOWNLOADS_SCHEMA || typeof candidate.version !== "string" || !Array.isArray(candidate.packages) || candidate.packages.length !== PUBLIC_DOWNLOAD_OPTIONS.length) return false;
+  const packageIds = candidate.packages.map((item) => item && typeof item === "object" ? (item as Record<string, unknown>).id : null);
+  if (new Set(packageIds).size !== PUBLIC_DOWNLOAD_OPTIONS.length) return false;
   return candidate.packages.every((item) => {
     if (!item || typeof item !== "object") return false;
     const entry = item as Record<string, unknown>;

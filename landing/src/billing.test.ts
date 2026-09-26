@@ -6,6 +6,7 @@ import {
   loadBillingAccount,
   newBillingIdempotencyKey,
 } from "./billing";
+import { billingPriceLabel } from "./BillingAccountPanel";
 
 describe("buyer billing client", () => {
   afterEach(() => vi.unstubAllGlobals());
@@ -56,5 +57,21 @@ describe("buyer billing client", () => {
     const second = newBillingIdempotencyKey("subscription");
     expect(first).toMatch(/^mycellios-subscription-/);
     expect(second).not.toBe(first);
+  });
+
+  it("does not invent a price when the subscription plan is unavailable", () => {
+    expect(billingPriceLabel(null)).toBe("Price unavailable");
+    expect(billingPriceLabel({ id: "go", version: 1, currency: "EUR", amountMicros: 10_000_000, includedTokens: 1_000, status: "draft" }))
+      .toBe("Price unavailable");
+    expect(billingPriceLabel({ id: "go", version: 1, currency: "EUR", amountMicros: 12_000_000, includedTokens: 1_000, status: "active" }))
+      .toContain("12");
+  });
+
+  it("ends a stalled billing request with a readable error", async () => {
+    const fetch = vi.fn().mockRejectedValue(new DOMException("Timed out", "TimeoutError"));
+    vi.stubGlobal("fetch", fetch);
+    await expect(loadBillingAccount("session-token"))
+      .rejects.toThrow("The billing service did not respond. Try again.");
+    expect(fetch.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
   });
 });

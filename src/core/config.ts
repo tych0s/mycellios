@@ -27,6 +27,7 @@ export interface CoordinatorConfig {
   contentHubApiUrl?: string | undefined;
   publicationWebhookSecret?: string | undefined;
   supabaseUrl?: string | undefined;
+  publicSupabaseUrl?: string | undefined;
   supabaseServiceRoleKey?: string | undefined;
   supabaseAnonKey?: string | undefined;
   supabasePersistenceRequired?: boolean | undefined;
@@ -171,6 +172,18 @@ export function loadCoordinatorConfig(
     environment.PUBLICATION_WEBHOOK_SECRET_FILE,
   );
   const supabaseUrl = environment.MYCELLIOS_SUPABASE_URL?.trim();
+  const publicSupabaseUrlValue = environment.MYCELLIOS_SUPABASE_PUBLIC_URL?.trim();
+  let publicSupabaseUrl: string | undefined;
+  if (publicSupabaseUrlValue) {
+    let url: URL;
+    try { url = new URL(publicSupabaseUrlValue); }
+    catch { throw new Error("MYCELLIOS_SUPABASE_PUBLIC_URL must be an HTTPS origin (or a loopback HTTP origin in development)."); }
+    if (
+      (url.protocol !== "https:" && !(url.protocol === "http:" && isCoordinatorLoopbackHost(url.hostname)))
+      || url.username || url.password || url.pathname !== "/" || url.search || url.hash
+    ) throw new Error("MYCELLIOS_SUPABASE_PUBLIC_URL must be an HTTPS origin (or a loopback HTTP origin in development).");
+    publicSupabaseUrl = url.origin;
+  }
   const supabaseServiceRoleKey = loadSecret(
     environment.MYCELLIOS_SUPABASE_SERVICE_ROLE_KEY,
     environment.MYCELLIOS_SUPABASE_SERVICE_ROLE_KEY_FILE,
@@ -183,6 +196,9 @@ export function loadCoordinatorConfig(
     throw new Error(
       "MYCELLIOS_SUPABASE_URL and MYCELLIOS_SUPABASE_SERVICE_ROLE_KEY(_FILE) must be configured together.",
     );
+  }
+  if (publicSupabaseUrl && (!supabaseUrl || !supabaseAnonKey)) {
+    throw new Error("MYCELLIOS_SUPABASE_PUBLIC_URL requires the Supabase server URL and anon key.");
   }
   const apiAccessEnabled = environment.MYCELLIOS_API_ACCESS_ENABLED === undefined
     ? Boolean(supabaseUrl && supabaseServiceRoleKey)
@@ -326,6 +342,7 @@ export function loadCoordinatorConfig(
     ...(contentHubApiUrl ? { contentHubApiUrl } : {}),
     ...(publicationWebhookSecret ? { publicationWebhookSecret } : {}),
     ...(supabaseUrl ? { supabaseUrl } : {}),
+    ...(publicSupabaseUrl ? { publicSupabaseUrl } : {}),
     ...(supabaseServiceRoleKey ? { supabaseServiceRoleKey } : {}),
     ...(supabaseAnonKey ? { supabaseAnonKey } : {}),
     ...(publicApiBaseUrl ? { publicApiBaseUrl: publicApiBaseUrl.replace(/\/+$/, "") } : {}),
