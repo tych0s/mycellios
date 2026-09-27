@@ -7,6 +7,8 @@ describe("canonical landing host", () => {
       .toBe("https://www.mycellios.com/network?view=globe");
     expect(canonicalLandingRedirectLocation("GET", "MYCELLIOS.COM", "/blog/research/"))
       .toBe("https://www.mycellios.com/blog/research");
+    expect(canonicalLandingRedirectLocation("GET", "mycellios.com", "/llms.txt"))
+      .toBe("https://www.mycellios.com/llms.txt");
   });
 
   it("routes browser and mobile aliases to the canonical browser worker", () => {

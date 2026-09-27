@@ -13,6 +13,7 @@ const CANONICAL_LANDING_PATHS = new Set([
   "/spore/treasury",
   "/spore/data",
   "/downloads",
+  "/llms.txt",
   "/admin",
   "/dashboard",
   "/account",

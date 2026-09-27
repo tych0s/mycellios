@@ -53,11 +53,29 @@ describe("landing SEO contract", () => {
     const robots = read("landing/public/robots.txt");
 
     expect(robots).toContain("Sitemap: https://www.mycellios.com/sitemap.xml");
+    expect(robots).toMatch(/User-agent:\s*OAI-SearchBot[\s\S]*?Allow:\s*\//);
+    expect(robots).toMatch(/User-agent:\s*OAI-SearchBot[\s\S]*?Disallow:\s*\/internal\//);
     expect(robots).toContain("Disallow: /internal/");
     expect(robots).toContain("Disallow: /mobile/v1/");
     expect(robots).toContain("Disallow: /public/v1/");
     expect(robots).toContain("Disallow: /v1/");
     expect(robots).not.toContain("Disallow: /admin");
+  });
+
+  it("publishes an agent guide that links only to public product and evidence pages", () => {
+    const guide = read("landing/public/llms.txt");
+
+    expect(guide).toMatch(/^# mycellios/m);
+    expect(guide).toContain("https://www.mycellios.com/network");
+    expect(guide).toContain("https://github.com/tych0s/mycellios/blob/main/docs/STATUS_AND_EVIDENCE.md");
+    expect(guide).not.toMatch(/\/internal\/|\/public\/v1\/|\/v1\/|\/admin/);
+    expect(guide).toContain("not established as general production capabilities");
+  });
+
+  it("links route documents to the agent guide before JavaScript runs", () => {
+    const html = read("landing/index.html");
+
+    expect(html).toContain('<link rel="describedby" href="https://www.mycellios.com/llms.txt" />');
   });
 
   it("ships universal browser-worker metadata before JavaScript runs", () => {
@@ -68,6 +86,7 @@ describe("landing SEO contract", () => {
     expect(mobileHtml).toContain(`<title>${mobile.title}</title>`);
     expect(mobileHtml).toContain(`content="${mobile.description}"`);
     expect(mobileHtml).toContain(`href="${canonicalUrl(mobile)}"`);
+    expect(mobileHtml).toContain('<link rel="describedby" href="https://www.mycellios.com/llms.txt" />');
     expect(mobileHtml).toContain('id="seo-structured-data"');
     const mobileStructuredData = mobileHtml.match(/<script\b[^>]*id="seo-structured-data"[^>]*>([\s\S]*?)<\/script>/)?.[1];
     const landingStructuredData = landingHtml.match(/<script\b[^>]*id="seo-structured-data"[^>]*>([\s\S]*?)<\/script>/)?.[1];
