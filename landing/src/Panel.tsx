@@ -57,7 +57,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
+import { lazy, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import "@fontsource-variable/manrope";
 import type {
@@ -84,7 +84,6 @@ import { projectObservedTopology } from "./network-topology";
 import { type ProductStatePresentation } from "./product-state";
 import type { NativeBuildIdentity } from "../../src/contracts/build-identity";
 import type { BenchmarkMeasurement, BenchmarkRun } from "../../src/benchlab/types";
-import { Contribute } from "./Contribute";
 import { DownloadsPage } from "./Downloads";
 import { EarnQuickMenu } from "./EarnQuickMenu";
 import { SupportAssistant } from "./SupportAssistant";
@@ -102,6 +101,7 @@ import {
 } from "./inference-attachments";
 import { firstFocusable, trapDialogTab, formatCompactNumber, formatCompactTokens, formatPower, shortId, shortFingerprint, formatMemory, relativeTime } from "./panel-ui-utilities";
 const brandIcon = "/assets/brand/favicon.png";
+const Contribute = lazy(() => import("./Contribute").then((module) => ({ default: module.Contribute })));
 
 function GoogleProviderIcon() {
   return <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -976,21 +976,23 @@ function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
               {view === "tests" && advancedAccess && <Tests canRunLocally={localBrowser && !localProductionProxy} />}
               {view === "logs" && advancedAccess && <SystemLogs snapshot={snapshot} connectionError={coordinatorError} />}
               {view === "inference" && <Inference key={authSession?.user.id ?? "guest"} accountUserId={authSession?.user.id ?? null} snapshot={snapshot} coordinatorConnected={!coordinatorError} onSend={sendPrompt} onNavigate={navigate} developerMode={panelMode === "developer"} accountAuthenticated={!authConfig.apiAccessEnabled || authSession !== null} onSignIn={() => setAuthOpen(true)} apiAccessEnabled={authConfig.apiAccessEnabled ?? false} apiBaseUrl={apiBaseUrl} accessToken={authSession?.accessToken ?? null} getValidSession={getValidSession} apiAccount={apiAccount} />}
-              {view === "contribute" && <Contribute
-                accessToken={authSession?.accessToken ?? null}
-                authConfig={authConfig}
-                authSession={authSession}
-                getValidSession={getValidSession}
-                onSessionElevated={setAuthSession}
-                onSignIn={() => setAuthOpen(true)}
-                onOpenAccount={() => setAuthOpen(true)}
-                onNavigate={navigate}
-                network={{
-                  connectedNodes: snapshot.summary.connected,
-                  completedJobs: snapshot.summary.completedJobs,
-                  traceCount: snapshot.recentNetworkTraces?.length ?? 0,
-                }}
-              />}
+              {view === "contribute" && <Suspense fallback={<div className="panel-loading" role="status" aria-live="polite"><LoaderCircle className="spin" /><strong>Loading contribution tools</strong><span>Preparing the browser and node options…</span></div>}>
+                <Contribute
+                  accessToken={authSession?.accessToken ?? null}
+                  authConfig={authConfig}
+                  authSession={authSession}
+                  getValidSession={getValidSession}
+                  onSessionElevated={setAuthSession}
+                  onSignIn={() => setAuthOpen(true)}
+                  onOpenAccount={() => setAuthOpen(true)}
+                  onNavigate={navigate}
+                  network={{
+                    connectedNodes: snapshot.summary.connected,
+                    completedJobs: snapshot.summary.completedJobs,
+                    traceCount: snapshot.recentNetworkTraces?.length ?? 0,
+                  }}
+                />
+              </Suspense>}
               {view === "downloads" && <DownloadsPage title={<PageTitle eyebrow="CLIENTS" title="Downloads" copy="Native packages are listed here only when their release files are available." />} publicLink={publicLink} external={false} />}
               {view === "admin" && advancedAccess && <AssistantAdmin
                 apiOrigin=""

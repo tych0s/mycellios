@@ -29,8 +29,14 @@ body:has(.public-panel-viewport) {
   max-width: 100%;
   min-height: 100vh;
   height: auto;
-  overflow-x: clip;
+  overflow: visible;
   background: #0e1712;
+}
+
+@media (max-width: 1024px) {
+  .public-panel-viewport {
+    overflow-x: clip;
+  }
 }
 
 /* Persistent network history */

@@ -728,7 +728,7 @@ export function defineMushroomStage() {
       this.quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.pBright);
       this.quadScene.add(this.quad);
 
-      this.clock = new THREE.Clock();
+      this._startTime = performance.now();
       this.pt = { x: 0, y: 0, tx: 0, ty: 0 };
       this._onMove = (e) => {
         if (this.motion === 'off' || this.reduce) return;
@@ -806,8 +806,8 @@ export function defineMushroomStage() {
     tick = () => {
       this._raf = requestAnimationFrame(this.tick);
       if (!this._visible) return;
-      const t = this.clock.getElapsedTime();
-      const dt = Math.min(0.05, this.clock.getDelta ? this._dt() : 0.016);
+      const t = (performance.now() - this._startTime) / 1000;
+      const dt = Math.min(0.05, this._dt());
       const still = this.reduce || this.motion === 'off';
       const amp = this.motion === 'calm' ? 0.5 : 1;
       this._progD += ((this._prog || 0) - this._progD) * 0.07;

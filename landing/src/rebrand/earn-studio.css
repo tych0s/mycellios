@@ -3,6 +3,14 @@
 @media(max-width:680px){.earn-page{padding:8px 8px 30px}.earn-intro{width:auto;margin:70px 14px 28px;text-align:left}.earn-intro h1{font-size:40px}.earn-intro p{font-size:12px}.earn-options{width:auto;margin:0 6px;grid-template-columns:1fr}.earn-option{min-height:0;padding:22px}.earn-option p{min-height:0}.earn-notice{width:auto;margin:12px 6px 0;padding:14px}.earn-notice>div{display:grid}.earn-option:hover{transform:none}}
 @media(prefers-reduced-motion:reduce){.earn-page *{transition-duration:.01ms!important}}
 
+/* Keep contribution-page spacing clear of the shared landing header. */
+.earn-page { box-sizing: border-box; font-family: var(--rb-font-body); }
+.earn-page * { box-sizing: border-box; }
+.earn-intro { margin-top: clamp(170px, 22vh, 230px); }
+.earn-option small, .earn-option-copy > span, .earn-notice { color: #aaa69e; }
+@media (max-width:1000px) { .earn-intro { margin-top: 150px; } }
+@media (max-width:680px) { .earn-intro { margin-top: 136px; } }
+
 /* The public header sits over this dark page, so reserve room for it. */
 .earn-page { font-family: var(--rb-font-body); }
 .earn-intro { margin-top: clamp(170px, 22vh, 230px); }
