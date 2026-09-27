@@ -414,7 +414,7 @@ function Panel({ mobileEntry = false, accountEntry = false }: PanelProps = {}) {
   const [theme, setTheme] = useState<"dark" | "light">(() => {
     const saved = window.localStorage.getItem("mycellios.theme");
     if (saved === "light" || saved === "dark") return saved;
-    return window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark";
+    return "light";
   });
 
   const canManageModels = networkIdentity?.role === "owner"
