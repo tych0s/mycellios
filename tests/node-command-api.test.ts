@@ -67,6 +67,36 @@ describe("node command API", () => {
     });
     expect(redeemed.statusCode).toBe(200);
 
+    const legacyCapabilities = { ...capabilities, agentVersion: "0.2.70" };
+    const legacyDigest = workerRegistrationDigest({ identity, capabilities: legacyCapabilities, protocol });
+    const legacyChallenge = await runtime.app.inject({
+      method: "POST",
+      url: "/internal/v1/workers/admission-challenge",
+      headers: { authorization: "Bearer network-secret" },
+      payload: { identity, publicKey: signer.publicKey, protocol, registrationDigest: legacyDigest },
+    });
+    expect(legacyChallenge.statusCode).toBe(200);
+    const legacyChallengeBody = legacyChallenge.json<{ challengeId: string; signingPayload: string }>();
+    const legacyRegistration = await runtime.app.inject({
+      method: "POST",
+      url: "/internal/v1/workers/register",
+      headers: { authorization: "Bearer network-secret" },
+      payload: {
+        identity,
+        capabilities: legacyCapabilities,
+        protocol,
+        admission: {
+          challengeId: legacyChallengeBody.challengeId,
+          publicKey: signer.publicKey,
+          protocol,
+          registrationDigest: legacyDigest,
+          signature: signer.sign(legacyChallengeBody.signingPayload),
+        },
+      },
+    });
+    expect(legacyRegistration.statusCode).toBe(201);
+    expect(legacyRegistration.json()).not.toHaveProperty("nodeGeneration");
+
     const challenge = await runtime.app.inject({
       method: "POST",
       url: "/internal/v1/workers/admission-challenge",

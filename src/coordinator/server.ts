@@ -4498,7 +4498,10 @@ export async function createCoordinator(
         ? { credentialFingerprint: admission.credentialFingerprint }
         : {}),
       ...(workerSessionToken ? { workerSessionToken } : {}),
-      ...(nodeOwnership?.status === "active" ? { nodeGeneration: nodeOwnership.generation } : {}),
+      // Desktop 0.2.70 strictly parses this response and predates nodeGeneration.
+      ...(nodeOwnership?.status === "active" && registration.capabilities.agentVersion !== "0.2.70"
+        ? { nodeGeneration: nodeOwnership.generation }
+        : {}),
       enrollment: admission.enrollment,
     });
   });
