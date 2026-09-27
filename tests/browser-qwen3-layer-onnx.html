@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Mycellios complete Qwen3 browser layer probe</title>
+<h1>Complete Qwen3 browser layer probe</h1>
+<button id="run">Run browser layer</button>
+<pre id="result">Ready</pre>
+<script src="/ort/ort.webgpu.min.js"></script>
+<script>
+  const result = document.querySelector('#result');
+  document.querySelector('#run').addEventListener('click', async () => {
+    result.textContent = 'Loading model…';
+    let session;
+    try {
+      const query = new URLSearchParams(location.search);
+      const backend = query.get('backend') === 'wasm' ? 'wasm' : 'webgpu';
+      if (backend === 'webgpu' && !navigator.gpu) throw new Error('WebGPU unavailable');
+      ort.env.wasm.wasmPaths = '/ort/';
+      ort.env.wasm.numThreads = 1;
+      const realCheckpoint = query.has('real');
+      const fixture = await (await fetch(realCheckpoint
+        ? '/real-fixture.json' : '/fixture.json')).json();
+      const started = performance.now();
+      session = await ort.InferenceSession.create(realCheckpoint
+        ? '/real-model.onnx' : '/model.onnx', {
+        executionProviders: [backend],
+        ...(backend === 'webgpu'
+          ? { preferredOutputLocation: { key: 'gpu-buffer', value: 'gpu-buffer' } }
+          : {}),
+      });
+      const loadMs = performance.now() - started;
+      let key = new ort.Tensor('float32', new Float32Array(0),
+        [1, fixture.keyValueHeads, 0, fixture.headDim]);
+      let value = new ort.Tensor('float32', new Float32Array(0),
+        [1, fixture.keyValueHeads, 0, fixture.headDim]);
+      const checks = [];
+      const returnedSteps = [];
+      for (const step of fixture.steps) {
+        const feeds = {
+          hidden: new ort.Tensor('float32', Float32Array.from(step.hidden),
+            [1, step.tokens, fixture.hiddenSize]),
+          cos: new ort.Tensor('float32', Float32Array.from(step.cos),
+            [1, step.tokens, fixture.headDim]),
+          sin: new ort.Tensor('float32', Float32Array.from(step.sin),
+            [1, step.tokens, fixture.headDim]),
+          past_key: key,
+          past_value: value,
+          attention_mask: new ort.Tensor('float32', Float32Array.from(step.mask),
+            [1, 1, step.tokens, step.mask.length / step.tokens]),
+        };
+        const runStart = performance.now();
+        const output = await session.run(feeds);
+        const runMs = performance.now() - runStart;
+        const values = await output.output.getData();
+        const newKey = await output.new_key.getData();
+        const newValue = await output.new_value.getData();
+        let maxAbsError = 0;
+        for (let index = 0; index < step.expected.length; index++) {
+          maxAbsError = Math.max(maxAbsError,
+            Math.abs(values[index] - step.expected[index]));
+        }
+        let maxNewKeyError = 0;
+        let maxNewValueError = 0;
+        for (let index = 0; index < step.expectedNewKey.length; index++) {
+          maxNewKeyError = Math.max(maxNewKeyError,
+            Math.abs(newKey[index] - step.expectedNewKey[index]));
+          maxNewValueError = Math.max(maxNewValueError,
+            Math.abs(newValue[index] - step.expectedNewValue[index]));
+        }
+        returnedSteps.push({
+          output: Array.from(values),
+          newKey: Array.from(newKey),
+          newValue: Array.from(newValue),
+        });
+        output.output.dispose();
+        output.new_key.dispose();
+        output.new_value.dispose();
+        key.dispose();
+        value.dispose();
+        key = output.key;
+        value = output.value;
+        checks.push({
+          tokens: step.tokens, runMs: +runMs.toFixed(2), maxAbsError,
+          maxNewKeyError, maxNewValueError,
+          keyLocation: key.location, valueLocation: value.location,
+        });
+        result.textContent = JSON.stringify({ loadMs, checks }, null, 2);
+        if (maxAbsError > 2e-4 || maxNewKeyError > 5e-4
+            || maxNewValueError > 2e-4 || (backend === 'webgpu'
+            && (key.location !== 'gpu-buffer' || value.location !== 'gpu-buffer'))) {
+          throw new Error('layer parity or expected GPU-resident KV failed');
+        }
+      }
+      key.dispose();
+      value.dispose();
+      const warmDecodeMs = checks.slice(3).map((check) => check.runMs).sort((a, b) => a - b);
+      const midpoint = Math.floor(warmDecodeMs.length / 2);
+      const warmDecodeMedianMs = warmDecodeMs.length % 2
+        ? warmDecodeMs[midpoint]
+        : (warmDecodeMs[midpoint - 1] + warmDecodeMs[midpoint]) / 2;
+      const saved = await fetch('/receipt', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          schema: 'mycellios-local-browser-layer-receipt/1',
+          backend, realCheckpoint, checks, steps: returnedSteps,
+        }),
+      });
+      if (!saved.ok) throw new Error(`Could not save local receipt: HTTP ${saved.status}`);
+      result.textContent = JSON.stringify({
+        ok: true, backend, loadMs, checks,
+        warmDecodeMedianMs,
+      }, null, 2);
+    } catch (error) {
+      result.textContent += `\nERROR: ${error.stack || error}`;
+    } finally {
+      await session?.release();
+    }
+  });
+</script>
+</html>

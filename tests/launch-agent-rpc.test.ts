@@ -49,6 +49,18 @@ afterEach(async () => {
 });
 
 describe("HTTP LaunchAgent RPC", () => {
+  it("accepts a source checkout without generated build identity", async () => {
+    const fake = new FakeAgent("fake:source-checkout");
+    const { address } = await serve(fake, "host-b", { buildIdentity: null });
+    const response = await fetch(`${address.url}/healthz`);
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      nodeId: "host-b",
+      buildIdentity: null,
+    });
+  });
+
   it("derives a valid stable agent id for an IPv6 endpoint", () => {
     const first = new HttpLaunchAgent({ endpoint: "http://[::1]:9750" });
     const second = new HttpLaunchAgent({ endpoint: "http://[::1]:9750" });

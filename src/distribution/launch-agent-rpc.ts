@@ -580,7 +580,7 @@ export class LaunchAgentRpcServer {
     this.agent = options.agent;
     if (options.nodeId !== undefined) assertIdentifier(options.nodeId, "nodeId");
     this.nodeId = options.nodeId;
-    this.buildIdentity = options.buildIdentity === undefined
+    this.buildIdentity = options.buildIdentity == null
       ? null
       : nativeBuildIdentitySchema.parse(options.buildIdentity);
     const authToken = normalizeOptionalAuthToken(options.authToken);

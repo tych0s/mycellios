@@ -16028,6 +16028,7 @@ body:has(.public-panel-viewport) {
 .public-panel .contribute-browser-action > button:active:not(:disabled) { transform: translateY(0); }
 .public-panel .contribute-browser-action > button:disabled { opacity: .58; cursor: wait; }
 .public-panel .contribute-browser-action > button svg { width: 16px; }
+.public-panel .contribute-browser-explainer { margin: 0; padding: 0 20px 15px; color: var(--text-secondary); font-size: 11px; line-height: 1.5; }
 .public-panel .contribute-power-row {
   min-height: 54px;
   display: grid;
@@ -16082,6 +16083,7 @@ body:has(.public-panel-viewport) {
   .public-panel .contribute-browser-facts { align-items: stretch; justify-content: space-between; gap: 12px; }
   .public-panel .contribute-browser-facts > span { flex: 1; }
   .public-panel .contribute-browser-action > button { width: 100%; }
+  .public-panel .contribute-browser-explainer { padding: 0 15px 14px; }
   .public-panel .contribute-power-row { grid-template-columns: 1fr; gap: 7px; padding: 11px 15px 14px; }
   .public-panel .contribute-native-disclosure > summary { grid-template-columns: 36px minmax(0, 1fr) 16px; padding: 11px 12px; }
   .public-panel .contribute-native-disclosure > summary > b { display: none; }

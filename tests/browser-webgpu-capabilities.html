@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Mycellios local WebGPU capability probe</title>
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 76rem; margin: 2rem auto; padding: 0 1rem; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #111827; color: #e5e7eb; padding: 1rem; border-radius: .5rem; }
+</style>
+<h1>Mycellios local WebGPU capability probe</h1>
+<p>This page uses only browser APIs. It does not send data or download a model.</p>
+<pre id="result">Checking WebGPU…</pre>
+<script type="module">
+  const result = {
+    secureContext: isSecureContext,
+    userAgent: navigator.userAgent,
+    webgpu: Boolean(navigator.gpu),
+    adapters: {},
+  };
+  const output = document.getElementById("result");
+  const show = () => { output.textContent = JSON.stringify(result, null, 2); };
+  show();
+  if (navigator.gpu) {
+    for (const level of ["core", "compatibility"]) {
+      try {
+        const adapter = await navigator.gpu.requestAdapter({
+          featureLevel: level,
+          powerPreference: "high-performance",
+        });
+        if (!adapter) {
+          result.adapters[level] = { available: false };
+          show();
+          continue;
+        }
+        const features = [...adapter.features].sort();
+        const limits = {
+          maxBufferSize: Number(adapter.limits.maxBufferSize),
+          maxStorageBufferBindingSize: Number(adapter.limits.maxStorageBufferBindingSize),
+          maxComputeWorkgroupStorageSize: Number(adapter.limits.maxComputeWorkgroupStorageSize),
+          maxComputeInvocationsPerWorkgroup: Number(adapter.limits.maxComputeInvocationsPerWorkgroup),
+        };
+        const wanted = ["core-features-and-limits", "shader-f16", "subgroups", "chromium-experimental-subgroup-matrix"];
+        const requiredFeatures = wanted.filter((feature) => adapter.features.has(feature));
+        let device;
+        try {
+          device = await adapter.requestDevice({ requiredFeatures });
+        } catch (error) {
+          result.adapters[level] = {
+            available: true, adapterInfo: adapter.info, features, limits,
+            requestDeviceError: String(error),
+          };
+          show();
+          continue;
+        }
+        result.adapters[level] = {
+          available: true,
+          adapterInfo: adapter.info,
+          features,
+          limits,
+          deviceFeatures: [...device.features].sort(),
+          deviceLimits: {
+            maxBufferSize: Number(device.limits.maxBufferSize),
+            maxStorageBufferBindingSize: Number(device.limits.maxStorageBufferBindingSize),
+          },
+        };
+        const lost = device.lost;
+        device.destroy();
+        const loss = await lost;
+        result.adapters[level].intentionalDeviceLoss = {
+          reason: loss.reason, message: loss.message,
+        };
+        try {
+          const largerAdapter = await navigator.gpu.requestAdapter({
+            featureLevel: level,
+            powerPreference: "high-performance",
+          });
+          if (!largerAdapter) throw new Error("No adapter for higher limits");
+          const larger = await largerAdapter.requestDevice({
+            requiredFeatures,
+            requiredLimits: {
+              maxBufferSize: limits.maxBufferSize,
+              maxStorageBufferBindingSize: limits.maxStorageBufferBindingSize,
+            },
+          });
+          result.adapters[level].requestedDeviceLimits = {
+            maxBufferSize: Number(larger.limits.maxBufferSize),
+            maxStorageBufferBindingSize: Number(larger.limits.maxStorageBufferBindingSize),
+          };
+          const data = larger.createBuffer({
+            size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+          });
+          const readback = larger.createBuffer({
+            size: 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+          });
+          const shader = larger.createShaderModule({ code: `
+            @group(0) @binding(0) var<storage, read_write> value: array<u32>;
+            @compute @workgroup_size(1) fn main() { value[0] = 42u; }
+          ` });
+          const pipeline = await larger.createComputePipelineAsync({
+            layout: "auto", compute: {module: shader, entryPoint: "main"},
+          });
+          const group = larger.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [{binding: 0, resource: {buffer: data}}],
+          });
+          const encoder = larger.createCommandEncoder();
+          const pass = encoder.beginComputePass();
+          pass.setPipeline(pipeline);
+          pass.setBindGroup(0, group);
+          pass.dispatchWorkgroups(1);
+          pass.end();
+          encoder.copyBufferToBuffer(data, 0, readback, 0, 4);
+          larger.queue.submit([encoder.finish()]);
+          await readback.mapAsync(GPUMapMode.READ);
+          result.adapters[level].recoveredComputeValue = new Uint32Array(readback.getMappedRange())[0];
+          readback.unmap();
+          readback.destroy();
+          data.destroy();
+          if (level === "core" && larger.limits.maxBufferSize >= 512 * 1024 * 1024
+              && larger.limits.maxStorageBufferBindingSize >= 512 * 1024 * 1024) {
+            const bytes = 512 * 1024 * 1024;
+            const large = larger.createBuffer({
+              size: bytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+            });
+            const edgeReadback = larger.createBuffer({
+              size: 8, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+            });
+            const edgeShader = larger.createShaderModule({ code: `
+              @group(0) @binding(0) var<storage, read_write> words: array<u32>;
+              @compute @workgroup_size(1) fn main() {
+                words[0] = 123u;
+                words[134217727] = 456u;
+              }
+            ` });
+            const edgePipeline = await larger.createComputePipelineAsync({
+              layout: "auto", compute: { module: edgeShader, entryPoint: "main" },
+            });
+            const edgeGroup = larger.createBindGroup({
+              layout: edgePipeline.getBindGroupLayout(0),
+              entries: [{ binding: 0, resource: { buffer: large } }],
+            });
+            const edgeEncoder = larger.createCommandEncoder();
+            const edgePass = edgeEncoder.beginComputePass();
+            edgePass.setPipeline(edgePipeline);
+            edgePass.setBindGroup(0, edgeGroup);
+            edgePass.dispatchWorkgroups(1);
+            edgePass.end();
+            edgeEncoder.copyBufferToBuffer(large, 0, edgeReadback, 0, 4);
+            edgeEncoder.copyBufferToBuffer(large, bytes - 4, edgeReadback, 4, 4);
+            larger.queue.submit([edgeEncoder.finish()]);
+            await edgeReadback.mapAsync(GPUMapMode.READ);
+            result.adapters[level].largeBufferProbe = {
+              bytes, edges: Array.from(new Uint32Array(edgeReadback.getMappedRange())),
+            };
+            edgeReadback.unmap();
+            edgeReadback.destroy();
+            large.destroy();
+          }
+          larger.destroy();
+        } catch (error) {
+          result.adapters[level].requestedDeviceError = String(error);
+        }
+      } catch (error) {
+        result.adapters[level] = { error: String(error) };
+      }
+      show();
+    }
+  }
+</script>
+</html>

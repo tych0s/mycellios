@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="es">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mycellios · actualizaciones dispersas WebGPU</title>
+<style>
+  body { font: 15px system-ui; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
+  button { padding: .7rem 1rem; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #eee; padding: 1rem; }
+</style>
+<h1>Actualización de parámetros WebGPU</h1>
+<p>Prueba local sintética: 64 bloques de 72 bytes repartidos en un buffer uniforme de 18.944 bytes, 9 envíos por token y 32 tokens. Un shader lee el buffer tras cada envío.</p>
+<button id="run">Comparar tres métodos</button>
+<p id="status">Pendiente</p>
+<pre id="results"></pre>
+<script type="module">
+  const $ = (id) => document.getElementById(id);
+  const batches = 9 * 32;
+  const slots = 64;
+  const wordsPerSlot = 18;
+  const bufferBytes = 18944;
+  const slotStride = 256;
+  const expected = 64 * batches * (batches + 1) / 2;
+  const readShader = `
+    struct Params { data: array<vec4<u32>, 1184> };
+    @group(0) @binding(0) var<uniform> params: Params;
+    @group(0) @binding(1) var<storage, read_write> checksum: array<u32>;
+    @compute @workgroup_size(1)
+    fn main() {
+      var sum: u32 = 0u;
+      for (var i: u32 = 0u; i < 64u; i = i + 1u) {
+        sum = sum + params.data[i * 16u].x;
+      }
+      checksum[0] = checksum[0] + sum;
+    }`;
+  const scatterShader = `
+    struct Words { data: array<u32> };
+    @group(0) @binding(0) var<storage, read> patches: Words;
+    @group(0) @binding(1) var<storage, read_write> destination: Words;
+    @compute @workgroup_size(64)
+    fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+      if (id.x >= patches.data[0]) { return; }
+      let pos = 1u + id.x * 2u;
+      destination.data[patches.data[pos]] = patches.data[pos + 1u];
+    }`;
+
+  $('run').onclick = async () => {
+    $('run').disabled = true;
+    $('results').textContent = '';
+    try {
+      const adapter = await navigator.gpu?.requestAdapter({ powerPreference: 'high-performance' });
+      if (!adapter) throw new Error('WebGPU no disponible');
+      const device = await adapter.requestDevice();
+      const uncaptured = [];
+      device.addEventListener('uncapturederror', (event) => {
+        uncaptured.push(event.error.message);
+        $('status').textContent = `WebGPU: ${event.error.message}`;
+      });
+      device.pushErrorScope('validation');
+      const readPipeline = device.createComputePipeline({ layout: 'auto',
+        compute: { module: device.createShaderModule({ code: readShader }), entryPoint: 'main' } });
+      const scatterPipeline = device.createComputePipeline({ layout: 'auto',
+        compute: { module: device.createShaderModule({ code: scatterShader }), entryPoint: 'main' } });
+      const pipelineError = await device.popErrorScope();
+      if (pipelineError) throw new Error(`Pipeline: ${pipelineError.message}`);
+      const rows = [];
+      for (const mode of ['direct', 'scatter', 'wide', 'wide', 'scatter', 'direct']) {
+        $('status').textContent = `Ejecutando ${mode} (${rows.length + 1}/6)…`;
+        device.pushErrorScope('validation');
+        const target = device.createBuffer({ size: bufferBytes,
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+        const checksum = device.createBuffer({ size: 4,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const readback = device.createBuffer({ size: 4,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+        const packedBytes = 4 * (1 + 2 * slots * wordsPerSlot);
+        const patches = mode === 'scatter' ? device.createBuffer({ size: packedBytes,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }) : null;
+        const readBindGroup = device.createBindGroup({ layout: readPipeline.getBindGroupLayout(0),
+          entries: [{ binding: 0, resource: { buffer: target } },
+            { binding: 1, resource: { buffer: checksum } }] });
+        const scatterBindGroup = patches ? device.createBindGroup({
+          layout: scatterPipeline.getBindGroupLayout(0),
+          entries: [{ binding: 0, resource: { buffer: patches } },
+            { binding: 1, resource: { buffer: target } }] }) : null;
+        const shadow = new Uint8Array(bufferBytes);
+        let hostWrites = 0;
+        let hostBytes = 0;
+        let scatterPasses = 0;
+        const started = performance.now();
+        for (let batch = 0; batch < batches; batch++) {
+          const block = new Uint32Array(wordsPerSlot);
+          block.fill(batch + 1);
+          let packed;
+          if (mode === 'scatter') {
+            packed = new Uint32Array(1 + 2 * slots * wordsPerSlot);
+            packed[0] = slots * wordsPerSlot;
+          }
+          for (let slot = 0; slot < slots; slot++) {
+            const offset = slot * slotStride;
+            if (mode === 'direct') {
+              device.queue.writeBuffer(target, offset, block);
+              hostWrites++;
+              hostBytes += block.byteLength;
+            } else if (mode === 'wide') {
+              shadow.set(new Uint8Array(block.buffer), offset);
+            } else {
+              for (let word = 0; word < wordsPerSlot; word++) {
+                const index = slot * wordsPerSlot + word;
+                packed[1 + 2 * index] = offset / 4 + word;
+                packed[2 + 2 * index] = block[word];
+              }
+            }
+          }
+          if (mode === 'wide') {
+            const span = (slots - 1) * slotStride + block.byteLength;
+            device.queue.writeBuffer(target, 0, shadow.subarray(0, span));
+            hostWrites++;
+            hostBytes += span;
+          } else if (mode === 'scatter') {
+            device.queue.writeBuffer(patches, 0, packed);
+            hostWrites++;
+            hostBytes += packed.byteLength;
+          }
+          const encoder = device.createCommandEncoder();
+          if (mode === 'scatter') {
+            const pass = encoder.beginComputePass();
+            pass.setPipeline(scatterPipeline);
+            pass.setBindGroup(0, scatterBindGroup);
+            pass.dispatchWorkgroups(Math.ceil(slots * wordsPerSlot / 64));
+            pass.end();
+            scatterPasses++;
+          }
+          const pass = encoder.beginComputePass();
+          pass.setPipeline(readPipeline);
+          pass.setBindGroup(0, readBindGroup);
+          pass.dispatchWorkgroups(1);
+          pass.end();
+          device.queue.submit([encoder.finish()]);
+        }
+        await device.queue.onSubmittedWorkDone();
+        const wallMs = Math.round(performance.now() - started);
+        const encoder = device.createCommandEncoder();
+        encoder.copyBufferToBuffer(checksum, 0, readback, 0, 4);
+        device.queue.submit([encoder.finish()]);
+        await readback.mapAsync(GPUMapMode.READ);
+        const actual = new Uint32Array(readback.getMappedRange())[0];
+        readback.unmap();
+        const validationError = await device.popErrorScope();
+        const row = { mode, wallMs, hostWrites, hostBytes, scatterPasses,
+          expected, actual, correct: actual === expected,
+          validationError: validationError?.message ?? null, uncaptured: [...uncaptured] };
+        rows.push(row);
+        $('results').textContent = JSON.stringify({ adapter: adapter.info, rows }, null, 2);
+        target.destroy(); checksum.destroy(); readback.destroy(); patches?.destroy();
+        if (!row.correct || validationError) throw new Error(`${mode} produjo ${actual}; esperado ${expected}; ${validationError?.message ?? ''}`);
+      }
+      $('status').textContent = 'Comparación completada';
+    } catch (error) {
+      $('status').textContent = `ERROR: ${error.stack || error.message}`;
+    } finally {
+      $('run').disabled = false;
+    }
+  };
+</script>
