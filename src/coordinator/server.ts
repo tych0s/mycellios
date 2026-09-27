@@ -137,7 +137,7 @@ import {
   registerContentHubRoutes,
 } from "./content-hub.js";
 import { registerPublicDownloadRoutes } from "./public-download-routes.js";
-import { registerLandingEntryRoutes } from "./landing-entry-routes.js";
+import { registerCanonicalLandingHostRedirect, registerLandingEntryRoutes } from "./landing-entry-routes.js";
 import { SupabaseAuthService } from "./supabase-auth.js";
 import {
   DeploymentControlPlane,
@@ -398,6 +398,7 @@ export async function createCoordinator(
   const runtimeVersion = runtimeMetadata.version;
   const runtimeRevision = runtimeMetadata.revision;
   const app = Fastify({ logger: options.logger ?? false, bodyLimit: 2 * 1024 * 1024 });
+  registerCanonicalLandingHostRedirect(app);
   app.setErrorHandler((error, request, reply) => {
     if (error instanceof ZodError) {
       return reply.code(400).send({

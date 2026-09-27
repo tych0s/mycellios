@@ -62,11 +62,39 @@ describe("landing SEO contract", () => {
 
   it("ships universal browser-worker metadata before JavaScript runs", () => {
     const mobileHtml = read("src/mobile/index.html");
+    const landingHtml = read("landing/index.html");
     const mobile = SEO_PAGES["/browser/"];
 
     expect(mobileHtml).toContain(`<title>${mobile.title}</title>`);
     expect(mobileHtml).toContain(`content="${mobile.description}"`);
     expect(mobileHtml).toContain(`href="${canonicalUrl(mobile)}"`);
     expect(mobileHtml).toContain('id="seo-structured-data"');
+    const mobileStructuredData = mobileHtml.match(/<script\b[^>]*id="seo-structured-data"[^>]*>([\s\S]*?)<\/script>/)?.[1];
+    const landingStructuredData = landingHtml.match(/<script\b[^>]*id="seo-structured-data"[^>]*>([\s\S]*?)<\/script>/)?.[1];
+    expect(JSON.parse(mobileStructuredData ?? "null")).toBeTruthy();
+    expect(JSON.parse(landingStructuredData ?? "null")).toBeTruthy();
+    expect(mobileStructuredData).not.toMatch(/"price"\s*:/);
+    expect(landingStructuredData).not.toMatch(/"price"\s*:/);
+    expect(mobile.staticContent).toBeDefined();
+    expect(mobileHtml).toContain(`<h1>${mobile.staticContent!.heading}</h1>`);
+    for (const paragraph of mobile.staticContent!.paragraphs) {
+      expect(mobileHtml).toContain(`<p>${paragraph}</p>`);
+    }
+  });
+
+  it("provides specific static content for every indexable page before JavaScript runs", () => {
+    for (const path of INDEXABLE_SEO_PATHS) {
+      const page = SEO_PAGES[path];
+      expect(page.staticContent, `${path} static copy`).toBeDefined();
+      expect(page.staticContent!.heading.trim()).not.toBe("");
+      expect(page.staticContent!.paragraphs.length).toBeGreaterThanOrEqual(2);
+      expect(page.staticContent!.links.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("does not publish an unverified zero price in application structured data", () => {
+    for (const path of ["/", "/downloads", "/browser/"] as const) {
+      expect(JSON.stringify(SEO_PAGES[path].structuredData)).not.toMatch(/"price"\s*:/);
+    }
   });
 });

@@ -7,7 +7,7 @@
     <meta name="color-scheme" content="dark" />
     <meta
       name="description"
-      content="Run AI models too big for one computer. Mycellios splits the model across many machines, so it runs anyway."
+      content="Mycellios develops open-source distributed AI inference. Explore model-stage coordination, public network data, browser workers, and current evidence."
     />
     <meta name="robots" content="index, follow, max-image-preview:large" />
     <meta property="og:type" content="website" />
@@ -17,7 +17,7 @@
     <meta property="og:title" content="mycellios — The open compute layer for distributed AI" />
     <meta
       property="og:description"
-      content="Run AI models too big for one computer. Mycellios splits the model across many machines, so it runs anyway."
+      content="Mycellios develops open-source distributed AI inference. Explore model-stage coordination, public network data, browser workers, and current evidence."
     />
     <meta property="og:image" content="https://www.mycellios.com/assets/brand/og-image.png" />
     <meta property="og:image:alt" content="mycellios — distributed intelligence, rooted in nature" />
@@ -25,7 +25,7 @@
     <meta name="twitter:title" content="mycellios — The open compute layer for distributed AI" />
     <meta
       name="twitter:description"
-      content="Run AI models too big for one computer. Mycellios splits the model across many machines, so it runs anyway."
+      content="Mycellios develops open-source distributed AI inference. Explore model-stage coordination, public network data, browser workers, and current evidence."
     />
     <meta name="twitter:image" content="https://www.mycellios.com/assets/brand/og-image.png" />
     <link rel="canonical" href="https://www.mycellios.com/" />
@@ -37,6 +37,13 @@
     <link rel="shortcut icon" href="/assets/brand/favicon.png" type="image/png" />
     <link rel="apple-touch-icon" href="/assets/brand/app-icon.png" />
     <style>
+      html, body { min-height:100%; margin:0; }
+      .seo-static-fallback { box-sizing:border-box; min-height:100vh; max-width:72rem; margin-inline:auto; padding:clamp(2rem,8vw,7rem) clamp(1.25rem,6vw,4rem); background:#f8f5f0; color:#1e2a22; font-family:system-ui,-apple-system,"Segoe UI",sans-serif; line-height:1.7; }
+      .seo-static-fallback h1 { max-width:18ch; margin:0 0 1.5rem; font-size:clamp(2.25rem,7vw,4.5rem); line-height:1.08; }
+      .seo-static-fallback p { max-width:68ch; font-size:1.1rem; }
+      .seo-static-fallback a { color:#142019; text-underline-offset:.2em; }
+      .seo-static-fallback li { margin-block:.6rem; }
+      .seo-static-fallback ul { padding-inline-start:1.25rem; }
       #mycellios-loader { position:fixed; z-index:1000; inset:0; display:grid; place-items:center; color:#eee9e2; background:#0b0f0c; transition:opacity 240ms ease-in,visibility 240ms ease-in; }
       #mycellios-loader[data-state="leaving"] { opacity:0; visibility:hidden; }
       .mycellios-loader__mark { width:68px; height:68px; overflow:visible; filter:drop-shadow(0 0 20px rgba(173,122,72,.22)); }
@@ -53,6 +60,7 @@
       @keyframes mycellios-spore-rise { 0%,100% { opacity:.12; transform:translateY(4px) scale(.7); } 48% { opacity:.85; transform:translateY(-5px) scale(1); } }
       @media (prefers-reduced-motion:reduce) { #mycellios-loader { transition-duration:80ms; } .mycellios-loader__cap,.mycellios-loader__stem,.mycellios-loader__gills,.mycellios-loader__spore { animation:none; } }
     </style>
+    <noscript><style>#mycellios-loader { display:none !important; }</style></noscript>
     <script id="seo-structured-data" type="application/ld+json">
       {
         "@context": "https://schema.org",
@@ -84,16 +92,11 @@
             "name": "mycellios",
             "applicationCategory": "DeveloperApplication",
             "operatingSystem": "Windows 10/11, macOS, Ubuntu, Debian, Fedora, RHEL",
-            "description": "Run AI models too big for one computer. Mycellios splits the model across many machines, so it runs anyway.",
+            "description": "Open-source software coordinating AI inference across model-stage workers. Multi-host GPU performance and combined-memory execution remain under development.",
             "url": "https://www.mycellios.com/",
             "downloadUrl": "https://www.mycellios.com/downloads",
             "publisher": {
               "@id": "https://www.mycellios.com/#organization"
-            },
-            "offers": {
-              "@type": "Offer",
-              "price": "0",
-              "priceCurrency": "USD"
             }
           }
         ]
