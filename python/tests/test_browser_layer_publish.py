@@ -9,8 +9,13 @@ import tempfile
 import unittest
 
 import numpy as np
-import onnx
-from onnx import TensorProto, helper
+try:
+    import onnx
+    from onnx import TensorProto, helper
+except ModuleNotFoundError:
+    onnx = None
+    TensorProto = None
+    helper = None
 
 
 def _encoded(values: list[float]) -> str:
@@ -52,6 +57,7 @@ def test_stateless_non_qwen_graph_uses_the_generic_manifest():
             raise AssertionError("publisher accepted a wrong numerical canary")
 
 
+@unittest.skipUnless(onnx is not None, "onnx is an optional publisher dependency")
 class BrowserLayerPublisherTests(unittest.TestCase):
     def test_stateless_generic_onnx_manifest(self):
         test_stateless_non_qwen_graph_uses_the_generic_manifest()
