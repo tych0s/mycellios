@@ -16,6 +16,7 @@ import {
   workerCredentialRotationProofSchema,
 } from "../contracts/worker-admission.js";
 import { sha256CanonicalEvidence } from "../core/json.js";
+import { BrowserLayerHub } from "./browser-layer-hub.js";
 import {
   WorkerAdmissionAuthority,
   WorkerAdmissionError,
@@ -201,6 +202,9 @@ const mobileMessageSchema = z.discriminatedUnion("type", [
       message: z.string().min(1).max(500),
     }).strict(),
   }).strict(),
+  z.object({ v: z.literal(1), type: z.literal("layer.ready"), payload: z.unknown() }).strict(),
+  z.object({ v: z.literal(1), type: z.literal("layer.result"), payload: z.unknown() }).strict(),
+  z.object({ v: z.literal(1), type: z.literal("layer.fail"), payload: z.unknown() }).strict(),
 ]);
 
 export type MobileRegistration = z.infer<typeof mobileRegistrationSchema>;
@@ -261,6 +265,7 @@ interface MobileWorkerState {
   completedTasks: number;
   failedTasks: number;
   verifiedTasks: number;
+  gpuValidated: boolean;
   pendingTask: MatrixTask | null;
   pendingExpertTask: PendingExpertTask | null;
   residentExperts: Set<string>;
@@ -318,15 +323,41 @@ export class MobileComputeHub {
   private readonly disconnectedRetentionMs: number;
   private readonly expertArtifactsPath: string;
   private readonly expertManifests = new Map<string, ExpertManifest>();
+  private readonly layerHub: BrowserLayerHub;
 
   constructor(private readonly options: MobileComputeHubOptions = {}) {
     this.taskTimeoutMs = options.taskTimeoutMs ?? 45_000;
     this.disconnectedRetentionMs = options.disconnectedRetentionMs ?? DEFAULT_DISCONNECTED_RETENTION_MS;
     this.expertArtifactsPath = resolve(options.expertArtifactsPath ?? "runtime/mobile-experts");
     mkdirSync(this.expertArtifactsPath, { recursive: true });
+    this.layerHub = new BrowserLayerHub({
+      artifactDirectory: resolve(this.expertArtifactsPath, "layers"),
+      timeoutMs: this.taskTimeoutMs,
+      ...(options.onArtifactStored ? { onArtifactStored: options.onArtifactStored } : {}),
+      peers: () => [...this.workers.values()].map((worker) => ({
+        id: worker.id,
+        token: worker.token,
+        backend: worker.registration.backend,
+        connected: worker.connected,
+        visible: worker.visible,
+        validated: worker.registration.backend === "webgpu"
+          ? worker.gpuValidated : worker.verifiedTasks > 0,
+        busy: Boolean(worker.pendingTask || worker.pendingExpertTask),
+      })),
+      send: (peerId, type, payload) => this.send(this.workers.get(peerId)?.socket ?? null, type, payload),
+      onExecutionVerified: (peerId, layer, backend) => {
+        const worker = this.workers.get(peerId);
+        if (!worker) return;
+        worker.completedTasks += 1;
+        worker.verifiedTasks += 1;
+        this.send(worker.socket, "layer.verified", { layer, backend,
+          verifiedTasks: worker.verifiedTasks });
+      },
+    });
   }
 
   attach(app: FastifyInstance): void {
+    this.layerHub.attach(app);
     app.post("/mobile/v1/admission-challenge", async (request, reply) => {
       if (!this.options.admissionAuthority) {
         return reply.code(503).send({
@@ -595,7 +626,7 @@ export class MobileComputeHub {
       this.send(socket, "server.ready", {
         workerId: worker.id,
         verifiedTasks: worker.verifiedTasks,
-        inferenceReady: worker.verifiedTasks > 0,
+        inferenceReady: worker.gpuValidated,
       });
       socket.on("message", (raw) => this.handleMessage(worker, raw.toString()));
       socket.on("close", (code, reason) => {
@@ -630,6 +661,7 @@ export class MobileComputeHub {
       completedTasks: previous?.completedTasks ?? 0,
       failedTasks: previous?.failedTasks ?? 0,
       verifiedTasks: previous?.verifiedTasks ?? 0,
+      gpuValidated: false,
       pendingTask: null,
       pendingExpertTask: null,
       residentExperts: new Set<string>(),
@@ -726,6 +758,7 @@ export class MobileComputeHub {
   }
 
   close(): void {
+    this.layerHub.close();
     for (const worker of this.workers.values()) {
       worker.socket?.close(1001, "coordinator shutting down");
       worker.socket = null;
@@ -760,10 +793,22 @@ export class MobileComputeHub {
     const message = parsed.data;
     switch (message.type) {
       case "mobile.heartbeat":
+        if (!message.payload.visible
+          || message.payload.backend !== worker.registration.backend) {
+          this.layerHub.disconnect(worker.id);
+        }
         worker.visible = message.payload.visible;
         worker.wakeLock = message.payload.wakeLock;
         worker.estimatedGflops = message.payload.estimatedGflops;
         worker.registration.backend = message.payload.backend;
+        if (message.payload.backend !== "webgpu") {
+          worker.gpuValidated = false;
+          const artifacts = new Set(worker.residentExperts);
+          if (worker.pendingExpertTask) artifacts.add(worker.pendingExpertTask.artifactId);
+          for (const artifactId of artifacts) {
+            this.rejectExpertConsensus([worker], artifactId, "gpu_unavailable");
+          }
+        }
         break;
       case "work.request":
         this.offerWork(worker);
@@ -789,15 +834,20 @@ export class MobileComputeHub {
       case "expert.fail":
         this.failExpertTask(worker, message.payload);
         break;
+      case "layer.ready":
+      case "layer.result":
+      case "layer.fail":
+        this.layerHub.handleMessage(worker.id, message.type, message.payload);
+        break;
     }
   }
 
   private offerWork(worker: MobileWorkerState): void {
     if (!worker.socket || worker.socket.readyState !== worker.socket.OPEN || !worker.visible) return;
-    // Matrix work is an admission check, not a permanent workload. Once one
-    // result has been independently verified, this worker stays idle and is
-    // reserved for real model-expert inference.
-    if (worker.verifiedTasks > 0 || worker.pendingExpertTask) return;
+    // Matrix work admits a GPU session. Historical task counts cannot admit a
+    // re-registered device or a device that has since fallen back to CPU.
+    if (worker.gpuValidated || (worker.verifiedTasks > 0 && worker.registration.backend !== "webgpu")
+      || worker.pendingExpertTask) return;
     if (worker.pendingTask) {
       if (Date.now() - worker.pendingTask.issuedAt <= this.taskTimeoutMs) return;
       worker.failedTasks += 1;
@@ -847,12 +897,13 @@ export class MobileComputeHub {
     worker.verifiedTasks += 1;
     worker.estimatedGflops = payload.estimatedGflops;
     worker.registration.backend = payload.backend;
+    worker.gpuValidated = payload.backend === "webgpu";
     worker.pendingTask = null;
     this.send(worker.socket, "compute.verified", {
       taskId: task.taskId,
       completedTasks: worker.completedTasks,
       verifiedTasks: worker.verifiedTasks,
-      inferenceReady: true,
+      inferenceReady: worker.gpuValidated,
     });
   }
 
@@ -912,7 +963,13 @@ export class MobileComputeHub {
       throw new Error("activation payload does not match its declared shape");
     }
     const primary = await this.prepareExpert(input.artifactId);
-    const replica = await this.prepareExpert(input.artifactId, new Set([primary.id]));
+    let replica: MobileWorkerState;
+    try {
+      replica = await this.prepareExpert(input.artifactId, new Set([primary.id]));
+    } catch (error) {
+      this.rejectExpertConsensus([primary], input.artifactId, "replica_unavailable");
+      throw error;
+    }
     let results: [ExpertExecutionResult, ExpertExecutionResult];
     try {
       results = await Promise.all([
@@ -1017,10 +1074,13 @@ export class MobileComputeHub {
         && Math.abs(value - (expected[index] ?? Number.POSITIVE_INFINITY)) <= 2e-4);
     clearTimeout(pending.timer);
     worker.pendingExpertTask = null;
-    if (!verified) {
+    if (!verified || payload.backend !== "webgpu") {
       worker.failedTasks += 1;
-      pending.reject(new Error("mobile expert canary verification failed"));
-      this.send(worker.socket, "expert.rejected", { artifactId: pending.artifactId, reason: "canary_failed" });
+      const reason = payload.backend === "webgpu" ? "canary_failed" : "gpu_unavailable";
+      pending.reject(new Error(reason === "canary_failed"
+        ? "mobile expert canary verification failed"
+        : "browser expert fell back to CPU"));
+      this.send(worker.socket, "expert.rejected", { artifactId: pending.artifactId, reason });
       return;
     }
     worker.residentExperts.add(pending.artifactId);
@@ -1036,14 +1096,17 @@ export class MobileComputeHub {
     const pending = worker.pendingExpertTask;
     if (!this.matchesExpert(pending, payload) || pending.kind !== "execute") return;
     const output = decodeFloat32(payload.outputBase64);
-    const valid = payload.rows === pending.rows && payload.hiddenSize === pending.hiddenSize
+    const valid = payload.backend === "webgpu"
+      && payload.rows === pending.rows && payload.hiddenSize === pending.hiddenSize
       && output.length === payload.rows * payload.hiddenSize && allFinite(output);
     clearTimeout(pending.timer);
     worker.pendingExpertTask = null;
     if (!valid) {
       worker.residentExperts.delete(pending.artifactId);
       worker.failedTasks += 1;
-      pending.reject(new Error("mobile expert returned an invalid tensor"));
+      pending.reject(new Error(payload.backend === "webgpu"
+        ? "mobile expert returned an invalid tensor"
+        : "browser expert fell back to CPU"));
       return;
     }
     pending.resolve({
@@ -1073,6 +1136,7 @@ export class MobileComputeHub {
     return Boolean(
       worker.connected && worker.visible && worker.socket
       && worker.socket.readyState === worker.socket.OPEN && worker.verifiedTasks > 0
+      && worker.registration.backend === "webgpu" && worker.gpuValidated
       && !worker.pendingExpertTask,
     );
   }
@@ -1119,6 +1183,7 @@ export class MobileComputeHub {
 
   private disconnect(worker: MobileWorkerState, socket: WebSocket, voluntary = false): void {
     if (worker.socket !== socket) return;
+    this.layerHub.disconnect(worker.id);
     worker.socket = null;
     worker.connected = false;
     worker.disconnectedAt = Date.now();

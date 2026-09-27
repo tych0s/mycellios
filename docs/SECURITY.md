@@ -41,6 +41,22 @@ node as an explicit trust decision, not as an anonymous shell target.
 - Checkpoint control uses one absolute deadline from connection acceptance
   through header/payload framing and queued execution. Dribbling bytes cannot
   reset that budget or hold the serial control server indefinitely.
+- Browser expert contribution sends the selected model weights and live MLP
+  activations to user-controlled browser workers. Its manifest and weight
+  download routes are public. Enable a browser bridge only for models whose
+  weights may be distributed and workloads whose activations may be processed
+  by such workers. The coordinator checks a weight hash, a numerical canary and
+  agreement from two distinct visible workers; replica agreement is not a
+  confidentiality guarantee or a defense against two colluding workers.
+- The browser bridge configuration and internal bearer token belong only on
+  the native stage. A remote coordinator origin requires HTTPS. Browsers never
+  receive the internal token.
+- A browser-owned Qwen3 decoder layer also receives live hidden states and
+  attention context, and keeps its KV for that request. Its ONNX graph is
+  downloaded only with the assigned browser worker token. Use this route only
+  when those model weights and request activations may leave the native stage.
+  A hash and numerical canary check compatibility; one browser response is not
+  independently replicated or a confidentiality guarantee.
 
 ## Operating a private test
 
