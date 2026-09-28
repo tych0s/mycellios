@@ -3,6 +3,50 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 
 const REPOSITORY_DOCS = "https://github.com/tych0s/mycellios/blob/main/docs";
+const CANONICAL_LANDING_HOST = "www.mycellios.com";
+const CANONICAL_LANDING_PATHS = new Set([
+  "/",
+  "/network",
+  "/create",
+  "/earn",
+  "/spore",
+  "/spore/treasury",
+  "/spore/data",
+  "/downloads",
+  "/llms.txt",
+  "/admin",
+  "/dashboard",
+  "/account",
+  "/browser/",
+]);
+
+export function canonicalLandingRedirectLocation(
+  method: string,
+  hostname: string,
+  requestUrl: string,
+): string | null {
+  if (!(["GET", "HEAD"].includes(method.toUpperCase())) || hostname.toLowerCase() !== "mycellios.com") return null;
+
+  const queryIndex = requestUrl.indexOf("?");
+  const pathname = queryIndex === -1 ? requestUrl : requestUrl.slice(0, queryIndex);
+  const query = queryIndex === -1 ? "" : requestUrl.slice(queryIndex);
+  const normalizedPath = pathname.length > 1 ? pathname.replace(/\/+$/, "") : "/";
+  const canonicalPath = normalizedPath === "/browser" || normalizedPath === "/mobile"
+    ? "/browser/"
+    : normalizedPath;
+  const isLandingPath = CANONICAL_LANDING_PATHS.has(canonicalPath)
+    || canonicalPath === "/blog"
+    || canonicalPath.startsWith("/blog/");
+
+  return isLandingPath ? `https://${CANONICAL_LANDING_HOST}${canonicalPath}${query}` : null;
+}
+
+export function registerCanonicalLandingHostRedirect(app: FastifyInstance): void {
+  app.addHook("onRequest", async (request, reply) => {
+    const location = canonicalLandingRedirectLocation(request.method, request.hostname, request.url);
+    if (location) return reply.redirect(location, 308);
+  });
+}
 
 export function registerLandingEntryRoutes(app: FastifyInstance, assetsRoot: string): void {
   const routeDocuments = {

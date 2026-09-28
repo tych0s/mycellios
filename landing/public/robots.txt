@@ -1,3 +1,12 @@
+User-agent: OAI-SearchBot
+Allow: /
+Disallow: /internal/
+Disallow: /local/
+Disallow: /mobile/v1/
+Disallow: /public/v1/
+Disallow: /v1/
+Disallow: /updates/
+
 User-agent: *
 Allow: /
 Disallow: /internal/

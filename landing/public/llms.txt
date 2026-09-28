@@ -1,0 +1,27 @@
+# mycellios
+
+> mycellios is an open-source project developing a local-first distributed AI inference runtime.
+
+The coordinator plans model stages across worker computers. The project is under active development; check the public evidence page before describing performance or production readiness. Multi-host GPU performance and combined-memory model execution are not established as general production capabilities.
+
+The public network page reports a live snapshot when data is available. Compute contributions are voluntary; rewards are not live or promised.
+
+## Product
+
+- [Project overview](https://www.mycellios.com/): What mycellios is building and current capability limits.
+- [Public network](https://www.mycellios.com/network): Public worker, model, and activity snapshot when available.
+- [Create Studio](https://www.mycellios.com/create): Draft and preview an AI identity before publishing.
+- [Contribute compute](https://www.mycellios.com/earn): Learn about voluntary browser and native test-network participation.
+- [Downloads](https://www.mycellios.com/downloads): Check current native package availability.
+- [Browser worker](https://www.mycellios.com/browser/): Try the browser-based worker where supported.
+
+## Documentation and evidence
+
+- [Repository README](https://github.com/tych0s/mycellios#readme): Project overview and setup.
+- [Status and evidence](https://github.com/tych0s/mycellios/blob/main/docs/STATUS_AND_EVIDENCE.md): The authoritative record for capability claims and test evidence.
+- [Security policy](https://github.com/tych0s/mycellios/blob/main/SECURITY.md): How to report security issues.
+- [License](https://github.com/tych0s/mycellios/blob/main/LICENSE): Project license.
+
+## Optional
+
+- [Research and field notes](https://www.mycellios.com/blog): Published project notes.

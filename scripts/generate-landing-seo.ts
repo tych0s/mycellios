@@ -42,6 +42,20 @@ function metaTag(attribute: "name" | "property", key: string, content: string): 
   return `<meta ${attribute}="${key}" content="${escapeAttribute(content)}">`;
 }
 
+function renderStaticSeoContent(page: (typeof SEO_PAGES)[SeoPath]): string {
+  const content = page.staticContent ?? {
+    heading: page.title,
+    paragraphs: [page.description],
+    links: [{ href: "/", label: "Return to Mycellios" }],
+  };
+  const paragraphs = content.paragraphs.map((paragraph) => `<p>${escapeAttribute(paragraph)}</p>`).join("");
+  const links = content.links
+    .map(({ href, label }) => `<li><a href="${escapeAttribute(href)}">${escapeAttribute(label)}</a></li>`)
+    .join("");
+
+  return `<main class="seo-static-fallback"><h1>${escapeAttribute(content.heading)}</h1>${paragraphs}<nav aria-label="Related Mycellios pages"><ul>${links}</ul></nav></main>`;
+}
+
 function renderSeoDocument(template: string, path: (typeof LANDING_SEO_PATHS)[number]): string {
   const page = seoPageForPath(path);
   const url = canonicalUrl(page);
@@ -96,6 +110,12 @@ function renderSeoDocument(template: string, path: (typeof LANDING_SEO_PATHS)[nu
     `<link rel="canonical" href="${escapeAttribute(url)}">`,
     "canonical URL",
   );
+  html = replaceRequired(
+    html,
+    /<div\s+id=["']root["']><\/div>/i,
+    `<div id="root">${renderStaticSeoContent(page)}</div>`,
+    "static page content",
+  );
 
   const structuredDataPattern =
     /<script\b[^>]*\bid=["']seo-structured-data["'][^>]*>[\s\S]*?<\/script>/i;
@@ -130,6 +150,19 @@ function verifyDocument(path: (typeof LANDING_SEO_PATHS)[number], html: string):
   ];
   for (const fragment of expected) {
     if (!html.includes(fragment)) throw new Error(`Generated SEO document for ${path} is missing ${fragment}`);
+  }
+  const pageContent = page.staticContent ?? { heading: page.title, paragraphs: [page.description] };
+  const staticBody = html.match(/<main\s+class=["']seo-static-fallback["']>([\s\S]*?)<\/main>/i)?.[1];
+  if (!staticBody || countMatches(staticBody, /<h1\b/gi) !== 1) {
+    throw new Error(`Generated SEO document for ${path} must include exactly one static H1`);
+  }
+  if (!staticBody.includes(`<h1>${escapeAttribute(pageContent.heading)}</h1>`)) {
+    throw new Error(`Generated SEO document for ${path} has the wrong static H1`);
+  }
+  for (const paragraph of pageContent.paragraphs) {
+    if (!staticBody.includes(`<p>${escapeAttribute(paragraph)}</p>`)) {
+      throw new Error(`Generated SEO document for ${path} is missing static page content`);
+    }
   }
   if (countMatches(html, /<link\b[^>]*\brel=["']canonical["'][^>]*>/gi) !== 1) {
     throw new Error(`Generated SEO document for ${path} must contain exactly one canonical URL`);
