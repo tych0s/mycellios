@@ -53,6 +53,8 @@ describe("landing SEO contract", () => {
     const robots = read("landing/public/robots.txt");
 
     expect(robots).toContain("Sitemap: https://www.mycellios.com/sitemap.xml");
+    expect(robots).toMatch(/User-agent:\s*OAI-SearchBot[\s\S]*?Allow:\s*\//);
+    expect(robots).toMatch(/User-agent:\s*OAI-SearchBot[\s\S]*?Disallow:\s*\/internal\//);
     expect(robots).toContain("Disallow: /internal/");
     expect(robots).toContain("Disallow: /mobile/v1/");
     expect(robots).toContain("Disallow: /public/v1/");
@@ -60,13 +62,58 @@ describe("landing SEO contract", () => {
     expect(robots).not.toContain("Disallow: /admin");
   });
 
+  it("publishes an agent guide that links only to public product and evidence pages", () => {
+    const guide = read("landing/public/llms.txt");
+
+    expect(guide).toMatch(/^# mycellios/m);
+    expect(guide).toContain("https://www.mycellios.com/network");
+    expect(guide).toContain("https://github.com/tych0s/mycellios/blob/main/docs/STATUS_AND_EVIDENCE.md");
+    expect(guide).not.toMatch(/\/internal\/|\/public\/v1\/|\/v1\/|\/admin/);
+    expect(guide).toContain("not established as general production capabilities");
+  });
+
+  it("links route documents to the agent guide before JavaScript runs", () => {
+    const html = read("landing/index.html");
+
+    expect(html).toContain('<link rel="describedby" href="https://www.mycellios.com/llms.txt" />');
+  });
+
   it("ships universal browser-worker metadata before JavaScript runs", () => {
     const mobileHtml = read("src/mobile/index.html");
+    const landingHtml = read("landing/index.html");
     const mobile = SEO_PAGES["/browser/"];
 
     expect(mobileHtml).toContain(`<title>${mobile.title}</title>`);
     expect(mobileHtml).toContain(`content="${mobile.description}"`);
     expect(mobileHtml).toContain(`href="${canonicalUrl(mobile)}"`);
+    expect(mobileHtml).toContain('<link rel="describedby" href="https://www.mycellios.com/llms.txt" />');
     expect(mobileHtml).toContain('id="seo-structured-data"');
+    const mobileStructuredData = mobileHtml.match(/<script\b[^>]*id="seo-structured-data"[^>]*>([\s\S]*?)<\/script>/)?.[1];
+    const landingStructuredData = landingHtml.match(/<script\b[^>]*id="seo-structured-data"[^>]*>([\s\S]*?)<\/script>/)?.[1];
+    expect(JSON.parse(mobileStructuredData ?? "null")).toBeTruthy();
+    expect(JSON.parse(landingStructuredData ?? "null")).toBeTruthy();
+    expect(mobileStructuredData).not.toMatch(/"price"\s*:/);
+    expect(landingStructuredData).not.toMatch(/"price"\s*:/);
+    expect(mobile.staticContent).toBeDefined();
+    expect(mobileHtml).toContain(`<h1>${mobile.staticContent!.heading}</h1>`);
+    for (const paragraph of mobile.staticContent!.paragraphs) {
+      expect(mobileHtml).toContain(`<p>${paragraph}</p>`);
+    }
+  });
+
+  it("provides specific static content for every indexable page before JavaScript runs", () => {
+    for (const path of INDEXABLE_SEO_PATHS) {
+      const page = SEO_PAGES[path];
+      expect(page.staticContent, `${path} static copy`).toBeDefined();
+      expect(page.staticContent!.heading.trim()).not.toBe("");
+      expect(page.staticContent!.paragraphs.length).toBeGreaterThanOrEqual(2);
+      expect(page.staticContent!.links.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("does not publish an unverified zero price in application structured data", () => {
+    for (const path of ["/", "/downloads", "/browser/"] as const) {
+      expect(JSON.stringify(SEO_PAGES[path].structuredData)).not.toMatch(/"price"\s*:/);
+    }
   });
 });
