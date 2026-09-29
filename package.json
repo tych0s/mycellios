@@ -1,7 +1,7 @@
 {
   "name": "mycellios",
   "productName": "mycellios",
-  "version": "0.2.80",
+  "version": "0.2.81",
   "private": true,
   "packageManager": "npm@10.9.8",
   "type": "module",
