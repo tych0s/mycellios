@@ -30,6 +30,10 @@ set:
 - the Python executable used on each host;
 - a unique authentication environment variable for the remote agent.
 
+Keep `runtime.apiAdvertiseHost` reachable from the coordinator on host A. The
+example API binds to `127.0.0.1`, so its advertise host is also `127.0.0.1`;
+the return endpoint and stage addresses still use the two LAN IPs.
+
 Run the non-mutating preflight before profiling or launching anything:
 
 ```bash
@@ -101,7 +105,105 @@ complete cleanup.
 
 ## Known boundary
 
-The generic automatic range executor is currently the safest first CPU path.
-GPU cells have separate physical campaign commands and stricter collective
-requirements. Prove the ordinary two-host pipeline first; then move the same
-evidence discipline to GPU execution.
+Start with the ordinary two-host pipeline. For a CUDA assignment, confirm the
+installed node reports a verified GPU backend and that the assigned stage
+performs a real GPU operation. Tensor-parallel GPU cells have separate physical
+campaign commands and stricter collective requirements. See
+`STATUS_AND_EVIDENCE.md` for measured physical results and their limits.
+
+## Windows troubleshooting and stopping
+
+- If the remote agent answers but the root cannot reach the stage, check TCP
+  `18101` from host A and TCP `18100` from host B. A Windows Firewall **block**
+  rule for `python.exe` takes precedence over a new allow rule. Inspect active
+  inbound rules for the exact Python executable, then use narrow, temporary
+  rules for the two hosts. Restore any pre-existing block rule after the test.
+- If both stages report ready but health fetching fails, confirm that
+  `runtime.apiAdvertiseHost` points to the address where the root API actually
+  binds. With `runtime.apiEndpoint.host` set to `127.0.0.1`, advertise
+  `127.0.0.1` to the local coordinator. Keep the return endpoint on the LAN IP.
+- Keep `runtime.connectTimeoutSeconds` large enough for stage startup. Set
+  `runtime.operationTimeoutSeconds` for the expected maximum active request
+  time when the supervisor may stop an unreachable stage earlier. The example
+  leaves it unset; the pinned SmolLM2 lab run used 20 seconds. Large or slow
+  models need a longer measured value. A timed-out request fails rather than
+  silently retrying.
+- After a failed launch, stop and restart the remote launch agent before
+  retrying. Its process records can retain a terminal state for a repeated
+  launch description. Confirm ports `9750`, `18101`, `18100` and the configured
+  API port have the expected listeners or are closed before each retry.
+- To pause the lab, stop the coordinator with Ctrl+C and stop the remote
+  launch agent. Check that no stage Python process remains and that the stage,
+  return and API ports have closed. Remove temporary firewall rules and
+  restore the original inbound policy. The persisted `status.json` is a
+  snapshot and does not replace those live checks.
+
+## Accompanied external tester procedure
+
+This procedure is a draft until a released native package has been installed
+and exercised by someone outside the lab. It does not require installing
+Jarvis or joining the lab Tailscale network on the tester's computer.
+
+1. The operator checks that the Windows x64 package is actually available at
+   `/downloads/windows`, verifies its published provenance and records the
+   release revision. If it is unavailable, stop before creating a pairing
+   bundle.
+2. The tester confirms Windows x64, administrator access, Internet access and
+   enough free disk for the package, runtime and selected model. For the NVIDIA
+   CUDA trial, reserve at least 8 GiB of free space and allow a 2.6 GB runtime
+   download. Record the start time and any warning or manual action.
+3. On a trusted browser, sign in to the tester's Mycellios account and create
+   a one-time pairing bundle from **Use a dedicated computer**. Put that bundle
+   with the verified MSI, its checksum and the USB launcher on the drive.
+   Prepare the bundle last: it expires within 15 minutes. The tester then runs
+   the launcher once on the target PC and accepts Windows administrator
+   elevation. No account sign-in is required on that PC. Never place a
+   reusable account credential in the installer or on the USB drive.
+4. Confirm from the trusted browser that the node appears under **Owned nodes**,
+   reaches **Ready**, and reports its detected CPU/GPU and resource limits.
+   Record the verified backend and any GPU fallback reason; a CUDA trial needs
+   a real GPU operation under the installed service account. Record the time
+   to connection. The operator assigns a small pinned model and verifies a real
+   remote layer and answer with a receipt; a connected status alone is not an
+   inference result.
+5. Use **Pause** and **Resume** in **Owned nodes**; verify that paused capacity
+   is no longer assigned. To end the pilot, use the available uninstall action
+   or ask the operator to revoke the node. Record any service, permission,
+   pairing or model-download error and the exact step where it occurred.
+
+Stop the attempt if pairing expires, package verification fails, the node
+never becomes ready or the assigned model cannot produce a verified answer.
+The operator should retain timings and sanitized diagnostics, never the
+pairing token or account credentials.
+
+### Invitation draft (not sent)
+
+> Hola, estamos probando Mycellios con un grupo muy pequeño. Buscamos a alguien
+> con un PC Windows x64 que pueda dedicar unos 45–60 minutos a instalar un nodo
+> con un pendrive y comprobar una inferencia real. Estaremos contigo durante la
+> prueba, mediremos el tiempo hasta conectar y podrás pausar o desinstalar el
+> nodo al terminar. Si te encaja, acordamos un momento y te explicamos los
+> requisitos antes de tocar tu equipo.
+
+Choose two or three people who can consent to the accompanied test and record
+their actual names separately before sending this invitation. No external
+installation or contact is counted until it happens.
+
+### Lab USB preparation after a fixed release exists
+
+The lab's `PREPARAR-PC.cmd` currently handles Jarvis and Tailscale only. For a
+native-node pilot, the operator can place `windows-usb-node-install.cmd` and
+`windows-usb-node-install.ps1` from `scripts/` beside a `Node` folder on the
+USB. That folder needs exactly one released Windows x64 MSI and its matching
+`<MSI filename>.sha256` file. A new PC also needs exactly one fresh
+`.mycellios-enrollment` downloaded from the tester's account. Prepare that
+file last; the script requires more than 10 minutes of its 15-minute lifetime
+to remain. Run the PowerShell script with `-PreflightOnly` before handing over
+the USB; that read-only check requests administrator elevation to inspect a
+retained identity. Then run the CMD file on the target PC. It requests
+administrator elevation, pairs a new node and waits for a running service, local `Ready`
+health and redemption of the one-time bundle. On an already paired node, the
+same file can install a higher MSI version without another pairing; a healthy
+matching version exits without restarting the service. If the MSI requires a
+reboot during an update, reboot and run the same USB file again. A failed
+first pairing needs diagnosis and a fresh unexpired bundle.

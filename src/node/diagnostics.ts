@@ -19,7 +19,7 @@ export const nodeDiagnosticSnapshotSchema = z.object({
     updateChannel: z.enum(["dev", "stable"]),
   }).strict(),
   runtime: z.object({
-    backend: z.enum(["cuda", "rocm"]),
+    backend: z.enum(["cpu", "cuda", "rocm"]),
     pythonVersion: z.string().min(1).max(64),
     cudaVersion: z.string().max(64).nullable(),
     rocmVersion: z.string().max(64).nullable(),
@@ -54,7 +54,9 @@ export function buildNodeDiagnosticSnapshot(input: {
   errorCodes?: readonly string[];
   now?: Date;
 }): NodeDiagnosticSnapshot {
-  const backend = input.physicalProbe.runtime.rocmVersion ? "rocm" as const : "cuda" as const;
+  const backend = input.physicalProbe.runtime.rocmVersion
+    ? "rocm" as const
+    : input.physicalProbe.runtime.cudaApiAvailable ? "cuda" as const : "cpu" as const;
   return nodeDiagnosticSnapshotSchema.parse({
     schema: "mycellios-node-diagnostics/1",
     generatedAt: (input.now ?? new Date()).toISOString(),

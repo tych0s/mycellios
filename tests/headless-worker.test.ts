@@ -13,6 +13,7 @@ import type {
 import {
   buildPhysicalIdentity,
   createHeadlessRuntime,
+  createNativeNodeRuntime,
   HeadlessStageLaunchAgent,
   loadHeadlessWorkerEnvironment,
 } from "../src/worker/headless-runtime.js";
@@ -28,6 +29,7 @@ const probe: PhysicalProbeV1 = {
     architecture: "x86_64",
     kernelRelease: "6.8.0",
     pythonVersion: "3.12.13",
+    cpuDeviceName: "Test CPU",
   },
   runtime: {
     torchVersion: "2.13.0+cu126",
@@ -196,6 +198,7 @@ describe("headless GpuCloud worker", () => {
           environment: {
             PYTHONPATH: "/opt/mycellios/runtime",
             HF_HOME: "/var/cache/mycellios",
+            PYTHONDONTWRITEBYTECODE: "1",
           },
         });
         options.onProgress?.({
@@ -241,5 +244,33 @@ describe("headless GpuCloud worker", () => {
       environment,
       { collect: async () => cpuProbe },
     )).rejects.toThrow("headless_worker_requires_verified_cuda_device");
+  });
+
+  it("starts a packaged native node with CPU stage capacity and no GPU claim", async () => {
+    const environment = loadHeadlessWorkerEnvironment({
+      MYCELLIOS_NODE_ID: "native-cpu-node",
+      GPU_MESH_COORDINATOR: "https://www.mycellios.com",
+      MYCELLIOS_NETWORK_TOKEN: "n".repeat(32),
+    }, "/opt/mycellios");
+    const cpuProbe = structuredClone(probe);
+    cpuProbe.runtime.torchVersion = "2.13.0+cpu";
+    cpuProbe.runtime.cudaApiAvailable = false;
+    cpuProbe.runtime.cudaVersion = null;
+    cpuProbe.runtime.ncclAvailable = false;
+    cpuProbe.runtime.ncclVersion = null;
+    cpuProbe.devices = [];
+    const runtime = await createNativeNodeRuntime(
+      environment,
+      { collect: async () => cpuProbe },
+      () => new Date("2026-09-28T00:00:00.000Z"),
+    );
+    expect(runtime.executor).toMatchObject({ computeMode: "cpu-only", cpuEligible: true });
+    expect(runtime.acceleration).toMatchObject({
+      state: "cpu-ready", backend: "cpu", deviceName: "Test CPU", gpuVendor: null,
+    });
+    expect(runtime.verifiedGpuRuntime).toBeUndefined();
+    expect(runtime.preferredHardwareGpu).toBeUndefined();
+    expect(runtime.executor.physicalIdentity).toBeUndefined();
+    expect(runtime.executor.launchAgent).toBeInstanceOf(HeadlessStageLaunchAgent);
   });
 });

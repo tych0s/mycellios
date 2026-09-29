@@ -25,7 +25,8 @@ export async function executeVerifiedUninstall(input: {
   const run = input.run ?? runPlatformCommand;
   await disableService(input.manifest, run);
   const remove = input.remove ?? (async (path) => rm(path, { recursive: true, force: true }));
-  const selected = new Set<string>([input.manifest.serviceDefinitionPath]);
+  const selected = new Set<string>([input.manifest.platform === "win32"
+    ? dirname(input.manifest.serviceDefinitionPath) : input.manifest.serviceDefinitionPath]);
   if (!input.request.retain.configuration) selected.add(input.manifest.configPath);
   if (!input.request.retain.identity) selected.add(input.manifest.identityPath);
   if (!input.request.retain.cache) selected.add(input.manifest.cachePath);

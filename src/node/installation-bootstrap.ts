@@ -33,10 +33,11 @@ export async function bootstrapNodeInstallation(input: {
   const enrollmentPath = join(configurationDirectory, "enrollment.json");
   const installationManifestPath = join(manifest.statePath, "installation.json");
   const nodeId = `node-${bundle.enrollmentId.replaceAll("-", "")}`;
-  const pythonPath = join(manifest.installRoot, "runtime");
+  const pythonPath = join(manifest.installRoot, "python");
+  const runtimePath = join(manifest.installRoot, "runtime");
   const pythonExecutable = manifest.platform === "win32"
-    ? join(pythonPath, "python.exe")
-    : join(pythonPath, "bin", "python3");
+    ? join(runtimePath, "python.exe")
+    : join(runtimePath, "bin", "python3");
   const isolation = manifest.platform === "win32"
     ? { mode: "windows-job-object" as const, brokerExecutable: join(manifest.installRoot, "bin", "mycellios-job-broker.exe") }
     : manifest.platform === "darwin"

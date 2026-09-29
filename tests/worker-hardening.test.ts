@@ -1,5 +1,6 @@
 import { createServer, type RequestListener, type Server } from "node:http";
 import { createConnection } from "node:net";
+import { WebSocketServer } from "ws";
 import { afterEach, describe, expect, it } from "vitest";
 import type { InferenceAdapter } from "../src/adapters/base.js";
 import { MycelliosPipelineAdapter } from "../src/adapters/mycellios-pipeline.js";
@@ -41,6 +42,58 @@ describe("worker boundary hardening", () => {
     expect(() => validateCoordinatorUrl("ws://coordinator.example")).toThrow(/HTTPS\/WSS/);
     expect(validateCoordinatorUrl("http://127.0.0.1:8080").protocol).toBe("http:");
     expect(validateCoordinatorUrl("https://coordinator.example").protocol).toBe("https:");
+  });
+
+  it("re-registers after a coordinator rejects an expired WebSocket session", async () => {
+    let registrations = 0;
+    let rejectedConnections = 0;
+    const websocketServer = new WebSocketServer({ noServer: true });
+    const coordinatorUrl = await listen(servers, (request, response) => {
+      if (request.url !== "/internal/v1/workers/register") {
+        response.writeHead(404).end();
+        return;
+      }
+      registrations += 1;
+      response.writeHead(201, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        workerId: "reconnecting-worker",
+        protocolVersion: 1,
+        workerSessionToken: `session-${registrations}`,
+      }));
+    });
+    servers.at(-1)!.on("upgrade", (request, socket, head) => {
+      if (request.url !== "/internal/v1/workers/connect") {
+        socket.destroy();
+        return;
+      }
+      if (request.headers.authorization !== "Bearer session-2") {
+        rejectedConnections += 1;
+        socket.end("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+        return;
+      }
+      websocketServer.handleUpgrade(request, socket, head, (connection) => {
+        connection.send(JSON.stringify({ v: 1, type: "server.ready", payload: { workerId: "reconnecting-worker" } }));
+      });
+    });
+    const agent = new WorkerAgent(baseConfig(), {
+      coordinatorUrl,
+      reconnect: true,
+      advertiseDeployment: false,
+      hardwareProbe: async () => ({ hostname: "reconnecting-worker", platform: process.platform, ramMb: 8_192, gpus: [] }),
+      logger: { info() {}, warn() {}, error() {} },
+    });
+    const run = agent.start();
+    try {
+      const deadline = Date.now() + 5_000;
+      while (!agent.isReady && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(agent.isReady).toBe(true);
+      expect(registrations).toBe(2);
+      expect(rejectedConnections).toBe(1);
+    } finally {
+      await agent.stop();
+      await run;
+      websocketServer.close();
+    }
   });
 
   it("cancels registration before a stopped worker can connect or retain its direct listener", async () => {

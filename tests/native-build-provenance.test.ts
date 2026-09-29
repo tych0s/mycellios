@@ -21,6 +21,8 @@ describe("native node source provenance", () => {
         "src/distribution/python-launcher.ts",
         "landing/src/main.tsx",
         "python/distributed_runtime/draft_model.py",
+        "sidecars/windows-job-broker/Program.cs",
+        "sidecars/windows-job-broker/Mycellios.JobBroker.csproj",
         ".github/workflows/node-build.yml",
       ]),
     );
@@ -30,6 +32,7 @@ describe("native node source provenance", () => {
         || path.startsWith("mobile-dist/")
         || path.startsWith("out/")
         || path.includes("/.vite/")
+        || /^sidecars\/[^/]+\/(bin|obj)\//.test(path)
       ),
     ).toBe(false);
     expect(() =>

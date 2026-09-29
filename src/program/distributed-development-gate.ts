@@ -43,7 +43,7 @@ import {
 } from "../worker/admission-credential.js";
 import { prepareNodeStageArtifacts } from "../worker/stage-artifact-preparer.js";
 
-const DEFAULT_MODEL = "hmellor/tiny-random-LlamaForCausalLM";
+const DEFAULT_MODEL = "HMellor/tiny-random-LlamaForCausalLM";
 const DEFAULT_TIMEOUT_SECONDS = 300;
 const CLEANUP_STEP_TIMEOUT_MS = 30_000;
 

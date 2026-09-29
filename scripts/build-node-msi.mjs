@@ -20,7 +20,8 @@ export function generateWixSource(input) {
   if (!/^\d+\.\d+\.\d+$/.test(input.version)) throw new Error("node_msi_version_is_invalid");
   if (!/^[a-f0-9]{40}$/.test(input.sourceRevision)) throw new Error("node_msi_source_revision_is_invalid");
   const root = directoryNode("INSTALLFOLDER", "Mycellios"); const componentIds = [];
-  for (const file of input.files) {
+  if (input.files.some((file) => file.path === "layout-manifest.json")) throw new Error("node_msi_manifest_is_duplicate");
+  for (const file of [{ path: "layout-manifest.json" }, ...input.files]) {
     const parts = file.path.split("/"); const name = parts.pop(); if (!name || parts.some((part) => !part || part === "." || part === "..")) throw new Error("node_msi_file_path_is_invalid");
     let directory = root; for (const part of parts) directory = childDirectory(directory, part);
     const id = wixId("cmp", file.path); componentIds.push(id);
@@ -31,6 +32,7 @@ export function generateWixSource(input) {
 <RegistryValue Root="HKLM" Key="Software\\Classes\\.mycellios-enrollment" Value="Mycellios.Enrollment" Type="string" KeyPath="yes" />
 <RegistryValue Root="HKLM" Key="Software\\Classes\\Mycellios.Enrollment" Value="Mycellios one-time computer pairing" Type="string" />
 <RegistryValue Root="HKLM" Key="Software\\Classes\\Mycellios.Enrollment\\shell\\open\\command" Value="&quot;[System64Folder]WindowsPowerShell\\v1.0\\powershell.exe&quot; -NoProfile -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]install.ps1&quot; -Enrollment &quot;%1&quot;" Type="string" />
+<ServiceControl Id="svc_remove_myc_node" Name="MycelliosNode" Stop="uninstall" Remove="uninstall" Wait="yes" />
 </Component>`);
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">

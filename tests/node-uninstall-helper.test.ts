@@ -55,7 +55,8 @@ describe("privileged node uninstall lifecycle", () => {
       expect(run).toHaveBeenNthCalledWith(2, "sc.exe", ["delete", "mycellios-node.service"], true);
     }
     const removed = remove.mock.calls.map(([path]) => path);
-    expect(removed).toEqual(expect.arrayContaining([manifest.logsPath, manifest.statePath, manifest.serviceDefinitionPath, manifest.installRoot]));
+    expect(removed).toEqual(expect.arrayContaining([manifest.logsPath, manifest.statePath,
+      manifest.platform === "win32" ? join(root, "service") : manifest.serviceDefinitionPath, manifest.installRoot]));
     expect(removed).not.toEqual(expect.arrayContaining([manifest.cachePath, manifest.configPath, manifest.identityPath]));
     expect(first.state).toBe("completed");
     run.mockClear(); remove.mockClear();
@@ -92,7 +93,7 @@ describe("privileged node uninstall lifecycle", () => {
     for (const [name, path] of Object.entries(dataPaths)) {
       expect(removed.has(path), name).toBe(!retain[name as keyof typeof retain]);
     }
-    expect(removed.has(manifest.serviceDefinitionPath)).toBe(true);
+    expect(removed.has(manifest.platform === "win32" ? join(root, "service") : manifest.serviceDefinitionPath)).toBe(true);
     expect(removed.has(manifest.statePath)).toBe(true);
     expect(removed.has(manifest.installRoot)).toBe(true);
     expect(receipt.retained).toEqual(expectedRetained);

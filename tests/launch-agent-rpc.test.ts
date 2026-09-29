@@ -717,6 +717,21 @@ describe("HTTP LaunchAgent RPC", () => {
     await Promise.all([ready, exited]);
   });
 
+  it("preserves an unsigned Windows child exit without crashing the agent", async () => {
+    const request = fixtureRequest();
+    const fake = new FakeAgent("fake:windows-exit", { autoReady: true });
+    const { address } = await serve(fake, request.nodeId);
+    const handle = await rpcClient(address).start(request, new AbortController().signal);
+    await handle.ready;
+    const windowsExit = 0xC000013A;
+    fake.handles.get(request.process.processId)!.exit({ code: windowsExit, signal: null });
+    await expect(handle.exited).resolves.toEqual({ code: windowsExit, signal: null });
+    await expect(rpcClient(address).health()).resolves.toMatchObject({
+      activeProcesses: 0,
+      retainedTombstones: 1,
+    });
+  });
+
   it("rejects a conflicting retry without spawning another process", async () => {
     const request = fixtureRequest();
     const fake = new FakeAgent("fake:conflict");

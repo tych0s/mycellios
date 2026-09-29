@@ -193,6 +193,7 @@ export interface PythonLaunchCompilerOptions {
   serverModule?: typeof MYCELLIOS_SERVER_MODULE;
   threadsPerStage?: number;
   connectTimeoutSeconds?: number;
+  operationTimeoutSeconds?: number;
   batchWindowMs?: number;
   /** Maximum ordered prefill chunks allowed on the physical route at once. */
   prefillInflightChunks?: number;
@@ -420,6 +421,7 @@ export interface PythonLaunchConfiguration {
   serverModule: typeof MYCELLIOS_SERVER_MODULE;
   threadsPerStage: number;
   connectTimeoutSeconds: number;
+  operationTimeoutSeconds: number;
   batchWindowMs: number;
   prefillInflightChunks: number;
   prefillInflightBytes: number;
@@ -1437,7 +1439,7 @@ function renderRootEngineArguments(
     "--startup-timeout-seconds",
     finiteNumber(configuration.connectTimeoutSeconds),
     "--socket-timeout-seconds",
-    finiteNumber(configuration.connectTimeoutSeconds),
+    finiteNumber(configuration.operationTimeoutSeconds),
   );
   if (launch.firstRemoteStage) {
     args.push(
@@ -1708,7 +1710,7 @@ function normalizeConfiguration(
       "stageModule",
       "serverModule",
       "threadsPerStage",
-      "connectTimeoutSeconds",
+      "connectTimeoutSeconds", "operationTimeoutSeconds",
       "batchWindowMs",
       "prefillInflightChunks",
       "prefillInflightBytes",
@@ -2030,10 +2032,8 @@ function normalizeConfiguration(
       1_024,
       "python_threads_per_stage_is_invalid",
     ),
-    connectTimeoutSeconds: positiveFinite(
-      value.connectTimeoutSeconds ?? 180,
-      "python_connect_timeout_is_invalid",
-    ),
+    connectTimeoutSeconds: positiveFinite(value.connectTimeoutSeconds ?? 180, "python_connect_timeout_is_invalid"),
+    operationTimeoutSeconds: positiveFinite(value.operationTimeoutSeconds ?? value.connectTimeoutSeconds ?? 180, "python_operation_timeout_is_invalid"),
     batchWindowMs: nonNegativeFinite(
       value.batchWindowMs ?? 2,
       "python_batch_window_is_invalid",

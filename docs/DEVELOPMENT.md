@@ -72,7 +72,7 @@ npm run dev:e2e:distributed -- --runtime runtime/distribution-venv --timeout 120
 ```
 
 The development gate needs its selected model in the Hugging Face cache. A
-local validation used `hmellor/tiny-random-LlamaForCausalLM` at revision
+local validation used `HMellor/tiny-random-LlamaForCausalLM` at revision
 `9408c553e5c189a7dcdc5a5dbd2feb476b061759`. Prepare the snapshot in the gate's
 cache before an offline run. Random tiny-model output validates routing and
 cleanup, not answer quality or physical multi-host performance.
@@ -85,6 +85,38 @@ rejected by the checkpoint containment guard. `MYCELLIOS_DEV_E2E_DEBUG=1` enable
 coordinator diagnostics for investigating preparation and worker disconnects.
 Keep native runs, builds and the full test suite sequential on memory-constrained
 machines; the example's `--maxWorkers=1` limits test concurrency.
+
+## Native release asset assembly
+
+The native CI workflow uploads one artifact per target. Download those three
+artifacts into a private directory with the names
+`mycellios-node-linux-x64`, `mycellios-node-macos-arm64` and
+`mycellios-node-windows-x64`. GitHub strips their common `build/` prefix, so
+each artifact directory must directly contain `node-package/`, `evidence/`
+and its package file. The upload step must use `include-hidden-files: true`:
+the staged manifest includes dotfiles and, on macOS, NumPy's `.dylibs` runtime
+libraries. A download missing them must fail layout verification. Then assemble
+one candidate set:
+
+```bash
+npm run node:release:assemble -- \
+  --artifacts=build/ci-artifacts \
+  --output=build/native-release-assets \
+  --version=0.2.80 \
+  --revision=<exact-CI-commit-SHA> \
+  --source-id=sha256:<exact-source-ID> \
+  --published-at=2026-09-29T00:00:00.000Z
+```
+
+The assembler verifies the three staged layouts, artifact/evidence hashes,
+source identity and CI run/attempt. It copies the packages into a new directory
+with `mycellios-node-latest.json` and `sha256sums.txt`. It refuses a mixed CI
+run or changed package bytes. The output is a **candidate**, even if the
+evidence says `signatureState: signed`: that field alone does not verify a
+cryptographic signature. Verify platform signatures and the release identity
+independently before preparing a public transaction or uploading any package.
+The `Native node build` workflow also performs this assembly after its three
+platform jobs and uploads a candidate manifest; it does not publish packages.
 
 ## Browser contribution pilot
 

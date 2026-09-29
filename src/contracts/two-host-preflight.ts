@@ -6,6 +6,7 @@ export const twoHostPreflightCodeSchema = z.enum([
   "stage_endpoint_loopback", "stage_endpoint_placeholder", "remote_agent_missing",
   "remote_agent_insecure", "remote_auth_missing", "python_runtime_unavailable",
   "model_revision_unpinned", "stage_range_unproven", "transport_unmeasured",
+  "api_advertise_mismatch",
 ]);
 export const twoHostPreflightDiagnosticSchema = z.object({
   code: twoHostPreflightCodeSchema,

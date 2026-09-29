@@ -927,7 +927,7 @@ export class LaunchAgentRpcServer {
         (error) => this.finishWithError(entry, normalizeError(error)),
       );
       void handle.exited.then(
-        (exit) => this.finish(entry, sanitizeExit(exit)),
+        (exit) => { try { this.finish(entry, sanitizeExit(exit)); } catch (error) { this.finishWithError(entry, normalizeError(error)); } },
         (error) => this.finishWithError(entry, normalizeError(error)),
       );
     } catch (error) {
@@ -2361,7 +2361,7 @@ function boundText(value: string, maxBytes: number): { text: string; truncated: 
 function sanitizeExit(value: unknown): LaunchProcessExit {
   assertRecord(value, "launch_process_exit");
   assertExactKeys(value, ["code", "signal"], ["error"], "launch_process_exit");
-  if (value.code !== null && (!Number.isInteger(value.code) || Math.abs(value.code as number) > 2 ** 31)) {
+  if (value.code !== null && (!Number.isInteger(value.code) || (value.code as number) < -(2 ** 31) || (value.code as number) > 2 ** 32 - 1)) {
     throw new Error("launch_process_exit_code_is_invalid");
   }
   if (value.signal !== null && (typeof value.signal !== "string" || !/^SIG[A-Z0-9]+$/.test(value.signal))) {

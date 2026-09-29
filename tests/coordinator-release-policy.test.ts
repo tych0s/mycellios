@@ -215,6 +215,7 @@ function createFixture(): string {
       dereference: true,
     });
   }
+  mkdirSync(join(root, "sidecars", "windows-job-broker"), { recursive: true });
   for (const portable of [
     ".gitattributes",
     "package.json",
@@ -225,6 +226,10 @@ function createFixture(): string {
     "tsconfig.build.json",
     "tsconfig.landing.json",
     "tsconfig.mobile.json",
+    "sidecars/winsw-license.txt",
+    "sidecars/windows-job-broker/Mycellios.JobBroker.csproj",
+    "sidecars/windows-job-broker/packages.lock.json",
+    "sidecars/windows-job-broker/Program.cs",
   ]) {
     copyFileSync(resolve(portable), join(root, portable));
   }

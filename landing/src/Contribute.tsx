@@ -270,7 +270,7 @@ function NativeNodeSetup(
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = url;
-      anchor.download = `mycellios-pair-${bundle.enrollmentId.slice(0, 8)}.json`;
+      anchor.download = `mycellios-pair-${bundle.enrollmentId.slice(0, 8)}.mycellios-enrollment`;
       anchor.click();
       URL.revokeObjectURL(url);
       props.onNotice(

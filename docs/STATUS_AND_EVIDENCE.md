@@ -154,6 +154,778 @@ unavailable capacity and draft persistence against an isolated API fixture.
 Neither the fixture nor the native local run is evidence of two physical hosts.
 The complete npm dependency audit reported zero known vulnerabilities.
 
+## Physical two-computer repeat on a fixed commit (2026-09-28)
+
+PC-DANI and MRPUCCHI ran the native route from the same public source commit
+`ff835802815f3749d72b8deb4b2ea5978b479f3b` with `npm ci`, passing
+`verify:structure` and `typecheck` on both hosts. The model was
+`HuggingFaceTB/SmolLM2-135M-Instruct` at revision
+`12fd25f77366fa6b3b4b768ec3050bf629380bac`; `model.safetensors` had
+SHA-256 `5af571cbf074e6d21a03528d2330792e532ca608f24ac70a143f6b369968ab8c`
+on both hosts. Both prepared launch descriptions had SHA-256
+`61256c112bd9900fc70525d7e592c76b21c9c128c5f90a4dffa9ab7cc3363948`.
+The route assigned `[0,15)` to PC-DANI (`192.168.1.79`, CPU) and `[15,30)`
+to MRPUCCHI (`192.168.1.2`, NVIDIA RTX 2060 CUDA). Established TCP
+connections were observed in both directions on stage port `18101` and return
+port `18100`. This was a mixed CPU/GPU physical run, not a GPU comparison or a
+monolithic parity test.
+
+The canary returned 16 tokens with TTFT 161.9 ms, TPOT 87.7 ms, pipeline
+1477.3 ms and 11.40 output tokens/s. Its text was `I'm sorry for any
+misunderstanding, but as a chatbot, I don't`; it did not obey the `Reply with
+only OK.` prompt. A separate API request answered `2 + 2 = 4.` with 9 output
+tokens, TTFT 293.1 ms, TPOT 73.4 ms and pipeline 880.6 ms. Observed process
+peak working sets were 970,891,264 bytes for the PC-DANI root and
+1,331,494,912 bytes for the MRPUCCHI stage. These are individual observations,
+not sustained throughput or GPU speedup claims.
+
+For a controlled failure, a second long API request was started at
+13:23:40.793 local time and the MRPUCCHI stage process was killed at
+13:23:52.041 while it was running. The request returned HTTP 500 after
+11.686 seconds. The coordinator then reported
+`launch_agent_rpc_timeout:poll:5000`, exited with failure, and closed its
+local API and return listeners. Automatic recovery was not observed. The
+remote stage and launch agent were no longer listening; temporary inbound
+firewall rules were removed and MRPUCCHI's original Python TCP block rule was
+restored. This tests loss of the remote stage process, not loss of power or
+network access to the whole PC. An earlier attempted fault happened after its
+request completed and is excluded from this result.
+
+The first launch attempt exposed a pre-existing Windows Firewall block rule
+for `python.exe` on MRPUCCHI. A later attempt reached both stages but failed
+health fetching because the local API bound to `127.0.0.1` while the local
+configuration advertised `192.168.1.79`; the successful run advertised
+`127.0.0.1`. Both are reproducible setup obstacles for a tester.
+
+### Failure-handling repeat after local fixes (2026-09-28)
+
+The coordinator and MRPUCCHI agent were relaunched with local, uncommitted
+changes to the API error mapping and Windows launch-agent exit handling. These
+results therefore do not establish a repeat on a new shared commit. The same
+pinned model and two physical stage ranges were used. A long request began at
+20:48:27.982 local time; the MRPUCCHI stage process was killed during it. The
+API returned HTTP 503 (`service_unavailable`) in 2,517 ms. The coordinator
+exited with `launch_process_exited:stage-92790ee51c7743c76aad:code=4294967295:signal=null`
+instead of the earlier agent poll timeout. A subsequent authenticated agent
+health check reported zero active processes and one retained tombstone. The
+local API and return listeners closed; the test agent was stopped, temporary
+firewall rules on both PCs were removed and MRPUCCHI's original Python block
+rule was enabled again. This is graceful failure reporting and cleanup for a
+killed stage process. Automatic recovery, loss of the entire PC and a third
+party installation remain unverified.
+
+### Whole-PC interruption (2026-09-28)
+
+MRPUCCHI was rebooted during a long active request at 20:53 local time. This
+was a physical loss of the remote computer, distinct from killing its stage
+process. The request ended in a transport error after 43,738 ms, without an
+HTTP response. The coordinator reported
+`launch_agent_rpc_timeout:poll:5000`, marked the route failed and closed the
+local API and return listeners. MRPUCCHI booted again at 20:53:48; SSH over
+Tailscale and its automatic services were available by 20:54:11. Temporary
+firewall rules were removed on both PCs and the original Python block rule was
+restored. The initial attempt therefore **did not** meet the controlled-error
+criterion. The generated Python root command used the 300-second startup
+deadline for active socket operations too, so the supervisor stopped the root
+before the request could time out and produce a 503.
+
+The physical repeat used a separate 20-second active-operation deadline while
+retaining the 300-second startup deadline. A long request began at 21:00:40.849
+local time and MRPUCCHI was commanded to reboot during the request. The API
+returned HTTP 503 (`service_unavailable`, `timed out waiting for request 5`)
+after 29,156 ms, before the supervisor stopped the root. The supervisor later
+reported the unavailable agent through `launch_agent_rpc_timeout:poll:5000`
+and closed the API and return listeners. MRPUCCHI booted at 21:01:09 and SSH
+over Tailscale, `sshd` and `Tailscale` services were reachable by 21:01:40.
+The temporary stage and return firewall rules were removed and the original
+Python block rule was enabled again. The run used local, uncommitted source
+changes on the two PCs; it demonstrates controlled error reporting for this
+small pinned model under this particular whole-PC reboot, not automatic
+recovery or a general performance guarantee. The agent did not restart
+automatically after the reboot, and the failed route was not resumed.
+
+The lab USB has Jarvis and Tailscale material plus a provisional Mycellios Node
+MSI and launcher; the one-click node path has not yet been run from the USB.
+The repository has an MSI build and one-time enrollment flow, but no MSI or
+pairing bundle was installed on a third PC in this campaign. The enrollment
+bundle lifetime is at most 15 minutes and must be issued for each installation;
+it is not a durable secret to leave on a USB. The contribute page previously
+downloaded that bundle with a `.json` extension while the Windows MSI registers
+`.mycellios-enrollment`; the local source now uses the registered extension.
+That UI fix and the portable-runtime package build do not establish a
+successful external installation or GPU contribution by an installed node.
+The local Windows x64 portable runtime build completed with pinned Python
+3.12.13 and CPU PyTorch 2.13.0; its relocated runtime and installed-stage
+canary passed the archive verifier.
+The local Windows x64 node payload was then assembled from the compiled app
+and portable runtime, and `verify-node-installer` confirmed its complete file
+layout and hashes. This is a provisional ignored build: its source revision
+field is the current HEAD while its source provenance includes uncommitted
+changes. A provisional 244,653,268-byte MSI was then built locally with WiX
+3.14.1 from this payload. `verify-node-msi` passed administrative extraction,
+exact staged-tree comparison and MSI metadata checks after adding the omitted
+layout manifest to the MSI and shortening its verification path. The local
+staging tree was mounted under a temporary drive letter for WiX because its
+ordinary source path exceeded Windows Installer's path limit; the mapping was
+removed after the build. This unsigned, uncommitted MSI is a lab artifact, not
+a release. Local release-evidence generation and verification passed for this
+MSI, with the required promotion signature still pending. It must be rebuilt
+from a fixed commit before distribution. A later service-start review found
+that this first MSI omitted the `distributed_runtime` Python source and the
+Windows Job Object broker, while the packaged CPU-only PyTorch runtime was
+sent through a CUDA-required startup path. The structural MSI checks therefore
+did **not** prove that its service could reach Ready; this first MSI cannot be
+used as the node pilot package. Local source now includes CPU node startup,
+the Python data plane and the broker in the staged layout. Package
+installation, enrollment and service participation have not been run in this
+campaign.
+A replacement provisional 249,811,116-byte Windows MSI was built locally from
+the current uncommitted tree. Its 33,993-file layout includes
+`python/distributed_runtime/physical_probe.py` and
+`bin/mycellios-job-broker.exe`; `verify-node-installer`, `verify-node-msi`
+and local release-evidence verification passed. The staged portable Python
+reported `torch 2.13.0+cpu`, no CUDA API and zero GPU devices. The compiled
+native runtime then selected `cpu-only`, `cpuEligible=true`, `cpu-ready`, and
+no GPU physical identity; a second layout verification passed after that
+probe because bytecode writes were disabled. The broker built locally as a
+self-contained fallback after Native AOT failed for lack of the C++ linker;
+seven broker tests passed, including physical child-process containment. CI
+now sets up pinned .NET SDK 8.0.423 and requires the Native AOT build, but
+that workflow has not run with these changes. The replacement MSI is unsigned
+and has not been installed, enrolled, or assigned a live stage.
+Further service review found that this replacement MSI also registered the
+console `node.exe` directly with the Windows Service Control Manager. It has
+no service entrypoint and must not be used for the USB pilot. Local source now
+stages pinned WinSW 2.12.0 and registers that wrapper with a protected XML
+definition. The later Windows payload was staged with the pinned wrapper and
+`verify-node-installer` checked its 33,995-file layout and hashes. The wrapper
+loaded a minimal XML for a non-installed service and reported `NonExistent`.
+A third provisional, unsigned 256,082,132-byte MSI was built locally from this
+uncommitted source and passed `verify-node-msi`: administrative extraction,
+exact staged-tree comparison and MSI metadata checks. Its SHA-256 is
+`829a5b023cc17cd2a01f2d04726906e20dab5400772f928cd92f0fc60c950d98`.
+Focused tests, typecheck, structure, format and architecture checks passed.
+On 28 September, this exact MSI was copied to MRPUCCHI and installed with
+Windows Installer as an administrator. Its verbose log ended with
+`Installation completed successfully` and `MainEngineThread is returning 0`;
+Windows registered Mycellios Node 0.2.77. The installed portable Python ran
+`torch 2.13.0+cpu` with no CUDA API. No pairing bundle was supplied, so
+`MycelliosNode` is not registered as a service and neither Ready nor live
+stage participation has been demonstrated. This was an MSI installation test,
+not the one-click USB flow or a release.
+The same MSI was then removed on MRPUCCHI with Windows Installer exit code 0.
+The product registry entry, service, Program Files installation root and
+ProgramData node configuration were all absent afterward. A revised local
+candidate adds automatic provisioning of the existing pinned CUDA pack after
+pairing, but it has not been installed or GPU-probed as an installed service.
+That revised 256,090,372-byte unsigned MSI was built from the dirty local
+source, with SHA-256
+`f954dbd9447f171de7c79ae798a72b8e6446856a3c31e9603b63714c182ba7e0`.
+Its 33,998-file staged layout and MSI administrative extraction comparison
+passed. The exact bytes and checksum were copied to the lab USB, with zero
+`.mycellios-enrollment` files; the revised candidate is not a release.
+After correcting the development gate's model ID to the Hub's canonical
+`HMellor/tiny-random-LlamaForCausalLM` spelling and refreshing its local
+snapshot reference, `npm run dev:e2e:distributed -- --timeout 240` passed on
+PC-DANI: two signed logical workers, two ready stages with non-overlapping
+ranges, two direct runtime links, matching canary and routed output
+`"eno Twe"`, and two completion tokens. The coordinator listener was absent
+after the gate and no new gate temporary directory remained. This is a
+single-host loopback regression check, not two-computer evidence.
+The revised MSI was installed on MRPUCCHI with Windows Installer exit code 0.
+The packaged accelerator setup detected its NVIDIA GeForce RTX 2060, downloaded
+the pinned 2,594,590,371-byte CUDA 12.6 PyTorch wheel, verified its exact size
+and SHA-256, installed it into an isolated machine runtime, and passed an
+actual FP16 matrix operation with PyTorch `2.13.0+cu126`. A temporary WinSW
+service then ran the same cached-runtime probe under
+`NT AUTHORITY\LocalService`; it again reported `gpu-ready`, `cuda`, the RTX
+2060 and `fp16_matmul`. The first temporary service attempt failed with Windows
+`Access denied` after its ACL was applied to already copied files; the second
+applied directory permissions before copying, as the product installer does,
+and passed. The temporary service and directory were verified absent afterward.
+The GPU pack test was run separately from the one-click path. The revised MSI
+was then removed with Windows Installer exit code 0. A subsequent remote check
+found no registered product, `MycelliosNode` service, Program Files install root
+or node configuration. The CUDA runtime cache remained and Tailscale was
+running. No installed-node Ready state or assigned inference has been shown.
+An accountless coordinator on PC-DANI was then reachable from MRPUCCHI through
+an SSH reverse tunnel over Tailscale. Installing the first GPU-auto lab MSI
+and redeeming its local-only pairing exposed three package/service defects:
+the staged MSI omitted the root `package.json`; Windows PowerShell 5.1 did not
+preload the DPAPI assembly and lacked the three-argument `File.Move` overload;
+and WinSW 2.12.0 under LocalService remained `Running` without a Node child
+after the node exited for its first configuration reconciliation. The first
+two produced service exit 1067. The WinSW behavior matches its upstream open
+issue #1136. Local source now packages `package.json`, loads the DPAPI assembly,
+uses an atomic move/replace compatible with PowerShell 5.1, grants the
+protected-identity directory to LocalService, and wraps the Node process in a
+small supervisor. A temporary installed-tree patch on MRPUCCHI showed the
+supervisor recover from a forcibly killed Node child (new Ready PID and online
+worker) and stop cleanly through SCM with health `stopped`; that patch was not
+an MSI result. The old product and lab configuration were removed, while the
+CUDA cache and Tailscale remained.
+The replacement supervisor MSI, 256,115,028 bytes with SHA-256
+`edb88e3e67cf929c5208341def1995be21712302ada79ed03e7ca55dfe0f0231`,
+passed staged-layout and administrative-extraction comparison. It was installed
+on clean MRPUCCHI with Windows Installer exit 0. Its packaged pairing entrypoint
+redeemed a fresh local-only lab bundle, reused and physically probed the cached
+CUDA pack, restarted the service, and returned `status: installed`,
+`backend: cuda`, exit 0. SCM reported `Running`, health and diagnostics reported
+Ready with CUDA 12.6 and an NVIDIA RTX 2060, and the private coordinator saw one
+connected online worker. This was **not** the USB launcher or a production
+account. No model stage or inference was assigned in this test.
+The installed node initially lacked the runtime performance callback required
+for scheduler eligibility. A subsequent **manual compiled-main patch** on this
+lab installation enabled the physical CUDA calibration, and the private
+coordinator stored validated CUDA performance evidence for its online worker.
+That calibration fix is in local source but **not** in the supervisor MSI above;
+it requires a rebuilt MSI and clean installation before package-level credit.
+The rebuilt calibrated lab MSI is 256,110,932 bytes, SHA-256
+`64992db049759cbebfd35c9ebd29282bcd756719ba64ad2769ec2e589b8c24dd`.
+Its staged layout and administrative MSI extraction passed verification. The
+same bytes were copied to MRPUCCHI, where the hash matched, then installed after
+removing the previous lab product; Windows Installer and the packaged pairing
+entrypoint both exited 0. The service reached `Running` and `Ready` with CUDA
+12.6 on the RTX 2060. Against a private, accountless PC-DANI coordinator, the
+installed worker completed the coordinator's physical runtime challenge: the
+stored, coordinator-sealed profile reports CUDA and 21 samples. Stopping and
+starting the installed service through SCM caused a fresh signed registration
+and a second successful CUDA challenge. The private coordinator uses a local
+SQLite database and an SSH reverse tunnel over Tailscale; this is package-level
+calibration evidence, **not** an assigned stage, generation, production pairing,
+USB-launcher run or reboot-persistence result. Its temporary coordinator token
+was rotated during diagnosis, which briefly produced HTTP 401 responses; the
+service re-registered after the lab coordinator was restarted without that
+ephemeral token.
+The same calibrated MSI then served an actual stage in a private two-PC route.
+MRPUCCHI's installed `MycelliosNode` service launched SmolLM2-135M-Instruct
+layers `[0,26)` on CUDA through its packaged Job Object broker; a PC-DANI
+source worker ran `[26,30)` on CPU. Both workers supplied coordinator-accepted
+physical runtime profiles and the relay measured links in both directions. The
+model was pinned to revision `12fd25f77366fa6b3b4b768ec3050bf629380bac`.
+The first 16-token canary passed with TTFT 96.2 ms, TPOT 75.8 ms and 13.20
+output tokens/s; a separate eight-token request answered `2 + 2 = 4`.
+Observed peak working sets for the stage processes were 1,521,766,400 bytes
+on MRPUCCHI and 692,690,944 bytes on PC-DANI. The remote process parent chain
+was `MycelliosNode.exe` → `node.exe` → `mycellios-job-broker.exe` → `python.exe`.
+Removing the requested model stopped both stage processes and closed their
+ports while leaving the installed service connected.
+
+In a later run, MRPUCCHI rebooted while a 256-token request was still open.
+The client failed after 4.1 seconds; the coordinator entered `waiting_capacity`
+and the local stage exited. MRPUCCHI's Tailscale SSH and `MycelliosNode` service
+returned after boot without local interaction. The temporary SSH reverse
+tunnel to the private coordinator had to be re-established from PC-DANI; only
+then could the node reconnect and re-calibrate. The coordinator initially
+crashed on a duplicate deployment-operation idempotency key when trying to
+reactivate a previously successful route. Local source now allocates a unique
+operation attempt within each generation; a focused regression passes. With
+that source fix, the coordinator stayed alive through a second in-flight
+MRPUCCHI reboot, retried after capacity returned, completed a fresh 16-token
+canary (TTFT 114.9 ms, TPOT 69.7 ms, 14.34 tokens/s), and answered another
+`2 + 2 = 4` request. Final model removal again left zero stage processes on
+both PCs. This is lab recovery with a manually restored tunnel, not proof of
+unattended production reconnection. The installed MSI predates the CPU identity
+and coordinator retry source fixes, and the PC-DANI CPU worker ran from source.
+On MRPUCCHI, the exact pinned WinSW executable from the staged package was
+copied into an isolated temporary service probe. Windows SCM started it as
+`NT AUTHORITY\LocalService`; the wrapped PowerShell child stayed running for
+three seconds, then `sc stop` reached `Stopped`. The temporary service,
+directory and copied files were deleted and verified absent. This proves the
+wrapper can run under SCM on that PC; it does not prove the Mycellios MSI,
+node process, enrollment or inference works as an installed service.
+An older GitHub Actions Windows x64 MSI was downloaded for read-only inspection.
+Its checksum matched the CI evidence, and an administrative extraction into a
+short path produced all 33,901 paths and hashes recorded in that build's node
+layout manifest. The companion uploaded staged tree lacked five hidden files,
+so `verify-node-release-evidence` rejected that downloaded tree. The workflow
+now requests hidden files in future artifact uploads, but that change has not
+run in CI. This MSI identifies an older CI merge revision, is not Authenticode
+signed and was not installed or enrolled on either computer. Administrative
+extraction is not an installation or a service/inference test.
+An earlier lab USB node launcher and matching provisional MSI/checksum were
+placed on the current USB, without an enrollment bundle. Its non-mutating preflight
+accepted a synthetic MSI/checksum and bundle, and rejected a changed hash,
+short expiry, invalid nonce and unexpected coordinator path. A further
+preflight on the actual USB accepted the exact 256,090,372-byte candidate MSI,
+its matching SHA-256 and a synthetic bundle; that bundle was removed afterward.
+That earlier USB copy did not install an MSI or redeem a real bundle.
+
+On 29 September, a newer **dirty-tree lab candidate** incorporating the CPU
+identity and deployment retry fixes was built as a 256,115,028-byte MSI,
+SHA-256 `42e445baa6ba52e3f41da491572f5e9e7f79e73867b69deb6f209b9ee4f6e53d`.
+Staged-layout and administrative-extraction verification passed. Its hash
+matched after transfer to MRPUCCHI. After a targeted removal of the preceding
+lab node (Tailscale and the CUDA cache stayed), the USB launcher preflight
+passed against a fresh private lab enrollment bundle. The same launcher then
+installed this MSI, redeemed the bundle and exited 0 with `backend: cuda`;
+SCM reported `Running`, health `ready`, and CUDA diagnostics. The private
+coordinator accepted a sealed 21-sample CUDA performance profile. Production
+launcher mode rejected the lab's HTTP loopback URL as intended; the lab run
+explicitly enabled loopback HTTP.
+
+With that installed service on MRPUCCHI and a source CPU worker on PC-DANI,
+the pinned SmolLM2-135M-Instruct revision above was split `[0,26)` on CUDA and
+`[26,30)` on CPU. Both physical profiles were accepted. The 16-token canary
+passed at TTFT 96.7 ms, TPOT 69.6 ms and 14.36 output tokens/s. A separate
+eight-token request through the installed remote stage answered `2 + 2 = 4`
+in 789 ms wall time. Removing the requested model stopped both stage processes
+and left no listeners on the tested stage ports; the node service remained.
+This verifies the actual launcher and package against a private two-PC lab
+coordinator through a manually maintained SSH reverse tunnel over Tailscale.
+It is not an account-owned production pairing, a fixed-commit release, or an
+unattended reboot-reconnection result. The physical USB at
+`D:\MYCELLIOS-LAB-VPN\Node` still carries the earlier 256,090,372-byte MSI,
+SHA-256 `f954dbd9447f171de7c79ae798a72b8e6446856a3c31e9603b63714c182ba7e0`;
+it has no account enrollment bundle and was not updated with this lab build.
+After correcting a release fixture and a Windows exit assertion exposed by
+the full run, the complete Vitest suite passed: 280 files and 1,960 tests,
+with 5 files and 17 tests skipped. Typecheck, structure, architecture,
+documentation and format gates
+also passed.
+
+A second 29 September **dirty-tree lab MSI** adds supervisor child IPC cleanup
+and preserves a resource-governor failure in service health. Its size is
+256,119,124 bytes, SHA-256
+`f2b2cd04cd452af8a67a66c9671670b2ef88c7b1a303f43cc177ba65e94d48d0`.
+The staged tree and administrative MSI extraction matched; the transferred
+hash matched on MRPUCCHI. After targeted lab-node removal, the USB launcher
+passed preflight, installed and redeemed a new private bundle, and exited 0
+with CUDA `Ready`. A coordinator challenge accepted its physical CUDA profile
+after the coordinator and installed service were restarted; the initial
+registration did not produce accepted performance evidence, and that delay
+remains unexplained. This test still used the temporary Tailscale SSH reverse
+tunnel to a private PC-DANI coordinator.
+Local CycloneDX SBOM, checksum and provenance files were generated and
+verified against this MSI and its restored staged tree. Their signature state
+is `pending`; signed-release promotion was not attempted.
+
+The installed node applied an account-shaped `set-limits` command changing
+`maxCpuPercent` from 90 to 89. Its main child changed PID 9652 → 7416 while
+the service supervisor stayed running, and returned to `Ready`. Restoring 90
+changed the child to PID 9388 and again reached `Ready`; the coordinator
+reported the new snapshot. Forcing a later installed main child (PID 9556)
+to exit made the packaged supervisor start PID 1628; health returned to
+`Ready`, SCM remained `Running`, and the coordinator worker was `online` with
+accepted CUDA evidence. The earlier installed lab candidate also applied
+`pause` and `resume`: local contribution changed false then true, while its
+coordinator worker changed `draining` then `online`. These prove physical
+command execution through the native node, not the authenticated owner UI.
+
+With the supervisor MSI, pinned SmolLM2-135M-Instruct split `[0,25)` on
+MRPUCCHI CUDA and `[25,30)` on PC-DANI CPU. Both stages became ready; the
+16-token canary passed with TTFT 121.6 ms, TPOT 71.2 ms and 14.04 output
+tokens/s. A separate eight-token request answered `2 + 2 = 4` in 758 ms.
+Removing the model left zero distributed stage processes and listeners on
+both PCs, while the MRPUCCHI service remained `Ready`. This is another lab
+package proof, not a fixed-commit release or unattended production route.
+After this supervisor change, the full Vitest suite again passed 1,960 tests
+(17 skipped across 5 skipped files).
+The same staged package's bundled Windows Python on PC-DANI reported
+PyTorch `2.13.0+cpu`, zero CUDA devices and its real CPU device name. Its
+packaged runtime profiler completed 21 physical samples each for decode
+memory, prefill compute and activation codec on CPU. This is a package
+preflight, not an installed CPU-only node or coordinator challenge.
+
+### Session recovery and a repeated installed-node route (29 September, lab)
+
+Restarting the private PC-DANI coordinator while MRPUCCHI retained a session
+from its prior random network secret left the installed worker running but
+repeating WebSocket HTTP 401. A focused network test now verifies that a worker
+re-registers after this rejection (13 tests passed in `worker-hardening.test.ts`).
+The lab coordinator also now reads a private secret retained in its ignored
+runtime state. With that secret unchanged, restarting only the coordinator
+restored two connected workers without restarting MRPUCCHI; its service PID
+remained 9176. This is coordinator-process recovery over the existing manually
+maintained SSH reverse tunnel, not an unattended PC reboot or durable HTTPS
+deployment.
+
+A new **dirty-tree lab MSI** including the worker recovery fix was built,
+its staged tree and administrative extraction verified, and its SHA-256
+matched after transfer to MRPUCCHI: 256,123,268 bytes,
+`6c6c7d03c46bb378fe1659a2633c2f80cb293f878a5af8e469e558493cdd7af4`.
+The previous lab MSI uninstalled with exit 0 but left its separately registered
+service and configuration in place. Those specific lab directories were backed
+up and the service registration removed before the clean-install preflight;
+Tailscale and the model cache remained. This is an **upgrade/reinstall obstacle**
+for an unattended user path, not a successful automatic upgrade. The fresh USB
+launcher then passed preflight, installed with exit 0, consumed the new
+one-time pairing file, and reported CUDA `Ready`. The installed `agent.js` hash
+matched the verified staged package.
+
+The lab coordinator secret was then deliberately rotated and the coordinator
+restarted while the newly installed MRPUCCHI service stayed at PID 11992.
+The installed worker logged a WebSocket HTTP 401, re-registered without a
+service restart, reconnected, and submitted an accepted RTX 2060 CUDA runtime
+profile. Pinned SmolLM2-135M-Instruct revision
+`12fd25f77366fa6b3b4b768ec3050bf629380bac` then ran with MRPUCCHI CUDA
+layers `[0,26)` and PC-DANI CPU layers `[26,30)`. The 16-token canary passed:
+TTFT 106.2 ms, TPOT 77.5 ms, 12.90 output tokens/s. A separate eight-token
+request returned `2 + 2 = 4` in 866 ms wall time. Deleting the model closed
+its proxy and left zero stage processes on both hosts and zero listed stage
+ports on MRPUCCHI; the Mycellios service remained running and both workers
+connected. The focused test, typecheck, structure/build and architecture gates
+passed after the source fix. This remains an unsigned, uncommitted lab build
+using the manual tunnel, with no production account pairing or external tester.
+
+The MSI generator now includes an uninstall-only `ServiceControl` for
+`MycelliosNode`. The focused MSI/layout tests passed (9 tests). On MRPUCCHI, a
+separate 32,768-byte probe MSI with that WiX service-control pattern uninstalled
+with exit 0 and removed its deliberately registered disposable service;
+MycelliosNode and Tailscale stayed running. This proves the Windows Installer
+mechanism on that PC. The **full dirty-tree node MSI** with this change was
+then built and verified by administrative extraction: 256,123,328 bytes,
+SHA-256 `f67525b6928088a2926db774a7fed15dbff3ad8f8957f426d2d8bd3d2619a0c4`.
+The transferred hash matched. A same-version Windows Installer repair returned
+1603 because its secure-repair source lookup referred to an older MSI path
+that was no longer present; it left the running node intact. After backing up
+the previous lab configuration and clearing the previous service registration,
+the fresh USB install of the new MSI passed preflight, consumed a new pairing
+bundle, and reported CUDA `Ready` with two workers connected.
+
+Uninstalling **that full MSI** returned 0, removed the MycelliosNode service,
+and retained node configuration, identity, wrapper, cache and Tailscale. The
+same MSI files were then reinstalled without consuming another pairing token.
+Re-registering the retained wrapper required explicit service-account and
+recovery settings: direct WinSW registration initially chose LocalSystem;
+setting `NT AUTHORITY\LocalService` and the restart policy restored the
+intended service configuration. MRPUCCHI returned to CUDA `Ready` with the
+same node ID `node-4c3832ee0e884100ba0a6596a400192c`, automatic service
+start and two connected workers. Service removal is now physically proven;
+**one-click reinstall and same-version upgrade remain unproven** because the
+launcher deliberately rejects retained configuration and this recovery needed
+manual service registration. This is still an unsigned, uncommitted lab MSI.
+
+After restoring that installation, MRPUCCHI was rebooted at
+2026-09-29 01:36:40 UTC with no model active. Windows restarted Tailscale and
+MycelliosNode automatically under LocalService, but the manually created
+reverse SSH tunnel disappeared. MRPUCCHI had no listener at `127.0.0.1:18790`,
+its worker process logged `ECONNREFUSED`, health stayed `starting`, and the
+coordinator saw only the PC-DANI worker. Restoring the tunnel brought the
+**same running service** back to CUDA `Ready` and two connected workers; no
+service restart was needed. This is a physical failure of the current network
+route across a PC reboot, not an unattended-reconnection pass.
+
+An ignored lab-only PowerShell supervisor was then started on PC-DANI to
+re-establish the same SSH reverse tunnel after its process exited. A second
+MRPUCCHI reboot was requested at 01:40:10 UTC. The supervisor observed SSH
+exit 255 and retried while the host was offline; Windows booted at 01:40:32
+UTC, and the coordinator observed two connected/online workers by 03:41:23
+Europe/Madrid time. MRPUCCHI's service remained automatic under
+`NT AUTHORITY\LocalService`, Tailscale was running, and health returned to
+CUDA `Ready`. This proves recovery **while a PC-DANI supervisor process remains
+active**, not persistence of the tunnel across a PC-DANI reboot or a durable
+HTTPS coordinator path.
+
+On 2026-09-29, the USB launcher gained a retained-identity update path. Its
+read-only preflight passed on MRPUCCHI without a new enrollment file. A
+dirty-tree 0.2.78 MSI passed staged-layout and administrative-extraction
+verification, but its physical upgrade from 0.2.77 **failed after MSI
+replacement**: the service restorer tried to set permissions on the already
+consumed `enrollment.json`. The 0.2.78 product was installed with its service
+absent. The retained wrapper was manually registered under LocalService with
+the recovery policy; the same node ID returned to CUDA `Ready` and two workers
+connected. This failure is part of the evidence, not a successful one-click
+upgrade.
+
+The restorer was corrected to omit the consumed enrollment file only on a
+retained-identity restore. The 0.2.79 lab MSI (256,123,376 bytes, SHA-256
+`7dd73e6db428ac4a8f3f03734c488f7489cc9a213a4571588560a9576d4ea0f1`)
+passed layout and full MSI extraction verification. Its source identity was
+`sha256:a4d816f41ff85b814937f901fbb6f4f905f9abee40b6a19deae4507b8b42c8aa`
+on dirty worktree HEAD `ff835802815f3749d72b8deb4b2ea5978b479f3b`.
+After matching the transferred hash and passing USB preflight, the same
+launcher upgraded MRPUCCHI from 0.2.78 to 0.2.79 without pairing or manual
+service registration. It retained node ID
+`node-4c3832ee0e884100ba0a6596a400192c`, registered an automatic
+LocalService service, reached CUDA `Ready`, and restored two connected workers.
+
+Post-upgrade, pinned `HuggingFaceTB/SmolLM2-135M-Instruct` revision
+`12fd25f77366fa6b3b4b768ec3050bf629380bac` assigned MRPUCCHI CUDA
+layers `[0,26)` and PC-DANI CPU layers `[26,30)`. Both stages reached Ready;
+the real 16-token canary passed with TTFT 121.3 ms, TPOT 98.5 ms and 10.15
+output tokens/s. Deleting the model removed it from the coordinator and left
+zero stage processes and stage ports on both PCs, while two workers remained
+connected. Re-running the same USB file against the healthy 0.2.79 install
+reported Ready without changing the service PID. In a separate physical
+recovery test, only `MycelliosNode` was stopped and deregistered; the same USB
+file recreated it in about 19 seconds with no new pairing. The node ID,
+automatic LocalService account, CUDA Ready health, Tailscale and two connected
+workers were verified afterward. These are lab results using a temporary
+reverse SSH tunnel and an unsigned, uncommitted MSI, not a released external
+installation or durable coordinator connection. The USB launches in these
+physical runs used an already elevated SSH session; the standard-user UAC
+handoff still needs a tester run. A later script revision moved retained
+identity preflight behind that single UAC prompt and passed read-only preflight
+and idempotent execution on MRPUCCHI without changing the service PID.
+
+With no model active, MRPUCCHI reboot was requested again at 2026-09-29
+02:37:13 UTC with the 0.2.79 MSI installed. The PC-DANI tunnel supervisor
+observed the SSH disconnect and retried while the host was offline. After the
+new Windows boot, Tailscale and MycelliosNode were `Running`, the latter
+automatic under LocalService with the unchanged node ID. Health reached CUDA
+`Ready` at 02:38:29 UTC and the coordinator again showed two connected/online
+workers. This verifies installed-service recovery after reboot **while the
+temporary PC-DANI tunnel supervisor stays active**; it does not verify an
+unattended route after PC-DANI itself restarts.
+
+A second activation of the same pinned model after that reboot again assigned
+MRPUCCHI CUDA `[0,26)` and PC-DANI CPU `[26,30)`. Its real 16-token canary
+passed with TTFT 122.9 ms, TPOT 132.9 ms and 7.53 output tokens/s. While the
+stages were active, `Get-Process` reported peak working sets of 1,452.7 MiB
+for MRPUCCHI's CUDA Python process and 662.0 MiB for PC-DANI's CPU Python
+process. Windows WDDM `nvidia-smi` reported zero GPU memory use while the CUDA
+stage was running, so that value is not a credible VRAM measurement. Deleting
+the model again left zero `distributed_runtime` Python processes and zero
+stage listeners on both PCs; the installed service stayed CUDA `Ready` with
+two connected workers. The two canary rates describe individual lab runs and
+do not establish a performance regression or improvement.
+
+The 0.2.79 lab candidate also passed `npm test` (280 files, 1,963 tests;
+5 files and 17 tests skipped), 33 focused Python `unittest` cases for physical
+probing and the distributed server, TypeScript typecheck, repository structure,
+architecture and documentation gates. A separate folder on the mounted lab USB
+contains the verified 0.2.79 MSI, checksum and launcher, but deliberately has
+no short-lived enrollment bundle. It is not ready for a first installation
+until an account-owned bundle is issued, and it is not a signed release.
+
+On 29 September, a separate dirty-tree 0.2.80 **lab candidate** was built
+after rebuilding the pinned Windows Python runtime and Job Object broker.
+The staged node layout and administrative MSI extraction both verified. The
+MSI is 256,127,504 bytes with SHA-256
+`14d2f03230467a6488044c5aefefbaeabf6f57400a174518aea880c9378c1e5f`;
+its source ID is
+`sha256:20ebaef654d23e7f99e21ecbe2aa7ef2e3337834e1c0266b23dc6b23a64556a5`
+on dirty-tree HEAD `ff835802815f3749d72b8deb4b2ea5978b479f3b`.
+The copied MSI on the mounted lab USB has the same hash and Windows Installer
+reports product version 0.2.80. The first WiX link attempt failed on long
+Torch paths; mapping the same worktree to a short temporary drive path let the
+link and full MSI verification pass. The USB folder has no enrollment bundle
+and is not suitable for a first installation.
+
+The same MSI, checksum and launcher were copied to MRPUCCHI, where the hash
+matched and the launcher preflight passed without a new pairing. The already
+elevated SSH session ran the launcher and upgraded the existing 0.2.79 node to
+0.2.80. Windows Installer registered one product; the node kept its ID
+`node-4c3832ee0e884100ba0a6596a400192c` and coordinator binding. Its
+automatic `MycelliosNode` service ran under `NT AUTHORITY\LocalService`,
+reported CUDA `Ready`, and restored two connected/online control workers.
+
+The pinned SmolLM2 revision activated as `lab-upgrade-0280-20260929` with
+MRPUCCHI CUDA layers `[0,26)` and PC-DANI CPU layers `[26,30)`. Both stages
+reached Ready. The 16-token canary passed with TTFT 126.9 ms, TPOT 102.2 ms
+and 9.79 tokens/s. A first immediate coordinator chat request returned 503
+`no_capacity` while the newly published cell deployment was still being
+verified; its deployment subsequently reached `verificationState: verified`.
+A second ordinary chat request completed as
+`job_39d3cc38ba864b0190604eb63778c14f`, returning `2 + 2 is 4.` with
+45 prompt and nine output tokens. Its lab-signed receipt
+`sha256:2f7273815bad5f27974e9170b280e73bc453ad4500bb53580d9b753e256dee93`
+reported TTFT 146 ms and active time 910 ms; its attached topology classified
+one direct GPU-to-CPU stage boundary as physical. The signing key was the
+ephemeral lab key, not a public release identity. While active, the MRPUCCHI CUDA Python
+process reported a 1,523,032,064-byte peak working set and the PC-DANI CPU
+process 693,653,504 bytes; these are process memory readings, not VRAM.
+Deleting the requested model left zero distributed-runtime Python processes
+and zero stage listeners on both PCs, with two control workers still online
+and no requested model. Re-running the launcher against the healthy 0.2.80
+installation returned Ready with the same service PID. This is physical lab
+evidence over the temporary reverse SSH tunnel and an already elevated
+session; the MSI remains unsigned, unpublished, built from a dirty worktree,
+and untested through standard-user UAC or a durable coordinator route.
+With no model active, MRPUCCHI reboot was requested at 04:23:17 UTC. Its new
+Windows boot time was 04:23:42.5 UTC; Tailscale and the automatic LocalService
+node were Running, diagnostics reported 0.2.80 CUDA `Ready`, and the lab
+coordinator again had two connected/online workers. The PC-DANI SSH tunnel
+supervisor was still running and retried through the outage, so this verifies
+the installed service after reboot but not recovery without that supervisor.
+The full 0.2.80 Vitest run initially reported 1,963 passing tests and 17
+skips but exited nonzero when a worker fork terminated unexpectedly. Repeating
+with `--maxWorkers=2` exited zero: 281 files and 1,968 tests passed, with
+five files and 17 tests skipped. The strict Python runner passed 1,094 tests
+with 19 skips, zero failures and zero errors. Format, component boundaries,
+landing/mobile typechecks, documentation and `git diff --check` also passed.
+
+On 29 September, the authenticated public Downloads page reported "Packages
+unavailable" and no native packages published. The public `/health` endpoint
+reported coordinator version 0.2.77 with zero connected/online workers. This
+does not affect the separate two-worker local lab, but the public account and
+download route cannot yet support the external native-node procedure.
+The dirty worktree now aligns a new public release transaction with the MSI,
+PKG and DEB filenames produced by the native build and keeps parsing of
+previously committed ZIP/TAR.GZ transactions for rollback. The downloads API
+and page prefer a committed native installer and report its real format; a
+legacy archive remains selectable only when that is the available asset.
+Four focused release/download test files passed (34 tests), including a
+committed legacy archive restored after rolling back an installer release;
+typecheck, structure, architecture and documentation gates passed. No native
+installer has been published through this new route, so public availability
+and an external download remain unverified.
+The same dirty worktree now has a candidate assembler for the three native CI
+artifact trees. It checks each staged payload and release evidence, requires
+the same source revision/ID/version and CI run/attempt, verifies copied bytes,
+and writes one update feed and checksum list before making the output directory
+visible. Three synthetic CI job trees passed assembly into the public manifest;
+mixed-run and changed-package fixtures were rejected. The focused assembler,
+transaction CLI and upload tests passed (21 tests), along with typecheck,
+structure, architecture, format, documentation and version checks. No real
+three-platform CI artifact set, cryptographic signature check or public upload
+has been exercised. The provenance `signature.state` field alone is not proof
+ of code signing. The native workflow now includes a candidate assembly job
+ after all three matrix builds. Its YAML passed local actionlint 1.7.12, but
+ this new job has not run on GitHub.
+
+The three real 0.2.77 CI artifacts from run `36347391341` were subsequently
+downloaded and each ZIP matched the SHA-256 reported by GitHub. Their source
+revision, source ID, run ID and attempt matched across Linux, macOS and Windows.
+The assembler rejected the unmodified set with
+`node_installer_layout_digest_mismatch`: GitHub's older upload had excluded
+five hidden staged files on Linux, nine on macOS and five on Windows. The
+macOS omissions included four NumPy `.dylibs` libraries needed at runtime.
+The current dirty workflow sets `include-hidden-files: true`, but that change
+has not run in CI, so no real complete three-platform set has passed the
+assembler yet. A focused fixture now removes a required hidden runtime file
+and confirms that the assembler rejects it (four focused tests passed).
+The public transaction store checks release identity and file hashes but does
+not cryptographically verify Windows, macOS or Linux package signatures at
+commit time. The local 0.2.80 lab MSI returned `NotSigned` from Windows
+Authenticode. No usable code-signing certificate was found in the inspected
+PC-DANI certificate stores, and no signing-related GitHub Actions secret name
+was listed for this repository. A public promotion still needs a verified
+signing process and explicit platform signature checks; a CI candidate manifest
+alone cannot satisfy that gate. The live public downloads API reported 0 of 3
+packages available on 29 September.
+
+The PC-DANI lab coordinator was restarted from the current dirty 0.2.80
+worktree, and its local CPU worker now reads that package version rather than
+an older hard-coded lab value. MRPUCCHI's installed 0.2.80 `MycelliosNode`
+remained Automatic/Running, and the coordinator reported two connected/online
+workers. The same pinned SmolLM2 revision activated as
+`lab-aligned-0280-20260929`: MRPUCCHI CUDA layers `[0,26)` and PC-DANI CPU
+layers `[26,30)`. The real 16-token canary reported TTFT 120.3 ms, TPOT
+85.2 ms and 11.73 tokens/s. Three ordinary 16-token chat completions followed:
+`job_0fe9127f587a4d9c8daebfd73c484dca`,
+`job_7ecd5c8358cd429f82de10d117faec20`, and
+`job_b6ec228535fb44f1bddec2498bd12da7`. Their receipts reported TTFT
+3,617/1,875/2,036 ms and active time 7,430/6,718/6,253 ms respectively.
+The last job's attached topology classified a direct physical CUDA-to-CPU
+boundary. These normal-request timings are materially slower than the internal
+canary and should be treated separately. The MRPUCCHI stage Python process
+reported 1,632,641,024 peak working-set bytes and the PC-DANI stage
+693,784,576 bytes, not VRAM measurements. Deleting the requested model left
+zero distributed-runtime Python processes and checked stage listeners on both
+PCs, while two control workers remained connected. This aligns the running
+version numbers, but the lab still uses a dirty worktree and the temporary
+reverse SSH tunnel; it does not prove identical committed source or unattended
+coordinator reachability. A trial tailnet-only Tailscale TCP proxy worked on
+PC-DANI but timed out from MRPUCCHI; it was removed after that failed test.
+
+The timeout was traced to the current Tailscale packet filter: MRPUCCHI was
+allowed to reach PC-DANI on TCP 18100, not on the trial port 18791. PC-DANI
+now has a background, tailnet-only
+Tailscale Serve TCP proxy from port 18100 to its loopback coordinator on 18790.
+MRPUCCHI fetched the coordinator's 0.2.80 `/health` through that route. Its
+automatic Windows IP Helper service has a persistent loopback port proxy from
+`127.0.0.1:18790` to PC-DANI's tailnet port 18100; the temporary reverse SSH tunnel
+supervisor was stopped, and the existing node configuration stayed on its
+loopback URL. Two control workers reconnected without the SSH tunnel. The
+extra trial port proxy on MRPUCCHI was removed.
+
+With no model active, MRPUCCHI rebooted again. Its boot time changed from
+04:23:42.5 to 04:45:49.5 UTC on 29 September. Tailscale, IP Helper and the
+automatic `MycelliosNode` service were Running; its loopback proxy returned
+coordinator `/health`, and the coordinator returned to two connected/online
+workers without restarting the SSH tunnel. A fresh activation of the pinned
+SmolLM2 revision as `lab-durable-0280-20260929` again assigned MRPUCCHI CUDA
+`[0,26)` and PC-DANI CPU `[26,30)`. Its real 16-token canary reported TTFT
+119.9 ms, TPOT 83.7 ms and 11.94 tokens/s. An ordinary 16-token chat request
+completed as `job_a1a4e89ce7554681b5ebe0d83aeaca79`, with receipt
+`sha256:00ddb0d9d77c975e0d7b4478065999fd88f7cf851648e05fd65b637ad3e82b94`,
+TTFT 3,244 ms, active time 7,549 ms, and an attached topology classifying a
+direct physical GPU-to-CPU boundary. Its generated text was cut at the
+16-token limit, so this run proves completed inference and routing rather than
+answer quality. Deleting the model left zero distributed-runtime Python
+processes on both PCs while two control workers stayed connected. This proves
+MRPUCCHI reboot recovery and a physical inference through the persistent
+tailnet route. PC-DANI's coordinator is still an interactive lab process;
+unattended PC-DANI reboot recovery, a sealed same-commit release, standard-user
+installation and external availability remain unverified.
+
+On 29 September a separate private-lab failure test activated the same pinned
+SmolLM2 revision as `loss-mrpucchi-20260929`. The reservation placed PC-DANI
+CPU layers `[0,4)` and MRPUCCHI CUDA layers `[4,30)`; the committed canary
+returned 16 tokens with TTFT 109.8 ms, TPOT 79.0 ms and 12.67 tokens/s. A
+normal streaming request to the root runtime at `127.0.0.1:18881` returned
+HTTP 200 and its first token after 225 ms. After that token, `MycelliosNode`
+was stopped on MRPUCCHI while the stream was still running. The stream ended
+after 14.4 seconds with an SSE `service_unavailable` error, "pipeline connection
+failed: socket closed while receiving a frame", followed by `[DONE]`. Thus the
+client received an explicit stream error, not a successful complete answer.
+Both computers then had zero distributed-runtime Python stage processes and
+zero stage listeners. Removing the requested model succeeded while MRPUCCHI
+was offline; restarting its service restored `Ready` and two connected/online
+workers, with no requested model or stage process left behind. This tests
+service loss during generation, not a full PC power or network outage.
+
+A separate ordinary streaming request to the lab coordinator's
+`/v1/chat/completions` for that committed model returned `503 no_capacity`
+after a 45-second admission wait, despite the direct runtime canary passing.
+The cause was the lab harness omitting the cell worker publication setting;
+native control workers correctly do not advertise inference deployments. After
+adding a loopback lab coordinator target and scoped lab credential to the
+ignored harness, activation published a `mycellios-pipeline` worker. Its
+deployment canary reached `verified`. A normal coordinator chat job
+`job_0ba3a776fb4a4a2a8f98efb556df9353` completed with eight output tokens,
+answer `2 + 2 = 4`, and 43 input tokens. The coordinator issued receipt
+`sha256:b1c1a734cb67151351f16eed7da6958c1016d99b7d0df0060dd52ffbb4441774`
+with TTFT 174 ms and active time 2,030 ms, signed by an **ephemeral lab** key.
+Its attached topology classified the execution as physical, with CPU stage 0,
+CUDA stage 1 and one physical relay boundary. This is a private-lab
+coordinator result, not a production account or release result.
+
+After the cell worker first appeared, the coordinator reactivated the model
+once as its worker inventory changed. A first streaming probe used the default
+temperature and failed with `adapter_error` because the root runtime at that
+point rejected nonzero temperature; it did not cut MRPUCCHI. Once the second
+activation and deployment verification finished, a coordinator SSE request
+with `temperature=0` returned HTTP 200 and its first token after 366 ms. The
+MRPUCCHI service was then stopped during generation. The stream ended after
+14.3 seconds with the explicit `worker_disconnected` error and `[DONE]`, and
+the coordinator recorded failed job `job_37c537464be04ae8845c5d8547417bc6`
+with that failure code. Both hosts had zero distributed-runtime Python stage
+processes and zero stage listeners. The model was removed while MRPUCCHI was
+offline; restarting the service restored two connected/online native workers
+and left no requested model active. There is no evidence of automatic
+mid-stream continuation after a remote node disappears.
+
+Later on 29 September, the dirty worktree added sampling parameter forwarding
+to the Python batcher and a separate admission key per automatic cell identity.
+The historical shared key is tried only when a cell has no dedicated key;
+`worker_credential_reused` then triggers one retry with a dedicated key. The
+focused TypeScript tests passed (23 cases), as did the Python server tests
+(33 cases) and typecheck. In the physical lab, a new pinned SmolLM2 request
+`lab-sampling-20260929` again assigned PC-DANI CPU layers `[0,5)` and MRPUCCHI
+CUDA layers `[5,30)`. Both stages reached Ready; the 16-token canary passed
+with TTFT 102.7 ms, TPOT 116.6 ms and 8.57 tokens/s. This time cell
+registration succeeded and the requested model became active with three
+connected workers. An ordinary coordinator chat request omitting temperature
+completed with six output tokens instead of the earlier `adapter_error`.
+Two requests with `temperature=0.7`, `top_p=0.8` and the same seed produced
+the same 12-token output; this is a reproducibility spot check, not a sampling
+quality or performance comparison. Deleting the requested model left zero
+distributed-runtime stage processes and stage listeners on both PCs and two
+connected native workers. The old shared key and one dedicated cell key both
+remained on disk. This verifies the one-time migration retry for this lab cell,
+not a released build or account-owned production enrollment.
+The previously enrolled `lab-chat-20260929` cell was then reactivated with
+the same pinned model and historical key. Its two physical stages reached
+Ready, the 16-token canary passed (TTFT 92.5 ms, TPOT 128.0 ms, 7.82
+tokens/s), and a coordinator chat job completed with eight output tokens.
+After deletion, both hosts again had zero stage processes and the coordinator
+had no requested model, with two native workers still connected. This checks
+backward compatibility for the one previously enrolled lab cell; it does not
+cover every preexisting installation or credential recovery after key loss.
+
 ## Physical two-computer CPU smoke test (local, uncommitted)
 
 On 2026-09-26 the native automatic route generated through two Windows PCs on
@@ -1499,6 +2271,24 @@ performance claim.
 
 ## Next gate
 
-Run the native contiguous pipeline on two computers using
-[`TWO_HOST_QUICKSTART.md`](TWO_HOST_QUICKSTART.md). Do not add a new engine or a
-new product surface before that run identifies a concrete missing capability.
+Build the Windows node installer and coordinator from a fixed commit including
+the CPU identity and retry fixes, then repeat the launcher with account-owned
+pairing against a durable coordinator. Verify an installed CPU-only node and
+its coordinator-accepted calibration,
+the authenticated owner Pause/Resume UI and unattended reboot reconnection.
+The lab launcher, native command protocol, supervisor reload, assigned
+ inference, session re-registration after HTTP 401 and stage cleanup now have
+ physical evidence. Preserve their measurements and failure result, but do not
+ treat this dirty-tree build as a reproducible release. Then test the same
+ installation path with an external participant before claiming one-click
+ readiness.
+ A private Tailscale Serve TCP proxy on the existing allowed port 18100 and a
+ persistent MRPUCCHI loopback port proxy replaced the manual SSH tunnel. The
+ installed node reconnected after an unattended MRPUCCHI reboot and completed
+ another physical inference. The PC-DANI coordinator remains an interactive
+ lab process, so its own unattended reboot recovery is unverified. This private
+ lab route does not replace the public HTTPS, account-owned coordinator needed
+ for external testers. The lab MSI physically upgrades a retained node and
+ restores a missing service under LocalService without another pairing. Repeat
+ that gate from a fixed commit and released artifact; the dirty-tree result is
+ not a release.

@@ -18,6 +18,8 @@ describe("native installation bootstrap", () => {
     const worker = JSON.parse(await readFile(result.workerConfigPath, "utf8"));
     expect(node).toMatchObject({ nodeId: result.nodeId, coordinator: { url: bundle().coordinatorUrl },
       isolation: { mode: "linux-cgroup-v2" }, uninstall: { manifestPath: join(manifest.statePath, "installation.json") } });
+    expect(node.runtime).toMatchObject({ pythonPath: join(manifest.installRoot, "python"),
+      pythonExecutable: join(manifest.installRoot, "runtime", "bin", "python3") });
     expect(worker).toMatchObject({ instanceId: result.nodeId, adapter: { kind: "mycellios-native" } });
     expect(`${JSON.stringify(node)}${JSON.stringify(worker)}`).not.toContain(bundle().enrollmentToken);
     expect(await readFile(result.enrollmentPath, "utf8")).toContain(bundle().enrollmentToken);
@@ -46,6 +48,10 @@ describe("native installation bootstrap", () => {
     const result = await bootstrapNodeInstallation({ manifest: windows, enrollmentSourcePath: enrollment });
     expect(JSON.parse(await readFile(result.configPath, "utf8")).isolation).toEqual({
       mode: "windows-job-object", brokerExecutable: join(windows.installRoot, "bin", "mycellios-job-broker.exe"),
+    });
+    expect(JSON.parse(await readFile(result.configPath, "utf8")).runtime).toMatchObject({
+      pythonPath: join(windows.installRoot, "python"),
+      pythonExecutable: join(windows.installRoot, "runtime", "python.exe"),
     });
     const secondRoot = await temporaryDirectory();
     const secondEnrollment = join(secondRoot, "pairing.json");

@@ -63,6 +63,7 @@ class PhysicalProbeTests(unittest.TestCase):
 
         self.assertEqual(first, second)
         self.assertRegex(first["host"]["fingerprintSha256"], r"^sha256:[0-9a-f]{64}$")
+        self.assertTrue(first["host"]["cpuDeviceName"])
         self.assertNotIn("machine-secret", str(first))
         self.assertTrue(first["runtime"]["ncclAvailable"])
         self.assertEqual(first["runtime"]["ncclVersion"], "2.25.1")

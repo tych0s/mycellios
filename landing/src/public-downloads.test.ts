@@ -10,9 +10,9 @@ describe("public package availability", () => {
     schema: "mycellios-public-downloads/1",
     version: "0.2.77",
     packages: [
-      { id: "windows-x64", label: "Windows", format: "ZIP", fileName: "mycellios.zip", path: "/downloads/mycellios.zip", available: true },
-      { id: "macos-arm64", label: "macOS", format: "TAR.GZ", fileName: "mycellios-macos.tar.gz", path: "/downloads/mycellios-macos.tar.gz", available: false },
-      { id: "linux-x64", label: "Linux", format: "TAR.GZ", fileName: "mycellios-linux.tar.gz", path: "/downloads/mycellios-linux.tar.gz", available: false },
+      { id: "windows-x64", label: "Windows", format: "MSI", fileName: "mycellios.msi", path: "/downloads/mycellios.msi", available: true },
+      { id: "macos-arm64", label: "macOS", format: "PKG", fileName: "mycellios-macos.pkg", path: "/downloads/mycellios-macos.pkg", available: false },
+      { id: "linux-x64", label: "Linux", format: "DEB", fileName: "mycellios-linux.deb", path: "/downloads/mycellios-linux.deb", available: false },
     ],
   };
 
@@ -24,7 +24,7 @@ describe("public package availability", () => {
   it("reports only the requested package if its current release is missing", () => {
     expect(downloadAvailabilityNotice(availability, false, "macos-arm64", "unavailable")).toEqual({
       title: "Package unavailable",
-      detail: "The macOS TAR.GZ package is not currently published.",
+      detail: "The macOS PKG package is not currently published.",
     });
   });
 
@@ -35,10 +35,10 @@ describe("public package availability", () => {
     });
   });
 
-  it("distinguishes unsupported RPM from the current Linux archive status", () => {
+  it("distinguishes unsupported RPM from the current Linux installer status", () => {
     expect(downloadAvailabilityNotice(availability, false, "linux-x64", "unsupported")).toEqual({
       title: "Package format unavailable",
-      detail: "No Fedora / RHEL RPM package is offered. Check whether the Linux x64 archive is currently published, or try the browser worker.",
+      detail: "No Fedora / RHEL RPM package is offered. Check whether the Linux x64 installer is currently published, or try the browser worker.",
     });
     expect(downloadAvailabilityNotice(null, true, "linux-x64", "unsupported")?.title).toBe("Could not check package status");
   });
