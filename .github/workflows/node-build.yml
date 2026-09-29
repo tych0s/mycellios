@@ -112,21 +112,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          broker_args=()
+          stage_node() {
+            node scripts/stage-node-installer.mjs \
+              --dist=dist \
+              --runtime=build/distribution-runtime \
+              --node-executable="$(node -p 'process.execPath')" \
+              --node-modules=node_modules \
+              --source-root=. \
+              --target="${{ matrix.target }}" \
+              --source-revision="$GITHUB_SHA" \
+              "$@" \
+              --output="build/node-package/${{ matrix.target }}"
+          }
           if [[ "${{ matrix.target }}" == "windows-x64" ]]; then
-            broker_args+=(--broker-executable=build/windows-job-broker/mycellios-job-broker.exe)
-            broker_args+=(--service-wrapper-executable=build/windows-service-wrapper/MycelliosNode.exe)
+            stage_node \
+              --broker-executable=build/windows-job-broker/mycellios-job-broker.exe \
+              --service-wrapper-executable=build/windows-service-wrapper/MycelliosNode.exe
+          else
+            stage_node
           fi
-          node scripts/stage-node-installer.mjs \
-            --dist=dist \
-            --runtime=build/distribution-runtime \
-            --node-executable="$(node -p 'process.execPath')" \
-            --node-modules=node_modules \
-            --source-root=. \
-            --target="${{ matrix.target }}" \
-            --source-revision="$GITHUB_SHA" \
-            "${broker_args[@]}" \
-            --output="build/node-package/${{ matrix.target }}"
           node scripts/verify-node-installer.mjs --root="build/node-package/${{ matrix.target }}"
       - name: Build and verify native Debian installer
         if: needs.native_scope.outputs.required == 'true' && matrix.target == 'linux-x64'
