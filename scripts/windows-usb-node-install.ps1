@@ -2,7 +2,8 @@
 param(
   [string]$PackageDirectory = (Join-Path $PSScriptRoot 'Node'),
   [switch]$PreflightOnly,
-  [switch]$AllowLoopbackHttpForLab
+  [switch]$AllowLoopbackHttpForLab,
+  [switch]$ReturnRebootCode
 )
 
 $ErrorActionPreference = 'Stop'
@@ -36,6 +37,11 @@ function Get-InstalledNode {
     throw 'El MSI Mycellios Node registrado no tiene un ProductCode valido.'
   }
   return $entries[0]
+}
+
+function Save-MsiProgress([string]$Path, $Package) {
+  $pending = @{mode=$Package.Mode;productCode=(Read-MsiProperty $Package.Msi 'ProductCode');msiHash=(Get-FileHash -LiteralPath $Package.Msi -Algorithm SHA256).Hash}
+  [IO.File]::WriteAllText($Path, ($pending | ConvertTo-Json), [Text.Encoding]::UTF8)
 }
 
 function Test-RetainedNode([string]$ConfigPath, $Service, $Installed) {
@@ -104,7 +110,7 @@ function Test-RetainedNode([string]$ConfigPath, $Service, $Installed) {
   return @{ NodeId = [string]$config.nodeId; Service = $Service }
 }
 
-function Test-Package {
+function Test-Package([switch]$ResumeMsiOnly) {
   if (-not [Environment]::Is64BitOperatingSystem) { throw 'El nodo requiere Windows x64.' }
   if (-not (Test-Path -LiteralPath $PackageDirectory -PathType Container)) {
     throw 'Falta la carpeta Node del pendrive.'
@@ -130,7 +136,16 @@ function Test-Package {
   $config = Join-Path $env:ProgramData 'Mycellios\Configuration\node.json'
   $service = Get-Service -Name MycelliosNode -ErrorAction SilentlyContinue
   $installed = Get-InstalledNode
-  if ($service -or $installed -or (Test-Path -LiteralPath $config)) {
+  if ($ResumeMsiOnly -and (Test-Path -LiteralPath $config)) {
+    $null = Assert-RegularFile $config 'Configuracion retenida'
+    $pairings = @(Get-ChildItem -LiteralPath $PackageDirectory -File -Filter '*.mycellios-enrollment')
+    if ($pairings.Count -gt 1) { throw 'Hay mas de un emparejamiento para recuperar el nodo.' }
+    $pendingPath = Join-Path (Split-Path -Parent $config) 'enrollment.json'
+    $bootstrapProgress = Join-Path $env:ProgramData 'Mycellios\State\bootstrap-progress.json'
+    $pairing = if ($pairings.Count -eq 1 -and ((Test-Path -LiteralPath $pendingPath) -or (Test-Path -LiteralPath $bootstrapProgress))) { (Assert-RegularFile $pairings[0].FullName 'Emparejamiento').FullName } else { $null }
+    return @{ Msi=$msi.FullName; Config=$config; Mode='resume'; Pairing=$pairing }
+  }
+  if (($service -or $installed -or (Test-Path -LiteralPath $config)) -and -not $ResumeMsiOnly) {
     $retained = Test-RetainedNode $config $service $installed
     if ($productCode -ine [string]$installed.PSChildName -and
         $incomingVersion -le [version]$installed.DisplayVersion) {
@@ -182,11 +197,27 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     '-PackageDirectory', ('"{0}"' -f $PackageDirectory))
   if ($PreflightOnly) { $arguments += '-PreflightOnly' }
   if ($AllowLoopbackHttpForLab) { $arguments += '-AllowLoopbackHttpForLab' }
+  if ($ReturnRebootCode) { $arguments += '-ReturnRebootCode' }
   $child = Start-Process powershell.exe -Verb RunAs -ArgumentList $arguments -Wait -PassThru
   exit $child.ExitCode
 }
 
-$package = Test-Package
+$rebootPath = Join-Path $PackageDirectory 'msi-reboot.json'
+$resumeMsi = $false
+if ($ReturnRebootCode -and (Test-Path -LiteralPath $rebootPath)) {
+  $null = Assert-RegularFile $rebootPath 'Avance de instalacion MSI'
+  $checkpoint = Get-Content -LiteralPath $rebootPath -Raw | ConvertFrom-Json
+  $incomingMsi = @(Get-ChildItem -LiteralPath $PackageDirectory -File -Filter 'mycellios-node-*-windows-x64.msi')
+  $registered = Get-InstalledNode
+  if ($incomingMsi.Count -ne 1 -or -not $registered -or $registered.PSChildName -ine $checkpoint.productCode -or
+      (Get-FileHash -LiteralPath $incomingMsi[0].FullName -Algorithm SHA256).Hash -ine $checkpoint.msiHash) {
+    throw 'El MSI registrado no corresponde al reinicio pendiente.'
+  }
+  $resumeMsi = $true
+  if ($checkpoint.mode -eq 'new') { $package = Test-Package -ResumeMsiOnly }
+  elseif ($checkpoint.mode -eq 'existing') { $package = Test-Package }
+  else { throw 'Modo de recuperacion MSI no valido.' }
+} else { $package = Test-Package }
 if ($PreflightOnly) {
   if ($package.Mode -eq 'existing') {
     Write-Output "Preflight listo: nodo $($package.NodeId), MSI y SHA-256 verificados; no se ha modificado nada."
@@ -203,18 +234,27 @@ if ($sameProduct -and $package.Service -and $package.Service.Status -eq 'Running
     catch { $currentHealth = $null }
     if ($currentHealth -and $currentHealth.state -eq 'ready' -and
         (Get-Process -Id $currentHealth.pid -ErrorAction SilentlyContinue)) {
+      if ($resumeMsi) { Remove-Item -LiteralPath $rebootPath -Force }
       Write-Output "Mycellios ya esta instalado y Ready: $($package.NodeId)."
       exit 0
     }
   }
   throw 'El servicio ya existe pero no esta Ready. Revisa los diagnosticos antes de actualizar.'
 }
-if (-not $sameProduct) {
+if (-not $sameProduct -and -not $resumeMsi) {
   $msi = Start-Process msiexec.exe -ArgumentList @('/i', ('"{0}"' -f $package.Msi), '/qn', '/norestart') -Wait -PassThru -WindowStyle Hidden
   if ($msi.ExitCode -eq 3010) {
+    if ($ReturnRebootCode) {
+      Save-MsiProgress $rebootPath $package
+      exit 3010
+    }
     throw 'El MSI requiere reinicio. Reinicia y vuelve a ejecutar el mismo archivo del pendrive para recuperar el nodo.'
   }
   if ($msi.ExitCode -ne 0) { throw "La instalacion MSI fallo con codigo $($msi.ExitCode)." }
+  if ($ReturnRebootCode -and $package.Mode -eq 'new') {
+    Save-MsiProgress $rebootPath $package
+    $resumeMsi = $true
+  }
   if ($package.Mode -eq 'existing') {
     $updated = Get-InstalledNode
     if (-not $updated -or [string]$updated.PSChildName -ine $package.ProductCode) {
@@ -222,7 +262,16 @@ if (-not $sameProduct) {
     }
   }
 }
-if ($package.Mode -eq 'existing') {
+if ($package.Mode -eq 'resume') {
+  $node = Join-Path $env:ProgramFiles 'Mycellios\bin\node.exe'
+  $installer = Join-Path $env:ProgramFiles 'Mycellios\app\node\install-main.js'
+  $null = Assert-RegularFile $node 'Runtime Node'
+  $null = Assert-RegularFile $installer 'Instalador nativo'
+  $arguments = @($installer, '--resume-installed')
+  if ($package.Pairing) { $arguments += @('--enrollment', $package.Pairing) }
+  & $node @arguments
+  if ($LASTEXITCODE -ne 0) { throw 'El nodo no pudo continuar su emparejamiento o la preparacion GPU.' }
+} elseif ($package.Mode -eq 'existing') {
   if ($package.Service -and $sameProduct) {
     Start-Service -Name MycelliosNode -ErrorAction Stop
   } else {
@@ -263,6 +312,7 @@ while ([DateTimeOffset]::UtcNow -lt $deadline) {
         catch { $diagnostics = $null }
         if ($diagnostics -and $diagnostics.runtime.backend -in @('cpu', 'cuda', 'rocm') -and
             (Get-Process -Id $health.pid -ErrorAction SilentlyContinue)) {
+          if ($resumeMsi) { Remove-Item -LiteralPath $rebootPath -Force }
           if ($package.Mode -eq 'existing') {
             Write-Output "Mycellios actualizado y Ready: $($package.NodeId). Backend verificado: $($diagnostics.runtime.backend)."
           } else {

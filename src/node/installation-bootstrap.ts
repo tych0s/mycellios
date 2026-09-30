@@ -1,6 +1,8 @@
 import { randomBytes } from "node:crypto";
 import { lstat, mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
+import { isDeepStrictEqual } from "node:util";
+import { z } from "zod";
 import { nodeEnrollmentBundleSchema } from "../contracts/node-control.js";
 import { nodeInstallationManifestSchema, type NodeInstallationManifest } from "../contracts/node-uninstall.js";
 import { NodeConfigurationStore } from "./config-store.js";
@@ -32,7 +34,18 @@ export async function bootstrapNodeInstallation(input: {
   const workerConfigPath = join(configurationDirectory, "worker.json");
   const enrollmentPath = join(configurationDirectory, "enrollment.json");
   const installationManifestPath = join(manifest.statePath, "installation.json");
-  const nodeId = `node-${bundle.enrollmentId.replaceAll("-", "")}`;
+  const progressPath = join(manifest.statePath, "bootstrap-progress.json");
+  const progress = await readBootstrapProgress(progressPath);
+  if (progress) {
+    if (!isDeepStrictEqual(progress.manifest, manifest) ||
+        new URL(progress.coordinatorUrl).toString() !== new URL(bundle.coordinatorUrl).toString()) {
+      throw new Error("node_install_bootstrap_progress_mismatch");
+    }
+    // A service cannot create its key until bootstrap is complete. Never reset
+    // resource settings from a journal belonging to a node that already ran.
+    await assertAbsent(manifest.identityPath);
+  }
+  const nodeId = progress?.nodeId ?? `node-${bundle.enrollmentId.replaceAll("-", "")}`;
   const pythonPath = join(manifest.installRoot, "python");
   const runtimePath = join(manifest.installRoot, "runtime");
   const pythonExecutable = manifest.platform === "win32"
@@ -67,20 +80,56 @@ export async function bootstrapNodeInstallation(input: {
 
   await mkdir(configurationDirectory, { recursive: true, mode: 0o700 });
   await mkdir(manifest.statePath, { recursive: true, mode: 0o700 });
-  await assertAbsent(manifest.configPath);
-  await assertAbsent(workerConfigPath);
-  await assertAbsent(enrollmentPath);
-  await assertAbsent(installationManifestPath);
+  const output = [[manifest.configPath, nodeConfiguration], [workerConfigPath, workerConfiguration],
+    [installationManifestPath, manifest]] as const;
+  if (progress) {
+    // Validate all surviving output before filling any missing file.
+    for (const [path, expected] of output) {
+      const existing = await readBootstrapJson(path);
+      if (existing !== undefined && !isDeepStrictEqual(existing, expected)) {
+        throw new Error("node_install_bootstrap_output_mismatch");
+      }
+    }
+    const pending = await readBootstrapJson(enrollmentPath);
+    if (pending !== undefined && new URL(nodeEnrollmentBundleSchema.parse(pending).coordinatorUrl).toString() !==
+        new URL(bundle.coordinatorUrl).toString()) throw new Error("node_install_bootstrap_progress_mismatch");
+  } else {
+    for (const path of [...output.map(([path]) => path), enrollmentPath]) await assertAbsent(path);
+    await writeProtectedJson(progressPath, { schema: "mycellios-node-bootstrap-progress/1", manifest, nodeId,
+      coordinatorUrl: bundle.coordinatorUrl });
+  }
   try {
-    await new NodeConfigurationStore(manifest.configPath).save(nodeConfiguration);
-    await writeProtectedJson(workerConfigPath, workerConfiguration);
+    for (const [path, value] of output) {
+      if (progress && await readBootstrapJson(path) !== undefined) continue;
+      if (path === manifest.configPath) await new NodeConfigurationStore(path).save(value);
+      else await writeProtectedJson(path, value);
+    }
     await writeProtectedJson(enrollmentPath, bundle);
-    await writeProtectedJson(installationManifestPath, manifest);
+    await rm(progressPath);
   } catch (error) {
-    await Promise.all([manifest.configPath, workerConfigPath, enrollmentPath, installationManifestPath].map((path) => rm(path, { force: true })));
+    if (!progress) await Promise.all([...output.map(([path]) => path), enrollmentPath, progressPath].map((path) => rm(path, { force: true })));
     throw error;
   }
   return { nodeId, configPath: manifest.configPath, workerConfigPath, enrollmentPath, installationManifestPath };
+}
+
+export async function hasNodeBootstrapProgress(manifest: NodeInstallationManifest): Promise<boolean> {
+  return await readBootstrapProgress(join(manifest.statePath, "bootstrap-progress.json")) !== undefined;
+}
+
+async function readBootstrapProgress(path: string) {
+  const value = await readBootstrapJson(path);
+  if (value === undefined) return undefined;
+  return z.object({ schema: z.literal("mycellios-node-bootstrap-progress/1"), manifest: nodeInstallationManifestSchema,
+    nodeId: z.string().regex(/^node-[a-f0-9]{32}$/), coordinatorUrl: z.string().url() }).strict().parse(value);
+}
+
+async function readBootstrapJson(path: string): Promise<unknown | undefined> {
+  let stats;
+  try { stats = await lstat(path); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+  if (!stats.isFile() || stats.isSymbolicLink() || stats.size > 65_536) throw new Error("node_install_bootstrap_file_is_unsafe");
+  return JSON.parse((await readFile(path, "utf8")).replace(/^\uFEFF/, "")) as unknown;
 }
 
 function assertManifestLayout(manifest: NodeInstallationManifest): void {
@@ -97,7 +146,7 @@ async function assertAbsent(path: string): Promise<void> {
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
 }
 
-async function writeProtectedJson(path: string, value: unknown): Promise<void> {
+export async function writeProtectedJson(path: string, value: unknown): Promise<void> {
   const temporary = `${path}.tmp-${process.pid}-${randomBytes(8).toString("hex")}`;
   const file = await open(temporary, "wx", 0o600);
   try {

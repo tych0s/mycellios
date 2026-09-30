@@ -87,7 +87,16 @@ export class NodeEnrollmentStore {
     return this.database.transaction(() => {
       const row = this.readByTokenHash(sha256(input.enrollmentToken));
       if (!row) return { state: "unknown" };
-      if (row.consumed_at !== null) return { state: "already-consumed" };
+      if (row.consumed_at !== null) {
+        if (row.nonce_hash !== sha256(input.nonce)) return { state: "nonce-mismatch" };
+        if (row.identity_kind !== input.identityKind || row.identity_id !== input.identityId ||
+            row.public_key_fingerprint !== input.publicKeyFingerprint) return { state: "recovery-required" };
+        const retained = this.database.getNodeOwnership(input.identityKind, input.identityId);
+        if (retained?.status === "revoked") return { state: "revoked" };
+        if (!retained || retained.accountId !== row.account_id ||
+            retained.credentialFingerprint !== input.publicKeyFingerprint) return { state: "recovery-required" };
+        return { state: "already-consumed" };
+      }
       if (row.expires_at <= this.now()) return { state: "expired" };
       if (row.confirmed_at === null) return { state: "unconfirmed" };
       if (row.nonce_hash !== sha256(input.nonce)) return { state: "nonce-mismatch" };

@@ -5,9 +5,27 @@ import type { HeadlessWorkerEnvironment } from "../worker/headless-runtime.js";
 import {
   prepareAcceleratorRuntime,
   type AcceleratorProgressEvent,
+  type AcceleratorProgressIssue,
   type AcceleratorRuntimeResult,
 } from "./accelerator-runtime.js";
 import { selectDesktopHardwareGpu } from "./hardware-selection.js";
+
+/** A supported GPU whose setup failed must retain the installer's retry task. */
+export async function prepareInstalledNodeAccelerator(
+  input: Parameters<typeof prepareNativeNodeAccelerator>[0],
+  prepare: typeof prepareNativeNodeAccelerator = prepareNativeNodeAccelerator,
+): Promise<AcceleratorRuntimeResult> {
+  let issue: AcceleratorProgressIssue | undefined;
+  const result = await prepare({ ...input, onProgress: (event) => {
+    if (event.issue) issue = event.issue;
+    input.onProgress?.(event);
+  } });
+  if (result.status === "gpu-fallback" && (!issue ||
+      !["unsupported-platform", "unsupported-gpu", "no-gpu"].includes(issue.code))) {
+    throw new Error(`node_install_gpu_setup_pending:${issue?.code ?? "unknown"}`);
+  }
+  return result;
+}
 
 export async function prepareNativeNodeAccelerator(input: {
   configPath: string;

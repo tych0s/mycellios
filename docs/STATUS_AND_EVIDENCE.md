@@ -2271,6 +2271,476 @@ performance claim.
 
 ## Next gate
 
+### Fixed candidate and access check, 30 September 2026
+
+The Windows 0.2.81 lab MSI was built from commit
+`d5058f687419f6a2d9cae8c24f8b4706c32acbc9`. Its SHA-256 is
+`2e56bc83322ac60d8cbea3ef6b3defeb5d676a8f7c092a01f3631c34514e9a1d`;
+Authenticode reports `NotSigned`. PR #37 remains a draft. Its current checks
+passed, including the Windows, Linux and macOS native jobs and real candidate
+assembly. This establishes CI packaging evidence, not public signing or a
+physical installation by itself. Later in this session, the hash-checked MSI
+upgraded MRPUCCHI to 0.2.81 and preserved its existing node identity.
+
+PC-DANI's private lab coordinator now has a scheduled supervisor. With no
+requested model, its coordinator process was deliberately terminated; the
+supervisor started a new process and `/health` returned 0.2.81 after 10.97
+seconds. PC-DANI's CPU worker subsequently reconnected. The evidence is retained
+locally in `runtime/native-node-lab/coordinator-recovery-20260930.json`. This
+is a local process recovery test; unattended PC-DANI reboot recovery and a
+two-computer inference with 0.2.81 remain unverified.
+
+MRPUCCHI answered a Tailscale ping, and the console's saved access rule permits
+PC-DANI (`100.93.34.56`) to reach MRPUCCHI (`100.102.91.6`) on TCP 22. However,
+Codex's local TCP probe returned Windows socket error 10013, including on the
+requested escalated retry. The local firewall contains Codex sandbox outbound
+restrictions. This does not establish a remote SSH authentication failure.
+Jarvis's PC panel separately reported MRPUCCHI offline with its last signal at
+28 September 20:37:20. Execution of the delivered `PREPARAR-MRPUCCHI.cmd`
+bootstrap had not been confirmed at that check. The fixed physical repeat was unavailable
+until a working authorized control route and the installed build are verified.
+
+A later access check at 07:00 UTC reached MRPUCCHI's SSH server and was rejected
+with `Permission denied (publickey)` for both the dedicated lab key and the
+existing default key/agent route. The preceding local socket error must not be
+treated as the current SSH failure. MRPUCCHI's signed native snapshots were
+fresh, reporting 0.2.80, CUDA and `reconnecting`, while its worker remained
+offline. With zero requested models and zero active commands, the operator
+queued command `3e7a91f1-dabf-476f-a7bb-a9dc48535068` through the private lab's
+validated command store to reapply the exact observed policy. MRPUCCHI returned
+an authenticated `applied` result with no error at 07:04:59.857 UTC. That command
+requests a process restart after acknowledgment. No newer snapshot appeared
+during the following 154 seconds, and the worker did not reconnect; this proves
+command delivery and acknowledgment, not successful restart or recovery.
+Its result is retained in
+`runtime/native-node-lab/reconnect-command-20260930.json`. The fixed MSI upgrade
+was subsequently completed; a fresh physical inference remains a separate gate.
+
+### Generic private USB bootstrap and actual reboot, 30 September 2026
+
+The earlier SSH rejection used the wrong Windows account, `daniel`. The same
+dedicated key successfully authenticated as `danie`, with administrator access.
+The missing Jarvis signal was separately traced to its user-login startup:
+MRPUCCHI had no interactive Windows user. Neither finding establishes a VPN or
+remote-server outage.
+
+The generic Windows x64 launcher was executed twice on MRPUCCHI, from the same
+hash-checked package copied to its local disk. Both completed with exit code
+zero. It created the managed `mycellios-control` administrator, retained existing
+SSH administrators and the Mycellios identity, restricted its firewall rule to
+the controller's Tailscale IP, configured service failure recovery and registered
+the SYSTEM startup recovery task. A fresh SSH connection as that new account
+confirmed administrator membership. Mycellios reported Ready with CUDA.
+
+MRPUCCHI then underwent a real Windows reboot. At 08:15:14 UTC, its boot time
+was 08:14:16.5 UTC, no interactive user was logged in, Tailscale, SSH and
+Mycellios were Running, and Mycellios reported Ready with CUDA. Exactly one
+Jarvis worker ran in session zero. Jarvis's database subsequently reported a
+fresh MRPUCCHI heartbeat. This verifies unattended administrative access and
+native-node startup on that PC; it does not verify an interactive desktop before
+Windows login. Evidence is retained locally in
+`runtime/native-node-lab/generic-usb-reboot-20260930.json`.
+
+The private generic package contains ten separate pre-approved, non-reusable
+Tailscale enrollments. The OAuth secret remains encrypted on PC-DANI and the
+package contains only its public SSH key. Unused VPN enrollments expire after
+90 days. The private coordinator issues a fresh 15-minute Mycellios enrollment
+against a per-install claim, permanently binding each claim to one machine.
+Three focused tests cover denial, expiration, same-machine retry, cross-machine
+rejection, renewal and consumed enrollment; all passed. Package integrity,
+structure, architecture, documentation and TypeScript checks passed. Tailscale's
+bundled MSI has a valid vendor signature; the private Mycellios candidate remains
+unsigned.
+
+Daniel subsequently mounted the ESD-USB removable drive at D:. The complete
+private package was copied into `D:\MYCELLIOS`, preserving Windows installation
+media and previous folders. The sole entry file is `D:\INSTALAR-MYCELLIOS.cmd`.
+Read-back preflight verified every static payload checksum and ten unused
+single-PC tickets remained on the drive. No OAuth secret or private SSH key was
+added to the new package. The generic Tailscale grant for controller SSH to
+`tag:mycellios-lab` is prepared but awaits the required browser confirmation.
+A first installation on a second clean PC, its interactive Jarvis pairing and a
+physical inference through 0.2.81 are not established by the retained-node test.
+PC-DANI's SYSTEM startup coordinator task was subsequently registered with
+elevated Windows permissions; its configuration receipt is retained at
+`runtime/native-node-lab/controller-startup-receipt.json`. Its actual reboot
+has not been tested.
+
+The single-file launcher now stages the complete static package and one ticket
+in protected ProgramData, registers startup and ten-minute retries, and handles
+installer reboot requests without reopening a USB file. A focused PowerShell
+test verified allocation of one ticket, no copying of the unused ticket pool,
+quoted profile paths, resume from disk after a simulated boot change, no repeat
+restart on the same boot, and bounded reboot/retry counts. This test does not
+establish a physical installer-required reboot.
+
+At 09:16 UTC the revised launcher was executed as SYSTEM on the actual MRPUCCHI
+against its existing installation. Exit code was zero, its original node identity
+was unchanged, local health was Ready and the recovery task was Running. The
+complete package was retained locally and the completed installation's resume
+task was removed. This retained-node regression is separate from a first clean
+installation or physical USB execution on another PC.
+
+At 09:18 UTC a second SYSTEM invocation used only the staged ProgramData
+installer with `-Resume`, without a USB source path or ticket pool on the PC.
+It completed with exit zero, Ready/CUDA, the same identity, no interactive
+Windows user, Running recovery, and no remaining installation resume task.
+Evidence is saved in `runtime/native-node-lab/generic-usb-local-resume-20260930.json`.
+Administrative SSH file transfer via its SFTP subsystem also passed. This is a
+physical local-disk resume check, not a fresh installation or a new reboot test.
+
+### Native 0.2.81 physical repeat and stream-failure finding, 30 September 2026
+
+At 09:30 UTC the private coordinator activated the pinned SmolLM2 135M model
+across PC-DANI and MRPUCCHI with both workers reporting 0.2.81. Native source
+areas had no diff from `d5058f687419f6a2d9cae8c24f8b4706c32acbc9`
+at this point; later administrative USB work was uncommitted. Both hosts' model
+weights matched SHA-256
+`5af571cbf074e6d21a03528d2330792e532ca608f24ac70a143f6b369968ab8c`
+at revision `12fd25f77366fa6b3b4b768ec3050bf629380bac`.
+The automatically planned route assigned [0,4) to PC-DANI CPU/float32 and
+[4,30) to MRPUCCHI RTX 2060 CUDA/float16, with fp16 activation transfer through
+the authenticated runtime relay. This differs from the earlier equal split and
+is not a controlled performance comparison.
+
+The 16-token canary measured TTFT 164.3 ms, TPOT 84.3 ms, pipeline 1428.8 ms
+and 11.86 output tokens/s. It returned the same apologetic text as the earlier
+canary rather than following the instruction to answer only OK. A separate
+coordinator API request answered `2 + 2 is 4.` with nine output tokens and
+204 ms reported TTFT. Its execution receipt identifies both physical hosts,
+assigned ranges and CPU/CUDA backends. Peak process working sets sampled after
+the request were 738,410,496 bytes locally and 1,414,848,512 bytes remotely.
+An additional whole-GPU sample reported 377 MiB used; this is neither per-model
+peak VRAM nor proof of exclusive GPU use. Evidence is retained under
+`runtime/native-node-lab/` in `activated-0281-20260930.json`,
+`inference-0281-20260930.json` and `memory-0281-20260930.json`.
+
+After a manual reactivation, a controlled fault terminated MRPUCCHI's stage at
+09:40:01.464 UTC while a 256-token streaming request was still running. The
+stream ended 206 ms later with only 101 text chunks, yet the coordinator marked
+the partial answer completed with no failure code. The native pipeline adapter
+ignored the Python runtime's SSE error payload and accepted DONE without a
+terminal result. This is an incorrect success report, not recovery. An earlier
+kill occurred after its request ended and is excluded from the active-inference
+fault result. Model status subsequently became failed with no automatic retry;
+manual deletion cleaned up the route and left both native workers connected.
+
+A local uncommitted adapter correction now rejects native SSE errors, bare DONE,
+premature EOF and terminal chunks without valid token usage. After partial output
+it does not classify such failures as retryable. Twenty-one focused adapter and
+worker-hardening tests passed, along with TypeScript, structure and architecture
+gates. At that point the correction was not committed, published or included in
+a replacement MSI.
+
+After reloading the private coordinator with that uncommitted correction, the
+same two physical nodes and pinned model passed another real activation canary.
+At 09:52:16.071 UTC, MRPUCCHI's stage was terminated during a new streaming
+request. This time the client received an explicit `adapter_error` rather than
+a successful partial result; the message explained that exact replay after
+streaming begins requires an explicit deterministic seed. The stream ended
+287 ms after the fault and included 89 partial text chunks. This verifies
+failure propagation, not automatic recovery or output completion. The test
+differs from the fixed-commit baseline by the local adapter correction.
+The coordinator recorded the request as failed. After removing the test model,
+neither host retained a Python stage, local API/return listeners were closed,
+both native workers were connected, and MRPUCCHI's installed service remained
+Running/Ready. Cleanup evidence is in `streamfix-cleanup-20260930.json`.
+Evidence is retained in `loss-stream-0281-streamfix-20260930.json`,
+`fault-0281-streamfix-20260930.json` and `streamfix-fault-state-20260930.json`
+under `runtime/native-node-lab/`. First clean-PC installation, the rebuilt
+fixed-commit release and external testers remain separate gates.
+
+### Private 0.2.82 upgrade, physical generation and reboot, 30 September 2026
+
+The replacement Windows x64 MSI includes the streaming adapter correction.
+Its administrative extraction and complete file-tree comparison passed, as did
+41 focused adapter, worker, provisioning, MSI/layout and version tests, the
+PowerShell USB staging/upgrade regression, TypeScript, structure, architecture
+and documentation checks. The MSI is 256,143,888 bytes, SHA-256
+`3ba4b6c6f1ac8474adff9d7ae4ca1843a5b2363a60101915573fadc29a7ef241`.
+Its native source snapshot is
+`sha256:8986f290b63132ea9df9fb6cda25029197d3a1197ae5458f286297e933508585`,
+with parent revision `d5058f687419f6a2d9cae8c24f8b4706c32acbc9`.
+This is an unsigned private candidate from uncommitted source.
+
+The generic installer ran as SYSTEM on the actual MRPUCCHI and returned 0.
+It retained `node-4c3832ee0e884100ba0a6596a400192c`, reached Ready/CUDA,
+kept service recovery running and removed its installation resume task.
+Only one MSI remained in the protected local package, and no unused ticket
+pool was copied to the PC. This verifies a retained-node upgrade through the
+generic installer, rather than a first installation on a clean PC.
+
+Both physical workers then reported 0.2.82 and generated with SmolLM2-135M-
+Instruct at revision `12fd25f77366fa6b3b4b768ec3050bf629380bac`.
+The receipt assigns layers [0,3) to PC-DANI CPU and [3,30) to MRPUCCHI CUDA.
+The 16-token activation canary measured TTFT 433.97 ms, TPOT 73.28 ms and
+13.65 tokens/s. The subsequent API request reported TTFT 222 ms. Its response
+described addition without answering 4, so this is generation evidence, not
+a passing arithmetic test. A separate monolithic CUDA/float16 eager reference
+used the same prompt, chat template, pinned snapshot and verified weight hash.
+It produced exactly the same text and 17 completion tokens. This verifies
+output parity for this one greedy prompt, not general semantic accuracy or a
+performance comparison. Peak process working sets were
+717,004,800 bytes on PC-DANI and 1,402,384,384 bytes on MRPUCCHI. These are
+process observations, not exclusive GPU memory or performance percentiles.
+Deleting the test model left zero stages, requested models and API/return
+listeners, with both native workers connected.
+
+MRPUCCHI was rebooted after cleanup with no interactive user. It booted at
+10:53:33.5 UTC. At 10:55:27 UTC, administrative SSH worked, Tailscale, sshd
+and MycelliosNode were running with automatic startup, and the node reported
+Ready/CUDA with the retained identity. A later process check found one headless
+Jarvis worker; Jarvis's operational database reported its fresh MRPUCCHI signal
+at 10:59:43 UTC. Desktop capability remained null without a Windows login.
+This verifies unattended access after an actual reboot of the upgraded PC.
+
+The mounted ESD-USB at D: now contains these verified MSI bytes, 22 verified
+static payload files and ten unused enrollments. Its single root entry remains
+`D:\INSTALAR-MYCELLIOS.cmd`. The USB readback/preflight passed and its Windows
+installation media were preserved. The generic SSH grant to tagged new PCs is
+still pending; the existing individual MRPUCCHI grant supported these tests.
+
+The local development gate initially failed with an unseeded default cache,
+then with canonical-source/cached-artifact mismatches in older Tiny-Llama data.
+Using its canonical `hmellor/tiny-random-LlamaForCausalLM` identifier, a prewarmed
+model cache and fresh node caches completed a real two-worker generation.
+This gate is CPU loopback with logical workers; its output was `eno Twe` and
+does not establish physical multi-host execution or answer quality. Older
+node caches were preserved separately. The default fixture/cache path is not
+verified as working from a fresh checkout.
+
+Evidence is retained under `runtime/native-node-lab/` in
+`candidate-0282-20260930.json`, `upgrade-0282-20260930.json`,
+`physical-repeat-0282-20260930.json`, `reboot-0282-after-20260930.json`,
+`jarvis-after-reboot-0282-20260930.json`,
+`monolithic-parity-0282-20260930.json`,
+`usb-drive-one-click-0282-20260930.json` and
+`dev-e2e-0282-fresh-cache-20260930.log`.
+No commit, public release, first clean-PC USB execution or external tester
+installation is claimed by these results.
+
+### Private USB retry correction, 30 September 2026
+
+The external PowerShell helper now retains MSI progress after a successful
+fresh installation, before native pairing. Its regression executes the actual
+installer entry with mocked Windows installation and pairing boundaries: two
+pairing failures resume bootstrap while running the MSI once, and altered MSI
+bytes are rejected. This is local regression evidence, not a clean-PC physical
+installation. The existing physical 0.2.82 MSI is unchanged.
+
+The verified static USB payload was refreshed without issuing new enrollment
+keys. Its readback/preflight verifies package integrity only. Pending native
+configuration, expired pairing after configuration creation and interrupted
+accelerator provisioning remain separate recovery gaps; this test does not
+establish their recovery or completion of the generic installation gate.
+
+### Unreleased native installation continuation, 30 September 2026
+
+Source now resumes complete bootstrap output, renews pending pairing without
+changing the node identity, and restarts only the validated LocalService SCM
+service. A protected bootstrap journal also reconstructs missing initial files
+with the original node ID after validating every surviving file. Existing
+identity metadata prevents resetting an already running node from this journal.
+Consumed enrollment retries require the same nonce, identity, key and active
+ownership; an expired unconsumed enrollment remains rejected by the coordinator.
+GPU setup failures retain installation retries instead of reporting CPU fallback
+as completed GPU setup. CPU-only and unsupported GPU devices remain permitted.
+
+63 focused tests passed across bootstrap, continuation, service registration,
+enrollment store/API/bootstrap, accelerator setup and private claim provisioning.
+PowerShell MSI retry/package selection and USB staging regressions also passed,
+as did TypeScript and architecture checks. These exercise real temporary files
+and databases with mocked service/GPU boundaries; they are not physical first-
+installation evidence. The mounted USB retains the previously verified 0.2.82
+payload. This continuation source requires a new matching native MSI and
+coordinator verification before replacing that payload.
+
+The private 0.2.83 MSI subsequently passed extracted-tree verification and a
+retained MRPUCCHI upgrade returned 0. Mycellios, SSH and Tailscale remained
+Running, the original node ID remained registered and CUDA diagnostics were
+ready. Physical SmolLM2-135M-Instruct inference then completed between MRPUCCHI
+CUDA layers [0,29) and PC-DANI CPU layers [29,30), using the previously pinned
+model revision. The execution trace recorded a direct physical boundary. API
+TTFT was 130 ms; the separate 16-token activation canary measured TTFT
+101.661 ms, TPOT 76.437 ms and 13.083 tokens/s. Observed peak process working
+sets were 629641216 bytes on PC-DANI and 1544298496 bytes on MRPUCCHI; these
+are not exclusive VRAM measurements. The response repeated the earlier
+arithmetic explanation without a numeric answer. No new general accuracy or
+performance comparison is claimed. Requested models and matching Python stage
+processes were absent after cleanup. Evidence is retained privately in
+`runtime/native-node-lab/physical-repeat-0283-20260930.json` and
+`runtime/native-node-lab/upgrade-0283-20260930.json`. The source remains uncommitted.
+
+An isolated new native service on that retained physical PC rejected an expired
+pairing as expected, but installation continuation failed with
+`node_install_resume_service_ownership_mismatch`: Spanish Windows translates
+the `sc.exe qc` labels assumed by the candidate. The temporary service, its
+data and its protected key were removed; the primary native node stayed Running.
+The 0.2.83 MSI therefore does not pass first-installation recovery. The source
+correction checks invariant CIM Name, PathName and StartName instead. Eight
+focused continuation tests passed, including Spanish state output and rejection
+of invalid CIM output, a foreign name or another account before any mutation.
+A read-only probe on the actual Spanish MRPUCCHI accepted the real owned service;
+stop/start operations were intercepted, so it is not a completed recovery test.
+Receipts are `runtime/native-node-lab/fresh-native-0283-result.json` and
+`runtime/native-node-lab/localized-resume-readonly-result.json`. The correction
+requires a rebuilt native MSI and a repeated actual continuation test before
+updating the mounted 0.2.82 USB. A separate PowerShell regression also verified
+that downloaded enrollment JSON is written without BOM and parsed by Node.
+
+### Private 0.2.84 recovery and USB refresh, 30 September 2026
+
+The rebuilt private Windows x64 MSI passed administrative extraction, decompilation
+and exact staged-tree comparison. Its SHA-256 is
+`1273efbc0012f649a06766ad13277af8b5f4d5e4e08fe0491f668a1bf1d7de3c`;
+the source ID is
+`sha256:6a7fc68334af51b9edd494a5818ae48569bcd634e284c6a3769f284e8925cdff`.
+It remains unsigned, uncommitted and unpublished. The generic retained upgrade
+on MRPUCCHI returned 0, reached CUDA Ready and preserved the hashes of identity
+metadata and its DPAPI-protected key. SSH and Tailscale stayed Running.
+
+An isolated new LocalService node on the same retained physical PC rejected a
+server-expired pairing. The actual installed resume entrypoint then renewed its
+pairing and reached CUDA Ready with the same identity and protected key. A second
+restart acknowledged the already consumed pairing despite an expired local
+bundle, removed pending pairing and again reached Ready. Temporary services,
+data and protected keys were removed, and their coordinator credentials revoked.
+The primary node remained Running. This reused installed Windows and the shared
+CUDA runtime; it is not a clean-PC USB installation or a cold GPU download.
+
+The initial recovery harness rejected the configuration-file change and recorded
+a failed assertion. The follow-up captured both files: the only changes were
+revision 1 to 2 and insertion of the exact default work policy during the first
+coordinator reconciliation. Runtime paths, resource limits and all other fields
+were unchanged. The follow-up checks only that documented transition in addition
+to exact identity/key preservation; it does not permit arbitrary configuration
+changes. Receipts are `runtime/native-node-lab/fresh-native-0284-result.json`,
+`runtime/native-node-lab/fresh-native-0284b-result.json` and
+`runtime/native-node-lab/upgrade-0284-20260930.json`.
+
+Another physical generation completed with the installed MRPUCCHI native GPU
+worker 0.2.84 and the existing PC-DANI lab CPU worker 0.2.83. The observed route
+was CPU [0,1), CUDA [1,30), with a direct physical boundary. API TTFT was 135 ms;
+the 16-token activation canary measured TTFT 119.330 ms, TPOT 75.293 ms and
+13.281 tokens/s. Observed peak process working sets were 674074624 and
+1415569408 bytes, respectively. The same non-numeric arithmetic explanation
+was returned. This mixed-version run verifies the updated GPU worker executes
+an assigned partition, but is not the same-commit release gate or a performance
+comparison. Evidence is `runtime/native-node-lab/physical-repeat-0284-mixed-20260930.json`.
+
+A separate current PC-DANI CPU microbenchmark passed the unchanged planner
+confidence gate: decode 19.799%, prefill 7.167%, codec 15.271% confidence
+half-widths. This is standalone calibration, not proof that the coordinator
+accepted the CPU node's challenged evidence. Twenty-seven focused packaging and
+continuation tests and the PowerShell retry, staging/reboot and no-BOM regressions
+passed, together with type, structure and architecture checks.
+
+The mounted ESD-USB was updated to this private 0.2.84 candidate. Readback
+verified 22 static files, exactly one MSI, unchanged root
+`INSTALAR-MYCELLIOS.cmd` and unchanged bytes of its ten unused tickets. Writes
+stayed inside `D:\MYCELLIOS`; Windows installation media was preserved. The
+receipt is `runtime/native-node-lab/usb-drive-one-click-0284-20260930.json`.
+The external USB helper was then corrected for installation on the controller
+itself: matching target/controller Tailscale IPs skip creation of a self-proxy on
+the coordinator's loopback port. A guarded PowerShell regression passed; the
+actual production helper ran on PC-DANI with the same listener PID and healthy
+coordinator before and after. The refreshed USB passed readback again, with
+manifest SHA-256
+`488d29b6153790fbe0d68d4c15243d02bcee34d93c15ff72fad8c6a243d88f35`.
+Its native MSI was unchanged. This is a route-helper check, not a full controller
+installation or reboot. The physical generation's subsequent cleanup found two
+connected workers, zero requested models and no matching Python stage processes
+on either PC; see `runtime/native-node-lab/cleanup-0284-20260930.json`.
+At this checkpoint, generic tagged SSH access still awaited administrative
+confirmation. The controller's SYSTEM startup configuration had a new elevated
+receipt, while automatic approval review had rejected the proposed live handoff.
+The subsequent saved grant and live handoff are recorded below; PC-DANI reboot,
+first clean-PC USB execution, a fixed committed release and accompanied external
+testers remain unverified.
+
+### Private access and live SYSTEM handoff, 30 September 2026
+
+The saved Tailscale grant now permits PC-DANI (`100.93.34.56`) to reach
+`tag:mycellios-lab` on TCP 9750, 18101 and 22. The existing unrelated grants
+were retained. The Machines panel independently showed both PC-DANI and
+MRPUCCHI connected with **Expiry disabled**. This verifies the currently saved
+private access configuration, not installation on another PC.
+
+The live coordinator handoff passed without rebooting Windows. The previous
+interactive task was disabled; the startup supervisor is Running as SYSTEM.
+The actual serving process changed from PID 62388 to 39844 and its owner SID
+is `S-1-5-18`. Both physical workers reconnected at version 0.2.84; see
+`runtime/native-node-lab/controller-system-startup-0284-20260930.json`.
+This proves the live serving identity and reconnection, not PC-DANI's first
+post-reboot execution.
+
+A subsequent physical generation assigned CPU layers `[0,1)` to PC-DANI and
+CUDA layers `[1,30)` to the installed MRPUCCHI node. The execution receipt
+reports one physical boundary using relay transport. API TTFT was 146 ms;
+the separate 16-token canary measured TTFT 171.6823 ms, TPOT 86.1085 ms and
+11.6132 tokens/s. Observed peak process working sets were 674,160,640 bytes
+on PC-DANI and 1,414,955,008 bytes on MRPUCCHI. These are process memory
+observations, not exclusive VRAM measurements or a browser/native comparison.
+The first diagnostic runner could not see SYSTEM stage command lines from its
+unelevated memory query; the elevated repetition recorded both actual stage
+processes and passed. See
+`runtime/native-node-lab/physical-repeat-0284-system-20260930.json`.
+The source is still uncommitted and this remains a private candidate, not a
+fixed-commit release or a first installation on a clean PC.
+
+The physical loss test then stopped `MycelliosNode` on MRPUCCHI after the first
+streamed token. The native service was Stopped at 15:25:22.910 UTC while VPN
+and SSH remained Running. The stream had delivered 20 content chunks and
+terminated with explicit `adapter_error` at 15:25:23.922 UTC. It did not replay
+the partial answer: exact replay requires an explicit deterministic seed.
+The SSE `[DONE]` event marks the end of this error stream, not successful
+completion. The harness restored the service and both physical workers were
+connected again by 15:25:39.761 UTC with zero requested models. See
+`runtime/native-node-lab/loss-0284-system-20260930.json`. This is actual worker
+service loss with administrative connectivity retained, not physical power
+loss, a network partition or seamless failover. An earlier harness attempt
+requested 512 tokens against the 256-token limit and issued no fault; its
+failed receipt is retained separately and is excluded from this result.
+
+After restoring MRPUCCHI, a new model request completed another physical
+CPU/CUDA generation with API TTFT 142 ms. The separate recovery canary measured
+TTFT 167.6377 ms, TPOT 91.5138 ms and 10.9273 tokens/s; it is not a controlled
+performance comparison with the earlier run. The final elevated observation at
+15:31:57 UTC found both physical workers connected, zero requested models and
+no matching stage processes on either computer. See
+`runtime/native-node-lab/physical-repeat-0284-system-recovered-20260930.json`
+and `runtime/native-node-lab/cleanup-0284-system-20260930.json`. The mounted
+USB's static hash and architecture preflight also passed again without installing
+anything. First clean-PC USB execution, the controller's actual reboot,
+fixed-commit packaging and accompanied external attempts still need their own
+evidence.
+
+The final source gate passed 52 focused tests in eight files covering the native
+installer, enrollment, accelerator retry, USB claims, stream adapter and worker
+hardening. Four PowerShell regressions passed for MSI continuation, protected
+staging/reboot retries, UTF-8 enrollment output and controller route preservation.
+TypeScript, repository structure, documentation and architecture verification
+also passed. These gates do not replace the missing physical installations or
+authorize publication.
+
+Daniel subsequently deferred the separate clean-PC USB check and requested
+moving to the next plan step. That check is deferred, not passed. Release
+preparation continues without repeating the USB installation gate.
+The public health endpoint still reported version 0.2.77 and its downloads
+availability endpoint reported all three native packages unavailable. HTTP 200
+from `/downloads/windows` returned the landing page, not an MSI. These public
+observations are separate from the working private two-PC 0.2.84 route.
+
+A prospective release-source snapshot was prepared from Git-visible files and
+the explicit build artwork, excluding ignored local configuration, runtime
+state, ticket pools, private credentials and previous binaries. The snapshot
+contains 1,135 files and seals source ID
+`sha256:58d6f84a6f50bc9883ac15a3fc76b55068b499890f2f66cec4c52856b6dc8050`;
+see `runtime/native-node-lab/release-source-review-0284-20260930.json`.
+It is an uncommitted review snapshot, not a compiled or deployed release, and
+its source ID differs from the earlier private MSI's source snapshot. A new
+build and installer verification must precede promotion of that source.
+
 Build the Windows node installer and coordinator from a fixed commit including
 the CPU identity and retry fixes, then repeat the launcher with account-owned
 pairing against a durable coordinator. Verify an installed CPU-only node and
@@ -2285,8 +2755,8 @@ The lab launcher, native command protocol, supervisor reload, assigned
  A private Tailscale Serve TCP proxy on the existing allowed port 18100 and a
  persistent MRPUCCHI loopback port proxy replaced the manual SSH tunnel. The
  installed node reconnected after an unattended MRPUCCHI reboot and completed
- another physical inference. The PC-DANI coordinator remains an interactive
- lab process, so its own unattended reboot recovery is unverified. This private
+ another physical inference. PC-DANI's own unattended reboot recovery is
+ unverified despite the configured startup supervisor. This private
  lab route does not replace the public HTTPS, account-owned coordinator needed
  for external testers. The lab MSI physically upgrades a retained node and
  restores a missing service under LocalService without another pairing. Repeat

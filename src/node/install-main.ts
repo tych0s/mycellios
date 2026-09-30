@@ -1,25 +1,39 @@
 import { lstat, readFile, rm } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
-import { bootstrapNodeInstallation } from "./installation-bootstrap.js";
+import { bootstrapNodeInstallation, hasNodeBootstrapProgress } from "./installation-bootstrap.js";
 import { NodeConfigurationStore } from "./config-store.js";
 import { nodeInstallationManifestSchema } from "../contracts/node-uninstall.js";
 import { registerNativeNodeService, runServiceCommand } from "./service-registration.js";
 import { defaultNodeInstallationManifest } from "./default-installation.js";
 import { dirname, join, resolve } from "node:path";
-import { prepareNativeNodeAccelerator } from "./native-accelerator.js";
+import { prepareInstalledNodeAccelerator } from "./native-accelerator.js";
+import { inspectNodeInstallationResume, renewNodeInstallationEnrollment } from "./installation-resume.js";
+import { resumeNodeInstallationService } from "./installation-service-resume.js";
 
 const enrollmentPath = argument("--enrollment");
-if (!enrollmentPath) throw new Error("usage: install-main --enrollment <path> [--manifest <path>]");
+const resumeInstalled = process.argv.includes("--resume-installed");
+if (!enrollmentPath && !resumeInstalled) throw new Error("usage: install-main --enrollment <path> [--resume-installed] [--manifest <path>]");
 const manifestPath = argument("--manifest");
 const manifest = manifestPath
   ? nodeInstallationManifestSchema.parse(JSON.parse(await readFile(manifestPath, "utf8")) as unknown)
   : defaultNodeInstallationManifest({ platform: supportedPlatform(), installRoot: argument("--install-root") ?? resolve(import.meta.dirname, "../..") });
-const result = await bootstrapNodeInstallation({ manifest, enrollmentSourcePath: enrollmentPath });
+if (resumeInstalled && await hasNodeBootstrapProgress(manifest)) {
+  if (!enrollmentPath) throw new Error("node_install_bootstrap_resume_requires_current_pairing");
+  await bootstrapNodeInstallation({ manifest, enrollmentSourcePath: enrollmentPath });
+}
+const retained = resumeInstalled ? await inspectNodeInstallationResume(manifest) : undefined;
+const result = retained?.result ?? await bootstrapNodeInstallation({ manifest, enrollmentSourcePath: enrollmentPath! });
 const config = (await new NodeConfigurationStore(result.configPath).load()).config;
-await registerNativeNodeService({ manifest, config });
-if (resolve(enrollmentPath) !== resolve(result.enrollmentPath)) await rm(resolve(enrollmentPath), { force: true });
-const firstPid = await waitForReady(result.configPath, result.enrollmentPath);
-const accelerator = await prepareNativeNodeAccelerator({
+const previousPid = retained ? await readFile(join(dirname(result.configPath), "state", "health.json"), "utf8")
+  .then((text) => (JSON.parse(text) as { pid?: number }).pid).catch(() => undefined) : undefined;
+if (retained) {
+  await resumeNodeInstallationService({ manifest, config, beforeStart: async () => {
+    if (enrollmentPath) await renewNodeInstallationEnrollment(retained, enrollmentPath);
+  } });
+} else await registerNativeNodeService({ manifest, config });
+if (enrollmentPath && resolve(enrollmentPath) !== resolve(result.enrollmentPath)) await rm(resolve(enrollmentPath), { force: true });
+const firstPid = await waitForReady(result.configPath, result.enrollmentPath, previousPid);
+const accelerator = await prepareInstalledNodeAccelerator({
   configPath: result.configPath,
   installRoot: manifest.installRoot,
   allowProvisioning: true,
@@ -46,7 +60,7 @@ async function waitForReady(configPath: string, pendingEnrollmentPath: string, p
     const health = await readFile(healthPath, "utf8").then((text) => JSON.parse(text) as {
       state?: string; pid?: number; error?: string;
     }).catch(() => null);
-    if (health?.state === "failed") throw new Error(`node_install_service_failed:${health.error ?? "unknown"}`);
+    if (health?.state === "failed" && health.pid !== previousPid) throw new Error(`node_install_service_failed:${health.error ?? "unknown"}`);
     if (health?.state === "ready" && typeof health.pid === "number" &&
         health.pid !== previousPid && await enrollmentConsumed(pendingEnrollmentPath)) {
       return health.pid;

@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { constants, copyFile, mkdir, open, writeFile } from "node:fs/promises";
+import { constants, copyFile, lstat, mkdir, open, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { NodeConfiguration } from "../contracts/node-configuration.js";
 import type { NodeInstallationManifest } from "../contracts/node-uninstall.js";
@@ -57,8 +57,12 @@ export async function registerNativeNodeService(input: {
     for (const path of writable) {
       await requireSuccess(run, "icacls.exe", [path, "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "/grant:r", "*S-1-5-32-544:(OI)(CI)F", "/grant:r", "*S-1-5-19:(OI)(CI)M"], "node_service_permissions_failed");
     }
+    const pendingPath = join(dirname(manifest.configPath), "enrollment.json");
+    const pending = !input.replaceRetainedServiceFiles || await lstat(pendingPath).then(() => true, (error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return false; throw error;
+    });
     const protectedFiles = [manifest.configPath, config.worker.configPath,
-      ...(!input.replaceRetainedServiceFiles ? [join(dirname(manifest.configPath), "enrollment.json")] : []),
+      ...(pending ? [pendingPath] : []),
       join(manifest.statePath, "installation.json")];
     for (const path of protectedFiles) {
       await requireSuccess(run, "icacls.exe", [path, "/inheritance:r", "/grant:r", "*S-1-5-18:F", "/grant:r", "*S-1-5-32-544:F", "/grant:r", "*S-1-5-19:M"], "node_service_permissions_failed");

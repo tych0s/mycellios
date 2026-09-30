@@ -8,6 +8,40 @@ const cleanup: string[] = [];
 afterEach(async () => Promise.all(cleanup.splice(0).map((path) => rm(path, { recursive: true, force: true }))));
 
 describe("native installation bootstrap", () => {
+  it("recovers each interrupted file-write phase with a renewed bundle and the original node ID", async () => {
+    for (const retainedCount of [0, 1, 2, 3, 4]) {
+      const root = await temporaryDirectory(); const manifest = installation(root, "win32");
+      const source = join(root, "pairing.json"); await writeFile(source, JSON.stringify(bundle()));
+      const original = await bootstrapNodeInstallation({ manifest, enrollmentSourcePath: source });
+      const outputs = [original.configPath, original.workerConfigPath, original.installationManifestPath, original.enrollmentPath];
+      const initialConfig = await readFile(original.configPath, "utf8");
+      for (const path of outputs.slice(retainedCount)) await rm(path);
+      const progressPath = join(manifest.statePath, "bootstrap-progress.json");
+      await writeFile(progressPath, JSON.stringify({ schema: "mycellios-node-bootstrap-progress/1", manifest,
+        nodeId: original.nodeId, coordinatorUrl: bundle().coordinatorUrl }));
+      const fresh = { ...bundle(), enrollmentId: "5b5e61db-9e21-4268-b1a3-50dd0e818660", enrollmentToken: "z".repeat(43) };
+      await writeFile(source, JSON.stringify(fresh));
+      const resumed = await bootstrapNodeInstallation({ manifest, enrollmentSourcePath: source });
+      expect(resumed.nodeId).toBe(original.nodeId);
+      expect(await readFile(resumed.configPath, "utf8")).toBe(initialConfig);
+      expect(JSON.parse(await readFile(resumed.enrollmentPath, "utf8"))).toEqual(fresh);
+      await expect(access(progressPath)).rejects.toMatchObject({ code: "ENOENT" });
+    }
+  });
+
+  it("rejects altered surviving output before filling missing files", async () => {
+    const root = await temporaryDirectory(); const manifest = installation(root, "win32");
+    const source = join(root, "pairing.json"); await writeFile(source, JSON.stringify(bundle()));
+    const original = await bootstrapNodeInstallation({ manifest, enrollmentSourcePath: source });
+    await writeFile(join(manifest.statePath, "bootstrap-progress.json"), JSON.stringify({
+      schema: "mycellios-node-bootstrap-progress/1", manifest, nodeId: original.nodeId, coordinatorUrl: bundle().coordinatorUrl }));
+    const changed = JSON.parse(await readFile(original.configPath, "utf8")); changed.limits.maxCpuPercent = 20;
+    await writeFile(original.configPath, JSON.stringify(changed)); await rm(original.workerConfigPath);
+    await expect(bootstrapNodeInstallation({ manifest, enrollmentSourcePath: source })).rejects.toThrow("output_mismatch");
+    await expect(access(original.workerConfigPath)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(JSON.parse(await readFile(original.configPath, "utf8")).limits.maxCpuPercent).toBe(20);
+  });
+
   it("creates protected service configuration without copying the enrollment secret into durable config", async () => {
     const root = await temporaryDirectory();
     const enrollment = join(root, "pairing.mycellios-enrollment");

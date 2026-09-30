@@ -207,3 +207,57 @@ same file can install a higher MSI version without another pairing; a healthy
 matching version exits without restarting the service. If the MSI requires a
 reboot during an update, reboot and run the same USB file again. A failed
 first pairing needs diagnosis and a fresh unexpired bundle.
+
+### Private multi-PC USB bootstrap
+
+For the operator's own Windows x64 PCs, `scripts/windows-usb-lab-prepare.ps1`
+assembles a separate private package. Supply its output directory, exact MSI
+path and expected SHA-256, existing Jarvis package directory, public SSH key
+and the private coordinator's claims path. The controller's restricted
+Tailscale OAuth credential stays DPAPI-encrypted in its Windows profile.
+`-EnrollmentCount` sets the number of single-PC VPN enrollments; unused
+enrollments expire after 90 days. Keep this generated package private.
+Use a new output directory for a different MSI version: the `Node` folder must
+contain exactly one MSI and its checksum. Preserve existing unused tickets
+when refreshing the private package, using `-Resume -WithoutNewKeys` after
+copying them to the new protected output. Do not issue replacement VPN keys
+for an already enrolled PC.
+
+Before travel, run its `windows-usb-lab-install.ps1 -PreflightOnly`, establish
+the controller's startup task with `windows-lab-controller-startup.ps1`, and
+enable controller TCP 22 access to `tag:mycellios-lab` in the tailnet policy.
+Register `registerLabUsbProvisioning` from `scripts/lab-usb-provisioning.ts`
+on the private coordinator, using the protected claims file and the owner's
+account. Keep the coordinator reachable through the private TCP proxy on
+18100. This bootstrap is not a public enrollment endpoint.
+The installer compares the target's Tailscale IP with the configured controller
+IP. On the controller it keeps the existing local coordinator listener; only
+other PCs receive a loopback proxy through the private controller address.
+
+Copy the complete generated folder to `MYCELLIOS` on the USB without replacing
+its Windows installation files. Copy `scripts/windows-usb-lab-entry.cmd` to the
+USB root as `INSTALAR-MYCELLIOS.cmd`. On each target PC, open that single file and
+accept administrator elevation. The launcher allocates a separate VPN key,
+detects the target IP, establishes the `mycellios-control` administrator and
+requests a fresh native enrollment when required. The initial Jarvis pairing
+is approved by the owner from the controller; it needs no target-side Jarvis
+login. Keep the controller online during this first installation.
+
+The elevated launcher copies the complete verified static package and exactly
+one enrollment ticket to protected local storage before installing anything.
+On a package upgrade, it removes obsolete regular files owned by the previous
+static manifest so the old MSI cannot conflict with its replacement.
+A SYSTEM task retries failures every ten minutes, up to 72 attempts, and resumes
+at startup. A requested installer reboot is announced 60 seconds in advance;
+after reboot no file needs to be opened again and the USB is not required.
+Reboot requests are limited to two. On success the installation resume task is
+removed, while the separate service recovery task remains. This does not bypass
+Windows administrator consent or the owner's initial Jarvis pairing approval.
+
+Retain the non-secret receipt and installation log under
+`C:\ProgramData\MycelliosUsb`. The receipt records the real SSH account, IP
+and host public key; use it to verify a new SSH host before accepting its key.
+The recovery task starts before Windows login. Interactive Jarvis desktop
+control still requires a Windows user session; administrative SSH is a
+separate recovery route. Current test evidence and pending gates are recorded
+only in [STATUS_AND_EVIDENCE.md](STATUS_AND_EVIDENCE.md).

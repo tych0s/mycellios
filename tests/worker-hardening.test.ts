@@ -329,7 +329,7 @@ describe("worker boundary hardening", () => {
       if (typeof evidenceSessionId === "string") evidenceSessionIds.push(evidenceSessionId);
       response.setHeader("content-type", "text/event-stream");
       response.write('data: {"choices":[{"delta":{"content":"ok"}}]}\n\n');
-      response.write('data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":1,"completion_tokens":1},"distribution_metrics":{"ttft_ms":1,"pipeline_ms":1}}\n\n');
+      response.write('data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1},"distribution_metrics":{"ttft_ms":1,"pipeline_ms":1}}\n\n');
       response.end("data: [DONE]\n\n");
     });
     const config = workerConfigSchema.parse({
