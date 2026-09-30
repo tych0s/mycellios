@@ -2762,3 +2762,47 @@ The lab launcher, native command protocol, supervisor reload, assigned
  restores a missing service under LocalService without another pairing. Repeat
  that gate from a fixed commit and released artifact; the dirty-tree result is
  not a release.
+
+### Official source build and coordinator deployment, 30 September 2026
+
+The native recovery changes were committed and pushed as `bd935e36`. The
+release revision `ef6078734f79f8a3c9fd25f40756d5078a6bc55f` increments only
+`package.json` and `package-lock.json` to 0.2.85 so Windows can upgrade the
+existing 0.2.84 lab installation. No inference code changed in that increment.
+The general public quality workflow passed for `bd935e36`. The official
+[0.2.85 native workflow](https://github.com/tych0s/mycellios/actions/runs/36749853179)
+passed Windows x64, Linux x64, macOS arm64 and the three-platform candidate
+assembly. This proves fixed-commit packaging; it does not prove a physical
+installation of those new CI packages or their cryptographic signing.
+
+An official Dockerfile build from that release revision produced coordinator
+image `sha256:9492ab1b55e1a9401ccfa258e221472729afbf00adcd3f3b804822b0c0818c4f`
+with source identity
+`sha256:566dbaa20f6e05b646979a2fc2be64c90966abe9a578bbfd3ba8626f0c9268ee`.
+An isolated container without production credentials, data or network passed
+health, landing, browser, downloads and snapshot HTTP checks. Initial canary
+attempts omitted the writable expert storage setting and failed without
+changing production; the corrected isolated configuration passed.
+
+The production coordinator was located on Hetzner DB, not the earlier
+Scaleway host. At 17:34:46 UTC it was replaced with that verified image after
+checking there were no active jobs, retaining its environment, mounts, network,
+resource limits and restart policy. A coherent SQLite backup and the stopped
+previous container were retained on that server. Supabase, ingress and Traefik
+were not restarted. Public root, www, browser page, browser entry JavaScript,
+health and download metadata returned HTTP 200. Public health identifies the
+exact 0.2.85 revision/source identity and persistence is connected without
+errors. Local evidence is in
+`runtime/native-node-lab/deployment-0285-20260930.json` and
+`runtime/native-node-lab/public-verification-0285-20260930.json`.
+
+This deployment uses the functional source already exercised in the two-PC
+0.2.84 lab route plus the metadata-only version increment. It is not a new
+same-commit physical installation test. Automatic permission review rejected
+an attempt to reload PC-DANI's SYSTEM controller with `blocked by policy`;
+that reload was not executed. The private PCs remain separate from production:
+public health still reports two registered but zero connected workers, so
+production inference capacity and a public one-click inference are unproven.
+All three native downloads remain unavailable: CI packages were not promoted
+without the required platform signature verification. The clean-PC USB check
+remains deferred by Daniel, and no external tester installation is counted.
