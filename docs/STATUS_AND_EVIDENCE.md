@@ -2770,10 +2770,10 @@ release revision `ef6078734f79f8a3c9fd25f40756d5078a6bc55f` increments only
 `package.json` and `package-lock.json` to 0.2.85 so Windows can upgrade the
 existing 0.2.84 lab installation. No inference code changed in that increment.
 The general public quality workflow passed for `bd935e36`. The official
-[0.2.85 native workflow](https://github.com/tych0s/mycellios/actions/runs/36749853179)
+[0.2.85 native workflow](https://github.com/tych0s/mycellios/actions/runs/36749878987)
 passed Windows x64, Linux x64, macOS arm64 and the three-platform candidate
-assembly. This proves fixed-commit packaging; it does not prove a physical
-installation of those new CI packages or their cryptographic signing.
+assembly. This proves fixed-commit packaging; physical installation evidence
+for the Windows MSI is recorded below. Platform signing is still unverified.
 
 An official Dockerfile build from that release revision produced coordinator
 image `sha256:9492ab1b55e1a9401ccfa258e221472729afbf00adcd3f3b804822b0c0818c4f`
@@ -2800,9 +2800,74 @@ This deployment uses the functional source already exercised in the two-PC
 0.2.84 lab route plus the metadata-only version increment. It is not a new
 same-commit physical installation test. Automatic permission review rejected
 an attempt to reload PC-DANI's SYSTEM controller with `blocked by policy`;
-that reload was not executed. The private PCs remain separate from production:
-public health still reports two registered but zero connected workers, so
-production inference capacity and a public one-click inference are unproven.
+that reload was not executed. The private PCs remain separate from production.
+The initial deployment verification found zero connected workers. A later
+public browser test connected one WebGPU browser node; native production
+inference capacity and a public one-click inference remain unproven.
 All three native downloads remain unavailable: CI packages were not promoted
 without the required platform signature verification. The clean-PC USB check
 remains deferred by Daniel, and no external tester installation is counted.
+
+### Public browser connection and exact CI artifact, 30 September 2026
+
+The public `/browser/` page on the deployed 0.2.85 coordinator was opened in
+the Codex in-app browser and `Start contributing` was clicked. The page reached
+`CONNECTED` and reported `GPU validated and waiting for compatible model
+work`. The dashboard independently showed one online browser and zero active
+models or evidenced routes. This proves public browser enrollment and the GPU
+validation task, not a model layer execution or full distributed inference.
+The screenshot is
+`runtime/native-node-lab/public-browser-connected-0285-20260930.png`.
+
+The manual workflow run `36749878987` produced the exact release revision
+`ef6078734f79f8a3c9fd25f40756d5078a6bc55f`; the pull-request workflow
+`36749853179` used a synthetic merge revision and is not the fixed revision
+artifact. The manual candidate manifest and Windows MSI were downloaded and
+the MSI's 252,764,784 bytes and SHA-256
+`aa6c8f487a225b5b6230154d5257b4d0de303506b04ce35c6838269b6f14b76b`
+matched that manifest. Windows Authenticode reports `NotSigned`. No code
+signing certificate was found in either Windows certificate store and GitHub
+lists no signing secrets. Candidate hashes and successful builds do not
+replace platform signing; public native downloads remain gated.
+
+Public native enrollment requires an authenticated account session. The
+opened dashboard has no such session; its sign-in form is prepared without
+creating credentials or bypassing account ownership.
+
+### Fixed CI Windows MSI on MRPUCCHI, 30 September 2026
+
+The checksum-verified Windows MSI from manual run `36749878987` was installed
+over the retained 0.2.84 node on physical MRPUCCHI. The existing installation
+helper restored its service and reported `Ready` with CUDA. The installed
+manifest reports version 0.2.85, revision
+`ef6078734f79f8a3c9fd25f40756d5078a6bc55f` and source identity matching the
+production coordinator. The identity file and DPAPI-protected key were
+byte-identical before and after the update. MycelliosNode, SSH and Tailscale
+were all running after installation. Evidence:
+`runtime/native-node-lab/ci-msi-upgrade-0285-20260930.json`.
+
+This is a physical update of an existing lab node, not a clean-PC installation
+or enrollment of that native node into the public coordinator. PC-DANI's
+private SYSTEM controller remains version 0.2.84.
+
+The fixed CI-installed MRPUCCHI node then completed another physical split
+generation with that existing PC-DANI controller using the same pinned
+SmolLM2-135M-Instruct model revision
+`12fd25f77366fa6b3b4b768ec3050bf629380bac`. The observed planner assigned
+MRPUCCHI CUDA layers [0,29) and PC-DANI CPU [29,30), with one direct physical
+boundary. Generation TTFT was 134 ms; the activation canary measured TTFT
+153.9803 ms, TPOT 95.8469 ms and 10.4333 tokens/s. These measurements are a
+mixed-version integration result, not a controlled performance comparison or
+output-parity assessment. The small model's returned text did not actually
+answer the arithmetic question correctly; execution success does not imply
+answer quality.
+
+The measurement harness exited with an error because its local process-memory
+collector returned empty JSON. Consequently this run has no verified live
+stage memory measurement. The generation receipt and execution trace were
+saved before that collector failed, and the harness's cleanup completed:
+zero requested models, zero observed stage processes and both native workers
+connected. Evidence is in
+`runtime/native-node-lab/physical-repeat-0285-ci-mixed-20260930.json`,
+`runtime/native-node-lab/inference-0285-ci-mixed-20260930.json` and
+`runtime/native-node-lab/cleanup-0285-ci-mixed-20260930.json`.
