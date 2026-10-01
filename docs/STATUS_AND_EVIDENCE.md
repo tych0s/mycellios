@@ -3125,3 +3125,77 @@ successful cleanup. Receipt:
 `runtime/native-node-lab/postreboot-0286-failed-20261001.json`.
 The healthy MRPUCCHI reboot does not close post-reboot distributed inference,
 PC-DANI calibration stability or the both-host fixed-release gate.
+
+
+### 2026-10-01 CPU calibration and connection diagnostics
+
+A separate current-user CPU probe completed successfully in 18.674 seconds
+with 3 warmups and 21 samples. Decode bandwidth, prefill throughput and codec
+confidence widths passed the unchanged 20% gate. An isolated native CPU-agent
+fixture subsequently performed real calibration in 11.632 seconds and retained
+a verified connection for 60.402 seconds: 13 heartbeats, maximum observed gap
+5.013 seconds. These are local hardware diagnostics, not two-host inference.
+Receipts: `runtime/native-node-lab/cpu-profile-diagnostic-20261001.stdout.json`
+and `runtime/native-cpu-heartbeat-canary/receipt.json`.
+
+A separate 60-second read-only observation of the existing controller database
+then found both physical workers online throughout its sampled window. Maximum
+stored last-seen ages were 4.965 seconds for PC-DANI and 4.863 seconds for
+MRPUCCHI. Stored last-seen updates also include evidence updates, so this is
+not a wire-level heartbeat trace. Receipt:
+`runtime/native-node-lab/controller-heartbeat-observation-20261001.json`.
+The existing controller subsequently logged successful CPU calibration. These
+results do not establish the cause of earlier intermittent disconnects or
+long-term stability, and no protected SYSTEM controller restart was performed.
+
+
+A subsequent post-reboot native retry completed successfully at
+2026-10-01T06:59:21.652Z. The pinned SmolLM2 revision ran layers [0,2) on
+PC-DANI CPU and [2,30) on MRPUCCHI CUDA. The generation request reported
+197 ms TTFT. Its separate 16-token activation canary measured 107.431 ms
+TTFT, 82.264 ms TPOT and 12.156 tokens/s. Observed Python peak working sets
+were 695,222,272 bytes on PC-DANI and 1,408,225,280 bytes on MRPUCCHI; these
+are process memory measurements, not exclusive GPU VRAM. The short generated
+answer described addition without returning the requested numerical result,
+so this is execution evidence and not an answer-quality claim.
+
+At 06:59:36.714Z cleanup observed zero requested models, zero remaining model
+stage processes on both hosts and both native workers connected. The harness
+returned exit 0. Receipts: `runtime/native-node-lab/physical-repeat-0286-ci-postreboot-retry-20261001.json`,
+`inference-0286-ci-postreboot-retry-20261001.json` and
+`cleanup-0286-ci-postreboot-retry-20261001.json` in the same directory. This
+closes this mixed-release post-MRPUCCHI-reboot execution and cleanup check.
+PC-DANI still runs 0.2.84 and MRPUCCHI 0.2.86, so the same-release two-host
+gate remains open. The earlier failed attempt remains recorded above.
+
+
+The 0.2.86 MRPUCCHI service-loss campaign also passed its explicit-failure and
+cleanup assertions. A real streamed request delivered its first token at
+2026-10-01T07:01:59.237Z before the fault was dispatched. MRPUCCHI's native
+service was observed stopped while SSH and Tailscale remained running. The
+stream delivered 41 content chunks and terminated with `adapter_error` at
+07:02:04.260Z. Its message states that exact replay after streaming requires
+an explicit deterministic seed. `[DONE]` on this path terminates the transport
+and does not mean successful inference. Local monotonic timestamps verify
+first token, fault dispatch, fault acknowledgement and stream termination in
+that order. No seamless failover is claimed.
+
+The campaign restored MycelliosNode; by 07:02:23.452Z both physical workers
+were connected, zero requested models remained and both stage-process lists
+were empty. The harness exited 0. Receipt:
+`runtime/native-node-lab/loss-0286-ci-monotonic-20261001.json`. This campaign
+still uses the mixed 0.2.84/0.2.86 route described above.
+
+
+A fresh inference after service-loss restoration also completed at
+2026-10-01T07:06:23.555Z with the same physical CPU [0,2) / CUDA [2,30)
+route and pinned model. The generation request reported 158 ms TTFT. The
+separate activation canary measured 121.929 ms TTFT, 85.567 ms TPOT and
+11.687 tokens/s. Peak Python working sets were 695,377,920 bytes on PC-DANI
+and 1,407,389,696 bytes on MRPUCCHI. Final cleanup again found zero requested
+models and zero model stages on either host, with both workers connected; the
+harness exited 0. Receipts: `runtime/native-node-lab/physical-repeat-0286-ci-recovered-20261001.json`,
+`inference-0286-ci-recovered-20261001.json` and
+`cleanup-0286-ci-recovered-20261001.json`. These short lab measurements do not
+establish a browser/native performance ratio, sustained throughput or recovery
+of the interrupted request itself.
