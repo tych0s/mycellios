@@ -106,7 +106,7 @@
 - [ ] Produce a reproducible same-device A/B report for prefill, decode, TTFT,
   memory, sustained rate and numerical parity.
 - [ ] Optimize only measured gaps and repeat the A/B report.
-- [ ] Prove a browser stage on a physical two-computer route.
+- [x] Prove a browser stage on a physical two-computer route.
 - [x] Route the real SmolLM2 block-0 SwiGLU MLP weights through the existing
   browser expert owner and resident mesh on one local computer; verify two
   distinct visible WebGPU browser workers against a native numerical result.

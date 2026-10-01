@@ -179,6 +179,18 @@ cached Qwen3-0.6B checkpoint. The latter fixture uses layer 0 and 28 layers.
 For the two-range local regression, export and publish layer 1, then run
 `tests/run-browser-layer-split-model.py` with its generated bridge config.
 
+For a physical browser/native check, keep the fixture and browser on one
+computer and run `tests/run-browser-layer-full-model.py` on the other through
+an authenticated loopback SSH forward. Publish a verified real checkpoint
+layer first. Copy the native source package and its `model_adapter_registry.json`,
+and preserve the checkpoint's canonical `snapshots/<revision>` layout when
+materializing cached files: a flat local copy has a different model identity.
+Check source, configuration and weight hashes across hosts before execution.
+Record host names, browser backend, exact layer, token parity, error bounds and
+cleanup. The fixture's injected-request-failure case is not a real browser
+disconnect; exercise actual Pause separately if claiming transport loss.
+Close the fixture and forward and remove ephemeral test tokens afterwards.
+
 For automatic discovery of an already published layer, configure the trusted
 native stage host once with `MYCELLIOS_BROWSER_LAYER_COORDINATOR_URL` and
 `MYCELLIOS_INTERNAL_TOKEN` or `MYCELLIOS_INTERNAL_TOKEN_FILE`. The origin must

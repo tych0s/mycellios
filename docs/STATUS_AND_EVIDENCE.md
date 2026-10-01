@@ -3019,8 +3019,8 @@ registration, not model-layer inference. Local receipts are
 `runtime/native-node-lab/public-browser-connected-0286-20261001.png`.
 
 The last native workflow observation had Windows still building; the next
-query received GitHub HTTP 403 API rate-limit exceeded. Its completion remains
-unverified. Native downloads were not promoted by the coordinator deployment.
+query received GitHub HTTP 403 API rate-limit exceeded. At that point completion
+was unverified. Native downloads were not promoted by the coordinator deployment.
 Trusted installer signing, both-host exact-release proof, authenticated public
 native pairing and external tester installation remain open gates.
 
@@ -3032,3 +3032,63 @@ health reported connected=1, mobile=1. Receipts are
 `runtime/native-node-lab/public-resume-0286-20261001.json`, with screenshot
 `runtime/native-node-lab/public-browser-resumed-0286-20261001.png`. This does
 not prove assigned model work or natural background-retention recovery.
+
+### Physical browser decoder layer, 1 October 2026
+
+An isolated source-based two-physical-computer run used MRPUCCHI for the native
+SmolLM2-135M-Instruct model and PC-DANI's real WebGPU browser for decoder
+layer 0. The checkpoint revision was
+`12fd25f77366fa6b3b4b768ec3050bf629380bac`, weight SHA-256
+`5af571cbf074e6d21a03528d2330792e532ca608f24ac70a143f6b369968ab8c`, and
+graph SHA-256 `8422e9284fbafb476e226b4e6ac59e0cbce673408b1919bd7ed2de5ba769e1b1`.
+The coordinator bound only PC-DANI loopback port 18920; an existing authenticated
+SSH connection forwarded MRPUCCHI loopback to that fixture over Tailscale.
+Production and the installed native service were not reconfigured.
+
+The exported layer passed all eleven native/ONNX incremental-KV checks using
+the existing thresholds. The native process executed the complete model on
+MRPUCCHI CPU while the selected layer executed on PC-DANI WebGPU. Four output
+token IDs `[376,198,2,198]` matched the all-native reference, with maximum
+final-hidden-state error `8.58306884765625e-05` (existing full-model threshold
+`2e-3`). The first run verified six browser forwards and two native fallback
+forwards, including the existing injected-request-failure case. The coordinator
+observed seven verified browser tasks, including admission. This is a short
+token/parity regression, not an answer-quality or sustained-performance result.
+
+A second run replaced that injected failure with a real browser Pause after
+two decode steps, using an explicit test barrier. The browser UI became paused
+and the coordinator observed connected=0 before the native process resumed.
+The remaining two steps used native fallback and produced the same token IDs
+and error bounds. Both native processes exited successfully; cleanup found no
+test Python processes, retained running native/SSH/VPN services, removed the
+ephemeral remote/local administration token, shut down the fixture, closed the
+test browser and terminated only its SSH forwarding process. Configuration,
+weights, source archive and adapter-registry hashes were checked across hosts.
+
+Receipts under `runtime/browser-physical-proof/` are `layer-0-export-receipt.json`,
+`native-receipt.json`, `physical-pause-receipt.json`, `browser-after.json`,
+`physical-pause-health.json`, `remote-cleanup.json` and `local-cleanup.json`.
+`browser-completed.png` shows layer 0 executed on WebGPU; the subsequent pause
+is captured in `browser-paused-during-generation.png`.
+
+The first layer-1 export was rejected with absolute error
+`4.57763671875e-05`, above the unchanged `2e-5` export threshold; it was not
+published. Initial harness setup also failed for a missing adapter-registry
+file and a copied checkpoint whose directory layout changed its identity.
+Adding the actual source registry and preserving the verified canonical
+snapshot layout resolved those setup errors without relaxing identity checks.
+This physical result closes the browser-stage two-computer regression gate
+for this exact layer/model. It does not prove arbitrary-layer export, public
+automatic assignment, both installed hosts on the same release, long-form
+generation, or browser/native performance parity.
+
+GitHub subsequently returned terminal success for the exact-revision native
+workflow 36818114425. Release-candidate artifact 11142184021 declares version
+0.2.86, revision 785c4d23428f947468dad6f62f4495f31402e27b and the clean
+source identity above. The retrieved 252,781,168-byte Windows MSI passed its
+declared SHA-256 `82061471037ad1b8d8849471e063700ebc4d73211a4faa630d1ff5863632f7de`.
+An independent Windows Authenticode check returned `NotSigned`, with no signer
+certificate. Public native-download promotion remains blocked on trusted
+signing. Receipt: `runtime/native-node-lab/windows-candidate-0286-verification.json`.
+Successful CI and source/checksum verification do not establish a trusted
+signature or an installed same-release two-host route.
