@@ -2999,10 +2999,27 @@ not close the both-host fixed-release or public account-owned route gate.
 
 The browser recovery change was committed and pushed as
 `785c4d23428f947468dad6f62f4495f31402e27b` for 0.2.86, source identity
-`sha256:a3ee0097a9df469ace1f96cb28ff0cb498f2b716b6109706b5704f80484b53be`.
+`sha256:523333b99132b8bd15d52b494759b960cb322710642db47e839d6ffa78d57607`
+for the clean pinned release checkout. The initial local working-tree identity
+included three ignored local configuration/bytecode inputs. Comparing every
+listed input found no tracked source differences; the clean checkout identity
+was verified in the image before deployment.
 The exact-revision manual native workflow
 [36818114425](https://github.com/tych0s/mycellios/actions/runs/36818114425)
-and the bounded coordinator image build were started. At this recording they
-were in progress; 0.2.86 has not been deployed and public production remains
-the previously verified 0.2.85 revision. No installer signing, publication or
-external tester installation is inferred from starting those builds.
+and the bounded coordinator image build were started. The coordinator image
+subsequently passed its isolated canary and was deployed at
+2026-10-01T05:19:52.982146Z, retaining the previous stopped container and a
+consistent SQLite backup. Public HTTPS health verified version, revision and
+clean source identity, with required persistence connected and no last error.
+The public browser button then validated WebGPU and connected one browser
+worker; its UI reports waiting for compatible model work. This verifies public
+registration, not model-layer inference. Local receipts are
+`runtime/native-node-lab/deployment-0286-20261001.json` and
+`runtime/native-node-lab/public-health-0286-20261001.json`, with screenshot
+`runtime/native-node-lab/public-browser-connected-0286-20261001.png`.
+
+The last native workflow observation had Windows still building; the next
+query received GitHub HTTP 403 API rate-limit exceeded. Its completion remains
+unverified. Native downloads were not promoted by the coordinator deployment.
+Trusted installer signing, both-host exact-release proof, authenticated public
+native pairing and external tester installation remain open gates.
