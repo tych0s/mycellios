@@ -176,6 +176,32 @@ never becomes ready or the assigned model cannot produce a verified answer.
 The operator should retain timings and sanitized diagnostics, never the
 pairing token or account credentials.
 
+### Preparing the first two accompanied attempts
+
+Use the same published revision and pinned model for both attempts. Before
+inviting anyone, complete the account-owned enrollment, owner Pause/Resume,
+assigned inference and restart checks on the operator's computers. Confirm
+the package signature independently and verify that the public download
+matches the recorded release identity. Current results belong in
+[STATUS_AND_EVIDENCE.md](STATUS_AND_EVIDENCE.md).
+
+Prepare these two slots for 1–7 October 2026; neither slot represents a real
+tester, an invitation or a completed installation:
+
+| Slot | Device to seek | Person and agreed time | Acceptance evidence |
+| --- | --- | --- | --- |
+| 1 | Windows x64 with a supported NVIDIA GPU | Unassigned | Account-owned Ready CUDA, assigned layer, response and cleanup |
+| 2 | Windows x64 using CPU only | Unassigned | Account-owned Ready CPU, assigned layer, response and cleanup |
+
+For each attempt, record the exact installer revision/hash, pinned model
+revision, device/backend, start and connection times, every manual action,
+assigned layer range, generation receipt, TTFT/TPOT, process memory and final
+cleanup. Verify Pause/Resume and reconnection after a planned restart. Record
+unavailable measurements as unavailable. If an installation or inference
+fails, save its exact step and sanitized error, then fix that blocker before
+expanding invitations. The owner selects the people and contacts them; this
+checklist does not authorize sending messages.
+
 ### Invitation draft (not sent)
 
 > Hola, estamos probando Mycellios con un grupo muy pequeño. Buscamos a alguien

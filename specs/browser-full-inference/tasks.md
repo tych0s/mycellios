@@ -114,3 +114,17 @@
   with short and long SmolLM2 prompts, plus a Qwen diagnostic, and record
   batch-size and worker-duration measurements for the browser expert route.
 - [ ] Update canonical documentation only when durable results are established.
+
+## Connection recovery gate
+
+- [ ] Exercise hiding the page beyond coordinator retention and returning to it;
+  recover registration with the stable signed browser identity when the old
+  ephemeral worker credentials are rejected. Cancel old leases before accepting
+  work under a renewed registration.
+- [ ] Verify pause during registration recovery cancels that recovery and does
+  not restart contribution. A rejected admission must remain rejected.
+- [ ] Verify coordinator removal and a superseding browser session do not cause
+  competing automatic re-registration loops.
+- [ ] Repeat the public visible-page Pause/Resume route and save both the UI
+  result and the coordinator's observed worker count. Keep browser connection
+  evidence separate from an assigned model-layer inference.

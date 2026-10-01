@@ -2871,3 +2871,61 @@ connected. Evidence is in
 `runtime/native-node-lab/physical-repeat-0285-ci-mixed-20260930.json`,
 `runtime/native-node-lab/inference-0285-ci-mixed-20260930.json` and
 `runtime/native-node-lab/cleanup-0285-ci-mixed-20260930.json`.
+
+### Browser continuation check, 30 September 2026
+
+On a later inspection, the previously connected browser was no longer counted
+by public health and its UI said it was waiting for coordinator confirmation.
+The first explicit Pause/Start attempt reached a reconnecting loop. A second
+explicit Pause/Start obtained admission challenge HTTP 200, registration HTTP
+201 and WebSocket HTTP 101, then reached `CONNECTED` and GPU validated again.
+Screenshot: `runtime/native-node-lab/public-browser-resumed-0285-20260930.png`.
+The production container had not restarted (restart count zero). This is a
+manual recovery result, not proof of unattended browser recovery.
+
+Source inspection identifies a recovery gap worth testing: disconnected
+browser registrations expire after 60 seconds in `mobile-compute-hub.ts`,
+while `mobile/runtime.ts` retries the existing credentials when the WebSocket
+closes. The hub rejects expired credentials with code 4401. The precise close
+code of the observed failure was not captured, so expiry is a plausible cause,
+not a confirmed diagnosis. Signed re-registration, cancellation and explicit
+removal/supersession behavior remain open in the browser specification.
+
+### Measured native repeat and next loss-test blocker, 30 September–1 October 2026
+
+A later mixed-version physical repeat completed with the exact 0.2.85 CI MSI
+on MRPUCCHI and the existing 0.2.84 controller on PC-DANI. The planner assigned
+PC-DANI CPU [0,3) and MRPUCCHI CUDA [3,30). Generation TTFT was 224 ms; the
+canary measured TTFT 137.3848 ms, TPOT 81.8881 ms and 12.2118 tokens/s.
+These are separate runs with different partitions, not a controlled speed
+comparison. Output parity and answer quality were not verified.
+
+The memory collector was repaired to trace local Python descendants of the
+owned coordinator listener, avoiding inaccessible SYSTEM command-line fields,
+and to serialize process arrays explicitly. The local process observation had
+working set 539,258,880 bytes and peak 717,258,752 bytes. MRPUCCHI's stage had
+working set 1,394,110,464 bytes and peak 1,400,238,080 bytes. The local group
+includes the pipeline server; these are process working sets, not exclusive
+VRAM measurements. Cleanup verified zero requested models, zero owned local
+Python descendants, zero observed remote stages and both native workers
+connected. Receipts:
+`runtime/native-node-lab/physical-repeat-0285-ci-measured-20260930.json` and
+`runtime/native-node-lab/cleanup-0285-ci-measured-20260930.json`.
+
+At 04:34 UTC on 1 October, the new loss test stopped at its preflight because
+the expected pair was not simultaneously available. No service fault was
+introduced. Its cleanup observation timed out. Subsequent snapshot retrieval
+did show both expected native versions connected, but repeated five-second
+`/health` requests timed out while the private listener PID 39844 remained
+alive. Controller logs showed stale worker heartbeats and an unavailable CPU
+calibration probe. MRPUCCHI SSH remained accessible. The cause of the private
+controller's intermittent response is unconfirmed; this new loss/recovery
+test is unavailable, not passing. Its failed-preflight receipt is
+`runtime/native-node-lab/loss-0285-ci-20260930.json`.
+
+The earlier automatic-review rejection still prevents an agent-driven SYSTEM
+controller restart. A manual restart of the existing startup task has been
+requested. Public account enrollment, signing, both-host fixed-release and
+controller reboot gates remain open. The quickstart now includes two unassigned
+external attempt slots and their acceptance checklist; no testers have been
+invented, contacted or counted as installations.
