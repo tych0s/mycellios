@@ -3023,3 +3023,12 @@ query received GitHub HTTP 403 API rate-limit exceeded. Its completion remains
 unverified. Native downloads were not promoted by the coordinator deployment.
 Trusted installer signing, both-host exact-release proof, authenticated public
 native pairing and external tester installation remain open gates.
+
+The visible public 0.2.86 browser subsequently passed Pause/Resume: clicking
+Pause left the UI paused and public health reported connected=0, mobile=0;
+clicking Start again validated WebGPU, restored the connected UI, and public
+health reported connected=1, mobile=1. Receipts are
+`runtime/native-node-lab/public-pause-0286-20261001.json` and
+`runtime/native-node-lab/public-resume-0286-20261001.json`, with screenshot
+`runtime/native-node-lab/public-browser-resumed-0286-20261001.png`. This does
+not prove assigned model work or natural background-retention recovery.

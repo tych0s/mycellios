@@ -127,6 +127,6 @@
   competing automatic re-registration loops.
 - [x] Verify renewal after coordinator restart and forced disconnected-session
   expiry in the isolated browser fixture, retaining the signed client identity.
-- [ ] Repeat the public visible-page Pause/Resume route and save both the UI
+- [x] Repeat the public visible-page Pause/Resume route and save both the UI
   result and the coordinator's observed worker count. Keep browser connection
   evidence separate from an assigned model-layer inference.
