@@ -2985,3 +2985,24 @@ activation budget was retained to exercise loss after startup; the earlier
 five-minute timeout remains an onboarding obstacle. This is bounded failure
 and reconnection evidence, not uninterrupted failover or a post-recovery
 generation result.
+
+A subsequent physical generation after that service restoration completed on
+PC-DANI CPU [0,2) and MRPUCCHI CUDA [2,30), with generation TTFT 234 ms. The
+canary measured TTFT 185.3940 ms, TPOT 115.9598 ms and 8.6237 tokens/s. The
+observed process peaks were 695,369,728 bytes on PC-DANI and 1,402,093,568
+bytes on MRPUCCHI. Cleanup again verified zero requested models and stages,
+with both native workers connected. Receipts:
+`runtime/native-node-lab/physical-repeat-0285-ci-recovered-20261001.json` and
+`runtime/native-node-lab/cleanup-0285-ci-recovered-20261001.json`. This completes
+the mixed-version loss, reconnection and subsequent-generation check; it does
+not close the both-host fixed-release or public account-owned route gate.
+
+The browser recovery change was committed and pushed as
+`785c4d23428f947468dad6f62f4495f31402e27b` for 0.2.86, source identity
+`sha256:a3ee0097a9df469ace1f96cb28ff0cb498f2b716b6109706b5704f80484b53be`.
+The exact-revision manual native workflow
+[36818114425](https://github.com/tych0s/mycellios/actions/runs/36818114425)
+and the bounded coordinator image build were started. At this recording they
+were in progress; 0.2.86 has not been deployed and public production remains
+the previously verified 0.2.85 revision. No installer signing, publication or
+external tester installation is inferred from starting those builds.
