@@ -3092,3 +3092,36 @@ certificate. Public native-download promotion remains blocked on trusted
 signing. Receipt: `runtime/native-node-lab/windows-candidate-0286-verification.json`.
 Successful CI and source/checksum verification do not establish a trusted
 signature or an installed same-release two-host route.
+
+The fixed 0.2.86 CI MSI was then installed as a lab update on MRPUCCHI.
+At 2026-10-01T06:02:37.7707976Z the installer verified Ready/CUDA, retained
+the same node identity and protected key, and confirmed exact revision/source
+identity. The private coordinator observed that node connected with agent
+version 0.2.86; PC-DANI's existing controller/CPU agent remained 0.2.84.
+Receipt: `runtime/native-node-lab/ci-msi-upgrade-0286-20261001.json`.
+
+A normal MRPUCCHI reboot subsequently passed. The observed boot time changed
+from 2026-09-30T10:53:33.5000000Z to 2026-10-01T06:05:03.5000000Z. By
+06:05:54.2738139Z SSH, Tailscale and MycelliosNode were running with automatic
+startup; the new native process had started after boot and reported Ready/CUDA
+with exact 0.2.86 provenance. The private coordinator again observed the same
+0.2.86 node connected. Receipt: `runtime/native-node-lab/reboot-0286-20261001.json`.
+This verifies recovery from this controlled reboot; it is not a guarantee of
+permanent connectivity, PC-DANI reboot recovery or public account enrollment.
+The separate post-reboot native inference attempt did not pass. Its requested
+model remained queued for activation while PC-DANI intermittently disconnected
+with `worker heartbeat stale` and reported an unavailable CPU runtime-performance
+probe. No generation receipt was produced. The harness exited with `Stage
+cleanup observation failed`: it had initialized its local cleanup query only
+after successful generation, masking the original failure on this path. The
+local harness now initializes that query before activation, preserves primary
+errors and bounds HTTP waits; this correction has passed syntax checking but
+has not been rerun under the unstable controller.
+
+A subsequent successful authenticated snapshot verified zero requested models
+and both workers connected. Model-stage process cleanup remains unverified;
+an earlier snapshot timeout was treated as unknown, never as zero capacity or
+successful cleanup. Receipt:
+`runtime/native-node-lab/postreboot-0286-failed-20261001.json`.
+The healthy MRPUCCHI reboot does not close post-reboot distributed inference,
+PC-DANI calibration stability or the both-host fixed-release gate.
