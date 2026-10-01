@@ -484,10 +484,20 @@ async function resumeVisibleWorker(): Promise<void> {
       assertExecutionAllowed(signal);
       await acquireWakeLock(signal);
       assertExecutionAllowed(signal);
+      if (!state.workerId || !state.token) {
+        const { size, result } = await runStartupBenchmark(73, signal);
+        assertExecutionAllowed(signal);
+        state.estimatedGflops = result.estimatedGflops;
+        const credentials = await registerWorker(size, result.durationMs, await persistentClientId(), signal);
+        assertExecutionAllowed(signal);
+        state.workerId = credentials.workerId;
+        state.token = credentials.token;
+        addLog("Browser registration renewed with its existing signed identity.");
+      }
       connect();
     } catch (error) {
       if (isMobileExecutionCancelled(error)) return;
-      state.running = false;
+      await stop(false, true);
       setStatus(errorText(error));
       setConnection("offline", "Unavailable");
       addLog(`Could not resume: ${errorText(error)}`);
@@ -532,17 +542,37 @@ function connect(): void {
   socket.addEventListener("message", (event) => {
     if (state.socket === socket) void handleServerMessage(String(event.data));
   });
-  socket.addEventListener("close", () => {
+  socket.addEventListener("close", (event) => {
     if (state.socket !== socket) return;
     state.socket = null;
     if (!state.running) return;
+    if ([4000, 4400, 4409, 4429].includes(event.code)) {
+      void stop(false, true);
+      setConnection("offline", "Paused");
+      setStatus(event.code === 4409
+        ? "Another session is using this browser identity. Contribution paused."
+        : "The coordinator closed this contribution. Press Start to try again.");
+      return;
+    }
+    if (event.code === 4401) {
+      state.workerId = null;
+      state.token = null;
+      state.verifiedTasks = 0;
+      if (state.heartbeatTimer !== null) window.clearInterval(state.heartbeatTimer);
+      state.heartbeatTimer = null;
+      cancelActiveExecutions("the browser registration expired");
+    }
     if (document.visibilityState !== "visible") {
       setConnection("offline", "Paused");
       return;
     }
     setConnection("connecting", "Reconnecting");
     setStatus("Connection lost; retrying automatically…");
-    state.reconnectTimer = window.setTimeout(connect, 2_000);
+    state.reconnectTimer = window.setTimeout(() => {
+      if (!state.running || document.visibilityState !== "visible") return;
+      if (!state.workerId || !state.token) void resumeVisibleWorker();
+      else connect();
+    }, 2_000);
   });
   socket.addEventListener("error", () => {
     if (state.socket === socket) socket.close();

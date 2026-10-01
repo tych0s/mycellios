@@ -120,6 +120,31 @@ platform jobs and uploads a candidate manifest; it does not publish packages.
 
 ## Browser contribution pilot
 
+### Browser registration recovery check
+
+Build the browser bundle, then run the isolated fixture:
+
+```bash
+npm run mobile:build
+npx tsx tests/serve-browser-recovery-integration.ts
+```
+
+It binds only `127.0.0.1:18910`, uses an in-memory coordinator and serves
+`/browser/`. Its `/lab/` routes are test controls and are never attached to the
+production coordinator. Start one browser worker and record `/lab/state`.
+POST JSON `{}` to `/lab/drop` closes the test transport and expires its
+disconnected registration. The browser should renew its signed registration
+automatically, retain the same client identity and pass GPU/CPU admission again.
+
+Use `/lab/hold` before a drop to hold the next admission challenge. Pause the
+browser while it is recovering, then `/lab/release`; it must stay paused with
+no registered worker. `/lab/deny` rejects subsequent challenges with HTTP 401;
+the browser must stop instead of bypassing admission. In a fresh fixture, start
+two tabs sharing the same origin: the older session must pause when superseded.
+`/lab/remove` must pause the current worker without an automatic re-registration
+loop. Use `/lab/shutdown` and close the test tabs after capturing results.
+These are browser lifecycle tests, not physical distributed inference evidence.
+
 ### Browser decoder layer gate
 
 For an exact local Qwen3 or Llama safetensors snapshot, export and verify the selected

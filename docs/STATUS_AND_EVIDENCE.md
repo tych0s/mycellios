@@ -2929,3 +2929,59 @@ requested. Public account enrollment, signing, both-host fixed-release and
 controller reboot gates remain open. The quickstart now includes two unassigned
 external attempt slots and their acceptance checklist; no testers have been
 invented, contacted or counted as installations.
+
+### Browser registration recovery correction, 1 October 2026
+
+The browser client now discards expired ephemeral credentials on WebSocket
+4401, cancels old execution state, reinitializes its backend and renews its
+signed registration with the existing browser identity. User pause aborts that
+renewal. Coordinator removal, supersession and terminal protocol/rate-limit
+closures pause contribution instead of causing a re-registration loop. A
+failed admission remains failed. Version 0.2.86 is prepared for this change;
+this section is local candidate evidence, not a claim of public deployment.
+
+An actual in-app browser against an isolated loopback coordinator passed:
+automatic recovery after restarting that coordinator with no additional Start
+click; unchanged client ID and a new worker session with a verified GPU task;
+pause while an admission challenge was held; terminal HTTP 401 admission
+denial; superseding the original tab with a second tab; and explicit coordinator
+removal. Both pause and denial left no worker registered, and supersession and
+removal left the old contribution paused. The test controls deliberately
+expire a disconnected registration; a natural long background-page interval
+and the updated public HTTPS route still need verification. No model layer
+inference was assigned by this lifecycle fixture.
+
+The reproducible fixture is `tests/serve-browser-recovery-integration.ts` and
+its procedure is in DEVELOPMENT. The local receipt is
+`runtime/native-node-lab/browser-recovery-test-20261001.json`; screenshots
+include `browser-session-superseded-20261001.png`,
+`browser-admission-denied-20261001.png` and
+`browser-coordinator-removal-20261001.png` under that same runtime directory.
+The focused mobile/backend tests passed 19 tests and browser-layer hub tests
+passed two. Browser build/bundle budget, mobile typecheck, root typecheck,
+structure and architecture checks passed for the functional change.
+
+The retried 0.2.85 physical worker-loss test first exceeded its five-minute
+activation budget and cleaned up. A ten-minute-budget attempt did inject
+MRPUCCHI service loss after the first streamed token: 20 chunks arrived, then
+an explicit `adapter_error`, while SSH and VPN stayed running. The service
+restored, both workers reconnected and cleanup observed zero requested models
+and stages. Its harness rejected ordering because it compared MRPUCCHI wall
+time with PC-DANI wall time; the remote timestamp was about 386 ms earlier
+than the already observed first token. That rejected receipt is preserved as
+`runtime/native-node-lab/loss-0285-ci-longstart-20261001.json`. The harness has
+been corrected to use PC-DANI monotonic timestamps for dispatch and
+acknowledgement; a passing rerun is still required. This is not seamless
+failover evidence.
+
+The corrected monotonic-clock rerun subsequently passed. Its first token was
+observed before the local fault-dispatch marker; acknowledgement of the stopped
+MRPUCCHI service preceded local stream termination. Seventeen chunks arrived
+before an explicit `adapter_error`; SSH and VPN remained running. The native
+service was restored, both native workers reconnected, and cleanup reported
+zero requested models and stages. The passing receipt is
+`runtime/native-node-lab/loss-0285-ci-monotonic-20261001.json`. The ten-minute
+activation budget was retained to exercise loss after startup; the earlier
+five-minute timeout remains an onboarding obstacle. This is bounded failure
+and reconnection evidence, not uninterrupted failover or a post-recovery
+generation result.

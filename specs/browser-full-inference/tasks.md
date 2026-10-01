@@ -121,10 +121,12 @@
   recover registration with the stable signed browser identity when the old
   ephemeral worker credentials are rejected. Cancel old leases before accepting
   work under a renewed registration.
-- [ ] Verify pause during registration recovery cancels that recovery and does
+- [x] Verify pause during registration recovery cancels that recovery and does
   not restart contribution. A rejected admission must remain rejected.
-- [ ] Verify coordinator removal and a superseding browser session do not cause
+- [x] Verify coordinator removal and a superseding browser session do not cause
   competing automatic re-registration loops.
+- [x] Verify renewal after coordinator restart and forced disconnected-session
+  expiry in the isolated browser fixture, retaining the signed client identity.
 - [ ] Repeat the public visible-page Pause/Resume route and save both the UI
   result and the coordinator's observed worker count. Keep browser connection
   evidence separate from an assigned model-layer inference.
