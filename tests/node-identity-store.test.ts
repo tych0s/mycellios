@@ -101,6 +101,8 @@ describe("NodeIdentityStore", () => {
       expect(call.stdin).toContain(credential.privateKeyPkcs8);
     }
     expect(calls[1]?.arguments_.join(" ")).toContain("DataProtectionScope]::LocalMachine");
+    expect(calls[1]?.arguments_.join(" ")).toContain("Add-Type -AssemblyName System.Security");
+    expect(calls[1]?.arguments_.join(" ")).toContain("[IO.File]::Replace");
     expect(calls[2]).toMatchObject({ executable: "/usr/bin/security", arguments_: ["-i"] });
   });
 

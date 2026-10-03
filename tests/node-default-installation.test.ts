@@ -21,6 +21,6 @@ describe("default native installation layouts", () => {
   it("derives canonical manager and service identities", () => {
     expect(defaultNodeInstallationManifest({ platform: "linux" })).toMatchObject({ serviceName: "mycellios-node", serviceDefinitionPath: "/etc/systemd/system/mycellios-node.service" });
     expect(defaultNodeInstallationManifest({ platform: "darwin" })).toMatchObject({ serviceName: "io.mycellios.node", serviceDefinitionPath: "/Library/LaunchDaemons/io.mycellios.node.plist" });
-    expect(defaultNodeInstallationManifest({ platform: "win32", programData: "C:\\Data" })).toMatchObject({ serviceName: "MycelliosNode", serviceDefinitionPath: "C:\\Data\\Mycellios\\Service\\definition.json" });
+    expect(defaultNodeInstallationManifest({ platform: "win32", programData: "C:\\Data" })).toMatchObject({ serviceName: "MycelliosNode", serviceDefinitionPath: "C:\\Data\\Mycellios\\Service\\MycelliosNode.xml" });
   });
 });

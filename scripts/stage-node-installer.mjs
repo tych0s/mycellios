@@ -11,21 +11,40 @@ export async function stageNodeInstaller(input) {
   const output = resolve(input.output);
   const dist = resolve(input.dist);
   const runtime = resolve(input.runtime);
+  const pythonSource = resolve(input.pythonSource);
   const nodeExecutable = resolve(input.nodeExecutable);
+  const brokerExecutable = input.brokerExecutable ? resolve(input.brokerExecutable) : null;
+  const serviceWrapperExecutable = input.serviceWrapperExecutable ? resolve(input.serviceWrapperExecutable) : null;
   const modules = resolve(input.nodeModules);
+  const sourcePackage = join(resolve(input.sourceRoot ?? "."), "package.json");
   if (!/^[a-f0-9]{40}$/.test(input.sourceRevision)) throw new Error("node_installer_source_revision_is_invalid");
   const provenance = verifyNativeBuildProvenanceDocument(input.sourceProvenance);
-  if (output === dist || output === runtime || output === modules || output === dirname(output)) {
+  if (output === dist || output === runtime || output === pythonSource || output === modules || output === dirname(output)) {
     throw new Error("node_installer_output_is_unsafe");
   }
   await assertDirectory(dist, "node_installer_dist_is_missing");
   await assertDirectory(runtime, "node_installer_runtime_is_missing");
+  await assertDirectory(pythonSource, "node_installer_python_source_is_missing");
+  for (const name of ["__init__.py", "physical_probe.py", "model_adapter_registry.json"]) {
+    await assertRegularFile(join(pythonSource, name), `node_installer_python_file_is_missing:${name}`);
+  }
   await assertRegularFile(nodeExecutable, "node_installer_node_executable_is_missing");
+  await assertRegularFile(sourcePackage, "node_installer_package_metadata_is_missing");
   await assertRegularFile(join(dist, "node", "main.js"), "node_installer_main_is_missing");
+  if (input.target === "windows-x64") {
+    await assertRegularFile(join(dist, "node", "service-supervisor.js"), "node_installer_service_supervisor_is_missing");
+    await assertRegularFile(join(dist, "node", "restore-main.js"), "node_installer_restore_is_missing");
+  }
   await assertRegularFile(join(dist, "node", "install-main.js"), "node_installer_bootstrap_is_missing");
   await assertRegularFile(join(dist, "node", "uninstall-main.js"), "node_installer_uninstall_helper_is_missing");
   const runtimeManifest = JSON.parse(await readFile(join(runtime, "runtime-manifest.json"), "utf8"));
   const [platform, arch] = parseTarget(input.target);
+  if (platform === "win32") {
+    if (!brokerExecutable) throw new Error("node_installer_windows_broker_is_missing");
+    await assertRegularFile(brokerExecutable, "node_installer_windows_broker_is_missing");
+    if (!serviceWrapperExecutable) throw new Error("node_installer_windows_service_wrapper_is_missing");
+    await assertRegularFile(serviceWrapperExecutable, "node_installer_windows_service_wrapper_is_missing");
+  }
   if (runtimeManifest.platform !== platform || runtimeManifest.arch !== arch) {
     throw new Error("node_installer_runtime_target_mismatch");
   }
@@ -35,7 +54,12 @@ export async function stageNodeInstaller(input) {
   await Promise.all([
     copyTree(dist, join(output, "app")),
     copyTree(runtime, join(output, "runtime"), { materializeInternalSymlinks: true }),
+    copyPythonPackage(pythonSource, join(output, "python", "distributed_runtime")),
+    cp(sourcePackage, join(output, "package.json")),
     cp(nodeExecutable, join(output, "bin", platform === "win32" ? "node.exe" : "node")),
+    ...(platform === "win32" ? [cp(brokerExecutable, join(output, "bin", "mycellios-job-broker.exe"))] : []),
+    ...(platform === "win32" ? [cp(serviceWrapperExecutable, join(output, "bin", "MycelliosNode.exe")),
+      cp(join(resolve(input.sourceRoot ?? "."), "sidecars", "winsw-license.txt"), join(output, "WinSW-LICENSE.txt"))] : []),
     ...PRODUCTION_DEPENDENCIES.map(async (dependency) => {
       const source = join(modules, dependency);
       await assertDirectory(source, `node_installer_dependency_is_missing:${dependency}`);
@@ -59,8 +83,9 @@ export async function stageNodeInstaller(input) {
     toolchain: { nodeVersion: process.version, pythonVersion: runtimeManifest.pythonVersion ?? "unknown",
       pythonAbi: runtimeManifest.pythonAbi ?? "unknown", backend: runtimeManifest.backend ?? "unknown" },
     entrypoints: {
-      service: "app/node/main.js",
+      service: platform === "win32" ? "app/node/service-supervisor.js" : "app/node/main.js",
       install: "app/node/install-main.js",
+      ...(platform === "win32" ? { restore: "app/node/restore-main.js" } : {}),
       uninstall: "app/node/uninstall-main.js",
       launcher,
     },
@@ -131,6 +156,17 @@ async function copyTree(source, destination, options = {}) {
   });
 }
 
+async function copyPythonPackage(source, destination) {
+  await mkdir(destination, { recursive: true });
+  for (const entry of await readdir(source, { withFileTypes: true })) {
+    if (entry.isDirectory() && entry.name === "__pycache__") continue;
+    const from = join(source, entry.name), to = join(destination, entry.name);
+    if (entry.isDirectory()) await copyPythonPackage(from, to);
+    else if (entry.isFile() && /\.(py|json)$/.test(entry.name)) await cp(from, to, { errorOnExist: true, force: false });
+    else throw new Error(`node_installer_python_source_is_unsafe:${entry.name}`);
+  }
+}
+
 async function assertSymlinksStayInside(root) {
   const canonicalRoot = await realpath(root);
   async function visit(directory) {
@@ -176,6 +212,10 @@ async function main(argv) {
     if (!values[key]) throw new Error(`node_installer_argument_is_missing:${key}`);
   }
   await stageNodeInstaller({ output: values.output, dist: values.dist, runtime: values.runtime,
+    pythonSource: join(resolve(values["source-root"]), "python", "distributed_runtime"),
+    ...(values["broker-executable"] ? { brokerExecutable: values["broker-executable"] } : {}),
+    ...(values["service-wrapper-executable"] ? { serviceWrapperExecutable: values["service-wrapper-executable"] } : {}),
+    sourceRoot: resolve(values["source-root"]),
     nodeExecutable: values["node-executable"], nodeModules: values["node-modules"], target: values.target,
     sourceRevision: values["source-revision"], sourceProvenance: buildNativeSourceProvenance(values["source-root"]) });
 }

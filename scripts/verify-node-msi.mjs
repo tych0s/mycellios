@@ -1,12 +1,14 @@
 import { spawnSync } from "node:child_process";
 import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { assertInstallerPackageTreeMatches } from "./verify-installer-package-tree.mjs";
 
 export async function verifyNodeMsi(input) {
-  const root = await mkdtemp(join(tmpdir(), "mycellios-node-msi-verify-")), extracted = join(root, "administrative"), decompiled = join(root, "decompiled.wxs");
+  // Windows Installer can reject long administrative extraction paths even
+  // when the normal Program Files destination is short enough.
+  const root = await mkdtemp(join(tmpdir(), "m-")), extracted = join(root, "a"), decompiled = join(root, "decompiled.wxs");
   try {
     run("msiexec.exe", ["/a", resolve(input.msi), "/qn", `TARGETDIR=${extracted}`], "node_msi_administrative_extract_failed");
     run("dark.exe", ["-nologo", "-x", join(root, "dark"), "-o", decompiled, resolve(input.msi)], "node_msi_decompile_failed");
@@ -14,11 +16,17 @@ export async function verifyNodeMsi(input) {
     if (manifests.length !== 1) throw new Error("node_msi_product_root_is_ambiguous");
     await assertInstallerPackageTreeMatches(resolve(input.stagedRoot), dirname(manifests[0]));
     const source = await readFile(decompiled, "utf8");
-    if (!source.includes(".mycellios-enrollment") || !source.includes("Mycellios.Enrollment") || !source.includes(input.sourceRevision)) {
+    if (!source.includes(".mycellios-enrollment") || !source.includes("Mycellios.Enrollment") || !source.includes(input.sourceRevision)
+      || !source.includes('Name="MycelliosNode" Stop="uninstall" Remove="uninstall" Wait="yes"')) {
       throw new Error("node_msi_pairing_or_source_identity_is_missing");
     }
     return { version: input.version, sourceRevision: input.sourceRevision };
-  } finally { await rm(root, { recursive: true, force: true }); }
+  } finally {
+    if (!resolve(root).startsWith(`${resolve(tmpdir())}${sep}`) || !basename(root).startsWith("m-")) {
+      throw new Error("node_msi_verifier_cleanup_path_is_unsafe");
+    }
+    await rm(root, { recursive: true, force: true });
+  }
 }
 
 async function find(root, name) { const matches = []; async function visit(directory) { for (const entry of await readdir(directory, { withFileTypes: true })) { const path = join(directory, entry.name); if (entry.isDirectory()) await visit(path); else if (entry.isFile() && entry.name === name) matches.push(path); } } await visit(root); return matches; }

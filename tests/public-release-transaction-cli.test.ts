@@ -32,9 +32,9 @@ describe("public release transaction CLI", () => {
     expect(manifest.assets).toHaveLength(4);
     expect(manifest.assets.map(({ channel, fileName }) => `${channel}/${fileName}`))
       .toEqual([
-        "downloads/mycellios-node-linux-x64.tar.gz",
-        "downloads/mycellios-node-macos-arm64.tar.gz",
-        "downloads/mycellios-node-windows-x64.zip",
+        "downloads/mycellios-node-0.2.19-linux-x64.deb",
+        "downloads/mycellios-node-0.2.19-macos-arm64.pkg",
+        "downloads/mycellios-node-0.2.19-windows-x64.msi",
         "updates/mycellios-node-latest.json",
       ]);
     expect(
@@ -46,7 +46,7 @@ describe("public release transaction CLI", () => {
 
   it("fails closed on a missing or unexpected release asset", async () => {
     const root = fixture();
-    rmSync(join(root, "mycellios-node-linux-x64.tar.gz"));
+    rmSync(join(root, "mycellios-node-0.2.19-linux-x64.deb"));
     writeFileSync(join(root, "unexpected.exe"), "unexpected");
 
     await expect(preparePublicReleaseTransaction({
@@ -61,7 +61,7 @@ describe("public release transaction CLI", () => {
 
   it("rejects a human checksum list that does not match the sealed assets", async () => {
     const root = fixture();
-    writeFileSync(join(root, "sha256sums.txt"), `${"0".repeat(64)}  mycellios-node-windows-x64.zip\n`);
+    writeFileSync(join(root, "sha256sums.txt"), `${"0".repeat(64)}  mycellios-node-0.2.19-windows-x64.msi\n`);
 
     await expect(preparePublicReleaseTransaction({
       assetsRoot: root,
@@ -79,9 +79,9 @@ function fixture(): string {
   roots.push(root);
   const names = [
     "mycellios-node-latest.json",
-    "mycellios-node-windows-x64.zip",
-    "mycellios-node-macos-arm64.tar.gz",
-    "mycellios-node-linux-x64.tar.gz",
+    "mycellios-node-0.2.19-windows-x64.msi",
+    "mycellios-node-0.2.19-macos-arm64.pkg",
+    "mycellios-node-0.2.19-linux-x64.deb",
   ];
   for (const name of names) writeFileSync(join(root, name), `fixture:${name}`);
   return root;
@@ -90,10 +90,10 @@ function fixture(): string {
 function writeChecksums(root: string): void {
   const names = [
     "mycellios-node-latest.json",
-    "mycellios-node-linux-x64.tar.gz",
-    "mycellios-node-macos-arm64.tar.gz",
-    "mycellios-node-windows-x64.zip",
-  ];
+    "mycellios-node-0.2.19-linux-x64.deb",
+    "mycellios-node-0.2.19-macos-arm64.pkg",
+    "mycellios-node-0.2.19-windows-x64.msi",
+  ].sort((left, right) => left.localeCompare(right, "en"));
   const content = names.map((name) => {
     const bytes = readFileSync(join(root, name));
     return `${createHash("sha256").update(bytes).digest("hex")}  ${name}`;

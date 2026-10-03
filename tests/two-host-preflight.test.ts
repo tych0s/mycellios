@@ -26,6 +26,14 @@ describe("two-host preflight", () => {
     expect(report).toMatchObject({ ready: false, dryRun: true });
     expect(report.diagnostics).toContainEqual(expect.objectContaining({ code: "stage_endpoint_placeholder" }));
   });
+
+  it("rejects a LAN advertise address for an API bound only to loopback", () => {
+    const value = config();
+    value.runtime.apiAdvertiseHost = "192.168.1.10";
+    const report = evaluateTwoHostPreflight(value, { python312: true, configuredEnvironmentNames: new Set(["REMOTE_TOKEN"]) });
+    expect(report.ready).toBe(false);
+    expect(report.diagnostics).toContainEqual(expect.objectContaining({ code: "api_advertise_mismatch", severity: "error" }));
+  });
 });
 
 function config() { return parseAutoDistributionConfig(raw()); }
@@ -34,7 +42,7 @@ function raw(): any {
     nodes: [node("host-a", "192.168.1.10", { kind: "local" }), node("host-b", "192.168.1.11", { kind: "http", endpoint: "http://192.168.1.11:9750", authTokenEnv: "REMOTE_TOKEN", requestTimeoutMs: 30000 })],
     links: [link("host-a", "host-b"), link("host-b", "host-a")], distribution: { minimumStages: 2, maximumStages: 2, allowLossyActivation: false },
     workload: { promptTokens: 64, outputTokens: 16, contextTokens: 2048, concurrentSequences: 1, minRouteAvailability: 0.9, batchWindowMs: 0, p95: true },
-    runtime: { pythonExecutable: "python", stagePythonExecutable: "python", pythonPath: "python", hfHome: "runtime/hf-cache", apiEndpoint: { host: "127.0.0.1", port: 8081 }, apiAdvertiseHost: "192.168.1.10", returnEndpoint: { host: "192.168.1.10", port: 18100 }, returnBindHost: "0.0.0.0", threadsPerStage: 1, connectTimeoutSeconds: 300, readinessTimeoutMs: 600000, maxOutputTokens: 256 },
+    runtime: { pythonExecutable: "python", stagePythonExecutable: "python", pythonPath: "python", hfHome: "runtime/hf-cache", apiEndpoint: { host: "127.0.0.1", port: 8081 }, apiAdvertiseHost: "127.0.0.1", returnEndpoint: { host: "192.168.1.10", port: 18100 }, returnBindHost: "0.0.0.0", threadsPerStage: 1, connectTimeoutSeconds: 300, readinessTimeoutMs: 600000, maxOutputTokens: 256 },
     canary: { prompt: "OK", maxTokens: 16, timeoutMs: 300000 }, artifactsDirectory: "runtime/physical" };
 }
 function node(id: string, host: string, agent: any) { return { id, region: "lan", endpoint: { host, port: 18101 }, memoryMiB: 8192, reserveMiB: 1024, decodeScale: 1, prefillScale: 1, codecScale: 1, powerWatts: 65, availability: 0.99, agent }; }

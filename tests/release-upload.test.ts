@@ -40,6 +40,28 @@ afterEach(async () => {
 });
 
 describe("release uploads", () => {
+  it("restores a committed archive release after rolling back a native installer release", async () => {
+    const storageRoot = join(temporaryDirectory(), "release-transactions");
+    const legacy = writeLegacyCommittedRelease(storageRoot);
+    const store = transactionStore(storageRoot);
+    await store.initialize();
+    expect(readFileSync((await store.publicAssetPath("downloads", "mycellios-node-windows-x64.zip"))!))
+      .toEqual(Buffer.from("legacy windows archive"));
+
+    const native = releaseFixture("transaction-native-rollback-0001");
+    await storeTransaction(store, native);
+    await store.commit(native.manifest);
+    expect(await store.publicAssetPath("downloads", "mycellios-node-windows-x64.zip")).toBeNull();
+    expect(await store.publicAssetPath("downloads", "mycellios-node-0.2.19-windows-x64.msi"))
+      .not.toBeNull();
+
+    await store.rollback(native.identity.transactionId);
+    expect((await store.publicAssetPath("downloads", "mycellios-node-windows-x64.zip")))
+      .not.toBeNull();
+    expect(await store.publicAssetPath("downloads", "mycellios-node-0.2.19-windows-x64.msi"))
+      .toBeNull();
+    expect(legacy.schema).toBe("mycellios-native-public-release/1");
+  });
   it("assembles checksum-verified chunks atomically", async () => {
     const root = temporaryDirectory();
     const content = Buffer.from("automatic native node update");
@@ -90,7 +112,7 @@ describe("release uploads", () => {
     const previousFeed = Buffer.from("previous node feed");
     const previousLinuxPackage = Buffer.from("previous Linux node package");
     writeFileSync(join(updates, "mycellios-node-latest.json"), previousFeed);
-    writeFileSync(join(downloads, "mycellios-node-linux-x64.tar.gz"), previousLinuxPackage);
+    writeFileSync(join(downloads, "mycellios-node-0.2.19-linux-x64.deb"), previousLinuxPackage);
     writeFileSync(join(landing, "index.html"), "<main>landing</main>");
     const runtime = await createCoordinator(
       {
@@ -121,7 +143,7 @@ describe("release uploads", () => {
     })).rawPayload).toEqual(previousFeed);
     expect((await runtime.app.inject({
       method: "GET",
-      url: "/downloads/mycellios-node-linux-x64.tar.gz",
+      url: "/downloads/mycellios-node-0.2.19-linux-x64.deb",
     })).rawPayload).toEqual(previousLinuxPackage);
 
     const transaction = releaseFixture("transaction-release-0001");
@@ -143,7 +165,7 @@ describe("release uploads", () => {
     })).rawPayload).toEqual(previousFeed);
     expect((await runtime.app.inject({
       method: "GET",
-      url: "/downloads/mycellios-node-linux-x64.tar.gz",
+      url: "/downloads/mycellios-node-0.2.19-linux-x64.deb",
     })).rawPayload).toEqual(previousLinuxPackage);
 
     const commit = await runtime.app.inject({
@@ -173,13 +195,13 @@ describe("release uploads", () => {
     })).rawPayload).toEqual(transaction.byPath.get("updates/mycellios-node-latest.json"));
     expect((await runtime.app.inject({
       method: "GET",
-      url: "/downloads/mycellios-node-linux-x64.tar.gz",
-    })).rawPayload).toEqual(transaction.byPath.get("downloads/mycellios-node-linux-x64.tar.gz"));
+      url: "/downloads/mycellios-node-0.2.19-linux-x64.deb",
+    })).rawPayload).toEqual(transaction.byPath.get("downloads/mycellios-node-0.2.19-linux-x64.deb"));
 
-    const deb = transaction.byPath.get("downloads/mycellios-node-linux-x64.tar.gz")!;
+    const deb = transaction.byPath.get("downloads/mycellios-node-0.2.19-linux-x64.deb")!;
     const partial = await runtime.app.inject({
       method: "GET",
-      url: "/downloads/mycellios-node-linux-x64.tar.gz",
+      url: "/downloads/mycellios-node-0.2.19-linux-x64.deb",
       headers: { range: "bytes=4-8" },
     });
     expect(partial.statusCode).toBe(206);
@@ -190,7 +212,7 @@ describe("release uploads", () => {
 
     const mismatchedIfRange = await runtime.app.inject({
       method: "GET",
-      url: "/downloads/mycellios-node-linux-x64.tar.gz",
+      url: "/downloads/mycellios-node-0.2.19-linux-x64.deb",
       headers: {
         range: "bytes=4-8",
         "if-range": "\"different-release\"",
@@ -201,7 +223,7 @@ describe("release uploads", () => {
 
     const unsatisfiable = await runtime.app.inject({
       method: "GET",
-      url: "/downloads/mycellios-node-linux-x64.tar.gz",
+      url: "/downloads/mycellios-node-0.2.19-linux-x64.deb",
       headers: { range: `bytes=${deb.length}-` },
     });
     expect(unsatisfiable.statusCode).toBe(416);
@@ -209,7 +231,7 @@ describe("release uploads", () => {
 
     const head = await runtime.app.inject({
       method: "HEAD",
-      url: "/downloads/mycellios-node-linux-x64.tar.gz",
+      url: "/downloads/mycellios-node-0.2.19-linux-x64.deb",
     });
     expect(head.statusCode).toBe(200);
     expect(head.headers["accept-ranges"]).toBe("bytes");
@@ -224,8 +246,8 @@ describe("release uploads", () => {
     expect(unauthorizedRollback.statusCode).toBe(401);
     expect((await runtime.app.inject({
       method: "GET",
-      url: "/downloads/mycellios-node-linux-x64.tar.gz",
-    })).rawPayload).toEqual(transaction.byPath.get("downloads/mycellios-node-linux-x64.tar.gz"));
+      url: "/downloads/mycellios-node-0.2.19-linux-x64.deb",
+    })).rawPayload).toEqual(transaction.byPath.get("downloads/mycellios-node-0.2.19-linux-x64.deb"));
 
     const rollback = await runtime.app.inject({
       method: "POST",
@@ -244,7 +266,7 @@ describe("release uploads", () => {
     })).rawPayload).toEqual(previousFeed);
     expect((await runtime.app.inject({
       method: "GET",
-      url: "/downloads/mycellios-node-linux-x64.tar.gz",
+      url: "/downloads/mycellios-node-0.2.19-linux-x64.deb",
     })).rawPayload).toEqual(previousLinuxPackage);
 
     const repeated = await runtime.app.inject({
@@ -598,7 +620,7 @@ describe("release uploads", () => {
       "abandoned commit",
     );
     writeFileSync(
-      join(downloadsRoot, ".mycellios-node-linux-x64.tar.gz.abandoned.durable-tmp"),
+      join(downloadsRoot, ".mycellios-node-0.2.19-linux-x64.deb.abandoned.durable-tmp"),
       "abandoned asset",
     );
 
@@ -619,11 +641,11 @@ describe("release uploads", () => {
     await restarted.initialize();
     const publicDeb = await restarted.publicAssetPath(
       "downloads",
-      "mycellios-node-linux-x64.tar.gz",
+      "mycellios-node-0.2.19-linux-x64.deb",
     );
     expect(publicDeb).not.toBeNull();
     expect(readFileSync(publicDeb!)).toEqual(
-      transaction.byPath.get("downloads/mycellios-node-linux-x64.tar.gz"),
+      transaction.byPath.get("downloads/mycellios-node-0.2.19-linux-x64.deb"),
     );
 
     await restarted.rollback(transaction.identity.transactionId);
@@ -631,7 +653,7 @@ describe("release uploads", () => {
     await afterRollback.initialize();
     expect(await afterRollback.publicAssetPath(
       "downloads",
-      "mycellios-node-linux-x64.tar.gz",
+      "mycellios-node-0.2.19-linux-x64.deb",
     )).toBeNull();
     expect(JSON.parse(readFileSync(join(storageRoot, "active.json"), "utf8")))
       .toEqual({
@@ -712,7 +734,7 @@ describe("release uploads", () => {
     ))).toBe(true);
     expect(await restarted.publicAssetPath(
       "downloads",
-      "mycellios-node-linux-x64.tar.gz",
+      "mycellios-node-0.2.19-linux-x64.deb",
     )).not.toBeNull();
   });
 
@@ -1016,6 +1038,60 @@ async function uploadLatest(
   });
 }
 
+function writeLegacyCommittedRelease(storageRoot: string) {
+  const transactionId = "legacy-archive-release-0001";
+  const packages = [
+    { target: "linux-x64", name: "mycellios-node-linux-x64.tar.gz", content: Buffer.from("legacy linux archive") },
+    { target: "macos-arm64", name: "mycellios-node-macos-arm64.tar.gz", content: Buffer.from("legacy mac archive") },
+    { target: "windows-x64", name: "mycellios-node-windows-x64.zip", content: Buffer.from("legacy windows archive") },
+  ];
+  const latest = Buffer.from(`${JSON.stringify({
+    schema: "mycellios-node-update-feed/1",
+    version: RELEASE_VERSION,
+    publishedAt: "2026-07-25T00:00:00.000Z",
+    packages: packages.map(({ target, name, content }) => ({
+      target, name, bytes: content.length, sha256: sha256(content),
+    })),
+  }, null, 2)}\n`);
+  const files = [
+    ...packages.map(({ name, content }) => ({ channel: "downloads" as const, fileName: name, content })),
+    { channel: "updates" as const, fileName: "mycellios-node-latest.json", content: latest },
+  ];
+  const assets = files.map(({ channel, fileName, content }) => ({
+    channel, fileName, fileSize: content.length, fileSha256: sha256(content),
+  }));
+  const manifest = buildReleaseTransactionManifest({
+    transactionId, sourceId: RUNTIME_SOURCE_ID, revision: RUNTIME_REVISION,
+    version: RELEASE_VERSION, schema: "mycellios-native-public-release/1", assets,
+  });
+  const root = join(storageRoot, "transactions", transactionId);
+  for (const [index, file] of files.entries()) {
+    const evidence = assets[index]!;
+    const assetRoot = join(root, "assets", file.channel);
+    const sealRoot = join(root, "asset-seals", file.channel);
+    mkdirSync(assetRoot, { recursive: true });
+    mkdirSync(sealRoot, { recursive: true });
+    writeFileSync(join(assetRoot, file.fileName), file.content);
+    writeFileSync(join(sealRoot, `${file.fileName}.json`), JSON.stringify({
+      ...evidence, chunkCount: 1,
+    }));
+  }
+  writeFileSync(join(root, "seal.json"), JSON.stringify({
+    schema: "mycellios-native-release-transaction-seal/1",
+    transactionId, sourceId: RUNTIME_SOURCE_ID,
+    revision: RUNTIME_REVISION, version: RELEASE_VERSION,
+  }));
+  writeFileSync(join(root, "commit.json"), JSON.stringify({
+    schema: "mycellios-native-release-commit/1", manifest,
+    previousTransactionId: null, previousReleaseId: null,
+  }));
+  writeFileSync(join(storageRoot, "active.json"), JSON.stringify({
+    schema: "mycellios-native-release-active/1",
+    transactionId, releaseId: manifest.releaseId,
+  }));
+  return manifest;
+}
+
 function releaseFixture(
   transactionId: string,
   _lineEnding: "\n" | "\r\n" = "\n",
@@ -1035,9 +1111,9 @@ function releaseFixture(
   const macos = Buffer.from("sealed macOS node package");
   const windows = Buffer.from("sealed Windows node package");
   const packageEvidence = [
-    { target: "linux-x64", name: "mycellios-node-linux-x64.tar.gz", content: linux },
-    { target: "macos-arm64", name: "mycellios-node-macos-arm64.tar.gz", content: macos },
-    { target: "windows-x64", name: "mycellios-node-windows-x64.zip", content: windows },
+    { target: "linux-x64", name: "mycellios-node-0.2.19-linux-x64.deb", content: linux },
+    { target: "macos-arm64", name: "mycellios-node-0.2.19-macos-arm64.pkg", content: macos },
+    { target: "windows-x64", name: "mycellios-node-0.2.19-windows-x64.msi", content: windows },
   ];
   const latest = Buffer.from(`${JSON.stringify({
     schema: "mycellios-node-update-feed/1",
@@ -1051,9 +1127,9 @@ function releaseFixture(
     })),
   }, null, 2)}\n`);
   const contents = new Map<string, Buffer>([
-    ["downloads/mycellios-node-linux-x64.tar.gz", linux],
-    ["downloads/mycellios-node-macos-arm64.tar.gz", macos],
-    ["downloads/mycellios-node-windows-x64.zip", windows],
+    ["downloads/mycellios-node-0.2.19-linux-x64.deb", linux],
+    ["downloads/mycellios-node-0.2.19-macos-arm64.pkg", macos],
+    ["downloads/mycellios-node-0.2.19-windows-x64.msi", windows],
     ["updates/mycellios-node-latest.json", latest],
   ]);
   const assets = [...contents.entries()].map(([path, content]) => {

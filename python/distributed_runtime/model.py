@@ -33,6 +33,9 @@ from .model_adapters import (
     SelectiveStageAdapter,
     resolve_selective_stage_adapter,
 )
+from .browser_layer_bridge import (
+    initialize_browser_layer_stage, close_browser_stage, reset_browser_stage, run_browser_stage,
+)
 
 MAX_PHYSICAL_STAGE_BATCH_SIZE = 8
 MAX_ACTIVATION_CHECKPOINT_PAYLOAD_BYTES = 512 * 1024 * 1024
@@ -275,9 +278,8 @@ class StageRunner:
             resident_dtype=compute_dtype,
             host_ram_budget_bytes=tiering_config.host_ram_budget_bytes,
         )
-        self._initialize_from_loaded_model(
-            spec,
-            model,
+        from .browser_dense_bridge import initialize_dense_stage_with_browser_bridge
+        initialize_dense_stage_with_browser_bridge(self, spec, model,
             loader="selective-safetensors",
             device_kinds=(execution_device.device.type,),
             execution_device=execution_device,
@@ -285,6 +287,7 @@ class StageRunner:
             move_model=True,
             dense_tiering=tiering_config,
         )
+        initialize_browser_layer_stage(self)
 
     def _initialize_from_loaded_model(
         self,
@@ -508,6 +511,7 @@ class StageRunner:
         self.active_requests.add(request_id)
 
     def end(self, request_id: int) -> None:
+        reset_browser_stage(self, request_id, end=True)
         self.caches.pop(request_id, None)
         self.tokens_seen.pop(request_id, None)
         self.active_requests.discard(request_id)
@@ -515,6 +519,7 @@ class StageRunner:
     def close(self) -> None:
         """Release request state; resident model tensors follow process lifetime."""
 
+        close_browser_stage(self)
         self.caches.clear()
         self.tokens_seen.clear()
         self.active_requests.clear()
@@ -538,6 +543,7 @@ class StageRunner:
             if not callable(crop):
                 raise TypeError("model cache does not support speculative rollback")
             crop(token_count)
+            reset_browser_stage(self, request_id, disable=True)
         self.tokens_seen[request_id] = token_count
 
     def request_cache_bytes(self, request_id: int) -> int:
@@ -825,6 +831,7 @@ class StageRunner:
             self.caches.pop(child_request_id, None)
         self.tokens_seen[child_request_id] = self.tokens_seen[parent_request_id]
         self.active_requests.add(child_request_id)
+        reset_browser_stage(self, child_request_id, disable=True)
         from .executor_abi import StageKVForkReport
 
         self._last_fork_report = StageKVForkReport(
@@ -848,6 +855,8 @@ class StageRunner:
             raise ValueError("promote parent and child request IDs must differ")
         self._require_active(parent_request_id)
         self._require_active(child_request_id)
+        reset_browser_stage(self, parent_request_id, disable=True)
+        reset_browser_stage(self, child_request_id, end=True)
 
         child_has_cache = child_request_id in self.caches
         child_cache = self.caches.get(child_request_id)
@@ -899,11 +908,8 @@ class StageRunner:
         if input_ids.dtype not in (torch.int32, torch.int64):
             raise TypeError("input_ids must contain integer token IDs")
         input_ids = input_ids.to(device=self._effective_compute_device())
-        output = self.base(
-            input_ids=input_ids,
-            past_key_values=self.caches.get(request_id),
-            use_cache=True,
-        )
+        output = run_browser_stage(self, request_id, input_ids=input_ids,
+            past_key_values=self.caches.get(request_id), use_cache=True)
         self.model_forward_calls += 1
         self.caches[request_id] = output.past_key_values
         self.tokens_seen[request_id] += int(input_ids.shape[1])
@@ -949,6 +955,8 @@ class StageRunner:
         tensors before this method returns.
         """
 
+        if getattr(self, "_browser_layer_bridge", None) is not None:
+            raise ValueError("browser layer stages require sequential requests")
         if not self.spec.first:
             raise RuntimeError("only the first stage accepts token IDs")
         ids, tensors, token_count = self._validate_physical_batch_inputs(
@@ -1021,11 +1029,8 @@ class StageRunner:
             device=self._effective_compute_device(),
             dtype=self._effective_compute_dtype(),
         )
-        output = self.base(
-            inputs_embeds=hidden,
-            past_key_values=self.caches.get(request_id),
-            use_cache=True,
-        )
+        output = run_browser_stage(self, request_id, inputs_embeds=hidden,
+            past_key_values=self.caches.get(request_id), use_cache=True)
         self.model_forward_calls += 1
         self.caches[request_id] = output.past_key_values
         self.tokens_seen[request_id] += int(hidden.shape[1])
@@ -1086,6 +1091,8 @@ class StageRunner:
         """
 
         self._require_active(request_id)
+        if getattr(self, "_browser_layer_bridge", None) is not None:
+            return None
         if not self._physical_batch_cache_supported:
             return None
         if (
@@ -1147,6 +1154,8 @@ class StageRunner:
     ]:
         """Execute one real tensor batch and split outputs/KV by request."""
 
+        if getattr(self, "_browser_layer_bridge", None) is not None:
+            raise ValueError("browser layer stages require sequential requests")
         if token_mode not in ("none", "last", "all"):
             raise ValueError("token_mode must be none, last or all")
         ids, tensors, token_count = self._validate_physical_batch_inputs(

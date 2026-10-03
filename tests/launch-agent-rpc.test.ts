@@ -49,6 +49,18 @@ afterEach(async () => {
 });
 
 describe("HTTP LaunchAgent RPC", () => {
+  it("accepts a source checkout without generated build identity", async () => {
+    const fake = new FakeAgent("fake:source-checkout");
+    const { address } = await serve(fake, "host-b", { buildIdentity: null });
+    const response = await fetch(`${address.url}/healthz`);
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      nodeId: "host-b",
+      buildIdentity: null,
+    });
+  });
+
   it("derives a valid stable agent id for an IPv6 endpoint", () => {
     const first = new HttpLaunchAgent({ endpoint: "http://[::1]:9750" });
     const second = new HttpLaunchAgent({ endpoint: "http://[::1]:9750" });
@@ -703,6 +715,21 @@ describe("HTTP LaunchAgent RPC", () => {
     const exited = expect(handle.exited).resolves.toEqual({ code: 7, signal: null });
     fake.handles.get(request.process.processId)!.exit({ code: 7, signal: null });
     await Promise.all([ready, exited]);
+  });
+
+  it("preserves an unsigned Windows child exit without crashing the agent", async () => {
+    const request = fixtureRequest();
+    const fake = new FakeAgent("fake:windows-exit", { autoReady: true });
+    const { address } = await serve(fake, request.nodeId);
+    const handle = await rpcClient(address).start(request, new AbortController().signal);
+    await handle.ready;
+    const windowsExit = 0xC000013A;
+    fake.handles.get(request.process.processId)!.exit({ code: windowsExit, signal: null });
+    await expect(handle.exited).resolves.toEqual({ code: windowsExit, signal: null });
+    await expect(rpcClient(address).health()).resolves.toMatchObject({
+      activeProcesses: 0,
+      retainedTombstones: 1,
+    });
   });
 
   it("rejects a conflicting retry without spawning another process", async () => {

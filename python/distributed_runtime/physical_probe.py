@@ -126,6 +126,7 @@ def collect_physical_probe(nonce: str) -> dict[str, Any]:
             "architecture": platform.machine().lower(),
             "kernelRelease": platform.release(),
             "pythonVersion": platform.python_version(),
+            "cpuDeviceName": platform.processor().strip() or "CPU",
         },
         "runtime": {
             "torchVersion": str(torch.__version__),

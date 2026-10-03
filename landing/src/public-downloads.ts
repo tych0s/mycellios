@@ -3,9 +3,9 @@ import type { PublicDownloadAvailability } from "../../src/contracts/public-down
 const DOWNLOADS_SCHEMA = "mycellios-public-downloads/1";
 
 export const PUBLIC_DOWNLOAD_OPTIONS = [
-  { id: "windows-x64", label: "Windows", detail: "Windows 10/11 · x64", format: "ZIP" },
-  { id: "macos-arm64", label: "macOS", detail: "Apple Silicon", format: "TAR.GZ" },
-  { id: "linux-x64", label: "Linux", detail: "Linux · x64", format: "TAR.GZ" },
+  { id: "windows-x64", label: "Windows", detail: "Windows 10/11 · x64", format: "MSI" },
+  { id: "macos-arm64", label: "macOS", detail: "Apple Silicon", format: "PKG" },
+  { id: "linux-x64", label: "Linux", detail: "Linux · x64", format: "DEB" },
 ] as const;
 
 export async function fetchPublicDownloadAvailability(signal?: AbortSignal): Promise<PublicDownloadAvailability> {
@@ -30,7 +30,7 @@ function isPublicDownloadAvailability(value: unknown): value is PublicDownloadAv
     const entry = item as Record<string, unknown>;
     return ["windows-x64", "macos-arm64", "linux-x64"].includes(String(entry.id))
       && typeof entry.label === "string"
-      && ["ZIP", "TAR.GZ"].includes(String(entry.format))
+      && ["MSI", "PKG", "DEB", "ZIP", "TAR.GZ"].includes(String(entry.format))
       && typeof entry.fileName === "string"
       && typeof entry.path === "string"
       && entry.path.startsWith("/downloads/")

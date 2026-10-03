@@ -40,6 +40,8 @@ import {
   type PythonPipelineLaunchDescription,
 } from "../distribution/python-launcher.js";
 import { isLaunchAgentStartRequest, runtimeFailureSummary } from "./runtime-start-validation.js";
+import { readResponseTextLimited } from "./response-limit.js";
+import { readWorkerRegistrationError } from "./registration-error.js";
 import { MAX_RUNTIME_STREAM_CHUNK_BYTES } from "../contracts/worker-protocol.js";
 import {
   RuntimeStreamTunnel,
@@ -628,6 +630,22 @@ export class WorkerAgent {
           delayMs = 500;
         } catch (error) {
           if (!this.stopped) this.logger.warn(`Worker connection failed: ${errorText(error)}`);
+          if (
+            !this.stopped
+            && !this.options.networkToken
+            && /^Unexpected server response: 401\b/.test(errorText(error))
+          ) {
+            // A coordinator restart or credential rotation can invalidate the
+            // scoped WebSocket session. Signed admission can issue a new one.
+            this.workerSessionToken = undefined;
+            this.registeredNodeGeneration = undefined;
+            try {
+              await this.register(signal);
+              delayMs = 500;
+            } catch (registrationError) {
+              if (!this.stopped) this.logger.warn(`Worker re-registration failed: ${errorText(registrationError)}`);
+            }
+          }
         }
         if (this.stopped || this.options.reconnect === false) break;
         await delay(delayMs, signal);
@@ -1195,9 +1213,7 @@ export class WorkerAgent {
         redirect: "manual",
       },
     );
-    if (!response.ok) {
-      throw new Error(`Worker registration failed with HTTP ${response.status}`);
-    }
+    if (!response.ok) throw await readWorkerRegistrationError(response);
     const serialized = await readResponseTextLimited(response, 64 * 1024);
     let decoded: unknown;
     try {
@@ -2653,29 +2669,6 @@ function coordinatorWebSocketUrl(base: URL, path: string): URL {
 
 function isLoopback(hostname: string): boolean {
   return LOOPBACK_HOSTS.has(hostname.toLowerCase());
-}
-
-async function readResponseTextLimited(response: Response, limitBytes: number): Promise<string> {
-  if (!response.body) return "";
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let result = "";
-  let bytes = 0;
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      bytes += value.byteLength;
-      if (bytes > limitBytes) {
-        throw new Error(`Response body exceeds ${limitBytes} bytes`);
-      }
-      result += decoder.decode(value, { stream: true });
-    }
-    result += decoder.decode();
-    return result;
-  } finally {
-    reader.releaseLock();
-  }
 }
 
 function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {

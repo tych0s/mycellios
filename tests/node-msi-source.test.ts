@@ -9,7 +9,9 @@ describe("native Windows MSI source", () => {
     ] });
     expect(source).toContain('InstallScope="perMachine"'); expect(source).toContain(".mycellios-enrollment");
     expect(source).toContain("[INSTALLFOLDER]install.ps1"); expect(source).toContain("%1"); expect(source).toContain("MYCELLIOSSOURCEREVISION");
-    expect(source.match(/<File /g)).toHaveLength(3); expect(source).not.toContain("enrollmentToken");
+    expect(source).toContain('<ServiceControl Id="svc_remove_myc_node" Name="MycelliosNode" Stop="uninstall" Remove="uninstall" Wait="yes" />');
+    expect(source.match(/<File /g)).toHaveLength(4); expect(source).toContain("layout-manifest.json");
+    expect(source).not.toContain("enrollmentToken");
   });
 
   it("is deterministic for identical source identity", () => {

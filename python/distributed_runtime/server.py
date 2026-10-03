@@ -9,6 +9,7 @@ import json
 import math
 import multiprocessing as mp
 from pathlib import Path
+import secrets
 import struct
 import sys
 import time
@@ -148,6 +149,9 @@ class PendingGeneration:
     events: asyncio.Queue[tuple[str, Any]] = field(default_factory=asyncio.Queue)
     abandoned: bool = False
     session_key: str | None = None
+    temperature: float = 0.0
+    top_p: float = 1.0
+    sampling_seed: bytes | None = None
 
 
 class ContinuousMicroBatcher:
@@ -255,6 +259,9 @@ class ContinuousMicroBatcher:
                 max_new_tokens=pending.max_new_tokens,
                 eos_token_ids=self.eos_token_ids,
                 session_key=pending.session_key,
+                temperature=pending.temperature,
+                top_p=pending.top_p,
+                sampling_seed=pending.sampling_seed,
             )
             for pending in batch
         ]
@@ -572,15 +579,21 @@ class DistributedMycelliosServer:
         if requested_model != self.public_model_name:
             raise ValueError(f"unknown model {requested_model!r}")
         temperature = exact_number(body.get("temperature", 0.0), "temperature")
-        if temperature != 0.0:
-            raise ValueError("this low-latency runtime currently supports greedy temperature=0 only")
+        if not 0.0 <= temperature <= 2.0:
+            raise ValueError("temperature must be between 0 and 2")
         top_p = exact_number(body.get("top_p", 1.0), "top_p")
         if not 0 < top_p <= 1:
             raise ValueError("top_p must be greater than 0 and at most 1")
         if exact_integer(body.get("n", 1), "n") != 1:
             raise ValueError("n must be 1")
-        if "seed" in body:
-            exact_integer(body["seed"], "seed")
+        seed = exact_integer(body["seed"], "seed") if "seed" in body else None
+        sampling_seed = (
+            hashlib.sha256(
+                b"mycellios-sampling-seed-v1\0" + str(seed).encode("ascii")
+            ).digest()
+            if seed is not None and temperature > 0
+            else secrets.token_bytes(32) if temperature > 0 else None
+        )
         if "stream" in body and type(body["stream"]) is not bool:
             raise ValueError("stream must be a boolean")
         messages = body.get("messages")
@@ -636,6 +649,9 @@ class DistributedMycelliosServer:
                 max_new_tokens=max_new_tokens,
                 prompt_tokens=prompt_tokens,
                 session_key=session_key,
+                temperature=temperature,
+                top_p=top_p,
+                sampling_seed=sampling_seed,
             ),
             body.get("stream", False),
         )
@@ -747,9 +763,13 @@ class DistributedMycelliosServer:
                     completed = True
                     break
                 elif kind == "error":
+                    unavailable = not self.engine.healthy
                     await write_sse(
                         response,
-                        {"error": {"message": str(payload), "type": "pipeline_error"}},
+                        {"error": {
+                            "message": str(payload),
+                            "type": "service_unavailable" if unavailable else "pipeline_error",
+                        }},
                     )
                     await response.write(b"data: [DONE]\n\n")
                     completed = True
@@ -780,6 +800,8 @@ class DistributedMycelliosServer:
                     # 500 genérico y no sabía que debía reintentar.
                     if isinstance(payload, QueueFullError):
                         return overloaded_response(payload)
+                    if not self.engine.healthy:
+                        return error_response(str(payload), "service_unavailable", 503)
                     return error_response(str(payload), "pipeline_error", 500)
                 elif kind == "done":
                     output: GenerationOutput = payload

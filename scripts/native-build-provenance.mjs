@@ -34,6 +34,8 @@ const SOURCE_INPUTS = Object.freeze([
   "landing/src",
   "src",
   "scripts",
+  "sidecars/windows-job-broker",
+  "sidecars/winsw-license.txt",
   ...NATIVE_PYTHON_PRODUCT_FILES.map((portable) => `python/${portable}`),
 ]);
 
@@ -169,7 +171,9 @@ function collectFiles(root, directory, output, observedPaths) {
       );
     }
     if (entry.isDirectory()) {
-      if (GENERATED_DIRECTORY_NAMES.has(entry.name)) continue;
+      const sidecarBuildOutput = (entry.name === "bin" || entry.name === "obj")
+        && portablePath(root, directory).startsWith("sidecars/");
+      if (GENERATED_DIRECTORY_NAMES.has(entry.name) || sidecarBuildOutput) continue;
       collectFiles(root, absolute, output, observedPaths);
     } else if (entry.isFile()) {
       addFileEvidence(root, absolute, output, observedPaths);

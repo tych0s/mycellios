@@ -56,6 +56,27 @@ describe("durable deployment control plane", () => {
     database.close();
   });
 
+  it("claims a new operation after a successful route loses capacity", () => {
+    const database = new MeshDatabase(":memory:");
+    const store = new MeshStore(database);
+    const model = addModel(store, "reconnect");
+    const controller = new DeploymentControlPlane(store, "controller-a");
+    controller.initialize(1_000);
+    const first = controller.claimOperation(model.id, "activate", { now: 2_000 })!;
+    expect(controller.completeOperation(first.id, "active", {}, 3_000)).toBe(true);
+    controller.markWaitingCapacity(model.id, "remote worker disconnected", 4_000);
+
+    const second = controller.claimOperation(model.id, "activate", { now: 5_000 })!;
+    expect(second.id).not.toBe(first.id);
+    expect(second.attempt).toBe(2);
+    expect(second.idempotencyKey).not.toBe(first.idempotencyKey);
+    expect(controller.getState(model.id)).toMatchObject({
+      activeOperationId: second.id,
+      observedState: "preparing",
+    });
+    database.close();
+  });
+
   it("reserves stage capacity atomically and publishes only after a canary commit", () => {
     const database = new MeshDatabase(":memory:");
     const store = new MeshStore(database);

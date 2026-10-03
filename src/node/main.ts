@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { loadWorkerConfig } from "../core/config.js";
 import { WorkerAgent } from "../worker/agent.js";
 import {
-  createHeadlessRuntime,
+  createNativeNodeRuntime,
   headlessEnvironmentFromNodeConfiguration,
 } from "../worker/headless-runtime.js";
 import { NodeConfigurationStore } from "./config-store.js";
@@ -29,7 +29,9 @@ import { NodeReconciliationStateStore } from "./reconciliation-state.js";
 import { MYCELLIOS_RUNTIME_ABI } from "../update/runtime-compatibility.js";
 import { NodeUninstallScheduler } from "./uninstall-helper.js";
 import { NodeEnrollmentBootstrap } from "./enrollment-bootstrap.js";
+import { activateNativeNodeAccelerator, prepareNativeNodeAccelerator } from "./native-accelerator.js";
 import { DEFAULT_NODE_WORK_POLICY, evaluateNodeWorkPolicy } from "../contracts/node-work-policy.js";
+import { probeRuntimePerformanceProfile } from "../performance/runtime-profile-probe.js";
 
 const configPath = argument("--config") ?? defaultNodeConfigurationPath();
 const allowLegacyMigration = process.argv.includes("--confirm-legacy-migration");
@@ -39,7 +41,7 @@ const config = loaded.config;
 if (loaded.migrated) await store.save(config);
 const version = packageVersion();
 const sourceRevision = await resolveNodeSourceRevision();
-const environment = headlessEnvironmentFromNodeConfiguration(config, version);
+let environment = headlessEnvironmentFromNodeConfiguration(config, version);
 const componentLifecycle = config.componentUpdates
   ? new NodeComponentLifecycle(config, version, async () => true, async () => async () => undefined)
   : null;
@@ -56,6 +58,17 @@ await assertNodeOsIsolation(config);
 const controlState = await controlStore.load();
 
 let agent: WorkerAgent | null = null;
+let supervisorStopRequested = false;
+let agentStarted = false;
+const stopForSupervisor = () => {
+  supervisorStopRequested = true;
+  if (agentStarted) void agent?.stop();
+};
+process.on("message", (message: unknown) => {
+  if (typeof message === "object" && message !== null && "type" in message
+    && message.type === "mycellios-node-stop") stopForSupervisor();
+});
+process.once("disconnect", stopForSupervisor);
 let governor: NodeResourceGovernor | null = null;
 let commandClientAbort: AbortController | null = null;
 let commandClient: Promise<void> | null = null;
@@ -68,12 +81,20 @@ try {
     componentInUseLease = await acquireComponentInUseLease(componentLifecycle.storageRoot, ["python-product"]);
     environment.pythonPath = componentInUseLease.roots["python-product"]!;
   }
-  const runtime = await createHeadlessRuntime(environment);
-  const device = runtime.physicalProbe.devices[0];
-  if (!device) throw new Error("mycellios_node_physical_probe_missing_device");
-  const detectedVramMiB = Math.floor(
-    Math.min(device.totalMemoryBytes, device.runtimeTotalMemoryBytes) / (1024 * 1024),
-  );
+  const accelerator = await prepareNativeNodeAccelerator({
+    configPath,
+    installRoot: dirname(dirname(config.runtime.pythonExecutable)),
+    allowProvisioning: false,
+  });
+  environment = activateNativeNodeAccelerator(environment, accelerator);
+  const runtime = await createNativeNodeRuntime(environment);
+  const device = runtime.verifiedGpuRuntime ? runtime.physicalProbe.devices[0] : undefined;
+  const detectedVramMiB = device
+    ? Math.floor(Math.min(device.totalMemoryBytes, device.runtimeTotalMemoryBytes) / (1024 * 1024))
+    : 0;
+  const offeredMemoryMiB = device
+    ? Math.min(detectedVramMiB, config.limits.maxVramMiB || detectedVramMiB)
+    : Math.max(512, Math.floor(config.limits.maxRamMiB / 2));
   const workerConfig = loadWorkerConfig(environment.configPath);
   const admissionSigner = await new NodeIdentityStore(
     config.coordinator.identityPath,
@@ -86,7 +107,7 @@ try {
   );
   agent = new WorkerAgent({
     ...workerConfig,
-    offeredVramMb: Math.min(detectedVramMiB, config.limits.maxVramMiB || detectedVramMiB),
+    offeredVramMb: offeredMemoryMiB,
     limits: {
       ...workerConfig.limits,
       maxConcurrency: Math.min(workerConfig.limits.maxConcurrency, config.limits.maxConcurrency),
@@ -99,15 +120,25 @@ try {
     reconnect: true,
     advertiseDeployment: false,
     agentVersion: version,
-    verifiedGpuRuntime: runtime.verifiedGpuRuntime,
-    preferredHardwareGpu: runtime.preferredHardwareGpu,
-    hardwareCapacityOverride: {
+    ...(runtime.verifiedGpuRuntime ? { verifiedGpuRuntime: runtime.verifiedGpuRuntime } : {}),
+    ...(runtime.preferredHardwareGpu ? { preferredHardwareGpu: runtime.preferredHardwareGpu } : {}),
+    ...(device && runtime.preferredHardwareGpu ? { hardwareCapacityOverride: {
       id: `physical-${device.index}`,
       vendor: runtime.preferredHardwareGpu.vendor,
       model: device.name,
       physicalVramMb: detectedVramMiB,
-    },
+    } } : {}),
     distributedExecutor: runtime.executor,
+    runtimePerformanceProfileProbe: () => probeRuntimePerformanceProfile({
+      pythonExecutable: environment.pythonExecutable,
+      pythonPath: [environment.pythonPath],
+      backend: runtime.verifiedGpuRuntime?.backend ?? "cpu",
+      device: runtime.verifiedGpuRuntime ? "cuda:0" : "cpu",
+      precision: runtime.verifiedGpuRuntime ? "float16" : "float32",
+      ...(runtime.verifiedGpuRuntime ? { expectedDeviceName: runtime.verifiedGpuRuntime.deviceName } : {}),
+      cwd: process.cwd(),
+      env: { HF_HOME: environment.cachePath },
+    }),
     contributionControl: {
       initialEnabled: controlState.contributionEnabled && !controlState.draining,
       onRemoteChange: async (enabled) => { await controlStore.setContributionEnabled(enabled); },
@@ -120,6 +151,7 @@ try {
     config.limits,
     resourceObserver,
     async (code) => {
+      failure = new Error(code);
       lastIncident = { code, occurredAt: new Date().toISOString() };
       await host.writeHealth("failed", config.revision, code);
       await controlStore.setContributionEnabled(false);
@@ -131,6 +163,8 @@ try {
     process.once(signal, () => void agent?.stop());
   }
   const running = agent.start();
+  agentStarted = true;
+  if (supervisorStopRequested) void agent.stop();
   await waitUntil(() => agent?.isReady === true, running, 60_000);
   const uninstall = config.uninstall
     ? new NodeUninstallScheduler(config.uninstall.manifestPath, join(host.stateDirectory, "uninstall-requests"))
@@ -199,7 +233,7 @@ try {
             policy: currentConfig.config.policy ?? DEFAULT_NODE_WORK_POLICY,
             activeCommandIds: journal.records.filter(({ state }) => state === "applying").map(({ commandId }) => commandId),
             build: { version, sourceRevision },
-            runtime: { ready: agent?.isReady === true, abi: MYCELLIOS_RUNTIME_ABI, backend: runtime.verifiedGpuRuntime.backend,
+            runtime: { ready: agent?.isReady === true, abi: MYCELLIOS_RUNTIME_ABI, backend: runtime.verifiedGpuRuntime?.backend ?? "cpu",
               uninstallAvailable: config.uninstall !== undefined },
             diagnostics: {
               capturedAt: new Date().toISOString(),
@@ -274,11 +308,17 @@ try {
   governor?.stop();
   await agent?.stop().catch(() => undefined);
   await componentInUseLease?.release().catch(() => undefined);
-  await host.release(
-    config.revision,
-    failure ? "failed" : "stopped",
-    failure instanceof Error ? failure.message : failure ? String(failure) : undefined,
-  );
+  try {
+    await host.release(
+      config.revision,
+      failure ? "failed" : "stopped",
+      failure instanceof Error ? failure.message : failure ? String(failure) : undefined,
+    );
+  } finally {
+    // The supervisor owns an IPC channel. Disconnect after shutdown so a
+    // completed child cannot stay alive and prevent the supervisor restart.
+    if (process.connected) process.disconnect();
+  }
 }
 
 function argument(name: string): string | undefined {

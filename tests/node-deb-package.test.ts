@@ -30,12 +30,17 @@ describe.runIf(process.platform === "linux" && process.arch === "x64")("native D
 async function stagedFixture() {
   const root = await mkdtemp(join(tmpdir(), "mycellios-deb-test-")); cleanup.push(root);
   const dist = join(root, "dist"), runtime = join(root, "runtime"), nodeModules = join(root, "node_modules"), output = join(root, "staged");
+  const pythonSource = join(root, "python", "distributed_runtime");
   await Promise.all([mkdir(join(dist, "node"), { recursive: true }), mkdir(join(dist, "contracts"), { recursive: true }), mkdir(runtime),
-    mkdir(join(nodeModules, "ws"), { recursive: true }), mkdir(join(nodeModules, "zod"), { recursive: true }), mkdir(join(root, "host"))]);
+    mkdir(join(nodeModules, "ws"), { recursive: true }), mkdir(join(nodeModules, "zod"), { recursive: true }), mkdir(join(root, "host")),
+    mkdir(pythonSource, { recursive: true })]);
   await Promise.all(["main.js", "install-main.js", "uninstall-main.js"].map((name) => writeFile(join(dist, "node", name), "export {};\n")));
   await writeFile(join(dist, "contracts", "node-control.js"), "export {};\n"); await writeFile(join(runtime, "runtime-manifest.json"), JSON.stringify({ platform: "linux", arch: "x64" }));
   await writeFile(join(runtime, "bin"), "runtime"); await writeFile(join(nodeModules, "ws", "package.json"), "{}"); await writeFile(join(nodeModules, "zod", "package.json"), "{}");
+  await Promise.all([writeFile(join(pythonSource, "__init__.py"), ""),
+    writeFile(join(pythonSource, "physical_probe.py"), ""),
+    writeFile(join(pythonSource, "model_adapter_registry.json"), "{}")]);
   const nodeExecutable = join(root, "host", "node"); await writeFile(nodeExecutable, "node");
-  await stageNodeInstaller({ output, dist, runtime, nodeExecutable, nodeModules, target: "linux-x64", sourceRevision: "a".repeat(40), sourceProvenance: buildNativeSourceProvenance(resolve(".")) });
+  await stageNodeInstaller({ output, dist, runtime, pythonSource, nodeExecutable, nodeModules, target: "linux-x64", sourceRevision: "a".repeat(40), sourceProvenance: buildNativeSourceProvenance(resolve(".")) });
   return { root, output };
 }

@@ -78,7 +78,7 @@
     "pythonPath": "python",
     "hfHome": "runtime/hf-cache",
     "apiEndpoint": { "host": "127.0.0.1", "port": 8081 },
-    "apiAdvertiseHost": "192.0.2.10",
+    "apiAdvertiseHost": "127.0.0.1",
     "returnEndpoint": { "host": "192.0.2.10", "port": 18100 },
     "returnBindHost": "0.0.0.0",
     "threadsPerStage": 1,

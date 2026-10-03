@@ -128,10 +128,13 @@ export class MycelliosPipelineAdapter implements InferenceAdapter {
         );
       }
       let index = 0;
+      let completed = false;
+      let done = false;
       for await (const payload of readSseData(response.body)) {
-        if (payload === "[DONE]") break;
+        if (payload === "[DONE]") { done = true; break; }
         const parsed = JSON.parse(payload) as {
-          choices?: Array<{ delta?: { content?: string }; text?: string }>;
+          error?: { message?: string; type?: string };
+          choices?: Array<{ delta?: { content?: string }; text?: string; finish_reason?: string | null }>;
           usage?: {
             prompt_tokens?: number;
             completion_tokens?: number;
@@ -142,6 +145,22 @@ export class MycelliosPipelineAdapter implements InferenceAdapter {
             reused_kv_tokens?: number;
           };
         };
+        if (parsed.error) {
+          if (parsed.error.type === "service_unavailable") this.ready = false;
+          throw new AdapterError(
+            `Native pipeline stream failed: ${String(parsed.error.message ?? "unknown error").slice(0, 300)}`,
+            "mycellios_pipeline_stream_failed",
+            index === 0 && parsed.error.type === "service_unavailable",
+          );
+        }
+        const reason = parsed.choices?.[0]?.finish_reason;
+        const inputTokens = parsed.usage?.prompt_tokens;
+        const outputTokens = parsed.usage?.completion_tokens;
+        if ((reason === "stop" || reason === "length")
+          && typeof inputTokens === "number" && Number.isInteger(inputTokens) && inputTokens >= 0
+          && typeof outputTokens === "number" && Number.isInteger(outputTokens) && outputTokens >= 0) {
+          completed = true;
+        }
         const text = parsed.choices?.[0]?.delta?.content ?? parsed.choices?.[0]?.text ?? "";
         if (text) yield { index: index++, text };
         const metrics = parsed.distribution_metrics;
@@ -158,6 +177,13 @@ export class MycelliosPipelineAdapter implements InferenceAdapter {
             },
           };
         }
+      }
+      if (!completed || !done) {
+        throw new AdapterError(
+          "Native pipeline stream ended without verified completion and token usage",
+          "mycellios_pipeline_stream_incomplete",
+          false,
+        );
       }
     } finally {
       this.activeJobs -= 1;

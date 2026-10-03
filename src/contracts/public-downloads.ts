@@ -8,7 +8,7 @@ export const publicDownloadAvailabilitySchema = z.object({
   packages: z.array(z.object({
     id: z.enum(["windows-x64", "macos-arm64", "linux-x64"]),
     label: z.string().min(1),
-    format: z.enum(["ZIP", "TAR.GZ"]),
+    format: z.enum(["MSI", "PKG", "DEB", "ZIP", "TAR.GZ"]),
     fileName: z.string().min(1),
     path: z.string().startsWith("/downloads/"),
     available: z.boolean(),

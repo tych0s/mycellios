@@ -60,6 +60,20 @@ function mobileAssets(): Plugin {
           packageVersion.version,
         ),
       });
+      for (const name of [
+        "ort-wasm-simd-threaded.mjs",
+        "ort-wasm-simd-threaded.wasm",
+        "ort-wasm-simd-threaded.jsep.mjs",
+        "ort-wasm-simd-threaded.jsep.wasm",
+        "ort-wasm-simd-threaded.asyncify.mjs",
+        "ort-wasm-simd-threaded.asyncify.wasm",
+      ]) {
+        this.emitFile({
+          type: "asset",
+          fileName: `ort/${name}`,
+          source: readFileSync(resolve(workspaceRoot, "node_modules/onnxruntime-web/dist", name)),
+        });
+      }
     },
   };
 }

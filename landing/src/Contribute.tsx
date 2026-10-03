@@ -201,7 +201,7 @@ function BrowserContribution({
       <div className="contribute-browser-action">
         <div className="contribute-browser-facts" aria-label="Browser worker details">
           <span><Cpu /><small>Engine</small><strong>{worker.backend === "webgpu" ? "WebGPU" : "CPU"}</strong></span>
-          <span><Activity /><small>Work</small><strong>{worker.verifiedTasks > 0 ? `${worker.verifiedTasks} verified` : "No tasks yet"}</strong></span>
+          <span><Activity /><small>Model jobs</small><strong>{worker.verifiedTasks > 1 ? `${worker.verifiedTasks - 1} verified` : "Waiting"}</strong></span>
         </div>
         <button
           ref={startButtonRef}
@@ -212,6 +212,10 @@ function BrowserContribution({
           {worker.running ? "Pause contribution" : "Start contributing"}
         </button>
       </div>
+
+      <p className="contribute-browser-explainer">
+        No installation needed. Keep this tab visible. When a compatible model layer is available, the network can assign it to this browser after validation on WebGPU or CPU. The native runtime offers the highest sustained performance.
+      </p>
 
       <div className="contribute-power-row">
         <span>Power</span>
@@ -266,7 +270,7 @@ function NativeNodeSetup(
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = url;
-      anchor.download = `mycellios-pair-${bundle.enrollmentId.slice(0, 8)}.json`;
+      anchor.download = `mycellios-pair-${bundle.enrollmentId.slice(0, 8)}.mycellios-enrollment`;
       anchor.click();
       URL.revokeObjectURL(url);
       props.onNotice(
