@@ -3199,3 +3199,33 @@ harness exited 0. Receipts: `runtime/native-node-lab/physical-repeat-0286-ci-rec
 `cleanup-0286-ci-recovered-20261001.json`. These short lab measurements do not
 establish a browser/native performance ratio, sustained throughput or recovery
 of the interrupted request itself.
+
+
+### 2026-10-03 native route with both agents reporting 0.2.86
+
+The live private coordinator now reports PC-DANI's source CPU agent as 0.2.86.
+MRPUCCHI initially appeared offline despite running native, SSH and Tailscale
+services; its private HTTP coordinator endpoint was reachable. A normal restart
+of only MycelliosNode restored its connection. No deployment, protected
+PC-DANI controller restart or network policy change was performed. The cause
+of that prior disconnection is not established.
+
+A fresh physical generation completed at 2026-10-03T09:08:30.454Z through
+PC-DANI CPU layers [0,3) and MRPUCCHI CUDA [3,30), with both agents reporting
+0.2.86 and the same pinned SmolLM2 revision used above. Request TTFT was
+141 ms. Its separate 16-token activation canary measured 172.444 ms TTFT,
+86.642 ms TPOT and 11.542 tokens/s. Observed peak Python working sets were
+716,505,088 and 1,400,860,672 bytes respectively, not exclusive VRAM. Cleanup
+observed zero requested models and zero remaining model-stage processes on
+either host, with both workers connected; the harness exited 0. Receipts:
+`runtime/native-node-lab/physical-repeat-0286-ci-both86-20261003.json`,
+`inference-0286-ci-both86-20261003.json` and
+`cleanup-0286-ci-both86-20261003.json`.
+
+This closes the observed agent-version mismatch for this physical run. It
+does not prove two installed packages from the same release: PC-DANI's source
+agent has no independently verified installed-package provenance in this
+receipt. The tracked execution code is unchanged from release commit
+785c4d23428f947468dad6f62f4495f31402e27b; later tracked changes are documentation
+and specification records. Package identity, trusted signing, public owned
+enrollment and external tester installations remain separate gates.
