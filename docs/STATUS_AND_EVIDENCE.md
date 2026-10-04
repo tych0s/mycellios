@@ -3391,3 +3391,19 @@ children and no remote stage/server processes; native service, SSH and VPN
 were Running. Receipts are retained under
 `runtime/native-node-lab/installed-gpus-0287-20261004-loss/`. The installer
 signing, trusted physical receipt and external tester gates remain open.
+
+On 2026-10-04, native release evidence verification was hardened to inspect
+the actual Windows MSI whenever signing is required or its provenance claims
+`signed`. Windows Authenticode must report `Valid`, the publisher certificate
+must match an independently supplied thumbprint, a timestamp must exist and
+the inspected SHA-256 must match the release evidence. Inspection holds a
+read lock to prevent concurrent file replacement. Metadata alone cannot
+authorize a signed candidate; unsupported Debian/macOS signature checks fail
+closed. Unsigned internal candidate builds are unaffected.
+
+The actual CI 0.2.87 MSI was inspected on Windows and rejected as unsigned by
+the new verifier. Receipt:
+`runtime/native-public-pc-dani-0287/signature-rejection.json`. This is a real
+negative validation, not successful publisher signing. No valid certificate
+with a private key was found in this machine's user or machine signing stores;
+a valid signed MSI acceptance test and public promotion remain unavailable.

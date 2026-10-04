@@ -4,6 +4,7 @@ import { basename, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { buildNodeCycloneDx, NODE_RELEASE_EVIDENCE_SCHEMA } from "./node-release-evidence.mjs";
 import { verifyNodeInstaller } from "./verify-node-installer.mjs";
+import { verifyWindowsAuthenticode } from "./windows-authenticode.mjs";
 
 export async function verifyNodeReleaseEvidence(input) {
   const artifact = resolve(input.artifact), staged = resolve(input.stagedRoot);
@@ -27,10 +28,16 @@ export async function verifyNodeReleaseEvidence(input) {
   if (evidence.sbom?.sha256 !== sha256(sbomBytes) || checksum !== `${artifactSha}  ${name}\n`) throw new Error("node_release_checksum_evidence_mismatch");
   if (evidence.signature?.requiredForPromotion !== true) throw new Error("node_release_signature_policy_is_missing");
   if (input.requireSigned && evidence.signature?.state !== "signed") throw new Error("node_release_artifact_is_not_signed");
+  if (input.requireSigned || evidence.signature?.state === "signed") {
+    if (layout.target !== "windows-x64" || evidence.artifact.format !== "msi") {
+      throw new Error("node_release_platform_signature_verifier_unavailable");
+    }
+    verifyWindowsAuthenticode({ artifact, sha256: artifactSha, signerThumbprint: input.signerThumbprint });
+  }
   return evidence;
 }
 async function readJson(path) { return JSON.parse(await readFile(path, "utf8")); }
 function sha256(bytes) { return createHash("sha256").update(bytes).digest("hex"); }
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) { const values = Object.fromEntries(process.argv.slice(2).map((argument) => { const match = /^--([^=]+)=(.+)$/.exec(argument); if (!match) throw new Error(`node_release_verify_argument_is_invalid:${argument}`); return [match[1], match[2]]; }));
   for (const key of ["artifact", "staged-root", "evidence", "sbom", "checksum"]) if (!values[key]) throw new Error(`node_release_verify_argument_is_missing:${key}`);
-  await verifyNodeReleaseEvidence({ artifact: values.artifact, stagedRoot: values["staged-root"], evidencePath: values.evidence, sbomPath: values.sbom, checksumPath: values.checksum, requireSigned: values["require-signed"] === "true" }); process.stdout.write(`Native node release evidence verified: ${values.artifact}\n`); }
+  await verifyNodeReleaseEvidence({ artifact: values.artifact, stagedRoot: values["staged-root"], evidencePath: values.evidence, sbomPath: values.sbom, checksumPath: values.checksum, requireSigned: values["require-signed"] === "true", signerThumbprint: values["signer-thumbprint"] }); process.stdout.write(`Native node release evidence verified: ${values.artifact}\n`); }

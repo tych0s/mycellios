@@ -323,3 +323,22 @@ For a partial installation, preserve logs and protected configuration for
 diagnosis. Do not disable security controls or copy private identity material
 into a troubleshooting report. Pause contribution before leaving the machine
 unused; distinguish pausing work from uninstalling or revoking ownership.
+
+### Windows package signature verification before publication
+
+The release verifier checks any artifact labelled `signed`, and also rejects
+an unsigned artifact when `--require-signed=true` is requested. Windows MSI
+verification must run on Windows with `--signer-thumbprint=<expected publisher
+certificate thumbprint>` supplied independently of the provenance document.
+Use the existing `scripts/verify-node-release-evidence.mjs` arguments for the
+artifact, staged payload, provenance, SBOM and checksum, adding those two
+options for a signed publication candidate.
+
+The verifier requires Windows Authenticode status `Valid`, the expected
+publisher, a timestamp and the same SHA-256 as the release evidence. Signing
+changes the MSI bytes: regenerate provenance and checksum for the signed file
+before verifying it. Merely editing its `signature.state` is insufficient.
+Unsigned candidate assembly remains available for internal validation.
+Signed Debian/macOS verification is currently unsupported and is rejected.
+This command verifies a prepared package; it does not purchase certificates,
+sign files, grant certificate trust or publish a release.

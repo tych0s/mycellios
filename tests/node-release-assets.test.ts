@@ -7,6 +7,7 @@ import { assembleNodeReleaseAssets } from "../scripts/assemble-node-release-asse
 import { buildNativeSourceProvenance } from "../scripts/native-build-provenance.mjs";
 import { stageNodeInstaller } from "../scripts/stage-node-installer.mjs";
 import { writeNodeReleaseEvidence } from "../scripts/node-release-evidence.mjs";
+import { verifyNodeReleaseEvidence } from "../scripts/verify-node-release-evidence.mjs";
 import { preparePublicReleaseTransaction } from "../src/coordinator/public-release-transaction-cli.js";
 import { NativeReleaseTransactionStore } from "../src/coordinator/release-upload.js";
 
@@ -102,6 +103,33 @@ describe("native node release asset assembly", () => {
       "node-package", "macos-arm64", "runtime", ".mycellios-runtime-marker"));
     await expect(assembleNodeReleaseAssets(fixture.input)).rejects.toThrow("node_installer_layout_digest_mismatch");
     await expect(access(fixture.outputRoot)).rejects.toThrow();
+  });
+
+  it("rejects a signed metadata label without a platform verifier before assembly", async () => {
+    const fixture = await createCiFixture();
+    const target = "linux-x64", name = `mycellios-node-${fixture.version}-${target}.deb`;
+    const path = join(fixture.artifactsRoot, `mycellios-node-${target}`, "evidence", target, `${name}.provenance.json`);
+    const evidence = JSON.parse(await readFile(path, "utf8"));
+    evidence.signature.state = "signed";
+    await writeFile(path, `${JSON.stringify(evidence, null, 2)}\n`);
+    await expect(assembleNodeReleaseAssets(fixture.input)).rejects.toThrow("node_release_platform_signature_verifier_unavailable");
+    await expect(access(fixture.outputRoot)).rejects.toThrow();
+  });
+
+  it.runIf(process.platform === "win32")("rejects fabricated Windows bytes even when provenance claims signed", async () => {
+    const fixture = await createCiFixture();
+    const target = "windows-x64", name = `mycellios-node-${fixture.version}-${target}.msi`;
+    const jobRoot = join(fixture.artifactsRoot, `mycellios-node-${target}`);
+    const evidenceRoot = join(jobRoot, "evidence", target);
+    const evidencePath = join(evidenceRoot, `${name}.provenance.json`);
+    const evidence = JSON.parse(await readFile(evidencePath, "utf8"));
+    evidence.signature.state = "signed";
+    await writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
+    await expect(verifyNodeReleaseEvidence({
+      artifact: join(jobRoot, name), stagedRoot: join(jobRoot, "node-package", target),
+      evidencePath, sbomPath: join(evidenceRoot, `${name}.cdx.json`),
+      checksumPath: join(evidenceRoot, `${name}.sha256`), signerThumbprint: "0".repeat(40),
+    })).rejects.toThrow(/node_release_authenticode_(not_valid|inspection_failed)/);
   });
 });
 
