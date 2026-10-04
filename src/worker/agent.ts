@@ -21,6 +21,7 @@ import { createAdapter } from "../adapters/factory.js";
 import { sha256Text } from "../core/json.js";
 import { estimateInputTokens } from "../core/request.js";
 import { safeVramBudget } from "../core/tiers.js";
+import { createHeartbeatHardwareSampler } from "./heartbeat-hardware.js";
 import {
   probeHardware,
   selectHardwareGpu,
@@ -529,6 +530,7 @@ const RUNTIME_RECONNECT_GRACE_MS = 45_000;
 
 export class WorkerAgent {
   private readonly adapter: InferenceAdapter;
+  private readonly readHeartbeatHardware: () => HardwareProbe | null;
   private readonly coordinatorBaseUrl: URL;
   private registeredWorkerId: string | undefined;
   private workerSessionToken: string | undefined;
@@ -587,6 +589,9 @@ export class WorkerAgent {
       );
     }
     this.adapter = createAdapter(config);
+    this.readHeartbeatHardware = createHeartbeatHardwareSampler(
+      () => this.options.hardwareProbe?.() ?? probeHardware(),
+    );
     this.logger = options.logger ?? console;
     this.contributionEnabled = options.contributionControl?.initialEnabled ?? true;
     this.runtimeTunnel = options.distributedExecutor
@@ -2510,12 +2515,10 @@ export class WorkerAgent {
 
   private async sendHeartbeat(): Promise<void> {
     if (!this.capabilities || !this.socket || this.socket.readyState !== WebSocket.OPEN) return;
-    const [metrics, liveHardware] = await Promise.all([
-      this.adapter.metrics(),
-      this.config.capacityScope === "host"
-        ? (this.options.hardwareProbe?.() ?? probeHardware()).catch(() => null)
-        : Promise.resolve(null),
-    ]);
+    const metrics = await this.adapter.metrics();
+    const liveHardware = this.config.capacityScope === "host"
+      ? this.readHeartbeatHardware()
+      : null;
     if (liveHardware) {
       this.capabilities = {
         ...this.capabilities,

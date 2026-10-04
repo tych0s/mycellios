@@ -325,6 +325,7 @@ export async function createNativeNodeRuntime(
 async function collectHeadlessProbe(config: HeadlessWorkerEnvironment, collector?: PhysicalProbeCollector): Promise<PhysicalProbeV1> {
   return (collector ?? new PythonPhysicalProbe({
     pythonExecutable: config.pythonExecutable,
+    timeoutMs: 120_000, // Cold vendor imports can exceed 30s under desktop load.
     cwd: process.cwd(),
     env: { PYTHONPATH: config.pythonPath, HF_HOME: config.cachePath, PYTHONDONTWRITEBYTECODE: "1" },
   })).collect(`headless-${randomBytes(16).toString("hex")}`);

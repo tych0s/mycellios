@@ -292,8 +292,19 @@ only in [STATUS_AND_EVIDENCE.md](STATUS_AND_EVIDENCE.md).
 
 Use this sequence for a supervised operator pilot. Before inviting a third
 party, check the signing and download gates in
-[STATUS_AND_EVIDENCE.md](STATUS_AND_EVIDENCE.md). Do not distribute an unsigned
-candidate as the public installer.
+[STATUS_AND_EVIDENCE.md](STATUS_AND_EVIDENCE.md). The operator has chosen to
+continue the supervised pilot with the existing unsigned candidate. Tell each
+participant that it is a pilot package without a verified Windows publisher
+signature before they agree to install it. Windows policy may prevent its
+installation; record that stopping point and preserve the policy. Do not
+disable protections or present this candidate as the public signed installer.
+
+For a participant, the short sequence is: use their own account, obtain a fresh
+pairing bundle, open the prepared launcher, approve administrator elevation,
+wait for Ready, and verify Pause/Resume and an actual inference together with
+the operator. Initial runtime downloads can take time. An expired bundle may
+require a fresh one and reopening the same launcher. This account installation
+does not require the private lab USB, administrator SSH or Tailscale enrollment.
 
 1. Record the participant, machine, Windows version, CPU/GPU, start time and
    exact package version, commit and SHA-256. Keep credentials out of the log.
@@ -317,7 +328,7 @@ candidate as the public installer.
    A connected node alone does not demonstrate model participation.
 7. Record elapsed time, every intervention and the exact stopping point. Count
    an external attempt only after the named participant actually starts it.
-   Count inference participation only with a receipt identifying that machine.
+Count inference participation only with a receipt identifying that machine.
 
 For a partial installation, preserve logs and protected configuration for
 diagnosis. Do not disable security controls or copy private identity material

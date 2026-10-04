@@ -3407,3 +3407,62 @@ the new verifier. Receipt:
 negative validation, not successful publisher signing. No valid certificate
 with a private key was found in this machine's user or machine signing stores;
 a valid signed MSI acceptance test and public promotion remain unavailable.
+
+The operator subsequently chose to continue the accompanied pilot using the
+existing unsigned 0.2.87 candidate. A separate package was prepared under
+`runtime/native-node-lab/pilot-0287-20261004/`, containing the verified CI MSI,
+checksum, single launcher, installation script, participant instructions and
+an empty attempt register. Its independently checked MSI SHA-256 is
+`fb3d985ebe7d856400819588e5c8376017e37e6bee52cab07a72cd96a122498d`;
+Windows still reports `NotSigned`. No pairing bundle or private lab access
+credential was included. Each participant must consent to the unsigned pilot
+and obtain a fresh bundle from their own account before installation. This
+preparation is not a fresh installation, an external attempt or authorization
+to weaken Windows policy; public signed release requirements remain open.
+
+An additional recovery fixture started at 11:10 UTC selected the existing
+0.2.86 CPU worker and MRPUCCHI instead of the intended two installed GPU
+workers. The temporary ROCm worker repeatedly reported heartbeat expiry
+(`4410`, `worker heartbeat stale`) during calibration. The operator cancelled
+this fixture before generation; it is not a passing post-loss GPU inference.
+Only its requested model and temporary harness were removed. At 11:14 UTC,
+observation found zero local or remote stage/server Python processes and
+MRPUCCHI's native service, SSH and VPN Running. Receipts are under
+`runtime/native-node-lab/installed-gpus-0287-20261004-recovered/`. Reliable
+participation of the calibrated GPU worker in this recovery scenario remains
+open; earlier successful installed-GPU receipts are separate observations.
+
+A subsequent installed-runtime diagnostic returned a valid ROCm physical
+probe after 59,866 ms despite the vendor `offload-arch` warning. The headless
+default probe budget was 30 seconds. Source now allows 120 seconds for this
+initial headless probe; this source adjustment is not installed in the 0.2.87
+MSI. The recovery fixture used the installed collector's supported 120-second
+timeout option and waited for measured GPU calibration before model admission.
+
+At 11:27 UTC, that fixture completed a new physical two-GPU generation:
+MRPUCCHI CUDA `[0,27)` and PC-DANI ROCm `[27,30)`, both installed 0.2.87,
+FP16, and the same pinned SmolLM2 revision. The exact response text matched
+the independent full-model reference, with 17 generated tokens and 107 ms
+request TTFT. Its 16-token canary measured 85.311 ms TTFT, 73.072 ms TPOT and
+13.685 tokens/s. Peak Python working sets were 1,098,600,448 bytes on PC-DANI
+and 1,529,294,848 bytes on MRPUCCHI; these are not exclusive VRAM measurements.
+Model cleanup recorded zero requested models and a disconnected temporary
+client. Independent observation at 11:28 UTC found zero local or remote stage
+Python processes, with remote native service, SSH and VPN Running. Receipts
+are under `runtime/native-node-lab/installed-gpus-0287-20261004-calibrated-recovery2/`.
+The coordinator still runs 0.2.86 source; token-by-token distributed parity,
+a trusted signed receipt and external installation attempts are unproved.
+This later generation proves recovery with operator preparation, not
+transparent failover or that the earlier heartbeat expiry has been fixed.
+
+A focused regression reproduced a separate liveness defect: a pending OS
+hardware telemetry query prevented `sendHeartbeat` from transmitting at all.
+Source now samples that optional telemetry asynchronously, keeps at most one
+query in flight, and sends heartbeats without waiting for it. The regression
+failed on the previous implementation and passed after the correction; an
+unavailable telemetry sample also recovered without fabricated hardware.
+Thirty-three focused worker, capacity, lifecycle and headless tests passed,
+along with type, structure and architecture verification. Candidate 0.2.88
+contains this correction and the larger initial physical-probe budget.
+These are source checks, not installed 0.2.88 two-PC evidence; they do not
+establish that delayed OS telemetry caused the earlier physical disconnects.
