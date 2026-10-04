@@ -3284,3 +3284,18 @@ to `win-x64-py312-torch291-rocm721-v2.pending-0287`. MycelliosNode was restarted
 normally to recover CPU operation while a corrected package is prepared.
 The installed 0.2.86 application source was not patched. The 0.2.87 packaged
 upgrade and GPU service recovery remain pending at this observation.
+
+A subsequent full-model ROCm test exposed Transformers 5.x unguarded DTensor
+checks when the official Windows Torch build lacks c10d. The compatibility
+adapter now supplies an unconstructible sentinel only when DTensor is absent;
+ordinary tensor loading works while distributed tensor/FSDP operations remain
+unavailable. Real distributed builds retain their genuine types. With this
+source correction, full SmolLM2 FP16 generation on the Radeon 890M completed
+with the same output text as the CPU reference. Cold observed TTFT was
+2797.611 ms and TPOT 75.318 ms; peak Torch allocated memory was 304,429,056
+bytes, not total device memory. Receipt:
+`runtime/native-node-lab/rocm-full-model-reference-20261004.json`. This is a
+single-host operator test with the recorded source correction, not public
+native-service recovery, a browser comparison or a multi-host repetition.
+The earlier 0.2.87 CI build was cancelled before using its package, so the
+replacement candidate includes both the diagnostic and loading corrections.

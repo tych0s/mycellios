@@ -104,4 +104,24 @@ def install_windows_rocm_transformers_compat(
     sharding._dtensor_from_local_like = unsupported
     sharding.__all__ = ["DtensorShardOperation", "_dtensor_from_local_like"]
     registry[_TRANSFORMERS_SHARDING_MODULE] = sharding
+    if module_registry is None:
+        install_rocm_loading_compat(importlib.import_module("transformers.core_model_loading"))
+    return True
+
+
+def install_rocm_loading_compat(loader_module: Any) -> bool:
+    """Keep ordinary tensors loadable when Transformers omitted DTensor.
+
+    Transformers 5.x performs unguarded isinstance checks even when c10d is
+    unavailable. An unconstructible sentinel makes those checks false for
+    ordinary tensors; it does not provide or advertise distributed tensors.
+    """
+    if hasattr(loader_module, "DTensor"):
+        return False
+
+    class UnavailableDTensor:
+        def __new__(cls, *_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("DTensor is unavailable in the official AMD ROCm runtime for Windows")
+
+    loader_module.DTensor = UnavailableDTensor
     return True

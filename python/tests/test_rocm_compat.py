@@ -3,10 +3,25 @@ from __future__ import annotations
 import types
 import unittest
 
-from distributed_runtime.rocm_compat import install_windows_rocm_transformers_compat
+from distributed_runtime.rocm_compat import install_rocm_loading_compat, install_windows_rocm_transformers_compat
 
 
 class WindowsRocmTransformersCompatTests(unittest.TestCase):
+    def test_loading_without_dtensor_keeps_checks_false_and_sharding_unavailable(self) -> None:
+        loader = types.SimpleNamespace()
+        self.assertTrue(install_rocm_loading_compat(loader))
+        self.assertFalse(isinstance(object(), loader.DTensor))
+        with self.assertRaisesRegex(RuntimeError, "DTensor is unavailable"):
+            loader.DTensor()
+        sentinel = loader.DTensor
+        self.assertFalse(install_rocm_loading_compat(loader))
+        self.assertIs(loader.DTensor, sentinel)
+
+    def test_real_dtensor_is_preserved(self) -> None:
+        loader = types.SimpleNamespace(DTensor=object)
+        self.assertFalse(install_rocm_loading_compat(loader))
+        self.assertIs(loader.DTensor, object)
+
     def test_cpu_and_cuda_builds_are_untouched(self) -> None:
         registry: dict[str, object] = {}
         torch_module = types.SimpleNamespace(version=types.SimpleNamespace(hip=None))
