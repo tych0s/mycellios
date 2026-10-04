@@ -287,3 +287,39 @@ The recovery task starts before Windows login. Interactive Jarvis desktop
 control still requires a Windows user session; administrative SSH is a
 separate recovery route. Current test evidence and pending gates are recorded
 only in [STATUS_AND_EVIDENCE.md](STATUS_AND_EVIDENCE.md).
+
+### Accompanied native account installation
+
+Use this sequence for a supervised operator pilot. Before inviting a third
+party, check the signing and download gates in
+[STATUS_AND_EVIDENCE.md](STATUS_AND_EVIDENCE.md). Do not distribute an unsigned
+candidate as the public installer.
+
+1. Record the participant, machine, Windows version, CPU/GPU, start time and
+   exact package version, commit and SHA-256. Keep credentials out of the log.
+2. Sign in to the participant's own Mycellios account. Open Run, expand
+   **Use a dedicated computer**, and create one pairing bundle immediately
+   before installation. Pairing grants ownership to that account; do not reuse
+   another participant's bundle.
+3. Put the bundle beside the single verified MSI and its checksum in `Node`.
+   Open `windows-usb-node-install.cmd` once and accept Windows administrator
+   elevation. Leave the installer running while it prepares the runtime.
+4. If enrollment expires during MSI installation, record the failure. Create
+   a fresh bundle in the same account, replace the expired source bundle and
+   reopen the same launcher. Keep its `msi-reboot.json` checkpoint; recovery
+   validates the registered MSI and continues pairing without reinstalling it.
+   Do not delete the installed identity or service configuration.
+5. Refresh Owned nodes. Match the new node, check the observed backend and
+   connection, then test Pause and Resume on that specific node. Wait for each
+   command to be **applied**; queued alone is insufficient.
+6. Request the pinned pilot model through the assigned network route. Save
+   output, assigned ranges, TTFT, TPOT, process memory and cleanup observations.
+   A connected node alone does not demonstrate model participation.
+7. Record elapsed time, every intervention and the exact stopping point. Count
+   an external attempt only after the named participant actually starts it.
+   Count inference participation only with a receipt identifying that machine.
+
+For a partial installation, preserve logs and protected configuration for
+diagnosis. Do not disable security controls or copy private identity material
+into a troubleshooting report. Pause contribution before leaving the machine
+unused; distinguish pausing work from uninstalling or revoking ownership.

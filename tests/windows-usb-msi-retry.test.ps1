@@ -23,7 +23,7 @@ function Start-Process {param($FilePath,$ArgumentList,[switch]$Wait,[switch]$Pas
 function powershell.exe { $script:bootstrapRuns++; $global:LASTEXITCODE=1 }
 try {
   $env:ProgramFiles=Join-Path $root 'programs'
-  $PackageDirectory=Join-Path $root 'Node'; $ReturnRebootCode=$true; $PreflightOnly=$false
+  $PackageDirectory=Join-Path $root 'Node'; $ReturnRebootCode=$false; $PreflightOnly=$false
   $null=New-Item -ItemType Directory -Path $PackageDirectory,(Join-Path $env:ProgramFiles 'Mycellios') -Force
   [IO.File]::WriteAllText((Join-Path $PackageDirectory 'mycellios-node-0.2.82-windows-x64.msi'),'fixture bytes, not a real MSI')
   [IO.File]::WriteAllText((Join-Path $env:ProgramFiles 'Mycellios\install.ps1'),'# bootstrap fixture')

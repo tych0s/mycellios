@@ -3229,3 +3229,41 @@ receipt. The tracked execution code is unchanged from release commit
 785c4d23428f947468dad6f62f4495f31402e27b; later tracked changes are documentation
 and specification records. Package identity, trusted signing, public owned
 enrollment and external tester installations remain separate gates.
+
+### 2026-10-04 public account enrollment and independent reference
+
+PC-DANI was installed from the 0.2.86 Windows CI MSI (SHA-256
+`82061471037ad1b8d8849471e063700ebc4d73211a4faa630d1ff5863632f7de`).
+Windows Installer recorded successful installation at 06:20:38Z. The installed
+manifest reports release commit `785c4d23428f947468dad6f62f4495f31402e27b`
+and source identity `sha256:523333b99132b8bd15d52b494759b960cb322710642db47e839d6ffa78d57607`.
+The MSI is unsigned; this supervised operator installation does not authorize
+public installer promotion.
+
+The first one-time enrollment expired during the approximately 13-minute MSI
+installation. A fresh bundle was redeemed through the installed resume entry
+point, retaining the node identity and skipping MSI installation. At 06:25Z,
+protected health reported ready with no error and no pending enrollment.
+The public account subsequently showed `node-b26ff63` connected, build 0.2.86,
+CPU backend. Pause and Resume were each observed as applied in the account;
+the final observed snapshot was ready at 06:29:10Z. Screenshots and sanitized
+diagnostics are under `runtime/native-public-pc-dani-0286/`. ROCm preparation
+for the Radeon 890M remains in progress at this observation; GPU execution,
+sustained connection, public model assignment and inference are not yet proved
+by this installation check. This operator-owned node is not an external tester.
+
+The ordinary Windows USB node launcher now persists the verified MSI checkpoint
+even without `-ReturnRebootCode`. A failed pairing can therefore resume without
+reinstalling the same MSI. The regression test covers the ordinary launcher,
+retained package identity and rejection of altered MSI bytes. This does not
+extend pairing expiry or silently issue account credentials.
+
+A separate single-host CPU reference reproduced the exact text of the physical
+2026-10-03 generation using the pinned SmolLM2 revision, full float32 model,
+eager attention and greedy decoding. Its weights SHA-256 was
+`5af571cbf074e6d21a03528d2330792e532ca608f24ac70a143f6b369968ab8c`.
+Receipt: `runtime/native-node-lab/native-short-reference-20261004.json`.
+This establishes text parity for that prompt, not token-by-token distributed
+parity, model answer quality or a new physical multi-host run. The committed
+trusted physical receipt remains open: the physical evidence trust registry
+currently contains no signing keys. External tester attempts remain unverified.
