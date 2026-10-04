@@ -3365,3 +3365,29 @@ test remains evidence of recovery with an explicit stream error, not
 transparent failover; it was not repeated against 0.2.87 in this run.
 Public Authenticode signing, a committed trusted physical receipt and actual
 external tester attempts remain open.
+
+At 09:07 UTC on 2026-10-04, a controlled loss test repeated the same installed
+0.2.87 GPU route and pinned SmolLM2 model, with PC-DANI ROCm `[0,7)` and
+MRPUCCHI CUDA `[7,30)`. Warm-up generation completed; its response TTFT was
+120 ms and the activation canary measured TTFT 110.714 ms, TPOT 70.086 ms and
+14.268 tokens/s. This is another physical sample, not a controlled benchmark
+comparison. The private coordinator remained source version 0.2.86.
+
+After the first non-empty streamed token at 09:07:35.879 UTC, the harness
+stopped only MRPUCCHI's MycelliosNode service. SSH and Tailscale remained
+Running. The stream ended with `adapter_error` requiring a deterministic seed
+for exact replay; `[DONE]` accompanied this error and does not mean successful
+inference. Local monotonic timestamps prove first token, fault dispatch,
+service-stop acknowledgment and stream termination occurred in that order.
+The service was restored at 09:07:44 UTC and its 0.2.87 worker reconnected by
+09:07:59 UTC. This establishes explicit interrupted-inference behavior and
+service recovery, not transparent failover, a power-loss test or a successful
+post-recovery generation.
+
+The loss harness exited successfully. Model cleanup recorded zero requested
+models and the temporary installed GPU client disconnected. A separate
+09:08 UTC observation found no recorded local stage PID, no controller Python
+children and no remote stage/server processes; native service, SSH and VPN
+were Running. Receipts are retained under
+`runtime/native-node-lab/installed-gpus-0287-20261004-loss/`. The installer
+signing, trusted physical receipt and external tester gates remain open.
