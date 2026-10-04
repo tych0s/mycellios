@@ -3299,3 +3299,69 @@ single-host operator test with the recorded source correction, not public
 native-service recovery, a browser comparison or a multi-host repetition.
 The earlier 0.2.87 CI build was cancelled before using its package, so the
 replacement candidate includes both the diagnostic and loading corrections.
+
+The replacement native CI run `37184131325` passed Windows, Linux, macOS and
+release assembly. Both physical PCs subsequently installed its 0.2.87 Windows
+MSI successfully, with no reboot requested by either installer. Their installed
+manifests match revision `fbc81863da1e395d2dd44d4331553b95149a7b82` and source ID
+`sha256:e40e4be1f5ac88eea7e2fb312ad5617b58c560ac86dd9633e3c214e96e80ac51`.
+This is the PR merge snapshot built by CI; its runtime source matches branch
+commit `c2f2a1d9fb4fb81b682db8a6f458213e05204778`. The MSI SHA-256 is
+`fb3d985ebe7d856400819588e5c8376017e37e6bee52cab07a72cd96a122498d`.
+
+PC-DANI's installed native service reached Ready on ROCm 7.2 with the Radeon
+890M after restoring its retained, verified accelerator cache. Its public
+paired node reported build 0.2.87, one accelerator, and both Pause and Resume
+commands applied. MRPUCCHI's installed service reached Ready on CUDA 12.6;
+MycelliosNode, SSH and Tailscale were Running with automatic startup at
+07:57 UTC. This establishes current service recovery and control, not a promise
+of uninterrupted future connectivity. Observations are retained under
+`runtime/native-public-pc-dani-0287/` and
+`runtime/native-node-lab/mrpucchi-installed-0287-provenance.json`.
+The candidate MSI remains Authenticode NotSigned and has not been promoted as
+a public signed installer. Same installed builds being Ready does not itself
+prove a distributed generation using those two installed executors.
+
+A subsequent private-network generation did use both installed 0.2.87
+executors: the temporary PC-DANI headless client ran layers `[0,6)` on ROCm
+FP16, while MRPUCCHI's persistent native service ran `[6,30)` on CUDA FP16.
+The existing private coordinator remained source version 0.2.86; it was not
+restarted or upgraded for this test. The model and pinned weights match the
+references above. Output text exactly matched the independent full-model CPU
+reference, and the response identified both GPUs and the artifact digest.
+Observed response TTFT was 160 ms. Its 16-token activation canary measured
+TTFT 160.297 ms, TPOT 79.014 ms and 12.656 tokens/s. Receipts are under
+`runtime/native-node-lab/installed-gpus-0287-20261004/`.
+
+The first activation selected the older CPU executor before the new GPU's
+calibration completed; automatic replanning subsequently selected the two
+installed GPUs. The test harness's DELETE mistakenly sent an empty JSON body
+and received HTTP 400 after generation. A corrected DELETE removed the model;
+the recovery snapshot records zero requested models and the temporary client
+disconnected. This first run does not close the memory and complete-cleanup
+measurement gate; a repeat with corrected cleanup is required. These local
+receipts are not committed, trusted signed physical evidence, and no external
+tester installation or invitation is established by this operator run.
+
+The corrected repeat completed at 08:11 UTC with the same installed packages
+and model: MRPUCCHI CUDA ran `[0,23)` and PC-DANI ROCm ran `[23,30)`, both FP16.
+Its output again exactly matched the independent full-model CPU reference;
+distributed token-by-token parity was not recorded. Response TTFT was 134 ms.
+The 16-token activation canary measured TTFT 93.314 ms, TPOT 68.078 ms and
+14.689 tokens/s. Peak Python process working sets were 1,124,134,912 bytes on
+PC-DANI and 1,502,662,656 bytes on MRPUCCHI; these are process memory, not
+exclusive GPU memory. The changed layer placement and network timing mean
+these samples are not a controlled performance comparison with earlier runs.
+
+The repeat harness exited successfully. Cleanup recorded zero requested
+models and the temporary installed client disconnected. A separate process
+observation at 08:12 UTC found neither recorded stage PID, no Python children
+of the private controller and no remote stage/server processes. The existing
+PC-DANI source CPU controller and MRPUCCHI native service stayed connected.
+Evidence, text/range assertions and file SHA-256 digests are retained under
+`runtime/native-node-lab/installed-gpus-0287-20261004-repeat/`. These digests
+provide file integrity checks, not trusted signatures. The prior 0.2.86 loss
+test remains evidence of recovery with an explicit stream error, not
+transparent failover; it was not repeated against 0.2.87 in this run.
+Public Authenticode signing, a committed trusted physical receipt and actual
+external tester attempts remain open.
