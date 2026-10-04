@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stdout
 import hashlib
 import json
 import os
@@ -11,7 +12,9 @@ import sys
 from typing import Any
 import uuid
 
-import torch
+# Vendor Python bootstrap messages must not contaminate the JSON protocol.
+with redirect_stdout(sys.stderr):
+    import torch
 
 
 SCHEMA = "gdlp-physical-probe/1"
@@ -151,9 +154,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    with redirect_stdout(sys.stderr):
+        probe = collect_physical_probe(args.nonce)
     print(
         json.dumps(
-            collect_physical_probe(args.nonce),
+            probe,
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,

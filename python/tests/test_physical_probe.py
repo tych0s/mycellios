@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from contextlib import redirect_stderr, redirect_stdout
+import io
+import json
 import unittest
 from unittest.mock import patch
 
-from distributed_runtime.physical_probe import collect_physical_probe
+from distributed_runtime.physical_probe import collect_physical_probe, main
 
 
 class _FakeCuda:
@@ -44,6 +47,21 @@ class _FakeDistributed:
 
 
 class PhysicalProbeTests(unittest.TestCase):
+    def test_cli_keeps_vendor_diagnostics_out_of_json_stdout(self) -> None:
+        def noisy_probe(nonce):
+            print("[WARNING] offload-arch failed with return code 1")
+            return {"nonce": nonce}
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (
+            patch("distributed_runtime.physical_probe.collect_physical_probe", noisy_probe),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(main(["--nonce", "campaign-nonce-0001"]), 0)
+        self.assertEqual(json.loads(stdout.getvalue()), {"nonce": "campaign-nonce-0001"})
+        self.assertIn("offload-arch", stderr.getvalue())
+
     def test_probe_reports_hashed_identity_gpu_memory_and_nccl(self) -> None:
         fake_torch = SimpleNamespace(
             __version__="2.test",

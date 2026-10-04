@@ -3267,3 +3267,20 @@ This establishes text parity for that prompt, not token-by-token distributed
 parity, model answer quality or a new physical multi-host run. The committed
 trusted physical receipt remains open: the physical evidence trust registry
 currently contains no signing keys. External tester attempts remain unverified.
+
+ROCm preparation subsequently passed its real FP16 operation on the Radeon
+890M. Activation then exposed a separate startup failure:
+`physical_probe_output_is_not_json`. The SDK prints an `offload-arch` warning
+to stdout while importing Torch, before the valid physical-probe JSON. This
+was reproduced with the installed runtime; it is not a missing GPU permission.
+The candidate 0.2.87 redirects Python vendor bootstrap and probe diagnostics
+to stderr while retaining strict JSON, nonce and capability validation.
+A real probe with the corrected source returned valid JSON, Torch
+2.9.1+rocm7.2.1, ROCm 7.2.53211-158bd99533 and the Radeon 890M. This probe ran
+under the operator account, not as evidence of a recovered native service.
+
+The verified GPU runtime was retained by renaming only its owned cache directory
+to `win-x64-py312-torch291-rocm721-v2.pending-0287`. MycelliosNode was restarted
+normally to recover CPU operation while a corrected package is prepared.
+The installed 0.2.86 application source was not patched. The 0.2.87 packaged
+upgrade and GPU service recovery remain pending at this observation.
