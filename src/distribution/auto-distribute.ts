@@ -8,6 +8,11 @@ import type { NativeBuildIdentity } from "../contracts/build-identity.js";
 import { workerConfigSchema, type WorkerConfig } from "../contracts/schemas.js";
 import { readNativeRuntimeBuildMetadata } from "../core/native-build-identity.js";
 import { WorkerAgent } from "../worker/agent.js";
+import { WorkerRegistrationError } from "../worker/registration-error.js";
+import {
+  loadOrCreateWorkerAdmissionCredential,
+  workerAdmissionSigner,
+} from "../worker/admission-credential.js";
 import { evaluateDistributionPlan, stageMemoryBytes } from "./cost-model.js";
 import { HttpLaunchAgent } from "./launch-agent-rpc.js";
 import {
@@ -36,6 +41,7 @@ import type {
   StagePlacement,
 } from "./types.js";
 import { UNMEASURED_RTT_MS } from "../core/rtt.js";
+import { browserLayerRuntimeEnvironment } from "./process-environment.js";
 
 export const AUTO_DISTRIBUTE_SCHEMA = "gdlp-auto-distribute/1";
 export const MODEL_PROFILE_SCHEMA = "gdlp-model-profile/1";
@@ -183,6 +189,7 @@ export const autoDistributionConfigSchema = z
         returnBindHost: z.string().min(1).max(253).default("0.0.0.0"),
         threadsPerStage: z.number().int().positive().max(1_024).default(1),
         connectTimeoutSeconds: z.number().positive().max(86_400).default(300),
+        operationTimeoutSeconds: z.number().positive().max(86_400).optional(),
         readinessTimeoutMs: z.number().int().positive().max(86_400_000).default(600_000),
         maxOutputTokens: z.number().int().positive().max(32_768).default(2_048),
       })
@@ -419,6 +426,7 @@ export function compileAutoDistribution(
       pythonExecutable: config.runtime.stagePythonExecutable ?? absoluteFrom(cwd, config.runtime.pythonExecutable),
     threadsPerStage: config.runtime.threadsPerStage,
     connectTimeoutSeconds: config.runtime.connectTimeoutSeconds,
+    ...(config.runtime.operationTimeoutSeconds === undefined ? {} : { operationTimeoutSeconds: config.runtime.operationTimeoutSeconds }),
     batchWindowMs: config.workload.batchWindowMs,
     maxOutputTokens: config.runtime.maxOutputTokens,
   });
@@ -589,18 +597,42 @@ export async function runAutoDistribution(
         collectExecutionTelemetry(compilation, runningSnapshot),
       );
       const token = optionalSecret(environment, config.coordinator.networkTokenEnv);
-      worker = new WorkerAgent(workerConfig, {
-        coordinatorUrl: config.coordinator.url,
+      const legacyCredentialPath = resolve(
+        cwd,
+        environment.MYCELLIOS_WORKER_CREDENTIAL_PATH
+          ?? "runtime/worker-admission-credential.json",
+      );
+      const cellIdentity = automaticCellIdentity(config, compilation);
+      const cellCredentialPath = automaticCellCredentialPath(legacyCredentialPath, cellIdentity);
+      const createCellWorker = (credentialPath: string) => new WorkerAgent(workerConfig, {
+        coordinatorUrl: config.coordinator!.url,
+        admissionSigner: workerAdmissionSigner(
+          loadOrCreateWorkerAdmissionCredential(credentialPath),
+        ),
         ...(workerAgentVersion ? { agentVersion: workerAgentVersion } : {}),
         ...(workerBuildIdentity ? { buildIdentity: workerBuildIdentity } : {}),
         ...(token ? { networkToken: token } : {}),
-        identity: {
-          kind: "cell",
-          id: automaticCellIdentity(config, compilation),
-        },
+        identity: { kind: "cell", id: cellIdentity },
       });
+      // An existing installation may have enrolled its first cell with the
+      // historical shared key. New cell identities get their own key.
+      const useLegacyKey = existsSync(legacyCredentialPath) && !existsSync(cellCredentialPath);
+      worker = createCellWorker(useLegacyKey ? legacyCredentialPath : cellCredentialPath);
       workerPromise = worker.start();
-      await waitForWorkerRegistration(worker, workerPromise, 30_000);
+      try {
+        await waitForWorkerRegistration(worker, workerPromise, 30_000);
+      } catch (error) {
+        const reusedLegacyKey = useLegacyKey
+          && error instanceof WorkerRegistrationError
+          && error.status === 409
+          && error.code === "worker_credential_reused";
+        if (!reusedLegacyKey) throw error;
+        await worker.stop();
+        await workerPromise.catch(() => undefined);
+        worker = createCellWorker(cellCredentialPath);
+        workerPromise = worker.start();
+        await waitForWorkerRegistration(worker, workerPromise, 30_000);
+      }
     }
     const result: AutoDistributionRunResult = {
       ...compilation,
@@ -701,6 +733,13 @@ function automaticCellIdentity(
     .digest("hex")
     .slice(0, 32);
   return `cell-${digest}`;
+}
+
+export function automaticCellCredentialPath(basePath: string, cellIdentity: string): string {
+  if (!/^cell-[a-f0-9]{32}$/.test(cellIdentity)) {
+    throw new Error("automatic_cell_identity_invalid");
+  }
+  return resolve(`${basePath}.cells`, `${cellIdentity}.json`);
 }
 
 function validateCompiledProfile(value: unknown): CompiledModelProfile {
@@ -1026,6 +1065,7 @@ async function createLaunchAgents(
       PYTHONPATH: absoluteFrom(cwd, config.runtime.pythonPath),
       HF_HOME: absoluteFrom(cwd, config.runtime.hfHome),
       TOKENIZERS_PARALLELISM: "false",
+      ...browserLayerRuntimeEnvironment(environment),
     },
   });
   for (const node of config.nodes) {

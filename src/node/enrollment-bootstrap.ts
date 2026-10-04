@@ -36,7 +36,7 @@ export class NodeEnrollmentBootstrap {
     if (process.platform !== "win32" && (stats.mode & 0o077) !== 0) throw new Error("node_enrollment_bundle_permissions_are_unsafe");
     if (stats.size > 4_096) throw new Error("node_enrollment_bundle_is_too_large");
     const bundle = nodeEnrollmentBundleSchema.parse(JSON.parse(await readFile(this.path, "utf8")));
-    if (Date.parse(bundle.expiresAt) <= this.now()) throw new Error("node_enrollment_bundle_expired");
+    const expired = Date.parse(bundle.expiresAt) <= this.now();
     const expected = normalizedCoordinator(this.expectedCoordinatorUrl);
     if (normalizedCoordinator(bundle.coordinatorUrl) !== expected) throw new Error("node_enrollment_bundle_coordinator_mismatch");
     const body = nodeEnrollmentRedeemSchema.parse({
@@ -67,6 +67,9 @@ export class NodeEnrollmentBootstrap {
       }
       throw new Error(code ?? `node_enrollment_http_${response.status}`);
     }
+    // The coordinator can confirm an already-consumed bundle after a lost reply,
+    // including after expiry. It must never accept a new expired enrollment.
+    if (expired) throw new Error("node_enrollment_bundle_expired");
     const result = responseSchema.parse(payload);
     if (result.enrollmentId !== bundle.enrollmentId || result.identity.kind !== input.identity.kind || result.identity.id !== input.identity.id) {
       throw new Error("node_enrollment_response_identity_mismatch");

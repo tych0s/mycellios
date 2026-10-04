@@ -15,6 +15,7 @@ export interface PhysicalProbeHostV1 {
   architecture: string;
   kernelRelease: string;
   pythonVersion: string;
+  cpuDeviceName?: string;
 }
 
 export interface PhysicalProbeRuntimeV1 {
@@ -184,6 +185,7 @@ function validateHost(value: unknown): asserts value is PhysicalProbeHostV1 {
       "architecture",
       "kernelRelease",
       "pythonVersion",
+      ...(value.cpuDeviceName === undefined ? [] : ["cpuDeviceName"]),
     ],
     "physical_probe_host",
   );
@@ -194,6 +196,7 @@ function validateHost(value: unknown): asserts value is PhysicalProbeHostV1 {
     "architecture",
     "kernelRelease",
     "pythonVersion",
+    ...(value.cpuDeviceName === undefined ? [] : ["cpuDeviceName"]),
   ] as const) {
     normalizedText(value[key], `physical_probe_host_${key}_is_invalid`);
   }

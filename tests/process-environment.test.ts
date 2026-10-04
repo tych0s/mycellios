@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  browserLayerRuntimeEnvironment,
   buildIsolatedProcessEnvironment,
   executorIsolationCapabilityFromPolicy,
   ISOLATED_PROCESS_INHERITED_ENVIRONMENT_KEYS,
@@ -8,6 +9,25 @@ import {
 } from "../src/distribution/process-environment.js";
 
 describe("isolated process environment", () => {
+  it("grants browser layer discovery only from an explicit safe origin and credential", () => {
+    expect(browserLayerRuntimeEnvironment({ MYCELLIOS_INTERNAL_TOKEN: "unused" })).toEqual({});
+    expect(browserLayerRuntimeEnvironment({
+      MYCELLIOS_BROWSER_LAYER_COORDINATOR_URL: "https://mycellios.example",
+      MYCELLIOS_INTERNAL_TOKEN_FILE: "C:/private/browser-layer-token",
+      HF_TOKEN: "not-for-the-stage",
+    })).toEqual({
+      MYCELLIOS_BROWSER_LAYER_COORDINATOR_URL: "https://mycellios.example",
+      MYCELLIOS_INTERNAL_TOKEN_FILE: "C:/private/browser-layer-token",
+    });
+    expect(() => browserLayerRuntimeEnvironment({
+      MYCELLIOS_BROWSER_LAYER_COORDINATOR_URL: "http://remote.example",
+      MYCELLIOS_INTERNAL_TOKEN: "secret",
+    })).toThrow("browser_layer_coordinator_origin_is_invalid");
+    expect(() => browserLayerRuntimeEnvironment({
+      MYCELLIOS_BROWSER_LAYER_COORDINATOR_URL: "https://mycellios.example",
+    })).toThrow("browser_layer_internal_token_is_missing");
+  });
+
   it("inherits only reviewed system keys and explicit overrides", () => {
     const environment = buildIsolatedProcessEnvironment({
       source: {

@@ -37,7 +37,7 @@ describe("mobile compute hub", () => {
     const address = runtime.app.server.address() as AddressInfo;
     const registration = await runtime.app.inject({
       method: "POST", url: "/mobile/v1/register",
-      payload: registrationPayload(),
+      payload: gpuRegistrationPayload(),
     });
     const credentials = registration.json<{ workerId: string; token: string }>();
     const socket = new WebSocket(
@@ -46,7 +46,7 @@ describe("mobile compute hub", () => {
     expect((await nextMessage(socket)).type).toBe("server.ready");
     const replicaRegistration = await runtime.app.inject({
       method: "POST", url: "/mobile/v1/register",
-      payload: { ...registrationPayload(), clientId: "mobile-client-replica", name: "Replica phone" },
+      payload: { ...gpuRegistrationPayload(), clientId: "mobile-client-replica", name: "Replica phone" },
     });
     const replicaCredentials = replicaRegistration.json<{ workerId: string; token: string }>();
     const replicaSocket = new WebSocket(
@@ -175,6 +175,51 @@ describe("mobile compute hub", () => {
     expect(rig.runtime.mobileHub.listWorkers()[0]?.verifiedTasks).toBe(1);
   });
 
+  it("does not give model work to CPU-only browsers after admission", async () => {
+    const rig = await createExpertRig(["honest", "honest"], "cpu");
+    const executed = await rig.runtime.app.inject({
+      method: "POST", url: "/internal/v1/mobile/experts/execute",
+      headers: { authorization: "Bearer expert-admin" },
+      payload: rig.executionPayload,
+    });
+    expect(executed.statusCode).toBe(503);
+    expect(rig.runtime.mobileHub.listWorkers()).toEqual([
+      expect.objectContaining({ backend: "cpu", verifiedTasks: 1, residentExperts: [] }),
+      expect.objectContaining({ backend: "cpu", verifiedTasks: 1, residentExperts: [] }),
+    ]);
+  });
+
+  it("removes GPU eligibility when a validated browser falls back to CPU", async () => {
+    const rig = await createExpertRig(["honest", "honest"]);
+    rig.sockets[0]!.send(JSON.stringify({
+      v: 1, type: "mobile.heartbeat",
+      payload: { visible: true, wakeLock: false, backend: "cpu", estimatedGflops: 0.5 },
+    }));
+    await waitUntil(() => rig.runtime.mobileHub.listWorkers().some((worker) => worker.backend === "cpu"));
+    const executed = await rig.runtime.app.inject({
+      method: "POST", url: "/internal/v1/mobile/experts/execute",
+      headers: { authorization: "Bearer expert-admin" },
+      payload: rig.executionPayload,
+    });
+    expect(executed.statusCode).toBe(503);
+  });
+
+  it.each(["cpu-load", "cpu-execute"] as const)(
+    "rejects a model result that fell back to CPU during %s",
+    async (mode) => {
+      const rig = await createExpertRig(["honest", mode]);
+      const executed = await rig.runtime.app.inject({
+        method: "POST", url: "/internal/v1/mobile/experts/execute",
+        headers: { authorization: "Bearer expert-admin" },
+        payload: rig.executionPayload,
+      });
+      expect(executed.statusCode).toBe(503);
+      expect(rig.runtime.mobileHub.listWorkers().every(
+        (worker) => worker.residentExperts.length === 0,
+      )).toBe(true);
+    },
+  );
+
   it("discards mismatched replicated expert tensors", async () => {
     const rig = await createExpertRig(["honest", "mismatch"]);
     const executed = await rig.runtime.app.inject({
@@ -254,7 +299,7 @@ describe("mobile compute hub", () => {
     );
     const verified = await nextMessage(socket);
     expect(verified.type).toBe("compute.verified");
-    expect(verified.payload).toMatchObject({ inferenceReady: true, verifiedTasks: 1 });
+    expect(verified.payload).toMatchObject({ inferenceReady: false, verifiedTasks: 1 });
 
     socket.send(JSON.stringify({ v: 1, type: "work.request", payload: {} }));
     await expectNoMessage(socket);
@@ -394,8 +439,21 @@ function registrationPayload() {
   };
 }
 
-async function createExpertRig(modes: Array<"honest" | "mismatch">): Promise<{
+function gpuRegistrationPayload() {
+  const payload = registrationPayload();
+  return {
+    ...payload,
+    backend: "webgpu" as const,
+    capabilities: { ...payload.capabilities, webgpu: true },
+  };
+}
+
+async function createExpertRig(
+  modes: Array<"honest" | "mismatch" | "cpu-load" | "cpu-execute">,
+  backend: "webgpu" | "cpu" = "webgpu",
+): Promise<{
   runtime: CoordinatorRuntime;
+  sockets: WebSocket[];
   executionPayload: { artifactId: string; rows: number; hiddenSize: number; activationsBase64: string };
 }> {
   const runtime = await createCoordinator({
@@ -446,12 +504,14 @@ async function createExpertRig(modes: Array<"honest" | "mismatch">): Promise<{
   expect(artifact.statusCode).toBe(201);
   const { artifactId } = artifact.json<{ artifactId: string }>();
 
+  const sockets: WebSocket[] = [];
+
   for (const [index, mode] of modes.entries()) {
     const registration = await runtime.app.inject({
       method: "POST",
       url: "/mobile/v1/register",
       payload: {
-        ...registrationPayload(),
+        ...(backend === "webgpu" ? gpuRegistrationPayload() : registrationPayload()),
         clientId: `replica-client-${index}`,
         name: `Replica ${index}`,
         joinToken: "trusted-expert-invite",
@@ -461,8 +521,9 @@ async function createExpertRig(modes: Array<"honest" | "mismatch">): Promise<{
     const socket = new WebSocket(
       `ws://127.0.0.1:${address.port}/mobile/v1/connect?workerId=${credentials.workerId}&token=${credentials.token}`,
     );
+    sockets.push(socket);
     expect((await nextMessage(socket)).type).toBe("server.ready");
-    await validateMobileWorker(socket);
+    await validateMobileWorker(socket, backend);
     socket.on("message", (raw) => {
       const message = JSON.parse(raw.toString()) as { type: string; payload: Record<string, unknown> };
       if (message.type === "expert.load") {
@@ -471,7 +532,7 @@ async function createExpertRig(modes: Array<"honest" | "mismatch">): Promise<{
           leaseId: message.payload.leaseId,
           artifactId,
           canaryOutputBase64: floatBuffer(canaryOutput).toString("base64"),
-          backend: "webgpu",
+          backend: mode === "cpu-load" ? "cpu" : "webgpu",
           durationMs: 1,
         } }));
       }
@@ -486,7 +547,7 @@ async function createExpertRig(modes: Array<"honest" | "mismatch">): Promise<{
           rows: message.payload.rows,
           hiddenSize: 1,
           outputBase64: floatBuffer(output).toString("base64"),
-          backend: "webgpu",
+          backend: mode === "cpu-execute" ? "cpu" : "webgpu",
           durationMs: 1,
         } }));
       }
@@ -496,6 +557,7 @@ async function createExpertRig(modes: Array<"honest" | "mismatch">): Promise<{
   const activations = new Float32Array([0.25]);
   return {
     runtime,
+    sockets,
     executionPayload: {
       artifactId,
       rows: 1,
@@ -525,7 +587,7 @@ function nextMessage(socket: WebSocket): Promise<{ type: string; payload: unknow
   });
 }
 
-async function validateMobileWorker(socket: WebSocket): Promise<void> {
+async function validateMobileWorker(socket: WebSocket, backend: "webgpu" | "cpu" = "webgpu"): Promise<void> {
   socket.send(JSON.stringify({ v: 1, type: "work.request", payload: {} }));
   const offered = await nextMessage(socket);
   expect(offered.type).toBe("compute.offer");
@@ -541,7 +603,7 @@ async function validateMobileWorker(socket: WebSocket): Promise<void> {
     payload: {
       taskId: task.taskId,
       leaseId: task.leaseId,
-      backend: "cpu",
+      backend,
       durationMs: 12,
       estimatedGflops: 0.5,
       samples: independentSamples(task.size, task.seed),
@@ -549,7 +611,7 @@ async function validateMobileWorker(socket: WebSocket): Promise<void> {
   }));
   const verified = await nextMessage(socket);
   expect(verified.type).toBe("compute.verified");
-  expect(verified.payload).toMatchObject({ inferenceReady: true });
+  expect(verified.payload).toMatchObject({ inferenceReady: backend === "webgpu" });
 }
 
 function expectNoMessage(socket: WebSocket, durationMs = 120): Promise<void> {

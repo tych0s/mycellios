@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="es">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mycellios: bloques GPU en SmolLM2</title>
+<style>
+  body { max-width: 65rem; margin: 2rem auto; padding: 0 1rem; font: 16px/1.5 system-ui, sans-serif; }
+  button { font: inherit; padding: .5rem .8rem; }
+  pre { padding: 1rem; white-space: pre-wrap; overflow-wrap: anywhere; background: #101827; color: #e5e7eb; border-radius: .5rem; }
+</style>
+<h1>Bloques de decodificación del modelo real</h1>
+<p>Experimento local sobre WebLLM 0.2.85 y SmolLM2 en WebGPU. Reutiliza el token seleccionado en GPU para el embedding siguiente y lee varios tokens al final de cada bloque. Compara texto, latencia y llamadas WebGPU con el motor original. Solo admite el prompt y los ajustes fijos de esta página.</p>
+<button id="start">Ejecutar comparación</button>
+<p id="status">Preparado.</p>
+<pre id="result">Sin resultados.</pre>
+<script type="module">
+const button = document.getElementById('start');
+const status = document.getElementById('status');
+const result = document.getElementById('result');
+const modelVariant = new URLSearchParams(location.search).get('model');
+const models = {
+  '135m': {id: 'SmolLM2-135M-Instruct-q0f16-MLC',
+    revision: '06fc409f2212adff29d93cbc742c1d6957302df5'},
+  '360m': {id: 'SmolLM2-360M-Instruct-q0f16-MLC',
+    revision: 'df74591537f91ed5c9b7e95b9eea1bb982ab67ed'},
+  '1.7b': {id: 'SmolLM2-1.7B-Instruct-q4f16_1-MLC',
+    revision: '84f57f8580a9d8d623266b600ad4273bb9fd84c1'},
+};
+const selectedModel = models[modelVariant] ?? models['135m'];
+const modelId = selectedModel.id;
+const modelRevision = selectedModel.revision;
+const libraryRevision = '025bcaf3780fa8254f5e5efd3bfea0a5397248f4';
+const requestedSuite = new URLSearchParams(location.search).get('suite');
+const suite = ['ab8', 'long', 'longsweep', 'longadaptive', 'longstream', 'stress', 'worker', 'multiturn', 'adaptive', 'stream', 'prompt', 'logits'].includes(requestedSuite)
+  ? requestedSuite : 'sweep';
+const prompt = ['long', 'longsweep', 'longadaptive', 'longstream', 'stress', 'worker'].includes(suite)
+  || new URLSearchParams(location.search).has('longPrompt')
+  ? 'Explain in three detailed paragraphs why the sky appears blue, including Rayleigh scattering, wavelength, and sunset colors.'
+  : 'Explain in one short sentence why the sky looks blue.';
+const counters = {submissions: 0, commandBuffers: 0, maps: 0, writes: 0, writeBytes: 0};
+const measureBuffers = new URLSearchParams(location.search).has('memory');
+const memory = {createdCount: 0, createdBytes: 0, liveCount: 0, liveBytes: 0,
+  peakLiveBytes: 0};
+let instrumented = false;
+function instrument() {
+  if (instrumented) return;
+  instrumented = true;
+  if (measureBuffers) {
+    const sizes = new WeakMap();
+    const createBuffer = GPUDevice.prototype.createBuffer;
+    GPUDevice.prototype.createBuffer = function(descriptor) {
+      const buffer = createBuffer.call(this, descriptor);
+      const bytes = Number(descriptor.size);
+      sizes.set(buffer, bytes);
+      memory.createdCount++;
+      memory.createdBytes += bytes;
+      memory.liveCount++;
+      memory.liveBytes += bytes;
+      memory.peakLiveBytes = Math.max(memory.peakLiveBytes, memory.liveBytes);
+      return buffer;
+    };
+    const destroy = GPUBuffer.prototype.destroy;
+    GPUBuffer.prototype.destroy = function() {
+      const bytes = sizes.get(this);
+      if (bytes !== undefined) {
+        sizes.delete(this);
+        memory.liveCount--;
+        memory.liveBytes -= bytes;
+      }
+      return destroy.call(this);
+    };
+  }
+  const submit = GPUQueue.prototype.submit;
+  GPUQueue.prototype.submit = function(buffers) {
+    counters.submissions++;
+    counters.commandBuffers += buffers.length;
+    return submit.call(this, buffers);
+  };
+  const writeBuffer = GPUQueue.prototype.writeBuffer;
+  GPUQueue.prototype.writeBuffer = function(buffer, offset, data, dataOffset, size) {
+    const bytesPerElement = ArrayBuffer.isView(data) && !(data instanceof DataView)
+      ? data.BYTES_PER_ELEMENT : 1;
+    counters.writes++;
+    counters.writeBytes += (size ?? data.byteLength / bytesPerElement - (dataOffset ?? 0)) * bytesPerElement;
+    return writeBuffer.call(this, buffer, offset, data, dataOffset, size);
+  };
+  const mapAsync = GPUBuffer.prototype.mapAsync;
+  GPUBuffer.prototype.mapAsync = function(...args) {
+    counters.maps++;
+    return mapAsync.apply(this, args);
+  };
+}
+const snapshot = () => ({...counters});
+const memorySnapshot = () => ({...memory});
+const delta = (before) => Object.fromEntries(Object.keys(counters).map((key) => [key, counters[key] - before[key]]));
+
+function installChunkDecode(pipeline, chunkSize, diagnostic) {
+  const original = pipeline.decodeStep;
+  pipeline.decodeStep = async function(genConfig) {
+    const currentChunk = Array.isArray(chunkSize)
+      ? chunkSize[Math.min(diagnostic.chunks, chunkSize.length - 1)] : chunkSize;
+    if (this.stopTriggered) throw new Error('Cannot decode a stopped request.');
+    if (genConfig?.temperature !== 0 || (genConfig?.top_p !== undefined && genConfig.top_p !== 1)
+      || this.config.repetition_penalty !== 1
+      || (this.config.frequency_penalty ?? 0) !== 0
+      || (this.config.presence_penalty ?? 0) !== 0
+      || genConfig?.logit_bias || genConfig?.logprobs || genConfig?.response_format
+      || this.logitProcessor || this.slidingWindowSize !== -1
+      || this.filledKVCacheLength + currentChunk >= this.contextWindowSize) {
+      diagnostic.unsupported = true;
+      diagnostic.fallbacks++;
+      return original.call(this, genConfig);
+    }
+    const started = performance.now();
+    const kvBefore = this.filledKVCacheLength;
+    const tvm = this.tvm;
+    let token = null;
+    let previousGpuToken = null;
+    try {
+      tvm.beginScope();
+      token = tvm.empty([1], 'int32', this.device)
+        .copyFrom([this.outputIds[this.outputIds.length - 1]]);
+      const outputGpu = tvm.empty([currentChunk], 'int32', this.device);
+      const gpuContext = tvm.lib.webGPUContext;
+      for (let step = 0; step < currentChunk; step++) {
+        tvm.beginScope();
+        let sampledGpu;
+        try {
+          const embeddings = this.embed(token, this.params);
+          const allEmbeddings = embeddings.view([1].concat(embeddings.shape));
+          const sequenceIds = tvm.makeShapeTuple([0]);
+          const inputLength = tvm.makeShapeTuple([1]);
+          const states = this.getActiveKVStates();
+          for (const state of states) this.fKVCacheBeginForward(state, sequenceIds, inputLength);
+          const ret = this.invokeDecode(allEmbeddings);
+          for (let i = states.length - 1; i >= 0; i--) this.fKVCacheEndForward(states[i]);
+          this.filledKVCacheLength++;
+          const logits = ret.get(0);
+
+          const temperature = tvm.empty([1], 'float32', this.device).copyFrom([1e-6]);
+          let probs = this.fsoftmaxWithTemperature(
+            logits.view([1, 1, this.fullVocabSize]), temperature);
+          probs = probs.view([1, this.fullVocabSize]);
+          const sorted = this.fargsortProbs(probs);
+          const uniform = tvm.uniform([1], 0, 1, this.device);
+          this.topPDevice.copyFrom([1]);
+          sampledGpu = tvm.detachFromCurrentScope(this.fsampleWithTopP(
+            sorted.get(0), sorted.get(1), uniform, this.sampleIndicesDevice, this.topPDevice));
+          gpuContext.deviceCopyWithinGPU(sampledGpu.getDataPtr(), 0,
+            outputGpu.getDataPtr(), step * 4, 4);
+        } finally {
+          tvm.endScope();
+        }
+        if (previousGpuToken) previousGpuToken.dispose();
+        previousGpuToken = sampledGpu;
+        token = sampledGpu;
+      }
+      diagnostic.chunks++;
+      diagnostic.queuedTokens += currentChunk;
+      diagnostic.chunkSizes.push(currentChunk);
+      const outputHost = tvm.empty([currentChunk], 'int32', tvm.cpu()).copyFrom(outputGpu);
+      await this.device.sync();
+      const decodeReady = performance.now();
+      let applied = 0;
+      for (const next of outputHost.toArray()) {
+        if (next < 0) throw new Error(`Invalid GPU token ${next}.`);
+        this.decodingTotalTokens++;
+        this.curRoundDecodingTotalTokens++;
+        this.processNextToken(next, genConfig);
+        applied++;
+        if (this.stopTriggered) break;
+      }
+      const excess = currentChunk - applied;
+      let rollbackMs = 0;
+      if (excess > 0) {
+        const rollbackStarted = performance.now();
+        const popn = tvm.getGlobalFunc('vm.builtin.kv_state_popn');
+        for (const state of this.getActiveKVStates()) {
+          popn(state, tvm.scalar(0, 'int64'), tvm.scalar(excess, 'int32'));
+        }
+        this.filledKVCacheLength -= excess;
+        await this.device.sync();
+        rollbackMs = performance.now() - rollbackStarted;
+        diagnostic.rolledBackTokens += excess;
+      }
+      if (this.filledKVCacheLength !== kvBefore + applied) {
+        throw new Error(`KV rollback mismatch: ${this.filledKVCacheLength} != ${kvBefore + applied}`);
+      }
+      const elapsed = (decodeReady - started + rollbackMs) / 1e3;
+      this.decodingTotalTime += elapsed;
+      this.curRoundDecodingTotalTime += elapsed;
+      diagnostic.appliedTokens += applied;
+      diagnostic.discardedAfterStop += currentChunk - applied;
+    } finally {
+      if (previousGpuToken) previousGpuToken.dispose();
+      tvm.endScope();
+    }
+  };
+  return () => { pipeline.decodeStep = original; };
+}
+
+button.addEventListener('click', async () => {
+  button.disabled = true;
+  let engine;
+  const report = {modelId, modelRevision, libraryRevision, prompt, suite, runs: []};
+  try {
+    instrument();
+    const webllm = await import('https://esm.run/@mlc-ai/web-llm@0.2.85');
+    const record = webllm.prebuiltAppConfig.model_list.find((entry) => entry.model_id === modelId);
+    if (!record) throw new Error('El modelo no figura en la versión fijada.');
+    const pinned = {...record, model: `${record.model}/resolve/${modelRevision}/`,
+      model_lib: record.model_lib.replace('/main/', `/${libraryRevision}/`)};
+    const adapter = await navigator.gpu.requestAdapter({featureLevel: 'core', powerPreference: 'high-performance'});
+    report.adapter = {vendor: adapter.info.vendor, device: adapter.info.device,
+      description: adapter.info.description, isFallbackAdapter: adapter.info.isFallbackAdapter};
+    status.textContent = 'Cargando el modelo completo…';
+    const loadStart = performance.now();
+    engine = await webllm.CreateMLCEngine(modelId, {appConfig: {model_list: [pinned]},
+      initProgressCallback: (progress) => { status.textContent = progress.text ?? 'Cargando…'; }});
+    report.loadSeconds = Number(((performance.now() - loadStart) / 1000).toFixed(2));
+    if (measureBuffers) report.memoryAfterLoad = memorySnapshot();
+    const pipeline = engine.loadedModelIdToPipeline.get(modelId);
+    if (!pipeline) throw new Error('No se encontró la canalización de WebLLM.');
+    report.pipeline = {embed: typeof pipeline.embed, sample: typeof pipeline.fsampleWithTopP,
+      decode: typeof pipeline.invokeDecode, kv: pipeline.getActiveKVStates().length};
+    if (suite === 'prompt' || suite === 'logits') {
+      const originalInput = pipeline.getInputData;
+      const originalSoftmax = pipeline.fsoftmaxWithTemperature;
+      const capturedLogits = [];
+      pipeline.getInputData = async function(...args) {
+        const input = await originalInput.apply(this, args);
+        report.inputTokenIds = input[0].flatMap((part) => {
+          if (!Array.isArray(part)) throw new Error('Prompt includes non-text input.');
+          return part;
+        });
+        return input;
+      };
+      if (suite === 'logits') {
+        pipeline.fsoftmaxWithTemperature = function(logits, temperature) {
+          if (capturedLogits.length < 10) {
+            const host = this.tvm.empty(logits.shape, logits.dtype, this.tvm.cpu())
+              .copyFrom(logits);
+            capturedLogits.push(this.tvm.detachFromCurrentScope(host));
+          }
+          return originalSoftmax.call(this, logits, temperature);
+        };
+      }
+      status.textContent = suite === 'logits'
+        ? 'Capturando los primeros logits del modelo…'
+        : 'Capturando el prompt exacto del modelo…';
+      try {
+        const response = await engine.chat.completions.create({
+          messages: [{role: 'user', content: prompt}], temperature: 0,
+          top_p: 1, max_tokens: 64, seed: 1,
+        });
+        report.outputTokenIds = pipeline.outputIds.slice();
+        report.text = response.choices[0]?.message?.content;
+        report.usage = response.usage;
+        report.inputCountMatchesUsage = report.inputTokenIds.length === response.usage.prompt_tokens;
+        if (suite === 'logits') {
+          await pipeline.device.sync();
+          report.logits = capturedLogits.map((host, step) => {
+            const values = host.toArray();
+            const ids = Array.from({length: values.length}, (_, i) => i);
+            ids.sort((a, b) => values[b] - values[a]);
+            return {step, shape: host.shape, dtype: host.dtype,
+              selectedToken: report.outputTokenIds[step],
+              top: ids.slice(0, 8).map((id) => ({id, logit: values[id]})),
+              candidate260: values[260], candidate13739: values[13739]};
+          });
+        }
+        status.textContent = report.inputCountMatchesUsage
+          ? 'Completado: prompt exacto y salida capturados.'
+          : 'Completado: revisar diferencia en cuenta de tokens.';
+        result.textContent = JSON.stringify(report, null, 2);
+      } finally {
+        pipeline.getInputData = originalInput;
+        pipeline.fsoftmaxWithTemperature = originalSoftmax;
+        for (const host of capturedLogits) host.dispose();
+      }
+      return;
+    }
+    if (suite === 'worker') {
+      const request = {messages: [{role: 'user', content: prompt}], temperature: 0,
+        top_p: 1, max_tokens: 64, seed: 1};
+      const measure = async (candidate, mode) => {
+        for (let attempt = 0; attempt < 6; attempt++) {
+          status.textContent = `${mode}, solicitud ${attempt + 1}/6…`;
+          const started = performance.now();
+          const response = await candidate.chat.completions.create(request);
+          report.runs.push({mode, attempt, wallSeconds:
+            Number(((performance.now() - started) / 1000).toFixed(4)),
+            text: response.choices[0]?.message?.content,
+            finishReason: response.choices[0]?.finish_reason, usage: response.usage});
+          result.textContent = JSON.stringify(report, null, 2);
+        }
+      };
+      await measure(engine, 'main-thread');
+      await engine.unload();
+      engine = null;
+      const source = `import { WebWorkerMLCEngineHandler } from 'https://esm.run/@mlc-ai/web-llm@0.2.85';\n` +
+        `const handler = new WebWorkerMLCEngineHandler();\n` +
+        `self.onmessage = (message) => handler.onmessage(message);\n`;
+      const workerUrl = URL.createObjectURL(new Blob([source], {type: 'text/javascript'}));
+      const worker = new Worker(workerUrl, {type: 'module'});
+      let workerEngine;
+      try {
+        status.textContent = 'Cargando el mismo modelo en Web Worker…';
+        const loadStarted = performance.now();
+        workerEngine = await webllm.CreateWebWorkerMLCEngine(worker, modelId, {
+          appConfig: {model_list: [pinned]},
+          initProgressCallback: (progress) => { status.textContent = progress.text ?? 'Cargando…'; },
+        });
+        report.workerLoadSeconds = Number(((performance.now() - loadStarted) / 1000).toFixed(2));
+        await measure(workerEngine, 'web-worker');
+      } finally {
+        await workerEngine?.unload().catch(() => {});
+        worker.terminate();
+        URL.revokeObjectURL(workerUrl);
+      }
+      report.sameText = report.runs.every((run) => run.text === report.runs[0].text);
+      report.sameUsage = report.runs.every((run) =>
+        run.usage?.completion_tokens === report.runs[0].usage?.completion_tokens);
+      status.textContent = report.sameText && report.sameUsage
+        ? 'Completado: mismo texto y cuenta de tokens en Web Worker.'
+        : 'Completado: revisar diferencias del Web Worker.';
+      result.textContent = JSON.stringify(report, null, 2);
+      return;
+    }
+    if (suite === 'stream' || suite === 'longstream') {
+      const increasing = suite === 'longstream' ? [1, 2, 4, 8, 16] : [1, 2, 4, 8];
+      const fixed = suite === 'longstream' ? 16 : 8;
+      const streamModes = [
+        ['original', 1], ['gpu-adaptive', increasing], ['gpu-chunk', fixed],
+        ['gpu-adaptive', increasing], ['gpu-chunk', fixed], ['original', 1],
+      ];
+      for (const [mode, chunkSize] of streamModes) {
+        const diagnostic = {chunks: 0, chunkSizes: [], queuedTokens: 0,
+          appliedTokens: 0, discardedAfterStop: 0, rolledBackTokens: 0, fallbacks: 0};
+        const restore = mode === 'original' ? () => {}
+          : installChunkDecode(pipeline, chunkSize, diagnostic);
+        const events = [];
+        let text = '';
+        let finishReason = null;
+        const start = performance.now();
+        status.textContent = `Recibiendo fragmentos: ${mode}…`;
+        try {
+          const stream = await engine.chat.completions.create({
+            messages: [{role: 'user', content: prompt}], temperature: 0,
+            top_p: 1, max_tokens: 64, seed: 1, stream: true,
+          });
+          for await (const part of stream) {
+            const delta = part.choices[0]?.delta?.content ?? '';
+            text += delta;
+            finishReason = part.choices[0]?.finish_reason ?? finishReason;
+            if (delta) events.push({atMs: Number((performance.now() - start).toFixed(2)),
+              characters: delta.length, tokensSoFar: pipeline.outputIds.length});
+          }
+          report.runs.push({mode, chunkSize, events, text, finishReason,
+            tokenIds: pipeline.outputIds.slice(), kvLength: pipeline.filledKVCacheLength,
+            wallSeconds: Number(((performance.now() - start) / 1000).toFixed(3)), diagnostic});
+          result.textContent = JSON.stringify(report, null, 2);
+        } finally { restore(); }
+      }
+      report.sameText = report.runs.every((run) => run.text === report.runs[0].text);
+      report.sameTokenIds = report.runs.every((run) =>
+        JSON.stringify(run.tokenIds) === JSON.stringify(report.runs[0].tokenIds));
+      status.textContent = report.sameText && report.sameTokenIds
+        ? 'Completado: mismos tokens y texto por streaming.'
+        : 'Completado: revisar diferencias de streaming.';
+      result.textContent = JSON.stringify(report, null, 2);
+      return;
+    }
+    if (suite === 'multiturn') {
+      const followup = 'In five words, what color is the sky?';
+      const requestedChunk = Number(new URLSearchParams(location.search).get('chunk'));
+      const continuationChunk = [4, 8, 16].includes(requestedChunk) ? requestedChunk : 8;
+      report.continuationChunk = continuationChunk;
+      const originalReset = pipeline.resetChat;
+      let resetCalls = 0;
+      pipeline.resetChat = function(...args) {
+        resetCalls++;
+        return originalReset.apply(this, args);
+      };
+      report.multiturn = [];
+      for (const mode of ['original', 'gpu-chunk']) {
+        await engine.resetChat();
+        const diagnostic = {chunks: 0, chunkSizes: [], queuedTokens: 0, appliedTokens: 0,
+          discardedAfterStop: 0, rolledBackTokens: 0, fallbacks: 0};
+        const restore = mode === 'gpu-chunk'
+          ? installChunkDecode(pipeline, continuationChunk, diagnostic) : () => {};
+        let first;
+        try {
+          status.textContent = `Primera conversación: ${mode}…`;
+          first = await engine.chat.completions.create({
+            messages: [{role: 'user', content: prompt}], temperature: 0,
+            top_p: 1, max_tokens: 64, seed: 1,
+          });
+        } finally { restore(); }
+        const firstText = first.choices[0]?.message?.content;
+        const firstTokens = pipeline.outputIds.slice();
+        const kvBeforeFollowup = pipeline.filledKVCacheLength;
+        const resetsBeforeFollowup = resetCalls;
+        status.textContent = `Segunda conversación tras ${mode}…`;
+        const second = await engine.chat.completions.create({
+          messages: [
+            {role: 'user', content: prompt},
+            {role: 'assistant', content: firstText},
+            {role: 'user', content: followup},
+          ], temperature: 0, top_p: 1, max_tokens: 24, seed: 1,
+        });
+        report.multiturn.push({mode, firstText, firstTokens, firstFinish: first.choices[0]?.finish_reason,
+          firstKvLength: kvBeforeFollowup, diagnostic, secondText: second.choices[0]?.message?.content,
+          secondTokens: pipeline.outputIds.slice(), secondPromptTokens: second.usage.prompt_tokens,
+          secondKvLength: pipeline.filledKVCacheLength,
+          resetOnFollowup: resetCalls !== resetsBeforeFollowup});
+        result.textContent = JSON.stringify(report, null, 2);
+      }
+      pipeline.resetChat = originalReset;
+      report.multiturnParity = report.multiturn.length === 2
+        && JSON.stringify(report.multiturn[0].firstTokens) === JSON.stringify(report.multiturn[1].firstTokens)
+        && JSON.stringify(report.multiturn[0].secondTokens) === JSON.stringify(report.multiturn[1].secondTokens)
+        && report.multiturn.every((entry) => !entry.resetOnFollowup);
+      status.textContent = report.multiturnParity
+        ? 'Completado: dos turnos idénticos con reutilización KV.'
+        : 'Completado: revisar diferencias o reinicios de KV.';
+      result.textContent = JSON.stringify(report, null, 2);
+      return;
+    }
+    const sequence = suite === 'ab8'
+      ? [['original', 1], ['gpu-chunk', 8],
+        ...Array.from({length: 3}, () => [['original', 1], ['gpu-chunk', 8],
+          ['gpu-chunk', 8], ['original', 1]]).flat()]
+      : suite === 'adaptive'
+      ? [['original', 1], ['gpu-adaptive', [1, 2, 4, 8]],
+        ['gpu-chunk', 8], ['gpu-adaptive', [1, 2, 4, 8]],
+        ['gpu-chunk', 8], ['gpu-adaptive', [1, 2, 4, 8]],
+        ['gpu-chunk', 8], ['original', 1]]
+      : suite === 'long'
+      ? [['original', 1], ['gpu-chunk', 8], ['gpu-chunk', 8], ['original', 1]]
+      : suite === 'longsweep'
+      ? [['original', 1], ['gpu-chunk', 8], ['gpu-chunk', 16],
+        ['gpu-chunk', 32], ['gpu-chunk', 32], ['gpu-chunk', 16],
+        ['gpu-chunk', 8], ['original', 1]]
+      : suite === 'longadaptive'
+      ? [['original', 1], ['gpu-adaptive', [1, 2, 4, 8, 16]],
+        ['gpu-chunk', 16], ['gpu-adaptive', [1, 2, 4, 8, 16]],
+        ['gpu-chunk', 16], ['gpu-adaptive', [1, 2, 4, 8, 16]],
+        ['gpu-chunk', 16], ['original', 1]]
+      : suite === 'stress'
+      ? (new URLSearchParams(location.search).get('order') === 'reverse'
+        ? [...Array.from({length: 12}, () => ['gpu-chunk', 16]),
+          ...Array.from({length: 12}, () => ['original', 1])]
+        : [...Array.from({length: 12}, () => ['original', 1]),
+          ...Array.from({length: 12}, () => ['gpu-chunk', 16])])
+      : [['original', 1], ['gpu-chunk', 4], ['gpu-chunk', 8],
+        ['gpu-chunk', 16], ['gpu-chunk', 16], ['gpu-chunk', 8],
+        ['gpu-chunk', 4], ['original', 1]];
+    for (const [name, chunkSize] of sequence) {
+      const diagnostic = {chunks: 0, chunkSizes: [], queuedTokens: 0, appliedTokens: 0,
+        discardedAfterStop: 0, rolledBackTokens: 0, fallbacks: 0};
+      const restore = name === 'original' ? () => {}
+        : installChunkDecode(pipeline, chunkSize, diagnostic);
+      const originalProcess = pipeline.processNextToken;
+      let processed = 0;
+      let firstDecodeVisibleMs = null;
+      pipeline.processNextToken = function(...args) {
+        const value = originalProcess.apply(this, args);
+        processed++;
+        if (processed === 2) firstDecodeVisibleMs = performance.now() - requestStart;
+        return value;
+      };
+      let requestStart;
+      try {
+        status.textContent = `Midiendo ${name}, bloque ${chunkSize}…`;
+        const before = snapshot();
+        const start = performance.now();
+        requestStart = start;
+        const response = await engine.chat.completions.create({
+          messages: [{role: 'user', content: prompt}], temperature: 0,
+          top_p: 1, max_tokens: 64, seed: 1,
+        });
+        report.runs.push({name, chunkSize, wallSeconds: Number(((performance.now() - start) / 1000).toFixed(3)),
+          text: response.choices[0]?.message?.content,
+          tokenIds: pipeline.outputIds.slice(),
+          kvLength: pipeline.filledKVCacheLength,
+          finishReason: response.choices[0]?.finish_reason,
+          usage: response.usage, gpuCalls: delta(before), diagnostic,
+          firstDecodeVisibleMs: Number(firstDecodeVisibleMs?.toFixed(2)),
+          decodeSeconds: Number(pipeline.curRoundDecodingTotalTime.toFixed(4)),
+          prefillSeconds: Number(pipeline.curRoundPrefillTotalTime.toFixed(4))});
+        result.textContent = JSON.stringify(report, null, 2);
+      } finally {
+        pipeline.processNextToken = originalProcess;
+        restore();
+      }
+    }
+    report.sameText = report.runs.every((run) => run.text === report.runs[0].text);
+    report.sameTokenIds = report.runs.every((run) =>
+      JSON.stringify(run.tokenIds) === JSON.stringify(report.runs[0].tokenIds));
+    if (suite === 'ab8') {
+      const measured = report.runs.slice(2);
+      const median = (values) => {
+        const sorted = values.toSorted((a, b) => a - b);
+        return (sorted[(sorted.length - 1) >> 1] + sorted[sorted.length >> 1]) / 2;
+      };
+      report.ab8 = Object.fromEntries(['original', 'gpu-chunk'].map((name) => {
+        const runs = measured.filter((run) => run.name === name);
+        return [name, {count: runs.length,
+          medianWallSeconds: Number(median(runs.map((run) => run.wallSeconds)).toFixed(4)),
+          medianDecodeSeconds: Number(median(runs.map((run) => run.decodeSeconds)).toFixed(4)),
+          rangeDecodeSeconds: [Math.min(...runs.map((run) => run.decodeSeconds)),
+            Math.max(...runs.map((run) => run.decodeSeconds))]}];
+      }));
+    }
+    status.textContent = report.sameText && report.sameTokenIds
+      ? 'Completado: mismos tokens y texto.' : 'Completado: las respuestas difieren.';
+    result.textContent = JSON.stringify(report, null, 2);
+  } catch (error) {
+    report.error = String(error?.stack ?? error);
+    status.textContent = `Error: ${String(error)}`;
+    result.textContent = JSON.stringify(report, null, 2);
+  } finally {
+    await engine?.unload().catch(() => {});
+    if (measureBuffers) {
+      report.memoryAfterUnload = memorySnapshot();
+      result.textContent = JSON.stringify(report, null, 2);
+    }
+    button.disabled = false;
+  }
+});
+</script>
+</html>

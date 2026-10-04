@@ -8,6 +8,12 @@ describe("physical GPU probe contract", () => {
   it("accepts a closed, nonce-bound physical probe", () => {
     const value = fixture();
     expect(() => validatePhysicalProbe(value, value.nonce)).not.toThrow();
+    value.host.cpuDeviceName = "AMD64 Family 26 Model 36 Stepping 0, AuthenticAMD";
+    expect(() => validatePhysicalProbe(value, value.nonce)).not.toThrow();
+    value.host.cpuDeviceName = "";
+    expect(() => validatePhysicalProbe(value, value.nonce)).toThrow(
+      "physical_probe_host_cpuDeviceName_is_invalid",
+    );
   });
 
   it("rejects replay, duplicate GPUs, non-finite memory and extra fields", () => {

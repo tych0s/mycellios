@@ -28,7 +28,7 @@ export function defaultNodeInstallationManifest(input: {
   const data = input.programData ?? process.env.PROGRAMDATA ?? "C:\\ProgramData";
   return nodeInstallationManifestSchema.parse({ schema: "mycellios-node-installation/1", platform: "win32", serviceName: "MycelliosNode",
     installRoot: root, nodeExecutable: windowsJoin(root, "bin\\node.exe"), helperEntrypoint: windowsJoin(root, "app\\node\\uninstall-main.js"),
-    serviceDefinitionPath: windowsJoin(data, "Mycellios\\Service\\definition.json"), configPath: windowsJoin(data, "Mycellios\\Configuration\\node.json"),
+    serviceDefinitionPath: windowsJoin(data, "Mycellios\\Service\\MycelliosNode.xml"), configPath: windowsJoin(data, "Mycellios\\Configuration\\node.json"),
     identityPath: windowsJoin(data, "Mycellios\\Identity\\node.json"), cachePath: windowsJoin(data, "Mycellios\\Cache"), logsPath: windowsJoin(data, "Mycellios\\Logs"),
     statePath: windowsJoin(data, "Mycellios\\State"), receiptPath: windowsJoin(data, "Mycellios\\Receipts\\uninstall.json") });
 }

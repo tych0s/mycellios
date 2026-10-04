@@ -36,6 +36,30 @@ describe("node diagnostics", () => {
     await writeNodeDiagnosticSnapshot(path, snapshot);
     expect(JSON.parse(await readFile(path, "utf8"))).toEqual(snapshot);
   });
+
+  it("reports a packaged CPU runtime without inventing a GPU", () => {
+    const cpuProbe = probe();
+    cpuProbe.runtime.cudaApiAvailable = false;
+    cpuProbe.runtime.cudaVersion = null;
+    cpuProbe.runtime.ncclAvailable = false;
+    cpuProbe.runtime.ncclVersion = null;
+    cpuProbe.devices = [];
+    const snapshot = buildNodeDiagnosticSnapshot({
+      config: configuration(), version: "0.2.77", state: "ready", physicalProbe: cpuProbe,
+    });
+    expect(snapshot.runtime.backend).toBe("cpu");
+    expect(snapshot.hardware).toEqual({ gpuCount: 0, devices: [] });
+  });
+
+  it("keeps a ROCm backend when CUDA is unavailable", () => {
+    const rocmProbe = probe();
+    rocmProbe.runtime.cudaApiAvailable = false;
+    rocmProbe.runtime.cudaVersion = null;
+    rocmProbe.runtime.rocmVersion = "6.4";
+    expect(buildNodeDiagnosticSnapshot({
+      config: configuration(), version: "0.2.77", state: "ready", physicalProbe: rocmProbe,
+    }).runtime.backend).toBe("rocm");
+  });
 });
 
 function configuration(): NodeConfiguration {

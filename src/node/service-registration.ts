@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdir, open, rm } from "node:fs/promises";
+import { constants, copyFile, lstat, mkdir, open, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { NodeConfiguration } from "../contracts/node-configuration.js";
 import type { NodeInstallationManifest } from "../contracts/node-uninstall.js";
@@ -12,6 +12,7 @@ export async function registerNativeNodeService(input: {
   manifest: NodeInstallationManifest;
   config: NodeConfiguration;
   run?: ServiceCommandRunner;
+  replaceRetainedServiceFiles?: boolean;
 }): Promise<void> {
   const run = input.run ?? runServiceCommand;
   const { manifest, config } = input;
@@ -38,12 +39,40 @@ export async function registerNativeNodeService(input: {
     return;
   }
   if (manifest.platform === "win32") {
-    const binPath = windowsServiceBinPath(manifest.nodeExecutable, serviceEntrypoint, manifest.configPath);
-    await writeNewServiceDefinition(manifest.serviceDefinitionPath, `${JSON.stringify({ schema: "mycellios-windows-service-definition/1", serviceName: manifest.serviceName, binPath }, null, 2)}\n`);
-    for (const path of [dirname(manifest.configPath), dirname(manifest.identityPath), manifest.cachePath, manifest.logsPath, manifest.statePath]) {
-      await requireSuccess(run, "icacls.exe", [path, "/inheritance:r", "/grant:r", "NT AUTHORITY\\SYSTEM:(OI)(CI)F", "/grant:r", "NT AUTHORITY\\LOCAL SERVICE:(OI)(CI)M"], "node_service_permissions_failed");
+    if (input.replaceRetainedServiceFiles) {
+      const existing = await run("sc.exe", ["query", manifest.serviceName]);
+      if (existing.code !== 1060) throw new Error("node_service_must_be_absent_for_restore");
     }
-    await requireSuccess(run, "sc.exe", ["create", manifest.serviceName, "binPath=", binPath, "start=", "auto", "obj=", "NT AUTHORITY\\LocalService"], "node_service_registration_failed");
+    const supervisedEntrypoint = join(dirname(manifest.helperEntrypoint), "service-supervisor.js");
+    const serviceDirectory = dirname(manifest.serviceDefinitionPath);
+    const wrapperSource = join(manifest.installRoot, "bin", "MycelliosNode.exe");
+    const wrapperTarget = join(serviceDirectory, "MycelliosNode.exe");
+    if (manifest.serviceDefinitionPath !== join(serviceDirectory, "MycelliosNode.xml")) {
+      throw new Error("node_service_definition_path_is_invalid");
+    }
+    const protectedIdentity = join(dirname(dirname(manifest.configPath)), "protected-identity");
+    const writable = [dirname(manifest.configPath), dirname(manifest.identityPath), protectedIdentity,
+      manifest.cachePath, manifest.logsPath, manifest.statePath];
+    for (const path of [...writable, serviceDirectory]) await mkdir(path, { recursive: true });
+    for (const path of writable) {
+      await requireSuccess(run, "icacls.exe", [path, "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "/grant:r", "*S-1-5-32-544:(OI)(CI)F", "/grant:r", "*S-1-5-19:(OI)(CI)M"], "node_service_permissions_failed");
+    }
+    const pendingPath = join(dirname(manifest.configPath), "enrollment.json");
+    const pending = !input.replaceRetainedServiceFiles || await lstat(pendingPath).then(() => true, (error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return false; throw error;
+    });
+    const protectedFiles = [manifest.configPath, config.worker.configPath,
+      ...(pending ? [pendingPath] : []),
+      join(manifest.statePath, "installation.json")];
+    for (const path of protectedFiles) {
+      await requireSuccess(run, "icacls.exe", [path, "/inheritance:r", "/grant:r", "*S-1-5-18:F", "/grant:r", "*S-1-5-32-544:F", "/grant:r", "*S-1-5-19:M"], "node_service_permissions_failed");
+    }
+    await requireSuccess(run, "icacls.exe", [serviceDirectory, "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "/grant:r", "*S-1-5-32-544:(OI)(CI)F", "/grant:r", "*S-1-5-19:(OI)(CI)RX"], "node_service_permissions_failed");
+    await copyFile(wrapperSource, wrapperTarget, input.replaceRetainedServiceFiles ? 0 : constants.COPYFILE_EXCL);
+    const definition = windowsServiceDefinition({ manifest, serviceEntrypoint: supervisedEntrypoint });
+    if (input.replaceRetainedServiceFiles) await writeFile(manifest.serviceDefinitionPath, definition, "utf8");
+    else await writeNewServiceDefinition(manifest.serviceDefinitionPath, definition);
+    await requireSuccess(run, "sc.exe", ["create", manifest.serviceName, "binPath=", `"${wrapperTarget}"`, "start=", "auto", "obj=", "NT AUTHORITY\\LocalService"], "node_service_registration_failed");
     await requireSuccess(run, "sc.exe", ["failure", manifest.serviceName, "reset=", "86400", "actions=", "restart/5000/restart/15000/none/0"], "node_service_recovery_policy_failed");
     await requireSuccess(run, "sc.exe", ["start", manifest.serviceName], "node_service_start_failed");
     return;
@@ -52,9 +81,19 @@ export async function registerNativeNodeService(input: {
   throw new Error(`node_service_platform_is_unsupported:${exhaustive}`);
 }
 
-function windowsServiceBinPath(nodeExecutable: string, entrypoint: string, configPath: string): string {
-  for (const value of [nodeExecutable, entrypoint, configPath]) if (/[\r\n\0"]/.test(value)) throw new Error("node_service_path_is_invalid");
-  return `"${nodeExecutable}" "${entrypoint}" --config "${configPath}"`;
+function windowsServiceDefinition(input: { manifest: NodeInstallationManifest; serviceEntrypoint: string }): string {
+  const { manifest, serviceEntrypoint } = input;
+  for (const value of [manifest.nodeExecutable, serviceEntrypoint, manifest.configPath, manifest.logsPath]) {
+    if (/[\r\n\0"]/.test(value)) throw new Error("node_service_path_is_invalid");
+  }
+  const escaped = (value: string) => value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+  return ["<service>", `  <id>${escaped(manifest.serviceName)}</id>`,
+    "  <name>Mycellios Node</name>", "  <description>Mycellios native inference node</description>",
+    `  <executable>${escaped(manifest.nodeExecutable)}</executable>`,
+    `  <arguments>${escaped(`"${serviceEntrypoint}" --config "${manifest.configPath}"`)}</arguments>`,
+    `  <workingdirectory>${escaped(manifest.installRoot)}</workingdirectory>`,
+    `  <logpath>${escaped(manifest.logsPath)}</logpath>`,
+    "  <log mode=\"roll\" />", "</service>", ""].join("\n");
 }
 
 async function writeNewServiceDefinition(path: string, value: string): Promise<void> {

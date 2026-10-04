@@ -34,6 +34,10 @@ export function evaluateTwoHostPreflight(config: AutoDistributionConfig, capabil
     }
   }
   if (!capabilities.python312) error("python_runtime_unavailable", "runtime", "The configured local runtime.pythonExecutable must run Python 3.12. Verify the remote interpreter separately on host B.");
+  if (classifyHost(config.runtime.apiEndpoint.host) === "loopback"
+    && config.runtime.apiAdvertiseHost !== config.runtime.apiEndpoint.host) {
+    error("api_advertise_mismatch", "runtime", "The local API binds to loopback; advertise that same loopback address to the local coordinator.");
+  }
   if (config.model.revision === null) warning("model_revision_unpinned", "model", "Pin an immutable model revision before accepting physical evidence.");
 
   const ranges = capabilities.preparedStageRanges ?? [];

@@ -12,6 +12,7 @@
         "contribution-route": { "match": "Contribute-", "maximumBytes": 65000 },
         "landing-route": { "match": "RebrandLanding-", "maximumBytes": 125000 },
         "mushroom-renderer": { "match": "mushroom-stage-", "maximumBytes": 575000 },
+        "browser-layer-engine": { "match": "browser-layer-", "maximumBytes": 140000 },
         "document-library": { "match": "lib-", "maximumBytes": 525000 },
         "pdf-reader": { "match": "pdf-", "maximumBytes": 450000 },
         "pdf-worker": { "match": "pdf.worker.min-", "maximumBytes": 1300000 }
@@ -29,6 +30,7 @@
       "budgets": {
         "application-shell": { "match": "index-", "maximumBytes": 550000 },
         "contribution-route": { "match": "Contribute-", "maximumBytes": 65000 },
+        "browser-layer-engine": { "match": "browser-layer-", "maximumBytes": 140000 },
         "document-library": { "match": "lib-", "maximumBytes": 525000 },
         "pdf-reader": { "match": "pdf-", "maximumBytes": 450000 },
         "pdf-worker": { "match": "pdf.worker.min-", "maximumBytes": 1300000 }

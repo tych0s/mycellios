@@ -1,0 +1,596 @@
+<!doctype html>
+<html lang="es">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mycellios: modelo completo en el navegador</title>
+<style>
+  body { max-width: 60rem; margin: 2rem auto; padding: 0 1rem; font: 16px/1.5 system-ui, sans-serif; }
+  button { font: inherit; padding: .5rem .8rem; }
+  pre { padding: 1rem; white-space: pre-wrap; overflow-wrap: anywhere; background: #101827; color: #e5e7eb; border-radius: .5rem; }
+</style>
+<h1>Modelo completo en WebGPU</h1>
+<p>Ejecuta SmolLM2 135M F16 con WebLLM 0.2.85 dentro de este navegador. Descarga los pesos públicos del modelo y la librería WebLLM de sus proveedores; el texto de prueba es fijo. La inferencia se hace localmente.</p>
+<p><label><input type="checkbox" id="profile"> Medir los pases GPU de la tercera ejecución (experimental; altera el rendimiento)</label></p>
+<p><label><input type="checkbox" id="subgroup-kernel"> Probar reducción por subgrupo en la proyección MLP (experimental)</label></p>
+<p><label><input type="checkbox" id="vocab-kernel"> Probar reducción por subgrupo en la proyección de vocabulario (experimental)</label></p>
+<p><label><input type="checkbox" id="batch-writes"> Agrupar escrituras pequeñas antes de cada envío (experimental)</label></p>
+<button id="start">Cargar y ejecutar</button>
+<p id="status">Preparado.</p>
+<pre id="result">Sin resultados.</pre>
+<pre id="shader-sources" hidden></pre>
+<script type="module">
+  const button = document.getElementById('start');
+  const status = document.getElementById('status');
+  const result = document.getElementById('result');
+  const profileToggle = document.getElementById('profile');
+  const subgroupKernelToggle = document.getElementById('subgroup-kernel');
+  const vocabKernelToggle = document.getElementById('vocab-kernel');
+  const batchWritesToggle = document.getElementById('batch-writes');
+  const modelId = 'SmolLM2-135M-Instruct-q0f16-MLC';
+  const prompt = 'Explain in one short sentence why the sky looks blue.';
+  const modelRevision = '06fc409f2212adff29d93cbc742c1d6957302df5';
+  const libraryRevision = '025bcaf3780fa8254f5e5efd3bfea0a5397248f4';
+  const gpuCalls = {submissions: 0, commandBuffers: 0, dispatches: 0,
+    computePasses: 0, completionWaits: 0, mappedBuffers: 0,
+    queueWrites: 0, queueWriteBytes: 0, submitCpuMs: 0, passCpuMs: 0,
+    queueWriteCpuMs: 0};
+  const mapLatenciesMs = [];
+  const mapReadBytes = [];
+  const queueWriteSizes = [];
+  const passByEncoder = new WeakMap();
+  const passIndexesByEncoder = new WeakMap();
+  const passIndexesByCommandBuffer = new WeakMap();
+  const pipelineIds = new WeakMap();
+  const moduleSources = new WeakMap();
+  const pipelineSources = new Map();
+  const gpuProfile = {device: null, capture: false, passes: [], querySets: []};
+  const shaderExperiment = {transformed: 0, vocabTransformed: 0, compilationErrors: []};
+  const deviceByQueue = new WeakMap();
+  const pendingWrites = new Map();
+  const stagingBuffers = [];
+  const batchStats = {packedSubmissions: 0, stagedBytes: 0, stagedCopies: 0,
+    extraFlushes: 0};
+  const passesPerQuerySet = 1024;
+  let mapCompletions = 0;
+  let batchCapture = false;
+  let nativeSubmit;
+  let nextPipelineId = 1;
+  let instrumented = false;
+  function encodedWrite(args) {
+    const data = args[2];
+    const bytesPerElement = ArrayBuffer.isView(data) && !(data instanceof DataView)
+      ? data.BYTES_PER_ELEMENT : 1;
+    const offset = (args[3] ?? 0) * bytesPerElement;
+    const size = (args[4] ?? data.byteLength / bytesPerElement - (args[3] ?? 0))
+      * bytesPerElement;
+    const source = new Uint8Array(data.buffer ?? data, (data.byteOffset ?? 0) + offset, size);
+    return {buffer: args[0], bufferOffset: args[1], bytes: new Uint8Array(source)};
+  }
+  function flushPending(queue, submit, buffers = []) {
+    const pending = pendingWrites.get(queue);
+    if (!pending?.length) return submit.call(queue, buffers);
+    const device = deviceByQueue.get(queue);
+    if (!device) throw new Error('No se encontró el dispositivo de la cola de escrituras.');
+    const totalBytes = pending.reduce((sum, entry) => sum + entry.bytes.byteLength, 0);
+    const staging = device.createBuffer({size: totalBytes,
+      usage: GPUBufferUsage.COPY_SRC, mappedAtCreation: true});
+    const mapped = new Uint8Array(staging.getMappedRange());
+    const encoder = device.createCommandEncoder();
+    let offset = 0;
+    for (const entry of pending) {
+      mapped.set(entry.bytes, offset);
+      encoder.copyBufferToBuffer(staging, offset, entry.buffer,
+        entry.bufferOffset, entry.bytes.byteLength);
+      offset += entry.bytes.byteLength;
+    }
+    staging.unmap();
+    const copyCommands = encoder.finish();
+    pendingWrites.set(queue, []);
+    stagingBuffers.push(staging);
+    batchStats.packedSubmissions++;
+    batchStats.stagedBytes += totalBytes;
+    batchStats.stagedCopies += pending.length;
+    gpuCalls.commandBuffers++;
+    return submit.call(queue, [copyCommands, ...buffers]);
+  }
+  function transformMlpGateReduction(code) {
+    if (!code.includes('// Function: NT_matmul12_kernel')) return code;
+    const signature = '  @builtin(local_invocation_id) threadIdx : vec3<u32>\n';
+    const start = code.indexOf('  workgroupBarrier();\n  red_buf0[i32(threadIdx.x)]');
+    const end = code.indexOf('\n}\n', start);
+    if (!code.includes(signature) || start < 0 || end < 0) {
+      throw new Error('El kernel MLP cambió: no se puede aplicar el experimento de subgrupos.');
+    }
+    const withFeature = code.replace('enable f16;', 'enable f16, subgroups;\nrequires subgroup_id;');
+    const withSignature = withFeature.replace(signature,
+      '  @builtin(local_invocation_id) threadIdx : vec3<u32>,\n' +
+      '  @builtin(subgroup_invocation_id) lane : u32,\n' +
+      '  @builtin(subgroup_id) subgroupIndex : u32,\n' +
+      '  @builtin(num_subgroups) subgroupCount : u32\n');
+    const bodyStart = withSignature.indexOf('  workgroupBarrier();\n  red_buf0[i32(threadIdx.x)]');
+    const bodyEnd = withSignature.indexOf('\n}\n', bodyStart);
+    const replacement = `  let subgroupSum = subgroupAdd(NT_matmul_rf_local_1[0i]);
+  if (lane == 0u) { red_buf0[subgroupIndex] = subgroupSum; }
+  workgroupBarrier();
+  if (threadIdx.x == 0u) {
+    var total: f16 = 0.0h;
+    for (var s: u32 = 0u; s < subgroupCount; s = s + 1u) {
+      total = total + red_buf0[s];
+    }
+    NT_matmul[v__1] = total;
+  }`;
+    shaderExperiment.transformed++;
+    return withSignature.slice(0, bodyStart) + replacement + withSignature.slice(bodyEnd);
+  }
+  function transformVocabReduction(code) {
+    if (!code.includes('// Function: NT_matmul14_kernel')) return code;
+    const signature = '  @builtin(local_invocation_id) threadIdx : vec3<u32>\n';
+    const start = code.indexOf('  workgroupBarrier();\n  red_buf0[i32(threadIdx.x)]');
+    const end = code.indexOf('\n}\n', start);
+    if (!code.includes(signature) || start < 0 || end < 0) {
+      throw new Error('El kernel de vocabulario cambió: no se puede aplicar el experimento.');
+    }
+    const withFeature = code.replace('enable f16;', 'enable f16, subgroups;\nrequires subgroup_id;');
+    const withSignature = withFeature.replace(signature,
+      '  @builtin(local_invocation_id) threadIdx : vec3<u32>,\n' +
+      '  @builtin(subgroup_invocation_id) lane : u32,\n' +
+      '  @builtin(subgroup_id) subgroupIndex : u32,\n' +
+      '  @builtin(num_subgroups) subgroupCount : u32\n');
+    const bodyStart = withSignature.indexOf('  workgroupBarrier();\n  red_buf0[i32(threadIdx.x)]');
+    const bodyEnd = withSignature.indexOf('\n}\n', bodyStart);
+    const replacement = `  let subgroupSum = subgroupAdd(NT_matmul_rf_local_1[0i]);
+  if (lane == 0u) { red_buf0[subgroupIndex] = subgroupSum; }
+  workgroupBarrier();
+  if (threadIdx.x == 0u) {
+    var total: f32 = 0.0f;
+    for (var s: u32 = 0u; s < subgroupCount; s = s + 1u) {
+      total = total + red_buf0[s];
+    }
+    NT_matmul[v__1] = total;
+  }`;
+    shaderExperiment.vocabTransformed++;
+    return withSignature.slice(0, bodyStart) + replacement + withSignature.slice(bodyEnd);
+  }
+  function instrumentWebGpu() {
+    if (instrumented) return;
+    const queue = GPUQueue.prototype;
+    const deviceProto = GPUDevice.prototype;
+    const pass = GPUComputePassEncoder.prototype;
+    const encoder = GPUCommandEncoder.prototype;
+    const submit = queue.submit;
+    nativeSubmit = submit;
+    const finish = encoder.finish;
+    const done = queue.onSubmittedWorkDone;
+    const write = queue.writeBuffer;
+    const dispatch = pass.dispatchWorkgroups;
+    const setPipeline = pass.setPipeline;
+    const begin = encoder.beginComputePass;
+    const map = GPUBuffer.prototype.mapAsync;
+    const requestDevice = GPUAdapter.prototype.requestDevice;
+    const createShaderModule = deviceProto.createShaderModule;
+    const createComputePipeline = deviceProto.createComputePipeline;
+    const createComputePipelineAsync = deviceProto.createComputePipelineAsync;
+    deviceProto.createShaderModule = function (descriptor) {
+      let code = descriptor.code;
+      if (subgroupKernelToggle.checked) code = transformMlpGateReduction(code);
+      if (vocabKernelToggle.checked) code = transformVocabReduction(code);
+      const module = createShaderModule.call(this, {...descriptor, code});
+      moduleSources.set(module, code);
+      if (code !== descriptor.code) {
+        module.getCompilationInfo().then((info) => {
+          shaderExperiment.compilationErrors.push(...info.messages
+            .filter((message) => message.type === 'error')
+            .map((message) => message.message));
+        });
+      }
+      return module;
+    };
+    deviceProto.createComputePipeline = function (descriptor) {
+      const pipeline = createComputePipeline.call(this, descriptor);
+      moduleSources.has(descriptor.compute.module) &&
+        moduleSources.set(pipeline, moduleSources.get(descriptor.compute.module));
+      return pipeline;
+    };
+    deviceProto.createComputePipelineAsync = async function (descriptor) {
+      const pipeline = await createComputePipelineAsync.call(this, descriptor);
+      moduleSources.has(descriptor.compute.module) &&
+        moduleSources.set(pipeline, moduleSources.get(descriptor.compute.module));
+      return pipeline;
+    };
+    GPUAdapter.prototype.requestDevice = async function (descriptor = {}) {
+      const requested = profileToggle.checked && this.features.has('timestamp-query');
+      const subgroupRequested = subgroupKernelToggle.checked || vocabKernelToggle.checked;
+      if (subgroupRequested && (!this.features.has('subgroups') ||
+          !navigator.gpu.wgslLanguageFeatures.has('subgroup_id'))) {
+        throw new Error('Este navegador no expone subgroups y subgroup_id.');
+      }
+      const options = requested || subgroupRequested ? {...descriptor,
+        requiredFeatures: [...new Set([...(descriptor.requiredFeatures ?? []),
+          ...(requested ? ['timestamp-query'] : []),
+          ...(subgroupRequested ? ['subgroups'] : [])])],
+      } : descriptor;
+      const device = await requestDevice.call(this, options);
+      deviceByQueue.set(device.queue, device);
+      if (requested) gpuProfile.device = device;
+      return device;
+    };
+    queue.submit = function (buffers) {
+      const begun = performance.now();
+      if (gpuProfile.capture) {
+        for (const buffer of buffers) {
+          const indexes = passIndexesByCommandBuffer.get(buffer);
+          if (indexes?.length) {
+            const entry = gpuProfile.passes[indexes[0]];
+            entry.submissionStart = true;
+            entry.mapsSincePreviousSubmit = mapCompletions - gpuProfile.lastSubmitMaps;
+            entry.writesSincePreviousSubmit = gpuCalls.queueWrites - gpuProfile.lastSubmitWrites;
+          }
+        }
+        gpuProfile.lastSubmitMaps = mapCompletions;
+        gpuProfile.lastSubmitWrites = gpuCalls.queueWrites;
+      }
+      gpuCalls.submissions++;
+      gpuCalls.commandBuffers += buffers.length;
+      const result = batchCapture ? flushPending(this, submit, buffers)
+        : submit.call(this, buffers);
+      gpuCalls.submitCpuMs += performance.now() - begun;
+      return result;
+    };
+    encoder.finish = function (...args) {
+      const buffer = finish.apply(this, args);
+      const indexes = passIndexesByEncoder.get(this);
+      if (indexes?.length) passIndexesByCommandBuffer.set(buffer, indexes);
+      return buffer;
+    };
+    queue.onSubmittedWorkDone = function () {
+      gpuCalls.completionWaits++;
+      if (batchCapture && pendingWrites.get(this)?.length) {
+        flushPending(this, submit);
+        batchStats.extraFlushes++;
+      }
+      return done.call(this);
+    };
+    pass.dispatchWorkgroups = function (...args) {
+      const begun = performance.now();
+      gpuCalls.dispatches++;
+      const entry = passByEncoder.get(this);
+      if (entry) {
+        entry.dispatches++;
+        entry.workgroups += args[0] * (args[1] ?? 1) * (args[2] ?? 1);
+      }
+      const result = dispatch.apply(this, args);
+      gpuCalls.passCpuMs += performance.now() - begun;
+      return result;
+    };
+    pass.setPipeline = function (pipeline) {
+      const entry = passByEncoder.get(this);
+      if (entry) {
+        if (!pipelineIds.has(pipeline)) {
+          const id = nextPipelineId++;
+          pipelineIds.set(pipeline, id);
+          if (moduleSources.has(pipeline)) {
+            pipelineSources.set(id, moduleSources.get(pipeline));
+          }
+        }
+        entry.pipelineId = pipelineIds.get(pipeline);
+        entry.pipelineLabel = pipeline.label || '';
+      }
+      return setPipeline.call(this, pipeline);
+    };
+    encoder.beginComputePass = function (...args) {
+      const begun = performance.now();
+      gpuCalls.computePasses++;
+      let entry;
+      if (gpuProfile.capture && gpuProfile.device) {
+        const index = gpuProfile.passes.length;
+        const setIndex = Math.floor(index / passesPerQuerySet);
+        if (!gpuProfile.querySets[setIndex]) {
+          gpuProfile.querySets[setIndex] = gpuProfile.device.createQuerySet({
+            type: 'timestamp', count: passesPerQuerySet * 2,
+          });
+        }
+        const slot = (index % passesPerQuerySet) * 2;
+        const options = {...(args[0] ?? {}), timestampWrites: {
+          querySet: gpuProfile.querySets[setIndex],
+          beginningOfPassWriteIndex: slot, endOfPassWriteIndex: slot + 1,
+        }};
+        entry = {pipelineId: 0, pipelineLabel: '', dispatches: 0, workgroups: 0};
+        gpuProfile.passes.push(entry);
+        const indexes = passIndexesByEncoder.get(this) ?? [];
+        indexes.push(index);
+        passIndexesByEncoder.set(this, indexes);
+        args = [options];
+      }
+      const result = begin.apply(this, args);
+      if (entry) passByEncoder.set(result, entry);
+      gpuCalls.passCpuMs += performance.now() - begun;
+      return result;
+    };
+    queue.writeBuffer = function (...args) {
+      const begun = performance.now();
+      const data = args[2];
+      const bytesPerElement = ArrayBuffer.isView(data) && !(data instanceof DataView)
+        ? data.BYTES_PER_ELEMENT : 1;
+      const size = (args[4] ?? data.byteLength / bytesPerElement - (args[3] ?? 0))
+        * bytesPerElement;
+      gpuCalls.queueWrites++;
+      gpuCalls.queueWriteBytes += size;
+      queueWriteSizes.push(size);
+      let result;
+      if (batchCapture && size > 0) {
+        const entries = pendingWrites.get(this) ?? [];
+        entries.push(encodedWrite(args));
+        pendingWrites.set(this, entries);
+      } else {
+        result = write.apply(this, args);
+      }
+      gpuCalls.queueWriteCpuMs += performance.now() - begun;
+      return result;
+    };
+    GPUBuffer.prototype.mapAsync = function (...args) {
+      const begun = performance.now();
+      gpuCalls.mappedBuffers++;
+      mapReadBytes.push(args[2] ?? this.size - (args[1] ?? 0));
+      if (batchCapture) {
+        for (const [queue, entries] of pendingWrites) {
+          if (entries.length) {
+            flushPending(queue, submit);
+            batchStats.extraFlushes++;
+          }
+        }
+      }
+      return map.apply(this, args).finally(() => {
+        mapCompletions++;
+        mapLatenciesMs.push(performance.now() - begun);
+      });
+    };
+    instrumented = true;
+  }
+  function snapshotCalls() { return {...gpuCalls}; }
+  function deltaCalls(before) {
+    return Object.fromEntries(Object.entries(gpuCalls).map(([key, value]) =>
+      [key, Number((value - before[key]).toFixed(3))]));
+  }
+  function summaryMs(values) {
+    if (!values.length) return null;
+    const sorted = [...values].sort((a, b) => a - b);
+    const rounded = (value) => Number(value.toFixed(3));
+    return {
+      count: values.length,
+      total: rounded(values.reduce((sum, value) => sum + value, 0)),
+      median: rounded(sorted[Math.floor(sorted.length / 2)]),
+      p95: rounded(sorted[Math.ceil(sorted.length * 0.95) - 1]),
+      max: rounded(sorted.at(-1)),
+    };
+  }
+  function summaryWriteSizes(values) {
+    return {count: values.length,
+      totalBytes: values.reduce((sum, value) => sum + value, 0),
+      atMost16Bytes: values.filter((value) => value <= 16).length,
+      atMost256Bytes: values.filter((value) => value <= 256).length,
+      atMost4096Bytes: values.filter((value) => value <= 4096).length,
+      maxBytes: Math.max(0, ...values)};
+  }
+  async function collectGpuProfile() {
+    const device = gpuProfile.device;
+    const commandEncoder = device.createCommandEncoder();
+    const buffers = [];
+    for (let setIndex = 0; setIndex < gpuProfile.querySets.length; setIndex++) {
+      const count = Math.min(passesPerQuerySet, gpuProfile.passes.length - setIndex * passesPerQuerySet);
+      const size = count * 16;
+      const resolve = device.createBuffer({size,
+        usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC});
+      const readback = device.createBuffer({size,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ});
+      commandEncoder.resolveQuerySet(gpuProfile.querySets[setIndex], 0, count * 2, resolve, 0);
+      commandEncoder.copyBufferToBuffer(resolve, 0, readback, 0, size);
+      buffers.push({resolve, readback, count});
+    }
+    device.queue.submit([commandEncoder.finish()]);
+    const durations = [];
+    const timestampsAll = [];
+    for (const {resolve, readback, count} of buffers) {
+      await readback.mapAsync(GPUMapMode.READ);
+      const timestamps = new BigUint64Array(readback.getMappedRange());
+      for (let i = 0; i < count; i++) {
+        durations.push(Number(timestamps[i * 2 + 1] - timestamps[i * 2]) / 1e6);
+        timestampsAll.push([timestamps[i * 2], timestamps[i * 2 + 1]]);
+      }
+      readback.unmap();
+      readback.destroy();
+      resolve.destroy();
+    }
+    gpuProfile.querySets.forEach((querySet) => querySet.destroy());
+    const withinSubmissionMs = [];
+    const betweenSubmissionMs = [];
+    const betweenAfterMapMs = [];
+    const betweenWithoutMapMs = [];
+    const betweenWithWritesMs = [];
+    const writesPerSubmission = [];
+    for (let i = 1; i < timestampsAll.length; i++) {
+      const gapMs = Number(timestampsAll[i][0] - timestampsAll[i - 1][1]) / 1e6;
+      const pass = gpuProfile.passes[i];
+      if (pass.submissionStart) {
+        betweenSubmissionMs.push(gapMs);
+        (pass.mapsSincePreviousSubmit ? betweenAfterMapMs : betweenWithoutMapMs)
+          .push(gapMs);
+        if (pass.writesSincePreviousSubmit) betweenWithWritesMs.push(gapMs);
+        writesPerSubmission.push(pass.writesSincePreviousSubmit ?? 0);
+      } else {
+        withinSubmissionMs.push(gapMs);
+      }
+    }
+    const grouped = new Map();
+    for (let i = 0; i < durations.length; i++) {
+      const pass = gpuProfile.passes[i];
+      const key = pass.pipelineId;
+      const group = grouped.get(key) ?? {pipelineId: key, label: pass.pipelineLabel,
+        count: 0, dispatches: 0, workgroups: 0, gpuMs: 0};
+      group.count++;
+      group.dispatches += pass.dispatches;
+      group.workgroups += pass.workgroups;
+      group.gpuMs += durations[i];
+      grouped.set(key, group);
+    }
+    return {
+      passCount: durations.length,
+      quantizedZeroPasses: durations.filter((duration) => duration === 0).length,
+      passMs: summaryMs(durations),
+      gpuSpanMs: Number((Number(timestampsAll.at(-1)[1] - timestampsAll[0][0]) / 1e6).toFixed(3)),
+      gapsWithinSubmissionMs: summaryMs(withinSubmissionMs),
+      gapsBetweenSubmissionsMs: summaryMs(betweenSubmissionMs),
+      gapsAfterTokenReadbackMs: summaryMs(betweenAfterMapMs),
+      gapsWithoutTokenReadbackMs: summaryMs(betweenWithoutMapMs),
+      gapsWithQueueWritesMs: summaryMs(betweenWithWritesMs),
+      writesBeforeMeasuredSubmissions: summaryMs(writesPerSubmission),
+      negativeGapCount: [...withinSubmissionMs, ...betweenSubmissionMs]
+        .filter((gap) => gap < 0).length,
+      topPipelines: [...grouped.values()].sort((a, b) => b.gpuMs - a.gpuMs)
+        .slice(0, 20).map((group) => ({...group,
+          shaderChars: pipelineSources.get(group.pipelineId)?.length ?? 0,
+          gpuMs: Number(group.gpuMs.toFixed(3)),
+          avgGpuMs: Number((group.gpuMs / group.count).toFixed(3))})),
+    };
+  }
+
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    subgroupKernelToggle.disabled = true;
+    vocabKernelToggle.disabled = true;
+    profileToggle.disabled = true;
+    batchWritesToggle.disabled = true;
+    gpuProfile.device = null;
+    gpuProfile.capture = false;
+    gpuProfile.passes = [];
+    gpuProfile.querySets = [];
+    shaderExperiment.transformed = 0;
+    shaderExperiment.vocabTransformed = 0;
+    shaderExperiment.compilationErrors = [];
+    pendingWrites.clear();
+    for (const key of Object.keys(batchStats)) batchStats[key] = 0;
+    const report = { modelId, webllmVersion: '0.2.85', modelRevision,
+      libraryRevision, prompt, profileRequested: profileToggle.checked,
+      subgroupKernelRequested: subgroupKernelToggle.checked,
+      vocabKernelRequested: vocabKernelToggle.checked,
+      batchWritesRequested: batchWritesToggle.checked, runs: [] };
+    let engine;
+    try {
+      const started = performance.now();
+      status.textContent = 'Importando WebLLM…';
+      const webllm = await import('https://esm.run/@mlc-ai/web-llm@0.2.85');
+      const model = webllm.prebuiltAppConfig.model_list.find((item) => item.model_id === modelId);
+      if (!model) throw new Error(`El modelo ${modelId} no está en esta versión de WebLLM.`);
+      const pinnedModel = {
+        ...model,
+        model: `${model.model}/resolve/${modelRevision}/`,
+        model_lib: model.model_lib.replace('/main/', `/${libraryRevision}/`),
+      };
+      report.modelUrl = pinnedModel.model;
+      report.modelLibUrl = pinnedModel.model_lib;
+      const adapter = navigator.gpu
+        ? await navigator.gpu.requestAdapter({featureLevel: 'core', powerPreference: 'high-performance'})
+        : null;
+      report.adapterInfo = adapter ? {
+        vendor: adapter.info.vendor,
+        architecture: adapter.info.architecture,
+        device: adapter.info.device,
+        description: adapter.info.description,
+        isFallbackAdapter: adapter.info.isFallbackAdapter,
+      } : null;
+      instrumentWebGpu();
+      engine = await webllm.CreateMLCEngine(modelId, {
+        appConfig: {model_list: [pinnedModel]},
+        initProgressCallback: (progress) => {
+          status.textContent = `Cargando modelo: ${progress.text ?? JSON.stringify(progress)}`;
+        },
+      });
+      const pipeline = engine.loadedModelIdToPipeline.get(modelId);
+      if (!pipeline) throw new Error('No se encontró la canalización de WebLLM.');
+      report.loadSeconds = Number(((performance.now() - started) / 1000).toFixed(3));
+      result.textContent = JSON.stringify(report, null, 2);
+      for (let i = 0; i < 3; i++) {
+        status.textContent = `Inferencia ${i + 1}/3…`;
+        gpuProfile.capture = i === 2 && profileToggle.checked && Boolean(gpuProfile.device);
+        batchCapture = batchWritesToggle.checked;
+        if (gpuProfile.capture) {
+          gpuProfile.lastSubmitMaps = mapCompletions;
+          gpuProfile.lastSubmitWrites = gpuCalls.queueWrites;
+        }
+        const begun = performance.now();
+        const gpuCallsBefore = snapshotCalls();
+        const batchStatsBefore = {...batchStats};
+        const mapIndex = mapLatenciesMs.length;
+        const mapBytesIndex = mapReadBytes.length;
+        const writeIndex = queueWriteSizes.length;
+        const response = await engine.chat.completions.create({
+          messages: [{role: 'user', content: prompt}],
+          temperature: 0,
+          max_tokens: 64,
+          seed: 1,
+          extra_body: {enable_latency_breakdown: true},
+        });
+        if (batchCapture) {
+          for (const [queue, entries] of pendingWrites) {
+            if (entries.length) {
+              flushPending(queue, nativeSubmit);
+              batchStats.extraFlushes++;
+            }
+          }
+        }
+        batchCapture = false;
+        gpuProfile.capture = false;
+        const usage = structuredClone(response.usage);
+        const breakdown = usage?.extra?.latencyBreakdown;
+        if (breakdown) {
+          usage.extra.latencyBreakdown = Object.fromEntries(
+            Object.entries(breakdown).map(([name, values]) => [name, {
+              count: values.length,
+              totalSeconds: Number(values.reduce((sum, value) => sum + value, 0).toFixed(4)),
+            }]),
+          );
+        }
+        report.runs.push({
+          wallSeconds: Number(((performance.now() - begun) / 1000).toFixed(3)),
+          finishReason: response.choices[0]?.finish_reason,
+          text: response.choices[0]?.message?.content,
+          tokenIds: pipeline.outputIds.slice(),
+          usage,
+          gpuCalls: deltaCalls(gpuCallsBefore),
+          batchStats: Object.fromEntries(Object.entries(batchStats).map(([key, value]) =>
+            [key, value - batchStatsBefore[key]])),
+          mapWaitMs: summaryMs(mapLatenciesMs.slice(mapIndex)),
+          mapReadBytes: mapReadBytes.slice(mapBytesIndex),
+          queueWriteSizes: summaryWriteSizes(queueWriteSizes.slice(writeIndex)),
+        });
+        if (i === 2 && profileToggle.checked) {
+          report.profile = gpuProfile.device ? await collectGpuProfile()
+            : {error: 'La librería no creó un dispositivo con timestamp-query.'};
+          document.getElementById('shader-sources').textContent = JSON.stringify(
+            report.profile.topPipelines?.map(({pipelineId}) => ({
+              pipelineId, source: pipelineSources.get(pipelineId) ?? null,
+            })) ?? [],
+          );
+        }
+        result.textContent = JSON.stringify(report, null, 2);
+      }
+      status.textContent = 'Modelo ejecutado íntegramente en el navegador.';
+    } catch (error) {
+      status.textContent = `Error: ${String(error)}`;
+      report.error = String(error?.stack ?? error);
+      result.textContent = JSON.stringify(report, null, 2);
+    } finally {
+      gpuProfile.capture = false;
+      batchCapture = false;
+      report.shaderExperiment = {...shaderExperiment};
+      result.textContent = JSON.stringify(report, null, 2);
+      await engine?.unload().catch(() => {});
+      stagingBuffers.splice(0).forEach((buffer) => buffer.destroy());
+      button.disabled = false;
+      subgroupKernelToggle.disabled = false;
+      vocabKernelToggle.disabled = false;
+      profileToggle.disabled = false;
+      batchWritesToggle.disabled = false;
+    }
+  });
+</script>
+</html>

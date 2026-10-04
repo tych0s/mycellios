@@ -701,6 +701,14 @@ function oneStageManifest(): RuntimePipelineManifestV2 {
 }
 
 describe("GDLP/2 Python launch compiler", () => {
+  it("separates startup and active pipeline deadlines", () => {
+    const configured = compile(manifest(), { connectTimeoutSeconds: 300, operationTimeoutSeconds: 20 });
+    const args = root(configured).command.args;
+    expect(argumentValue(args, "--startup-timeout-seconds")).toBe("300");
+    expect(argumentValue(args, "--socket-timeout-seconds")).toBe("20");
+    expect(() => validatePythonLaunchDescription(configured)).not.toThrow();
+    expect(argumentValue(root(compile()).command.args, "--socket-timeout-seconds")).toBe("45.5");
+  });
   it("is reproducible and validates every derived process and argv", () => {
     const first = compile();
     const second = compile();

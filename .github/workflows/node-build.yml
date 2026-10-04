@@ -38,6 +38,8 @@ jobs:
             src/node \
             src/worker \
             src/contracts \
+            python \
+            sidecars \
             scripts \
             'package*.json' \
             .github/workflows/node-build.yml; then
@@ -87,8 +89,18 @@ jobs:
         # Hosted images can carry a newer 3.14.1 package revision. Force the
         # audited version instead of failing before the MSI build starts.
         run: choco install wixtoolset --version=3.14.1 --allow-downgrade --no-progress -y
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
+        if: needs.native_scope.outputs.required == 'true' && matrix.target == 'windows-x64'
+        with:
+          dotnet-version: 8.0.423
+      - name: Build Windows Job Object broker
+        if: needs.native_scope.outputs.required == 'true' && matrix.target == 'windows-x64'
+        run: npm run node:isolation-broker
+      - name: Fetch pinned Windows service wrapper
+        if: needs.native_scope.outputs.required == 'true' && matrix.target == 'windows-x64'
+        run: node scripts/fetch-windows-service-wrapper.mjs --output=build/windows-service-wrapper/MycelliosNode.exe
       - if: needs.native_scope.outputs.required == 'true'
-        run: npx vitest run tests/node-*.test.ts tests/headless-worker.test.ts tests/worker-hardening.test.ts
+        run: npx vitest run tests/node- tests/headless-worker.test.ts tests/worker-hardening.test.ts tests/worker-registration-error.test.ts tests/auto-distribute.test.ts tests/windows-job-broker
       - name: Compile production node payload
         if: needs.native_scope.outputs.required == 'true'
         run: npm run clean --silent && npx tsc -p tsconfig.build.json
@@ -100,15 +112,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          node scripts/stage-node-installer.mjs \
-            --dist=dist \
-            --runtime=build/distribution-runtime \
-            --node-executable="$(node -p 'process.execPath')" \
-            --node-modules=node_modules \
-            --source-root=. \
-            --target="${{ matrix.target }}" \
-            --source-revision="$GITHUB_SHA" \
-            --output="build/node-package/${{ matrix.target }}"
+          stage_node() {
+            node scripts/stage-node-installer.mjs \
+              --dist=dist \
+              --runtime=build/distribution-runtime \
+              --node-executable="$(node -p 'process.execPath')" \
+              --node-modules=node_modules \
+              --source-root=. \
+              --target="${{ matrix.target }}" \
+              --source-revision="$GITHUB_SHA" \
+              "$@" \
+              --output="build/node-package/${{ matrix.target }}"
+          }
+          if [[ "${{ matrix.target }}" == "windows-x64" ]]; then
+            stage_node \
+              --broker-executable=build/windows-job-broker/mycellios-job-broker.exe \
+              --service-wrapper-executable=build/windows-service-wrapper/MycelliosNode.exe
+          else
+            stage_node
+          fi
           node scripts/verify-node-installer.mjs --root="build/node-package/${{ matrix.target }}"
       - name: Build and verify native Debian installer
         if: needs.native_scope.outputs.required == 'true' && matrix.target == 'linux-x64'
@@ -182,5 +204,55 @@ jobs:
             build/*.pkg
             build/*.msi
             build/evidence/${{ matrix.target }}
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+
+  assemble_release_candidate:
+    name: Native release candidate assembly
+    needs: [native_scope, node]
+    if: needs.native_scope.outputs.required == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: mycellios-node-*
+          path: build/ci-artifacts
+          merge-multiple: false
+      - name: Verify and assemble three native packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p 'require("./package.json").version')"
+          source_id="$(node --input-type=module -e 'import { buildNativeSourceProvenance } from "./scripts/native-build-provenance.mjs"; process.stdout.write(buildNativeSourceProvenance(".").sourceId)')"
+          epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          published_at="$(node -e 'process.stdout.write(new Date(Number(process.argv[1]) * 1000).toISOString())' "$epoch")"
+          transaction_id="ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA:0:12}"
+          npm run node:release:assemble -- \
+            --artifacts=build/ci-artifacts \
+            --output=build/native-release-assets \
+            --version="$version" \
+            --revision="$GITHUB_SHA" \
+            --source-id="$source_id" \
+            --published-at="$published_at"
+          npx --no-install tsx src/coordinator/public-release-transaction-cli.ts \
+            --assets=build/native-release-assets \
+            --output=build/native-release-manifest.json \
+            --version="$version" \
+            --revision="$GITHUB_SHA" \
+            --source-id="$source_id" \
+            --transaction-id="$transaction_id"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mycellios-node-release-candidate
+          path: |
+            build/native-release-assets
+            build/native-release-manifest.json
           if-no-files-found: error
           retention-days: 14

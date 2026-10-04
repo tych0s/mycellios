@@ -58,6 +58,14 @@ export interface HeadlessRuntime {
   physicalProbe: PhysicalProbeV1;
 }
 
+export interface NativeNodeRuntime {
+  executor: HeadlessRuntime["executor"];
+  verifiedGpuRuntime?: VerifiedGpuRuntimeEvidence;
+  preferredHardwareGpu?: HeadlessRuntime["preferredHardwareGpu"];
+  acceleration: WorkerAcceleratorDiagnostics;
+  physicalProbe: PhysicalProbeV1;
+}
+
 export function headlessEnvironmentFromNodeConfiguration(
   config: NodeConfiguration,
   appVersion: string,
@@ -119,6 +127,7 @@ export class HeadlessStageLaunchAgent implements LaunchAgent {
       environment: {
         PYTHONPATH: this.config.pythonPath,
         HF_HOME: this.config.cachePath,
+        PYTHONDONTWRITEBYTECODE: "1",
         TOKENIZERS_PARALLELISM: "false",
       },
       ...(onProgress ? { onProgress } : {}),
@@ -210,18 +219,7 @@ export async function createHeadlessRuntime(
   collector?: PhysicalProbeCollector,
   now: () => Date = () => new Date(),
 ): Promise<HeadlessRuntime> {
-  const runtimeEnvironment = {
-    PYTHONPATH: config.pythonPath,
-    HF_HOME: config.cachePath,
-  };
-  const physicalProbe = await (
-    collector
-      ?? new PythonPhysicalProbe({
-        pythonExecutable: config.pythonExecutable,
-        cwd: process.cwd(),
-        env: runtimeEnvironment,
-      })
-  ).collect(`headless-${randomBytes(16).toString("hex")}`);
+  const physicalProbe = await collectHeadlessProbe(config, collector);
   const device = physicalProbe.devices[0];
   if (!physicalProbe.runtime.cudaApiAvailable || !device) {
     throw new Error("headless_worker_requires_verified_cuda_device");
@@ -256,18 +254,7 @@ export async function createHeadlessRuntime(
       message: "Physical GPU probe passed; headless shard executor is ready.",
     }],
   };
-  const processAgent = new LocalProcessAgent({
-    id: `headless-shard-executor:${config.nodeId}`,
-    cwd: process.cwd(),
-    env: runtimeEnvironment,
-    allowedExecutables: [config.pythonExecutable],
-    workspaceRoot: resolve(config.cachePath, "process-workspaces"),
-    maxWorkspaceBytes: config.maxWorkspaceBytes,
-    ...(config.windowsJobBrokerExecutable
-      ? { windowsJobBrokerExecutable: config.windowsJobBrokerExecutable }
-      : {}),
-  });
-  const launchAgent = new HeadlessStageLaunchAgent(processAgent, config);
+  const launchAgent = createHeadlessStageLaunchAgent(config);
   return {
     executor: {
       nodeId: config.nodeId,
@@ -288,6 +275,75 @@ export async function createHeadlessRuntime(
     acceleration,
     physicalProbe,
   };
+}
+
+/** The packaged node may start with the pinned CPU runtime while a GPU pack is unavailable. */
+export async function createNativeNodeRuntime(
+  config: HeadlessWorkerEnvironment,
+  collector?: PhysicalProbeCollector,
+  now: () => Date = () => new Date(),
+): Promise<NativeNodeRuntime> {
+  const physicalProbe = await collectHeadlessProbe(config, collector);
+  if (physicalProbe.runtime.cudaApiAvailable) {
+    return createHeadlessRuntime(config, { collect: async () => physicalProbe }, now);
+  }
+  const at = now().toISOString();
+  const acceleration: WorkerAcceleratorDiagnostics = {
+    schema: "mycellios-accelerator-diagnostics/1",
+    appVersion: config.appVersion,
+    state: "cpu-ready",
+    backend: "cpu",
+    deviceName: physicalProbe.host.cpuDeviceName ?? null,
+    gpuVendor: null,
+    gpuModel: null,
+    phase: "ready",
+    progressPct: 100,
+    issueCode: null,
+    issueSummary: null,
+    retryable: false,
+    retryAttempt: 0,
+    nextRetryAt: null,
+    updatedAt: at,
+    recentEvents: [{ at, level: "success", message: "CPU runtime probe passed; native stage executor is ready." }],
+  };
+  return {
+    executor: {
+      nodeId: config.nodeId,
+      stageHost: `${config.nodeId}.relay`,
+      stagePort: config.stagePort,
+      launchAgent: createHeadlessStageLaunchAgent(config),
+      pythonExecutable: config.pythonExecutable,
+      computeMode: "cpu-only",
+      cpuEligible: true,
+      acceleration,
+    },
+    acceleration,
+    physicalProbe,
+  };
+}
+
+async function collectHeadlessProbe(config: HeadlessWorkerEnvironment, collector?: PhysicalProbeCollector): Promise<PhysicalProbeV1> {
+  return (collector ?? new PythonPhysicalProbe({
+    pythonExecutable: config.pythonExecutable,
+    timeoutMs: 120_000, // Cold vendor imports can exceed 30s under desktop load.
+    cwd: process.cwd(),
+    env: { PYTHONPATH: config.pythonPath, HF_HOME: config.cachePath, PYTHONDONTWRITEBYTECODE: "1" },
+  })).collect(`headless-${randomBytes(16).toString("hex")}`);
+}
+
+function createHeadlessStageLaunchAgent(config: HeadlessWorkerEnvironment): HeadlessStageLaunchAgent {
+  const processAgent = new LocalProcessAgent({
+    id: `headless-shard-executor:${config.nodeId}`,
+    cwd: process.cwd(),
+    env: { PYTHONPATH: config.pythonPath, HF_HOME: config.cachePath, PYTHONDONTWRITEBYTECODE: "1" },
+    allowedExecutables: [config.pythonExecutable],
+    workspaceRoot: resolve(config.cachePath, "process-workspaces"),
+    maxWorkspaceBytes: config.maxWorkspaceBytes,
+    ...(config.windowsJobBrokerExecutable
+      ? { windowsJobBrokerExecutable: config.windowsJobBrokerExecutable }
+      : {}),
+  });
+  return new HeadlessStageLaunchAgent(processAgent, config);
 }
 
 export function buildPhysicalIdentity(

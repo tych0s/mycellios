@@ -36,7 +36,7 @@ if (!existsSync(pythonExecutable)) {
   throw new Error(`Installed Mycellios Python is missing: ${pythonExecutable}`);
 }
 
-const model = option("--model") ?? "hmellor/tiny-random-LlamaForCausalLM";
+const model = option("--model") ?? "HMellor/tiny-random-LlamaForCausalLM";
 const profile = await profileCompatibleModelWithRuntime({
   source: model,
   revision: option("--revision") ?? null,

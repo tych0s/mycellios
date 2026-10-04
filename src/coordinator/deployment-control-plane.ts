@@ -339,7 +339,14 @@ export class DeploymentControlPlane {
         );
       }
       state = this.getState(modelId)!;
-      const attempt = state.retryCount + 1;
+      // retryCount tracks consecutive failures and resets after success. The
+      // operation attempt must remain unique within a generation after an
+      // active route loses capacity and needs another activation.
+      const previous = this.store.database.raw.prepare(
+        `SELECT MAX(attempt) AS attempt FROM deployment_operations
+         WHERE model_id = ? AND generation = ? AND kind = ?`,
+      ).get(modelId, state.generation, kind) as { attempt: number | null };
+      const attempt = Math.max(state.retryCount, previous.attempt ?? 0) + 1;
       const idempotencyKey = `${modelId}:${state.generation}:${kind}:${attempt}`;
       const existing = this.store.database.raw.prepare(
         "SELECT * FROM deployment_operations WHERE idempotency_key = ?",

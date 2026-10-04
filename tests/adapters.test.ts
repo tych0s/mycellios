@@ -96,6 +96,38 @@ describe("native Mycellios pipeline adapter", () => {
       .toBe("http://127.0.0.1:8080");
   });
 
+  it.each([
+    ['native error', 'data: {"error":{"type":"service_unavailable","message":"remote stage disconnected"}}\n\ndata: [DONE]\n\n', 'mycellios_pipeline_stream_failed'],
+    ['bare DONE', 'data: [DONE]\n\n', 'mycellios_pipeline_stream_incomplete'],
+    ['premature EOF', '', 'mycellios_pipeline_stream_incomplete'],
+    ['missing usage', 'data: {"choices":[{"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n', 'mycellios_pipeline_stream_incomplete'],
+  ])("rejects partial output followed by %s", async (_case, ending, code) => {
+    const baseUrl = await listen((request, response) => {
+      if (request.url === '/health') {
+        response.end(JSON.stringify({
+          status: 'ready', model: 'test-model', artifact_identity: MODEL_DIGEST,
+          pipeline_snapshot_identity: ACTIVATION_ID, stages: 2, boundaries: [0, 14, 28],
+        }));
+      } else {
+        response.setHeader('content-type', 'text/event-stream');
+        response.end('data: {"choices":[{"delta":{"content":"partial answer"}}]}\n\n' + ending);
+      }
+    });
+    const adapter = new MycelliosPipelineAdapter({
+      baseUrl, model: 'test-model', modelDigest: MODEL_DIGEST, activationId: ACTIVATION_ID,
+    });
+    await adapter.probe();
+    const chunks: string[] = [];
+    const run = async () => {
+      for await (const chunk of adapter.generate({
+        jobId: 'fault', request: {model: 'test-model', messages: [{role: 'user', content: 'test'}]},
+      }, new AbortController().signal)) chunks.push(chunk.text);
+    };
+    await expect(run()).rejects.toMatchObject({code, retryable: false});
+    expect(chunks).toEqual(['partial answer']);
+    expect((await adapter.metrics()).activeJobs).toBe(0);
+  });
+
   it("fails closed when loopback health is not the sealed native artifact", async () => {
     const baseUrl = await listen((_request, response) => {
       response.setHeader("content-type", "application/json");

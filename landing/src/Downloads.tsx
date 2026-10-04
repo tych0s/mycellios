@@ -14,20 +14,21 @@ export function downloadAvailabilityNotice(
   if (availabilityFailed) return {
     title: "Could not check package status",
     detail: availabilityReason === "unsupported"
-      ? "No Fedora / RHEL RPM package is offered. Current archive availability could not be checked; review the public releases or try the browser worker."
+      ? "No Fedora / RHEL RPM package is offered. Current installer availability could not be checked; review the public releases or try the browser worker."
       : "Current package availability could not be checked. Review the public releases or try the browser worker.",
   };
   if (availabilityReason === "unsupported") return {
     title: "Package format unavailable",
-    detail: "No Fedora / RHEL RPM package is offered. Check whether the Linux x64 archive is currently published, or try the browser worker.",
+    detail: "No Fedora / RHEL RPM package is offered. Check whether the Linux x64 installer is currently published, or try the browser worker.",
   };
   if (!availability) return null;
   const requestedOption = PUBLIC_DOWNLOAD_OPTIONS.find((option) => option.id === requestedPlatform);
   if (requestedOption) {
-    if (availability.packages.find((item) => item.id === requestedOption.id)?.available) return null;
+    const requestedPackage = availability.packages.find((item) => item.id === requestedOption.id);
+    if (requestedPackage?.available) return null;
     return {
       title: "Package unavailable",
-      detail: `The ${requestedOption.label} ${requestedOption.format} package is not currently published.`,
+      detail: `The ${requestedOption.label} ${requestedPackage?.format ?? requestedOption.format} package is not currently published.`,
     };
   }
   if (availability.packages.some((item) => item.available)) return null;
@@ -69,19 +70,20 @@ export function DownloadsPage({
     <div className="download-grid">{PUBLIC_DOWNLOAD_OPTIONS.map((option) => {
       const pkg = availability?.packages.find((item) => item.id === option.id);
       const available = pkg?.available === true;
+      const format = pkg?.format ?? option.format;
       const copy = availabilityFailed
         ? "Availability could not be confirmed. Check the public release page."
         : available && availability
-      ? `Version ${availability.version} · published ${option.format} archive.`
+      ? `Version ${availability.version} · ${format} installer published.`
           : availability
-            ? `No ${option.format} archive is published for the current version.`
+            ? `No ${format} installer is published for the current version.`
             : "Checking published release files…";
       return <article className={`download-card${available ? " ready" : " unavailable"}`} key={option.id}>
-        <span>{option.id === "windows-x64" ? <Laptop /> : <Cpu />}{option.label.toUpperCase()} · {option.format}</span>
+        <span>{option.id === "windows-x64" ? <Laptop /> : <Cpu />}{option.label.toUpperCase()} · {format}</span>
         <h2>{option.detail}</h2>
         <p>{copy}</p>
         {available && pkg
-          ? <a className="download-card-action" href={publicLink(pkg.path)} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}>Download {option.format} <Download /></a>
+          ? <a className="download-card-action" href={publicLink(pkg.path)} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined}>Download {format} <Download /></a>
           : availabilityFailed
             ? <a className="download-card-action" href={RELEASES_URL} target="_blank" rel="noreferrer">Check releases <ExternalLink /></a>
             : <span className="download-card-action">{availability ? "Not published" : "Checking…"}</span>}

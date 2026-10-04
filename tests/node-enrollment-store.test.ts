@@ -9,6 +9,23 @@ const actor = {
 };
 
 describe("NodeEnrollmentStore", () => {
+  it("acknowledges an expired consumed retry only for the same active identity and key", () => {
+    let clock = Date.now(); const database = new MeshDatabase(":memory:");
+    try {
+      const store = new NodeEnrollmentStore(database, () => clock);
+      const issued = store.issue({ accountId: "account-1", actor, expiresInSeconds: 60 });
+      store.confirm({ enrollmentId: issued.enrollmentId, accountId: "account-1", actorId: "account-1" });
+      const input = { enrollmentToken: issued.enrollmentToken, nonce: issued.nonce,
+        identityKind: "device" as const, identityId: "node-retained", publicKeyFingerprint: `sha256:${"a".repeat(64)}` as const };
+      expect(store.consume(input).state).toBe("consumed"); clock += 60_001;
+      expect(store.consume(input).state).toBe("already-consumed");
+      expect(store.consume({ ...input, nonce: "wrong" }).state).toBe("nonce-mismatch");
+      expect(store.consume({ ...input, identityId: "node-other" }).state).toBe("recovery-required");
+      expect(store.consume({ ...input, publicKeyFingerprint: `sha256:${"b".repeat(64)}` }).state).toBe("recovery-required");
+      database.raw.prepare("UPDATE node_ownership SET status = 'revoked' WHERE identity_id = ?").run(input.identityId);
+      expect(store.consume(input).state).toBe("revoked");
+    } finally { database.close(); }
+  });
   it("stores only hashes, requires account confirmation and consumes once atomically", async () => {
     const database = new MeshDatabase(":memory:");
     const store = new NodeEnrollmentStore(database, () => Date.parse("2026-08-09T20:00:00Z"));

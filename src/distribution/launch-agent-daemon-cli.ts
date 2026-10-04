@@ -5,6 +5,7 @@ import { readNativeRuntimeBuildMetadata } from "../core/native-build-identity.js
 import { LocalProcessAgent } from "./launch-supervisor.js";
 import { LaunchAgentRpcServer } from "./launch-agent-rpc.js";
 import { PythonPhysicalProbe } from "./physical-probe.js";
+import { browserLayerRuntimeEnvironment } from "./process-environment.js";
 import {
   validatePythonLaunchDescription,
   type PythonPipelineLaunchDescription,
@@ -46,9 +47,7 @@ async function main(): Promise<void> {
   const physicalProbe = new PythonPhysicalProbe({
     pythonExecutable: options.physicalProbePython,
     ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
-    env: {
-      ...runtimeEnvironment,
-    },
+    env: launchAgentRuntimeEnvironment(runtimeMetadata.root, {}),
     timeoutMs: options.physicalProbeTimeoutMs,
   });
   const local = new LocalProcessAgent({
@@ -215,9 +214,11 @@ export function parseLaunchAgentDaemonArguments(
 
 export function launchAgentRuntimeEnvironment(
   runtimeRoot: string,
+  source: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
   return {
     PYTHONPATH: resolve(runtimeRoot, "python"),
+    ...browserLayerRuntimeEnvironment(source),
   };
 }
 

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { workerConfigSchema } from "../src/contracts/schemas.js";
@@ -265,8 +265,8 @@ describe("inference-only coordinator and worker", () => {
       schema: "mycellios-public-downloads/1",
       packages: [
         { id: "windows-x64", format: "ZIP", path: "/downloads/windows", available: true, fileName: archiveName },
-        { id: "macos-arm64", format: "TAR.GZ", path: "/downloads/macos-arm64" },
-        { id: "linux-x64", format: "TAR.GZ", path: "/downloads/linux" },
+        { id: "macos-arm64", format: "PKG", path: "/downloads/macos-arm64" },
+        { id: "linux-x64", format: "DEB", path: "/downloads/linux" },
       ],
     });
 
@@ -283,6 +283,28 @@ describe("inference-only coordinator and worker", () => {
     const unsupported = await fetch(new URL("downloads/linux-rpm", `${address}/`), { redirect: "manual" });
     expect(unsupported.status).toBe(302);
     expect(unsupported.headers.get("location")).toBe("/downloads?availability=unsupported&platform=linux-rpm");
+  });
+
+  it("prefers a published native MSI over the legacy Windows archive", async () => {
+    const downloadsRoot = mkdtempSync(join(tmpdir(), "mycellios-native-downloads-"));
+    const version = (JSON.parse(readFileSync(resolve("package.json"), "utf8")) as { version: string }).version;
+    const msiName = `mycellios-node-${version}-windows-x64.msi`;
+    writeFileSync(join(downloadsRoot, msiName), "fixture MSI");
+    writeFileSync(join(downloadsRoot, "mycellios-node-windows-x64.zip"), "legacy archive");
+    const { runtime, address, agent, run } = await startNetwork({ releaseDownloadsPath: downloadsRoot });
+    cleanup.push(async () => {
+      await agent.stop();
+      await run;
+      await runtime.close();
+      rmSync(downloadsRoot, { recursive: true, force: true });
+    });
+
+    const availability = await (await fetch(new URL("public/v1/downloads", `${address}/`))).json();
+    expect(availability.packages[0]).toMatchObject({ format: "MSI", fileName: msiName, available: true });
+    const redirect = await fetch(new URL("downloads/windows", `${address}/`), { redirect: "manual" });
+    expect(redirect.headers.get("location")).toBe(`/downloads/${msiName}?v=${version}`);
+    const asset = await fetch(new URL(redirect.headers.get("location")!, `${address}/`));
+    expect(await asset.text()).toBe("fixture MSI");
   });
 
   it("connects a signed public cell worker without exposing the global network token", async () => {

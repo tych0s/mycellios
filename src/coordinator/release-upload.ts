@@ -46,7 +46,7 @@ export interface ReleaseAssetEvidence {
 }
 
 export interface ReleaseTransactionManifest extends ReleaseTransactionIdentity {
-  schema: "mycellios-native-public-release/1";
+  schema: "mycellios-native-public-release/1" | "mycellios-native-public-release/2";
   assets: ReleaseAssetEvidence[];
   releaseId: `sha256:${string}`;
 }
@@ -69,14 +69,15 @@ export interface ReleaseAbortResult {
   alreadyAborted: boolean;
 }
 
-const RELEASE_SCHEMA = "mycellios-native-public-release/1";
+const LEGACY_RELEASE_SCHEMA = "mycellios-native-public-release/1";
+const RELEASE_SCHEMA = "mycellios-native-public-release/2";
 const TRANSACTION_SEAL_SCHEMA = "mycellios-native-release-transaction-seal/1";
 const COMMIT_SCHEMA = "mycellios-native-release-commit/1";
 const ACTIVE_SCHEMA = "mycellios-native-release-active/1";
 const ROLLBACK_SCHEMA = "mycellios-native-release-rollback/1";
 
 const UPDATE_FILE = /^mycellios-node-latest\.json$/;
-const DOWNLOAD_FILE = /^mycellios-node-(?:windows-x64\.zip|macos-arm64\.tar\.gz|linux-x64\.tar\.gz)$/;
+const DOWNLOAD_FILE = /^mycellios-node-(?:windows-x64\.zip|macos-arm64\.tar\.gz|linux-x64\.tar\.gz|\d+\.\d+\.\d+-(?:windows-x64\.msi|macos-arm64\.pkg|linux-x64\.deb))$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const MAX_RELEASE_FILE_SIZE = 1_500_000_000;
 const MAX_RELEASE_CHUNKS = 2_048;
@@ -99,12 +100,16 @@ export function parseReleaseTransactionIdentity(
 }
 
 export function buildReleaseTransactionManifest(
-  input: ReleaseTransactionIdentity & { assets: ReleaseAssetEvidence[] },
+  input: ReleaseTransactionIdentity & {
+    assets: ReleaseAssetEvidence[];
+    schema?: ReleaseTransactionManifest["schema"];
+  },
 ): ReleaseTransactionManifest {
   const identity = validateTransactionIdentity(input);
-  const assets = validateManifestAssets(identity.version, input.assets);
+  const schema = input.schema ?? RELEASE_SCHEMA;
+  const assets = validateManifestAssets(identity.version, input.assets, schema);
   const sealed = {
-    schema: RELEASE_SCHEMA,
+    schema,
     transactionId: identity.transactionId,
     sourceId: identity.sourceId,
     revision: identity.revision,
@@ -134,7 +139,7 @@ export function parseReleaseTransactionManifest(
     ],
     "release_manifest",
   );
-  if (candidate.schema !== RELEASE_SCHEMA) {
+  if (candidate.schema !== RELEASE_SCHEMA && candidate.schema !== LEGACY_RELEASE_SCHEMA) {
     throw new Error("release_manifest_schema_invalid");
   }
   if (typeof candidate.releaseId !== "string" || !SOURCE_ID.test(candidate.releaseId)) {
@@ -147,6 +152,7 @@ export function parseReleaseTransactionManifest(
   const expected = buildReleaseTransactionManifest({
     ...identity,
     assets: candidate.assets,
+    schema: candidate.schema,
   });
   if (canonicalJson(candidate) !== canonicalJson(expected)) {
     throw new Error("release_manifest_seal_invalid");
@@ -888,10 +894,23 @@ function validateTransactionId(value: string): void {
   }
 }
 
-export function expectedPublicReleaseAssets(version: string): Array<{
+export function expectedPublicReleaseAssets(
+  version: string,
+  schema: ReleaseTransactionManifest["schema"] = RELEASE_SCHEMA,
+): Array<{
   channel: ReleaseAssetChannel;
   fileName: string;
 }> {
+  if (!VERSION.test(version)) throw new Error("release_transaction_version_invalid");
+  if (schema === RELEASE_SCHEMA) {
+    return [
+      { channel: "downloads", fileName: `mycellios-node-${version}-linux-x64.deb` },
+      { channel: "downloads", fileName: `mycellios-node-${version}-macos-arm64.pkg` },
+      { channel: "downloads", fileName: `mycellios-node-${version}-windows-x64.msi` },
+      { channel: "updates", fileName: "mycellios-node-latest.json" },
+    ];
+  }
+  if (schema !== LEGACY_RELEASE_SCHEMA) throw new Error("release_manifest_schema_invalid");
   return [
     { channel: "downloads", fileName: "mycellios-node-linux-x64.tar.gz" },
     { channel: "downloads", fileName: "mycellios-node-macos-arm64.tar.gz" },
@@ -903,8 +922,9 @@ export function expectedPublicReleaseAssets(version: string): Array<{
 function validateManifestAssets(
   version: string,
   candidates: unknown[],
+  schema: ReleaseTransactionManifest["schema"],
 ): ReleaseAssetEvidence[] {
-  const expected = expectedPublicReleaseAssets(version);
+  const expected = expectedPublicReleaseAssets(version, schema);
   if (candidates.length !== expected.length) {
     throw new Error("release_manifest_asset_count_invalid");
   }
@@ -1227,18 +1247,18 @@ async function verifyFeedCoherence(
   if (!Array.isArray(latest.packages)) {
     throw new Error("release_transaction_latest_packages_invalid");
   }
-  const latestPackages = [
-    ["linux-x64", "mycellios-node-linux-x64.tar.gz"],
-    ["macos-arm64", "mycellios-node-macos-arm64.tar.gz"],
-    ["windows-x64", "mycellios-node-windows-x64.zip"],
-  ].map(([target, name]) => {
-    const evidence = observed.get(`downloads/${name}`);
-    if (!target || !name || !evidence) {
+  const targets = ["linux-x64", "macos-arm64", "windows-x64"] as const;
+  const latestPackages = expectedPublicReleaseAssets(manifest.version, manifest.schema)
+    .filter((asset) => asset.channel === "downloads")
+    .map(({ fileName }, index) => {
+    const target = targets[index];
+    const evidence = observed.get(`downloads/${fileName}`);
+    if (!target || !evidence) {
       throw new Error("release_transaction_latest_packages_invalid");
     }
     return {
       target,
-      name,
+      name: fileName,
       bytes: evidence.bytes,
       sha256: evidence.sha256,
     };

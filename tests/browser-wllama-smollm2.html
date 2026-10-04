@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="es">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mycellios · llama.cpp WebGPU GGUF</title>
+<style>
+  body { font: 15px system-ui; max-width: 850px; margin: 2rem auto; padding: 0 1rem; }
+  button { padding: .7rem 1rem; margin: .3rem .4rem .3rem 0; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #eee; padding: 1rem; }
+  #log { max-height: 25rem; overflow: auto; }
+</style>
+<h1>llama.cpp en el navegador · <span id="model-name">SmolLM2 135M F16</span> <span id="backend-name"></span></h1>
+<p>Prueba local. El servidor solo entrega archivos; el cálculo ocurre en Chrome.</p>
+<p id="capabilities">Detectando WebGPU…</p>
+<button id="load">Cargar GGUF en WebGPU</button>
+<button id="run" disabled>Generar 32 tokens</button>
+<p id="status">Pendiente</p>
+<h2>Resultado</h2><pre id="result"></pre>
+<h2>Mediciones</h2><pre id="measurements"></pre>
+<h2>Muestras WebGPU</h2><pre id="probe"></pre>
+<h2>Acciones WebGPU</h2><pre id="actions"></pre>
+<h2>Registro del motor</h2><pre id="log"></pre>
+<script type="module">
+  import { Wllama } from '/wllama/index.js';
+
+  const $ = (id) => document.getElementById(id);
+  const selectedModel = new URL(location.href).searchParams.get('model') === 'qwen'
+    ? { name: 'Qwen3 0.6B Q8_0', path: '/qwen.gguf' }
+    : { name: 'SmolLM2 135M F16', path: '/model.gguf' };
+  const cpuOnly = new URL(location.href).searchParams.get('backend') === 'cpu';
+  const threadCount = new URL(location.href).searchParams.get('threads') === '1' ? 1 : 4;
+  const disablePromptCache = new URL(location.href).searchParams.get('cache') === 'off';
+  const inspectLogprobs = new URL(location.href).searchParams.get('logprobs') === '1';
+  const requestedRuns = Number(new URL(location.href).searchParams.get('runs') || '1');
+  const repeatCount = Number.isInteger(requestedRuns) && requestedRuns >= 1 && requestedRuns <= 12
+    ? requestedRuns : 1;
+  $('model-name').textContent = selectedModel.name;
+  $('backend-name').textContent = cpuOnly ? '(CPU/WASM)' : '(WebGPU)';
+  $('load').textContent = cpuOnly ? 'Cargar GGUF en CPU/WASM' : 'Cargar GGUF en WebGPU';
+  $('run').textContent = `${inspectLogprobs ? 'Diagnosticar 16 tokens' : 'Generar 32 tokens'}${repeatCount > 1 ? ` × ${repeatCount}` : ''}`;
+  const lines = [];
+  const probeSamples = [];
+  const probeActions = [];
+  const log = (level, ...args) => {
+    const message = args.map((x) => typeof x === 'string' ? x : JSON.stringify(x)).join(' ');
+    if (message.startsWith('MYCELLIOS_GPU_PROBE_SAMPLE ')) {
+      try {
+        probeSamples.push(JSON.parse(message.slice('MYCELLIOS_GPU_PROBE_SAMPLE '.length)));
+        $('probe').textContent = probeSamples.slice(-120).map(JSON.stringify).join('\n');
+      } catch (error) {
+        lines.push(`probe parse error: ${error.message}`);
+      }
+    }
+    if (message.startsWith('MYCELLIOS_GPU_PROBE_ACTION ')) {
+      try {
+        probeActions.push(JSON.parse(message.slice('MYCELLIOS_GPU_PROBE_ACTION '.length)));
+        $('actions').textContent = probeActions.slice(-120).map(JSON.stringify).join('\n');
+      } catch (error) {
+        lines.push(`action parse error: ${error.message}`);
+      }
+    }
+    lines.push(`${level}: ${message}`);
+    $('log').textContent = lines.slice(-100).join('\n');
+  };
+  const logger = Object.fromEntries(['debug', 'info', 'log', 'warn', 'error'].map(
+    (level) => [level, (...args) => log(level, ...args)]));
+  const runtime = new Wllama({ default: '/wllama/wasm/wllama.wasm' }, { logger });
+  const prompt = new URL(location.href).searchParams.get('prompt') === 'long'
+    ? `${'The capital of France is Paris. '.repeat(20)}The capital of Germany is`
+    : 'The capital of France is';
+  const measurements = [];
+  let adapter;
+
+  try {
+    adapter = await navigator.gpu?.requestAdapter({ powerPreference: 'high-performance' });
+    $('capabilities').textContent = JSON.stringify({
+      webgpu: Boolean(adapter),
+      adapter: adapter?.info ? { vendor: adapter.info.vendor, architecture: adapter.info.architecture,
+        device: adapter.info.device, description: adapter.info.description } : null,
+      crossOriginIsolated,
+      hardwareConcurrency: navigator.hardwareConcurrency,
+    });
+  } catch (error) {
+    $('capabilities').textContent = `WebGPU error: ${error.message}`;
+  }
+
+  $('load').onclick = async () => {
+    $('load').disabled = true;
+    const start = performance.now();
+    try {
+      $('status').textContent = `Descargando GGUF local: ${selectedModel.name}…`;
+      const response = await fetch(selectedModel.path);
+      if (!response.ok) throw new Error(`GGUF HTTP ${response.status}`);
+      const blob = await response.blob();
+      const fetchMs = Math.round(performance.now() - start);
+      $('status').textContent = `Cargando ${blob.size} bytes en llama.cpp/${cpuOnly ? 'CPU/WASM' : 'WebGPU'}…`;
+      await runtime.loadModel([blob], { n_gpu_layers: cpuOnly ? 0 : 99999,
+        n_ctx: 512, n_batch: 128, n_threads: threadCount });
+      const model = runtime.getModelMetadata();
+      $('status').textContent = JSON.stringify({ loaded: true,
+        loadMs: Math.round(performance.now() - start), fetchMs,
+        model: model.meta?.['general.name'],
+        multithread: runtime.isMultithread(), threads: threadCount,
+        gpuRequested: !cpuOnly && Boolean(adapter),
+        gpuLayersRequested: cpuOnly ? 0 : 99999 });
+      $('run').disabled = false;
+    } catch (error) {
+      $('status').textContent = `ERROR: ${error.stack || error.message}`;
+      log('error', error.stack || error.message);
+      $('load').disabled = false;
+    }
+  };
+
+  $('run').onclick = async () => {
+    $('run').disabled = true;
+    try {
+      for (let run = 0; run < repeatCount; run++) {
+        $('result').textContent = '';
+        const start = performance.now();
+        const startEpochMs = Date.now();
+        let firstTokenMs = null;
+        let chunks = 0;
+        let response;
+        if (inspectLogprobs) {
+          response = await runtime.createCompletion({ prompt, max_tokens: 16, temperature: 0,
+            cache_prompt: !disablePromptCache, stream: false, logprobs: 5 });
+          $('result').textContent = response.choices?.[0]?.text ?? '';
+        } else {
+          response = await runtime.createCompletion({ prompt, max_tokens: 32, temperature: 0,
+            cache_prompt: !disablePromptCache,
+            stream: true, onData: (chunk) => {
+              if (firstTokenMs === null) firstTokenMs = Math.round(performance.now() - start);
+              chunks++;
+              $('result').textContent += chunk.choices?.[0]?.text ?? '';
+            } });
+        }
+        const probabilities = response?.choices?.[0]?.logprobs;
+        const measurement = { completed: true, prompt, cachePrompt: !disablePromptCache,
+          visibility: document.visibilityState, focused: document.hasFocus(), firstTokenMs,
+          startEpochMs, endEpochMs: Date.now(),
+          totalMs: Math.round(performance.now() - start), chunks,
+          completionTokens: response?.usage?.completion_tokens ?? null, text: $('result').textContent,
+          tokens: probabilities?.tokens?.slice(0, 12),
+          topLogprobs: probabilities?.top_logprobs?.slice(0, 12),
+          logprobRecords: probabilities?.content?.slice(0, 16),
+          logprobKeys: probabilities ? Object.keys(probabilities) : null };
+        measurements.push(measurement);
+        $('status').textContent = JSON.stringify(measurement);
+        $('measurements').textContent = measurements.map((item, index) =>
+          JSON.stringify({ run: index + 1, ...item })).join('\n');
+      }
+    } catch (error) {
+      $('status').textContent = `ERROR: ${error.stack || error.message}`;
+      log('error', error.stack || error.message);
+    } finally {
+      $('run').disabled = false;
+    }
+  };
+</script>

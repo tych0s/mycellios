@@ -626,6 +626,30 @@ class HealthStatusCodeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["status"], "recovering")
         self.assertEqual(status, 200)
 
+    async def test_stage_loss_during_request_answers_503(self) -> None:
+        engine = _HttpEngine()
+
+        def fail_stage(requests, _callback):
+            engine.closed = True
+            futures = []
+            for _ in requests:
+                future = Future()
+                future.set_exception(ConnectionError("remote stage disconnected"))
+                futures.append(future)
+            return futures
+
+        engine.submit = fail_stage
+        server = DistributedMycelliosServer(
+            engine, _HttpTokenizer(), public_model_name="distributed-test",
+            max_batch_size=2, batch_window_ms=0, max_output_tokens=8,
+        )
+        async with TestClient(TestServer(server.create_app())) as client:
+            response = await client.post(
+                "/v1/chat/completions", json=_http_request(stream=False)
+            )
+            self.assertEqual(response.status, 503)
+            self.assertEqual((await response.json())["error"]["type"], "service_unavailable")
+
 
 class HttpInferenceEvidenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_real_http_health_non_stream_and_sse_expose_sealed_evidence(self) -> None:
@@ -786,11 +810,17 @@ class ContinuousMicroBatcherTests(unittest.IsolatedAsyncioTestCase):
             eos_token_ids=frozenset(),
         )
         await batcher.start()
-        first = PendingGeneration(11, torch.tensor([[1]]), 1, 1)
+        first = PendingGeneration(
+            11, torch.tensor([[1]]), 1, 1,
+            temperature=0.7, top_p=0.8, sampling_seed=b"s" * 32,
+        )
         second = PendingGeneration(22, torch.tensor([[2]]), 1, 1)
         try:
             await batcher.submit(first)
             await _eventually(lambda: len(engine.submissions) == 1)
+            self.assertEqual(engine.requests[0].temperature, 0.7)
+            self.assertEqual(engine.requests[0].top_p, 0.8)
+            self.assertEqual(engine.requests[0].sampling_seed, b"s" * 32)
             await batcher.submit(second)
             await _eventually(lambda: len(engine.submissions) == 2)
             self.assertFalse(engine.submissions[0][0].done())
@@ -845,6 +875,24 @@ class RequestValidationTests(unittest.TestCase):
         pending, stream = self.server._prepare_request(body)
         self.assertFalse(stream)
         self.assertEqual(pending.max_new_tokens, 4)
+
+    def test_sampling_parameters_reach_the_engine_with_replayable_seed(self) -> None:
+        body = {**self.valid(), "temperature": 0.7, "top_p": 0.85, "seed": 42}
+        first, _ = self.server._prepare_request(body)
+        second, _ = self.server._prepare_request(body)
+        third, _ = self.server._prepare_request({**body, "seed": 43})
+        self.assertEqual(first.temperature, 0.7)
+        self.assertEqual(first.top_p, 0.85)
+        self.assertEqual(len(first.sampling_seed or b""), 32)
+        self.assertEqual(first.sampling_seed, second.sampling_seed)
+        self.assertNotEqual(first.sampling_seed, third.sampling_seed)
+        greedy, _ = self.server._prepare_request(self.valid())
+        self.assertIsNone(greedy.sampling_seed)
+
+    def test_sampling_rejects_out_of_range_values(self) -> None:
+        for field, value in (("temperature", -0.1), ("temperature", 2.1), ("top_p", 0)):
+            with self.subTest(field=field, value=value), self.assertRaisesRegex(ValueError, field):
+                self.server._prepare_request({**self.valid(), field: value})
 
 
 async def _read_until_done(pending: PendingGeneration):

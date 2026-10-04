@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   AUTO_DISTRIBUTE_SCHEMA,
+  automaticCellCredentialPath,
   buildCellWorkerConfig,
   compileAutoDistribution,
   parseAutoDistributionConfig,
@@ -14,6 +15,24 @@ const SNAPSHOT_HEX = "0000000000003039";
 const ARTIFACT_IDENTITY = `sha256:${SNAPSHOT_HEX}${"a".repeat(48)}`;
 
 describe("automatic compatible-model distribution", () => {
+  it("stores automatic cell credentials separately for each model identity", () => {
+    const base = "runtime/worker-admission-credential.json";
+    const first = automaticCellCredentialPath(base, `cell-${"a".repeat(32)}`);
+    const second = automaticCellCredentialPath(base, `cell-${"b".repeat(32)}`);
+    expect(first).not.toBe(second);
+    expect(first).toMatch(/worker-admission-credential\.json\.cells[/\\]cell-a{32}\.json$/);
+    expect(() => automaticCellCredentialPath(base, "../other"))
+      .toThrow("automatic_cell_identity_invalid");
+  });
+  it("passes a bounded operation timeout to the sealed root launch", () => {
+    const config = configFixture();
+    config.runtime.operationTimeoutSeconds = 20;
+    const launch = compileAutoDistribution(parseAutoDistributionConfig(config), profileFixture()).launch;
+    const root = launch.launchOrder.find((entry) => entry.kind === "root-engine")!;
+    const args = root.command.args;
+    expect(args[args.indexOf("--startup-timeout-seconds") + 1]).toBe("60");
+    expect(args[args.indexOf("--socket-timeout-seconds") + 1]).toBe("20");
+  });
   it("forces a real multi-stage route and calculates layer boundaries", () => {
     const config = parseAutoDistributionConfig(configFixture());
     const compiled = compileAutoDistribution(config, profileFixture());

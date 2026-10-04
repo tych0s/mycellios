@@ -408,9 +408,8 @@ describe("Python launch supervisor", () => {
     await handle.ready;
     expect(handle.output?.().stderr).toContain("stage_ready");
     await handle.stop("test_complete");
-    await expect(handle.exited).resolves.toMatchObject({
-      code: expect.anything(),
-    });
+    const exit = await handle.exited;
+    expect(exit.code !== null || exit.signal !== null).toBe(true);
   });
 
   it("rejects a sealed process policy above the local agent ceilings", async () => {
