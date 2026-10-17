@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="es">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mycellios: grafo transformador GPU residente</title>
+<style>
+  body { max-width: 64rem; margin: 2rem auto; padding: 0 1rem; font: 16px/1.5 system-ui, sans-serif; }
+  button { font: inherit; padding: .5rem .8rem; }
+  pre { padding: 1rem; white-space: pre-wrap; overflow-wrap: anywhere; background: #101827; color: #e5e7eb; border-radius: .5rem; }
+</style>
+<h1>Grafo transformador dentro de WebGPU</h1>
+<p>Prueba local de un transformador diminuto: embedding, Q/K/V, atención causal con caché KV, MLP, logits, argmax y EOS. Compara la lectura y reescritura de cada token con bloques pregrabados que conservan el token en GPU. Los pesos sintéticos y el tamaño reducido no representan el rendimiento de un modelo comercial.</p>
+<button id="start">Comparar bloques</button>
+<p id="status">Preparado.</p>
+<pre id="result">Sin resultados.</pre>
+<script type="module">
+const button = document.getElementById('start');
+const status = document.getElementById('status');
+const result = document.getElementById('result');
+const D = 32, H = 64, V = 128, STEPS = 64, EOS = 0, SENTINEL = 0xffffffff;
+let randomState = 0x23451;
+const random = () => { randomState = (Math.imul(randomState, 1664525) + 1013904223) >>> 0; return (randomState / 0xffffffff) * 2 - 1; };
+const weights = {
+  embedding: Float32Array.from({length: V * D}, () => random() * .45),
+  q: Float32Array.from({length: D * D}, () => random() * .16),
+  k: Float32Array.from({length: D * D}, () => random() * .16),
+  v: Float32Array.from({length: D * D}, () => random() * .16),
+  up: Float32Array.from({length: H * D}, () => random() * .16),
+  down: Float32Array.from({length: D * H}, () => random() * .16),
+  output: Float32Array.from({length: V * D}, () => random() * .4),
+};
+
+function cpuReference(eosStep = STEPS - 1) {
+  const keys = new Float32Array(STEPS * D), values = new Float32Array(STEPS * D);
+  let token = 7;
+  const output = [];
+  const dot = (matrix, row, vector, columns) => {
+    let total = 0;
+    for (let i = 0; i < columns; i++) total += matrix[row * columns + i] * vector[i];
+    return Math.fround(total);
+  };
+  for (let step = 0; step < STEPS; step++) {
+    if (token === EOS) { output.push(SENTINEL); continue; }
+    const hidden = weights.embedding.slice(token * D, (token + 1) * D);
+    const q = new Float32Array(D);
+    for (let i = 0; i < D; i++) {
+      q[i] = dot(weights.q, i, hidden, D);
+      keys[step * D + i] = dot(weights.k, i, hidden, D);
+      values[step * D + i] = dot(weights.v, i, hidden, D);
+    }
+    const scores = [];
+    for (let t = 0; t <= step; t++) {
+      let score = 0;
+      for (let i = 0; i < D; i++) score += q[i] * keys[t * D + i];
+      scores.push(Math.exp(score / Math.sqrt(D)));
+    }
+    const denominator = scores.reduce((sum, value) => sum + value, 0);
+    const context = new Float32Array(D);
+    for (let i = 0; i < D; i++) {
+      for (let t = 0; t <= step; t++) context[i] += scores[t] * values[t * D + i] / denominator;
+    }
+    const combined = Float32Array.from(hidden, (value, i) => value + context[i]);
+    const activated = new Float32Array(H);
+    for (let j = 0; j < H; j++) {
+      const x = dot(weights.up, j, combined, D);
+      activated[j] = x / (1 + Math.exp(-x));
+    }
+    const final = Float32Array.from(combined, (value, i) => value + dot(weights.down, i, activated, H));
+    let best = -Infinity, bestId = 0;
+    for (let candidate = 1; candidate < V; candidate++) {
+      const logit = dot(weights.output, candidate, final, D);
+      if (logit > best) { best = logit; bestId = candidate; }
+    }
+    token = step === eosStep ? EOS : bestId;
+    output.push(token);
+  }
+  return output;
+}
+
+button.addEventListener('click', async () => {
+  button.disabled = true;
+  let device;
+  try {
+    status.textContent = 'Preparando el dispositivo y los shaders…';
+    const adapter = await navigator.gpu?.requestAdapter({powerPreference: 'high-performance', featureLevel: 'core'});
+    if (!adapter) throw new Error('WebGPU no está disponible.');
+    device = await adapter.requestDevice();
+    const report = {shape: {dimension: D, mlp: H, vocabulary: V, steps: STEPS, layers: 1},
+      adapter: {vendor: adapter.info.vendor, device: adapter.info.device, description: adapter.info.description,
+        isFallbackAdapter: adapter.info.isFallbackAdapter}, runs: []};
+    const storage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
+    const buffer = (bytes, usage = storage) => device.createBuffer({size: bytes, usage});
+    const weightBuffers = Object.fromEntries(Object.entries(weights).map(([name, data]) => {
+      const gpu = buffer(data.byteLength);
+      device.queue.writeBuffer(gpu, 0, data);
+      return [name, gpu];
+    }));
+    const gpu = {
+      token: buffer(4), stopped: buffer(4), hidden: buffer(D * 4), query: buffer(D * 4),
+      keys: buffer(STEPS * D * 4), values: buffer(STEPS * D * 4),
+      context: buffer(D * 4), activated: buffer(H * 4), output: buffer(STEPS * 4),
+      tokenRead: buffer(4, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ),
+      outputRead: buffer(STEPS * 4, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ),
+    };
+    const steps = new Uint8Array(STEPS * 256);
+    const stepView = new DataView(steps.buffer);
+    for (let i = 0; i < STEPS; i++) stepView.setUint32(i * 256, i, true);
+    gpu.step = buffer(steps.byteLength, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+    device.queue.writeBuffer(gpu.step, 0, steps);
+
+    const shaders = [
+      ['embed', `
+        @group(0) @binding(0) var<storage, read> token: array<u32>;
+        @group(0) @binding(1) var<storage, read> stopped: array<u32>;
+        @group(0) @binding(2) var<storage, read> embedding: array<f32>;
+        @group(0) @binding(3) var<storage, read_write> hidden: array<f32>;
+        @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+          if (id.x < ${D}u && stopped[0] == 0u) { hidden[id.x] = embedding[token[0] * ${D}u + id.x]; }
+        }`],
+      ['qkv', `
+        struct Step { index: u32, eos_step: u32 }
+        @group(0) @binding(0) var<storage, read> hidden: array<f32>;
+        @group(0) @binding(1) var<storage, read> wq: array<f32>;
+        @group(0) @binding(2) var<storage, read> wk: array<f32>;
+        @group(0) @binding(3) var<storage, read> wv: array<f32>;
+        @group(0) @binding(4) var<storage, read_write> query: array<f32>;
+        @group(0) @binding(5) var<storage, read_write> keys: array<f32>;
+        @group(0) @binding(6) var<storage, read_write> values: array<f32>;
+        @group(0) @binding(7) var<storage, read> stopped: array<u32>;
+        @group(1) @binding(0) var<uniform> step: Step;
+        @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+          if (id.x >= ${D}u || stopped[0] != 0u) { return; }
+          var q = 0.0; var k = 0.0; var v = 0.0;
+          for (var j = 0u; j < ${D}u; j++) {
+            let input = hidden[j]; let offset = id.x * ${D}u + j;
+            q += wq[offset] * input; k += wk[offset] * input; v += wv[offset] * input;
+          }
+          query[id.x] = q;
+          keys[step.index * ${D}u + id.x] = k;
+          values[step.index * ${D}u + id.x] = v;
+        }`],
+      ['attention', `
+        struct Step { index: u32, eos_step: u32 }
+        @group(0) @binding(0) var<storage, read> query: array<f32>;
+        @group(0) @binding(1) var<storage, read> keys: array<f32>;
+        @group(0) @binding(2) var<storage, read> values: array<f32>;
+        @group(0) @binding(3) var<storage, read_write> context: array<f32>;
+        @group(0) @binding(4) var<storage, read> stopped: array<u32>;
+        @group(1) @binding(0) var<uniform> step: Step;
+        @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+          if (id.x >= ${D}u || stopped[0] != 0u) { return; }
+          var numerator = 0.0; var denominator = 0.0;
+          for (var t = 0u; t <= step.index; t++) {
+            var score = 0.0;
+            for (var j = 0u; j < ${D}u; j++) { score += query[j] * keys[t * ${D}u + j]; }
+            let weight = exp(score * ${1 / Math.sqrt(D)});
+            numerator += weight * values[t * ${D}u + id.x]; denominator += weight;
+          }
+          context[id.x] = numerator / denominator;
+        }`],
+      ['up', `
+        @group(0) @binding(0) var<storage, read> hidden: array<f32>;
+        @group(0) @binding(1) var<storage, read> context: array<f32>;
+        @group(0) @binding(2) var<storage, read> weight: array<f32>;
+        @group(0) @binding(3) var<storage, read_write> activated: array<f32>;
+        @group(0) @binding(4) var<storage, read> stopped: array<u32>;
+        @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+          if (id.x >= ${H}u || stopped[0] != 0u) { return; }
+          var value = 0.0;
+          for (var j = 0u; j < ${D}u; j++) { value += weight[id.x * ${D}u + j] * (hidden[j] + context[j]); }
+          activated[id.x] = value / (1.0 + exp(-value));
+        }`],
+      ['down', `
+        @group(0) @binding(0) var<storage, read_write> hidden: array<f32>;
+        @group(0) @binding(1) var<storage, read> context: array<f32>;
+        @group(0) @binding(2) var<storage, read> activated: array<f32>;
+        @group(0) @binding(3) var<storage, read> weight: array<f32>;
+        @group(0) @binding(4) var<storage, read> stopped: array<u32>;
+        @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+          if (id.x >= ${D}u || stopped[0] != 0u) { return; }
+          var value = hidden[id.x] + context[id.x];
+          for (var j = 0u; j < ${H}u; j++) { value += weight[id.x * ${H}u + j] * activated[j]; }
+          hidden[id.x] = value;
+        }`],
+      ['sample', `
+        struct Step { index: u32, eos_step: u32 }
+        @group(0) @binding(0) var<storage, read> hidden: array<f32>;
+        @group(0) @binding(1) var<storage, read> weight: array<f32>;
+        @group(0) @binding(2) var<storage, read_write> token: array<u32>;
+        @group(0) @binding(3) var<storage, read_write> stopped: array<u32>;
+        @group(0) @binding(4) var<storage, read_write> output: array<u32>;
+        @group(1) @binding(0) var<uniform> step: Step;
+        @compute @workgroup_size(1) fn main() {
+          if (stopped[0] != 0u) { output[step.index] = ${SENTINEL}u; return; }
+          var best = -3.402823e+38f; var best_id = 0u;
+          for (var candidate = 1u; candidate < ${V}u; candidate++) {
+            var logit = 0.0;
+            for (var j = 0u; j < ${D}u; j++) { logit += weight[candidate * ${D}u + j] * hidden[j]; }
+            if (logit > best) { best = logit; best_id = candidate; }
+          }
+          let next = select(best_id, ${EOS}u, step.index == step.eos_step);
+          token[0] = next; output[step.index] = next;
+          if (next == ${EOS}u) { stopped[0] = 1u; }
+        }`],
+    ];
+    const bindings = {
+      embed: [gpu.token, gpu.stopped, weightBuffers.embedding, gpu.hidden],
+      qkv: [gpu.hidden, weightBuffers.q, weightBuffers.k, weightBuffers.v, gpu.query, gpu.keys, gpu.values, gpu.stopped],
+      attention: [gpu.query, gpu.keys, gpu.values, gpu.context, gpu.stopped],
+      up: [gpu.hidden, gpu.context, weightBuffers.up, gpu.activated, gpu.stopped],
+      down: [gpu.hidden, gpu.context, gpu.activated, weightBuffers.down, gpu.stopped],
+      sample: [gpu.hidden, weightBuffers.output, gpu.token, gpu.stopped, gpu.output],
+    };
+    const stages = [];
+    for (const [name, code] of shaders) {
+      const module = device.createShaderModule({label: name, code});
+      const info = await module.getCompilationInfo();
+      const errors = info.messages.filter((message) => message.type === 'error');
+      if (errors.length) throw new Error(`${name}: ${errors.map((error) => error.message).join('; ')}`);
+      const pipeline = await device.createComputePipelineAsync({layout: 'auto', compute: {module, entryPoint: 'main'}});
+      const group0 = device.createBindGroup({layout: pipeline.getBindGroupLayout(0),
+        entries: bindings[name].map((resource, binding) => ({binding, resource: {buffer: resource}}))});
+      const groups1 = code.includes('@group(1)') ? Array.from({length: STEPS}, (_, step) =>
+        device.createBindGroup({layout: pipeline.getBindGroupLayout(1),
+          entries: [{binding: 0, resource: {buffer: gpu.step, offset: step * 256, size: 8}}]})) : null;
+      stages.push({name, pipeline, group0, groups1});
+    }
+    function encodeStep(encoder, step) {
+      for (const stage of stages) {
+        const pass = encoder.beginComputePass();
+        pass.setPipeline(stage.pipeline);
+        pass.setBindGroup(0, stage.group0);
+        if (stage.groups1) pass.setBindGroup(1, stage.groups1[step]);
+        pass.dispatchWorkgroups(1);
+        pass.end();
+      }
+    }
+    async function run(mode, chunkSize, eosStep = STEPS - 1) {
+      const expected = cpuReference(eosStep);
+      for (let i = 0; i < STEPS; i++) stepView.setUint32(i * 256 + 4, eosStep, true);
+      device.queue.writeBuffer(gpu.step, 0, steps);
+      device.queue.writeBuffer(gpu.token, 0, new Uint32Array([7]));
+      device.queue.writeBuffer(gpu.stopped, 0, new Uint32Array([0]));
+      device.queue.writeBuffer(gpu.keys, 0, new Float32Array(STEPS * D));
+      device.queue.writeBuffer(gpu.values, 0, new Float32Array(STEPS * D));
+      device.queue.writeBuffer(gpu.output, 0, new Uint32Array(STEPS).fill(SENTINEL));
+      await device.queue.onSubmittedWorkDone();
+      const started = performance.now();
+      let firstChunkMs = null, submissions = 0, maps = 0, hostTokenWrites = 0;
+      if (mode === 'cpu-roundtrip') {
+        for (let step = 0; step < STEPS; step++) {
+          const encoder = device.createCommandEncoder();
+          encodeStep(encoder, step);
+          encoder.copyBufferToBuffer(gpu.token, 0, gpu.tokenRead, 0, 4);
+          device.queue.submit([encoder.finish()]); submissions++;
+          await gpu.tokenRead.mapAsync(GPUMapMode.READ); maps++;
+          const next = new Uint32Array(gpu.tokenRead.getMappedRange())[0];
+          gpu.tokenRead.unmap();
+          if (firstChunkMs === null) firstChunkMs = performance.now() - started;
+          if (step + 1 < STEPS) {
+            device.queue.writeBuffer(gpu.token, 0, new Uint32Array([next])); hostTokenWrites++;
+          }
+        }
+      } else {
+        for (let offset = 0; offset < STEPS; offset += chunkSize) {
+          const encoder = device.createCommandEncoder();
+          for (let step = offset; step < Math.min(STEPS, offset + chunkSize); step++) encodeStep(encoder, step);
+          encoder.copyBufferToBuffer(gpu.output, 0, gpu.outputRead, 0, STEPS * 4);
+          device.queue.submit([encoder.finish()]); submissions++;
+          await gpu.outputRead.mapAsync(GPUMapMode.READ); maps++;
+          const chunk = new Uint32Array(gpu.outputRead.getMappedRange()).slice(offset,
+            Math.min(STEPS, offset + chunkSize));
+          gpu.outputRead.unmap();
+          if (firstChunkMs === null) firstChunkMs = performance.now() - started;
+          if (chunk.includes(EOS)) break;
+        }
+      }
+      const finish = device.createCommandEncoder();
+      finish.copyBufferToBuffer(gpu.output, 0, gpu.outputRead, 0, STEPS * 4);
+      device.queue.submit([finish.finish()]); submissions++;
+      await gpu.outputRead.mapAsync(GPUMapMode.READ); maps++;
+      const tokens = Array.from(new Uint32Array(gpu.outputRead.getMappedRange()));
+      gpu.outputRead.unmap();
+      const wallMs = performance.now() - started;
+      const mismatches = tokens.flatMap((token, index) => token === expected[index] ? [] : [{index, expected: expected[index], actual: token}]);
+      return {mode, chunkSize, eosStep, wallMs: Number(wallMs.toFixed(2)),
+        firstChunkMs: Number(firstChunkMs.toFixed(2)), submissions, maps, hostTokenWrites,
+        matchedCpuReference: mismatches.length === 0, mismatches: mismatches.slice(0, 8),
+        distinctTokens: new Set(tokens).size, firstTokens: tokens.slice(0, 16), lastTokens: tokens.slice(-8)};
+    }
+    status.textContent = 'Calentando el grafo…';
+    const warmup = await run('gpu-resident', 16);
+    if (!warmup.matchedCpuReference) throw new Error(`El calentamiento no coincide: ${JSON.stringify(warmup.mismatches)}`);
+    for (const [mode, chunkSize] of [['cpu-roundtrip', 1], ['gpu-resident', 1],
+      ['gpu-resident', 4], ['gpu-resident', 16], ['gpu-resident', 64],
+      ['gpu-resident', 64], ['gpu-resident', 16], ['gpu-resident', 4],
+      ['gpu-resident', 1], ['cpu-roundtrip', 1]]) {
+      status.textContent = `Midiendo ${mode}, bloque ${chunkSize}…`;
+      const runResult = await run(mode, chunkSize);
+      report.runs.push(runResult);
+      result.textContent = JSON.stringify(report, null, 2);
+      if (!runResult.matchedCpuReference) throw new Error(`Diferencia en ${mode}/${chunkSize}: ${JSON.stringify(runResult.mismatches)}`);
+    }
+    report.cpuRoundtripMeanMs = Number(((report.runs[0].wallMs + report.runs.at(-1).wallMs) / 2).toFixed(2));
+    report.speedupVsCpu = Object.fromEntries([1, 4, 16, 64].map((chunkSize) => {
+      const matching = report.runs.filter((run) => run.mode === 'gpu-resident' && run.chunkSize === chunkSize);
+      const mean = matching.reduce((sum, run) => sum + run.wallMs, 0) / matching.length;
+      return [chunkSize, Number((report.cpuRoundtripMeanMs / mean).toFixed(2))];
+    }));
+    status.textContent = 'Comprobando EOS a mitad de bloque…';
+    report.earlyEos = await run('gpu-resident', 16, 24);
+    if (!report.earlyEos.matchedCpuReference) throw new Error(`EOS incorrecto: ${JSON.stringify(report.earlyEos.mismatches)}`);
+    result.textContent = JSON.stringify(report, null, 2);
+    status.textContent = 'Completado: secuencias contrastadas con CPU.';
+  } catch (error) {
+    status.textContent = `Error: ${error.message}`;
+  } finally {
+    device?.destroy();
+    button.disabled = false;
+  }
+});
+</script>
+</html>

@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="es">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mycellios: prueba local WebGPU</title>
+<style>
+  body { max-width: 58rem; margin: 2rem auto; padding: 0 1rem; font: 16px/1.5 system-ui, sans-serif; }
+  button, select { font: inherit; padding: .45rem .75rem; }
+  pre { padding: 1rem; overflow-wrap: anywhere; white-space: pre-wrap; background: #101827; color: #e5e7eb; border-radius: .5rem; }
+  .row { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; }
+</style>
+<h1>Prueba local de cálculo WebGPU</h1>
+<p>Multiplica matrices reales en la GPU desde este navegador. Comprueba varias celdas del resultado en CPU. No descarga modelos ni envía datos.</p>
+<div class="row">
+  <label for="size">Matriz</label>
+  <select id="size">
+    <option value="512">512 × 512</option>
+    <option value="1024" selected>1024 × 1024</option>
+    <option value="1536">1536 × 1536</option>
+  </select>
+  <label for="kernel">Kernel</label>
+  <select id="kernel">
+    <option value="scalar8">8 × 8, una salida por hilo</option>
+    <option value="scalar16" selected>16 × 16, una salida por hilo</option>
+    <option value="scalar32">32 × 32, una salida por hilo</option>
+    <option value="four">16 × 16, cuatro salidas por hilo</option>
+  </select>
+  <label for="precision">Pesos</label>
+  <select id="precision">
+    <option value="f32" selected>F32</option>
+    <option value="f16">F16</option>
+  </select>
+  <label for="batch">Operaciones por envío</label>
+  <select id="batch">
+    <option value="1">1</option>
+    <option value="4">4</option>
+    <option value="16" selected>16</option>
+    <option value="32">32</option>
+  </select>
+  <label for="duration">Duración</label>
+  <select id="duration">
+    <option value="12" selected>12 segundos</option>
+    <option value="30">30 segundos</option>
+  </select>
+  <button id="start">Iniciar prueba</button>
+  <button id="stop" disabled>Detener</button>
+</div>
+<p id="status">Lista para empezar.</p>
+<pre id="result">Sin resultados.</pre>
+<script type="module">
+  const sizeSelect = document.getElementById("size");
+  const kernelSelect = document.getElementById("kernel");
+  const precisionSelect = document.getElementById("precision");
+  const batchSelect = document.getElementById("batch");
+  const durationSelect = document.getElementById("duration");
+  const startButton = document.getElementById("start");
+  const stopButton = document.getElementById("stop");
+  const status = document.getElementById("status");
+  const result = document.getElementById("result");
+  let stopped = false;
+
+  function aValue(row, column) { return ((row * 3 + column * 5) % 17 - 8) / 17; }
+  function bValue(row, column) { return ((row * 7 + column * 11) % 19 - 9) / 19; }
+  function expectedCell(row, column, n) {
+    let sum = 0;
+    for (let k = 0; k < n; k++) sum += aValue(row, k) * bValue(k, column);
+    return sum;
+  }
+  const f32 = new Float32Array(1);
+  const u32 = new Uint32Array(f32.buffer);
+  function halfBits(value) {
+    f32[0] = value;
+    const bits = u32[0];
+    const sign = (bits >>> 16) & 0x8000;
+    const exponent = ((bits >>> 23) & 255) - 127 + 15;
+    if (exponent <= 0) return sign;
+    if (exponent >= 31) return sign | 0x7c00;
+    return sign | (exponent << 10) | (((bits & 0x7fffff) + 0x1000) >>> 13);
+  }
+
+  async function run() {
+    startButton.disabled = true;
+    sizeSelect.disabled = true;
+    kernelSelect.disabled = true;
+    precisionSelect.disabled = true;
+    batchSelect.disabled = true;
+    durationSelect.disabled = true;
+    stopButton.disabled = false;
+    stopped = false;
+    let device;
+    let expectedDestroy = false;
+    const buffers = [];
+    try {
+      if (!navigator.gpu) throw new Error("Este navegador no ofrece WebGPU.");
+      status.textContent = "Solicitando la GPU…";
+      const adapter = await navigator.gpu.requestAdapter({
+        featureLevel: "core", powerPreference: "high-performance",
+      });
+      if (!adapter) throw new Error("No se encontró un adaptador WebGPU core.");
+      const n = Number(sizeSelect.value);
+      const kernel = kernelSelect.value;
+      const tile = kernel === "scalar8" ? 8 : kernel === "scalar32" ? 32 : 16;
+      const precision = precisionSelect.value;
+      const dispatchesPerBatch = Number(batchSelect.value);
+      const durationSeconds = Number(durationSelect.value);
+      const inputBytes = n * n * (precision === "f16" ? 2 : 4);
+      const outputBytes = n * n * 4;
+      const features = ["shader-f16", "subgroups", "timestamp-query"]
+        .filter((feature) => adapter.features.has(feature));
+      if (precision === "f16" && !features.includes("shader-f16")) {
+        throw new Error("Este adaptador no permite shader-f16.");
+      }
+      device = await adapter.requestDevice({
+        requiredFeatures: features,
+        requiredLimits: {
+          maxBufferSize: Math.max(outputBytes, 268435456),
+          maxStorageBufferBindingSize: Math.max(outputBytes, 134217728),
+          maxComputeInvocationsPerWorkgroup: Math.max(tile * tile, 256),
+        },
+      });
+      let lost = false;
+      device.lost.then((info) => {
+        if (expectedDestroy && info.reason === "destroyed") return;
+        lost = true;
+        status.textContent = `Dispositivo GPU perdido: ${info.reason} ${info.message}`;
+      });
+      const a = precision === "f16" ? new Uint16Array(n * n) : new Float32Array(n * n);
+      const b = precision === "f16" ? new Uint16Array(n * n) : new Float32Array(n * n);
+      for (let row = 0; row < n; row++) {
+        for (let column = 0; column < n; column++) {
+          a[row * n + column] = precision === "f16"
+            ? halfBits(aValue(row, column)) : aValue(row, column);
+          b[row * n + column] = precision === "f16"
+            ? halfBits(bValue(row, column)) : bValue(row, column);
+        }
+      }
+      function makeBuffer(label, size, usage) {
+        const buffer = device.createBuffer({ label, size, usage });
+        buffers.push(buffer);
+        return buffer;
+      }
+      const aBuffer = makeBuffer("A", inputBytes, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+      const bBuffer = makeBuffer("B", inputBytes, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+      const cBuffer = makeBuffer("C", outputBytes, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+      device.queue.writeBuffer(aBuffer, 0, a);
+      device.queue.writeBuffer(bBuffer, 0, b);
+      a.fill(0); b.fill(0);
+
+      const inputType = precision === "f16" ? "f16" : "f32";
+      const enableF16 = precision === "f16" ? "enable f16;" : "";
+      const scalarShader = `
+        ${enableF16}
+        @group(0) @binding(0) var<storage, read> a: array<${inputType}>;
+        @group(0) @binding(1) var<storage, read> b: array<${inputType}>;
+        @group(0) @binding(2) var<storage, read_write> c: array<f32>;
+        var<workgroup> tileA: array<${inputType}, ${tile * tile}>;
+        var<workgroup> tileB: array<${inputType}, ${tile * tile}>;
+        @compute @workgroup_size(${tile}, ${tile})
+        fn main(@builtin(local_invocation_id) local: vec3<u32>,
+                @builtin(workgroup_id) group: vec3<u32>) {
+          let row = group.y * ${tile}u + local.y;
+          let column = group.x * ${tile}u + local.x;
+          var sum = 0.0;
+          for (var block = 0u; block < ${n / tile}u; block++) {
+            tileA[local.y * ${tile}u + local.x] =
+              a[row * ${n}u + block * ${tile}u + local.x];
+            tileB[local.y * ${tile}u + local.x] =
+              b[(block * ${tile}u + local.y) * ${n}u + column];
+            workgroupBarrier();
+            for (var k = 0u; k < ${tile}u; k++) {
+              sum = fma(f32(tileA[local.y * ${tile}u + k]),
+                        f32(tileB[k * ${tile}u + local.x]), sum);
+            }
+            workgroupBarrier();
+          }
+          c[row * ${n}u + column] = sum;
+        }
+      `;
+      const fourShader = `
+        ${enableF16}
+        @group(0) @binding(0) var<storage, read> a: array<${inputType}>;
+        @group(0) @binding(1) var<storage, read> b: array<${inputType}>;
+        @group(0) @binding(2) var<storage, read_write> c: array<f32>;
+        var<workgroup> tileA: array<${inputType}, 256>;
+        var<workgroup> tileB: array<${inputType}, 256>;
+        @compute @workgroup_size(8, 8)
+        fn main(@builtin(local_invocation_id) local: vec3<u32>,
+                @builtin(workgroup_id) group: vec3<u32>) {
+          let row = group.y * 16u + local.y * 2u;
+          let column = group.x * 16u + local.x * 2u;
+          var c00 = 0.0;
+          var c01 = 0.0;
+          var c10 = 0.0;
+          var c11 = 0.0;
+          for (var block = 0u; block < ${n / 16}u; block++) {
+            let ar = local.y * 2u;
+            let ac = local.x * 2u;
+            tileA[ar * 16u + ac] = a[row * ${n}u + block * 16u + ac];
+            tileA[ar * 16u + ac + 1u] = a[row * ${n}u + block * 16u + ac + 1u];
+            tileA[(ar + 1u) * 16u + ac] = a[(row + 1u) * ${n}u + block * 16u + ac];
+            tileA[(ar + 1u) * 16u + ac + 1u] = a[(row + 1u) * ${n}u + block * 16u + ac + 1u];
+            tileB[ar * 16u + ac] = b[(block * 16u + ar) * ${n}u + column];
+            tileB[ar * 16u + ac + 1u] = b[(block * 16u + ar) * ${n}u + column + 1u];
+            tileB[(ar + 1u) * 16u + ac] = b[(block * 16u + ar + 1u) * ${n}u + column];
+            tileB[(ar + 1u) * 16u + ac + 1u] = b[(block * 16u + ar + 1u) * ${n}u + column + 1u];
+            workgroupBarrier();
+            for (var k = 0u; k < 16u; k++) {
+              let a0 = f32(tileA[ar * 16u + k]);
+              let a1 = f32(tileA[(ar + 1u) * 16u + k]);
+              let b0 = f32(tileB[k * 16u + ac]);
+              let b1 = f32(tileB[k * 16u + ac + 1u]);
+              c00 = fma(a0, b0, c00);
+              c01 = fma(a0, b1, c01);
+              c10 = fma(a1, b0, c10);
+              c11 = fma(a1, b1, c11);
+            }
+            workgroupBarrier();
+          }
+          c[row * ${n}u + column] = c00;
+          c[row * ${n}u + column + 1u] = c01;
+          c[(row + 1u) * ${n}u + column] = c10;
+          c[(row + 1u) * ${n}u + column + 1u] = c11;
+        }
+      `;
+      const shader = device.createShaderModule({ code: kernel === "four" ? fourShader : scalarShader });
+      const pipeline = await device.createComputePipelineAsync({
+        layout: "auto", compute: { module: shader, entryPoint: "main" },
+      });
+      const bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+        { binding: 0, resource: { buffer: aBuffer } },
+        { binding: 1, resource: { buffer: bBuffer } },
+        { binding: 2, resource: { buffer: cBuffer } },
+      ] });
+      async function submitBatch(timed = false) {
+        const encoder = device.createCommandEncoder();
+        const querySet = timed && features.includes("timestamp-query")
+          ? device.createQuerySet({ type: "timestamp", count: 2 }) : null;
+        const pass = encoder.beginComputePass(querySet ? {
+          timestampWrites: {
+            querySet, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1,
+          },
+        } : undefined);
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, bindGroup);
+        for (let i = 0; i < dispatchesPerBatch; i++) {
+          pass.dispatchWorkgroups(n / tile, n / tile);
+        }
+        pass.end();
+        let queryResult;
+        let queryReadback;
+        if (querySet) {
+          queryResult = device.createBuffer({
+            size: 256, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+          });
+          queryReadback = device.createBuffer({
+            size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+          });
+          encoder.resolveQuerySet(querySet, 0, 2, queryResult, 0);
+          encoder.copyBufferToBuffer(queryResult, 0, queryReadback, 0, 16);
+        }
+        device.queue.submit([encoder.finish()]);
+        await device.queue.onSubmittedWorkDone();
+        if (lost) throw new Error("El dispositivo GPU se perdió durante la prueba.");
+        if (queryReadback) {
+          await queryReadback.mapAsync(GPUMapMode.READ);
+          const stamps = new BigUint64Array(queryReadback.getMappedRange(), 0, 2);
+          const milliseconds = Number(stamps[1] - stamps[0]) / 1e6;
+          queryReadback.unmap();
+          queryReadback.destroy();
+          queryResult.destroy();
+          querySet.destroy();
+          return milliseconds;
+        }
+        return null;
+      }
+      status.textContent = "Calentando GPU…";
+      await submitBatch();
+      const gpuBatchMilliseconds = await submitBatch(true);
+      const started = performance.now();
+      let batches = 0;
+      while (!stopped && performance.now() - started < durationSeconds * 1000) {
+        await submitBatch();
+        batches++;
+        status.textContent = `GPU trabajando: ${batches * dispatchesPerBatch} multiplicaciones completas…`;
+      }
+      const elapsedSeconds = (performance.now() - started) / 1000;
+      if (batches === 0) throw new Error("La prueba se detuvo antes de medir.");
+      status.textContent = "Comprobando el resultado…";
+      const readback = makeBuffer("readback", outputBytes, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
+      const copy = device.createCommandEncoder();
+      copy.copyBufferToBuffer(cBuffer, 0, readback, 0, outputBytes);
+      device.queue.submit([copy.finish()]);
+      await readback.mapAsync(GPUMapMode.READ);
+      const output = new Float32Array(readback.getMappedRange());
+      const positions = [[0, 0], [Math.floor(n / 2), Math.floor(n / 3)], [n - 1, n - 1]];
+      const checks = positions.map(([row, column]) => {
+        const actual = output[row * n + column];
+        const expected = expectedCell(row, column, n);
+        return { row, column, actual, expected,
+          relativeError: Math.abs(actual - expected) / Math.max(1, Math.abs(expected)) };
+      });
+      readback.unmap();
+      const valid = checks.every((check) => check.relativeError < 0.002);
+      const dispatches = batches * dispatchesPerBatch;
+      const operations = 2 * n * n * n * dispatches;
+      result.textContent = JSON.stringify({
+        valid, matrixSize: n, kernel, precision, dispatchesPerBatch,
+        durationSeconds, dispatches,
+        elapsedSeconds: Number(elapsedSeconds.toFixed(3)),
+        sustainedGflops: Number((operations / elapsedSeconds / 1e9).toFixed(2)),
+        gpuBatchMilliseconds,
+        gpuBatchGflops: gpuBatchMilliseconds
+          ? Number((2 * n * n * n * dispatchesPerBatch / (gpuBatchMilliseconds / 1000) / 1e9).toFixed(2))
+          : null,
+        adapterInfo: {
+          vendor: adapter.info.vendor, architecture: adapter.info.architecture,
+          device: adapter.info.device, description: adapter.info.description,
+          isFallbackAdapter: adapter.info.isFallbackAdapter,
+        },
+        adapterFeaturesUsed: features,
+        note: "GFLOPS de esta multiplicación WGSL; no equivale al pico físico ni a tokens/s de un modelo.",
+        checks,
+      }, null, 2);
+      status.textContent = valid ? "Prueba terminada y resultado correcto." : "Prueba terminada: resultado incorrecto.";
+    } catch (error) {
+      status.textContent = `Error: ${String(error)}`;
+      result.textContent = String(error?.stack ?? error);
+    } finally {
+      buffers.forEach((buffer) => buffer.destroy());
+      expectedDestroy = true;
+      device?.destroy();
+      startButton.disabled = false;
+      sizeSelect.disabled = false;
+      kernelSelect.disabled = false;
+      precisionSelect.disabled = false;
+      batchSelect.disabled = false;
+      durationSelect.disabled = false;
+      stopButton.disabled = true;
+    }
+  }
+  startButton.addEventListener("click", run);
+  stopButton.addEventListener("click", () => { stopped = true; });
+</script>
+</html>

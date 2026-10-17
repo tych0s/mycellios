@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="es">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mycellios: prueba local WebNN</title>
+<style>
+  body { max-width: 58rem; margin: 2rem auto; padding: 0 1rem; font: 16px/1.5 system-ui, sans-serif; }
+  button { font: inherit; padding: .5rem .8rem; }
+  pre { padding: 1rem; white-space: pre-wrap; overflow-wrap: anywhere; background: #101827; color: #e5e7eb; border-radius: .5rem; }
+</style>
+<h1>WebNN nativo en este navegador</h1>
+<p>Comprueba si el navegador expone WebNN y, si existe, ejecuta una matriz F32 de 256 × 256. No usa polyfills, instala extensiones ni envía datos.</p>
+<button id="start">Probar WebNN</button>
+<p id="status">Preparado.</p>
+<pre id="result">Sin resultados.</pre>
+<script type="module">
+const button = document.getElementById('start');
+const status = document.getElementById('status');
+const output = document.getElementById('result');
+
+button.addEventListener('click', async () => {
+  button.disabled = true;
+  const report = {
+    secureContext: isSecureContext,
+    userAgent: navigator.userAgent,
+    nativeWebNN: typeof navigator.ml?.createContext === 'function',
+    graphBuilder: typeof MLGraphBuilder,
+    nativeWebGPU: typeof navigator.gpu?.requestAdapter === 'function',
+  };
+  let context;
+  const tensors = [];
+  try {
+    if (report.nativeWebGPU) {
+      const high = await navigator.gpu.requestAdapter({powerPreference: 'high-performance'});
+      const low = await navigator.gpu.requestAdapter({powerPreference: 'low-power'});
+      const describe = (adapter) => adapter && {vendor: adapter.info.vendor,
+        device: adapter.info.device, isFallbackAdapter: adapter.info.isFallbackAdapter};
+      report.webGPUAdapters = {highPerformance: describe(high), lowPower: describe(low)};
+      report.sameReportedAdapter = JSON.stringify(report.webGPUAdapters.highPerformance) ===
+        JSON.stringify(report.webGPUAdapters.lowPower);
+    }
+    if (!report.nativeWebNN) {
+      report.conclusion = 'El navegador no expone WebNN nativo en esta configuración.';
+      status.textContent = 'WebNN nativo no disponible.';
+      output.textContent = JSON.stringify(report, null, 2);
+      return;
+    }
+    status.textContent = 'Creando contexto WebNN acelerado…';
+    const startContext = performance.now();
+    context = await navigator.ml.createContext({powerPreference: 'high-performance',
+      accelerated: true});
+    report.contextMs = performance.now() - startContext;
+    report.context = {accelerated: context.accelerated,
+      powerPreference: context.powerPreference,
+      hasDispatch: typeof context.dispatch === 'function',
+      hasTensor: typeof context.createTensor === 'function',
+      hasExportToGPU: typeof context.exportToGPU === 'function'};
+    if (typeof MLGraphBuilder !== 'function' || !report.context.hasDispatch ||
+      !report.context.hasTensor) throw new Error('WebNN incompleto para el benchmark.');
+    const n = 256;
+    const descriptor = {dataType: 'float32', shape: [n, n]};
+    const builder = new MLGraphBuilder(context);
+    const a = builder.input('a', descriptor);
+    const b = builder.input('b', descriptor);
+    const c = builder.matmul(a, b);
+    const buildStart = performance.now();
+    const graph = await builder.build({c});
+    report.buildMs = performance.now() - buildStart;
+    const aTensor = await context.createTensor({...descriptor, writable: true});
+    const bTensor = await context.createTensor({...descriptor, writable: true});
+    const cTensor = await context.createTensor({...descriptor, readable: true});
+    tensors.push(aTensor, bTensor, cTensor);
+    const aData = new Float32Array(n * n);
+    const bData = new Float32Array(n * n);
+    for (let row = 0; row < n; row++) {
+      for (let col = 0; col < n; col++) {
+        aData[row * n + col] = ((row + 3 * col) % 13 - 6) / 13;
+        bData[row * n + col] = ((5 * row + col) % 11 - 5) / 11;
+      }
+    }
+    context.writeTensor(aTensor, aData);
+    context.writeTensor(bTensor, bData);
+    const timesMs = [];
+    let values;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const start = performance.now();
+      context.dispatch(graph, {a: aTensor, b: bTensor}, {c: cTensor});
+      values = new Float32Array(await context.readTensor(cTensor));
+      timesMs.push(performance.now() - start);
+    }
+    const cells = [[0, 0], [17, 37], [255, 255]].map(([row, col]) => {
+      let expected = 0;
+      for (let k = 0; k < n; k++) expected += aData[row * n + k] * bData[k * n + col];
+      const actual = values[row * n + col];
+      return {row, col, expected, actual, absoluteError: Math.abs(expected - actual)};
+    });
+    report.matrix = {size: n, timesMs, cells,
+      correct: cells.every((cell) => cell.absoluteError < 0.01)};
+    status.textContent = report.matrix.correct ? 'WebNN nativo completó el cálculo.'
+      : 'WebNN devolvió un resultado incorrecto.';
+  } catch (error) {
+    report.error = String(error?.stack ?? error);
+    status.textContent = `Error WebNN: ${String(error)}`;
+  } finally {
+    for (const tensor of tensors) tensor.destroy?.();
+    context?.destroy?.();
+    output.textContent = JSON.stringify(report, null, 2);
+    button.disabled = false;
+  }
+});
+</script>
+</html>

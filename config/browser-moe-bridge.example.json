@@ -1,0 +1,14 @@
+{
+  "schema": "mycellios-browser-moe-bridge/1",
+  "artifactIdentity": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "coordinatorUrl": "https://coordinator.example.invalid",
+  "layer": 0,
+  "expert": 0,
+  "localComputeMsPerToken": 10,
+  "browserComputeMsPerToken": 20,
+  "ramToDeviceGbytesPerSecond": 8,
+  "roundTripMs": 20,
+  "bandwidthMbps": 100,
+  "localVramBudgetBytes": 268435456,
+  "browserVramBudgetBytes": 268435456
+}

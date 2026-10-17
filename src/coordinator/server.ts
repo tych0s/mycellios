@@ -95,6 +95,7 @@ import {
 } from "../support/assistant.js";
 import { MeshService, MeshServiceError, type JobStreamEvent } from "./mesh-service.js";
 import { MobileComputeHub, type MobileWorkerSnapshot } from "./mobile-compute-hub.js";
+import { queueExistingMobileArtifacts } from "./mobile-artifact-backup.js";
 import {
   verifyGitHubReleaseUploadToken,
   type GitHubReleaseClaims,
@@ -503,7 +504,8 @@ export async function createCoordinator(
   const internalToken = config.internalToken ?? config.modelAdminToken ?? config.networkToken;
   app.addHook("onRequest", async (request, reply) => {
     const path = request.url.split("?", 1)[0] ?? request.url;
-    if (!path.startsWith("/internal/v1/mobile/experts/")) return;
+    if (!path.startsWith("/internal/v1/mobile/experts/")
+      && !path.startsWith("/internal/v1/mobile/layers/")) return;
     if (!internalToken) {
       return reply.code(503).send({
         error: {
@@ -542,7 +544,8 @@ export async function createCoordinator(
       // Mobile expert administration has its own stronger control-plane
       // credential above. Requiring both secrets in one Authorization header
       // would make the route impossible to use when the tokens differ.
-      if (path.startsWith("/internal/v1/mobile/experts/")) return;
+      if (path.startsWith("/internal/v1/mobile/experts/")
+        || path.startsWith("/internal/v1/mobile/layers/")) return;
       if (
         (path === WORKER_CONNECT_PATH || WORKER_NODE_CONTROL_PATH.test(path))
         && received?.startsWith(`${WORKER_SESSION_TOKEN_PREFIX}.`)
@@ -5310,49 +5313,6 @@ function sendDevelopmentLabError(
         : "The development lab request was rejected.",
     },
   });
-}
-
-function queueExistingMobileArtifacts(
-  persistence: SupabasePersistence,
-  directory: string,
-): void {
-  let files: string[];
-  try {
-    files = readdirSync(directory);
-  } catch {
-    return;
-  }
-  for (const file of files) {
-    const path = resolve(directory, file);
-    if (file.endsWith(".bin")) {
-      const weightsHash = file.slice(0, -4);
-      if (!/^[a-f0-9]{64}$/.test(weightsHash)) continue;
-      const sizeBytes = statSync(path).size;
-      persistence.registerArtifactBackup({
-        id: `mobile-weight-${weightsHash}`,
-        localPath: path,
-        storagePath: `mobile-experts/weights/${file}`,
-        contentType: "application/octet-stream",
-        sha256: weightsHash,
-        sizeBytes,
-        metadata: { kind: "mobile-expert-weights", weightsHash },
-      });
-      continue;
-    }
-    if (!file.endsWith(".json")) continue;
-    const artifactId = file.slice(0, -5);
-    if (!/^[a-f0-9]{64}$/.test(artifactId)) continue;
-    const body = readFileSync(path);
-    persistence.registerArtifactBackup({
-      id: `mobile-manifest-${artifactId}`,
-      localPath: path,
-      storagePath: `mobile-experts/manifests/${file}`,
-      contentType: "application/json",
-      sha256: createHash("sha256").update(body).digest("hex"),
-      sizeBytes: body.length,
-      metadata: { kind: "mobile-expert-manifest", artifactId },
-    });
-  }
 }
 
 const benchmarkRunRequestSchema = z.object({

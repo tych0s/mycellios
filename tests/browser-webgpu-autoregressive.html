@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="es">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mycellios: decodificación GPU residente</title>
+<style>
+  body { max-width: 62rem; margin: 2rem auto; padding: 0 1rem; font: 16px/1.5 system-ui, sans-serif; }
+  button { font: inherit; padding: .5rem .8rem; }
+  pre { padding: 1rem; white-space: pre-wrap; overflow-wrap: anywhere; background: #101827; color: #e5e7eb; border-radius: .5rem; }
+</style>
+<h1>Decodificación con estado dentro de la GPU</h1>
+<p>Compara 64 pasos dependientes, con 32 pases de cálculo por paso. Una ruta devuelve cada token a JavaScript; la otra deja token y estado en la GPU hasta el final. Es una carga sintética: demuestra el coste de la coordinación, no la velocidad de un LLM.</p>
+<button id="start">Comparar las dos rutas</button>
+<p id="status">Preparado.</p>
+<pre id="result">Sin resultados.</pre>
+<script type="module">
+  const start = document.getElementById('start');
+  const status = document.getElementById('status');
+  const result = document.getElementById('result');
+  const tokenCount = 64;
+  const stageCount = 32;
+  const requestedStateSize = Number(new URLSearchParams(location.search).get('state'));
+  const stateSize = [1024, 16384, 65536].includes(requestedStateSize)
+    ? requestedStateSize : 1024;
+  const seed = Uint32Array.from({length: stateSize}, (_, i) =>
+    (Math.imul(i, 1664525) + 1013904223) >>> 0);
+  const emptyState = new Uint32Array(stateSize);
+  const emptyTokens = new Uint32Array(tokenCount);
+  const stepData = new Uint8Array(tokenCount * 256);
+  const steps = new DataView(stepData.buffer);
+  for (let i = 0; i < tokenCount; i++) steps.setUint32(i * 256, i, true);
+
+  function reference(count) {
+    let source = seed.slice();
+    let target = new Uint32Array(stateSize);
+    let token = 1;
+    const output = [];
+    for (let step = 0; step < count; step++) {
+      for (let stage = 0; stage < stageCount; stage++) {
+        for (let i = 0; i < stateSize; i++) {
+          target[i] = (Math.imul(source[i], 1664525) + 1013904223
+            + token * 17 + i * 13) >>> 0;
+        }
+        [source, target] = [target, source];
+      }
+      token = (source[0] ^ source[17] ^ source[71]) & 255;
+      output.push(token);
+    }
+    return output;
+  }
+
+  start.addEventListener('click', async () => {
+    start.disabled = true;
+    const report = {tokenCount, stageCount, stateSize, runs: []};
+    let device;
+    try {
+      status.textContent = 'Preparando WebGPU…';
+      const adapter = await navigator.gpu?.requestAdapter({featureLevel: 'core'});
+      if (!adapter) throw new Error('Este navegador no ofrece un adaptador WebGPU.');
+      device = await adapter.requestDevice();
+      report.adapter = {vendor: adapter.info.vendor, device: adapter.info.device,
+        description: adapter.info.description, isFallbackAdapter: adapter.info.isFallbackAdapter};
+
+      const stateA = device.createBuffer({size: seed.byteLength,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST});
+      const stateB = device.createBuffer({size: seed.byteLength,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST});
+      const token = device.createBuffer({size: 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST});
+      const output = device.createBuffer({size: emptyTokens.byteLength,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST});
+      const tokenReadback = device.createBuffer({size: 4,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ});
+      const outputReadback = device.createBuffer({size: emptyTokens.byteLength,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ});
+      const stepBuffer = device.createBuffer({size: stepData.byteLength,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST});
+      device.queue.writeBuffer(stepBuffer, 0, stepData);
+
+      const stageModule = device.createShaderModule({code: `
+        @group(0) @binding(0) var<storage, read> source: array<u32>;
+        @group(0) @binding(1) var<storage, read_write> destination: array<u32>;
+        @group(0) @binding(2) var<storage, read> token: array<u32>;
+        @compute @workgroup_size(64)
+        fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+          if (id.x >= ${stateSize}u) { return; }
+          destination[id.x] = source[id.x] * 1664525u + 1013904223u
+            + token[0] * 17u + id.x * 13u;
+        }
+      `});
+      const sampleModule = device.createShaderModule({code: `
+        struct Step { index: u32 }
+        @group(0) @binding(0) var<storage, read> state: array<u32>;
+        @group(0) @binding(1) var<storage, read_write> token: array<u32>;
+        @group(0) @binding(2) var<storage, read_write> output: array<u32>;
+        @group(0) @binding(3) var<uniform> step: Step;
+        @compute @workgroup_size(1)
+        fn main() {
+          let next = (state[0] ^ state[17] ^ state[71]) & 255u;
+          token[0] = next;
+          output[step.index] = next;
+        }
+      `});
+      const shaderErrors = [];
+      for (const [name, module] of [['stage', stageModule], ['sample', sampleModule]]) {
+        const info = await module.getCompilationInfo();
+        shaderErrors.push(...info.messages.filter((message) => message.type === 'error')
+          .map((message) => ({name, line: message.lineNum, text: message.message})));
+      }
+      if (shaderErrors.length) throw new Error(JSON.stringify(shaderErrors));
+      const stageLayout = device.createBindGroupLayout({entries: [
+        {binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: {type: 'read-only-storage'}},
+        {binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: {type: 'storage'}},
+        {binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: {type: 'read-only-storage'}},
+      ]});
+      const sampleLayout = device.createBindGroupLayout({entries: [
+        {binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: {type: 'read-only-storage'}},
+        {binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: {type: 'storage'}},
+        {binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: {type: 'storage'}},
+        {binding: 3, visibility: GPUShaderStage.COMPUTE,
+          buffer: {type: 'uniform', hasDynamicOffset: true, minBindingSize: 4}},
+      ]});
+      const stagePipeline = await device.createComputePipelineAsync({
+        layout: device.createPipelineLayout({bindGroupLayouts: [stageLayout]}),
+        compute: {module: stageModule, entryPoint: 'main'},
+      });
+      const samplePipeline = await device.createComputePipelineAsync({
+        layout: device.createPipelineLayout({bindGroupLayouts: [sampleLayout]}),
+        compute: {module: sampleModule, entryPoint: 'main'},
+      });
+      const stageGroups = [[stateA, stateB], [stateB, stateA]].map(([src, dst]) =>
+        device.createBindGroup({layout: stageLayout, entries: [
+          {binding: 0, resource: {buffer: src}},
+          {binding: 1, resource: {buffer: dst}},
+          {binding: 2, resource: {buffer: token}},
+        ]}));
+      const sampleGroup = device.createBindGroup({layout: sampleLayout, entries: [
+        {binding: 0, resource: {buffer: stateA}},
+        {binding: 1, resource: {buffer: token}},
+        {binding: 2, resource: {buffer: output}},
+        {binding: 3, resource: {buffer: stepBuffer, size: 4}},
+      ]});
+
+      function encodeStep(encoder, step) {
+        for (let stage = 0; stage < stageCount; stage++) {
+          const pass = encoder.beginComputePass();
+          pass.setPipeline(stagePipeline);
+          pass.setBindGroup(0, stageGroups[stage & 1]);
+          pass.dispatchWorkgroups(stateSize / 64);
+          pass.end();
+        }
+        const sample = encoder.beginComputePass();
+        sample.setPipeline(samplePipeline);
+        sample.setBindGroup(0, sampleGroup, [step * 256]);
+        sample.dispatchWorkgroups(1);
+        sample.end();
+      }
+
+      async function run(mode, count) {
+        device.queue.writeBuffer(stateA, 0, seed);
+        device.queue.writeBuffer(stateB, 0, emptyState);
+        device.queue.writeBuffer(token, 0, new Uint32Array([1]));
+        device.queue.writeBuffer(output, 0, emptyTokens);
+        const begun = performance.now();
+        let submissions = 0;
+        let tokenMaps = 0;
+        if (mode === 'gpu-resident') {
+          const encoder = device.createCommandEncoder();
+          for (let step = 0; step < count; step++) encodeStep(encoder, step);
+          device.queue.submit([encoder.finish()]);
+          submissions++;
+        } else {
+          for (let step = 0; step < count; step++) {
+            const encoder = device.createCommandEncoder();
+            encodeStep(encoder, step);
+            encoder.copyBufferToBuffer(token, 0, tokenReadback, 0, 4);
+            device.queue.submit([encoder.finish()]);
+            submissions++;
+            await tokenReadback.mapAsync(GPUMapMode.READ);
+            const sampledToken = new Uint32Array(tokenReadback.getMappedRange())[0];
+            tokenReadback.unmap();
+            tokenMaps++;
+            if (step + 1 < count) device.queue.writeBuffer(token, 0,
+              new Uint32Array([sampledToken]));
+          }
+        }
+        const finish = device.createCommandEncoder();
+        finish.copyBufferToBuffer(output, 0, outputReadback, 0, emptyTokens.byteLength);
+        device.queue.submit([finish.finish()]);
+        submissions++;
+        await outputReadback.mapAsync(GPUMapMode.READ);
+        const tokens = Array.from(new Uint32Array(outputReadback.getMappedRange()).slice(0, count));
+        outputReadback.unmap();
+        const wallMs = Number((performance.now() - begun).toFixed(3));
+        const expected = reference(count);
+        return {mode, count, wallMs, tokensPerSecond: Number((count * 1000 / wallMs).toFixed(2)),
+          submissions, tokenMaps, correct: tokens.every((value, i) => value === expected[i]),
+          outputChecksum: tokens.reduce((sum, value) => (sum + value) >>> 0, 0),
+          distinctTokens: new Set(tokens).size, firstTokens: tokens.slice(0, 12)};
+      }
+
+      status.textContent = 'Calentando shaders…';
+      const warmup = await run('gpu-resident', 4);
+      if (!warmup.correct) throw new Error('Falló la comprobación de la carga de calentamiento.');
+      for (const mode of ['cpu-roundtrip', 'gpu-resident', 'gpu-resident', 'cpu-roundtrip']) {
+        status.textContent = `Midiendo ${mode} (${report.runs.length + 1}/4)…`;
+        const runResult = await run(mode, tokenCount);
+        report.runs.push(runResult);
+        result.textContent = JSON.stringify(report, null, 2);
+        if (!runResult.correct) throw new Error(`El resultado ${mode} no coincide con CPU.`);
+      }
+      const average = (mode) => report.runs.filter((run) => run.mode === mode)
+        .reduce((sum, run) => sum + run.wallMs, 0) / 2;
+      report.meanWallMs = {
+        cpuRoundtrip: Number(average('cpu-roundtrip').toFixed(3)),
+        gpuResident: Number(average('gpu-resident').toFixed(3)),
+      };
+      report.speedup = Number((report.meanWallMs.cpuRoundtrip
+        / report.meanWallMs.gpuResident).toFixed(2));
+      result.textContent = JSON.stringify(report, null, 2);
+      status.textContent = 'Comparación terminada y resultados contrastados con CPU.';
+    } catch (error) {
+      report.error = String(error?.stack ?? error);
+      result.textContent = JSON.stringify(report, null, 2);
+      status.textContent = `Error: ${String(error)}`;
+    } finally {
+      device?.destroy();
+      start.disabled = false;
+    }
+  });
+</script>
+</html>

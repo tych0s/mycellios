@@ -9,6 +9,7 @@ import {
 } from "./backend-state";
 import type { NativeBuildIdentity } from "../contracts/build-identity";
 import { trustedExpertManifestPath } from "./expert-manifest-url";
+import { BrowserLayerWork, type LayerExecuteTask, type LayerLoadTask } from "./browser-layer-work";
 
 declare const __MYCELLIOS_BUILD_IDENTITY__: NativeBuildIdentity;
 
@@ -55,6 +56,17 @@ interface ResidentExpert {
   up: Float32Array;
   down: Float32Array;
 }
+
+interface GpuResidentExpert {
+  device: GPUDevice;
+  gate: GPUBuffer;
+  up: GPUBuffer;
+  down: GPUBuffer;
+  bytes: number;
+}
+
+const gpuResidentExperts = new Map<string, GpuResidentExpert>();
+const MAX_GPU_RESIDENT_EXPERT_BYTES = 256 * 1024 * 1024;
 
 interface RuntimeState {
   running: boolean;
@@ -125,6 +137,14 @@ const viewState: Pick<MobileWorkerSnapshot, "connection" | "connectionLabel" | "
   activity: ["Worker ready to start."],
 };
 const listeners = new Set<(snapshot: MobileWorkerSnapshot) => void>();
+const browserLayers = new BrowserLayerWork({
+  backend: () => state.backend,
+  token: () => state.token,
+  signal: () => state.executionController.signal,
+  active: () => state.running && document.visibilityState === "visible",
+  send,
+  status: setStatus,
+});
 let initialized = false;
 let backendProbeVersion = 0;
 
@@ -238,6 +258,8 @@ async function stop(log = true, preserveView = false): Promise<void> {
   await state.wakeLock?.release().catch(() => undefined);
   state.wakeLock = null;
   state.residentExperts.clear();
+  await browserLayers.close();
+  clearGpuResidentExperts();
   state.cancelledMatrixTasks.clear();
   renderWakeLock();
   setBusy(false);
@@ -543,10 +565,12 @@ async function handleServerMessage(raw: string): Promise<void> {
     sendHeartbeat();
     if (state.heartbeatTimer !== null) window.clearInterval(state.heartbeatTimer);
     state.heartbeatTimer = window.setInterval(sendHeartbeat, 5_000);
-    if (payload.inferenceReady || state.verifiedTasks > 0) {
+    if (payload.inferenceReady && state.backend === "webgpu") {
       setStatus("Device validated and waiting for real inference work.");
       addLog("Device already validated · ready for real model inference.");
       emit();
+    } else if (state.backend === "cpu" && state.verifiedTasks > 0) {
+      setStatus("CPU check passed. Waiting for a compatible model layer.");
     } else {
       setStatus("Connected. Running the one-time network admission check…");
       addLog("Browser worker connected · requesting its one-time admission check.");
@@ -588,14 +612,45 @@ async function handleServerMessage(raw: string): Promise<void> {
     return;
   }
   if (message.type === "expert.rejected") {
+    const payload = message.payload as { artifactId?: string };
+    if (payload.artifactId) {
+      state.residentExperts.delete(payload.artifactId);
+      releaseGpuResidentExpert(payload.artifactId);
+    }
     addLog("Expert weights or replicated output failed validation and were removed.");
+  }
+  if (message.type === "layer.load") {
+    await browserLayers.load(message.payload as LayerLoadTask);
+    return;
+  }
+  if (message.type === "layer.execute") {
+    await browserLayers.execute(message.payload as LayerExecuteTask);
+    return;
+  }
+  if (message.type === "layer.reset") {
+    const payload = message.payload as { artifactId?: string; requestId?: string };
+    if (payload.artifactId && payload.requestId) {
+      browserLayers.reset(payload.artifactId, payload.requestId);
+    }
+    return;
+  }
+  if (message.type === "layer.verified") {
+    const payload = message.payload as { layer?: number; backend?: string; verifiedTasks?: number };
+    state.verifiedTasks = payload.verifiedTasks ?? state.verifiedTasks + 1;
+    setStatus(`Layer ${payload.layer ?? "?"} executed on ${payload.backend ?? state.backend} for the model network.`);
+    emit();
+    return;
   }
   if (message.type === "compute.verified") {
     const payload = message.payload as { verifiedTasks?: number; inferenceReady?: boolean };
     state.verifiedTasks = payload.verifiedTasks ?? state.verifiedTasks + 1;
-    setStatus("Device validated and waiting for real inference work.");
+    setStatus(payload.inferenceReady && state.backend === "webgpu"
+      ? "GPU validated and waiting for compatible model work."
+      : "CPU check passed. Waiting for a compatible model layer.");
     emit();
-    addLog("Admission check verified · this device is ready for real model inference.");
+    addLog(payload.inferenceReady && state.backend === "webgpu"
+      ? "GPU admission check verified · ready for compatible model work."
+      : "CPU admission check verified · waiting for compatible model work.");
     return;
   }
   if (message.type === "compute.rejected") {
@@ -703,6 +758,7 @@ async function loadExpert(offer: {
     addLog(`Loaded ${manifest.modelId} L${manifest.layer}/E${manifest.expert}; SHA-256 verified.`);
   } catch (error) {
     state.residentExperts.delete(offer.artifactId);
+    releaseGpuResidentExpert(offer.artifactId);
     if (isMobileExecutionCancelled(error)) return;
     send("expert.fail", {
       taskId: offer.taskId,
@@ -749,6 +805,7 @@ async function executeExpert(offer: {
   } catch (error) {
     if (isMobileExecutionCancelled(error)) return;
     state.residentExperts.delete(offer.artifactId);
+    releaseGpuResidentExpert(offer.artifactId);
     send("expert.fail", {
       taskId: offer.taskId,
       leaseId: offer.leaseId,
@@ -856,9 +913,10 @@ async function swiGluWebGpu(
     return buffer;
   };
   const input = storage("expert-input", activations);
-  const gate = storage("expert-gate", expert.gate);
-  const up = storage("expert-up", expert.up);
-  const down = storage("expert-down", expert.down);
+  const resident = gpuResidentExpertWeights(device, expert);
+  const gate = resident?.gate ?? storage("expert-gate", expert.gate);
+  const up = resident?.up ?? storage("expert-up", expert.up);
+  const down = resident?.down ?? storage("expert-down", expert.down);
   const activated = device.createBuffer({
     label: "expert-activated",
     size: rows * intermediateSize * 4,
@@ -940,6 +998,67 @@ async function swiGluWebGpu(
     if (readback.mapState === "mapped") readback.unmap();
     buffers.forEach((buffer) => buffer.destroy());
   }
+}
+
+function gpuResidentExpertWeights(device: GPUDevice, expert: ResidentExpert): GpuResidentExpert | null {
+  const id = expert.manifest.artifactId;
+  const existing = gpuResidentExperts.get(id);
+  if (existing?.device === device) {
+    gpuResidentExperts.delete(id);
+    gpuResidentExperts.set(id, existing);
+    return existing;
+  }
+  if (existing) releaseGpuResidentExpert(id);
+  const bytes = expert.gate.byteLength + expert.up.byteLength + expert.down.byteLength;
+  if (bytes > MAX_GPU_RESIDENT_EXPERT_BYTES) return null;
+  while (gpuResidentExperts.size > 0 && gpuResidentExpertBytes() + bytes > MAX_GPU_RESIDENT_EXPERT_BYTES) {
+    const oldest = gpuResidentExperts.keys().next().value;
+    if (typeof oldest !== "string") break;
+    releaseGpuResidentExpert(oldest);
+  }
+  const created: GPUBuffer[] = [];
+  try {
+    const upload = (label: string, values: Float32Array): GPUBuffer => {
+      const buffer = device.createBuffer({
+        label, size: values.byteLength,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      });
+      created.push(buffer);
+      device.queue.writeBuffer(buffer, 0, values);
+      return buffer;
+    };
+    const entry = {
+      device,
+      gate: upload("resident-expert-gate", expert.gate),
+      up: upload("resident-expert-up", expert.up),
+      down: upload("resident-expert-down", expert.down),
+      bytes,
+    };
+    gpuResidentExperts.set(id, entry);
+    return entry;
+  } catch (error) {
+    created.forEach((buffer) => buffer.destroy());
+    throw error;
+  }
+}
+
+function gpuResidentExpertBytes(): number {
+  let bytes = 0;
+  for (const expert of gpuResidentExperts.values()) bytes += expert.bytes;
+  return bytes;
+}
+
+function releaseGpuResidentExpert(id: string): void {
+  const entry = gpuResidentExperts.get(id);
+  if (!entry) return;
+  gpuResidentExperts.delete(id);
+  entry.gate.destroy();
+  entry.up.destroy();
+  entry.down.destroy();
+}
+
+function clearGpuResidentExperts(): void {
+  for (const id of [...gpuResidentExperts.keys()]) releaseGpuResidentExpert(id);
 }
 
 function float32FromBase64(value: string): Float32Array {
@@ -1250,6 +1369,8 @@ function beginExecutionSession(reason: string): AbortSignal {
 function cancelActiveExecutions(reason: string): void {
   state.executionController.abort(new MobileExecutionCancelledError(reason));
   state.executionController = new AbortController();
+  clearGpuResidentExperts();
+  void browserLayers.close();
   const device = state.device;
   state.device = null;
   state.gpu = null;
@@ -1296,6 +1417,7 @@ async function yieldToBrowser(signal: AbortSignal): Promise<void> {
 
 function transitionToCpuFallback(reason: string, failedDevice: GPUDevice | null): void {
   if (failedDevice && state.device !== failedDevice) return;
+  clearGpuResidentExperts();
   const device = state.device;
   state.device = null;
   state.gpu = null;

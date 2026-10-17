@@ -86,6 +86,114 @@ coordinator diagnostics for investigating preparation and worker disconnects.
 Keep native runs, builds and the full test suite sequential on memory-constrained
 machines; the example's `--maxWorkers=1` limits test concurrency.
 
+## Browser contribution pilot
+
+### Browser decoder layer gate
+
+For an exact local Qwen3 or Llama safetensors snapshot, export and verify the selected
+layer, then publish it to the coordinator. Use an origin with an internal
+administration token; the publisher reads `MYCELLIOS_INTERNAL_TOKEN` or
+`MYCELLIOS_INTERNAL_TOKEN_FILE`. The generated bridge file contains no token.
+
+```bash
+python tests/run-browser-qwen3-layer-onnx.py --architecture <qwen3|llama> \
+  --model <snapshot> --layer 0 --output runtime/layer-0.onnx \
+  --fixture runtime/layer-0-fixture.json
+python scripts/publish-browser-qwen3-layer.py --model <snapshot> \
+  --graph runtime/layer-0.onnx --fixture runtime/layer-0-fixture.json \
+  --coordinator-url <origin> --config-output runtime/browser-layer-bridge.json
+```
+
+For another model family, supply an ONNX graph and a
+`mycellios-browser-layer/2` manifest with its exact model and graph digests,
+declared tensor names/shapes, state outputs and a native-output canary. Register
+a trusted `BrowserLayerAdapter` in the native process before stage creation,
+then use `scripts/publish-browser-layer.py --model <snapshot> --graph <onnx>
+--manifest <json> --coordinator-url <origin> --config-output <json>`. The
+publisher checks the graph's declared inputs/outputs and canary numerically.
+
+Set `MYCELLIOS_BROWSER_LAYER_BRIDGE_FILE` to the absolute path of that generated
+JSON in the selected Python stage environment. The selected layer must belong
+to that stage's range. Keep the coordinator origin and artifact identity bound
+to the same model snapshot. Run `tests/run-browser-layer-network.py` with the
+generated config and fixture for a local browser/coordinator check, and
+`tests/run-browser-layer-full-model.py` for the full-model regression on the
+cached Qwen3-0.6B checkpoint. The latter fixture uses layer 0 and 28 layers.
+For the two-range local regression, export and publish layer 1, then run
+`tests/run-browser-layer-split-model.py` with its generated bridge config.
+
+For automatic discovery of an already published layer, configure the trusted
+native stage host once with `MYCELLIOS_BROWSER_LAYER_COORDINATOR_URL` and
+`MYCELLIOS_INTERNAL_TOKEN` or `MYCELLIOS_INTERNAL_TOKEN_FILE`. The origin must
+use HTTPS, except for local loopback tests. The local auto-distribution agent
+and remote launch daemon pass this explicit grant to their isolated Python
+stages. At stage startup, the runtime looks up the active artifact by exact
+model digest and assigned layer range, then attaches one compatible decoder
+layer. The coordinator prefers an admitted WebGPU browser, validates the
+model-specific numerical canary, and tries another eligible browser if that
+canary or load fails. A disconnected or failed browser falls back to the
+native layer. The explicit bridge file above remains available for a pinned
+single-artifact run and takes precedence over discovery.
+
+An operator must still export and publish a verified graph for each supported
+model checkpoint before starting its stage. A browser click alone cannot turn
+an unexported architecture, an unsupported ONNX operator, or an insufficient
+device into a usable model layer. The browser may receive no layer when these
+requirements are unmet. `--auto-discovery` on
+`tests/run-browser-layer-full-model.py` verifies the lookup route without
+passing a per-model bridge file to the stage.
+
+
+`/browser/` admits a worker after the user presses **Start contributing** and
+keeps that tab visible. For a regular Qwen3 model, copy
+`config/browser-dense-bridge.example.json` to a private local file, set its
+exact active model identity, coordinator HTTPS origin and one assigned layer,
+then set `MYCELLIOS_BROWSER_DENSE_BRIDGE_FILE` to its absolute path in the
+Python stage environment. The standard Torch `StageRunner` publishes that
+layer's dense SiLU MLP and uses two admitted browsers when present. It keeps
+the complete native MLP for loss of browser residency or execution. This
+currently applies to the Torch safetensors Qwen3 stage, not the GGUF backend.
+Published weights and live activations reach untrusted browser devices; enable
+this only for models and workloads allowed to leave the native stage.
+
+For routed models, an operator can opt one SiLU expert from a
+RAM-backed Qwen3/GLM4 MoE stage into browser placement. Copy
+`config/browser-moe-bridge.example.json` to a private local file, then replace
+the zero digest and example URL with the active model's exact SHA-256 identity
+and the coordinator HTTPS origin. Choose an actual sparse `layer` and `expert`.
+The five latency/bandwidth fields and two available VRAM budgets must come
+from the intended hosts and devices; the example values are placeholders.
+The budgets describe memory available to this expert mesh after other model
+allocations. Keep `MYCELLIOS_INTERNAL_TOKEN` or
+`MYCELLIOS_INTERNAL_TOKEN_FILE` in the native stage environment and set
+`MYCELLIOS_BROWSER_MOE_BRIDGE_FILE` to the absolute path of the private JSON
+file on the stage host. Never put the token in either JSON file or a public URL.
+
+The stage publishes the exact float32 expert and retains its local RAM copy.
+The planner selects the browser only when its profile and live residency favor
+it. The coordinator requires two distinct, visible, admitted browser workers
+and compares their outputs. A missing browser returns to the native expert.
+The bridges currently cover one Qwen3 dense MLP or one routed MoE expert, not
+an arbitrary transformer layer or the complete model on a phone. The browser
+worker remains available without an operator bridge, but then receives only
+its admission check unless another compatible model job is published.
+
+For a local end-to-end check, run `npm run mobile:build`, start
+`npx tsx tests/serve-browser-split-probe.ts`, open two independent browser
+profiles at `http://127.0.0.1:8770/browser/`, press **Start contributing** in
+both, and run `tests/run-browser-moe-generation.py` with `PYTHONPATH=python`
+and `MYCELLIOS_INTERNAL_TOKEN=local-browser-split-probe` in its process
+environment. The script creates a tiny model, compares complete token IDs,
+checks that both browsers verified real expert work, and writes an ignored
+local receipt under `runtime/`. Loopback and two browser profiles on one PC
+remain a software check, not physical multi-host evidence.
+`tests/run-browser-dense-generation.py` does the equivalent for a tiny dense
+Qwen3 model; `--expect-fallback` verifies the native path after one browser is
+paused. Both scripts generate test fixtures and leave production unchanged.
+`tests/run-browser-qwen3-real-layer.py --snapshot <absolute-local-snapshot>`
+compares one browser-owned layer against native Torch using an already cached
+Qwen3 0.6B safetensors checkpoint; it does not generate a full answer.
+
 ## Development rules
 
 - Preserve fail-closed schemas and identity checks.

@@ -81,6 +81,34 @@ export interface IsolatedProcessEnvironmentOptions {
   additionalInheritedKeys?: readonly string[];
 }
 
+/** Explicit per-host grant for a native stage to discover published browser layers. */
+export function browserLayerRuntimeEnvironment(
+  source: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const origin = source.MYCELLIOS_BROWSER_LAYER_COORDINATOR_URL?.trim();
+  if (!origin) return {};
+  let url: URL;
+  try {
+    url = new URL(origin);
+  } catch {
+    throw new Error("browser_layer_coordinator_origin_is_invalid");
+  }
+  if ((url.protocol !== "https:" && url.protocol !== "http:")
+    || (url.protocol === "http:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))
+    || url.username || url.password || url.search || url.hash
+    || url.pathname !== "/") {
+    throw new Error("browser_layer_coordinator_origin_is_invalid");
+  }
+  const token = source.MYCELLIOS_INTERNAL_TOKEN?.trim();
+  const tokenFile = source.MYCELLIOS_INTERNAL_TOKEN_FILE?.trim();
+  if (!token && !tokenFile) throw new Error("browser_layer_internal_token_is_missing");
+  return {
+    MYCELLIOS_BROWSER_LAYER_COORDINATOR_URL: origin,
+    ...(token ? { MYCELLIOS_INTERNAL_TOKEN: token }
+      : { MYCELLIOS_INTERNAL_TOKEN_FILE: tokenFile }),
+  };
+}
+
 /**
  * Build a fresh child environment instead of spreading process.env.
  *

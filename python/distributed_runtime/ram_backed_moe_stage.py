@@ -1130,6 +1130,7 @@ class RamBackedMoeStageRunner(StageRunner):
             if isinstance(getattr(getattr(layer, "mlp", None), "experts", None), RamBackedMoeExperts)
         )
         self._resident_mesh_owned_owners: dict[int, ExpertOwner] = {}
+        self._browser_expert_meshes: list[ResidentExpertMesh] = []
         # The store adopted only routed bundles. Router/shared tensors were
         # streamed directly from safetensors into the resident device model;
         # they never joined the persistent host-RAM bundle set.
@@ -1174,6 +1175,11 @@ class RamBackedMoeStageRunner(StageRunner):
         """Detach a layer without closing or otherwise mutating injected owners."""
 
         self._expert_module_for_layer(layer).detach_resident_expert_mesh()
+
+    def adopt_browser_expert_mesh(self, mesh: ResidentExpertMesh) -> None:
+        """Own the worker pool of a bridge created for this runner."""
+
+        self._browser_expert_meshes.append(mesh)
 
     def _forward_scope(self, operation):
         self.prefetch_coordinator.begin_forward()
@@ -1279,6 +1285,10 @@ class RamBackedMoeStageRunner(StageRunner):
             self._resident_mesh_owned_owners.clear()
             for owner in owned:
                 owner.close()  # type: ignore[attr-defined]
+            meshes = tuple(self._browser_expert_meshes)
+            self._browser_expert_meshes.clear()
+            for mesh in meshes:
+                mesh.close()
 
 
 def _build_meta_resident_model(

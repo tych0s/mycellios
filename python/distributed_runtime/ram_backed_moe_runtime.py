@@ -422,6 +422,13 @@ def build_ram_backed_moe_stage_runner(
     ):
         runner.close()
         raise RuntimeError("production RAM-backed MoE runner did not remain on CUDA")
+    try:
+        from .browser_moe_bridge import attach_browser_moe_bridge
+
+        attach_browser_moe_bridge(runner)
+    except BaseException:
+        runner.close()
+        raise
     return runner
 
 

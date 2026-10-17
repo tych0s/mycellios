@@ -8,6 +8,10 @@ import type { NativeBuildIdentity } from "../contracts/build-identity.js";
 import { workerConfigSchema, type WorkerConfig } from "../contracts/schemas.js";
 import { readNativeRuntimeBuildMetadata } from "../core/native-build-identity.js";
 import { WorkerAgent } from "../worker/agent.js";
+import {
+  loadOrCreateWorkerAdmissionCredential,
+  workerAdmissionSigner,
+} from "../worker/admission-credential.js";
 import { evaluateDistributionPlan, stageMemoryBytes } from "./cost-model.js";
 import { HttpLaunchAgent } from "./launch-agent-rpc.js";
 import {
@@ -36,6 +40,7 @@ import type {
   StagePlacement,
 } from "./types.js";
 import { UNMEASURED_RTT_MS } from "../core/rtt.js";
+import { browserLayerRuntimeEnvironment } from "./process-environment.js";
 
 export const AUTO_DISTRIBUTE_SCHEMA = "gdlp-auto-distribute/1";
 export const MODEL_PROFILE_SCHEMA = "gdlp-model-profile/1";
@@ -589,8 +594,16 @@ export async function runAutoDistribution(
         collectExecutionTelemetry(compilation, runningSnapshot),
       );
       const token = optionalSecret(environment, config.coordinator.networkTokenEnv);
+      const admissionCredentialPath = resolve(
+        cwd,
+        environment.MYCELLIOS_WORKER_CREDENTIAL_PATH
+          ?? "runtime/worker-admission-credential.json",
+      );
       worker = new WorkerAgent(workerConfig, {
         coordinatorUrl: config.coordinator.url,
+        admissionSigner: workerAdmissionSigner(
+          loadOrCreateWorkerAdmissionCredential(admissionCredentialPath),
+        ),
         ...(workerAgentVersion ? { agentVersion: workerAgentVersion } : {}),
         ...(workerBuildIdentity ? { buildIdentity: workerBuildIdentity } : {}),
         ...(token ? { networkToken: token } : {}),
@@ -1026,6 +1039,7 @@ async function createLaunchAgents(
       PYTHONPATH: absoluteFrom(cwd, config.runtime.pythonPath),
       HF_HOME: absoluteFrom(cwd, config.runtime.hfHome),
       TOKENIZERS_PARALLELISM: "false",
+      ...browserLayerRuntimeEnvironment(environment),
     },
   });
   for (const node of config.nodes) {

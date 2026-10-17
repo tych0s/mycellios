@@ -188,10 +188,12 @@ class BrowserExpertOwner:
             results.append(OwnerExpertBatchResult(item.key, output))
         return tuple(results)
 
-    def _request_json(self, method: str, path: str, payload: dict[str, object]) -> dict[str, object]:
+    def _request_json(self, method: str, path: str,
+                      payload: dict[str, object] | None = None) -> dict[str, object]:
         raw = self._request(
             method,
             path,
+            None if payload is None else
             json.dumps(payload, separators=(",", ":")).encode("utf-8"),
             content_type="application/json",
         )
@@ -207,11 +209,13 @@ class BrowserExpertOwner:
         self,
         method: str,
         path: str,
-        body: bytes,
+        body: bytes | None,
         *,
         content_type: str,
     ) -> bytes:
-        headers = {"content-type": content_type, "accept": "application/json"}
+        headers = {"accept": "application/json"}
+        if body is not None:
+            headers["content-type"] = content_type
         if path.startswith("/internal/"):
             headers["authorization"] = f"Bearer {self._internal_token}"
         request = Request(

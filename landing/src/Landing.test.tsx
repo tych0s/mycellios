@@ -159,6 +159,7 @@ describe("Landing", () => {
     expect(html).toContain('id="install"');
     expect(html).toContain("Checking availability");
     expect(html).toContain("Windows 10/11 · x64");
+    expect(html).toContain('href="/browser/"');
   });
 
   it("gives the staggered lists the index their entrance animation needs", () => {

@@ -1,0 +1,6 @@
+{
+  "schema": "mycellios-browser-dense-bridge/1",
+  "artifactIdentity": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "coordinatorUrl": "https://coordinator.example.invalid",
+  "layer": 0
+}

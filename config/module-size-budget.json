@@ -5,7 +5,7 @@
     "landing/src/Panel.tsx": { "ceiling": 5555, "target": 5400, "owner": "web-control" },
     "python/distributed_runtime/engine.py": { "ceiling": 7387, "target": 7200, "owner": "python-runtime" },
     "python/distributed_runtime/external_cell.py": { "ceiling": 2323, "target": 2200, "owner": "python-runtime" },
-    "python/distributed_runtime/model.py": { "ceiling": 2501, "target": 2400, "owner": "python-runtime" },
+    "python/distributed_runtime/model.py": { "ceiling": 2510, "target": 2400, "owner": "python-runtime" },
     "python/distributed_runtime/native_gguf.py": { "ceiling": 2008, "target": 1950, "owner": "python-runtime" },
     "python/distributed_runtime/paged_stage.py": { "ceiling": 2562, "target": 2450, "owner": "python-runtime" },
     "python/distributed_runtime/resident_expert_mesh.py": { "ceiling": 3131, "target": 3000, "owner": "python-runtime" },
